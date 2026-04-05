@@ -24,6 +24,12 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
 - **Bidirectional Linking**: Use Obsidian-style wikilinks `[[Page Name]]` whenever referring to an existing entity, concept, or source. This is critical for graph rendering.
 - **Contradictions & Synthesis**: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction (e.g., "> **Conflict Note:** Source A claims X, but Source B claims Y.").
 
+- **File Naming Policy**: To prevent entropy in the `wiki/` directory, every new node MUST follow these naming prefixes:
+  - `Source_*.md`: Summary pages for documents in `raw/`.
+  - `Entity_*.md`: Specific organizations, products, or individuals.
+  - `Concept_*.md`: Abstract architectures, theories, or phenomena.
+  - `Synthesis_*.md`: Deep reasoning, comparative analysis, or comprehensive reports.
+
 ## 4. Workflows
 
 ### A. Ingestion (Processing a new source)
