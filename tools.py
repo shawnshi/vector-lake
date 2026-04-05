@@ -314,7 +314,10 @@ def visualize_vector_lake():
             .nodeVal('val')
             .linkDirectionalArrowLength(3.5)
             .linkDirectionalArrowRelPos(1)
-            .linkColor(() => '#374151')
+            .linkColor(() => 'rgba(255, 255, 255, 0.2)')
+            .linkWidth(1.5)
+            .linkDirectionalParticles(2)
+            .linkDirectionalParticleWidth(1.5)
             .onNodeClick(node => {{
                 // Camera focus
                 const distance = 40;
