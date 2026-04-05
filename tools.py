@@ -330,9 +330,13 @@ def visualize_vector_lake():
                 
                 document.getElementById('info-summary').innerText = node.summary || '';
                 
+                let memoryBasePath = "file:///{os.path.join(os.path.expanduser('~'), '.gemini', 'MEMORY').replace(chr(92), '/')}/";
                 let sourcesHtml = '';
                 if (node.sources && node.sources.length > 0) {{
-                    sourcesHtml = '<b>Raw Sources:</b><ul>' + node.sources.map(s => `<li>${{s}}</li>`).join('') + '</ul>';
+                    sourcesHtml = '<b>Raw Sources:</b><ul>' + node.sources.map(s => {{
+                        let url = s.startsWith('http') ? s : memoryBasePath + s;
+                        return `<li><a href="${{url}}" target="_blank" style="color: #60A5FA; text-decoration: underline; word-wrap: break-word;">${{s}}</a></li>`;
+                    }}).join('') + '</ul>';
                 }}
                 document.getElementById('info-sources').innerHTML = sourcesHtml;
                 
