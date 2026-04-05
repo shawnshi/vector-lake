@@ -1,0 +1,159 @@
+import os
+import json
+import logging
+from pathlib import Path
+import ingest
+
+from db import get_chroma_client
+from embedding import GeminiEmbeddingFunction
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("vector-lake-tools")
+
+EXTENSION_ROOT = Path(__file__).parent
+
+def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
+    """Semantic search over the Wiki pages via ChromaDB."""
+    client = get_chroma_client()
+    embedding_func = GeminiEmbeddingFunction()
+    
+    try:
+        collection = client.get_collection(name="vector_lake", embedding_function=embedding_func)
+        results = collection.query(
+            query_texts=[query],
+            n_results=top_k
+        )
+        
+        if not results.get('documents') or not results['documents'][0]:
+            return "No relevant information found in the Wiki."
+            
+        formatted_output = ""
+        unique_sources = set()
+        
+        for i, doc in enumerate(results['documents'][0]):
+            meta = results['metadatas'][0][i] if results.get('metadatas') and results['metadatas'][0] else {}
+            source = meta.get('source', 'Unknown')
+            unique_sources.add(source)
+            if not as_xml:
+                formatted_output += f"- **Source**: {os.path.basename(source)}\n  **Content**: {doc[:300]}...\n\n"
+            else:
+                formatted_output += f'<Evidence_Node ID="Wiki_{i}" Source="{os.path.basename(source)}">\n{doc}\n</Evidence_Node>\n'
+                
+        return formatted_output
+    except Exception as e:
+        return f"Error querying vector lake: {e}"
+
+def sync_vector_lake():
+    ingest.sync_all()
+    return "Ingestion Sync completed."
+
+def lint_vector_lake():
+    import re
+    from collections import defaultdict
+    import difflib
+    
+    wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
+    if not os.path.exists(wiki_dir):
+        return "Wiki directory not found."
+    
+    ids = {}
+    aliases_map = defaultdict(list)
+    potential_dups = []
+    
+    for filename in os.listdir(wiki_dir):
+        if not filename.endswith(".md") or filename in ("index.md", "log.md"):
+            continue
+        filepath = os.path.join(wiki_dir, filename)
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+            id_match = re.search(r'^id:\s*"(.*?)"', content, re.MULTILINE)
+            node_id = id_match.group(1) if id_match else filename.replace(".md", "")
+            if node_id in ids:
+                potential_dups.append(f"DUPLICATE ID: '{node_id}' found in both '{ids[node_id]}' and '{filename}'")
+            else:
+                ids[node_id] = filename
+                
+            alias_match = re.search(r'^aliases:\s*\[(.*?)\]', content, re.MULTILINE)
+            if alias_match:
+                aliases_str = alias_match.group(1)
+                aliases = [a.strip().strip('"').strip("'") for a in aliases_str.split(',') if a.strip()]
+                for alias in aliases:
+                    aliases_map[alias].append(node_id)
+                    
+    report = ["--- Wiki Lint Report ---"]
+    if potential_dups:
+        report.append("1. Duplicate IDs Found:")
+        for dup in potential_dups:
+            report.append(f"  - {dup}")
+    else:
+        report.append("1. No Duplicate IDs Found.")
+        
+    report.append("\n2. Alias Conflicts (Alias matching an existing ID):")
+    conflict_found = False
+    for alias, nodes in aliases_map.items():
+        if alias in ids:
+            report.append(f"  - Alias '{alias}' in node(s) {nodes} conflicts with existing Node ID '{alias}' (file: {ids[alias]})")
+            conflict_found = True
+    if not conflict_found:
+        report.append("  - No Alias Conflicts Found.")
+        
+    report.append("\n3. Shared Aliases (Multiple nodes using the same alias):")
+    shared_found = False
+    for alias, nodes in aliases_map.items():
+        if len(nodes) > 1:
+            report.append(f"  - Alias '{alias}' is shared by nodes: {nodes}")
+            shared_found = True
+    if not shared_found:
+        report.append("  - No Shared Aliases Found.")
+        
+    report.append("\n4. Checking for File Name similarities:")
+    filenames = [f for f in os.listdir(wiki_dir) if f.endswith(".md") and f not in ("index.md", "log.md")]
+    similars = []
+    for i in range(len(filenames)):
+        for j in range(i+1, len(filenames)):
+            seq = difflib.SequenceMatcher(None, filenames[i], filenames[j])
+            if seq.ratio() > 0.8:
+                similars.append((filenames[i], filenames[j], seq.ratio()))
+    if similars:
+        for sim in similars:
+            report.append(f"  - Similar files: {sim[0]} and {sim[1]} (similarity: {sim[2]:.2f})")
+    else:
+        report.append("  - No obvious similar filenames.")
+        
+    return "\n".join(report)
+
+def query_logic_lake(query_str: str):
+    import subprocess
+    wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
+    schema_path = os.path.join(EXTENSION_ROOT, "schema.md")
+    
+    prompt = f"""
+You are the Vector Lake Deep Research Agent (Query-to-Page Compiler).
+The user has requested a deep analysis/insight generation on the following topic or query:
+"{query_str}"
+
+Your mandate:
+1. Execute semantic search using the `run_shell_command` tool to execute: `python C:\\Users\\shich\\.gemini\\extensions\\vector-lake\\cli.py search "{query_str}" --top_k 10`.
+2. Based on the retrieved evidence, synthesize a high-density, structured insight report. 
+3. You MUST physically save this report as a new Markdown node in {wiki_dir} using `write_file`. Follow the rules (YAML frontmatter, [[双向链接]]) defined in {schema_path}.
+4. Terminate immediately after the file system operations are complete. Do not ask for further instructions.
+"""
+    gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
+    cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
+    
+    log.info(f"Triggering Native Agent for deep query: '{query_str}'...")
+    try:
+        result = subprocess.run(cmd, input=prompt, text=True, encoding='utf-8')
+        if result.returncode == 0:
+            return "Query logic lake operation completed successfully."
+        else:
+            return f"Agent returned non-zero exit code: {result.returncode}"
+    except Exception as e:
+        return f"Error triggering agent: {e}"
+
+__all__ = [
+    "search_vector_lake",
+    "sync_vector_lake",
+    "lint_vector_lake",
+    "query_logic_lake"
+]

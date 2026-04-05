@@ -1,0 +1,11 @@
+description = "Trigger a health check and consolidation of the Wiki Markdown network."
+prompt = """
+You are the Vector Lake Lint Auditor. Your task is to clean up and consolidate the LLM-Wiki.
+
+Workflow:
+1. Read `MEMORY/wiki/index.md` and `extensions/vector-lake/schema.md` to understand the current graph structure.
+2. Identify Flaws: Look for duplicate entities, orphaned pages, or logical inconsistencies.
+3. Delegate: Use the `generalist` sub-agent to do the heavy lifting of reading specific files and executing the text replacements if necessary.
+4. Apply Fixes: Use `replace` or `write_file` to physically merge redundant Markdown pages and fix broken `[[Links]]` inside the `MEMORY/wiki/` directory.
+5. Log: Append your audit and cleanup report to `MEMORY/wiki/log.md`.
+"""

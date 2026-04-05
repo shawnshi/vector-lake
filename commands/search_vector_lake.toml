@@ -1,0 +1,4 @@
+description = "Search the ChromaDB index for matching Markdown pages in the LLM-Wiki using semantic similarity."
+prompt = """
+Please use the vector-lake-server.search_vector_lake tool to search for: {{args}}
+"""

@@ -1,0 +1,13 @@
+description = "Query the LLM-Wiki to synthesize insights and auto-generate new Wiki pages (Query-to-Page)."
+prompt = """
+You are performing a Query-to-Page operation on the Vector Lake LLM-Wiki.
+User Query: {{args}}
+
+Workflow:
+1. Search the Wiki: Use the `vector-lake-server.search_vector_lake` tool or the `read_file` tool to find relevant context in `MEMORY/wiki/`.
+2. Read the Mandate: Briefly read `MEMORY/wiki/index.md` and `extensions/vector-lake/schema.md` to ensure your writing conforms to the rules.
+3. Synthesize & Respond: Synthesize your answer to the user.
+4. Asset Generation (Mandatory): If your synthesis generates a high-value insight, a deep comparison, or a new mental model, you MUST use the `write_file` tool to save it as a new Markdown node in `MEMORY/wiki/` (e.g., `MEMORY/wiki/Synthesis_...md`).
+5. Update Logs: If you created a new page, use `write_file` or `replace` to append links to `MEMORY/wiki/index.md` and log the event in `MEMORY/wiki/log.md`.
+6. Delegate: You may delegate to the `generalist` sub-agent if the reasoning required is extremely complex.
+"""

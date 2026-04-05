@@ -1,0 +1,6 @@
+{
+  "name": "vector-lake",
+  "version": "1.0.0",
+  "description": "Dual-engine local vector and logic lake for long-term memory retrieval and semantic consolidation.",
+  "contextFileName": "CONTEXT.md"
+}
