@@ -151,9 +151,130 @@ Your mandate:
     except Exception as e:
         return f"Error triggering agent: {e}"
 
+def visualize_vector_lake():
+    import os
+    import re
+    import json
+    import webbrowser
+
+    wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
+    if not os.path.exists(wiki_dir):
+        return "Wiki directory not found."
+
+    nodes = []
+    edges = []
+    node_ids = set()
+
+    for filename in os.listdir(wiki_dir):
+        if not filename.endswith(".md") or filename in ("index.md", "log.md"):
+            continue
+
+        filepath = os.path.join(wiki_dir, filename)
+        node_id = filename[:-3]
+        node_ids.add(node_id)
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            title = node_id
+            node_type = "concept"
+            tags = []
+
+            # Basic YAML frontmatter parsing to avoid PyYAML dependency
+            frontmatter_match = re.search(r'^---\n(.*?)\n---', content, re.MULTILINE | re.DOTALL)
+            if frontmatter_match:
+                fm_str = frontmatter_match.group(1)
+                for line in fm_str.splitlines():
+                    if line.startswith('title:'):
+                        title = line.replace('title:', '').strip().strip('"').strip("'")
+                    elif line.startswith('type:'):
+                        node_type = line.replace('type:', '').strip().strip('"').strip("'")
+
+            # Semantic color mapping for the nodes
+            color = "#00B0FF" # Default Quantum Blue
+            if "entity" in node_type.lower(): color = "#EF4444"
+            elif "source" in node_type.lower(): color = "#10B981"
+            elif "synthesis" in node_type.lower(): color = "#F59E0B"
+
+            nodes.append({
+                "id": node_id,
+                "name": title,
+                "val": max(5, min(30, len(content) / 200)), # Cap size scaling
+                "color": color,
+                "group": node_type
+            })
+
+            # Extract bidirectional links [[Link]] or [[Link|Alias]]
+            link_matches = re.finditer(r'\[\[(.*?)\]\]', content)
+            for match in link_matches:
+                link_text = match.group(1)
+                target_id = link_text.split('|')[0].strip()
+                edges.append({
+                    "source": node_id,
+                    "target": target_id
+                })
+
+        except Exception as e:
+            log.error(f"Error parsing {filename}: {e}")
+
+    # Add implicit 'ghost' nodes that are linked to but don't exist as files yet
+    existing_targets = set(edge["target"] for edge in edges)
+    missing_nodes = existing_targets - node_ids
+    for missing in missing_nodes:
+        nodes.append({
+            "id": missing,
+            "name": missing,
+            "val": 3,
+            "color": "#9CA3AF", # Gray
+            "group": "ghost"
+        })
+
+    graph_data = {"nodes": nodes, "links": edges}
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Vector Lake 3D Topology (V4.0)</title>
+    <style> body {{ margin: 0; padding: 0; background-color: #0A0F14; overflow: hidden; font-family: sans-serif; }} </style>
+    <script src="https://unpkg.com/3d-force-graph"></script>
+</head>
+<body>
+    <div id="3d-graph"></div>
+    <script>
+        const data = {json.dumps(graph_data)};
+        
+        const Graph = ForceGraph3D()
+            (document.getElementById('3d-graph'))
+            .graphData(data)
+            .nodeLabel('name')
+            .nodeAutoColorBy('group')
+            .nodeColor(node => node.color)
+            .nodeVal('val')
+            .linkDirectionalArrowLength(3.5)
+            .linkDirectionalArrowRelPos(1)
+            .linkColor(() => '#374151')
+            .onNodeClick(node => {{
+                const distance = 40;
+                const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
+                Graph.cameraPosition({{ x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio }}, node, 3000);
+            }});
+    </script>
+</body>
+</html>
+"""
+    output_html = os.path.join(wiki_dir, "tactical_topology.html")
+    with open(output_html, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    webbrowser.open(f"file:///{output_html.replace(chr(92), '/')}")
+    return f"Topology graph generated and opened: {output_html}"
+
 __all__ = [
     "search_vector_lake",
     "sync_vector_lake",
     "lint_vector_lake",
-    "query_logic_lake"
+    "query_logic_lake",
+    "visualize_vector_lake"
 ]
