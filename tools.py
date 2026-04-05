@@ -179,9 +179,10 @@ def visualize_vector_lake():
 
             title = node_id
             node_type = "concept"
-            tags = []
+            updated = "Unknown"
+            sources = []
 
-            # Basic YAML frontmatter parsing to avoid PyYAML dependency
+            # Basic YAML frontmatter parsing
             frontmatter_match = re.search(r'^---\n(.*?)\n---', content, re.MULTILINE | re.DOTALL)
             if frontmatter_match:
                 fm_str = frontmatter_match.group(1)
@@ -190,6 +191,24 @@ def visualize_vector_lake():
                         title = line.replace('title:', '').strip().strip('"').strip("'")
                     elif line.startswith('type:'):
                         node_type = line.replace('type:', '').strip().strip('"').strip("'")
+                    elif line.startswith('updated:'):
+                        updated = line.replace('updated:', '').strip().strip('"').strip("'")
+                    elif line.startswith('sources:'):
+                        s_str = line.replace('sources:', '').strip()
+                        # Extract paths within brackets and quotes
+                        s_list = re.findall(r'["\'](.*?)["\']', s_str)
+                        if s_list:
+                            sources = s_list
+                        else:
+                            clean_str = s_str.strip('[]"\' ')
+                            sources = [clean_str] if clean_str else []
+
+            # Extract Summary (first ~200 chars of text after frontmatter)
+            text_content = content[frontmatter_match.end():] if frontmatter_match else content
+            text_content = re.sub(r'#.*?\n', '', text_content) # Remove markdown headings
+            text_content = re.sub(r'\[\[(.*?)\]\]', lambda m: m.group(1).split('|')[0], text_content) # Clean links
+            text_content = text_content.strip().replace('\n', ' ')
+            summary = text_content[:200] + "..." if len(text_content) > 200 else text_content
 
             # Semantic color mapping for the nodes
             color = "#00B0FF" # Default Quantum Blue
@@ -202,7 +221,10 @@ def visualize_vector_lake():
                 "name": title,
                 "val": max(5, min(30, len(content) / 200)), # Cap size scaling
                 "color": color,
-                "group": node_type
+                "group": node_type,
+                "updated": updated,
+                "sources": sources,
+                "summary": summary
             })
 
             # Extract bidirectional links [[Link]] or [[Link|Alias]]
@@ -227,7 +249,10 @@ def visualize_vector_lake():
             "name": missing,
             "val": 3,
             "color": "#9CA3AF", # Gray
-            "group": "ghost"
+            "group": "ghost",
+            "updated": "N/A",
+            "sources": [],
+            "summary": "This entity has been referenced but does not have a dedicated Markdown file yet."
         })
 
     graph_data = {"nodes": nodes, "links": edges}
@@ -237,10 +262,45 @@ def visualize_vector_lake():
 <head>
     <meta charset="UTF-8">
     <title>Vector Lake 3D Topology (V4.0)</title>
-    <style> body {{ margin: 0; padding: 0; background-color: #0A0F14; overflow: hidden; font-family: sans-serif; }} </style>
+    <style> 
+        body {{ margin: 0; padding: 0; background-color: #0A0F14; overflow: hidden; font-family: sans-serif; color: #E5E7EB; }} 
+        #info-panel {{
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 350px;
+            max-height: 80vh;
+            overflow-y: auto;
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid #374151;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            z-index: 10;
+            display: none;
+            backdrop-filter: blur(8px);
+            pointer-events: none; /* Let clicks pass through if needed, though we probably want text selection */
+        }}
+        #info-panel.visible {{ display: block; pointer-events: auto; }}
+        #info-title {{ margin: 0 0 12px 0; font-size: 1.3rem; color: #60A5FA; line-height: 1.2; }}
+        #info-meta {{ font-size: 0.8rem; color: #9CA3AF; margin-bottom: 12px; border-bottom: 1px solid #374151; padding-bottom: 8px; }}
+        #info-meta span {{ display: block; margin-bottom: 4px; }}
+        #info-summary {{ font-size: 0.9rem; line-height: 1.5; margin-bottom: 15px; color: #D1D5DB; }}
+        #info-sources {{ font-size: 0.85rem; color: #10B981; word-break: break-all; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px; }}
+        #info-sources ul {{ margin: 5px 0 0 0; padding-left: 20px; }}
+        #close-btn {{ position: absolute; top: 10px; right: 15px; cursor: pointer; color: #9CA3AF; font-size: 1.2rem; }}
+        #close-btn:hover {{ color: #FFFFFF; }}
+    </style>
     <script src="https://unpkg.com/3d-force-graph"></script>
 </head>
 <body>
+    <div id="info-panel">
+        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible')">×</div>
+        <h2 id="info-title"></h2>
+        <div id="info-meta"></div>
+        <div id="info-summary"></div>
+        <div id="info-sources"></div>
+    </div>
     <div id="3d-graph"></div>
     <script>
         const data = {json.dumps(graph_data)};
@@ -256,9 +316,30 @@ def visualize_vector_lake():
             .linkDirectionalArrowRelPos(1)
             .linkColor(() => '#374151')
             .onNodeClick(node => {{
+                // Camera focus
                 const distance = 40;
                 const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
                 Graph.cameraPosition({{ x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio }}, node, 3000);
+                
+                // Update Info Panel
+                document.getElementById('info-title').innerText = node.name;
+                
+                let metaHtml = `<span><b>Type:</b> ${{node.group}}</span>`;
+                metaHtml += `<span><b>Updated:</b> ${{node.updated || 'N/A'}}</span>`;
+                document.getElementById('info-meta').innerHTML = metaHtml;
+                
+                document.getElementById('info-summary').innerText = node.summary || '';
+                
+                let sourcesHtml = '';
+                if (node.sources && node.sources.length > 0) {{
+                    sourcesHtml = '<b>Raw Sources:</b><ul>' + node.sources.map(s => `<li>${{s}}</li>`).join('') + '</ul>';
+                }}
+                document.getElementById('info-sources').innerHTML = sourcesHtml;
+                
+                document.getElementById('info-panel').classList.add('visible');
+            }})
+            .onBackgroundClick(() => {{
+                document.getElementById('info-panel').classList.remove('visible');
             }});
     </script>
 </body>
