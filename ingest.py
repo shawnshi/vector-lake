@@ -134,7 +134,16 @@ def process_file_batch(filepaths: list, chroma_collection):
             if entry.is_file() and entry.name.endswith('.md'):
                 before_mtimes[entry.path] = entry.stat().st_mtime
 
-    file_list_str = "\n".join([f"- {p}" for p in filepaths])
+    # Use relative paths to avoid encoding issues with absolute paths in the prompt
+    root_dir = str(EXTENSION_ROOT.parent.parent.resolve())
+    rel_filepaths = []
+    for p in filepaths:
+        try:
+            rel_filepaths.append(os.path.relpath(p, root_dir))
+        except ValueError:
+            rel_filepaths.append(p)
+            
+    file_list_str = "\n".join([f"- {p}" for p in rel_filepaths])
     # The Subagent holds the schema, rules, and identity within its `system.md`.
     # We only need to provide the target paths.
     prompt = f"""
@@ -152,13 +161,11 @@ Please begin extraction and node weaving.
     # Pivot to Native Subagent via @mention
     cmd = [gemini_exec, "--prompt", prompt, "--approval-mode", "yolo"]
     try:
-        # We pass the prompt directly in command line now since passing it through input= might not parse the @mention properly if the agent requires it to be part of the initial args
-        # Actually doing it via stdin (input=prompt) also works but let's check.
-        # Wait, if we use input=prompt it's given as a conversation hook, the @mention might not trigger a skill route unless it's the first chat message. It's safer to pass it.
-        # NO, subprocess.run(cmd, input=prompt) was doing `gemini --prompt ""` and piping it via stdin.
-        # Let's keep input=prompt, `gemini --prompt ""` will take stdin as the first message.
         cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
-        result = subprocess.run(cmd, input=prompt, text=True, encoding='utf-8')
+        print("Waiting for Ingestor Agent to process the batch (this may take 1~2 minutes)...", flush=True)
+        result = subprocess.run(cmd, input=prompt, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
+        
+        if result.stdout: print(result.stdout)
         success = (result.returncode == 0)
     except Exception as e:
         log.error(f"Gemini CLI failed for batch: {e}")

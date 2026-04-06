@@ -26,6 +26,13 @@ def generate_index():
     
     for filename in files:
         filepath = os.path.join(WIKI_DIR, filename)
+        
+        valid_prefixes = ("Concept_", "Source_", "Entity_", "Event_", "Person_", "Project_", "Term_", "System_")
+        if not filename.startswith(valid_prefixes) and filename not in ("index.md", "log.md"):
+            index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
+            log.warning(f"Schema violation in {filename}, bypassing index inclusion.")
+            continue
+            
         node_key = filename[:-3] # remove .md
         
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -104,6 +111,23 @@ def update_index_item(filename: str):
             return generate_index()
             
     filepath = os.path.join(WIKI_DIR, filename)
+    
+    valid_prefixes = ("Concept_", "Source_", "Entity_", "Event_", "Person_", "Project_", "Term_", "System_")
+    if not filename.startswith(valid_prefixes) and filename not in ("index.md", "log.md"):
+        if "error_log" not in index_data:
+            index_data["error_log"] = []
+        index_data["error_log"] = [e for e in index_data["error_log"] if e.get("file") != filename]
+        index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
+        log.warning(f"Schema violation in {filename} during partial update.")
+        
+        node_key = filename[:-3]
+        if node_key in index_data.get("nodes", {}):
+            del index_data["nodes"][node_key]
+            
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, ensure_ascii=False, indent=2)
+        return
+        
     node_key = filename[:-3]
     
     # Prune old aliases mapping for this key
