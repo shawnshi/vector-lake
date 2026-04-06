@@ -126,7 +126,7 @@ def index_wiki_page_in_chroma(filepath: str, chroma_collection):
 def process_file_batch(filepaths: list, chroma_collection):
     if not filepaths: return False
 
-    log.info(f"Delegating ingestion of a batch of {len(filepaths)} files to Gemini Agent...")
+    log.info(f"Delegating ingestion of a batch of {len(filepaths)} files to Vector Lake Ingestor Agent...")
     
     before_mtimes = {}
     if os.path.exists(WIKI_DIR):
@@ -135,29 +135,29 @@ def process_file_batch(filepaths: list, chroma_collection):
                 before_mtimes[entry.path] = entry.stat().st_mtime
 
     file_list_str = "\n".join([f"- {p}" for p in filepaths])
+    # The Subagent holds the schema, rules, and identity within its `system.md`.
+    # We only need to provide the target paths.
     prompt = f"""
-You are the Vector Lake Ingest Compiler Agent.
-Task: Ingest the following raw source files into the LLM-Wiki in sequence.
+@vector-lake-ingestor
+[BATCH INGEST PROCESS EXECUTED]
+Please compile the following raw source files into the Wiki directory (`{WIKI_DIR}`):
 
 Source Files:
 {file_list_str}
 
-Wiki Directory: {WIKI_DIR}
-
-Workflow for EACH file:
-1. Read the schema at {SCHEMA_PATH} to understand formatting rules.
-2. Read the Source File. Delegate to `generalist` sub-agent if it is long.
-3. Use `write_file` or `replace` to create/update Markdown pages in the Wiki Directory.
-4. Append an entry to {INDEX_PATH} and {LOG_PATH}.
-
-Process ALL the files listed above. Do not stop until all are processed.
-Terminate and do not ask for further user instructions.
+Please begin extraction and node weaving.
 """
 
     gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
-    cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
+    # Pivot to Native Subagent via @mention
+    cmd = [gemini_exec, "--prompt", prompt, "--approval-mode", "yolo"]
     try:
-        # subprocess.run with input= automatically sends EOF when done writing
+        # We pass the prompt directly in command line now since passing it through input= might not parse the @mention properly if the agent requires it to be part of the initial args
+        # Actually doing it via stdin (input=prompt) also works but let's check.
+        # Wait, if we use input=prompt it's given as a conversation hook, the @mention might not trigger a skill route unless it's the first chat message. It's safer to pass it.
+        # NO, subprocess.run(cmd, input=prompt) was doing `gemini --prompt ""` and piping it via stdin.
+        # Let's keep input=prompt, `gemini --prompt ""` will take stdin as the first message.
+        cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
         result = subprocess.run(cmd, input=prompt, text=True, encoding='utf-8')
         success = (result.returncode == 0)
     except Exception as e:
@@ -165,7 +165,7 @@ Terminate and do not ask for further user instructions.
         success = False
 
     if not success:
-        log.error("Agent failed or crashed during batch processing.")
+        log.error("Ingestor Subagent failed or crashed during batch processing.")
         return False
             
     changed_files = []

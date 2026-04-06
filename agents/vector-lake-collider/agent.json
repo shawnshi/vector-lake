@@ -1,0 +1,10 @@
+{
+  "name": "vector-lake-collider",
+  "description": "Exclusive subagent for Serendipity collisions and cross-disciplinary mapping.",
+  "system_instructions_file": "system.md",
+  "tools": [
+    "view_file",
+    "write_to_file",
+    "multi_replace_file_content"
+  ]
+}

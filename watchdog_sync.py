@@ -25,6 +25,40 @@ DEBOUNCE_SECONDS = 3.0
 # Global Task Queue
 task_queue = queue.Queue()
 
+class WikiIndexHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.last_triggered = {}
+        self.lock = threading.Lock()
+
+    def update_index(self, event):
+        if event.is_directory:
+            return
+            
+        filepath = os.path.abspath(event.src_path)
+        filename = os.path.basename(filepath)
+        if not filename.endswith(".md") or filename in ("index.md", "log.md"):
+            return
+            
+        now = time.time()
+        with self.lock:
+            if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
+                return
+            self.last_triggered[filepath] = now
+            
+        def delayed_update():
+            time.sleep(DEBOUNCE_SECONDS)
+            import indexer
+            indexer.update_index_item(filename)
+            log.info(f"O(1) Index updated for modified wiki node: {filename}")
+            
+        threading.Thread(target=delayed_update, daemon=True).start()
+
+    def on_created(self, event):
+        self.update_index(event)
+
+    def on_modified(self, event):
+        self.update_index(event)
+
 class VectorLakeIngestHandler(FileSystemEventHandler):
     def __init__(self):
         self.last_triggered = {}
@@ -141,6 +175,13 @@ def start_watchdog():
     if watch_count == 0:
         log.error("No valid TARGET_DIRS to monitor. Sentinel terminating.")
         return
+
+    # Add Wiki DIR monitor for index.json updates
+    WIKI_DIR = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
+    if os.path.exists(WIKI_DIR):
+        wiki_handler = WikiIndexHandler()
+        observer.schedule(wiki_handler, WIKI_DIR, recursive=False)
+        log.info(f"Wiki AST monitor active on directory: {WIKI_DIR}")
 
     observer.start()
     log.info("Vector Lake Watchdog Agent is now running in YOLO background mode.")

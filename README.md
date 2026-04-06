@@ -1,6 +1,6 @@
-# Vector Lake (LLM-Wiki 引擎 - Native Agent Edition)
+# Vector Lake (LLM-Wiki 引擎 - Agentic Computable-Graph V6.0)
 
-**Vector Lake** (V4.1) 是 Gemini CLI 的有状态、可产生复利的知识库引擎。
+**Vector Lake** (V6.0) 是 Gemini CLI 的有状态、可产生复利的知识图谱与语义编译引擎。
 
 它实现了由 Andrej Karpathy 提出的 [LLM-Wiki 模式](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)，彻底摒弃了传统的“无状态检索增强生成 (RAG)”和黑盒数据库。取而代之的是，它依赖 Gemini CLI Native Agent 来主动编译、相互链接并维护一个纯 Markdown 文件组成的持久化网络。
 
@@ -12,17 +12,16 @@
 2. **活跃的知识库 (`MEMORY/wiki/`)**：持久化的逻辑资产区。Agent 在这里拥有绝对的写权限。当摄入新信源或回答新问题时，Agent 会利用其自带的 `write_file` 和 `replace` 工具，在此创建实体、概念、综合推演页面，并更新双向链接 (`[[Link]]`)。
 3. **语义索引 (`data/vector_lake_db`)**：一个轻量级的 ChromaDB 实例，严格降级为只读的语义搜索引擎。它的唯一作用是帮助 Agent 在海量的 Markdown Wiki 页面中快速进行空间定位。
 
-## Native Agent 编译流 (The V4.1 Shift)
-与之前的版本通过 Python SDK 直接调用 Google API 不同，**V4.1 彻底转向了 Native Agent 架构**：
-* Python 脚本（`ingest.py` / `watchdog_sync.py`）不再处理 JSON 解析，也不再直接调用模型。
-* 它们通过 `subprocess` 在后台唤醒一个无头模式 (Headless) 的 Gemini CLI Agent (带 `--yolo` 参数)。
-* 这种架构完美继承了您本地的网络代理（解决了 API 区域限制），并且赋予了编译流水线调用子代理（如 `generalist`）处理超长文献的能力。
+## Agentic 编译流 (The V6.0 Shift)
+与之前的版本通过调用通用泛型大模型不同，**V6.0 彻底转向了独立子代理 (Subagent) 和物理隔离架构**：
+* 后台通过 `vector-lake-ingestor` 专用 Subagent 进行处理，该代理被剥夺了任何终端执行权限，强制锁定在文件 I/O，规避了 YOLO 模式的致命风险。
+* `schema.md` 中的格式规则、元数据字段集、[Relation:: [[ID]]] 生成规则已被全量内聚入子代理的 DNA (system.md)，大幅收敛上下文推理所需的 Tokens。
 
 ## 核心元文件 (Core Files)
 
-*   **`wiki/index.md`**：内容检索目录。Agent 在每次注入编译后都会更新这份实体、概念和信源的清单。
-*   **`wiki/log.md`**：按时间顺序追加的操作流水日志，记录 Agent 执行过的所有注入 (Ingest)、查询 (Query) 或审计 (Lint) 动作。
-*   **`schema.md`**：系统治理协议。该文件规定了 Agent 在编写 Wiki 时必须遵守的格式纪律（YAML 元数据、双向链接规范、如何处理事实冲突）。
+*   **`wiki/index.json`**：极速检索缓存。取代了脆弱的单体 `index.md`，由后台监听器做 O(1) 的局部更新，保障 Agent 寻路不迷失。
+*   **`wiki/log.md`**：按时间顺序追加的操作流水日志，记录 Agent 执行过的所有动作。
+*   **`schema.md` / `SCHEMA_CATEGORIES.md`**：系统治理协议的呈现。包含子代理所固化的 YAML V6.0 元数据、双向链接范式等。
 
 ## 工作流与命令 (Workflows & Commands)
 
@@ -34,15 +33,15 @@
 *   **手动全量编译**: `gemini sync_vector_lake`
 *   **启动后台监听哨兵**: `gemini watchdog_sync`
 
-### 2. 深度推演落盘 (Query-to-Page)
-不同于阅后即焚的聊天对话，高价值的综合推演问题将基于 Wiki 进行评估。如果 Agent 生成了全新的洞察或对比分析，它会强制要求自己将这份高质量答案作为新的 Markdown 页面写入 `wiki/` 目录中。
+### 2. 深度推演落盘 (Tacit Query-to-Page)
+系统会自动在 ChromaDB 查找关联节点，然后在文件系统中抽取它们基于 `[Relation:: [[ID]]]` 的真实物理拓扑邻居，组装为“默会图谱上下文 (Tacit Subgraph Context)”，再抛给模型进行无偏见合成。
 
 *   **推演查询**: `gemini query_logic_lake "对比一下 Vendor A 和 Vendor B 的 AI 战略差异"`
 
-### 3. 结构化审计自愈 (Structural Linting)
-周期性地对 Wiki 进行健康体检。Agent 会扫描孤儿页面、重复实体以及过时的声明，并自动对它们进行合并与重构。
+### 3. 结构化审计自愈 (Structural Linting & Decay)
+周期性地对 Wiki 进行健康体检。系统会扫描孤儿页面、重复实体，并自动执行 AutoDream 脱水重写（针对超过 60 天处于 sprouting 状态的节点强制写入 `decayed: true`）。
 
-*   **审计清理**: `gemini run_wiki_lint`
+*   **审计清理**: `gemini run_wiki_lint` (调用代码底层的 `--auto-fix`)
 
 ### 4. 语义空间检索 (Semantic Search)
 使用 ChromaDB 向量索引在已编译的 Markdown 页面中进行快速的语义搜索。

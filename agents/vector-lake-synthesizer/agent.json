@@ -1,0 +1,10 @@
+{
+  "name": "vector-lake-synthesizer",
+  "description": "Exclusive subagent for deep logical synthesis and Tacit Subgraph folding.",
+  "system_instructions_file": "system.md",
+  "tools": [
+    "view_file",
+    "write_to_file",
+    "multi_replace_file_content"
+  ]
+}

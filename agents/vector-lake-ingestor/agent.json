@@ -1,0 +1,11 @@
+{
+  "name": "vector-lake-ingestor",
+  "description": "Exclusive subagent for compiling raw sources into markdown nodes via Polanyi protocol.",
+  "system_instructions_file": "system.md",
+  "tools": [
+    "view_file",
+    "write_to_file",
+    "multi_replace_file_content",
+    "list_dir"
+  ]
+}

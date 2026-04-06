@@ -45,9 +45,11 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
 
 def sync_vector_lake():
     ingest.sync_all()
-    return "Ingestion Sync completed."
+    import indexer
+    indexer.generate_index()
+    return "Ingestion Sync and Index generation completed."
 
-def lint_vector_lake():
+def lint_vector_lake(auto_fix: bool = False):
     import re
     from collections import defaultdict
     import difflib
@@ -59,6 +61,10 @@ def lint_vector_lake():
     ids = {}
     aliases_map = defaultdict(list)
     potential_dups = []
+    decay_warnings = []
+    
+    import yaml
+    from datetime import datetime
     
     for filename in os.listdir(wiki_dir):
         if not filename.endswith(".md") or filename in ("index.md", "log.md"):
@@ -66,8 +72,48 @@ def lint_vector_lake():
         filepath = os.path.join(wiki_dir, filename)
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-            id_match = re.search(r'^id:\s*"(.*?)"', content, re.MULTILINE)
-            node_id = id_match.group(1) if id_match else filename.replace(".md", "")
+            
+            try:
+                parts = content.split('---')
+                if len(parts) >= 3:
+                    fm_data = yaml.safe_load(parts[1])
+                    if fm_data and isinstance(fm_data, dict):
+                        status = fm_data.get('epistemic-status', '').strip().lower()
+                        updated = fm_data.get('updated', '')
+                        if status == 'sprouting' and updated:
+                            try:
+                                dt = datetime.strptime(str(updated), "%Y-%m-%d")
+                                if (datetime.now() - dt).days > 60:
+                                    if auto_fix:
+                                        # auto-fix logic
+                                        fm_data['decayed'] = True
+                                        new_fm_str = yaml.dump(fm_data, allow_unicode=True, default_flow_style=False)
+                                        # Write back modifying just the frontmatter
+                                        new_content = "---\n" + new_fm_str + "---\n" + '---'.join(parts[2:])
+                                        if len(parts) > 2:
+                                            # in case there are multiple '---' in the text body
+                                            new_content = "---\n" + new_fm_str.strip() + "\n" + '---'.join([''] + parts[2:])
+                                        
+                                        # More precise replacement
+                                        # parts[1] is the frontmatter
+                                        # To avoid issues with multiple --- in content, we replace the first occurrence
+                                        
+                                        # Actually, safe reconstruct:
+                                        after_frontmatter = content.split('---', 2)[2]
+                                        new_content = "---\n" + yaml.dump(fm_data, allow_unicode=True, default_flow_style=False).strip() + "\n---" + after_frontmatter
+                                        
+                                        with open(filepath, 'w', encoding='utf-8') as wf:
+                                            wf.write(new_content)
+                                        decay_warnings.append(f"DECAY WARNING [AUTO-FIXED]: '{filename}' status is sprouting and unmodified for >60 days. Added `decayed: true`.")
+                                    else:
+                                        decay_warnings.append(f"DECAY WARNING: '{filename}' status is sprouting and unmodified for >60 days.")
+                            except ValueError:
+                                pass
+            except Exception:
+                pass
+
+            id_match = re.search(r'^id:\s*"(.*?)"|^id:\s*\'(.*?)\'|^id:\s*([^\s]+)', content, re.MULTILINE)
+            node_id = id_match.group(1) or id_match.group(2) or id_match.group(3) if id_match else filename.replace(".md", "")
             if node_id in ids:
                 potential_dups.append(f"DUPLICATE ID: '{node_id}' found in both '{ids[node_id]}' and '{filename}'")
             else:
@@ -120,26 +166,94 @@ def lint_vector_lake():
     else:
         report.append("  - No obvious similar filenames.")
         
+    report.append("\n5. Knowledge Decay Warnings (sprouting > 60 days):")
+    if decay_warnings:
+        for warning in decay_warnings:
+            report.append(f"  - {warning}")
+    else:
+        report.append("  - No knowledge decay detected.")
+        
     return "\n".join(report)
 
 def query_logic_lake(query_str: str):
     import subprocess
+    import re
     wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
     schema_path = os.path.join(EXTENSION_ROOT, "schema.md")
     
+    # --- Polanyi Tacit Indwelling: Subgraph Context Compilation ---
+    try:
+        from db import get_chroma_client
+        from embedding import GeminiEmbeddingFunction
+        client = get_chroma_client()
+        embedding_func = GeminiEmbeddingFunction()
+        collection = client.get_collection(name="vector_lake", embedding_function=embedding_func)
+        results = collection.query(query_texts=[query_str], n_results=10)
+        
+        # 1. Full Semantic Evidence Context
+        evidence_context = "=== ChromaDB Search Evidence (Top 10) ===\n"
+        if results.get('documents') and results['documents'][0]:
+            for doc in results['documents'][0]:
+                evidence_context += f"Evidence Segment: {doc[:500]}...\n\n"
+        
+        # 2. Tacit Subgraph Context (only for top 3 focal nodes to avoid overflow)
+        focal_files = set()
+        if results.get('metadatas') and results['metadatas'][0]:
+            for meta in results['metadatas'][0][:3]:
+                if meta and 'source' in meta:
+                    focal_files.add(meta['source'])
+        
+        subgraph_context = "=== 默会图谱关联上下文 (Tacit Subgraph Topology) ===\n"
+        if not focal_files:
+            subgraph_context += "No immediate focal nodes found.\n"
+        else:
+            subgraph_context += f"Found {len(focal_files)} focal nodes. Extracting 1-degree tacit connections...\n"
+            for src in focal_files:
+                if not os.path.exists(src): continue
+                with open(src, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                node_id = os.path.basename(src).replace('.md', '')
+                subgraph_context += f"\n--- Focal Node: {node_id} ---\n"
+                
+                # Extract links
+                links = set()
+                v6_matches = re.finditer(r'\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]', content)
+                for m in v6_matches:
+                    links.add(m.group(2).split('|')[0].strip().replace('.md', ''))
+                    
+                basic_matches = re.finditer(r'\[\[(.*?)\]\]', content)
+                for m in basic_matches:
+                    link_text = m.group(1).split('|')[0].strip().replace('.md', '')
+                    if "::" in link_text:
+                        link_text = link_text.split("::", 1)[1].strip()
+                    links.add(link_text)
+                    
+                if not links:
+                    subgraph_context += "  (No outgoing links)\n"
+                else:
+                    subgraph_context += "  -> Tacit Neighbors: " + ", ".join(links) + "\n"
+                    
+    except Exception as e:
+        evidence_context = "Failed to fetch ChromaDB evidence."
+        subgraph_context = f"Failed to compile tacit subgraph: {e}"
+        log.error(subgraph_context)
+    # -------------------------------------------------------------
+
     prompt = f"""
-You are the Vector Lake Deep Research Agent (Query-to-Page Compiler).
-The user has requested a deep analysis/insight generation on the following topic or query:
+@vector-lake-synthesizer
+[Deep Research Synthesis Sequence Triggered]
+
+Target Query:
 "{query_str}"
 
-Your mandate:
-1. Execute semantic search using the `run_shell_command` tool to execute: `python C:\\Users\\shich\\.gemini\\extensions\\vector-lake\\cli.py search "{query_str}" --top_k 10`.
-2. Based on the retrieved evidence, synthesize a high-density, structured insight report. 
-3. You MUST physically save this report as a new Markdown node in {wiki_dir} using `write_file`. Follow the rules (YAML frontmatter, [[双向链接]]) defined in {schema_path}.
-4. Terminate immediately after the file system operations are complete. Do not ask for further instructions.
+{evidence_context}
+{subgraph_context}
+
+Please execute synthesis and persist to Wiki.
 """
     gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
-    cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
+    cmd = [gemini_exec, "--prompt", prompt, "--approval-mode", "yolo"]
     
     log.info(f"Triggering Native Agent for deep query: '{query_str}'...")
     try:
@@ -162,23 +276,28 @@ def trigger_serendipity_collision():
         
     node_a, node_b = random.sample(files, 2)
     
+    node_a_path = os.path.join(wiki_dir, node_a)
+    node_b_path = os.path.join(wiki_dir, node_b)
+    
+    with open(node_a_path, 'r', encoding='utf-8') as f:
+        node_a_content = f.read()
+    with open(node_b_path, 'r', encoding='utf-8') as f:
+        node_b_content = f.read()
+
     prompt = f"""
-You are the Vector Lake Serendipity Engine.
-Your task is to find hidden, non-obvious cross-disciplinary insights between two random nodes.
+@vector-lake-collider
+[Serendipity Collision Triggered]
 
-Node A: {node_a}
-Node B: {node_b}
+=== Node A: {node_a} ===
+{node_a_content}
 
-Workflow:
-1. Read both markdown files in {wiki_dir}.
-2. Actively look for structural isomorphisms, hidden contradictions, or orthogonal synthesis points.
-3. If the collision yields a high-density insight, save it as a new page named `Synthesis_Serendipity_[Topic].md` in {wiki_dir}. Use epistemic-status and [[Relation::Target]] formatting.
-4. Link back to Node A and Node B using `[[衍生于::{node_a}]]` and `[[衍生于::{node_b}]]`.
-5. Update `MEMORY/wiki/index.md` and `log.md`.
-Never ask for user permission. Just do it and terminate.
+=== Node B: {node_b} ===
+{node_b_content}
+
+Please execute lateral synthesis and persist the result into the Vector Lake.
 """
     gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
-    cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
+    cmd = [gemini_exec, "--prompt", prompt, "--approval-mode", "yolo"]
     
     log.info(f"Triggering Serendipity Collider between {node_a} and {node_b}...")
     try:
@@ -266,7 +385,18 @@ def visualize_vector_lake():
                 "summary": summary
             })
 
-            # Extract semantic bidirectional links [[Relation::Link]] or [[Link|Alias]]
+            # Extract V6.0 links [Relation:: [[Target]]]
+            v6_matches = re.finditer(r'\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]', content)
+            for match in v6_matches:
+                relation = match.group(1).strip()
+                target_id = match.group(2).split('|')[0].strip().replace('.md', '')
+                edges.append({
+                    "source": node_id,
+                    "target": target_id,
+                    "relation": relation
+                })
+
+            # Extract semantic bidirectional links [[Relation::Link]] or raw [[Link|Alias]]
             link_matches = re.finditer(r'\[\[(.*?)\]\]', content)
             for match in link_matches:
                 link_text = match.group(1)

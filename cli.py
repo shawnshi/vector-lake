@@ -31,7 +31,8 @@ Usage Examples:
 
     subparsers.add_parser("sync", help="[🟢 Ingest] Trigger a sync of all raw sources into the Wiki via Native Agent.")
     
-    subparsers.add_parser("lint", help="[🟡 Lint] Run self-healing audit on the Wiki nodes.")
+    lint_parser = subparsers.add_parser("lint", help="[🟡 Lint] Run self-healing audit on the Wiki nodes.")
+    lint_parser.add_argument("--auto-fix", action="store_true", help="Automatically fix issues such as decaying notes.")
 
     search_parser = subparsers.add_parser("search", help="[🔍 Search] Semantic search over the Wiki pages via ChromaDB.")
     search_parser.add_argument("query", help="Semantic query string.")
@@ -52,7 +53,7 @@ Usage Examples:
         elif args.command == "search":
             print(tools.search_vector_lake(args.query, args.top_k))
         elif args.command == "lint":
-            print(tools.lint_vector_lake())
+            print(tools.lint_vector_lake(getattr(args, 'auto_fix', False)))
         elif args.command == "query":
             print(tools.query_logic_lake(args.query_str))
         elif args.command == "serendipity":
