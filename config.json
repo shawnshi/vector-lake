@@ -2,10 +2,6 @@
   "target_directories": [
     "../../MEMORY/raw"
   ],
-  "db_path_chroma": "data/vector_lake_db",
   "processed_files_path": "data/processed_files.json",
-  "chunk_size": 1000,
-  "chunk_overlap": 150,
-  "embedding_model": "gemini-embedding-2-preview",
   "agent_model": "gemini-3.1-pro-preview"
 }

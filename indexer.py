@@ -35,8 +35,13 @@ def generate_index():
             
         node_key = filename[:-3] # remove .md
         
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except (UnicodeDecodeError, OSError) as e:
+            index_data["error_log"].append({"file": filename, "error": f"Read error: {e}"})
+            log.warning(f"Cannot read {filename}: {e}")
+            continue
 
         frontmatter_match = re.search(r'^---\n(.*?)\n---', content, re.MULTILINE | re.DOTALL)
         if not frontmatter_match:
@@ -63,6 +68,27 @@ def generate_index():
         elif isinstance(raw_aliases, str):
             aliases = [raw_aliases.strip()]
 
+        # Extract [[bidirectional links]] from content body
+        links = set()
+        body = content[frontmatter_match.end():]
+        # V6.0 relation links: [Relation:: [[Target]]]
+        for m in re.finditer(r'\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]', body):
+            links.add(m.group(2).split('|')[0].strip().replace('.md', ''))
+        # Standard wiki links: [[Target]] or [[Target|Alias]]
+        for m in re.finditer(r'\[\[(.*?)\]\]', body):
+            link_text = m.group(1).split('|')[0].strip().replace('.md', '')
+            if '::' in link_text:
+                link_text = link_text.split('::', 1)[1].strip()
+            links.add(link_text)
+        links.discard('')  # Remove empty strings
+
+        # Extract summary (first 200 chars of clean body text)
+        summary_text = re.sub(r'#.*?\n', '', body)  # Remove headings
+        summary_text = re.sub(r'\[\[([^\]]*?\|)?([^\]]*?)\]\]', r'\2', summary_text)  # Clean wiki links
+        summary_text = re.sub(r'\[([^\[\]]+?)::\s*\[\[.*?\]\]\]', '', summary_text)  # Remove relation links
+        summary_text = summary_text.strip().replace('\n', ' ')
+        summary = summary_text[:200]
+
         # Register in nodes
         index_data["nodes"][node_key] = {
             "id": node_id,
@@ -70,7 +96,9 @@ def generate_index():
             "type": node_type,
             "updated": updated,
             "categories": cats,
-            "aliases": aliases
+            "aliases": aliases,
+            "links": sorted(links),
+            "summary": summary
         }
 
         # Register aliases & id mapping back to node_key
@@ -163,6 +191,25 @@ def update_index_item(filename: str):
                     aliases = [str(a).strip() for a in raw_aliases]
                 elif isinstance(raw_aliases, str):
                     aliases = [raw_aliases.strip()]
+
+                # Extract [[bidirectional links]] from content body
+                links = set()
+                body = content[frontmatter_match.end():]
+                for m in re.finditer(r'\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]', body):
+                    links.add(m.group(2).split('|')[0].strip().replace('.md', ''))
+                for m in re.finditer(r'\[\[(.*?)\]\]', body):
+                    link_text = m.group(1).split('|')[0].strip().replace('.md', '')
+                    if '::' in link_text:
+                        link_text = link_text.split('::', 1)[1].strip()
+                    links.add(link_text)
+                links.discard('')
+
+                # Extract summary
+                summary_text = re.sub(r'#.*?\n', '', body)
+                summary_text = re.sub(r'\[\[([^\]]*?\|)?([^\]]*?)\]\]', r'\2', summary_text)
+                summary_text = re.sub(r'\[([^\[\]]+?)::\s*\[\[.*?\]\]\]', '', summary_text)
+                summary_text = summary_text.strip().replace('\n', ' ')
+                summary = summary_text[:200]
                     
                 index_data["nodes"][node_key] = {
                     "id": node_id,
@@ -170,7 +217,9 @@ def update_index_item(filename: str):
                     "type": node_type,
                     "updated": updated,
                     "categories": cats,
-                    "aliases": aliases
+                    "aliases": aliases,
+                    "links": sorted(links),
+                    "summary": summary
                 }
                 
                 if node_id: index_data["aliases"][node_id] = node_key

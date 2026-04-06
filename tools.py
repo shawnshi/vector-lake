@@ -24,20 +24,26 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
     except Exception as e:
         return f"Error reading index.json: {e}"
     
-    nodes = index_data.get("nodes", [])
+    # index.json stores nodes as dict: { "node_key": { id, title, ... } }
+    raw_nodes = index_data.get("nodes", {})
+    nodes = [{"_key": k, **v} for k, v in raw_nodes.items()]
     query_lower = query.lower()
     query_terms = query_lower.split()
     
     scored = []
     for node in nodes:
         score = 0
+        node_key = node.get("_key", "").lower()
         title = (node.get("title") or node.get("id", "")).lower()
         node_type = (node.get("type") or "").lower()
         aliases = [a.lower() for a in node.get("aliases", [])]
         links = [l.lower() for l in node.get("links", [])]
+        summary = (node.get("summary") or "").lower()
         
         for term in query_terms:
+            if term in node_key: score += 10
             if term in title: score += 10
+            if term in summary: score += 3
             for alias in aliases:
                 if term in alias: score += 5
             for link in links:
@@ -54,10 +60,10 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
     
     formatted_output = ""
     for i, (score, node) in enumerate(results):
-        node_id = node.get("id", "Unknown")
-        title = node.get("title", node_id)
+        node_key = node.get("_key", "Unknown")
+        title = node.get("title", node_key)
         node_type = node.get("type", "unknown")
-        filepath = os.path.join(wiki_dir, f"{node_id}.md")
+        filepath = os.path.join(wiki_dir, f"{node_key}.md")
         
         snippet = ""
         if os.path.exists(filepath):
@@ -73,7 +79,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
         if not as_xml:
             formatted_output += f"- **{title}** ({node_type})\n  {snippet}...\n\n"
         else:
-            formatted_output += f'<Evidence_Node ID="Wiki_{i}" Source="{node_id}.md">\n{snippet}\n</Evidence_Node>\n'
+            formatted_output += f'<Evidence_Node ID="Wiki_{i}" Source="{node_key}.md">\n{snippet}\n</Evidence_Node>\n'
     
     return formatted_output
 
@@ -225,7 +231,8 @@ def query_logic_lake(query_str: str):
             with open(index_path, "r", encoding="utf-8") as f:
                 index_data = json.load(f)
             
-            nodes = index_data.get("nodes", [])
+            raw_nodes = index_data.get("nodes", {})
+            nodes = [{"_key": k, **v} for k, v in raw_nodes.items()]
             query_lower = query_str.lower()
             query_terms = query_lower.split()
             
@@ -249,8 +256,8 @@ def query_logic_lake(query_str: str):
             # Build evidence context from top matching files
             evidence_context = "=== Index Search Evidence (Top 10) ===\n"
             for _, node in top_nodes:
-                node_id = node.get("id", "")
-                filepath = os.path.join(wiki_dir, f"{node_id}.md")
+                node_key = node.get("_key", "")
+                filepath = os.path.join(wiki_dir, f"{node_key}.md")
                 if os.path.exists(filepath):
                     with open(filepath, "r", encoding="utf-8") as f:
                         content = f.read()

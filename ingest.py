@@ -1,7 +1,7 @@
 import os
+import re
 import json
 import hashlib
-import time
 import logging
 import subprocess
 from pathlib import Path
@@ -22,8 +22,6 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 EXTENSION_ROOT = Path(__file__).parent
 TARGET_DIRS = [str((EXTENSION_ROOT / d).resolve()) for d in config.get("target_directories", [])]
 WIKI_DIR = (EXTENSION_ROOT / "../../MEMORY/wiki").resolve()
-INDEX_PATH = WIKI_DIR / "index.md"
-LOG_PATH = WIKI_DIR / "log.md"
 SCHEMA_PATH = EXTENSION_ROOT / "schema.md"
 MEMORY_DIR = WIKI_DIR.parent  # .gemini/MEMORY/
 
@@ -90,13 +88,37 @@ def calculate_hash(filepath: str) -> str:
         log.error(f"Error calculating hash for {filepath}: {e}")
         return ""
 
-def get_file_content_safely(filepath: str) -> str:
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
 
+def _sanitize_for_prompt(text: str) -> str:
+    """Sanitize text before embedding in LLM prompt to prevent injection."""
+    # Strip characters that could be used for prompt injection
+    text = text.replace('`', '')       # Prevent code block escapes
+    text = text.replace('@', '_at_')   # Prevent @mention hijacking
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)  # Strip control chars
+    # Truncate excessively long paths
+    if len(text) > 500:
+        text = text[:500] + '...'
+    return text
+
+
+def _backup_wiki_targets(wiki_dir, file_entries: list):
+    """Create .bak snapshots of existing wiki files that may be modified.
+    Enables rollback if the Ingestor Agent produces bad writes.
+    """
+    import shutil
+    backup_count = 0
+    for entry in file_entries:
+        if entry.get("action") == "UPDATE":
+            target = os.path.join(str(wiki_dir), entry["target_source_file"])
+            if os.path.exists(target):
+                bak_path = target + ".bak"
+                try:
+                    shutil.copy2(target, bak_path)
+                    backup_count += 1
+                except Exception as e:
+                    log.warning(f"Failed to backup {target}: {e}")
+    if backup_count > 0:
+        log.info(f"Created {backup_count} .bak snapshots before agent write.")
 
 
 def process_file_batch(filepaths: list):
@@ -147,20 +169,34 @@ def process_file_batch(filepaths: list):
             "action": action,
         })
     
-    # Build structured file list with explicit target filenames
+    # Build structured file list with explicit target filenames (sanitized)
     file_list_lines = []
     for entry in file_entries:
+        safe_rel = _sanitize_for_prompt(entry['rel_path'])
+        safe_target = _sanitize_for_prompt(entry['target_source_file'])
+        safe_ref = _sanitize_for_prompt(entry['raw_ref'])
         file_list_lines.append(
-            f"- Source: `{entry['rel_path']}`\n"
-            f"  Target Source Page: `{entry['target_source_file']}` ({entry['action']})\n"
-            f"  YAML sources field: [\"{entry['raw_ref']}\"]"
+            f"- Source: `{safe_rel}`\n"
+            f"  Target Source Page: `{safe_target}` ({entry['action']})\n"
+            f"  YAML sources field: [\"{safe_ref}\"]"
         )
     file_list_str = "\n".join(file_list_lines)
 
-    # Load Schemas
-    schema_content = get_file_content_safely(str(SCHEMA_PATH))
+    # P3-13: Backup wiki targets before agent write
+    _backup_wiki_targets(WIKI_DIR, file_entries)
+
+    schema_path = EXTENSION_ROOT / "schema.md"
+    try:
+        with open(str(schema_path), "r", encoding="utf-8") as f:
+            schema_content = f.read()
+    except Exception:
+        schema_content = ""
     categories_path = EXTENSION_ROOT / "SCHEMA_CATEGORIES.md"
-    categories_content = get_file_content_safely(str(categories_path))
+    try:
+        with open(str(categories_path), "r", encoding="utf-8") as f:
+            categories_content = f.read()
+    except Exception:
+        categories_content = ""
 
     prompt = f"""
 @vector-lake-ingestor
@@ -189,8 +225,6 @@ Please begin extraction and node weaving.
 """
 
     gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
-    # Pivot to Native Subagent via @mention
-    cmd = [gemini_exec, "--prompt", prompt, "--approval-mode", "yolo"]
     try:
         cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
         print("Waiting for Ingestor Agent to process the batch (this may take 1~2 minutes)...", flush=True)
@@ -243,13 +277,13 @@ def sync_all():
 
     log.info(f"Scanned {len(files_to_process)} candidate raw sources.")
 
+    processed = get_processed_files()
     batch = []
-    batch_size = 2
+    batch_size = 5 # Increased batch size for better efficiency
     
     for filepath in files_to_process:
         file_hash = calculate_hash(filepath)
         if not file_hash: continue
-        processed = get_processed_files()
         if filepath in processed and processed[filepath].get("hash") == file_hash:
             continue
             

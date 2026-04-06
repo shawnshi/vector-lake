@@ -1,4 +1,4 @@
 description = "Trigger the Serendipity Engine to randomly collide 2 disparate nodes in the Wiki to discover orthogonal insights."
 prompt = """
-Please use the `serendipity_lake` or `run_command` tool to execute "python cli.py serendipity" in the background (WaitMsBeforeAsync=500). Inform the user that the background serendipity engine has started generating random collisions.
+Please use the `trigger_serendipity_collision` tool, or use `run_command` to execute "python cli.py serendipity" in the background (WaitMsBeforeAsync=500). Inform the user that the background serendipity engine has started generating random collisions.
 """

@@ -1,4 +1,4 @@
-# Vector Lake Schema & Governance (LLM-Wiki V5.0 Cognitive Pattern)
+# Vector Lake Schema & Governance (LLM-Wiki V7.0 Cognitive Pattern)
 
 ## 1. Core Mandate
 You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your primary job is to incrementally build and maintain a persistent, compounding knowledge base in Markdown format.
