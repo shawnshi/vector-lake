@@ -121,7 +121,7 @@ def _backup_wiki_targets(wiki_dir, file_entries: list):
         log.info(f"Created {backup_count} .bak snapshots before agent write.")
 
 
-def process_file_batch(filepaths: list):
+def process_file_batch(filepaths: list, existing_source_map: dict = None):
     if not filepaths: return False
 
     log.info(f"Delegating ingestion of a batch of {len(filepaths)} files to Vector Lake Ingestor Agent...")
@@ -142,8 +142,9 @@ def process_file_batch(filepaths: list):
             rel_filepaths.append(p)
             
     # --- DEDUP: Plan A - Scan existing Source pages ---
-    existing_source_map = scan_existing_sources(WIKI_DIR)
-    log.info(f"Scanned {len(existing_source_map)} existing Source page mappings for dedup.")
+    if existing_source_map is None:
+        existing_source_map = scan_existing_sources(WIKI_DIR)
+        log.info(f"Scanned {len(existing_source_map)} existing Source page mappings for dedup.")
 
     # --- DEDUP: Plan B - Compute canonical target filenames ---
     file_entries = []
@@ -278,8 +279,11 @@ def sync_all():
     log.info(f"Scanned {len(files_to_process)} candidate raw sources.")
 
     processed = get_processed_files()
+    existing_source_map = scan_existing_sources(WIKI_DIR)
+    log.info(f"Cached {len(existing_source_map)} existing Source page mappings for dedup.")
+    
     batch = []
-    batch_size = 5 # Increased batch size for better efficiency
+    batch_size = 15 # Increased batch size
     
     for filepath in files_to_process:
         file_hash = calculate_hash(filepath)
@@ -289,11 +293,11 @@ def sync_all():
             
         batch.append(filepath)
         if len(batch) >= batch_size:
-            process_file_batch(batch)
+            process_file_batch(batch, existing_source_map)
             batch = []
             
     if batch:
-        process_file_batch(batch)
+        process_file_batch(batch, existing_source_map)
                     
     log.info("Ingest sync completed.")
 
