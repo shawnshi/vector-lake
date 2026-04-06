@@ -10,7 +10,7 @@
 
 1. **不可变信源区 (`MEMORY/raw/`)**：您收集的原始数据（PDF、文章、日志）。Agent 会从中读取信息，但**绝对不会**修改该目录下的任何文件。
 2. **活跃的知识库 (`MEMORY/wiki/`)**：持久化的逻辑资产区。Agent 在这里拥有绝对的写权限。当摄入新信源或回答新问题时，Agent 会利用其自带的 `write_file` 和 `replace` 工具，在此创建实体、概念、综合推演页面，并更新双向链接 (`[[Link]]`)。
-3. **语义索引 (`data/vector_lake_db`)**：一个轻量级的 ChromaDB 实例，严格降级为只读的语义搜索引擎。它的唯一作用是帮助 Agent 在海量的 Markdown Wiki 页面中快速进行空间定位。
+3. **轻量级索引 (`wiki/index.json`)**：Pure-JSON 元数据索引，由 `indexer.py` 在每次 sync 时在 <0.1s 内全量重建。驱动 3D 拓扑可视化与 Agent 寻路。
 
 ## Agentic 编译流 (The V6.0 Shift)
 与之前的版本通过调用通用泛型大模型不同，**V6.0 彻底转向了独立子代理 (Subagent) 和物理隔离架构**：
@@ -34,7 +34,7 @@
 *   **启动后台监听哨兵**: `gemini watchdog_sync`
 
 ### 2. 深度推演落盘 (Tacit Query-to-Page)
-系统会自动在 ChromaDB 查找关联节点，然后在文件系统中抽取它们基于 `[Relation:: [[ID]]]` 的真实物理拓扑邻居，组装为“默会图谱上下文 (Tacit Subgraph Context)”，再抛给模型进行无偏见合成。
+系统会在 `index.json` 中查找关联节点，然后在文件系统中抽取它们基于 `[Relation:: [[ID]]]` 的真实物理拓扑邻居，组装为“默会图谱上下文 (Tacit Subgraph Context)”，再抛给模型进行无偏见合成。
 
 *   **推演查询**: `gemini query_logic_lake "对比一下 Vendor A 和 Vendor B 的 AI 战略差异"`
 
@@ -43,8 +43,8 @@
 
 *   **审计清理**: `gemini run_wiki_lint` (调用代码底层的 `--auto-fix`)
 
-### 4. 语义空间检索 (Semantic Search)
-使用 ChromaDB 向量索引在已编译的 Markdown 页面中进行快速的语义搜索。
+### 4. 知识检索 (Search)
+使用 `index.json` 元数据索引在已编译的 Markdown 页面中进行结构化检索。
 
 *   **搜索**: `gemini search_vector_lake "边缘计算模型"`
 
@@ -54,4 +54,4 @@
 *   **大屏展示**: `gemini show_graph`
 
 ## 为什么采用这种架构？ (Why this approach?)
-传统的 RAG 系统在每次被提问时都在从零开始重新拼凑知识碎片。而 LLM-Wiki 模式将知识编译一次并保持常新。交叉引用在物理层面上真实存在；事实冲突会被显式标注；逻辑综合反映了您阅读过的一切。维护一个维基百科所带来的记账、打标签、更新链接的庞大“脑力体力活”——现在已完全外包给了永不疲倦的 LLM。
+传统的 RAG 系统在每次被提问时都在从零开始重新拼凑知识碎片。而 LLM-Wiki 模式将知识编译一次并保持常新。交叉引用在物理层面上真实存在；事实冲突会被显式标注；逻辑综合反映了您阅读过的一切。维护一个维基百科所带来的记账、打标签、更新链接的庞大“脑力体力活”——现在已完全外包给了永不疲倦的 LLM。全量索引重建在 <0.1s 内完成，无需外部向量数据库，确保系统自主可控。

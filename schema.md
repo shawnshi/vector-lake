@@ -34,7 +34,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
 - **File Naming Policy & Ontology Lock**: 
   - To prevent entity drift, you MUST check existing aliases in `index.json` before inventing new Entities.
   - Prefix rules:
-    - `Source_*.md`: Summary pages for documents in `raw/`.
+    - `Source_*.md`: Summary pages for documents in `raw/`. **Deterministic naming**: the filename MUST be `Source_{raw_filename_stem}.md` (e.g., `raw/article/白皮书20260404.md` → `Source_白皮书20260404.md`). Each raw file maps to exactly ONE Source page. If a Source page already exists for a raw file, UPDATE it instead of creating a new one.
     - `Entity_*.md`: Organizations, products, or individuals.
     - `Concept_*.md`: Abstract architectures, theories, phenomena.
     - `Synthesis_*.md`: Deep reasoning, comparative analysis, serendipity, or comprehensive reports.

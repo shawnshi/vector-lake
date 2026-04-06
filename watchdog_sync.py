@@ -13,8 +13,6 @@ except ImportError:
     import sys
     sys.exit(1)
 
-from db import get_chroma_client, chroma_lock
-from embedding import GeminiEmbeddingFunction
 from ingest import TARGET_DIRS, SUPPORTED_EXTS, process_file_batch, calculate_hash, get_processed_files
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -132,14 +130,7 @@ def worker_loop():
                     
             log.info(f"Worker dequeued a batch of {len(batch)} files for ingestion.")
             
-            with chroma_lock:
-                chroma_client = get_chroma_client()
-                embedding_func = GeminiEmbeddingFunction()
-                collection = chroma_client.get_or_create_collection(
-                    name="vector_lake",
-                    embedding_function=embedding_func
-                )
-                success = process_file_batch(batch, collection)
+            success = process_file_batch(batch)
                 
             if success:
                 log.info(f"Batch processed successfully.")

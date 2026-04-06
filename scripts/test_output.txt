@@ -1,0 +1,36 @@
+=== Test 1: canonical_source_name ===
+  [PASS] 本地自主智能体集群架构白皮书20260404.md -> Source_本地自主智能体集群架构白皮书20260404.md
+  [PASS] 2025系统裂缝中的生存算法.md -> Source_2025系统裂缝中的生存算法.md
+  [PASS] RAG_to_Agentic_Compilation_Full.md -> Source_RAG_to_Agentic_Compilation_Full.md
+
+=== Test 2: scan_existing_sources (WIKI_DIR=C:\Users\shich\.gemini\MEMORY\wiki) ===
+  Found 6 raw->source mappings
+    raw/article/RAG_to_Agentic_Compilation_Full.md -> Source_RAG_to_Agentic_Compilation.md
+    raw/article/digitalhealthobserve/2025系统裂缝中的生存算法.md -> Source_2025_Survival_Algorithm.md
+    raw/article/digitalhealthobserve/4128数智健康蓝图一场以数据为核心的权力、利益与效率的重构.md -> Source_4128_Digital_Health_Blueprint.md
+    raw/article/从 RAG 检索到 Agentic 编译——个人知识库的物理重构_20260403_Full.md -> Source_Agentic_Compilation.md
+    raw/article/本地自主智能体集群架构白皮书20260404.md -> Source_Autonomous_Agent_Cluster_Whitepaper.md
+    raw/article/重构售前工程师的“认知操作系统”——基于Google AI生态的实战演化论.md -> Source_Cognitive_OS_Presales.md
+
+=== Test 3: Dedup resolution for known problem raws ===
+  [DEDUP HIT] raw/article/本地自主智能体集群架构白皮书20260404.md
+      Would UPDATE: Source_Autonomous_Agent_Cluster_Whitepaper.md
+      (Canonical fallback: Source_本地自主智能体集群架构白皮书20260404.md)
+  [DEDUP HIT] raw/article/RAG_to_Agentic_Compilation_Full.md
+      Would UPDATE: Source_RAG_to_Agentic_Compilation.md
+      (Canonical fallback: Source_RAG_to_Agentic_Compilation_Full.md)
+  [DEDUP HIT] raw/article/digitalhealthobserve/2025系统裂缝中的生存算法.md
+      Would UPDATE: Source_2025_Survival_Algorithm.md
+      (Canonical fallback: Source_2025系统裂缝中的生存算法.md)
+
+=== Test 4: Simulate batch prompt entry ===
+  raw_ref: raw/article/本地自主智能体集群架构白皮书20260404.md
+  normalized: raw/article/本地自主智能体集群架构白皮书20260404.md
+  existing: Source_Autonomous_Agent_Cluster_Whitepaper.md
+  canonical: Source_本地自主智能体集群架构白皮书20260404.md
+  DECISION: UPDATE -> Source_Autonomous_Agent_Cluster_Whitepaper.md
+
+=== SUMMARY ===
+  canonical_source_name tests: ALL PASS
+  scan_existing_sources found: 6 mappings
+  All 3 problem raws have dedup hits: True

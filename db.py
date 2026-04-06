@@ -9,19 +9,10 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config = json.load(f)
 
 EXTENSION_ROOT = Path(__file__).parent
-CHROMA_DB_PATH = str(EXTENSION_ROOT / config.get("db_path_chroma", "data/vector_lake_db"))
 PROCESSED_FILES_PATH = str(EXTENSION_ROOT / config.get("processed_files_path", "data/processed_files.json"))
 
-# Global Cross-Process Locks
-# We use filelocks to prevent concurrent CLI commands and Watchdog threads from corrupting SQLite/JSON.
+# Cross-process lock to prevent concurrent writes to processed_files.json
 json_lock = FileLock(f"{PROCESSED_FILES_PATH}.lock", timeout=30)
-chroma_lock = FileLock(f"{CHROMA_DB_PATH}/chroma.lock", timeout=120)
-
-def get_chroma_client():
-    """Gets a connection to the ChromaDB Vector Lake."""
-    import chromadb
-    os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    return chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
 def get_processed_files() -> dict:
     with json_lock:

@@ -34,7 +34,7 @@ Usage Examples:
     lint_parser = subparsers.add_parser("lint", help="[🟡 Lint] Run self-healing audit on the Wiki nodes.")
     lint_parser.add_argument("--auto-fix", action="store_true", help="Automatically fix issues such as decaying notes.")
 
-    search_parser = subparsers.add_parser("search", help="[🔍 Search] Semantic search over the Wiki pages via ChromaDB.")
+    search_parser = subparsers.add_parser("search", help="[🔍 Search] Search over the Wiki pages via index.json.")
     search_parser.add_argument("query", help="Semantic query string.")
     search_parser.add_argument("--top_k", type=int, default=5, help="Number of results (default: 5).")
 

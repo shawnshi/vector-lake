@@ -4,10 +4,10 @@
 **Vector Lake** (V4.0 LLM-Wiki Engine) 是 Gemini CLI 的有状态知识库编译基座。它摒弃了传统的“无状态检索(Stateless RAG)”和黑盒数据库，将长程记忆彻底重构为**基于大模型维护的纯 Markdown 节点网络 (Stateful Compounding Wiki)**。
 
 ## 2. 物理拓扑 (Architecture)
-采用 **Hybrid Engine（Markdown 绝对主权 + 向量辅助索引）**：
+采用 **Markdown 绝对主权**架构：
 *   **System 1 (Raw Sources)**: `MEMORY/raw/`。不可变的原始信源层（PDF、文章）。
 *   **System 2 (The Wiki)**: `MEMORY/wiki/`。大模型拥有绝对读写权限的固态资产层。所有的实体、概念、分析推演均以 `.md` 文件形式存在，通过 `[[双向链接]]` 相互交织。
-*   **System 3 (Semantic Index)**: ChromaDB (`data/vector_lake_db`)。降级为纯粹的向量检索引擎，仅用于帮助大模型在 `wiki/` 目录中执行空间定位。
+*   **System 3 (Lightweight Index)**: `wiki/index.json`。Pure-JSON 元数据索引，由 `indexer.py` 在 <0.1s 内全量重建，驱动拓扑可视化与 Agent 寻路。
 
 ## 3. 交互协议 (Interaction Protocol - CLI Native)
 ⚠️ **[HARD LOCK]** 所有交互必须通过 `run_shell_command` 调用底层 CLI 工具执行。

@@ -1,11 +1,9 @@
 import os
 import json
 import logging
+import re
 from pathlib import Path
 import ingest
-
-from db import get_chroma_client
-from embedding import GeminiEmbeddingFunction
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tools")
@@ -13,35 +11,71 @@ log = logging.getLogger("vector-lake-tools")
 EXTENSION_ROOT = Path(__file__).parent
 
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
-    """Semantic search over the Wiki pages via ChromaDB."""
-    client = get_chroma_client()
-    embedding_func = GeminiEmbeddingFunction()
+    """Search Wiki pages via index.json metadata and file content scanning."""
+    wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
+    index_path = os.path.join(wiki_dir, "index.json")
+    
+    if not os.path.exists(index_path):
+        return "index.json not found. Run sync first."
     
     try:
-        collection = client.get_collection(name="vector_lake", embedding_function=embedding_func)
-        results = collection.query(
-            query_texts=[query],
-            n_results=top_k
-        )
-        
-        if not results.get('documents') or not results['documents'][0]:
-            return "No relevant information found in the Wiki."
-            
-        formatted_output = ""
-        unique_sources = set()
-        
-        for i, doc in enumerate(results['documents'][0]):
-            meta = results['metadatas'][0][i] if results.get('metadatas') and results['metadatas'][0] else {}
-            source = meta.get('source', 'Unknown')
-            unique_sources.add(source)
-            if not as_xml:
-                formatted_output += f"- **Source**: {os.path.basename(source)}\n  **Content**: {doc[:300]}...\n\n"
-            else:
-                formatted_output += f'<Evidence_Node ID="Wiki_{i}" Source="{os.path.basename(source)}">\n{doc}\n</Evidence_Node>\n'
-                
-        return formatted_output
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
     except Exception as e:
-        return f"Error querying vector lake: {e}"
+        return f"Error reading index.json: {e}"
+    
+    nodes = index_data.get("nodes", [])
+    query_lower = query.lower()
+    query_terms = query_lower.split()
+    
+    scored = []
+    for node in nodes:
+        score = 0
+        title = (node.get("title") or node.get("id", "")).lower()
+        node_type = (node.get("type") or "").lower()
+        aliases = [a.lower() for a in node.get("aliases", [])]
+        links = [l.lower() for l in node.get("links", [])]
+        
+        for term in query_terms:
+            if term in title: score += 10
+            for alias in aliases:
+                if term in alias: score += 5
+            for link in links:
+                if term in link: score += 2
+        
+        if score > 0:
+            scored.append((score, node))
+    
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = scored[:top_k]
+    
+    if not results:
+        return "No relevant information found in the Wiki."
+    
+    formatted_output = ""
+    for i, (score, node) in enumerate(results):
+        node_id = node.get("id", "Unknown")
+        title = node.get("title", node_id)
+        node_type = node.get("type", "unknown")
+        filepath = os.path.join(wiki_dir, f"{node_id}.md")
+        
+        snippet = ""
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                # Strip YAML frontmatter
+                body = re.sub(r'^---.*?---\s*', '', content, flags=re.DOTALL)
+                snippet = body.strip()[:300]
+            except Exception:
+                snippet = "(unable to read)"
+        
+        if not as_xml:
+            formatted_output += f"- **{title}** ({node_type})\n  {snippet}...\n\n"
+        else:
+            formatted_output += f'<Evidence_Node ID="Wiki_{i}" Source="{node_id}.md">\n{snippet}\n</Evidence_Node>\n'
+    
+    return formatted_output
 
 def sync_vector_lake():
     ingest.sync_all()
@@ -181,61 +215,67 @@ def query_logic_lake(query_str: str):
     wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
     schema_path = os.path.join(EXTENSION_ROOT, "schema.md")
     
-    # --- Polanyi Tacit Indwelling: Subgraph Context Compilation ---
+    # --- Evidence Context from index.json + File Scanning ---
     try:
-        from db import get_chroma_client
-        from embedding import GeminiEmbeddingFunction
-        client = get_chroma_client()
-        embedding_func = GeminiEmbeddingFunction()
-        collection = client.get_collection(name="vector_lake", embedding_function=embedding_func)
-        results = collection.query(query_texts=[query_str], n_results=10)
+        index_path = os.path.join(wiki_dir, "index.json")
+        evidence_context = ""
+        subgraph_context = ""
         
-        # 1. Full Semantic Evidence Context
-        evidence_context = "=== ChromaDB Search Evidence (Top 10) ===\n"
-        if results.get('documents') and results['documents'][0]:
-            for doc in results['documents'][0]:
-                evidence_context += f"Evidence Segment: {doc[:500]}...\n\n"
-        
-        # 2. Tacit Subgraph Context (only for top 3 focal nodes to avoid overflow)
-        focal_files = set()
-        if results.get('metadatas') and results['metadatas'][0]:
-            for meta in results['metadatas'][0][:3]:
-                if meta and 'source' in meta:
-                    focal_files.add(meta['source'])
-        
-        subgraph_context = "=== 默会图谱关联上下文 (Tacit Subgraph Topology) ===\n"
-        if not focal_files:
-            subgraph_context += "No immediate focal nodes found.\n"
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            
+            nodes = index_data.get("nodes", [])
+            query_lower = query_str.lower()
+            query_terms = query_lower.split()
+            
+            # Score and rank nodes
+            scored = []
+            for node in nodes:
+                score = 0
+                title = (node.get("title") or node.get("id", "")).lower()
+                for term in query_terms:
+                    if term in title: score += 10
+                    for alias in [a.lower() for a in node.get("aliases", [])]:
+                        if term in alias: score += 5
+                    for link in [l.lower() for l in node.get("links", [])]:
+                        if term in link: score += 2
+                if score > 0:
+                    scored.append((score, node))
+            
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_nodes = scored[:10]
+            
+            # Build evidence context from top matching files
+            evidence_context = "=== Index Search Evidence (Top 10) ===\n"
+            for _, node in top_nodes:
+                node_id = node.get("id", "")
+                filepath = os.path.join(wiki_dir, f"{node_id}.md")
+                if os.path.exists(filepath):
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    evidence_context += f"Evidence Segment ({node_id}): {content[:500]}...\n\n"
+            
+            # Build tacit subgraph context from top 3
+            focal_nodes = top_nodes[:3]
+            subgraph_context = "=== 默会图谱关联上下文 (Tacit Subgraph Topology) ===\n"
+            if not focal_nodes:
+                subgraph_context += "No immediate focal nodes found.\n"
+            else:
+                subgraph_context += f"Found {len(focal_nodes)} focal nodes. Extracting 1-degree tacit connections...\n"
+                for _, node in focal_nodes:
+                    node_id = node.get("id", "")
+                    links = node.get("links", [])
+                    subgraph_context += f"\n--- Focal Node: {node_id} ---\n"
+                    if not links:
+                        subgraph_context += "  (No outgoing links)\n"
+                    else:
+                        subgraph_context += "  -> Tacit Neighbors: " + ", ".join(links) + "\n"
         else:
-            subgraph_context += f"Found {len(focal_files)} focal nodes. Extracting 1-degree tacit connections...\n"
-            for src in focal_files:
-                if not os.path.exists(src): continue
-                with open(src, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                node_id = os.path.basename(src).replace('.md', '')
-                subgraph_context += f"\n--- Focal Node: {node_id} ---\n"
-                
-                # Extract links
-                links = set()
-                v6_matches = re.finditer(r'\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]', content)
-                for m in v6_matches:
-                    links.add(m.group(2).split('|')[0].strip().replace('.md', ''))
-                    
-                basic_matches = re.finditer(r'\[\[(.*?)\]\]', content)
-                for m in basic_matches:
-                    link_text = m.group(1).split('|')[0].strip().replace('.md', '')
-                    if "::" in link_text:
-                        link_text = link_text.split("::", 1)[1].strip()
-                    links.add(link_text)
-                    
-                if not links:
-                    subgraph_context += "  (No outgoing links)\n"
-                else:
-                    subgraph_context += "  -> Tacit Neighbors: " + ", ".join(links) + "\n"
-                    
+            evidence_context = "index.json not found. Run sync first."
+            subgraph_context = ""
     except Exception as e:
-        evidence_context = "Failed to fetch ChromaDB evidence."
+        evidence_context = "Failed to fetch search evidence."
         subgraph_context = f"Failed to compile tacit subgraph: {e}"
         log.error(subgraph_context)
     # -------------------------------------------------------------
@@ -489,6 +529,9 @@ def visualize_vector_lake():
         .filter-checkbox {{ display: flex; align-items: center; margin-bottom: 6px; font-size: 0.85rem; cursor: pointer; color: #D1D5DB; }}
         .filter-checkbox input {{ margin-right: 8px; cursor: pointer; accent-color: #60A5FA; }}
         .filter-checkbox:hover {{ color: #FFFFFF; }}
+        #stats-panel {{ position: absolute; bottom: 0; left: 0; width: 100%; background: rgba(15, 23, 42, 0.85); border-top: 1px solid #374151; padding: 12px 20px; box-sizing: border-box; display: flex; justify-content: center; gap: 40px; backdrop-filter: blur(8px); z-index: 10; font-family: 'Inter', sans-serif; }}
+        .stat-item {{ display: flex; align-items: center; gap: 8px; font-size: 0.9rem; color: #D1D5DB; font-weight: 500; letter-spacing: 0.05em; text-transform: uppercase; }}
+        .stat-color-box {{ width: 12px; height: 12px; border-radius: 3px; }}
     </style>
     <script src="https://unpkg.com/3d-force-graph"></script>
 </head>
@@ -513,6 +556,12 @@ def visualize_vector_lake():
         <div id="search-results"></div>
     </div>
     <div id="3d-graph"></div>
+    <div id="stats-panel">
+        <div class="stat-item"><div class="stat-color-box" style="background: #10B981;"></div>Source: <span id="stat-source">0</span></div>
+        <div class="stat-item"><div class="stat-color-box" style="background: #EF4444;"></div>Entity: <span id="stat-entity">0</span></div>
+        <div class="stat-item"><div class="stat-color-box" style="background: #00B0FF;"></div>Concept: <span id="stat-concept">0</span></div>
+        <div class="stat-item"><div class="stat-color-box" style="background: #F59E0B;"></div>Synthesis: <span id="stat-synthesis">0</span></div>
+    </div>
     <script>
         document.getElementById('filter-toggle').addEventListener('click', () => {{
             const opts = document.getElementById('filter-options');
@@ -742,6 +791,20 @@ def visualize_vector_lake():
                 searchResults.style.display = 'none';
             }}
         }});
+        
+        // Calculate and display node type statistics
+        const stats = {{ source: 0, entity: 0, concept: 0, synthesis: 0 }};
+        data.nodes.forEach(n => {{
+            const g = (n.group || '').toLowerCase();
+            if (g.includes('source')) stats.source++;
+            else if (g.includes('entity')) stats.entity++;
+            else if (g.includes('concept')) stats.concept++;
+            else if (g.includes('synthesis')) stats.synthesis++;
+        }});
+        document.getElementById('stat-source').innerText = stats.source;
+        document.getElementById('stat-entity').innerText = stats.entity;
+        document.getElementById('stat-concept').innerText = stats.concept;
+        document.getElementById('stat-synthesis').innerText = stats.synthesis;
     </script>
 </body>
 </html>
