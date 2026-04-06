@@ -40,6 +40,8 @@ Usage Examples:
     query_parser = subparsers.add_parser("query", help="[🧠 Query] Trigger deep reasoning and create a new Wiki node.")
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
 
+    seren_parser = subparsers.add_parser("serendipity", help="[✨ Serendipity] Trigger background random synthesis collision.")
+
     graph_parser = subparsers.add_parser("graph", help="[🌐 Graph] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.")
 
     args = parser.parse_args()
@@ -53,6 +55,8 @@ Usage Examples:
             print(tools.lint_vector_lake())
         elif args.command == "query":
             print(tools.query_logic_lake(args.query_str))
+        elif args.command == "serendipity":
+            print(tools.trigger_serendipity_collision())
         elif args.command == "graph":
             print(tools.visualize_vector_lake())
     except Exception as e:

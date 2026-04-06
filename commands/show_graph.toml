@@ -1,2 +1,2 @@
 description = "Visualize the Vector Lake V4.0 Markdown network as an interactive 3D graph."
-prompt = "Execute 'python C:\\Users\\shich\\.gemini\\extensions\\vector-lake\\cli.py graph' via run_shell_command."
+prompt = "Execute 'python cli.py graph' via run_command."

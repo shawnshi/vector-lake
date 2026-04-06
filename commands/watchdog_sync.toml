@@ -1,4 +1,4 @@
 description = "Launch the real-time LLM-Wiki ingest compiler. It listens to the MEMORY/raw directory and incrementally compiles new sources into Markdown pages. Runs as a background service."
 prompt = '''
-Please use the run_shell_command tool to execute "python C:\\Users\\shich\\.gemini\\extensions\\vector-lake\\watchdog_sync.py" in the background (is_background=true). Inform the user that the background ingest compiler service has started.
+Please use the run_command tool to execute "python watchdog_sync.py". Make sure to send it to the background by setting WaitMsBeforeAsync=500. Inform the user that the background ingest compiler service has started.
 '''

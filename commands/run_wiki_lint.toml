@@ -6,6 +6,6 @@ Workflow:
 1. Read `MEMORY/wiki/index.md` and `extensions/vector-lake/schema.md` to understand the current graph structure.
 2. Identify Flaws: Look for duplicate entities, orphaned pages, or logical inconsistencies.
 3. Delegate: Use the `generalist` sub-agent to do the heavy lifting of reading specific files and executing the text replacements if necessary.
-4. Apply Fixes: Use `replace` or `write_file` to physically merge redundant Markdown pages and fix broken `[[Links]]` inside the `MEMORY/wiki/` directory.
-5. Log: Append your audit and cleanup report to `MEMORY/wiki/log.md`.
+4. Propose Fixes: Generate a staging report. NEVER use `replace_file_content` or `write_file` to physically merge files. Instead, present the recommended file merges and link fixes to the user.
+5. Log: Append your audit report to `MEMORY/wiki/log.md`.
 """

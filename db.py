@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from threading import Lock
+from filelock import FileLock, Timeout
 
 # Load config
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -12,17 +12,19 @@ EXTENSION_ROOT = Path(__file__).parent
 CHROMA_DB_PATH = str(EXTENSION_ROOT / config.get("db_path_chroma", "data/vector_lake_db"))
 PROCESSED_FILES_PATH = str(EXTENSION_ROOT / config.get("processed_files_path", "data/processed_files.json"))
 
-_processed_lock = Lock()
+# Global Cross-Process Locks
+# We use filelocks to prevent concurrent CLI commands and Watchdog threads from corrupting SQLite/JSON.
+json_lock = FileLock(f"{PROCESSED_FILES_PATH}.lock", timeout=30)
+chroma_lock = FileLock(f"{CHROMA_DB_PATH}/chroma.lock", timeout=120)
 
 def get_chroma_client():
     """Gets a connection to the ChromaDB Vector Lake."""
     import chromadb
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    return client
+    return chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
 def get_processed_files() -> dict:
-    with _processed_lock:
+    with json_lock:
         if not os.path.exists(PROCESSED_FILES_PATH):
             return {}
         try:
@@ -32,7 +34,7 @@ def get_processed_files() -> dict:
             return {}
 
 def mark_file_processed(filepath: str, file_hash: str, timestamp: str):
-    with _processed_lock:
+    with json_lock:
         os.makedirs(os.path.dirname(PROCESSED_FILES_PATH), exist_ok=True)
         data = {}
         if os.path.exists(PROCESSED_FILES_PATH):

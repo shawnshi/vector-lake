@@ -35,18 +35,30 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
         
         for i in range(0, len(input), batch_size):
             batch = input[i : i + batch_size]
-            try:
-                # Add a small delay between batches to mitigate rate limiting
-                if i > 0:
-                    time.sleep(1.0)
-                
-                response = self.client.models.embed_content(
+            
+            import backoff
+            from google.genai.errors import APIError
+            
+            # Decorator to catch 429 quota errors and apply exponential backoff
+            @backoff.on_exception(
+                backoff.expo, 
+                APIError, 
+                max_tries=5, 
+                giveup=lambda e: e.code != 429,
+                factor=2,
+                jitter=backoff.full_jitter
+            )
+            def request_embeddings_with_retry(batch_data):
+                return self.client.models.embed_content(
                     model=EMBEDDING_MODEL,
-                    contents=batch,
+                    contents=batch_data,
                     config=types.EmbedContentConfig(
                         task_type=self.task_type
                     )
                 )
+
+            try:
+                response = request_embeddings_with_retry(batch)
                 
                 if isinstance(response.embeddings, list):
                     for emb in response.embeddings:

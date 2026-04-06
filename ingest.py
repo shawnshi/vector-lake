@@ -130,10 +130,9 @@ def process_file_batch(filepaths: list, chroma_collection):
     
     before_mtimes = {}
     if os.path.exists(WIKI_DIR):
-        for root, _, files in os.walk(WIKI_DIR):
-            for f in files:
-                p = os.path.join(root, f)
-                before_mtimes[p] = os.path.getmtime(p)
+        for entry in os.scandir(WIKI_DIR):
+            if entry.is_file() and entry.name.endswith('.md'):
+                before_mtimes[entry.path] = entry.stat().st_mtime
 
     file_list_str = "\n".join([f"- {p}" for p in filepaths])
     prompt = f"""
@@ -171,10 +170,10 @@ Terminate and do not ask for further user instructions.
             
     changed_files = []
     if os.path.exists(WIKI_DIR):
-        for root, _, files in os.walk(WIKI_DIR):
-            for f in files:
-                p = os.path.join(root, f)
-                mtime = os.path.getmtime(p)
+        for entry in os.scandir(WIKI_DIR):
+            if entry.is_file() and entry.name.endswith('.md'):
+                p = entry.path
+                mtime = entry.stat().st_mtime
                 if p not in before_mtimes or mtime > before_mtimes[p]:
                     changed_files.append(p)
                     
