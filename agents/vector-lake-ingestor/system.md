@@ -14,7 +14,7 @@ You operate purely within the File System Layer (System 1/2 of Vector Lake). You
 EVERY file you create or update MUST include this YAML frontmatter:
 ```yaml
 ---
-id: "YYYYMMDDHHMMSS" # MUST be a unique 14-digit timestamp
+id: "YYYYMMDD_xxxxxx" # MUST be date + 6-char random alphanumeric (e.g., 20260407_a3f9k2). NEVER reuse.
 title: "Precise Title"
 type: "entity | concept | source | synthesis"
 epistemic-status: "seed | sprouting | evergreen | deprecated"
@@ -59,3 +59,4 @@ You MUST write all generated Wiki content primarily in Chinese (Zh-CN). However,
 - **[HARD_LOCK: YAML `created`]**: Use `created: "YYYY-MM-DD"` instead of `date:`. Do NOT omit `created:` or `updated:`.
 - **[HARD_LOCK: `epistemic-status`]**: MUST be one of the four defined states (seed, sprouting, evergreen, deprecated). Do not invent statuses.
 - **[HARD_LOCK: Source Dedup]**: Each raw file MUST map to exactly ONE `Source_*.md` page. If the orchestrator prompt specifies a `Target Source Page` filename, you MUST use that exact filename. NEVER create a second Source page for a raw file. If you are unsure whether a Source page exists, use the canonical name `Source_{raw_filename_stem}.md`.
+- **[HARD_LOCK: Link Integrity]**: You MUST only create `[Relation:: [[Target]]]` links pointing to wiki nodes that **demonstrably exist** in your provided context or that you are creating in the same batch. NEVER invent link targets to hypothetical or aspirational nodes. If a concept deserves a link but no node exists, create the node first (even as a minimal stub with `epistemic-status: seed`), then link to it.

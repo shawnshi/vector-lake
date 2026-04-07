@@ -90,129 +90,339 @@ def sync_vector_lake():
     return "Ingestion Sync and Index generation completed."
 
 def lint_vector_lake(auto_fix: bool = False):
+    """Comprehensive schema-aware lint for the Vector Lake wiki.
+
+    Checks:
+      1. YAML Frontmatter completeness (id, title, type, epistemic-status, categories, created, updated, sources)
+      2. File name prefix compliance (Source_/Entity_/Concept_/Synthesis_/...)
+      3. Type & epistemic-status value legality
+      4. Categories against SCHEMA_CATEGORIES.md controlled vocabulary
+      5. Duplicate YAML IDs
+      6. Alias ↔ ID collisions & shared aliases
+      7. Broken links (outbound [[links]] pointing to non-existent nodes)
+      8. Orphan pages (zero inbound links from other nodes)
+      9. File name similarity (> 0.8 SequenceMatcher ratio)
+     10. Knowledge decay (sprouting > 60 days)
+    """
     import re
-    from collections import defaultdict
+    import yaml
     import difflib
-    
+    from collections import defaultdict
+    from datetime import datetime
+
     wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
     if not os.path.exists(wiki_dir):
         return "Wiki directory not found."
-    
-    ids = {}
-    aliases_map = defaultdict(list)
-    potential_dups = []
-    decay_warnings = []
-    
-    import yaml
-    from datetime import datetime
-    
-    for filename in os.listdir(wiki_dir):
-        if not filename.endswith(".md") or filename in ("index.md", "log.md"):
-            continue
-        filepath = os.path.join(wiki_dir, filename)
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-            
-            try:
-                parts = content.split('---')
-                if len(parts) >= 3:
-                    fm_data = yaml.safe_load(parts[1])
-                    if fm_data and isinstance(fm_data, dict):
-                        status = fm_data.get('epistemic-status', '').strip().lower()
-                        updated = fm_data.get('updated', '')
-                        if status == 'sprouting' and updated:
-                            try:
-                                dt = datetime.strptime(str(updated), "%Y-%m-%d")
-                                if (datetime.now() - dt).days > 60:
-                                    if auto_fix:
-                                        # auto-fix logic
-                                        fm_data['decayed'] = True
-                                        new_fm_str = yaml.dump(fm_data, allow_unicode=True, default_flow_style=False)
-                                        # Write back modifying just the frontmatter
-                                        new_content = "---\n" + new_fm_str + "---\n" + '---'.join(parts[2:])
-                                        if len(parts) > 2:
-                                            # in case there are multiple '---' in the text body
-                                            new_content = "---\n" + new_fm_str.strip() + "\n" + '---'.join([''] + parts[2:])
-                                        
-                                        # More precise replacement
-                                        # parts[1] is the frontmatter
-                                        # To avoid issues with multiple --- in content, we replace the first occurrence
-                                        
-                                        # Actually, safe reconstruct:
-                                        after_frontmatter = content.split('---', 2)[2]
-                                        new_content = "---\n" + yaml.dump(fm_data, allow_unicode=True, default_flow_style=False).strip() + "\n---" + after_frontmatter
-                                        
-                                        with open(filepath, 'w', encoding='utf-8') as wf:
-                                            wf.write(new_content)
-                                        decay_warnings.append(f"DECAY WARNING [AUTO-FIXED]: '{filename}' status is sprouting and unmodified for >60 days. Added `decayed: true`.")
-                                    else:
-                                        decay_warnings.append(f"DECAY WARNING: '{filename}' status is sprouting and unmodified for >60 days.")
-                            except ValueError:
-                                pass
-            except Exception:
-                pass
 
-            id_match = re.search(r'^id:\s*"(.*?)"|^id:\s*\'(.*?)\'|^id:\s*([^\s]+)', content, re.MULTILINE)
-            node_id = id_match.group(1) or id_match.group(2) or id_match.group(3) if id_match else filename.replace(".md", "")
+    # --- Load controlled vocabulary from SCHEMA_CATEGORIES.md ---
+    schema_categories_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SCHEMA_CATEGORIES.md")
+    allowed_categories = set()
+    if os.path.exists(schema_categories_path):
+        with open(schema_categories_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                m = re.match(r'^-\s*`(\w+)`', line.strip())
+                if m:
+                    allowed_categories.add(m.group(1))
+    if not allowed_categories:
+        allowed_categories = {"Uncategorized", "Artificial_Intelligence", "Healthcare_IT",
+                              "Strategy_and_Business", "System_Architecture",
+                              "Philosophy_and_Cognitive", "Biomedicine"}
+
+    VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_", "Event_", "Person_", "Project_", "Term_", "System_")
+    VALID_TYPES = {"entity", "concept", "source", "synthesis"}
+    VALID_EPISTEMIC = {"seed", "sprouting", "evergreen", "deprecated"}
+    REQUIRED_FM_FIELDS = ("id", "title", "type", "epistemic-status", "categories", "created", "updated", "sources")
+
+    # --- Collection containers ---
+    ids = {}                           # id → filename
+    aliases_map = defaultdict(list)    # alias → [node_ids]
+    node_keys = set()                  # all node_key (filename without .md)
+    outbound_links = defaultdict(set)  # node_key → {target_keys}
+    inbound_count = defaultdict(int)   # node_key → int
+
+    # Per-file issues
+    prefix_violations = []
+    fm_missing = []                    # missing frontmatter entirely
+    fm_field_issues = []               # missing required fields
+    type_violations = []
+    epistemic_violations = []
+    category_violations = []
+    duplicate_ids = []
+    decay_warnings = []
+
+    # --- Single pass: parse every file ---
+    filenames = [f for f in os.listdir(wiki_dir) if f.endswith(".md") and f not in ("index.md", "log.md")]
+
+    for filename in filenames:
+        filepath = os.path.join(wiki_dir, filename)
+        node_key = filename[:-3]
+        node_keys.add(node_key)
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except (UnicodeDecodeError, OSError) as e:
+            fm_missing.append(f"{filename}: Read error — {e}")
+            continue
+
+        # --- Check 2: File name prefix ---
+        if not filename.startswith(VALID_PREFIXES):
+            prefix_violations.append(filename)
+
+        # --- Parse YAML frontmatter (single canonical parse) ---
+        frontmatter_match = re.search(r'^---\n(.*?)\n---', content, re.MULTILINE | re.DOTALL)
+        if not frontmatter_match:
+            fm_missing.append(filename)
+            continue
+
+        try:
+            fm_data = yaml.safe_load(frontmatter_match.group(1)) or {}
+        except yaml.YAMLError:
+            fm_missing.append(f"{filename}: YAML parse error")
+            continue
+
+        if not isinstance(fm_data, dict):
+            fm_missing.append(f"{filename}: Frontmatter is not a dict")
+            continue
+
+        # --- Check 1: Required field completeness ---
+        missing_fields = [field for field in REQUIRED_FM_FIELDS if field not in fm_data or fm_data[field] in (None, "", [])]
+        if missing_fields:
+            fm_field_issues.append(f"{filename}: missing [{', '.join(missing_fields)}]")
+
+        # --- Check 3: Type legality ---
+        node_type = str(fm_data.get("type", "")).strip().lower()
+        if node_type and node_type not in VALID_TYPES:
+            type_violations.append(f"{filename}: type='{fm_data.get('type')}' (valid: {', '.join(sorted(VALID_TYPES))})")
+
+        # --- Check 3: Epistemic-status legality ---
+        status = str(fm_data.get("epistemic-status", "")).strip().lower()
+        if status and status not in VALID_EPISTEMIC:
+            epistemic_violations.append(f"{filename}: epistemic-status='{fm_data.get('epistemic-status')}' (valid: {', '.join(sorted(VALID_EPISTEMIC))})")
+
+        # --- Check 4: Categories against controlled vocabulary ---
+        cats = fm_data.get("categories", [])
+        if isinstance(cats, list):
+            for cat in cats:
+                cat_str = str(cat).strip()
+                if cat_str and cat_str not in allowed_categories:
+                    category_violations.append(f"{filename}: category='{cat_str}' not in SCHEMA_CATEGORIES")
+
+        # --- Check 5: Duplicate ID ---
+        node_id = str(fm_data.get("id", "")).strip()
+        if node_id:
             if node_id in ids:
-                potential_dups.append(f"DUPLICATE ID: '{node_id}' found in both '{ids[node_id]}' and '{filename}'")
+                duplicate_ids.append(f"ID '{node_id}' in both '{ids[node_id]}' and '{filename}'")
             else:
                 ids[node_id] = filename
-                
-            alias_match = re.search(r'^aliases:\s*\[(.*?)\]', content, re.MULTILINE)
-            if alias_match:
-                aliases_str = alias_match.group(1)
-                aliases = [a.strip().strip('"').strip("'") for a in aliases_str.split(',') if a.strip()]
-                for alias in aliases:
-                    aliases_map[alias].append(node_id)
-                    
-    report = ["--- Wiki Lint Report ---"]
-    if potential_dups:
-        report.append("1. Duplicate IDs Found:")
-        for dup in potential_dups:
-            report.append(f"  - {dup}")
-    else:
-        report.append("1. No Duplicate IDs Found.")
-        
-    report.append("\n2. Alias Conflicts (Alias matching an existing ID):")
-    conflict_found = False
-    for alias, nodes in aliases_map.items():
-        if alias in ids:
-            report.append(f"  - Alias '{alias}' in node(s) {nodes} conflicts with existing Node ID '{alias}' (file: {ids[alias]})")
-            conflict_found = True
-    if not conflict_found:
-        report.append("  - No Alias Conflicts Found.")
-        
-    report.append("\n3. Shared Aliases (Multiple nodes using the same alias):")
-    shared_found = False
-    for alias, nodes in aliases_map.items():
-        if len(nodes) > 1:
-            report.append(f"  - Alias '{alias}' is shared by nodes: {nodes}")
-            shared_found = True
-    if not shared_found:
-        report.append("  - No Shared Aliases Found.")
-        
-    report.append("\n4. Checking for File Name similarities:")
-    filenames = [f for f in os.listdir(wiki_dir) if f.endswith(".md") and f not in ("index.md", "log.md")]
+
+        # --- Check 6: Alias collection ---
+        raw_aliases = fm_data.get("aliases", [])
+        if isinstance(raw_aliases, list):
+            for a in raw_aliases:
+                aliases_map[str(a).strip()].append(node_key)
+        elif isinstance(raw_aliases, str):
+            aliases_map[raw_aliases.strip()].append(node_key)
+
+        # --- Collect outbound links for Check 7 & 8 ---
+        body = content[frontmatter_match.end():]
+        # V7.0 relation links: [Relation:: [[Target]]]
+        for m in re.finditer(r'\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]', body):
+            target = m.group(2).split('|')[0].strip().replace('.md', '')
+            if target:
+                outbound_links[node_key].add(target)
+        # Standard wiki links: [[Target]] or [[Target|Alias]]
+        for m in re.finditer(r'\[\[(.*?)\]\]', body):
+            link_text = m.group(1).split('|')[0].strip().replace('.md', '')
+            if '::' in link_text:
+                link_text = link_text.split('::', 1)[1].strip()
+            if link_text:
+                outbound_links[node_key].add(link_text)
+
+        # --- Check 10: Knowledge decay ---
+        if status == 'sprouting' and fm_data.get('updated'):
+            try:
+                dt = datetime.strptime(str(fm_data['updated']), "%Y-%m-%d")
+                if (datetime.now() - dt).days > 60:
+                    if auto_fix:
+                        fm_data['decayed'] = True
+                        after_fm = content.split('---', 2)[2]
+                        new_content = "---\n" + yaml.dump(fm_data, allow_unicode=True, default_flow_style=False).strip() + "\n---" + after_fm
+                        with open(filepath, 'w', encoding='utf-8') as wf:
+                            wf.write(new_content)
+                        decay_warnings.append(f"[AUTO-FIXED] '{filename}': sprouting >60 days → decayed: true")
+                    else:
+                        decay_warnings.append(f"'{filename}': sprouting since {fm_data['updated']} (>{(datetime.now() - dt).days} days)")
+            except (ValueError, TypeError):
+                pass
+
+    # --- Post-scan: Compute broken links & orphans ---
+    # Build alias → node_key lookup (node_key itself is also a valid target)
+    alias_lookup = {}
+    for nk in node_keys:
+        alias_lookup[nk] = nk
+    for nid, fname in ids.items():
+        alias_lookup[nid] = fname.replace('.md', '')
+    for alias, nks in aliases_map.items():
+        if len(nks) == 1:
+            alias_lookup[alias] = nks[0]
+
+    # Check 7: Broken links
+    broken_links = []
+    for source_key, targets in outbound_links.items():
+        for target in targets:
+            resolved = alias_lookup.get(target)
+            if resolved:
+                inbound_count[resolved] += 1
+            elif target not in node_keys:
+                broken_links.append(f"{source_key}.md → [[{target}]]")
+
+    # Check 8: Orphan pages (zero inbound)
+    orphan_pages = [nk for nk in node_keys if inbound_count.get(nk, 0) == 0]
+
+    # Check 9: File name similarity (O(n²) — cap at 50 reports)
     similars = []
     for i in range(len(filenames)):
-        for j in range(i+1, len(filenames)):
-            seq = difflib.SequenceMatcher(None, filenames[i], filenames[j])
-            if seq.ratio() > 0.8:
-                similars.append((filenames[i], filenames[j], seq.ratio()))
+        if len(similars) >= 50:
+            break
+        for j in range(i + 1, len(filenames)):
+            ratio = difflib.SequenceMatcher(None, filenames[i], filenames[j]).ratio()
+            if ratio > 0.8:
+                similars.append((filenames[i], filenames[j], ratio))
+
+    # Check 6 resolved: Alias ↔ ID conflicts & shared aliases
+    alias_id_conflicts = []
+    shared_aliases = []
+    id_set = set(ids.keys())
+    for alias, nks in aliases_map.items():
+        if alias in id_set:
+            alias_id_conflicts.append(f"Alias '{alias}' in node(s) {nks} conflicts with ID (file: {ids[alias]})")
+        if len(nks) > 1:
+            shared_aliases.append(f"Alias '{alias}' shared by: {nks}")
+
+    # ======= Build Report =======
+    total_files = len(filenames)
+    section_num = 0
+
+    def section(title):
+        nonlocal section_num
+        section_num += 1
+        return f"\n{section_num}. {title}:"
+
+    report = [f"{'='*50}", f" Vector Lake Lint Report (V7.0)", f" Scanned: {total_files} files | auto_fix={'ON' if auto_fix else 'OFF'}", f"{'='*50}"]
+
+    # S1: Frontmatter completeness
+    report.append(section("YAML Frontmatter Issues"))
+    if fm_missing:
+        report.append(f"  Missing or unparseable frontmatter ({len(fm_missing)}):")
+        for item in fm_missing[:20]:
+            report.append(f"    - {item}")
+    if fm_field_issues:
+        report.append(f"  Missing required fields ({len(fm_field_issues)}):")
+        for item in fm_field_issues[:30]:
+            report.append(f"    - {item}")
+    if not fm_missing and not fm_field_issues:
+        report.append("  ✅ All files have complete frontmatter.")
+
+    # S2: Prefix compliance
+    report.append(section("File Name Prefix Compliance"))
+    if prefix_violations:
+        report.append(f"  Non-compliant filenames ({len(prefix_violations)}):")
+        for pv in prefix_violations[:20]:
+            report.append(f"    - {pv}")
+    else:
+        report.append("  ✅ All files follow naming convention.")
+
+    # S3: Type & epistemic-status legality
+    report.append(section("Type & Epistemic-Status Legality"))
+    if type_violations:
+        for tv in type_violations:
+            report.append(f"    - {tv}")
+    if epistemic_violations:
+        for ev in epistemic_violations:
+            report.append(f"    - {ev}")
+    if not type_violations and not epistemic_violations:
+        report.append("  ✅ All type and epistemic-status values are valid.")
+
+    # S4: Category validation
+    report.append(section("Categories vs SCHEMA_CATEGORIES"))
+    if category_violations:
+        report.append(f"  Unauthorized categories ({len(category_violations)}):")
+        for cv in category_violations[:20]:
+            report.append(f"    - {cv}")
+    else:
+        report.append("  ✅ All categories are within controlled vocabulary.")
+
+    # S5: Duplicate IDs
+    report.append(section("Duplicate IDs"))
+    if duplicate_ids:
+        for d in duplicate_ids:
+            report.append(f"    - {d}")
+    else:
+        report.append("  ✅ No duplicate IDs found.")
+
+    # S6: Alias conflicts & shared aliases
+    report.append(section("Alias Conflicts & Sharing"))
+    if alias_id_conflicts:
+        report.append(f"  Alias ↔ ID conflicts ({len(alias_id_conflicts)}):")
+        for a in alias_id_conflicts:
+            report.append(f"    - {a}")
+    if shared_aliases:
+        report.append(f"  Shared aliases ({len(shared_aliases)}):")
+        for s in shared_aliases:
+            report.append(f"    - {s}")
+    if not alias_id_conflicts and not shared_aliases:
+        report.append("  ✅ No alias conflicts.")
+
+    # S7: Broken links
+    report.append(section("Broken Links (outbound → non-existent target)"))
+    if broken_links:
+        report.append(f"  Broken links ({len(broken_links)}):")
+        for bl in broken_links[:30]:
+            report.append(f"    - {bl}")
+        if len(broken_links) > 30:
+            report.append(f"    ... and {len(broken_links) - 30} more.")
+    else:
+        report.append("  ✅ No broken links detected.")
+
+    # S8: Orphan pages
+    report.append(section("Orphan Pages (zero inbound links)"))
+    if orphan_pages:
+        report.append(f"  Orphan pages ({len(orphan_pages)}):")
+        for op in sorted(orphan_pages)[:30]:
+            report.append(f"    - {op}.md")
+        if len(orphan_pages) > 30:
+            report.append(f"    ... and {len(orphan_pages) - 30} more.")
+    else:
+        report.append("  ✅ All pages have at least one inbound link.")
+
+    # S9: File name similarity
+    report.append(section("File Name Similarity (ratio > 0.80)"))
     if similars:
-        for sim in similars:
-            report.append(f"  - Similar files: {sim[0]} and {sim[1]} (similarity: {sim[2]:.2f})")
+        for sim in similars[:20]:
+            report.append(f"    - {sim[0]} ↔ {sim[1]} ({sim[2]:.2f})")
+        if len(similars) > 20:
+            report.append(f"    ... and {len(similars) - 20} more.")
     else:
-        report.append("  - No obvious similar filenames.")
-        
-    report.append("\n5. Knowledge Decay Warnings (sprouting > 60 days):")
+        report.append("  ✅ No suspiciously similar filenames.")
+
+    # S10: Knowledge Decay
+    report.append(section("Knowledge Decay (sprouting > 60 days)"))
     if decay_warnings:
-        for warning in decay_warnings:
-            report.append(f"  - {warning}")
+        for dw in decay_warnings:
+            report.append(f"    - {dw}")
     else:
-        report.append("  - No knowledge decay detected.")
-        
+        report.append("  ✅ No knowledge decay detected.")
+
+    # Summary
+    total_issues = (len(fm_missing) + len(fm_field_issues) + len(prefix_violations)
+                    + len(type_violations) + len(epistemic_violations) + len(category_violations)
+                    + len(duplicate_ids) + len(alias_id_conflicts) + len(shared_aliases)
+                    + len(broken_links) + len(decay_warnings))
+    report.append(f"\n{'='*50}")
+    report.append(f" TOTAL: {total_issues} issues | {len(orphan_pages)} orphans | {len(similars)} similar-name pairs")
+    report.append(f"{'='*50}")
+
     return "\n".join(report)
 
 def query_logic_lake(query_str: str):

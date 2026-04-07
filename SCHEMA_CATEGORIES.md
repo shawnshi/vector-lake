@@ -1,6 +1,6 @@
 # Vector Lake Schema Categories (受控词表)
 
-This document defines the rigid ontology for the `categories` field in Vector Lake V6.0.
+This document defines the rigid ontology for the `categories` field in Vector Lake V7.0.
 All entities, concepts, and synthesis logic nodes must belong to one of these macro-domains. 
 Folksonomy and fine-grained labels should go into the `tags` field instead.
 

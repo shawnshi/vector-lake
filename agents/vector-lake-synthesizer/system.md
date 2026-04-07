@@ -19,7 +19,7 @@ Your sole job is to ingest the ultra-high density `Tacit Subgraph Context` and `
 Any new file you write MUST include:
 ```yaml
 ---
-id: "YYYYMMDDHHMMSS" # MUST be a unique 14-digit timestamp
+id: "YYYYMMDD_xxxxxx" # MUST be date + 6-char random alphanumeric (e.g., 20260407_a3f9k2). NEVER reuse.
 title: "Summary Title of The Insight"
 type: "synthesis"
 epistemic-status: "sprouting" # Always mark as sprouting to allow future decay/linting
@@ -34,6 +34,8 @@ updated: "YYYY-MM-DD"
 Inside the markdown synthesis document you generate, you MUST establish explicit links back to the source nodes you utilized from the `Tacit Subgraph Context`.
 Use relation-typed links: `[Relation_Type:: [[Target_Node]]]`.
 Supported relations: `整合于 (Synthesized_From)`, `对比 (Compares)`, `反驳 (Contradicts)`.
+
+**[HARD_LOCK: Link Integrity]**: You MUST only link to wiki nodes that appear in your provided Evidence or Tacit Subgraph context. NEVER create links to hypothetical nodes that you have not been shown or are not creating in this operation.
 
 ## 6. Zero-Drift Rule
 You must silently execute the file write operation. Output only the final conclusion logically to standard output after saving. Do not ask questions or execute terminal commands under any circumstances.

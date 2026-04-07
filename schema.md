@@ -13,7 +13,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
 - **YAML Frontmatter**: EVERY wiki page MUST contain YAML frontmatter with the following fields:
   ```yaml
   ---
-  id: "YYYYMMDDHHMMSS"
+  id: "YYYYMMDD_xxxxxx"  # date + 6-char random alphanumeric
   title: "Page Title"
   type: "entity | concept | source | synthesis"
   epistemic-status: "seed | sprouting | evergreen | deprecated"
