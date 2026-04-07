@@ -26,12 +26,13 @@ V7.0 采用**独立子代理 (Subagent) + 物理隔离 + 纵深防御**架构：
 
 | 模块 | 行数 | 职责 |
 |---|---|---|
-| `cli.py` | 69 | Argparse CLI 路由入口 |
-| `tools.py` | 830 | 6 个 Tool 函数 + 3D 力导向拓扑可视化 |
-| `ingest.py` | 295 | Raw→Wiki 编译管线（sanitize + backup + dedup） |
-| `indexer.py` | 245 | `index.json` 全量/O(1)增量生成器 |
-| `db.py` | 40 | `processed_files.json` 线程安全读写 |
-| `watchdog_sync.py` | 189 | 文件系统实时监听哨兵 |
+| `cli.py` | 56 | Argparse CLI 路由入口 |
+| `tools.py` | 471 | 6 个 Tool 函数（数据构建 + 模板渲染） |
+| `ingest.py` | 271 | Raw→Wiki 编译管线（sanitize + backup + dedup + timeout） |
+| `indexer.py` | 193 | `index.json` 全量/O(1)增量生成器（含 `_parse_wiki_node` 公共解析） |
+| `db.py` | 34 | `processed_files.json` 线程安全读写 |
+| `watchdog_sync.py` | 166 | 文件系统实时监听哨兵 |
+| `templates/topology.html` | 250 | 3D 力导向拓扑可视化 HTML 模板 |
 
 ## 核心元文件 (Core Files)
 

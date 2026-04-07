@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Vector Lake 3D Topology (V7.0)</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style> 
+        body { margin: 0; padding: 0; background-color: #0A0F14; overflow: hidden; font-family: 'Inter', sans-serif; color: #E5E7EB; } 
+        ::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(156, 163, 175, 0.2); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(156, 163, 175, 0.4); }
+        ::-webkit-scrollbar-corner { background: transparent; }
+        #info-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 350px;
+            max-height: 80vh;
+            overflow-y: auto;
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid #374151;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            z-index: 10;
+            display: none;
+            backdrop-filter: blur(8px);
+            pointer-events: none;
+        }
+        #info-panel.visible { display: block; pointer-events: auto; }
+        #info-title { margin: 0 0 12px 0; font-size: 1.3rem; color: #60A5FA; line-height: 1.2; }
+        #info-meta { font-size: 0.8rem; color: #9CA3AF; margin-bottom: 12px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
+        #info-meta span { display: block; margin-bottom: 4px; }
+        #info-summary { font-size: 0.9rem; line-height: 1.5; margin-bottom: 15px; color: #D1D5DB; }
+        #info-sources { font-size: 0.85rem; color: #10B981; word-break: break-all; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px; }
+        #info-sources ul { margin: 5px 0 0 0; padding-left: 20px; }
+        #close-btn { position: absolute; top: 10px; right: 15px; cursor: pointer; color: #9CA3AF; font-size: 1.2rem; }
+        #close-btn:hover { color: #FFFFFF; }
+        #info-neighbors { margin-top: 15px; border-top: 1px dashed #374151; padding-top: 10px; font-size: 0.9rem; color: #E5E7EB; }
+        #search-container { position: absolute; top: 20px; right: 20px; width: 250px; z-index: 10; font-family: sans-serif; }
+        #search-input { width: 100%; padding: 10px; background: rgba(15, 23, 42, 0.85); border: 1px solid #374151; border-radius: 6px; color: #E5E7EB; font-size: 0.9rem; outline: none; box-sizing: border-box; backdrop-filter: blur(8px); }
+        #search-input:focus { border-color: #60A5FA; }
+        #search-results { background: rgba(15, 23, 42, 0.95); border: 1px solid #374151; border-radius: 0 0 6px 6px; border-top: none; max-height: 300px; overflow-y: auto; display: none; backdrop-filter: blur(8px); box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); }
+        .search-item { padding: 8px 10px; cursor: pointer; font-size: 0.85rem; border-bottom: 1px solid #1F2937; }
+        .search-item:hover { background: #374151; color: #60A5FA; }
+        #node-tooltip { position: absolute; background: rgba(15, 23, 42, 0.85); border: 1px solid #374151; border-radius: 6px; padding: 6px 10px; color: #E5E7EB; font-size: 0.8rem; pointer-events: none; display: none; z-index: 20; backdrop-filter: blur(8px); white-space: nowrap; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5); }
+        #node-tooltip .tt-title { font-weight: 600; color: #60A5FA; margin-bottom: 2px; font-size: 0.9rem; }
+        #node-tooltip .tt-meta { font-size: 0.75rem; color: #9CA3AF; }
+        #filter-hud { position: absolute; top: 20px; right: 285px; width: 180px; background: rgba(15, 23, 42, 0.85); border: 1px solid #374151; border-radius: 8px; padding: 12px 15px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); z-index: 10; backdrop-filter: blur(8px); }
+        #filter-hud h4 { margin: 0 0 10px 0; font-size: 0.85rem; color: #9CA3AF; text-transform: uppercase; letter-spacing: 0.05em; }
+        .filter-checkbox { display: flex; align-items: center; margin-bottom: 6px; font-size: 0.85rem; cursor: pointer; color: #D1D5DB; }
+        .filter-checkbox input { margin-right: 8px; cursor: pointer; accent-color: #60A5FA; }
+        .filter-checkbox:hover { color: #FFFFFF; }
+        #stats-panel { position: absolute; bottom: 0; left: 0; width: 100%; background: rgba(15, 23, 42, 0.85); border-top: 1px solid #374151; padding: 12px 20px; box-sizing: border-box; display: flex; justify-content: center; gap: 40px; backdrop-filter: blur(8px); z-index: 10; font-family: 'Inter', sans-serif; }
+        .stat-item { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; color: #D1D5DB; font-weight: 500; letter-spacing: 0.05em; text-transform: uppercase; }
+        .stat-color-box { width: 12px; height: 12px; border-radius: 3px; }
+    </style>
+    <script src="https://unpkg.com/3d-force-graph"></script>
+</head>
+<body>
+    <div id="info-panel">
+        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible')">×</div>
+        <h2 id="info-title"></h2>
+        <div id="info-meta"></div>
+        <div id="info-summary"></div>
+        <div id="info-sources"></div>
+        <div id="info-neighbors"></div>
+    </div>
+    <div id="node-tooltip"></div>
+    <div id="filter-hud">
+        <h4 id="filter-toggle" style="cursor: pointer; display: flex; justify-content: space-between; align-items: center; margin-bottom: 0;">
+            Epistemic Filters <span id="filter-icon" style="font-size: 0.7rem; color: #60A5FA;">▼</span>
+        </h4>
+        <div id="filter-options" style="display: none; margin-top: 10px;"></div>
+    </div>
+    <div id="search-container">
+        <input type="text" id="search-input" placeholder="Search Node..." autocomplete="off">
+        <div id="search-results"></div>
+    </div>
+    <div id="3d-graph"></div>
+    <div id="stats-panel">
+        <div class="stat-item"><div class="stat-color-box" style="background: #10B981;"></div>Source: <span id="stat-source">0</span></div>
+        <div class="stat-item"><div class="stat-color-box" style="background: #EF4444;"></div>Entity: <span id="stat-entity">0</span></div>
+        <div class="stat-item"><div class="stat-color-box" style="background: #00B0FF;"></div>Concept: <span id="stat-concept">0</span></div>
+        <div class="stat-item"><div class="stat-color-box" style="background: #F59E0B;"></div>Synthesis: <span id="stat-synthesis">0</span></div>
+    </div>
+    <script>
+        document.getElementById('filter-toggle').addEventListener('click', () => {
+            const opts = document.getElementById('filter-options');
+            const icon = document.getElementById('filter-icon');
+            if (opts.style.display === 'none') {
+                opts.style.display = 'block';
+                icon.innerText = '▲';
+            } else {
+                opts.style.display = 'none';
+                icon.innerText = '▼';
+            }
+        });
+        
+        const data = %%GRAPH_DATA%%;
+        const nodeById = Object.fromEntries(data.nodes.map(n => [n.id, n]));
+        
+        const highlightNodes = new Set();
+        const highlightLinks = new Set();
+        let hoverNode = null;
+        
+        const activeFilters = new Set();
+        const groups = [...new Set(data.nodes.map(n => n.group))].sort();
+        groups.forEach(g => activeFilters.add(g));
+        
+        const filterOpts = document.getElementById('filter-options');
+        groups.forEach(g => {
+            const lbl = document.createElement('label');
+            lbl.className = 'filter-checkbox';
+            lbl.innerHTML = `<input type="checkbox" value="${g}" checked> ${g}`;
+            lbl.querySelector('input').addEventListener('change', (e) => {
+                if(e.target.checked) activeFilters.add(g);
+                else activeFilters.delete(g);
+                Graph.nodeVisibility(Graph.nodeVisibility());
+                Graph.linkVisibility(Graph.linkVisibility());
+            });
+            filterOpts.appendChild(lbl);
+        });
+        
+        // Track mouse globally for tooltip
+        document.addEventListener('mousemove', e => {
+            const tt = document.getElementById('node-tooltip');
+            if (tt.style.display === 'block') {
+                tt.style.left = (e.clientX + 15) + 'px';
+                tt.style.top = (e.clientY + 15) + 'px';
+            }
+        });
+        
+        window.focusNode = function(nodeId) {
+            const node = nodeById[nodeId];
+            if (!node) return;
+            
+            // Spotlight logic
+            highlightNodes.clear();
+            highlightLinks.clear();
+            if (node) {
+                highlightNodes.add(node);
+                data.links.forEach(l => {
+                    const s = l.source.id || l.source;
+                    const t = l.target.id || l.target;
+                    if (s === node.id || t === node.id) {
+                        highlightLinks.add(l);
+                        highlightNodes.add(typeof l.source === 'object' ? l.source : nodeById[s]);
+                        highlightNodes.add(typeof l.target === 'object' ? l.target : nodeById[t]);
+                    }
+                });
+            }
+            if (typeof Graph !== 'undefined') {
+                Graph.nodeColor(Graph.nodeColor()).linkWidth(Graph.linkWidth()).linkColor(Graph.linkColor()).linkDirectionalParticles(Graph.linkDirectionalParticles());
+            }
+            
+            // Camera focus
+            const distance = 40;
+            const distRatio = 1 + distance/Math.hypot(node.x || 0, node.y || 0, node.z || 0);
+            if (Graph.cameraPosition) {
+                Graph.cameraPosition({ x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio }, node, 3000);
+            }
+            
+            // Update Info Panel
+            document.getElementById('info-title').innerText = node.name;
+            
+            let metaHtml = `<span><b>Type:</b> ${node.group}</span>`;
+            metaHtml += `<span><b>Updated:</b> ${node.updated || 'N/A'}</span>`;
+            document.getElementById('info-meta').innerHTML = metaHtml;
+            
+            document.getElementById('info-summary').innerText = node.summary || '';
+            
+            let memoryBasePath = "%%MEMORY_BASE_PATH%%";
+            let sourcesHtml = '';
+            if (node.sources && node.sources.length > 0) {
+                sourcesHtml = '<b>Raw Sources:</b><ul>' + node.sources.map(s => {
+                    let url = s.startsWith('http') ? s : memoryBasePath + s;
+                    return `<li><a href="${url}" target="_blank" style="color: #60A5FA; text-decoration: underline; word-wrap: break-word;">${s}</a></li>`;
+                }).join('') + '</ul>';
+            }
+            document.getElementById('info-sources').innerHTML = sourcesHtml;
+            
+            // Inject Neighbors Logic
+            let inbound = data.links.filter(l => (l.target.id === node.id || l.target === node.id));
+            let outbound = data.links.filter(l => (l.source.id === node.id || l.source === node.id));
+            
+            let neighborsHtml = ``;
+            if(outbound.length > 0) {
+                neighborsHtml += `<div><b>Outbound Links:</b><ul style="margin-top:4px; padding-left:15px; font-size:0.85em; list-style-type:none; margin-left:0; padding-left:0;">`;
+                outbound.forEach(l => {
+                    let tId = l.target.id || l.target;
+                    let rel = l.relation || '关联';
+                    let relColor = '#9CA3AF';
+                    if (rel.includes('反驳')) relColor = '#EF4444';
+                    else if (rel.includes('支持')) relColor = '#10B981';
+                    else if (rel.includes('衍生')) relColor = '#60A5FA';
+                    
+                    neighborsHtml += `<li style="margin-bottom:6px;">
+                        <span style="color:${relColor}; font-size:0.8em; border:1px solid ${relColor}; padding:1px 4px; border-radius:3px; margin-right:6px;">${rel}</span> 
+                        <a href="javascript:void(0)" onclick="window.focusNode('${tId}')" style="color:#D1D5DB; text-decoration:underline;">${nodeById[tId] ? nodeById[tId].name : tId}</a>
+                    </li>`;
+                });
+                neighborsHtml += `</ul></div>`;
+            }
+            
+            if(inbound.length > 0) {
+                neighborsHtml += `<div style="margin-top:10px;"><b>Inbound Links:</b><ul style="margin-top:4px; padding-left:15px; font-size:0.85em; list-style-type:none; margin-left:0; padding-left:0;">`;
+                inbound.forEach(l => {
+                    let sId = l.source.id || l.source;
+                    let rel = l.relation || '关联';
+                    let relColor = '#9CA3AF';
+                    if (rel.includes('反驳')) relColor = '#EF4444';
+                    else if (rel.includes('支持')) relColor = '#10B981';
+                    else if (rel.includes('衍生')) relColor = '#60A5FA';
+                    
+                    neighborsHtml += `<li style="margin-bottom:6px;">
+                        <span style="color:${relColor}; font-size:0.8em; border:1px solid ${relColor}; padding:1px 4px; border-radius:3px; margin-right:6px;">${rel}</span> 
+                        <a href="javascript:void(0)" onclick="window.focusNode('${sId}')" style="color:#D1D5DB; text-decoration:underline;">${nodeById[sId] ? nodeById[sId].name : sId}</a>
+                    </li>`;
+                });
+                neighborsHtml += `</ul></div>`;
+            }
+            document.getElementById('info-neighbors').innerHTML = neighborsHtml;
+            
+            document.getElementById('info-panel').classList.add('visible');
+        };
+        
+        const Graph = ForceGraph3D()
+            (document.getElementById('3d-graph'))
+            .graphData(data)
+            .nodeVisibility(node => activeFilters.has(node.group))
+            .linkVisibility(link => {
+                const sGrp = typeof link.source === 'object' ? link.source.group : (nodeById[link.source] || {}).group;
+                const tGrp = typeof link.target === 'object' ? link.target.group : (nodeById[link.target] || {}).group;
+                return activeFilters.has(sGrp) && activeFilters.has(tGrp);
+            })
+            .nodeLabel(node => '')
+            .nodeAutoColorBy('group')
+            .nodeColor(node => {
+                const activeMode = highlightNodes.size > 0;
+                if (activeMode && !highlightNodes.has(node)) {
+                    return 'rgba(50, 50, 50, 0.1)';
+                }
+                return node === hoverNode ? '#FFFFFF' : node.color;
+            })
+            .nodeVal('val')
+            .linkLabel(link => '')
+            .linkDirectionalArrowLength(3.5)
+            .linkDirectionalArrowRelPos(1)
+            .linkColor(link => {
+                const activeMode = highlightNodes.size > 0;
+                if (activeMode && !highlightLinks.has(link)) return 'rgba(50, 50, 50, 0.05)';
+                
+                const rel = link.relation || "";
+                if (rel.includes("反驳") || rel.includes("Contradict")) return activeMode ? "rgba(239, 68, 68, 1)" : "rgba(239, 68, 68, 0.8)";
+                if (rel.includes("支持") || rel.includes("Support")) return activeMode ? "rgba(16, 185, 129, 1)" : "rgba(16, 185, 129, 0.8)";
+                if (rel.includes("衍生") || rel.includes("Derive")) return activeMode ? "rgba(96, 165, 250, 1)" : "rgba(96, 165, 250, 0.8)";
+                return activeMode ? "rgba(255, 255, 255, 0.6)" : "rgba(255, 255, 255, 0.2)";
+            })
+            .linkWidth(link => highlightLinks.has(link) ? 3 : 1.5)
+            .linkDirectionalParticles(link => highlightLinks.has(link) ? 4 : 2)
+            .linkDirectionalParticleWidth(1.5)
+            .onNodeHover(node => {
+                const tt = document.getElementById('node-tooltip');
+                if (node) {
+                    hoverNode = node;
+                    tt.style.display = 'block';
+                    tt.innerHTML = `<div class="tt-title">${node.name}</div><div class="tt-meta">${node.group || 'N/A'} | Links: ${node.val}</div>`;
+                } else {
+                    hoverNode = null;
+                    tt.style.display = 'none';
+                }
+                Graph.nodeColor(Graph.nodeColor());
+            })
+            .onNodeClick(node => {
+                window.focusNode(node.id);
+            })
+            .onBackgroundClick(() => {
+                document.getElementById('info-panel').classList.remove('visible');
+                highlightNodes.clear();
+                highlightLinks.clear();
+                Graph.nodeColor(Graph.nodeColor()).linkWidth(Graph.linkWidth()).linkColor(Graph.linkColor()).linkDirectionalParticles(Graph.linkDirectionalParticles());
+            });
+            
+        // Search Logic
+        const searchInput = document.getElementById('search-input');
+        const searchResults = document.getElementById('search-results');
+        
+        searchInput.addEventListener('input', (e) => {
+            const val = e.target.value.toLowerCase().trim();
+            if (!val) {
+                searchResults.style.display = 'none';
+                return;
+            }
+            
+            const matches = data.nodes.filter(n => 
+                (n.name && n.name.toLowerCase().includes(val)) || (n.id && n.id.toLowerCase().includes(val))
+            ).slice(0, 10);
+            
+            if (matches.length > 0) {
+                searchResults.innerHTML = matches.map(m => 
+                    `<div class="search-item" onclick="window.focusNode('${m.id}'); document.getElementById('search-results').style.display='none'; document.getElementById('search-input').value='';">${m.name}</div>`
+                ).join('');
+                searchResults.style.display = 'block';
+            } else {
+                searchResults.innerHTML = `<div class="search-item" style="color:#9CA3AF;pointer-events:none;">No matches found</div>`;
+                searchResults.style.display = 'block';
+            }
+        });
+        
+        document.addEventListener('click', (e) => {
+            if (!document.getElementById('search-container').contains(e.target)) {
+                searchResults.style.display = 'none';
+            }
+        });
+        
+        // Calculate and display node type statistics
+        const stats = { source: 0, entity: 0, concept: 0, synthesis: 0 };
+        data.nodes.forEach(n => {
+            const g = (n.group || '').toLowerCase();
+            if (g.includes('source')) stats.source++;
+            else if (g.includes('entity')) stats.entity++;
+            else if (g.includes('concept')) stats.concept++;
+            else if (g.includes('synthesis')) stats.synthesis++;
+        });
+        document.getElementById('stat-source').innerText = stats.source;
+        document.getElementById('stat-entity').innerText = stats.entity;
+        document.getElementById('stat-concept').innerText = stats.concept;
+        document.getElementById('stat-synthesis').innerText = stats.synthesis;
+    </script>
+</body>
+</html>

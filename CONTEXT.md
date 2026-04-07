@@ -18,6 +18,7 @@
 | `indexer.py` | `index.json` 全量/增量生成器（nodes + links + summary） |
 | `db.py` | `processed_files.json` 读写（MD5 哈希去重） |
 | `watchdog_sync.py` | 文件系统实时哨兵 |
+| `templates/` | 3D 拓扑可视化 HTML 模板 |
 | `agents/` | 3 个 Gemini Subagent（ingestor/synthesizer/collider） |
 
 ## 4. 交互协议 (Interaction Protocol - CLI Native)
