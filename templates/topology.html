@@ -162,17 +162,17 @@
             }
             
             // Update Info Panel
-            document.getElementById('info-title').innerText = node.name;
-            
+            let memoryBasePath = "%%MEMORY_BASE_PATH%%";
+            let nodeUrl = memoryBasePath + "wiki/" + node.id + ".md";
+            document.getElementById('info-title').innerHTML = `<a href="${nodeUrl}" target="_blank" style="color: inherit; text-decoration: none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${node.name}</a>`;
+
             let metaHtml = `<span><b>Type:</b> ${node.group}</span>`;
             metaHtml += `<span><b>Updated:</b> ${node.updated || 'N/A'}</span>`;
             document.getElementById('info-meta').innerHTML = metaHtml;
-            
+
             document.getElementById('info-summary').innerText = node.summary || '';
-            
-            let memoryBasePath = "%%MEMORY_BASE_PATH%%";
-            let sourcesHtml = '';
-            if (node.sources && node.sources.length > 0) {
+
+            let sourcesHtml = '';            if (node.sources && node.sources.length > 0) {
                 sourcesHtml = '<b>Raw Sources:</b><ul>' + node.sources.map(s => {
                     let url = s.startsWith('http') ? s : memoryBasePath + s;
                     return `<li><a href="${url}" target="_blank" style="color: #60A5FA; text-decoration: underline; word-wrap: break-word;">${s}</a></li>`;

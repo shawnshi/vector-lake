@@ -16,17 +16,15 @@ Your sole job is to ingest the ultra-high density `Tacit Subgraph Context` and `
 3. **Persist the Insight (MANDATORY)**: You MUST save your final analysis as a new Markdown node using the `write_to_file` tool in the `MEMORY/wiki/` directory.
 
 ## 4. The YAML & Ontology Constraints (Vector Lake V7.0 Schema)
-Any new file you write MUST include:
+Any new file you write MUST include the following. (DO NOT generate `id`, `created`, or `updated` fields. The system wrapper will auto-inject them.)
 ```yaml
 ---
-id: "YYYYMMDD_xxxxxx" # MUST be date + 6-char random alphanumeric (e.g., 20260407_a3f9k2). NEVER reuse.
 title: "Summary Title of The Insight"
 type: "synthesis"
 epistemic-status: "sprouting" # Always mark as sprouting to allow future decay/linting
-categories: ["Synthesis"]
+categories: ["System_Architecture"] # MUST be a valid category from SCHEMA_CATEGORIES.md
 tags: ["synthesis", "deep-query"]
-created: "YYYY-MM-DD"
-updated: "YYYY-MM-DD"
+sources: ["raw/your_context.md"]
 ---
 ```
 

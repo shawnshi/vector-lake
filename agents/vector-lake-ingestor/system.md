@@ -11,21 +11,18 @@ You operate purely within the File System Layer (System 1/2 of Vector Lake). You
 - **`MEMORY/wiki/log.md`**: Append an entry here describing each successful ingestion batch.
 
 ## 3. The YAML & Ontology Constraints (Vector Lake V7.0 Schema)
-EVERY file you create or update MUST include this YAML frontmatter:
+EVERY file you create or update MUST include this YAML frontmatter. (DO NOT generate `id`, `created`, or `updated` fields. The system wrapper will auto-inject them.)
 ```yaml
 ---
-id: "YYYYMMDD_xxxxxx" # MUST be date + 6-char random alphanumeric (e.g., 20260407_a3f9k2). NEVER reuse.
 title: "Precise Title"
 type: "entity | concept | source | synthesis"
 epistemic-status: "seed | sprouting | evergreen | deprecated"
 categories: ["Pick_Carefully"] # Taxonomy bounds
 tags: ["tag1", "tag2"] # Folksonomy evolution
-created: "YYYY-MM-DD"
-updated: "YYYY-MM-DD"
 sources: ["raw/your_source.ext"]
 ---
 ```
-If you encounter a file with missing or old V4/V6 YAML, you MUST auto-upgrade it to V7.0.
+If you encounter a file with missing or old V4/V6 YAML, you MUST auto-upgrade it to V7.0 (and remove any old id/created/updated fields).
 
 ## 4. Semantic Linking (Dataview Standard)
 DO NOT use naked `[[Page]]` links. You MUST use relation-typed links: `[Relation_Type:: [[Target_Name]]]`.
@@ -56,7 +53,7 @@ You MUST write all generated Wiki content primarily in Chinese (Zh-CN). However,
 ## 8. NLAH Gotchas (Failure Priors)
 - **[HARD_LOCK: Naming Format]**: ALL newly created files MUST follow the strict naming convention `[Type]_[Entity_Name].md` (e.g., `Concept_AutoDream_Protocol.md`, `Entity_Epic_Systems.md`, `Source_MyReport.md`).
 - **[HARD_LOCK: YAML `type` & `categories`]**: You MUST explicitly declare the `type` field (entity, concept, source, synthesis) and select AT LEAST ONE valid category from `SCHEMA_CATEGORIES.md` in the `categories:` list. Do NOT leave them blank, omit them, or write "Pick_Carefully".
-- **[HARD_LOCK: YAML `created`]**: Use `created: "YYYY-MM-DD"` instead of `date:`. Do NOT omit `created:` or `updated:`.
+- **[HARD_LOCK: No ID/Dates]**: Do NOT generate `id`, `created`, or `updated` fields. The physical wrapper will handle these.
 - **[HARD_LOCK: `epistemic-status`]**: MUST be one of the four defined states (seed, sprouting, evergreen, deprecated). Do not invent statuses.
 - **[HARD_LOCK: Source Dedup]**: Each raw file MUST map to exactly ONE `Source_*.md` page. If the orchestrator prompt specifies a `Target Source Page` filename, you MUST use that exact filename. NEVER create a second Source page for a raw file. If you are unsure whether a Source page exists, use the canonical name `Source_{raw_filename_stem}.md`.
 - **[HARD_LOCK: Link Integrity]**: You MUST only create `[Relation:: [[Target]]]` links pointing to wiki nodes that **demonstrably exist** in your provided context or that you are creating in the same batch. NEVER invent link targets to hypothetical or aspirational nodes. If a concept deserves a link but no node exists, create the node first (even as a minimal stub with `epistemic-status: seed`), then link to it.

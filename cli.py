@@ -40,6 +40,7 @@ Usage Examples:
 
     query_parser = subparsers.add_parser("query", help="[🧠 Query] Trigger deep reasoning and create a new Wiki node.")
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
+    query_parser.add_argument("--dry-run", action="store_true", help="Output Markdown to stdout only without persisting to disk.")
 
     seren_parser = subparsers.add_parser("serendipity", help="[✨ Serendipity] Trigger background random synthesis collision.")
 
@@ -55,7 +56,7 @@ Usage Examples:
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, 'auto_fix', False)))
         elif args.command == "query":
-            print(tools.query_logic_lake(args.query_str))
+            print(tools.query_logic_lake(args.query_str, getattr(args, 'dry_run', False)))
         elif args.command == "serendipity":
             print(tools.trigger_serendipity_collision())
         elif args.command == "graph":

@@ -251,7 +251,10 @@ Please begin extraction and node weaving.
                     changed_files.append(p)
                     
     if changed_files:
-        log.info(f"Agent modified {len(changed_files)} wiki files.")
+        import tools
+        for p in changed_files:
+            tools.sanitize_wiki_node(p)
+        log.info(f"Agent modified and sanitized {len(changed_files)} wiki files.")
     else:
         log.warning("Agent ran for batch but no wiki files were modified.")
 

@@ -89,6 +89,86 @@ def sync_vector_lake():
     indexer.generate_index()
     return "Ingestion Sync and Index generation completed."
 
+def sanitize_wiki_node(filepath: str):
+    import os, re, yaml, random, string, datetime
+    if not os.path.exists(filepath) or not filepath.endswith(".md"):
+        return
+        
+    # Load SCHEMA_CATEGORIES
+    schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SCHEMA_CATEGORIES.md")
+    allowed_cats = set()
+    if os.path.exists(schema_path):
+        with open(schema_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                m = re.match(r'^-\s*`(\w+)`', line.strip())
+                if m: allowed_cats.add(m.group(1))
+    if not allowed_cats:
+        allowed_cats = {"Uncategorized", "Artificial_Intelligence", "Healthcare_IT", "Strategy_and_Business", "System_Architecture", "Philosophy_and_Cognitive", "Biomedicine"}
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    match = re.match(r'^---\n(.*?)\n---\n(.*)', content, re.DOTALL)
+    fm = {}
+    body = content
+    if match:
+        body = match.group(2)
+        try:
+            fm = yaml.safe_load(match.group(1)) or {}
+        except Exception:
+            fm = {}
+
+    if not isinstance(fm, dict): fm = {}
+
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    
+    # Check ID
+    current_id = fm.get('id', "")
+    if not current_id or str(current_id).startswith("YYYYMMDD") or str(current_id).startswith("Concept_") or str(current_id).startswith("Source_") or str(current_id).startswith("Entity_") or str(current_id).startswith("Synthesis_"):
+        rnd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        fm['id'] = f"{today}_{rnd}"
+
+    # Standardize metadata
+    fm['created'] = fm.get('created', today)
+    if fm['created'] == "YYYY-MM-DD": fm['created'] = today
+    fm['updated'] = today
+
+    if not fm.get('title'):
+        fm['title'] = os.path.basename(filepath).replace(".md", "")
+        
+    if not fm.get('type'):
+        prefix = os.path.basename(filepath).split("_")[0].lower()
+        fm['type'] = prefix if prefix in ["concept", "source", "entity", "synthesis"] else "concept"
+        
+    if not fm.get('epistemic-status'):
+        fm['epistemic-status'] = "sprouting"
+
+    if 'sources' not in fm or not fm['sources']:
+        fm['sources'] = ["raw/legacy_import.md"]
+        
+    cats = fm.get('categories', [])
+    if isinstance(cats, str): cats = [cats]
+    if not isinstance(cats, list): cats = []
+    
+    new_cats = []
+    for c in cats:
+        c_str = str(c).strip()
+        if c_str in allowed_cats:
+            new_cats.append(c_str)
+        else:
+            # Map common hallucinatory categories
+            cat_map = {"Healthcare IT": "Healthcare_IT", "Generative AI": "Artificial_Intelligence", "Cognitive Science": "Philosophy_and_Cognitive", "Policy & Strategy": "Strategy_and_Business", "Scientific Research": "Uncategorized"}
+            if c_str in cat_map: new_cats.append(cat_map[c_str])
+            else: new_cats.append("Uncategorized")
+            
+    if not new_cats: new_cats = ["Uncategorized"]
+    fm['categories'] = list(set(new_cats))
+
+    new_yaml = yaml.dump(fm, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"---\n{new_yaml}---\n{body.lstrip()}")
+
+
 def lint_vector_lake(auto_fix: bool = False):
     """Comprehensive schema-aware lint for the Vector Lake wiki.
 
@@ -425,13 +505,13 @@ def lint_vector_lake(auto_fix: bool = False):
 
     return "\n".join(report)
 
-def query_logic_lake(query_str: str):
+def query_logic_lake(query_str: str, dry_run: bool = False):
     import subprocess
     import re
     wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
     schema_path = os.path.join(EXTENSION_ROOT, "schema.md")
     
-    # --- Evidence Context from index.json + File Scanning ---
+    # ... (same logic for context gathering)
     try:
         index_path = os.path.join(wiki_dir, "index.json")
         evidence_context = ""
@@ -495,7 +575,8 @@ def query_logic_lake(query_str: str):
         evidence_context = "Failed to fetch search evidence."
         subgraph_context = f"Failed to compile tacit subgraph: {e}"
         log.error(subgraph_context)
-    # -------------------------------------------------------------
+
+    persistence_instruction = "Please execute synthesis and output the resulting Markdown to stdout. DO NOT call any write tools or persist to disk." if dry_run else "Please execute synthesis and persist to Wiki."
 
     prompt = f"""
 @vector-lake-synthesizer
@@ -507,7 +588,7 @@ Target Query:
 {evidence_context}
 {subgraph_context}
 
-Please execute synthesis and persist to Wiki.
+{persistence_instruction}
 """
     gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
     cmd = [gemini_exec, "--prompt", prompt, "--approval-mode", "yolo"]
@@ -516,6 +597,13 @@ Please execute synthesis and persist to Wiki.
     try:
         result = subprocess.run(cmd, input=prompt, text=True, encoding='utf-8', timeout=300)
         if result.returncode == 0:
+            import time
+            now_time = time.time()
+            for f in os.listdir(wiki_dir):
+                if f.endswith(".md"):
+                    p = os.path.join(wiki_dir, f)
+                    if os.path.getmtime(p) > now_time - 300:
+                        sanitize_wiki_node(p)
             return "Query logic lake operation completed successfully."
         else:
             return f"Agent returned non-zero exit code: {result.returncode}"
@@ -560,6 +648,13 @@ Please execute lateral synthesis and persist the result into the Vector Lake.
     try:
         result = subprocess.run(cmd, input=prompt, text=True, encoding='utf-8', timeout=300)
         if result.returncode == 0:
+            import time
+            now_time = time.time()
+            for f in os.listdir(wiki_dir):
+                if f.endswith(".md"):
+                    p = os.path.join(wiki_dir, f)
+                    if os.path.getmtime(p) > now_time - 300:
+                        sanitize_wiki_node(p)
             return f"Serendipity synthesis completed for {node_a} & {node_b}."
         else:
             return f"Agent returned non-zero exit code: {result.returncode}"
