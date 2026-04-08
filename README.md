@@ -17,7 +17,8 @@
 V7.0 采用**独立子代理 (Subagent) + 物理隔离 + 纵深防御**架构：
 
 * **Subagent 隔离**: 后台通过 `vector-lake-ingestor`/ `vector-lake-synthesizer`/ `vector-lake-collider` 三个专用 Subagent 进行处理，这些代理被剥夺了终端执行权限，强制锁定在文件 I/O，规避了 YOLO 模式的致命风险。
-* **Schema 内聚**: `schema.md` 中的格式规则、元数据字段集、`[Relation:: [[ID]]]` 生成规则已被全量内聚入子代理的 DNA (system.md)，大幅收敛上下文推理所需的 Tokens。
+* **强制中文架构**: 子代理在生成任何报告、实体解析和推演洞察时，强制使用高质量中文输出，从根本上解决 LLM 塑料味与翻译腔问题。
+* **Schema 内聚**: `schema.md` 中的格式规则、元数据字段集、`[Relation:: [[ID]]]` 生成规则已被全量内聚入子代理的 DNA (system.md) 中，大幅收敛上下文推理所需的 Tokens。
 * **Prompt 注入防御**: 文件路径在注入 LLM prompt 前经过 `_sanitize_for_prompt()` 处理，剥离控制字符、反引号和 `@mention` 劫持向量。
 * **写入快照保护**: UPDATE 操作前自动调用 `_backup_wiki_targets()` 创建 `.bak` 快照，支持异常回滚。
 * **增量去重**: 基于 MD5 内容哈希的 `processed_files.json` 状态追踪，跳过未变更文件。
@@ -62,7 +63,7 @@ V7.0 采用**独立子代理 (Subagent) + 物理隔离 + 纵深防御**架构：
 *   **推演查询**: `gemini query_logic_lake "对比一下 Vendor A 和 Vendor B 的 AI 战略差异"`
 
 ### 4. 结构化审计自愈 (Structural Linting & Decay)
-周期性地对 Wiki 进行健康体检。系统会扫描孤儿页面、重复实体，并自动执行 AutoDream 脱水重写（针对超过 60 天处于 sprouting 状态的节点强制写入 `decayed: true`）。
+周期性地对 Wiki 进行10项深度健康体检。系统会扫描孤儿页面、重复实体、别名冲突，并自动执行 AutoDream 脱水重写（针对超过 60 天处于 sprouting 状态的节点强制写入 `decayed: true`）。
 
 *   **审计清理**: `gemini run_wiki_lint`
 
@@ -72,7 +73,7 @@ V7.0 采用**独立子代理 (Subagent) + 物理隔离 + 纵深防御**架构：
 *   **碰撞**: `gemini serendipity_lake`
 
 ### 6. 3D 拓扑图谱 (Graph View)
-解析纯 Markdown 节点网络，提取 `[[双向链接]]` 并将其渲染为无需依赖图数据库的、轻量级、可交互的 3D 力导向关系图大屏。
+解析纯 Markdown 节点网络，提取 `[[双向链接]]` 并将其渲染为无需依赖图数据库的、轻量级、可交互的 3D 力导向关系图大屏。并在底部集成了 Source / Entity / Concept / Synthesis 维度的全局资产仪表盘。
 
 *   **大屏展示**: `gemini show_graph`
 
