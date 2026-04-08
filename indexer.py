@@ -37,6 +37,15 @@ def _parse_wiki_node(filepath: str, node_key: str):
     updated = str(fm_data.get('updated', ""))
     cats = fm_data.get('categories', [])
 
+    # --- Strict Mode Enforcement ---
+    domain = fm_data.get('domain')
+    topic_cluster = fm_data.get('topic_cluster', 'General')
+    status = fm_data.get('status')
+
+    if not domain or not status:
+        log.warning(f"Schema violation: Missing 'domain' or 'status' in {os.path.basename(filepath)}. Node excluded from index.")
+        return None
+
     raw_aliases = fm_data.get('aliases', [])
     aliases = []
     if isinstance(raw_aliases, list):
@@ -71,6 +80,9 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "type": node_type,
         "updated": updated,
         "categories": cats,
+        "domain": domain,
+        "topic_cluster": topic_cluster,
+        "status": status,
         "aliases": aliases,
         "links": sorted(links),
         "summary": summary
@@ -195,7 +207,11 @@ def update_index_item(filename: str):
                 del index_data["nodes"][node_key]
             node_data = None
 
-        if node_data is not None:
+        if node_data is None:
+            index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing 'domain' or 'status'. Node excluded."})
+            if node_key in index_data.get("nodes", {}):
+                del index_data["nodes"][node_key]
+        else:
             index_data["nodes"][node_key] = node_data
             
             node_id = node_data["id"]

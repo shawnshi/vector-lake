@@ -10,7 +10,7 @@ log = logging.getLogger("vector-lake-tools")
 
 EXTENSION_ROOT = Path(__file__).parent
 
-def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
+def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False):
     """Search Wiki pages via index.json metadata and file content scanning."""
     wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
     index_path = os.path.join(wiki_dir, "index.json")
@@ -32,6 +32,18 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False):
     
     scored = []
     for node in nodes:
+        status = str(node.get("status", "")).strip()
+        if not include_history and status in ["Deprecated", "Archived"]:
+            continue
+
+        node_domain = str(node.get("domain", "")).strip()
+        if domain and node_domain.lower() != domain.lower():
+            continue
+
+        node_cluster = str(node.get("topic_cluster", "")).strip()
+        if cluster and node_cluster.lower() != cluster.lower():
+            continue
+
         score = 0
         node_key = node.get("_key", "").lower()
         title = (node.get("title") or node.get("id", "")).lower()
@@ -143,12 +155,21 @@ def sanitize_wiki_node(filepath: str):
     if not fm.get('epistemic-status'):
         fm['epistemic-status'] = "sprouting"
 
-    if 'sources' not in fm or not fm['sources']:
-        fm['sources'] = ["raw/legacy_import.md"]
-        
     cats = fm.get('categories', [])
     if isinstance(cats, str): cats = [cats]
     if not isinstance(cats, list): cats = []
+    
+    if not fm.get('domain'):
+        fm['domain'] = str(cats[0]).strip() if cats else "Uncategorized"
+    
+    if not fm.get('topic_cluster'):
+        fm['topic_cluster'] = "General"
+        
+    if not fm.get('status'):
+        fm['status'] = "Active"
+
+    if 'sources' not in fm or not fm['sources']:
+        fm['sources'] = ["raw/legacy_import.md"]
     
     new_cats = []
     for c in cats:
@@ -211,7 +232,8 @@ def lint_vector_lake(auto_fix: bool = False):
     VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_", "Event_", "Person_", "Project_", "Term_", "System_")
     VALID_TYPES = {"entity", "concept", "source", "synthesis"}
     VALID_EPISTEMIC = {"seed", "sprouting", "evergreen", "deprecated"}
-    REQUIRED_FM_FIELDS = ("id", "title", "type", "epistemic-status", "categories", "created", "updated", "sources")
+    VALID_STATUS = {"Active", "Deprecated", "Archived", "Contested"}
+    REQUIRED_FM_FIELDS = ("id", "title", "type", "domain", "topic_cluster", "status", "epistemic-status", "categories", "created", "updated", "sources")
 
     # --- Collection containers ---
     ids = {}                           # id → filename

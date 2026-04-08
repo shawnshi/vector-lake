@@ -37,6 +37,9 @@ Usage Examples:
     search_parser = subparsers.add_parser("search", help="[🔍 Search] Search over the Wiki pages via index.json.")
     search_parser.add_argument("query", help="Semantic query string.")
     search_parser.add_argument("--top_k", type=int, default=5, help="Number of results (default: 5).")
+    search_parser.add_argument("--domain", type=str, default=None, help="Filter by domain namespace.")
+    search_parser.add_argument("--cluster", type=str, default=None, help="Filter by topic cluster.")
+    search_parser.add_argument("--include-history", action="store_true", help="Bypass temporal invalidation to search deprecated facts.")
 
     query_parser = subparsers.add_parser("query", help="[🧠 Query] Trigger deep reasoning and create a new Wiki node.")
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
@@ -52,7 +55,13 @@ Usage Examples:
         if args.command == "sync":
             print(tools.sync_vector_lake())
         elif args.command == "search":
-            print(tools.search_vector_lake(args.query, args.top_k))
+            print(tools.search_vector_lake(
+                args.query, 
+                args.top_k, 
+                domain=getattr(args, 'domain', None), 
+                cluster=getattr(args, 'cluster', None), 
+                include_history=getattr(args, 'include_history', False)
+            ))
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, 'auto_fix', False)))
         elif args.command == "query":

@@ -16,7 +16,10 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   id: "YYYYMMDD_xxxxxx"  # date + 6-char random alphanumeric
   title: "Page Title"
   type: "entity | concept | source | synthesis"
-  epistemic-status: "seed | sprouting | evergreen | deprecated"
+  domain: "Medical_IT"  # REQUIRED: The macro-domain (e.g., Medical_IT, Architecture)
+  topic_cluster: "General" # REQUIRED: The specific sub-topic or room
+  status: "Active" # REQUIRED: "Active", "Deprecated", "Archived", or "Contested"
+  epistemic-status: "seed | sprouting | evergreen" # Note: use `status` for deprecation
   categories: ["System_Architecture"] # MUST be from SCHEMA_CATEGORIES.md
   tags: ["tag1", "tag2"]
   created: "YYYY-MM-DD"
