@@ -146,8 +146,10 @@ def generate_index():
     index_data["categories"] = list(index_data["categories"])
     
     output_path = os.path.join(WIKI_DIR, "index.json")
-    with open(output_path, "w", encoding="utf-8") as f:
+    temp_path = output_path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(index_data, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, output_path)
         
     log.info(f"Generated index.json with {len(index_data['nodes'])} nodes | {len(index_data.get('error_log', []))} errors.")
     return output_path
@@ -180,8 +182,10 @@ def update_index_item(filename: str):
         if node_key in index_data.get("nodes", {}):
             del index_data["nodes"][node_key]
             
-        with open(output_path, "w", encoding="utf-8") as f:
+        temp_path = output_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(index_data, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, output_path)
         return
         
     node_key = filename[:-3]
@@ -226,8 +230,10 @@ def update_index_item(filename: str):
                 for c in cats: cat_set.add(c)
                 index_data["categories"] = list(cat_set)
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    temp_path = output_path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(index_data, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, output_path)
 
 if __name__ == "__main__":
     generate_index()

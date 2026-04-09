@@ -229,9 +229,11 @@ Please begin extraction and node weaving.
     try:
         cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
         print("Waiting for Ingestor Agent to process the batch (this may take 1~2 minutes)...", flush=True)
-        result = subprocess.run(cmd, input=prompt, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', timeout=1800)
+        # Capture bytes to handle potential encoding issues manually
+        result = subprocess.run(cmd, input=prompt.encode('utf-8'), capture_output=True, timeout=1800)
         
-        if result.stdout: print(result.stdout)
+        stdout_str = result.stdout.decode('utf-8', errors='replace')
+        if stdout_str: print(stdout_str)
         success = (result.returncode == 0)
     except Exception as e:
         log.error(f"Gemini CLI failed for batch: {e}")
