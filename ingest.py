@@ -48,7 +48,6 @@ def scan_existing_sources(wiki_dir) -> dict:
     """Scan wiki/ for all Source_*.md files and build raw_path -> source_filename mapping.
     Returns: { 'raw/article/file.md': 'Source_File.md', ... }
     """
-    import re
     mapping = {}
     wiki_path = Path(wiki_dir)
     if not wiki_path.exists():
@@ -121,10 +120,54 @@ def _backup_wiki_targets(wiki_dir, file_entries: list):
         log.info(f"Created {backup_count} .bak snapshots before agent write.")
 
 
+def _read_purpose() -> str:
+    """Read purpose.md for LLM context injection."""
+    purpose_path = MEMORY_DIR / "purpose.md"
+    try:
+        return purpose_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _read_overview() -> str:
+    """Read current wiki overview for context."""
+    overview_path = WIKI_DIR / "overview.md"
+    try:
+        return overview_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _read_index_summary() -> str:
+    """Read a compact summary of index.json for existing content awareness."""
+    index_path = WIKI_DIR / "index.json"
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        nodes = index_data.get("nodes", {})
+        if not nodes:
+            return ""
+        lines = []
+        for key, node in list(nodes.items())[:100]:  # Cap at 100 entries
+            title = node.get("title", key)
+            ntype = node.get("type", "?")
+            summary = (node.get("summary", "") or "")[:80]
+            lines.append(f"- [{ntype}] {title}: {summary}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def process_file_batch(filepaths: list, existing_source_map: dict = None):
+    """Two-step Chain-of-Thought ingest pipeline.
+    
+    Step 1 (Analysis): LLM reads source → structured analysis of entities, concepts,
+                       arguments, connections, contradictions.
+    Step 2 (Generation): LLM takes analysis → generates wiki files + review items.
+    """
     if not filepaths: return False
 
-    log.info(f"Delegating ingestion of a batch of {len(filepaths)} files to Vector Lake Ingestor Agent...")
+    log.info(f"[2-Step CoT] Ingesting batch of {len(filepaths)} files...")
     
     before_mtimes = {}
     if os.path.exists(WIKI_DIR):
@@ -183,29 +226,109 @@ def process_file_batch(filepaths: list, existing_source_map: dict = None):
         )
     file_list_str = "\n".join(file_list_lines)
 
-    # P3-13: Backup wiki targets before agent write
+    # Backup wiki targets before agent write
     _backup_wiki_targets(WIKI_DIR, file_entries)
 
-    schema_path = EXTENSION_ROOT / "schema.md"
+    # Load schema, categories, purpose, index summary, overview
+    schema_content = ""
     try:
-        with open(str(schema_path), "r", encoding="utf-8") as f:
-            schema_content = f.read()
+        schema_content = (EXTENSION_ROOT / "schema.md").read_text(encoding="utf-8")
     except Exception:
-        schema_content = ""
-    categories_path = EXTENSION_ROOT / "SCHEMA_CATEGORIES.md"
+        pass
+    categories_content = ""
     try:
-        with open(str(categories_path), "r", encoding="utf-8") as f:
-            categories_content = f.read()
+        categories_content = (EXTENSION_ROOT / "SCHEMA_CATEGORIES.md").read_text(encoding="utf-8")
     except Exception:
-        categories_content = ""
+        pass
+    
+    purpose_content = _read_purpose()
+    index_summary = _read_index_summary()
+    overview_content = _read_overview()
 
-    prompt = f"""
-@vector-lake-ingestor
-[BATCH INGEST PROCESS EXECUTED]
-Please compile the following raw source files into the Wiki directory (`{WIKI_DIR}`):
+    # ── Step 1: Analysis ──────────────────────────────────────────
+    # LLM reads sources and produces structured analysis:
+    # key entities, concepts, arguments, connections to existing wiki, contradictions
+    log.info("[Step 1/2] Running analysis pass...")
+
+    analysis_prompt = f"""@vector-lake-ingestor
+[STEP 1 OF 2 — ANALYSIS ONLY. DO NOT WRITE ANY FILES.]
+
+Read the following source files and produce a **structured analysis** in Chinese.
+Do NOT create or modify any wiki files in this step. Only output your analysis text.
+
+Source Files:
+{file_list_str}
+
+Your analysis MUST cover these sections:
+
+## 关键实体 (Key Entities)
+List people, organizations, products, datasets, tools mentioned. For each:
+- Name and type (Entity/Person/System)
+- Role in the source (central vs. peripheral)
+- Whether it likely already exists in the wiki (check the index below)
+
+## 关键概念 (Key Concepts)
+List theories, methods, techniques, phenomena. For each:
+- Name and brief definition
+- Why it matters in this source
+
+## 核心论点与发现 (Main Arguments & Findings)
+- What are the core claims or results?
+- What evidence supports them?
+
+## 与现有知识库的联系 (Connections to Existing Wiki)
+- What existing pages does this source relate to?
+- Does it strengthen, challenge, or extend existing knowledge?
+
+## 矛盾与张力 (Contradictions & Tensions)
+- Does anything conflict with existing wiki content?
+- Are there internal tensions or caveats?
+
+## 建议 (Recommendations)
+- What wiki pages should be created or updated?
+- Any open questions worth flagging for the user?
+
+Be thorough but concise. Focus on what's genuinely important.
+
+{f"--- PURPOSE (Wiki 目标) ---{chr(10)}{purpose_content}" if purpose_content else ""}
+
+{f"--- EXISTING WIKI INDEX (检查现有内容) ---{chr(10)}{index_summary}" if index_summary else ""}
+"""
+
+    gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
+    analysis_result = ""
+    
+    try:
+        log.info("Waiting for Analysis Agent (Step 1)...")
+        result = subprocess.run(
+            [gemini_exec, "--prompt", "", "--approval-mode", "yolo"],
+            input=analysis_prompt.encode('utf-8'),
+            capture_output=True, timeout=900
+        )
+        analysis_result = result.stdout.decode('utf-8', errors='replace')
+        if result.returncode != 0:
+            log.warning("Analysis step returned non-zero, proceeding with available output.")
+    except Exception as e:
+        log.error(f"Analysis step failed: {e}")
+        # Fall back to single-step if analysis fails
+        analysis_result = "(Analysis unavailable — falling back to direct generation)"
+
+    log.info(f"[Step 1/2] Analysis complete ({len(analysis_result)} chars).")
+
+    # ── Step 2: Generation ────────────────────────────────────────
+    # LLM takes analysis → generates wiki files + review items + overview update
+    log.info("[Step 2/2] Running generation pass...")
+
+    generation_prompt = f"""@vector-lake-ingestor
+[STEP 2 OF 2 — GENERATION. NOW WRITE FILES.]
+
+Based on the following analysis, compile the source files into the Wiki directory (`{WIKI_DIR}`).
 
 Source Files (with MANDATORY target filenames):
 {file_list_str}
+
+--- SOURCE ANALYSIS (from Step 1) ---
+{analysis_result[:20000]}
 
 --- CRITICAL DEDUP RULES ---
 1. You MUST use the exact "Target Source Page" filename specified above for each Source page. DO NOT invent your own filename.
@@ -214,35 +337,65 @@ Source Files (with MANDATORY target filenames):
 4. NEVER create multiple Source pages for the same raw file.
 5. Use the exact "YAML sources field" value provided above in the frontmatter `sources:` array.
 
-Please strictly adhere to the following schemas and categories when extracting and node weaving:
-
 --- SCHEMA ---
 {schema_content}
 
 --- CATEGORIES ---
 {categories_content}
 
+{f"--- PURPOSE (对齐目标) ---{chr(10)}{purpose_content}" if purpose_content else ""}
+
+--- ADDITIONAL REQUIREMENTS ---
+
+### overview.md 更新（必须）
+After writing entity/concept/source pages, you MUST also update `wiki/overview.md`.
+This file is a 2-5 paragraph high-level summary of ALL topics in the wiki (not just this batch).
+{f"Current overview:{chr(10)}{overview_content}" if overview_content else "Create a new overview.md if it does not exist."}
+
+### Review Items（矛盾/空白/建议）
+After writing wiki files, if you identified contradictions, duplicates, knowledge gaps, or
+research suggestions in the analysis, output REVIEW blocks in this exact format:
+
+---REVIEW: type | Title---
+Description of what needs the user's attention.
+SEARCH: search query 1 | search query 2
+PAGES: wiki/page1.md, wiki/page2.md
+---END REVIEW---
+
+Valid types: contradiction, duplicate, missing-page, suggestion
+Only create reviews for things that genuinely need human input.
+
 Please begin extraction and node weaving.
 """
 
-    gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
     try:
+        log.info("Waiting for Generation Agent (Step 2)...")
         cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
-        print("Waiting for Ingestor Agent to process the batch (this may take 1~2 minutes)...", flush=True)
-        # Capture bytes to handle potential encoding issues manually
-        result = subprocess.run(cmd, input=prompt.encode('utf-8'), capture_output=True, timeout=1800)
+        result = subprocess.run(cmd, input=generation_prompt.encode('utf-8'), capture_output=True, timeout=1800)
         
         stdout_str = result.stdout.decode('utf-8', errors='replace')
         if stdout_str: print(stdout_str)
         success = (result.returncode == 0)
     except Exception as e:
-        log.error(f"Gemini CLI failed for batch: {e}")
+        log.error(f"Gemini CLI failed for generation step: {e}")
         success = False
 
     if not success:
-        log.error("Ingestor Subagent failed or crashed during batch processing.")
+        log.error("Generation Agent failed or crashed.")
         return False
+    
+    # ── Step 3: Parse review items from agent output ──────────────
+    if stdout_str:
+        try:
+            import review
+            review_items = review.parse_review_blocks(stdout_str, str(filepaths))
+            if review_items:
+                review.add_items(review_items)
+                log.info(f"Captured {len(review_items)} review item(s) from agent output.")
+        except Exception as e:
+            log.warning(f"Failed to parse review items: {e}")
             
+    # ── Step 4: Post-processing ───────────────────────────────────
     changed_files = []
     if os.path.exists(WIKI_DIR):
         for entry in os.scandir(WIKI_DIR):
@@ -268,7 +421,7 @@ Please begin extraction and node weaving.
     return True
 
 def sync_all():
-    log.info("Starting Native Agent Ingest Sync...")
+    log.info("Starting Native Agent Ingest Sync (2-Step CoT)...")
     
     files_to_process = []
     for target_dir in TARGET_DIRS:

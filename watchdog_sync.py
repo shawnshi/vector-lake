@@ -13,7 +13,8 @@ except ImportError:
     import sys
     sys.exit(1)
 
-from ingest import TARGET_DIRS, SUPPORTED_EXTS, process_file_batch, calculate_hash, get_processed_files
+from ingest import TARGET_DIRS, SUPPORTED_EXTS, process_file_batch, calculate_hash
+from db import get_processed_files
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("watchdog_sync")
@@ -34,7 +35,7 @@ class WikiIndexHandler(FileSystemEventHandler):
             
         filepath = os.path.abspath(event.src_path)
         filename = os.path.basename(filepath)
-        if not filename.endswith(".md") or filename in ("index.md", "log.md"):
+        if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md"):
             return
             
         now = time.time()
