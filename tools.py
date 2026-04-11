@@ -842,7 +842,8 @@ def visualize_vector_lake():
         val = max(1, min(links_count.get(key, 1) // 2, 20))
         
         graph_nodes.append({
-            "id": node.get("id", key),
+            "id": key,
+            "nid": node.get("id", ""),
             "name": node.get("title", key),
             "group": str(node.get("type", "unknown")).capitalize(),
             "val": val,
@@ -852,16 +853,12 @@ def visualize_vector_lake():
         })
         
     graph_links = []
-    key_to_id = {k: n.get("id", k) for k, n in nodes_dict.items()}
-    
     for key, node in nodes_dict.items():
-        source_id = key_to_id[key]
         for target_key in node.get("links", []):
-            target_id = key_to_id.get(target_key)
-            if target_id:
+            if target_key in nodes_dict:
                 graph_links.append({
-                    "source": source_id,
-                    "target": target_id
+                    "source": key,
+                    "target": target_key
                 })
                 
     graph_data = {

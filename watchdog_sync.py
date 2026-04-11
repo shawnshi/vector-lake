@@ -21,8 +21,9 @@ log = logging.getLogger("watchdog_sync")
 
 DEBOUNCE_SECONDS = 3.0
 
-# Global Task Queue
+# Global Task Queues
 task_queue = queue.Queue()
+index_queue = queue.Queue()
 
 class WikiIndexHandler(FileSystemEventHandler):
     def __init__(self):
@@ -44,13 +45,8 @@ class WikiIndexHandler(FileSystemEventHandler):
                 return
             self.last_triggered[filepath] = now
             
-        def delayed_update():
-            time.sleep(DEBOUNCE_SECONDS)
-            import indexer
-            indexer.update_index_item(filename)
-            log.info(f"O(1) Index updated for modified wiki node: {filename}")
-            
-        threading.Thread(target=delayed_update, daemon=True).start()
+        # Put into index_queue instead of spawning a new thread per file
+        index_queue.put(filename)
 
     def on_created(self, event):
         self.update_index(event)
@@ -146,10 +142,38 @@ def worker_loop():
             log.error(f"Worker thread error: {e}")
             time.sleep(2)
 
+def index_worker_loop():
+    log.info("Index Update Worker Thread started.")
+    while True:
+        try:
+            filename = index_queue.get()
+            # Wait a bit for the file write to finish if it's high frequency
+            time.sleep(DEBOUNCE_SECONDS)
+            
+            # Drain similar updates for the same file if queued to avoid redundant indexing
+            pending_filenames = {filename}
+            while not index_queue.empty():
+                try:
+                    peek = index_queue.get_nowait()
+                    pending_filenames.add(peek)
+                    index_queue.task_done()
+                except queue.Empty:
+                    break
+
+            import indexer
+            for fname in pending_filenames:
+                indexer.update_index_item(fname)
+                log.info(f"O(1) Index updated for modified wiki node: {fname}")
+            
+            index_queue.task_done()
+        except Exception as e:
+            log.error(f"Index worker error: {e}")
+            time.sleep(1)
+
 def start_watchdog():
-    # Start singleton worker
-    worker_thread = threading.Thread(target=worker_loop, daemon=True)
-    worker_thread.start()
+    # Start singleton workers
+    threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=index_worker_loop, daemon=True).start()
 
     event_handler = VectorLakeIngestHandler()
     observer = Observer()

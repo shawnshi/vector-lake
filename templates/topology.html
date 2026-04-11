@@ -154,11 +154,20 @@
                 Graph.nodeColor(Graph.nodeColor()).linkWidth(Graph.linkWidth()).linkColor(Graph.linkColor()).linkDirectionalParticles(Graph.linkDirectionalParticles());
             }
             
-            // Camera focus
-            const distance = 40;
-            const distRatio = 1 + distance/Math.hypot(node.x || 0, node.y || 0, node.z || 0);
+            // Camera focus logic (safeguard against undefined/zero coordinates)
+            const nx = node.x || 0;
+            const ny = node.y || 0;
+            const nz = node.z || 0;
+            const distance = 80;
+            const currentDist = Math.hypot(nx, ny, nz) || 1;
+            const distRatio = 1 + distance / currentDist;
+            
             if (Graph.cameraPosition) {
-                Graph.cameraPosition({ x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio }, node, 3000);
+                Graph.cameraPosition(
+                    { x: nx * distRatio, y: ny * distRatio, z: nz * distRatio }, 
+                    { x: nx, y: ny, z: nz }, 
+                    2000
+                );
             }
             
             // Update Info Panel
@@ -167,6 +176,8 @@
             document.getElementById('info-title').innerHTML = `<a href="${nodeUrl}" target="_blank" style="color: inherit; text-decoration: none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${node.name}</a>`;
 
             let metaHtml = `<span><b>Type:</b> ${node.group}</span>`;
+            metaHtml += `<span><b>ID:</b> ${node.nid || 'N/A'}</span>`;
+            metaHtml += `<span><b>Filename:</b> ${node.id}.md</span>`;
             metaHtml += `<span><b>Updated:</b> ${node.updated || 'N/A'}</span>`;
             document.getElementById('info-meta').innerHTML = metaHtml;
 
@@ -225,6 +236,14 @@
             document.getElementById('info-panel').classList.add('visible');
         };
         
+        // Color Map for groups (matches stats-panel)
+        const nodeColorMap = {
+            'source': '#10B981',
+            'entity': '#EF4444',
+            'concept': '#00B0FF',
+            'synthesis': '#F59E0B'
+        };
+
         const Graph = ForceGraph3D()
             (document.getElementById('3d-graph'))
             .graphData(data)
@@ -235,13 +254,13 @@
                 return activeFilters.has(sGrp) && activeFilters.has(tGrp);
             })
             .nodeLabel(node => '')
-            .nodeAutoColorBy('group')
             .nodeColor(node => {
                 const activeMode = highlightNodes.size > 0;
                 if (activeMode && !highlightNodes.has(node)) {
                     return 'rgba(50, 50, 50, 0.1)';
                 }
-                return node === hoverNode ? '#FFFFFF' : node.color;
+                if (node === hoverNode) return '#FFFFFF';
+                return nodeColorMap[(node.group || '').toLowerCase()] || '#9CA3AF';
             })
             .nodeVal('val')
             .linkLabel(link => '')
