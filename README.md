@@ -4,8 +4,11 @@
 
 它实现了由 Andrej Karpathy 提出的 [LLM-Wiki 模式](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)，彻底摒弃了传统的"无状态检索增强生成 (RAG)"和黑盒数据库。取而代之的是，它依赖 Gemini CLI Native Agent 来主动编译、相互链接并维护一个纯 Markdown 文件组成的持久化网络。
 
-## V7.1 新特性（借鉴 nashsu/llm_wiki）
+## V7.1 新特性（借鉴 nashsu/llm_wiki 与 Garry Tan gbrain）
 
+- **双轨制契约 (Dual-Track Schema)**：实体页面物理切分为液态的“编译共识 (Compiled Truth)”与追加写入的固态“证据时间线 (Timeline)”。
+- **检索降噪 (Diversity Capping)**：引入前置查询裂变 (Query Expansion) 与后置类型压制，最高限制 Source 类型占 60%，防止长尾数据淹没上下文。
+- **并发安全互斥 (Global FileLock)**：在所有的 index.json 读写边界加装排他锁，彻底根治 Windows 下的并发 I/O 破损。
 - **两步 Chain-of-Thought 摄取**：分析与生成物理分离。Step 1 LLM 先输出结构化分析（实体、概念、矛盾），Step 2 再基于分析驱动文件生成
 - **4-信号相关性模型**：直接链接(3.0) + 源重叠(4.0) + Adamic-Adar 共同邻居(1.5) + 类型亲和(1.0)，`index.json` 新增 `weighted_edges` 字段
 - **`purpose.md` 语义锚点**：定义知识库的"为什么"——核心定位、关键问题、研究范围，注入每次 LLM 操作
@@ -31,6 +34,7 @@
 
 V7.1 采用**两步 CoT + 子代理隔离 + 纵深防御**架构：
 
+* **强制读写节律 (Read-Write Rhythm)**：OODA 循环注入强制的前置实体嗅探 (Entity Sniffing) 与后置的图谱同步 (Graph Sync)，把检索与回写变成系统的“底层呼吸”。
 * **两步 Chain-of-Thought**：Step 1 注入 purpose + index summary → LLM 输出结构化分析；Step 2 注入分析结果 + schema → LLM 执行文件写入。物理分离确保"先想清楚再动手"。
 * **Subagent 隔离**：`vector-lake-ingestor` / `vector-lake-synthesizer` / `vector-lake-collider` 三个专用 Subagent，被剥夺终端执行权限，强制锁定在文件 I/O。
 * **4-信号相关性引擎**：每次索引重建时计算节点间的加权边 (direct link 3.0, source overlap 4.0, Adamic-Adar 1.5, type affinity 1.0)，驱动搜索图扩展和拓扑可视化。

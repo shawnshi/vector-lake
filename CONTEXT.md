@@ -3,7 +3,10 @@
 ## 1. 核心定位 (Status)
 **Vector Lake** (V7.1 LLM-Wiki Engine) 是 Gemini CLI 的有状态知识库编译基座。它摒弃了传统的"无状态检索(Stateless RAG)"和黑盒数据库，将长程记忆彻底重构为**基于大模型维护的纯 Markdown 节点网络 (Stateful Compounding Wiki)**。
 
-V7.1 核心升级（借鉴 Karpathy LLM-Wiki 模式）：
+V7.1 核心升级（借鉴 Karpathy LLM-Wiki 模式与 Garry Tan gbrain）：
+*   **双轨制实体模型 (Dual-Track Schema)**: 实体页面物理隔离为液态的“编译共识”与固态的“证据时间线”，彻底消除 LLM 记忆塌缩。
+*   **并发安全防御 (FileLock)**: 在所有底层读写（indexer.py & tools.py）中注入跨进程文件锁，彻底解决并发破损（WinError 32）。
+*   **检索管线降噪**: 引入前置查询裂变 (Query Expansion) 与后置类型压制 (Type Diversity Capping)，最高限定 Source 类型占 60%，提供立体上下文。
 *   **两步 CoT 摄取**: 分析与生成物理分离，先结构化分析再编译写入
 *   **4-信号相关性模型**: 直接链接(3.0) + 源重叠(4.0) + Adamic-Adar(1.5) + 类型亲和(1.0)
 *   **purpose.md 语义锚点**: 为 Wiki 定义"为什么"，注入每次 LLM 操作

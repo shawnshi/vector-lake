@@ -10,6 +10,7 @@ from pathlib import Path
 from collections import defaultdict
 import yaml
 import ingest
+from filelock import FileLock, Timeout
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tools")
@@ -35,33 +36,49 @@ STOP_WORDS = {
     "of", "and", "or", "but", "with", "by", "from", "as", "it", "this", "that",
 }
 
+# ── Query Expansion Dictionary ──────────────────────────────────────────────
+QUERY_EXPANSION_DICT = {
+    "医疗信息化": ["HIT", "卫宁", "电子病历", "医疗IT"],
+    "大模型": ["LLM", "大语言模型", "Agent", "智能体"],
+    "医疗AI": ["临床Agent", "大模型医疗落地", "电子病历 智能化"]
+}
+
 def _tokenize_query(query: str) -> list:
     """Tokenize query with CJK bigram support.
     
     For CJK text: produce bigrams + unigrams + original tokens.
     For Latin text: space-split + stopword filter.
+    Includes basic Query Expansion.
     """
     tokens = set()
     
-    for word in query.strip().split():
-        word_lower = word.lower()
-        if word_lower in STOP_WORDS:
-            continue
-        
-        has_cjk = bool(CJK_REGEX.search(word))
-        if has_cjk:
-            # Bigrams for CJK
-            chars = list(word)
-            for i in range(len(chars) - 1):
-                tokens.add(chars[i] + chars[i + 1])
-            # Individual characters
-            for c in chars:
-                if CJK_REGEX.match(c):
-                    tokens.add(c)
-            # Full token
-            tokens.add(word)
-        else:
-            tokens.add(word_lower)
+    # ── Query Expansion ──
+    expanded_terms = set([query])
+    for key, expansions in QUERY_EXPANSION_DICT.items():
+        if key in query:
+            for exp in expansions:
+                expanded_terms.add(exp)
+                
+    for term in expanded_terms:
+        for word in term.strip().split():
+            word_lower = word.lower()
+            if word_lower in STOP_WORDS:
+                continue
+            
+            has_cjk = bool(CJK_REGEX.search(word))
+            if has_cjk:
+                # Bigrams for CJK
+                chars = list(word)
+                for i in range(len(chars) - 1):
+                    tokens.add(chars[i] + chars[i + 1])
+                # Individual characters
+                for c in chars:
+                    if CJK_REGEX.match(c):
+                        tokens.add(c)
+                # Full token
+                tokens.add(word)
+            else:
+                tokens.add(word_lower)
     
     return list(tokens)
 
@@ -78,12 +95,22 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
     index_path = os.path.join(wiki_dir, "index.json")
     if not os.path.exists(index_path): return "index.json not found."
+    lock_path = index_path + ".lock"
+    
     try:
-        with open(index_path, "r", encoding="utf-8") as f: index_data = json.load(f)
+        with FileLock(lock_path, timeout=5):
+            with open(index_path, "r", encoding="utf-8") as f: index_data = json.load(f)
+    except Timeout:
+        log.warning("Timeout acquiring lock for index.json during search. System is busy.")
+        return "System is currently busy syncing the knowledge base. Please try again in a few seconds."
     except Exception:
         import indexer
         indexer.generate_index()
-        with open(index_path, "r", encoding="utf-8") as f: index_data = json.load(f)
+        try:
+            with FileLock(lock_path, timeout=5):
+                with open(index_path, "r", encoding="utf-8") as f: index_data = json.load(f)
+        except Timeout:
+            return "System is currently busy generating the index. Please try again later."
     
     nodes = [{"_key": k, **v} for k, v in index_data.get("nodes", {}).items()]
     tokens = _tokenize_query(query)
@@ -152,10 +179,35 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 exp_node = index_data["nodes"].get(exp_key)
                 if exp_node:
                     scored.append((exp_weight, {"_key": exp_key, **exp_node}))
+                    
+    # Re-sort after injecting expanded nodes
+    scored.sort(key=lambda x: x[0], reverse=True)
+                    
+    # ── Type Diversity Capping ──
+    # Prevent the result context from being flooded exclusively by "Source" documents
+    final_scored = []
+    source_count = 0
+    max_sources = int(top_k * 0.6)  # Maximum 60% of results can be of type Source
     
+    for s, n in scored:
+        node_type = n.get("type", "").lower()
+        if node_type == "source":
+            if source_count < max_sources:
+                final_scored.append((s, n))
+                source_count += 1
+            # Skip if we have enough sources to preserve diversity
+        else:
+            final_scored.append((s, n))
+            
+        if len(final_scored) >= top_k:
+            break
+            
+    # Fallback: if we didn't fill top_k and we skipped some sources, we could append them, 
+    # but strictly adhering to the cap is usually better for diversity.
+
     # Format output
     res = ""
-    for i, (s, n) in enumerate(scored[:top_k]):
+    for i, (s, n) in enumerate(final_scored):
         fp = os.path.join(wiki_dir, f"{n['_key']}.md")
         snip = ""
         if os.path.exists(fp):
@@ -194,16 +246,22 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     # Index summary (compact)
     index_summary = ""
     index_path = os.path.join(wiki_dir, "index.json")
+    lock_path = index_path + ".lock"
+    
     if os.path.exists(index_path):
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                idx = json.load(f)
+            with FileLock(lock_path, timeout=5):
+                with open(index_path, "r", encoding="utf-8") as f:
+                    idx = json.load(f)
             lines = []
             for key, node in list(idx.get("nodes", {}).items())[:50]:
                 title = node.get("title", key)
                 ntype = node.get("type", "?")
                 lines.append(f"[{ntype}] {title}")
             index_summary = "\n".join(lines)[:index_budget]
+        except Timeout:
+            log.warning("Timeout acquiring lock for index.json during context assembly.")
+            index_summary = "[Index currently locked for update]"
         except Exception:
             pass
     
@@ -277,7 +335,7 @@ def lint_vector_lake(auto_fix: bool = False):
         "Strategy_and_Business", "System_Architecture",
         "Philosophy_and_Cognitive", "Biomedicine",
     }
-    VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_")
+    VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_", "Event_", "Person_", "Project_", "Term_", "System_")
     REQUIRED_FIELDS = ["title", "type", "domain", "status", "epistemic-status", "categories"]
     
     files = [f for f in os.listdir(wiki_dir) if f.endswith(".md") and f not in SKIP_FILES]
@@ -814,20 +872,24 @@ def visualize_vector_lake():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     gemini_dir = os.path.dirname(os.path.dirname(base_dir))
     index_path = os.path.join(gemini_dir, "MEMORY", "wiki", "index.json")
+    lock_path = index_path + ".lock"
     template_path = os.path.join(base_dir, "templates", "topology.html")
     output_path = os.path.join(gemini_dir, "tmp", "vector_lake_graph.html")
-    
+
     if not os.path.exists(index_path):
         return "Error: index.json not found."
     if not os.path.exists(template_path):
         return "Error: template not found."
-        
-    with open(index_path, "r", encoding="utf-8") as f:
-        try:
-            idx_data = json.load(f)
-        except json.JSONDecodeError:
-            return "Error: Failed to parse index.json."
-            
+
+    try:
+        with FileLock(lock_path, timeout=5):
+            with open(index_path, "r", encoding="utf-8") as f:
+                idx_data = json.load(f)
+    except Timeout:
+        log.warning("Timeout acquiring lock for index.json during graph generation.")
+        return "Error: System is busy generating the index. Please try again later."
+    except json.JSONDecodeError:
+        return "Error: Failed to parse index.json."            
     nodes_dict = idx_data.get("nodes", {})
     
     links_count = {k: 0 for k in nodes_dict}

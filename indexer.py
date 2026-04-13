@@ -4,6 +4,7 @@ import re
 import math
 import yaml
 import logging
+from filelock import FileLock, Timeout
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
@@ -250,7 +251,7 @@ def generate_index():
                 continue
             
             relevance = calculate_relevance(node_a, node_b, nodes_dict)
-            if relevance > 0:
+            if relevance >= 1.5:
                 edges.append({
                     "source": key_a,
                     "target": key_b,
@@ -269,13 +270,18 @@ def generate_index():
     index_data["categories"] = list(index_data["categories"])
     
     output_path = os.path.join(WIKI_DIR, "index.json")
-    temp_path = output_path + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(index_data, f, ensure_ascii=False, indent=2)
-    os.replace(temp_path, output_path)
-        
-    log.info(f"Generated index.json with {len(index_data['nodes'])} nodes | "
-             f"{len(edges)} weighted edges | "
+    lock_path = output_path + ".lock"
+
+    try:
+        with FileLock(lock_path, timeout=15):
+            temp_path = output_path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(index_data, f, ensure_ascii=False, separators=(',', ':'))
+            os.replace(temp_path, output_path)
+    except Timeout:
+        log.error(f"Timeout while acquiring lock for {output_path}")
+
+    log.info(f"Generated index.json with {len(index_data['nodes'])} nodes | "             f"{len(edges)} weighted edges | "
              f"{len(index_data.get('error_log', []))} errors.")
     return output_path
 
@@ -307,10 +313,15 @@ def update_index_item(filename: str):
         if node_key in index_data.get("nodes", {}):
             del index_data["nodes"][node_key]
             
-        temp_path = output_path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(index_data, f, ensure_ascii=False, indent=2)
-        os.replace(temp_path, output_path)
+        lock_path = output_path + ".lock"
+        try:
+            with FileLock(lock_path, timeout=15):
+                temp_path = output_path + ".tmp"
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(index_data, f, ensure_ascii=False, separators=(',', ':'))
+                os.replace(temp_path, output_path)
+        except Timeout:
+            log.error(f"Timeout while acquiring lock for {output_path}")
         return
         
     node_key = filename[:-3]
@@ -372,7 +383,7 @@ def update_index_item(filename: str):
                     continue
                 other_node["_key"] = other_key
                 relevance = calculate_relevance(node_data, other_node, all_nodes)
-                if relevance > 0:
+                if relevance >= 1.5:
                     index_data["weighted_edges"].append({
                         "source": min(node_key, other_key),
                         "target": max(node_key, other_key),
@@ -381,10 +392,15 @@ def update_index_item(filename: str):
                 other_node.pop("_key", None)
             node_data.pop("_key", None)
 
-    temp_path = output_path + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(index_data, f, ensure_ascii=False, indent=2)
-    os.replace(temp_path, output_path)
+    lock_path = output_path + ".lock"
+    try:
+        with FileLock(lock_path, timeout=15):
+            temp_path = output_path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(index_data, f, ensure_ascii=False, separators=(',', ':'))
+            os.replace(temp_path, output_path)
+    except Timeout:
+        log.error(f"Timeout while acquiring lock for {output_path}")
 
 if __name__ == "__main__":
     generate_index()
