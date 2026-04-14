@@ -415,8 +415,9 @@ Please begin extraction and node weaving.
 
     now = datetime.now(timezone.utc).isoformat()
     for fp in filepaths:
-        f_hash = calculate_hash(fp)
-        if f_hash: mark_file_processed(fp, f_hash, now)
+        if os.path.exists(fp):
+            f_hash = calculate_hash(fp)
+            if f_hash: mark_file_processed(fp, f_hash, now)
         
     return True
 

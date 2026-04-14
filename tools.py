@@ -856,8 +856,19 @@ def review_vector_lake(action: str = "list", index: int = -1, resolution: str = 
     elif action == "resolve":
         if index < 0:
             return "Error: specify review item index. Usage: cli.py review resolve <index>"
-        success = review.resolve_item(index, resolution)
-        return f"Resolved item #{index}." if success else f"Failed to resolve item #{index}."
+        item = review.resolve_item(index, resolution)
+        if not item:
+            return f"Failed to resolve item #{index}."
+            
+        result_msg = f"Resolved item #{index} ('{item.get('title')}') → {resolution}."
+        
+        if resolution == "create" and item.get("search_queries"):
+            queries = " | ".join(item["search_queries"])
+            result_msg += f"\n\n[SYSTEM DIRECTIVE]: Autonomous Deep Research Triggered.\n"
+            result_msg += f"Agent: You must now execute `google_web_search` for the following queries:\n{queries}\n"
+            result_msg += f"Save the extracted content as Markdown to MEMORY/raw/, then run `python cli.py sync`."
+            
+        return result_msg
     else:
         return f"Unknown review action: {action}. Use 'list' or 'resolve'."
 
@@ -889,45 +900,47 @@ def visualize_vector_lake():
         log.warning("Timeout acquiring lock for index.json during graph generation.")
         return "Error: System is busy generating the index. Please try again later."
     except json.JSONDecodeError:
-        return "Error: Failed to parse index.json."            
+        return "Error: Failed to parse index.json."
     nodes_dict = idx_data.get("nodes", {})
-    
+    communities = idx_data.get("communities", {})
+    weighted_edges = idx_data.get("weighted_edges", [])
+    aliases = idx_data.get("aliases", {})
+
     links_count = {k: 0 for k in nodes_dict}
     for k, n in nodes_dict.items():
         for t in n.get("links", []):
-            if t in nodes_dict:
-                links_count[t] = links_count.get(t, 0) + 1
+            target_key = aliases.get(t, t)
+            if target_key in nodes_dict:
+                links_count[target_key] = links_count.get(target_key, 0) + 1
             links_count[k] += 1
-            
+
     graph_nodes = []
     for key, node in nodes_dict.items():
-        val = max(1, min(links_count.get(key, 1) // 2, 20))
+        degree = links_count.get(key, 0)
         
+        valid_links = []
+        for t in node.get("links", []):
+            target_key = aliases.get(t, t)
+            if target_key in nodes_dict:
+                valid_links.append(target_key)
+
         graph_nodes.append({
             "id": key,
             "nid": node.get("id", ""),
             "name": node.get("title", key),
             "group": str(node.get("type", "unknown")).capitalize(),
-            "val": val,
+            "community": communities.get(key, 0),
+            "degree": degree,
             "updated": node.get("updated", ""),
             "summary": node.get("summary", ""),
-            "sources": node.get("sources", [])
+            "sources": node.get("sources", []),
+            "semantic_links": list(set(valid_links))
         })
-        
-    graph_links = []
-    for key, node in nodes_dict.items():
-        for target_key in node.get("links", []):
-            if target_key in nodes_dict:
-                graph_links.append({
-                    "source": key,
-                    "target": target_key
-                })
-                
+
     graph_data = {
         "nodes": graph_nodes,
-        "links": graph_links
-    }
-    
+        "edges": weighted_edges
+    }    
     with open(template_path, "r", encoding="utf-8") as f:
         html = f.read()
         
@@ -943,8 +956,38 @@ def visualize_vector_lake():
         
     webbrowser.open(f"file:///{output_path.replace(os.sep, '/')}")
     
-    return f"Visualized {len(graph_nodes)} nodes and {len(graph_links)} links. Opened graph in browser: {output_path}"
+    return f"Visualized {len(graph_nodes)} nodes and {len(weighted_edges)} edges. Opened graph in browser: {output_path}"
+
+def audit_graph() -> str:
+    import json
+    import os
+    import review
+    wiki_dir = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
+    index_path = os.path.join(wiki_dir, "index.json")
+    if not os.path.exists(index_path):
+        return "Error: index.json not found."
+    with open(index_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    insights = data.get("graph_insights", [])
+    if not insights:
+        return "No graph insights found. Please ensure 'sync' has been run recently."
+        
+    items = []
+    for insight in insights:
+        items.append({
+            "type": "suggestion",
+            "title": f"Topology Insight: {insight['type'].replace('_', ' ').title()}",
+            "description": insight.get("description", "A topological insight was detected."),
+            "search_query": insight.get("node", ""),
+            "pages": [f"wiki/{insight.get('node', '')}.md"] if insight.get("node") else []
+        })
+        
+    if items:
+        review.add_items(items)
+        return f"Audit complete. Pushed {len(items)} graph topology insights into the async review queue."
+    return "Audit complete. No actionable insights found."
 
 __all__ = ["search_vector_lake", "sync_vector_lake", "lint_vector_lake", "query_logic_lake", 
            "visualize_vector_lake", "trigger_serendipity_collision", "review_vector_lake",
-           "assemble_context", "delete_source"]
+           "audit_graph", "assemble_context", "delete_source"]

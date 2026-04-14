@@ -65,6 +65,8 @@ Usage Examples:
     review_parser.add_argument("--resolution", type=str, default="skip",
                                help="Resolution type: 'skip', 'create', 'acknowledge' (default: skip).")
 
+    audit_graph_parser = subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the review queue.")
+
     delete_parser = subparsers.add_parser("delete", help="[DELETE] Cascade-delete a raw source and all related wiki pages.")
     delete_parser.add_argument("raw_path", help="Path to the raw source file to remove.")
     delete_parser.add_argument("--dry-run", action="store_true",
@@ -97,6 +99,8 @@ Usage Examples:
                 index=args.index,
                 resolution=getattr(args, 'resolution', 'skip')
             ))
+        elif args.command == "audit-graph":
+            print(tools.audit_graph())
         elif args.command == "delete":
             print(tools.delete_source(
                 args.raw_path,

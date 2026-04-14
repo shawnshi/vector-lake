@@ -6,12 +6,19 @@ import yaml
 import logging
 from filelock import FileLock, Timeout
 
+try:
+    import networkx as nx
+    from community import community_louvain
+except ImportError:
+    nx = None
+    community_louvain = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
 
 WIKI_DIR = os.path.expanduser("~/.gemini/MEMORY/wiki")
 
-VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_")
+VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_", "Event_", "Person_", "Project_", "Term_", "System_")
 
 # ── 4-Signal Relevance Model ─────────────────────────────────────────────────
 
@@ -52,7 +59,17 @@ def _parse_wiki_node(filepath: str, node_key: str):
 
     node_id = fm_data.get('id', "")
     title = fm_data.get('title', node_key)
-    node_type = fm_data.get('type', "concept")
+    
+    raw_type = str(fm_data.get('type', "concept")).lower().strip().replace('"', '').replace("'", "")
+    if raw_type in ["entity", "person", "system", "project", "organization"]:
+        node_type = "concept" if raw_type == "system" else "entity"
+    elif raw_type in ["source", "reference"]:
+        node_type = "source"
+    elif raw_type in ["synthesis", "comparison", "report"]:
+        node_type = "synthesis"
+    else:
+        node_type = "concept"
+        
     updated = str(fm_data.get('updated', ""))
     cats = fm_data.get('categories', [])
 
@@ -261,6 +278,90 @@ def generate_index():
     # Sort edges by weight descending for the graph visualization
     edges.sort(key=lambda e: e["weight"], reverse=True)
     index_data["weighted_edges"] = edges
+    
+    # --- Topology Audit (Louvain Community Detection) ---
+    index_data["communities"] = {}
+    index_data["graph_insights"] = []
+    
+    if nx and community_louvain and edges:
+        G = nx.Graph()
+        for key in node_keys:
+            G.add_node(key)
+        for e in edges:
+            G.add_edge(e["source"], e["target"], weight=e["weight"])
+            
+        try:
+            # 1. Community Partitioning
+            partition = community_louvain.best_partition(G, weight='weight')
+            index_data["communities"] = partition
+            
+            # 2. Cohesion Scoring
+            community_nodes = {}
+            for node, comm_id in partition.items():
+                if comm_id not in community_nodes:
+                    community_nodes[comm_id] = []
+                community_nodes[comm_id].append(node)
+                
+            for comm_id, nodes in community_nodes.items():
+                if len(nodes) < 3:
+                    continue # Too small for cohesion analysis
+                    
+                subgraph = G.subgraph(nodes)
+                possible_edges = len(nodes) * (len(nodes) - 1) / 2
+                actual_edges = subgraph.number_of_edges()
+                cohesion = actual_edges / possible_edges if possible_edges > 0 else 0
+                
+                # Insight: Sparse Community (Knowledge Gap)
+                if cohesion < 0.15:
+                    index_data["graph_insights"].append({
+                        "type": "sparse_community",
+                        "community_id": int(comm_id),
+                        "nodes": nodes,
+                        "cohesion": float(cohesion),
+                        "description": f"Community {comm_id} has low internal cohesion ({cohesion:.2f}). Indicates a potential knowledge gap."
+                    })
+                    
+            # 3. Identify Isolated Nodes
+            for node in node_keys:
+                if G.degree(node) <= 1:
+                    index_data["graph_insights"].append({
+                        "type": "isolated_node",
+                        "node": node,
+                        "description": f"Node '{node}' is isolated or weakly connected (Degree <= 1)."
+                    })
+                    
+            # 4. Identify Bridge Nodes
+            for node in node_keys:
+                connected_communities = set()
+                for neighbor in G.neighbors(node):
+                    connected_communities.add(partition.get(neighbor))
+                if len(connected_communities) >= 3:
+                    index_data["graph_insights"].append({
+                        "type": "bridge_node",
+                        "node": node,
+                        "connected_communities": [int(c) for c in connected_communities if c is not None],
+                        "description": f"Node '{node}' connects {len(connected_communities)} distinct communities. High strategic value."
+                    })
+                    
+            # 5. Generate Community Labels
+            community_labels = {}
+            for comm_id, nodes in community_nodes.items():
+                sorted_nodes = sorted(nodes, key=lambda n: G.degree(n), reverse=True)
+                top_nodes = sorted_nodes[:2]
+                titles = []
+                for n in top_nodes:
+                    node_data = nodes_dict.get(n)
+                    if node_data and "title" in node_data:
+                        titles.append(node_data["title"])
+                    else:
+                        titles.append(n)
+                label_name = " / ".join(titles) if titles else "Unknown"
+                community_labels[int(comm_id)] = f"Comm {comm_id}: {label_name}"
+            
+            index_data["community_labels"] = community_labels
+        except Exception as e:
+            log.error(f"Graph analysis failed: {e}")
+    # ----------------------------------------------------
     
     # Clean up _key from nodes before serialization
     for node in nodes_dict.values():

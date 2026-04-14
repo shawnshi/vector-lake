@@ -121,7 +121,7 @@ def resolve_item(index: int, resolution: str = "skip"):
     
     if index < 0 or index >= len(pending_indices):
         log.error(f"Invalid review index: {index}. Pending items: {len(pending_indices)}")
-        return False
+        return None
     
     real_index = pending_indices[index]
     queue[real_index]["resolved"] = True
@@ -129,7 +129,7 @@ def resolve_item(index: int, resolution: str = "skip"):
     queue[real_index]["resolved_at"] = datetime.now(timezone.utc).isoformat()
     _save_queue(queue)
     log.info(f"Resolved review item #{index}: '{queue[real_index]['title']}' → {resolution}")
-    return True
+    return queue[real_index]
 
 
 def format_pending_report() -> str:

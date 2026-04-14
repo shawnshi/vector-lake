@@ -43,6 +43,11 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
     - `Entity_*.md`: Organizations, products, or individuals.
     - `Concept_*.md`: Abstract architectures, theories, phenomena.
     - `Synthesis_*.md`: Deep reasoning, comparative analysis, serendipity, or comprehensive reports.
+    - `Event_*.md`: Historical or industry events.
+    - `Person_*.md`: Individuals, authors, or executives.
+    - `Project_*.md`: Specific initiatives or projects.
+    - `Term_*.md`: Glossary definitions or acronyms.
+    - `System_*.md`: Software systems or IT platforms.
 
 ## 4. Workflows
 
