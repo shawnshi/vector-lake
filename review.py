@@ -10,6 +10,7 @@ import re
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from filelock import FileLock
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-review")
@@ -31,8 +32,13 @@ def _ensure_meta_dir():
     meta_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _load_queue() -> list:
-    """Load review queue from disk."""
+def _queue_lock() -> FileLock:
+    _ensure_meta_dir()
+    return FileLock(str(REVIEW_FILE) + ".lock", timeout=10)
+
+
+def _load_queue_unlocked() -> list:
+    """Load review queue from disk without taking a lock."""
     if not REVIEW_FILE.exists():
         return []
     try:
@@ -42,13 +48,23 @@ def _load_queue() -> list:
         return []
 
 
-def _save_queue(items: list):
-    """Atomically save review queue to disk."""
+def _save_queue_unlocked(items: list):
+    """Atomically save review queue to disk without taking a lock."""
     _ensure_meta_dir()
     temp_path = str(REVIEW_FILE) + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
     os.replace(temp_path, str(REVIEW_FILE))
+
+
+def _load_queue() -> list:
+    with _queue_lock():
+        return _load_queue_unlocked()
+
+
+def _save_queue(items: list):
+    with _queue_lock():
+        _save_queue_unlocked(items)
 
 
 def parse_review_blocks(agent_output: str, source_path: str) -> list:
@@ -102,34 +118,37 @@ def add_items(items: list):
     """Add new review items to the persistent queue."""
     if not items:
         return
-    queue = _load_queue()
-    queue.extend(items)
-    _save_queue(queue)
+    with _queue_lock():
+        queue = _load_queue_unlocked()
+        queue.extend(items)
+        _save_queue_unlocked(queue)
     log.info(f"Added {len(items)} review item(s) to queue. Total: {len(queue)} pending.")
 
 
 def get_pending() -> list:
     """Return all unresolved review items."""
-    queue = _load_queue()
-    return [item for item in queue if not item.get("resolved", False)]
+    with _queue_lock():
+        queue = _load_queue_unlocked()
+        return [item for item in queue if not item.get("resolved", False)]
 
 
 def resolve_item(index: int, resolution: str = "skip"):
     """Mark a review item as resolved by its index in the pending list."""
-    queue = _load_queue()
-    pending_indices = [i for i, item in enumerate(queue) if not item.get("resolved", False)]
-    
-    if index < 0 or index >= len(pending_indices):
-        log.error(f"Invalid review index: {index}. Pending items: {len(pending_indices)}")
-        return None
-    
-    real_index = pending_indices[index]
-    queue[real_index]["resolved"] = True
-    queue[real_index]["resolution"] = resolution
-    queue[real_index]["resolved_at"] = datetime.now(timezone.utc).isoformat()
-    _save_queue(queue)
-    log.info(f"Resolved review item #{index}: '{queue[real_index]['title']}' → {resolution}")
-    return queue[real_index]
+    with _queue_lock():
+        queue = _load_queue_unlocked()
+        pending_indices = [i for i, item in enumerate(queue) if not item.get("resolved", False)]
+
+        if index < 0 or index >= len(pending_indices):
+            log.error(f"Invalid review index: {index}. Pending items: {len(pending_indices)}")
+            return None
+
+        real_index = pending_indices[index]
+        queue[real_index]["resolved"] = True
+        queue[real_index]["resolution"] = resolution
+        queue[real_index]["resolved_at"] = datetime.now(timezone.utc).isoformat()
+        _save_queue_unlocked(queue)
+        log.info(f"Resolved review item #{index}: '{queue[real_index]['title']}' → {resolution}")
+        return queue[real_index]
 
 
 def format_pending_report() -> str:

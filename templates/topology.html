@@ -2,146 +2,119 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Vector Lake 3D Topology (ForceGraph3D)</title>
+    <title>Vector Lake Topology</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #0A0F14; overflow: hidden; font-family: 'Inter', sans-serif; color: #E5E7EB; }
-        ::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(156, 163, 175, 0.2); border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(156, 163, 175, 0.4); }
-        ::-webkit-scrollbar-corner { background: transparent; }
-        
-        #3d-graph { width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 1; }
-        
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #0A0F14; overflow: hidden; font-family: 'Inter', sans-serif; color: #E5E7EB; }
+        #3d-graph { width: 100%; height: 100%; position: absolute; inset: 0; z-index: 1; }
+        #info-panel, .hud-box, #stats-panel {
+            background: rgba(15, 23, 42, 0.86);
+            border: 1px solid #374151;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.45);
+            backdrop-filter: blur(8px);
+        }
         #info-panel {
-            position: absolute; top: 20px; left: 20px; width: 380px; max-height: 80vh; overflow-y: auto;
-            background: rgba(15, 23, 42, 0.85); border: 1px solid #374151; border-radius: 8px;
-            padding: 20px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); z-index: 10;
-            display: none; backdrop-filter: blur(8px); pointer-events: auto;
+            position: absolute; top: 20px; left: 20px; width: 400px; max-height: 82vh; overflow-y: auto;
+            border-radius: 10px; padding: 20px; z-index: 10; display: none;
         }
         #info-panel.visible { display: block; }
-        #info-title { margin: 0 0 12px 0; font-size: 1.3rem; line-height: 1.2; }
+        #info-title { margin: 0 0 12px 0; font-size: 1.25rem; line-height: 1.2; }
         #info-title a { color: #60A5FA; text-decoration: none; }
         #info-title a:hover { text-decoration: underline; }
-        
-        #info-meta { font-size: 0.8rem; color: #9CA3AF; margin-bottom: 12px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
+        #info-meta { font-size: 0.82rem; color: #9CA3AF; margin-bottom: 12px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
         #info-meta span { display: block; margin-bottom: 4px; }
-        #info-summary { font-size: 0.9rem; line-height: 1.5; margin-bottom: 15px; color: #D1D5DB; }
-        
-        .info-section { font-size: 0.85rem; word-break: break-all; background: rgba(0,0,0,0.3); padding: 10px; border-radius: 4px; margin-bottom: 10px; }
-        .info-section strong { color: #10B981; display: block; margin-bottom: 6px; }
-        .info-section ul { margin: 0; padding-left: 20px; color: #D1D5DB; }
-        .info-section a { color: #34D399; text-decoration: none; cursor: pointer; }
+        #info-summary { font-size: 0.92rem; line-height: 1.55; color: #D1D5DB; }
+        .info-section { font-size: 0.85rem; word-break: break-word; background: rgba(0, 0, 0, 0.25); padding: 10px; border-radius: 6px; margin-bottom: 10px; }
+        .info-section strong { color: #34D399; display: block; margin-bottom: 6px; }
+        .info-section ul { margin: 0; padding-left: 20px; }
+        .info-section a { color: #60A5FA; text-decoration: none; cursor: pointer; }
         .info-section a:hover { text-decoration: underline; }
-        .node-link { color: #60A5FA !important; }
-
         #close-btn { position: absolute; top: 10px; right: 15px; cursor: pointer; color: #9CA3AF; font-size: 1.2rem; }
-        #close-btn:hover { color: #FFFFFF; }
-        
-        #right-hud {
-            position: absolute; top: 20px; right: 20px; width: 260px; z-index: 10;
-            display: flex; flex-direction: column; gap: 12px;
-        }
-
-        .hud-box {
-            background: rgba(15, 23, 42, 0.85); border: 1px solid #374151; border-radius: 8px;
-            padding: 12px 15px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); backdrop-filter: blur(8px);
-        }
-        .hud-box h4 { margin: 0 0 10px 0; font-size: 0.85rem; color: #9CA3AF; text-transform: uppercase; letter-spacing: 0.05em; }
-        
+        #right-hud { position: absolute; top: 20px; right: 20px; width: 280px; z-index: 10; display: flex; flex-direction: column; gap: 12px; }
+        .hud-box { border-radius: 10px; padding: 12px 15px; }
+        .hud-box h4 { margin: 0 0 10px 0; font-size: 0.82rem; color: #9CA3AF; text-transform: uppercase; letter-spacing: 0.06em; }
         #search-input {
-            width: 100%; padding: 8px 10px; background: rgba(0,0,0,0.4); border: 1px solid #4B5563;
-            border-radius: 4px; color: #E5E7EB; font-size: 0.85rem; outline: none; box-sizing: border-box;
+            width: 100%; padding: 8px 10px; box-sizing: border-box; background: rgba(0,0,0,0.4);
+            border: 1px solid #4B5563; border-radius: 6px; color: #E5E7EB; font-size: 0.85rem;
         }
-        #search-input:focus { border-color: #60A5FA; }
-        #search-results {
-            max-height: 200px; overflow-y: auto; background: rgba(15, 23, 42, 0.95);
-            border: 1px solid #374151; border-top: none; border-radius: 0 0 4px 4px; display: none;
-        }
+        #search-results { max-height: 220px; overflow-y: auto; background: rgba(15, 23, 42, 0.95); border-radius: 0 0 6px 6px; display: none; margin-top: 2px; }
         .search-item { padding: 6px 10px; font-size: 0.8rem; cursor: pointer; border-bottom: 1px solid #1F2937; }
         .search-item:hover { background: #374151; color: #60A5FA; }
-
         .toggle-btn {
-            background: #1F2937; color: #D1D5DB; border: 1px solid #374151; padding: 6px 12px;
-            border-radius: 4px; cursor: pointer; width: 100%; text-align: left; margin-bottom: 8px;
-            font-size: 0.85rem; transition: all 0.2s;
+            background: #1F2937; color: #D1D5DB; border: 1px solid #374151; padding: 7px 12px; border-radius: 6px;
+            cursor: pointer; width: 100%; text-align: left; margin-bottom: 8px; font-size: 0.85rem;
         }
-        .toggle-btn:hover { background: #374151; color: #FFFFFF; }
         .toggle-btn.active { background: #2563EB; color: #FFFFFF; border-color: #3B82F6; }
-        
-        .filter-checkbox { display: flex; align-items: center; margin-bottom: 6px; font-size: 0.85rem; cursor: pointer; color: #D1D5DB; }
-        .filter-checkbox input { margin-right: 8px; cursor: pointer; accent-color: #60A5FA; }
-        .filter-checkbox:hover { color: #FFFFFF; }
-
-        #legend { margin-top: 15px; font-size: 0.85rem; }
-        .legend-item { display: flex; align-items: center; margin-bottom: 6px; color: #D1D5DB; }
-        .legend-color { width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
-
+        .legend-item, .metric-item { display: flex; align-items: center; margin-bottom: 6px; font-size: 0.82rem; color: #D1D5DB; }
+        .legend-color, .metric-color { width: 12px; height: 12px; border-radius: 999px; margin-right: 8px; flex-shrink: 0; }
+        .filter-checkbox { display: flex; align-items: center; margin-bottom: 6px; font-size: 0.84rem; }
+        .filter-checkbox input { margin-right: 8px; accent-color: #60A5FA; }
         #stats-panel {
-            position: absolute; bottom: 0; left: 0; width: 100%; background: rgba(15, 23, 42, 0.85);
-            border-top: 1px solid #374151; padding: 12px 20px; box-sizing: border-box; display: flex;
-            justify-content: center; gap: 30px; backdrop-filter: blur(8px); z-index: 10; flex-wrap: wrap;
+            position: absolute; bottom: 0; left: 0; width: 100%; padding: 12px 20px; box-sizing: border-box;
+            display: flex; justify-content: center; gap: 24px; z-index: 10; flex-wrap: wrap; border-top: 1px solid #374151;
         }
-        .stat-item { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; color: #D1D5DB; font-weight: 500; text-transform: uppercase; }
-        .stat-color-box { width: 10px; height: 10px; border-radius: 3px; }
-
+        .stat-item { font-size: 0.84rem; color: #D1D5DB; font-weight: 500; text-transform: uppercase; }
         #loading {
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            background: rgba(0,0,0,0.8); padding: 20px 40px; border-radius: 8px; color: #fff;
-            font-size: 1.2rem; z-index: 100; pointer-events: none; border: 1px solid #374151;
+            background: rgba(0,0,0,0.8); padding: 20px 40px; border-radius: 8px; color: #fff; z-index: 100;
         }
     </style>
     <script src="https://unpkg.com/3d-force-graph"></script>
 </head>
 <body>
-    <div id="loading">Computing 3D Topology...</div>
+    <div id="loading">Computing Topology...</div>
     <div id="3d-graph"></div>
-    
+
     <div id="info-panel">
         <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible')">×</div>
         <h2 id="info-title"></h2>
         <div id="info-meta"></div>
-        
         <div class="info-section">
-            <strong>定义 (Definition)</strong>
+            <strong>Summary</strong>
             <div id="info-summary"></div>
         </div>
-        
         <div class="info-section">
-            <strong style="color: #60A5FA;">关联节点 (Associated Nodes)</strong>
-            <div id="info-outbound-container" style="margin-top: 10px;">
-                <strong style="font-size: 0.8rem; color: #9CA3AF;">Outbound Links (References)</strong>
-                <ul id="info-outbound"></ul>
-            </div>
-            <div id="info-inbound-container" style="margin-top: 10px;">
-                <strong style="font-size: 0.8rem; color: #9CA3AF;">Inbound Links (Referenced By)</strong>
-                <ul id="info-inbound"></ul>
-            </div>
+            <strong>Links</strong>
+            <ul id="info-links"></ul>
         </div>
-
-        <div class="info-section" id="info-sources-container">
+        <div class="info-section">
             <strong>Sources</strong>
             <ul id="info-sources"></ul>
         </div>
     </div>
-    
+
     <div id="right-hud">
         <div class="hud-box">
-            <h4>Search Wiki</h4>
-            <input type="text" id="search-input" placeholder="Type to search..." autocomplete="off">
+            <h4>Search</h4>
+            <input type="text" id="search-input" placeholder="Search node or claim..." autocomplete="off">
             <div id="search-results"></div>
         </div>
 
         <div class="hud-box">
+            <h4>View Mode</h4>
+            <button id="btn-page-view" class="toggle-btn active">Page View</button>
+            <button id="btn-claim-view" class="toggle-btn">Claim View</button>
+        </div>
+
+        <div class="hud-box">
             <h4>Color Mode</h4>
-            <button id="btn-type" class="toggle-btn active">Ontology (By Type)</button>
-            <button id="btn-community" class="toggle-btn">Topology (By Community)</button>
+            <button id="btn-type" class="toggle-btn active">Ontology / Claim State</button>
+            <button id="btn-community" class="toggle-btn">Page Community</button>
+        </div>
+
+        <div class="hud-box">
+            <h4>Legend</h4>
             <div id="legend"></div>
         </div>
 
         <div class="hud-box">
-            <h4>Filter Types</h4>
+            <h4>Filters</h4>
             <div id="type-filters"></div>
+        </div>
+
+        <div class="hud-box">
+            <h4>Governance</h4>
+            <div id="governance-metrics"></div>
         </div>
     </div>
 
@@ -150,299 +123,337 @@
     <script>
         const rawData = %%GRAPH_DATA%%;
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
-        
-        const TYPE_COLORS = {
-            "Entity": "#EF4444",   // Red
-            "Concept": "#00B0FF",  // Light Blue
-            "Source": "#10B981",   // Green
-            "Synthesis": "#F59E0B",// Orange
-            "System": "#8B5CF6",   // Purple
-            "Project": "#EC4899",  // Pink
-            "Person": "#F43F5E",   // Rose
-            "Event": "#14B8A6",    // Teal
-            "Term": "#64748B",     // Slate
-            "Unknown": "#9CA3AF"   // Gray
+
+        const PAGE_COLORS = {
+            "Entity": "#EF4444",
+            "Concept": "#00B0FF",
+            "Source": "#10B981",
+            "Synthesis": "#F59E0B",
+            "System": "#8B5CF6",
+            "Project": "#EC4899",
+            "Person": "#F43F5E",
+            "Event": "#14B8A6",
+            "Term": "#64748B",
+            "Unknown": "#9CA3AF"
         };
-        const COMMUNITY_COLORS = [
-            '#e6194b', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#d946ef', '#06b6d4', '#f43f5e', '#14b8a6', '#84cc16'
-        ];
-        
-        let colorMode = 'type'; 
-        const activeTypes = new Set();
-        
-        // Data processing
-        const inboundLinks = {};
-        const typeCounts = { _total: 0, _edges: rawData.edges.length };
-        
-        rawData.nodes.forEach(n => {
-            const grp = n.group || "Unknown";
-            activeTypes.add(grp);
-            typeCounts[grp] = (typeCounts[grp] || 0) + 1;
-            typeCounts._total++;
-
-            if (n.semantic_links) {
-                n.semantic_links.forEach(target => {
-                    if (!inboundLinks[target]) inboundLinks[target] = [];
-                    inboundLinks[target].push(n.id);
-                });
-            }
-        });
-
-        // Initialize HUD stats
-        const statsPanel = document.getElementById('stats-panel');
-        statsPanel.innerHTML = `<div class="stat-item">Nodes: ${typeCounts._total}</div>
-                                <div class="stat-item">Edges: ${typeCounts._edges}</div>
-                                <div style="width: 2px; height: 15px; background: #374151; margin: 0 10px;"></div>`;
-        
-        Object.keys(typeCounts).filter(k => !k.startsWith('_')).sort().forEach(type => {
-            const color = TYPE_COLORS[type] || TYPE_COLORS['Unknown'];
-            statsPanel.innerHTML += `<div class="stat-item"><div class="stat-color-box" style="background: ${color};"></div>${type}: ${typeCounts[type]}</div>`;
-        });
-
-        // Search logic
-        const searchInput = document.getElementById('search-input');
-        const searchResults = document.getElementById('search-results');
-        
-        searchInput.addEventListener('input', (e) => {
-            const val = e.target.value.toLowerCase();
-            searchResults.innerHTML = '';
-            if (!val) {
-                searchResults.style.display = 'none';
-                return;
-            }
-            
-            const matches = rawData.nodes.filter(n => n.name.toLowerCase().includes(val) || n.id.toLowerCase().includes(val)).slice(0, 10);
-            if (matches.length > 0) {
-                searchResults.style.display = 'block';
-                matches.forEach(m => {
-                    const div = document.createElement('div');
-                    div.className = 'search-item';
-                    const c = TYPE_COLORS[m.group] || TYPE_COLORS['Unknown'];
-                    div.innerHTML = `<span style="color:${c}; font-size:0.65rem; font-weight:600; padding:1px 3px; background:rgba(255,255,255,0.1); border-radius:2px; margin-right:5px; vertical-align:middle;">${(m.group || 'UNKNOWN').toUpperCase()}</span>${m.name}`;
-                    div.onclick = () => {
-                        searchInput.value = m.name;
-                        searchResults.style.display = 'none';
-                        window.selectNode(m.id);
-                    };
-                    searchResults.appendChild(div);
-                });
-            } else {
-                searchResults.style.display = 'none';
-            }
-        });
-
-        const gData = {
-            nodes: rawData.nodes.map(n => ({ ...n, id: n.id })),
-            links: rawData.edges.map(e => ({ source: e.source, target: e.target, weight: e.weight }))
+        const CLAIM_STATE_COLORS = {
+            "active": "#10B981",
+            "review-due": "#F59E0B",
+            "needs-review": "#F97316",
+            "expiring-soon": "#FB7185",
+            "expired": "#EF4444",
+            "unsupported": "#A855F7",
+            "conflicted": "#E11D48",
+            "provisional": "#38BDF8",
+            "unknown": "#9CA3AF"
         };
+        const COMMUNITY_COLORS = ['#e6194b', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#d946ef', '#06b6d4', '#f43f5e', '#14b8a6', '#84cc16'];
 
-        const neighbors = {};
-        gData.links.forEach(l => {
-            const s = l.source;
-            const t = l.target;
-            if (!neighbors[s]) neighbors[s] = new Set();
-            if (!neighbors[t]) neighbors[t] = new Set();
-            neighbors[s].add(t);
-            neighbors[t].add(s);
-        });
+        const graphs = {
+            page: rawData.pageGraph || { nodes: rawData.nodes || [], edges: rawData.edges || [], community_labels: rawData.community_labels || {} },
+            claim: rawData.claimGraph || { nodes: [], edges: [], community_labels: {} }
+        };
+        let activeGraphKey = 'page';
+        let colorMode = 'type';
+        let hoverNode = null;
+        const activeGroups = new Set();
 
-        function isNeighbor(n1, n2) {
-            const s = n1.id || n1;
-            const t = n2.id || n2;
-            return neighbors[s] && neighbors[s].has(t);
+        const graphDiv = document.getElementById('3d-graph');
+        const Graph = ForceGraph3D()(graphDiv);
+
+        function currentGraph() {
+            return graphs[activeGraphKey];
         }
 
-        let hoverNode = null;
+        function currentColor(node) {
+            if (hoverNode && hoverNode.id !== node.id && !isNeighbor(hoverNode, node)) {
+                return 'rgba(55,65,81,0.18)';
+            }
+            if (activeGraphKey === 'claim') {
+                return CLAIM_STATE_COLORS[node.validity_state || 'unknown'] || CLAIM_STATE_COLORS.unknown;
+            }
+            if (colorMode === 'community') {
+                const cid = node.community || 0;
+                return COMMUNITY_COLORS[cid % COMMUNITY_COLORS.length];
+            }
+            return PAGE_COLORS[node.group] || PAGE_COLORS.Unknown;
+        }
 
-        // Initialize 3D Force Graph
-        const Graph = ForceGraph3D()
-            (document.getElementById('3d-graph'))
-            .graphData(gData)
-            .nodeId('id')
-            .nodeLabel('name')
-            .nodeVal(node => Math.max(1, Math.sqrt(node.degree) * 1.5))
-            .nodeColor(node => {
-                if (hoverNode && hoverNode.id !== node.id && !isNeighbor(hoverNode, node)) {
-                    return 'rgba(55, 65, 81, 0.2)'; // Dimmed
-                }
-                if (colorMode === 'type') {
-                    return TYPE_COLORS[node.group] || TYPE_COLORS['Unknown'];
-                } else {
-                    const cid = node.community || 0;
-                    return COMMUNITY_COLORS[cid % COMMUNITY_COLORS.length];
-                }
-            })
-            .nodeOpacity(0.9)
-            .nodeVisibility(node => activeTypes.has(node.group))
-            .linkWidth(link => Math.max(0.5, link.weight * 0.3))
-            .linkColor(link => {
-                if (hoverNode) {
-                    const s = link.source.id || link.source;
-                    const t = link.target.id || link.target;
-                    if (s === hoverNode.id || t === hoverNode.id) {
-                        return 'rgba(96, 165, 250, 0.8)';
-                    }
-                    return 'rgba(0,0,0,0)';
-                }
-                return link.weight > 3.0 ? "rgba(16, 185, 129, 0.4)" : "rgba(156, 163, 175, 0.1)";
-            })
-            .linkVisibility(link => {
-                const s = link.source.group || (gData.nodes.find(n=>n.id==(link.source.id||link.source))||{}).group;
-                const t = link.target.group || (gData.nodes.find(n=>n.id==(link.target.id||link.target))||{}).group;
-                if (!activeTypes.has(s) || !activeTypes.has(t)) return false;
-                if (hoverNode) {
-                    const src = link.source.id || link.source;
-                    const tgt = link.target.id || link.target;
-                    return src === hoverNode.id || tgt === hoverNode.id;
-                }
-                return true;
-            })
-            .onNodeHover(node => {
-                document.body.style.cursor = node ? 'pointer' : null;
-                hoverNode = node;
-                Graph.nodeColor(Graph.nodeColor())
-                     .linkColor(Graph.linkColor())
-                     .linkVisibility(Graph.linkVisibility());
-            })
-            .onNodeClick(node => {
-                window.selectNode(node.id);
+        function buildNeighbors(graphData) {
+            const map = {};
+            graphData.links.forEach(link => {
+                const s = link.source.id || link.source;
+                const t = link.target.id || link.target;
+                if (!map[s]) map[s] = new Set();
+                if (!map[t]) map[t] = new Set();
+                map[s].add(t);
+                map[t].add(s);
             });
+            return map;
+        }
 
-        // Initialize Type Filters
-        const filtersContainer = document.getElementById('type-filters');
-        Array.from(activeTypes).sort().forEach(type => {
-            const lbl = document.createElement('label');
-            lbl.className = 'filter-checkbox';
-            lbl.innerHTML = `<input type="checkbox" value="${type}" checked> ${type}`;
-            lbl.querySelector('input').addEventListener('change', (e) => {
-                if(e.target.checked) activeTypes.add(type);
-                else activeTypes.delete(type);
-                Graph.nodeVisibility(Graph.nodeVisibility())
-                     .linkVisibility(Graph.linkVisibility());
-                renderLegend();
+        let neighbors = {};
+
+        function isNeighbor(n1, n2) {
+            const a = n1.id || n1;
+            const b = n2.id || n2;
+            return neighbors[a] && neighbors[a].has(b);
+        }
+
+        function syncActiveGroups() {
+            activeGroups.clear();
+            currentGraph().nodes.forEach(node => activeGroups.add(node.group || 'Unknown'));
+        }
+
+        function toGraphData(data) {
+            return {
+                nodes: data.nodes.map(node => ({ ...node })),
+                links: data.edges.map(edge => ({ ...edge }))
+            };
+        }
+
+        function updateFilters() {
+            const container = document.getElementById('type-filters');
+            container.innerHTML = '';
+            Array.from(new Set(currentGraph().nodes.map(node => node.group || 'Unknown'))).sort().forEach(group => {
+                const label = document.createElement('label');
+                label.className = 'filter-checkbox';
+                const checked = activeGroups.has(group) ? 'checked' : '';
+                label.innerHTML = `<input type="checkbox" value="${group}" ${checked}> ${group}`;
+                label.querySelector('input').addEventListener('change', (event) => {
+                    if (event.target.checked) activeGroups.add(group);
+                    else activeGroups.delete(group);
+                    renderGraph();
+                });
+                container.appendChild(label);
             });
-            filtersContainer.appendChild(lbl);
-        });
+        }
 
         function renderLegend() {
             const legend = document.getElementById('legend');
             legend.innerHTML = '';
-            if (colorMode === 'type') {
-                Array.from(activeTypes).sort().forEach((type) => {
-                    if(!activeTypes.has(type)) return;
-                    const color = TYPE_COLORS[type] || TYPE_COLORS['Unknown'];
-                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${type}</div>`;
+            if (activeGraphKey === 'claim') {
+                Object.entries(CLAIM_STATE_COLORS).forEach(([state, color]) => {
+                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${state}</div>`;
                 });
-            } else {
-                const counts = {};
-                gData.nodes.forEach(n => {
-                    if (activeTypes.has(n.group)) {
-                        counts[n.community] = (counts[n.community] || 0) + 1;
-                    }
-                });
-                const sortedComms = Object.keys(counts).sort((a,b) => counts[b] - counts[a]).slice(0, 8);
-                sortedComms.forEach(cid => {
+                return;
+            }
+            if (colorMode === 'community') {
+                const labels = currentGraph().community_labels || {};
+                Object.keys(labels).slice(0, 8).forEach(cid => {
                     const color = COMMUNITY_COLORS[cid % COMMUNITY_COLORS.length];
-                    const commLabels = rawData.community_labels || {};
-                    const label = commLabels[cid] || `Comm ${cid}`;
-                    // Truncate long labels for the legend
-                    const shortLabel = label.length > 25 ? label.substring(0, 25) + '...' : label;
-                    legend.innerHTML += `<div class="legend-item" title="${label}"><div class="legend-color" style="background:${color}"></div>${shortLabel} (${counts[cid]})</div>`;
+                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${labels[cid]}</div>`;
+                });
+                return;
+            }
+            Array.from(activeGroups).sort().forEach(group => {
+                const color = PAGE_COLORS[group] || PAGE_COLORS.Unknown;
+                legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${group}</div>`;
+            });
+        }
+
+        function renderGovernanceMetrics() {
+            const container = document.getElementById('governance-metrics');
+            const metrics = rawData.governanceMetrics || {};
+            const validityCounts = metrics.validity_state_counts || {};
+            container.innerHTML = '';
+            Object.entries(validityCounts).forEach(([state, count]) => {
+                const color = CLAIM_STATE_COLORS[state] || CLAIM_STATE_COLORS.unknown;
+                container.innerHTML += `<div class="metric-item"><div class="metric-color" style="background:${color}"></div>${state}: ${count}</div>`;
+            });
+            if (!container.innerHTML) {
+                container.innerHTML = '<div class="metric-item">No governance metrics.</div>';
+            }
+        }
+
+        function renderStats() {
+            const stats = document.getElementById('stats-panel');
+            const graph = currentGraph();
+            stats.innerHTML = '';
+            stats.innerHTML += `<div class="stat-item">${activeGraphKey} nodes: ${graph.nodes.length}</div>`;
+            stats.innerHTML += `<div class="stat-item">${activeGraphKey} edges: ${graph.edges.length}</div>`;
+            if (activeGraphKey === 'claim') {
+                const counts = rawData.governanceMetrics && rawData.governanceMetrics.validity_state_counts ? rawData.governanceMetrics.validity_state_counts : {};
+                Object.entries(counts).forEach(([state, count]) => {
+                    stats.innerHTML += `<div class="stat-item">${state}: ${count}</div>`;
                 });
             }
         }
 
-        // Toggles
-        document.getElementById('btn-type').addEventListener('click', (e) => {
+        function renderSearch() {
+            const input = document.getElementById('search-input');
+            const results = document.getElementById('search-results');
+            input.oninput = (event) => {
+                const val = event.target.value.toLowerCase();
+                results.innerHTML = '';
+                if (!val) {
+                    results.style.display = 'none';
+                    return;
+                }
+                const matches = currentGraph().nodes.filter(node => {
+                    const haystack = `${node.name || ''} ${node.id || ''} ${node.summary || ''}`.toLowerCase();
+                    return haystack.includes(val);
+                }).slice(0, 10);
+                if (!matches.length) {
+                    results.style.display = 'none';
+                    return;
+                }
+                results.style.display = 'block';
+                matches.forEach(match => {
+                    const row = document.createElement('div');
+                    row.className = 'search-item';
+                    row.textContent = match.name || match.id;
+                    row.onclick = () => {
+                        results.style.display = 'none';
+                        selectNode(match.id);
+                    };
+                    results.appendChild(row);
+                });
+            };
+        }
+
+        function nodeVisibility(node) {
+            return activeGroups.has(node.group || 'Unknown');
+        }
+
+        function resolveNode(idOrNode) {
+            if (typeof idOrNode === 'object') return idOrNode;
+            return currentGraph().nodes.find(node => node.id === idOrNode) || { group: 'Unknown' };
+        }
+
+        function linkVisibility(link) {
+            const s = resolveNode(link.source).group || 'Unknown';
+            const t = resolveNode(link.target).group || 'Unknown';
+            if (!activeGroups.has(s) || !activeGroups.has(t)) return false;
+            if (!hoverNode) return true;
+            const src = link.source.id || link.source;
+            const tgt = link.target.id || link.target;
+            return src === hoverNode.id || tgt === hoverNode.id;
+        }
+
+        function renderGraph() {
+            const data = toGraphData(currentGraph());
+            neighbors = buildNeighbors(data);
+            Graph.graphData(data)
+                .nodeId('id')
+                .nodeLabel(node => node.name || node.id)
+                .nodeVal(node => Math.max(1, Math.sqrt(node.degree || 1) * 1.4))
+                .nodeColor(currentColor)
+                .nodeVisibility(nodeVisibility)
+                .nodeOpacity(0.92)
+                .linkWidth(link => Math.max(0.5, (link.weight || 1) * 0.3))
+                .linkColor(link => {
+                    if (hoverNode) {
+                        const s = link.source.id || link.source;
+                        const t = link.target.id || link.target;
+                        if (s === hoverNode.id || t === hoverNode.id) return 'rgba(96,165,250,0.8)';
+                        return 'rgba(0,0,0,0)';
+                    }
+                    if (activeGraphKey === 'claim' && link.relation === 'contradiction') return 'rgba(239,68,68,0.55)';
+                    return 'rgba(156,163,175,0.12)';
+                })
+                .linkVisibility(linkVisibility)
+                .onNodeHover(node => {
+                    document.body.style.cursor = node ? 'pointer' : null;
+                    hoverNode = node;
+                    Graph.nodeColor(currentColor).linkVisibility(linkVisibility);
+                })
+                .onNodeClick(node => selectNode(node.id));
+            updateFilters();
+            renderLegend();
+            renderStats();
+        }
+
+        function nodeHref(node) {
+            if (activeGraphKey === 'claim') return null;
+            return `${memoryBasePath}wiki/${node.id}.md`;
+        }
+
+        function selectNode(nodeId) {
+            const node = currentGraph().nodes.find(item => item.id === nodeId);
+            if (!node) return;
+            const liveNode = Graph.graphData().nodes.find(item => item.id === nodeId) || node;
+            const distance = 150;
+            const norm = Math.hypot(liveNode.x || 1, liveNode.y || 1, liveNode.z || 1);
+            const ratio = 1 + distance / norm;
+            Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
+
+            const href = nodeHref(node);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+
+            const meta = [];
+            meta.push(`<span><strong>Mode:</strong> ${activeGraphKey}</span>`);
+            meta.push(`<span><strong>Group:</strong> ${node.group || 'Unknown'}</span>`);
+            meta.push(`<span><strong>Degree:</strong> ${node.degree || 0}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity:</strong> ${node.validity_state}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim Type:</strong> ${node.claim_type}</span>`);
+            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Confidence:</strong> ${node.confidence}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain:</strong> ${node.domain}</span>`);
+            if (node.updated) meta.push(`<span><strong>Updated:</strong> ${node.updated}</span>`);
+            if (node.subject_entities && node.subject_entities.length) meta.push(`<span><strong>Entities:</strong> ${node.subject_entities.join(', ')}</span>`);
+            document.getElementById('info-meta').innerHTML = meta.join('');
+            document.getElementById('info-summary').innerText = node.summary || 'No summary available.';
+
+            const links = document.getElementById('info-links');
+            const sources = document.getElementById('info-sources');
+            links.innerHTML = '';
+            sources.innerHTML = '';
+
+            (node.semantic_links || []).forEach(targetId => {
+                const targetNode = currentGraph().nodes.find(item => item.id === targetId);
+                const name = targetNode ? (targetNode.name || targetId) : targetId;
+                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">${name}</a></li>`;
+            });
+            if (!links.innerHTML) links.innerHTML = '<li>None</li>';
+
+            (node.sources || []).forEach(source => {
+                const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
+                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+            });
+            if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
+
+            document.getElementById('info-panel').classList.add('visible');
+        }
+
+        document.getElementById('btn-page-view').onclick = () => {
+            activeGraphKey = 'page';
+            colorMode = 'type';
+            syncActiveGroups();
+            document.getElementById('btn-page-view').classList.add('active');
+            document.getElementById('btn-claim-view').classList.remove('active');
+            document.getElementById('btn-community').disabled = false;
+            renderGraph();
+        };
+        document.getElementById('btn-claim-view').onclick = () => {
+            activeGraphKey = 'claim';
+            colorMode = 'type';
+            syncActiveGroups();
+            document.getElementById('btn-claim-view').classList.add('active');
+            document.getElementById('btn-page-view').classList.remove('active');
+            document.getElementById('btn-community').disabled = true;
+            document.getElementById('btn-community').classList.remove('active');
+            document.getElementById('btn-type').classList.add('active');
+            renderGraph();
+        };
+        document.getElementById('btn-type').onclick = () => {
             colorMode = 'type';
             document.getElementById('btn-type').classList.add('active');
             document.getElementById('btn-community').classList.remove('active');
-            Graph.nodeColor(Graph.nodeColor());
-            renderLegend();
-        });
-        document.getElementById('btn-community').addEventListener('click', (e) => {
+            renderGraph();
+        };
+        document.getElementById('btn-community').onclick = () => {
+            if (activeGraphKey === 'claim') return;
             colorMode = 'community';
             document.getElementById('btn-community').classList.add('active');
             document.getElementById('btn-type').classList.remove('active');
-            Graph.nodeColor(Graph.nodeColor());
-            renderLegend();
-        });
-
-        window.selectNode = function(nodeId) {
-            const node = gData.nodes.find(n => n.id === nodeId);
-            if (!node) return;
-            
-            // Move camera
-            const distance = 150;
-            const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
-            const newPos = { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio };
-            Graph.cameraPosition(newPos, node, 1500);
-
-            document.getElementById("info-title").innerHTML = `<a href="${memoryBasePath}wiki/${node.id}.md" target="_blank">${node.name}</a>`;
-            
-            const commLabels = rawData.community_labels || {};
-            const commLabel = commLabels[node.community] || `Comm ${node.community || 0}`;
-
-            document.getElementById("info-meta").innerHTML = `
-                <span><strong>Type:</strong> ${node.group}</span>
-                <span><strong>Status:</strong> ${node.status || 'draft'}</span>
-                <span><strong>Domain:</strong> ${node.domain || 'General'}</span>
-                <span><strong>Degree:</strong> ${node.degree}</span>
-                <span><strong>Community:</strong> ${commLabel}</span>
-                <span><strong>Updated:</strong> ${node.updated}</span>`;
-            
-            document.getElementById("info-summary").innerText = node.summary || "No summary available.";
-            
-            // Sources
-            let sourcesHtml = "";
-            if (node.sources && node.sources.length > 0) {
-                node.sources.forEach(s => {
-                    sourcesHtml += `<li><a href="${memoryBasePath}${s}" target="_blank">${s}</a></li>`;
-                });
-            } else {
-                sourcesHtml += "<li>None</li>";
-            }
-            document.getElementById("info-sources").innerHTML = sourcesHtml;
-            
-            // Outbound Links
-            let outHtml = "";
-            if (node.semantic_links && node.semantic_links.length > 0) {
-                node.semantic_links.forEach(t => {
-                    const tNode = gData.nodes.find(n => n.id === t);
-                    const tName = tNode ? tNode.name : t;
-                    const tGrp = tNode ? tNode.group : 'Unknown';
-                    const c = TYPE_COLORS[tGrp] || TYPE_COLORS['Unknown'];
-                    outHtml += `<li><span style="color:${c}; font-size:0.7rem; font-weight:600; padding:2px 4px; background:rgba(255,255,255,0.1); border-radius:3px; margin-right:5px; vertical-align:middle;">${tGrp.toUpperCase()}</span><a class="node-link" onclick="window.selectNode('${t}')">${tName}</a></li>`;
-                });
-            } else {
-                outHtml += "<li>None</li>";
-            }
-            document.getElementById("info-outbound").innerHTML = outHtml;
-
-            // Inbound Links
-            let inHtml = "";
-            const inLinks = inboundLinks[node.id] || [];
-            if (inLinks.length > 0) {
-                inLinks.forEach(t => {
-                    const tNode = gData.nodes.find(n => n.id === t);
-                    const tName = tNode ? tNode.name : t;
-                    const tGrp = tNode ? tNode.group : 'Unknown';
-                    const c = TYPE_COLORS[tGrp] || TYPE_COLORS['Unknown'];
-                    inHtml += `<li><span style="color:${c}; font-size:0.7rem; font-weight:600; padding:2px 4px; background:rgba(255,255,255,0.1); border-radius:3px; margin-right:5px; vertical-align:middle;">${tGrp.toUpperCase()}</span><a class="node-link" onclick="window.selectNode('${t}')">${tName}</a></li>`;
-                });
-            } else {
-                inHtml += "<li>None</li>";
-            }
-            document.getElementById("info-inbound").innerHTML = inHtml;
-            
-            document.getElementById("info-panel").classList.add("visible");
+            renderGraph();
         };
 
-        renderLegend();
-        
-        // Hide loading
-        setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 1000);
-
+        syncActiveGroups();
+        renderGovernanceMetrics();
+        renderSearch();
+        renderGraph();
+        setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 800);
     </script>
 </body>
 </html>

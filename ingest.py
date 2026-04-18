@@ -8,6 +8,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from db import get_processed_files, mark_file_processed
+import governance_store
+from wiki_utils import backup_file, get_memory_dir, get_wiki_dir, normalize_raw_ref, normalize_sources, read_markdown_file, sanitize_wiki_node
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -21,9 +23,9 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 # Resolve paths
 EXTENSION_ROOT = Path(__file__).parent
 TARGET_DIRS = [str((EXTENSION_ROOT / d).resolve()) for d in config.get("target_directories", [])]
-WIKI_DIR = (EXTENSION_ROOT / "../../MEMORY/wiki").resolve()
+WIKI_DIR = get_wiki_dir()
 SCHEMA_PATH = EXTENSION_ROOT / "schema.md"
-MEMORY_DIR = WIKI_DIR.parent  # .gemini/MEMORY/
+MEMORY_DIR = get_memory_dir()
 
 SUPPORTED_EXTS = { ".md", ".txt", ".png", ".jpeg", ".pdf" }
 
@@ -38,11 +40,7 @@ def _normalize_raw_ref(raw_ref: str) -> str:
     """Normalize a raw reference path for consistent matching.
     Strips leading MEMORY/ prefix, normalizes slashes.
     """
-    normalized = raw_ref.replace("\\", "/").strip()
-    # Remove leading MEMORY/ if present
-    if normalized.startswith("MEMORY/"):
-        normalized = normalized[len("MEMORY/"):]
-    return normalized
+    return normalize_raw_ref(raw_ref)
 
 def scan_existing_sources(wiki_dir) -> dict:
     """Scan wiki/ for all Source_*.md files and build raw_path -> source_filename mapping.
@@ -56,24 +54,13 @@ def scan_existing_sources(wiki_dir) -> dict:
         if not entry.is_file() or not entry.name.startswith("Source_") or not entry.name.endswith(".md"):
             continue
         try:
-            content = entry.read_text(encoding="utf-8")
+            frontmatter, _, _ = read_markdown_file(entry)
         except Exception:
             continue
-        # Parse YAML frontmatter
-        match = re.search(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-        if not match:
-            continue
-        yaml_block = match.group(1)
-        src_match = re.search(r"sources:\s*\[(.*?)\]", yaml_block, re.DOTALL)
-        if not src_match:
-            continue
-        sources_str = src_match.group(1)
-        sources = [s.strip().strip('"').strip("'") for s in sources_str.split(",")]
-        for src in sources:
+        for src in normalize_sources(frontmatter.get("sources", [])):
             if src:
-                normalized = _normalize_raw_ref(src)
-                if normalized not in mapping:
-                    mapping[normalized] = entry.name
+                if src not in mapping:
+                    mapping[src] = entry.name
     return mapping
 
 def calculate_hash(filepath: str) -> str:
@@ -104,15 +91,13 @@ def _backup_wiki_targets(wiki_dir, file_entries: list):
     """Create .bak snapshots of existing wiki files that may be modified.
     Enables rollback if the Ingestor Agent produces bad writes.
     """
-    import shutil
     backup_count = 0
     for entry in file_entries:
         if entry.get("action") == "UPDATE":
             target = os.path.join(str(wiki_dir), entry["target_source_file"])
             if os.path.exists(target):
-                bak_path = target + ".bak"
                 try:
-                    shutil.copy2(target, bak_path)
+                    backup_file(target)
                     backup_count += 1
                 except Exception as e:
                     log.warning(f"Failed to backup {target}: {e}")
@@ -406,9 +391,14 @@ Please begin extraction and node weaving.
                     changed_files.append(p)
                     
     if changed_files:
-        import tools
         for p in changed_files:
-            tools.sanitize_wiki_node(p)
+            sanitize_wiki_node(p)
+        governance_store.sync_pages_to_canonical(
+            changed_files,
+            origin="ingest",
+            auto_approve=True,
+            summary=f"Ingest sync for {len(changed_files)} page(s)",
+        )
         log.info(f"Agent modified and sanitized {len(changed_files)} wiki files.")
     else:
         log.warning("Agent ran for batch but no wiki files were modified.")

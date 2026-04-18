@@ -1,0 +1,4 @@
+description = "Preview or enqueue V8 merge suggestions for duplicate entities."
+prompt = """
+Please use the `merge_suggestions_vector_lake` tool and show the resulting merge candidates to the user.
+"""

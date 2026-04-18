@@ -1,6 +1,21 @@
 {
   "name": "vector-lake",
-  "version": "7.0.0",
+  "version": "7.2.0",
   "description": "LLM-Wiki engine for long-term memory retrieval and semantic consolidation via pure Markdown knowledge graph.",
-  "contextFileName": "CONTEXT.md"
+  "contextFileName": "CONTEXT.md",
+  "entry_points": {
+    "cli": "./cli.py",
+    "ingest": "./ingest.py",
+    "indexer": "./indexer.py",
+    "watchdog": "./watchdog_sync.py",
+    "review": "./review.py"
+  },
+  "runtime": {
+    "recommended_cwd": "extensions/vector-lake/",
+    "python_version": ">=3.10"
+  },
+  "excludeTools": [
+    "run_shell_command(rm -rf *)",
+    "run_shell_command(del /s /q *)"
+  ]
 }

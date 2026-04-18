@@ -32,6 +32,8 @@ Usage Examples:
   python cli.py review
   python cli.py review resolve 0
   python cli.py delete "/path/to/raw/file.pdf" --dry-run
+  python cli.py doctor
+  python cli.py migrate-v8 --dry-run
 """
     )
     
@@ -66,6 +68,18 @@ Usage Examples:
                                help="Resolution type: 'skip', 'create', 'acknowledge' (default: skip).")
 
     audit_graph_parser = subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the review queue.")
+    subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")
+    migrate_parser = subparsers.add_parser("migrate-v8", help="[MIGRATE] Backfill V8 canonical governance stores from existing wiki pages.")
+    migrate_parser.add_argument("--dry-run", action="store_true", help="Preview migration counts without persisting canonical stores.")
+    publish_parser = subparsers.add_parser("publish", help="[PUBLISH] Publish pending V8 change sets.")
+    publish_parser.add_argument("--limit", type=int, default=None, help="Maximum number of change sets to publish.")
+    debt_parser = subparsers.add_parser("debt", help="[DEBT] Show governance debt metrics.")
+    debt_parser.add_argument("--top", type=int, default=20, help="Top debt window size.")
+    trace_parser = subparsers.add_parser("trace", help="[TRACE] Show provenance trace for a query or identifier.")
+    trace_parser.add_argument("query_or_id", help="Query text or object identifier.")
+    merge_parser = subparsers.add_parser("merge-suggestions", help="[MERGE] Detect and enqueue candidate entity merges.")
+    merge_parser.add_argument("--limit", type=int, default=20, help="Maximum number of merge candidates to surface.")
+    merge_parser.add_argument("--preview", action="store_true", help="Do not enqueue governance items; only preview candidates.")
 
     delete_parser = subparsers.add_parser("delete", help="[DELETE] Cascade-delete a raw source and all related wiki pages.")
     delete_parser.add_argument("raw_path", help="Path to the raw source file to remove.")
@@ -101,6 +115,21 @@ Usage Examples:
             ))
         elif args.command == "audit-graph":
             print(tools.audit_graph())
+        elif args.command == "doctor":
+            print(tools.doctor_vector_lake())
+        elif args.command == "migrate-v8":
+            print(tools.migrate_v8(getattr(args, "dry_run", False)))
+        elif args.command == "publish":
+            print(tools.publish_vector_lake(getattr(args, "limit", None)))
+        elif args.command == "debt":
+            print(tools.debt_vector_lake(getattr(args, "top", 20)))
+        elif args.command == "trace":
+            print(tools.trace_vector_lake(args.query_or_id))
+        elif args.command == "merge-suggestions":
+            print(tools.merge_suggestions_vector_lake(
+                limit=getattr(args, "limit", 20),
+                enqueue=not getattr(args, "preview", False),
+            ))
         elif args.command == "delete":
             print(tools.delete_source(
                 args.raw_path,

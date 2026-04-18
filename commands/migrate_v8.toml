@@ -1,0 +1,4 @@
+description = "Backfill V8 canonical governance stores from the existing wiki corpus."
+prompt = """
+Please use the `migrate_v8` tool. If the user asked for a preview, call it with `dry_run=True`; otherwise run the full migration.
+"""

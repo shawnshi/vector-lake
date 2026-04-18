@@ -164,6 +164,8 @@ def index_worker_loop():
             for fname in pending_filenames:
                 indexer.update_index_item(fname)
                 log.info(f"O(1) Index updated for modified wiki node: {fname}")
+            if indexer.refresh_graph_topology_if_dirty():
+                log.info("Graph topology refreshed after partial wiki updates.")
             
             index_queue.task_done()
         except Exception as e:
