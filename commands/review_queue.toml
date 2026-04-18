@@ -1,4 +1,0 @@
-description = "Inspect the async review queue for contradictions, duplicates, and knowledge gaps flagged during ingestion."
-prompt = """
-Please use the `review_vector_lake` tool to list all pending review items. If there are items, read them out and ask the user which ones to resolve.
-"""

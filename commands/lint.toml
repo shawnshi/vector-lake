@@ -1,0 +1,4 @@
+description = "Trigger a comprehensive health check of the Vector Lake wiki and governance layers."
+prompt = """
+Please use the `lint_vector_lake` tool to trigger a full system health check. If the user explicitly asked to auto-fix issues, call it with `auto_fix=True`; otherwise leave `auto_fix=False`. This scans frontmatter completeness, naming compliance, type/status legality, category vocabulary, duplicate IDs, alias conflicts, broken links, orphan pages, file name similarities, knowledge decay, and governance debt signals. Read out the generated report to the user.
+"""

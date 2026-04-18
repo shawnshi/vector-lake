@@ -1,4 +1,0 @@
-description = "Search the Wiki pages via index.json metadata matching."
-prompt = """
-Please use the search_vector_lake tool to search for: {{args}}
-"""

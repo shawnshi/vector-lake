@@ -1,0 +1,4 @@
+description = "Manually trigger an ingest sync. Raw sources will be compiled into new or updated wiki nodes."
+prompt = """
+Please use the `sync_vector_lake` tool to synchronize raw sources into the wiki.
+"""

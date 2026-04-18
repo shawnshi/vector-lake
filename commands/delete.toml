@@ -1,0 +1,4 @@
+description = "Cascade-delete a raw source file and clean up all related wiki pages."
+prompt = """
+Please use the `delete_source` tool with the path "{{args}}" and `dry_run=True` first. Show the user what would be deleted. If the user confirms, re-run with `dry_run=False`.
+"""

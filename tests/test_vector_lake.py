@@ -7,21 +7,21 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-import ingest
-import indexer
-import review
-import governance_store
-import claim_extractor
-import tool_debt
-import tool_delete
-import tool_graph
-import tool_merge
-import tool_migrate
-import tool_publish
-import tool_query
-import tool_trace
-import wiki_utils
-from wiki_utils import write_markdown_file
+from vector_lake import ingest
+from vector_lake import indexer
+from vector_lake import review
+from vector_lake import governance_store
+from vector_lake import claim_extractor
+from vector_lake import tool_debt
+from vector_lake import tool_delete
+from vector_lake import tool_graph
+from vector_lake import tool_merge
+from vector_lake import tool_migrate
+from vector_lake import tool_publish
+from vector_lake import tool_query
+from vector_lake import tool_trace
+from vector_lake import wiki_utils
+from vector_lake.wiki_utils import write_markdown_file
 
 
 def _make_page(path: Path, title: str, page_type: str, sources=None, body: str = ""):
@@ -63,8 +63,8 @@ class VectorLakeTestCase(unittest.TestCase):
 class QueryDryRunTests(VectorLakeTestCase):
     def test_query_dry_run_does_not_persist_files(self):
         expected = "---\ntitle: Preview\n---\nBody"
-        with mock.patch("tool_query.assemble_context", return_value={"wiki_context": "", "wiki_page_count": 0, "purpose": "", "budget_used": 0, "budget_max": 0}):
-            with mock.patch("tool_query._run_gemini", return_value=mock.Mock(returncode=0, stdout=expected, stderr="")) as run_mock:
+        with mock.patch("vector_lake.tool_query.assemble_context", return_value={"wiki_context": "", "wiki_page_count": 0, "purpose": "", "budget_used": 0, "budget_max": 0}):
+            with mock.patch("vector_lake.tool_query._run_gemini", return_value=mock.Mock(returncode=0, stdout=expected, stderr="")) as run_mock:
                 result = tool_query.query_logic_lake("test", dry_run=True)
 
         self.assertIn(expected, result)
@@ -80,7 +80,7 @@ class DeleteSourceTests(VectorLakeTestCase):
         _make_page(self.wiki_dir / "Source_paper.md", "Source paper", "source", ["raw/paper.md"])
         _make_page(self.wiki_dir / "Concept_related.md", "Related", "concept", ["raw/paper.md", "raw/other.md"])
 
-        with mock.patch("tool_delete.indexer.generate_index"):
+        with mock.patch("vector_lake.tool_delete.indexer.generate_index"):
             preview = tool_delete.delete_source(str(raw_path), dry_run=True)
             self.assertIn("[DELETE_RAW]", preview)
             self.assertTrue(raw_path.exists())
@@ -99,8 +99,8 @@ class DeleteSourceTests(VectorLakeTestCase):
         _make_page(self.wiki_dir / "Source_paper.md", "Source paper", "source", ["raw/paper.md"])
         _make_page(self.wiki_dir / "Concept_related.md", "Related", "concept", ["raw/paper.md", "raw/other.md"])
 
-        with mock.patch("tool_delete.write_markdown_file", side_effect=OSError("write failed")):
-            with mock.patch("tool_delete.indexer.generate_index"):
+        with mock.patch("vector_lake.tool_delete.write_markdown_file", side_effect=OSError("write failed")):
+            with mock.patch("vector_lake.tool_delete.indexer.generate_index"):
                 result = tool_delete.delete_source(str(raw_path), dry_run=False)
 
         self.assertIn("Raw source was preserved", result)
@@ -210,8 +210,8 @@ class AuditGraphTests(VectorLakeTestCase):
         }), encoding="utf-8")
 
         captured = []
-        with mock.patch("tool_graph.indexer.refresh_graph_topology_if_dirty", return_value=False):
-            with mock.patch("tool_graph.review.add_items", side_effect=lambda items: captured.extend(items)):
+        with mock.patch("vector_lake.tool_graph.indexer.refresh_graph_topology_if_dirty", return_value=False):
+            with mock.patch("vector_lake.tool_graph.review.add_items", side_effect=lambda items: captured.extend(items)):
                 result = tool_graph.audit_graph()
 
         self.assertIn("Pushed 1", result)
@@ -229,9 +229,9 @@ class QueryUpdateTests(VectorLakeTestCase):
             write_markdown_file(target, current_frontmatter, "# Existing\n\nUpdated body\n")
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch("tool_query.assemble_context", return_value={"wiki_context": "", "wiki_page_count": 0, "purpose": "", "budget_used": 0, "budget_max": 0}):
-            with mock.patch("tool_query._run_gemini", side_effect=fake_run):
-                with mock.patch("tool_query.indexer.generate_index") as generate_index_mock:
+        with mock.patch("vector_lake.tool_query.assemble_context", return_value={"wiki_context": "", "wiki_page_count": 0, "purpose": "", "budget_used": 0, "budget_max": 0}):
+            with mock.patch("vector_lake.tool_query._run_gemini", side_effect=fake_run):
+                with mock.patch("vector_lake.tool_query.indexer.generate_index") as generate_index_mock:
                     result = tool_query.query_logic_lake("refresh existing synthesis", dry_run=False)
 
         self.assertIn("1 existing page(s) updated", result)
@@ -360,6 +360,35 @@ class GovernanceV8Tests(VectorLakeTestCase):
         self.assertGreaterEqual(len(payload["claimGraph"]["nodes"]), 2)
         self.assertTrue(all(node.get("node_kind") == "claim" for node in payload["claimGraph"]["nodes"]))
 
+    def test_governance_tools_bootstrap_from_existing_wiki_when_canonical_store_is_empty(self):
+        _make_page(self.wiki_dir / "Concept_alpha.md", "Alpha", "concept", ["raw/a.md"], "Alpha body")
+        stale_index = {
+            "nodes": {"Concept_alpha": {"title": "Alpha", "type": "concept", "links": [], "sources": ["raw/a.md"], "summary": "Alpha body"}},
+            "weighted_edges": [],
+            "aliases": {"Concept_alpha": "Concept_alpha"},
+            "claim_graph": {"nodes": [], "edges": []},
+            "entity_index": {},
+            "claim_index": {},
+            "source_index": {},
+            "governance_metrics": {},
+        }
+        index_path = wiki_utils.get_index_path()
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(json.dumps(stale_index), encoding="utf-8")
+
+        debt = tool_debt.debt_vector_lake()
+        trace = tool_trace.trace_vector_lake("Alpha")
+        with mock.patch("vector_lake.tool_graph.webbrowser.open"):
+            graph_result = tool_graph.visualize_vector_lake()
+
+        projection = governance_store.governance_projection()
+        self.assertGreater(len(governance_store.load_claims()["items"]), 0)
+        self.assertGreater(len(projection.get("claim_graph", {}).get("nodes", [])), 0)
+        self.assertIn("validity_state_counts", debt)
+        self.assertIn("Provenance Trace", trace)
+        self.assertIn("claim nodes", graph_result)
+
 
 if __name__ == "__main__":
     unittest.main()
+

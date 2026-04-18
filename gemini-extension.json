@@ -5,10 +5,10 @@
   "contextFileName": "CONTEXT.md",
   "entry_points": {
     "cli": "./cli.py",
-    "ingest": "./ingest.py",
-    "indexer": "./indexer.py",
+    "ingest": "./vector_lake/ingest.py",
+    "indexer": "./vector_lake/indexer.py",
     "watchdog": "./watchdog_sync.py",
-    "review": "./review.py"
+    "review": "./vector_lake/review.py"
   },
   "runtime": {
     "recommended_cwd": "extensions/vector-lake/",

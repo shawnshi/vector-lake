@@ -1,25 +1,39 @@
-import os
-import re
-from collections import defaultdict
+"""
+Purpose:
+    Ad hoc report for duplicated raw->Source mappings and near-duplicate Source page names.
 
-wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
+Safe to delete:
+    Yes, if equivalent checks are folded into a permanent governance or lint command.
+
+Replaced by CLI:
+    Partially. Current lint/governance commands cover related classes but not this exact report.
+"""
+
+import os
+import sys
+from collections import defaultdict
+from difflib import SequenceMatcher
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from vector_lake.wiki_utils import get_wiki_dir, normalize_sources, read_markdown_file
+
+wiki_dir = str(get_wiki_dir())
 source_map = defaultdict(list)
 
 for f in os.listdir(wiki_dir):
     if f.startswith("Source_") and f.endswith(".md"):
         filepath = os.path.join(wiki_dir, f)
-        with open(filepath, "r", encoding="utf-8") as fh:
-            content = fh.read()
-        match = re.search(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-        if match:
-            yaml_block = match.group(1)
-            src_match = re.search(r"sources:\s*\[(.*?)\]", yaml_block, re.DOTALL)
-            if src_match:
-                sources_str = src_match.group(1)
-                sources = [s.strip().strip('"').strip("'") for s in sources_str.split(",")]
-                for src in sources:
-                    if src:
-                        source_map[src].append(f)
+        try:
+            frontmatter, _, _ = read_markdown_file(filepath)
+        except Exception:
+            continue
+        for src in normalize_sources(frontmatter.get("sources", [])):
+            if src:
+                source_map[src].append(f)
 
 output = []
 output.append("=== Raw files with multiple Source wiki pages ===")
@@ -35,8 +49,6 @@ output.append(f"\n\n=== Stats ===")
 output.append(f"Total unique raw file references: {len(source_map)}")
 output.append(f"Raw files with duplicates: {dup_count}")
 
-# Also find Source pages with similar names
-from difflib import SequenceMatcher
 source_files = sorted([f for f in os.listdir(wiki_dir) if f.startswith("Source_") and f.endswith(".md")])
 output.append(f"\n\n=== Name-similar Source pages (ratio > 0.75) ===")
 sim_count = 0

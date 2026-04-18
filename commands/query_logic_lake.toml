@@ -1,4 +1,0 @@
-description = "Query the LLM-Wiki to synthesize insights and auto-generate new Wiki pages (Query-to-Page)."
-prompt = """
-Please use the `query_logic_lake` tool and pass the query text "{{args}}". If the user asks for a preview or dry run, call it with `dry_run=True` so it returns Markdown without writing files. Otherwise allow the normal persistent write flow.
-"""

@@ -73,10 +73,10 @@ The ingestion pipeline uses a two-step process to improve quality:
    Valid types: `contradiction`, `duplicate`, `missing-page`, `suggestion`.
 6. **Resync Index**: Let the background synchronizer rebuild `index.json`.
 
-### B. Query-to-Page & Serendipity
+### B. Query-to-Page
 When asked a complex question requiring synthesis across multiple wiki pages:
 1. Provide the answer to the user.
-2. If the synthesis generates new, valuable insights or cross-domain comparisons, **immediately write** this synthesis into a new Markdown page in `wiki/` (e.g., `Synthesis_Serendipity_X_Y.md`).
+2. If the synthesis generates new, valuable insights or cross-domain comparisons, **immediately write** this synthesis into a new Markdown page in `wiki/` (e.g., `Synthesis_Query_X_Y.md`).
 3. Update `log.md`.
 
 ### C. Linting (Health check)

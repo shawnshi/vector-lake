@@ -1,11 +1,15 @@
 """Validation: Test the new dedup functions against actual wiki data."""
-import sys
 import os
-sys.path.insert(0, r"c:\Users\shich\.gemini\extensions\vector-lake")
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
-from ingest import scan_existing_sources, canonical_source_name, _normalize_raw_ref, WIKI_DIR, MEMORY_DIR
-from pathlib import Path
+from vector_lake.ingest import scan_existing_sources, canonical_source_name, _normalize_raw_ref, WIKI_DIR, MEMORY_DIR
 
 print("=== Test 1: canonical_source_name ===")
 test_cases = [
@@ -71,3 +75,4 @@ print(f"\n=== SUMMARY ===")
 print(f"  canonical_source_name tests: {'ALL PASS' if all_pass else 'SOME FAILED'}")
 print(f"  scan_existing_sources found: {len(mapping)} mappings")
 print(f"  All 3 problem raws have dedup hits: {all(mapping.get(_normalize_raw_ref(r)) for r in problem_raws)}")
+

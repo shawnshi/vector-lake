@@ -4,7 +4,7 @@
 **Vector Lake** (V7.2 LLM-Wiki Engine) 是 Gemini CLI 的有状态知识库编译基座。它摒弃了传统的"无状态检索(Stateless RAG)"和黑盒数据库，将长程记忆彻底重构为**基于大模型维护的纯 Markdown 节点网络 (Stateful Compounding Wiki)**。
 
 V7.2 核心升级（The Topology & Autonomous Expansion Edition）：
-*   **拓扑审计与图谱裂缝发现 (Louvain Integration)**: 在 `indexer.py` 环节原生集成 Louvain 算法，自动划分动态知识社区（Community Detection），并为其动态提取主题标签（如 `Comm 2: Agentic AI / Vector Lake`）。算法同时计算内聚度 (Cohesion Score)，侦测孤立节点、稀疏知识区与跨域桥接节点。
+*   **拓扑审计与图谱裂缝发现 (Louvain Integration)**: 在 `vector_lake/indexer.py` 环节原生集成 Louvain 算法，自动划分动态知识社区（Community Detection），并为其动态提取主题标签（如 `Comm 2: Agentic AI / Vector Lake`）。算法同时计算内聚度 (Cohesion Score)，侦测孤立节点、稀疏知识区与跨域桥接节点。
 *   **自动捕食闭环 (Autonomous Deep Research)**: 引入 `audit-graph` 指令。系统自动将发现的拓扑裂缝合成为预定义研究任务注入 `review_queue.json`。人类批准（resolve create）后，系统自动触发网络爬虫获取资料并执行两步 CoT 回摄，实现知识边界的自主扩张。
 *   **3D 拓扑视觉引擎 (ForceGraph3D)**: 重新引入 3D 力导向球形渲染架构，同时保留并升级了所有高级 UI：节点度数缩放、双轨制着色切换（本体类型 vs. 拓扑社区）、带类别徽章（Category Badges）的悬停高亮 Ego-Graph、以及相机自动拉近的全局搜索框。
 *   **严酷本体论降维 (Strict Ontology Coercion)**: 在代码层级将所有节点强制拍扁、归一化为四种核心基础类型：`Entity`, `Concept`, `Source`, `Synthesis`。系统自动拦截并纠正 LLM 产生的命名幻觉（如 `Project`、`Person`、`System` 等），保障大盘统计的绝对纯净。
@@ -16,22 +16,22 @@ V7.2 核心升级（The Topology & Autonomous Expansion Edition）：
 采用 **Markdown 绝对主权**架构，零外部数据库依赖：
 *   **System 1 (Raw Sources)**: `MEMORY/raw/`。不可变的原始信源层（PDF、文章）。
 *   **System 2 (The Wiki)**: `MEMORY/wiki/`。大模型拥有绝对读写权限的固态资产层。所有的实体、概念、分析推演均以 `.md` 文件形式存在，通过 `[Relation:: [[双向链接]]]` 相互交织。
-*   **System 3 (Lightweight Index)**: `wiki/index.json`。Pure-JSON 元数据索引，由 `indexer.py` 全量重建，驱动搜索、拓扑可视化与 Agent 寻路。
+*   **System 3 (Lightweight Index)**: `wiki/index.json`。Pure-JSON 元数据索引，由 `vector_lake/indexer.py` 全量重建，驱动搜索、拓扑可视化与 Agent 寻路。
 *   **System 4 (Semantic Anchor)**: `MEMORY/purpose.md`。Wiki 的战略目标与关键问题定义。
 *   **System 5 (Review Queue)**: `wiki/.meta/review_queue.json`。异步人机协作与智能体任务分发队列。
 
 ## 3. 核心模块 (Module Map)
 | 模块 | 职责 |
 |---|---|
-| `cli.py` | Argparse 路由入口（含 review / delete / audit-graph 命令） |
-| `tools.py` | 9 个 Tool 函数（sync/search/lint/query/serendipity/graph/review/delete/audit_graph）。包含孤岛别名解析。 |
-| `ingest.py` | Raw→Wiki 两步 CoT 编译管线 |
-| `indexer.py` | `index.json` 生成器（含 4-信号相关性、Louvain 社区划分、裂缝洞察、动态标签、4 类本体强制降维） |
-| `review.py` | 异步审查队列与 Deep Research 触发器 |
-| `db.py` | `processed_files.json` 读写（MD5 哈希去重） |
-| `watchdog_sync.py` | 文件系统实时哨兵 |
+| `cli.py` | 根目录薄入口 |
+| `vector_lake/tools.py` | Tool facade（sync/search/lint/query/graph/review/delete/audit_graph） |
+| `vector_lake/ingest.py` | Raw→Wiki 两步 CoT 编译管线 |
+| `vector_lake/indexer.py` | `index.json` 生成器（含 4-信号相关性、Louvain 社区划分、裂缝洞察、动态标签、4 类本体强制降维） |
+| `vector_lake/review.py` | 异步审查队列与 Deep Research 触发器 |
+| `vector_lake/db.py` | `processed_files.json` 读写（MD5 哈希去重） |
+| `watchdog_sync.py` | 根目录薄入口，转发到包内 watchdog 应用 |
 | `templates/` | 3D 球形拓扑可视化 HTML 模板（ForceGraph3D，带丰富 UI 交互与信息卡片） |
-| `agents/` | 3 个 Gemini Subagent |
+| `agents/` | 2 个 Gemini Subagent（ingestor / synthesizer） |
 
 ## 4. 交互协议 (Interaction Protocol - CLI Native)
 **`[HARD_LOCK]`** 所有交互必须通过 `run_shell_command` 调用底层 CLI 工具执行。

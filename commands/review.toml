@@ -1,0 +1,4 @@
+description = "Inspect the async review queue for contradictions, topology gaps, merge suggestions, and knowledge debt items."
+prompt = """
+Please use the `review_vector_lake` tool to list all pending review items. If there are items, read them out and ask the user which ones to resolve.
+"""
