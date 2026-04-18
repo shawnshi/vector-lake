@@ -1,93 +1,187 @@
-# Vector Lake (LLM-Wiki 引擎 - Agentic Computable-Graph V7.2)
+# Vector Lake
 
-**Vector Lake** (V7.2) 是 Gemini CLI 的有状态、可产生复利的知识图谱与语义编译引擎。
+Vector Lake 是一个运行在 Gemini CLI 扩展环境中的 Markdown 知识图谱编译器。它保留了 V7.2 的 page-centric LLM-Wiki 工作流，同时已经接入一层最小可运行的 V8 知识治理内核：`Entity / Claim / Evidence / Source / Change Set`。
 
-它实现了由 Andrej Karpathy 提出的 [LLM-Wiki 模式](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)，彻底摒弃了传统的"无状态检索增强生成 (RAG)"和黑盒数据库。取而代之的是，它依赖 Gemini CLI Native Agent 来主动编译、相互链接并维护一个纯 Markdown 文件组成的持久化网络。
+它不是传统 RAG 服务，也不依赖外部数据库。主存仍然是 `MEMORY/raw` 和 `MEMORY/wiki`，但关键身份、provenance、validity 和 publish 状态已经进入 canonical object store。
 
-## V7.2 新特性 (The Topology Edition)
+## 当前状态
 
-- **拓扑审计与图谱裂缝发现 (Louvain Integration)**：在 `indexer.py` 环节原生集成 Louvain 算法，自动划分知识社区并提取**动态主题标签**（如 `Comm 2: Agentic AI / Vector Lake`）。系统同时计算内聚度 (Cohesion Score)，侦测孤立节点、稀疏知识区与跨域桥接节点。
-- **自动捕食闭环 (Autonomous Deep Research)**：引入 `audit-graph` 指令。系统自动将图谱裂缝合成为预定义研究任务注入异步审查队列。人类批准后，系统自动截获指令、触发网络搜索爬取资料并执行回摄，实现知识边界的自主扩张。
-- **3D 物理视觉引擎 (ForceGraph3D)**：彻底重写 `topology.html`，从 2D 升级回 3D WebGL 球形渲染。保留并增强了高级 UI：节点度数缩放、双轨制着色切换（本体分类 / 拓扑社区）、带动态类别徽章的悬停信息卡片、以及相机自动聚焦的搜索框。
-- **严酷本体论降维 (Strict Ontology Coercion)**：在索引生成阶段，强制拦截并把 LLM 创造的幻觉分类（如 Project、Person 等）降维归一化为 4 种基础类型（Entity, Concept, Source, Synthesis），保障了全局数据资产的结构纯净。
-- **孤岛链接解析 (Orphan & Alias Resolution)**：图谱生成器在前端静默解析双向链接的别名映射，并剔除指向尚未建立的空气节点的断链，彻底清除了图谱 UI 中烦人的 `[UNKNOWN]` 节点。
-- **双轨制契约 (Dual-Track Schema)**：实体页面物理切分为液态的“编译共识 (Compiled Truth)”与追加写入的固态“证据时间线 (Timeline)”。
-- **检索降噪 (Diversity Capping)**：引入前置查询裂变 (Query Expansion) 与后置类型压制，最高限制 Source 类型占 60%，防止长尾数据淹没上下文。
-- **并发安全互斥 (Global FileLock)**：在所有的 `index.json` 读写边界加装排他锁，彻底根治 Windows 下的并发 I/O 破损。
+- V7.2 兼容命令仍可用：`sync`、`search`、`query`、`lint`、`graph`、`review`、`audit-graph`、`delete`
+- V8 治理命令已落地：`doctor`、`migrate-v8`、`publish`、`debt`、`trace`、`merge-suggestions`
+- `query --dry-run` 已实现为真正不落盘的预览模式
+- 图谱支持双视图：
+  `Page View` 用于传统 wiki node topology
+  `Claim View` 用于 claim-level governance graph
 
-## 物理架构 (Architecture)
+## 核心能力
 
-系统在五个截然不同的物理层面上运行，**零外部数据库依赖**：
+- Markdown-first 知识库：原始信源在 `MEMORY/raw/`，发布页面在 `MEMORY/wiki/`
+- Canonical governance store：实体、主张、证据、来源和变更集保存在 `.meta/*.json`
+- Provenance trace：query 和 trace 可以追到 claim、source page、locator 和 validity state
+- Candidate publish flow：ingest / query 会生成 change set，publish 负责把 canonical 变更正式落地
+- Governance debt：系统会计算 `review-due`、`expired`、`unsupported`、`conflicted`、merge candidates 等知识债务
+- Dual graph UI：3D 拓扑图支持 page graph / claim graph 切换
+- FileLock safety：索引和队列写入都有锁，避免 Windows 下并发写坏
 
-1. **不可变信源区 (`MEMORY/raw/`)**：原始数据（PDF、文章、日志）。Agent 从中读取，**绝不修改**。
-2. **活跃知识库 (`MEMORY/wiki/`)**：持久化逻辑资产。Agent 拥有绝对写权限。实体、概念、推演页面通过 `[Relation:: [[双向链接]]]` 交织。
-3. **轻量级索引 (`wiki/index.json`)**：Pure-JSON 元数据索引，由 `indexer.py` 全量重建。包含 `nodes`、`weighted_edges`（4-信号相关性权重）、`communities`（Louvain 社区划分）、`community_labels`（动态标签）与 `graph_insights`（拓扑裂缝）。
-4. **语义锚点 (`MEMORY/purpose.md`)**：Wiki 的战略目标与关键问题定义，注入每次 LLM 操作以确保方向一致。
-5. **审查队列 (`wiki/.meta/review_queue.json`)**：异步人机协作队列与自动捕食任务存储。
+## 存储结构
 
-## Agentic 编译流
+```text
+MEMORY/
+  raw/
+  wiki/
+    *.md
+    index.json
+    views/
+      *.md
+      open_questions.md
+    .meta/
+      entities.json
+      claims.json
+      evidence.json
+      sources.json
+      change_sets.json
+      governance_queue.json
+      alias_registry.json
+```
 
-V7.2 采用**两步 CoT + 子代理隔离 + 纵深防御**架构：
+如果 `MEMORY/wiki/.meta` 不可写，系统会自动回退到仓库内的 `data/v8_meta/`。这让 Vector Lake 可以在只读 wiki 元目录环境下继续运行。
 
-* **强制读写节律 (Read-Write Rhythm)**：OODA 循环注入强制的前置实体嗅探 (Entity Sniffing) 与后置的图谱同步 (Graph Sync)，把检索与回写变成系统的“底层呼吸”。
-* **两步 Chain-of-Thought**：Step 1 注入 purpose + index summary → LLM 输出结构化分析；Step 2 注入分析结果 + schema → LLM 执行文件写入。物理分离确保"先想清楚再动手"。
-* **Subagent 隔离**：`vector-lake-ingestor` / `vector-lake-synthesizer` / `vector-lake-collider` 三个专用 Subagent，被剥夺终端执行权限，强制锁定在文件 I/O。
-* **4-信号相关性引擎**：每次索引重建时计算节点间的加权边 (direct link 3.0, source overlap 4.0, Adamic-Adar 1.5, type affinity 1.0)，驱动搜索图扩展和拓扑可视化。
-* **Review 闭环**：Agent 在 Step 2 结束时输出 `---REVIEW: type | title---` 块，由 `review.py` 解析存入 JSON 队列，用户异步裁决。
-* **强制中文架构**：子代理生成任何报告、实体解析和推演洞察时，强制使用高质量中文输出。
-* **Prompt 注入防御**：文件路径注入前经 `_sanitize_for_prompt()` 处理，剥离控制字符、反引号和 `@mention` 劫持向量。
-* **写入快照保护**：UPDATE 操作前自动调用 `_backup_wiki_targets()` 创建 `.bak` 快照。
+## 运行模型
 
-## 核心模块 (Module Map)
+### 1. Ingest
+
+`sync` 或 `watchdog_sync.py` 会扫描 `MEMORY/raw/`，通过两步式流程把原始信源编译进 wiki。当前兼容层仍保留 V7 风格页面写入，但在写完页面后会同步 canonical store。
+
+### 2. Query
+
+`query` 会先组装上下文，再调用 synthesizer。非 dry-run 模式下：
+
+- 检测新建或更新的 wiki 页面
+- sanitize 页面
+- 重建索引
+- 同步 canonical store
+- 附加 provenance trace
+
+### 3. Publish
+
+`publish` 会发布 pending change sets，并重建 canonical markdown views。当前 view builder 已支持：
+
+- entity canonical view
+- `open_questions.md` debt view
+
+### 4. Governance
+
+V8 治理层会把 claim 解析为 runtime validity states，例如：
+
+- `active`
+- `review-due`
+- `needs-review`
+- `expiring-soon`
+- `expired`
+- `unsupported`
+- `conflicted`
+- `provisional`
+
+## 命令
+
+### 基础工作流
+
+- 全量编译：`python cli.py sync`
+- 后台监听：`python watchdog_sync.py`
+- 搜索：`python cli.py search "Agentic workflow" --top_k 5`
+- 推演：`python cli.py query "对比两个方案的知识治理路径"`
+- 推演预览：`python cli.py query "生成一版提纲" --dry-run`
+- 审计：`python cli.py lint`
+- 图谱：`python cli.py graph`
+- 图谱洞察入队：`python cli.py audit-graph`
+- 查看 review 队列：`python cli.py review`
+- 删除 raw 及关联 wiki：`python cli.py delete "C:\\path\\to\\raw\\file.pdf"`
+
+### V8 治理命令
+
+- 环境检查：`python cli.py doctor`
+- 迁移现有 wiki 到 canonical store：`python cli.py migrate-v8`
+- 迁移预览：`python cli.py migrate-v8 --dry-run`
+- 发布 pending change sets：`python cli.py publish --limit 10`
+- 查看知识债务：`python cli.py debt --top 20`
+- 查看可追溯链路：`python cli.py trace "Agentic"`
+- 查看 merge 建议：`python cli.py merge-suggestions --limit 20`
+- 仅预览 merge 建议：`python cli.py merge-suggestions --limit 20 --preview`
+
+## 主要模块
 
 | 模块 | 职责 |
 |---|---|
-| `cli.py` | Argparse CLI 路由入口（sync/search/lint/query/serendipity/graph/review/audit-graph/delete） |
-| `tools.py` | 9 个 Tool 函数（含孤岛别名解析、图谱渲染网关等） |
-| `ingest.py` | Raw→Wiki 两步 CoT 编译管线（分析→生成 + purpose 注入 + review 解析） |
-| `indexer.py` | `index.json` 生成器（4-信号相关性 + Louvain 社区发现 + 动态主题标签 + 强制本体降维） |
-| `review.py` | 异步审查队列（REVIEW 块解析、JSON 持久化、CLI 展示/解决） |
-| `db.py` | `processed_files.json` 线程安全读写（FileLock） |
-| `watchdog_sync.py` | 文件系统实时监听哨兵 |
-| `templates/topology.html` | 3D WebGL 力导向拓扑可视化 HTML 模板（带信息抽屉与搜索聚焦） |
+| `cli.py` | CLI 路由入口 |
+| `tools.py` | Tool facade，聚合各命令模块 |
+| `ingest.py` | raw -> wiki 编译流程 |
+| `indexer.py` | 生成 `index.json`，维护 page graph + claim graph 投影 |
+| `review.py` | review queue 与治理队列兼容层 |
+| `wiki_utils.py` | 路径、frontmatter、atomic write、meta store helper |
+| `governance_store.py` | canonical object store 读写 |
+| `claim_extractor.py` | page/block -> claim/evidence/source 抽取 |
+| `change_sets.py` | change set 创建与发布包装 |
+| `governance_metrics.py` | validity 推理与 debt metrics |
+| `provenance.py` | provenance trace 构建 |
+| `view_builder.py` | canonical objects -> markdown views |
+| `tool_graph.py` | 3D 图谱渲染与 audit-graph |
+| `templates/topology.html` | page/claim 双视图 WebGL 模板 |
 
-## 工作流与命令 (Workflows & Commands)
+## 图谱说明
 
-通过 `gemini` CLI 命令或 `python cli.py <command>` 与 Vector Lake 交互。
+`graph` 命令会打开一个本地 HTML dashboard，当前支持：
 
-### 1. 自动编译管线 (Ingestion Compiler — 2-Step CoT)
-当您将新文件放入 `MEMORY/raw/` 目录时，系统唤醒 Agent 执行两步 CoT：先结构化分析（实体、概念、矛盾），再基于分析驱动文件生成、overview 更新和 review 标注。
-*   **手动全量编译**: `python cli.py sync`
-*   **启动后台监听哨兵**: `python watchdog_sync.py`
+- `Page View`
+  传统 wiki 页面节点图
+- `Claim View`
+  claim-level 节点图，按 validity state 着色
+- `Ontology / Claim State` 着色
+- `Page Community` 着色
+- governance metrics HUD
 
-### 2. 知识检索 (Search — CJK + Graph Expansion)
-CJK bigram 分词 + 三级评分（title +10 / summary +3 / body +1）+ 图扩展（top 3 结果的高权重邻居自动注入候选）。
-*   **搜索**: `python cli.py search "DRG 医保" --top_k 5`
+## 测试与验证
 
-### 3. 深度推演落盘 (Query-to-Page — 带预算控制 + 自动回摄)
-预算控制的上下文组装（60/20/5/15 分配），推演完成后自动检测新文件、重建索引、为断链生成 seed 页面。
-*   **推演查询**: `python cli.py query "对比 Vendor A 和 Vendor B 的 AI 战略差异"`
+当前仓库内有回归测试：
 
-### 4. 结构化审计自愈 (10-Point Structural Lint)
-10 项深度健康体检：前端完整性、命名合规、Type/Status 合法性、Category 词表、重复 ID、Alias 冲突、断链、孤岛页、相似文件名、知识衰变。
-*   **审计**: `python cli.py lint [--auto-fix]`
+- `python -m unittest discover -s tests -p "test_*.py" -v`
 
-### 5. 审查队列与拓扑审计 (Async Review Queue & Audit-Graph)
-查看和处理 LLM 在摄取过程中标记的矛盾、知识空白，以及由图谱算法发现的跨界桥梁（Bridge Nodes）等。
-*   **触发图谱审计**: `python cli.py audit-graph` (从索引中抽取网络拓扑裂缝并推入队列)
-*   **查看队列**: `python cli.py review`
-*   **解决条目**: `python cli.py review resolve <index> [--resolution skip|create]` (若 create 将触发爬虫自动补全网络盲区)
+覆盖的重点包括：
 
-### 6. 3D 拓扑图谱 (Graph View — 动态社区与实体降维)
-利用 `weighted_edges` 渲染 3D 交互图谱大屏，支持按本体分类（Entity/Concept）与 Louvain 社区（自动抽取主题词）进行双轨制着色。
-*   **大屏展示**: `python cli.py graph`
+- `query --dry-run` 不落盘
+- `delete_source` 安全语义
+- review queue 并发写
+- multiline YAML source parsing
+- 索引脏标记与恢复路径
+- V8 migration / publish / debt / trace
+- block-level claim extraction
+- validity state inference
+- claim graph projection
 
-### 7. 级联删除 (Cascade Delete)
-删除原始源文件及其关联的 wiki 页面。
-*   **执行**: `python cli.py delete "/path/to/raw/file.pdf"`
+## 依赖
 
-## 为什么采用这种架构？
+最小运行依赖在 [requirements.txt](requirements.txt)：
 
-传统的 RAG 系统在每次被提问时都在从零开始重新拼凑知识碎片。而 LLM-Wiki 模式将知识编译一次并保持常新。交叉引用在物理层面上真实存在；事实冲突被显式标注；逻辑综合反映了您阅读过的一切。
+- `filelock`
+- `networkx`
+- `python-dotenv`
+- `python-louvain`
+- `PyYAML`
+- `watchdog`
 
-V7.2 更是将图谱推入了“自治”阶段。它不再是一个被动查询的静态数据库，而是一个会利用 Louvain 算法侦测自己的“知识盲区”，并主动发起“网络捕食”的生命体。维护一个维基百科所带来的庞大脑力与体力劳动——现在已完全由底层的代码锁、图谱分析与永不疲倦的 LLM 接管。
+## 版本说明
+
+仓库实现已经包含 V8 治理层，但 `gemini-extension.json` 仍沿用 `7.2.0` 的扩展版本号。可以把当前状态理解为：
+
+- 运行时兼容层：V7.2
+- 知识治理内核：V8 minimal runnable implementation
+
+## 设计原则
+
+- 不引入外部数据库作为主存
+- Markdown 仍然是人类可读、可审计的发布层
+- canonical objects 才是身份、有效期和 provenance 的主权层
+- 能兼容旧工作流时，不破坏旧命令
+
+## 相关文档
+
+- V8 规范：[docs/specs/2026-04-19-v8-knowledge-governance-spec.md](docs/specs/2026-04-19-v8-knowledge-governance-spec.md)
