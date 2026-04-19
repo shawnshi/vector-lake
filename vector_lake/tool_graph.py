@@ -10,7 +10,7 @@ from vector_lake import get_extension_root
 from vector_lake import indexer
 from vector_lake import review
 from vector_lake import governance_store
-from vector_lake.wiki_utils import get_index_path, get_memory_dir
+from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_memory_dir
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -78,8 +78,17 @@ def _build_page_graph(index_data: dict) -> dict:
     }
 
 
-def _build_claim_graph(index_data: dict) -> dict:
-    claim_graph = index_data.get("claim_graph", {}) or {}
+def _build_claim_graph(claim_graph: dict) -> dict:
+    claim_graph = claim_graph or {}
+    adjacency = {}
+    for edge in claim_graph.get("edges", []):
+        source = edge.get("source")
+        target = edge.get("target")
+        if not source or not target:
+            continue
+        adjacency.setdefault(source, []).append(target)
+        adjacency.setdefault(target, []).append(source)
+
     nodes = []
     for node in claim_graph.get("nodes", []):
         nodes.append({
@@ -88,9 +97,9 @@ def _build_claim_graph(index_data: dict) -> dict:
             "group": node.get("group", "Claim"),
             "degree": node.get("degree", 0),
             "updated": node.get("updated", ""),
-            "summary": node.get("full_text", node.get("summary", "")),
+            "summary": node.get("summary", ""),
             "sources": node.get("source_pages", []),
-            "semantic_links": node.get("semantic_links", []),
+            "semantic_links": adjacency.get(node.get("id"), []),
             "node_kind": "claim",
             "validity_state": node.get("validity_state", "unknown"),
             "claim_type": node.get("claim_type", "claim"),
@@ -104,9 +113,9 @@ def _build_claim_graph(index_data: dict) -> dict:
     }
 
 
-def _build_graph_payload(index_data: dict) -> dict:
+def _build_graph_payload(index_data: dict, claim_graph_data: dict | None = None) -> dict:
     page_graph = _build_page_graph(index_data)
-    claim_graph = _build_claim_graph(index_data)
+    claim_graph = _build_claim_graph(claim_graph_data or {})
     return {
         "nodes": page_graph["nodes"],
         "edges": page_graph["edges"],
@@ -127,6 +136,7 @@ def visualize_vector_lake():
     extension_root = get_extension_root()
     memory_dir = str(get_memory_dir())
     index_path = str(get_index_path())
+    claim_graph_path = str(get_claim_graph_path())
     lock_path = index_path + ".lock"
     template_path = str(extension_root / "templates" / "topology.html")
     output_path = _graph_output_path(memory_dir)
@@ -150,15 +160,13 @@ def visualize_vector_lake():
     except json.JSONDecodeError:
         return "Error: Failed to parse index.json."
 
-    claim_graph = index_data.get("claim_graph", {}) or {}
-    if not claim_graph.get("nodes") and index_data.get("nodes"):
-        projection = governance_store.governance_projection()
-        index_data["entity_index"] = projection.get("entity_index", {})
-        index_data["claim_index"] = projection.get("claim_index", {})
-        index_data["source_index"] = projection.get("source_index", {})
-        index_data["claim_graph"] = projection.get("claim_graph", {"nodes": [], "edges": []})
+    try:
+        with open(claim_graph_path, "r", encoding="utf-8") as handle:
+            claim_graph = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        claim_graph = governance_store.build_claim_graph_projection()
 
-    graph_data = _build_graph_payload(index_data)
+    graph_data = _build_graph_payload(index_data, claim_graph)
 
     with open(template_path, "r", encoding="utf-8") as handle:
         html = handle.read()

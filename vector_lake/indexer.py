@@ -10,7 +10,7 @@ from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
 from vector_lake import governance_store
-from vector_lake.wiki_utils import get_index_path, get_wiki_dir
+from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir
 
 try:
     import networkx as nx
@@ -73,16 +73,24 @@ def _load_index_unlocked(output_path: str) -> dict | None:
         return json.load(handle)
 
 
-def _write_index(output_path: str, index_data: dict):
+def _write_json_payload(output_path: str, payload: dict):
     lock_path = output_path + ".lock"
     try:
         with FileLock(lock_path, timeout=15):
             temp_path = output_path + ".tmp"
             with open(temp_path, "w", encoding="utf-8") as handle:
-                json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
             os.replace(temp_path, output_path)
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
+
+
+def _write_index(output_path: str, index_data: dict):
+    _write_json_payload(output_path, index_data)
+
+
+def _write_claim_graph(output_path: str, claim_graph_data: dict):
+    _write_json_payload(output_path, claim_graph_data)
 
 
 def _mark_graph_dirty(index_data: dict, reason: str):
@@ -188,7 +196,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "aliases": aliases,
         "sources": sources,
         "links": sorted(links),
-        "summary": summary_text[:500],
+        "summary": summary_text[:240],
     }
 
 
@@ -383,15 +391,12 @@ def generate_index():
     index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
     _apply_graph_topology(index_data)
     index_data["categories"] = list(index_data["categories"])
-    projection = governance_store.governance_projection()
-    index_data["entity_index"] = projection["entity_index"]
-    index_data["claim_index"] = projection["claim_index"]
-    index_data["source_index"] = projection["source_index"]
-    index_data["claim_graph"] = projection["claim_graph"]
     index_data["governance_metrics"] = governance_metrics.compute_debt_metrics()
     index_data["schema_version"] = "8.0"
 
     output_path = str(get_index_path())
+    claim_graph_path = str(get_claim_graph_path())
+    _write_claim_graph(claim_graph_path, governance_store.build_claim_graph_projection())
     _write_index(output_path, index_data)
     log.info(
         f"Generated index.json with {len(index_data['nodes'])} nodes | "
@@ -497,17 +502,13 @@ def update_index_item(filename: str):
 
                 _mark_graph_dirty(index_data, f"Partial update for {filename}")
                 index_data["categories"] = list(index_data.get("categories", []))
-                projection = governance_store.governance_projection()
-                index_data["entity_index"] = projection["entity_index"]
-                index_data["claim_index"] = projection["claim_index"]
-                index_data["source_index"] = projection["source_index"]
-                index_data["claim_graph"] = projection["claim_graph"]
                 index_data["governance_metrics"] = governance_metrics.compute_debt_metrics()
                 index_data["schema_version"] = "8.0"
                 temp_path = output_path + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as handle:
                     json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
                 os.replace(temp_path, output_path)
+                _write_claim_graph(str(get_claim_graph_path()), governance_store.build_claim_graph_projection())
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
         return

@@ -34,6 +34,7 @@ Usage Examples:
   python cli.py search "MSL" --top_k 5
   python cli.py review
   python cli.py review resolve 0
+  python cli.py review resolve review_ab12cd34ef56
   python cli.py delete "/path/to/raw/file.pdf" --dry-run
   python cli.py doctor
   python cli.py migrate-v8 --dry-run
@@ -60,12 +61,12 @@ Usage Examples:
 
     subparsers.add_parser("graph", help="[GRAPH] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.")
 
-    review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the async review queue.")
+    review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.")
     review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve"], help="Action: 'list' (default) or 'resolve'.")
-    review_parser.add_argument("index", nargs="?", type=int, default=-1, help="Index of review item to resolve (for 'resolve' action).")
+    review_parser.add_argument("index", nargs="?", default="-1", help="Index or item_id of review item to resolve (for 'resolve' action).")
     review_parser.add_argument("--resolution", type=str, default="skip", help="Resolution type: 'skip', 'create', 'acknowledge' (default: skip).")
 
-    subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the review queue.")
+    subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.")
     subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")
 
     migrate_parser = subparsers.add_parser("migrate-v8", help="[MIGRATE] Backfill V8 canonical governance stores from existing wiki pages.")

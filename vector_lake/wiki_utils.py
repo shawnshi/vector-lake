@@ -63,6 +63,10 @@ def get_index_path() -> Path:
     return get_wiki_dir() / "index.json"
 
 
+def get_claim_graph_path() -> Path:
+    return get_wiki_dir() / "claim_graph.json"
+
+
 def get_entities_path() -> Path:
     return get_meta_dir() / "entities.json"
 
@@ -85,6 +89,10 @@ def get_change_sets_path() -> Path:
 
 def get_governance_queue_path() -> Path:
     return get_meta_dir() / "governance_queue.json"
+
+
+def get_review_queue_path() -> Path:
+    return get_meta_dir() / "review_queue.json"
 
 
 def get_alias_registry_path() -> Path:

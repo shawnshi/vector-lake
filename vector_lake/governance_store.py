@@ -184,7 +184,17 @@ def annotated_claims() -> list[dict]:
     ]
 
 
+def _compact_claim_text(text: str, limit: int = 240) -> str:
+    normalized = " ".join((text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 1)].rstrip() + "…"
+
+
 def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
+    max_degree = 12
+    entity_window = 6
+    source_window = 4
     entities = load_entities()["items"]
     sources = load_sources()["items"]
     claims = annotated_claims()
@@ -193,9 +203,9 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
         claims = claims[:limit_nodes]
 
     nodes = []
-    seen_edges = set()
-    edges = []
     claim_ids = {claim["claim_id"] for claim in claims}
+    node_lookup = {}
+    degree_map = {}
 
     for claim in claims:
         subject_names = [
@@ -208,65 +218,103 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
             for source_id in claim.get("source_ids", [])
             if source_id in sources
         ]
+        compact_text = _compact_claim_text(claim.get("claim_text", ""))
         nodes.append({
             "id": claim["claim_id"],
             "name": claim.get("claim_text", "")[:96] or claim["claim_id"],
-            "full_text": claim.get("claim_text", ""),
             "group": "Claim",
             "validity_state": claim.get("validity_state", "unknown"),
             "claim_type": claim.get("claim_type", "claim"),
             "confidence": claim.get("confidence"),
-            "summary": claim.get("claim_text", ""),
+            "summary": compact_text,
             "subject_entities": subject_names,
             "source_pages": source_pages,
             "degree": 0,
             "updated": claim.get("updated_at", ""),
-            "semantic_links": [],
         })
+        node_lookup[claim["claim_id"]] = nodes[-1]
+        degree_map[claim["claim_id"]] = 0
 
-    for index, left in enumerate(claims):
-        for right in claims[index + 1 :]:
-            relation = None
-            weight = 0.0
-            shared_entities = set(left.get("subject_entity_ids", [])) & set(right.get("subject_entity_ids", []))
-            shared_sources = set(left.get("source_ids", [])) & set(right.get("source_ids", []))
-            if right["claim_id"] in left.get("contradicts", []) or left["claim_id"] in right.get("contradicts", []):
-                relation = "contradiction"
-                weight = 4.0
-            elif shared_entities:
-                relation = "shared-entity"
-                weight = 2.5 + min(len(shared_entities), 3) * 0.5
-            elif shared_sources:
-                relation = "shared-source"
-                weight = 1.5 + min(len(shared_sources), 3) * 0.5
+    edge_records = {}
 
-            if not relation:
-                continue
+    def _record_edge(left_id: str, right_id: str, relation: str, weight: float, force: bool = False):
+        if left_id == right_id or left_id not in claim_ids or right_id not in claim_ids:
+            return
+        source_id, target_id = sorted((left_id, right_id))
+        edge_key = (source_id, target_id)
 
-            edge_key = tuple(sorted([left["claim_id"], right["claim_id"]]))
-            if edge_key in seen_edges:
-                continue
-            seen_edges.add(edge_key)
-            edges.append({
-                "source": edge_key[0],
-                "target": edge_key[1],
-                "weight": round(weight, 3),
-                "relation": relation,
-            })
+        existing = edge_records.get(edge_key)
+        if existing:
+            if weight > existing["weight"]:
+                existing["weight"] = round(weight, 3)
+                existing["relation"] = relation
+            return
 
-    degrees = {}
-    semantic_links = {}
-    for edge in edges:
-        degrees[edge["source"]] = degrees.get(edge["source"], 0) + 1
-        degrees[edge["target"]] = degrees.get(edge["target"], 0) + 1
-        semantic_links.setdefault(edge["source"], []).append(edge["target"])
-        semantic_links.setdefault(edge["target"], []).append(edge["source"])
+        if not force and (degree_map[source_id] >= max_degree or degree_map[target_id] >= max_degree):
+            return
 
-    for node in nodes:
-        node["degree"] = degrees.get(node["id"], 0)
-        node["semantic_links"] = semantic_links.get(node["id"], [])
+        edge_records[edge_key] = {
+            "source": source_id,
+            "target": target_id,
+            "weight": round(weight, 3),
+            "relation": relation,
+        }
+        degree_map[source_id] += 1
+        degree_map[target_id] += 1
 
-    return {"nodes": nodes, "edges": edges}
+    contradiction_pairs = set()
+    entity_buckets = {}
+    source_buckets = {}
+
+    for claim in claims:
+        claim_id = claim["claim_id"]
+        for right_id in claim.get("contradicts", []):
+            if right_id in claim_ids:
+                contradiction_pairs.add(tuple(sorted((claim_id, right_id))))
+        for entity_id in claim.get("subject_entity_ids", []):
+            entity_buckets.setdefault(entity_id, []).append(claim_id)
+        for source_id in claim.get("source_ids", []):
+            source_buckets.setdefault(source_id, []).append(claim_id)
+
+    for source_id, target_id in sorted(contradiction_pairs):
+        _record_edge(source_id, target_id, "contradiction", 4.0, force=True)
+
+    entity_pair_counts = {}
+    for claim_ids_for_entity in entity_buckets.values():
+        ordered_ids = sorted(set(claim_ids_for_entity))
+        for index, left_id in enumerate(ordered_ids):
+            for right_id in ordered_ids[index + 1 : index + 1 + entity_window]:
+                edge_key = tuple(sorted((left_id, right_id)))
+                entity_pair_counts[edge_key] = entity_pair_counts.get(edge_key, 0) + 1
+
+    for (source_id, target_id), shared_count in sorted(entity_pair_counts.items(), key=lambda item: (-item[1], item[0])):
+        weight = 2.5 + min(shared_count, 3) * 0.5
+        _record_edge(source_id, target_id, "shared-entity", weight)
+
+    source_pair_counts = {}
+    for claim_ids_for_source in source_buckets.values():
+        ordered_ids = sorted(set(claim_ids_for_source))
+        for index, left_id in enumerate(ordered_ids):
+            for right_id in ordered_ids[index + 1 : index + 1 + source_window]:
+                edge_key = tuple(sorted((left_id, right_id)))
+                source_pair_counts[edge_key] = source_pair_counts.get(edge_key, 0) + 1
+
+    for (source_id, target_id), shared_count in sorted(source_pair_counts.items(), key=lambda item: (-item[1], item[0])):
+        if (source_id, target_id) in edge_records:
+            continue
+        weight = 1.5 + min(shared_count, 3) * 0.5
+        _record_edge(source_id, target_id, "shared-source", weight)
+
+    edges = sorted(edge_records.values(), key=lambda edge: (-edge["weight"], edge["source"], edge["target"]))
+    for claim_id, degree in degree_map.items():
+        if claim_id in node_lookup:
+            node_lookup[claim_id]["degree"] = degree
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": _utc_now(),
+        "nodes": nodes,
+        "edges": edges,
+    }
 
 
 def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
@@ -428,6 +476,23 @@ def publish_change_sets(limit: int | None = None) -> dict:
 
 def pending_change_sets() -> list:
     return [item for item in load_change_sets()["items"] if item.get("status") == "pending"]
+
+
+def pending_governance_items() -> list:
+    return [item for item in load_governance_queue()["items"] if item.get("status") == "pending"]
+
+
+def resolve_governance_item(item_id: str, resolution: str = "skip") -> dict | None:
+    queue = load_governance_queue()
+    for item in queue["items"]:
+        if item.get("item_id") != item_id or item.get("status") != "pending":
+            continue
+        item["status"] = "resolved"
+        item["resolution"] = resolution
+        item["resolved_at"] = _utc_now()
+        save_governance_queue(queue)
+        return item
+    return None
 
 
 def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bool = True, summary: str | None = None) -> dict | None:

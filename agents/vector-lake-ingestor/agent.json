@@ -1,6 +1,6 @@
 {
   "name": "vector-lake-ingestor",
-  "description": "Exclusive subagent for compiling raw sources into markdown nodes via Polanyi protocol.",
+  "description": "Exclusive subagent for compiling raw sources into wiki pages within the current V7-compatible and V8-governed runtime.",
   "system_instructions_file": "system.md",
   "tools": [
     "view_file",

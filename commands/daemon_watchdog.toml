@@ -1,4 +1,4 @@
-description = "Launch the real-time ingest compiler as a background service."
+description = "Launch the real-time ingest watcher as the long-running background compiler for raw sources."
 prompt = '''
-Please use the run_command tool to execute "python watchdog_sync.py" as a background service, with WaitMsBeforeAsync=500. Do not substitute one-off sync commands for this daemon. Inform the user that the background ingest compiler service has started.
+Please start the long-running Vector Lake watchdog by executing `python watchdog_sync.py` as a background service. This is the persistent daemon path for ingest monitoring; do not substitute a one-off `sync` run for it. After starting it, tell the user that the watchdog daemon is running.
 '''

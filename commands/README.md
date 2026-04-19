@@ -9,7 +9,7 @@
 - `query.toml`: synthesize answers and optionally dry-run output
 - `lint.toml`: run wiki and governance health checks
 - `graph.toml`: render the interactive page/claim topology
-- `review.toml`: inspect and resolve governance review items
+- `review.toml`: inspect and resolve the unified legacy/governance review surface
 - `delete.toml`: preview or execute raw-source cascade deletion
 - `doctor.toml`: validate runtime dependencies and filesystem layout
 
@@ -25,6 +25,15 @@
 ## Background Services
 
 - `daemon_watchdog.toml`: launch the background ingest watcher
+
+## Review Semantics
+
+`review.toml` fronts the CLI `review` command, which now merges:
+
+- legacy `review_queue.json`
+- V8 `governance_queue.json`
+
+Operators can resolve items either by the visible pending index or by stable `item_id`.
 
 ## Renamed Commands
 
