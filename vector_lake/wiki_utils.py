@@ -91,10 +91,6 @@ def get_governance_queue_path() -> Path:
     return get_meta_dir() / "governance_queue.json"
 
 
-def get_review_queue_path() -> Path:
-    return get_meta_dir() / "review_queue.json"
-
-
 def get_alias_registry_path() -> Path:
     return get_meta_dir() / "alias_registry.json"
 

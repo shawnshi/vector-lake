@@ -5,24 +5,26 @@
     <title>Vector Lake Topology</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #0A0F14; overflow: hidden; font-family: 'Inter', sans-serif; color: #E5E7EB; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: radial-gradient(circle at center, #111827 0%, #030712 100%); overflow: hidden; font-family: 'Inter', sans-serif; color: #E5E7EB; }
         #3d-graph { width: 100%; height: 100%; position: absolute; inset: 0; z-index: 1; }
         #info-panel, .hud-box, #stats-panel {
-            background: rgba(15, 23, 42, 0.86);
-            border: 1px solid #374151;
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.45);
-            backdrop-filter: blur(8px);
+            background: rgba(15, 23, 42, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(16px) saturate(180%);
+            -webkit-backdrop-filter: blur(16px) saturate(180%);
         }
         #info-panel {
-            position: absolute; top: 20px; left: 20px; width: 400px; max-height: 82vh; overflow-y: auto;
+            position: absolute; top: 20px; left: 20px; width: 320px; max-height: 82vh; overflow-y: auto;
             border-radius: 10px; padding: 20px; z-index: 10; display: none;
         }
         #info-panel.visible { display: block; }
         #info-title { margin: 0 0 12px 0; font-size: 1.25rem; line-height: 1.2; }
         #info-title a { color: #60A5FA; text-decoration: none; }
         #info-title a:hover { text-decoration: underline; }
-        #info-meta { font-size: 0.82rem; color: #9CA3AF; margin-bottom: 12px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
-        #info-meta span { display: block; margin-bottom: 4px; }
+        #info-meta { font-size: 0.8rem; display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 12px; }
+        #info-meta span { display: inline-flex; align-items: center; background: rgba(55,65,81,0.5); padding: 4px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.05); }
+        #info-meta span strong { color: #9CA3AF; margin-right: 4px; font-weight: 500; }
         #info-summary { font-size: 0.92rem; line-height: 1.55; color: #D1D5DB; }
         .info-section { font-size: 0.85rem; word-break: break-word; background: rgba(0, 0, 0, 0.25); padding: 10px; border-radius: 6px; margin-bottom: 10px; }
         .info-section strong { color: #34D399; display: block; margin-bottom: 6px; }
@@ -30,7 +32,7 @@
         .info-section a { color: #60A5FA; text-decoration: none; cursor: pointer; }
         .info-section a:hover { text-decoration: underline; }
         #close-btn { position: absolute; top: 10px; right: 15px; cursor: pointer; color: #9CA3AF; font-size: 1.2rem; }
-        #right-hud { position: absolute; top: 20px; right: 20px; width: 280px; z-index: 10; display: flex; flex-direction: column; gap: 12px; }
+        #right-hud { position: absolute; top: 20px; right: 20px; width: 252px; max-height: 92vh; overflow-y: auto; z-index: 10; display: flex; flex-direction: column; gap: 12px; padding-right: 5px; }
         .hud-box { border-radius: 10px; padding: 12px 15px; }
         .hud-box h4 { margin: 0 0 10px 0; font-size: 0.82rem; color: #9CA3AF; text-transform: uppercase; letter-spacing: 0.06em; }
         #search-input {
@@ -66,7 +68,7 @@
     <div id="3d-graph"></div>
 
     <div id="info-panel">
-        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible')">×</div>
+        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible'); selectedNode = null; if(typeof Graph !== 'undefined') Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);">×</div>
         <h2 id="info-title"></h2>
         <div id="info-meta"></div>
         <div class="info-section">
@@ -125,10 +127,10 @@
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
 
         const PAGE_COLORS = {
-            "Entity": "#EF4444",
-            "Concept": "#00B0FF",
-            "Source": "#10B981",
-            "Synthesis": "#F59E0B",
+            "Entity": "#FF0266",
+            "Concept": "#00F0FF",
+            "Source": "#00FF41",
+            "Synthesis": "#FFB000",
             "System": "#8B5CF6",
             "Project": "#EC4899",
             "Person": "#F43F5E",
@@ -156,6 +158,7 @@
         let activeGraphKey = 'page';
         let colorMode = 'type';
         let hoverNode = null;
+        let selectedNode = null;
         const activeGroups = new Set();
 
         const graphDiv = document.getElementById('3d-graph');
@@ -165,9 +168,25 @@
             return graphs[activeGraphKey];
         }
 
+        function currentLinkColor(link) {
+            const focusNode = hoverNode || selectedNode;
+            if (focusNode) {
+                const s = link.source.id || link.source;
+                const t = link.target.id || link.target;
+                if (s === focusNode.id || t === focusNode.id) return 'rgba(255,2,102,0.85)';
+                return 'rgba(0,0,0,0)';
+            }
+            if (activeGraphKey === 'claim' && link.relation === 'contradiction') return 'rgba(255,0,60,0.6)';
+            return 'rgba(0,240,255,0.18)';
+        }
+
         function currentColor(node) {
-            if (hoverNode && hoverNode.id !== node.id && !isNeighbor(hoverNode, node)) {
-                return 'rgba(55,65,81,0.18)';
+            if (activeGraphKey === 'page' && (node.alignment_score < 60 || node.status === 'contested' || node.status === 'misaligned')) {
+                return '#FF003C';
+            }
+            const focusNode = hoverNode || selectedNode;
+            if (focusNode && focusNode.id !== node.id && !isNeighbor(focusNode, node)) {
+                return 'rgba(55,65,81,0.2)';
             }
             if (activeGraphKey === 'claim') {
                 return CLAIM_STATE_COLORS[node.validity_state || 'unknown'] || CLAIM_STATE_COLORS.unknown;
@@ -248,7 +267,8 @@
             }
             Array.from(activeGroups).sort().forEach(group => {
                 const color = PAGE_COLORS[group] || PAGE_COLORS.Unknown;
-                legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${group}</div>`;
+                const count = currentGraph().nodes.filter(n => (n.group || 'Unknown') === group).length;
+                legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${group} (${count})</div>`;
             });
         }
 
@@ -284,25 +304,54 @@
             const input = document.getElementById('search-input');
             const results = document.getElementById('search-results');
             input.oninput = (event) => {
-                const val = event.target.value.toLowerCase();
+                const val = event.target.value.toLowerCase().trim();
                 results.innerHTML = '';
                 if (!val) {
                     results.style.display = 'none';
                     return;
                 }
-                const matches = currentGraph().nodes.filter(node => {
-                    const haystack = `${node.name || ''} ${node.id || ''} ${node.summary || ''}`.toLowerCase();
-                    return haystack.includes(val);
-                }).slice(0, 10);
+                const tokens = val.split(/\s+/);
+                
+                const scoredMatches = currentGraph().nodes.map(node => {
+                    const name = (node.name || '').toLowerCase();
+                    const id = (node.id || '').toLowerCase();
+                    const summary = (node.summary || '').toLowerCase();
+                    
+                    let score = 0;
+                    let allTokensMatch = true;
+                    
+                    for (const token of tokens) {
+                        let tokenScore = 0;
+                        if (name.includes(token)) tokenScore = 10;
+                        else if (id.includes(token)) tokenScore = 5;
+                        else if (summary.includes(token)) tokenScore = 1;
+                        
+                        if (tokenScore === 0) {
+                            allTokensMatch = false;
+                            break;
+                        }
+                        score += tokenScore;
+                    }
+                    
+                    return { node, score, allTokensMatch };
+                }).filter(m => m.allTokensMatch && m.score > 0);
+                
+                scoredMatches.sort((a, b) => b.score - a.score);
+                const matches = scoredMatches.slice(0, 10);
+                
                 if (!matches.length) {
                     results.style.display = 'none';
                     return;
                 }
                 results.style.display = 'block';
-                matches.forEach(match => {
+                matches.forEach(matchObj => {
+                    const match = matchObj.node;
                     const row = document.createElement('div');
                     row.className = 'search-item';
-                    row.textContent = match.name || match.id;
+                    const title = match.name || match.id;
+                    const type = match.group ? `[${match.group}] ` : '';
+                    const degreeInfo = match.degree ? ` (关联: ${match.degree})` : '';
+                    row.textContent = `${type}${title}${degreeInfo}`;
                     row.onclick = () => {
                         results.style.display = 'none';
                         selectNode(match.id);
@@ -325,10 +374,11 @@
             const s = resolveNode(link.source).group || 'Unknown';
             const t = resolveNode(link.target).group || 'Unknown';
             if (!activeGroups.has(s) || !activeGroups.has(t)) return false;
-            if (!hoverNode) return true;
+            const focusNode = hoverNode || selectedNode;
+            if (!focusNode) return true;
             const src = link.source.id || link.source;
             const tgt = link.target.id || link.target;
-            return src === hoverNode.id || tgt === hoverNode.id;
+            return src === focusNode.id || tgt === focusNode.id;
         }
 
         function renderGraph() {
@@ -340,25 +390,36 @@
                 .nodeVal(node => Math.max(1, Math.sqrt(node.degree || 1) * 1.4))
                 .nodeColor(currentColor)
                 .nodeVisibility(nodeVisibility)
-                .nodeOpacity(0.92)
-                .linkWidth(link => Math.max(0.5, (link.weight || 1) * 0.3))
-                .linkColor(link => {
-                    if (hoverNode) {
-                        const s = link.source.id || link.source;
-                        const t = link.target.id || link.target;
-                        if (s === hoverNode.id || t === hoverNode.id) return 'rgba(96,165,250,0.8)';
-                        return 'rgba(0,0,0,0)';
-                    }
-                    if (activeGraphKey === 'claim' && link.relation === 'contradiction') return 'rgba(239,68,68,0.55)';
-                    return 'rgba(156,163,175,0.12)';
+                .nodeOpacity(node => {
+                    const focusNode = hoverNode || selectedNode;
+                    if (focusNode && focusNode.id !== node.id && !isNeighbor(focusNode, node)) return 0.25;
+                    let decay = node.decay_weight;
+                    if (decay === undefined) decay = 1.0;
+                    return Math.max(0.45, decay);
                 })
+                .linkWidth(link => Math.max(0.5, (link.weight || 1) * 0.3))
+                .linkColor(currentLinkColor)
                 .linkVisibility(linkVisibility)
+                .linkDirectionalParticles(link => {
+                    const focusNode = hoverNode || selectedNode;
+                    if (!focusNode) return 1;
+                    const src = link.source.id || link.source;
+                    const tgt = link.target.id || link.target;
+                    return (src === focusNode.id || tgt === focusNode.id) ? 3 : 0;
+                })
+                .linkDirectionalParticleSpeed(0.006)
+                .linkDirectionalParticleWidth(1.2)
                 .onNodeHover(node => {
                     document.body.style.cursor = node ? 'pointer' : null;
                     hoverNode = node;
-                    Graph.nodeColor(currentColor).linkVisibility(linkVisibility);
+                    Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
                 })
-                .onNodeClick(node => selectNode(node.id));
+                .onNodeClick(node => selectNode(node.id))
+                 .onBackgroundClick(() => {
+                     selectedNode = null;
+                     document.getElementById('info-panel').classList.remove('visible');
+                     Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
+                 });
             updateFilters();
             renderLegend();
             renderStats();
@@ -380,17 +441,20 @@
 
             const href = nodeHref(node);
             document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            selectedNode = node;
+            Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
             const meta = [];
-            meta.push(`<span><strong>Mode:</strong> ${activeGraphKey}</span>`);
-            meta.push(`<span><strong>Group:</strong> ${node.group || 'Unknown'}</span>`);
-            meta.push(`<span><strong>Degree:</strong> ${node.degree || 0}</span>`);
-            if (node.validity_state) meta.push(`<span><strong>Validity:</strong> ${node.validity_state}</span>`);
-            if (node.claim_type) meta.push(`<span><strong>Claim Type:</strong> ${node.claim_type}</span>`);
-            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Confidence:</strong> ${node.confidence}</span>`);
-            if (node.domain) meta.push(`<span><strong>Domain:</strong> ${node.domain}</span>`);
-            if (node.updated) meta.push(`<span><strong>Updated:</strong> ${node.updated}</span>`);
-            if (node.subject_entities && node.subject_entities.length) meta.push(`<span><strong>Entities:</strong> ${node.subject_entities.join(', ')}</span>`);
+            meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
+            meta.push(`<span><strong>Type</strong> ${node.group || 'Unknown'}</span>`);
+            meta.push(`<span><strong>Degree</strong> ${node.degree || 0}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${node.validity_state}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${node.claim_type}</span>`);
+            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${node.confidence}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain</strong> ${node.domain}</span>`);
+            if (node.updated) meta.push(`<span><strong>Updated</strong> ${node.updated.substring(0, 10)}</span>`);
+            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${node.alignment_score}</span>`);
+            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${node.decay_weight}</span>`);
             document.getElementById('info-meta').innerHTML = meta.join('');
             document.getElementById('info-summary').innerText = node.summary || 'No summary available.';
 
@@ -402,7 +466,8 @@
             (node.semantic_links || []).forEach(targetId => {
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">${name}</a></li>`;
+                const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
+                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
             });
             if (!links.innerHTML) links.innerHTML = '<li>None</li>';
 
@@ -457,3 +522,4 @@
     </script>
 </body>
 </html>
+>

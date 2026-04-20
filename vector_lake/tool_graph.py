@@ -8,7 +8,6 @@ from filelock import FileLock, Timeout
 
 from vector_lake import get_extension_root
 from vector_lake import indexer
-from vector_lake import review
 from vector_lake import governance_store
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_memory_dir
 
@@ -69,6 +68,8 @@ def _build_page_graph(index_data: dict) -> dict:
             "node_kind": "page",
             "status": node.get("status", ""),
             "domain": node.get("domain", ""),
+            "alignment_score": node.get("alignment_score", 100),
+            "decay_weight": node.get("decay_weight", 1.0),
         })
 
     return {

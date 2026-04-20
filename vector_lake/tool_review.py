@@ -1,5 +1,4 @@
 from vector_lake import governance_store
-from vector_lake import review
 
 
 def _truncate_text(text: str, limit: int = 120) -> str:
@@ -28,10 +27,6 @@ def _summarize_values(values, limit: int = 5) -> str:
 
 def _combined_pending_items() -> list[dict]:
     combined = []
-    for item in review.get_pending():
-        enriched = dict(item)
-        enriched["queue_kind"] = "review"
-        combined.append(enriched)
     for item in governance_store.pending_governance_items():
         enriched = dict(item)
         enriched["queue_kind"] = "governance"
@@ -52,17 +47,14 @@ def _format_combined_report(items: list[dict]) -> str:
         "merge": "[M]",
         "publish-candidate": "[P]",
     }
-    review_count = len([item for item in items if item.get("queue_kind") == "review"])
-    governance_count = len(items) - review_count
     lines = [
-        f"[REVIEW] {len(items)} Pending Items",
-        f"legacy_review: {review_count} | governance: {governance_count}",
+        f"[REVIEW] {len(items)} Pending Governance Items",
         "",
     ]
     for index, item in enumerate(items):
         icon = type_icons.get(item.get("type"), "[*]")
         lines.append(f"  [{index}] {icon} **{item.get('title', 'Untitled')}** ({item.get('type', 'unknown')})")
-        lines.append(f"      ID: {item.get('item_id', 'unknown')} | Queue: {item.get('queue_kind', 'unknown')}")
+        lines.append(f"      ID: {item.get('item_id', 'unknown')}")
         lines.append(f"      Source: {item.get('source', 'unknown')}")
         if item.get("description"):
             lines.append(f"      {_truncate_text(item['description'])}")
@@ -71,7 +63,7 @@ def _format_combined_report(items: list[dict]) -> str:
         if item.get("affected_pages"):
             lines.append(f"      Pages: {_summarize_values(item['affected_pages'], limit=5)}")
         lines.append("")
-    lines.append("Actions: `python cli.py review resolve <index|item_id> [--resolution skip|create]`")
+    lines.append("Actions: `python cli.py review resolve <index|item_id> [--resolution skip|create|merge|acknowledge]`")
     return "\n".join(lines)
 
 
@@ -87,9 +79,7 @@ def _resolve_combined_item(identifier, resolution: str = "skip"):
     if not target:
         return None
 
-    if target.get("queue_kind") == "governance":
-        return governance_store.resolve_governance_item(target["item_id"], resolution)
-    return review.resolve_item(target["item_id"], resolution)
+    return governance_store.resolve_governance_item(target["item_id"], resolution)
 
 
 def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip"):

@@ -1,11 +1,10 @@
-description = "Inspect the unified legacy/governance review surface for contradictions, topology gaps, merge suggestions, and knowledge debt items."
+description = "Inspect the unified V8 governance queue for contradictions, topology gaps, merge suggestions, and knowledge debt items."
 prompt = """
-Please use the `review_vector_lake` tool to list all pending review items across both the legacy review queue and the V8 governance queue.
+Please use the `review_vector_lake` tool to list all pending review items in the V8 governance queue.
 
 When presenting the result:
 - call out the visible pending index
 - preserve the stable item_id shown by the tool
-- mention whether the item came from the legacy queue or the governance queue
 - keep long query/page lists summarized rather than expanding the full payload
 
 If the user asks to resolve an item, accept either the pending index or the stable item_id and pass it back to `review_vector_lake`.

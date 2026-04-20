@@ -35,11 +35,11 @@ def lint_vector_lake(auto_fix: bool = False):
         "Strategy_and_Business", "System_Architecture",
         "Philosophy_and_Cognitive", "Biomedicine",
     }
-    valid_prefixes = ("Concept_", "Source_", "Entity_", "Synthesis_", "Event_", "Person_", "Project_", "Term_", "System_")
+    valid_prefixes = ("Concept_", "Source_", "Entity_", "Synthesis_")
     required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]
 
     files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]
-    issues = {key: [] for key in ["frontmatter", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "governance"]}
+    issues = {key: [] for key in ["frontmatter", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "governance", "alignment"]}
     fixes_applied = 0
 
     parsed = {}
@@ -169,25 +169,43 @@ def lint_vector_lake(auto_fix: bool = False):
             if ratio > 0.85 and key_a != key_b:
                 issues["similarity"].append(f"Possible duplicate: {key_a}.md <-> {key_b}.md (similarity: {ratio:.0%})")
 
-    today = datetime.datetime.now()
+    DEFAULT_TTL = {
+        "source": 365,
+        "synthesis": 730,
+        "entity": 1095,
+        "concept": 1825,
+    }
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
     for filename, data in parsed.items():
         frontmatter = data["fm"]
-        if str(frontmatter.get("epistemic-status", "")).lower() != "sprouting":
-            continue
         updated_str = str(frontmatter.get("updated", ""))
         if not updated_str:
             continue
         try:
-            updated = datetime.datetime.strptime(updated_str.replace("-", "")[:8], "%Y%m%d")
+            updated_dt = datetime.datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+            if updated_dt.tzinfo is None:
+                updated_dt = updated_dt.replace(tzinfo=datetime.timezone.utc)
+            age_days = (now_utc - updated_dt).days
         except (ValueError, TypeError):
             continue
-        age_days = (today - updated).days
-        if age_days > 60:
-            issues["decay"].append(f"{filename}: 'sprouting' for {age_days} days (updated: {updated_str})")
-            if auto_fix:
-                frontmatter["epistemic-status"] = "evergreen"
-                _write_fixed_frontmatter(data["path"], frontmatter, data["body"])
-                fixes_applied += 1
+            
+        if age_days > 0:
+            node_type = str(frontmatter.get("type", "concept")).lower().strip()
+            ttl = frontmatter.get("ttl")
+            if not isinstance(ttl, (int, float)):
+                ttl = DEFAULT_TTL.get(node_type, 1095)
+            
+            if ttl > 0:
+                decay_weight = 0.5 ** (age_days / ttl)
+                if decay_weight < 0.2:
+                    issues["decay"].append(f"{filename}: Severe Knowledge Decay (weight: {decay_weight:.2f}, age: {age_days}d, ttl: {ttl})")
+
+        alignment_score = frontmatter.get("alignment_score")
+        if isinstance(alignment_score, (int, float)) and alignment_score < 60:
+            node_status = str(frontmatter.get("status", "")).lower()
+            if node_status not in ["contested", "misaligned"]:
+                issues["alignment"].append(f"{filename}: Alignment Score {alignment_score} < 60 but status is '{node_status}', MUST be 'Contested'")
 
     governance_store.initialize_meta_store()
     metrics = governance_metrics.compute_debt_metrics()
@@ -210,6 +228,7 @@ def lint_vector_lake(auto_fix: bool = False):
         "similarity": "9. Filename Similarity",
         "decay": "10. Knowledge Decay",
         "governance": "11. Governance Debt",
+        "alignment": "12. Alignment Drift",
     }
 
     total_issues = sum(len(items) for items in issues.values())

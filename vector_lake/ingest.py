@@ -144,6 +144,26 @@ def _read_index_summary() -> str:
         return ""
 
 
+def _read_entity_dictionary() -> str:
+    """Read canonical identities and aliases to prevent entity drift."""
+    try:
+        from vector_lake import governance_store
+        entities = governance_store.load_entities().get("items", {})
+        if not entities:
+            return ""
+        lines = []
+        for entity in entities.values():
+            name = entity.get("canonical_name")
+            aliases = entity.get("aliases", [])
+            if name and aliases:
+                lines.append(f"- {name} (Aliases: {', '.join(aliases)})")
+            elif name:
+                lines.append(f"- {name}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def process_file_batch(filepaths: list, existing_source_map: dict = None):
     """Two-step Chain-of-Thought ingest pipeline.
     
@@ -229,6 +249,7 @@ def process_file_batch(filepaths: list, existing_source_map: dict = None):
     
     purpose_content = _read_purpose()
     index_summary = _read_index_summary()
+    entity_dict = _read_entity_dictionary()
     overview_content = _read_overview()
 
     # ── Step 1: Analysis ──────────────────────────────────────────
@@ -279,6 +300,8 @@ Be thorough but concise. Focus on what's genuinely important.
 {f"--- PURPOSE (Wiki 目标) ---{chr(10)}{purpose_content}" if purpose_content else ""}
 
 {f"--- EXISTING WIKI INDEX (检查现有内容) ---{chr(10)}{index_summary}" if index_summary else ""}
+
+{f"--- EXISTING ENTITY DICTIONARY (强制实体对齐) ---{chr(10)}{entity_dict}" if entity_dict else ""}
 """
 
     gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
@@ -322,6 +345,7 @@ Source Files (with MANDATORY target filenames):
 3. If the action is "CREATE", create a new file with the exact specified filename.
 4. NEVER create multiple Source pages for the same raw file.
 5. Use the exact "YAML sources field" value provided above in the frontmatter `sources:` array.
+6. ALWAYS check the EXISTING ENTITY DICTIONARY below. If an entity you are about to extract matches any Alias, you MUST normalize it to its Canonical Name. Do NOT create new pages for existing aliases.
 
 --- SCHEMA ---
 {schema_content}
@@ -331,7 +355,15 @@ Source Files (with MANDATORY target filenames):
 
 {f"--- PURPOSE (对齐目标) ---{chr(10)}{purpose_content}" if purpose_content else ""}
 
+{f"--- EXISTING ENTITY DICTIONARY (强制实体对齐) ---{chr(10)}{entity_dict}" if entity_dict else ""}
+
 --- ADDITIONAL REQUIREMENTS ---
+
+### Anti-Drift Alignment Scoring (反漂移验证)
+You MUST evaluate how closely each generated node (Entity, Concept, Source, Synthesis) aligns with `PURPOSE`.
+1. Calculate an `alignment_score` from 0 to 100.
+2. Add `alignment_score: [score]` to the YAML frontmatter.
+3. If `alignment_score` < 60, you MUST set `status: "Contested"`. Do not set it to "Active".
 
 ### overview.md 更新（必须）
 After writing entity/concept/source pages, you MUST also update `wiki/overview.md`.
@@ -373,10 +405,43 @@ Please begin extraction and node weaving.
     # ── Step 3: Parse review items from agent output ──────────────
     if stdout_str:
         try:
-            from vector_lake import review
-            review_items = review.parse_review_blocks(stdout_str, str(filepaths))
+            import re
+            from vector_lake import governance_store
+            
+            REVIEW_BLOCK_REGEX = re.compile(r'---REVIEW:\s*(\w[\w-]*)\s*\|\s*(.+?)\s*---\n([\s\S]*?)---END REVIEW---')
+            VALID_TYPES = {"contradiction", "duplicate", "missing-page", "suggestion"}
+            
+            review_items = []
+            for match in REVIEW_BLOCK_REGEX.finditer(stdout_str):
+                raw_type = match.group(1).strip().lower()
+                title = match.group(2).strip()
+                body = match.group(3).strip()
+
+                review_type = raw_type if raw_type in VALID_TYPES else "suggestion"
+
+                search_match = re.search(r'^SEARCH:\s*(.+)$', body, re.MULTILINE)
+                search_queries = [q.strip() for q in search_match.group(1).split("|") if q.strip()] if search_match else []
+
+                pages_match = re.search(r'^PAGES:\s*(.+)$', body, re.MULTILINE)
+                affected_pages = [p.strip() for p in pages_match.group(1).split(",") if p.strip()] if pages_match else []
+
+                description = body
+                description = re.sub(r'^SEARCH:.*$', '', description, flags=re.MULTILINE)
+                description = re.sub(r'^PAGES:.*$', '', description, flags=re.MULTILINE)
+                description = description.strip()
+
+                review_items.append({
+                    "item_type": review_type,
+                    "title": title,
+                    "description": description,
+                    "source": str(filepaths),
+                    "search_queries": search_queries,
+                    "affected_pages": affected_pages
+                })
+                
             if review_items:
-                review.add_items(review_items)
+                for item in review_items:
+                    governance_store.enqueue_governance_item(**item)
                 log.info(f"Captured {len(review_items)} review item(s) from agent output.")
         except Exception as e:
             log.warning(f"Failed to parse review items: {e}")

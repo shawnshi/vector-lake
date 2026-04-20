@@ -64,7 +64,7 @@ Usage Examples:
     review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.")
     review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve"], help="Action: 'list' (default) or 'resolve'.")
     review_parser.add_argument("index", nargs="?", default="-1", help="Index or item_id of review item to resolve (for 'resolve' action).")
-    review_parser.add_argument("--resolution", type=str, default="skip", help="Resolution type: 'skip', 'create', 'acknowledge' (default: skip).")
+    review_parser.add_argument("--resolution", type=str, default="skip", help="Resolution type: 'skip', 'create', 'merge', 'acknowledge' (default: skip).")
 
     subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.")
     subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")

@@ -23,7 +23,14 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
 
-VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_", "Event_", "Person_", "Project_", "Term_", "System_")
+VALID_PREFIXES = ("Concept_", "Source_", "Entity_", "Synthesis_")
+
+DEFAULT_TTL = {
+    "source": 365,
+    "synthesis": 730,
+    "entity": 1095,
+    "concept": 1825,
+}
 
 RELEVANCE_WEIGHTS = {
     "direct_link": 3.0,
@@ -38,6 +45,13 @@ TYPE_AFFINITY = {
     "source": {"entity": 1.0, "concept": 1.0, "source": 0.5, "synthesis": 1.0},
     "synthesis": {"entity": 1.0, "concept": 1.2, "source": 1.0, "synthesis": 0.8},
 }
+
+LEGACY_EMBEDDED_INDEX_KEYS = (
+    "claim_graph",
+    "claim_index",
+    "entity_index",
+    "source_index",
+)
 
 
 def _utc_now() -> str:
@@ -73,6 +87,17 @@ def _load_index_unlocked(output_path: str) -> dict | None:
         return json.load(handle)
 
 
+def _strip_legacy_embedded_payloads(index_data: dict | None) -> list[str]:
+    if not isinstance(index_data, dict):
+        return []
+    removed = []
+    for key in LEGACY_EMBEDDED_INDEX_KEYS:
+        if key in index_data:
+            index_data.pop(key, None)
+            removed.append(key)
+    return removed
+
+
 def _write_json_payload(output_path: str, payload: dict):
     lock_path = output_path + ".lock"
     try:
@@ -86,6 +111,9 @@ def _write_json_payload(output_path: str, payload: dict):
 
 
 def _write_index(output_path: str, index_data: dict):
+    removed = _strip_legacy_embedded_payloads(index_data)
+    if removed:
+        log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
     _write_json_payload(output_path, index_data)
 
 
@@ -148,6 +176,21 @@ def _parse_wiki_node(filepath: str, node_key: str):
     topic_cluster = fm_data.get("topic_cluster", "General")
     status = fm_data.get("status")
 
+    ttl = fm_data.get("ttl")
+    if not isinstance(ttl, (int, float)):
+        ttl = DEFAULT_TTL.get(node_type, 1095)
+
+    decay_weight = 1.0
+    try:
+        updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        if updated_dt.tzinfo is None:
+            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - updated_dt).days
+        if age_days > 0 and ttl > 0:
+            decay_weight = 0.5 ** (age_days / ttl)
+    except Exception:
+        pass
+
     if not domain or not status:
         log.warning(f"Schema violation: Missing 'domain' or 'status' in {os.path.basename(filepath)}. Node excluded from index.")
         return None
@@ -167,6 +210,11 @@ def _parse_wiki_node(filepath: str, node_key: str):
         sources = [raw_sources.strip()]
     else:
         sources = []
+
+    raw_alignment = fm_data.get("alignment_score", 100)
+    if not isinstance(raw_alignment, (int, float)):
+        raw_alignment = 100
+    alignment_score = max(0.0, min(100.0, float(raw_alignment)))
 
     links = set()
     body = content[frontmatter_match.end() :]
@@ -197,6 +245,8 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "sources": sources,
         "links": sorted(links),
         "summary": summary_text[:240],
+        "decay_weight": round(decay_weight, 4),
+        "alignment_score": round(alignment_score, 2),
     }
 
 
@@ -229,6 +279,15 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
     type_b = node_b.get("type", "concept").lower()
     affinity = TYPE_AFFINITY.get(type_a, {}).get(type_b, 0.5) * RELEVANCE_WEIGHTS["type_affinity"]
     score += affinity
+
+    decay_a = node_a.get("decay_weight", 1.0)
+    decay_b = node_b.get("decay_weight", 1.0)
+    
+    align_a = max(0.1, node_a.get("alignment_score", 100.0) / 100.0)
+    align_b = max(0.1, node_b.get("alignment_score", 100.0) / 100.0)
+    
+    score *= math.sqrt(decay_a * decay_b)
+    score *= math.sqrt(align_a * align_b)
 
     return round(score, 3)
 
@@ -428,6 +487,16 @@ def update_index_item(filename: str):
             if index_data is None:
                 needs_full_rebuild = True
             else:
+                removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
+                if removed_legacy_keys:
+                    log.info(
+                        "Detected legacy embedded governance payloads in index.json "
+                        f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+                    )
+                    needs_full_rebuild = True
+                    index_data = None
+
+            if index_data is not None:
                 if isinstance(index_data.get("categories"), list):
                     index_data["categories"] = set(index_data["categories"])
 
@@ -533,6 +602,15 @@ def refresh_graph_topology_if_dirty() -> bool:
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
         return False
+
+    removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
+    if removed_legacy_keys:
+        log.info(
+            "Detected legacy embedded governance payloads during graph refresh "
+            f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+        )
+        generate_index()
+        return True
 
     if is_graph_dirty(index_data):
         generate_index()

@@ -485,8 +485,31 @@ def pending_governance_items() -> list:
 def resolve_governance_item(item_id: str, resolution: str = "skip") -> dict | None:
     queue = load_governance_queue()
     for item in queue["items"]:
-        if item.get("item_id") != item_id or item.get("status") != "pending":
+        if item.get("item_id") != item_id:
             continue
+        # We allow re-resolving if it's already resolved but we need to re-apply the merge
+        if item.get("status") != "pending" and not (item.get("status") == "resolved" and resolution == "merge"):
+            continue
+        
+        # ACTUALLY PERFORM THE MERGE LOGIC HERE IF RESOLUTION IS MERGE
+        if resolution == "merge" and item.get("type") == "merge":
+            candidate = item.get("merge_candidate")
+            if candidate:
+                left_id = candidate.get("left_entity_id")
+                right_id = candidate.get("right_entity_id")
+                if left_id and right_id:
+                    # Update the alias registry to map right to left
+                    registry = load_alias_registry()
+                    registry["items"][right_id] = left_id
+                    save_alias_registry(registry)
+                    
+                    # Update entities file to mark right_id as merged/deprecated
+                    entities = load_entities()
+                    if right_id in entities["items"]:
+                        entities["items"][right_id]["status"] = "Merged"
+                        entities["items"][right_id]["merged_into"] = left_id
+                        save_entities(entities)
+
         item["status"] = "resolved"
         item["resolution"] = resolution
         item["resolved_at"] = _utc_now()

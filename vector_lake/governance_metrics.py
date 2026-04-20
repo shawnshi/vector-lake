@@ -72,11 +72,13 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
     candidates = []
 
     for index, left in enumerate(entities):
+        if left.get("status") == "Merged":
+            continue
         left_names = {left.get("canonical_name", ""), *left.get("aliases", [])}
         left_norms = {_normalized_name(name) for name in left_names if name}
         left_tokens = {token for name in left_names for token in re.split(r"\W+", str(name).lower()) if token}
         for right in entities[index + 1 :]:
-            if left["entity_id"] == right["entity_id"]:
+            if left["entity_id"] == right["entity_id"] or right.get("status") == "Merged":
                 continue
 
             right_names = {right.get("canonical_name", ""), *right.get("aliases", [])}

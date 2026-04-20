@@ -21,7 +21,9 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   domain: "Medical_IT"  # REQUIRED: The macro-domain (e.g., Medical_IT, Architecture)
   topic_cluster: "General" # REQUIRED: The specific sub-topic or room
   status: "Active" # REQUIRED: "Active", "Deprecated", "Archived", or "Contested"
+  alignment_score: 100 # REQUIRED: 0-100 indicating alignment with purpose.md (if < 60, status MUST be Contested)
   epistemic-status: "seed | sprouting | evergreen" # Note: use `status` for deprecation
+  ttl: 365 # Optional: Semantic half-life in days (e.g., 90 for fast-changing sources, 1825 for concepts)
   categories: ["System_Architecture"] # MUST be from SCHEMA_CATEGORIES.md
   tags: ["tag1", "tag2"]
   created: "YYYY-MM-DD"
@@ -35,6 +37,8 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
 - **Block-Level Provenance (Footnotes)**: When summarizing or extracting claims from sources, you MUST use Markdown footnotes to attribute specific claims to exact sources.
    - Example: `The model achieves SOTA performance[^1].\n\n[^1]: [[Source_Report_A.md]]`
 - **Contradictions & Synthesis**: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction (e.g., "> **Conflict Note:** Source A claims X, but Source B claims Y.").
+- **Epistemic Decay (TTL)**: For time-sensitive nodes (like news, market dynamics, product releases), actively assign a shorter `ttl` (e.g., 90 to 180 days). The system automatically tracks node age (days since `updated`) and applies an exponential decay weight: $D = 0.5 ^{age\_days / ttl}$. Default TTLs: Concept: 1825, Entity: 1095, Synthesis: 730, Source: 365. You may explicitly set `ttl` to override these defaults.
+- **Anti-Drift Forcefield**: Every page must have an `alignment_score` (0-100) determining its relevance to `purpose.md`. If a node's score is less than 60, its `status` MUST be set to "Contested" or "Misaligned". The topology engine will drastically penalize the graph relevance of low-alignment nodes.
 
 - **File Naming Policy & Ontology Lock**: 
   - To prevent entity drift, you MUST check existing aliases in `index.json` before inventing new Entities.
@@ -43,11 +47,6 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
     - `Entity_*.md`: Organizations, products, or individuals.
     - `Concept_*.md`: Abstract architectures, theories, phenomena.
     - `Synthesis_*.md`: Deep reasoning, comparative analysis, serendipity, or comprehensive reports.
-    - `Event_*.md`: Historical or industry events.
-    - `Person_*.md`: Individuals, authors, or executives.
-    - `Project_*.md`: Specific initiatives or projects.
-    - `Term_*.md`: Glossary definitions or acronyms.
-    - `System_*.md`: Software systems or IT platforms.
 
 ## 4. Workflows
 
