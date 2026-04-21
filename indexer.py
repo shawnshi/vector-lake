@@ -13,6 +13,11 @@ except ImportError:
     nx = None
     community_louvain = None
 
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
 
@@ -55,7 +60,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = yaml.load(fm_str, Loader=SafeLoader) or {}
 
     node_id = fm_data.get('id', "")
     title = fm_data.get('title', node_key)
@@ -149,8 +154,8 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
     key_a = node_a.get("_key", "")
     key_b = node_b.get("_key", "")
     
-    links_a = set(node_a.get("links", []))
-    links_b = set(node_b.get("links", []))
+    links_a = node_a.get("_links_set", set(node_a.get("links", [])))
+    links_b = node_b.get("_links_set", set(node_b.get("links", [])))
     
     # Signal 1: Direct link
     if key_b in links_a:
@@ -159,8 +164,8 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
         score += RELEVANCE_WEIGHTS["direct_link"]
     
     # Signal 2: Source overlap (most powerful — same source = same topic)
-    sources_a = set(node_a.get("sources", []))
-    sources_b = set(node_b.get("sources", []))
+    sources_a = node_a.get("_sources_set", set(node_a.get("sources", [])))
+    sources_b = node_b.get("_sources_set", set(node_b.get("sources", [])))
     shared_sources = len(sources_a & sources_b)
     score += shared_sources * RELEVANCE_WEIGHTS["source_overlap"]
     
@@ -234,6 +239,10 @@ def generate_index():
         if isinstance(cats, list):
             for c in cats:
                 index_data["categories"].add(c)
+
+        # Precompute sets for faster relevance calculation
+        node_data["_links_set"] = set(node_data.get("links", []))
+        node_data["_sources_set"] = set(node_data.get("sources", []))
     
     # ── Calculate weighted edges (4-signal relevance) ─────────────
     nodes_dict = index_data["nodes"]
@@ -248,16 +257,16 @@ def generate_index():
     for key_a in node_keys:
         node_a = nodes_dict[key_a]
         # Only compute edges for nodes that have links (performance optimization)
-        links_a = set(node_a.get("links", []))
-        sources_a = set(node_a.get("sources", []))
+        links_a = node_a.get("_links_set", set())
+        sources_a = node_a.get("_sources_set", set())
         
         for key_b in node_keys:
             if key_a >= key_b:  # Avoid duplicates (A-B same as B-A)
                 continue
             
             node_b = nodes_dict[key_b]
-            links_b = set(node_b.get("links", []))
-            sources_b = set(node_b.get("sources", []))
+            links_b = node_b.get("_links_set", set())
+            sources_b = node_b.get("_sources_set", set())
             
             # Skip if no possible connection (optimization: prune O(n²))
             has_direct = key_b in links_a or key_a in links_b
@@ -363,9 +372,11 @@ def generate_index():
             log.error(f"Graph analysis failed: {e}")
     # ----------------------------------------------------
     
-    # Clean up _key from nodes before serialization
+    # Clean up _key and precomputed sets from nodes before serialization
     for node in nodes_dict.values():
         node.pop("_key", None)
+        node.pop("_links_set", None)
+        node.pop("_sources_set", None)
     
     # Convert sets to list for JSON serialization
     index_data["categories"] = list(index_data["categories"])
@@ -458,6 +469,10 @@ def update_index_item(filename: str):
             if node_key in index_data.get("nodes", {}):
                 del index_data["nodes"][node_key]
         else:
+            # Precompute sets for faster relevance calculation
+            node_data["_links_set"] = set(node_data.get("links", []))
+            node_data["_sources_set"] = set(node_data.get("sources", []))
+
             index_data["nodes"][node_key] = node_data
             
             node_id = node_data["id"]
@@ -483,6 +498,13 @@ def update_index_item(filename: str):
                 if other_key == node_key:
                     continue
                 other_node["_key"] = other_key
+
+                # Make sure other_node has sets too
+                if "_links_set" not in other_node:
+                    other_node["_links_set"] = set(other_node.get("links", []))
+                if "_sources_set" not in other_node:
+                    other_node["_sources_set"] = set(other_node.get("sources", []))
+
                 relevance = calculate_relevance(node_data, other_node, all_nodes)
                 if relevance >= 1.5:
                     index_data["weighted_edges"].append({
@@ -491,7 +513,11 @@ def update_index_item(filename: str):
                         "weight": relevance,
                     })
                 other_node.pop("_key", None)
+                other_node.pop("_links_set", None)
+                other_node.pop("_sources_set", None)
             node_data.pop("_key", None)
+            node_data.pop("_links_set", None)
+            node_data.pop("_sources_set", None)
 
     lock_path = output_path + ".lock"
     try:

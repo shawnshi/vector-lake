@@ -1,0 +1,3 @@
+## 2026-04-21 - Caching Repeated Set Conversions in O(N^2) Relevance Loop
+**Learning:** The graph generation step in `indexer.py` compared every node with every other node ($O(N^2)$), and previously converted lists to sets inside the nested loop, causing millions of redundant array-to-set conversions. Additionally, `yaml.safe_load` uses pure Python, which was slow.
+**Action:** When building graph relationships in O(N^2) complexity, precompute and cache structure conversions (like lists to sets) on the node objects *before* entering the comparison loops, cleaning them up before JSON serialization. Switch to `yaml.CSafeLoader` where available.
