@@ -7,6 +7,11 @@ import logging
 from filelock import FileLock, Timeout
 
 try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
+try:
     import networkx as nx
     from community import community_louvain
 except ImportError:
@@ -55,7 +60,8 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    # Optimization: use C-based loader for speed
+    fm_data = yaml.load(fm_str, Loader=SafeLoader) or {}
 
     node_id = fm_data.get('id', "")
     title = fm_data.get('title', node_key)
