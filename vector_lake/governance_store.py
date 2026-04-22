@@ -616,3 +616,21 @@ def governance_projection() -> dict:
         "claim_graph": build_claim_graph_projection(),
     }
 
+
+def enqueue_governance_item(item_type: str, title: str, description: str, source: str, search_queries: list, affected_pages: list):
+    import uuid
+    queue = load_governance_queue()
+    queue["items"].append({
+        "item_id": f"gov_{uuid.uuid4().hex[:12]}",
+        "type": item_type,
+        "title": title,
+        "description": description,
+        "created_at": _utc_now(),
+        "status": "pending",
+        "source": source,
+        "search_queries": search_queries,
+        "affected_pages": affected_pages,
+    })
+    save_governance_queue(queue)
+
+

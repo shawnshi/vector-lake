@@ -2,5 +2,10 @@
   "target_directories": [
     "../../MEMORY/raw"
   ],
+  "exclude_paths": [
+    "stocks/",
+    "garmin/",
+    "personal-insights/"
+  ],
   "processed_files_path": "data/processed_files.json"
 }

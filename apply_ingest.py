@@ -1,6 +1,5 @@
 import os
 import datetime
-import re
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 os.makedirs(wiki_dir, exist_ok=True)
@@ -22,233 +21,413 @@ def append_file(filename, content):
     with open(path, 'a', encoding='utf-8') as f:
         f.write('\n' + content.strip() + '\n')
 
-def update_or_create_source(filename, title, yaml_sources, insights, category):
-    content = read_file(filename)
-    date_str = datetime.datetime.now().strftime('%Y-%m-%d')
-    if content:
-        # Append insights
-        content += f"\n\n## {date_str} 战略审计增补\n" + insights.strip()
-        write_file(filename, content)
-    else:
-        # Create new
-        id_str = datetime.datetime.now().strftime('%Y%m%d') + "_srcnew"
-        new_content = f"""
+# 1. Source Pages
+sources = [
+    {
+        "file": "Source_从数字化到智能化：中国医疗信息化的过去、现在与未来.md",
+        "title": "从数字化到智能化：中国医疗信息化的过去、现在与未来",
+        "content": """---
+id: \"20260421_s1a2b3\"
+title: \"Source_从数字化到智能化：中国医疗信息化的过去、现在与未来\"
+type: \"source\"
+domain: \"Medical_IT\"
+topic_cluster: \"General\"
+status: \"Active\"
+alignment_score: 95
+epistemic-status: \"evergreen\"
+categories: [\"Healthcare_IT\"]
+tags: [\"中国医疗信息化\", \"发展阶段\", \"集成困局\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/从数字化到智能化：中国医疗信息化的过去、现在与未来.md\"]
 ---
-id: "{id_str}"
-title: "{title}"
-type: "source"
-domain: "Medical_IT"
-topic_cluster: "General"
-status: "Active"
-epistemic-status: "evergreen"
-categories: ["{category}"]
-tags: ["2026", "Audit"]
-created: "{date_str}"
-updated: "{date_str}"
-sources: {yaml_sources}
+
+# 从数字化到智能化：中国医疗信息化的过去、现在与未来
+
+## 核心摘要
+本文梳理了中国医疗信息化发展的四个阶段：以行政管理为核心的 HIS 阶段、以临床应用为核心的 CIS/EMR 阶段、以互联互通为核心的平台阶段，以及正在迈入的以价值驱动为核心的智能化阶段。文章指出，当前中国医疗 IT 正处于由系统碎片化和标准不统一导致的“集成困局”中，迫切需要通过重构架构实现向智能化的跃迁。
+
+## 关键观点
+- **集成困局 (Integration Abyss)**：由于早期建设缺乏顶层规划，导致医院内部形成了大量“数据孤岛”，系统间的互操作性极差[^1]。
+- **范式转移**：从“流程驱动”转向“价值驱动”，IT 系统必须从记录工具进化为智能反馈系统[^1]。
+
+## 关联实体
+- [属于:: [[中国医疗信息化市场战略分析]]]
+- [支持:: [[Concept_Medical_Semantic_Layer]]] (作为解决集成困局的技术方案)
+
+[^1]: [[Source_从数字化到智能化：中国医疗信息化的过去、现在与未来.md]]"""
+    },
+    {
+        "file": "Source_价值医疗的本质：重塑激励罗盘与构建数字化神经系统.md",
+        "title": "价值医疗的本质：重塑激励罗盘与构建数字化神经系统",
+        "content": """---
+id: \"20260421_s2c3d4\"
+title: \"Source_价值医疗的本质：重塑激励罗盘与构建数字化神经系统\"
+type: \"source\"
+domain: \"Medical_IT\"
+topic_cluster: \"General\"
+status: \"Active\"
+alignment_score: 98
+epistemic-status: \"evergreen\"
+categories: [\"Strategy_and_Business\"]
+tags: [\"价值医疗\", \"数字化神经系统\", \"激励机制\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/价值医疗的本质：重塑激励罗盘与构建数字化神经系统.md\"]
 ---
-# {title}
 
-## 核心主旨
-{insights.strip()}
-"""
-        write_file(filename, new_content)
+# 价值医疗的本质：重塑激励罗盘与构建数字化神经系统
 
-def update_or_create_concept(filename, title, insights, category):
-    content = read_file(filename)
-    date_str = datetime.datetime.now().strftime('%Y-%m-%d')
-    if content:
-        # Append insights
-        content += f"\n\n## {date_str} 审计增补\n" + insights.strip()
-        write_file(filename, content)
-    else:
-        # Create new
-        id_str = datetime.datetime.now().strftime('%Y%m%d') + "_connew"
-        new_content = f"""
+## 核心摘要
+本文深入探讨了价值医疗（Value-Based Healthcare, VBH）的本质及其实现路径。核心逻辑在于通过重构“激励罗盘”，即从按量付费（FFS）向按价值付费（DRG/DIP）转型，迫使医疗机构构建“数字化神经系统”以实现成本与质量的实时精准管控。
+
+## 关键观点
+- **数字化神经系统 (Digital Nervous System)**：指能够实时感知临床和运营数据，并通过闭环反馈机制做出响应的 IT 系统架构[^1]。
+- **激励罗盘 (Incentive Compass)**：底层激励机制的改变是推动医疗数字化的根本动力[^1]。
+
+## 关联概念
+- [衍生于:: [[Concept_数字化神经系统]]]
+- [关联:: [[Concept_Agentic_Hospital]]]
+
+[^1]: [[Source_价值医疗的本质：重塑激励罗盘与构建数字化神经系统.md]]"""
+    },
+    {
+        "file": "Source_全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md",
+        "title": "全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告",
+        "content": """---
+id: \"20260421_s3e4f5\"
+title: \"Source_全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告\"
+type: \"source\"
+domain: \"Medical_IT\"
+topic_cluster: \"General\"
+status: \"Active\"
+alignment_score: 92
+epistemic-status: \"evergreen\"
+categories: [\"Strategy_and_Business\"]
+tags: [\"医疗AI独角兽\", \"投资逻辑\", \"工作流集成\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md\"]
 ---
-id: "{id_str}"
-title: "{title}"
-type: "concept"
-domain: "Medical_IT"
-topic_cluster: "General"
-status: "Active"
-epistemic-status: "evergreen"
-categories: ["{category}"]
-tags: ["2026", "Architecture"]
-created: "{date_str}"
-updated: "{date_str}"
-sources: []
+
+# 全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告
+
+## 核心摘要
+该报告分析了全球医疗 AI 独角兽（如 Tempus, Xaira, Abridge）的竞争策略。文章提出，在 AI 2.0 时代，算法优势正被快速平庸化，真正的防御性来自于对专有数据的掌控、对核心工作流的深度集成以及对监管门控的专业应对。
+
+## 关键观点
+- **防御三位一体 (Defensive Triad)**：专有数据资产、深度集成入口（工作流）、监管合规门控[^1]。
+- **工作流为王**：成功的医疗 AI 必须嵌入医生的现有操作流中，而不是作为一个独立的工具[^1]。
+
+## 关联实体
+- [提及:: [[Entity_Tempus]]]
+- [提及:: [[Entity_Xaira_Therapeutics]]]
+- [提及:: [[Entity_Abridge]]]
+- [提及:: [[Entity_Insilico_Medicine]]]
+
+[^1]: [[Source_全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md]]"""
+    },
+    {
+        "file": "Source_冰与火之歌：一份医疗AI“新基建”的工业革命蓝图.md",
+        "title": "冰与火之歌：一份医疗AI“新基建”的工业革命蓝图",
+        "content": """---
+id: \"20260421_s4g5h6\"
+title: \"Source_冰与火之歌：一份医疗AI“新基建”的工业革命蓝图\"
+type: \"source\"
+domain: \"Medical_IT\"
+topic_cluster: \"General\"
+status: \"Active\"
+alignment_score: 94
+epistemic-status: \"evergreen\"
+categories: [\"System_Architecture\"]
+tags: [\"医疗AI新基建\", \"认知工业化\", \"可信数据空间\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/冰与火之歌：一份医疗AI“新基建”的工业革命蓝图.md\"]
 ---
-# {title}
 
-## 核心内涵
-{insights.strip()}
-"""
-        write_file(filename, new_content)
+# 冰与火之歌：一份医疗AI“新基建”的工业革命蓝图
 
-# Source: 2026医疗数字化：一场剥离幻觉的冷酷清算_20260419.md
-update_or_create_source(
-    "Source_2026医疗数字化：一场剥离幻觉的冷酷清算_20260419.md",
-    "2026医疗数字化：一场剥离幻觉的冷酷清算",
-    '["raw/article/digitalhealthobserve/2026医疗数字化：一场剥离幻觉的冷酷清算_20260419.md"]',
-    "医疗数字化的冷酷清算：2026 年医疗 IT 从“颠覆性创新”全面退防至“物理合规围栏”。技术不再是创造增量的造梦机，而是以降低成本和满足 DRG/DIP 控费限制为核心的“止血工具”。\n临床解释权的转移与算力寡头游戏：99% 的 AI 沦为打杂苦力，而 1% 掌握真实数据与顶级算力的寡头通过“数字孪生”垄断了临床生命科学的试错权。\n关联实体：[反面案例:: [[Entity_Pear_Therapeutics]]]，[支持:: [[Concept_1-bit_LLM]]]，[应用:: [[Concept_Ambient_AI_Scribes]]]。",
-    "Strategy_and_Business"
-)
+## 核心摘要
+本文将医疗 AI 的落地比作工业革命，提出需要建立支撑“认知工业化”的新型基础设施。重点讨论了“可信数据空间”在解决医疗数据隐私与流转矛盾中的核心作用。
 
-# Source: 2026-Q2.md
-update_or_create_source(
-    "Source_2026-Q2.md",
-    "个人日志 2026-Q2",
-    '["raw/privacy/Diary/2026-Q2.md"]',
-    "Mentat 高强度执行中发现，系统的鲁棒性不取决于大模型自身的智能，而是取决于“底层物理硬锁”、“Win32 Payload 降维”和剥离幻觉的四层壳架构。\n记录了 Vector Lake V7.2 的架构升级（解决并发锁、引入 Louvain 拓扑）。",
-    "Philosophy_and_Cognitive"
-)
+## 关键观点
+- **认知工业化 (Industrialized Cognition)**：通过 AI 将顶级专家的诊疗逻辑标准化并大规模复制[^1]。
+- **可信数据空间 (Trusted Data Space)**：基于“数据可用不可见”的物理与法律架构，保障数据要素的合规流通[^1]。
 
-# Source: 2026-Q2_Audit.md
-update_or_create_source(
-    "Source_2026-Q2_Audit.md",
-    "Mentat 审计日志 2026-Q2",
-    '["raw/privacy/Diary/mentat_audit/2026-Q2_Audit.md"]',
-    "静默降级掩盖失败 (Silent Degradation Masking Failure)：代码中过度“优雅”的后备机制导致底层致命断层（如文件丢失）被掩盖。要求全面转向“Fail-Fast（快速失败）”与绝对物理路径硬锁。\n关联概念：[防范:: [[Concept_Silent_Degradation_Masking_Failure]]]",
-    "System_Architecture"
-)
+## 关联概念
+- [支持:: [[Concept_可信数据空间]]]
+- [关联:: [[Concept_认知工业化]]]
 
-# Source: 20260419_Strategic_Audit_7d.md
-update_or_create_source(
-    "Source_20260419_Strategic_Audit_7d.md",
-    "7天战略审计报告",
-    '["raw/personal-insights/20260419_Strategic_Audit_7d.md"]',
-    "暗负载 / 认知摩擦 (Shadow Load)：纯精神或认知上的高强度消耗，即使物理消耗极低，也会导致系统性皮质醇淤积与神经疲劳。通过读取 [关联:: [[System_Garmin]]] 的底层 JSON 数据对抗“Shadow Load”，实现在指挥官处于睡眠负债与高压时，强制阻断高维系统重构指令。\n关联概念：[监控:: [[Concept_Shadow_Load]]]",
-    "Philosophy_and_Cognitive"
-)
-
-# Concept_1-bit_LLM.md
-update_or_create_concept(
-    "Concept_1-bit_LLM.md",
-    "1-bit LLM (1-bit 小脑化)",
-    "在面临芯片禁令与数据合规出境双重封锁下，医疗 AI 唯一的物理突围路径。放弃云端庞大算力，将大模型压缩至 1-bit 级并硬核植入边缘设备（如移动查房车、超声终端），兼顾绝对合规与超低延迟。\n来源：[[Source_2026医疗数字化：一场剥离幻觉的冷酷清算_20260419.md]]",
-    "Artificial_Intelligence"
-)
-
-# Concept_Ambient_AI_Scribes.md
-update_or_create_concept(
-    "Concept_Ambient_AI_Scribes.md",
-    "环境智能与 HUD 隐喻 (Ambient AI Scribes)",
-    "隐式运行在诊室后台的守护进程，自动监听医患对话并清洗生成结构化病历。这是医疗 Agentic AI 落地的最现实路径——放弃干预临床决策，主动承担最繁重的“行政/合规苦力工作”。\n来源：[[Source_2026医疗数字化：一场剥离幻觉的冷酷清算_20260419.md]]",
-    "Healthcare_IT"
-)
-
-# Concept_Digital_Twins_in_Healthcare.md
-update_or_create_concept(
-    "Concept_Digital_Twins_in_Healthcare.md",
-    "数字孪生与多组学沙盘 (Digital Twins in Healthcare)",
-    "结合基因、蛋白质等真实世界数据，在虚拟环境中为患者建立高精度副本。全球跨国药企绕开临床活体测试的高维玩法，通过纯算力推演药物毒性，拉开医疗数字化绝对的“贫富差距”。",
-    "Biomedicine"
-)
-
-# Concept_Silent_Degradation_Masking_Failure.md
-update_or_create_concept(
-    "Concept_Silent_Degradation_Masking_Failure.md",
-    "静默降级掩盖失败 (Silent Degradation Masking Failure)",
-    "代码中过度“优雅”的后备机制（Fallback）导致底层致命断层（如文件丢失）被掩盖。在系统审计中被发现为核心架构漏洞，要求全面转向“Fail-Fast（快速失败）”与绝对物理路径硬锁。",
-    "System_Architecture"
-)
-
-# Concept_Shadow_Load.md
-update_or_create_concept(
-    "Concept_Shadow_Load.md",
-    "暗负载 / 认知摩擦 (Shadow Load)",
-    "纯精神或认知上的高强度消耗，即使物理消耗极低，也会导致系统性皮质醇淤积与神经疲劳。揭示了过度投入高密度架构推演对生理缓冲垫的快速击穿，需作为阻断工作流的生理预警。通过底层传感器如 [支持:: [[System_Garmin]]] 监控。",
-    "Philosophy_and_Cognitive"
-)
-
-# Entity_Pear_Therapeutics.md
-entity_content = """
+[^1]: [[Source_冰与火之歌：一份医疗AI“新基建”的工业革命蓝图.md]]"""
+    },
+    {
+        "file": "Source_医疗AI的“十五五”：从技术狂欢到制度深潜.md",
+        "title": "医疗AI的“十五五”：从技术狂欢到制度深潜",
+        "content": """---
+id: \"20260421_s5i6j7\"
+title: \"Source_医疗AI的“十五五”：从技术狂欢到制度深潜\"
+type: \"source\"
+domain: \"Medical_IT\"
+topic_cluster: \"General\"
+status: \"Active\"
+alignment_score: 96
+epistemic-status: \"evergreen\"
+categories: [\"Strategy_and_Business\"]
+tags: [\"十五五规划\", \"制度深潜\", \"医疗AI落地\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/医疗AI的“十五五”：从技术狂欢到制度深潜.md\"]
 ---
-id: "20260419_ent_pear"
-title: "Pear Therapeutics"
-type: "entity"
-domain: "Strategy_and_Business"
-topic_cluster: "General"
-status: "Active"
-epistemic-status: "evergreen"
-categories: ["Strategy_and_Business"]
-tags: ["数字疗法", "DTx", "反面案例", "破产"]
-created: "2026-04-19"
-updated: "2026-04-19"
-sources: []
+
+# 医疗AI的“十五五”：从技术狂欢到制度深潜
+
+## 核心摘要
+针对“十五五”规划的前瞻性分析。文章认为，医疗 AI 将告别概念炒作阶段，进入深度嵌入医疗制度（医保支付、责任认定、临床路径）的“制度深潜”期。
+
+## 关键观点
+- **制度深潜 (Institutional Deep Diving)**：技术落地已非首要障碍，制度性的配套（如 AI 诊疗收费、法律责任判定）将成为核心变量[^1]。
+- **中试基地模式**：通过设立国家级人工智能应用中试基地，在受控沙盒中加速产品化[^1]。
+
+## 关联概念
+- [属于:: [[医疗数字化的“十五五”：从“连接”到“重塑”的惊险一跃]]]
+- [支持:: [[Concept_制度深潜]]]
+
+[^1]: [[Source_医疗AI的“十五五”：从技术狂欢到制度深潜.md]]"""
+    }
+]
+
+# 2. Concept Pages
+concepts = [
+    {
+        "file": "Concept_数字化神经系统.md",
+        "content": """---
+id: \"20260421_c1n2o3\"
+title: \"Concept_数字化神经系统\"
+type: \"concept\"
+domain: \"Medical_IT\"
+topic_cluster: \"Architecture\"
+status: \"Active\"
+alignment_score: 98
+epistemic-status: \"sprouting\"
+categories: [\"System_Architecture\"]
+tags: [\"闭环反馈\", \"价值医疗\", \"实时感知\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/价值医疗的本质：重塑激励罗盘与构建数字化神经系统.md\"]
 ---
-# Pear Therapeutics
 
-## 核心定位
-曾经的“处方数字疗法第一股”。
+# 数字化神经系统 (Digital Nervous System)
 
-## 案例分析
-作为核心反面案例。因未能向医保支付方证明其“节省医疗成本”的价值，最终破产，标志着单纯追求用户参与度（Engagement）的互联网医疗模式的消亡。
-"""
-write_file("Entity_Pear_Therapeutics.md", entity_content)
+## 定义
+一种能够实时感知医疗机构临床与运营数据，并根据预设逻辑（如临床路径、控费规则）自动做出响应、干预或决策反馈的闭环系统架构。它是实现“价值医疗”的技术底座。
 
-# Entity_北大医疗.md (check if exists, if not create, if exists append)
-beida_content = read_file("Entity_北大医疗.md")
-date_str = datetime.datetime.now().strftime('%Y-%m-%d')
-if beida_content:
-    beida_content += f"\n\n## {date_str} 战略审计增补\n业务交涉对象，日志中提到进行业务交流与合作推演。\n"
-    write_file("Entity_北大医疗.md", beida_content)
-else:
-    new_beida = f"""
+## 核心特征
+1. **实时感知**：不再依赖事后报表，而是实时监控临床关键指标。
+2. **自动反馈**：在工作流中实时嵌入提醒或阻断逻辑。
+3. **闭环演进**：通过结果数据不断优化前端决策规则。
+
+## 战略价值
+解决中国 HIT 长期存在的“重记录、轻管控”问题[^1]。
+
+## 关联
+- [支持:: [[Source_价值医疗的本质：重塑激励罗盘与构建数字化神经系统.md]]]
+- [属于:: [[Concept_Agentic_Hospital]]]
+
+[^1]: [[Source_价值医疗的本质：重塑激励罗盘与构建数字化神经系统.md]]"""
+    },
+    {
+        "file": "Concept_制度深潜.md",
+        "content": """---
+id: \"20260421_c2p3q4\"
+title: \"Concept_制度深潜\"
+type: \"concept\"
+domain: \"Medical_IT\"
+topic_cluster: \"Strategy\"
+status: \"Active\"
+alignment_score: 95
+epistemic-status: \"sprouting\"
+categories: [\"Strategy_and_Business\"]
+tags: [\"十五五\", \"医疗改革\", \"AI落地\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/医疗AI的“十五五”：从技术狂欢到制度深潜.md\"]
 ---
-id: "20260419_ent_beida"
-title: "北大医疗"
-type: "entity"
-domain: "Healthcare_IT"
-topic_cluster: "General"
-status: "Active"
-epistemic-status: "evergreen"
-categories: ["Healthcare_IT"]
-tags: ["合作伙伴", "业务交流"]
-created: "{date_str}"
-updated: "{date_str}"
-sources: []
+
+# 制度深潜 (Institutional Deep Diving)
+
+## 定义
+指医疗新技术（尤其是 AI）从单纯的技术实验阶段，进入到与医疗行业的支付制度、责任体系、临床准入路径以及绩效考核深度融合的阶段。
+
+## 特征
+- **从“加法”到“乘法”**：AI 不再是医疗流程外的额外插件，而是重构流程的内生要素。
+- **利益博弈显性化**：涉及医保基金分配、医生责任分担等深层利益调整[^1]。
+
+## 关联
+- [支持:: [[Source_医疗AI的“十五五”：从技术狂欢到制度深潜.md]]]
+- [关联:: [[“十五五”时期大型公立医院数字化建设迈向高质量发展的重点与路径战略分析]]]
+
+[^1]: [[Source_医疗AI的“十五五”：从技术狂欢到制度深潜.md]]"""
+    },
+    {
+        "file": "Concept_可信数据空间.md",
+        "content": """---
+id: \"20260421_c3r4s5\"
+title: \"Concept_可信数据空间\"
+type: \"concept\"
+domain: \"Medical_IT\"
+topic_cluster: \"Architecture\"
+status: \"Active\"
+alignment_score: 97
+epistemic-status: \"sprouting\"
+categories: [\"System_Architecture\"]
+tags: [\"数据要素\", \"隐私计算\", \"数据可用不可见\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/冰与火之歌：一份医疗AI“新基建”的工业革命蓝图.md\"]
 ---
-# 北大医疗
 
-## 核心定位
-业务交涉对象，日志中提到进行业务交流与合作推演。
-"""
-    write_file("Entity_北大医疗.md", new_beida)
+# 可信数据空间 (Trusted Data Space)
 
-# Update overview.md
-overview = """
+## 定义
+一种基于物理隔离、法律合规与隐私计算技术（如联邦学习、TEE）构建的医疗数据流通架构。其核心准则是“数据可用不可见，用途可控可计量”。
+
+## 解决的矛盾
+解决医疗机构对数据主权的保护诉求与外部（如 AI 开发、跨院协作）对数据利用诉求之间的冲突[^1]。
+
+## 关联
+- [支持:: [[Source_冰与火之歌：一份医疗AI“新基建”的工业革命蓝图.md]]]
+- [关联:: [[医疗机构可信数据空间建设建设策略与实施路径]]]
+- [关联:: [[在AI与可信数据空间驱动下的新一代医院数据平台：定位、框架与建设策略]]]
+
+[^1]: [[Source_冰与火之歌：一份医疗AI“新基建”的工业革命蓝图.md]]"""
+    }
+]
+
+# 3. Entity Pages
+entities = [
+    {
+        "file": "Entity_Xaira_Therapeutics.md",
+        "content": """---
+id: \"20260421_e1u2v3\"
+title: \"Entity_Xaira_Therapeutics\"
+type: \"entity\"
+domain: \"Biomedicine\"
+topic_cluster: \"Investment\"
+status: \"Active\"
+alignment_score: 85
+epistemic-status: \"seed\"
+categories: [\"Strategy_and_Business\"]
+tags: [\"AI新药研发\", \"TechBio\", \"独角兽\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md\"]
 ---
-id: 20260419_overview
-title: Vector Lake Overview
-type: synthesis
-domain: Medical_IT
-topic_cluster: General
-status: Active
-epistemic-status: evergreen
-categories:
-- System_Architecture
-tags:
-- 全局概览
-- 医疗IT
-created: '2026-04-19'
-updated: '2026-04-19'
-sources: []
+
+# Xaira Therapeutics
+
+## 基本信息
+2024 年成立的顶级 AI 新药研发（TechBio）公司，融资额巨大。其核心竞争力在于利用生成式 AI 设计全新的蛋白质药物。
+
+## 战略地位
+代表了医疗 AI 投资的“杠铃式”一端：极端的基础科学前沿突破。与 Abridge 这种解决现有流程效率的公司形成对比[^1]。
+
+## 关联
+- [属于:: [[Source_全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md]]]
+- [对比:: [[Entity_Insilico_Medicine]]]
+
+[^1]: [[Source_全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md]]"""
+    },
+    {
+        "file": "Entity_Abridge.md",
+        "content": """---
+id: \"20260421_e2w3x4\"
+title: \"Entity_Abridge\"
+type: \"entity\"
+domain: \"Medical_IT\"
+topic_cluster: \"Product\"
+status: \"Active\"
+alignment_score: 92
+epistemic-status: \"sprouting\"
+categories: [\"Healthcare_IT\"]
+tags: [\"Ambient_AI\", \"临床文档\", \"Epic集成\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md\"]
 ---
-# Vector Lake Overview
 
-Vector Lake (V7.2) 是一座以医疗信息化 (HIT) 为主轴、兼顾战略架构与 AI 基础设施的深层认知网络。本知识库旨在通过结构化压缩行业变量，揭示医疗 IT 市场的结构性拐点（如 DRG/DIP 控费驱动下的系统重构），并为 AI Agent 在医疗场景的临床决策与院内运营落地提供高维推演支撑。
+# Abridge
 
-当前，全球医疗 IT 正面临代际跃迁的重大关口。从依赖“if-then-else”规则与字典表匹配的传统 HIS 巨石架构，全面迈向 Software 3.0 范式的 Agentic Runtime（智能体运行时）。在极高的医疗容错压力下，这一演进摒弃了单纯的涌现智能，确立了“非对称架构”为物理防线。通过建立固态的医疗语义层 (MSL) 充当“翻译黑盒”，并将核心合规逻辑经“洁净室重构”原子化，系统得以防范 LLM 经验毒性并掌握医院财务咽喉。大模型不再仅仅是效率“副驾驶”，而是化身为冷酷的审计权实体，将合规审查从“事后追溯”前置到“事中生成”。为保障医生“敢于签字”的临床确定性，底层架构强制挂载 Evidence-Mesh (证据网)，提供加密因果的推演链路与责任确权。
+## 基本信息
+环境式 AI 临床文档（Ambient AI Scribes）领域的领先者。通过监听医患对话并自动生成结构化病历，极大地缓解了医生的书写负担。
 
-医疗数字化的商业逻辑已发生根本性反转。数字疗法（DTx）过往的流量叙事彻底破产，被迫转向“结果导向前瞻性支付”，以 [反面案例:: [[Entity_Pear_Therapeutics]]] 为代表的破产宣告了缺乏降本 ROI 逻辑的终结。医院逐步演化为向商业健康险输送高确定性结构化数据的算力工厂。与此同时，在算力受限与数据出境阻断的边缘节点（如超声、移动查房车），AI 架构正向“1-bit 小脑化”（[关联:: [[Concept_1-bit_LLM]]]）物理降维，确立了端侧零依赖的自主生存法则。为了降低合规风险，基于 [应用:: [[Concept_Ambient_AI_Scribes]]] 的隐式环境监听成为 Agentic AI 最现实的落地路径。同时，顶尖药企正利用 [应用:: [[Concept_Digital_Twins_in_Healthcare]]] 的算力垄断拉开贫富差距。
+## 核心策略
+**深度集成工作流**：Abridge 的成功很大程度上归功于其与 Epic 系统的深度垂直集成，使其直接进入医生的核心工作界面，从而建立了极高的防御性[^1]。
 
-在纯数字与逻辑层面的架构演进中，一个被频繁忽视的物理陷阱是“纯认知摩擦 ([关联:: [[Concept_Shadow_Load]]])”。指挥官在进行无休止的逻辑审计与架构反熵时，往往遭受着严重的睡眠负债与内分泌失调（由 Garmin 等系统监控证实）。这警示我们在拥抱全维度数字化时，必须建立基于生理态势感知的决策阻断机制，以防止肉体在系统走向完美的途中坍塌。此外，面对 [防范:: [[Concept_Silent_Degradation_Masking_Failure]]] 等系统漏洞，架构必须转向 Fail-Fast 和绝对物理路径硬锁。
-"""
-write_file("overview.md", overview)
+## 关联
+- [属于:: [[Source_全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md]]]
+- [关联:: [[Concept_Ambient_AI_Scribes]]]
+- [关联:: [[Entity_Epic_Systems]]]
 
-# Update log.md
+[^1]: [[Source_全球医疗AI独角兽格局：市场领导者、技术平台与投资逻辑分析报告.md]]"""
+    },
+    {
+        "file": "Entity_数坤科技.md",
+        "content": """---
+id: \"20260421_e3y4z5\"
+title: \"Entity_数坤科技\"
+type: \"entity\"
+domain: \"Medical_IT\"
+topic_cluster: \"China_Market\"
+status: \"Active\"
+alignment_score: 88
+epistemic-status: \"sprouting\"
+categories: [\"Healthcare_IT\"]
+tags: [\"AI影像\", \"中国医疗AI\", \"独角兽\"]
+created: \"2026-04-21\"
+updated: \"2026-04-21\"
+sources: [\"raw/article/digitalhealthobserve/从数字化到智能化：中国医疗信息化的过去、现在与未来.md\"]
+---
+
+# 数坤科技 (Shukun)
+
+## 基本信息
+中国领先的医疗 AI 影像厂商。其核心产品覆盖心脑血管、肺部、骨科等多个领域。
+
+## 演进方向
+正从单一的 AI 影像诊断工具向贯穿全临床业务流的“数字医生”演进，试图解决中国医疗 IT 的“集成困局”[^1]。
+
+## 关联
+- [属于:: [[Source_从数字化到智能化：中国医疗信息化的过去、现在与未来.md]]]
+- [关联:: [[中国医疗信息化市场战略分析]]]
+
+[^1]: [[Source_从数字化到智能化：中国医疗信息化的过去、现在与未来.md]]"""
+    }
+]
+
+# Process writes
+for item in sources + concepts + entities:
+    write_file(item["file"], item["content"])
+
+# Update overview
+overview_content = """---
+id: 20260421_7d8x6e
+updated: '2026-04-21'
+---
+# Vector Lake 知识全景概览 (Overview)
+
+Vector Lake 当前锚定于解决医疗 IT 与系统架构领域的结构性拐点与抗熵增难题。通过构建纯 Markdown 的多智能体状态机，本知识库重点映射了由核心中枢 Mentat 所指挥的本地自主智能体集群架构。这套架构抛弃了单纯的单体大模型幻想，转而拥抱物理约束、隔离边界与自动化防腐管线，并主张从被动的 RAG 检索向具有物理边界的 Agentic 编译跃迁。
+
+在防御与认知层面，图谱深入探讨了四层壳模型、活沙箱化子代理与黑板模式的协作机制。这些物理维度的架构设计用于对抗大模型固有的上下文腐烂与注意力坍塌问题。同时，结合 Gotchas (避坑先验) 的负样本沉淀与零自我防御 (Zero-Ego) 哲学，确保整个系统在高度复杂的业务博弈中维持极高密度的逻辑信噪比与持续演化能力。医疗语义层（MSL）作为核心的置信度评估网与降级触发器，强行拦截概率引擎与 HIS 确定性引擎之间的错配风险。
+
+近期研究揭示了 AI 在落地深水区（如医疗）遭遇的“合规红线与物理降维”。大模型正从云端全能幻觉退守边缘侧（1-bit 小脑化），其核心价值锚定于实时合规拦截与环境监听（Ambient AI Scribes）。在战略布局上，中国特色的顶层意志通过《意见》和“十五五”规划，推行“钳形攻势”以及设立“国家人工智能应用中试基地”，意图在合规与创新间建立沙箱。中国医疗 IT 正在经历从 HIS/EMR 时代的“扫盲式数字化”向以价值医疗（VBH）为导向的“制度深潜”跨越。这一转变催生了“数字化神经系统”这一核心概念，旨在通过重构激励罗盘（从按量到按价值）来实现临床与运营的实时闭环管控。
+
+在商业护城河方面，“防御三位一体”框架（专有数据、工作流整合、监管准入）正取代单纯算法优势，促使资本发生“杠铃式”分化——涌向基础前沿（如 Xaira Therapeutics）或确切 ROI 工具（如 Abridge）。系统控制权的保卫与抵御算力附庸，仍然是智能体医院下半场的绝对核心命题。解决“集成困局”不仅需要 MSL 这种软件定义方案，更需要“可信数据空间”等物理层基础设施的支持，以保障数据要素在安全、主权与价值之间的动态平衡。"""
+write_file("overview.md", overview_content)
+
+# Update log
 now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
-append_file("log.md", f"## [{now}] Ingest | 2026医疗数字化冷酷清算与 Q2 Mentat 战略审计")
-print("Write complete.")
+log_entry = f"## [{now}] Ingest | Healthcare AI Reports Ingestion Batch (5 Sources)"
+append_file("log.md", log_entry)
+
+print("Batch Ingestion Complete")

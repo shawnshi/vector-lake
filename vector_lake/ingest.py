@@ -24,6 +24,7 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 # Resolve paths
 EXTENSION_ROOT = get_extension_root()
 TARGET_DIRS = [str((EXTENSION_ROOT / d).resolve()) for d in config.get("target_directories", [])]
+EXCLUDE_PATHS = config.get("exclude_paths", [])
 WIKI_DIR = get_wiki_dir()
 SCHEMA_PATH = EXTENSION_ROOT / "schema.md"
 MEMORY_DIR = get_memory_dir()
@@ -228,7 +229,7 @@ def process_file_batch(filepaths: list, existing_source_map: dict = None):
         file_list_lines.append(
             f"- Source: `{safe_rel}`\n"
             f"  Target Source Page: `{safe_target}` ({entry['action']})\n"
-            f"  YAML sources field: [\"{safe_ref}\"]"
+            f"  YAML sources field: [\"{safe_ref.replace('\"', '\\\"')}\"]"
         )
     file_list_str = "\n".join(file_list_lines)
 
@@ -310,7 +311,7 @@ Be thorough but concise. Focus on what's genuinely important.
     try:
         log.info("Waiting for Analysis Agent (Step 1)...")
         result = subprocess.run(
-            [gemini_exec, "--prompt", "", "--approval-mode", "yolo"],
+            [gemini_exec, "--model", "gemini-3-flash-preview", "--prompt", "", "--approval-mode", "yolo"],
             input=analysis_prompt.encode('utf-8'),
             capture_output=True, timeout=900
         )
@@ -388,7 +389,7 @@ Please begin extraction and node weaving.
 
     try:
         log.info("Waiting for Generation Agent (Step 2)...")
-        cmd = [gemini_exec, "--prompt", "", "--approval-mode", "yolo"]
+        cmd = [gemini_exec, "--model", "gemini-3-flash-preview", "--prompt", "", "--approval-mode", "yolo"]
         result = subprocess.run(cmd, input=generation_prompt.encode('utf-8'), capture_output=True, timeout=1800)
         
         stdout_str = result.stdout.decode('utf-8', errors='replace')
@@ -488,8 +489,14 @@ def sync_all():
             dirs[:] = [d for d in dirs if not d.startswith('.')] # Ignore hidden directories
             for file in files:
                 if file.startswith('~') or file.startswith('.'): continue # Ignore temporary/hidden files
+                
+                filepath = os.path.join(root, file)
+                path_str = filepath.replace("\\", "/")
+                if any(exclude in path_str for exclude in EXCLUDE_PATHS):
+                    continue
+
                 if os.path.splitext(file)[1].lower() in SUPPORTED_EXTS:
-                    files_to_process.append(os.path.join(root, file))
+                    files_to_process.append(filepath)
 
     log.info(f"Scanned {len(files_to_process)} candidate raw sources.")
 

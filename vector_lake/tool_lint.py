@@ -26,7 +26,7 @@ def lint_vector_lake(auto_fix: bool = False):
     if not os.path.exists(wiki_dir):
         return "Wiki directory not found."
 
-    skip_files = {"index.md", "log.md", "overview.md"}
+    skip_files = {"Entity_index.md", "Entity_log.md", "Entity_overview.md"}
     valid_types = {"entity", "concept", "source", "synthesis"}
     valid_status = {"active", "deprecated", "archived", "contested"}
     valid_epistemic = {"seed", "sprouting", "evergreen"}

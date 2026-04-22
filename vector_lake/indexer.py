@@ -417,7 +417,12 @@ def generate_index():
         return
 
     index_data = _empty_index_data()
-    files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in ("index.md", "log.md", "overview.md")]
+    files = [
+        name for name in os.listdir(wiki_dir) 
+        if name.endswith(".md") 
+        and name not in ("index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md")
+        and not name.startswith("System_")
+    ]
 
     for filename in files:
         filepath = os.path.join(wiki_dir, filename)
@@ -466,7 +471,7 @@ def generate_index():
 
 
 def update_index_item(filename: str):
-    if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md"):
+    if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md") or filename.startswith("System_"):
         return
 
     output_path = str(get_index_path())

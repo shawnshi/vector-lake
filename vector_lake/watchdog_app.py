@@ -5,6 +5,17 @@ import threading
 import time
 from pathlib import Path
 
+import json
+from pathlib import Path
+from vector_lake import get_extension_root
+
+# Load config
+CONFIG_PATH = get_extension_root() / "config.json"
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+EXCLUDE_PATHS = config.get("exclude_paths", [])
+
 try:
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
@@ -63,6 +74,13 @@ class VectorLakeIngestHandler(FileSystemEventHandler):
         filename = os.path.basename(filepath)
         if filename.startswith("~") or filename.startswith("."):
             return True
+            
+        # Ignore specific directories configured in config.json
+        path_str = filepath.replace("\\", "/")
+        for exclude in EXCLUDE_PATHS:
+            if exclude in path_str:
+                return True
+            
         _, ext = os.path.splitext(filename)
         return ext.lower() not in SUPPORTED_EXTS
 

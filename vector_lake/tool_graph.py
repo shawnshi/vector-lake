@@ -216,7 +216,10 @@ def audit_graph() -> str:
         })
 
     if items:
-        review.add_items(items)
+        from vector_lake import governance_store
+        queue = governance_store.load_governance_queue()
+        queue.setdefault("items", []).extend(items)
+        governance_store.save_governance_queue(queue)
         return f"Audit complete. Pushed {len(items)} graph topology insights into the async review queue."
     return "Audit complete. No actionable insights found."
 
