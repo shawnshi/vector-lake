@@ -12,6 +12,11 @@ import yaml
 import ingest
 from filelock import FileLock, Timeout
 
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tools")
 
@@ -298,7 +303,7 @@ def sanitize_wiki_node(filepath: str):
     body = content
     if match:
         body = match.group(2)
-        try: fm = yaml.safe_load(match.group(1)) or {}
+        try: fm = yaml.load(match.group(1), Loader=SafeLoader) or {}
         except Exception: fm = {}
     if not isinstance(fm, dict): fm = {}
     today = datetime.datetime.now().strftime("%Y%m%d")
@@ -379,7 +384,7 @@ def lint_vector_lake(auto_fix: bool = False):
             continue
         
         try:
-            fm = yaml.safe_load(fm_match.group(1)) or {}
+            fm = yaml.load(fm_match.group(1), Loader=SafeLoader) or {}
         except Exception as e:
             issues["frontmatter"].append(f"{filename}: YAML parse error: {e}")
             continue
@@ -761,7 +766,7 @@ def delete_source(raw_path: str, dry_run: bool = False) -> str:
             continue
         
         try:
-            fm = yaml.safe_load(fm_match.group(1)) or {}
+            fm = yaml.load(fm_match.group(1), Loader=SafeLoader) or {}
         except Exception:
             continue
         
@@ -824,7 +829,7 @@ def delete_source(raw_path: str, dry_run: bool = False) -> str:
                     content = f.read()
                 fm_match = re.match(r'^---\n(.*?)\n---\n(.*)', content, re.DOTALL)
                 if fm_match:
-                    fm = yaml.safe_load(fm_match.group(1)) or {}
+                    fm = yaml.load(fm_match.group(1), Loader=SafeLoader) or {}
                     body = fm_match.group(2)
                     sources = fm.get('sources', [])
                     fm['sources'] = [

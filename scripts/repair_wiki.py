@@ -17,6 +17,11 @@ import string
 from collections import defaultdict
 from datetime import datetime
 
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
 WIKI_DIR = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
 
 # --- P1: epistemic-status normalization map ---
@@ -37,7 +42,7 @@ def parse_frontmatter(content):
     if not m:
         return None, None
     try:
-        data = yaml.safe_load(m.group(1))
+        data = yaml.load(m.group(1), Loader=SafeLoader)
         if isinstance(data, dict):
             return data, m
     except yaml.YAMLError:
