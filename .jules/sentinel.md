@@ -1,0 +1,4 @@
+## 2024-05-28 - Cross-Site Scripting (XSS) in 3D Topology Graph
+**Vulnerability:** The HTML template `templates/topology.html` dynamically constructs innerHTML using user-controlled data such as node names, groups, domains, and summary without adequate escaping. This exposes the dashboard to DOM-based XSS when visualizing malicious wiki graphs.
+**Learning:** Visualization outputs that consume raw wiki files (or parsed indices like `index.json`) must assume that note contents, attributes, and references might contain malicious HTML or scripts.
+**Prevention:** Implement and enforce a standard HTML escape mechanism (e.g., an `escapeHtml` function) in all Javascript components that inject data into the DOM via innerHTML, or alternatively use `innerText` or `textContent` where HTML parsing is not required.
