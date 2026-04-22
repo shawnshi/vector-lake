@@ -62,7 +62,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     wiki_dir = str(get_wiki_dir())
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
-        return "index.json not found."
+        return "Lake is drying. No index.json found, please ingest sources first."
     lock_path = index_path + ".lock"
 
     try:

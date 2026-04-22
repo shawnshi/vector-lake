@@ -37,7 +37,6 @@ Usage Examples:
   python cli.py review resolve review_ab12cd34ef56
   python cli.py delete "/path/to/raw/file.pdf" --dry-run
   python cli.py doctor
-  python cli.py migrate-v8 --dry-run
 """,
     )
 
@@ -69,11 +68,6 @@ Usage Examples:
     subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.")
     subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")
 
-    migrate_parser = subparsers.add_parser("migrate-v8", help="[MIGRATE] Backfill V8 canonical governance stores from existing wiki pages.")
-    migrate_parser.add_argument("--dry-run", action="store_true", help="Preview migration counts without persisting canonical stores.")
-
-    publish_parser = subparsers.add_parser("publish", help="[PUBLISH] Publish pending V8 change sets.")
-    publish_parser.add_argument("--limit", type=int, default=None, help="Maximum number of change sets to publish.")
 
     debt_parser = subparsers.add_parser("debt", help="[DEBT] Show governance debt metrics.")
     debt_parser.add_argument("--top", type=int, default=20, help="Top debt window size.")
@@ -124,10 +118,6 @@ def main() -> int:
             print(tools.audit_graph())
         elif args.command == "doctor":
             print(tools.doctor_vector_lake())
-        elif args.command == "migrate-v8":
-            print(tools.migrate_v8(getattr(args, "dry_run", False)))
-        elif args.command == "publish":
-            print(tools.publish_vector_lake(getattr(args, "limit", None)))
         elif args.command == "debt":
             print(tools.debt_vector_lake(getattr(args, "top", 20)))
         elif args.command == "trace":

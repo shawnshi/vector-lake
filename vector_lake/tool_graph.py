@@ -143,7 +143,7 @@ def visualize_vector_lake():
     output_path = _graph_output_path(memory_dir)
 
     if not os.path.exists(index_path):
-        return "Error: index.json not found."
+        return "Error: Lake is drying. index.json not found. Please ingest sources first."
     if not os.path.exists(template_path):
         return "Error: template not found."
 
@@ -190,7 +190,7 @@ def audit_graph() -> str:
 
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
-        return "Error: index.json not found."
+        return "Error: Lake is drying. index.json not found. Please ingest sources first."
 
     with open(index_path, "r", encoding="utf-8") as handle:
         data = json.load(handle)

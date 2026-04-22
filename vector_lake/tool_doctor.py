@@ -21,7 +21,8 @@ def doctor_vector_lake() -> str:
     for label, path in [("MEMORY", get_memory_dir()), ("Raw", get_raw_dir()), ("Wiki", get_wiki_dir())]:
         checks.append((label, path.exists(), str(path)))
 
-    checks.append(("Index", get_index_path().exists(), str(get_index_path())))
+    index_exists = get_index_path().exists()
+    checks.append(("Index", True, str(get_index_path()) if index_exists else "Lake is drying (Empty)"))
     for label, path in [("Meta", get_meta_dir()), ("Entities", get_entities_path()), ("Claims", get_claims_path()), ("Evidence", get_evidence_path()), ("Sources", get_sources_path())]:
         checks.append((label, path.exists(), str(path)))
 

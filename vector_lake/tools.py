@@ -5,8 +5,6 @@ from vector_lake.tool_gc import gc_vector_lake
 from vector_lake.tool_graph import audit_graph, visualize_vector_lake
 from vector_lake.tool_lint import lint_vector_lake
 from vector_lake.tool_merge import merge_suggestions_vector_lake
-from vector_lake.tool_migrate import migrate_v8
-from vector_lake.tool_publish import publish_vector_lake
 from vector_lake.tool_query import query_logic_lake
 from vector_lake.tool_review import review_vector_lake
 from vector_lake.tool_search import assemble_context, search_vector_lake
@@ -23,8 +21,6 @@ __all__ = [
     "gc_vector_lake",
     "lint_vector_lake",
     "merge_suggestions_vector_lake",
-    "migrate_v8",
-    "publish_vector_lake",
     "query_logic_lake",
     "review_vector_lake",
     "search_vector_lake",

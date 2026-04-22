@@ -11,6 +11,7 @@ from vector_lake import get_extension_root
 from vector_lake.db import get_processed_files, mark_file_processed
 from vector_lake import governance_store
 from vector_lake.wiki_utils import backup_file, get_memory_dir, get_wiki_dir, normalize_raw_ref, normalize_sources, read_markdown_file, sanitize_wiki_node
+import time
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -308,19 +309,45 @@ Be thorough but concise. Focus on what's genuinely important.
     gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
     analysis_result = ""
     
-    try:
-        log.info("Waiting for Analysis Agent (Step 1)...")
-        result = subprocess.run(
-            [gemini_exec, "--model", "gemini-3-flash-preview", "--prompt", "", "--approval-mode", "yolo"],
-            input=analysis_prompt.encode('utf-8'),
-            capture_output=True, timeout=900
-        )
-        analysis_result = result.stdout.decode('utf-8', errors='replace')
-        if result.returncode != 0:
-            log.warning("Analysis step returned non-zero, proceeding with available output.")
-    except Exception as e:
-        log.error(f"Analysis step failed: {e}")
-        # Fall back to single-step if analysis fails
+    llm_config = config.get("llm", {})
+    model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash", "gemini-3.1-8b"])
+    timeout_analysis = llm_config.get("timeout_analysis", 120)
+    retries = len(model_cascade)
+
+    for attempt in range(retries):
+        try:
+            current_model = model_cascade[attempt]
+            model_flag = [] if current_model in ("", "default") else ["-m", current_model]
+            model_disp = current_model if current_model not in ("", "default") else "default"
+            log.info(f"Waiting for Analysis Agent (Step 1) - Attempt {attempt+1}/{retries}... (Model: {model_disp})")
+            cmd = [gemini_exec] + model_flag + ["-p", "You are an analysis agent.", "--approval-mode", "yolo"]
+            result = subprocess.run(
+                cmd,
+                input=analysis_prompt.encode('utf-8'),
+                capture_output=True, timeout=timeout_analysis
+            )
+            if result.returncode == 0:
+                analysis_result = result.stdout.decode('utf-8', errors='replace')
+                stderr_str = result.stderr.decode('utf-8', errors='replace')
+                if "GaxiosError" in stderr_str or "RESOURCE_EXHAUSTED" in stderr_str or "rateLimitExceeded" in stderr_str:
+                    log.warning(f"Analysis step attempt {attempt+1} encountered API error despite exit code 0.")
+                elif len(analysis_result.strip()) > 50:
+                    break
+                else:
+                    log.warning(f"Analysis step attempt {attempt+1} returned suspiciously empty output.")
+            else:
+                stderr = result.stderr.decode('utf-8', errors='replace').strip()
+                log.warning(f"Analysis step attempt {attempt+1} returned non-zero: {stderr}")
+        except subprocess.TimeoutExpired as e:
+            log.warning(f"Analysis step attempt {attempt+1} timed out.")
+        except Exception as e:
+            log.error(f"Analysis step attempt {attempt+1} failed: {e}")
+            
+        if attempt < retries - 1:
+            time.sleep(3)
+            
+    if not analysis_result:
+        log.warning("Analysis step failed after retries, proceeding with available output.")
         analysis_result = "(Analysis unavailable — falling back to direct generation)"
 
     log.info(f"[Step 1/2] Analysis complete ({len(analysis_result)} chars).")
@@ -396,20 +423,46 @@ Only create reviews for things that genuinely need human input.
 Please begin extraction and node weaving.
 """
 
-    try:
-        log.info("Waiting for Generation Agent (Step 2)...")
-        cmd = [gemini_exec, "--model", "gemini-3-flash-preview", "--prompt", "", "--approval-mode", "yolo"]
-        result = subprocess.run(cmd, input=generation_prompt.encode('utf-8'), capture_output=True, timeout=1800)
-        
-        stdout_str = result.stdout.decode('utf-8', errors='replace')
-        if stdout_str: print(stdout_str)
-        success = (result.returncode == 0)
-    except Exception as e:
-        log.error(f"Gemini CLI failed for generation step: {e}")
-        success = False
+    success = False
+    stdout_str = ""
+    llm_config = config.get("llm", {})
+    model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash", "gemini-3.1-8b"])
+    timeout_generation = llm_config.get("timeout_generation", 180)
+    retries = len(model_cascade)
+
+    for attempt in range(retries):
+        try:
+            current_model = model_cascade[attempt]
+            model_flag = [] if current_model in ("", "default") else ["-m", current_model]
+            model_disp = current_model if current_model not in ("", "default") else "default"
+            log.info(f"Waiting for Generation Agent (Step 2) - Attempt {attempt+1}/{retries}... (Model: {model_disp})")
+            cmd = [gemini_exec] + model_flag + ["-p", "You are a generation agent.", "--approval-mode", "yolo"]
+            result = subprocess.run(cmd, input=generation_prompt.encode('utf-8'), capture_output=True, timeout=timeout_generation)
+            
+            if result.returncode == 0:
+                stdout_str = result.stdout.decode('utf-8', errors='replace')
+                stderr_str = result.stderr.decode('utf-8', errors='replace')
+                if "GaxiosError" in stderr_str or "RESOURCE_EXHAUSTED" in stderr_str or "rateLimitExceeded" in stderr_str:
+                    log.warning(f"Generation Agent attempt {attempt+1} encountered API error despite exit code 0.")
+                elif "---FILE:" in stdout_str or "---REVIEW:" in stdout_str or len(stdout_str.strip()) > 100:
+                    if stdout_str: print(stdout_str)
+                    success = True
+                    break
+                else:
+                    log.warning(f"Generation Agent attempt {attempt+1} returned suspiciously empty output without valid structures.")
+            else:
+                stderr = result.stderr.decode('utf-8', errors='replace').strip()
+                log.warning(f"Generation Agent attempt {attempt+1} failed: {stderr}")
+        except subprocess.TimeoutExpired as e:
+            log.warning(f"Generation Agent attempt {attempt+1} timed out.")
+        except Exception as e:
+            log.error(f"Gemini CLI failed for generation step: {e}")
+            
+        if attempt < retries - 1:
+            time.sleep(3)
 
     if not success:
-        log.error("Generation Agent failed or crashed.")
+        log.error("Generation Agent failed or crashed after retries.")
         return False
     
     # ── Step 3: Parse review items from agent output ──────────────
@@ -456,15 +509,25 @@ Please begin extraction and node weaving.
         except Exception as e:
             log.warning(f"Failed to parse review items: {e}")
             
-    # ── Step 4: Post-processing ───────────────────────────────────
+    # ── Step 4: Post-processing (Python-Led I/O) ──────────────────
     changed_files = []
-    if os.path.exists(WIKI_DIR):
-        for entry in os.scandir(WIKI_DIR):
-            if entry.is_file() and entry.name.endswith('.md'):
-                p = entry.path
-                mtime = entry.stat().st_mtime
-                if p not in before_mtimes or mtime > before_mtimes[p]:
-                    changed_files.append(p)
+    if stdout_str:
+        from vector_lake.wiki_utils import atomic_write_text
+        file_blocks = re.finditer(r"---FILE:\s*([^\n]+)---\n(.*?)\n---END FILE---", stdout_str, re.DOTALL)
+        for match in file_blocks:
+            filename = match.group(1).strip()
+            content = match.group(2).strip()
+            
+            if not filename.startswith(("Source_", "Entity_", "Concept_", "Synthesis_")) and filename != "overview.md":
+                log.warning(f"Intercepted illegal write attempt to {filename}")
+                continue
+                
+            file_path = os.path.join(WIKI_DIR, filename)
+            try:
+                atomic_write_text(Path(file_path), content)
+                changed_files.append(file_path)
+            except Exception as e:
+                log.error(f"Failed to write {filename}: {e}")
                     
     if changed_files:
         for p in changed_files:
@@ -514,7 +577,8 @@ def sync_all():
     log.info(f"Cached {len(existing_source_map)} existing Source page mappings for dedup.")
     
     batch = []
-    batch_size = 5 # Decreased batch size
+    llm_config = config.get("llm", {})
+    batch_size = llm_config.get("batch_size", 20)
     
     for filepath in files_to_process:
         file_hash = calculate_hash(filepath)
@@ -529,13 +593,6 @@ def sync_all():
             
     if batch:
         process_file_batch(batch, existing_source_map)
-                    
-    log.info("Ingest sync completed.")
-
-if __name__ == "__main__":
-    sync_all()
-
-tch, existing_source_map)
                     
     log.info("Ingest sync completed.")
 

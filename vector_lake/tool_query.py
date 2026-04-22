@@ -15,14 +15,59 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vector-lake-tool-query")
 
 
+import time
+import json
+from vector_lake import get_extension_root
+
 def _run_gemini(prompt: str):
-    return subprocess.run(
-        ["gemini.cmd", "-p", "", "--approval-mode", "yolo"],
-        input=prompt,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        timeout=300,
+    config_path = get_extension_root() / "config.json"
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            llm_config = json.load(f).get("llm", {})
+            timeout = llm_config.get("timeout_query", 120)
+            model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash", "gemini-3.1-8b"])
+    except Exception:
+        timeout = 120
+        model_cascade = ["default", "gemini-3.1-flash", "gemini-3.1-8b"]
+    
+    retries = len(model_cascade)
+    last_err = None
+    for attempt in range(retries):
+        try:
+            current_model = model_cascade[attempt]
+            model_flag = [] if current_model in ("", "default") else ["-m", current_model]
+            model_disp = current_model if current_model not in ("", "default") else "default"
+            log.info(f"Invoking gemini.cmd (Attempt {attempt + 1}/{retries})... (Model: {model_disp})")
+            cmd = ["gemini.cmd"] + model_flag + ["-p", "You are a Vector Lake Synthesizer.", "--approval-mode", "yolo"]
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=timeout,
+            )
+            if result.returncode == 0:
+                return result
+            else:
+                log.warning(f"gemini.cmd returned {result.returncode}: {result.stderr.strip()}")
+                last_err = result.stderr.strip()
+        except subprocess.TimeoutExpired as e:
+            log.warning(f"gemini.cmd timed out after {timeout} seconds on attempt {attempt + 1}.")
+            last_err = str(e)
+        except Exception as e:
+            log.error(f"gemini.cmd failed unexpectedly: {e}")
+            last_err = str(e)
+        
+        if attempt < retries - 1:
+            time.sleep(3)
+            
+    # Return a fake CompletedProcess representing failure
+    return subprocess.CompletedProcess(
+        args=["gemini.cmd"],
+        returncode=1,
+        stdout="",
+        stderr=f"Exhausted {retries} retries. Last error: {last_err}"
     )
 
 

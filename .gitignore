@@ -10,3 +10,4 @@ data/
 tmp/
 tests_tmp/
 .env
+tests/
