@@ -65,7 +65,17 @@ def query_logic_lake(query_str: str, dry_run: bool = False):
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
         return f"{output or 'Dry-run query returned no output.'}\n\n{trace}"
 
-    prompt = f"@vector-lake-synthesizer\nQuery: {query_str}{context_block}"
+    prompt = f"""@vector-lake-synthesizer
+[SYSTEM DIRECTIVE: PYTHON-LED I/O]
+You are running in a restricted sandbox. DO NOT use the `write_file`, `replace`, or `run_shell_command` tools.
+You MUST output the generated synthesis pages in the following plain text format exactly:
+
+---FILE: Synthesis_Topic_Name.md---
+(yaml frontmatter)
+(body content)
+---END FILE---
+
+Query: {query_str}{context_block}"""
     try:
         result = _run_gemini(prompt)
     except Exception as e:
@@ -75,19 +85,24 @@ def query_logic_lake(query_str: str, dry_run: bool = False):
         stderr = (result.stderr or "").strip()
         return stderr or "Query failed."
 
+    stdout_str = result.stdout or ""
     changed_node_files = set()
-    excluded_files = {"index.md", "log.md", "overview.md"}
-    if os.path.exists(wiki_dir):
-        for name in os.listdir(wiki_dir):
-            if not name.endswith(".md") or name in excluded_files:
-                continue
-            path = os.path.join(wiki_dir, name)
-            try:
-                after_mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            if name not in before_mtimes or after_mtime > before_mtimes.get(name, 0):
-                changed_node_files.add(name)
+    
+    from vector_lake.wiki_utils import atomic_write_text
+    from pathlib import Path
+    file_blocks = re.finditer(r"---FILE:\s*([^\n]+)---\n(.*?)\n---END FILE---", stdout_str, re.DOTALL)
+    for match in file_blocks:
+        filename = match.group(1).strip()
+        content = match.group(2).strip()
+        if not filename.startswith(("Source_", "Entity_", "Concept_", "Synthesis_")):
+            log.warning(f"Intercepted illegal write attempt to {filename}")
+            continue
+        file_path = os.path.join(wiki_dir, filename)
+        try:
+            atomic_write_text(Path(file_path), content)
+            changed_node_files.add(filename)
+        except Exception as e:
+            log.error(f"Failed to write {filename}: {e}")
 
     if changed_node_files:
         new_files = {name for name in changed_node_files if name not in before_mtimes}

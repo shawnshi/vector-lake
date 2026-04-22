@@ -11,6 +11,7 @@
 - `graph.toml`: render the interactive page/claim topology
 - `review.toml`: inspect and resolve the unified legacy/governance review surface
 - `delete.toml`: preview or execute raw-source cascade deletion
+- `gc.toml`: auto-prune isolated low-degree nodes and long-tail debris
 - `doctor.toml`: validate runtime dependencies and filesystem layout
 
 ## Governance Workflow

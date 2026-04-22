@@ -85,6 +85,30 @@ def _resolve_combined_item(identifier, resolution: str = "skip"):
 def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip"):
     if action == "list":
         return _format_combined_report(_combined_pending_items())
+    if action == "ground":
+        if index in (-1, "-1", None, ""):
+            return "Error: specify review item index or item_id. Usage: cli.py review ground <index|item_id>"
+        pending = _combined_pending_items()
+        target = None
+        if isinstance(index, str) and not index.isdigit():
+            target = next((item for item in pending if item.get("item_id") == index), None)
+        else:
+            idx = int(index)
+            if 0 <= idx < len(pending):
+                target = pending[idx]
+        if not target:
+            return f"Failed to resolve item '{index}'."
+        if target.get("type") != "missing-page":
+            return f"Item {target.get('item_id')} is not a missing-page item. Cannot ground."
+        
+        queries = " | ".join(target.get("search_queries", []))
+        result = f"[SYSTEM DIRECTIVE]: Autonomous Web Grounding Triggered for Item {target.get('item_id')}.\n"
+        result += "Agent: You must now execute the following steps:\n"
+        result += f"1. Use `google_web_search` with the queries: {queries}\n"
+        result += "2. Pick the most authoritative result and fetch it using the `url-to-markdown` skill (or web_fetch).\n"
+        result += "3. Use `write_file` to save the clean Markdown content to a new file in `MEMORY/raw/news/` (or appropriate subfolder).\n"
+        result += f"4. Resolve this governance item by running `python cli.py review resolve {target.get('item_id')} --resolution create`."
+        return result
     if action == "resolve":
         if index in (-1, "-1", None, ""):
             return "Error: specify review item index or item_id. Usage: cli.py review resolve <index|item_id>"
@@ -100,5 +124,5 @@ def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip
             result += f"{queries}\n"
             result += "Save the extracted content as Markdown to MEMORY/raw/, then run `python cli.py sync`."
         return result
-    return f"Unknown review action: {action}. Use 'list' or 'resolve'."
+    return f"Unknown review action: {action}. Use 'list', 'resolve', or 'ground'."
 

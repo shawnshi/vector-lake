@@ -1,6 +1,7 @@
 from vector_lake.tool_delete import delete_source
 from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.tool_debt import debt_vector_lake
+from vector_lake.tool_gc import gc_vector_lake
 from vector_lake.tool_graph import audit_graph, visualize_vector_lake
 from vector_lake.tool_lint import lint_vector_lake
 from vector_lake.tool_merge import merge_suggestions_vector_lake
@@ -19,6 +20,7 @@ __all__ = [
     "delete_source",
     "debt_vector_lake",
     "doctor_vector_lake",
+    "gc_vector_lake",
     "lint_vector_lake",
     "merge_suggestions_vector_lake",
     "migrate_v8",

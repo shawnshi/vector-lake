@@ -8,4 +8,5 @@ When presenting the result:
 - keep long query/page lists summarized rather than expanding the full payload
 
 If the user asks to resolve an item, accept either the pending index or the stable item_id and pass it back to `review_vector_lake`.
+If an item points to a missing page gap, you can also suggest using the `ground` action to trigger the Autonomous Web Grounding crawler to fetch real internet data to fill the gap.
 """

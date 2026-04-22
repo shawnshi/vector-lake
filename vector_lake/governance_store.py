@@ -451,14 +451,12 @@ def publish_change_sets(limit: int | None = None) -> dict:
     change_sets = load_change_sets()
     published = 0
     published_ids = []
-    rebuilt_views = 0
     for change_set in change_sets["items"]:
         if change_set.get("status") != "pending":
             continue
         apply_change_set(change_set)
         change_set["status"] = "published"
         change_set["published_at"] = _utc_now()
-        rebuilt_views += int(change_set.get("view_rebuild", {}).get("rebuilt", 0))
         published += 1
         published_ids.append(change_set["change_set_id"])
         if limit is not None and published >= limit:
@@ -471,7 +469,7 @@ def publish_change_sets(limit: int | None = None) -> dict:
             item["status"] = "published"
             item["resolved_at"] = _utc_now()
     save_governance_queue(queue)
-    return {"published": published, "change_set_ids": published_ids, "views_rebuilt": rebuilt_views}
+    return {"published": published, "change_set_ids": published_ids}
 
 
 def pending_change_sets() -> list:

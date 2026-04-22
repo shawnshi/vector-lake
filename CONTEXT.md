@@ -24,14 +24,15 @@ V7.2 核心升级（The Topology & Autonomous Expansion Edition）：
 | 模块 | 职责 |
 |---|---|
 | `cli.py` | 根目录薄入口 |
-| `vector_lake/tools.py` | Tool facade（sync/search/lint/query/graph/review/delete/audit_graph） |
-| `vector_lake/ingest.py` | Raw→Wiki 两步 CoT 编译管线 |
-| `vector_lake/indexer.py` | `index.json` 生成器（含 4-信号相关性、Louvain 社区划分、裂缝洞察、动态标签、4 类本体强制降维） |
-| `vector_lake/review.py` | 异步审查队列与 Deep Research 触发器 |
-| `vector_lake/db.py` | `processed_files.json` 读写（MD5 哈希去重） |
-| `watchdog_sync.py` | 根目录薄入口，转发到包内 watchdog 应用 |
-| `templates/` | 3D 球形拓扑可视化 HTML 模板（ForceGraph3D，带丰富 UI 交互与信息卡片） |
-| `agents/` | 2 个 Gemini Subagent（ingestor / synthesizer） |
+| `vector_lake/tools.py` | Tool facade（sync/search/lint/query/graph/review/gc/delete/audit_graph等） |
+| `vector_lake/ingest.py` | 基于 Python-Led I/O 的两步 CoT 编译管线 |
+| `vector_lake/indexer.py` | `index.json` 生成器（含 Louvain 社区划分、4 类本体强制降维） |
+| `vector_lake/tool_review.py` | 异步审查队列与 Web Grounding 触发器 |
+| `vector_lake/tool_gc.py` | 自动化修剪低度数长尾孤岛节点 |
+| `vector_lake/governance_store.py` | V8 统一事实引擎主控 |
+| `watchdog_sync.py` | 常驻后台的增量编译监控守护进程 |
+| `templates/` | 3D 球形拓扑可视化 HTML 模板（ForceGraph3D） |
+| `agents/` | 2 个 Gemini Subagent（ingestor / synthesizer），已切换至纯输出态 |
 
 ## 4. 交互协议 (Interaction Protocol - CLI Native)
 **`[HARD_LOCK]`** 所有交互必须通过 `run_shell_command` 调用底层 CLI 工具执行。
@@ -46,14 +47,16 @@ V7.2 核心升级（The Topology & Autonomous Expansion Edition）：
 *   **🧠 深度推演落盘 (Query-to-Page)**
     `python cli.py query "推演指令" [--dry-run]`
 *   **🔍 知识检索 (Search)**
-    `python\cli.py search "关键词" [--top_k 5]`
+    `python cli.py search "关键词" [--top_k 5]`
 *   **🌐 3D 拓扑图谱 (Graph)**
     `python cli.py graph`
-*   **📋 审查队列与图谱审计 (Review & Audit-Graph)**
-    `pythoncli.py audit-graph` (从 index.json 抽取 Louvain 裂缝洞察注入队列)
+*   **📋 审查队列与自动化捕食 (Review & Grounding)**
+    `python cli.py audit-graph` (抽取 Louvain 裂缝注入队列)
     `python cli.py review`
     `python cli.py review resolve <index> [--resolution skip|create]`
-*   **🗑️ 级联删除 (Delete)**
+    `python cli.py review ground <index>` (一键触发 Google Search 全自动知识入湖)
+*   **🗑️ 级联删除与修剪 (Delete & GC)**
+    `python cli.py gc --days 30` (修剪长尾孤岛节点)
     `python cli.py delete "<raw文件路径>"`
 
 ## 5. 运行守则 (Runtime Rules)

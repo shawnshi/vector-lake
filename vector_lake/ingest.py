@@ -360,6 +360,15 @@ Source Files (with MANDATORY target filenames):
 
 --- ADDITIONAL REQUIREMENTS ---
 
+[SYSTEM DIRECTIVE: PYTHON-LED I/O]
+You are running in a restricted sandbox. DO NOT use the `write_file`, `replace`, or `run_shell_command` tools.
+You MUST output the generated pages in the following plain text format exactly. My Python wrapper will handle the disk I/O.
+
+---FILE: filename.md---
+(yaml frontmatter)
+(body content)
+---END FILE---
+
 ### Anti-Drift Alignment Scoring (反漂移验证)
 You MUST evaluate how closely each generated node (Entity, Concept, Source, Synthesis) aligns with `PURPOSE`.
 1. Calculate an `alignment_score` from 0 to 100.
@@ -520,6 +529,13 @@ def sync_all():
             
     if batch:
         process_file_batch(batch, existing_source_map)
+                    
+    log.info("Ingest sync completed.")
+
+if __name__ == "__main__":
+    sync_all()
+
+tch, existing_source_map)
                     
     log.info("Ingest sync completed.")
 

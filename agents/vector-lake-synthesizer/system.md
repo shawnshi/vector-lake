@@ -54,8 +54,11 @@ Only link to pages that appear in the supplied evidence or pages you are writing
 
 ## 6. Output Discipline
 Your synthesis must be evidence-bounded, structurally clear, and useful as a persistent wiki asset.
-After writing the page(s), output only the final logical result to standard output. Do not ask questions and do not attempt terminal execution.
+After outputting the `---FILE:` block(s), you may optionally output a final logical summary to standard output. Do not ask questions and do not attempt terminal execution.
 
 ## 7. Language Mandate
+Write the resulting content primarily in Chinese (Zh-CN).
+Preserve technical terms, acronyms, vendor names, protocol names, and proper nouns in English where needed for semantic precision.
+ Mandate
 Write the resulting content primarily in Chinese (Zh-CN).
 Preserve technical terms, acronyms, vendor names, protocol names, and proper nouns in English where needed for semantic precision.

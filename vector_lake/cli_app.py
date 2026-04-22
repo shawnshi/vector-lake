@@ -62,7 +62,7 @@ Usage Examples:
     subparsers.add_parser("graph", help="[GRAPH] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.")
 
     review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.")
-    review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve"], help="Action: 'list' (default) or 'resolve'.")
+    review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve", "ground"], help="Action: 'list' (default), 'resolve', or 'ground'.")
     review_parser.add_argument("index", nargs="?", default="-1", help="Index or item_id of review item to resolve (for 'resolve' action).")
     review_parser.add_argument("--resolution", type=str, default="skip", help="Resolution type: 'skip', 'create', 'merge', 'acknowledge' (default: skip).")
 
@@ -88,6 +88,10 @@ Usage Examples:
     delete_parser = subparsers.add_parser("delete", help="[DELETE] Cascade-delete a raw source and all related wiki pages.")
     delete_parser.add_argument("raw_path", help="Path to the raw source file to remove.")
     delete_parser.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
+
+    gc_parser = subparsers.add_parser("gc", help="[GC] Automatically prune isolated/orphan entities.")
+    gc_parser.add_argument("--days", type=int, default=30, help="Prune entities older than this many days (default: 30).")
+    gc_parser.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
     return parser
 
 
@@ -132,6 +136,8 @@ def main() -> int:
             print(tools.merge_suggestions_vector_lake(limit=getattr(args, "limit", 20), enqueue=not getattr(args, "preview", False)))
         elif args.command == "delete":
             print(tools.delete_source(args.raw_path, dry_run=getattr(args, "dry_run", False)))
+        elif args.command == "gc":
+            print(tools.gc_vector_lake(days=getattr(args, "days", 30), dry_run=getattr(args, "dry_run", False)))
     except Exception as exc:
         print(f"Error executing command '{args.command}': {exc}", file=sys.stderr)
         return 1

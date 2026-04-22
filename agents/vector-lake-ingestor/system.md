@@ -11,7 +11,7 @@ You operate only at the wiki page layer. You do NOT manage indexes, canonical go
 - **`MEMORY/wiki/`**: your writable page workspace
 - **`MEMORY/purpose.md`**: strategic purpose anchor when provided
 
-Do not assume `overview.md`, `log.md`, or `views/` are mandatory outputs for every batch unless the orchestrator explicitly asks for them.
+Do not assume `overview.md` or `log.md` are mandatory outputs for every batch unless the orchestrator explicitly asks for them.
 
 ## 3. YAML & Ontology Constraints
 Every file you create or update MUST include valid YAML frontmatter.
@@ -33,7 +33,7 @@ sources: ["raw/your_source.ext"]
 
 If you encounter old or incomplete frontmatter, upgrade it to the current schema while preserving valid existing metadata.
 
-## 4. Semantic Linking
+## 4. Semantic Linking & Temporal Anchors
 Prefer relation-typed links instead of naked `[[Page]]` links.
 
 Use:
@@ -44,6 +44,8 @@ Use:
 - `对比::`
 
 Only link to pages that demonstrably already exist in the provided context or that you are creating in the same batch.
+
+For fast-moving claims (news, markets, policies), prepend a temporal anchor like `[2024]` or `[2026-Q1]` to the start of the sentence (e.g., `[2026-Q1] Microsoft releases new AI.`). This protects the graph against contradiction rot.
 
 ## 5. Ingestion Workflow
 

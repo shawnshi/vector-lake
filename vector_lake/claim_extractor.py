@@ -104,6 +104,7 @@ def _validity_defaults(frontmatter: dict) -> dict:
         "valid_to": _jsonable(frontmatter.get("valid_to")),
         "review_after": _jsonable(frontmatter.get("review_after")),
         "freshness_tier": frontmatter.get("freshness_tier", "unknown"),
+        "temporal_anchor": frontmatter.get("temporal_anchor"),
     }
 
 
@@ -120,6 +121,12 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
     sources = normalize_sources(frontmatter.get("sources", []))
     summary = frontmatter.get("summary") or _body_summary(body)
     validity_defaults = _validity_defaults(frontmatter)
+
+    def _parse_temporal(text: str):
+        match = re.match(r"^\[(20\d\d(?:-[H|Q]\d|-[0-1]\d)?)\]\s*", text)
+        if match:
+            return match.group(1), text[match.end():]
+        return None, text
 
     subject_entity_ids = []
     entity_records = []
@@ -168,9 +175,12 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         }]
 
     for block_index, block in enumerate(blocks, start=1):
+        block_temporal, cleaned_text = _parse_temporal(block["text"])
+        final_temporal = block_temporal or validity_defaults.get("temporal_anchor")
+
         evidence_ids = []
         for raw_ref, source_id in zip(sources, source_ids):
-            evidence_id = _stable_id("evidence", f"{page_key}:{block_index}:{raw_ref}:{block['text']}")
+            evidence_id = _stable_id("evidence", f"{page_key}:{block_index}:{raw_ref}:{cleaned_text}")
             evidence_ids.append(evidence_id)
             evidence_records.append({
                 "evidence_id": evidence_id,
@@ -180,7 +190,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                     "heading": block.get("heading") or title,
                     "block_index": block_index,
                 },
-                "evidence_text": block["text"],
+                "evidence_text": cleaned_text,
                 "evidence_type": f"block-{block['kind']}",
                 "created_at": now,
                 "supports_claim_ids": [],
@@ -188,10 +198,10 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             })
 
         claim_id = frontmatter.get("claim_id") if block_index == 1 else None
-        claim_id = claim_id or _stable_id("claim", f"{page_key}:{block_index}:{block['text']}")
+        claim_id = claim_id or _stable_id("claim", f"{page_key}:{block_index}:{cleaned_text}")
         claim_record = {
             "claim_id": claim_id,
-            "claim_text": block["text"],
+            "claim_text": cleaned_text,
             "claim_type": _claim_type_for_block(block["kind"]),
             "claim_scope": "block",
             "status": frontmatter.get("status", "Active"),
@@ -205,6 +215,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                 "block_index": block_index,
             },
             **validity_defaults,
+            "temporal_anchor": final_temporal,
             "created_at": _jsonable(frontmatter.get("created", now)),
             "updated_at": _jsonable(frontmatter.get("updated", now)),
             "source_page": page_name,
@@ -215,6 +226,9 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                 evidence_record["supports_claim_ids"].append(claim_id)
 
     if summary:
+        summary_temporal, cleaned_summary = _parse_temporal(summary)
+        final_summary_temporal = summary_temporal or validity_defaults.get("temporal_anchor")
+
         summary_evidence_ids = []
         for raw_ref, source_id in zip(sources, source_ids):
             evidence_id = _stable_id("evidence", f"{page_key}:summary:{raw_ref}")
@@ -223,17 +237,17 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                 "evidence_id": evidence_id,
                 "source_id": source_id,
                 "locator": {"page_key": page_key, "heading": title, "block_index": 0},
-                "evidence_text": summary,
+                "evidence_text": cleaned_summary,
                 "evidence_type": "page-summary",
                 "created_at": now,
                 "supports_claim_ids": [],
                 "contradicts_claim_ids": [],
             })
 
-        summary_claim_id = _stable_id("claim", f"{page_key}:summary:{summary}")
+        summary_claim_id = _stable_id("claim", f"{page_key}:summary:{cleaned_summary}")
         summary_claim = {
             "claim_id": summary_claim_id,
-            "claim_text": summary,
+            "claim_text": cleaned_summary,
             "claim_type": "summary",
             "claim_scope": "page",
             "status": frontmatter.get("status", "Active"),
@@ -243,6 +257,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             "source_ids": list(source_ids),
             "locator": {"page_key": page_key, "heading": title, "block_index": 0},
             **validity_defaults,
+            "temporal_anchor": final_summary_temporal,
             "created_at": _jsonable(frontmatter.get("created", now)),
             "updated_at": _jsonable(frontmatter.get("updated", now)),
             "source_page": page_name,

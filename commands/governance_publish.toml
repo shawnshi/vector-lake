@@ -1,4 +1,0 @@
-description = "Publish pending V8 change sets into the canonical governance store."
-prompt = """
-Please use the `publish_vector_lake` tool. If the user provided a limit, pass it through.
-"""

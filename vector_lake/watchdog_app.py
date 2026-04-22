@@ -211,7 +211,7 @@ def start_watchdog():
         log.info(f"Wiki AST monitor active on directory: {wiki_dir}")
 
     observer.start()
-    log.info("Vector Lake Watchdog Agent is now running in YOLO background mode.")
+    log.info("Vector Lake Watchdog Agent is now running in Python-Led I/O background mode.")
     try:
         while True:
             time.sleep(1)

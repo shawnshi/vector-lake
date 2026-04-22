@@ -1,6 +1,6 @@
 {
   "name": "vector-lake",
-  "version": "7.2.0",
+  "version": "8.1.0",
   "description": "LLM-Wiki engine for long-term memory retrieval and semantic consolidation via pure Markdown knowledge graph.",
   "contextFileName": "CONTEXT.md",
   "entry_points": {

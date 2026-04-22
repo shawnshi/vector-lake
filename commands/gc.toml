@@ -1,0 +1,6 @@
+description = "Auto-prune isolated low-degree nodes and long-tail debris to perform anti-entropy maintenance."
+prompt = """
+Please use the `gc_vector_lake` tool to identify and prune isolated wiki nodes (degree <= 1).
+By default, you should run it with dry-run=True to show the user what will be deleted.
+If the user confirms, run it again with dry-run=False to permanently execute the garbage collection.
+"""
