@@ -6,6 +6,7 @@
 V7.2 核心升级（The Topology & Autonomous Expansion Edition）：
 *   **拓扑审计与图谱裂缝发现 (Louvain Integration)**: 在 `vector_lake/indexer.py` 环节原生集成 Louvain 算法，自动划分动态知识社区（Community Detection），并为其动态提取主题标签（如 `Comm 2: Agentic AI / Vector Lake`）。算法同时计算内聚度 (Cohesion Score)，侦测孤立节点、稀疏知识区与跨域桥接节点。
 *   **自动捕食闭环 (Autonomous Deep Research)**: 引入 `audit-graph` 指令。系统自动将发现的拓扑裂缝合成为预定义研究任务注入 `review_queue.json`。人类批准（resolve create）后，系统自动触发网络爬虫获取资料并执行两步 CoT 回摄，实现知识边界的自主扩张。
+*   **高并发免疫与级联降级 (429 Immunity Cascade)**: 彻底重构 Ingestion 引擎的 LLM 通信层，免疫底层 API 耗尽（429 报错）导致的进程静默假死假象。拦截底层 stderr 以越过 Exit 0 欺骗，实现顺滑的模型阶梯降维打击。
 *   **3D 拓扑视觉引擎 (ForceGraph3D)**: 重新引入 3D 力导向球形渲染架构，同时保留并升级了所有高级 UI：节点度数缩放、双轨制着色切换（本体类型 vs. 拓扑社区）、带类别徽章（Category Badges）的悬停高亮 Ego-Graph、以及相机自动拉近的全局搜索框。
 *   **严酷本体论降维 (Strict Ontology Coercion)**: 在代码层级将所有节点强制拍扁、归一化为四种核心基础类型：`Entity`, `Concept`, `Source`, `Synthesis`。系统自动拦截并纠正 LLM 产生的命名幻觉（如 `Project`、`Person`、`System` 等），保障大盘统计的绝对纯净。
 *   **别名解析与孤岛过滤 (Orphan Link Resolution)**: 图谱渲染引擎自动将前端别名（Aliases）映射到真实的物理节点，并静默过滤掉指向不存在文件的空链（Orphan Links），彻底消除了前端图谱中出现的 `[UNKNOWN]` 节点。
