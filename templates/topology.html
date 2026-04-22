@@ -148,6 +148,16 @@
     <div id="stats-panel"></div>
 
     <script>
+        function escapeHtml(unsafe) {
+            if (unsafe == null) return '';
+            return unsafe
+                 .toString()
+                 .replace(/&/g, '&amp;')
+                 .replace(/</g, '&lt;')
+                 .replace(/>/g, '&gt;')
+                 .replace(/"/g, '&quot;')
+                 .replace(/'/g, '&#039;');
+        }
         const rawData = %%GRAPH_DATA%%;
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
         
@@ -196,7 +206,7 @@
         
         Object.keys(typeCounts).filter(k => !k.startsWith('_')).sort().forEach(type => {
             const color = TYPE_COLORS[type] || TYPE_COLORS['Unknown'];
-            statsPanel.innerHTML += `<div class="stat-item"><div class="stat-color-box" style="background: ${color};"></div>${type}: ${typeCounts[type]}</div>`;
+            statsPanel.innerHTML += `<div class="stat-item"><div class="stat-color-box" style="background: ${color};"></div>${escapeHtml(type)}: ${typeCounts[type]}</div>`;
         });
 
         // Search logic
@@ -218,7 +228,7 @@
                     const div = document.createElement('div');
                     div.className = 'search-item';
                     const c = TYPE_COLORS[m.group] || TYPE_COLORS['Unknown'];
-                    div.innerHTML = `<span style="color:${c}; font-size:0.65rem; font-weight:600; padding:1px 3px; background:rgba(255,255,255,0.1); border-radius:2px; margin-right:5px; vertical-align:middle;">${(m.group || 'UNKNOWN').toUpperCase()}</span>${m.name}`;
+                    div.innerHTML = `<span style="color:${c}; font-size:0.65rem; font-weight:600; padding:1px 3px; background:rgba(255,255,255,0.1); border-radius:2px; margin-right:5px; vertical-align:middle;">${escapeHtml((m.group || 'UNKNOWN').toUpperCase())}</span>${escapeHtml(m.name)}`;
                     div.onclick = () => {
                         searchInput.value = m.name;
                         searchResults.style.display = 'none';
@@ -313,7 +323,7 @@
         Array.from(activeTypes).sort().forEach(type => {
             const lbl = document.createElement('label');
             lbl.className = 'filter-checkbox';
-            lbl.innerHTML = `<input type="checkbox" value="${type}" checked> ${type}`;
+            lbl.innerHTML = `<input type="checkbox" value="${escapeHtml(type)}" checked> ${escapeHtml(type)}`;
             lbl.querySelector('input').addEventListener('change', (e) => {
                 if(e.target.checked) activeTypes.add(type);
                 else activeTypes.delete(type);
@@ -331,7 +341,7 @@
                 Array.from(activeTypes).sort().forEach((type) => {
                     if(!activeTypes.has(type)) return;
                     const color = TYPE_COLORS[type] || TYPE_COLORS['Unknown'];
-                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${type}</div>`;
+                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${escapeHtml(type)}</div>`;
                 });
             } else {
                 const counts = {};
@@ -347,7 +357,7 @@
                     const label = commLabels[cid] || `Comm ${cid}`;
                     // Truncate long labels for the legend
                     const shortLabel = label.length > 25 ? label.substring(0, 25) + '...' : label;
-                    legend.innerHTML += `<div class="legend-item" title="${label}"><div class="legend-color" style="background:${color}"></div>${shortLabel} (${counts[cid]})</div>`;
+                    legend.innerHTML += `<div class="legend-item" title="${escapeHtml(label)}"><div class="legend-color" style="background:${color}"></div>${escapeHtml(shortLabel)} (${counts[cid]})</div>`;
                 });
             }
         }
@@ -378,18 +388,18 @@
             const newPos = { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio };
             Graph.cameraPosition(newPos, node, 1500);
 
-            document.getElementById("info-title").innerHTML = `<a href="${memoryBasePath}wiki/${node.id}.md" target="_blank">${node.name}</a>`;
+            document.getElementById("info-title").innerHTML = `<a href="${memoryBasePath}wiki/${encodeURIComponent(node.id)}.md" target="_blank">${escapeHtml(node.name)}</a>`;
             
             const commLabels = rawData.community_labels || {};
             const commLabel = commLabels[node.community] || `Comm ${node.community || 0}`;
 
             document.getElementById("info-meta").innerHTML = `
-                <span><strong>Type:</strong> ${node.group}</span>
-                <span><strong>Status:</strong> ${node.status || 'draft'}</span>
-                <span><strong>Domain:</strong> ${node.domain || 'General'}</span>
+                <span><strong>Type:</strong> ${escapeHtml(node.group)}</span>
+                <span><strong>Status:</strong> ${escapeHtml(node.status || 'draft')}</span>
+                <span><strong>Domain:</strong> ${escapeHtml(node.domain || 'General')}</span>
                 <span><strong>Degree:</strong> ${node.degree}</span>
-                <span><strong>Community:</strong> ${commLabel}</span>
-                <span><strong>Updated:</strong> ${node.updated}</span>`;
+                <span><strong>Community:</strong> ${escapeHtml(commLabel)}</span>
+                <span><strong>Updated:</strong> ${escapeHtml(node.updated)}</span>`;
             
             document.getElementById("info-summary").innerText = node.summary || "No summary available.";
             
@@ -397,7 +407,7 @@
             let sourcesHtml = "";
             if (node.sources && node.sources.length > 0) {
                 node.sources.forEach(s => {
-                    sourcesHtml += `<li><a href="${memoryBasePath}${s}" target="_blank">${s}</a></li>`;
+                    sourcesHtml += `<li><a href="${memoryBasePath}${escapeHtml(s)}" target="_blank">${escapeHtml(s)}</a></li>`;
                 });
             } else {
                 sourcesHtml += "<li>None</li>";
@@ -412,7 +422,7 @@
                     const tName = tNode ? tNode.name : t;
                     const tGrp = tNode ? tNode.group : 'Unknown';
                     const c = TYPE_COLORS[tGrp] || TYPE_COLORS['Unknown'];
-                    outHtml += `<li><span style="color:${c}; font-size:0.7rem; font-weight:600; padding:2px 4px; background:rgba(255,255,255,0.1); border-radius:3px; margin-right:5px; vertical-align:middle;">${tGrp.toUpperCase()}</span><a class="node-link" onclick="window.selectNode('${t}')">${tName}</a></li>`;
+                    outHtml += `<li><span style="color:${c}; font-size:0.7rem; font-weight:600; padding:2px 4px; background:rgba(255,255,255,0.1); border-radius:3px; margin-right:5px; vertical-align:middle;">${escapeHtml(tGrp.toUpperCase())}</span><a class="node-link" data-node-id="${escapeHtml(t)}">${escapeHtml(tName)}</a></li>`;
                 });
             } else {
                 outHtml += "<li>None</li>";
@@ -428,7 +438,7 @@
                     const tName = tNode ? tNode.name : t;
                     const tGrp = tNode ? tNode.group : 'Unknown';
                     const c = TYPE_COLORS[tGrp] || TYPE_COLORS['Unknown'];
-                    inHtml += `<li><span style="color:${c}; font-size:0.7rem; font-weight:600; padding:2px 4px; background:rgba(255,255,255,0.1); border-radius:3px; margin-right:5px; vertical-align:middle;">${tGrp.toUpperCase()}</span><a class="node-link" onclick="window.selectNode('${t}')">${tName}</a></li>`;
+                    inHtml += `<li><span style="color:${c}; font-size:0.7rem; font-weight:600; padding:2px 4px; background:rgba(255,255,255,0.1); border-radius:3px; margin-right:5px; vertical-align:middle;">${escapeHtml(tGrp.toUpperCase())}</span><a class="node-link" data-node-id="${escapeHtml(t)}">${escapeHtml(tName)}</a></li>`;
                 });
             } else {
                 inHtml += "<li>None</li>";
@@ -436,6 +446,11 @@
             document.getElementById("info-inbound").innerHTML = inHtml;
             
             document.getElementById("info-panel").classList.add("visible");
+            document.querySelectorAll('.node-link').forEach(link => {
+                link.addEventListener('click', (e) => {
+                    window.selectNode(e.target.dataset.nodeId);
+                });
+            });
         };
 
         renderLegend();
