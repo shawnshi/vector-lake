@@ -3,6 +3,15 @@ Vector Lake Wiki Batch Repair Script
 =====================================
 Fixes P0-1 (Duplicate IDs) and P1 (Invalid epistemic-status) in a single pass.
 
+Purpose:
+    Ad hoc maintenance utility for wiki frontmatter normalization.
+
+Safe to delete:
+    Yes, after the equivalent checks are permanently covered by CLI lint/fix flows.
+
+Replaced by CLI:
+    Partially. `python cli.py lint --auto-fix` overlaps with parts of this script.
+
 Usage:
     python scripts/repair_wiki.py          # Dry-run (report only)
     python scripts/repair_wiki.py --apply  # Apply changes
@@ -14,10 +23,18 @@ import sys
 import yaml
 import random
 import string
+from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 
-WIKI_DIR = os.path.join(os.path.expanduser("~"), ".gemini", "MEMORY", "wiki")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from vector_lake.wiki_utils import get_wiki_dir
+
+
+WIKI_DIR = str(get_wiki_dir())
 
 # --- P1: epistemic-status normalization map ---
 EPISTEMIC_NORMALIZE = {

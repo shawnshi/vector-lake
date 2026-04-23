@@ -4,4 +4,10 @@ __pycache__/
 data/
 *.log
 *.bak
+*.tmp
+.pytest_cache/
+.coverage
+tmp/
+tests_tmp/
 .env
+tests/

@@ -1,0 +1,12 @@
+description = "Inspect the unified V8 governance queue for contradictions, topology gaps, merge suggestions, and knowledge debt items."
+prompt = """
+Please use the `review_vector_lake` tool to list all pending review items in the V8 governance queue.
+
+When presenting the result:
+- call out the visible pending index
+- preserve the stable item_id shown by the tool
+- keep long query/page lists summarized rather than expanding the full payload
+
+If the user asks to resolve an item, accept either the pending index or the stable item_id and pass it back to `review_vector_lake`.
+If an item points to a missing page gap, you can also suggest using the `ground` action to trigger the Autonomous Web Grounding crawler to fetch real internet data to fill the gap.
+"""

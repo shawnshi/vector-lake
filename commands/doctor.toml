@@ -1,0 +1,4 @@
+description = "Run Vector Lake runtime diagnostics for dependencies, CLI wiring, and filesystem layout."
+prompt = """
+Please use the `doctor_vector_lake` tool and show the resulting diagnostic report to the user.
+"""

@@ -2,5 +2,21 @@
   "target_directories": [
     "../../MEMORY/raw"
   ],
-  "processed_files_path": "data/processed_files.json"
+  "exclude_paths": [
+    "stocks/",
+    "garmin/",
+    "personal-insights/"
+  ],
+  "processed_files_path": "data/processed_files.json",
+  "llm": {
+    "model_cascade": [
+      "default",
+      "gemini-2.5-pro",
+      "gemini-3.1-flash"
+    ],
+    "batch_size": 10,
+    "timeout_analysis": 120,
+    "timeout_generation": 180,
+    "timeout_query": 120
+  }
 }

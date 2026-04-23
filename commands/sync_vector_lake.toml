@@ -1,4 +1,0 @@
-description = "Manually trigger an ingest sync. The LLM will read raw sources and compile them into new or updated Markdown nodes in the Wiki."
-prompt = """
-Please use the sync_vector_lake tool to synchronize raw sources into the LLM-Wiki.
-"""

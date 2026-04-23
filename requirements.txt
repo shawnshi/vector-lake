@@ -1,0 +1,6 @@
+filelock>=3.12
+networkx>=3.0
+python-dotenv>=1.0
+python-louvain>=0.16
+PyYAML>=6.0
+watchdog>=4.0

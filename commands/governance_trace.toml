@@ -1,0 +1,4 @@
+description = "Show provenance trace for a query or identifier."
+prompt = """
+Please use the `trace_vector_lake` tool and pass the user argument through as the trace query.
+"""

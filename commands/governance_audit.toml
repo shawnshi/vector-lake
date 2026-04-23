@@ -1,0 +1,4 @@
+description = "Audit topology gaps and push graph-derived governance items into the review queue."
+prompt = """
+Please use the `audit_graph` tool and show the resulting audit summary to the user.
+"""

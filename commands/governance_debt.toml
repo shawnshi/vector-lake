@@ -1,0 +1,4 @@
+description = "Show the current V8 governance debt dashboard."
+prompt = """
+Please use the `debt_vector_lake` tool and show the resulting dashboard to the user.
+"""

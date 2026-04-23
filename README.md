@@ -1,93 +1,206 @@
-# Vector Lake (LLM-Wiki 引擎 - Agentic Computable-Graph V7.2)
+# Vector Lake
 
-**Vector Lake** (V7.2) 是 Gemini CLI 的有状态、可产生复利的知识图谱与语义编译引擎。
+Vector Lake 是一个运行在 Gemini 扩展环境里的 Markdown-first 知识编译器。
 
-它实现了由 Andrej Karpathy 提出的 [LLM-Wiki 模式](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)，彻底摒弃了传统的"无状态检索增强生成 (RAG)"和黑盒数据库。取而代之的是，它依赖 Gemini CLI Native Agent 来主动编译、相互链接并维护一个纯 Markdown 文件组成的持久化网络。
+随着后续持续净化构建，现在它已不仅是一个检索架构，而是具备**自发性反熵（Anti-Drift）与高度战术可视化的战略数据湖**，完全剥离了原有的双轨制，由 V8 强力驱动：`Entity / Claim / Evidence / Source / Change Set`。
 
-## V7.2 新特性 (The Topology Edition)
+## 项目定位
 
-- **拓扑审计与图谱裂缝发现 (Louvain Integration)**：在 `indexer.py` 环节原生集成 Louvain 算法，自动划分知识社区并提取**动态主题标签**（如 `Comm 2: Agentic AI / Vector Lake`）。系统同时计算内聚度 (Cohesion Score)，侦测孤立节点、稀疏知识区与跨域桥接节点。
-- **自动捕食闭环 (Autonomous Deep Research)**：引入 `audit-graph` 指令。系统自动将图谱裂缝合成为预定义研究任务注入异步审查队列。人类批准后，系统自动截获指令、触发网络搜索爬取资料并执行回摄，实现知识边界的自主扩张。
-- **3D 物理视觉引擎 (ForceGraph3D)**：彻底重写 `topology.html`，从 2D 升级回 3D WebGL 球形渲染。保留并增强了高级 UI：节点度数缩放、双轨制着色切换（本体分类 / 拓扑社区）、带动态类别徽章的悬停信息卡片、以及相机自动聚焦的搜索框。
-- **严酷本体论降维 (Strict Ontology Coercion)**：在索引生成阶段，强制拦截并把 LLM 创造的幻觉分类（如 Project、Person 等）降维归一化为 4 种基础类型（Entity, Concept, Source, Synthesis），保障了全局数据资产的结构纯净。
-- **孤岛链接解析 (Orphan & Alias Resolution)**：图谱生成器在前端静默解析双向链接的别名映射，并剔除指向尚未建立的空气节点的断链，彻底清除了图谱 UI 中烦人的 `[UNKNOWN]` 节点。
-- **双轨制契约 (Dual-Track Schema)**：实体页面物理切分为液态的“编译共识 (Compiled Truth)”与追加写入的固态“证据时间线 (Timeline)”。
-- **检索降噪 (Diversity Capping)**：引入前置查询裂变 (Query Expansion) 与后置类型压制，最高限制 Source 类型占 60%，防止长尾数据淹没上下文。
-- **并发安全互斥 (Global FileLock)**：在所有的 `index.json` 读写边界加装排他锁，彻底根治 Windows 下的并发 I/O 破损。
+- 主存仍然是文件系统，确保最高权限的语义资产主权可掌控，不轻易被外部无端修改。
+- `MEMORY/raw` 是原始信源层，无情喂入各类军工级数据。
+- `MEMORY/wiki` 是被净化过的纯人类可编译可读的出版阵地。
+- `.meta/*.json` 是唯一的 Canonical Governance Store 主权事实库，旧的 legacy tracks 被全面停尸并清理。
+- `index.json` 作为轻量级的页面核心图数据库影子。
+- `claim_graph.json` 单独投影为逻辑主干索引。
 
-## 物理架构 (Architecture)
+## 系统架构与数据流 (Architecture & Data Flow)
 
-系统在五个截然不同的物理层面上运行，**零外部数据库依赖**：
+### 1. 系统架构图 (Architecture)
 
-1. **不可变信源区 (`MEMORY/raw/`)**：原始数据（PDF、文章、日志）。Agent 从中读取，**绝不修改**。
-2. **活跃知识库 (`MEMORY/wiki/`)**：持久化逻辑资产。Agent 拥有绝对写权限。实体、概念、推演页面通过 `[Relation:: [[双向链接]]]` 交织。
-3. **轻量级索引 (`wiki/index.json`)**：Pure-JSON 元数据索引，由 `indexer.py` 全量重建。包含 `nodes`、`weighted_edges`（4-信号相关性权重）、`communities`（Louvain 社区划分）、`community_labels`（动态标签）与 `graph_insights`（拓扑裂缝）。
-4. **语义锚点 (`MEMORY/purpose.md`)**：Wiki 的战略目标与关键问题定义，注入每次 LLM 操作以确保方向一致。
-5. **审查队列 (`wiki/.meta/review_queue.json`)**：异步人机协作队列与自动捕食任务存储。
+```mermaid
+graph LR
+    subgraph 原始信源层
+        RAW[MEMORY/raw]
+    end
 
-## Agentic 编译流
+    subgraph V8 核心防腐引擎
+        ER[实体前置截胡<br>Shift-Left Resolution]
+        AD[反漂移力场<br>Anti-Drift Forcefield]
+        IC[高并发免疫瀑布<br>429 Cascade]
+    end
 
-V7.2 采用**两步 CoT + 子代理隔离 + 纵深防御**架构：
+    subgraph 语义主权湖
+        WIKI[MEMORY/wiki<br>Markdown 阵地]
+        META[.meta/*<br>治理事实库]
+        INDEX[index.json / claim_graph.json<br>图数据库索引]
+    end
 
-* **强制读写节律 (Read-Write Rhythm)**：OODA 循环注入强制的前置实体嗅探 (Entity Sniffing) 与后置的图谱同步 (Graph Sync)，把检索与回写变成系统的“底层呼吸”。
-* **两步 Chain-of-Thought**：Step 1 注入 purpose + index summary → LLM 输出结构化分析；Step 2 注入分析结果 + schema → LLM 执行文件写入。物理分离确保"先想清楚再动手"。
-* **Subagent 隔离**：`vector-lake-ingestor` / `vector-lake-synthesizer` / `vector-lake-collider` 三个专用 Subagent，被剥夺终端执行权限，强制锁定在文件 I/O。
-* **4-信号相关性引擎**：每次索引重建时计算节点间的加权边 (direct link 3.0, source overlap 4.0, Adamic-Adar 1.5, type affinity 1.0)，驱动搜索图扩展和拓扑可视化。
-* **Review 闭环**：Agent 在 Step 2 结束时输出 `---REVIEW: type | title---` 块，由 `review.py` 解析存入 JSON 队列，用户异步裁决。
-* **强制中文架构**：子代理生成任何报告、实体解析和推演洞察时，强制使用高质量中文输出。
-* **Prompt 注入防御**：文件路径注入前经 `_sanitize_for_prompt()` 处理，剥离控制字符、反引号和 `@mention` 劫持向量。
-* **写入快照保护**：UPDATE 操作前自动调用 `_backup_wiki_targets()` 创建 `.bak` 快照。
+    RAW -->|Sync / Watchdog| ER
+    ER -->|识别变种/同态| AD
+    AD -->|计算 Alignment Score| IC
+    IC -->|净化的资产入库| WIKI
+    IC -->|主权治理元数据| META
+    META -->|投影拓扑| INDEX
+    
+    style RAW fill:#1e293b,stroke:#94a3b8,color:#fff
+    style WIKI fill:#064e3b,stroke:#34d399,color:#fff
+    style META fill:#064e3b,stroke:#34d399,color:#fff
+    style INDEX fill:#064e3b,stroke:#34d399,color:#fff
+    style ER fill:#0f172a,stroke:#38bdf8,color:#fff
+    style AD fill:#0f172a,stroke:#38bdf8,color:#fff
+    style IC fill:#0f172a,stroke:#38bdf8,color:#fff
+```
 
-## 核心模块 (Module Map)
+### 2. 核心数据流 (Data Flow)
 
-| 模块 | 职责 |
-|---|---|
-| `cli.py` | Argparse CLI 路由入口（sync/search/lint/query/serendipity/graph/review/audit-graph/delete） |
-| `tools.py` | 9 个 Tool 函数（含孤岛别名解析、图谱渲染网关等） |
-| `ingest.py` | Raw→Wiki 两步 CoT 编译管线（分析→生成 + purpose 注入 + review 解析） |
-| `indexer.py` | `index.json` 生成器（4-信号相关性 + Louvain 社区发现 + 动态主题标签 + 强制本体降维） |
-| `review.py` | 异步审查队列（REVIEW 块解析、JSON 持久化、CLI 展示/解决） |
-| `db.py` | `processed_files.json` 线程安全读写（FileLock） |
-| `watchdog_sync.py` | 文件系统实时监听哨兵 |
-| `templates/topology.html` | 3D WebGL 力导向拓扑可视化 HTML 模板（带信息抽屉与搜索聚焦） |
+```mermaid
+flowchart TD
+    Start([Raw 原始文件输入]) --> Sync[启动 Watchdog/Sync 管线]
+    Sync --> ER{大模型 Context-Injection<br>是否存在同态实体?}
+    
+    ER -->|是 | Merge[截胡并合并实体]
+    ER -->|否 | Create[创建全新 Entity/Claim]
+    
+    Merge --> Score{计算 Alignment Score}
+    Create --> Score
+    
+    Score -->|Score >= 60| Core[(编入核心 Canonical Lake)]
+    Score -->|Score < 60| Contested[标记 Contested 状态<br>图谱降权隔离]
+    
+    Core --> Render[Project Hologram 全息图谱渲染]
+    Contested --> Render
+    
+    Render --> Review[Review 审查与治理排雷]
+    Review --> Publish([Publish 发布变更集])
+    
+    style Start fill:#334155,color:#fff,stroke:#cbd5e1
+    style Core fill:#064e3b,color:#fff,stroke:#34d399
+    style Contested fill:#7f1d1d,color:#fff,stroke:#f87171
+    style Publish fill:#0f172a,color:#fff,stroke:#38bdf8
+```
 
-## 工作流与命令 (Workflows & Commands)
+## 核心架构大升级 (V8 Hardened Kernel)
 
-通过 `gemini` CLI 命令或 `python cli.py <command>` 与 Vector Lake 交互。
+- **反漂移力场 (Anti-Drift Forcefield)**：引入了严苛的 `alignment_score` (0-100)，低于 60 分的节点会被处刑进入 `Contested` 状态，并在图谱中以强力惩罚（$\sqrt{align\_a \times align\_b}$）降级相关边权重，将其与核心高价值知识集群做物理隔离。
+- **前置归并防腐 (Shift-Left Entity Resolution)**：引入了前置的实体同态字典，利用大模型的 Context-Injection 截胡（左移）所有的重复与变种名，阻止分裂数据在诞生之时流入 Lake 中。
+- **全息沙盘视觉重构 (Project Hologram)**：基于深海拟态、透明玻璃美感与 Cyberpunk 赛博朋克强互动的 HUD 全面改造 `topology.html`。将代谢期的 `decay_weight` 在图形管线转化为衰变阴影视野，将 `Contested` 节点强制在深空地图里发出刺眼的血红警示。
+- **高并发免疫与级联降级 (429 Immunity Cascade)**：重构了 Ingestion 引擎的底层 API 监听机制。在调用诸如 `gemini-3.1-pro` 导致资源耗尽 (429 RESOURCE_EXHAUSTED) 时，彻底截断底层 CLI 的 `Exit 0` 状态码欺骗，强制拦截 `stderr` 并顺滑降级到 Flash / 8B 模型梯队，保障静默期管线的绝对健壮。
 
-### 1. 自动编译管线 (Ingestion Compiler — 2-Step CoT)
-当您将新文件放入 `MEMORY/raw/` 目录时，系统唤醒 Agent 执行两步 CoT：先结构化分析（实体、概念、矛盾），再基于分析驱动文件生成、overview 更新和 review 标注。
-*   **手动全量编译**: `python cli.py sync`
-*   **启动后台监听哨兵**: `python watchdog_sync.py`
+## 🚀 新手快速上手指南 (Quick Start for Beginners)
 
-### 2. 知识检索 (Search — CJK + Graph Expansion)
-CJK bigram 分词 + 三级评分（title +10 / summary +3 / body +1）+ 图扩展（top 3 结果的高权重邻居自动注入候选）。
-*   **搜索**: `python cli.py search "DRG 医保" --top_k 5`
+为了让 Vector Lake 的 V8 引擎能在本地顺利启动，请按照以下步骤进行环境配置与首次投喂：
 
-### 3. 深度推演落盘 (Query-to-Page — 带预算控制 + 自动回摄)
-预算控制的上下文组装（60/20/5/15 分配），推演完成后自动检测新文件、重建索引、为断链生成 seed 页面。
-*   **推演查询**: `python cli.py query "对比 Vendor A 和 Vendor B 的 AI 战略差异"`
+### 1. 环境依赖与配置 (Prerequisites & Config)
+- **Python 3.10+**: 确保本地环境支持。
+- **依赖安装**: 在终端执行以下命令安装核心依赖（如 `networkx`, `colorama` 等）：
+  ```bash
+  pip install -r requirements.txt
+  ```
+- **底层引擎无缝调用**: 本系统完全依赖原生 Gemini CLI，**无需配置任何额外的 Gemini API Key**。
+- **核心配置 `config.json`**:
+  在执行前，请确保项目根目录存在 `config.json`。这是用来管控雷达扫描范围和模型梯队的核心配置文件：
+  - `target_directories`: 设定要被 V8 引擎吞噬监控的路径（默认为 `["../../MEMORY/raw"]`）。
+  - `exclude_paths`: 配置物理隔离区，确保像健康指标（`garmin/`）等噪音不被卷入知识图谱。
+  - `llm.model_cascade`: 抗 429 攻击的级联降级梯队（默认为 `["default", "gemini-2.5-pro", "gemini-3.1-flash"]`）。
 
-### 4. 结构化审计自愈 (10-Point Structural Lint)
-10 项深度健康体检：前端完整性、命名合规、Type/Status 合法性、Category 词表、重复 ID、Alias 冲突、断链、孤岛页、相似文件名、知识衰变。
-*   **审计**: `python cli.py lint [--auto-fix]`
+### 2. 初始化与体检 (Initialization)
+首次运行前，通过 `doctor` 巡检命令进行物理目录与依赖的自检：
+```bash
+python cli.py doctor
+```
+*（引擎会自动补全缺失的 `MEMORY/raw`、`MEMORY/wiki` 及 `.meta/` 事实库目录）*
 
-### 5. 审查队列与拓扑审计 (Async Review Queue & Audit-Graph)
-查看和处理 LLM 在摄取过程中标记的矛盾、知识空白，以及由图谱算法发现的跨界桥梁（Bridge Nodes）等。
-*   **触发图谱审计**: `python cli.py audit-graph` (从索引中抽取网络拓扑裂缝并推入队列)
-*   **查看队列**: `python cli.py review`
-*   **解决条目**: `python cli.py review resolve <index> [--resolution skip|create]` (若 create 将触发爬虫自动补全网络盲区)
+### 3. 标准作战工作流 (Standard Workflow)
+- **步骤一：投喂原始情报**。将未处理的日志、文档或 Markdown 放入 `MEMORY/raw` 目录。
+- **步骤二：启动知识编译**。执行同步管线，系统会自动触发 Shift-Left 防腐机制：
+  ```bash
+  python cli.py sync
+  ```
+- **步骤三：全息沙盘视察**。编译完成后，启动图形化拓扑雷达：
+  ```bash
+  python cli.py graph
+  ```
+- **步骤四：战略推演问答**。基于被净化后的 Canonical 事实库进行精准提问：
+  ```bash
+  python cli.py query "总结刚刚录入的系统架构升级了哪些特性？"
+  ```
 
-### 6. 3D 拓扑图谱 (Graph View — 动态社区与实体降维)
-利用 `weighted_edges` 渲染 3D 交互图谱大屏，支持按本体分类（Entity/Concept）与 Louvain 社区（自动抽取主题词）进行双轨制着色。
-*   **大屏展示**: `python cli.py graph`
+## 当前能力
 
-### 7. 级联删除 (Cascade Delete)
-删除原始源文件及其关联的 wiki 页面。
-*   **执行**: `python cli.py delete "/path/to/raw/file.pdf"`
+- `sync` / `watchdog`：把 raw sources 编译成 wiki 页面，强制施加防腐过滤。
+- `search`：基于 page index 做 CJK-aware 搜索和图扩展。
+- `query`：组装上下文并调用 synthesizer 生成推演结果。
+- `graph`：**全新赛博朋克级渲染图谱**。
+- `review`：统一在基于 V8 Canonical 事实引擎运行治理入列审查 (支持 `resolve` 与 `ground` 自动捕食)。
+- `audit-graph`：把拓扑洞察转成待处理治理项。
+- `publish`：发布 pending change sets。
+- `debt`：输出治理债务指标，严管系统混乱度。
+- `trace`：查看 claim/source/provenance 链路，实施归因审计。
+- `merge-suggestions`：生成或入队实体归并候选清单。
+- `delete`：无情斩杀无效关联与原始资产。
+- `gc`：自动化识别并修剪出入度过低的边缘孤岛节点。
+- `doctor`：自愈与依赖体检。
 
-## 为什么采用这种架构？
+## 存储结构
 
-传统的 RAG 系统在每次被提问时都在从零开始重新拼凑知识碎片。而 LLM-Wiki 模式将知识编译一次并保持常新。交叉引用在物理层面上真实存在；事实冲突被显式标注；逻辑综合反映了您阅读过的一切。
+```text
+MEMORY/
+  raw/
+  wiki/
+    *.md
+    index.json
+    claim_graph.json
+    .meta/
+      entities.json
+      claims.json
+      evidence.json
+      sources.json
+      alias_registry.json
+      change_sets.json
+      governance_queue.json
+```
 
-V7.2 更是将图谱推入了“自治”阶段。它不再是一个被动查询的静态数据库，而是一个会利用 Louvain 算法侦测自己的“知识盲区”，并主动发起“网络捕食”的生命体。维护一个维基百科所带来的庞大脑力与体力劳动——现在已完全由底层的代码锁、图谱分析与永不疲倦的 LLM 接管。
+
+
+## 运行模型
+
+### Governance 治理边界
+
+V8 治理层管理这些对象，以物理事实为底座：
+- `Entity` 强控名录
+- `Claim` 断言节点
+- `Evidence` 证据锚点
+- `Source` 底座溯源
+- `Change Set` 操作记录
+
+运行时的健康映射指标 (`validity_state`) 与防御映射：
+- `active` / `review-due` / `needs-review` / `unsupported` / `conflicted`
+- **对齐惩罚值**: `alignment_score` 低于基线的会在各个引擎的遍历被强制熔断。
+- **半衰期抛弃**: `decay_weight` 控制存留强度。
+
+## 命令行主入口
+
+CLI 是核心操作界面：
+
+- **编译与防御**：`python cli.py sync`
+- **情报搜索**：`python cli.py search "边缘计算模型" --top_k 5`
+- **深度合成**：`python cli.py query "对比 Vendor A 和 Vendor B 的 AI 战略差异"`
+- **全息沙盘**：`python cli.py graph`（推荐体验最新霓虹渲染）
+- **审计熔断区**：`python cli.py lint`
+- **巡检排雷**：`python cli.py doctor`
+
+（更高级的执行命令可以查看 `commands/` ）
+
+## 测试与防御验证
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+当前核心攻坚的测试网路如下：
+- `query --dry-run` 严格不落盘协议
+- 前置 Entity Mapping 字典的劫持成功率
+- V8 实体唯一权威性、`alignment_score` 反边缘漂移机制效能。
+
+---
+*SYS_CHECK: Mentat Ready. Assault Mode Active.*

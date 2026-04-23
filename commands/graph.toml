@@ -1,0 +1,4 @@
+description = "Visualize the current Vector Lake page graph and claim graph as an interactive 3D topology."
+prompt = """
+Please use the `visualize_vector_lake` tool and show the resulting status to the user.
+"""

@@ -1,4 +1,0 @@
-description = "Trigger a comprehensive health check of the Wiki Markdown network (V7.1)."
-prompt = """
-Please use the `lint_vector_lake` tool with `auto_fix=True` to trigger a full system health check. This scans frontmatter completeness, naming compliance, type/status legality, category vocabulary, duplicate IDs, alias conflicts, broken links, orphan pages, file name similarities, and knowledge decay (>60 days sprouting). Read out the generated report to the user.
-"""
