@@ -1,0 +1,3 @@
+## 2024-05-14 - Optimize YAML parsing with CSafeLoader
+**Learning:** PyYAML's `yaml.safe_load` is written in pure Python and can be significantly slower than necessary. In a codebase that parses frontmatter for every wiki file (e.g., this app's `indexer.py` and `repair_wiki.py`), this can create a severe bottleneck. The `CSafeLoader` uses the libyaml C library when available and offers ~7x faster performance.
+**Action:** When working in Python environments that do a lot of YAML parsing (especially frontmatter in markdown or config loading in hot paths), default to trying to import `CSafeLoader` and falling back to `SafeLoader`, then using `yaml.load(data, Loader=SafeLoader)` instead of `yaml.safe_load(data)`.
