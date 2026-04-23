@@ -199,6 +199,7 @@ def process_file_batch(filepaths: list, existing_source_map: dict = None):
 
     # --- DEDUP: Plan B - Compute canonical target filenames ---
     file_entries = []
+    file_contents_for_prompt = []
     for abs_p, rel_p in zip(filepaths, rel_filepaths):
         # Compute the raw ref path as it appears in YAML sources: field (relative to MEMORY/)
         try:
@@ -214,11 +215,26 @@ def process_file_batch(filepaths: list, existing_source_map: dict = None):
         target_name = existing_name if existing_name else canonical_name
         action = "UPDATE" if existing_name else "CREATE"
         
+        # Read file content to pass to agent
+        content = ""
+        try:
+            with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            # Add to content block for prompt
+            file_contents_for_prompt.append(
+                f"--- SOURCE FILE: {rel_p} ---\n"
+                f"{content}\n"
+                f"--- END SOURCE FILE ---\n"
+            )
+        except Exception as e:
+            log.error(f"Could not read file {abs_p} for ingest: {e}")
+
         file_entries.append({
             "rel_path": rel_p,
             "raw_ref": raw_ref,
             "target_source_file": target_name,
             "action": action,
+            "content": content
         })
     
     # Build structured file list with explicit target filenames (sanitized)
@@ -233,6 +249,7 @@ def process_file_batch(filepaths: list, existing_source_map: dict = None):
             f"  YAML sources field: [\"{safe_ref.replace('\"', '\\\"')}\"]"
         )
     file_list_str = "\n".join(file_list_lines)
+    file_content_str = "\n".join(file_contents_for_prompt)
 
     # Backup wiki targets before agent write
     _backup_wiki_targets(WIKI_DIR, file_entries)
@@ -262,11 +279,15 @@ def process_file_batch(filepaths: list, existing_source_map: dict = None):
     analysis_prompt = f"""@vector-lake-ingestor
 [STEP 1 OF 2 — ANALYSIS ONLY. DO NOT WRITE ANY FILES.]
 
-Read the following source files and produce a **structured analysis** in Chinese.
+Analyze the content of the source files provided below and produce a **structured analysis** in Chinese.
 Do NOT create or modify any wiki files in this step. Only output your analysis text.
 
-Source Files:
+Source Files Information:
 {file_list_str}
+
+--- SOURCE FILE CONTENTS ---
+{file_content_str}
+--- END SOURCE FILE CONTENTS ---
 
 Your analysis MUST cover these sections:
 
@@ -359,13 +380,17 @@ Be thorough but concise. Focus on what's genuinely important.
     generation_prompt = f"""@vector-lake-ingestor
 [STEP 2 OF 2 — GENERATION. NOW WRITE FILES.]
 
-Based on the following analysis, compile the source files into the Wiki directory (`{WIKI_DIR}`).
+Based on the following analysis and original source content, compile the source files into the Wiki directory (`{WIKI_DIR}`).
 
 Source Files (with MANDATORY target filenames):
 {file_list_str}
 
 --- SOURCE ANALYSIS (from Step 1) ---
 {analysis_result[:20000]}
+
+--- ORIGINAL SOURCE FILE CONTENTS ---
+{file_content_str}
+--- END ORIGINAL SOURCE FILE CONTENTS ---
 
 --- CRITICAL DEDUP RULES ---
 1. You MUST use the exact "Target Source Page" filename specified above for each Source page. DO NOT invent your own filename.
