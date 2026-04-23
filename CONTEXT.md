@@ -1,9 +1,10 @@
 # CONTEXT: Vector Lake (LLM-Wiki Engine)
 
 ## 1. 核心定位 (Status)
-**Vector Lake** (V7.2 LLM-Wiki Engine) 是 Gemini CLI 的有状态知识库编译基座。它摒弃了传统的"无状态检索(Stateless RAG)"和黑盒数据库，将长程记忆彻底重构为**基于大模型维护的纯 Markdown 节点网络 (Stateful Compounding Wiki)**。
+**Vector Lake** (V8 Hardened Kernel) 是 Gemini CLI 的有状态知识库编译基座。它摒弃了传统的"无状态检索(Stateless RAG)"和黑盒数据库，将长程记忆彻底重构为**基于大模型维护的纯 Markdown 节点网络 (Stateful Compounding Wiki)**。
 
-V7.2 核心升级（The Topology & Autonomous Expansion Edition）：
+V8 核心升级（The Topology & Autonomous Expansion Edition）：
+*   **反漂移力场与前置防腐 (V8 Kernel)**: 引入 `alignment_score` 和 Shift-Left Entity Resolution 前置同态字典，高频截胡大模型的幻觉与变种命名。
 *   **拓扑审计与图谱裂缝发现 (Louvain Integration)**: 在 `vector_lake/indexer.py` 环节原生集成 Louvain 算法，自动划分动态知识社区（Community Detection），并为其动态提取主题标签（如 `Comm 2: Agentic AI / Vector Lake`）。算法同时计算内聚度 (Cohesion Score)，侦测孤立节点、稀疏知识区与跨域桥接节点。
 *   **自动捕食闭环 (Autonomous Deep Research)**: 引入 `audit-graph` 指令。系统自动将发现的拓扑裂缝合成为预定义研究任务注入 `review_queue.json`。人类批准（resolve create）后，系统自动触发网络爬虫获取资料并执行两步 CoT 回摄，实现知识边界的自主扩张。
 *   **高并发免疫与级联降级 (429 Immunity Cascade)**: 彻底重构 Ingestion 引擎的 LLM 通信层，免疫底层 API 耗尽（429 报错）导致的进程静默假死假象。拦截底层 stderr 以越过 Exit 0 欺骗，实现顺滑的模型阶梯降维打击。
@@ -59,6 +60,11 @@ V7.2 核心升级（The Topology & Autonomous Expansion Edition）：
 *   **🗑️ 级联删除与修剪 (Delete & GC)**
     `python cli.py gc --days 30` (修剪长尾孤岛节点)
     `python cli.py delete "<raw文件路径>"`
+*   **🛠️ 治理与系统运维 (Governance & Ops)**
+    `python cli.py doctor` (运行时环境与文件物理阵地体检)
+    `python cli.py debt` (输出系统混乱度债务与治理指标)
+    `python cli.py trace "<查询或ID>"` (全链路溯源归因审计)
+    `python cli.py merge-suggestions` (自动探测并生成实体归并候选清单)
 
 ## 5. 运行守则 (Runtime Rules)
 1.  **资产化原则**: 每当进行复杂的多文件对比或逻辑推演时，必须优先使用 `query` 命令，让其洞察过程固化为物理 Markdown 文件。

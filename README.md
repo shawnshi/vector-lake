@@ -71,12 +71,12 @@ flowchart TD
     Contested --> Render
     
     Render --> Review[Review 审查与治理排雷]
-    Review --> Publish([Publish 发布变更集])
+    Review --> Resolve([Resolve / Ground 事实闭环])
     
     style Start fill:#334155,color:#fff,stroke:#cbd5e1
     style Core fill:#064e3b,color:#fff,stroke:#34d399
     style Contested fill:#7f1d1d,color:#fff,stroke:#f87171
-    style Publish fill:#0f172a,color:#fff,stroke:#38bdf8
+    style Resolve fill:#0f172a,color:#fff,stroke:#38bdf8
 ```
 
 ## 核心架构大升级 (V8 Hardened Kernel)
@@ -133,7 +133,6 @@ python cli.py doctor
 - `graph`：**全新赛博朋克级渲染图谱**。
 - `review`：统一在基于 V8 Canonical 事实引擎运行治理入列审查 (支持 `resolve` 与 `ground` 自动捕食)。
 - `audit-graph`：把拓扑洞察转成待处理治理项。
-- `publish`：发布 pending change sets。
 - `debt`：输出治理债务指标，严管系统混乱度。
 - `trace`：查看 claim/source/provenance 链路，实施归因审计。
 - `merge-suggestions`：生成或入队实体归并候选清单。
