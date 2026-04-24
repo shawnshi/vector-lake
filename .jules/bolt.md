@@ -1,0 +1,3 @@
+## 2024-05-24 - [Optimize YAML Parsing Performance]
+ **Learning:** In projects parsing a large volume of Markdown files with YAML frontmatter (like this wiki engine), `yaml.safe_load` from the standard PyYAML library can become a significant bottleneck. Using `yaml.load(..., Loader=yaml.CSafeLoader)` leverages the underlying C library (libyaml) and parsing performance can be around ~8x faster.
+ **Action:** Prefer importing `CSafeLoader` over `SafeLoader` (falling back safely if `CSafeLoader` is unavailable) when reading YAML in Python components. Avoid using the slower `yaml.safe_load` wrapper.
