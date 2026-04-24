@@ -1,0 +1,4 @@
+## 2024-04-24 - Fix DOM XSS in topology visualization
+**Vulnerability:** DOM-based Cross-Site Scripting (XSS) in HTML templates where user-controlled string variables are concatenated into innerHTML and string interpolation within inline JavaScript event handlers (e.g., `onclick="selectNode('${targetId}')"`).
+**Learning:** Rendering arbitrary strings directly into `.innerHTML` and inline handlers exposes the UI to executing unexpected Javascript payloads.
+**Prevention:** Avoid string interpolation with `.innerHTML` or `onclick`. Use `escapeHtml` function to encode template variables for `.innerHTML`, build dynamic lists using safer DOM APIs like `document.createElement()` with `.textContent`, and attach variables to event handlers safely using HTML `data-*` attributes via `element.setAttribute('data-id')` along with closures that retrieve the specific dataset identifier `this.getAttribute('data-id')`.
