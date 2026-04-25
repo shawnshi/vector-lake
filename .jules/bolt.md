@@ -1,0 +1,3 @@
+## 2024-04-25 - Use CSafeLoader for YAML parsing
+**Learning:** PyYAML's default `yaml.safe_load` is written in pure Python and is very slow for large numbers of files (takes ~4.6s for 10000 loads vs 0.6s with CSafeLoader). Since Vector Lake indexes many markdown files containing YAML frontmatter, this parsing is a significant bottleneck.
+**Action:** Always use `yaml.load(data, Loader=SafeLoader)` instead of `yaml.safe_load(data)` when parsing frontmatter or configuration to speed up indexing, falling back to pure Python `SafeLoader` if `CSafeLoader` fails to import: `try: from yaml import CSafeLoader as SafeLoader except ImportError: from yaml import SafeLoader`.
