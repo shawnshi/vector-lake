@@ -6,6 +6,11 @@ import re
 from datetime import datetime, timezone
 
 import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -155,7 +160,9 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    # ⚡ Bolt Optimization: Use CSafeLoader (aliased to SafeLoader) for faster YAML parsing
+    # Impact: Significantly improves indexing performance by reducing time spent parsing node frontmatter.
+    fm_data = yaml.load(fm_str, Loader=SafeLoader) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
