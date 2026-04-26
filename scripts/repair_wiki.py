@@ -23,6 +23,11 @@ import sys
 import yaml
 import random
 import string
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -54,7 +59,9 @@ def parse_frontmatter(content):
     if not m:
         return None, None
     try:
-        data = yaml.safe_load(m.group(1))
+        # ⚡ Bolt Optimization: Use CSafeLoader (aliased to SafeLoader) for faster YAML parsing
+        # Impact: Accelerates wiki repair operations when scanning and modifying large numbers of files.
+        data = yaml.load(m.group(1), Loader=SafeLoader)
         if isinstance(data, dict):
             return data, m
     except yaml.YAMLError:
