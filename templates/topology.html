@@ -62,6 +62,14 @@
         }
     </style>
     <script src="https://unpkg.com/3d-force-graph"></script>
+    <script>
+        function escapeHTML(str) {
+            if (str === null || str === undefined) return '';
+            const div = document.createElement('div');
+            div.textContent = String(str);
+            return div.innerHTML;
+        }
+    </script>
 </head>
 <body>
     <div id="loading">Computing Topology...</div>
@@ -386,7 +394,7 @@
             neighbors = buildNeighbors(data);
             Graph.graphData(data)
                 .nodeId('id')
-                .nodeLabel(node => `[${node.group}] ${node.name || node.id} (关联: ${node.degree || 0})`)
+                .nodeLabel(node => `[${escapeHTML(node.group)}] ${escapeHTML(node.name || node.id)} (关联: ${escapeHTML(node.degree || 0)})`)
                 .nodeVal(node => Math.max(2.5, Math.sqrt(node.degree || 1) * 3.8))
                 .nodeRelSize(7)
                 .nodeColor(currentColor)
@@ -446,21 +454,31 @@
             Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            const titleEl = document.getElementById('info-title');
+            titleEl.innerHTML = '';
+            if (href) {
+                const a = document.createElement('a');
+                a.href = href;
+                a.target = '_blank';
+                a.textContent = node.name || node.id;
+                titleEl.appendChild(a);
+            } else {
+                titleEl.textContent = node.name || node.id;
+            }
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
             const meta = [];
-            meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
-            meta.push(`<span><strong>Type</strong> ${node.group || 'Unknown'}</span>`);
-            meta.push(`<span><strong>Degree</strong> ${node.degree || 0}</span>`);
-            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${node.validity_state}</span>`);
-            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${node.claim_type}</span>`);
-            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${node.confidence}</span>`);
-            if (node.domain) meta.push(`<span><strong>Domain</strong> ${node.domain}</span>`);
-            if (node.updated) meta.push(`<span><strong>Updated</strong> ${node.updated.substring(0, 10)}</span>`);
-            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${node.alignment_score}</span>`);
-            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${node.decay_weight}</span>`);
+            meta.push(`<span><strong>Mode</strong> ${escapeHTML(activeGraphKey)}</span>`);
+            meta.push(`<span><strong>Type</strong> ${escapeHTML(node.group || 'Unknown')}</span>`);
+            meta.push(`<span><strong>Degree</strong> ${escapeHTML(node.degree || 0)}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${escapeHTML(node.validity_state)}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${escapeHTML(node.claim_type)}</span>`);
+            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${escapeHTML(node.confidence)}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain</strong> ${escapeHTML(node.domain)}</span>`);
+            if (node.updated) meta.push(`<span><strong>Updated</strong> ${escapeHTML(node.updated.substring(0, 10))}</span>`);
+            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${escapeHTML(node.alignment_score)}</span>`);
+            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${escapeHTML(node.decay_weight)}</span>`);
             document.getElementById('info-meta').innerHTML = meta.join('');
             document.getElementById('info-summary').innerText = node.summary || 'No summary available.';
 
@@ -473,13 +491,25 @@
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.setAttribute('data-id', targetId);
+                a.textContent = `[${group}] ${name}`;
+                a.onclick = function() { selectNode(this.getAttribute('data-id')); };
+                li.appendChild(a);
+                links.appendChild(li);
             });
             if (!links.innerHTML) links.innerHTML = '<li>None</li>';
 
             (node.sources || []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.href = hrefValue;
+                a.target = '_blank';
+                a.textContent = source;
+                li.appendChild(a);
+                sources.appendChild(li);
             });
             if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
 
