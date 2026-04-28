@@ -1,0 +1,3 @@
+## 2024-04-28 - [Performance Issue] YAML Parsing Overhead
+**Learning:** Pure Python YAML parsing (`yaml.safe_load()`) causes significant performance bottlenecks when processing a large number of markdown files with frontmatter, such as those within the `vector_lake/wiki_utils.py` and `vector_lake/indexer.py`. The standard Library provides a C extension loader `CSafeLoader` that is much faster, if LibYAML is available.
+**Action:** Replaced `yaml.safe_load(...)` with `yaml.load(..., Loader=SafeLoader)` after explicitly trying to import `CSafeLoader` as `SafeLoader` (falling back to pure python `SafeLoader` if not found). This significantly improves parsing speed when `LibYAML` is present without risking portability.
