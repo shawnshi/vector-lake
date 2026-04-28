@@ -1,0 +1,4 @@
+## 2025-04-28 - [Mitigate DOM XSS Vulnerability in Frontend Application]
+**Vulnerability:** Found multiple cases of DOM-based Cross-Site Scripting (XSS) in `templates/topology.html` where variables derived from node labels/ids (`node.name`, `node.group`, `targetId`, `source`) were directly concatenated into HTML strings via `.innerHTML`.
+**Learning:** This existed because the D3.js visualization used pure JS string interpolation for speed and ease of development without sanitizing data that might be injected via backend responses or Markdown inputs.
+**Prevention:** Avoid interpolating variables into `.innerHTML` strings, especially within event handlers like `onclick`. Use HTML element attributes and the standard DOM APIs (`document.createElement` and `textContent`) combined with a robust HTML encoding helper like `escapeHtml`.
