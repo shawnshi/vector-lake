@@ -123,6 +123,17 @@
     <div id="stats-panel"></div>
 
     <script>
+
+        function escapeHTML(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
         const rawData = %%GRAPH_DATA%%;
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
 
@@ -238,7 +249,7 @@
                 const label = document.createElement('label');
                 label.className = 'filter-checkbox';
                 const checked = activeGroups.has(group) ? 'checked' : '';
-                label.innerHTML = `<input type="checkbox" value="${group}" ${checked}> ${group}`;
+                label.innerHTML = `<input type="checkbox" value="${escapeHTML(group)}" ${checked}> ${escapeHTML(group)}`;
                 label.querySelector('input').addEventListener('change', (event) => {
                     if (event.target.checked) activeGroups.add(group);
                     else activeGroups.delete(group);
@@ -253,7 +264,7 @@
             legend.innerHTML = '';
             if (activeGraphKey === 'claim') {
                 Object.entries(CLAIM_STATE_COLORS).forEach(([state, color]) => {
-                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${state}</div>`;
+                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${escapeHTML(state)}</div>`;
                 });
                 return;
             }
@@ -261,14 +272,14 @@
                 const labels = currentGraph().community_labels || {};
                 Object.keys(labels).slice(0, 8).forEach(cid => {
                     const color = COMMUNITY_COLORS[cid % COMMUNITY_COLORS.length];
-                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${labels[cid]}</div>`;
+                    legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${escapeHTML(labels[cid])}</div>`;
                 });
                 return;
             }
             Array.from(activeGroups).sort().forEach(group => {
                 const color = PAGE_COLORS[group] || PAGE_COLORS.Unknown;
                 const count = currentGraph().nodes.filter(n => (n.group || 'Unknown') === group).length;
-                legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${group} (${count})</div>`;
+                legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${escapeHTML(group)} (${count})</div>`;
             });
         }
 
@@ -279,7 +290,7 @@
             container.innerHTML = '';
             Object.entries(validityCounts).forEach(([state, count]) => {
                 const color = CLAIM_STATE_COLORS[state] || CLAIM_STATE_COLORS.unknown;
-                container.innerHTML += `<div class="metric-item"><div class="metric-color" style="background:${color}"></div>${state}: ${count}</div>`;
+                container.innerHTML += `<div class="metric-item"><div class="metric-color" style="background:${color}"></div>${escapeHTML(state)}: ${count}</div>`;
             });
             if (!container.innerHTML) {
                 container.innerHTML = '<div class="metric-item">No governance metrics.</div>';
@@ -295,7 +306,7 @@
             if (activeGraphKey === 'claim') {
                 const counts = rawData.governanceMetrics && rawData.governanceMetrics.validity_state_counts ? rawData.governanceMetrics.validity_state_counts : {};
                 Object.entries(counts).forEach(([state, count]) => {
-                    stats.innerHTML += `<div class="stat-item">${state}: ${count}</div>`;
+                    stats.innerHTML += `<div class="stat-item">${escapeHTML(state)}: ${count}</div>`;
                 });
             }
         }
@@ -446,18 +457,18 @@
             Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${escapeHTML(href)}" target="_blank">${escapeHTML(node.name || node.id)}</a>` : escapeHTML(node.name || node.id);
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
             const meta = [];
             meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
-            meta.push(`<span><strong>Type</strong> ${node.group || 'Unknown'}</span>`);
+            meta.push(`<span><strong>Type</strong> ${escapeHTML(node.group || 'Unknown')}</span>`);
             meta.push(`<span><strong>Degree</strong> ${node.degree || 0}</span>`);
-            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${node.validity_state}</span>`);
-            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${node.claim_type}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${escapeHTML(node.validity_state)}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${escapeHTML(node.claim_type)}</span>`);
             if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${node.confidence}</span>`);
-            if (node.domain) meta.push(`<span><strong>Domain</strong> ${node.domain}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain</strong> ${escapeHTML(node.domain)}</span>`);
             if (node.updated) meta.push(`<span><strong>Updated</strong> ${node.updated.substring(0, 10)}</span>`);
             if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${node.alignment_score}</span>`);
             if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${node.decay_weight}</span>`);
@@ -473,13 +484,13 @@
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
+                links.innerHTML += `<li><a href="javascript:void(0)" data-id="${escapeHTML(targetId)}" onclick="selectNode(this.getAttribute('data-id'))">[${escapeHTML(group)}] ${escapeHTML(name)}</a></li>`;
             });
             if (!links.innerHTML) links.innerHTML = '<li>None</li>';
 
             (node.sources || []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                sources.innerHTML += `<li><a href="${escapeHTML(hrefValue)}" target="_blank">${escapeHTML(source)}</a></li>`;
             });
             if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
 
