@@ -126,6 +126,16 @@
         const rawData = %%GRAPH_DATA%%;
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
 
+        function escapeHtml(unsafe) {
+            if (unsafe == null) return '';
+            return String(unsafe)
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+
         const PAGE_COLORS = {
             "Entity": "#FF0266",
             "Concept": "#00F0FF",
@@ -238,7 +248,7 @@
                 const label = document.createElement('label');
                 label.className = 'filter-checkbox';
                 const checked = activeGroups.has(group) ? 'checked' : '';
-                label.innerHTML = `<input type="checkbox" value="${group}" ${checked}> ${group}`;
+                label.innerHTML = `<input type="checkbox" value="${escapeHtml(group)}" ${checked}> ${escapeHtml(group)}`;
                 label.querySelector('input').addEventListener('change', (event) => {
                     if (event.target.checked) activeGroups.add(group);
                     else activeGroups.delete(group);
@@ -446,23 +456,24 @@
             Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            const safeName = escapeHtml(node.name || node.id);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${escapeHtml(href)}" target="_blank">${safeName}</a>` : safeName;
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
             const meta = [];
-            meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
-            meta.push(`<span><strong>Type</strong> ${node.group || 'Unknown'}</span>`);
-            meta.push(`<span><strong>Degree</strong> ${node.degree || 0}</span>`);
-            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${node.validity_state}</span>`);
-            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${node.claim_type}</span>`);
-            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${node.confidence}</span>`);
-            if (node.domain) meta.push(`<span><strong>Domain</strong> ${node.domain}</span>`);
-            if (node.updated) meta.push(`<span><strong>Updated</strong> ${node.updated.substring(0, 10)}</span>`);
-            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${node.alignment_score}</span>`);
-            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${node.decay_weight}</span>`);
+            meta.push(`<span><strong>Mode</strong> ${escapeHtml(activeGraphKey)}</span>`);
+            meta.push(`<span><strong>Type</strong> ${escapeHtml(node.group || 'Unknown')}</span>`);
+            meta.push(`<span><strong>Degree</strong> ${escapeHtml(node.degree || 0)}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${escapeHtml(node.validity_state)}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${escapeHtml(node.claim_type)}</span>`);
+            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${escapeHtml(node.confidence)}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain</strong> ${escapeHtml(node.domain)}</span>`);
+            if (node.updated) meta.push(`<span><strong>Updated</strong> ${escapeHtml(node.updated.substring(0, 10))}</span>`);
+            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${escapeHtml(node.alignment_score)}</span>`);
+            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${escapeHtml(node.decay_weight)}</span>`);
             document.getElementById('info-meta').innerHTML = meta.join('');
-            document.getElementById('info-summary').innerText = node.summary || 'No summary available.';
+            document.getElementById('info-summary').textContent = node.summary || 'No summary available.';
 
             const links = document.getElementById('info-links');
             const sources = document.getElementById('info-sources');
@@ -473,13 +484,24 @@
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.textContent = `[${group}] ${name}`;
+                a.onclick = () => selectNode(targetId);
+                li.appendChild(a);
+                links.appendChild(li);
             });
             if (!links.innerHTML) links.innerHTML = '<li>None</li>';
 
             (node.sources || []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.href = hrefValue;
+                a.target = '_blank';
+                a.textContent = source;
+                li.appendChild(a);
+                sources.appendChild(li);
             });
             if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
 
