@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
 Usage Examples:
   python cli.py sync
   python cli.py search "MSL" --top_k 5
+  python cli.py search "deployment target" --mode memory
   python cli.py review
   python cli.py review resolve 0
   python cli.py review resolve review_ab12cd34ef56
@@ -53,6 +54,7 @@ Usage Examples:
     search_parser.add_argument("--domain", type=str, default=None, help="Filter by domain namespace.")
     search_parser.add_argument("--cluster", type=str, default=None, help="Filter by topic cluster.")
     search_parser.add_argument("--include-history", action="store_true", help="Bypass temporal invalidation to search deprecated facts.")
+    search_parser.add_argument("--mode", choices=["page", "memory", "claim"], default="page", help="Search page index, operational memory, or fact claims.")
 
     query_parser = subparsers.add_parser("query", help="[QUERY] Deep reasoning with budget-controlled context.")
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
@@ -105,6 +107,7 @@ def main() -> int:
                 domain=getattr(args, "domain", None),
                 cluster=getattr(args, "cluster", None),
                 include_history=getattr(args, "include_history", False),
+                mode=getattr(args, "mode", "page"),
             ))
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, "auto_fix", False)))

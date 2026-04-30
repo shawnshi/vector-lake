@@ -30,7 +30,7 @@ WIKI_DIR = get_wiki_dir()
 SCHEMA_PATH = EXTENSION_ROOT / "schema.md"
 MEMORY_DIR = get_memory_dir()
 
-SUPPORTED_EXTS = { ".md", ".txt", ".png", ".jpeg", ".pdf" }
+SUPPORTED_EXTS = set(config.get("supported_extensions", [".md", ".txt"]))
 
 def canonical_source_name(raw_path: str) -> str:
     """Deterministically derive a Source wiki filename from a raw file path.
@@ -331,7 +331,7 @@ Be thorough but concise. Focus on what's genuinely important.
     analysis_result = ""
     
     llm_config = config.get("llm", {})
-    model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash", "gemini-3.1-8b"])
+    model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash"])
     timeout_analysis = llm_config.get("timeout_analysis", 120)
     retries = len(model_cascade)
 

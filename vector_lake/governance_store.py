@@ -1,7 +1,10 @@
 import copy
+import hashlib
 import json
 import logging
+import math
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -17,6 +20,7 @@ from vector_lake.wiki_utils import (
     get_evidence_path,
     get_governance_queue_path,
     get_meta_dir,
+    get_memory_objects_path,
     get_sources_path,
     get_wiki_dir,
     read_markdown_file,
@@ -27,6 +31,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vector-lake-governance-store")
 
 SCHEMA_VERSION = "8.0"
+OPERATIONAL_MEMORY_TYPES = {"fact", "preference", "decision", "task_state"}
+MEMORY_TTL_DAYS = {
+    "fact": 365,
+    "preference": 365,
+    "decision": 730,
+    "task_state": 45,
+}
+VALIDITY_FACTORS = {
+    "active": 1.0,
+    "expiring-soon": 0.82,
+    "review-due": 0.72,
+    "needs-review": 0.62,
+    "provisional": 0.58,
+    "unsupported": 0.42,
+    "conflicted": 0.18,
+    "superseded": 0.08,
+    "expired": 0.0,
+    "archived": 0.0,
+}
 
 
 def _utc_now() -> str:
@@ -62,6 +85,7 @@ def initialize_meta_store():
         (get_evidence_path(), _default_map_store("evidence_id")),
         (get_sources_path(), _default_map_store("source_id")),
         (get_alias_registry_path(), _default_map_store("alias")),
+        (get_memory_objects_path(), _default_map_store("memory_id")),
         (get_change_sets_path(), _default_queue_store()),
         (get_governance_queue_path(), _default_queue_store()),
     ]:
@@ -121,6 +145,10 @@ def load_alias_registry():
     return _load_json(get_alias_registry_path(), lambda: _default_map_store("alias"))
 
 
+def load_memory_objects():
+    return _load_json(get_memory_objects_path(), lambda: _default_map_store("memory_id"))
+
+
 def load_change_sets():
     return _load_json(get_change_sets_path(), _default_queue_store)
 
@@ -147,6 +175,10 @@ def save_sources(data):
 
 def save_alias_registry(data):
     _save_json(get_alias_registry_path(), data)
+
+
+def save_memory_objects(data):
+    _save_json(get_memory_objects_path(), data)
 
 
 def save_change_sets(data):
@@ -189,6 +221,346 @@ def _compact_claim_text(text: str, limit: int = 240) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _stable_id(prefix: str, value: str) -> str:
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def _coerce_float(value, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def _parse_dt(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _dt_rank(value) -> float:
+    parsed = _parse_dt(value)
+    if not parsed:
+        return 0.0
+    return parsed.timestamp()
+
+
+def _normalize_memory_key(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized[:96] or "general"
+
+
+def _query_terms(query: str) -> list[str]:
+    text = str(query or "").lower()
+    terms = {token for token in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", text) if token}
+    cjk_chars = [char for char in text if "\u4e00" <= char <= "\u9fff"]
+    for index in range(len(cjk_chars) - 1):
+        terms.add(cjk_chars[index] + cjk_chars[index + 1])
+    terms.update(cjk_chars)
+    return sorted(terms)
+
+
+def infer_memory_type(claim: dict) -> str:
+    explicit = str(claim.get("memory_type") or "").strip().lower().replace("-", "_")
+    if explicit in OPERATIONAL_MEMORY_TYPES:
+        return explicit
+
+    claim_type = str(claim.get("claim_type") or "").lower().replace("-", "_")
+    if claim_type in OPERATIONAL_MEMORY_TYPES:
+        return claim_type
+
+    text = f"{claim.get('claim_text', '')} {claim.get('source_page', '')}".lower()
+    if any(token in text for token in ("preference", "preferred", "用户偏好", "偏好", "首选", "不要", "倾向")):
+        return "preference"
+    if any(token in text for token in ("decision", "decided", "approved", "决策", "决定", "方案", "采用", "选型")):
+        return "decision"
+    if any(token in text for token in ("task", "todo", "pending", "blocked", "open item", "待办", "未完成", "阻塞", "状态")):
+        return "task_state"
+    return "fact"
+
+
+def _infer_memory_key(claim: dict, memory_type: str) -> str:
+    explicit = claim.get("memory_key") or claim.get("preference_key") or claim.get("decision_key") or claim.get("task_key")
+    if explicit:
+        return _normalize_memory_key(explicit)
+
+    locator = claim.get("locator") or {}
+    heading = locator.get("heading") or claim.get("source_page") or "general"
+    text = str(claim.get("claim_text") or "")
+    match = re.match(r"^(.{2,80}?)[：:]\s+.+$", text)
+    if match:
+        heading = match.group(1)
+
+    if memory_type == "fact":
+        return _normalize_memory_key(claim.get("claim_id") or text[:96])
+    return _normalize_memory_key(f"{memory_type}:{heading}")
+
+
+def _freshness_score(record: dict, now=None) -> float:
+    now = now or datetime.now(timezone.utc)
+    valid_to = _parse_dt(record.get("valid_to"))
+    if valid_to and valid_to < now:
+        return 0.0
+
+    updated_at = _parse_dt(record.get("updated_at")) or _parse_dt(record.get("created_at"))
+    if not updated_at:
+        return 0.55
+
+    age_days = max(0, (now - updated_at).days)
+    ttl_days = record.get("ttl_days") or MEMORY_TTL_DAYS.get(record.get("memory_type", "fact"), 365)
+    try:
+        ttl_days = max(1.0, float(ttl_days))
+    except (TypeError, ValueError):
+        ttl_days = MEMORY_TTL_DAYS.get(record.get("memory_type", "fact"), 365)
+    return round(0.5 ** (age_days / ttl_days), 4)
+
+
+def score_memory_object(memory: dict, now=None) -> dict:
+    confidence_score = _coerce_float(memory.get("confidence"), 0.72)
+    authority_score = _coerce_float(memory.get("authority_score"), 0.65)
+    importance_score = _coerce_float(memory.get("importance_score"), 0.55)
+    freshness_score = _freshness_score(memory, now=now)
+    reinforcement_count = int(memory.get("reinforcement_count") or 0)
+    reinforcement_score = min(1.0, math.log1p(max(0, reinforcement_count)) / math.log(8))
+    validity_factor = VALIDITY_FACTORS.get(str(memory.get("validity_state", "active")).lower(), 0.5)
+    memory_score = (
+        0.30 * confidence_score
+        + 0.25 * freshness_score
+        + 0.20 * authority_score
+        + 0.15 * importance_score
+        + 0.10 * reinforcement_score
+    ) * validity_factor
+    return {
+        "confidence_score": round(confidence_score, 4),
+        "freshness_score": round(freshness_score, 4),
+        "authority_score": round(authority_score, 4),
+        "importance_score": round(importance_score, 4),
+        "reinforcement_score": round(reinforcement_score, 4),
+        "validity_factor": round(validity_factor, 4),
+        "memory_score": round(memory_score, 4),
+    }
+
+
+def _memory_object_from_claim(claim: dict) -> dict:
+    memory_type = infer_memory_type(claim)
+    memory_key = _infer_memory_key(claim, memory_type)
+    memory_id = _stable_id("mem", f"{claim.get('claim_id')}:{memory_type}:{memory_key}")
+    source_ids = list(claim.get("source_ids", []))
+    evidence_ids = list(claim.get("evidence_ids", []))
+    memory = {
+        "memory_id": memory_id,
+        "memory_type": memory_type,
+        "memory_key": memory_key,
+        "text": claim.get("claim_text", ""),
+        "value": claim.get("memory_value") or claim.get("claim_text", ""),
+        "source_claim_id": claim.get("claim_id"),
+        "source_page": claim.get("source_page"),
+        "locator": claim.get("locator", {}),
+        "subject_entity_ids": list(claim.get("subject_entity_ids", [])),
+        "evidence_ids": evidence_ids,
+        "source_ids": source_ids,
+        "source_count": len(source_ids),
+        "status": claim.get("status", "Active"),
+        "validity_state": claim.get("validity_state", "active"),
+        "validity_reasons": claim.get("validity_reasons", []),
+        "temporal_anchor": claim.get("temporal_anchor"),
+        "valid_from": claim.get("valid_from"),
+        "valid_to": claim.get("valid_to"),
+        "review_after": claim.get("review_after"),
+        "created_at": claim.get("created_at"),
+        "updated_at": claim.get("updated_at"),
+        "confidence": claim.get("confidence", 0.72),
+        "authority_score": claim.get("authority_score", 0.72 if source_ids else 0.48),
+        "importance_score": claim.get("importance_score", 0.55),
+        "reinforcement_count": claim.get("reinforcement_count", len(evidence_ids)),
+        "ttl_days": claim.get("ttl_days") or MEMORY_TTL_DAYS.get(memory_type, 365),
+        "contradicts_claim_ids": list(claim.get("contradicts", [])),
+    }
+    memory.update(score_memory_object(memory))
+    return memory
+
+
+def _rank_memory_for_conflict(memory: dict, explicit_contradiction: bool = False) -> tuple:
+    if explicit_contradiction:
+        return (
+            memory.get("authority_score", 0),
+            memory.get("confidence_score", 0),
+            _dt_rank(memory.get("updated_at")),
+            memory.get("memory_score", 0),
+        )
+    return (
+        _dt_rank(memory.get("updated_at")),
+        memory.get("authority_score", 0),
+        memory.get("confidence_score", 0),
+        memory.get("memory_score", 0),
+    )
+
+
+def _mark_superseded(loser: dict, winner: dict, reason: str):
+    loser["validity_state"] = "superseded"
+    loser["superseded_by"] = winner["memory_id"]
+    loser["conflict_resolution"] = {
+        "state": "superseded",
+        "winner": winner["memory_id"],
+        "rule": reason,
+        "resolved_at": _utc_now(),
+    }
+    loser.update(score_memory_object(loser))
+
+
+def _resolve_memory_conflicts(store: dict) -> dict:
+    items = store.get("items", {})
+    by_claim_id = {
+        memory.get("source_claim_id"): memory
+        for memory in items.values()
+        if memory.get("source_claim_id")
+    }
+    conflict_events = []
+
+    for memory in list(items.values()):
+        for right_claim_id in memory.get("contradicts_claim_ids", []):
+            other = by_claim_id.get(right_claim_id)
+            if not other or other["memory_id"] == memory["memory_id"]:
+                continue
+            left_rank = _rank_memory_for_conflict(memory, explicit_contradiction=True)
+            right_rank = _rank_memory_for_conflict(other, explicit_contradiction=True)
+            if left_rank == right_rank:
+                memory["validity_state"] = "conflicted"
+                other["validity_state"] = "conflicted"
+                memory.update(score_memory_object(memory))
+                other.update(score_memory_object(other))
+                conflict_events.append({
+                    "type": "unresolved-explicit-contradiction",
+                    "memory_ids": sorted([memory["memory_id"], other["memory_id"]]),
+                })
+            elif left_rank > right_rank:
+                _mark_superseded(other, memory, "explicit-contradiction:authority-confidence-recency")
+            else:
+                _mark_superseded(memory, other, "explicit-contradiction:authority-confidence-recency")
+
+    grouped = {}
+    for memory in items.values():
+        if memory.get("memory_type") == "fact":
+            continue
+        if str(memory.get("validity_state", "")).lower() in {"expired", "archived", "superseded"}:
+            continue
+        grouped.setdefault((memory.get("memory_type"), memory.get("memory_key")), []).append(memory)
+
+    for (memory_type, memory_key), candidates in grouped.items():
+        if len(candidates) <= 1:
+            continue
+        ordered = sorted(candidates, key=_rank_memory_for_conflict, reverse=True)
+        winner = ordered[0]
+        winner["conflict_resolution"] = {
+            "state": "winner",
+            "rule": f"{memory_type}:newer-authority-confidence",
+            "resolved_at": _utc_now(),
+            "competing_memory_ids": [item["memory_id"] for item in ordered[1:]],
+        }
+        for loser in ordered[1:]:
+            _mark_superseded(loser, winner, f"{memory_type}:newer-authority-confidence")
+        conflict_events.append({
+            "type": "typed-memory-supersession",
+            "memory_type": memory_type,
+            "memory_key": memory_key,
+            "winner": winner["memory_id"],
+            "losers": [item["memory_id"] for item in ordered[1:]],
+        })
+
+    store["conflict_events"] = conflict_events
+    store["memory_type_counts"] = {}
+    for memory in items.values():
+        memory_type = memory.get("memory_type", "fact")
+        store["memory_type_counts"][memory_type] = store["memory_type_counts"].get(memory_type, 0) + 1
+    return store
+
+
+def rebuild_operational_memory() -> dict:
+    claims = annotated_claims()
+    store = _default_map_store("memory_id")
+    for claim in claims:
+        memory = _memory_object_from_claim(claim)
+        store["items"][memory["memory_id"]] = memory
+    store = _resolve_memory_conflicts(store)
+    save_memory_objects(store)
+    return store
+
+
+def _memory_relevance(memory: dict, terms: list[str]) -> float:
+    if not terms:
+        return 0.0
+    haystacks = {
+        "key": str(memory.get("memory_key", "")).lower(),
+        "text": str(memory.get("text", "")).lower(),
+        "page": str(memory.get("source_page", "")).lower(),
+        "type": str(memory.get("memory_type", "")).lower(),
+    }
+    score = 0.0
+    for term in terms:
+        if term in haystacks["key"]:
+            score += 4.0
+        if term in haystacks["text"]:
+            score += 3.0
+        if term in haystacks["page"]:
+            score += 1.0
+        if term in haystacks["type"]:
+            score += 1.0
+    return score
+
+
+def search_operational_memory(
+    query: str,
+    top_k: int = 12,
+    memory_types: list[str] | None = None,
+    include_history: bool = False,
+) -> list[dict]:
+    store = load_memory_objects()
+    if not store.get("items") and load_claims().get("items"):
+        store = rebuild_operational_memory()
+
+    allowed_types = None
+    if memory_types:
+        allowed_types = {str(item).strip().lower().replace("-", "_") for item in memory_types}
+
+    terms = _query_terms(query)
+    ranked = []
+    hidden_states = {"archived", "expired", "superseded"}
+    for memory in store.get("items", {}).values():
+        memory_type = str(memory.get("memory_type", "fact")).lower()
+        if allowed_types and memory_type not in allowed_types:
+            continue
+        state = str(memory.get("validity_state", "active")).lower()
+        if not include_history and state in hidden_states:
+            continue
+        relevance = _memory_relevance(memory, terms)
+        if relevance <= 0 and terms:
+            continue
+        score = relevance + (float(memory.get("memory_score", 0) or 0) * 5)
+        item = copy.deepcopy(memory)
+        item["retrieval_score"] = round(score, 4)
+        ranked.append(item)
+
+    ranked.sort(
+        key=lambda item: (
+            item.get("retrieval_score", 0),
+            item.get("memory_score", 0),
+            _dt_rank(item.get("updated_at")),
+        ),
+        reverse=True,
+    )
+    return ranked[:top_k]
 
 
 def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
@@ -354,7 +726,13 @@ def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
     return {"created": created, "suggestions": suggestions}
 
 
-def create_change_set(page_paths: list[str], origin: str, summary: str | None = None, auto_approve: bool = False) -> dict:
+def create_change_set(
+    page_paths: list[str],
+    origin: str,
+    summary: str | None = None,
+    auto_approve: bool = False,
+    force: bool = False,
+) -> dict:
     initialize_meta_store()
     entities = load_entities()
     claims = load_claims()
@@ -367,11 +745,13 @@ def create_change_set(page_paths: list[str], origin: str, summary: str | None = 
     proposed_source_updates = []
     affected_ids = []
     page_summaries = []
+    page_fingerprints = []
 
     for page_path in page_paths:
         if not os.path.exists(page_path):
             continue
-        frontmatter, body, _ = read_markdown_file(page_path)
+        frontmatter, body, raw_content = read_markdown_file(page_path)
+        page_fingerprints.append(hashlib.sha1(raw_content.encode("utf-8")).hexdigest())
         extracted = extract_page_objects(page_path, frontmatter, body)
         proposed_entities.extend(extracted["entities"])
         proposed_claims.extend(extracted["claims"])
@@ -381,8 +761,21 @@ def create_change_set(page_paths: list[str], origin: str, summary: str | None = 
         affected_ids.extend([record["claim_id"] for record in extracted["claims"]])
         page_summaries.append(extracted["page_key"])
 
+    idempotency_key = _stable_id(
+        "changeset_idem",
+        "|".join([origin, *sorted(page_summaries), *sorted(page_fingerprints)]),
+    )
+    existing_change_sets = load_change_sets()
+    if not force:
+        for existing in existing_change_sets["items"]:
+            if existing.get("idempotency_key") == idempotency_key:
+                duplicate = copy.deepcopy(existing)
+                duplicate["deduplicated"] = True
+                return duplicate
+
     change_set = {
         "change_set_id": f"changeset_{uuid.uuid4().hex[:12]}",
+        "idempotency_key": idempotency_key,
         "origin": origin,
         "created_at": _utc_now(),
         "status": "published" if auto_approve else "pending",
@@ -394,6 +787,11 @@ def create_change_set(page_paths: list[str], origin: str, summary: str | None = 
         "proposed_claims": proposed_claims,
         "proposed_evidence": proposed_evidence,
         "proposed_source_updates": proposed_source_updates,
+        "write_contract": {
+            "transactional": True,
+            "idempotent": True,
+            "canonical_targets": ["entities", "claims", "evidence", "sources", "operational_memory"],
+        },
     }
 
     if auto_approve:
@@ -416,9 +814,8 @@ def create_change_set(page_paths: list[str], origin: str, summary: str | None = 
         })
         save_governance_queue(queue)
 
-    change_sets = load_change_sets()
-    change_sets["items"].append(change_set)
-    save_change_sets(change_sets)
+    existing_change_sets["items"].append(change_set)
+    save_change_sets(existing_change_sets)
     return change_set
 
 
@@ -438,6 +835,12 @@ def apply_change_set(change_set: dict) -> dict:
     save_evidence(evidence)
     save_sources(sources)
     rebuild_alias_registry()
+    try:
+        memory_store = rebuild_operational_memory()
+        change_set["operational_memory_count"] = len(memory_store.get("items", {}))
+        change_set["conflict_event_count"] = len(memory_store.get("conflict_events", []))
+    except Exception as exc:
+        log.warning(f"Operational memory rebuild failed for {change_set.get('change_set_id')}: {exc}")
     try:
         from vector_lake import view_builder
 
@@ -553,13 +956,15 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
     evidence = _default_map_store("evidence_id")
     sources = _default_map_store("source_id")
     alias_registry = _default_map_store("alias")
+    memory_objects = _default_map_store("memory_id")
     save_entities(entities)
     save_claims(claims)
     save_evidence(evidence)
     save_sources(sources)
     save_alias_registry(alias_registry)
+    save_memory_objects(memory_objects)
 
-    change_set = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration", auto_approve=True)
+    change_set = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration", auto_approve=True, force=True)
     change_sets = load_change_sets()
     for item in change_sets["items"]:
         if item["change_set_id"] == change_set["change_set_id"]:
@@ -603,12 +1008,17 @@ def governance_projection() -> dict:
     ensure_canonical_store_populated()
     entities = load_entities()
     sources = load_sources()
+    memory_objects = load_memory_objects()
+    if not memory_objects.get("items") and load_claims().get("items"):
+        memory_objects = rebuild_operational_memory()
     queue = load_governance_queue()
     annotated = annotated_claims()
     claim_index = {claim["claim_id"]: copy.deepcopy(claim) for claim in annotated}
     return {
         "entity_index": copy.deepcopy(entities["items"]),
         "claim_index": claim_index,
+        "memory_index": copy.deepcopy(memory_objects["items"]),
+        "memory_type_counts": copy.deepcopy(memory_objects.get("memory_type_counts", {})),
         "source_index": copy.deepcopy(sources["items"]),
         "pending_change_set_count": len([item for item in queue["items"] if item.get("status") == "pending"]),
         "claim_graph": build_claim_graph_projection(),

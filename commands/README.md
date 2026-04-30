@@ -5,7 +5,7 @@
 ## Core Workflow
 
 - `sync.toml`: compile raw sources into wiki nodes
-- `search.toml`: query the runtime index with optional filters
+- `search.toml`: query the page index, operational memory, or claim-level fact layer with optional filters
 - `query.toml`: synthesize answers and optionally dry-run output
 - `lint.toml`: run wiki and governance health checks
 - `graph.toml`: render the interactive page/claim topology
@@ -16,8 +16,6 @@
 
 ## Governance Workflow
 
-- `governance_migrate.toml`: backfill canonical V8 governance objects
-- `governance_publish.toml`: publish pending change sets
 - `governance_debt.toml`: show the governance debt dashboard
 - `governance_trace.toml`: inspect provenance for a query or identifier
 - `governance_merge.toml`: preview or enqueue entity merge suggestions
@@ -46,8 +44,6 @@ Operators can resolve items either by the visible pending index or by stable `it
 - `review_queue.toml` -> `review.toml`
 - `delete_source.toml` -> `delete.toml`
 - `doctor_vector_lake.toml` -> `doctor.toml`
-- `migrate_v8.toml` -> `governance_migrate.toml`
-- `publish_vector_lake.toml` -> `governance_publish.toml`
 - `debt_vector_lake.toml` -> `governance_debt.toml`
 - `trace_vector_lake.toml` -> `governance_trace.toml`
 - `merge_suggestions_vector_lake.toml` -> `governance_merge.toml`

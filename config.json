@@ -7,16 +7,20 @@
     "garmin/",
     "personal-insights/"
   ],
+  "supported_extensions": [
+    ".md",
+    ".txt"
+  ],
   "processed_files_path": "data/processed_files.json",
   "llm": {
     "model_cascade": [
       "default",
-      "gemini-2.5-pro",
-      "gemini-3.1-flash"
+      "gemini-3.1-flash",
+      "gemini-2.5-pro"
     ],
     "batch_size": 10,
-    "timeout_analysis": 120,
-    "timeout_generation": 180,
-    "timeout_query": 120
+    "timeout_analysis": 60,
+    "timeout_generation": 90,
+    "timeout_query": 60
   }
 }

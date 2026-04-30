@@ -1,9 +1,10 @@
-description = "Search Vector Lake pages through the runtime index with optional governance-aware filters."
+description = "Search Vector Lake pages, operational memory, or claim-level facts with optional governance-aware filters."
 prompt = """
 Please use the `search_vector_lake` tool to search for "{{args}}". Parse explicit search controls from the user request when present:
 - `top_k=<n>` or phrases like "top 10"
 - `domain=<name>`
 - `cluster=<name>`
+- `mode=page|memory|claim` or phrases like "operational memory" / "claim-level facts"
 - `include-history=true` or phrases like "include deprecated history"
 Pass only the controls the user actually specified; otherwise rely on tool defaults.
 """

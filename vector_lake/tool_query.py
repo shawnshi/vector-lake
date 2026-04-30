@@ -85,8 +85,14 @@ def query_logic_lake(query_str: str, dry_run: bool = False):
 
     context = assemble_context(query_str)
     context_block = ""
+    if context.get("memory_packet"):
+        context_block += (
+            f"\n\n--- OPERATIONAL MEMORY PACKET "
+            f"({context.get('memory_count', 0)} items, {context.get('memory_warning_count', 0)} warnings) ---\n"
+            f"{context['memory_packet']}"
+        )
     if context["wiki_context"]:
-        context_block = (
+        context_block += (
             f"\n\n--- RELEVANT WIKI PAGES ({context['wiki_page_count']} pages, "
             f"{context['budget_used']}/{context['budget_max']} chars) ---\n{context['wiki_context']}"
         )
@@ -98,6 +104,7 @@ def query_logic_lake(query_str: str, dry_run: bool = False):
             "You are drafting a Vector Lake synthesis preview.\n"
             "Return exactly one Markdown document with valid YAML frontmatter for a synthesis page.\n"
             "Do not write files. Do not mention that this is a preview.\n"
+            "Treat OPERATIONAL MEMORY PACKET as the authoritative machine-facing state when it conflicts with page prose.\n"
             f"Query: {query_str}{context_block}"
         )
         try:
@@ -120,6 +127,7 @@ You MUST output the generated synthesis pages in the following plain text format
 (body content)
 ---END FILE---
 
+Treat OPERATIONAL MEMORY PACKET as the authoritative machine-facing state when it conflicts with page prose.
 Query: {query_str}{context_block}"""
     try:
         result = _run_gemini(prompt)

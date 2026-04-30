@@ -125,6 +125,10 @@ def compute_debt_metrics() -> dict:
     entities = governance_store.load_entities()["items"].values()
     sources = governance_store.load_sources()["items"].values()
     queue = governance_store.load_governance_queue()["items"]
+    memory_store = governance_store.load_memory_objects()
+    if not memory_store.get("items") and claims:
+        memory_store = governance_store.rebuild_operational_memory()
+    memory_items = list(memory_store.get("items", {}).values())
 
     validity_state_counts = {}
     unsupported_claim_count = 0
@@ -170,6 +174,10 @@ def compute_debt_metrics() -> dict:
         "orphan_source_count": orphan_source_count,
         "high_centrality_low_confidence_count": high_centrality_low_confidence,
         "pending_governance_item_count": len(pending_items),
+        "operational_memory_count": len(memory_items),
+        "superseded_memory_count": len([item for item in memory_items if item.get("validity_state") == "superseded"]),
+        "conflicted_memory_count": len([item for item in memory_items if item.get("validity_state") == "conflicted"]),
+        "memory_type_counts": memory_store.get("memory_type_counts", {}),
         "validity_state_counts": validity_state_counts,
     }
 

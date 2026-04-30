@@ -95,6 +95,10 @@ def get_alias_registry_path() -> Path:
     return get_meta_dir() / "alias_registry.json"
 
 
+def get_memory_objects_path() -> Path:
+    return get_meta_dir() / "operational_memory.json"
+
+
 def normalize_raw_ref(raw_ref: str) -> str:
     normalized = str(raw_ref).replace("\\", "/").strip()
     if normalized.startswith("MEMORY/"):

@@ -105,6 +105,12 @@ def _validity_defaults(frontmatter: dict) -> dict:
         "review_after": _jsonable(frontmatter.get("review_after")),
         "freshness_tier": frontmatter.get("freshness_tier", "unknown"),
         "temporal_anchor": frontmatter.get("temporal_anchor"),
+        "memory_type": frontmatter.get("memory_type"),
+        "memory_key": frontmatter.get("memory_key"),
+        "authority_score": frontmatter.get("authority_score"),
+        "importance_score": frontmatter.get("importance_score"),
+        "reinforcement_count": frontmatter.get("reinforcement_count"),
+        "ttl_days": frontmatter.get("ttl_days") or frontmatter.get("ttl"),
     }
 
 
