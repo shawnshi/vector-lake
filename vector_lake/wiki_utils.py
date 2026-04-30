@@ -8,6 +8,10 @@ import uuid
 from pathlib import Path
 
 import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
 from vector_lake import get_extension_root
 
 
@@ -121,7 +125,7 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     try:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
+        frontmatter = yaml.load(match.group(1), Loader=SafeLoader) or {}
     except yaml.YAMLError:
         raise
 
