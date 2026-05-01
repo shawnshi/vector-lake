@@ -1,0 +1,4 @@
+## 2024-05-01 - [HIGH] Fix DOM XSS in topology graph rendering
+**Vulnerability:** The `templates/topology.html` file rendered dynamic user data (`node.name`, `node.id`, `targetId`, `group`) directly into the DOM using `.innerHTML` without sanitization. Specifically, it used string interpolation for an `onclick` inline event handler which introduced a severe DOM-based XSS risk if the user data contained quotes or payload content.
+**Learning:** This codebase uses pure JS/DOM API for some templates, relying on `.innerHTML` interpolation for simplicity, which bypasses the typical template engine escaping mitigations.
+**Prevention:** When applying DOM XSS mitigations in HTML templates, always use `document.createElement()`, `document.createTextNode()`, and `element.textContent` instead of `.innerHTML` to insert dynamic data safely. Avoid inline JavaScript event handlers in string templates; attach events using `addEventListener` or `element.onclick`.

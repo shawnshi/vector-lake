@@ -237,9 +237,18 @@
             Array.from(new Set(currentGraph().nodes.map(node => node.group || 'Unknown'))).sort().forEach(group => {
                 const label = document.createElement('label');
                 label.className = 'filter-checkbox';
-                const checked = activeGroups.has(group) ? 'checked' : '';
-                label.innerHTML = `<input type="checkbox" value="${group}" ${checked}> ${group}`;
-                label.querySelector('input').addEventListener('change', (event) => {
+
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.value = group;
+                if (activeGroups.has(group)) {
+                    input.checked = true;
+                }
+
+                label.appendChild(input);
+                label.appendChild(document.createTextNode(' ' + group));
+
+                input.addEventListener('change', (event) => {
                     if (event.target.checked) activeGroups.add(group);
                     else activeGroups.delete(group);
                     renderGraph();
@@ -446,7 +455,17 @@
             Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            const titleElem = document.getElementById('info-title');
+            titleElem.innerHTML = '';
+            if (href) {
+                const aElem = document.createElement('a');
+                aElem.href = href;
+                aElem.target = "_blank";
+                aElem.textContent = node.name || node.id;
+                titleElem.appendChild(aElem);
+            } else {
+                titleElem.textContent = node.name || node.id;
+            }
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
@@ -473,15 +492,34 @@
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
+                const liElem = document.createElement('li');
+                const aElem = document.createElement('a');
+                aElem.textContent = `[${group}] ${name}`;
+                aElem.onclick = () => selectNode(targetId);
+                liElem.appendChild(aElem);
+                links.appendChild(liElem);
             });
-            if (!links.innerHTML) links.innerHTML = '<li>None</li>';
+            if (links.childNodes.length === 0) {
+                const liElem = document.createElement('li');
+                liElem.textContent = 'None';
+                links.appendChild(liElem);
+            }
 
             (node.sources || []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                const liElem = document.createElement('li');
+                const aElem = document.createElement('a');
+                aElem.href = hrefValue;
+                aElem.target = "_blank";
+                aElem.textContent = source;
+                liElem.appendChild(aElem);
+                sources.appendChild(liElem);
             });
-            if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
+            if (sources.childNodes.length === 0) {
+                const liElem = document.createElement('li');
+                liElem.textContent = 'None';
+                sources.appendChild(liElem);
+            }
 
             document.getElementById('info-panel').classList.add('visible');
         }
