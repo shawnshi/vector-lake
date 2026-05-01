@@ -21,6 +21,10 @@ import os
 import re
 import sys
 import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader, CSafeDumper as SafeDumper
+except ImportError:
+    from yaml import SafeLoader, SafeDumper
 import random
 import string
 from pathlib import Path
@@ -54,7 +58,7 @@ def parse_frontmatter(content):
     if not m:
         return None, None
     try:
-        data = yaml.safe_load(m.group(1))
+        data = yaml.load(m.group(1), Loader=SafeLoader)
         if isinstance(data, dict):
             return data, m
     except yaml.YAMLError:
@@ -65,7 +69,7 @@ def parse_frontmatter(content):
 def rebuild_content(content, fm_data, fm_match):
     """Rebuild file content with modified frontmatter, preserving body."""
     after_fm = content.split('---', 2)[2]
-    new_fm = yaml.dump(fm_data, allow_unicode=True, default_flow_style=False).strip()
+    new_fm = yaml.dump(fm_data, Dumper=SafeDumper, allow_unicode=True, default_flow_style=False).strip()
     return "---\n" + new_fm + "\n---" + after_fm
 
 
