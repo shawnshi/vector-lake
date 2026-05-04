@@ -123,6 +123,16 @@
     <div id="stats-panel"></div>
 
     <script>
+        function escapeHTML(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
         const rawData = %%GRAPH_DATA%%;
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
 
@@ -446,7 +456,8 @@
             Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            const titleSafe = escapeHTML(node.name || node.id);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${escapeHTML(href)}" target="_blank">${titleSafe}</a>` : titleSafe;
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
@@ -473,15 +484,28 @@
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.style.cursor = 'pointer';
+                a.setAttribute('data-id', targetId);
+                a.onclick = function() { selectNode(this.getAttribute('data-id')); };
+                a.textContent = `[${group}] ${name}`;
+                li.appendChild(a);
+                links.appendChild(li);
             });
-            if (!links.innerHTML) links.innerHTML = '<li>None</li>';
+            if (links.children.length === 0) links.innerHTML = '<li>None</li>';
 
             (node.sources || []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.href = hrefValue;
+                a.target = '_blank';
+                a.textContent = source;
+                li.appendChild(a);
+                sources.appendChild(li);
             });
-            if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
+            if (sources.children.length === 0) sources.innerHTML = '<li>None</li>';
 
             document.getElementById('info-panel').classList.add('visible');
         }
