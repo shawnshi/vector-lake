@@ -1,0 +1,3 @@
+## 2024-05-16 - [Optimize YAML Parsing]
+**Learning:** PyYAML's default `yaml.safe_load()` uses the pure Python parser by default, which can be significantly slower than the C extension variant `CSafeLoader`. In environments where LibYAML is available and PyYAML is compiled with C extensions, using `CSafeLoader` can result in a 5-10x performance boost, which is critical when parsing many YAML frontmatters (e.g., during full directory index builds).
+**Action:** Always attempt to import and use `CSafeLoader as SafeLoader` with a fallback to pure Python `SafeLoader` for robust, high-performance YAML loading: `yaml.load(data, Loader=SafeLoader)`.
