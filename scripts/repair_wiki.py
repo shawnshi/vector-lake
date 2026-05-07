@@ -21,6 +21,11 @@ import os
 import re
 import sys
 import yaml
+try:
+    # ⚡ Bolt: Use CSafeLoader for ~7x faster YAML parsing
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
 import random
 import string
 from pathlib import Path
@@ -54,7 +59,7 @@ def parse_frontmatter(content):
     if not m:
         return None, None
     try:
-        data = yaml.safe_load(m.group(1))
+        data = yaml.load(m.group(1), Loader=SafeLoader)
         if isinstance(data, dict):
             return data, m
     except yaml.YAMLError:
