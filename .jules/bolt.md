@@ -1,0 +1,3 @@
+## 2025-05-18 - Faster YAML Parsing with LibYAML
+**Learning:** Python's default `yaml.safe_load` uses the pure Python `SafeLoader`, which is significantly slower than the C-based LibYAML loader. In environments where LibYAML is available, using `CSafeLoader` can dramatically speed up YAML parsing, which is crucial for applications that read many markdown files with YAML frontmatter.
+**Action:** Always attempt to import `CSafeLoader as SafeLoader` from `yaml` with a fallback to the pure Python `SafeLoader`. Then use `yaml.load(data, Loader=SafeLoader)` instead of `yaml.safe_load(data)` for optimal parsing performance without risking portability issues.
