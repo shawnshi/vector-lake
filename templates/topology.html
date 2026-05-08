@@ -231,6 +231,16 @@
             };
         }
 
+        function escapeHtml(unsafe) {
+            if (unsafe === undefined || unsafe === null) return '';
+            return String(unsafe)
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+
         function updateFilters() {
             const container = document.getElementById('type-filters');
             container.innerHTML = '';
@@ -446,7 +456,7 @@
             Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${escapeHtml(href)}" target="_blank">${escapeHtml(node.name || node.id)}</a>` : escapeHtml(node.name || node.id);
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
@@ -473,13 +483,14 @@
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
+                links.innerHTML += `<li><a href="#" class="node-link" data-id="${escapeHtml(targetId)}">[${escapeHtml(group)}] ${escapeHtml(name)}</a></li>`;
             });
             if (!links.innerHTML) links.innerHTML = '<li>None</li>';
+            links.querySelectorAll('.node-link').forEach(el => el.onclick = function(e) { e.preventDefault(); selectNode(this.getAttribute('data-id')); });
 
             (node.sources || []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                sources.innerHTML += `<li><a href="${escapeHtml(hrefValue)}" target="_blank">${escapeHtml(source)}</a></li>`;
             });
             if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
 
