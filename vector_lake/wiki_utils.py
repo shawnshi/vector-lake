@@ -8,6 +8,11 @@ import uuid
 from pathlib import Path
 
 import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader, CDumper as Dumper
+except ImportError:
+    from yaml import SafeLoader, Dumper
+
 from vector_lake import get_extension_root
 
 
@@ -121,7 +126,8 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     try:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
+        # Use SafeLoader which will be CSafeLoader if available for performance
+        frontmatter = yaml.load(match.group(1), Loader=SafeLoader) or {}
     except yaml.YAMLError:
         raise
 
@@ -151,7 +157,8 @@ def ensure_parent_dir(path: str | Path):
 
 
 def write_markdown_file(path: str | Path, frontmatter: dict, body: str):
-    yaml_block = yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    # Use Dumper which will be CDumper if available for performance
+    yaml_block = yaml.dump(frontmatter, Dumper=Dumper, allow_unicode=True, default_flow_style=False, sort_keys=False)
     atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}")
 
 
