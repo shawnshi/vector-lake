@@ -436,6 +436,8 @@
             return `${memoryBasePath}wiki/${node.id}.md`;
         }
 
+        const e = (str) => String(str ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\'':'&#39;','"':'&quot;'}[c]));
+
         function selectNode(nodeId) {
             const node = currentGraph().nodes.find(item => item.id === nodeId);
             if (!node) return;
@@ -446,21 +448,22 @@
             Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            const nodeDisplayId = e(node.name || node.id);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${e(href)}" target="_blank">${nodeDisplayId}</a>` : nodeDisplayId;
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
 
             const meta = [];
-            meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
-            meta.push(`<span><strong>Type</strong> ${node.group || 'Unknown'}</span>`);
-            meta.push(`<span><strong>Degree</strong> ${node.degree || 0}</span>`);
-            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${node.validity_state}</span>`);
-            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${node.claim_type}</span>`);
-            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${node.confidence}</span>`);
-            if (node.domain) meta.push(`<span><strong>Domain</strong> ${node.domain}</span>`);
-            if (node.updated) meta.push(`<span><strong>Updated</strong> ${node.updated.substring(0, 10)}</span>`);
-            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${node.alignment_score}</span>`);
-            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${node.decay_weight}</span>`);
+            meta.push(`<span><strong>Mode</strong> ${e(activeGraphKey)}</span>`);
+            meta.push(`<span><strong>Type</strong> ${e(node.group || 'Unknown')}</span>`);
+            meta.push(`<span><strong>Degree</strong> ${e(node.degree || 0)}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${e(node.validity_state)}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${e(node.claim_type)}</span>`);
+            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${e(node.confidence)}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain</strong> ${e(node.domain)}</span>`);
+            if (node.updated) meta.push(`<span><strong>Updated</strong> ${e(node.updated.substring(0, 10))}</span>`);
+            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${e(node.alignment_score)}</span>`);
+            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${e(node.decay_weight)}</span>`);
             document.getElementById('info-meta').innerHTML = meta.join('');
             document.getElementById('info-summary').innerText = node.summary || 'No summary available.';
 
@@ -469,19 +472,37 @@
             links.innerHTML = '';
             sources.innerHTML = '';
 
+            let linksCount = 0;
             (node.semantic_links || []).forEach(targetId => {
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
-            });
-            if (!links.innerHTML) links.innerHTML = '<li>None</li>';
 
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.style.cursor = 'pointer';
+                a.setAttribute('data-id', targetId);
+                a.onclick = function() { selectNode(this.getAttribute('data-id')); };
+                a.textContent = `[${group}] ${name}`;
+                li.appendChild(a);
+                links.appendChild(li);
+                linksCount++;
+            });
+            if (linksCount === 0) links.innerHTML = '<li>None</li>';
+
+            let sourcesCount = 0;
             (node.sources || []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.href = hrefValue;
+                a.target = '_blank';
+                a.textContent = source;
+                li.appendChild(a);
+                sources.appendChild(li);
+                sourcesCount++;
             });
-            if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
+            if (sourcesCount === 0) sources.innerHTML = '<li>None</li>';
 
             document.getElementById('info-panel').classList.add('visible');
         }
