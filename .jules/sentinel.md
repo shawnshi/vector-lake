@@ -1,0 +1,4 @@
+## 2024-05-18 - Fix DOM XSS in topology.html
+**Vulnerability:** DOM-based Cross-Site Scripting (XSS) in `templates/topology.html` due to unsafe usage of `innerHTML` with unsanitized node properties (like `name`, `id`, `group`, etc.) from the `.meta/` dataset.
+**Learning:** In interactive graph visualizations, node names and metadata are often dynamically injected into tooltips or info panels. Using string interpolation into `innerHTML` without HTML encoding allows malicious or improperly formatted data to execute arbitrary JavaScript.
+**Prevention:** Always use safe text assignment (`textContent`, `innerText`) for displaying user-controlled or dynamically generated string properties, or utilize a robust HTML escaping function when creating HTML strings. Avoid interpolating data into inline event handlers (like `onclick=`); instead use closures or HTML dataset attributes.
