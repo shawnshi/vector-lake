@@ -1,0 +1,5 @@
+
+## 2024-05-24 - [Fix DOM XSS vulnerability in topology UI]
+**Vulnerability:** The HTML template `templates/topology.html` was susceptible to DOM-based Cross-Site Scripting (XSS) due to insecure manipulation of the DOM using `innerHTML` with unsanitized data from Markdown fields like node names or IDs.
+**Learning:** The previous implementation directly concatenated string data representing HTML tags mixed with variables like `node.name` into `innerHTML`. This made it possible to execute arbitrary JS in an administrator's browser if a malicious markdown file was ingested as a node. The dynamic event handler construction for `onclick` using string interpolation was especially dangerous.
+**Prevention:** Use safer DOM APIs like `document.createElement`, setting properties with `.textContent` or `.innerText` which escape HTML automatically. When dealing with inline dynamic event handlers, use data attributes (e.g., `data-id`) on the element, and attach the handler as a function that reads the dataset, thereby separating the data completely from the execution context.
