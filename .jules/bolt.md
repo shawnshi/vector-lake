@@ -1,0 +1,3 @@
+## 2024-05-13 - [PyYAML Pure Python vs C-Extension Performance]
+ **Learning:** Discovered a performance bottleneck where YAML loading/dumping (which this wiki system relies heavily upon for markdown frontmatter parsing) was utilizing PyYAML's pure python implementation, which is around 5x-8x slower compared to the LibYAML-based C extension (`CSafeLoader`, `CDumper`).
+ **Action:** Update all `yaml.safe_load` and `yaml.dump` calls across the codebase to explicitly use `CSafeLoader`/`CDumper` when available, falling back to pure python gracefully for portability (`try...except ImportError...`). Ensure `yaml.load(..., Loader=SafeLoader)` is used as `yaml.safe_load()` does not easily accept a custom Loader.
