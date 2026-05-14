@@ -1,0 +1,3 @@
+## 2026-05-14 - Replace yaml.safe_load/dump with libyaml C equivalents
+**Learning:** PyYAML's pure-Python implementation (`yaml.safe_load`, `yaml.dump`) is notoriously slow, especially for parsing large or many files (like when indexing an entire wiki corpus). The C-based equivalents (`CSafeLoader`, `CDumper`) provide significant speedups but require `libyaml` bindings which may not be present in all environments.
+**Action:** When working with PyYAML, attempt to import `CSafeLoader` and `CDumper` and use them with `yaml.load(..., Loader=SafeLoader)` and `yaml.dump(..., Dumper=Dumper)`, falling back to `SafeLoader` and `Dumper` if the C-extensions are unavailable. This ensures maximum performance without sacrificing portability.
