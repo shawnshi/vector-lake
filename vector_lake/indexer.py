@@ -6,6 +6,12 @@ import re
 from datetime import datetime, timezone
 
 import yaml
+# Performance optimization: Use libyaml-based C loaders (7-10x faster) when available.
+# Critical for minimizing index generation times across thousands of files.
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -155,7 +161,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = yaml.load(fm_str, Loader=SafeLoader) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
