@@ -1,0 +1,5 @@
+
+## 2024-05-18 - DOM XSS in Topology UI Rendering
+**Vulnerability:** User-controlled graph data (such as node names, groups, semantic links, and states) were being directly interpolated into `innerHTML` strings in `topology.html` without HTML encoding, and also directly into inline JavaScript event handlers (e.g. `onclick="selectNode('${targetId}')"`). This allowed any node with a malicious property (like `<img src=x onerror=alert()>`) to achieve cross-site scripting (XSS).
+**Learning:** Due to the local nature of the graph UI processing arbitrary user Markdown content into a JSON payload which is rendered statically, XSS on the client-side allows malicious nodes to potentially execute arbitrary code or exfiltrate state in the local viewer context.
+**Prevention:** Apply a robust `escapeHTML()` function when setting `innerHTML` and transition all dynamic string interpolation away from inline event handlers (such as `onclick`) to standard `data-*` attributes (e.g., `data-id="..." onclick="selectNode(this.getAttribute('data-id'))"`) which avoids both syntax errors and injection risks.
