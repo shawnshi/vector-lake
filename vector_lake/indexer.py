@@ -6,6 +6,12 @@ import re
 from datetime import datetime, timezone
 
 import yaml
+try:
+    # Use C extensions for massive parsing speedup (e.g. 5x-10x), fallback to pure Python if unavailable
+    from yaml import CSafeLoader as SafeLoader, CDumper as Dumper
+except ImportError:
+    from yaml import SafeLoader, Dumper
+
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -155,7 +161,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = yaml.load(fm_str, Loader=SafeLoader) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
