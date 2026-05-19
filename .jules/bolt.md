@@ -1,0 +1,3 @@
+## 2024-05-24 - Optimize YAML Parsing with CSafeLoader
+**Learning:** PyYAML provides C-based loaders and dumpers (`CSafeLoader`, `CDumper`) via the LibYAML library which are substantially faster than their pure Python counterparts (around 4-7x speedup for both parsing and dumping). However, these are not always available depending on system libraries.
+**Action:** When parsing or dumping YAML in performance-critical paths (e.g. indexing lots of markdown files with frontmatter), try importing `CSafeLoader` and `CDumper` and use them as the `Loader`/`Dumper` arguments. Fall back to `SafeLoader`/`Dumper` if ImportError is caught to ensure portability.
