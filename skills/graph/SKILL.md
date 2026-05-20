@@ -1,6 +1,5 @@
 ---
 name: graph
-description: Generate the interactive 3D HTML topology dashboard without running a full governance audit.
+description: Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.
 ---
-Please execute the native Vector Lake CLI to generate the visual topology graph.
-Use the `run_shell_command` tool to execute: `python C:/Users/shich/.gemini/extensions/vector-lake/cli.py graph`
+Please use the `visualize_vector_lake` MCP tool from the `vector-lake-mcp` server to build and export the 3D network graph HTML file.

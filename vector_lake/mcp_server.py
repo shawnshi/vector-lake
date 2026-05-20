@@ -100,5 +100,55 @@ def trigger_audit_graph() -> str:
     """Synthesize graph topology insights into the unified review surface."""
     return tools.audit_graph()
 
+@mcp.tool()
+def delete_source(raw_path: str, dry_run: bool = False) -> str:
+    """Cascade-delete a raw source and all related wiki pages.
+    
+    Args:
+        raw_path: Path to the raw source file to remove.
+        dry_run: Preview what would be deleted without making changes.
+    """
+    return tools.delete_source(raw_path, dry_run=dry_run)
+
+@mcp.tool()
+def doctor_vector_lake() -> str:
+    """Validate runtime dependencies and filesystem layout health."""
+    return tools.doctor_vector_lake()
+
+@mcp.tool()
+def trace_vector_lake(query_or_id: str) -> str:
+    """Show provenance trace for a query or identifier.
+    
+    Args:
+        query_or_id: Query text or object identifier.
+    """
+    return tools.trace_vector_lake(query_or_id)
+
+@mcp.tool()
+def merge_suggestions_vector_lake(limit: int = 20, enqueue: bool = False) -> str:
+    """Detect and surface candidate entity merges.
+    
+    Args:
+        limit: Maximum number of merge candidates to surface.
+        enqueue: If True, enqueue the candidates into the governance review queue.
+    """
+    return tools.merge_suggestions_vector_lake(limit=limit, enqueue=enqueue)
+
+@mcp.tool()
+def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
+    """Automatically prune isolated or orphaned entities.
+    
+    Args:
+        days: Prune entities older than this many days (default: 30).
+        dry_run: Preview what would be deleted without making changes.
+    """
+    return tools.gc_vector_lake(days=days, dry_run=dry_run)
+
+@mcp.tool()
+def visualize_vector_lake() -> str:
+    """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
+    return tools.visualize_vector_lake()
+
 if __name__ == "__main__":
     mcp.run()
+
