@@ -1,0 +1,5 @@
+---
+name: daemon_watchdog
+description: Launch the real-time ingest watcher as the long-running background compiler for raw sources.
+---
+Please start the long-running Vector Lake watchdog by executing `python watchdog_sync.py` as a background service. This is the persistent daemon path for ingest monitoring; do not substitute a one-off `sync` run for it. After starting it, tell the user that the watchdog daemon is running.

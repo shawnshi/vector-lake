@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "vector-lake-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "vector_lake.mcp_server"
+      ],
+      "cwd": "C:/Users/shich/.gemini/extensions/vector-lake",
+      "env": {
+        "PYTHONPATH": "c:/Users/shich/.gemini/extensions/vector-lake"
+      }
+    }
+  }
+}
