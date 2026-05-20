@@ -33,7 +33,7 @@ graph LR
 
 ## Quick Start
 
-1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀（默认 `.md` 和 `.txt`）。
+1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。**必须在环境变量中设置 `GEMINI_API_KEY`**，系统已全面迁移至原生的 `google-genai` Python SDK，不再依赖 `gemini.cmd` 的子进程调用。
 2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
 3. **后台监听与自治管理**：日常运行 `python watchdog_sync.py` 启动守护进程。它搭载了四大核心基建与防御系统：
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
@@ -108,6 +108,12 @@ MEMORY/
 > - `/lint`：执行节点健康度自愈审查
 > - `/research`：自主扫描并下发网络检索指令
 > - `/graph`：直接生成并刷新 3D 可视化拓扑面板
+> - `/doctor`：运行环境与依赖健康体检
+> - `/gc`：垃圾回收与孤儿节点自动清理
+> - `/delete`：级联删除信源与切断图谱边
+> - `/trace`：展示实体或知识断言的溯源追踪
+> - `/merge`：扫描并提出知识合并建议
+> - `/timeline`：搜索与提取战略时间线事件
 > 
 > 以下底层 CLI 命令仍然保留，供人类开发者日常手动调试与状态维护。
 
@@ -187,7 +193,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 - `exclude_paths`：排除目录。
 - `supported_extensions`：当前启用的输入扩展名。
 - `processed_files_path`：已处理 raw 文件记录。
-- `llm.model_cascade`：Gemini CLI 模型降级链。
+- `llm.model_cascade`：Google GenAI SDK 模型降级链（例如 `["gemini-2.5-pro", "gemini-3.1-pro-preview"]`）。
 - `llm.batch_size`：批处理规模。
 - `llm.timeout_analysis / timeout_generation / timeout_query`：LLM 调用超时。
 
@@ -218,7 +224,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 
 ## Validation
 
-最近验证基线（2026-04-30）：
+最近验证基线（2026-05-20）：
 
 ```powershell
 $env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v

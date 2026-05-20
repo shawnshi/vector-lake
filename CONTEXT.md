@@ -87,6 +87,11 @@ Conflict rules:
 - `/lint`: Self-healing audit of nodes
 - `/research`: Autonomous web research directive
 - `/graph`: Generate interactive 3D HTML topology
+- `/doctor`: Validate runtime dependencies and health
+- `/gc`: Garbage collect orphaned entities
+- `/delete`: Cascade-delete sources and sever graph edges
+- `/trace`: Audit provenance traces
+- `/merge`: Surface candidate entity merges
 - `/timeline`: SQL query against historical timeline_events (via MCP)
 
 The following CLI commands remain the ground truth operating surface for *human operators*:
@@ -118,7 +123,7 @@ $env:PYTHONUTF8='1'; python -m compileall vector_lake tests
 
 ## 5. Current Validation Baseline
 
-Last verified: 2026-04-30.
+Last verified: 2026-05-20.
 
 - Unit tests: `Ran 8 tests ... OK`
 - Compile: `python -m compileall vector_lake tests` OK
