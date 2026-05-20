@@ -22,6 +22,8 @@ You may:
 - create a new synthesis page when the query yields a genuinely new asset
 - update an existing synthesis or related page when that produces a cleaner knowledge graph outcome
 
+**DUAL-SCHEMA ENFORCEMENT**: When writing or updating `Entity_*.md` or `Concept_*.md`, you MUST implement the physical `---` split defined in the wikiFormat Contract. The top half must be cleanly REWRITTEN as the 'Compiled Truth'. The bottom half must be strictly APPEND-ONLY for the 'Timeline'. NEVER mix historical narrative into the top section.
+
 Do not assume “new page” is always the correct behavior.
 
 ## 4. YAML & Ontology Constraints
@@ -57,8 +59,5 @@ Your synthesis must be evidence-bounded, structurally clear, and useful as a per
 After outputting the `---FILE:` block(s), you may optionally output a final logical summary to standard output. Do not ask questions and do not attempt terminal execution.
 
 ## 7. Language Mandate
-Write the resulting content primarily in Chinese (Zh-CN).
-Preserve technical terms, acronyms, vendor names, protocol names, and proper nouns in English where needed for semantic precision.
- Mandate
 Write the resulting content primarily in Chinese (Zh-CN).
 Preserve technical terms, acronyms, vendor names, protocol names, and proper nouns in English where needed for semantic precision.

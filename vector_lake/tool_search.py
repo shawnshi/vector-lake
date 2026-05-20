@@ -2,9 +2,11 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 
 from filelock import FileLock, Timeout
 
+from vector_lake import governance_store
 from vector_lake.wiki_utils import get_index_path, get_purpose_path, get_wiki_dir
 
 
@@ -12,8 +14,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vector-lake-tool-search")
 
 TOKEN_BUDGET = {
-    "wiki_pages": 0.60,
-    "chat_history": 0.20,
+    "operational_memory": 0.30,
+    "wiki_pages": 0.45,
+    "chat_history": 0.05,
     "index_summary": 0.05,
     "system_prompt": 0.15,
 }
@@ -33,13 +36,51 @@ QUERY_EXPANSION_DICT = {
 }
 
 
-def _tokenize_query(query: str) -> list:
-    tokens = set()
-    expanded_terms = {query}
+def _expand_query_with_llm(query: str) -> list[str]:
+    expanded_terms = set([query])
     for key, expansions in QUERY_EXPANSION_DICT.items():
         if key in query:
             expanded_terms.update(expansions)
+            
+    try:
+        import subprocess, json
+        from vector_lake import get_extension_root
+        models_to_try = ["gemini-flash-latest"]
+        try:
+            cfg_path = get_extension_root() / "config.json"
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                cascade = cfg.get("llm", {}).get("model_cascade", [])
+                for m in cascade:
+                    if m and m not in models_to_try:
+                        models_to_try.append(m)
+        except Exception:
+            pass
+            
+        prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a space-separated list of keywords. Query: '{query}'"
+        gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
+        
+        for model in models_to_try:
+            cmd_args = [gemini_exec]
+            if model and model not in ("default", ""):
+                cmd_args.extend(["-m", model])
+            cmd_args.extend(["-p", "You are an expert search engine query expander.", "--approval-mode", "yolo"])
 
+            result = subprocess.run(
+                cmd_args,
+                input=prompt.encode('utf-8'),
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
+                if stdout_str:
+                    expanded_terms.update(stdout_str.split())
+                    break
+    except Exception as e:
+        log.warning(f"LLM query expansion failed: {e}")
+
+    tokens = set()
     for term in expanded_terms:
         for word in term.strip().split():
             word_lower = word.lower()
@@ -57,8 +98,153 @@ def _tokenize_query(query: str) -> list:
                 tokens.add(word_lower)
     return list(tokens)
 
+import math
 
-def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False):
+def _score_bm25(query_tokens: list[str], bm25_index: dict) -> dict:
+    if not bm25_index or not bm25_index.get("total_docs"):
+        return {}
+    
+    inverted_index = bm25_index.get("inverted_index", {})
+    doc_lengths = bm25_index.get("doc_lengths", {})
+    avgdl = bm25_index.get("avgdl", 1.0)
+    total_docs = bm25_index.get("total_docs", 0)
+    
+    k1 = 1.5
+    b = 0.75
+    
+    scores = {}
+    for term in query_tokens:
+        doc_freqs = inverted_index.get(term, {})
+        n_q = len(doc_freqs)
+        if n_q == 0:
+            continue
+        
+        idf = math.log(1 + (total_docs - n_q + 0.5) / (n_q + 0.5))
+        
+        for doc_id, freq in doc_freqs.items():
+            dl = doc_lengths.get(doc_id, avgdl)
+            score = idf * (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * dl / avgdl))
+            scores[doc_id] = scores.get(doc_id, 0.0) + score
+            
+    return scores
+
+
+def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) -> str:
+    state = memory.get("validity_state", "active")
+    memory_type = memory.get("memory_type", "fact")
+    score = memory.get("retrieval_score", memory.get("memory_score", 0))
+    text = " ".join(str(memory.get("text", "")).split())[:420]
+    source = memory.get("source_page") or memory.get("source_claim_id") or "operational_memory"
+    if as_xml:
+        attrs = (
+            f"ID='Memory_{index}' Type='{memory_type}' State='{state}' "
+            f"Score='{score}' Source='{source}'"
+        )
+        return f"<Memory_Item {attrs}>{text}</Memory_Item>\n"
+    return (
+        f"- **{memory_type}:{memory.get('memory_key', memory.get('memory_id'))}** "
+        f"(score: {score:.2f}, state: {state})\n"
+        f"  {text}\n"
+        f"  Source: {source}\n\n"
+    )
+
+
+def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool = False, include_history: bool = False, memory_types: list[str] | None = None) -> str:
+    memories = governance_store.search_operational_memory(
+        query,
+        top_k=top_k,
+        include_history=include_history,
+        memory_types=memory_types,
+    )
+    if not memories:
+        return "No operational memory matched the query."
+    return "".join(_format_memory_result(memory, as_xml=as_xml, index=index) for index, memory in enumerate(memories))
+
+
+def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
+    memories = governance_store.search_operational_memory(query, top_k=24, include_history=False)
+    historical = governance_store.search_operational_memory(query, top_k=12, include_history=True)
+    stale_or_conflicted = [
+        item for item in historical
+        if str(item.get("validity_state", "")).lower() in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
+    ][:6]
+
+    sections = {
+        "Current Preferences": [],
+        "Open Decisions": [],
+        "Task State": [],
+        "Relevant Facts": [],
+    }
+    type_to_section = {
+        "preference": "Current Preferences",
+        "decision": "Open Decisions",
+        "task_state": "Task State",
+        "fact": "Relevant Facts",
+    }
+
+    evidence_pointers = []
+    for memory in memories:
+        section = type_to_section.get(memory.get("memory_type", "fact"), "Relevant Facts")
+        text = " ".join(str(memory.get("text", "")).split())
+        line = (
+            f"- [{memory.get('memory_score', 0):.2f}/{memory.get('validity_state', 'active')}] "
+            f"{text[:420]}"
+        )
+        if memory.get("source_page"):
+            line += f" ({memory['source_page']})"
+        sections[section].append(line)
+        if memory.get("source_claim_id"):
+            evidence_pointers.append(
+                f"- {memory.get('source_claim_id')} -> {memory.get('source_page', 'unknown')}"
+            )
+
+    lines = [
+        "<MEMORY_PACKET>",
+        f"Generated: {datetime.now(timezone.utc).isoformat()}",
+        f"Query: {query}",
+        "Policy: Use this packet as the machine-facing runtime memory. If it conflicts with wiki prose, prefer active non-conflicted memory items and surface the conflict.",
+        "",
+    ]
+    for title in ("Current Preferences", "Open Decisions", "Task State", "Relevant Facts"):
+        lines.append(f"## {title}")
+        lines.extend(sections[title] or ["- None matched."])
+        lines.append("")
+
+    lines.append("## Conflicts / Stale Warnings")
+    if stale_or_conflicted:
+        for memory in stale_or_conflicted:
+            lines.append(
+                f"- [{memory.get('validity_state')}] {memory.get('memory_type')}:{memory.get('memory_key')} "
+                f"-> {str(memory.get('text', ''))[:260]}"
+            )
+    else:
+        lines.append("- None matched.")
+    lines.append("")
+
+    lines.append("## Evidence Pointers")
+    lines.extend(evidence_pointers[:12] or ["- None matched."])
+    lines.append("</MEMORY_PACKET>")
+
+    packet = "\n".join(lines)
+    omitted = 0
+    if len(packet) > max_chars:
+        packet = packet[: max(0, max_chars - 80)].rstrip() + "\n...[memory packet truncated]\n</MEMORY_PACKET>"
+        omitted = max(0, len(memories) - 12)
+    return {
+        "packet": packet,
+        "memory_count": len(memories),
+        "warning_count": len(stale_or_conflicted),
+        "omitted_count": omitted,
+    }
+
+
+def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page"):
+    normalized_mode = str(mode or "page").lower()
+    if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
+        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history)
+    if normalized_mode in {"claim", "claims"}:
+        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history, memory_types=["fact"])
+
     wiki_dir = str(get_wiki_dir())
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
@@ -84,44 +270,64 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             return "System is currently busy generating the index. Please try again later."
 
     nodes = [{"_key": key, **value} for key, value in index_data.get("nodes", {}).items()]
-    tokens = _tokenize_query(query)
+    tokens = _expand_query_with_llm(query)
     if not tokens:
         return "No valid search tokens."
 
     scored = []
-    for node in nodes:
-        if domain and node.get("domain", "").lower() != domain.lower():
-            continue
-        if cluster and node.get("topic_cluster", "").lower() != cluster.lower():
-            continue
-        if not include_history and node.get("status", "").lower() in ("deprecated", "archived"):
-            continue
+    bm25_index = index_data.get("bm25_index")
+    
+    if bm25_index and bm25_index.get("total_docs"):
+        base_scores = _score_bm25(tokens, bm25_index)
+        for node in nodes:
+            if domain and node.get("domain", "").lower() != domain.lower():
+                continue
+            if cluster and node.get("topic_cluster", "").lower() != cluster.lower():
+                continue
+            if not include_history and node.get("status", "").lower() in ("deprecated", "archived"):
+                continue
+            
+            score = base_scores.get(node["_key"], 0.0)
+            if score > 0:
+                if not include_history and node.get("status", "").lower() == "decayed":
+                    score *= 0.2
+                scored.append((score, node))
+    else:
+        for node in nodes:
+            if domain and node.get("domain", "").lower() != domain.lower():
+                continue
+            if cluster and node.get("topic_cluster", "").lower() != cluster.lower():
+                continue
+            if not include_history and node.get("status", "").lower() in ("deprecated", "archived"):
+                continue
 
-        score = 0
-        title = (node.get("title") or "").lower()
-        summary = (node.get("summary") or "").lower()
+            score = 0
+            title = (node.get("title") or "").lower()
+            summary = (node.get("summary") or "").lower()
 
-        for term in tokens:
-            if term in title:
-                score += 10
-            if term in summary:
-                score += 3
+            for term in tokens:
+                if term in title:
+                    score += 10
+                if term in summary:
+                    score += 3
 
-        if score == 0:
-            filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
-            if os.path.exists(filepath):
-                try:
-                    with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                        body_preview = handle.read(2000).lower()
-                    body_preview = re.sub(r"^---.*?---\s*", "", body_preview, flags=re.DOTALL)
-                    for term in tokens:
-                        if term in body_preview:
-                            score += 1
-                except Exception:
-                    pass
+            if score == 0:
+                filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
+                if os.path.exists(filepath):
+                    try:
+                        with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+                            body_preview = handle.read(2000).lower()
+                        body_preview = re.sub(r"^---.*?---\s*", "", body_preview, flags=re.DOTALL)
+                        for term in tokens:
+                            if term in body_preview:
+                                score += 1
+                    except Exception:
+                        pass
 
-        if score > 0:
-            scored.append((score, node))
+            if score > 0:
+                if not include_history and node.get("status", "").lower() == "decayed":
+                    score *= 0.2
+                scored.append((score, node))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
@@ -176,8 +382,10 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
 
 def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    memory_budget = int(max_chars * TOKEN_BUDGET["operational_memory"])
     wiki_budget = int(max_chars * TOKEN_BUDGET["wiki_pages"])
     index_budget = int(max_chars * TOKEN_BUDGET["index_summary"])
+    memory_packet = build_memory_packet(query, max_chars=memory_budget)
 
     search_results = search_vector_lake(query, top_k=15, as_xml=False)
     wiki_context = ""
@@ -215,11 +423,15 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
         pass
 
     return {
+        "memory_packet": memory_packet["packet"],
+        "memory_count": memory_packet["memory_count"],
+        "memory_warning_count": memory_packet["warning_count"],
+        "memory_omitted_count": memory_packet["omitted_count"],
         "wiki_context": wiki_context,
         "wiki_page_count": page_count,
         "index_summary": index_summary,
         "purpose": purpose,
-        "budget_used": len(wiki_context) + len(index_summary) + len(purpose),
+        "budget_used": len(memory_packet["packet"]) + len(wiki_context) + len(index_summary) + len(purpose),
         "budget_max": max_chars,
     }
 

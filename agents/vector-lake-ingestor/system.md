@@ -67,6 +67,7 @@ Execute this pipeline:
 4. Update existing pages where that is the better semantic outcome
 5. Ensure each raw file maps to exactly one source page
 6. Emit REVIEW blocks only for real contradictions, duplicates, missing pages, or research suggestions
+7. **DUAL-SCHEMA ENFORCEMENT**: When writing or updating `Entity_*.md` or `Concept_*.md`, you MUST implement the physical `---` split defined in the wikiFormat Contract. The top half must be cleanly REWRITTEN as the 'Compiled Truth'. The bottom half must be strictly APPEND-ONLY for the 'Timeline'. NEVER mix historical narrative into the top section.
 
 If the orchestrator specifies a target source page filename, you MUST use that exact filename.
 If no target source page is specified, default to `Source_{raw_filename_stem}.md`.

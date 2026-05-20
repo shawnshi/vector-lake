@@ -1,17 +1,23 @@
 import os
 import re
 import json
+import math
 import hashlib
 import logging
 import subprocess
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
+from collections import Counter
 
 from vector_lake import get_extension_root
 from vector_lake.db import get_processed_files, mark_file_processed
 from vector_lake import governance_store
-from vector_lake.wiki_utils import backup_file, get_memory_dir, get_wiki_dir, normalize_raw_ref, normalize_sources, read_markdown_file, sanitize_wiki_node
+from vector_lake.wiki_utils import backup_file, get_memory_dir, get_wiki_dir, normalize_raw_ref, normalize_sources, read_markdown_file, sanitize_wiki_node, atomic_write_text, get_index_path, normalize_entity_name
 import time
+import random
+
+CIRCUIT_BREAKER = {}
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -30,7 +36,7 @@ WIKI_DIR = get_wiki_dir()
 SCHEMA_PATH = EXTENSION_ROOT / "schema.md"
 MEMORY_DIR = get_memory_dir()
 
-SUPPORTED_EXTS = { ".md", ".txt", ".png", ".jpeg", ".pdf" }
+SUPPORTED_EXTS = set(config.get("supported_extensions", [".md", ".txt"]))
 
 def canonical_source_name(raw_path: str) -> str:
     """Deterministically derive a Source wiki filename from a raw file path.
@@ -80,20 +86,15 @@ def calculate_hash(filepath: str) -> str:
 
 def _sanitize_for_prompt(text: str) -> str:
     """Sanitize text before embedding in LLM prompt to prevent injection."""
-    # Strip characters that could be used for prompt injection
-    text = text.replace('`', '')       # Prevent code block escapes
-    text = text.replace('@', '_at_')   # Prevent @mention hijacking
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)  # Strip control chars
-    # Truncate excessively long paths
+    text = text.replace('`', '')
+    text = text.replace('@', '_at_')
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
     if len(text) > 500:
         text = text[:500] + '...'
     return text
 
 
 def _backup_wiki_targets(wiki_dir, file_entries: list):
-    """Create .bak snapshots of existing wiki files that may be modified.
-    Enables rollback if the Ingestor Agent produces bad writes.
-    """
     backup_count = 0
     for entry in file_entries:
         if entry.get("action") == "UPDATE":
@@ -109,7 +110,6 @@ def _backup_wiki_targets(wiki_dir, file_entries: list):
 
 
 def _read_purpose() -> str:
-    """Read purpose.md for LLM context injection."""
     purpose_path = MEMORY_DIR / "purpose.md"
     try:
         return purpose_path.read_text(encoding="utf-8")
@@ -118,7 +118,6 @@ def _read_purpose() -> str:
 
 
 def _read_overview() -> str:
-    """Read current wiki overview for context."""
     overview_path = WIKI_DIR / "overview.md"
     try:
         return overview_path.read_text(encoding="utf-8")
@@ -127,7 +126,6 @@ def _read_overview() -> str:
 
 
 def _read_index_summary() -> str:
-    """Read a compact summary of index.json for existing content awareness."""
     index_path = WIKI_DIR / "index.json"
     try:
         with open(index_path, "r", encoding="utf-8") as f:
@@ -136,7 +134,7 @@ def _read_index_summary() -> str:
         if not nodes:
             return ""
         lines = []
-        for key, node in list(nodes.items())[:100]:  # Cap at 100 entries
+        for key, node in list(nodes.items())[:100]:
             title = node.get("title", key)
             ntype = node.get("type", "?")
             summary = (node.get("summary", "") or "")[:80]
@@ -147,14 +145,13 @@ def _read_index_summary() -> str:
 
 
 def _read_entity_dictionary() -> str:
-    """Read canonical identities and aliases to prevent entity drift."""
     try:
         from vector_lake import governance_store
         entities = governance_store.load_entities().get("items", {})
         if not entities:
             return ""
         lines = []
-        for entity in entities.values():
+        for entity in list(entities.values())[:50]:
             name = entity.get("canonical_name")
             aliases = entity.get("aliases", [])
             if name and aliases:
@@ -166,116 +163,202 @@ def _read_entity_dictionary() -> str:
         return ""
 
 
-def process_file_batch(filepaths: list, existing_source_map: dict = None):
-    """Two-step Chain-of-Thought ingest pipeline.
-    
-    Step 1 (Analysis): LLM reads source → structured analysis of entities, concepts,
-                       arguments, connections, contradictions.
-    Step 2 (Generation): LLM takes analysis → generates wiki files + review items.
-    """
-    if not filepaths: return False
+def _calculate_cosine_similarity(text1: str, text2: str) -> float:
+    def get_tokens(text):
+        tokens = Counter()
+        text = text.lower()
+        cjk_chars = re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]", text)
+        for char in cjk_chars:
+            tokens[char] += 1
+        for i in range(len(cjk_chars) - 1):
+            tokens[cjk_chars[i] + cjk_chars[i+1]] += 1
+        latin_words = re.findall(r"[a-z0-9]+", text)
+        for word in latin_words:
+            tokens[word] += 2
+        return tokens
 
-    log.info(f"[2-Step CoT] Ingesting batch of {len(filepaths)} files...")
-    
-    before_mtimes = {}
-    if os.path.exists(WIKI_DIR):
-        for entry in os.scandir(WIKI_DIR):
-            if entry.is_file() and entry.name.endswith('.md'):
-                before_mtimes[entry.path] = entry.stat().st_mtime
+    vec1 = get_tokens(text1)
+    vec2 = get_tokens(text2)
+    intersection = set(vec1.keys()) & set(vec2.keys())
+    numerator = sum([vec1[x] * vec2[x] for x in intersection])
+    sum1 = sum([vec1[x] ** 2 for x in vec1.keys()])
+    sum2 = sum([vec2[x] ** 2 for x in vec2.keys()])
+    denominator = math.sqrt(sum1) * math.sqrt(sum2)
+    if not denominator:
+        return 0.0
+    return float(numerator) / denominator
 
-    # Use relative paths to avoid encoding issues with absolute paths in the prompt
-    root_dir = str(EXTENSION_ROOT.parent.parent.resolve())
-    rel_filepaths = []
-    for p in filepaths:
-        try:
-            rel_filepaths.append(os.path.relpath(p, root_dir))
-        except ValueError:
-            rel_filepaths.append(p)
+
+def _normalize_memory_key(value: str) -> str:
+    """Normalize a string by converting to lowercase and replacing non-alphanumeric/CJK chars with underscores."""
+    import re
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized[:96] or "general"
+
+
+def _piea_intercept(filename: str, content: str, index_data: dict) -> dict | None:
+    """PIEA Hook: Intercept duplicate nodes using hard normalization and cosine similarity before writing."""
+    try:
+        m_type = re.search(r"^type:\s*(\w+)", content, re.MULTILINE)
+        m_title = re.search(r"^title:\s*([^\n]+)", content, re.MULTILINE)
+        m_summary = re.search(r"^summary:\s*([^\n]+)", content, re.MULTILINE)
+
+        if not m_type or not m_title:
+            return None
+
+        candidate_type = m_type.group(1).strip().lower()
+        candidate_title = m_title.group(1).strip().strip('"').strip("'")
+        candidate_summary = m_summary.group(1).strip() if m_summary else candidate_title
+
+        if candidate_type not in ("entity", "concept"):
+            return None
+
+        nodes = index_data.get("nodes", {})
+        threshold = config.get("piea", {}).get("threshold", 0.92)
+
+        candidate_norm = _normalize_memory_key(candidate_title)
+
+        for key, node in nodes.items():
+            if node.get("type") != candidate_type:
+                continue
+
+            existing_title = node.get("title", "").strip('"').strip("'")
+            existing_norm = _normalize_memory_key(existing_title)
+
+            # 1. Hard Normalization Match (Strategy A)
+            if candidate_norm == existing_norm and candidate_norm != "general":
+                return {
+                    "existing_key": key,
+                    "existing_title": existing_title,
+                    "similarity": 1.0,
+                    "match_type": "hard_normalization"
+                }
+
+            # 2. Fallback to Cosine Similarity
+            existing_summary = node.get("summary") or existing_title
+            sim = _calculate_cosine_similarity(candidate_summary, existing_summary)
+
+            if sim >= threshold:
+                return {
+                    "existing_key": key,
+                    "existing_title": existing_title,
+                    "similarity": sim,
+                    "match_type": "cosine_similarity"
+                }
+    except Exception as e:
+        log.warning(f"PIEA interception failed for {filename}: {e}")
+
+    return None
+
+async def _async_call_gemini_cli(prompt: str, role_prompt: str, model_cascade: list, timeout_sec: int, semaphore: asyncio.Semaphore, step_name: str) -> str:
+    from google import genai
+    from google.genai import types
+    from google.genai.errors import APIError
+
+    retries = len(model_cascade)
+    client = genai.Client()
+    
+    async with semaphore:
+        for attempt in range(retries):
+            current_model = model_cascade[attempt]
+            if current_model in ("", "default"):
+                current_model = "gemini-2.5-pro"
             
-    # --- DEDUP: Plan A - Scan existing Source pages ---
-    if existing_source_map is None:
-        existing_source_map = scan_existing_sources(WIKI_DIR)
-        log.info(f"Scanned {len(existing_source_map)} existing Source page mappings for dedup.")
+            # Check Circuit Breaker
+            if current_model in CIRCUIT_BREAKER:
+                cooldown_until = CIRCUIT_BREAKER[current_model]
+                if time.time() < cooldown_until:
+                    log.warning(f"[{step_name}] Model '{current_model}' is in cooldown (circuit broken). Skipping...")
+                    continue
+                else:
+                    del CIRCUIT_BREAKER[current_model] # Cooldown expired
 
-    # --- DEDUP: Plan B - Compute canonical target filenames ---
-    file_entries = []
-    file_contents_for_prompt = []
-    for abs_p, rel_p in zip(filepaths, rel_filepaths):
-        # Compute the raw ref path as it appears in YAML sources: field (relative to MEMORY/)
-        try:
-            raw_ref = os.path.relpath(abs_p, str(MEMORY_DIR)).replace("\\", "/")
-        except ValueError:
-            raw_ref = rel_p.replace("\\", "/")
-        
-        normalized_ref = _normalize_raw_ref(raw_ref)
-        canonical_name = canonical_source_name(abs_p)
-        
-        # Check if an existing Source page already covers this raw file
-        existing_name = existing_source_map.get(normalized_ref)
-        target_name = existing_name if existing_name else canonical_name
-        action = "UPDATE" if existing_name else "CREATE"
-        
-        # Read file content to pass to agent
-        content = ""
-        try:
-            with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            # Add to content block for prompt
-            file_contents_for_prompt.append(
-                f"--- SOURCE FILE: {rel_p} ---\n"
-                f"{content}\n"
-                f"--- END SOURCE FILE ---\n"
-            )
-        except Exception as e:
-            log.error(f"Could not read file {abs_p} for ingest: {e}")
+            log.info(f"[{step_name}] Waiting for Agent - Attempt {attempt+1}/{retries}... (Model: {current_model})")
+            
+            try:
+                # Use asyncio.wait_for to enforce timeout
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=role_prompt
+                        )
+                    ),
+                    timeout=timeout_sec
+                )
+                stdout_str = response.text
+                if stdout_str and len(stdout_str.strip()) > 50:
+                    return stdout_str
+                else:
+                    log.warning(f"[{step_name}] attempt {attempt+1} returned suspiciously empty output.")
+            except asyncio.TimeoutError:
+                log.warning(f"[{step_name}] attempt {attempt+1} timed out after {timeout_sec}s.")
+            except APIError as e:
+                log.warning(f"[{step_name}] attempt {attempt+1} API Error: {e}")
+                err_str = str(e)
+                if "quotaExceeded" in err_str or "ModelNotFoundError" in err_str:
+                    log.error(f"[{step_name}] Hard API Error detected for '{current_model}'. Tripping circuit breaker for 10 minutes.")
+                    CIRCUIT_BREAKER[current_model] = time.time() + 600
+            except Exception as e:
+                log.error(f"[{step_name}] attempt {attempt+1} failed: {e}")
+                
+            if attempt < retries - 1:
+                # Exponential Backoff with Jitter
+                sleep_time = (2 ** attempt) + random.uniform(0, 1)
+                log.info(f"[{step_name}] Backing off for {sleep_time:.2f}s before next attempt...")
+                await asyncio.sleep(sleep_time)
+                
+        return ""
 
-        file_entries.append({
-            "rel_path": rel_p,
-            "raw_ref": raw_ref,
-            "target_source_file": target_name,
-            "action": action,
-            "content": content
-        })
-    
-    # Build structured file list with explicit target filenames (sanitized)
-    file_list_lines = []
-    for entry in file_entries:
-        safe_rel = _sanitize_for_prompt(entry['rel_path'])
-        safe_target = _sanitize_for_prompt(entry['target_source_file'])
-        safe_ref = _sanitize_for_prompt(entry['raw_ref'])
-        file_list_lines.append(
-            f"- Source: `{safe_rel}`\n"
-            f"  Target Source Page: `{safe_target}` ({entry['action']})\n"
-            f"  YAML sources field: [\"{safe_ref.replace('\"', '\\\"')}\"]"
-        )
-    file_list_str = "\n".join(file_list_lines)
-    file_content_str = "\n".join(file_contents_for_prompt)
-
-    # Backup wiki targets before agent write
-    _backup_wiki_targets(WIKI_DIR, file_entries)
-
-    # Load schema, categories, purpose, index summary, overview
-    schema_content = ""
+async def _process_single_file_async(abs_p: str, existing_source_map: dict, semaphore: asyncio.Semaphore, shared_context: dict) -> tuple[list, list]:
+    root_dir = shared_context['root_dir']
     try:
-        schema_content = (EXTENSION_ROOT / "schema.md").read_text(encoding="utf-8")
-    except Exception:
-        pass
-    categories_content = ""
+        rel_p = os.path.relpath(abs_p, root_dir)
+    except ValueError:
+        rel_p = abs_p
+        
     try:
-        categories_content = (EXTENSION_ROOT / "SCHEMA_CATEGORIES.md").read_text(encoding="utf-8")
-    except Exception:
-        pass
+        raw_ref = os.path.relpath(abs_p, str(MEMORY_DIR)).replace("\\", "/")
+    except ValueError:
+        raw_ref = rel_p.replace("\\", "/")
     
-    purpose_content = _read_purpose()
-    index_summary = _read_index_summary()
-    entity_dict = _read_entity_dictionary()
-    overview_content = _read_overview()
+    normalized_ref = _normalize_raw_ref(raw_ref)
+    canonical_name = canonical_source_name(abs_p)
+    existing_name = existing_source_map.get(normalized_ref)
+    target_name = existing_name if existing_name else canonical_name
+    action = "UPDATE" if existing_name else "CREATE"
+    
+    try:
+        with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as e:
+        log.error(f"Could not read file {abs_p} for ingest: {e}")
+        return [], []
 
-    # ── Step 1: Analysis ──────────────────────────────────────────
-    # LLM reads sources and produces structured analysis:
-    # key entities, concepts, arguments, connections to existing wiki, contradictions
-    log.info("[Step 1/2] Running analysis pass...")
+    safe_rel = _sanitize_for_prompt(rel_p)
+    safe_target = _sanitize_for_prompt(target_name)
+    safe_ref = _sanitize_for_prompt(raw_ref)
+    
+    file_list_str = (
+        f"- Source: `{safe_rel}`\n"
+        f"  Target Source Page: `{safe_target}` ({action})\n"
+        f"  YAML sources field: [\"{safe_ref.replace('"', '\\"')}\"]"
+    )
+    
+    file_content_str = (
+        f"--- SOURCE FILE: {rel_p} ---\n"
+        f"{content}\n"
+        f"--- END SOURCE FILE ---"
+    )
 
+    _backup_wiki_targets(WIKI_DIR, [{"target_source_file": target_name, "action": action}])
+
+    llm_config = config.get("llm", {})
+    model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"])
+    
     analysis_prompt = f"""@vector-lake-ingestor
 [STEP 1 OF 2 — ANALYSIS ONLY. DO NOT WRITE ANY FILES.]
 
@@ -320,62 +403,21 @@ List theories, methods, techniques, phenomena. For each:
 
 Be thorough but concise. Focus on what's genuinely important.
 
-{f"--- PURPOSE (Wiki 目标) ---{chr(10)}{purpose_content}" if purpose_content else ""}
+{f"--- PURPOSE (Wiki 目标) ---\\n{shared_context['purpose_content']}" if shared_context['purpose_content'] else ""}
 
-{f"--- EXISTING WIKI INDEX (检查现有内容) ---{chr(10)}{index_summary}" if index_summary else ""}
+{f"--- EXISTING WIKI INDEX (检查现有内容) ---\\n{shared_context['index_summary']}" if shared_context['index_summary'] else ""}
 
-{f"--- EXISTING ENTITY DICTIONARY (强制实体对齐) ---{chr(10)}{entity_dict}" if entity_dict else ""}
+{f"--- EXISTING ENTITY DICTIONARY (强制实体对齐) ---\\n{shared_context['entity_dict']}" if shared_context['entity_dict'] else ""}
 """
-
-    gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
-    analysis_result = ""
     
-    llm_config = config.get("llm", {})
-    model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash", "gemini-3.1-8b"])
     timeout_analysis = llm_config.get("timeout_analysis", 120)
-    retries = len(model_cascade)
-
-    for attempt in range(retries):
-        try:
-            current_model = model_cascade[attempt]
-            model_flag = [] if current_model in ("", "default") else ["-m", current_model]
-            model_disp = current_model if current_model not in ("", "default") else "default"
-            log.info(f"Waiting for Analysis Agent (Step 1) - Attempt {attempt+1}/{retries}... (Model: {model_disp})")
-            cmd = [gemini_exec] + model_flag + ["-p", "You are an analysis agent.", "--approval-mode", "yolo"]
-            result = subprocess.run(
-                cmd,
-                input=analysis_prompt.encode('utf-8'),
-                capture_output=True, timeout=timeout_analysis
-            )
-            if result.returncode == 0:
-                analysis_result = result.stdout.decode('utf-8', errors='replace')
-                stderr_str = result.stderr.decode('utf-8', errors='replace')
-                if "GaxiosError" in stderr_str or "RESOURCE_EXHAUSTED" in stderr_str or "rateLimitExceeded" in stderr_str:
-                    log.warning(f"Analysis step attempt {attempt+1} encountered API error despite exit code 0.")
-                elif len(analysis_result.strip()) > 50:
-                    break
-                else:
-                    log.warning(f"Analysis step attempt {attempt+1} returned suspiciously empty output.")
-            else:
-                stderr = result.stderr.decode('utf-8', errors='replace').strip()
-                log.warning(f"Analysis step attempt {attempt+1} returned non-zero: {stderr}")
-        except subprocess.TimeoutExpired as e:
-            log.warning(f"Analysis step attempt {attempt+1} timed out.")
-        except Exception as e:
-            log.error(f"Analysis step attempt {attempt+1} failed: {e}")
-            
-        if attempt < retries - 1:
-            time.sleep(3)
-            
+    analysis_result = await _async_call_gemini_cli(
+        analysis_prompt, "You are an analysis agent.", model_cascade, timeout_analysis, semaphore, f"Step 1 | {safe_rel[-20:]}"
+    )
+    
     if not analysis_result:
-        log.warning("Analysis step failed after retries, proceeding with available output.")
+        log.warning(f"Analysis step failed for {rel_p}, proceeding with direct generation")
         analysis_result = "(Analysis unavailable — falling back to direct generation)"
-
-    log.info(f"[Step 1/2] Analysis complete ({len(analysis_result)} chars).")
-
-    # ── Step 2: Generation ────────────────────────────────────────
-    # LLM takes analysis → generates wiki files + review items + overview update
-    log.info("[Step 2/2] Running generation pass...")
 
     generation_prompt = f"""@vector-lake-ingestor
 [STEP 2 OF 2 — GENERATION. NOW WRITE FILES.]
@@ -401,14 +443,14 @@ Source Files (with MANDATORY target filenames):
 6. ALWAYS check the EXISTING ENTITY DICTIONARY below. If an entity you are about to extract matches any Alias, you MUST normalize it to its Canonical Name. Do NOT create new pages for existing aliases.
 
 --- SCHEMA ---
-{schema_content}
+{shared_context['schema_content']}
 
 --- CATEGORIES ---
-{categories_content}
+{shared_context['categories_content']}
 
-{f"--- PURPOSE (对齐目标) ---{chr(10)}{purpose_content}" if purpose_content else ""}
+{f"--- PURPOSE (对齐目标) ---\\n{shared_context['purpose_content']}" if shared_context['purpose_content'] else ""}
 
-{f"--- EXISTING ENTITY DICTIONARY (强制实体对齐) ---{chr(10)}{entity_dict}" if entity_dict else ""}
+{f"--- EXISTING ENTITY DICTIONARY (强制实体对齐) ---\\n{shared_context['entity_dict']}" if shared_context['entity_dict'] else ""}
 
 --- ADDITIONAL REQUIREMENTS ---
 
@@ -430,7 +472,7 @@ You MUST evaluate how closely each generated node (Entity, Concept, Source, Synt
 ### overview.md 更新（必须）
 After writing entity/concept/source pages, you MUST also update `wiki/overview.md`.
 This file is a 2-5 paragraph high-level summary of ALL topics in the wiki (not just this batch).
-{f"Current overview:{chr(10)}{overview_content}" if overview_content else "Create a new overview.md if it does not exist."}
+{f"Current overview:{chr(10)}{shared_context['overview_content']}" if shared_context['overview_content'] else "Create a new overview.md if it does not exist."} 
 
 ### Review Items（矛盾/空白/建议）
 After writing wiki files, if you identified contradictions, duplicates, knowledge gaps, or
@@ -447,136 +489,227 @@ Only create reviews for things that genuinely need human input.
 
 Please begin extraction and node weaving.
 """
-
-    success = False
-    stdout_str = ""
-    llm_config = config.get("llm", {})
-    model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash", "gemini-3.1-8b"])
-    timeout_generation = llm_config.get("timeout_generation", 180)
-    retries = len(model_cascade)
-
-    for attempt in range(retries):
-        try:
-            current_model = model_cascade[attempt]
-            model_flag = [] if current_model in ("", "default") else ["-m", current_model]
-            model_disp = current_model if current_model not in ("", "default") else "default"
-            log.info(f"Waiting for Generation Agent (Step 2) - Attempt {attempt+1}/{retries}... (Model: {model_disp})")
-            cmd = [gemini_exec] + model_flag + ["-p", "You are a generation agent.", "--approval-mode", "yolo"]
-            result = subprocess.run(cmd, input=generation_prompt.encode('utf-8'), capture_output=True, timeout=timeout_generation)
-            
-            if result.returncode == 0:
-                stdout_str = result.stdout.decode('utf-8', errors='replace')
-                stderr_str = result.stderr.decode('utf-8', errors='replace')
-                if "GaxiosError" in stderr_str or "RESOURCE_EXHAUSTED" in stderr_str or "rateLimitExceeded" in stderr_str:
-                    log.warning(f"Generation Agent attempt {attempt+1} encountered API error despite exit code 0.")
-                elif "---FILE:" in stdout_str or "---REVIEW:" in stdout_str or len(stdout_str.strip()) > 100:
-                    if stdout_str: print(stdout_str)
-                    success = True
-                    break
-                else:
-                    log.warning(f"Generation Agent attempt {attempt+1} returned suspiciously empty output without valid structures.")
-            else:
-                stderr = result.stderr.decode('utf-8', errors='replace').strip()
-                log.warning(f"Generation Agent attempt {attempt+1} failed: {stderr}")
-        except subprocess.TimeoutExpired as e:
-            log.warning(f"Generation Agent attempt {attempt+1} timed out.")
-        except Exception as e:
-            log.error(f"Gemini CLI failed for generation step: {e}")
-            
-        if attempt < retries - 1:
-            time.sleep(3)
-
-    if not success:
-        log.error("Generation Agent failed or crashed after retries.")
-        return False
     
-    # ── Step 3: Parse review items from agent output ──────────────
-    if stdout_str:
-        try:
-            import re
-            from vector_lake import governance_store
-            
-            REVIEW_BLOCK_REGEX = re.compile(r'---REVIEW:\s*(\w[\w-]*)\s*\|\s*(.+?)\s*---\n([\s\S]*?)---END REVIEW---')
-            VALID_TYPES = {"contradiction", "duplicate", "missing-page", "suggestion"}
-            
-            review_items = []
-            for match in REVIEW_BLOCK_REGEX.finditer(stdout_str):
-                raw_type = match.group(1).strip().lower()
-                title = match.group(2).strip()
-                body = match.group(3).strip()
+    timeout_generation = llm_config.get("timeout_generation", 180)
+    stdout_str = await _async_call_gemini_cli(
+        generation_prompt, "You are a generation agent.", model_cascade, timeout_generation, semaphore, f"Step 2 | {safe_rel[-20:]}"
+    )
+    
+    if not stdout_str:
+        log.error(f"Generation Agent failed for {rel_p}")
+        return [], []
+        
+    review_items = []
+    try:
+        import re
+        # Fix unescaped pipe character and add fallback for optional groups
+        REVIEW_BLOCK_REGEX = re.compile(r'---REVIEW:\s*(\w[\w-]*)\s*\|?\s*(.+?)\s*---\n([\s\S]*?)---END REVIEW---')
+        VALID_TYPES = {"contradiction", "duplicate", "missing-page", "suggestion"}
 
-                review_type = raw_type if raw_type in VALID_TYPES else "suggestion"
+        for match in REVIEW_BLOCK_REGEX.finditer(stdout_str):
+            raw_type = (match.group(1) or "").strip().lower()
+            title = (match.group(2) or "").strip()
+            body = (match.group(3) or "").strip()
+            review_type = raw_type if raw_type in VALID_TYPES else "suggestion"
 
-                search_match = re.search(r'^SEARCH:\s*(.+)$', body, re.MULTILINE)
-                search_queries = [q.strip() for q in search_match.group(1).split("|") if q.strip()] if search_match else []
+            search_match = re.search(r'^SEARCH:\s*(.+)$', body, re.MULTILINE)
+            search_queries = [q.strip() for q in search_match.group(1).split("|") if q.strip()] if search_match else []
 
-                pages_match = re.search(r'^PAGES:\s*(.+)$', body, re.MULTILINE)
-                affected_pages = [p.strip() for p in pages_match.group(1).split(",") if p.strip()] if pages_match else []
+            pages_match = re.search(r'^PAGES:\s*(.+)$', body, re.MULTILINE)
+            affected_pages = [p.strip() for p in pages_match.group(1).split(",") if p.strip()] if pages_match else []
 
-                description = body
-                description = re.sub(r'^SEARCH:.*$', '', description, flags=re.MULTILINE)
-                description = re.sub(r'^PAGES:.*$', '', description, flags=re.MULTILINE)
-                description = description.strip()
+            description = body
+            description = re.sub(r'^SEARCH:.*$', '', description, flags=re.MULTILINE)
+            description = re.sub(r'^PAGES:.*$', '', description, flags=re.MULTILINE)
+            description = description.strip()
 
-                review_items.append({
-                    "item_type": review_type,
-                    "title": title,
-                    "description": description,
-                    "source": str(filepaths),
-                    "search_queries": search_queries,
-                    "affected_pages": affected_pages
-                })
-                
-            if review_items:
-                for item in review_items:
-                    governance_store.enqueue_governance_item(**item)
-                log.info(f"Captured {len(review_items)} review item(s) from agent output.")
-        except Exception as e:
-            log.warning(f"Failed to parse review items: {e}")
-            
-    # ── Step 4: Post-processing (Python-Led I/O) ──────────────────
+            review_items.append({
+                "item_type": review_type,
+                "title": title,
+                "description": description,
+                "source": str([abs_p]),
+                "search_queries": search_queries,
+                "affected_pages": affected_pages
+            })
+    except Exception as e:
+        log.warning(f"Failed to parse review items for {rel_p}: {e}")
+        
     changed_files = []
-    if stdout_str:
-        from vector_lake.wiki_utils import atomic_write_text
+    try:
+        import re
         file_blocks = re.finditer(r"---FILE:\s*([^\n]+)---\n(.*?)\n---END FILE---", stdout_str, re.DOTALL)
         for match in file_blocks:
             filename = match.group(1).strip()
+            filename = filename.replace("[[", "").replace("]]", "").replace("[", "")
+            if filename != "overview.md":
+                if filename.endswith(".md"):
+                    filename = normalize_entity_name(filename[:-3]) + ".md"
+                else:
+                    filename = normalize_entity_name(filename)
             content = match.group(2).strip()
             
-            if not filename.startswith(("Source_", "Entity_", "Concept_", "Synthesis_")) and filename != "overview.md":
+            if not filename.startswith(VALID_PREFIXES) and filename != "overview.md":
                 log.warning(f"Intercepted illegal write attempt to {filename}")
                 continue
                 
+            intercept_match = _piea_intercept(filename, content, shared_context['index_data'])
+            if intercept_match:
+                existing_key = intercept_match["existing_key"]
+                sim = intercept_match["similarity"]
+                match_type = intercept_match.get("match_type", "cosine_similarity")
+                
+                log.info(f"[PIEA] Intercepted {filename}: Aligned with {existing_key} (similarity: {sim:.3f}, type: {match_type})")
+                
+                # Strategy: Physical Append for ALL matched items
+                log.info(f"[PIEA-Append] High similarity match. Appending to {existing_key}.md instead of creating {filename}.")
+                existing_file_path = os.path.join(WIKI_DIR, f"{existing_key}.md")
+                
+                if os.path.exists(existing_file_path):
+                    # Extract main body, ignoring YAML
+                    body_content = re.sub(r'^---\n(.*?)\n---\n?', '', content, flags=re.DOTALL)
+                    
+                    try:
+                        with open(existing_file_path, "a", encoding="utf-8") as ef:
+                            ef.write(f"\n\n## Timeline (证据时间线)\n\n### [Auto-Append via PIEA: {now}]\n{body_content}")
+                        changed_files.append(existing_file_path)
+                        
+                        review_items.append({
+                            "item_type": "duplicate",
+                            "title": f"PIEA Append: {filename} -> {existing_key}",
+                            "description": f"Pre-Ingestion Entity Alignment intercepted a duplicate ({match_type}, sim: {sim:.3f}) and physically appended the content.",
+                            "source": str([abs_p]),
+                            "search_queries": [intercept_match["existing_title"], filename],
+                            "affected_pages": [f"{existing_key}.md"]
+                        })
+                        continue # Skip writing the new file
+                    except Exception as e:
+                        log.error(f"Failed to append to {existing_file_path}: {e}")
+                        # Fallback to Contested file if append fails
+                
+                # If append failed, write as Contested
+                content = re.sub(r'^status:\s*"Active"', 'status: "Contested"', content, flags=re.MULTILINE)
+                content = re.sub(r'^(alignment_score:\s*\d+)', r'\1\npiea_aligned_with: ' + existing_key, content, flags=re.MULTILINE)
+                
+                review_items.append({
+                    "item_type": "duplicate",
+                    "title": f"PIEA: {filename} <> {existing_key}",
+                    "description": f"Pre-Ingestion Entity Alignment intercepted a high-similarity duplicate node (similarity: {sim:.3f}).",
+                    "source": str([abs_p]),
+                    "search_queries": [intercept_match["existing_title"], filename],
+                    "affected_pages": [filename, f"{existing_key}.md"]
+                })
+
             file_path = os.path.join(WIKI_DIR, filename)
             try:
                 atomic_write_text(Path(file_path), content)
                 changed_files.append(file_path)
             except Exception as e:
                 log.error(f"Failed to write {filename}: {e}")
-                    
+    except Exception as e:
+        log.error(f"Failed in file writing for {rel_p}: {e}")
+        
     if changed_files:
         for p in changed_files:
             sanitize_wiki_node(p)
+            
+    now = datetime.now(timezone.utc).isoformat()
+    f_hash = calculate_hash(abs_p)
+    if f_hash: 
+        mark_file_processed(abs_p, f_hash, now)
+        
+    return changed_files, review_items
+
+async def _run_batch_async(filepaths: list, existing_source_map: dict = None):
+    log.info(f"[Async CoT] Ingesting batch of {len(filepaths)} files concurrently...")
+    
+    if existing_source_map is None:
+        existing_source_map = scan_existing_sources(WIKI_DIR)
+        
+    root_dir = str(EXTENSION_ROOT.parent.parent.resolve())
+    
+    schema_content = ""
+    try:
+        schema_content = (EXTENSION_ROOT / "schema.md").read_text(encoding="utf-8")
+    except Exception: pass
+    
+    categories_content = ""
+    try:
+        categories_content = (EXTENSION_ROOT / "SCHEMA_CATEGORIES.md").read_text(encoding="utf-8")
+    except Exception: pass
+    
+    index_data = {}
+    index_path = get_index_path()
+    if index_path.exists():
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+        except Exception: pass
+    
+    shared_context = {
+        'root_dir': root_dir,
+        'schema_content': schema_content,
+        'categories_content': categories_content,
+        'purpose_content': _read_purpose(),
+        'index_summary': _read_index_summary(),
+        'entity_dict': _read_entity_dictionary(),
+        'overview_content': _read_overview(),
+        'index_data': index_data
+    }
+    
+    max_concurrency = config.get("llm", {}).get("max_concurrent_tasks", 3)
+    semaphore = asyncio.Semaphore(max_concurrency)
+    
+    tasks = []
+    for fp in filepaths:
+        tasks.append(asyncio.create_task(_process_single_file_async(fp, existing_source_map, semaphore, shared_context)))
+        
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    all_changed_files = []
+    all_review_items = []
+    
+    for res in results:
+        if isinstance(res, Exception):
+            log.error(f"File processing task raised exception: {res}")
+        elif res:
+            cf, ri = res
+            all_changed_files.extend(cf)
+            all_review_items.extend(ri)
+            
+    if all_review_items:
+        for item in all_review_items:
+            try:
+                governance_store.enqueue_governance_item(**item)
+            except Exception as e:
+                log.warning(f"Failed to enqueue item: {e}")
+                
+    if all_changed_files:
+        unique_changed = list(set(all_changed_files))
         governance_store.sync_pages_to_canonical(
-            changed_files,
-            origin="ingest",
+            unique_changed,
+            origin="ingest-async",
             auto_approve=True,
-            summary=f"Ingest sync for {len(changed_files)} page(s)",
+            summary=f"Async ingest sync for {len(unique_changed)} page(s)",
         )
-        log.info(f"Agent modified and sanitized {len(changed_files)} wiki files.")
+        log.info(f"Agent modified and sanitized {len(unique_changed)} wiki files.")
     else:
         log.warning("Agent ran for batch but no wiki files were modified.")
 
-    now = datetime.now(timezone.utc).isoformat()
-    for fp in filepaths:
-        if os.path.exists(fp):
-            f_hash = calculate_hash(fp)
-            if f_hash: mark_file_processed(fp, f_hash, now)
+
+def process_file_batch(filepaths: list, existing_source_map: dict = None):
+    """Synchronous entrypoint for the Async 2-Step CoT ingest pipeline."""
+    if not filepaths: return False
+    
+    try:
+        asyncio.run(_run_batch_async(filepaths, existing_source_map))
+    except Exception as e:
+        log.error(f"Async batch failed: {e}")
+        return False
         
     return True
 
 def sync_all():
-    log.info("Starting Native Agent Ingest Sync (2-Step CoT)...")
+    log.info("Starting Native Agent Ingest Sync (Async 2-Step CoT)...")
     
     files_to_process = []
     for target_dir in TARGET_DIRS:
@@ -623,4 +756,3 @@ def sync_all():
 
 if __name__ == "__main__":
     sync_all()
-

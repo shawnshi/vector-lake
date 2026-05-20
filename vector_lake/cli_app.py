@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
 Usage Examples:
   python cli.py sync
   python cli.py search "MSL" --top_k 5
+  python cli.py search "deployment target" --mode memory
   python cli.py review
   python cli.py review resolve 0
   python cli.py review resolve review_ab12cd34ef56
@@ -53,6 +54,7 @@ Usage Examples:
     search_parser.add_argument("--domain", type=str, default=None, help="Filter by domain namespace.")
     search_parser.add_argument("--cluster", type=str, default=None, help="Filter by topic cluster.")
     search_parser.add_argument("--include-history", action="store_true", help="Bypass temporal invalidation to search deprecated facts.")
+    search_parser.add_argument("--mode", choices=["page", "memory", "claim"], default="page", help="Search page index, operational memory, or fact claims.")
 
     query_parser = subparsers.add_parser("query", help="[QUERY] Deep reasoning with budget-controlled context.")
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
@@ -67,6 +69,9 @@ Usage Examples:
 
     subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.")
     subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")
+
+    research_parser = subparsers.add_parser("research", help="[RESEARCH] Autonomously scan graph gaps and governance queue to formulate web research directives.")
+    research_parser.add_argument("--dry-run", action="store_true", help="Preview the research queries without the SYSTEM DIRECTIVE execution hook.")
 
 
     debt_parser = subparsers.add_parser("debt", help="[DEBT] Show governance debt metrics.")
@@ -96,6 +101,12 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        requires_key = ["sync", "query"]
+        if args.command in requires_key and not os.environ.get("GEMINI_API_KEY"):
+            print(f"ERROR: Command '{args.command}' requires GEMINI_API_KEY to be set.", file=sys.stderr)
+            print("Please configure it in your environment or ~/.gemini/.env file.", file=sys.stderr)
+            return 1
+
         if args.command == "sync":
             print(tools.sync_vector_lake())
         elif args.command == "search":
@@ -105,6 +116,7 @@ def main() -> int:
                 domain=getattr(args, "domain", None),
                 cluster=getattr(args, "cluster", None),
                 include_history=getattr(args, "include_history", False),
+                mode=getattr(args, "mode", "page"),
             ))
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, "auto_fix", False)))
@@ -118,6 +130,8 @@ def main() -> int:
             print(tools.audit_graph())
         elif args.command == "doctor":
             print(tools.doctor_vector_lake())
+        elif args.command == "research":
+            print(tools.research_vector_lake(getattr(args, "dry_run", False)))
         elif args.command == "debt":
             print(tools.debt_vector_lake(getattr(args, "top", 20)))
         elif args.command == "trace":

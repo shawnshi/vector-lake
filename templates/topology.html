@@ -68,7 +68,7 @@
     <div id="3d-graph"></div>
 
     <div id="info-panel">
-        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible'); selectedNode = null; if(typeof Graph !== 'undefined') Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);">×</div>
+        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible'); selectedNode = null; if(typeof Graph !== 'undefined') Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());">×</div>
         <h2 id="info-title"></h2>
         <div id="info-meta"></div>
         <div class="info-section">
@@ -83,6 +83,10 @@
             <strong>Sources</strong>
             <ul id="info-sources"></ul>
         </div>
+        <div class="info-section">
+            <strong>Actions</strong>
+            <ul id="info-actions"></ul>
+        </div>
     </div>
 
     <div id="right-hud">
@@ -90,6 +94,12 @@
             <h4>Search</h4>
             <input type="text" id="search-input" placeholder="Search node or claim..." autocomplete="off">
             <div id="search-results"></div>
+        </div>
+
+        <div class="hud-box">
+            <h4>Controls</h4>
+            <button id="btn-focus-mode" class="toggle-btn">Ego-Net Focus</button>
+            <button id="btn-pause-physics" class="toggle-btn">Pause Physics</button>
         </div>
 
         <div class="hud-box">
@@ -159,6 +169,9 @@
         let colorMode = 'type';
         let hoverNode = null;
         let selectedNode = null;
+        let focusMode = false;
+        let physicsPaused = false;
+        let searchTokens = [];
         const activeGroups = new Set();
 
         const graphDiv = document.getElementById('3d-graph');
@@ -307,10 +320,14 @@
                 const val = event.target.value.toLowerCase().trim();
                 results.innerHTML = '';
                 if (!val) {
+                    searchTokens = [];
+                    Graph.nodeOpacity(Graph.nodeOpacity());
                     results.style.display = 'none';
                     return;
                 }
                 const tokens = val.split(/\s+/);
+                searchTokens = tokens;
+                Graph.nodeOpacity(Graph.nodeOpacity());
                 
                 const scoredMatches = currentGraph().nodes.map(node => {
                     const name = (node.name || '').toLowerCase();
@@ -393,7 +410,21 @@
                 .nodeVisibility(nodeVisibility)
                 .nodeOpacity(node => {
                     const focusNode = hoverNode || selectedNode;
-                    if (focusNode && focusNode.id !== node.id && !isNeighbor(focusNode, node)) return 0.25;
+                    if (searchTokens.length > 0) {
+                        const name = (node.name || '').toLowerCase();
+                        const id = (node.id || '').toLowerCase();
+                        const summary = (node.summary || '').toLowerCase();
+                        let match = true;
+                        for (const token of searchTokens) {
+                            if (!(name.includes(token) || id.includes(token) || summary.includes(token))) {
+                                match = false; break;
+                            }
+                        }
+                        if (!match) return 0.05;
+                    }
+                    if (focusNode && focusNode.id !== node.id && !isNeighbor(focusNode, node)) {
+                        return focusMode ? 0.02 : 0.25;
+                    }
                     let decay = node.decay_weight;
                     if (decay === undefined) decay = 1.0;
                     return Math.max(0.65, decay);
@@ -402,8 +433,9 @@
                 .linkColor(currentLinkColor)
                 .linkVisibility(linkVisibility)
                 .linkDirectionalParticles(link => {
+                    if (physicsPaused) return 0;
                     const focusNode = hoverNode || selectedNode;
-                    if (!focusNode) return 0.5;
+                    if (!focusNode) return currentGraph().nodes.length > 2000 ? 0 : 0.5;
                     const src = link.source.id || link.source;
                     const tgt = link.target.id || link.target;
                     return (src === focusNode.id || tgt === focusNode.id) ? 3 : 0;
@@ -419,12 +451,24 @@
                  .onBackgroundClick(() => {
                      selectedNode = null;
                      document.getElementById('info-panel').classList.remove('visible');
-                     Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
+                     Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
                  });
 
             // Adjust Forces for 1500+ nodes
             Graph.d3Force('charge').strength(-200);
             Graph.d3Force('link').distance(120);
+            
+            if (activeGraphKey === 'page') {
+                const zForce = (alpha) => {
+                    currentGraph().nodes.forEach(node => {
+                        const targetZ = node.group === 'Synthesis' ? 400 : (node.group === 'Source' ? -400 : 0);
+                        node.vz += (targetZ - (node.z || 0)) * 0.1 * alpha;
+                    });
+                };
+                Graph.d3Force('z', zForce);
+            } else {
+                Graph.d3Force('z', null);
+            }
 
             updateFilters();
             renderLegend();
@@ -448,7 +492,7 @@
             const href = nodeHref(node);
             document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
             selectedNode = node;
-            Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor);
+            Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
 
             const meta = [];
             meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
@@ -482,6 +526,15 @@
                 sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
             });
             if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
+
+            const actions = document.getElementById('info-actions');
+            actions.innerHTML = '';
+            if (activeGraphKey === 'page') {
+                const filePath = `${memoryBasePath.replace('file:///', '').replace(/\\//g, '\\\\')}wiki\\\\${node.id}.md`;
+                const copyCmd = `navigator.clipboard.writeText('notepad "' + '${filePath.replace(/\\/g, '\\\\')}' + '"').then(() => alert('已复制: notepad ${node.id}.md\\n请在终端粘贴执行 (受浏览器安全限制无法直接唤起记事本)'))`;
+                actions.innerHTML += `<li><a onclick="${copyCmd}">📝 Copy Notepad Command</a></li>`;
+            }
+            if (!actions.innerHTML) actions.innerHTML = '<li>None</li>';
 
             document.getElementById('info-panel').classList.add('visible');
         }
@@ -520,6 +573,22 @@
             renderGraph();
         };
 
+        document.getElementById('btn-focus-mode').onclick = () => {
+            focusMode = !focusMode;
+            document.getElementById('btn-focus-mode').classList.toggle('active', focusMode);
+            Graph.nodeOpacity(Graph.nodeOpacity());
+        };
+
+        document.getElementById('btn-pause-physics').onclick = () => {
+            physicsPaused = !physicsPaused;
+            document.getElementById('btn-pause-physics').classList.toggle('active', physicsPaused);
+            if (physicsPaused) {
+                Graph.pauseAnimation();
+            } else {
+                Graph.resumeAnimation();
+            }
+        };
+
         syncActiveGroups();
         renderGovernanceMetrics();
         renderSearch();
@@ -528,4 +597,3 @@
     </script>
 </body>
 </html>
->

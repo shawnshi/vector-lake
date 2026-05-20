@@ -6,9 +6,9 @@
         "-m",
         "vector_lake.mcp_server"
       ],
-      "cwd": "C:/Users/shich/.gemini/extensions/vector-lake",
+      "cwd": "c:/Users/shich/.gemini/antigravity-cli/plugins/vector-lake",
       "env": {
-        "PYTHONPATH": "c:/Users/shich/.gemini/extensions/vector-lake"
+        "PYTHONPATH": "c:/Users/shich/.gemini/antigravity-cli/plugins/vector-lake"
       }
     }
   }

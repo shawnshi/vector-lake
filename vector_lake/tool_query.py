@@ -2,13 +2,15 @@ import datetime
 import logging
 import os
 import re
-import subprocess
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
 
 from vector_lake import governance_store
 from vector_lake import indexer
 from vector_lake import provenance
 from vector_lake.tool_search import assemble_context
-from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, write_markdown_file
+from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, write_markdown_file, normalize_entity_name
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -19,56 +21,53 @@ import time
 import json
 from vector_lake import get_extension_root
 
+class DummyResult:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
 def _run_gemini(prompt: str):
     config_path = get_extension_root() / "config.json"
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             llm_config = json.load(f).get("llm", {})
-            timeout = llm_config.get("timeout_query", 120)
-            model_cascade = llm_config.get("model_cascade", ["default", "gemini-3.1-flash", "gemini-3.1-8b"])
+            model_cascade = llm_config.get("model_cascade", ["default",  "gemini-3.1-pro-preview",  "gemini-3-flash-preview",  "gemini-2.5-pro"])
     except Exception:
-        timeout = 120
-        model_cascade = ["default", "gemini-3.1-flash", "gemini-3.1-8b"]
+        model_cascade = ["default",  "gemini-3.1-pro-preview",  "gemini-3-flash-preview",  "gemini-2.5-pro"]
     
     retries = len(model_cascade)
     last_err = None
+    client = genai.Client()
+    
     for attempt in range(retries):
         try:
             current_model = model_cascade[attempt]
-            model_flag = [] if current_model in ("", "default") else ["-m", current_model]
-            model_disp = current_model if current_model not in ("", "default") else "default"
-            log.info(f"Invoking gemini.cmd (Attempt {attempt + 1}/{retries})... (Model: {model_disp})")
-            cmd = ["gemini.cmd"] + model_flag + ["-p", "You are a Vector Lake Synthesizer.", "--approval-mode", "yolo"]
-            result = subprocess.run(
-                cmd,
-                input=prompt,
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                timeout=timeout,
+            if current_model in ("", "default"):
+                current_model = "gemini-2.5-pro"
+            
+            log.info(f"Invoking google-genai SDK (Attempt {attempt + 1}/{retries})... (Model: {current_model})")
+            
+            response = client.models.generate_content(
+                model=current_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction="You are a Vector Lake Synthesizer.",
+                )
             )
-            if result.returncode == 0:
-                return result
-            else:
-                log.warning(f"gemini.cmd returned {result.returncode}: {result.stderr.strip()}")
-                last_err = result.stderr.strip()
-        except subprocess.TimeoutExpired as e:
-            log.warning(f"gemini.cmd timed out after {timeout} seconds on attempt {attempt + 1}.")
+            return DummyResult(0, response.text, "")
+            
+        except APIError as e:
+            log.warning(f"Google GenAI APIError on attempt {attempt + 1}: {e}")
             last_err = str(e)
         except Exception as e:
-            log.error(f"gemini.cmd failed unexpectedly: {e}")
+            log.error(f"Google GenAI failed unexpectedly: {e}")
             last_err = str(e)
         
         if attempt < retries - 1:
             time.sleep(3)
             
-    # Return a fake CompletedProcess representing failure
-    return subprocess.CompletedProcess(
-        args=["gemini.cmd"],
-        returncode=1,
-        stdout="",
-        stderr=f"Exhausted {retries} retries. Last error: {last_err}"
-    )
+    return DummyResult(1, "", f"Exhausted {retries} retries. Last error: {last_err}")
 
 
 def query_logic_lake(query_str: str, dry_run: bool = False):
@@ -85,8 +84,14 @@ def query_logic_lake(query_str: str, dry_run: bool = False):
 
     context = assemble_context(query_str)
     context_block = ""
+    if context.get("memory_packet"):
+        context_block += (
+            f"\n\n--- OPERATIONAL MEMORY PACKET "
+            f"({context.get('memory_count', 0)} items, {context.get('memory_warning_count', 0)} warnings) ---\n"
+            f"{context['memory_packet']}"
+        )
     if context["wiki_context"]:
-        context_block = (
+        context_block += (
             f"\n\n--- RELEVANT WIKI PAGES ({context['wiki_page_count']} pages, "
             f"{context['budget_used']}/{context['budget_max']} chars) ---\n{context['wiki_context']}"
         )
@@ -98,6 +103,7 @@ def query_logic_lake(query_str: str, dry_run: bool = False):
             "You are drafting a Vector Lake synthesis preview.\n"
             "Return exactly one Markdown document with valid YAML frontmatter for a synthesis page.\n"
             "Do not write files. Do not mention that this is a preview.\n"
+            "Treat OPERATIONAL MEMORY PACKET as the authoritative machine-facing state when it conflicts with page prose.\n"
             f"Query: {query_str}{context_block}"
         )
         try:
@@ -120,6 +126,7 @@ You MUST output the generated synthesis pages in the following plain text format
 (body content)
 ---END FILE---
 
+Treat OPERATIONAL MEMORY PACKET as the authoritative machine-facing state when it conflicts with page prose.
 Query: {query_str}{context_block}"""
     try:
         result = _run_gemini(prompt)
@@ -139,7 +146,7 @@ Query: {query_str}{context_block}"""
     for match in file_blocks:
         filename = match.group(1).strip()
         content = match.group(2).strip()
-        if not filename.startswith(("Source_", "Entity_", "Concept_", "Synthesis_")):
+        if not filename.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")):
             log.warning(f"Intercepted illegal write attempt to {filename}")
             continue
         file_path = os.path.join(wiki_dir, filename)
@@ -178,6 +185,7 @@ Query: {query_str}{context_block}"""
 
 def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     existing_files = {name.replace(".md", "") for name in os.listdir(wiki_dir) if name.endswith(".md")}
+    normalized_existing = {normalize_entity_name(f) for f in existing_files}
     broken_targets = set()
 
     for filename in files_to_scan:
@@ -189,12 +197,14 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
             continue
 
         for match in re.finditer(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]", content):
-            target = match.group(1).strip().replace(".md", "")
-            if target and target not in existing_files:
+            raw_target = match.group(1).strip().replace(".md", "")
+            target = normalize_entity_name(raw_target)
+            if target and target not in normalized_existing and target not in existing_files:
                 broken_targets.add(target)
         for match in re.finditer(r"\[[^\[\]]+?::\s*\[\[([^\]]+?)\]\]\]", content):
-            target = match.group(1).strip().split("|")[0].strip().replace(".md", "")
-            if target and target not in existing_files:
+            raw_target = match.group(1).strip().split("|")[0].strip().replace(".md", "")
+            target = normalize_entity_name(raw_target)
+            if target and target not in normalized_existing and target not in existing_files:
                 broken_targets.add(target)
 
     if not broken_targets:
@@ -203,7 +213,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     stubs = 0
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     for target in broken_targets:
-        node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Entity_", "Source_", "Synthesis_")) else "concept"
+        node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")) else "concept"
         frontmatter = {
             "title": target.replace("_", " "),
             "type": node_type,

@@ -4,3 +4,5 @@ python-dotenv>=1.0
 python-louvain>=0.16
 PyYAML>=6.0
 watchdog>=4.0
+google-genai>=0.1.0
+mcp>=1.0.0

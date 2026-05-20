@@ -67,7 +67,7 @@ def _format_combined_report(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _resolve_combined_item(identifier, resolution: str = "skip"):
+def _resolve_combined_item(identifier, resolution: str = "skip", change_manifest: dict = None):
     pending = _combined_pending_items()
     target = None
     if isinstance(identifier, str) and not identifier.isdigit():
@@ -79,10 +79,10 @@ def _resolve_combined_item(identifier, resolution: str = "skip"):
     if not target:
         return None
 
-    return governance_store.resolve_governance_item(target["item_id"], resolution)
+    return governance_store.resolve_governance_item(target["item_id"], resolution, change_manifest=change_manifest)
 
 
-def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip"):
+def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip", change_manifest: dict = None):
     if action == "list":
         return _format_combined_report(_combined_pending_items())
     if action == "ground":
@@ -100,7 +100,7 @@ def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip
             return f"Failed to resolve item '{index}'."
         if target.get("type") != "missing-page":
             return f"Item {target.get('item_id')} is not a missing-page item. Cannot ground."
-        
+
         queries = " | ".join(target.get("search_queries", []))
         result = f"[SYSTEM DIRECTIVE]: Autonomous Web Grounding Triggered for Item {target.get('item_id')}.\n"
         result += "Agent: You must now execute the following steps:\n"
@@ -112,7 +112,7 @@ def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip
     if action == "resolve":
         if index in (-1, "-1", None, ""):
             return "Error: specify review item index or item_id. Usage: cli.py review resolve <index|item_id>"
-        item = _resolve_combined_item(index, resolution)
+        item = _resolve_combined_item(index, resolution, change_manifest=change_manifest)
         if not item:
             return f"Failed to resolve item '{index}'."
 

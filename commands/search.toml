@@ -1,9 +1,6 @@
-description = "Search Vector Lake pages through the runtime index with optional governance-aware filters."
+description = "Search the Vector Lake index for knowledge graph nodes and entities."
 prompt = """
-Please use the `search_vector_lake` tool to search for "{{args}}". Parse explicit search controls from the user request when present:
-- `top_k=<n>` or phrases like "top 10"
-- `domain=<name>`
-- `cluster=<name>`
-- `include-history=true` or phrases like "include deprecated history"
-Pass only the controls the user actually specified; otherwise rely on tool defaults.
+Please use the `search_vector_lake` MCP tool from the `vector-lake-mcp` server to query the index.
+Provide the semantic query string to the `query` parameter.
+You can adjust the `top_k` parameter and choose the `mode` ('page', 'memory', or 'claim').
 """

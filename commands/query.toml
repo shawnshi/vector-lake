@@ -1,4 +1,5 @@
-description = "Query the wiki to synthesize insights, optionally previewing output without persistence."
+description = "Deep reasoning with budget-controlled context over the Logic Lake."
 prompt = """
-Please use the `query_logic_lake` tool and pass the query text "{{args}}". If the user asks for a preview or dry run, call it with `dry_run=True` so it returns Markdown without writing files. Otherwise allow the normal persistent write flow.
+Please use the `query_logic_lake` MCP tool from the `vector-lake-mcp` server for deep reasoning.
+Provide the query string to the `query_str` parameter.
 """

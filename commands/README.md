@@ -1,54 +1,14 @@
 # Commands Layout
 
-`commands/` is grouped by operational intent rather than historical naming.
+`commands/` is reserved for macro-level workflows that orchestrate multiple Agent steps or launch background services.
 
-## Core Workflow
+> **Note**: Vector Lake 8.3+ has migrated entirely to the Model Context Protocol (MCP). All low-level CRUD operations (sync, query, lint, trace, delete) are now directly exposed to the Agent as MCP Tools via `vector_lake/mcp_server.py`. They no longer require `.toml` prompt macros.
 
-- `sync.toml`: compile raw sources into wiki nodes
-- `search.toml`: query the runtime index with optional filters
-- `query.toml`: synthesize answers and optionally dry-run output
-- `lint.toml`: run wiki and governance health checks
-- `graph.toml`: render the interactive page/claim topology
-- `review.toml`: inspect and resolve the unified legacy/governance review surface
-- `delete.toml`: preview or execute raw-source cascade deletion
-- `gc.toml`: auto-prune isolated low-degree nodes and long-tail debris
-- `doctor.toml`: validate runtime dependencies and filesystem layout
+## Macro Workflows
 
-## Governance Workflow
-
-- `governance_migrate.toml`: backfill canonical V8 governance objects
-- `governance_publish.toml`: publish pending change sets
-- `governance_debt.toml`: show the governance debt dashboard
-- `governance_trace.toml`: inspect provenance for a query or identifier
-- `governance_merge.toml`: preview or enqueue entity merge suggestions
-- `governance_audit.toml`: audit graph topology gaps into the review queue
+- `research.toml`: autonomously orchestrates the graph gap scanning, web research loop, and subsequent synchronization.
+- `review.toml`: inspects and resolves the unified governance review surface using the MCP backend.
 
 ## Background Services
 
-- `daemon_watchdog.toml`: launch the background ingest watcher
-
-## Review Semantics
-
-`review.toml` fronts the CLI `review` command, which now merges:
-
-- legacy `review_queue.json`
-- V8 `governance_queue.json`
-
-Operators can resolve items either by the visible pending index or by stable `item_id`.
-
-## Renamed Commands
-
-- `sync_vector_lake.toml` -> `sync.toml`
-- `search_vector_lake.toml` -> `search.toml`
-- `query_logic_lake.toml` -> `query.toml`
-- `run_wiki_lint.toml` -> `lint.toml`
-- `show_graph.toml` -> `graph.toml`
-- `review_queue.toml` -> `review.toml`
-- `delete_source.toml` -> `delete.toml`
-- `doctor_vector_lake.toml` -> `doctor.toml`
-- `migrate_v8.toml` -> `governance_migrate.toml`
-- `publish_vector_lake.toml` -> `governance_publish.toml`
-- `debt_vector_lake.toml` -> `governance_debt.toml`
-- `trace_vector_lake.toml` -> `governance_trace.toml`
-- `merge_suggestions_vector_lake.toml` -> `governance_merge.toml`
-- `watchdog_sync.toml` -> `daemon_watchdog.toml`
+- `daemon_watchdog.toml`: launch the background ingest watcher.

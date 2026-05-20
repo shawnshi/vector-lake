@@ -34,6 +34,7 @@ log = logging.getLogger("watchdog_sync")
 DEBOUNCE_SECONDS = 3.0
 task_queue = queue.Queue()
 index_queue = queue.Queue()
+global_task_lock = threading.Lock()
 
 
 class WikiIndexHandler(FileSystemEventHandler):
@@ -41,11 +42,8 @@ class WikiIndexHandler(FileSystemEventHandler):
         self.last_triggered = {}
         self.lock = threading.Lock()
 
-    def update_index(self, event):
-        if event.is_directory:
-            return
-
-        filepath = os.path.abspath(event.src_path)
+    def queue_path(self, filepath_str: str):
+        filepath = os.path.abspath(filepath_str)
         filename = os.path.basename(filepath)
         if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md"):
             return
@@ -58,11 +56,25 @@ class WikiIndexHandler(FileSystemEventHandler):
 
         index_queue.put(filename)
 
+    def update_index(self, event):
+        if event.is_directory:
+            return
+        self.queue_path(event.src_path)
+
     def on_created(self, event):
         self.update_index(event)
 
     def on_modified(self, event):
         self.update_index(event)
+
+    def on_deleted(self, event):
+        self.update_index(event)
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        self.queue_path(event.src_path)
+        self.queue_path(event.dest_path)
 
 
 class VectorLakeIngestHandler(FileSystemEventHandler):
@@ -122,12 +134,50 @@ class VectorLakeIngestHandler(FileSystemEventHandler):
     def on_modified(self, event):
         self.process_event(event)
 
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+
+        filepath = os.path.abspath(event.src_path)
+        if self._should_ignore(filepath):
+            return
+
+        log.info(f"Triggered (deleted): {filepath}")
+
+        def perform_delete():
+            # [FIX] Atomic replace mitigation: Wait and check if the file was recreated/replaced
+            time.sleep(0.5)
+            if os.path.exists(filepath):
+                log.info(f"Ignoring false deletion (atomic replace detected): {filepath}")
+                return
+            try:
+                from vector_lake.tool_delete import delete_source
+                result = delete_source(filepath, dry_run=False)
+                log.info(f"Auto-delete finished for {filepath}:\n{result}")
+            except Exception as e:
+                log.error(f"Auto-delete failed for {filepath}: {e}")
+
+        threading.Thread(target=perform_delete, daemon=True).start()
+
+
+from vector_lake.watchdog_status import write_status
 
 def worker_loop():
     log.info("Ingestion Worker Thread started.")
     batch_limit = 5
+    consecutive_failures = 0
+    max_failures = 5
+    backoff_base = 2
+
     while True:
         try:
+            if consecutive_failures >= max_failures:
+                write_status("halted", task_queue.qsize(), index_queue.qsize(), "Ingestion Worker Halted", "Max consecutive failures reached")
+                log.error("Ingestion Worker Halted due to repeated failures.")
+                time.sleep(60)
+                continue
+
+            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Waiting for ingestion tasks", "")
             item = task_queue.get()
             batch = [item]
             while len(batch) < batch_limit:
@@ -138,23 +188,47 @@ def worker_loop():
                 except queue.Empty:
                     break
 
+            write_status("processing", task_queue.qsize(), index_queue.qsize(), f"Processing batch of {len(batch)} files", "")
             log.info(f"Worker dequeued a batch of {len(batch)} files for ingestion.")
-            success = process_file_batch(batch)
+            
+            with global_task_lock:
+                success = process_file_batch(batch)
+            
             if success:
                 log.info("Batch processed successfully.")
+                consecutive_failures = 0
             else:
                 log.error("Failed to process batch.")
+                consecutive_failures += 1
+                time.sleep(min(backoff_base ** consecutive_failures, 60))
+            
             for _ in batch:
                 task_queue.task_done()
+                
+            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Batch finished", "")
+
         except Exception as exc:
+            consecutive_failures += 1
             log.error(f"Worker thread error: {exc}")
-            time.sleep(2)
+            write_status("error", task_queue.qsize(), index_queue.qsize(), "Exception caught", str(exc))
+            time.sleep(min(backoff_base ** consecutive_failures, 60))
 
 
 def index_worker_loop():
     log.info("Index Update Worker Thread started.")
+    consecutive_failures = 0
+    max_failures = 5
+    backoff_base = 2
+
     while True:
         try:
+            if consecutive_failures >= max_failures:
+                write_status("halted", task_queue.qsize(), index_queue.qsize(), "Index Worker Halted", "Max consecutive failures reached")
+                log.error("Index Worker Halted due to repeated failures.")
+                time.sleep(60)
+                continue
+
+            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Waiting for index tasks", "")
             filename = index_queue.get()
             time.sleep(DEBOUNCE_SECONDS)
 
@@ -167,23 +241,139 @@ def index_worker_loop():
                 except queue.Empty:
                     break
 
-            from vector_lake import indexer
+            write_status("processing", task_queue.qsize(), index_queue.qsize(), f"Updating index for {len(pending_filenames)} files", "")
 
-            for fname in pending_filenames:
-                indexer.update_index_item(fname)
-                log.info(f"O(1) Index updated for modified wiki node: {fname}")
-            if indexer.refresh_graph_topology_if_dirty():
-                log.info("Graph topology refreshed after partial wiki updates.")
+            from vector_lake import indexer
+            from vector_lake import governance_store
+            from vector_lake.wiki_utils import get_wiki_dir
+            import os
+
+            wiki_dir = get_wiki_dir()
+            filepaths = []
+
+            with global_task_lock:
+                valid_filenames = list(pending_filenames)
+                indexer.update_index_items(valid_filenames)
+                for fname in valid_filenames:
+                    filepaths.append(str(os.path.join(wiki_dir, fname)))
+                log.info(f"O(1) Batched Index updated for {len(valid_filenames)} modified wiki nodes")
+
+                # Sync human modifications back to canonical JSON metadata
+                if filepaths:
+                    governance_store.sync_pages_to_canonical(
+                        filepaths,
+                        origin="watchdog",
+                        auto_approve=True,
+                        summary=f"Human/Watchdog modification sync for {len(filepaths)} page(s)"
+                    )
+                    log.info(f"Canonical metadata (JSON) synchronized for {len(filepaths)} modified node(s).")
 
             index_queue.task_done()
+            consecutive_failures = 0
+            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Index update finished", "")
+
         except Exception as exc:
+            consecutive_failures += 1
             log.error(f"Index worker error: {exc}")
-            time.sleep(1)
+            write_status("error", task_queue.qsize(), index_queue.qsize(), "Index thread exception", str(exc))
+            time.sleep(min(backoff_base ** consecutive_failures, 60))
+
+
+def scheduled_lint_loop():
+    log.info("Scheduled Lint Worker Thread started.")
+    last_run_date_hour = ""
+    last_snapshot_minute = -1
+
+    while True:
+        try:
+            now = time.localtime()
+            
+            # Run topology snapshot every 15 minutes
+            if now.tm_min % 15 == 0 and now.tm_min != last_snapshot_minute:
+                try:
+                    import subprocess
+                    import sys
+                    import os
+                    snapshot_script = os.path.expanduser("~/.gemini/extensions/vector-lake/scripts/generate_topology_snapshot.py")
+                    if os.path.exists(snapshot_script):
+                        res = subprocess.run([sys.executable, snapshot_script], capture_output=True, text=True)
+                        if res.returncode == 0:
+                            log.info("Generated DB Topology Snapshot successfully.")
+                        else:
+                            log.warning(f"Failed to generate snapshot: {res.stderr}")
+                except Exception as e:
+                    log.warning(f"Error running topology snapshot: {e}")
+                last_snapshot_minute = now.tm_min
+
+            # Run at 10:00 and 23:00
+            if now.tm_hour in (10, 23) and now.tm_min == 0:
+                current_date_hour = f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
+                if current_date_hour != last_run_date_hour:
+                    write_status("processing", task_queue.qsize(), index_queue.qsize(), "Running Scheduled Auto-Lint", "")
+                    log.info("Triggering Scheduled Autonomous Auto-Lint...")
+                    
+                    import subprocess
+                    import sys
+                    import os
+                    try:
+                        decay_script = os.path.expanduser("~/.gemini/scripts/metadata_decay_daemon.py")
+                        if os.path.exists(decay_script):
+                            log.info("Running Metadata Decay Daemon...")
+                            res = subprocess.run([sys.executable, decay_script], capture_output=True, text=True)
+                            if res.returncode != 0:
+                                log.error(f"Metadata Decay Daemon failed: {res.stderr}")
+                                write_status("error", task_queue.qsize(), index_queue.qsize(), "Decay Daemon Failed", res.stderr)
+
+                        sync_timeline_script = os.path.expanduser("~/.gemini/scripts/sync_timeline_db.py")
+                        if os.path.exists(sync_timeline_script):
+                            log.info("Running Timeline DB Sync Daemon...")
+                            res = subprocess.run([sys.executable, sync_timeline_script], capture_output=True, text=True)
+                            if res.returncode != 0:
+                                log.error(f"Timeline Sync Failed: {res.stderr}")
+                                write_status("error", task_queue.qsize(), index_queue.qsize(), "Timeline Sync Failed", res.stderr)
+
+                        scout_script = os.path.expanduser("~/.gemini/scripts/missing_evidence_scout.py")
+                        if os.path.exists(scout_script):
+                            log.info("Running Missing Evidence Scout...")
+                            res = subprocess.run([sys.executable, scout_script], capture_output=True, text=True)
+                            if res.returncode != 0:
+                                log.error(f"Missing Evidence Scout Failed: {res.stderr}")
+                                write_status("error", task_queue.qsize(), index_queue.qsize(), "Scout Failed", res.stderr)
+                    except Exception as e:
+                        log.warning(f"Failed to run auxiliary daemons: {e}")
+                        write_status("error", task_queue.qsize(), index_queue.qsize(), "Auxiliary Daemons Error", str(e))
+                    
+                    from vector_lake.tool_lint import lint_vector_lake
+                    from vector_lake import indexer
+                    with global_task_lock:
+                        if indexer.refresh_graph_topology_if_dirty():
+                            log.info("Graph topology refreshed during scheduled lint.")
+                        lint_vector_lake(auto_fix=True)
+                        
+                        # Truncate WAL to prevent unbounded growth
+                        from vector_lake.db_store import get_connection
+                        try:
+                            conn = get_connection()
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                            log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
+                        except Exception as e:
+                            log.error(f"Failed to truncate WAL: {e}")
+                    
+                    log.info("Scheduled Autonomous Auto-Lint completed.")
+                    last_run_date_hour = current_date_hour
+                    write_status("idle", task_queue.qsize(), index_queue.qsize(), "Scheduled Lint finished", "")
+            
+            time.sleep(30) # Poll every 30 seconds
+        except Exception as exc:
+            log.error(f"Scheduled lint worker error: {exc}")
+            write_status("error", task_queue.qsize(), index_queue.qsize(), "Scheduled lint exception", str(exc))
+            time.sleep(60)
 
 
 def start_watchdog():
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=index_worker_loop, daemon=True).start()
+    threading.Thread(target=scheduled_lint_loop, daemon=True).start()
 
     event_handler = VectorLakeIngestHandler()
     observer = Observer()

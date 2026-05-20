@@ -10,6 +10,7 @@ from vector_lake.tool_review import review_vector_lake
 from vector_lake.tool_search import assemble_context, search_vector_lake
 from vector_lake.tool_sync import sync_vector_lake
 from vector_lake.tool_trace import trace_vector_lake
+from vector_lake.tool_research import research_vector_lake
 
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "lint_vector_lake",
     "merge_suggestions_vector_lake",
     "query_logic_lake",
+    "research_vector_lake",
     "review_vector_lake",
     "search_vector_lake",
     "sync_vector_lake",
