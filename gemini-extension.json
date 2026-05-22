@@ -6,10 +6,13 @@
   "mcpServers": {
     "vector-lake-mcp": {
       "command": "python",
-      "args": ["-m", "vector_lake.mcp_server"],
-      "cwd": "C:/Users/shich/.gemini/extensions/vector-lake",
+      "args": [
+        "-m",
+        "vector_lake.mcp_server"
+      ],
+      "cwd": "C:/Users/shich/.gemini/antigravity-cli/plugins/vector-lake",
       "env": {
-        "PYTHONPATH": "c:/Users/shich/.gemini/extensions/vector-lake"
+        "PYTHONPATH": "C:/Users/shich/.gemini/antigravity-cli/plugins/vector-lake"
       }
     }
   },

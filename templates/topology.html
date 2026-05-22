@@ -83,10 +83,6 @@
             <strong>Sources</strong>
             <ul id="info-sources"></ul>
         </div>
-        <div class="info-section">
-            <strong>Actions</strong>
-            <ul id="info-actions"></ul>
-        </div>
     </div>
 
     <div id="right-hud">
@@ -137,15 +133,13 @@
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
 
         const PAGE_COLORS = {
-            "Entity": "#FF0266",
+            "Vendor": "#8B5CF6",
+            "Product": "#F59E0B",
+            "Person": "#F43F5E",
+            "Event": "#14B8A6",
             "Concept": "#00F0FF",
             "Source": "#00FF41",
             "Synthesis": "#FFB000",
-            "System": "#8B5CF6",
-            "Project": "#EC4899",
-            "Person": "#F43F5E",
-            "Event": "#14B8A6",
-            "Term": "#64748B",
             "Unknown": "#9CA3AF"
         };
         const CLAIM_STATE_COLORS = {
@@ -208,7 +202,7 @@
                 const cid = node.community || 0;
                 return COMMUNITY_COLORS[cid % COMMUNITY_COLORS.length];
             }
-            return PAGE_COLORS[node.group] || PAGE_COLORS.Unknown;
+            return PAGE_COLORS[node.raw_type || 'Unknown'] || PAGE_COLORS.Unknown;
         }
 
         function buildNeighbors(graphData) {
@@ -278,10 +272,10 @@
                 });
                 return;
             }
-            Array.from(activeGroups).sort().forEach(group => {
-                const color = PAGE_COLORS[group] || PAGE_COLORS.Unknown;
-                const count = currentGraph().nodes.filter(n => (n.group || 'Unknown') === group).length;
-                legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${group} (${count})</div>`;
+            Object.keys(PAGE_COLORS).filter(k => k !== 'Unknown').forEach(type => {
+                const color = PAGE_COLORS[type];
+                const count = currentGraph().nodes.filter(n => (n.raw_type || 'Unknown') === type).length;
+                legend.innerHTML += `<div class="legend-item"><div class="legend-color" style="background:${color}"></div>${type} (${count})</div>`;
             });
         }
 
@@ -366,9 +360,9 @@
                     const row = document.createElement('div');
                     row.className = 'search-item';
                     const title = match.name || match.id;
-                    const type = match.group ? `[${match.group}] ` : '';
+                    const typeStr = match.raw_type ? `[${match.raw_type}] ` : (match.group ? `[${match.group}] ` : '');
                     const degreeInfo = match.degree ? ` (关联: ${match.degree})` : '';
-                    row.textContent = `${type}${title}${degreeInfo}`;
+                    row.textContent = `${typeStr}${title}${degreeInfo}`;
                     row.onclick = () => {
                         results.style.display = 'none';
                         selectNode(match.id);
@@ -403,7 +397,7 @@
             neighbors = buildNeighbors(data);
             Graph.graphData(data)
                 .nodeId('id')
-                .nodeLabel(node => `[${node.group}] ${node.name || node.id} (关联: ${node.degree || 0})`)
+                .nodeLabel(node => `[${node.raw_type || node.group}] ${node.name || node.id} (关联: ${node.degree || 0})`)
                 .nodeVal(node => Math.max(2.5, Math.sqrt(node.degree || 1) * 3.8))
                 .nodeRelSize(7)
                 .nodeColor(currentColor)
@@ -485,9 +479,14 @@
             if (!node) return;
             const liveNode = Graph.graphData().nodes.find(item => item.id === nodeId) || node;
             const distance = 150;
-            const norm = Math.hypot(liveNode.x || 1, liveNode.y || 1, liveNode.z || 1);
+            const targetX = liveNode.x || 1;
+            const targetY = liveNode.y || 1;
+            const targetZ = liveNode.z || 1;
+            const norm = Math.hypot(targetX, targetY, targetZ);
             const ratio = 1 + distance / norm;
-            Graph.cameraPosition({ x: (liveNode.x || 1) * ratio, y: (liveNode.y || 1) * ratio, z: (liveNode.z || 1) * ratio }, liveNode, 1200);
+            
+            const lookAtPos = { x: targetX, y: targetY, z: targetZ };
+            Graph.cameraPosition({ x: targetX * ratio, y: targetY * ratio, z: targetZ * ratio }, lookAtPos, 1200);
 
             const href = nodeHref(node);
             document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
@@ -496,13 +495,17 @@
 
             const meta = [];
             meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
-            meta.push(`<span><strong>Type</strong> ${node.group || 'Unknown'}</span>`);
+            meta.push(`<span><strong>Category</strong> ${node.group || 'Unknown'}</span>`);
+            meta.push(`<span><strong>Type</strong> ${node.raw_type || 'Unknown'}</span>`);
             meta.push(`<span><strong>Degree</strong> ${node.degree || 0}</span>`);
             if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${node.validity_state}</span>`);
             if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${node.claim_type}</span>`);
             if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${node.confidence}</span>`);
             if (node.domain) meta.push(`<span><strong>Domain</strong> ${node.domain}</span>`);
-            if (node.updated) meta.push(`<span><strong>Updated</strong> ${node.updated.substring(0, 10)}</span>`);
+            if (node.updated) {
+                const updatedStr = typeof node.updated === 'string' ? node.updated.substring(0, 10) : String(node.updated);
+                meta.push(`<span><strong>Updated</strong> ${updatedStr}</span>`);
+            }
             if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${node.alignment_score}</span>`);
             if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${node.decay_weight}</span>`);
             document.getElementById('info-meta').innerHTML = meta.join('');
@@ -513,28 +516,30 @@
             links.innerHTML = '';
             sources.innerHTML = '';
 
-            (node.semantic_links || []).forEach(targetId => {
+            (Array.isArray(node.semantic_links) ? node.semantic_links : []).forEach(targetId => {
                 const targetNode = currentGraph().nodes.find(item => item.id === targetId);
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
-                links.innerHTML += `<li><a onclick="selectNode('${targetId}')">[${group}] ${name}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.textContent = `[${group}] ${name}`;
+                a.onclick = () => selectNode(targetId);
+                li.appendChild(a);
+                links.appendChild(li);
             });
-            if (!links.innerHTML) links.innerHTML = '<li>None</li>';
+            if (links.children.length === 0) links.innerHTML = '<li>None</li>';
 
-            (node.sources || []).forEach(source => {
+            (Array.isArray(node.sources) ? node.sources : []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
-                sources.innerHTML += `<li><a href="${hrefValue}" target="_blank">${source}</a></li>`;
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.href = hrefValue;
+                a.target = '_blank';
+                a.textContent = source;
+                li.appendChild(a);
+                sources.appendChild(li);
             });
-            if (!sources.innerHTML) sources.innerHTML = '<li>None</li>';
-
-            const actions = document.getElementById('info-actions');
-            actions.innerHTML = '';
-            if (activeGraphKey === 'page') {
-                const filePath = `${memoryBasePath.replace('file:///', '').replace(/\\//g, '\\\\')}wiki\\\\${node.id}.md`;
-                const copyCmd = `navigator.clipboard.writeText('notepad "' + '${filePath.replace(/\\/g, '\\\\')}' + '"').then(() => alert('已复制: notepad ${node.id}.md\\n请在终端粘贴执行 (受浏览器安全限制无法直接唤起记事本)'))`;
-                actions.innerHTML += `<li><a onclick="${copyCmd}">📝 Copy Notepad Command</a></li>`;
-            }
-            if (!actions.innerHTML) actions.innerHTML = '<li>None</li>';
+            if (sources.children.length === 0) sources.innerHTML = '<li>None</li>';
 
             document.getElementById('info-panel').classList.add('visible');
         }
