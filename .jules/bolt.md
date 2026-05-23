@@ -1,0 +1,3 @@
+## 2024-05-24 - [Optimize YAML Loading and Dumping]
+**Learning:** PyYAML's pure Python implementation (`yaml.safe_load` and `yaml.dump`) is notoriously slow when parsing many small files or large blocks. Using `CSafeLoader` and `CDumper` when available provides a massive speedup without losing functionality, which is critical for an application processing hundreds/thousands of Markdown frontmatter blocks like Vector Lake.
+**Action:** Always attempt to import `CSafeLoader` as `SafeLoader` and `CDumper` as `Dumper` with a fallback to the pure python implementations. Use `yaml.load(data, Loader=SafeLoader)` instead of `yaml.safe_load(data)` and pass `Dumper=Dumper` to `yaml.dump()`.

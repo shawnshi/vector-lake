@@ -1,5 +1,10 @@
 import os
 import yaml
+# Use C-based PyYAML extensions for a massive parsing/dumping speedup, with pure Python fallback.
+try:
+    from yaml import CSafeLoader as SafeLoader, CDumper as Dumper
+except ImportError:
+    from yaml import SafeLoader, Dumper
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 
@@ -18,7 +23,7 @@ def merge(winner_name, loser_name):
         content = f.read()
         
     parts = content.split("---", 2)
-    fm = yaml.safe_load(parts[1])
+    fm = yaml.load(parts[1], Loader=SafeLoader)
     
     # Ensure aliases list exists
     if "aliases" not in fm or fm["aliases"] is None:
@@ -32,7 +37,7 @@ def merge(winner_name, loser_name):
         
     with open(winner_path, "w", encoding="utf-8") as f:
         f.write("---\n")
-        yaml.dump(fm, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        yaml.dump(fm, f, Dumper=Dumper, allow_unicode=True, sort_keys=False, default_flow_style=False)
         f.write("---")
         f.write(parts[2])
         
