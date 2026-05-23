@@ -24,15 +24,11 @@ except ImportError:
     import sys
     sys.exit(1)
 
-from vector_lake.ingest import TARGET_DIRS, SUPPORTED_EXTS, calculate_hash, process_file_batch
-from vector_lake.db import get_processed_files
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("watchdog_sync")
 
 DEBOUNCE_SECONDS = 3.0
-task_queue = queue.Queue()
 index_queue = queue.Queue()
 global_task_lock = threading.Lock()
 
@@ -77,142 +73,7 @@ class WikiIndexHandler(FileSystemEventHandler):
         self.queue_path(event.dest_path)
 
 
-class VectorLakeIngestHandler(FileSystemEventHandler):
-    def __init__(self):
-        self.last_triggered = {}
-        self.lock = threading.Lock()
-
-    def _should_ignore(self, filepath):
-        filename = os.path.basename(filepath)
-        if filename.startswith("~") or filename.startswith("."):
-            return True
-            
-        # Ignore specific directories configured in config.json
-        path_str = filepath.replace("\\", "/")
-        for exclude in EXCLUDE_PATHS:
-            if exclude in path_str:
-                return True
-            
-        _, ext = os.path.splitext(filename)
-        return ext.lower() not in SUPPORTED_EXTS
-
-    def process_event(self, event):
-        if event.is_directory:
-            return
-
-        filepath = os.path.abspath(event.src_path)
-        if self._should_ignore(filepath):
-            return
-
-        now = time.time()
-        with self.lock:
-            if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
-                return
-            self.last_triggered[filepath] = now
-
-        log.info(f"Triggered ({event.event_type}): {filepath}")
-
-        def delayed_commit():
-            time.sleep(DEBOUNCE_SECONDS)
-            file_hash = calculate_hash(filepath)
-            if not file_hash:
-                return
-
-            processed = get_processed_files()
-            if filepath in processed and processed[filepath].get("hash") == file_hash:
-                filename = os.path.basename(filepath)
-                log.info(f"File '{filename}' content hasn't changed (hash match). Skipping ingestion.")
-                return
-
-            task_queue.put(filepath)
-
-        threading.Thread(target=delayed_commit, daemon=True).start()
-
-    def on_created(self, event):
-        self.process_event(event)
-
-    def on_modified(self, event):
-        self.process_event(event)
-
-    def on_deleted(self, event):
-        if event.is_directory:
-            return
-
-        filepath = os.path.abspath(event.src_path)
-        if self._should_ignore(filepath):
-            return
-
-        log.info(f"Triggered (deleted): {filepath}")
-
-        def perform_delete():
-            # [FIX] Atomic replace mitigation: Wait and check if the file was recreated/replaced
-            time.sleep(0.5)
-            if os.path.exists(filepath):
-                log.info(f"Ignoring false deletion (atomic replace detected): {filepath}")
-                return
-            try:
-                from vector_lake.tool_delete import delete_source
-                result = delete_source(filepath, dry_run=False)
-                log.info(f"Auto-delete finished for {filepath}:\n{result}")
-            except Exception as e:
-                log.error(f"Auto-delete failed for {filepath}: {e}")
-
-        threading.Thread(target=perform_delete, daemon=True).start()
-
-
 from vector_lake.watchdog_status import write_status
-
-def worker_loop():
-    log.info("Ingestion Worker Thread started.")
-    batch_limit = 5
-    consecutive_failures = 0
-    max_failures = 5
-    backoff_base = 2
-
-    while True:
-        try:
-            if consecutive_failures >= max_failures:
-                write_status("halted", task_queue.qsize(), index_queue.qsize(), "Ingestion Worker Halted", "Max consecutive failures reached")
-                log.error("Ingestion Worker Halted due to repeated failures.")
-                time.sleep(60)
-                continue
-
-            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Waiting for ingestion tasks", "")
-            item = task_queue.get()
-            batch = [item]
-            while len(batch) < batch_limit:
-                try:
-                    next_item = task_queue.get_nowait()
-                    if next_item not in batch:
-                        batch.append(next_item)
-                except queue.Empty:
-                    break
-
-            write_status("processing", task_queue.qsize(), index_queue.qsize(), f"Processing batch of {len(batch)} files", "")
-            log.info(f"Worker dequeued a batch of {len(batch)} files for ingestion.")
-            
-            with global_task_lock:
-                success = process_file_batch(batch)
-            
-            if success:
-                log.info("Batch processed successfully.")
-                consecutive_failures = 0
-            else:
-                log.error("Failed to process batch.")
-                consecutive_failures += 1
-                time.sleep(min(backoff_base ** consecutive_failures, 60))
-            
-            for _ in batch:
-                task_queue.task_done()
-                
-            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Batch finished", "")
-
-        except Exception as exc:
-            consecutive_failures += 1
-            log.error(f"Worker thread error: {exc}")
-            write_status("error", task_queue.qsize(), index_queue.qsize(), "Exception caught", str(exc))
-            time.sleep(min(backoff_base ** consecutive_failures, 60))
-
 
 def index_worker_loop():
     log.info("Index Update Worker Thread started.")
@@ -223,12 +84,12 @@ def index_worker_loop():
     while True:
         try:
             if consecutive_failures >= max_failures:
-                write_status("halted", task_queue.qsize(), index_queue.qsize(), "Index Worker Halted", "Max consecutive failures reached")
+                write_status("halted", 0, index_queue.qsize(), "Index Worker Halted", "Max consecutive failures reached")
                 log.error("Index Worker Halted due to repeated failures.")
                 time.sleep(60)
                 continue
 
-            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Waiting for index tasks", "")
+            write_status("idle", 0, index_queue.qsize(), "Waiting for index tasks", "")
             filename = index_queue.get()
             time.sleep(DEBOUNCE_SECONDS)
 
@@ -241,7 +102,7 @@ def index_worker_loop():
                 except queue.Empty:
                     break
 
-            write_status("processing", task_queue.qsize(), index_queue.qsize(), f"Updating index for {len(pending_filenames)} files", "")
+            write_status("processing", 0, index_queue.qsize(), f"Updating index for {len(pending_filenames)} files", "")
 
             from vector_lake import indexer
             from vector_lake import governance_store
@@ -270,12 +131,12 @@ def index_worker_loop():
 
             index_queue.task_done()
             consecutive_failures = 0
-            write_status("idle", task_queue.qsize(), index_queue.qsize(), "Index update finished", "")
+            write_status("idle", 0, index_queue.qsize(), "Index update finished", "")
 
         except Exception as exc:
             consecutive_failures += 1
             log.error(f"Index worker error: {exc}")
-            write_status("error", task_queue.qsize(), index_queue.qsize(), "Index thread exception", str(exc))
+            write_status("error", 0, index_queue.qsize(), "Index thread exception", str(exc))
             time.sleep(min(backoff_base ** consecutive_failures, 60))
 
 
@@ -288,28 +149,11 @@ def scheduled_lint_loop():
         try:
             now = time.localtime()
             
-            # Run topology snapshot every 15 minutes
-            if now.tm_min % 15 == 0 and now.tm_min != last_snapshot_minute:
-                try:
-                    import subprocess
-                    import sys
-                    import os
-                    snapshot_script = os.path.expanduser("~/.gemini/extensions/vector-lake/scripts/generate_topology_snapshot.py")
-                    if os.path.exists(snapshot_script):
-                        res = subprocess.run([sys.executable, snapshot_script], capture_output=True, text=True)
-                        if res.returncode == 0:
-                            log.info("Generated DB Topology Snapshot successfully.")
-                        else:
-                            log.warning(f"Failed to generate snapshot: {res.stderr}")
-                except Exception as e:
-                    log.warning(f"Error running topology snapshot: {e}")
-                last_snapshot_minute = now.tm_min
-
             # Run at 10:00 and 23:00
             if now.tm_hour in (10, 23) and now.tm_min == 0:
                 current_date_hour = f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
                 if current_date_hour != last_run_date_hour:
-                    write_status("processing", task_queue.qsize(), index_queue.qsize(), "Running Scheduled Auto-Lint", "")
+                    write_status("processing", 0, index_queue.qsize(), "Running Scheduled Auto-Lint", "")
                     log.info("Triggering Scheduled Autonomous Auto-Lint...")
                     
                     import subprocess
@@ -322,7 +166,7 @@ def scheduled_lint_loop():
                             res = subprocess.run([sys.executable, decay_script], capture_output=True, text=True)
                             if res.returncode != 0:
                                 log.error(f"Metadata Decay Daemon failed: {res.stderr}")
-                                write_status("error", task_queue.qsize(), index_queue.qsize(), "Decay Daemon Failed", res.stderr)
+                                write_status("error", 0, index_queue.qsize(), "Decay Daemon Failed", res.stderr)
 
                         sync_timeline_script = os.path.expanduser("~/.gemini/scripts/sync_timeline_db.py")
                         if os.path.exists(sync_timeline_script):
@@ -330,7 +174,7 @@ def scheduled_lint_loop():
                             res = subprocess.run([sys.executable, sync_timeline_script], capture_output=True, text=True)
                             if res.returncode != 0:
                                 log.error(f"Timeline Sync Failed: {res.stderr}")
-                                write_status("error", task_queue.qsize(), index_queue.qsize(), "Timeline Sync Failed", res.stderr)
+                                write_status("error", 0, index_queue.qsize(), "Timeline Sync Failed", res.stderr)
 
                         scout_script = os.path.expanduser("~/.gemini/scripts/missing_evidence_scout.py")
                         if os.path.exists(scout_script):
@@ -338,10 +182,10 @@ def scheduled_lint_loop():
                             res = subprocess.run([sys.executable, scout_script], capture_output=True, text=True)
                             if res.returncode != 0:
                                 log.error(f"Missing Evidence Scout Failed: {res.stderr}")
-                                write_status("error", task_queue.qsize(), index_queue.qsize(), "Scout Failed", res.stderr)
+                                write_status("error", 0, index_queue.qsize(), "Scout Failed", res.stderr)
                     except Exception as e:
                         log.warning(f"Failed to run auxiliary daemons: {e}")
-                        write_status("error", task_queue.qsize(), index_queue.qsize(), "Auxiliary Daemons Error", str(e))
+                        write_status("error", 0, index_queue.qsize(), "Auxiliary Daemons Error", str(e))
                     
                     from vector_lake.tool_lint import lint_vector_lake
                     from vector_lake import indexer
@@ -361,36 +205,20 @@ def scheduled_lint_loop():
                     
                     log.info("Scheduled Autonomous Auto-Lint completed.")
                     last_run_date_hour = current_date_hour
-                    write_status("idle", task_queue.qsize(), index_queue.qsize(), "Scheduled Lint finished", "")
+                    write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "")
             
             time.sleep(30) # Poll every 30 seconds
         except Exception as exc:
             log.error(f"Scheduled lint worker error: {exc}")
-            write_status("error", task_queue.qsize(), index_queue.qsize(), "Scheduled lint exception", str(exc))
+            write_status("error", 0, index_queue.qsize(), "Scheduled lint exception", str(exc))
             time.sleep(60)
 
 
 def start_watchdog():
-    threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=index_worker_loop, daemon=True).start()
     threading.Thread(target=scheduled_lint_loop, daemon=True).start()
 
-    event_handler = VectorLakeIngestHandler()
     observer = Observer()
-
-    watch_count = 0
-    for target_dir in TARGET_DIRS:
-        folder = Path(target_dir)
-        if folder.exists() and folder.is_dir():
-            observer.schedule(event_handler, str(folder), recursive=True)
-            log.info(f"Sentry active on directory: {folder}")
-            watch_count += 1
-        else:
-            log.warning(f"Target directory does not exist or is not a folder: {folder}")
-
-    if watch_count == 0:
-        log.error("No valid TARGET_DIRS to monitor. Sentinel terminating.")
-        return
 
     from vector_lake.wiki_utils import get_wiki_dir
 
@@ -401,7 +229,7 @@ def start_watchdog():
         log.info(f"Wiki AST monitor active on directory: {wiki_dir}")
 
     observer.start()
-    log.info("Vector Lake Watchdog Agent is now running in Python-Led I/O background mode.")
+    log.info("Vector Lake Watchdog Agent is now running in Background Index/Lint mode.")
     try:
         while True:
             time.sleep(1)
@@ -409,3 +237,6 @@ def start_watchdog():
         log.info("Termination signal received. Shutting down Watchdog...")
         observer.stop()
     observer.join()
+
+if __name__ == "__main__":
+    start_watchdog()

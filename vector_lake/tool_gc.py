@@ -35,7 +35,7 @@ def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
 
     orphans = []
     for key, node in nodes.items():
-        if node.get("type") != "entity":
+        if node.get("type") not in ("vendor", "product", "person", "event"):
             continue
         if degrees[key] <= 1:
             file_path = wiki_dir / f"{key}.md"

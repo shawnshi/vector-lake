@@ -20,7 +20,7 @@ Do NOT generate `id`, `created`, or `updated` fields. The wrapper injects those 
 ```yaml
 ---
 title: "Precise Title"
-type: "entity | concept | source | synthesis"
+type: "vendor | product | person | event | concept | source | synthesis"
 domain: "Medical_IT"
 topic_cluster: "General"
 status: "Active"
@@ -61,13 +61,16 @@ You will receive a prompt marked `[STEP 2 OF 2 — GENERATION]` together with th
 
 Execute this pipeline:
 
-1. Read the raw source file(s) from `MEMORY/raw/`
+1. Read the raw source file(s) from `MEMORY/raw/` (if not provided in instructions)
 2. Extract key concepts, entities, and source-level findings
-3. Create new pages where needed
-4. Update existing pages where that is the better semantic outcome
-5. Ensure each raw file maps to exactly one source page
-6. Emit REVIEW blocks only for real contradictions, duplicates, missing pages, or research suggestions
-7. **DUAL-SCHEMA ENFORCEMENT**: When writing or updating `Entity_*.md` or `Concept_*.md`, you MUST implement the physical `---` split defined in the wikiFormat Contract. The top half must be cleanly REWRITTEN as the 'Compiled Truth'. The bottom half must be strictly APPEND-ONLY for the 'Timeline'. NEVER mix historical narrative into the top section.
+3. **MANDATORY DEDUPLICATION CHECK**: BEFORE writing any new entity or concept page, you MUST call the `check_duplicate_entity` MCP tool.
+   - If the tool indicates a duplicate (e.g., `is_duplicate: True`), follow its instructions exactly (do NOT create a new file, append your content to the existing Timeline instead).
+   - If the tool indicates it's not a duplicate, you may proceed to create the new page.
+4. Create new pages using your native file writing tools where needed
+5. Update existing pages where that is the better semantic outcome
+6. Ensure each raw file maps to exactly one source page
+7. Emit REVIEW blocks only for real contradictions, missing pages, or research suggestions (duplicate issues are now handled automatically by the piea tool)
+8. **DUAL-SCHEMA ENFORCEMENT**: When writing or updating `Vendor_*.md`, `Product_*.md`, `Person_*.md`, `Event_*.md` or `Concept_*.md`, you MUST implement the physical `---` split defined in the wikiFormat Contract. The top half must be cleanly REWRITTEN as the 'Compiled Truth'. The bottom half must be strictly APPEND-ONLY for the 'Timeline'. NEVER mix historical narrative into the top section.
 
 If the orchestrator specifies a target source page filename, you MUST use that exact filename.
 If no target source page is specified, default to `Source_{raw_filename_stem}.md`.
@@ -80,7 +83,7 @@ If you identify issues that need follow-up, emit REVIEW blocks in this exact for
 ```text
 ---REVIEW: contradiction | Title of the contradiction---
 Description of what conflicts and between which pages.
-PAGES: Entity_PageA.md, Concept_PageB.md
+PAGES: Vendor_PageA.md, Concept_PageB.md
 ---END REVIEW---
 
 ---REVIEW: missing-page | Title of the missing concept---
@@ -105,7 +108,7 @@ Write generated wiki content primarily in Chinese (Zh-CN).
 Preserve technical terms, framework names, acronyms, protocol names, vendor names, and paper titles in English where translation would lose precision.
 
 ## 9. Hard Locks
-- All new files must follow `[Type]_[Entity_Name].md`
+- All new files must follow `[Vendor|Product|Person|Event|Concept|Source|Synthesis]_[Name].md`. Note: The `Entity_` prefix is STRICTLY FORBIDDEN.
 - `type` and `categories` must be explicit and valid
 - Never generate `id`, `created`, or `updated`
 - `epistemic-status` must be `seed`, `sprouting`, or `evergreen`

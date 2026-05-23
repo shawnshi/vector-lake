@@ -28,7 +28,10 @@ VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Sourc
 DEFAULT_TTL = {
     "source": 365,
     "synthesis": 730,
-    "entity": 1095,
+    "vendor": 1095,
+    "product": 1095,
+    "person": 1095,
+    "event": 1095,
     "concept": 1825,
 }
 
@@ -40,10 +43,13 @@ RELEVANCE_WEIGHTS = {
 }
 
 TYPE_AFFINITY = {
-    "entity": {"entity": 0.8, "concept": 1.2, "source": 1.0, "synthesis": 1.0},
-    "concept": {"entity": 1.2, "concept": 0.8, "source": 1.0, "synthesis": 1.2},
-    "source": {"entity": 1.0, "concept": 1.0, "source": 0.5, "synthesis": 1.0},
-    "synthesis": {"entity": 1.0, "concept": 1.2, "source": 1.0, "synthesis": 0.8},
+    "vendor": {"vendor": 0.8, "product": 1.2, "person": 1.0, "concept": 1.2, "source": 1.0, "synthesis": 1.0},
+    "product": {"vendor": 1.2, "product": 0.8, "person": 1.0, "concept": 1.2, "source": 1.0, "synthesis": 1.0},
+    "person": {"vendor": 1.0, "product": 1.0, "person": 0.8, "concept": 1.2, "source": 1.0, "synthesis": 1.0},
+    "event": {"vendor": 1.0, "product": 1.0, "person": 1.0, "event": 0.8, "concept": 1.2, "source": 1.0, "synthesis": 1.0},
+    "concept": {"vendor": 1.2, "product": 1.2, "person": 1.2, "event": 1.2, "concept": 0.8, "source": 1.0, "synthesis": 1.2},
+    "source": {"vendor": 1.0, "product": 1.0, "person": 1.0, "event": 1.0, "concept": 1.0, "source": 0.5, "synthesis": 1.0},
+    "synthesis": {"vendor": 1.0, "product": 1.0, "person": 1.0, "event": 1.0, "concept": 1.2, "source": 1.0, "synthesis": 0.8},
 }
 
 LEGACY_EMBEDDED_INDEX_KEYS = (
@@ -262,11 +268,15 @@ def _parse_wiki_node(filepath: str, node_key: str):
     title = fm_data.get("title", node_key)
 
     raw_type = str(fm_data.get("type", "concept")).lower().strip().replace('"', "").replace("'", "")
-    if raw_type in ["entity", "person", "system", "project", "organization"]:
-        node_type = "concept" if raw_type == "system" else "entity"
-    elif raw_type in ["source", "reference"]:
+    if raw_type in ["vendor", "product", "person", "event", "concept", "source", "synthesis"]:
+        node_type = raw_type
+    elif raw_type in ["entity", "organization"]:
+        node_type = "vendor"
+    elif raw_type in ["system", "project"]:
+        node_type = "product"
+    elif raw_type in ["reference"]:
         node_type = "source"
-    elif raw_type in ["synthesis", "comparison", "report"]:
+    elif raw_type in ["comparison", "report"]:
         node_type = "synthesis"
     else:
         node_type = "concept"

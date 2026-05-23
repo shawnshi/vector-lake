@@ -17,7 +17,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 ```mermaid
 graph LR
-    RAW["MEMORY/raw<br>Immutable sources"] --> INGEST["sync / watchdog<br>LLM-assisted compiler"]
+    RAW["MEMORY/raw<br>Immutable sources"] --> INGEST["Native Subagents<br>Asynchronous Ingestion Pipeline"]
     INGEST --> WIKI["MEMORY/wiki<br>Markdown pages"]
     WIKI --> INDEX["index.json<br>page index + BM25"]
     WIKI --> META[".meta/*.json<br>canonical store"]
@@ -98,7 +98,7 @@ MEMORY/
 > **Note (v8.3+)**: Vector Lake 现已全面接入 MCP (Model Context Protocol)。大语言模型 Agent 将直接通过 `vector_lake/mcp_server.py` 调用底层 Tool 接口，不再需要通过终端模拟。
 > 
 > **Gemini CLI Slash Commands**: 我们已将常用功能映射为快捷指令（在聊天框输入 `/` 触发）：
-> - `/sync`：执行知识图谱的两阶段 CoT 同步
+> - `/vl_sync`：自动调度 Ingestor 子智能体执行图谱知识的异步增量同步
 > - `/search`：语义搜索向量湖索引
 > - `/query`：深度逻辑推理与查询
 > - `/review`：检查统一治理队列
@@ -132,7 +132,7 @@ python cli.py sync
 启动后台守护进程（增量监听）：
 
 ```powershell
-python watchdog_sync.py
+python watchdog_app.py
 ```
 
 搜索页面层：
@@ -204,7 +204,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `cli.py` | 根目录薄入口 |
 | `vector_lake/cli_app.py` | CLI 参数与命令路由 |
 | `vector_lake/tools.py` | Tool facade |
-| `vector_lake/ingest.py` | raw -> wiki 两步编译管线 |
+| `vector_lake/tool_ingest.py` | Raw-source 批量扫描与 Subagent 摄取指令生成 |
 | `vector_lake/indexer.py` | `index.json` 生成，含 BM25 纯 Python 倒排索引 |
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
 | `vector_lake/governance_store.py` | canonical store、change set、operational memory、conflict resolver |
@@ -224,7 +224,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 
 ## Validation
 
-最近验证基线（2026-05-20）：
+最近验证基线（2026-05-23）：
 
 ```powershell
 $env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v

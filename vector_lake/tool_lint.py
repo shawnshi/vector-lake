@@ -32,7 +32,7 @@ def lint_vector_lake(auto_fix: bool = False):
         return "Wiki directory not found."
 
     skip_files = {"index.md", "log.md", "overview.md"}
-    valid_types = {"entity", "concept", "source", "synthesis"}
+    valid_types = {"vendor", "product", "person", "event", "concept", "source", "synthesis"}
     valid_status = {"active", "deprecated", "archived", "contested"}
     valid_epistemic = {"seed", "sprouting", "evergreen"}
     valid_categories = {
@@ -308,7 +308,10 @@ def lint_vector_lake(auto_fix: bool = False):
     DEFAULT_TTL = {
         "source": 365,
         "synthesis": 730,
-        "entity": 1095,
+        "vendor": 1095,
+        "product": 1095,
+        "person": 1095,
+        "event": 1095,
         "concept": 1825,
     }
 

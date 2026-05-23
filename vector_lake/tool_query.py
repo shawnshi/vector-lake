@@ -19,69 +19,12 @@ log = logging.getLogger("vector-lake-tool-query")
 
 import time
 import json
+import hashlib
 from vector_lake import get_extension_root
 
-class DummyResult:
-    def __init__(self, returncode, stdout, stderr):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-
-def _run_gemini(prompt: str):
-    config_path = get_extension_root() / "config.json"
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            llm_config = json.load(f).get("llm", {})
-            model_cascade = llm_config.get("model_cascade", ["default",  "gemini-3.1-pro-preview",  "gemini-3-flash-preview",  "gemini-2.5-pro"])
-    except Exception:
-        model_cascade = ["default",  "gemini-3.1-pro-preview",  "gemini-3-flash-preview",  "gemini-2.5-pro"]
-    
-    retries = len(model_cascade)
-    last_err = None
-    client = genai.Client()
-    
-    for attempt in range(retries):
-        try:
-            current_model = model_cascade[attempt]
-            if current_model in ("", "default"):
-                current_model = "gemini-2.5-pro"
-            
-            log.info(f"Invoking google-genai SDK (Attempt {attempt + 1}/{retries})... (Model: {current_model})")
-            
-            response = client.models.generate_content(
-                model=current_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction="You are a Vector Lake Synthesizer.",
-                )
-            )
-            return DummyResult(0, response.text, "")
-            
-        except APIError as e:
-            log.warning(f"Google GenAI APIError on attempt {attempt + 1}: {e}")
-            last_err = str(e)
-        except Exception as e:
-            log.error(f"Google GenAI failed unexpectedly: {e}")
-            last_err = str(e)
-        
-        if attempt < retries - 1:
-            time.sleep(3)
-            
-    return DummyResult(1, "", f"Exhausted {retries} retries. Last error: {last_err}")
-
-
-def query_logic_lake(query_str: str, dry_run: bool = False):
+def prepare_query_context(query_str: str, dry_run: bool = False):
     wiki_dir = str(get_wiki_dir())
-    before_mtimes = {}
-    if os.path.exists(wiki_dir):
-        for name in os.listdir(wiki_dir):
-            if name.endswith(".md"):
-                path = os.path.join(wiki_dir, name)
-                try:
-                    before_mtimes[name] = os.path.getmtime(path)
-                except OSError:
-                    continue
-
+    
     context = assemble_context(query_str)
     context_block = ""
     if context.get("memory_packet"):
@@ -98,89 +41,76 @@ def query_logic_lake(query_str: str, dry_run: bool = False):
     if context["purpose"]:
         context_block += f"\n\n--- PURPOSE ---\n{context['purpose']}"
 
-    if dry_run:
-        prompt = (
-            "You are drafting a Vector Lake synthesis preview.\n"
-            "Return exactly one Markdown document with valid YAML frontmatter for a synthesis page.\n"
-            "Do not write files. Do not mention that this is a preview.\n"
-            "Treat OPERATIONAL MEMORY PACKET as the authoritative machine-facing state when it conflicts with page prose.\n"
-            f"Query: {query_str}{context_block}"
-        )
-        try:
-            result = _run_gemini(prompt)
-        except Exception as e:
-            return f"Error: {e}"
-        output = (result.stdout or "").strip()
-        if result.returncode != 0 and not output:
-            return (result.stderr or "").strip() or "Dry-run query failed."
-        trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
-        return f"{output or 'Dry-run query returned no output.'}\n\n{trace}"
-
-    prompt = f"""@vector-lake-synthesizer
-[SYSTEM DIRECTIVE: PYTHON-LED I/O]
-You are running in a restricted sandbox. DO NOT use the `write_file`, `replace`, or `run_shell_command` tools.
-You MUST output the generated synthesis pages in the following plain text format exactly:
-
----FILE: Synthesis_Topic_Name.md---
-(yaml frontmatter)
-(body content)
----END FILE---
-
-Treat OPERATIONAL MEMORY PACKET as the authoritative machine-facing state when it conflicts with page prose.
-Query: {query_str}{context_block}"""
-    try:
-        result = _run_gemini(prompt)
-    except Exception as e:
-        return f"Error: {e}"
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        return stderr or "Query failed."
-
-    stdout_str = result.stdout or ""
-    changed_node_files = set()
+    # Write context to a temporary payload file
+    tmp_dir = get_extension_root() / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     
-    from vector_lake.wiki_utils import atomic_write_text
-    from pathlib import Path
-    file_blocks = re.finditer(r"---FILE:\s*([^\n]+)---\n(.*?)\n---END FILE---", stdout_str, re.DOTALL)
-    for match in file_blocks:
-        filename = match.group(1).strip()
-        content = match.group(2).strip()
+    # Create a unique hash for this query
+    query_hash = hashlib.md5(query_str.encode("utf-8")).hexdigest()[:8]
+    payload_path = tmp_dir / f"query_context_{query_hash}.md"
+    
+    with open(payload_path, "w", encoding="utf-8") as f:
+        f.write(context_block)
+        
+    if dry_run:
+        trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
+        return f"[DRY RUN] Context assembled at {payload_path}\n\nTrace:\n{trace}"
+
+    instructions = f"""[SUBAGENT DELEGATION REQUIRED]
+Context successfully assembled and saved to: {payload_path}
+
+Please execute the following workflow:
+1. Invoke the subagent `vector-lake-synthesizer` with the exact prompt below.
+2. Wait for the subagent to finish writing the file(s) (it must use its write_file tool).
+3. Once the subagent finishes, find out which Synthesis_*.md files were created or modified.
+4. Call the MCP tool `finalize_query_synthesis` with those filenames (comma-separated, e.g., 'Synthesis_A.md,Synthesis_B.md') and the original query string.
+
+--- SUBAGENT PROMPT ---
+Query: {query_str}
+
+Instructions:
+Read the context from {payload_path}. 
+Perform bounded logical synthesis and generate the resulting Markdown synthesis page(s).
+You MUST use your native `write_to_file` / `multi_replace_file_content` tools to write directly to `MEMORY/wiki/`.
+Make sure the filename starts with `Synthesis_`.
+-----------------------
+"""
+    return instructions
+
+def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
+    if not files_written_str.strip():
+        return "No files were written."
+        
+    wiki_dir = str(get_wiki_dir())
+    changed_node_files = set([f.strip() for f in files_written_str.split(",") if f.strip()])
+    
+    valid_files = set()
+    for filename in changed_node_files:
         if not filename.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")):
-            log.warning(f"Intercepted illegal write attempt to {filename}")
+            log.warning(f"Ignoring non-wiki file: {filename}")
             continue
         file_path = os.path.join(wiki_dir, filename)
-        try:
-            atomic_write_text(Path(file_path), content)
-            changed_node_files.add(filename)
-        except Exception as e:
-            log.error(f"Failed to write {filename}: {e}")
-
-    if changed_node_files:
-        new_files = {name for name in changed_node_files if name not in before_mtimes}
-        updated_files = changed_node_files - new_files
-        log.info(f"[Auto-Reingest] Detected {len(new_files)} new and {len(updated_files)} updated wiki node(s): {changed_node_files}")
-        for filename in changed_node_files:
-            sanitize_wiki_node(os.path.join(wiki_dir, filename))
-
+        if os.path.exists(file_path):
+            valid_files.add(filename)
+            sanitize_wiki_node(file_path)
+            
+    if valid_files:
         indexer.generate_index()
-        stubs_created = _generate_stubs_for_broken_links(wiki_dir, changed_node_files)
+        stubs_created = _generate_stubs_for_broken_links(wiki_dir, valid_files)
         if stubs_created:
             indexer.generate_index()
         change_set = governance_store.sync_pages_to_canonical(
-            [os.path.join(wiki_dir, filename) for filename in changed_node_files],
+            [os.path.join(wiki_dir, filename) for filename in valid_files],
             origin="query",
             auto_approve=True,
             summary=f"Query synthesis for: {query_str[:80]}",
         )
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
         return (
-            f"Query completed. {len(new_files)} new page(s) created. "
-            f"{len(updated_files)} existing page(s) updated. {stubs_created} stub(s) generated.\n"
+            f"Query finalization completed. {len(valid_files)} page(s) synced. {stubs_created} stub(s) generated.\n"
             f"Canonical change set: {change_set['change_set_id'] if change_set else 'none'}\n\n{trace}"
         )
-
-    return "Query completed."
+    return "Query finalization completed with no valid wiki files synced."
 
 
 def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:

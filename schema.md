@@ -18,7 +18,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   ---
   id: "YYYYMMDD_xxxxxx"  # date + 6-char random alphanumeric
   title: "Page Title"
-  type: "entity | concept | source | synthesis"
+  type: "vendor | product | person | event | concept | source | synthesis"
   domain: "Medical_IT"  # REQUIRED: The macro-domain (e.g., Medical_IT, Architecture)
   topic_cluster: "General" # REQUIRED: The specific sub-topic or room
   status: "Active" # REQUIRED: "Active", "Deprecated", "Archived", or "Contested"
@@ -45,7 +45,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
    - Example: `The model achieves SOTA performance[^1].\n\n[^1]: [[Source_Report_A.md]]`
 - **Contradictions & Synthesis**: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction (e.g., "> **Conflict Note:** Source A claims X, but Source B claims Y.").
 - **Temporal Rot Defense**: For fast-moving domains (like policies or tech releases), you MUST anchor claims to a specific time frame using inline brackets at the start of a bullet/paragraph (e.g., `[2024] The market is...` or `[2026-Q1] Agentic models dominate...`). This allows the system to algorithmically resolve contradictions by deprecating older historical claims in favor of newer ones.
-- **Epistemic Decay (TTL)**: For time-sensitive nodes (like news, market dynamics, product releases), actively assign a shorter `ttl` (e.g., 90 to 180 days). The system automatically tracks node age (days since `updated`) and applies an exponential decay weight: $D = 0.5 ^{age\_days / ttl}$. Default TTLs: Concept: 1825, Entity: 1095, Synthesis: 730, Source: 365. You may explicitly set `ttl` to override these defaults.
+- **Epistemic Decay (TTL)**: For time-sensitive nodes (like news, market dynamics, product releases), actively assign a shorter `ttl` (e.g., 90 to 180 days). The system automatically tracks node age (days since `updated`) and applies an exponential decay weight: $D = 0.5 ^{age\_days / ttl}$. Default TTLs: Concept: 1825, Vendor/Product/Person/Event: 1095, Synthesis: 730, Source: 365. You may explicitly set `ttl` to override these defaults.
 - **Anti-Drift Forcefield**: Every page must have an `alignment_score` (0-100) determining its relevance to `purpose.md`. If a node's score is less than 60, its `status` MUST be set to "Contested" or "Misaligned". The topology engine will drastically penalize the graph relevance of low-alignment nodes.
 - **Operational Memory Split**: Markdown remains the human-readable publication layer. Agent runtime state is compiled into `operational_memory.json` as `fact`, `preference`, `decision`, and `task_state` records. Query prompts receive a Memory Packet before page prose.
 - **Runtime Scoring**: Operational memory records carry `confidence_score`, `freshness_score`, `authority_score`, `importance_score`, `reinforcement_score`, `validity_factor`, and `memory_score`. Retrieval must prefer active, fresh, high-authority records over stale page text.

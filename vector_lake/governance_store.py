@@ -14,15 +14,7 @@ from vector_lake.claim_extractor import extract_page_objects
 from vector_lake.db_store import get_connection, init_db
 from vector_lake.wiki_utils import (
     atomic_write_text,
-    get_alias_registry_path,
-    get_change_sets_path,
-    get_claims_path,
-    get_entities_path,
-    get_evidence_path,
-    get_governance_queue_path,
     get_meta_dir,
-    get_memory_objects_path,
-    get_sources_path,
     get_wiki_dir,
     read_markdown_file,
 )
@@ -958,7 +950,8 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                         script_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "semantic_merge.py")
                         
                         def find_md_file(name):
-                            for prefix in ["Entity_", "Concept_"]:
+                            from vector_lake.wiki_utils import VALID_PREFIXES
+                            for prefix in VALID_PREFIXES:
                                 p = os.path.join(wiki_dir, f"{prefix}{name}.md")
                                 if os.path.exists(p): return p
                             p = os.path.join(wiki_dir, f"{name}.md")

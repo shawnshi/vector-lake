@@ -54,7 +54,7 @@ Conflict rules:
 | `cli.py` | Root CLI shim |
 | `vector_lake/cli_app.py` | Argument parsing and command dispatch |
 | `vector_lake/tools.py` | Tool facade |
-| `vector_lake/ingest.py` | Raw-source sync and two-step page generation |
+| `vector_lake/tool_ingest.py` | Raw-source scan and Subagent instructions generation |
 | `vector_lake/indexer.py` | Page index, weighted edges, claim graph refresh, pure-Python BM25 inverted index |
 | `vector_lake/claim_extractor.py` | Page-to-entity/claim/evidence/source extraction |
 | `vector_lake/governance_store.py` | Canonical store, change sets, operational memory, conflict resolver |
@@ -77,7 +77,7 @@ Conflict rules:
 **Note (v8.3+)**: Agents interact with the system entirely through the `vector_lake/mcp_server.py` MCP tools (e.g. `search_vector_lake`, `sync_vector_lake`).
 
 **Gemini CLI Slash Commands**: Common functions have been mapped to slash commands (trigger with `/` in the chat input):
-- `/sync`: 2-step CoT sync of graph
+- `/vl_sync`: Distributed Subagent pipeline for graph sync and raw file ingestion
 - `/search`: Semantic query
 - `/query`: Deep logic reasoning
 - `/review`: Check governance queue
@@ -123,7 +123,7 @@ $env:PYTHONUTF8='1'; python -m compileall vector_lake tests
 
 ## 5. Current Validation Baseline
 
-Last verified: 2026-05-20.
+Last verified: 2026-05-23.
 
 - Unit tests: `Ran 8 tests ... OK`
 - Compile: `python -m compileall vector_lake tests` OK

@@ -108,36 +108,7 @@ def get_claim_graph_path() -> Path:
     return get_wiki_dir() / "claim_graph.json"
 
 
-def get_entities_path() -> Path:
-    return get_meta_dir() / "entities.json"
 
-
-def get_claims_path() -> Path:
-    return get_meta_dir() / "claims.json"
-
-
-def get_evidence_path() -> Path:
-    return get_meta_dir() / "evidence.json"
-
-
-def get_sources_path() -> Path:
-    return get_meta_dir() / "sources.json"
-
-
-def get_change_sets_path() -> Path:
-    return get_meta_dir() / "change_sets.json"
-
-
-def get_governance_queue_path() -> Path:
-    return get_meta_dir() / "governance_queue.json"
-
-
-def get_alias_registry_path() -> Path:
-    return get_meta_dir() / "alias_registry.json"
-
-
-def get_memory_objects_path() -> Path:
-    return get_meta_dir() / "operational_memory.json"
 
 
 def normalize_raw_ref(raw_ref: str) -> str:

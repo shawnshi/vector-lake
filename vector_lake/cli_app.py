@@ -43,7 +43,7 @@ Usage Examples:
 
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available wiki operations")
 
-    subparsers.add_parser("sync", help="[INGEST] Trigger a 2-step CoT sync of all raw sources into the Wiki.")
+    subparsers.add_parser("sync", help="[INGEST] Generates MCP ingestion instructions for Native Subagents.")
 
     lint_parser = subparsers.add_parser("lint", help="[LINT] Run self-healing audit on the Wiki nodes.")
     lint_parser.add_argument("--auto-fix", action="store_true", help="Automatically fix issues such as decaying notes.")
