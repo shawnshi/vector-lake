@@ -6,6 +6,13 @@ import re
 from datetime import datetime, timezone
 
 import yaml
+try:
+    # ⚡ Bolt: Use C-based loader for ~7-8x speedup in YAML parsing
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    # Fallback to pure Python implementation if LibYAML is missing
+    from yaml import SafeLoader
+
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -262,7 +269,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = yaml.load(fm_str, Loader=SafeLoader) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)

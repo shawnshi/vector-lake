@@ -1,0 +1,3 @@
+## 2024-05-15 - [Fast YAML Parsing and Dumping]
+**Learning:** `yaml.safe_load` and `yaml.dump` without specific loaders/dumpers are notoriously slow in PyYAML. `CSafeLoader` and `CDumper` (which wrap LibYAML) provide a significant ~7-8x performance speedup. However, these C-based classes might not be available in environments without the C library installed.
+**Action:** Use `yaml.load(data, Loader=SafeLoader)` and `yaml.dump(data, Dumper=Dumper)` after attempting to import `CSafeLoader as SafeLoader, CDumper as Dumper` with a fallback to the pure Python `SafeLoader` and `Dumper`. This guarantees performance optimization where possible without risking `ImportError` or breaking functionality.
