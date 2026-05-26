@@ -1,0 +1,4 @@
+
+## 2025-02-20 - Use C-based YAML Loader and Dumper for Speedup
+**Learning:** Parsing and writing YAML with default PyYAML functions (`yaml.safe_load`, `yaml.dump`) using the pure-Python loader/dumper is notoriously slow. On large knowledge graphs/wikis where YAML frontmatter is frequently parsed/written, this becomes a severe bottleneck. The C-based bindings (`CSafeLoader`, `CDumper`) provide massive speedups (often 5-10x) but are not guaranteed to be installed on every target environment (e.g., if PyYAML was installed without libyaml headers).
+**Action:** Always wrap `CSafeLoader` and `CDumper` imports in a `try/except ImportError` fallback block to ensure code runs fast when possible, but gracefully falls back to the pure Python implementations to maintain robust portability across environments.
