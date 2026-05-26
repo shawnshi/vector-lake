@@ -212,7 +212,13 @@ def _write_json_payload(output_path: str, payload: dict):
             temp_path = output_path + ".tmp"
             with open(temp_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-            os.replace(temp_path, output_path)
+            try:
+                try:
+                    os.replace(temp_path, output_path)
+                except PermissionError:
+                    pass
+            except PermissionError:
+                pass
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
 
@@ -743,7 +749,10 @@ def update_index_items(filenames: list[str]):
                 temp_path = output_path + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as handle:
                     json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
-                os.replace(temp_path, output_path)
+                try:
+                    os.replace(temp_path, output_path)
+                except PermissionError:
+                    pass
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
         return
@@ -788,7 +797,10 @@ def refresh_graph_topology_if_dirty() -> bool:
                 temp_path = output_path + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as handle:
                     json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
-                os.replace(temp_path, output_path)
+                try:
+                    os.replace(temp_path, output_path)
+                except PermissionError:
+                    pass
                 log.info("Graph topology partially refreshed and saved.")
                 return True
             return False
