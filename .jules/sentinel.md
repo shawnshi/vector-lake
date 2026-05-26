@@ -1,0 +1,4 @@
+## 2025-05-26 - Prevent Server-Side XSS when injecting JSON into HTML templates
+**Vulnerability:** XSS via unsafe JSON serialization injected directly into an HTML template inside a `<script>` tag in `vector_lake/tool_graph.py`. The `%%GRAPH_DATA%%` replacement used `json.dumps()` without escaping HTML special characters. If malicious data was in the graph index, it could have prematurely closed the `<script>` tag or executed arbitrary JavaScript.
+**Learning:** Directly injecting JSON into HTML is unsafe if user-controlled or external data is part of the JSON object, as HTML parsers look for `</script>` tags or other HTML artifacts before the JSON is even parsed.
+**Prevention:** Always escape HTML characters like `<`, `>`, and `&` when embedding JSON into HTML `<script>` contexts by using chained `.replace()` calls or similar techniques (`.replace('<', r'\u003c')`, etc.).
