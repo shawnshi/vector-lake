@@ -1,0 +1,4 @@
+## 2024-05-24 - Server-Side JSON XSS in HTML Template
+**Vulnerability:** A Server-Side XSS vulnerability was identified in `vector_lake/tool_graph.py` where `json.dumps` output was injected directly into a `<script>` tag in the `templates/topology.html` template.
+**Learning:** `json.dumps` does not automatically escape HTML control characters like `<` and `>` because they are valid inside JSON string values. When this JSON is interpolated directly into an HTML `<script>` block, an attacker can embed `</script>` inside a JSON field to break out of the script tag and execute arbitrary JS.
+**Prevention:** When injecting JSON directly into HTML script tags, strictly chain `.replace('<', r'\u003c').replace('>', r'\u003e').replace('&', r'\u0026')` onto the `json.dumps` output. This relies on JSON parsers correctly resolving standard unicode escapes (`\uXXXX`) while neutralizing the characters before the HTML parser processes them.
