@@ -42,9 +42,14 @@ def _heading_to_text(line: str) -> str:
 
 def _clean_claim_text(text: str, limit: int = 360) -> str:
     cleaned = _collapse_text(text)
+    # Strip inline sources completely to reduce RAG noise
+    cleaned = re.sub(r"\(Source[s]?:\s*(.*?)\)", "", cleaned, flags=re.IGNORECASE)
+    # Strip typed links first: [predicate:: [[Target|Alias]]] -> Alias or [predicate:: [[Target]]] -> Target
+    cleaned = re.sub(r"\[([^\[\]]+?)::\s*\[\[([^\]|]+)\|([^\]]+)\]\]\]", r"\3", cleaned)
+    cleaned = re.sub(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", r"\2", cleaned)
+    # Then strip legacy links
     cleaned = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", cleaned)
     cleaned = re.sub(r"\[\[([^\]]+)\]\]", r"\1", cleaned)
-    cleaned = re.sub(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", r"\1 \2", cleaned)
     return cleaned[:limit]
 
 
@@ -57,12 +62,14 @@ def _iter_blocks(body: str) -> list[dict]:
         nonlocal paragraph_lines
         if not paragraph_lines:
             return
-        text = _clean_claim_text(" ".join(paragraph_lines))
+        raw = " ".join(paragraph_lines)
+        text = _clean_claim_text(raw)
         if text:
             blocks.append({
                 "kind": "paragraph",
                 "heading": current_heading,
                 "text": text,
+                "raw_text": raw,
             })
         paragraph_lines = []
 
@@ -78,12 +85,14 @@ def _iter_blocks(body: str) -> list[dict]:
             continue
         if re.match(r"^[-*+]\s+", stripped):
             flush_paragraph()
-            text = _clean_claim_text(re.sub(r"^[-*+]\s+", "", stripped))
+            raw = re.sub(r"^[-*+]\s+", "", stripped)
+            text = _clean_claim_text(raw)
             if text:
                 blocks.append({
                     "kind": "bullet",
                     "heading": current_heading,
                     "text": text,
+                    "raw_text": raw,
                 })
             continue
         paragraph_lines.append(stripped)
@@ -133,6 +142,14 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         if match:
             return match.group(1), text[match.end():]
         return None, text
+
+    def _parse_inline_sources(raw_text: str):
+        found_sources = []
+        for match in re.finditer(r"\(Source[s]?:\s*(.*?)\)", raw_text, flags=re.IGNORECASE):
+            content = match.group(1)
+            for m2 in re.finditer(r"\[\[(.*?)\]\]", content):
+                found_sources.append(m2.group(1).split("|")[0].strip().replace(".md", ""))
+        return found_sources
 
     subject_entity_ids = []
     entity_records = []
@@ -184,6 +201,16 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         block_temporal, cleaned_text = _parse_temporal(block["text"])
         final_temporal = block_temporal or validity_defaults.get("temporal_anchor")
 
+        raw_text = block.get("raw_text", block["text"])
+        inline_sources = _parse_inline_sources(raw_text)
+
+        custom_claim_type = _claim_type_for_block(block["kind"])
+        heading = block.get("heading") or title
+        if "编译事实" in heading:
+            custom_claim_type = "compiled-truth"
+        elif "证据时间线" in heading:
+            custom_claim_type = "timeline-event"
+
         evidence_ids = []
         for raw_ref, source_id in zip(sources, source_ids):
             evidence_id = _stable_id("evidence", f"{page_key}:{block_index}:{raw_ref}:{cleaned_text}")
@@ -208,13 +235,14 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         claim_record = {
             "claim_id": claim_id,
             "claim_text": cleaned_text,
-            "claim_type": _claim_type_for_block(block["kind"]),
+            "claim_type": custom_claim_type,
             "claim_scope": "block",
             "status": frontmatter.get("status", "Active"),
             "confidence": frontmatter.get("confidence", 0.6 if page_type == "synthesis" else 0.8),
             "subject_entity_ids": list(subject_entity_ids),
             "evidence_ids": evidence_ids,
             "source_ids": list(source_ids),
+            "inline_sources": inline_sources,
             "locator": {
                 "page_key": page_key,
                 "heading": block.get("heading") or title,

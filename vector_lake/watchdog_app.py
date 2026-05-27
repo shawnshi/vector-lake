@@ -183,6 +183,24 @@ def scheduled_lint_loop():
                             if res.returncode != 0:
                                 log.error(f"Missing Evidence Scout Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Scout Failed", res.stderr)
+
+                        # V7.2 Asynchronous Domain Overview Compilation
+                        overview_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/compile_domain_overviews.py")
+                        if os.path.exists(overview_script):
+                            log.info("Running Domain Overview Compiler...")
+                            res = subprocess.run([sys.executable, overview_script], capture_output=True, text=True)
+                            if res.returncode != 0:
+                                log.error(f"Domain Overview Compiler Failed: {res.stderr}")
+                                write_status("error", 0, index_queue.qsize(), "Overview Compiler Failed", res.stderr)
+                        
+                        # V7.2 Semantic Deduplication Daemon
+                        semantic_dedup_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/semantic_dedup_daemon.py")
+                        if os.path.exists(semantic_dedup_script):
+                            log.info("Running Semantic Deduplication Daemon...")
+                            res = subprocess.run([sys.executable, semantic_dedup_script], capture_output=True, text=True)
+                            if res.returncode != 0:
+                                log.error(f"Semantic Deduplication Daemon Failed: {res.stderr}")
+                                write_status("error", 0, index_queue.qsize(), "Semantic Dedup Failed", res.stderr)
                     except Exception as e:
                         log.warning(f"Failed to run auxiliary daemons: {e}")
                         write_status("error", 0, index_queue.qsize(), "Auxiliary Daemons Error", str(e))

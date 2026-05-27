@@ -1,5 +1,5 @@
 from mcp.server.fastmcp import FastMCP
-from vector_lake import tools
+from vector_lake import tools, tool_memory
 from vector_lake.tool_timeline import search_timeline_events
 
 mcp = FastMCP("vector-lake")
@@ -31,6 +31,16 @@ def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
         mode: Search mode, can be 'page', 'memory', or 'claim'.
     """
     return tools.search_vector_lake(query, top_k, mode=mode)
+
+@mcp.tool()
+def update_operational_memory(memory_type: str, content: str) -> str:
+    """Safely persist an operational memory (preference, decision, fact, task_state) without corrupting the graph.
+    
+    Args:
+        memory_type: Type of memory ('preference', 'decision', 'fact', 'task_state').
+        content: The text content of the operational memory to store.
+    """
+    return tool_memory.update_operational_memory(memory_type, content)
 
 @mcp.tool()
 def sync_vector_lake() -> str:

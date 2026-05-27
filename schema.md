@@ -1,4 +1,4 @@
-# Vector Lake Schema & Governance (LLM-Wiki V7.1 Cognitive Pattern)
+# Vector Lake Schema & Governance (LLM-Wiki V7.2 Cognitive Pattern)
 
 ## 1. Core Mandate
 You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your primary job is to incrementally build and maintain a persistent, compounding knowledge base in Markdown format.
@@ -22,13 +22,10 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   domain: "Medical_IT"  # REQUIRED: The macro-domain (e.g., Medical_IT, Architecture)
   topic_cluster: "General" # REQUIRED: The specific sub-topic or room
   status: "Active" # REQUIRED: "Active", "Deprecated", "Archived", or "Contested"
-  alignment_score: 100 # REQUIRED: 0-100 indicating alignment with purpose.md (if < 60, status MUST be Contested)
   epistemic-status: "seed | sprouting | evergreen" # Note: use `status` for deprecation
   ttl: 365 # Optional: Semantic half-life in days (e.g., 90 for fast-changing sources, 1825 for concepts)
   memory_type: "fact | preference | decision | task_state" # Optional: overrides deterministic claim classification
   memory_key: "stable_runtime_key" # Optional: groups preferences, decisions, and task state for conflict resolution
-  authority_score: 0.8 # Optional: 0-1 source authority for operational memory scoring
-  importance_score: 0.7 # Optional: 0-1 retrieval priority for operational memory scoring
   categories: ["System_Architecture"] # MUST be from SCHEMA_CATEGORIES.md
   tags: ["tag1", "tag2"]
   created: "YYYY-MM-DD"
@@ -41,14 +38,14 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
    - **Strategic**: `[competes-with:: [[...]]]`, `[supplies-to:: [[...]]]`, `[blocks:: [[...]]]`
    - **Epistemic**: `[validates:: [[...]]]`, `[falsifies:: [[...]]]`, `[depends-on:: [[...]]]`
    - Example: `此框架的设计 [falsifies:: [[Concept_Perfect_Design]]]`
-- **Block-Level Provenance (Footnotes)**: When summarizing or extracting claims from sources, you MUST use Markdown footnotes to attribute specific claims to exact sources.
-   - Example: `The model achieves SOTA performance[^1].\n\n[^1]: [[Source_Report_A.md]]`
+- **Inline Provenance (RAG Chunking Friendly)**: When summarizing or extracting claims from sources, you MUST use inline source anchors rather than bottom footnotes to ensure provenance survives RAG chunking.
+   - Example: `The model achieves SOTA performance (Source: [[Source_Report_A]]).`
 - **Contradictions & Synthesis**: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction (e.g., "> **Conflict Note:** Source A claims X, but Source B claims Y.").
 - **Temporal Rot Defense**: For fast-moving domains (like policies or tech releases), you MUST anchor claims to a specific time frame using inline brackets at the start of a bullet/paragraph (e.g., `[2024] The market is...` or `[2026-Q1] Agentic models dominate...`). This allows the system to algorithmically resolve contradictions by deprecating older historical claims in favor of newer ones.
 - **Epistemic Decay (TTL)**: For time-sensitive nodes (like news, market dynamics, product releases), actively assign a shorter `ttl` (e.g., 90 to 180 days). The system automatically tracks node age (days since `updated`) and applies an exponential decay weight: $D = 0.5 ^{age\_days / ttl}$. Default TTLs: Concept: 1825, Vendor/Product/Person/Event: 1095, Synthesis: 730, Source: 365. You may explicitly set `ttl` to override these defaults.
-- **Anti-Drift Forcefield**: Every page must have an `alignment_score` (0-100) determining its relevance to `purpose.md`. If a node's score is less than 60, its `status` MUST be set to "Contested" or "Misaligned". The topology engine will drastically penalize the graph relevance of low-alignment nodes.
-- **Operational Memory Split**: Markdown remains the human-readable publication layer. Agent runtime state is compiled into `operational_memory.json` as `fact`, `preference`, `decision`, and `task_state` records. Query prompts receive a Memory Packet before page prose.
-- **Runtime Scoring**: Operational memory records carry `confidence_score`, `freshness_score`, `authority_score`, `importance_score`, `reinforcement_score`, `validity_factor`, and `memory_score`. Retrieval must prefer active, fresh, high-authority records over stale page text.
+- **Anti-Drift Forcefield & Computed Scores**: Scores such as `alignment_score`, `authority_score`, and `importance_score` are NO LONGER manually maintained by the LLM in YAML. They are automatically computed by the background Graph Indexer (based on PageRank, update frequency, TTL, and relevance to `purpose.md`) and written directly to `index.json` or `operational_memory.json`.
+- **Operational Memory Split**: Markdown remains the human-readable publication layer. Agent runtime state is stored in `operational_memory.json`. LLMs MUST NOT manually write JSON or use Markdown blockquotes to update this state. Instead, trigger the appropriate MCP Tool (e.g., `update_operational_memory`) to register decisions, facts, or preferences.
+- **Runtime Scoring**: Operational memory records carry computed scores (`confidence_score`, `freshness_score`, `authority_score`, etc.). Retrieval must prefer active, fresh, high-authority records over stale page text.
 - **Conflict Resolution**: For explicit contradictions, higher authority then higher confidence then newer update wins. For `preference`, `decision`, and `task_state` records sharing a `memory_key`, newer records win, with authority and confidence as tie-breakers. Losers are marked `superseded`; unresolved ties remain `conflicted`.
 
 - **File Naming Policy & Ontology Lock**: 
@@ -73,28 +70,55 @@ To prevent history noise and AST parsing failures during RAG/search, wiki files 
 
 ### A. Entity & Concept Files (Dual-Schema Mandate)
 **Target Files:** `Concept_*.md`, `Vendor_*.md`, `Product_*.md`, `Person_*.md`, `Event_*.md`.
-**Format Constraint:** These files MUST adhere to the "Compiled Truth | Timeline" physical structure. The file MUST use exact H2 headers and be split by a physical markdown divider `---`.
+**Design Pattern:** CQRS (Command Query Responsibility Segregation) & Event Sourcing.
+**Format Constraint:** These files MUST adhere to the "Compiled Truth | Timeline" physical structure. The file MUST use exact H2 headers, be split by a physical markdown divider `---`, and explicitly forbid the creation of any standalone "References/Sources" section.
 
 ```markdown
-# [Title]
+# [[Title]]
 
-## 1. 编译事实 (Compiled Truth)
-[Provide a concise 50-word ultimate definition. NO marketing fluff.]
+## 1. 编译事实 (Compiled Truth - READ MODEL)
+*[System Directive: This section represents the LATEST consensus. NO historical narrative here. NO marketing fluff.]*
 
-### [Mandatory Slot 1] (e.g., "核心护城河" for Vendors, "物理映射" for Concepts)
-- [Fact 1]
-### [Mandatory Slot 2] (e.g., "脆弱点与阻力" for Vendors, "失效边界" for Concepts)
-- [Fact 2]
+[Provide a concise 50-word ultimate definition. ELI5 style.] (Last Reshaped: [[YYYY-MM-DD]] timeline anchor)
 
-*Rewrite Rule*: Always OVERWRITE Section 1 with the latest synthesized truth. NEVER put historical narrative here.
+> **Chunking Rule (No-Pronoun Constraint):**
+> Every bullet point in this section MUST restate the entity's explicit name (e.g., "[[Vendor_Acme]] 的底层架构是...", NOT "它的底层架构是..."). This ensures Vector chunks retain semantic meaning when isolated.
+>
+> **Provenance Anchoring Constraint (Micro-Anchoring):**
+> Every synthesized fact MUST use a Markdown footnote linking to the exact Source Wiki it originated from. DO NOT create a "References" H2/H3 section at the bottom. 
+
+### [Strict Typed Slot 1]
+- [[Entity_Name]] [Fact 1 with explicit semantic links][^1]
+### [Strict Typed Slot 2]
+- [[Entity_Name]] [Fact 2 with explicit semantic links][^2]
+
+[^1]: [[Source_FilenameA]], extraction note.
+[^2]: [[Source_FilenameB]], extraction note.
+
+> **Type-Bound H3 Slots Constraint (NO INVENTING NEW HEADINGS):**
+> You MUST use ONLY the following H3 headers based on the YAML `type`:
+> - If `Vendor`: `### 核心护城河 (Moat)` | `### 脆弱点与阻力 (Risks)` | `### 关键产品线 (Key Products)`
+> - If `Concept`: `### 物理机制 (Mechanism)` | `### 适用与失效边界 (Boundaries)` | `### 演进关联 (Evolution)`
+> - If `Product`: `### 核心价值流 (Value Stream)` | `### 技术栈与依赖 (Dependencies)`
+> - If `Person`: `### 核心主张与理念 (Key Stances)` | `### 利益纽带 (Affiliations)`
+> - If `Event`: `### 核心影响与转折 (Impact)` | `### 关键参与方 (Stakeholders)`
+
+*Rewrite Rule*: OVERWRITE this entire Section 1 whenever a new insight changes the core truth. Keep it lean, dense, and factual.
 
 ---
 
-## 2. 证据时间线 (Timeline)
-*Rewrite Rule*: APPEND-ONLY. Never edit or delete old entries. Every line MUST start with a strict date anchor.
+## 2. 证据时间线 (Timeline - EVENT STORE)
+*[System Directive: This is the immutable event ledger. All facts in Section 1 MUST trace back to entries here.]*
 
-- [YYYY-MM-DD] Event description, raw extract, or dialogue summary. [validates:: [[Target]]]
-- [YYYY-MM] Broader historical phase description.
+> **Syntax Constraint:** 
+> Every entry MUST start with `- [YYYY-MM-DD] [Event_Tag]`. 
+> Valid Tags: `[Release]`(发布), `[Pivot]`(转向/重构), `[Conflict]`(矛盾/暴雷), `[Validation]`(验证), `[Observation]`(观察/报告).
+> Every entry MUST end with an inline Source anchor.
+
+- [YYYY-MM-DD] [Event_Tag] Event description, raw extract, or dialogue summary. [validates:: [[Target_Entity]]] (Source: [[Source_X]])
+- [YYYY-MM-DD] [Conflict] Source B claims opposite... (Source: [[Source_Y]])
+
+*Rewrite Rule*: APPEND-ONLY. NEVER edit, summarize, or delete old entries. DO NOT generate empty Timeline sections (if no events, state "No events recorded").
 ```
 
 ### B. Exempted Files (Free-Form)
@@ -113,7 +137,7 @@ The ingestion pipeline uses a two-step process to improve quality:
 **Step 2 — Generation (WRITE FILES)**:
 1. **Create/Update Source Page**: Create a summary page for the source itself in `wiki/`.
 2. **Extract & Link**: Identify key entities and concepts. Create new pages for them if they don't exist. If they do exist, *update* them with the new insights and ensure Bidirectional Links and Block-Level citations are correctly added.
-3. **Update overview.md**: Rewrite `wiki/overview.md` as a 2-5 paragraph global summary of ALL wiki topics.
+3. **Update Domain Overview**: Append or incrementally update the specific domain overview (e.g., `Overview_Healthcare_IT.md`) rather than globally rewriting `overview.md` to prevent context window exhaustion. Global `overview.md` is compiled asynchronously by the Watchdog.
 4. **Log Operation**: Append an entry to `wiki/log.md`.
 5. **Review Items**: If contradictions, duplicates, or knowledge gaps are found, output REVIEW blocks:
    ```
@@ -136,6 +160,7 @@ When asked a complex question requiring synthesis across multiple wiki pages:
 ### C. Linting (Health check)
 When executing a lint pass:
 1. Scan for broken links, orphan pages (no inbound links), and outdated claims (epistemic check).
+2. **Alias & Similarity Detection**: Proactively scan for similarly named entities (e.g., `Vendor_Ali` vs `Vendor_Alibaba`). If duplicates are found, output a Merge Request for the Watchdog to process via `resolve_governance_item`.
 2. Report redundant pages back to the user via audit report text. 
 3. Append a linting report to `log.md`.
 
@@ -146,11 +171,10 @@ When executing a lint pass:
 
 ## 6. Entity Linking Contract (图谱硬连接规范)
 
-To support Zero-LLM physical graph extraction and topological querying, all LLM writes to Tier 2 (Durable Knowledge) MUST use strict bidirectional linking syntax for recognized entities.
+To support Zero-LLM physical graph extraction and topological querying, all topological relations MUST be explicitly declared using semantic brackets. Natural language surrounding verbs are NOT parsed by the AST engine.
 
-**Constraint (强制规则)**: Whenever referring to a specific company, core person, product, or domain-specific terminology within Tier 2 Markdown files, the entity name MUST be wrapped in double square brackets `[[ ]]` (e.g., "我们分析了 [[Vendor_Acme AI]] 的最新动向").
-
-**Surrounding Verb Principle**: Attempt to use precise relational verbs adjacent to the linked entity (e.g., *founded*, *invested_in*, *competes_with*, *acquired*, *works_at*). This semantic anchor enables background Hook scripts to extract deterministic graph edges without requiring a separate LLM pass.
+**Constraint (强制规则)**: All relations MUST use the `[predicate:: [[Entity_Name]]]` syntax.
+Example: `Acme AI [acquired:: [[Product_StartupX]]]` instead of "Acme AI acquired [[Product_StartupX]]".
 
 **Merge Constraint (禁止手工合并)**: ABSOLUTELY NO manual shell deletion or manual file merging of duplicate entity nodes. If a duplicate is found, you MUST use the MCP tool `resolve_governance_item` (with `resolution="merge"`) and submit a `change_manifest_json` for Sandboxed execution.
 

@@ -39,13 +39,15 @@ graph LR
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
    - **API 熔断器 (Circuit Breaker)**：在 LLM 并发摄入时，通过带抖动的指数退避（Exponential Backoff with Jitter）与黑名单冷却机制，彻底消除死锁、配额枯竭与 429 限流风暴。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
-   - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、以及 `missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
+   - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**，以及 **`compile_domain_overviews.py` (PageRank 中心度预编译)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
 4. **日常搜索**：使用 `python cli.py search "<keyword>"` 或 `python cli.py query "<question>"` 检索编译后的知识网络。
 5. **周期治理**：定期执行 `python cli.py review` 处理冲突队列，执行 `python cli.py doctor` 检查健康度。
 
 ## Operational Memory
 
 运行态记忆由 `vector_lake/governance_store.py` 从 canonical claims 编译生成。它解决的问题是：Agent 常常只需要一个事实、偏好、决策或任务状态，不应该每次加载整页 Markdown。
+
+> **V7.2 "Wiki-as-Database" 写回范式**：Agent 在运行态生成的新记忆，**严禁**直接写入 SQLite。它们必须通过 `update_operational_memory` 工具，按严格的 **Dual-Schema（双架构）** 规范，即 `# 1. 编译实体特征 (Compiled Truth)` 与 `## 2. 证据时间线 (Evidence Timeline)`，物理追加到相应的 Wiki 实体文件（如 `Concept_UserPreferences.md`）的时间线下方。这确保了在图谱完全重建时，Agent 记忆依然通过 Markdown 原质保留。
 
 内置类型：
 
@@ -207,6 +209,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/tool_ingest.py` | Raw-source 批量扫描与 Subagent 摄取指令生成 |
 | `vector_lake/indexer.py` | `index.json` 生成，含 BM25 纯 Python 倒排索引 |
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
+| `vector_lake/tool_memory.py` | 基于 "Wiki-as-Database" 架构的运行态记忆物理写回 |
 | `vector_lake/governance_store.py` | canonical store、change set、operational memory、conflict resolver |
 | `vector_lake/governance_metrics.py` | debt metrics 和治理统计 |
 | `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + BM25 + Graph Traversal) 与 Memory Packet |
@@ -224,7 +227,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 
 ## Validation
 
-最近验证基线（2026-05-23）：
+最近验证基线（2026-05-27）：
 
 ```powershell
 $env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v

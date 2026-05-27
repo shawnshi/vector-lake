@@ -328,25 +328,33 @@ def _parse_wiki_node(filepath: str, node_key: str):
     else:
         sources = []
 
-    raw_alignment = fm_data.get("alignment_score", 100)
-    if not isinstance(raw_alignment, (int, float)):
-        raw_alignment = 100
-    alignment_score = max(0.0, min(100.0, float(raw_alignment)))
+    alignment_score = 100.0  # V7.2: Removed manual LLM alignment_score scoring. Handled algorithmically.
 
     links = set()
+    triples = []
     body = content[frontmatter_match.end() :]
+    
+    # 1. Extract strict AST relations
     for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", body):
-        links.add(match.group(2).split("|")[0].strip().replace(".md", ""))
-    for match in re.finditer(r"\[\[(.*?)\]\]", body):
+        predicate = match.group(1).strip()
+        target = match.group(2).split("|")[0].strip().replace(".md", "")
+        if target:
+            links.add(target)
+            triples.append({"predicate": predicate, "target": target})
+            
+    # 2. Catch legacy or plain links
+    for match in re.finditer(r"(?<!::\s)\[\[(.*?)\]\]", body):
         link_text = match.group(1).split("|")[0].strip().replace(".md", "")
-        if "::" in link_text:
-            link_text = link_text.split("::", 1)[1].strip()
-        links.add(link_text)
+        if link_text and "::" not in link_text:
+            log.warning(f"Legacy/Un-typed link [[{link_text}]] found in {node_key}. Defaulting to [mentions::]")
+            links.add(link_text)
+            triples.append({"predicate": "mentions", "target": link_text})
+            
     links.discard("")
 
     summary_text = re.sub(r"#.*?\n", "", body)
-    summary_text = re.sub(r"\[\[([^\]]*?\|)?([^\]]*?)\]\]", r"\2", summary_text)
     summary_text = re.sub(r"\[([^\[\]]+?)::\s*\[\[.*?\]\]\]", "", summary_text)
+    summary_text = re.sub(r"\[\[([^\]]*?\|)?([^\]]*?)\]\]", r"\2", summary_text)
     summary_text = summary_text.strip().replace("\n", " ")
 
     return {
@@ -361,6 +369,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "aliases": aliases,
         "sources": sources,
         "links": sorted(links),
+        "triples": triples,
         "summary": summary_text[:240],
         "decay_weight": round(decay_weight, 4),
         "alignment_score": round(alignment_score, 2),
@@ -481,6 +490,27 @@ def _apply_graph_topology(index_data: dict):
         G.add_node(key)
     for edge in edges:
         G.add_edge(edge["source"], edge["target"], weight=edge["weight"])
+
+    if nx and G.number_of_nodes() > 0:
+        try:
+            pageranks = nx.pagerank(G, weight="weight")
+            pr_scale = len(node_keys) if len(node_keys) > 0 else 1
+            for node_key in node_keys:
+                pr_score = pageranks.get(node_key, 0.0) * pr_scale
+                node = index_data["nodes"][node_key]
+                node["centrality_score"] = round(pr_score, 4)
+                node["node_score"] = round(node.get("decay_weight", 1.0) * pr_score, 4)
+        except Exception as e:
+            log.error(f"PageRank computation failed: {e}")
+            for node_key in node_keys:
+                node = index_data["nodes"][node_key]
+                node["centrality_score"] = 1.0
+                node["node_score"] = round(node.get("decay_weight", 1.0), 4)
+    else:
+        for node_key in node_keys:
+            node = index_data["nodes"][node_key]
+            node["centrality_score"] = 1.0
+            node["node_score"] = round(node.get("decay_weight", 1.0), 4)
 
     try:
         partition = community_louvain.best_partition(G, weight="weight")

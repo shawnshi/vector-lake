@@ -21,7 +21,7 @@ raw source -> Markdown wiki -> canonical claims/evidence -> operational memory -
 
 ## 2. Runtime Model
 
-Markdown remains the sovereign, inspectable publication layer. Agent memory is compiled, scored, and selectively injected.
+Markdown remains the sovereign, inspectable publication layer. Agent memory is compiled, scored, and selectively injected. **(V7.2+ Mandate: All new operational memory MUST be persisted directly into Markdown Wiki nodes via the Dual-Schema layout, specifically under the `## 2. 证据时间线 (Evidence Timeline)` section to prevent index-rebuild data loss.)**
 
 Operational memory types:
 
@@ -57,6 +57,7 @@ Conflict rules:
 | `vector_lake/tool_ingest.py` | Raw-source scan and Subagent instructions generation |
 | `vector_lake/indexer.py` | Page index, weighted edges, claim graph refresh, pure-Python BM25 inverted index |
 | `vector_lake/claim_extractor.py` | Page-to-entity/claim/evidence/source extraction |
+| `vector_lake/tool_memory.py` | Wiki-as-Database operational memory persistence via MCP |
 | `vector_lake/governance_store.py` | Canonical store, change sets, operational memory, conflict resolver |
 | `vector_lake/governance_metrics.py` | Debt and health metrics |
 | `vector_lake/tool_search.py` | Hybrid search (LLM Query Expansion + BM25 + Graph Traversal), Memory Packet assembly |
@@ -123,7 +124,7 @@ $env:PYTHONUTF8='1'; python -m compileall vector_lake tests
 
 ## 5. Current Validation Baseline
 
-Last verified: 2026-05-23.
+Last verified: 2026-05-27.
 
 - Unit tests: `Ran 8 tests ... OK`
 - Compile: `python -m compileall vector_lake tests` OK
@@ -151,6 +152,6 @@ The Vector Lake system is designed for high-concurrency ingestion and graph main
 - **API Circuit Breaker**: Protects against quota exhaustion and rate-limit thrashing during concurrent LLM ingestion. Features an exponential backoff with jitter and a 10-minute cooldown blacklist for hard API errors (e.g., 404, quota limits).
 - **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
 - **Lock-Free Auto-Lint**: Runs a highly-destructive, autonomous `lint_vector_lake(auto_fix=True)` daily at 10:00 AM and 23:00 PM. This offline routine merges duplicate nodes, archives decaying/contested pages (Semantic GC), and enforces schema compliance. Crucially, it executes purely deterministically without synchronous LLM calls, preventing hours-long thread locks.
-- **Autonomous Sub-Daemons**: The lint loop silently orchestrates `metadata_decay_daemon.py` (TTL rot), `sync_timeline_db.py` (SQL timeline extraction), and `missing_evidence_scout.py` (dispatching intelligence tasks to governance queue), culminating in a daily SQLite `WAL TRUNCATE` maintenance.
+- **Autonomous Sub-Daemons**: The lint loop silently orchestrates `metadata_decay_daemon.py` (TTL rot), `sync_timeline_db.py` (SQL timeline extraction), `missing_evidence_scout.py` (dispatching intelligence tasks to governance queue), **`semantic_dedup_daemon.py`** (pairwise semantic deduplication via Gemini embeddings), and **`compile_domain_overviews.py`** (PageRank centrality compilations), culminating in a daily SQLite `WAL TRUNCATE` maintenance.
 - **Error Resilience**: Utilizes a global `global_task_lock` for thread safety and halts on consecutive failures to prevent cascading storms. Status telemetry and subprocess errors are emitted to `MEMORY/wiki/.meta/.watchdog_status.json`.
 tus.json`.
