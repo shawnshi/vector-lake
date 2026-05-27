@@ -6,6 +6,14 @@ import re
 from datetime import datetime, timezone
 
 import yaml
+# ⚡ Bolt: Performance optimization
+# Use PyYAML C Extensions for faster YAML parsing/dumping if available
+# This can yield a ~4-7x speedup for heavy I/O operations like indexing.
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -268,7 +276,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = yaml.load(fm_str, Loader=SafeLoader) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
