@@ -1,4 +1,9 @@
 from mcp.server.fastmcp import FastMCP
+import sys
+import logging
+
+# Global lock against stdout pollution
+logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', force=True)
 from vector_lake import tools, tool_memory
 from vector_lake.tool_timeline import search_timeline_events
 
@@ -45,7 +50,11 @@ def update_operational_memory(memory_type: str, content: str) -> str:
 @mcp.tool()
 def sync_vector_lake() -> str:
     """(Legacy Alias) Trigger an ingestion batch scan. Replaced by the asynchronous Subagent pipeline, now wraps prepare_ingest_batch."""
-    return tools.sync_vector_lake()
+    try:
+        return tools.sync_vector_lake()
+    except Exception as e:
+        logging.error(f"MCP Tool Exception (sync_vector_lake): {e}")
+        return f"MCP Exception (Likely DB Lock or Timeout): {str(e)}" 
 
 @mcp.tool()
 def lint_vector_lake(auto_fix: bool = False) -> str:
@@ -54,7 +63,11 @@ def lint_vector_lake(auto_fix: bool = False) -> str:
     Args:
         auto_fix: Automatically fix issues such as decaying notes.
     """
-    return tools.lint_vector_lake(auto_fix=auto_fix)
+    try:
+        return tools.lint_vector_lake(auto_fix=auto_fix)
+    except Exception as e:
+        logging.error(f"MCP Tool Exception (lint_vector_lake): {e}")
+        return f"MCP Exception (Likely DB Lock or Timeout): {str(e)}" 
 
 @mcp.tool()
 def query_logic_lake(query_str: str) -> str:
@@ -198,6 +211,35 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
 def visualize_vector_lake() -> str:
     """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
     return tools.visualize_vector_lake()
+
+import uuid
+from vector_lake.governance_store import load_governance_queue, save_governance_queue, _utc_now
+
+@mcp.tool()
+def propose_schema_mutation(new_category: str, description: str, parent_category: str = "Uncategorized") -> str:
+    """Propose a new schema category when a concept falls outside existing bounds.
+    
+    Args:
+        new_category: The proposed new category name (e.g. 'Quantum_Computing').
+        description: A brief definition or justification for the category.
+        parent_category: The existing category this might fall under, or 'Uncategorized'.
+    """
+    queue = load_governance_queue()
+    item_id = f"gov_{uuid.uuid4().hex[:12]}"
+    queue.setdefault("items", []).append({
+        "item_id": item_id,
+        "type": "schema-mutation",
+        "title": f"New Schema Category: {new_category}",
+        "description": f"Definition: {description}\nParent: {parent_category}",
+        "created_at": _utc_now(),
+        "status": "pending",
+        "source": "mcp-agent",
+        "affected_ids": [],
+        "search_queries": [],
+        "affected_pages": ["SCHEMA_CATEGORIES.md"],
+    })
+    save_governance_queue(queue)
+    return f"Schema mutation proposed and logged as {item_id} for review."
 
 if __name__ == "__main__":
     mcp.run()

@@ -45,6 +45,25 @@ VALIDITY_FACTORS = {
 }
 
 
+_PURPOSE_VECTORS_CACHE = None
+
+def get_purpose_vectors() -> dict:
+    global _PURPOSE_VECTORS_CACHE
+    if _PURPOSE_VECTORS_CACHE is not None:
+        return _PURPOSE_VECTORS_CACHE
+    
+    path = get_meta_dir() / "purpose_vectors.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                _PURPOSE_VECTORS_CACHE = json.load(f)
+        except Exception:
+            _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
+    else:
+        _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
+    return _PURPOSE_VECTORS_CACHE
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -195,6 +214,17 @@ def save_evidence(data):
 
 def save_sources(data):
     _save_db_map("sources", "source_id", data)
+
+
+def save_graph_edges(edges: list[dict]):
+    if not edges: return
+    conn = get_connection()
+    with conn:
+        for edge in edges:
+            conn.execute(
+                "INSERT OR REPLACE INTO claim_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
+            )
 
 
 def save_alias_registry(data):
@@ -360,6 +390,19 @@ def score_memory_object(memory: dict, now=None) -> dict:
     confidence_score = _coerce_float(memory.get("confidence"), 0.72)
     authority_score = _coerce_float(memory.get("authority_score"), 0.65)
     importance_score = _coerce_float(memory.get("importance_score"), 0.55)
+    
+    purpose_vectors = get_purpose_vectors()
+    intent_weight = 0.0
+    if purpose_vectors.get("keywords"):
+        text = (memory.get("text") or "").lower()
+        key = (memory.get("memory_key") or "").lower()
+        for kw in purpose_vectors["keywords"]:
+            if kw.lower() in text or kw.lower() in key:
+                intent_weight = float(purpose_vectors.get("weight_boost", 0.20))
+                break
+                
+    importance_score = min(1.0, importance_score + intent_weight)
+    
     freshness_score = _freshness_score(memory, now=now)
     reinforcement_count = int(memory.get("reinforcement_count") or 0)
     reinforcement_score = min(1.0, math.log1p(max(0, reinforcement_count)) / math.log(8))
@@ -778,6 +821,7 @@ def create_change_set(
     proposed_claims = []
     proposed_evidence = []
     proposed_source_updates = []
+    proposed_edges = []
     affected_ids = []
     page_summaries = []
     page_fingerprints = []
@@ -792,6 +836,7 @@ def create_change_set(
         proposed_claims.extend(extracted["claims"])
         proposed_evidence.extend(extracted["evidence"])
         proposed_source_updates.extend(extracted["sources"])
+        proposed_edges.extend(extracted.get("edges", []))
         affected_ids.extend([record["entity_id"] for record in extracted["entities"]])
         affected_ids.extend([record["claim_id"] for record in extracted["claims"]])
         page_summaries.append(extracted["page_key"])
@@ -822,6 +867,7 @@ def create_change_set(
         "proposed_claims": proposed_claims,
         "proposed_evidence": proposed_evidence,
         "proposed_source_updates": proposed_source_updates,
+        "proposed_edges": proposed_edges,
         "write_contract": {
             "transactional": True,
             "idempotent": True,
@@ -869,6 +915,7 @@ def apply_change_set(change_set: dict) -> dict:
     save_claims(claims)
     save_evidence(evidence)
     save_sources(sources)
+    save_graph_edges(change_set.get("proposed_edges", []))
     rebuild_alias_registry()
     try:
         memory_store = rebuild_operational_memory()

@@ -301,11 +301,23 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             for evidence_record in evidence_records[-len(summary_evidence_ids):]:
                 evidence_record["supports_claim_ids"].append(summary_claim_id)
 
+    page_edges = []
+    for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", body):
+        predicate = match.group(1).strip()
+        target = match.group(2).split("|")[0].strip().replace(".md", "")
+        if target:
+            page_edges.append({"source_id": page_key, "target_id": target, "relation": predicate, "weight": 1.0, "updated_at": now})
+    for match in re.finditer(r"(?<!::\s)\[\[(.*?)\]\]", body):
+        target = match.group(1).split("|")[0].strip().replace(".md", "")
+        if target and "::" not in target:
+            page_edges.append({"source_id": page_key, "target_id": target, "relation": "mentions", "weight": 1.0, "updated_at": now})
+
     return {
         "entities": entity_records,
         "claims": claim_records,
         "evidence": evidence_records,
         "sources": source_records,
+        "edges": page_edges,
         "page_key": page_key,
         "page_type": page_type,
     }

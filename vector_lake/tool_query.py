@@ -71,8 +71,15 @@ Query: {query_str}
 Instructions:
 Read the context from {payload_path}. 
 Perform bounded logical synthesis and generate the resulting Markdown synthesis page(s).
-You MUST use your native `write_to_file` / `multi_replace_file_content` tools to write directly to `MEMORY/wiki/`.
+You MUST use your native `write_to_file` / `multi_replace_file_content` tools to write directly to `{wiki_dir}`.
 Make sure the filename starts with `Synthesis_`.
+
+[CRITICAL REQUIREMENT: GAP ANALYSIS]
+You MUST include a section titled "## 盲区与缺失度分析 (Gap Analysis)" at the end of your synthesis.
+In this section, explicitly state:
+1. What crucial evidence is MISSING to definitively answer the query.
+2. The staleness of the retrieved context.
+3. Unresolved contradictions flagged in the Operational Memory warnings.
 -----------------------
 """
     return instructions

@@ -456,8 +456,28 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     for node in nodes_dict.values():
         node.pop("_key", None)
 
+    # --- Incorporate zero-LLM edges from SQLite ---
+    try:
+        from vector_lake.db_store import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT source_id, target_id, weight FROM claim_graph_edges")
+        db_edges = cursor.fetchall()
+        for row in db_edges:
+            src = row["source_id"]
+            tgt = row["target_id"]
+            if src in nodes_dict and tgt in nodes_dict:
+                edges.append({
+                    "source": src,
+                    "target": tgt,
+                    "weight": float(row["weight"]) if row["weight"] else 1.0,
+                })
+    except Exception as e:
+        import logging
+        logging.getLogger("vector-lake-indexer").debug(f"Could not load claim_graph_edges from SQLite: {e}")
+
     edges.sort(key=lambda edge: edge["weight"], reverse=True)
-    
+
     # --- Top-K Edge Pruning to prevent Force Collapse ---
     MAX_EDGES_PER_NODE = 15
     node_edge_counts = {k: 0 for k in node_keys}

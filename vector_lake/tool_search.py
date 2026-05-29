@@ -36,6 +36,16 @@ QUERY_EXPANSION_DICT = {
 }
 
 
+def _classify_intent(query: str) -> str:
+    temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
+    entity_keywords = {"是谁", "哪里", "谁在", "who is", "where is", "公司", "人员", "关联", "图谱", "网络"}
+    for kw in temporal_keywords:
+        if kw in query.lower(): return "temporal"
+    for kw in entity_keywords:
+        if kw in query.lower(): return "entity"
+    return "general"
+
+
 def _expand_query_with_llm(query: str) -> list[str]:
     expanded_terms = set([query])
     for key, expansions in QUERY_EXPANSION_DICT.items():
@@ -238,6 +248,81 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     }
 
 
+def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
+    if not candidates or len(candidates) <= 3:
+        return candidates
+        
+    wiki_dir = str(get_wiki_dir())
+    candidate_prompts = []
+    
+    for idx, (score, node) in enumerate(candidates):
+        filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
+        snippet = ""
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+                snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:150].strip()
+            except Exception:
+                pass
+        title = node.get("title", node["_key"])
+        candidate_prompts.append(f"[{idx}] {title}: {snippet}")
+        
+    prompt = (
+        f"You are a relevance ranker. Score each of the following candidate documents from 0 to 10 "
+        f"based on its relevance to the query: '{query}'.\n"
+        f"Output ONLY a JSON dict where keys are the string IDs (e.g., '0', '1') and values are the integer scores.\n\n"
+        + "\n".join(candidate_prompts)
+    )
+    
+    try:
+        import subprocess, json
+        from vector_lake import get_extension_root
+        gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
+        
+        models_to_try = ["gemini-flash-latest"]
+        try:
+            cfg_path = get_extension_root() / "config.json"
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                cascade = cfg.get("llm", {}).get("model_cascade", [])
+                for m in cascade:
+                    if m and m not in models_to_try:
+                        models_to_try.append(m)
+        except Exception:
+            pass
+            
+        for model in models_to_try:
+            cmd_args = [gemini_exec]
+            if model and model not in ("default", ""):
+                cmd_args.extend(["-m", model])
+            cmd_args.extend(["-p", "You are an expert search engine reranker.", "--approval-mode", "yolo"])
+
+            result = subprocess.run(
+                cmd_args,
+                input=prompt.encode('utf-8'),
+                capture_output=True,
+                timeout=15
+            )
+            if result.returncode == 0:
+                stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
+                match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
+                if match:
+                    scores_dict = json.loads(match.group(0))
+                    new_scored = []
+                    for idx, (score, node) in enumerate(candidates):
+                        llm_score = float(scores_dict.get(str(idx), scores_dict.get(idx, 0)))
+                        new_score = score * 0.1 + llm_score * 10
+                        new_scored.append((new_score, node))
+                    new_scored.sort(key=lambda item: item[0], reverse=True)
+                    return new_scored
+                break
+    except Exception as e:
+        log.warning(f"LLM Reranking failed: {e}")
+        
+    return candidates
+
+
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page"):
     normalized_mode = str(mode or "page").lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
@@ -270,6 +355,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             return "System is currently busy generating the index. Please try again later."
 
     nodes = [{"_key": key, **value} for key, value in index_data.get("nodes", {}).items()]
+    intent = _classify_intent(query)
     tokens = _expand_query_with_llm(query)
     if not tokens:
         return "No valid search tokens."
@@ -289,7 +375,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             
             score = base_scores.get(node["_key"], 0.0)
             if score > 0:
-                if not include_history and node.get("status", "").lower() == "decayed":
+                if not include_history and node.get("status", "").lower() == "decayed" and intent != "temporal":
                     score *= 0.2
                 scored.append((score, node))
     else:
@@ -325,7 +411,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                         pass
 
             if score > 0:
-                if not include_history and node.get("status", "").lower() == "decayed":
+                if not include_history and node.get("status", "").lower() == "decayed" and intent != "temporal":
                     score *= 0.2
                 scored.append((score, node))
 
@@ -344,7 +430,8 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 expansion_candidates[source] = max(expansion_candidates.get(source, 0), weight)
 
         existing_keys = {node["_key"] for _, node in scored}
-        for expanded_key, expanded_weight in sorted(expansion_candidates.items(), key=lambda item: item[1], reverse=True)[:3]:
+        expansion_limit = 10 if intent == "entity" else 3
+        for expanded_key, expanded_weight in sorted(expansion_candidates.items(), key=lambda item: item[1], reverse=True)[:expansion_limit]:
             if expanded_key not in existing_keys:
                 expanded_node = index_data["nodes"].get(expanded_key)
                 if expanded_node:
@@ -352,13 +439,33 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
-    final_scored = []
+    # Phase 1: Expand candidate pool for reranking
+    candidate_pool = []
     source_count = 0
-    max_sources = int(top_k * 0.6)
+    pool_size = max(40, top_k * 3)
+    max_sources_pool = int(pool_size * 0.6)
     for score, node in scored:
         node_type = node.get("type", "").lower()
         if node_type == "source":
-            if source_count < max_sources:
+            if source_count < max_sources_pool:
+                candidate_pool.append((score, node))
+                source_count += 1
+        else:
+            candidate_pool.append((score, node))
+        if len(candidate_pool) >= pool_size:
+            break
+            
+    # Phase 2: Lightweight LLM-as-a-Judge Reranking
+    reranked = _rerank_candidates_with_llm(query, candidate_pool)
+
+    # Phase 3: Final top_k extraction
+    final_scored = []
+    source_count = 0
+    max_sources_final = int(top_k * 0.6)
+    for score, node in reranked:
+        node_type = node.get("type", "").lower()
+        if node_type == "source":
+            if source_count < max_sources_final:
                 final_scored.append((score, node))
                 source_count += 1
         else:

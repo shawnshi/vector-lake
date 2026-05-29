@@ -10,6 +10,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 - `MEMORY/wiki/claim_graph.json`：claim 级逻辑图投影。
 - `MEMORY/wiki/.meta/*.json`：canonical governance store，保存实体、断言、证据、信源、变更集和治理队列。
 - `MEMORY/wiki/.meta/operational_memory.json`：Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state`。
+- `MEMORY/purpose.md` & `purpose_vectors.json`：(V9.0) 战略意图配置，为 Agent 提供研究靶点与记忆权重加成 (Intent-Weight)。
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
 
@@ -39,7 +40,8 @@ graph LR
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
    - **API 熔断器 (Circuit Breaker)**：在 LLM 并发摄入时，通过带抖动的指数退避（Exponential Backoff with Jitter）与黑名单冷却机制，彻底消除死锁、配额枯竭与 429 限流风暴。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
-   - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**，以及 **`compile_domain_overviews.py` (PageRank 中心度预编译)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
+   - **两步思维链摄入 (V9.0 Two-Step CoT)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
+   - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
 4. **日常搜索**：使用 `python cli.py search "<keyword>"` 或 `python cli.py query "<question>"` 检索编译后的知识网络。
 5. **周期治理**：定期执行 `python cli.py review` 处理冲突队列，执行 `python cli.py doctor` 检查健康度。
 
@@ -78,12 +80,14 @@ graph LR
 
 ```text
 MEMORY/
+  purpose.md          <-- V9.0 Strategic Intent
   raw/
   wiki/
     *.md
     index.json
     claim_graph.json
     .meta/
+      purpose_vectors.json <-- V9.0 Compiled Intent Weights
       entities.json
       claims.json
       evidence.json
@@ -221,6 +225,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/watchdog_app.py` | 增量监听后台服务，队列调度，定时自愈审计 (Scheduled Auto-Lint) |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
+| `scripts/community_clustering_daemon.py` | V9.0 Louvain Community Detection |
 | `schema.md` | Wiki 与运行态记忆契约 |
 | `commands/` | 面向 Agent 的宏大业务流定义 (research/review) |
 | `agents/` | ingestor / synthesizer agent 契约 |

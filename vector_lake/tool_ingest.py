@@ -206,13 +206,21 @@ You have been invoked to ingest the following raw source file into the Vector La
 - Index Summary:
 {shared_context['index_summary']}
 
-## Instructions
-1. Analyze the Source Content.
-2. If this introduces new concepts or entities, verify against the Existing Entities Dictionary.
-3. BEFORE writing any new entity or concept page, you MUST call the `check_duplicate_entity` MCP tool. Follow its instructions exactly. If it says it's a duplicate, append to the existing Timeline instead of creating a new file.
-4. Write the `{canonical_name}` source page.
-5. Write or update any related concept/entity pages natively using your file writing tools in `MEMORY/wiki/`.
-6. Terminate.
+## Strict Two-Step CoT Ingestion (Phase 2)
+You MUST execute this task in exactly two distinct steps. DO NOT write Wiki pages before completing Step 1.
+
+### Step 1: Tension Parser & Analysis (Analysis Buffer)
+1. Deeply analyze the Source Content against the existing Context (Entities Dictionary & Index Summary).
+2. Explicitly write down your analysis to a temporary file `{tmp_dir.as_posix()}/analysis_{task_id}.json`. This file must contain:
+   - `tensions`: Array of contradictions with existing knowledge.
+   - `consensus`: Array of points that align perfectly.
+   - `unknowns`: Array of new concepts/entities that need to be created.
+3. BEFORE proceeding, you MUST call the `check_duplicate_entity` MCP tool for ANY new entities you identified.
+
+### Step 2: Canonical Writer
+1. Based strictly on the `analysis_{task_id}.json` you just created, write the `{canonical_name}` source page.
+2. Write or update the related concept/entity pages natively using your file writing tools in `MEMORY/wiki/`.
+3. Terminate only when files are successfully written.
 
 File Hash tracking: {file_hash}
 Raw Path: {filepath}

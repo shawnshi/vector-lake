@@ -14,4 +14,5 @@ Folksonomy and fine-grained labels should go into the `tags` field instead.
 - `Biomedicine`: Clinical science, pharmacology, molecular biology.
 
 ## Enforcement
-Agents generating new entities **must not** hallucinate new categories. If a concept falls outside these bounds, use `Uncategorized` and propose an addition to this document via a User `<Auth_Required>` validation.
+Agents should generally use the above categories. However, if a concept fundamentally falls outside these bounds and warrants a new domain, Agents **may** propose new categories using the `propose_schema_mutation` MCP tool. 
+Proposed categories will be logged in the governance queue for review. Once approved, this document will be automatically updated.

@@ -201,6 +201,15 @@ def scheduled_lint_loop():
                             if res.returncode != 0:
                                 log.error(f"Semantic Deduplication Daemon Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Semantic Dedup Failed", res.stderr)
+                        
+                        # V9.0 Louvain Community Clustering Daemon
+                        clustering_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/community_clustering_daemon.py")
+                        if os.path.exists(clustering_script):
+                            log.info("Running Louvain Community Clustering Daemon...")
+                            res = subprocess.run([sys.executable, clustering_script], capture_output=True, text=True)
+                            if res.returncode != 0:
+                                log.error(f"Clustering Daemon Failed: {res.stderr}")
+                                write_status("error", 0, index_queue.qsize(), "Clustering Failed", res.stderr)
                     except Exception as e:
                         log.warning(f"Failed to run auxiliary daemons: {e}")
                         write_status("error", 0, index_queue.qsize(), "Auxiliary Daemons Error", str(e))
