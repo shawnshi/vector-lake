@@ -1,0 +1,3 @@
+## 2024-05-18 - PyYAML C-Extensions for Performance
+**Learning:** In projects heavily relying on YAML parsing and dumping (like Vector Lake's Markdown frontmatter), standard PyYAML functions (`yaml.safe_load`, `yaml.dump`) are significant bottlenecks because they use pure Python implementations by default.
+**Action:** Always attempt to import and use `CSafeLoader` and `CDumper` (which use libyaml) wrapped in a `try...except ImportError` block. Pass them via the `Loader=` and `Dumper=` arguments to `yaml.load()` and `yaml.dump()` for roughly 10x speedup in parsing and 5x speedup in dumping, without breaking portability where C-extensions are unavailable.
