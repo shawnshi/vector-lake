@@ -1,0 +1,3 @@
+## 2026-05-31 - Fast YAML Parsing with PyYAML C-extensions
+**Learning:** PyYAML's `safe_load` and `dump` functions use a pure Python implementation by default which can be up to 10x slower than the C-based LibYAML extensions. Since markdown frontmatter parsing is heavily used in index generation, this is a significant bottleneck.
+**Action:** Always attempt to import `CSafeLoader` and `CDumper` from `yaml` and use them with `yaml.load(..., Loader=SafeLoader)` instead of `yaml.safe_load()`. Ensure to wrap the import in a `try...except ImportError` block to fallback safely on systems where C-extensions are uncompiled/missing.
