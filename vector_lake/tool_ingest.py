@@ -159,6 +159,14 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     tmp_dir = get_extension_root() / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     
+    # Clear previous pending entities lock to start fresh for this batch
+    pending_path = tmp_dir / "pending_entities.json"
+    if pending_path.exists():
+        try:
+            pending_path.unlink()
+        except Exception as e:
+            log.warning(f"Failed to clear pending entities: {e}")
+            
     instructions = []
     
     for filepath, file_hash in pending_files:
@@ -187,6 +195,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
             f"  YAML sources field: [\"{raw_ref}\"]"
         )
         
+        task_id = uuid.uuid4().hex[:8]
         instruction_md = f"""# Ingestion Task
 You have been invoked to ingest the following raw source file into the Vector Lake Wiki.
 
@@ -225,7 +234,6 @@ You MUST execute this task in exactly two distinct steps. DO NOT write Wiki page
 File Hash tracking: {file_hash}
 Raw Path: {filepath}
 """
-        task_id = uuid.uuid4().hex[:8]
         tmp_file = tmp_dir / f"ingest_task_{task_id}.md"
         tmp_file.write_text(instruction_md, encoding="utf-8")
         

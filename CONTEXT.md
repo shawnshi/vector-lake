@@ -126,7 +126,7 @@ $env:PYTHONUTF8='1'; python -m compileall vector_lake tests
 
 ## 5. Current Validation Baseline
 
-Last verified: 2026-05-27.
+Last verified: 2026-05-31.
 
 - Unit tests: `Ran 8 tests ... OK`
 - Compile: `python -m compileall vector_lake tests` OK
@@ -157,4 +157,6 @@ The Vector Lake system is designed for high-concurrency ingestion and graph main
 - **Autonomous Sub-Daemons**: The lint loop silently orchestrates `metadata_decay_daemon.py` (TTL rot), `sync_timeline_db.py` (SQL timeline extraction), `missing_evidence_scout.py` (dispatching intelligence tasks to governance queue), **`semantic_dedup_daemon.py`** (pairwise semantic deduplication via Gemini embeddings), **`compile_domain_overviews.py`** (PageRank centrality compilations), and the V9.0 **`community_clustering_daemon.py`** (Louvain clustering to detect low-cohesion blind spots), culminating in a daily SQLite `WAL TRUNCATE` maintenance.
 - **Strategic Intent Engine (V9.0)**: Reads `MEMORY/purpose.md` to inject `Intent-Weight` into operational memory scoring, ensuring strategic alignment during conflict resolution.
 - **Strict Two-Step CoT Ingestion (V9.0)**: Forces ingestion subagents to output an intermediate `analysis_buffer.json` (parsing tensions, consensus, unknowns) before writing Markdown, eliminating extraction omissions.
+- **Strict 7-Type Enforcement (V9.1)**: The PIEA interceptor actively strips nested/invalid prefixes (e.g., `Concept_Synthesis_` or `Entity_`) and forces LLM agents to save files using exact, canonical 7-type filenames (`vendor`, `product`, `person`, `event`, `concept`, `synthesis`, `source`). All backend algorithms are strictly aligned to this matrix.
+- **Cross-Type PIEA Deduplication (V9.1)**: `tool_piea.py` no longer segregates similarity checks by type. If an agent proposes `Vendor_Accenture` when `Concept_Accenture` already exists, it triggers a hard block and forces a timeline append, eradicating "Same Name, Multi-Type" pollution.
 - **Error Resilience**: Utilizes a global `global_task_lock` for thread safety and halts on consecutive failures to prevent cascading storms. Status telemetry and subprocess errors are emitted to `MEMORY/wiki/.meta/.watchdog_status.json`.

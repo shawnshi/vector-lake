@@ -72,7 +72,7 @@ def run_daemon():
     nodes = index_data.get("nodes", {})
     entities = {
         key: node for key, node in nodes.items()
-        if node.get("type") in ("vendor", "product", "person", "event", "concept")
+        if node.get("type") in ("vendor", "product", "person", "event", "concept", "synthesis", "source")
     }
 
     cache = load_cache()

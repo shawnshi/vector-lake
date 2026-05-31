@@ -101,7 +101,11 @@ def lint_vector_lake(auto_fix: bool = False):
                 new_filename = f"Concept_{filename}"
                 old_path = os.path.join(wiki_dir, filename)
                 new_path = os.path.join(wiki_dir, new_filename)
-                os.rename(old_path, new_path)
+                try:
+                    os.replace(old_path, new_path)
+                except Exception as e:
+                    log.error(f"Failed to rename {old_path} to {new_path}: {e}")
+                    continue
                 renamed_files[filename] = new_filename
                 all_keys.remove(filename[:-3])
                 all_keys.add(new_filename[:-3])
