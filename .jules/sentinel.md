@@ -1,0 +1,4 @@
+## 2024-06-01 - Prevent XSS in HTML string replacements
+**Vulnerability:** When replacing placeholders in HTML files with stringified JSON data, characters like `<`, `>`, and `&` in the stringified JSON were not escaped. This allowed injecting `<script>` tags which would close the containing string and execute arbitrary JavaScript.
+**Learning:** Raw string replacements to embed JSON payloads inside HTML `<script>` tags require manual HTML character escaping, otherwise the browser will parse any unescaped `<script>` tags found within the data instead of treating it as part of the stringified JSON literal.
+**Prevention:** Always escape HTML characters such as `<`, `>`, and `&` into their unicode equivalents (e.g. `\u003c`) when stringifying JSON for direct injection into a script block. Use raw strings (`r'\u003c'`) to prevent python from turning the escape sequences back into unescaped characters before stringifying.
