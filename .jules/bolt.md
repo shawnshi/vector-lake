@@ -1,0 +1,3 @@
+## 2024-06-01 - Use CDumper and CSafeLoader for PyYAML
+**Learning:** PyYAML's `yaml.safe_load` and `yaml.dump` functions use pure Python implementations by default, which can be significantly slower than their C-extension counterparts (`CSafeLoader` and `CDumper`), especially for a system like Vector Lake that heavily relies on parsing YAML frontmatter from thousands of wiki files.
+**Action:** Always attempt to import `CSafeLoader` and `CDumper` (falling back to `SafeLoader` and `Dumper` if `libyaml` is unavailable) and explicitly pass them using the `Loader` and `Dumper` arguments to `yaml.load` and `yaml.dump` to achieve a 4x-8x speedup.
