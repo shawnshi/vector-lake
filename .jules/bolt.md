@@ -1,0 +1,3 @@
+## 2024-06-02 - Fast YAML parsing
+**Learning:** Pure Python `yaml.safe_load` and `yaml.dump` are very slow compared to the LibYAML-based `CSafeLoader` and `CDumper` implementations (up to 7x faster load and 4x faster dump).
+**Action:** When parsing/dumping YAML files in high-throughput areas (like indexing/updating wiki frontmatter), use a try/except block to import `CSafeLoader` as `SafeLoader` and `CDumper` as `Dumper` from `yaml`, falling back to pure Python equivalents if LibYAML is missing. Then use `yaml.load(data, Loader=SafeLoader)` instead of `yaml.safe_load(data)` and `yaml.dump(data, Dumper=Dumper)` instead of `yaml.dump(data)`.
