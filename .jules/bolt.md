@@ -1,0 +1,3 @@
+## 2025-02-12 - [YAML Parsing Performance]
+**Learning:** PyYAML's default `yaml.safe_load` and `yaml.dump` use pure Python implementations which are extremely slow for large documents or loops (nearly 10x slower). They do not automatically use the fast C extensions (`CSafeLoader`, `CDumper`) even if `libyaml` is installed.
+**Action:** Always wrap YAML imports in a `try/except` block to attempt importing `CSafeLoader as SafeLoader, CDumper as Dumper` and fallback to the standard Python `SafeLoader`/`Dumper`. Use `yaml.load(data, Loader=SafeLoader)` instead of `yaml.safe_load` and `yaml.dump(data, Dumper=Dumper)` instead of `yaml.dump`.

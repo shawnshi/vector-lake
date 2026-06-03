@@ -2,6 +2,10 @@ import os
 import re
 import datetime
 import yaml
+try:
+    from yaml import CDumper as Dumper
+except ImportError:
+    from yaml import Dumper
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 
@@ -52,7 +56,7 @@ for target in broken_targets:
         path = os.path.join(wiki_dir, f"{target}.md")
         with open(path, "w", encoding="utf-8") as f:
             f.write("---\n")
-            yaml.dump(frontmatter, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            yaml.dump(frontmatter, f, Dumper=Dumper, allow_unicode=True, sort_keys=False, default_flow_style=False)
             f.write("---\n")
             f.write(body)
         stubs += 1

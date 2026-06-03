@@ -1,5 +1,10 @@
 import os
 import re
+import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader, CDumper as Dumper
+except ImportError:
+    from yaml import SafeLoader, Dumper
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 alias_map = {}
@@ -14,11 +19,10 @@ for f in os.listdir(wiki_dir):
             file_contents[f] = content
             
             # Find aliases: [...] or aliases: \n  - ...
-            import yaml
             if content.startswith("---"):
                 parts = content.split("---", 2)
                 if len(parts) >= 3:
-                    fm = yaml.safe_load(parts[1])
+                    fm = yaml.load(parts[1], Loader=SafeLoader)
                     if fm and "aliases" in fm:
                         aliases = fm["aliases"]
                         if isinstance(aliases, str): aliases = [aliases]
@@ -30,8 +34,6 @@ for f in os.listdir(wiki_dir):
 
 conflicts = {a: fs for a, fs in alias_map.items() if len(set(fs)) > 1}
 print(f"Found {len(conflicts)} alias conflicts.")
-
-import yaml
 
 for alias, fs in conflicts.items():
     fs = list(set(fs))
@@ -49,7 +51,7 @@ for alias, fs in conflicts.items():
             parts = content.split("---", 2)
             if len(parts) < 3: continue
             
-            fm = yaml.safe_load(parts[1])
+            fm = yaml.load(parts[1], Loader=SafeLoader)
             if fm and "aliases" in fm:
                 aliases = fm["aliases"]
                 if isinstance(aliases, str): aliases = [aliases]
@@ -59,7 +61,7 @@ for alias, fs in conflicts.items():
                     
                     with open(p, "w", encoding="utf-8") as file:
                         file.write("---\n")
-                        yaml.dump(fm, file, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                        yaml.dump(fm, file, Dumper=Dumper, allow_unicode=True, sort_keys=False, default_flow_style=False)
                         file.write("---")
                         file.write(parts[2])
                     print(f"Removed alias '{alias}' from {loser}")
