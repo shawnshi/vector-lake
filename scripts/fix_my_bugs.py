@@ -1,5 +1,9 @@
 import os
 import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader, CDumper as Dumper
+except ImportError:
+    from yaml import SafeLoader, Dumper
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 count = 0
@@ -14,7 +18,7 @@ for filename in os.listdir(wiki_dir):
         parts = content.split("---", 2)
         if len(parts) < 3: continue
         
-        fm = yaml.safe_load(parts[1])
+        fm = yaml.load(parts[1], Loader=SafeLoader)
         changed = False
         
         # Capitalize type
@@ -47,7 +51,7 @@ for filename in os.listdir(wiki_dir):
         if changed:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write("---\n")
-                yaml.dump(fm, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                yaml.dump(fm, f, Dumper=Dumper, allow_unicode=True, sort_keys=False, default_flow_style=False)
                 f.write("---")
                 f.write(parts[2])
             count += 1

@@ -1,0 +1,3 @@
+## 2023-10-26 - Use C-based YAML loaders for parsing and dumping
+**Learning:** The default `yaml.safe_load` and `yaml.dump` in `PyYAML` use a pure-Python implementation, which is very slow for large amounts of parsing (e.g. index generation of hundreds of wiki files). C-based extensions (`CSafeLoader`, `CDumper`) provide approximately 3-5x performance improvement.
+**Action:** When performing `yaml.load` or `yaml.dump`, attempt to import `CSafeLoader as SafeLoader` and `CDumper as Dumper` from `yaml`, falling back to `SafeLoader`/`Dumper` to maintain compatibility, then pass the loaders to `yaml.load(data, Loader=SafeLoader)` and `yaml.dump(data, Dumper=Dumper)` respectively.
