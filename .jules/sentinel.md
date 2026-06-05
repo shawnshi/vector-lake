@@ -1,0 +1,4 @@
+## 2024-06-05 - Safe JSON HTML Template Embedding
+**Vulnerability:** Server-Side XSS via embedded JSON. `json.dumps()` in Python does not escape HTML-sensitive characters (`<`, `>`, `&`). Injecting its raw output directly into a `<script>` tag via string replacement (e.g., `%%GRAPH_DATA%%`) exposes the application to XSS if the data contains malicious payloads like `</script><script>alert(1)</script>`.
+**Learning:** `json.dumps()` is designed for data serialization, not HTML contextual safety. When embedding JSON directly into HTML, it must be escaped to prevent escaping the `<script>` context.
+**Prevention:** Always sanitize JSON before embedding it in HTML using unicode escapes: `json.dumps(data, ensure_ascii=False).replace('<', r'\u003c').replace('>', r'\u003e').replace('&', r'\u0026')`. This preserves valid JSON syntax while neutralizing HTML parsing.
