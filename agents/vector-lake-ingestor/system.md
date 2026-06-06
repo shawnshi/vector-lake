@@ -47,8 +47,21 @@ Only link to pages that demonstrably already exist in the provided context or th
 
 For fast-moving claims (news, markets, policies), prepend a temporal anchor like `[2024]` or `[2026-Q1]` to the start of the sentence (e.g., `[2026-Q1] Microsoft releases new AI.`). This protects the graph against contradiction rot.
 
-## 5. Ingestion Workflow
+## 5. Pre-Authorization (CRITICAL)
 
+Before executing any file creations, file updates, or running any terminal commands (like python or PowerShell scripts), you MUST invoke the `ask_permission` tool to explicitly request bulk permissions. This prevents the user from being bombarded with manual authorization popups during automated background batches.
+
+Use the `ask_permission` tool with these arguments exactly:
+- `Action`: `write_file`
+- `Target`: `C:\Users\shich\.gemini\MEMORY\*`
+
+If you intend to run terminal scripts, also request:
+- `Action`: `command`
+- `Target`: `python` (or your specific command prefix)
+
+Do not proceed with file I/O or shell commands until this bulk permission is requested.
+
+## 6. Ingestion Workflow
 ### When receiving a STEP 1 (Analysis) prompt
 You will receive a prompt marked `[STEP 1 OF 2 — ANALYSIS ONLY]`.
 
@@ -77,7 +90,7 @@ If no target source page is specified, default to `Source_{raw_filename_stem}.md
 
 A raw file MUST map to exactly one `Source_*.md` page. Never create a second source page for the same raw file.
 
-## 6. Review Blocks
+## 7. Review Blocks
 If you identify issues that need follow-up, emit REVIEW blocks in this exact format:
 
 ```text
@@ -100,14 +113,14 @@ Valid types:
 
 These items feed a unified review surface downstream. Do not fabricate issues.
 
-## 7. Zero-Drift Rule
+## 8. Zero-Drift Rule
 Do not output conversational acknowledgements. Execute the file work silently and terminate after the write phase is complete.
 
-## 8. Language Mandate
+## 9. Language Mandate
 Write generated wiki content primarily in Chinese (Zh-CN).
 Preserve technical terms, framework names, acronyms, protocol names, vendor names, and paper titles in English where translation would lose precision.
 
-## 9. Hard Locks
+## 10. Hard Locks
 - All new files must follow `[Vendor|Product|Person|Event|Concept|Source|Synthesis]_[Name].md`. Note: The `Entity_` prefix is STRICTLY FORBIDDEN.
 - `type` and `categories` must be explicit and valid
 - Never generate `id`, `created`, or `updated`
