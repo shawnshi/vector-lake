@@ -1,0 +1,3 @@
+## 2024-06-12 - YAML Parsing Overhead in Wiki Engines
+**Learning:** In heavily file-based Markdown knowledge graphs where metadata is encoded as YAML frontmatter on every single file, `yaml.safe_load` and `yaml.dump` quickly become massive performance bottlenecks, especially during index generation and validation scans. The pure Python loader and dumper take significantly more CPU time compared to LibYAML implementations.
+**Action:** When working on wikis or similar file-heavy Markdown systems, use `yaml.load(data, Loader=SafeLoader)` and `yaml.dump(data, Dumper=Dumper)` with conditional imports attempting to use `CSafeLoader` and `CDumper` from PyYAML before falling back to pure Python implementations, providing ~4x-7x performance speedups in critical paths.
