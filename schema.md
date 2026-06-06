@@ -18,14 +18,18 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   ---
   id: "YYYYMMDD_xxxxxx"  # date + 6-char random alphanumeric
   title: "Page Title"
+  aliases: ["Alias1", "Alias2"] # REQUIRED: Known synonyms or obsolete names
   type: "vendor | product | person | event | concept | source | synthesis"
   domain: "Medical_IT"  # REQUIRED: The macro-domain (e.g., Medical_IT, Architecture)
   topic_cluster: "General" # REQUIRED: The specific sub-topic or room
   status: "Active" # REQUIRED: "Active", "Deprecated", "Archived", or "Contested"
   epistemic-status: "seed | sprouting | evergreen" # Note: use `status` for deprecation
   ttl: 365 # Optional: Semantic half-life in days (e.g., 90 for fast-changing sources, 1825 for concepts)
-  memory_type: "fact | preference | decision | task_state" # Optional: overrides deterministic claim classification
-  memory_key: "stable_runtime_key" # Optional: groups preferences, decisions, and task state for conflict resolution
+  parents: [] # NEW: Directed edge to parent entities (e.g. parent company, superset concept)
+  children: [] # NEW: Directed edge to child entities (e.g. subsidiaries, subsets)
+  competes_with: [] # NEW: Strategic conflict edges
+  memory_type: "fact | preference | decision | task_state" # Optional
+  memory_key: "stable_runtime_key" # Optional
   categories: ["System_Architecture"] # MUST be from SCHEMA_CATEGORIES.md
   tags: ["tag1", "tag2"]
   created: "YYYY-MM-DD"

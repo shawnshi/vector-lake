@@ -149,6 +149,17 @@ def doctor_vector_lake() -> str:
     return tools.doctor_vector_lake()
 
 @mcp.tool()
+def rename_entity(old_name: str, new_name: str) -> str:
+    """Safely renames a Vector Lake entity and automatically updates all global graph links.
+    
+    Args:
+        old_name: Current name of the entity (e.g. 'Concept_Old-Name.md').
+        new_name: New name for the entity (e.g. 'Concept_New-Name.md').
+    """
+    from vector_lake.tool_rename import rename_vector_lake_entity
+    return rename_vector_lake_entity(old_name, new_name)
+
+@mcp.tool()
 def trace_vector_lake(query_or_id: str) -> str:
     """Show provenance trace for a query or identifier.
     

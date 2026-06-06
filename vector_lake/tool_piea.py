@@ -97,8 +97,14 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
         existing_norm = _normalize_memory_key(existing_title)
         existing_type = node.get("type", "unknown")
 
-        # 1. Hard Normalization Match
-        if candidate_norm == existing_norm and candidate_norm != "general":
+        # 1. Hard Normalization Match (Title or Aliases)
+        aliases = node.get("aliases", [])
+        if isinstance(aliases, list):
+            alias_norms = [_normalize_memory_key(a) for a in aliases]
+        else:
+            alias_norms = []
+            
+        if candidate_norm != "general" and (candidate_norm == existing_norm or candidate_norm in alias_norms):
             instruction = f"Do NOT create a new file. Append your content to the Timeline of {key}.md instead."
             if existing_type != candidate_type:
                 instruction += f" Note: This entity is already registered as a '{existing_type}'. Do NOT create a '{candidate_type}' variant."
@@ -181,9 +187,8 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
                     })
 
             # If not found in index OR pending, register it as pending for other workers
-            safe_title = re.sub(r'[\\/*?:"<>|]', "", candidate_title).strip()
-            type_capitalized = candidate_type.capitalize()
-            new_key = f"{type_capitalized}_{safe_title.replace(' ', '-').replace('_', '-')}"
+            from vector_lake.wiki_utils import normalize_entity_name
+            new_key = normalize_entity_name(f"{type_capitalized}_{candidate_title}")
             
             pending_data[new_key] = {
                 "title": candidate_title,
@@ -203,9 +208,8 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
         log.error(f"Error accessing pending entities lock: {e}")
 
     # Fallback return if lock fails
-    safe_title = re.sub(r'[\\/*?:"<>|]', "", candidate_title).strip()
-    type_capitalized = candidate_type.capitalize()
-    new_key = f"{type_capitalized}_{safe_title.replace(' ', '-').replace('_', '-')}"
+    from vector_lake.wiki_utils import normalize_entity_name
+    new_key = normalize_entity_name(f"{candidate_type.capitalize()}_{candidate_title}")
     return json.dumps({
         "is_duplicate": False, 
         "instruction": f"Safe to create new entity. You MUST use the exact filename: {new_key}.md"
