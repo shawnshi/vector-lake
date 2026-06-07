@@ -8,6 +8,11 @@ import uuid
 from pathlib import Path
 
 import yaml
+try:
+    from yaml import CSafeLoader as SafeLoader, CDumper as Dumper
+except ImportError:
+    from yaml import SafeLoader, Dumper
+
 from vector_lake import get_extension_root
 
 
@@ -137,7 +142,7 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     try:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
+        frontmatter = yaml.load(match.group(1), Loader=SafeLoader) or {}
     except yaml.YAMLError:
         raise
 
@@ -170,7 +175,7 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str):
     filename = Path(path).name
     validate_wiki_filename(filename)
 
-    yaml_block = yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    yaml_block = yaml.dump(frontmatter, Dumper=Dumper, allow_unicode=True, default_flow_style=False, sort_keys=False)
     atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}")
 
 
