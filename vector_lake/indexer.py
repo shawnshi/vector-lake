@@ -11,6 +11,7 @@ from filelock import FileLock, Timeout
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir
+from vector_lake.yaml_utils import load_yaml
 
 try:
     import networkx as nx
@@ -268,7 +269,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = load_yaml(fm_str) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
