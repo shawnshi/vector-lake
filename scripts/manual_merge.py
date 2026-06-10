@@ -14,7 +14,7 @@ def merge(winner_name, loser_name):
         print(f"Skipping: Loser {loser_name} not found")
         return
         
-    with open(winner_path, "r", encoding="utf-8") as f:
+    with open(winner_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
         
     parts = content.split("---", 2)

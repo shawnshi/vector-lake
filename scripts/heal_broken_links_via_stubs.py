@@ -13,7 +13,7 @@ for filename in os.listdir(wiki_dir):
     if not filename.endswith(".md"): continue
     filepath = os.path.join(wiki_dir, filename)
     try:
-        with open(filepath, "r", encoding="utf-8") as handle:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as handle:
             content = handle.read()
             for match in re.finditer(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]", content):
                 raw_target = match.group(1).strip().replace(".md", "")

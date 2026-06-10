@@ -211,7 +211,8 @@ def _write_json_payload(output_path: str, payload: dict):
         with FileLock(lock_path, timeout=15):
             temp_path = output_path + ".tmp"
             with open(temp_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                import datetime
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), default=lambda o: o.isoformat() if isinstance(o, (datetime.date, datetime.datetime)) else str(o))
             try:
                 try:
                     os.replace(temp_path, output_path)

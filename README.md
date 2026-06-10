@@ -43,6 +43,13 @@ graph LR
    - **两步思维链摄入 (V9.0 Two-Step CoT)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
    - **跨类型 PIEA 与强制格式漏斗 (V9.1 Cross-Type PIEA & Naming Funnel)**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
    - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
+
+### 🔌 V8.0 Antigravity Orchestrator 深度集成
+
+在最新的 V8.0 架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
+1. **Query_Vector_Lake 探针**：所有微角色 (Micro-Personas) 只要在 Python 编排器中注册了 `tools=["Query_Vector_Lake"]`，在多步推演时都会自动暂停并向图谱核实现有事实，打破了大模型的“信息孤岛”幻觉。
+2. **Dream Cycle 梦境联通**：系统的夜间清洗引擎 (`mentat-dream-cycle`) 现已被设定为每日凌晨 3 点 Cron 守护进程。提取日间短期记忆 (`hot_facts.md`) 时，系统强制利用 `Query_Vector_Lake` 探针查询重叠度，决定是【合并 Merge】还是【新建 Create】，从物理层斩断了垃圾增量。
+
 4. **日常搜索**：使用 `python cli.py search "<keyword>"` 或 `python cli.py query "<question>"` 检索编译后的知识网络。
 5. **周期治理**：定期执行 `python cli.py review` 处理冲突队列，执行 `python cli.py doctor` 检查健康度。
 

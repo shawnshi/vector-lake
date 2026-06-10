@@ -73,6 +73,40 @@ class WikiIndexHandler(FileSystemEventHandler):
         self.queue_path(event.dest_path)
 
 
+class DiaryWatchdogHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.last_triggered = {}
+        self.lock = threading.Lock()
+
+    def handle_event(self, event):
+        if event.is_directory:
+            return
+        filepath = event.src_path
+        filename = os.path.basename(filepath)
+        if not filename.endswith(".md"):
+            return
+
+        now = time.time()
+        with self.lock:
+            if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
+                return
+            self.last_triggered[filepath] = now
+
+        log.info(f"Diary modified: {filename}. Triggering sync_focus.py...")
+        import subprocess
+        import sys
+        try:
+            sync_script = os.path.expanduser("~/.gemini/scripts/sync_focus.py")
+            if os.path.exists(sync_script):
+                subprocess.run([sys.executable, sync_script], capture_output=True)
+        except Exception as e:
+            log.error(f"Failed to trigger sync_focus.py: {e}")
+
+    def on_created(self, event): self.handle_event(event)
+    def on_modified(self, event): self.handle_event(event)
+
+
+
 from vector_lake.watchdog_status import write_status
 
 def index_worker_loop():
@@ -254,6 +288,12 @@ def start_watchdog():
         wiki_handler = WikiIndexHandler()
         observer.schedule(wiki_handler, wiki_dir, recursive=False)
         log.info(f"Wiki AST monitor active on directory: {wiki_dir}")
+
+    diary_dir = os.path.expanduser("~/.gemini/MEMORY/raw/privacy/Diary")
+    if os.path.exists(diary_dir):
+        diary_handler = DiaryWatchdogHandler()
+        observer.schedule(diary_handler, diary_dir, recursive=False)
+        log.info(f"Diary monitor active on directory: {diary_dir}")
 
     observer.start()
     log.info("Vector Lake Watchdog Agent is now running in Background Index/Lint mode.")
