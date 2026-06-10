@@ -172,7 +172,10 @@ def visualize_vector_lake():
 
     with open(template_path, "r", encoding="utf-8") as handle:
         html = handle.read()
-    html = html.replace("%%GRAPH_DATA%%", json.dumps(graph_data, ensure_ascii=False))
+
+    # Sentinel: Safely serialize JSON for injection into a <script> block to prevent Server-Side XSS
+    safe_json = json.dumps(graph_data, ensure_ascii=False).replace('<', r'\u003c').replace('>', r'\u003e').replace('&', r'\u0026')
+    html = html.replace("%%GRAPH_DATA%%", safe_json)
     html = html.replace("%%MEMORY_BASE_PATH%%", f"file:///{memory_dir.replace(os.sep, '/')}/")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
