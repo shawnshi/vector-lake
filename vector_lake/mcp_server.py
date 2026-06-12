@@ -202,8 +202,8 @@ def finalize_ingest(files_written_str: str, raw_files_processed_json: str) -> st
     """Finalize ingestion batch after subagents have finished.
     
     Args:
-        files_written_str: Comma-separated list of absolute paths for all modified wiki files.
-        raw_files_processed_json: JSON string mapping raw file paths to their hashes, e.g. '{"/path/to/raw.md": "hash123"}'.
+        files_written_str: JSON string array of objects containing 'filename' and 'content', e.g. '[{"filename": "...", "content": "..."}]'.
+        raw_files_processed_json: JSON string with keys 'filepath' and 'hash', e.g. '{"filepath": "/path/to/raw.md", "hash": "hash123"}'.
     """
     return tools.finalize_ingest(files_written_str, raw_files_processed_json)
 
