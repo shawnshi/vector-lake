@@ -1,0 +1,3 @@
+## 2024-06-12 - [Optimize YAML Parsing]
+**Learning:** Vector Lake's architecture relies heavily on Markdown files where metadata is encoded as YAML frontmatter on every single file, making YAML parsing and dumping a critical performance path during index generation and validation scans. The default `yaml.safe_load` in pure Python is relatively slow when parsing thousands of files.
+**Action:** Use `yaml.load(data, Loader=SafeLoader)` after attempting to import `CSafeLoader as SafeLoader` from `yaml` to fall back gracefully to the pure Python implementation if C extensions are unavailable. Create a central utility module (`vector_lake/yaml_utils.py`) to manage this and apply it across the codebase (`wiki_utils.py`, `indexer.py`).
