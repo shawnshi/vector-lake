@@ -1,6 +1,6 @@
----
+﻿---
 name: research
-description: Autonomously scan graph gaps and the governance queue to formulate web research directives.
+description: 'Autonomously scan graph gaps and the governance queue to formulate web research directives.'
 ---
 Please use the `trigger_autonomous_research` MCP tool from the `vector-lake-mcp` server to scan the graph topology and governance queue for knowledge gaps.
 

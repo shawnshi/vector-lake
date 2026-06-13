@@ -1,6 +1,6 @@
----
+﻿---
 name: query
-description: Deep reasoning with budget-controlled context over the Logic Lake.
+description: 'Deep reasoning with budget-controlled context over the Logic Lake.'
 ---
 Please use the `query_logic_lake` MCP tool from the `vector-lake-mcp` server for deep reasoning.
 Provide the query string to the `query_str` parameter.

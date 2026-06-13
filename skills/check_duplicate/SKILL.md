@@ -1,6 +1,6 @@
----
+﻿---
 name: check_duplicate
-description: Check if an entity or concept already exists in the graph to prevent duplicates before creation.
+description: 'Check if an entity or concept already exists in the graph to prevent duplicates before creation.'
 ---
 Please use the `check_duplicate_entity` MCP tool from the `vector-lake-mcp` server.
 

@@ -44,6 +44,17 @@ def _normalize_memory_key(value: str) -> str:
     return normalized[:96] or "general"
 
 
+def strip_name(name: str) -> str:
+    name = name.replace('.md', '')
+    for prefix in ['Concept_', 'Vendor_', 'Person_', 'Product_', 'Event_', 'Synthesis_', 'Source_']:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    for w in ['系统', '架构', '模型', '法则', '理论', '平台', 'System', 'Model', 'Theory', 'Platform', '与', '的']:
+        name = name.replace(w, '')
+    name = re.sub(r'[\s_\-\(\)]+', '', name)
+    return name.lower()
+
+
 def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_summary: str = "") -> str:
     """PIEA Hook: Check if an entity or concept already exists in the graph using hard normalization and cosine similarity.
     
@@ -101,10 +112,21 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
         aliases = node.get("aliases", [])
         if isinstance(aliases, list):
             alias_norms = [_normalize_memory_key(a) for a in aliases]
+            alias_stripped = [strip_name(a) for a in aliases]
         else:
             alias_norms = []
+            alias_stripped = []
             
+        candidate_stripped = strip_name(candidate_title)
+        existing_stripped = strip_name(existing_title)
+            
+        is_hard_match = False
         if candidate_norm != "general" and (candidate_norm == existing_norm or candidate_norm in alias_norms):
+            is_hard_match = True
+        elif len(candidate_stripped) > 2 and (candidate_stripped == existing_stripped or candidate_stripped in alias_stripped):
+            is_hard_match = True
+            
+        if is_hard_match:
             instruction = f"Do NOT create a new file. Append your content to the Timeline of {key}.md instead."
             if existing_type != candidate_type:
                 instruction += f" Note: This entity is already registered as a '{existing_type}'. Do NOT create a '{candidate_type}' variant."
@@ -157,7 +179,16 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
                 existing_type = node.get("type", "unknown")
                 
                 # 1. Hard Normalization Match (Pending)
+                candidate_stripped = strip_name(candidate_title)
+                existing_stripped = strip_name(existing_title)
+                
+                is_hard_match = False
                 if candidate_norm == existing_norm and candidate_norm != "general":
+                    is_hard_match = True
+                elif len(candidate_stripped) > 2 and candidate_stripped == existing_stripped:
+                    is_hard_match = True
+                    
+                if is_hard_match:
                     instruction = f"Do NOT create a new file. Append your content to the Timeline of {key}.md instead (currently being built by another worker)."
                     if existing_type != candidate_type:
                         instruction += f" Note: This entity is being created as a '{existing_type}'. Do NOT create a '{candidate_type}' variant."

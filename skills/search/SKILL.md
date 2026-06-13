@@ -1,6 +1,6 @@
----
+﻿---
 name: search
-description: Search the Vector Lake index for knowledge graph nodes and entities.
+description: 'Search the Vector Lake index for knowledge graph nodes and entities.'
 ---
 Please use the `search_vector_lake` MCP tool from the `vector-lake-mcp` server to query the index.
 Provide the semantic query string to the `query` parameter.

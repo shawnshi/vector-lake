@@ -1,5 +1,5 @@
----
+﻿---
 name: audit
-description: Synthesize graph topology insights into the unified review surface.
+description: 'Synthesize graph topology insights into the unified review surface.'
 ---
 Please use the `trigger_audit_graph` MCP tool from the `vector-lake-mcp` server to synthesize graph topology insights.

@@ -1,6 +1,6 @@
----
+﻿---
 name: memory_update
-description: Safely persist an operational memory (preference, decision, fact, task_state) into the Vector Lake knowledge graph.
+description: 'Safely persist an operational memory (preference, decision, fact, task_state) into the Vector Lake knowledge graph.'
 ---
 Please use the `update_operational_memory` MCP tool from the `vector-lake-mcp` server.
 

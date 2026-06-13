@@ -1,6 +1,6 @@
----
+﻿---
 name: review
-description: Inspect the unified V8 governance queue for contradictions, topology gaps, merge suggestions, and knowledge debt items.
+description: 'Inspect the unified V8 governance queue for contradictions, topology gaps, merge suggestions, and knowledge debt items.'
 ---
 Please use the `review_governance_list` MCP tool from the `vector-lake-mcp` server to list all pending review items.
 
