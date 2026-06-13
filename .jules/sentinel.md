@@ -1,0 +1,4 @@
+## 2024-05-25 - Prevent Server-Side XSS in JSON-to-HTML serialization
+**Vulnerability:** A Server-Side Cross-Site Scripting (XSS) vulnerability was found where `json.dumps()` output was interpolated directly into an HTML template (`html.replace("%%GRAPH_DATA%%", json.dumps(...))`). If a node or claim title contained malicious tags (e.g., `</script>`), it would close the enclosing `<script>` block and execute arbitrary code.
+**Learning:** `json.dumps()` does not inherently escape HTML characters like `<`, `>`, or `&`. When injecting JSON directly into an HTML document, these characters must be manually escaped to prevent the browser from interpreting them as HTML tags.
+**Prevention:** Always serialize JSON safely when rendering it inside HTML `<script>` tags by chaining replacements for dangerous characters (`.replace("<", r"\u003c")`) and setting `ensure_ascii=False`.
