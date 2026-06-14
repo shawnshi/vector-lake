@@ -1,5 +1,8 @@
 import os
-import yaml
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 
@@ -18,7 +21,7 @@ def merge(winner_name, loser_name):
         content = f.read()
         
     parts = content.split("---", 2)
-    fm = yaml.safe_load(parts[1])
+    fm = load_yaml(parts[1])
     
     # Ensure aliases list exists
     if "aliases" not in fm or fm["aliases"] is None:
@@ -32,7 +35,7 @@ def merge(winner_name, loser_name):
         
     with open(winner_path, "w", encoding="utf-8") as f:
         f.write("---\n")
-        yaml.dump(fm, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        dump_yaml(fm, stream=f, allow_unicode=True, sort_keys=False, default_flow_style=False)
         f.write("---")
         f.write(parts[2])
         

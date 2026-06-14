@@ -1,0 +1,3 @@
+## 2024-06-14 - LibYAML parsing vs pure Python parsing
+**Learning:** Vector Lake's architecture relies heavily on Markdown files where metadata is encoded as YAML frontmatter on every single file, making YAML parsing and dumping a critical performance path during index generation and validation scans. The pure Python `SafeLoader` and `SafeDumper` are significantly slower than the LibYAML C extensions.
+**Action:** Always import and use the helper functions `load_yaml` and `dump_yaml` from `vector_lake.yaml_utils`, which automatically handle the performance fallback between fast LibYAML C extensions (`CSafeLoader`, `CSafeDumper`) and pure Python implementations.

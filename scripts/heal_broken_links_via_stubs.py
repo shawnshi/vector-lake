@@ -1,7 +1,10 @@
 import os
 import re
 import datetime
-import yaml
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from vector_lake.yaml_utils import dump_yaml
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 
@@ -52,7 +55,7 @@ for target in broken_targets:
         path = os.path.join(wiki_dir, f"{target}.md")
         with open(path, "w", encoding="utf-8") as f:
             f.write("---\n")
-            yaml.dump(frontmatter, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            dump_yaml(frontmatter, stream=f, allow_unicode=True, sort_keys=False, default_flow_style=False)
             f.write("---\n")
             f.write(body)
         stubs += 1
