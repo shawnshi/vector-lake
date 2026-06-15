@@ -7,7 +7,7 @@ import string
 import uuid
 from pathlib import Path
 
-import yaml
+from vector_lake.yaml_utils import load_yaml, dump_yaml, YAMLError
 from vector_lake import get_extension_root
 
 
@@ -137,8 +137,8 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     try:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
-    except yaml.YAMLError:
+        frontmatter = load_yaml(match.group(1)) or {}
+    except YAMLError:
         raise
 
     if not isinstance(frontmatter, dict):
@@ -170,7 +170,7 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str):
     filename = Path(path).name
     validate_wiki_filename(filename)
 
-    yaml_block = yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    yaml_block = dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
     atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}")
 
 

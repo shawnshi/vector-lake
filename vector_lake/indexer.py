@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-import yaml
+from vector_lake.yaml_utils import load_yaml, YAMLError
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -269,7 +269,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = load_yaml(fm_str) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
@@ -616,7 +616,7 @@ def generate_index():
         node_key = filename[:-3]
         try:
             node_data = _parse_wiki_node(filepath, node_key)
-        except yaml.YAMLError as e:
+        except YAMLError as e:
             index_data["error_log"].append({"file": filename, "error": str(e)})
             log.warning(f"YAML Error in {filename}, suppressing to error_log.")
             continue
@@ -728,7 +728,7 @@ def update_index_items(filenames: list[str]):
                         else:
                             try:
                                 node_data = _parse_wiki_node(filepath, node_key)
-                            except yaml.YAMLError as e:
+                            except YAMLError as e:
                                 index_data["error_log"].append({"file": filename, "error": str(e)})
                                 log.warning(f"YAML Error in {filename} during partial update.")
                                 node_data = None
