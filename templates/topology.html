@@ -226,6 +226,16 @@
             return neighbors[a] && neighbors[a].has(b);
         }
 
+        function escapeHTML(str) {
+            if (str === undefined || str === null) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
         function syncActiveGroups() {
             activeGroups.clear();
             currentGraph().nodes.forEach(node => activeGroups.add(node.group || 'Unknown'));
@@ -245,7 +255,7 @@
                 const label = document.createElement('label');
                 label.className = 'filter-checkbox';
                 const checked = activeGroups.has(group) ? 'checked' : '';
-                label.innerHTML = `<input type="checkbox" value="${group}" ${checked}> ${group}`;
+                label.innerHTML = `<input type="checkbox" value="${escapeHTML(group)}" ${checked}> ${escapeHTML(group)}`;
                 label.querySelector('input').addEventListener('change', (event) => {
                     if (event.target.checked) activeGroups.add(group);
                     else activeGroups.delete(group);
@@ -489,7 +499,7 @@
             Graph.cameraPosition({ x: targetX * ratio, y: targetY * ratio, z: targetZ * ratio }, lookAtPos, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${encodeURI(href)}" target="_blank">${escapeHTML(node.name || node.id)}</a>` : escapeHTML(node.name || node.id);
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
 
