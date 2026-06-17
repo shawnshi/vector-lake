@@ -1,0 +1,3 @@
+## 2024-05-18 - Optimized YAML Parsing/Dumping
+**Learning:** Pure Python YAML parsing (`yaml.safe_load`) and dumping (`yaml.dump`) are significant performance bottlenecks during index generation and validation scans for markdown files with YAML frontmatter. LibYAML C extensions (`CSafeLoader`, `CSafeDumper`) offer an 80%+ performance improvement, but they might not be available in all environments.
+**Action:** Always import and use the helper functions `load_yaml` and `dump_yaml` from `vector_lake.yaml_utils`, which automatically handle the performance fallback between fast LibYAML C extensions and pure Python implementations without risking portability issues.
