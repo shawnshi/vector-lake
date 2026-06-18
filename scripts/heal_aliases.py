@@ -15,10 +15,11 @@ for f in os.listdir(wiki_dir):
             
             # Find aliases: [...] or aliases: \n  - ...
             import yaml
+            from vector_lake.yaml_utils import load_yaml, dump_yaml
             if content.startswith("---"):
                 parts = content.split("---", 2)
                 if len(parts) >= 3:
-                    fm = yaml.safe_load(parts[1])
+                    fm = load_yaml(parts[1])
                     if fm and "aliases" in fm:
                         aliases = fm["aliases"]
                         if isinstance(aliases, str): aliases = [aliases]
@@ -49,7 +50,7 @@ for alias, fs in conflicts.items():
             parts = content.split("---", 2)
             if len(parts) < 3: continue
             
-            fm = yaml.safe_load(parts[1])
+            fm = load_yaml(parts[1])
             if fm and "aliases" in fm:
                 aliases = fm["aliases"]
                 if isinstance(aliases, str): aliases = [aliases]
@@ -59,7 +60,7 @@ for alias, fs in conflicts.items():
                     
                     with open(p, "w", encoding="utf-8") as file:
                         file.write("---\n")
-                        yaml.dump(fm, file, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                        dump_yaml(fm, file, allow_unicode=True, sort_keys=False, default_flow_style=False)
                         file.write("---")
                         file.write(parts[2])
                     print(f"Removed alias '{alias}' from {loser}")
