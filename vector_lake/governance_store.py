@@ -1010,7 +1010,9 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                         
                         if left_path and right_path and left_path != right_path and os.path.exists(script_path):
                             log.info(f"Triggering LLM semantic merge: {left_name} <- {right_name}")
-                            subprocess.run([sys.executable, script_path, left_path, right_path])
+                            env = os.environ.copy()
+                            env["PYTHONIOENCODING"] = "utf-8"
+                            subprocess.run([sys.executable, script_path, left_path, right_path], env=env)
 
                     # Update the alias registry to map right to left
                     registry = load_alias_registry()

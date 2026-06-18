@@ -102,9 +102,14 @@ def delete_source(raw_path: str, dry_run: bool = False) -> str:
         except Exception as e:
             log.warning(f"Failed to delete raw source {raw_path}: {e}")
 
-    indexer.generate_index()
+    from vector_lake import get_extension_root
+    tmp_dir = get_extension_root() / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with open(tmp_dir / "flag_reindex.lock", "w") as f:
+        f.write("1")
+        
     lines.append("")
-    lines.append(f"Executed: raw_deleted={raw_deleted}, wiki_deleted={deleted}, wiki_updated={updated}. Index rebuilt.")
+    lines.append(f"Executed: raw_deleted={raw_deleted}, wiki_deleted={deleted}, wiki_updated={updated}. Async index rebuild scheduled.")
     if failures:
         lines.append("Warnings:")
         for failure in failures:

@@ -348,6 +348,18 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_val
 
     filename = path.name
     validate_wiki_filename(filename)
+    
+    if filename.startswith("Synthesis_STORM_") and not skip_validation:
+        required_headers = [
+            "## 1. Top 5 Key Findings",
+            "## 2. The Contradiction Map",
+            "## 3. Actionable Insights",
+            "## 4. Multi-Perspective Raw Scan",
+            "## 5. Peer Review"
+        ]
+        for header in required_headers:
+            if header not in body:
+                raise SafeWriteError(f"STORM Synthesis Structural Violation: The file {filename} is missing mandatory H2 section '{header}'. Please strictly follow the references/storm_report_template.md structure.")
     yaml_block = yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
     backup_file(path)
     atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}")
@@ -372,7 +384,7 @@ def sanitize_wiki_node(filepath: str | Path):
     if not frontmatter.get("id"):
         frontmatter["id"] = f"{today}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
     frontmatter["updated"] = today
-    write_markdown_file(filepath, frontmatter, body, skip_validation=True)
+    write_markdown_file(filepath, frontmatter, body, skip_validation=False)
 
 
 class SafeWriteError(Exception):

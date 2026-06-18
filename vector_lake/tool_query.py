@@ -2,9 +2,6 @@ import datetime
 import logging
 import os
 import re
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
 
 from vector_lake import governance_store
 from vector_lake import indexer
@@ -45,8 +42,11 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
     tmp_dir = get_extension_root() / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create a unique hash for this query
-    query_hash = hashlib.md5(query_str.encode("utf-8")).hexdigest()[:8]
+    # Create a unique hash for this query with anti-collision
+    import time
+    import uuid
+    unique_str = f"{query_str}_{time.time()}_{uuid.uuid4().hex}"
+    query_hash = hashlib.md5(unique_str.encode("utf-8")).hexdigest()[:12]
     payload_path = tmp_dir / f"query_context_{query_hash}.md"
     
     with open(payload_path, "w", encoding="utf-8") as f:
@@ -78,19 +78,36 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
     
     valid_files = set()
     for filename in changed_node_files:
-        if not filename.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")):
-            log.warning(f"Ignoring non-wiki file: {filename}")
-            continue
+        # P1-3: Dynamic Ontology Prefix Checking
+        prefix = filename.split('_')[0] + "_" if "_" in filename else ""
+        if not prefix or not prefix[0].isupper() or not filename.endswith(".md"):
+            log.warning(f"File {filename} missing standard prefix. Treating as Orphan.")
+            new_filename = f"Orphan_{filename}" if not filename.startswith("Orphan_") else filename
+            if filename != new_filename and os.path.exists(os.path.join(wiki_dir, filename)):
+                os.rename(os.path.join(wiki_dir, filename), os.path.join(wiki_dir, new_filename))
+                filename = new_filename
+        
         file_path = os.path.join(wiki_dir, filename)
         if os.path.exists(file_path):
+            # P1-2: Quality Gate for Gap Analysis
+            if filename.startswith("Synthesis_"):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "盲区与缺失度分析" not in content and "Gap Analysis" not in content:
+                    os.remove(file_path)
+                    raise ValueError(f"VALIDATION_FAIL: {filename} is missing mandatory '盲区与缺失度分析' (Gap Analysis) section. Synthesis rejected.")
+                    
             valid_files.add(filename)
             sanitize_wiki_node(file_path)
             
     if valid_files:
-        indexer.generate_index()
+        # P0-1: Async Indexing Signal
+        tmp_dir = get_extension_root() / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        with open(tmp_dir / "flag_reindex.lock", "w") as f:
+            f.write("1")
+            
         stubs_created = _generate_stubs_for_broken_links(wiki_dir, valid_files)
-        if stubs_created:
-            indexer.generate_index()
         change_set = governance_store.sync_pages_to_canonical(
             [os.path.join(wiki_dir, filename) for filename in valid_files],
             origin="query",
@@ -117,6 +134,10 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
                 content = handle.read()
         except Exception:
             continue
+
+        # P1-1: Pre-strip code blocks to avoid fragile stubbing
+        content = re.sub(r'```.*?```', '', content, flags=re.DOTALL)
+        content = re.sub(r'`.*?`', '', content)
 
         for match in re.finditer(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]", content):
             raw_target = match.group(1).strip().replace(".md", "")

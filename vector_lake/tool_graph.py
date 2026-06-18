@@ -131,9 +131,11 @@ def _build_graph_payload(index_data: dict, claim_graph_data: dict | None = None)
 def visualize_vector_lake():
     bootstrap = governance_store.ensure_canonical_store_populated()
     if bootstrap.get("bootstrapped"):
-        indexer.generate_index()
-    else:
-        indexer.refresh_graph_topology_if_dirty()
+        from vector_lake import get_extension_root
+        tmp_dir = get_extension_root() / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        with open(tmp_dir / "flag_reindex.lock", "w") as f:
+            f.write("1")
 
     extension_root = get_extension_root()
     memory_dir = str(get_memory_dir())
@@ -187,7 +189,8 @@ def visualize_vector_lake():
 
 
 def audit_graph() -> str:
-    indexer.refresh_graph_topology_if_dirty()
+    # Removed synchronous refresh_graph_topology_if_dirty()
+
 
     index_path = str(get_index_path())
     if not os.path.exists(index_path):

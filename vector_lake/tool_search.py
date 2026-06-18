@@ -55,6 +55,7 @@ def _expand_query_with_llm(query: str) -> list[str]:
     try:
         import subprocess, json
         from vector_lake import get_extension_root
+        
         models_to_try = ["gemini-flash-latest"]
         try:
             cfg_path = get_extension_root() / "config.json"
@@ -67,7 +68,7 @@ def _expand_query_with_llm(query: str) -> list[str]:
         except Exception:
             pass
             
-        prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a space-separated list of keywords. Query: '{query}'"
+        prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a JSON array of strings. Query: '{query}'"
         gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
         
         for model in models_to_try:
@@ -76,36 +77,58 @@ def _expand_query_with_llm(query: str) -> list[str]:
                 cmd_args.extend(["-m", model])
             cmd_args.extend(["-p", "You are an expert search engine query expander.", "--approval-mode", "yolo"])
 
-            result = subprocess.run(
-                cmd_args,
-                input=prompt.encode('utf-8'),
-                capture_output=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                if stdout_str:
-                    expanded_terms.update(stdout_str.split())
-                    break
+            try:
+                result = subprocess.run(
+                    cmd_args,
+                    input=prompt.encode('utf-8'),
+                    capture_output=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
+                    match = re.search(r"\[.*?\]", stdout_str, re.DOTALL)
+                    if match:
+                        terms = json.loads(match.group(0))
+                        expanded_terms.update([str(t) for t in terms])
+                        break
+            except Exception as e:
+                log.warning(f"Model {model} failed via subprocess: {e}")
+                
     except Exception as e:
         log.warning(f"LLM query expansion failed: {e}")
 
     tokens = set()
+    try:
+        import jieba
+        for term in QUERY_EXPANSION_DICT.keys():
+            jieba.add_word(term)
+        for expansions in QUERY_EXPANSION_DICT.values():
+            for exp in expansions:
+                jieba.add_word(exp)
+    except ImportError:
+        jieba = None
+
     for term in expanded_terms:
-        for word in term.strip().split():
-            word_lower = word.lower()
-            if word_lower in STOP_WORDS:
-                continue
-            if CJK_REGEX.search(word):
-                chars = list(word)
-                for index in range(len(chars) - 1):
-                    tokens.add(chars[index] + chars[index + 1])
-                for char in chars:
-                    if CJK_REGEX.match(char):
-                        tokens.add(char)
-                tokens.add(word)
-            else:
-                tokens.add(word_lower)
+        if jieba and CJK_REGEX.search(term):
+            for word in jieba.lcut(term):
+                word_lower = word.lower()
+                if word_lower not in STOP_WORDS and word_lower.strip():
+                    tokens.add(word_lower)
+        else:
+            for word in term.strip().split():
+                word_lower = word.lower()
+                if word_lower in STOP_WORDS:
+                    continue
+                if CJK_REGEX.search(word):
+                    chars = list(word)
+                    for index in range(len(chars) - 1):
+                        tokens.add(chars[index] + chars[index + 1])
+                    for char in chars:
+                        if CJK_REGEX.match(char):
+                            tokens.add(char)
+                    tokens.add(word)
+                else:
+                    tokens.add(word_lower)
     return list(tokens)
 
 import math
@@ -298,25 +321,28 @@ def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]
                 cmd_args.extend(["-m", model])
             cmd_args.extend(["-p", "You are an expert search engine reranker.", "--approval-mode", "yolo"])
 
-            result = subprocess.run(
-                cmd_args,
-                input=prompt.encode('utf-8'),
-                capture_output=True,
-                timeout=15
-            )
-            if result.returncode == 0:
-                stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
-                if match:
-                    scores_dict = json.loads(match.group(0))
-                    new_scored = []
-                    for idx, (score, node) in enumerate(candidates):
-                        llm_score = float(scores_dict.get(str(idx), scores_dict.get(idx, 0)))
-                        new_score = score * 0.1 + llm_score * 10
-                        new_scored.append((new_score, node))
-                    new_scored.sort(key=lambda item: item[0], reverse=True)
-                    return new_scored
-                break
+            try:
+                result = subprocess.run(
+                    cmd_args,
+                    input=prompt.encode('utf-8'),
+                    capture_output=True,
+                    timeout=15
+                )
+                if result.returncode == 0:
+                    stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
+                    match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
+                    if match:
+                        scores_dict = json.loads(match.group(0))
+                        new_scored = []
+                        for idx, (score, node) in enumerate(candidates):
+                            llm_score = float(scores_dict.get(str(idx), scores_dict.get(idx, 0)))
+                            new_score = score * 0.1 + llm_score * 10
+                            new_scored.append((new_score, node))
+                        new_scored.sort(key=lambda item: item[0], reverse=True)
+                        return new_scored
+            except Exception as e:
+                log.warning(f"Model {model} failed via subprocess: {e}")
+                
     except Exception as e:
         log.warning(f"LLM Reranking failed: {e}")
         
@@ -343,16 +369,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     except Timeout:
         log.warning("Timeout acquiring lock for index.json during search. System is busy.")
         return "System is currently busy syncing the knowledge base. Please try again in a few seconds."
-    except Exception:
-        from vector_lake import indexer
-
-        indexer.generate_index()
-        try:
-            with FileLock(lock_path, timeout=5):
-                with open(index_path, "r", encoding="utf-8") as handle:
-                    index_data = json.load(handle)
-        except Timeout:
-            return "System is currently busy generating the index. Please try again later."
+    except Exception as e:
+        log.error(f"Failed to read index.json: {e}")
+        return "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
 
     nodes = [{"_key": key, **value} for key, value in index_data.get("nodes", {}).items()]
     intent = _classify_intent(query)
@@ -417,25 +436,45 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
-    top_keys = {node["_key"] for _, node in scored[:3]}
+    # P2-1: Dynamic Graph Expansion via Multi-hop PPR (Personalized PageRank)
+    top_keys = {node["_key"] for _, node in scored[:5]}
     if top_keys and index_data.get("weighted_edges"):
-        expansion_candidates = {}
+        # Build adjacency list
+        adj = {}
         for edge in index_data["weighted_edges"]:
-            source = edge["source"]
-            target = edge["target"]
-            weight = edge["weight"]
-            if source in top_keys and target not in top_keys:
-                expansion_candidates[target] = max(expansion_candidates.get(target, 0), weight)
-            elif target in top_keys and source not in top_keys:
-                expansion_candidates[source] = max(expansion_candidates.get(source, 0), weight)
+            s, t, w = edge["source"], edge["target"], edge.get("weight", 1.0)
+            adj.setdefault(s, []).append((t, w))
+            adj.setdefault(t, []).append((s, w))
+            
+        # PPR parameters
+        ppr_scores = {k: 1.0 for k in top_keys}
+        alpha = 0.85
+        
+        # 2-Hop Random Walk
+        for _ in range(2):
+            next_scores = {k: (1 - alpha) * 1.0 if k in top_keys else 0.0 for k in ppr_scores.keys()}
+            for node, current_score in ppr_scores.items():
+                neighbors = adj.get(node, [])
+                if neighbors:
+                    total_weight = sum(w for _, w in neighbors)
+                    for neighbor, w in neighbors:
+                        next_scores[neighbor] = next_scores.get(neighbor, 0.0) + alpha * current_score * (w / total_weight)
+            ppr_scores = next_scores
 
         existing_keys = {node["_key"] for _, node in scored}
-        expansion_limit = 10 if intent == "entity" else 3
-        for expanded_key, expanded_weight in sorted(expansion_candidates.items(), key=lambda item: item[1], reverse=True)[:expansion_limit]:
-            if expanded_key not in existing_keys:
-                expanded_node = index_data["nodes"].get(expanded_key)
-                if expanded_node:
-                    scored.append((expanded_weight, {"_key": expanded_key, **expanded_node}))
+        expansion_limit = 12 if intent == "entity" else 5
+        
+        sorted_expansions = sorted(
+            [(k, v) for k, v in ppr_scores.items() if k not in existing_keys], 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        for expanded_key, ppr_weight in sorted_expansions[:expansion_limit]:
+            expanded_node = index_data["nodes"].get(expanded_key)
+            if expanded_node:
+                # Scale PPR weight to match BM25 range approximately
+                scored.append((ppr_weight * 15.0, {"_key": expanded_key, **expanded_node}))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
@@ -489,10 +528,16 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
 
 def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
-    memory_budget = int(max_chars * TOKEN_BUDGET["operational_memory"])
-    wiki_budget = int(max_chars * TOKEN_BUDGET["wiki_pages"])
+    base_memory_budget = int(max_chars * TOKEN_BUDGET["operational_memory"])
     index_budget = int(max_chars * TOKEN_BUDGET["index_summary"])
-    memory_packet = build_memory_packet(query, max_chars=memory_budget)
+    
+    # P2-2: Dynamic Sliding Window for Budget
+    # Allow memory to burst up to 50% if there are critical alerts
+    memory_packet = build_memory_packet(query, max_chars=int(max_chars * 0.50))
+    actual_memory_used = len(memory_packet["packet"])
+    
+    # Wiki dynamically eats the remaining budget
+    wiki_budget = max_chars - actual_memory_used - index_budget
 
     search_results = search_vector_lake(query, top_k=15, as_xml=False)
     wiki_context = ""
