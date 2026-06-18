@@ -34,7 +34,7 @@ graph LR
 
 ## Quick Start
 
-1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。**必须在环境变量中设置 `GEMINI_API_KEY`**，系统已全面迁移至原生的 `google-genai` Python SDK，不再依赖 `gemini.cmd` 的子进程调用。
+1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。**系统已全面回归无 SDK 的纯净架构（Zero-SDK）**，抛弃了沉重的 `google-genai` 依赖。底层 LLM 推理深度依赖跨平台的 `gemini` CLI 工具（如 Windows 的 `gemini.cmd`），因此必须确保该工具在操作系统的 PATH 环境变量中。所有的模型调用均通过隔离的 `subprocess.run` 级联容灾模型链（Model Cascade）防崩溃执行。
 2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
 3. **后台监听与自治管理**：日常运行 `python watchdog_sync.py` 启动守护进程。它搭载了四大核心基建与防御系统：
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
@@ -42,6 +42,8 @@ graph LR
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
    - **两步思维链摄入 (V9.0 Two-Step CoT)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
    - **跨类型 PIEA 与强制格式漏斗 (V9.1 Cross-Type PIEA & Naming Funnel)**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
+   - **无感异步全量索引 (Zero-Blocking Async Reindex) [V10.x]**：前台所有的重负载图谱变更（Query 合成、Delete 级联删除、Sync、Graph），全部被优化为仅写入极轻量的 `flag_reindex.lock` 信号。由 Watchdog 主循环在空闲时原子化消费并执行全量图谱重建，彻底杜绝前端 UI 线程的阻塞与卡顿。
+   - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox) [V10.x]**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
    - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
 
 ### 🔌 V8.0 Antigravity Orchestrator 深度集成
@@ -207,7 +209,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 - `exclude_paths`：排除目录。
 - `supported_extensions`：当前启用的输入扩展名。
 - `processed_files_path`：已处理 raw 文件记录。
-- `llm.model_cascade`：Google GenAI SDK 模型降级链（例如 `["gemini-2.5-pro", "gemini-3.1-pro-preview"]`）。
+- `llm.model_cascade`：CLI 模型降级链（例如 `["gemini-2.5-pro", "gemini-3.1-pro-preview"]`），单模型报错自动 fallback。
 - `llm.batch_size`：批处理规模。
 - `llm.timeout_analysis / timeout_generation / timeout_query`：LLM 调用超时。
 
@@ -224,7 +226,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/tool_memory.py` | 基于 "Wiki-as-Database" 架构的运行态记忆物理写回 |
 | `vector_lake/governance_store.py` | canonical store、change set、operational memory、conflict resolver |
 | `vector_lake/governance_metrics.py` | debt metrics 和治理统计 |
-| `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + BM25 + Graph Traversal) 与 Memory Packet |
+| `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + 引入 `jieba` 分词的 BM25 + Multi-Hop PPR) 与 Memory Packet |
 | `vector_lake/tool_query.py` | query-to-page synthesis |
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |
 | `vector_lake/tool_review.py` | legacy/governance review surface |
@@ -240,7 +242,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 
 ## Validation
 
-最近验证基线（2026-05-31）：
+最近验证基线（2026-06-18 V10.x 军工级韧性加固版）：
 
 ```powershell
 $env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v
