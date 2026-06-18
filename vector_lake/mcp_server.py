@@ -223,6 +223,26 @@ def visualize_vector_lake() -> str:
     """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
     return tools.visualize_vector_lake()
 
+@mcp.tool()
+def write_wiki_page(filename: str, content: str) -> str:
+    """Write or update a Vector Lake wiki page safely.
+    
+    Args:
+        filename: The filename (e.g. 'Concept_Example.md').
+        content: The full markdown content including YAML frontmatter.
+    """
+    from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError, get_wiki_dir
+    import os
+    try:
+        wiki_dir = get_wiki_dir()
+        file_path = os.path.join(wiki_dir, filename)
+        safe_write_markdown(file_path, content)
+        return f"Successfully wrote {filename}."
+    except SafeWriteError as e:
+        return f"[Write Rejected] {str(e)}"
+    except Exception as e:
+        return f"Error writing file: {str(e)}"
+
 import uuid
 from vector_lake.governance_store import load_governance_queue, save_governance_queue, _utc_now
 

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from vector_lake import get_extension_root
 from vector_lake.db import get_processed_files, mark_file_processed
 from vector_lake import governance_store
+from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
     get_memory_dir,
     get_wiki_dir,
@@ -124,25 +125,22 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
         task_file = tmp_dir / f"ingest_task_{task_id}.md"
         
         canonical_name = canonical_source_name(filepath)
+        skeleton_block = parse_static_skeleton(filepath)
         
-        instructions = f"""You are the Vector Lake Ingestion Engine.
-Your task is to ingest a raw source file into the Knowledge Graph (Wiki).
+        templates_dir = get_extension_root() / "templates"
+        prompt_path = templates_dir / "ingest_prompt.md"
+        if prompt_path.exists():
+            prompt_template = prompt_path.read_text(encoding="utf-8")
+        else:
+            prompt_template = "Error: templates/ingest_prompt.md not found."
+            
+        instructions = prompt_template.replace("{{filepath}}", str(filepath)) \
+            .replace("{{file_hash}}", file_hash) \
+            .replace("{{canonical_name}}", canonical_name) \
+            .replace("{{skeleton_block}}", skeleton_block) \
+            .replace("{{schema_content}}", schema_content) \
+            .replace("{{index_summary}}", index_summary)
 
-Source Path: {filepath}
-File Hash: {file_hash}
-Canonical Name: {canonical_name}
-
-Wiki Rules & Schema:
-{schema_content}
-
-Existing Index Summary:
-{index_summary}
-
-Task:
-1. Read the Source Path content using `view_file`.
-2. Extract the core entities, concepts, and tensions based on the Schema.
-3. Call the lazy MCP tool using `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="finalize_ingest"). Pass the formatted JSON array of new wiki nodes to `files_written_str`, and `{"filepath": "<filepath>", "hash": "<file_hash>"}` to `raw_files_processed_json`.
-"""
         task_file.write_text(instructions, encoding="utf-8")
         
         subagent_prompts.append(f"""{{
@@ -160,6 +158,7 @@ Task:
 def finalize_ingest(files_written_str: str, raw_files_processed_json: str) -> str:
     """Finalizes an ingest operation from a subagent."""
     try:
+        from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError
         files = json.loads(files_written_str)
         wiki_dir = get_wiki_dir()
         
@@ -168,8 +167,13 @@ def finalize_ingest(files_written_str: str, raw_files_processed_json: str) -> st
             fname = item["filename"]
             fcontent = item["content"]
             out_path = wiki_dir / fname
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(fcontent)
+            
+            if "Concept_Decision_" in fname:
+                lower_content = fcontent.lower()
+                if not all(k in lower_content for k in ["context", "alternatives", "justification"]):
+                    raise SafeWriteError(f"Decision nodes like {fname} MUST contain 'context', 'alternatives', and 'justification'.")
+                    
+            safe_write_markdown(out_path, fcontent)
             files_written.append(str(out_path))
             
         if files_written:

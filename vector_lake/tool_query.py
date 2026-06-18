@@ -56,32 +56,17 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
         return f"[DRY RUN] Context assembled at {payload_path}\n\nTrace:\n{trace}"
 
-    instructions = f"""[SUBAGENT DELEGATION REQUIRED]
-Context successfully assembled and saved to: {payload_path}
-
-Please execute the following workflow:
-1. Invoke the subagent `vector-lake-synthesizer` with the exact prompt below.
-2. Wait for the subagent to finish writing the file(s) (it must use its write_file tool).
-3. Once the subagent finishes, find out which Synthesis_*.md files were created or modified.
-4. Call the MCP tool `finalize_query_synthesis` with those filenames (comma-separated, e.g., 'Synthesis_A.md,Synthesis_B.md') and the original query string.
-
---- SUBAGENT PROMPT ---
-Query: {query_str}
-
-Instructions:
-Read the context from {payload_path}. 
-Perform bounded logical synthesis and generate the resulting Markdown synthesis page(s).
-You MUST use your native `write_to_file` / `multi_replace_file_content` tools to write directly to `{wiki_dir}`.
-Make sure the filename starts with `Synthesis_`.
-
-[CRITICAL REQUIREMENT: GAP ANALYSIS]
-You MUST include a section titled "## 盲区与缺失度分析 (Gap Analysis)" at the end of your synthesis.
-In this section, explicitly state:
-1. What crucial evidence is MISSING to definitively answer the query.
-2. The staleness of the retrieved context.
-3. Unresolved contradictions flagged in the Operational Memory warnings.
------------------------
-"""
+    templates_dir = get_extension_root() / "templates"
+    prompt_path = templates_dir / "query_prompt.md"
+    if prompt_path.exists():
+        prompt_template = prompt_path.read_text(encoding="utf-8")
+    else:
+        prompt_template = "Error: templates/query_prompt.md not found."
+        
+    instructions = prompt_template.replace("{{payload_path}}", str(payload_path)) \
+        .replace("{{query_str}}", query_str) \
+        .replace("{{wiki_dir}}", wiki_dir)
+        
     return instructions
 
 def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
