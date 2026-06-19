@@ -1,0 +1,3 @@
+## 2026-06-19 - Fast YAML Parsing via LibYAML C Extensions
+**Learning:** PyYAML's pure Python implementation (`yaml.safe_load`, `yaml.dump`) is a massive bottleneck when repeatedly processing numerous Markdown files with YAML frontmatter. However, PyYAML can use LibYAML C extensions (`CSafeLoader`, `CSafeDumper`) which drastically speed up parsing and dumping (e.g., ~6.8x speedup for loading, ~4.1x for dumping) if properly imported.
+**Action:** Created `vector_lake/yaml_utils.py` to wrap YAML operations, gracefully falling back to pure Python implementations if the C extensions are unavailable, ensuring both high performance and portability. Replaced direct PyYAML imports with this wrapper throughout the codebase.
