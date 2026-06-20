@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 
 import yaml
+from vector_lake.yaml_utils import load_yaml, dump_yaml
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -272,7 +273,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         return None
 
     fm_str = frontmatter_match.group(1)
-    fm_data = yaml.safe_load(fm_str) or {}
+    fm_data = load_yaml(fm_str) or {}
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)

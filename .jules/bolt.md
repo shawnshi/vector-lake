@@ -1,0 +1,3 @@
+## 2024-05-24 - Speed up YAML parsing using LibYAML C-extensions
+**Learning:** The application heavily relies on YAML frontmatter parsing for potentially thousands of `.md` files during indexing. Pure Python `yaml.safe_load` is extremely slow. Using the `CSafeLoader` and `CSafeDumper` from `pyyaml` (which binds to libyaml) provides a ~6-7x performance speedup.
+**Action:** When building indexers or pipelines parsing numerous Markdown files with YAML frontmatter, always abstract the YAML load/dump functions to optionally use `CSafeLoader` / `CSafeDumper` and fallback to pure Python `SafeLoader` gracefully.
