@@ -592,9 +592,14 @@ def _apply_graph_topology(index_data: dict):
             
             # --- PROGRESSIVE DISCLOSURE INDEX ---
             try:
+                import re
                 from vector_lake.wiki_utils import get_wiki_dir
                 wiki_dir = get_wiki_dir()
-                index_filename = f"System_Community_{comm_id}.md"
+                sanitized_title = re.sub(r'[\\/*?:"<>|\'#]', '_', label.replace(f"Comm {comm_id}:", "").strip())
+                sanitized_title = re.sub(r'_+', '_', sanitized_title).strip('_ ')
+                if not sanitized_title:
+                    sanitized_title = "Unknown"
+                index_filename = f"System_Community_{comm_id}_{sanitized_title}.md"
                 index_filepath = wiki_dir / index_filename
                 
                 hubs_markdown = "\n".join([f"- [[{node}]]" for node in sorted_nodes[:5]])

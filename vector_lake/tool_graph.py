@@ -131,7 +131,6 @@ def _build_graph_payload(index_data: dict, claim_graph_data: dict | None = None)
 def visualize_vector_lake():
     bootstrap = governance_store.ensure_canonical_store_populated()
     if bootstrap.get("bootstrapped"):
-        from vector_lake import get_extension_root
         tmp_dir = get_extension_root() / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         with open(tmp_dir / "flag_reindex.lock", "w") as f:
@@ -203,27 +202,37 @@ def audit_graph() -> str:
     if not insights:
         return "No graph insights found. Please ensure 'sync' has been run recently."
 
+    import uuid
+    from datetime import datetime, timezone
+
     items = []
     for insight in insights:
         search_queries = [insight.get("node", "")] if insight.get("node") else []
         affected_pages = [f"wiki/{insight.get('node', '')}.md"] if insight.get("node") else []
         items.append({
+            "item_id": f"gov_{uuid.uuid4().hex[:12]}",
             "type": "suggestion",
             "title": f"Topology Insight: {insight['type'].replace('_', ' ').title()}",
             "description": insight.get("description", "A topological insight was detected."),
             "search_queries": search_queries,
             "affected_pages": affected_pages,
             "source": "audit-graph",
-            "created": None,
-            "resolved": False,
-            "resolution": None,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
         })
 
     if items:
         from vector_lake import governance_store
         queue = governance_store.load_governance_queue()
-        queue.setdefault("items", []).extend(items)
-        governance_store.save_governance_queue(queue)
-        return f"Audit complete. Pushed {len(items)} graph topology insights into the async review queue."
+        
+        existing_titles = {item.get("title") for item in queue.get("items", [])}
+        new_items = [item for item in items if item["title"] not in existing_titles]
+        
+        if new_items:
+            queue.setdefault("items", []).extend(new_items)
+            governance_store.save_governance_queue(queue)
+            return f"Audit complete. Pushed {len(new_items)} new graph topology insights into the async review queue ({len(items) - len(new_items)} duplicates skipped)."
+        else:
+            return f"Audit complete. No new actionable insights found ({len(items)} existing insights already in queue)."
     return "Audit complete. No actionable insights found."
 

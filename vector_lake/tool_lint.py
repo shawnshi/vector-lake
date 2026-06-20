@@ -32,7 +32,7 @@ def lint_vector_lake(auto_fix: bool = False):
         return "Wiki directory not found."
 
     skip_files = {"index.md", "log.md", "overview.md"}
-    valid_types = {"vendor", "product", "person", "event", "concept", "source", "synthesis"}
+    valid_types = {"vendor", "product", "person", "event", "concept", "source", "synthesis", "system"}
     valid_status = {"active", "deprecated", "archived", "contested"}
     valid_epistemic = {"seed", "sprouting", "evergreen"}
     valid_categories = {
@@ -40,7 +40,7 @@ def lint_vector_lake(auto_fix: bool = False):
         "Strategy_and_Business", "System_Architecture",
         "Philosophy_and_Cognitive", "Biomedicine",
     }
-    valid_prefixes = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")
+    valid_prefixes = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_", "System_")
     required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]
 
     files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]

@@ -21,8 +21,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("semantic-dedup-daemon")
 
 EMBEDDING_MODEL = "gemini-embedding-2"
-SIMILARITY_THRESHOLD = 0.85
-ADVANCED_THRESHOLD = 0.88
+SIMILARITY_THRESHOLD = 0.92
+ADVANCED_THRESHOLD = 0.94
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -33,23 +33,48 @@ def calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
     norm2 = math.sqrt(sum(a * a for a in v2))
     return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
 
+def llm_semantic_arbiter(client, left_name: str, left_summary: str, right_name: str, right_summary: str) -> bool:
+    if not client:
+        return True
+    prompt = f"""You are a strict Medical Knowledge Graph Ontology Arbiter.
+Analyze the following two entities:
+Entity 1: [{left_name}] - {left_summary}
+Entity 2: [{right_name}] - {right_summary}
+
+Determine if these two entities are SEMANTICALLY EQUIVALENT (meaning they represent the exact same concept, e.g., one is an abbreviation of the other, or they are exact synonyms).
+If they are merely related (e.g., cause/effect, platform/paradigm, whole/part, competing frameworks), they are NOT equivalent.
+
+Answer with exactly one word: YES if they are the exact same concept and should be merged. NO if they are distinct concepts.
+"""
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        return "YES" in response.text.upper()
+    except Exception as e:
+        log.error(f"LLM Arbiter failed: {e}")
+        return True
+
 def _get_cache_path():
-    return get_meta_dir() / "embeddings.json"
+    return get_meta_dir() / "embeddings.pkl"
 
 def load_cache() -> dict:
+    import pickle
     cache_path = _get_cache_path()
     if cache_path.exists():
         try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
         except Exception as e:
             log.warning(f"Failed to load embeddings cache: {e}")
     return {"schema_version": "1.0", "embeddings": {}}
 
 def save_cache(cache: dict):
+    import pickle
     cache_path = _get_cache_path()
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+    with open(cache_path, "wb") as f:
+        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 def strip_name(name: str) -> str:
     name = name.replace('.md', '')
@@ -177,6 +202,10 @@ def run_daemon():
             if pair_key in existing_pairs:
                 continue
                 
+            # DO NOT merge raw Sources (they are immutable ingested files, often false positives due to weekly reports)
+            if left_key.startswith('Source_') and right_key.startswith('Source_'):
+                continue
+                
             # Layer A: Stemming / Metadata Collision
             collision = False
             if len(left_strip) > 2 and left_strip == right_strip:
@@ -219,6 +248,14 @@ def run_daemon():
                 if not reasons:
                     reasons.append(f"lexical-similarity:{round(str_score, 3)}")
                 
+                if client:
+                    is_equiv = llm_semantic_arbiter(client, left_title, left_node.get("summary", ""), right_title, right_node.get("summary", ""))
+                    if not is_equiv:
+                        log.info(f"LLM Arbiter Rejected (False Alarm): {left_title} <> {right_title}")
+                        existing_pairs.add(pair_key)
+                        continue
+                    reasons.append("llm-arbiter-approved")
+
                 candidates.append({
                     "pair_key": pair_key,
                     "score": round(final_score, 3),
@@ -252,14 +289,24 @@ def run_daemon():
                     
                 sim = calculate_cosine_similarity(left_data["vector"], right_data["vector"])
                 if sim >= SIMILARITY_THRESHOLD:
+                    right_title = right_data["title"]
+                    if client:
+                        l_sum = index_data.get("nodes", {}).get(left_key, {}).get("summary", "")
+                        r_sum = index_data.get("nodes", {}).get(right_key, {}).get("summary", "")
+                        is_equiv = llm_semantic_arbiter(client, left_title, l_sum, right_title, r_sum)
+                        if not is_equiv:
+                            log.info(f"LLM Arbiter Rejected (False Alarm): {left_title} <> {right_title}")
+                            existing_pairs.add(pair_key)
+                            continue
+                            
                     candidates.append({
                         "pair_key": pair_key,
                         "score": round(sim, 3),
                         "left_entity_id": left_key,
                         "left_name": left_title,
                         "right_entity_id": right_key,
-                        "right_name": right_data["title"],
-                        "reasons": [f"semantic-embedding-match:{round(sim, 3)}"]
+                        "right_name": right_title,
+                        "reasons": [f"semantic-embedding-match:{round(sim, 3)}", "llm-arbiter-approved"] if client else [f"semantic-embedding-match:{round(sim, 3)}"]
                     })
                     existing_pairs.add(pair_key)
 

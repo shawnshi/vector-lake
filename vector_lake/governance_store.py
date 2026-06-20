@@ -984,9 +984,13 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                 if left_id and right_id:
                     import subprocess
                     import sys
+                    import shutil
+                    import os
                     
                     left_name = candidate.get("left_name")
                     right_name = candidate.get("right_name")
+                    left_bak, right_bak = None, None
+                    left_path, right_path = None, None
                     
                     # AHE Phase 3: Snapshot state before mutation
                     old_registry = load_alias_registry()
@@ -1008,11 +1012,25 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                         left_path = find_md_file(left_name)
                         right_path = find_md_file(right_name)
                         
+                        if left_path and os.path.exists(left_path):
+                            left_bak = left_path + ".bak"
+                            shutil.copy2(left_path, left_bak)
+                        if right_path and os.path.exists(right_path):
+                            right_bak = right_path + ".bak"
+                            shutil.copy2(right_path, right_bak)
+                            
                         if left_path and right_path and left_path != right_path and os.path.exists(script_path):
                             log.info(f"Triggering LLM semantic merge: {left_name} <- {right_name}")
                             env = os.environ.copy()
                             env["PYTHONIOENCODING"] = "utf-8"
-                            subprocess.run([sys.executable, script_path, left_path, right_path], env=env)
+                            try:
+                                subprocess.run([sys.executable, script_path, left_path, right_path], env=env, check=True)
+                            except subprocess.CalledProcessError as e:
+                                if left_bak and os.path.exists(left_bak):
+                                    shutil.move(left_bak, left_path)
+                                if right_bak and os.path.exists(right_bak):
+                                    shutil.move(right_bak, right_path)
+                                raise RuntimeError(f"LLM Semantic Merge failed: {e}")
 
                     # Update the alias registry to map right to left
                     registry = load_alias_registry()
@@ -1045,9 +1063,32 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                                     current = registry["items"][current]
                         except Exception as e:
                             log.error(f"AHE Contract Failed: {e}. Executing ROLLBACK.")
-                            save_alias_registry(old_registry)
-                            save_entities(old_entities)
+                            
+                            r = load_alias_registry()
+                            if right_id in old_registry["items"]:
+                                r["items"][right_id] = old_registry["items"][right_id]
+                            elif right_id in r["items"]:
+                                del r["items"][right_id]
+                            save_alias_registry(r)
+                            
+                            e_store = load_entities()
+                            if right_id in old_entities["items"]:
+                                e_store["items"][right_id] = old_entities["items"][right_id]
+                            elif right_id in e_store["items"]:
+                                del e_store["items"][right_id]
+                            save_entities(e_store)
+                            
+                            if left_bak and os.path.exists(left_bak):
+                                shutil.move(left_bak, left_path)
+                            if right_bak and os.path.exists(right_bak):
+                                shutil.move(right_bak, right_path)
+                                
                             raise RuntimeError(f"Manifest validation failed: {e}")
+
+                    if left_bak and os.path.exists(left_bak):
+                        os.remove(left_bak)
+                    if right_bak and os.path.exists(right_bak):
+                        os.remove(right_bak)
 
         item["status"] = "resolved"
         item["resolution"] = resolution

@@ -272,6 +272,36 @@ def propose_schema_mutation(new_category: str, description: str, parent_category
     save_governance_queue(queue)
     return f"Schema mutation proposed and logged as {item_id} for review."
 
+
+
+@mcp.tool()
+def batch_replace_links(old_text: str, new_text: str) -> str:
+    """Safely replace a string (e.g. an old entity name) across all markdown files in the wiki.
+    This tool should be used instead of running custom I/O scripts.
+    
+    Args:
+        old_text: The string to search for (e.g., 'Concept_Formula_自回归条件概率').
+        new_text: The replacement string (e.g., 'Concept_Formula-自回归条件概率').
+    """
+    import os
+    from vector_lake.wiki_utils import get_wiki_dir, atomic_write_text
+    wiki_dir = get_wiki_dir()
+    modified_count = 0
+    for filename in os.listdir(wiki_dir):
+        if not filename.endswith(".md"):
+            continue
+        filepath = os.path.join(wiki_dir, filename)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            if old_text in content:
+                new_content = content.replace(old_text, new_text)
+                atomic_write_text(filepath, new_content)
+                modified_count += 1
+        except Exception as e:
+            logging.error(f"Error processing {filename} for link replacement: {e}")
+            
+    return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files."
+
 if __name__ == "__main__":
     mcp.run()
-
