@@ -1,0 +1,5 @@
+
+## 2025-02-18 - Prevent Server-Side XSS during JSON Serialization
+**Vulnerability:** A potential Server-Side Cross-Site Scripting (XSS) vulnerability existed when serializing dynamic Python dictionaries to JSON and directly injecting them into HTML `<script>` tags in `tool_graph.py`.
+**Learning:** If user-controlled data or untrusted markdown content within the serialized JSON payload contains closing script tags followed by malicious executable scripts (e.g., `</script><script>alert(1)</script>`), the browser will prematurely close the outer script tag and immediately execute the injected payload when the HTML template is loaded.
+**Prevention:** Always safely escape HTML-sensitive characters (`<`, `>`, and `&`) within the serialized JSON string using Unicode escapes (e.g., `\u003c`) before interpolating the payload into an HTML template. This ensures the data remains perfectly valid JSON for JavaScript parsers while preventing the browser from interpreting any characters as executable HTML tags.
