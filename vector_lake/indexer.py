@@ -387,11 +387,32 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
 
     links_a = set(node_a.get("links", []))
     links_b = set(node_b.get("links", []))
+    
+    def get_pred_weight(pred: str) -> float:
+        pred_lower = pred.lower()
+        if pred_lower in ("属于", "parent", "is_a", "belongs_to", "instance_of", "has_part", "核心构件"):
+            return RELEVANCE_WEIGHTS["direct_link"] * 3.0  # Taxonomy / hierarchy
+        if pred_lower in ("类似", "related_to", "see_also", "peer", "关联"):
+            return RELEVANCE_WEIGHTS["direct_link"] * 1.5  # Strong relation
+        if pred_lower in ("mentions", "提及", "引用"):
+            return RELEVANCE_WEIGHTS["direct_link"] * 0.4  # Weak generic mention penalty
+        return RELEVANCE_WEIGHTS["direct_link"]
 
     if key_b in links_a:
-        score += RELEVANCE_WEIGHTS["direct_link"]
+        pred = "mentions"
+        for t in node_a.get("triples", []):
+            if t.get("target") == key_b:
+                pred = t.get("predicate", "mentions")
+                break
+        score += get_pred_weight(pred)
+        
     if key_a in links_b:
-        score += RELEVANCE_WEIGHTS["direct_link"]
+        pred = "mentions"
+        for t in node_b.get("triples", []):
+            if t.get("target") == key_a:
+                pred = t.get("predicate", "mentions")
+                break
+        score += get_pred_weight(pred)
 
     sources_a = set(node_a.get("sources", []))
     sources_b = set(node_b.get("sources", []))
@@ -499,142 +520,18 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
 
 def _apply_graph_topology(index_data: dict):
-    edges = index_data.get("weighted_edges", [])
+    if "graph_state" not in index_data:
+        index_data["graph_state"] = {}
+    index_data["graph_state"]["dirty"] = True
+    index_data["graph_state"]["reason"] = "Index generated, awaiting async clustering"
+    index_data["graph_state"]["updated_at"] = _utc_now()
+    
+    # Initialize basic node scores so BM25 doesn't crash
     node_keys = list(index_data["nodes"].keys())
-    index_data["communities"] = {}
-    index_data["community_labels"] = {}
-    index_data["graph_insights"] = []
-
-    if not (nx and community_louvain and edges):
-        _mark_graph_clean(index_data)
-        return
-
-    G = nx.Graph()
-    for key in node_keys:
-        G.add_node(key)
-    for edge in edges:
-        G.add_edge(edge["source"], edge["target"], weight=edge["weight"])
-
-    if nx and G.number_of_nodes() > 0:
-        try:
-            pageranks = nx.pagerank(G, weight="weight")
-            pr_scale = len(node_keys) if len(node_keys) > 0 else 1
-            for node_key in node_keys:
-                pr_score = pageranks.get(node_key, 0.0) * pr_scale
-                node = index_data["nodes"][node_key]
-                node["centrality_score"] = round(pr_score, 4)
-                node["node_score"] = round(node.get("decay_weight", 1.0) * pr_score, 4)
-        except Exception as e:
-            log.error(f"PageRank computation failed: {e}")
-            for node_key in node_keys:
-                node = index_data["nodes"][node_key]
-                node["centrality_score"] = 1.0
-                node["node_score"] = round(node.get("decay_weight", 1.0), 4)
-    else:
-        for node_key in node_keys:
-            node = index_data["nodes"][node_key]
-            node["centrality_score"] = 1.0
-            node["node_score"] = round(node.get("decay_weight", 1.0), 4)
-
-    try:
-        partition = community_louvain.best_partition(G, weight="weight")
-        index_data["communities"] = partition
-
-        community_nodes = {}
-        for node, comm_id in partition.items():
-            community_nodes.setdefault(comm_id, []).append(node)
-
-        for comm_id, nodes in community_nodes.items():
-            if len(nodes) < 3:
-                continue
-            subgraph = G.subgraph(nodes)
-            possible_edges = len(nodes) * (len(nodes) - 1) / 2
-            actual_edges = subgraph.number_of_edges()
-            cohesion = actual_edges / possible_edges if possible_edges > 0 else 0
-            if cohesion < 0.15:
-                index_data["graph_insights"].append({
-                    "type": "sparse_community",
-                    "community_id": int(comm_id),
-                    "nodes": nodes,
-                    "cohesion": float(cohesion),
-                    "description": f"Community {comm_id} has low internal cohesion ({cohesion:.2f}). Indicates a potential knowledge gap.",
-                })
-
-        for node in node_keys:
-            if G.degree(node) <= 1:
-                index_data["graph_insights"].append({
-                    "type": "isolated_node",
-                    "node": node,
-                    "description": f"Node '{node}' is isolated or weakly connected (Degree <= 1).",
-                })
-
-        for node in node_keys:
-            connected_communities = {partition.get(neighbor) for neighbor in G.neighbors(node)}
-            connected_communities.discard(None)
-            if len(connected_communities) >= 3:
-                index_data["graph_insights"].append({
-                    "type": "bridge_node",
-                    "node": node,
-                    "connected_communities": [int(comm_id) for comm_id in connected_communities],
-                    "description": f"Node '{node}' connects {len(connected_communities)} distinct communities. High strategic value.",
-                })
-
-        community_labels = {}
-        for comm_id, nodes in community_nodes.items():
-            sorted_nodes = sorted(nodes, key=lambda node: G.degree(node), reverse=True)
-            top_nodes = sorted_nodes[:2]
-            titles = []
-            for node in top_nodes:
-                node_data = index_data["nodes"].get(node)
-                titles.append(node_data.get("title", node) if node_data else node)
-            label = f"Comm {comm_id}: {' / '.join(titles) if titles else 'Unknown'}"
-            community_labels[int(comm_id)] = label
-            
-            # --- PROGRESSIVE DISCLOSURE INDEX ---
-            try:
-                import re
-                from vector_lake.wiki_utils import get_wiki_dir
-                wiki_dir = get_wiki_dir()
-                sanitized_title = re.sub(r'[\\/*?:"<>|\'#]', '_', label.replace(f"Comm {comm_id}:", "").strip())
-                sanitized_title = re.sub(r'_+', '_', sanitized_title).strip('_ ')
-                if not sanitized_title:
-                    sanitized_title = "Unknown"
-                index_filename = f"System_Community_{comm_id}_{sanitized_title}.md"
-                index_filepath = wiki_dir / index_filename
-                
-                hubs_markdown = "\n".join([f"- [[{node}]]" for node in sorted_nodes[:5]])
-                members_markdown = "\n".join([f"- [[{node}]]" for node in sorted_nodes[5:]])
-                
-                content = f"""---
-title: "{label}"
-type: system
-status: Active
-community_id: {comm_id}
----
-# {label}
-
-> [!NOTE]
-> 这是一个系统自动生成的**社区索引文件 (Progressive Disclosure Index)**。下游 Agent 可以通过优先阅读此文件来快速掌握该知识聚类的全局拓扑。
-
-## 核心节点 (Hubs)
-{hubs_markdown}
-
-## 社区成员 (Members)
-{members_markdown}
-
-## 语义总结 (Semantic Summary)
-*(To be generated by LLM during Review/Synthesis)*
-"""
-                with open(index_filepath, "w", encoding="utf-8") as f:
-                    f.write(content)
-            except Exception as e:
-                log.warning(f"Failed to generate Progressive Disclosure Index for Comm {comm_id}: {e}")
-
-        index_data["community_labels"] = community_labels
-    except Exception as e:
-        log.error(f"Graph analysis failed: {e}")
-    finally:
-        _mark_graph_clean(index_data)
+    for node_key in node_keys:
+        node = index_data["nodes"][node_key]
+        node["centrality_score"] = 1.0
+        node["node_score"] = round(node.get("decay_weight", 1.0), 4)
 
 
 def generate_index():

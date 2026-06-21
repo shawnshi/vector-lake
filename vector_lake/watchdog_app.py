@@ -247,6 +247,7 @@ def scheduled_lint_loop():
                             if res.returncode != 0:
                                 log.error(f"Domain Overview Compiler Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Overview Compiler Failed", res.stderr)
+
                         
                         # V7.2 Semantic Deduplication Daemon
                         semantic_dedup_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/semantic_dedup_daemon.py")
@@ -256,6 +257,17 @@ def scheduled_lint_loop():
                             if res.returncode != 0:
                                 log.error(f"Semantic Deduplication Daemon Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Semantic Dedup Failed", res.stderr)
+                                
+                        # V10 Autonomous Janitor Swarm (Nighttime Cleanup)
+                        janitor_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/launch_janitor_swarm.py")
+                        if os.path.exists(janitor_script):
+                            log.info("Launching Nighttime Janitor Swarm...")
+                            res = subprocess.run([sys.executable, janitor_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            if res.returncode != 0:
+                                log.error(f"Janitor Swarm Launch Failed: {res.stderr}")
+                                write_status("error", 0, index_queue.qsize(), "Janitor Swarm Failed", res.stderr)
+                            else:
+                                log.info("Janitor Swarm successfully launched background agents.")
                         
                         # V9.0 Louvain Community Clustering Daemon
                         clustering_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/community_clustering_daemon.py")

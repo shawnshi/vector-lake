@@ -68,7 +68,7 @@ def annotate_claim_validity(claim: dict, now=None) -> dict:
 
 
 def find_merge_candidates(limit: int = 20) -> list[dict]:
-    entities = list(governance_store.load_entities()["items"].values())
+    entities = list(governance_store.query_entities("status != 'Merged' AND type != 'system'")["items"].values())
     candidates = []
 
     for index, left in enumerate(entities):
@@ -124,7 +124,6 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
 
 def compute_debt_metrics(skip_heavy: bool = False) -> dict:
     claims = [annotate_claim_validity(claim) for claim in governance_store.load_claims()["items"].values()]
-    entities = governance_store.load_entities()["items"].values()
     sources = governance_store.load_sources()["items"].values()
     queue = governance_store.load_governance_queue()["items"]
     memory_store = governance_store.load_memory_objects()

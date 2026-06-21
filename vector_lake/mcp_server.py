@@ -37,14 +37,27 @@ def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
     """
     return tools.search_vector_lake(query, top_k, mode=mode)
 
+def _read_payload(payload_file: str) -> str:
+    if not payload_file:
+        return ""
+    import os
+    if not os.path.exists(payload_file):
+        raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Please use write_to_file to create it first.")
+    with open(payload_file, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
 @mcp.tool()
-def update_operational_memory(memory_type: str, content: str) -> str:
+def update_operational_memory(memory_type: str, payload_file: str) -> str:
     """Safely persist an operational memory (preference, decision, fact, task_state) without corrupting the graph.
     
     Args:
         memory_type: Type of memory ('preference', 'decision', 'fact', 'task_state').
-        content: The text content of the operational memory to store.
+        payload_file: Absolute path to a temporary file containing the text content of the memory.
     """
+    try:
+        content = _read_payload(payload_file)
+    except Exception as e:
+        return str(e)
     return tool_memory.update_operational_memory(memory_type, content)
 
 @mcp.tool()
@@ -94,21 +107,25 @@ def review_governance_list() -> str:
     return tools.review_vector_lake(action="list")
 
 @mcp.tool()
-def resolve_governance_item(item_id: str, resolution: str, change_manifest_json: str = None) -> str:
+def resolve_governance_item(item_id: str, resolution: str, payload_file: str = None) -> str:
     """Resolve a governance item.
 
     Args:
         item_id: The ID or index of the item.
         resolution: Resolution action: 'skip', 'create', 'merge', 'acknowledge'.
-        change_manifest_json: Optional JSON string of the expected outcome manifest to ensure safety (e.g. '{"allow_cycles": false}').
+        payload_file: Optional absolute path to a temporary JSON file containing the expected outcome manifest (e.g. {"allow_cycles": false}).
     """
     import json
     manifest = None
-    if change_manifest_json:
+    if payload_file:
         try:
-            manifest = json.loads(change_manifest_json)
-        except Exception:
-            pass
+            manifest_str = _read_payload(payload_file)
+            if manifest_str.strip():
+                manifest = json.loads(manifest_str)
+        except json.JSONDecodeError as e:
+            return f"[Sandbox JSON Error] Failed to parse payload file {payload_file}: {e}. Please fix the JSON and retry."
+        except Exception as e:
+            return str(e)
     return tools.review_vector_lake(action="resolve", index=item_id, resolution=resolution, change_manifest=manifest)
 @mcp.tool()
 def trigger_autonomous_research(dry_run: bool = False) -> str:
@@ -198,13 +215,18 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     return tools.prepare_ingest_batch(batch_size=batch_size)
 
 @mcp.tool()
-def finalize_ingest(files_written_str: str, raw_files_processed_json: str) -> str:
+def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str) -> str:
     """Finalize ingestion batch after subagents have finished.
     
     Args:
-        files_written_str: JSON string array of objects containing 'filename' and 'content', e.g. '[{"filename": "...", "content": "..."}]'.
-        raw_files_processed_json: JSON string with keys 'filepath' and 'hash', e.g. '{"filepath": "/path/to/raw.md", "hash": "hash123"}'.
+        files_written_payload_file: Absolute path to a temporary JSON file containing an array of objects with 'filename' and 'content'.
+        raw_files_payload_file: Absolute path to a temporary JSON file containing an object with 'filepath' and 'hash'.
     """
+    try:
+        files_written_str = _read_payload(files_written_payload_file)
+        raw_files_processed_json = _read_payload(raw_files_payload_file)
+    except Exception as e:
+        return str(e)
     return tools.finalize_ingest(files_written_str, raw_files_processed_json)
 
 @mcp.tool()
@@ -224,13 +246,17 @@ def visualize_vector_lake() -> str:
     return tools.visualize_vector_lake()
 
 @mcp.tool()
-def write_wiki_page(filename: str, content: str) -> str:
+def write_wiki_page(filename: str, payload_file: str) -> str:
     """Write or update a Vector Lake wiki page safely.
     
     Args:
         filename: The filename (e.g. 'Concept_Example.md').
-        content: The full markdown content including YAML frontmatter.
+        payload_file: Absolute path to a temporary file containing the full markdown content including YAML frontmatter.
     """
+    try:
+        content = _read_payload(payload_file)
+    except Exception as e:
+        return str(e)
     from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError, get_wiki_dir
     import os
     try:
@@ -247,14 +273,18 @@ import uuid
 from vector_lake.governance_store import load_governance_queue, save_governance_queue, _utc_now
 
 @mcp.tool()
-def propose_schema_mutation(new_category: str, description: str, parent_category: str = "Uncategorized") -> str:
-    """Propose a new schema category when a concept falls outside existing bounds.
+def propose_schema_mutation(new_category: str, payload_file: str, parent_category: str = "Uncategorized") -> str:
+    """Propose a new taxonomy category to the ontology team.
     
     Args:
-        new_category: The proposed new category name (e.g. 'Quantum_Computing').
-        description: A brief definition or justification for the category.
-        parent_category: The existing category this might fall under, or 'Uncategorized'.
+        new_category: The name of the new category.
+        payload_file: Absolute path to a temporary file containing a brief definition or justification for the category.
+        parent_category: The parent category (default: 'Uncategorized').
     """
+    try:
+        description = _read_payload(payload_file)
+    except Exception as e:
+        return str(e)
     queue = load_governance_queue()
     item_id = f"gov_{uuid.uuid4().hex[:12]}"
     queue.setdefault("items", []).append({
@@ -275,14 +305,20 @@ def propose_schema_mutation(new_category: str, description: str, parent_category
 
 
 @mcp.tool()
-def batch_replace_links(old_text: str, new_text: str) -> str:
-    """Safely replace a string (e.g. an old entity name) across all markdown files in the wiki.
-    This tool should be used instead of running custom I/O scripts.
+def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str) -> str:
+    """Batch replace occurrences of a string (usually a link) across all wiki pages.
+    Use this when an entity's name changes but `rename_entity` failed to cover all cases.
     
     Args:
-        old_text: The string to search for (e.g., 'Concept_Formula_自回归条件概率').
-        new_text: The replacement string (e.g., 'Concept_Formula-自回归条件概率').
+        old_text_payload_file: Absolute path to a file containing the exact string to search for (e.g. '[[Old Name]]').
+        new_text_payload_file: Absolute path to a file containing the exact replacement string (e.g. '[[New Name]]').
     """
+    try:
+        old_text = _read_payload(old_text_payload_file)
+        new_text = _read_payload(new_text_payload_file)
+    except Exception as e:
+        return str(e)
+    
     import os
     from vector_lake.wiki_utils import get_wiki_dir, atomic_write_text
     wiki_dir = get_wiki_dir()

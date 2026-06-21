@@ -164,7 +164,7 @@ def finalize_ingest(files_written_str: str, raw_files_processed_json: str) -> st
         
         files_written = []
         for item in files:
-            fname = item["filename"]
+            fname = os.path.basename(item["filename"])
             fcontent = item["content"]
             out_path = wiki_dir / fname
             

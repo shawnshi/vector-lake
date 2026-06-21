@@ -6,9 +6,8 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 - `MEMORY/raw`：原始信源层，只读输入。
 - `MEMORY/wiki`：人类可读的 Markdown 发布层，用于审计、浏览、复盘和长期资产沉淀。
-- `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展。
-- `MEMORY/wiki/claim_graph.json`：claim 级逻辑图投影。
-- `MEMORY/wiki/.meta/*.json`：canonical governance store，保存实体、断言、证据、信源、变更集和治理队列。
+- `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
+- `MEMORY/wiki/.meta/vector_lake.db`：(V10) 统一的 SQLite 底层引擎，保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列。
 - `MEMORY/wiki/.meta/operational_memory.json`：Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state`。
 - `MEMORY/purpose.md` & `purpose_vectors.json`：(V9.0) 战略意图配置，为 Agent 提供研究靶点与记忆权重加成 (Intent-Weight)。
 
@@ -21,8 +20,8 @@ graph LR
     RAW["MEMORY/raw<br>Immutable sources"] --> INGEST["Native Subagents<br>Asynchronous Ingestion Pipeline"]
     INGEST --> WIKI["MEMORY/wiki<br>Markdown pages"]
     WIKI --> INDEX["index.json<br>page index + BM25"]
-    WIKI --> META[".meta/*.json<br>canonical store"]
-    META --> CLAIM["claim_graph.json<br>claim topology"]
+    WIKI --> META["vector_lake.db<br>SQLite Canonical Store"]
+    META --> CLAIM["SQLite claim_graph_nodes<br>claim topology"]
     META --> MEMORY["operational_memory.json<br>agent runtime memory"]
     MEMORY --> PACKET["Memory Packet<br>selective context injection"]
     INDEX --> QUERY["search<br>LLM Expansion + BM25 + Graph Spreading"]
@@ -47,6 +46,10 @@ graph LR
    - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
    - **原生二进制向量引擎 (Native Binary Embeddings) [V11.0]**：将臃肿的纯文本 JSON 序列化彻底淘汰，重构为基于 C 层级的高性能 Pickle (`HIGHEST_PROTOCOL`) 二进制缓冲。大幅抹除了无用 I/O 载荷（体积暴降 60%），并将语义对比矩阵的加载时间从数秒降至毫秒级，根绝了内存爆栈风险。
    - **本体免疫型排重 (Ontology-Immune Deduplication) [V11.0]**：在去重守护进程中注入了严格的前缀屏障，自动豁免 `Source_` 等具有时序不可变性的物理原始信源，从根源上彻底斩断了“因文档相似度过高而将不同日期研报强行合并”的灾难性合并幻觉，令治理队列（Governance Queue）保持绝对纯净。
+   - **统一 SQLite 数据底座 (Unified SQLite Engine) [V10.0]**：彻底废弃易损坏且不支持原子操作的散装 JSON 存储，全面迁移至原生 SQLite。通过严格的 Schema 列约束与 `PRAGMA WAL` 实现了毫秒级的高并发原子级 CRUD 响应。
+   - **差分垃圾回收机制 (Diff-based GC) [V10.1]**：针对早期系统只增不减 (Append-Only) 的痛点，重构了同步层的级联清理逻辑。当用户在 Markdown 层面重命名/删除文件，或者删除某句特征断言时，系统会执行精确对比，物理上擦除 SQLite 中冗余的实体 (Entities)、声索 (Claims) 和证据 (Evidence)，保证图谱 0 负担。
+   - **夜间拾荒者集群 (Janitor Swarm) [V10.0]**：全自动的语义去重重构框架。通过 `launch_janitor_swarm.py`，夜间守护进程会自动读取 SQLite 治理队列中的 pending merge 项，拉起 `tool_rename.py` 进行跨文件双链重命名、文件合并，并由 Diff GC 彻底抹除幽灵节点。
+   - **MCP 沙箱安全网关 (JSON Sandbox Gateway) [V10.0]**：面向所有大模型 MCP Tool，将所有长文本/特殊符号参数转入 `--config_file` JSON 载荷逃逸机制，彻底封堵因命令行参数截断或特殊字符（如引号、换行符）导致的命令注入与崩溃。
 ### 🔌 V8.0 Antigravity Orchestrator 深度集成
 
 在最新的 V8.0 架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
@@ -96,18 +99,10 @@ MEMORY/
   wiki/
     *.md
     index.json
-    claim_graph.json
     .meta/
       purpose_vectors.json <-- V9.0 Compiled Intent Weights
-      entities.json
-      claims.json
-      evidence.json
-      sources.json
+      vector_lake.db       <-- V10 Unified SQLite Store (Entities, Claims, Graph, Timeline)
       operational_memory.json
-      alias_registry.json
-      change_sets.json
-      governance_queue.json
-      vector_lake.db  <-- Unified SQLite Store (Entities, Claims, Graph, Timeline)
 ```
 
 ## Commands

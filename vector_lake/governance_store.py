@@ -131,6 +131,16 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
         extra_cols = []
     
     with conn:
+        # V10.1 Diff-based Orphan Pruning (Delete missing keys)
+        existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
+        existing_keys = {row[0] for row in existing_keys_query}
+        new_keys = set(data.get("items", {}).keys())
+        keys_to_delete = existing_keys - new_keys
+        
+        for k in keys_to_delete:
+            conn.execute(f"DELETE FROM {table_name} WHERE {pk_col} = ?", (k,))
+            
+        # V10.1 Insert or Update
         for key, item in data.get("items", {}).items():
             cols = [pk_col] + [c[0] for c in extra_cols] + ["data_json", "updated_at"]
             placeholders = ["?"] * len(cols)
@@ -151,19 +161,42 @@ def _save_db_queue(table_name: str, pk_col: str, data: dict):
     now = _utc_now()
     data["updated_at"] = now
     with conn:
-        conn.execute(f"DELETE FROM {table_name}")
+        # V10.1 Diff-based synchronization (Avoid full table wipe)
+        for item in data.get("items", []):
+            if not item.get(pk_col):
+                import uuid
+                item[pk_col] = uuid.uuid4().hex
+                
+        existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
+        existing_keys = {row[0] for row in existing_keys_query}
+        new_keys = {item[pk_col] for item in data.get("items", [])}
+        keys_to_delete = existing_keys - new_keys
+        
+        for k in keys_to_delete:
+            conn.execute(f"DELETE FROM {table_name} WHERE {pk_col} = ?", (k,))
+            
         for item in data.get("items", []):
             k = item.get(pk_col)
-            if not k:
-                import uuid
-                k = uuid.uuid4().hex
-                item[pk_col] = k
-            conn.execute(f"INSERT INTO {table_name} ({pk_col}, data_json, updated_at) VALUES (?, ?, ?)", 
+            conn.execute(f"INSERT OR REPLACE INTO {table_name} ({pk_col}, data_json, updated_at) VALUES (?, ?, ?)", 
                          (k, json.dumps(item, ensure_ascii=False), now))
 
 
 def load_entities():
     return _load_db_map("entities", "entity_id")
+
+
+def query_entities(where_clause: str = None, params: tuple = None) -> dict:
+    initialize_meta_store()
+    conn = get_connection()
+    store = _default_map_store("entity_id")
+    query = "SELECT data_json FROM entities"
+    if where_clause:
+        query += f" WHERE {where_clause}"
+    rows = conn.execute(query, params or ()).fetchall()
+    for row in rows:
+        data = json.loads(row["data_json"])
+        store["items"][data["entity_id"]] = data
+    return store
 
 
 def load_claims():
@@ -192,6 +225,20 @@ def load_memory_objects():
     return _load_db_map("operational_memory", "memory_id")
 
 
+def query_memory_objects(where_clause: str = None, params: tuple = None) -> dict:
+    initialize_meta_store()
+    conn = get_connection()
+    store = _default_map_store("memory_id")
+    query = "SELECT data_json FROM operational_memory"
+    if where_clause:
+        query += f" WHERE {where_clause}"
+    rows = conn.execute(query, params or ()).fetchall()
+    for row in rows:
+        data = json.loads(row["data_json"])
+        store["items"][data["memory_id"]] = data
+    return store
+
+
 def load_change_sets():
     return _load_db_queue("change_sets", "change_set_id")
 
@@ -201,7 +248,13 @@ def load_governance_queue():
 
 
 def save_entities(data):
-    _save_db_map("entities", "entity_id", data, [("canonical_name", "canonical_name", str)])
+    _save_db_map("entities", "entity_id", data, [
+        ("canonical_name", "canonical_name", str),
+        ("type", "type", str),
+        ("status", "status", str),
+        ("ttl", "ttl", float),
+        ("decay_weight", "decay_weight", float)
+    ])
 
 
 def save_claims(data):
@@ -237,16 +290,50 @@ def save_alias_registry(data):
 
 
 def save_memory_objects(data):
-    _save_db_map("operational_memory", "memory_id", data, [("memory_type", "memory_type", str), ("score", "memory_score", float)])
+    _save_db_map("operational_memory", "memory_id", data, [
+        ("memory_type", "memory_type", str), 
+        ("score", "memory_score", float),
+        ("status", "status", str),
+        ("ttl", "ttl", float)
+    ])
 
 
 def save_change_sets(data):
-    _save_db_queue("change_sets", "change_set_id", data)
-
+    _save_db_map("change_sets", "change_id", data)
 
 def save_governance_queue(data):
     _save_db_queue("governance_queue", "item_id", data)
 
+# =============================================================================
+# V10.1 TARGETED ATOMIC CRUD (Replaces load_all -> save_all pattern)
+# =============================================================================
+def get_entity(entity_id: str) -> dict | None:
+    conn = get_connection()
+    row = conn.execute("SELECT data_json FROM entities WHERE entity_id = ?", (entity_id,)).fetchone()
+    if row:
+        return json.loads(row["data_json"])
+    return None
+
+def upsert_entity(entity_id: str, data: dict):
+    conn = get_connection()
+    now = _utc_now()
+    cols = ["entity_id", "type", "status", "data_json", "updated_at"]
+    placeholders = ["?"] * len(cols)
+    params = [
+        entity_id,
+        str(data.get("type", "")),
+        str(data.get("status", "Active")),
+        json.dumps(data, ensure_ascii=False),
+        now
+    ]
+    with conn:
+        conn.execute(f"INSERT OR REPLACE INTO entities ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", params)
+
+def delete_entity(entity_id: str):
+    conn = get_connection()
+    with conn:
+        conn.execute("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
+# =============================================================================
 
 def _upsert_map_records(store: dict, records: list, key_name: str):
     for record in records:
@@ -906,6 +993,31 @@ def apply_change_set(change_set: dict) -> dict:
     evidence = load_evidence()
     sources = load_sources()
 
+    affected_pages = change_set.get("affected_pages", [])
+    affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
+
+    if affected_page_keys:
+        proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
+        proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
+
+        # Prune claims no longer in the markdown
+        keys_to_remove = []
+        for k, v in claims.get("items", {}).items():
+            locator_page = v.get("locator", {}).get("page_key")
+            if locator_page in affected_page_keys and k not in proposed_claim_ids:
+                keys_to_remove.append(k)
+        for k in keys_to_remove:
+            del claims["items"][k]
+            
+        # Prune evidence no longer in the markdown
+        keys_to_remove = []
+        for k, v in evidence.get("items", {}).items():
+            locator_page = v.get("locator", {}).get("page_key")
+            if locator_page in affected_page_keys and k not in proposed_evidence_ids:
+                keys_to_remove.append(k)
+        for k in keys_to_remove:
+            del evidence["items"][k]
+
     _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
     _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
     _upsert_map_records(evidence, change_set.get("proposed_evidence", []), "evidence_id")
@@ -1099,7 +1211,26 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
 
 
 def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bool = True, summary: str | None = None) -> dict | None:
-    existing_paths = [str(path) for path in page_paths if path and os.path.exists(path)]
+    existing_paths = []
+    deleted_paths = []
+    for path in page_paths:
+        if path:
+            if os.path.exists(path):
+                existing_paths.append(str(path))
+            else:
+                deleted_paths.append(str(path))
+                
+    # V10.1 Delete orphaned entities in SQLite when Markdown file is deleted/renamed
+    if deleted_paths:
+        for path in deleted_paths:
+            basename = os.path.basename(path)
+            if basename.endswith(".md"):
+                page_key = basename[:-3]
+                entity_id = _stable_id("entity", page_key)
+                delete_entity(entity_id)
+                import logging
+                logging.getLogger("governance").info(f"Deleted orphan entity {entity_id} ({page_key}) from SQLite due to missing markdown file.")
+
     if not existing_paths:
         return None
     return create_change_set(existing_paths, origin=origin, summary=summary, auto_approve=auto_approve)
