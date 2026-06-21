@@ -469,6 +469,11 @@
             renderStats();
         }
 
+        function escapeHTML(str) {
+            if (str === undefined || str === null) return '';
+            return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+        }
+
         function nodeHref(node) {
             if (activeGraphKey === 'claim') return null;
             return `${memoryBasePath}wiki/${node.id}.md`;
@@ -489,25 +494,26 @@
             Graph.cameraPosition({ x: targetX * ratio, y: targetY * ratio, z: targetZ * ratio }, lookAtPos, 1200);
 
             const href = nodeHref(node);
-            document.getElementById('info-title').innerHTML = href ? `<a href="${href}" target="_blank">${node.name || node.id}</a>` : (node.name || node.id);
+            const safeName = escapeHTML(node.name || node.id);
+            document.getElementById('info-title').innerHTML = href ? `<a href="${encodeURI(href)}" target="_blank">${safeName}</a>` : safeName;
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
 
             const meta = [];
-            meta.push(`<span><strong>Mode</strong> ${activeGraphKey}</span>`);
-            meta.push(`<span><strong>Category</strong> ${node.group || 'Unknown'}</span>`);
-            meta.push(`<span><strong>Type</strong> ${node.raw_type || 'Unknown'}</span>`);
-            meta.push(`<span><strong>Degree</strong> ${node.degree || 0}</span>`);
-            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${node.validity_state}</span>`);
-            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${node.claim_type}</span>`);
-            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${node.confidence}</span>`);
-            if (node.domain) meta.push(`<span><strong>Domain</strong> ${node.domain}</span>`);
+            meta.push(`<span><strong>Mode</strong> ${escapeHTML(activeGraphKey)}</span>`);
+            meta.push(`<span><strong>Category</strong> ${escapeHTML(node.group || 'Unknown')}</span>`);
+            meta.push(`<span><strong>Type</strong> ${escapeHTML(node.raw_type || 'Unknown')}</span>`);
+            meta.push(`<span><strong>Degree</strong> ${escapeHTML(node.degree || 0)}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${escapeHTML(node.validity_state)}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${escapeHTML(node.claim_type)}</span>`);
+            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${escapeHTML(node.confidence)}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain</strong> ${escapeHTML(node.domain)}</span>`);
             if (node.updated) {
                 const updatedStr = typeof node.updated === 'string' ? node.updated.substring(0, 10) : String(node.updated);
-                meta.push(`<span><strong>Updated</strong> ${updatedStr}</span>`);
+                meta.push(`<span><strong>Updated</strong> ${escapeHTML(updatedStr)}</span>`);
             }
-            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${node.alignment_score}</span>`);
-            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${node.decay_weight}</span>`);
+            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${escapeHTML(node.alignment_score)}</span>`);
+            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${escapeHTML(node.decay_weight)}</span>`);
             document.getElementById('info-meta').innerHTML = meta.join('');
             document.getElementById('info-summary').innerText = node.summary || 'No summary available.';
 
