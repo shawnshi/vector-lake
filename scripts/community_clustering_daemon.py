@@ -3,6 +3,8 @@ import logging
 import math
 import os
 import re
+import uuid
+import glob
 from datetime import datetime, timezone
 import time
 from filelock import FileLock
@@ -34,6 +36,40 @@ def _mark_graph_clean(index_data: dict):
     index_data["graph_state"]["reason"] = "Community clustering applied"
     index_data["graph_state"]["updated_at"] = _utc_now()
 
+def _stabilize_community_ids(new_partition, old_partition, old_uuids):
+    new_comm_nodes = {}
+    for n, c in new_partition.items():
+        new_comm_nodes.setdefault(c, []).append(n)
+        
+    stable_uuids = {}
+    diffs = {}
+    
+    for new_cid, nodes in new_comm_nodes.items():
+        overlap_counts = {}
+        for n in nodes:
+            old_u = old_partition.get(n)
+            if old_u:
+                overlap_counts[old_u] = overlap_counts.get(old_u, 0) + 1
+                
+        if overlap_counts:
+            best_old_u = max(overlap_counts.items(), key=lambda x: x[1])[0]
+            old_nodes_in_u = [n for n, u in old_partition.items() if u == best_old_u]
+            overlap = overlap_counts[best_old_u]
+            added = len(nodes) - overlap
+            removed = len(old_nodes_in_u) - overlap
+            total_old = len(old_nodes_in_u) if old_nodes_in_u else 1
+            diff_ratio = (added + removed) / total_old
+            
+            stable_uuids[new_cid] = best_old_u
+            diffs[best_old_u] = {"ratio": diff_ratio, "added": [n for n in nodes if old_partition.get(n) != best_old_u]}
+        else:
+            new_u = uuid.uuid4().hex[:8]
+            stable_uuids[new_cid] = new_u
+            diffs[new_u] = {"ratio": 1.0, "added": nodes}
+            
+    final_partition = {n: stable_uuids[c] for n, c in new_partition.items()}
+    return final_partition, diffs, stable_uuids
+
 def run_clustering():
     index_file = get_index_path()
     if not index_file.exists():
@@ -46,13 +82,8 @@ def run_clustering():
         with open(index_file, "r", encoding="utf-8") as f:
             index_data = json.load(f)
 
-        # Check if dirty
-        graph_state = index_data.get("graph_state", {})
-        if not graph_state.get("dirty", True):
-            log.info("Graph is not dirty. Skipping clustering.")
-            return
-
-        log.info("Starting heavy graph topology clustering...")
+        # Force run for the migration
+        log.info("Starting V9 heavy graph topology clustering (Hierarchical + Stable Hashing)...")
         
         edges = index_data.get("weighted_edges", [])
         node_keys = list(index_data.get("nodes", {}).keys())
@@ -82,112 +113,95 @@ def run_clustering():
                     node["centrality_score"] = round(pr_score, 4)
                     node["node_score"] = round(node.get("decay_weight", 1.0) * pr_score, 4)
             except Exception as e:
-                log.error(f"PageRank computation failed: {e}")
-                for node_key in node_keys:
-                    node = index_data["nodes"][node_key]
-                    node["centrality_score"] = 1.0
-                    node["node_score"] = round(node.get("decay_weight", 1.0), 4)
-        else:
-            for node_key in node_keys:
-                node = index_data["nodes"][node_key]
-                node["centrality_score"] = 1.0
-                node["node_score"] = round(node.get("decay_weight", 1.0), 4)
+                pass
 
         try:
-            partition = community_louvain.best_partition(G, weight="weight")
-            index_data["communities"] = partition
+            dendro = community_louvain.generate_dendrogram(G, weight="weight")
+            if len(dendro) >= 2:
+                raw_part_L1 = community_louvain.partition_at_level(dendro, 0) # Micro
+                raw_part_L0 = community_louvain.partition_at_level(dendro, len(dendro)-1) # Global
+            else:
+                raw_part_L1 = community_louvain.partition_at_level(dendro, 0)
+                raw_part_L0 = raw_part_L1
 
-            community_nodes = {}
-            for node, comm_id in partition.items():
-                community_nodes.setdefault(comm_id, []).append(node)
-
-            for comm_id, nodes in community_nodes.items():
-                if len(nodes) < 3:
-                    continue
-                subgraph = G.subgraph(nodes)
-                possible_edges = len(nodes) * (len(nodes) - 1) / 2
-                actual_edges = subgraph.number_of_edges()
-                cohesion = actual_edges / possible_edges if possible_edges > 0 else 0
-                if cohesion < 0.15:
-                    index_data["graph_insights"].append({
-                        "type": "sparse_community",
-                        "community_id": int(comm_id),
-                        "nodes": nodes,
-                        "cohesion": float(cohesion),
-                        "description": f"Community {comm_id} has low internal cohesion ({cohesion:.2f}). Indicates a potential knowledge gap.",
-                    })
-
-            for node in node_keys:
-                if G.degree(node) <= 1:
-                    index_data["graph_insights"].append({
-                        "type": "isolated_node",
-                        "node": node,
-                        "description": f"Node '{node}' is isolated or weakly connected (Degree <= 1).",
-                    })
-
-            for node in node_keys:
-                connected_communities = {partition.get(neighbor) for neighbor in G.neighbors(node)}
-                connected_communities.discard(None)
-                if len(connected_communities) >= 3:
-                    index_data["graph_insights"].append({
-                        "type": "bridge_node",
-                        "node": node,
-                        "connected_communities": [int(comm_id) for comm_id in connected_communities],
-                        "description": f"Node '{node}' connects {len(connected_communities)} distinct communities. High strategic value.",
-                    })
-
-            community_labels = {}
-            for comm_id, nodes in community_nodes.items():
-                sorted_nodes = sorted(nodes, key=lambda node: G.degree(node), reverse=True)
-                top_nodes = sorted_nodes[:2]
-                titles = []
-                for node in top_nodes:
-                    node_data = index_data["nodes"].get(node)
-                    titles.append(node_data.get("title", node) if node_data else node)
-                label = f"Comm {comm_id}: {' / '.join(titles) if titles else 'Unknown'}"
-                community_labels[int(comm_id)] = label
-                
-                # --- PROGRESSIVE DISCLOSURE INDEX ---
+            snapshot_file = get_meta_dir() / "community_snapshot.json"
+            old_part_L0 = {}
+            old_part_L1 = {}
+            if snapshot_file.exists():
                 try:
-                    wiki_dir = get_wiki_dir()
-                    sanitized_title = re.sub(r'[\\/*?:"<>|\'#\s\[\]\(\)&]', '_', label.replace(f"Comm {comm_id}:", "").strip())
-                    sanitized_title = re.sub(r'_+', '_', sanitized_title).strip('_ ')
-                    if not sanitized_title:
-                        sanitized_title = "Unknown"
-                    index_filename = f"System_Community_{comm_id}_{sanitized_title}.md"
+                    with open(snapshot_file, "r", encoding="utf-8") as f:
+                        old_snap = json.load(f)
+                        # Handle legacy snapshot conversion
+                        if "partition" in old_snap and "partition_L0" not in old_snap:
+                            old_part_L0 = old_snap["partition"]
+                            # Convert integer CIDs to strings for stable matching
+                            old_part_L0 = {k: str(v) for k, v in old_part_L0.items()}
+                        else:
+                            old_part_L0 = old_snap.get("partition_L0", {})
+                            old_part_L1 = old_snap.get("partition_L1", {})
+                except Exception:
+                    pass
+
+            part_L0, diffs_L0, uuid_map_L0 = _stabilize_community_ids(raw_part_L0, old_part_L0, {})
+            part_L1, diffs_L1, uuid_map_L1 = _stabilize_community_ids(raw_part_L1, old_part_L1, {})
+
+            index_data["communities"] = part_L0
+
+            wiki_dir = get_wiki_dir()
+
+            def process_level(level_name, final_partition, diffs_info):
+                community_nodes = {}
+                for node, c_uuid in final_partition.items():
+                    community_nodes.setdefault(c_uuid, []).append(node)
+
+                for c_uuid, nodes in community_nodes.items():
+                    if len(nodes) < 3: continue
+                    sorted_nodes = sorted(nodes, key=lambda node: G.degree(node), reverse=True)
+                    titles = [index_data["nodes"].get(n, {}).get("title", n) for n in sorted_nodes[:2]]
+                    label = f"{level_name} Comm: {' / '.join(titles) if titles else 'Unknown'}"
+                    
+                    diff_ratio = diffs_info.get(c_uuid, {}).get("ratio", 1.0)
+                    added_nodes = diffs_info.get(c_uuid, {}).get("added", [])
+
+                    index_filename = f"System_Community_{level_name}_{c_uuid}.md"
                     index_filepath = wiki_dir / index_filename
                     
                     hubs_markdown = "\n".join([f"- [[{node}]]" for node in sorted_nodes[:5]])
                     members_markdown = "\n".join([f"- [[{node}]]" for node in sorted_nodes[5:]])
                     
                     existing_summary = "*(To be generated by LLM during Review/Synthesis)*"
-                    import glob
-                    old_files = glob.glob(str(wiki_dir / f"System_Community_{comm_id}_*.md"))
-                    for old_file in old_files:
+                    unassimilated = ""
+                    
+                    if index_filepath.exists():
                         try:
-                            with open(old_file, "r", encoding="utf-8") as old_f:
+                            with open(index_filepath, "r", encoding="utf-8") as old_f:
                                 old_content = old_f.read()
                                 if "## 语义总结" in old_content:
                                     parts = old_content.split("## 语义总结", 1)
                                     if len(parts) > 1:
-                                        extracted = parts[1].split("\n", 1)[-1].strip()
-                                        if extracted and extracted != "*(To be generated by LLM during Review/Synthesis)*" and not extracted.startswith("*(To be generated"):
+                                        extracted = parts[1].split("##", 1)[0].strip()
+                                        if extracted and not extracted.startswith("*(To be generated"):
                                             existing_summary = extracted
-                                            break
                         except Exception:
                             pass
-                            
-                    if existing_summary.startswith("*(To be generated"):
+
+                    needs_llm = False
+                    if diff_ratio >= 0.15 or existing_summary.startswith("*(To be generated"):
+                        existing_summary = "*(To be generated by LLM during Review/Synthesis)*"
+                        needs_llm = True
+                    elif added_nodes:
+                        unassimilated = "\n> [!WARNING] **待同化增量 (Unassimilated Delta)**:\n" + "\n".join([f"> - [[{n}]]" for n in added_nodes])
+
+                    if needs_llm:
                         try:
-                            import uuid
                             queue = load_governance_queue()
-                            if not any(item.get("community_id") == comm_id and item.get("type") == "community_naming" and item.get("status") == "pending" for item in queue.get("items", [])):
+                            if not any(item.get("community_id") == c_uuid and item.get("status") == "pending" for item in queue.get("items", [])):
                                 queue["items"].append({
                                     "item_id": f"gov_{uuid.uuid4().hex[:12]}",
                                     "type": "community_naming",
-                                    "community_id": comm_id,
-                                    "title": f"Community {comm_id} Requires Semantic Naming",
-                                    "description": f"Hubs: {' / '.join(titles)}. Provide a 3-5 word abstraction.",
+                                    "community_id": c_uuid,
+                                    "title": f"{level_name} Comm {c_uuid} Requires Synthesis",
+                                    "description": f"Diff ratio {diff_ratio:.2f}. Hubs: {' / '.join(titles)}.",
                                     "created_at": _utc_now(),
                                     "status": "pending",
                                     "source": "indexer",
@@ -196,25 +210,22 @@ def run_clustering():
                                 })
                                 save_governance_queue(queue)
                         except Exception as e:
-                            log.warning(f"Failed to queue community_naming for Comm {comm_id}: {e}")
-                            
-                    for old_file in old_files:
-                        if os.path.basename(old_file) != index_filename:
-                            try:
-                                os.remove(old_file)
-                            except OSError:
-                                pass
-                    
+                            log.warning(f"Failed to queue naming for {c_uuid}: {e}")
+
                     content = f"""---
 title: "{label}"
 type: system
 status: Active
-community_id: {comm_id}
+community_id: {c_uuid}
+level: {level_name}
+aliases:
+- "{label}"
 ---
 # {label}
 
 > [!NOTE]
-> 这是一个系统自动生成的**社区索引文件 (Progressive Disclosure Index)**。下游 Agent 可以通过优先阅读此文件来快速掌握该知识聚类的全局拓扑。
+> 这是一个系统自动生成的**社区索引文件 (Progressive Disclosure Index)**。
+> 当前缩放级别: **{level_name}** ({'Global' if level_name=='L0' else 'Micro'})
 
 ## 核心节点 (Hubs)
 {hubs_markdown}
@@ -224,60 +235,23 @@ community_id: {comm_id}
 
 ## 语义总结 (Semantic Summary)
 {existing_summary}
+{unassimilated}
 """
                     with open(index_filepath, "w", encoding="utf-8") as f:
                         f.write(content)
-                except Exception as e:
-                    log.warning(f"Failed to generate Progressive Disclosure Index for Comm {comm_id}: {e}")
 
-            index_data["community_labels"] = community_labels
-            
-            # --- EVOLUTION TRACKING ---
-            try:
-                snapshot_file = get_meta_dir() / "community_snapshot.json"
-                
-                if snapshot_file.exists():
-                    with open(snapshot_file, "r", encoding="utf-8") as f:
-                        old_snapshot = json.load(f)
-                    old_partition = old_snapshot.get("partition", {})
-                    old_labels = old_snapshot.get("labels", {})
-                    
-                    old_comm_nodes = {}
-                    for node, old_c in old_partition.items():
-                        old_comm_nodes.setdefault(str(old_c), []).append(node)
-                        
-                    for old_cid, old_nodes in old_comm_nodes.items():
-                        if len(old_nodes) < 5: continue
-                        
-                        destinations = {}
-                        for node in old_nodes:
-                            new_cid = partition.get(node)
-                            if new_cid is not None:
-                                destinations[str(new_cid)] = destinations.get(str(new_cid), 0) + 1
-                                
-                        for new_cid, count in destinations.items():
-                            new_nodes = community_nodes.get(int(new_cid))
-                            if not new_nodes: continue
-                            
-                            ratio_old = float(count) / len(old_nodes)
-                            ratio_new = float(count) / len(new_nodes)
-                            
-                            if count >= 3 and 0.15 <= ratio_old < 0.85 and 0.15 <= ratio_new < 0.85:
-                                old_label = old_labels.get(old_cid, f"Comm {old_cid}")
-                                new_label = community_labels.get(int(new_cid), f"Comm {new_cid}")
-                                index_data["graph_insights"].append({
-                                    "type": "strategic_convergence",
-                                    "old_community": int(old_cid),
-                                    "new_community": int(new_cid),
-                                    "node_count": count,
-                                    "description": f"Convergence Signal: {count} nodes migrated from [{old_label}] to [{new_label}]. This indicates cross-disciplinary fusion or topic fission."
-                                })
-                                
-                with open(snapshot_file, "w", encoding="utf-8") as f:
-                    json.dump({"partition": partition, "labels": community_labels}, f, ensure_ascii=False)
-            except Exception as e:
-                log.warning(f"Community drift tracking failed: {e}")
-                
+            process_level("L0", part_L0, diffs_L0)
+            process_level("L1", part_L1, diffs_L1)
+
+            # Clean up old legacy flat files safely
+            legacy_files = glob.glob(str(wiki_dir / "System_Community_[0-9]*.md"))
+            for old_file in legacy_files:
+                try: os.remove(old_file)
+                except OSError: pass
+
+            with open(snapshot_file, "w", encoding="utf-8") as f:
+                json.dump({"partition_L0": part_L0, "partition_L1": part_L1}, f, ensure_ascii=False)
+
         except Exception as e:
             log.error(f"Graph analysis failed: {e}")
         finally:
@@ -285,7 +259,7 @@ community_id: {comm_id}
             with open(index_file, "w", encoding="utf-8") as f:
                 json.dump(index_data, f, ensure_ascii=False)
                 
-        log.info("Heavy graph topology clustering complete.")
+        log.info("V9 Heavy graph topology clustering complete.")
 
 if __name__ == "__main__":
     run_clustering()

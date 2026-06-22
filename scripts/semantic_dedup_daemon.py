@@ -48,7 +48,7 @@ Answer with exactly one word: YES if they are the exact same concept and should 
 """
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.5-flash",
             contents=prompt
         )
         return "YES" in response.text.upper()
