@@ -1,5 +1,8 @@
 import os
+import sys
 import yaml
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 count = 0
@@ -14,7 +17,7 @@ for filename in os.listdir(wiki_dir):
         parts = content.split("---", 2)
         if len(parts) < 3: continue
         
-        fm = yaml.safe_load(parts[1])
+        fm = load_yaml(parts[1])
         changed = False
         
         # Capitalize type
@@ -47,7 +50,7 @@ for filename in os.listdir(wiki_dir):
         if changed:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write("---\n")
-                yaml.dump(fm, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                dump_yaml(fm, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
                 f.write("---")
                 f.write(parts[2])
             count += 1
