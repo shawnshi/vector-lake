@@ -16,7 +16,7 @@ FRONTMATTER_REGEX = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 _META_DIR_CACHE = None
 
 SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
-VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")
+VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
 
 def normalize_entity_name(name: str) -> str:
@@ -156,6 +156,18 @@ def read_markdown_file(path: str | Path, errors: str = "replace") -> tuple[dict,
 
 def atomic_write_text(path: str | Path, content: str):
     path = Path(path)
+    
+    # NEW: Trigger Defense Hook for wiki markdown files
+    if path.name.endswith(".md") and "wiki" in path.parts:
+        try:
+            from vector_lake.defense_hook import verify_asset
+            frontmatter, _ = split_frontmatter(content)
+            verify_asset(content, path.name, frontmatter, get_index_path())
+        except Exception as e:
+            if type(e).__name__ == "DefenseHookException":
+                raise e # Bubble up the specific defense hook violation
+            pass # Ignore other import or parsing errors to prevent system lockup
+            
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     with open(temp_path, "w", encoding="utf-8") as handle:
@@ -178,7 +190,7 @@ FRONTMATTER_REGEX = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 _META_DIR_CACHE = None
 
 SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
-VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")
+VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
 
 def normalize_entity_name(name: str) -> str:
@@ -318,6 +330,18 @@ def read_markdown_file(path: str | Path, errors: str = "replace") -> tuple[dict,
 
 def atomic_write_text(path: str | Path, content: str):
     path = Path(path)
+    
+    # NEW: Trigger Defense Hook for wiki markdown files
+    if path.name.endswith(".md") and "wiki" in path.parts:
+        try:
+            from vector_lake.defense_hook import verify_asset
+            frontmatter, _ = split_frontmatter(content)
+            verify_asset(content, path.name, frontmatter, get_index_path())
+        except Exception as e:
+            if type(e).__name__ == "DefenseHookException":
+                raise e # Bubble up the specific defense hook violation
+            pass # Ignore other import or parsing errors to prevent system lockup
+            
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     with open(temp_path, "w", encoding="utf-8") as handle:

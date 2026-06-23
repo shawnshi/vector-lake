@@ -18,6 +18,8 @@ Task:
 2. Extract the core entities, concepts, and tensions based on the Schema.
 3. If a `确定性结构 (Static Skeleton)` block is provided above, you MUST copy it EXACTLY into the final output under the `## 确定性结构 (Static Skeleton)` section. Do not alter or summarize it.
 4. Call the lazy MCP tool using `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="finalize_ingest"). Pass the formatted JSON array of new wiki nodes to `files_written_str`, and `{"filepath": "{{filepath}}", "hash": "{{file_hash}}"}` to `raw_files_processed_json`.
+5. 闭环执行 (Agentic Workflow): If contradictions, duplicates, or knowledge gaps are found, you MUST NOT just output text. You MUST invoke the `enqueue_governance_item` MCP tool with the payload `{"type": "contradiction", "entities": ["page1", "page2"], "description": "..."}`. The Watchdog will queue this for the next resolving cycle.
+
 
 [CRITICAL REQUIREMENT: MICRO-ASSET FUNNEL]
 If the source text contains explicit highly-structured knowledge (e.g. formulas, exact config parameters, or architecture decisions), you MUST NOT bury them inside long prose.
@@ -26,3 +28,9 @@ Instead, mint a DEDICATED node for them with a specific prefix:
 - `Concept_Config_XYZ.md`
 - `Concept_Decision_XYZ.md`
 For `Concept_Decision_*` files, you MUST include explicit bullet points for: `context`, `alternatives`, and `justification`.
+
+[STRICT SCHEMA RULE: NEGATIVE CONSTRAINTS]
+`Person`, `Vendor`, `Product`, `Synthesis`, `Event`, `Policy`, `Standard`, `Source` are FIRST-CLASS node types. YOU MUST NEVER prefix them with `Concept_`. Output `Person_XXX.md`, NOT `Concept_Person_XXX.md`. Output `Synthesis_XXX.md`, NOT `Concept_Synthesis_XXX.md`.
+
+[CRITICAL SYSTEM OVERRIDE]
+You are not a creative writer; you are a strict Database Compiler. Your output Markdown is physically parsed by an AST logic engine. Any deviation from the `[predicate:: [[Target]]]` syntax, any invention of H3 headers, or any use of pronouns (it/they/he) in Section 1 will cause a fatal compilation crash. Write with the cold, dense precision of machine code.

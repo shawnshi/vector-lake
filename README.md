@@ -9,7 +9,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 - `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
 - `MEMORY/wiki/.meta/vector_lake.db`：(V10) 统一的 SQLite 底层引擎，保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列。
 - `MEMORY/wiki/.meta/operational_memory.json`：Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state`。
-- `MEMORY/purpose.md` & `purpose_vectors.json`：(V9.0) 战略意图配置，为 Agent 提供研究靶点与记忆权重加成 (Intent-Weight)。
+- `MEMORY/purpose.md` & `purpose_vectors.json`：(V12.0) 战略意图引擎与最高系统宪法。硬编码了“破窗证伪阈值 (Falsification Threshold)”、“静默丢弃 (Silent Drop)”规则与“结构性张力连线”，强制所有 Agent 抛弃附和，保持冷酷的医疗数字化情报局审计立场。
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
 
@@ -95,13 +95,13 @@ graph LR
 
 ```text
 MEMORY/
-  purpose.md          <-- V9.0 Strategic Intent
+  purpose.md          <-- V12.0 Strategic Intent & Epistemic Stance
   raw/
   wiki/
     *.md
     index.json
     .meta/
-      purpose_vectors.json <-- V9.0 Compiled Intent Weights
+      purpose_vectors.json <-- V12.0 Compiled Intent Weights
       vector_lake.db       <-- V10 Unified SQLite Store (Entities, Claims, Graph, Timeline)
       operational_memory.json
 ```
@@ -118,7 +118,7 @@ MEMORY/
 > - `/resolve`：处理治理队列中的待办项
 > - `/audit`：合成图拓扑并执行审查
 > - `/debt`：查看图谱治理债务指标
-> - `/lint`：执行节点健康度自愈审查
+> - `/lint`：执行节点健康度自愈审查（支持传入 `auto_fix=True` 自动修复残缺元数据与图谱断层）
 > - `/research`：自主扫描并下发网络检索指令
 > - `/graph`：直接生成并刷新 3D 可视化拓扑面板
 > - `/doctor`：运行环境与依赖健康体检
@@ -239,7 +239,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 
 ## Validation
 
-最近验证基线（2026-06-20 V11.0 极速 I/O 与数据净空版）：
+最近验证基线（2026-06-23 V12.0 高维战略意图与智能自愈版）：
 
 ```powershell
 $env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v

@@ -339,5 +339,19 @@ def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str) 
             
     return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files."
 
+@mcp.tool()
+def bulk_reconciliation(payload_file: str) -> str:
+    """Execute a batch of graph reconciliation operations (merge, replace_only, alias).
+    
+    Args:
+        payload_file: Absolute path to a temporary JSON file containing the operations array.
+    """
+    try:
+        payload = _read_payload(payload_file)
+    except Exception as e:
+        return str(e)
+    from vector_lake.tool_bulk_reconciliation import bulk_reconcile
+    return bulk_reconcile(payload)
+
 if __name__ == "__main__":
     mcp.run()

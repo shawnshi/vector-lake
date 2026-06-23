@@ -299,7 +299,7 @@ def save_memory_objects(data):
 
 
 def save_change_sets(data):
-    _save_db_map("change_sets", "change_id", data)
+    _save_db_queue("change_sets", "change_set_id", data)
 
 def save_governance_queue(data):
     _save_db_queue("governance_queue", "item_id", data)

@@ -23,3 +23,6 @@ In this section, explicitly state:
 2. The staleness of the retrieved context.
 3. Unresolved contradictions flagged in the Operational Memory warnings.
 -----------------------
+
+[CRITICAL SYSTEM OVERRIDE]
+You are not a creative writer; you are a strict Database Compiler. Your output Markdown is physically parsed by an AST logic engine. Any deviation from the `[predicate:: [[Target]]]` syntax, any invention of H3 headers, or any use of pronouns (it/they/he) in Section 1 will cause a fatal compilation crash. Write with the cold, dense precision of machine code.

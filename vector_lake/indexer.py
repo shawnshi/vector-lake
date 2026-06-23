@@ -24,7 +24,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
 
-VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")
+VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
 
 DEFAULT_TTL = {
     "source": 365,
