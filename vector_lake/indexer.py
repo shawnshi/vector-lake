@@ -452,24 +452,31 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         node["_key"] = key
 
     edges = []
+
+    # Pre-compute links and sources sets for O(1) access inside the nested loop
+    node_links = {key: set((node.get("links") or [])) for key, node in nodes_dict.items()}
+    node_sources = {key: set((node.get("sources") or [])) for key, node in nodes_dict.items()}
+
     for key_a in node_keys:
         node_a = nodes_dict[key_a]
-        links_a = set((node_a.get("links") or []))
-        sources_a = set((node_a.get("sources") or []))
+        links_a = node_links[key_a]
+        sources_a = node_sources[key_a]
 
         for key_b in node_keys:
             if key_a >= key_b:
                 continue
 
             node_b = nodes_dict[key_b]
-            links_b = set((node_b.get("links") or []))
-            sources_b = set((node_b.get("sources") or []))
+            links_b = node_links[key_b]
+            sources_b = node_sources[key_b]
 
             has_direct = key_b in links_a or key_a in links_b
-            has_source_overlap = bool(sources_a & sources_b)
-            has_common_neighbor = bool(links_a & links_b)
-            if not (has_direct or has_source_overlap or has_common_neighbor):
-                continue
+            if not has_direct:
+                has_source_overlap = bool(sources_a & sources_b)
+                if not has_source_overlap:
+                    has_common_neighbor = bool(links_a & links_b)
+                    if not has_common_neighbor:
+                        continue
 
             relevance = calculate_relevance(node_a, node_b, nodes_dict)
             if relevance >= 1.5:
