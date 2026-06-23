@@ -2,6 +2,7 @@ import os
 import json
 import ast
 import yaml
+from vector_lake.yaml_utils import load_yaml
 
 def parse_static_skeleton(filepath: str) -> str:
     """
@@ -56,7 +57,7 @@ def parse_static_skeleton(filepath: str) -> str:
             
         elif ext in [".yaml", ".yml"]:
             with open(filepath, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
+                data = load_yaml(f)
             if isinstance(data, dict):
                 keys = list(data.keys())
                 skeleton = (

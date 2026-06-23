@@ -9,6 +9,7 @@ from pathlib import Path
 
 import yaml
 from vector_lake import get_extension_root
+from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 
 FRONTMATTER_REGEX = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
@@ -137,7 +138,7 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     try:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
+        frontmatter = load_yaml(match.group(1)) or {}
     except yaml.YAMLError:
         raise
 
@@ -299,7 +300,7 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
     try:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
+        frontmatter = load_yaml(match.group(1)) or {}
     except yaml.YAMLError:
         raise
 
@@ -360,7 +361,7 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_val
         for header in required_headers:
             if header not in body:
                 raise SafeWriteError(f"STORM Synthesis Structural Violation: The file {filename} is missing mandatory H2 section '{header}'. Please strictly follow the references/storm_report_template.md structure.")
-    yaml_block = yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    yaml_block = dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
     backup_file(path)
     atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}")
 
