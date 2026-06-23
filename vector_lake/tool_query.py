@@ -156,7 +156,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     stubs = 0
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     for target in broken_targets:
-        node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")) else "concept"
+        node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")) else "concept"
         frontmatter = {
             "title": target.replace("_", " "),
             "type": node_type,

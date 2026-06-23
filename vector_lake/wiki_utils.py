@@ -34,7 +34,7 @@ def normalize_entity_name(name: str) -> str:
     return f"{prefix}{name}"
 
 def validate_wiki_filename(filename: str):
-    if filename in SYSTEM_WHITELIST:
+    if filename in SYSTEM_WHITELIST or filename.startswith("System_"):
         return
     
     if not filename.endswith(".md"):
@@ -46,7 +46,7 @@ def validate_wiki_filename(filename: str):
     if INVALID_CHARS_REGEX.search(filename):
         raise ValueError(f"Invalid characters: '{filename}' contains forbidden characters (e.g., brackets, slashes, spaces).")
         
-    if not re.match(r'^(Concept|Vendor|Product|Person|Event|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*\.md$', filename):
+    if not re.match(r'^(Concept|Vendor|Product|Person|Event|Policy|Standard|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*\.md$', filename):
         raise ValueError(f"Strict Naming Violation: '{filename}' must match pattern [Type]_[MainName]-[SubName].md")
         
     core_name = filename.split("_", 1)[1][:-3] if "_" in filename else filename[:-3]
@@ -208,7 +208,7 @@ def normalize_entity_name(name: str) -> str:
     return f"{prefix}{name}"
 
 def validate_wiki_filename(filename: str):
-    if filename in SYSTEM_WHITELIST:
+    if filename in SYSTEM_WHITELIST or filename.startswith("System_"):
         return
     
     if not filename.endswith(".md"):
@@ -220,7 +220,7 @@ def validate_wiki_filename(filename: str):
     if INVALID_CHARS_REGEX.search(filename):
         raise ValueError(f"Invalid characters: '{filename}' contains forbidden characters (e.g., brackets, slashes, spaces).")
         
-    if not re.match(r'^(Concept|Vendor|Product|Person|Event|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*\.md$', filename):
+    if not re.match(r'^(Concept|Vendor|Product|Person|Event|Policy|Standard|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*\.md$', filename):
         raise ValueError(f"Strict Naming Violation: '{filename}' must match pattern [Type]_[MainName]-[SubName].md")
         
     core_name = filename.split("_", 1)[1][:-3] if "_" in filename else filename[:-3]

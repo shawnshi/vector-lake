@@ -30,7 +30,7 @@ print(f"Found {len(broken_targets)} unique broken link targets.")
 stubs = 0
 today = datetime.datetime.now().strftime("%Y-%m-%d")
 for target in broken_targets:
-    node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Source_", "Synthesis_")) else "concept"
+    node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")) else "concept"
     frontmatter = {
         "id": f"stub_{target.lower()}",
         "title": target.replace("_", " "),

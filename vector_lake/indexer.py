@@ -110,7 +110,7 @@ def _tokenize(text: str) -> list[str]:
     return tokens
 
 def _build_bm25_index(index_data: dict):
-    nodes = index_data.get("nodes", {})
+    nodes = (index_data.get("nodes") or {})
     inverted_index = defaultdict(dict)
     doc_lengths = {}
     total_docs = len(nodes)
@@ -121,7 +121,7 @@ def _build_bm25_index(index_data: dict):
 
     total_len = 0
     for node_key, node in nodes.items():
-        aliases_str = " ".join(node.get("aliases", [])) if isinstance(node.get("aliases"), list) else ""
+        aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
         text_to_index = f"{node.get('title', '')} {aliases_str} {node.get('summary', '')}"
         tokens = _tokenize(text_to_index)
         token_counts = Counter(tokens)
@@ -149,7 +149,7 @@ def _remove_node_from_bm25(index_data: dict, node_key: str, old_node: dict):
     if node_key not in doc_lengths:
         return
 
-    aliases_str = " ".join(old_node.get("aliases", [])) if isinstance(old_node.get("aliases"), list) else ""
+    aliases_str = " ".join(old_(node.get("aliases") or [])) if isinstance(old_node.get("aliases"), list) else ""
     text_to_index = f"{old_node.get('title', '')} {aliases_str} {old_node.get('summary', '')}"
     tokens = _tokenize(text_to_index)
     
@@ -178,7 +178,7 @@ def _add_node_to_bm25(index_data: dict, node_key: str, new_node: dict):
     if node_key in doc_lengths:
         return # Prevent double adding
 
-    aliases_str = " ".join(new_node.get("aliases", [])) if isinstance(new_node.get("aliases"), list) else ""
+    aliases_str = " ".join(new_(node.get("aliases") or [])) if isinstance(new_node.get("aliases"), list) else ""
     text_to_index = f"{new_node.get('title', '')} {aliases_str} {new_node.get('summary', '')}"
     tokens = _tokenize(text_to_index)
     token_counts = Counter(tokens)
@@ -256,7 +256,7 @@ def _mark_graph_clean(index_data: dict):
 def is_graph_dirty(index_data: dict | None) -> bool:
     if not index_data:
         return True
-    graph_state = index_data.get("graph_state", {})
+    graph_state = (index_data.get("graph_state") or {})
     return bool(graph_state.get("dirty"))
 
 
@@ -386,8 +386,8 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
     key_a = node_a.get("_key", "")
     key_b = node_b.get("_key", "")
 
-    links_a = set(node_a.get("links", []))
-    links_b = set(node_b.get("links", []))
+    links_a = set((node_a.get("links") or []))
+    links_b = set((node_b.get("links") or []))
     
     def get_pred_weight(pred: str) -> float:
         pred_lower = pred.lower()
@@ -401,7 +401,7 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
 
     if key_b in links_a:
         pred = "mentions"
-        for t in node_a.get("triples", []):
+        for t in (node_a.get("triples") or []):
             if t.get("target") == key_b:
                 pred = t.get("predicate", "mentions")
                 break
@@ -409,14 +409,14 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
         
     if key_a in links_b:
         pred = "mentions"
-        for t in node_b.get("triples", []):
+        for t in (node_b.get("triples") or []):
             if t.get("target") == key_a:
                 pred = t.get("predicate", "mentions")
                 break
         score += get_pred_weight(pred)
 
-    sources_a = set(node_a.get("sources", []))
-    sources_b = set(node_b.get("sources", []))
+    sources_a = set((node_a.get("sources") or []))
+    sources_b = set((node_b.get("sources") or []))
     shared_sources = len(sources_a & sources_b)
     score += shared_sources * RELEVANCE_WEIGHTS["source_overlap"]
 
@@ -454,16 +454,16 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     edges = []
     for key_a in node_keys:
         node_a = nodes_dict[key_a]
-        links_a = set(node_a.get("links", []))
-        sources_a = set(node_a.get("sources", []))
+        links_a = set((node_a.get("links") or []))
+        sources_a = set((node_a.get("sources") or []))
 
         for key_b in node_keys:
             if key_a >= key_b:
                 continue
 
             node_b = nodes_dict[key_b]
-            links_b = set(node_b.get("links", []))
-            sources_b = set(node_b.get("sources", []))
+            links_b = set((node_b.get("links") or []))
+            sources_b = set((node_b.get("sources") or []))
 
             has_direct = key_b in links_a or key_a in links_b
             has_source_overlap = bool(sources_a & sources_b)
@@ -591,7 +591,7 @@ def generate_index():
     log.info(
         f"Generated index.json with {len(index_data['nodes'])} nodes | "
         f"{len(index_data['weighted_edges'])} weighted edges | "
-        f"{len(index_data.get('error_log', []))} errors."
+        f"{len((index_data.get('error_log') or []))} errors."
     )
     return output_path
 
@@ -650,22 +650,22 @@ def update_index_items(filenames: list[str]):
                         index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
                         index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
                         log.warning(f"Schema violation in {filename} during partial update.")
-                        index_data.get("nodes", {}).pop(node_key, None)
+                        (index_data.get("nodes") or {}).pop(node_key, None)
                         index_data["weighted_edges"] = [
-                            edge for edge in index_data.get("weighted_edges", [])
+                            edge for edge in (index_data.get("weighted_edges") or [])
                             if edge["source"] != node_key and edge["target"] != node_key
                         ]
                     else:
-                        index_data["aliases"] = {key: value for key, value in index_data.get("aliases", {}).items() if value != node_key}
+                        index_data["aliases"] = {key: value for key, value in (index_data.get("aliases") or {}).items() if value != node_key}
                         index_data.setdefault("error_log", [])
                         index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
 
                         if not os.path.exists(filepath):
-                            old_node = index_data.get("nodes", {}).pop(node_key, None)
+                            old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                             if old_node:
                                 _remove_node_from_bm25(index_data, node_key, old_node)
                             index_data["weighted_edges"] = [
-                                edge for edge in index_data.get("weighted_edges", [])
+                                edge for edge in (index_data.get("weighted_edges") or [])
                                 if edge["source"] != node_key and edge["target"] != node_key
                             ]
                         else:
@@ -678,7 +678,7 @@ def update_index_items(filenames: list[str]):
 
                             if node_data is None:
                                 index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing 'domain' or 'status'. Node excluded."})
-                                old_node = index_data.get("nodes", {}).pop(node_key, None)
+                                old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                                 if old_node:
                                     _remove_node_from_bm25(index_data, node_key, old_node)
                             else:
@@ -696,26 +696,26 @@ def update_index_items(filenames: list[str]):
                                     index_data["aliases"][alias] = node_key
 
                                 if isinstance(node_data["categories"], list):
-                                    categories = set(index_data.get("categories", []))
+                                    categories = set((index_data.get("categories") or []))
                                     for category in node_data["categories"]:
                                         categories.add(category)
                                     index_data["categories"] = categories
 
                                 index_data["weighted_edges"] = [
-                                    edge for edge in index_data.get("weighted_edges", [])
+                                    edge for edge in (index_data.get("weighted_edges") or [])
                                     if edge["source"] != node_key and edge["target"] != node_key
                                 ]
                                 node_data["_key"] = node_key
                                 all_nodes = index_data["nodes"]
                                 
-                                node_links = set(node_data.get("links", []))
-                                node_sources = set(node_data.get("sources", []))
+                                node_links = set((node_data.get("links") or []))
+                                node_sources = set((node_data.get("sources") or []))
                                 for other_key, other_node in all_nodes.items():
                                     if other_key == node_key:
                                         continue
                                         
-                                    other_links = set(other_node.get("links", []))
-                                    other_sources = set(other_node.get("sources", []))
+                                    other_links = set((other_node.get("links") or []))
+                                    other_sources = set((other_node.get("sources") or []))
                                     
                                     has_direct = other_key in node_links or node_key in other_links
                                     has_source_overlap = bool(node_sources & other_sources)
@@ -736,9 +736,9 @@ def update_index_items(filenames: list[str]):
                                 node_data.pop("_key", None)
 
                 _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
-                index_data["categories"] = list(index_data.get("categories", []))
+                index_data["categories"] = list((index_data.get("categories") or []))
                 # Do not recompute heavy debt metrics on partial update
-                index_data["governance_metrics"] = index_data.get("governance_metrics", {})
+                index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
                 index_data["schema_version"] = "8.0"
                 temp_path = output_path + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as handle:

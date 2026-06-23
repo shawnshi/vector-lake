@@ -78,7 +78,7 @@ def save_cache(cache: dict):
 
 def strip_name(name: str) -> str:
     name = name.replace('.md', '')
-    for prefix in ['Concept_', 'Vendor_', 'Person_', 'Product_', 'Event_', 'Synthesis_', 'Source_']:
+    for prefix in ['Concept_', 'Vendor_', 'Person_', 'Product_', 'Event_', 'Policy_', 'Standard_', 'Synthesis_', 'Source_']:
         if name.startswith(prefix):
             name = name[len(prefix):]
     for w in ['系统', '架构', '模型', '法则', '理论', '平台', 'System', 'Model', 'Theory', 'Platform', '与', '的']:
