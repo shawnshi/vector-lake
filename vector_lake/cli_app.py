@@ -121,7 +121,7 @@ def main() -> int:
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, "auto_fix", False)))
         elif args.command == "query":
-            print(tools.query_logic_lake(args.query_str, getattr(args, "dry_run", False)))
+            print(tools.prepare_query_context(args.query_str, getattr(args, "dry_run", False)))
         elif args.command == "graph":
             print(tools.visualize_vector_lake())
         elif args.command == "review":

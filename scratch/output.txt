@@ -1,7 +1,0 @@
-C:\Users\shich\.gemini\MEMORY\wiki\Source_概率引擎与逻辑锚点的结构性坍塌-2026-05-17.md
-C:\Users\shich\.gemini\MEMORY\wiki\Concept_介观数据带.md
-C:\Users\shich\.gemini\MEMORY\wiki\Concept_高维空间度量失效.md
-C:\Users\shich\.gemini\MEMORY\wiki\Concept_拓扑相变.md
-C:\Users\shich\.gemini\MEMORY\wiki\Concept_计算不可能三角.md
-C:\Users\shich\.gemini\MEMORY\wiki\Overview_AI_Research.md
-C:\Users\shich\.gemini\MEMORY\wiki\log.md

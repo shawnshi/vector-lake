@@ -7,9 +7,9 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 - `MEMORY/raw`：原始信源层，只读输入。
 - `MEMORY/wiki`：人类可读的 Markdown 发布层，用于审计、浏览、复盘和长期资产沉淀。
 - `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
-- `MEMORY/wiki/.meta/vector_lake.db`：(V10) 统一的 SQLite 底层引擎，保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列。
+- `MEMORY/wiki/.meta/vector_lake.db`：[V10.0] 统一的 SQLite 底层引擎，保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列。
 - `MEMORY/wiki/.meta/operational_memory.json`：Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state`。
-- `MEMORY/purpose.md` & `purpose_vectors.json`：(V12.0) 战略意图引擎与最高系统宪法。硬编码了“破窗证伪阈值 (Falsification Threshold)”、“静默丢弃 (Silent Drop)”规则与“结构性张力连线”，强制所有 Agent 抛弃附和，保持冷酷的医疗数字化情报局审计立场。
+- `MEMORY/purpose.md` & `purpose_vectors.json`：[V12.0] 战略意图引擎与最高系统宪法。硬编码了“破窗证伪阈值 (Falsification Threshold)”、“静默丢弃 (Silent Drop)”规则与“结构性张力连线”，强制所有 Agent 抛弃附和，保持冷酷的医疗数字化情报局审计立场。
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
 
@@ -31,6 +31,34 @@ graph LR
 
 核心原则：**Markdown 是人类界面，`.meta` 是事实底座，`operational_memory` 是 Agent 运行层。**
 
+## 📂 受控类型与文件结构规范 (Controlled Types & File Structures)
+
+为了保持图谱检索的高信噪比与一致性，Wiki 目录下的 Markdown 文件必须遵循严格的**受控命名前缀**，并被划分为两种完全不同的文件组织结构规范。
+
+### 1. 核心受控类型 (Prefixes)
+所有文件强制锁定以下前缀（禁用空格与其他非规范符号，格式如 `Vendor_卫宁健康.md`）：
+- **`Vendor_*`**：企业、医院、组织机构。
+- **`Product_*`**：产品、系统、软件架构。
+- **`Person_*`**：核心高管、研究员、关键人物。
+- **`Event_*`**：重要会议、行业突发事件。
+- **`Concept_*`**：抽象架构、理论、业务机制。
+- **`Policy_*` / `Standard_*`**：政策法规、行业标准。
+- **`Source_*`**：对应的 `raw/` 原始信源的一对一摘要节点。
+- **`Synthesis_*`**：人工或 LLM 生成的深度推演、跨界比较与调研长文。
+
+### 2. 双重文件结构设计 (Dual-Schema Format)
+根据文件的受控类型，内部的 Markdown 结构被严格限制为两类：
+
+#### A. 实体与概念类 (Dual-Schema Mandate)
+- **适用类型**：`Vendor_`, `Product_`, `Person_`, `Event_`, `Concept_`, `Policy_`, `Standard_`
+- **结构要求**：采用严格的 CQRS 与事件溯源模式。物理上由 `---` 分隔为两部分：
+  1. **`## 1. 编译事实 (Compiled Truth)`**：作为 Read Model，只保留当下最新鲜的终极共识。所有特征点强制分配到类型专属的 `###` 固化插槽（如 Vendor 的 `### 组织架构与商业模式`）。所有论点必须在句末附加内联来源出处。
+  2. **`## 2. 证据时间线 (Timeline)`**：作为 Event Store，只能追加日志（Append-Only）。格式强制形如 `- [YYYY-MM-DD] [Event_Tag]...`，支撑上方“编译事实”的演进流。
+
+#### B. 豁免类 (Free-Form)
+- **适用类型**：`Source_`, `Synthesis_`
+- **结构要求**：自由格式。专门保留给单篇文献精读、书籍伴读笔记、以及横向的战略纵览研报。不需要切割出“事实”与“时间线”，允许更灵活的文章长文组织形式。
+
 ## Quick Start
 
 1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。**系统已全面回归无 SDK 的纯净架构（Zero-SDK）**，抛弃了沉重的 `google-genai` 依赖。底层 LLM 推理深度依赖跨平台的 `gemini` CLI 工具（如 Windows 的 `gemini.cmd`），因此必须确保该工具在操作系统的 PATH 环境变量中。所有的模型调用均通过隔离的 `subprocess.run` 级联容灾模型链（Model Cascade）防崩溃执行。
@@ -39,10 +67,10 @@ graph LR
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
    - **API 熔断器 (Circuit Breaker)**：在 LLM 并发摄入时，通过带抖动的指数退避（Exponential Backoff with Jitter）与黑名单冷却机制，彻底消除死锁、配额枯竭与 429 限流风暴。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
-   - **两步思维链摄入 (V9.0 Two-Step CoT)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
-   - **跨类型 PIEA 与强制格式漏斗 (V9.1 Cross-Type PIEA & Naming Funnel)**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
-   - **无感异步全量索引 (Zero-Blocking Async Reindex) [V10.x]**：前台所有的重负载图谱变更（Query 合成、Delete 级联删除、Sync、Graph），全部被优化为仅写入极轻量的 `flag_reindex.lock` 信号。由 Watchdog 主循环在空闲时原子化消费并执行全量图谱重建，彻底杜绝前端 UI 线程的阻塞与卡顿。
-   - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox) [V10.x]**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
+   - **两步思维链摄入 [V9.0]**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
+   - **跨类型 PIEA 与强制格式漏斗 [V9.1]**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
+   - **无感异步全量索引 (Zero-Blocking Async Reindex) [V10.2]**：前台所有的重负载图谱变更（Query 合成、Delete 级联删除、Sync、Graph），全部被优化为仅写入极轻量的 `flag_reindex.lock` 信号。由 Watchdog 主循环在空闲时原子化消费并执行全量图谱重建，彻底杜绝前端 UI 线程的阻塞与卡顿。
+   - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox) [V10.2]**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
    - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
    - **原生二进制向量引擎 (Native Binary Embeddings) [V11.0]**：将臃肿的纯文本 JSON 序列化彻底淘汰，重构为基于 C 层级的高性能 Pickle (`HIGHEST_PROTOCOL`) 二进制缓冲。大幅抹除了无用 I/O 载荷（体积暴降 60%），并将语义对比矩阵的加载时间从数秒降至毫秒级，根绝了内存爆栈风险。
    - **本体免疫型排重 (Ontology-Immune Deduplication) [V11.0]**：在去重守护进程中注入了严格的前缀屏障，自动豁免 `Source_` 等具有时序不可变性的物理原始信源，从根源上彻底斩断了“因文档相似度过高而将不同日期研报强行合并”的灾难性合并幻觉，令治理队列（Governance Queue）保持绝对纯净。
@@ -96,14 +124,14 @@ graph LR
 
 ```text
 MEMORY/
-  purpose.md          <-- V12.0 Strategic Intent & Epistemic Stance
+  purpose.md          <-- [V12.0] Strategic Intent & Epistemic Stance
   raw/
   wiki/
     *.md
     index.json
     .meta/
-      purpose_vectors.json <-- V12.0 Compiled Intent Weights
-      vector_lake.db       <-- V10 Unified SQLite Store (Entities, Claims, Graph, Timeline)
+      purpose_vectors.json <-- [V12.0] Compiled Intent Weights
+      vector_lake.db       <-- [V10.0] Unified SQLite Store (Entities, Claims, Graph, Timeline)
       operational_memory.json
 ```
 
@@ -146,7 +174,7 @@ python cli.py sync
 启动后台守护进程（增量监听）：
 
 ```powershell
-python watchdog_app.py
+python watchdog_sync.py
 ```
 
 搜索页面层：
@@ -240,7 +268,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 
 ## Validation
 
-最近验证基线（2026-06-23 V12.0 高维战略意图与智能自愈版）：
+最近验证基线（2026-06-24 V12.1 全态前缀契约与高维战略意图版）：
 
 ```powershell
 $env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v

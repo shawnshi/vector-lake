@@ -86,10 +86,20 @@ def init_db():
                 memory_id TEXT PRIMARY KEY,
                 memory_type TEXT,
                 score REAL,
+                status TEXT,
+                ttl REAL,
                 data_json TEXT,
                 updated_at TEXT
             )
         """)
+        try:
+            conn.execute("ALTER TABLE operational_memory ADD COLUMN status TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE operational_memory ADD COLUMN ttl REAL")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claim_graph_nodes (
                 node_id TEXT PRIMARY KEY,
