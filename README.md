@@ -7,9 +7,9 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 - `MEMORY/raw`：原始信源层，只读输入。
 - `MEMORY/wiki`：人类可读的 Markdown 发布层，用于审计、浏览、复盘和长期资产沉淀。
 - `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
-- `MEMORY/wiki/.meta/vector_lake.db`：[V10.0] 统一的 SQLite 底层引擎，保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列。
+- `MEMORY/wiki/.meta/vector_lake.db`：统一的 SQLite 底层引擎，保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列。
 - `MEMORY/wiki/.meta/operational_memory.json`：Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state`。
-- `MEMORY/purpose.md` & `purpose_vectors.json`：[V12.0] 战略意图引擎与最高系统宪法。硬编码了“破窗证伪阈值 (Falsification Threshold)”、“静默丢弃 (Silent Drop)”规则与“结构性张力连线”，强制所有 Agent 抛弃附和，保持冷酷的医疗数字化情报局审计立场。
+- `MEMORY/purpose.md` & `purpose_vectors.json`：战略意图引擎与最高系统宪法。硬编码了“破窗证伪阈值 (Falsification Threshold)”、“静默丢弃 (Silent Drop)”规则与“结构性张力连线”，强制所有 Agent 抛弃附和，保持冷酷的医疗数字化情报局审计立场。
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
 
@@ -67,22 +67,22 @@ graph LR
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
    - **API 熔断器 (Circuit Breaker)**：在 LLM 并发摄入时，通过带抖动的指数退避（Exponential Backoff with Jitter）与黑名单冷却机制，彻底消除死锁、配额枯竭与 429 限流风暴。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
-   - **两步思维链摄入 [V9.0]**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
-   - **跨类型 PIEA 与强制格式漏斗 [V9.1]**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
-   - **无感异步全量索引 (Zero-Blocking Async Reindex) [V10.2]**：前台所有的重负载图谱变更（Query 合成、Delete 级联删除、Sync、Graph），全部被优化为仅写入极轻量的 `flag_reindex.lock` 信号。由 Watchdog 主循环在空闲时原子化消费并执行全量图谱重建，彻底杜绝前端 UI 线程的阻塞与卡顿。
-   - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox) [V10.2]**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
+   - **两步思维链摄入**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
+   - **跨类型 PIEA 与强制格式漏斗**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
+   - **无感异步全量索引 (Zero-Blocking Async Reindex)**：前台所有的重负载图谱变更（Query 合成、Delete 级联删除、Sync、Graph），全部被优化为仅写入极轻量的 `flag_reindex.lock` 信号。由 Watchdog 主循环在空闲时原子化消费并执行全量图谱重建，彻底杜绝前端 UI 线程的阻塞与卡顿。
+   - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox)**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
    - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
-   - **原生二进制向量引擎 (Native Binary Embeddings) [V11.0]**：将臃肿的纯文本 JSON 序列化彻底淘汰，重构为基于 C 层级的高性能 Pickle (`HIGHEST_PROTOCOL`) 二进制缓冲。大幅抹除了无用 I/O 载荷（体积暴降 60%），并将语义对比矩阵的加载时间从数秒降至毫秒级，根绝了内存爆栈风险。
-   - **本体免疫型排重 (Ontology-Immune Deduplication) [V11.0]**：在去重守护进程中注入了严格的前缀屏障，自动豁免 `Source_` 等具有时序不可变性的物理原始信源，从根源上彻底斩断了“因文档相似度过高而将不同日期研报强行合并”的灾难性合并幻觉，令治理队列（Governance Queue）保持绝对纯净。
-   - **全态前缀契约闭环 (Omni-State Prefix Compliance) [V12.1]**：全面拉齐并修正了所有后台异步批处理守护进程（如语义去重器和死链自愈系统）对 `Policy_`、`Standard_` 和 `Synthesis_` 等全部 9 大核心一等公民 (First-Class) 前缀的精确捕获与清洗机制，彻底根除了前缀“盲区”导致的同质化噪音与分类退化。
-   - **宏观拓扑收容与防断链重组 (Topology Optimization & Orphan Weaving) [V11.1]**：引入彻底的结构化清洗管线。通过自动提取 Frontmatter 元数据将所有零入度孤岛节点编织回 `Concept_Overview_` 宏观主干；并上线“梯队式语义去重 (Tiered Merge)”，实现了 Level 1 绝对同质化碎片的后台物理无损合并与全局边缘重定向 (Edge Redirection)，以及 Level 2 包含级父子节点双链确立，彻底终结上下文污染。
-   - **统一 SQLite 数据底座 (Unified SQLite Engine) [V10.0]**：彻底废弃易损坏且不支持原子操作的散装 JSON 存储，全面迁移至原生 SQLite。通过严格的 Schema 列约束与 `PRAGMA WAL` 实现了毫秒级的高并发原子级 CRUD 响应。
-   - **差分垃圾回收机制 (Diff-based GC) [V10.1]**：针对早期系统只增不减 (Append-Only) 的痛点，重构了同步层的级联清理逻辑。当用户在 Markdown 层面重命名/删除文件，或者删除某句特征断言时，系统会执行精确对比，物理上擦除 SQLite 中冗余的实体 (Entities)、声索 (Claims) 和证据 (Evidence)，保证图谱 0 负担。
-   - **夜间拾荒者集群 (Janitor Swarm) [V10.0]**：全自动的语义去重重构框架。通过 `launch_janitor_swarm.py`，夜间守护进程会自动读取 SQLite 治理队列中的 pending merge 项，拉起 `tool_rename.py` 进行跨文件双链重命名、文件合并，并由 Diff GC 彻底抹除幽灵节点。
-   - **MCP 沙箱安全网关 (JSON Sandbox Gateway) [V10.0]**：面向所有大模型 MCP Tool，将所有长文本/特殊符号参数转入 `--config_file` JSON 载荷逃逸机制，彻底封堵因命令行参数截断或特殊字符（如引号、换行符）导致的命令注入与崩溃。
-### 🔌 V8.0 Antigravity Orchestrator 深度集成
+   - **原生二进制向量引擎 (Native Binary Embeddings)**：将臃肿的纯文本 JSON 序列化彻底淘汰，重构为基于 C 层级的高性能 Pickle (`HIGHEST_PROTOCOL`) 二进制缓冲。大幅抹除了无用 I/O 载荷（体积暴降 60%），并将语义对比矩阵的加载时间从数秒降至毫秒级，根绝了内存爆栈风险。
+   - **本体免疫型排重 (Ontology-Immune Deduplication)**：在去重守护进程中注入了严格的前缀屏障，自动豁免 `Source_` 等具有时序不可变性的物理原始信源，从根源上彻底斩断了“因文档相似度过高而将不同日期研报强行合并”的灾难性合并幻觉，令治理队列（Governance Queue）保持绝对纯净。
+   - **全态前缀契约闭环 (Omni-State Prefix Compliance)**：全面拉齐并修正了所有后台异步批处理守护进程（如语义去重器和死链自愈系统）对 `Policy_`、`Standard_` 和 `Synthesis_` 等全部 9 大核心一等公民 (First-Class) 前缀的精确捕获与清洗机制，彻底根除了前缀“盲区”导致的同质化噪音与分类退化。
+   - **宏观拓扑收容与防断链重组 (Topology Optimization & Orphan Weaving)**：引入彻底的结构化清洗管线。通过自动提取 Frontmatter 元数据将所有零入度孤岛节点编织回 `Concept_Overview_` 宏观主干；并上线“梯队式语义去重 (Tiered Merge)”，实现了 Level 1 绝对同质化碎片的后台物理无损合并与全局边缘重定向 (Edge Redirection)，以及 Level 2 包含级父子节点双链确立，彻底终结上下文污染。
+   - **统一 SQLite 数据底座 (Unified SQLite Engine)**：彻底废弃易损坏且不支持原子操作的散装 JSON 存储，全面迁移至原生 SQLite。通过严格的 Schema 列约束与 `PRAGMA WAL` 实现了毫秒级的高并发原子级 CRUD 响应。
+   - **差分垃圾回收机制 (Diff-based GC)**：针对早期系统只增不减 (Append-Only) 的痛点，重构了同步层的级联清理逻辑。当用户在 Markdown 层面重命名/删除文件，或者删除某句特征断言时，系统会执行精确对比，物理上擦除 SQLite 中冗余的实体 (Entities)、声索 (Claims) 和证据 (Evidence)，保证图谱 0 负担。
+   - **夜间拾荒者集群 (Janitor Swarm)**：全自动的语义去重重构框架。通过 `launch_janitor_swarm.py`，夜间守护进程会自动读取 SQLite 治理队列中的 pending merge 项，拉起 `tool_rename.py` 进行跨文件双链重命名、文件合并，并由 Diff GC 彻底抹除幽灵节点。
+   - **MCP 沙箱安全网关 (JSON Sandbox Gateway)**：面向所有大模型 MCP Tool，将所有长文本/特殊符号参数转入 `--config_file` JSON 载荷逃逸机制，彻底封堵因命令行参数截断或特殊字符（如引号、换行符）导致的命令注入与崩溃。
+### 🔌 Antigravity Orchestrator 深度集成
 
-在最新的 V8.0 架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
+在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
 1. **Query_Vector_Lake 探针**：所有微角色 (Micro-Personas) 只要在 Python 编排器中注册了 `tools=["Query_Vector_Lake"]`，在多步推演时都会自动暂停并向图谱核实现有事实，打破了大模型的“信息孤岛”幻觉。
 2. **Dream Cycle 梦境联通**：系统的夜间清洗引擎 (`mentat-dream-cycle`) 现已被设定为每日凌晨 3 点 Cron 守护进程。提取日间短期记忆 (`hot_facts.md`) 时，系统强制利用 `Query_Vector_Lake` 探针查询重叠度，决定是【合并 Merge】还是【新建 Create】，从物理层斩断了垃圾增量。
 
@@ -93,7 +93,7 @@ graph LR
 
 运行态记忆由 `vector_lake/governance_store.py` 从 canonical claims 编译生成。它解决的问题是：Agent 常常只需要一个事实、偏好、决策或任务状态，不应该每次加载整页 Markdown。
 
-> **V7.2 "Wiki-as-Database" 写回范式**：Agent 在运行态生成的新记忆，**严禁**直接写入 SQLite。它们必须通过 `update_operational_memory` 工具，按严格的 **Dual-Schema（双架构）** 规范，即 `# 1. 编译实体特征 (Compiled Truth)` 与 `## 2. 证据时间线 (Evidence Timeline)`，物理追加到相应的 Wiki 实体文件（如 `Concept_UserPreferences.md`）的时间线下方。这确保了在图谱完全重建时，Agent 记忆依然通过 Markdown 原质保留。
+> **"Wiki-as-Database" 写回范式**：Agent 在运行态生成的新记忆，**严禁**直接写入 SQLite。它们必须通过 `update_operational_memory` 工具，按严格的 **Dual-Schema（双架构）** 规范，即 `# 1. 编译实体特征 (Compiled Truth)` 与 `## 2. 证据时间线 (Evidence Timeline)`，物理追加到相应的 Wiki 实体文件（如 `Concept_UserPreferences.md`）的时间线下方。这确保了在图谱完全重建时，Agent 记忆依然通过 Markdown 原质保留。
 
 内置类型：
 
@@ -124,20 +124,20 @@ graph LR
 
 ```text
 MEMORY/
-  purpose.md          <-- [V12.0] Strategic Intent & Epistemic Stance
+  purpose.md          <-- Strategic Intent & Epistemic Stance
   raw/
   wiki/
     *.md
     index.json
     .meta/
-      purpose_vectors.json <-- [V12.0] Compiled Intent Weights
-      vector_lake.db       <-- [V10.0] Unified SQLite Store (Entities, Claims, Graph, Timeline)
+      purpose_vectors.json <-- Compiled Intent Weights
+      vector_lake.db       <-- Unified SQLite Store (Entities, Claims, Graph, Timeline)
       operational_memory.json
 ```
 
 ## Commands
 
-> **Note (v8.3+)**: Vector Lake 现已全面接入 MCP (Model Context Protocol)。大语言模型 Agent 将直接通过 `vector_lake/mcp_server.py` 调用底层 Tool 接口，不再需要通过终端模拟。
+> **Note**: Vector Lake 现已全面接入 MCP (Model Context Protocol)。大语言模型 Agent 将直接通过 `vector_lake/mcp_server.py` 调用底层 Tool 接口，不再需要通过终端模拟。
 > 
 > **Gemini CLI Slash Commands**: 我们已将常用功能映射为快捷指令（在聊天框输入 `/` 触发）：
 > - `/vl_sync`：自动调度 Ingestor 子智能体执行图谱知识的异步增量同步
@@ -261,14 +261,14 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/watchdog_app.py` | 增量监听后台服务，队列调度，定时自愈审计 (Scheduled Auto-Lint) |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
-| `scripts/community_clustering_daemon.py` | V9.0 Louvain Community Detection |
+| `scripts/community_clustering_daemon.py` | Louvain Community Detection |
 | `schema.md` | Wiki 与运行态记忆契约 |
 | `commands/` | 面向 Agent 的宏大业务流定义 (research/review) |
 | `agents/` | ingestor / synthesizer agent 契约 |
 
 ## Validation
 
-最近验证基线（2026-06-24 V12.1 全态前缀契约与高维战略意图版）：
+最近验证基线（当前最新态）：
 
 ```powershell
 $env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v
