@@ -43,6 +43,20 @@ RELEVANCE_WEIGHTS = {
     "type_affinity": 1.0,
 }
 
+PRED_WEIGHT_TAXONOMY = frozenset({"属于", "parent", "is_a", "belongs_to", "instance_of", "has_part", "核心构件"})
+PRED_WEIGHT_RELATION = frozenset({"类似", "related_to", "see_also", "peer", "关联"})
+PRED_WEIGHT_MENTION = frozenset({"mentions", "提及", "引用"})
+
+def get_pred_weight(pred: str) -> float:
+    pred_lower = pred.lower()
+    if pred_lower in PRED_WEIGHT_TAXONOMY:
+        return RELEVANCE_WEIGHTS["direct_link"] * 3.0
+    if pred_lower in PRED_WEIGHT_RELATION:
+        return RELEVANCE_WEIGHTS["direct_link"] * 1.5
+    if pred_lower in PRED_WEIGHT_MENTION:
+        return RELEVANCE_WEIGHTS["direct_link"] * 0.4
+    return RELEVANCE_WEIGHTS["direct_link"]
+
 TYPE_AFFINITY = {
     "vendor": {"vendor": 0.8, "product": 1.2, "person": 1.0, "concept": 1.2, "source": 1.0, "synthesis": 1.0},
     "product": {"vendor": 1.2, "product": 0.8, "person": 1.0, "concept": 1.2, "source": 1.0, "synthesis": 1.0},
@@ -381,24 +395,17 @@ def _parse_wiki_node(filepath: str, node_key: str):
     }
 
 
-def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
+def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
+                        links_a=None, links_b=None,
+                        sources_a=None, sources_b=None) -> float:
+    """Calculates relevance score between two nodes. O(N^2) hot path."""
     score = 0.0
     key_a = node_a.get("_key", "")
     key_b = node_b.get("_key", "")
 
-    links_a = set((node_a.get("links") or []))
-    links_b = set((node_b.get("links") or []))
+    if links_a is None: links_a = set((node_a.get("links") or []))
+    if links_b is None: links_b = set((node_b.get("links") or []))
     
-    def get_pred_weight(pred: str) -> float:
-        pred_lower = pred.lower()
-        if pred_lower in ("属于", "parent", "is_a", "belongs_to", "instance_of", "has_part", "核心构件"):
-            return RELEVANCE_WEIGHTS["direct_link"] * 3.0  # Taxonomy / hierarchy
-        if pred_lower in ("类似", "related_to", "see_also", "peer", "关联"):
-            return RELEVANCE_WEIGHTS["direct_link"] * 1.5  # Strong relation
-        if pred_lower in ("mentions", "提及", "引用"):
-            return RELEVANCE_WEIGHTS["direct_link"] * 0.4  # Weak generic mention penalty
-        return RELEVANCE_WEIGHTS["direct_link"]
-
     if key_b in links_a:
         pred = "mentions"
         for t in (node_a.get("triples") or []):
@@ -415,28 +422,42 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict) -> float:
                 break
         score += get_pred_weight(pred)
 
-    sources_a = set((node_a.get("sources") or []))
-    sources_b = set((node_b.get("sources") or []))
+    if sources_a is None: sources_a = set((node_a.get("sources") or []))
+    if sources_b is None: sources_b = set((node_b.get("sources") or []))
+
     shared_sources = len(sources_a & sources_b)
-    score += shared_sources * RELEVANCE_WEIGHTS["source_overlap"]
+    if shared_sources:
+        score += shared_sources * RELEVANCE_WEIGHTS["source_overlap"]
 
     common_neighbors = links_a & links_b
-    for neighbor_key in common_neighbors:
-        neighbor = all_nodes.get(neighbor_key, {})
-        degree = len(neighbor.get("links", []))
-        if degree > 1:
-            score += (1.0 / math.log(degree)) * RELEVANCE_WEIGHTS["common_neighbor"]
+    if common_neighbors:
+        for neighbor_key in common_neighbors:
+            neighbor = all_nodes.get(neighbor_key)
+            if neighbor:
+                links = neighbor.get("links")
+                if links:
+                    degree = len(links)
+                    if degree > 1:
+                        score += (1.0 / math.log(degree)) * RELEVANCE_WEIGHTS["common_neighbor"]
 
     type_a = node_a.get("type", "concept").lower()
     type_b = node_b.get("type", "concept").lower()
-    affinity = TYPE_AFFINITY.get(type_a, {}).get(type_b, 0.5) * RELEVANCE_WEIGHTS["type_affinity"]
+
+    type_a_dict = TYPE_AFFINITY.get(type_a)
+    if type_a_dict:
+        affinity = type_a_dict.get(type_b, 0.5) * RELEVANCE_WEIGHTS["type_affinity"]
+    else:
+        affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
     score += affinity
 
     decay_a = node_a.get("decay_weight", 1.0)
     decay_b = node_b.get("decay_weight", 1.0)
     
-    align_a = max(0.1, node_a.get("alignment_score", 100.0) / 100.0)
-    align_b = max(0.1, node_b.get("alignment_score", 100.0) / 100.0)
+    align_a = node_a.get("alignment_score", 100.0) / 100.0
+    if align_a < 0.1: align_a = 0.1
+
+    align_b = node_b.get("alignment_score", 100.0) / 100.0
+    if align_b < 0.1: align_b = 0.1
     
     score *= math.sqrt(decay_a * decay_b)
     score *= math.sqrt(align_a * align_b)
@@ -478,7 +499,11 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                     if not has_common_neighbor:
                         continue
 
-            relevance = calculate_relevance(node_a, node_b, nodes_dict)
+            relevance = calculate_relevance(
+                node_a, node_b, nodes_dict,
+                links_a=links_a, links_b=links_b,
+                sources_a=sources_a, sources_b=sources_b
+            )
             if relevance >= 1.5:
                 edges.append({
                     "source": key_a,
@@ -732,7 +757,11 @@ def update_index_items(filenames: list[str]):
                                         continue
 
                                     other_node["_key"] = other_key
-                                    relevance = calculate_relevance(node_data, other_node, all_nodes)
+                                    relevance = calculate_relevance(
+                                        node_data, other_node, all_nodes,
+                                        links_a=node_links, links_b=other_links,
+                                        sources_a=node_sources, sources_b=other_sources
+                                    )
                                     if relevance >= 1.5:
                                         index_data["weighted_edges"].append({
                                             "source": min(node_key, other_key),
