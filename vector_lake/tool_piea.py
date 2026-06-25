@@ -1,3 +1,4 @@
+import time
 import json
 import logging
 import math
@@ -168,7 +169,13 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
             if pending_path.exists():
                 try:
                     with open(pending_path, "r", encoding="utf-8") as f:
-                        pending_data = json.load(f)
+                        raw_data = json.load(f)
+                        # Filter out entries older than 5 minutes (300s)
+                        current_time = time.time()
+                        pending_data = {
+                            k: v for k, v in raw_data.items() 
+                            if current_time - v.get("timestamp", 0) < 300
+                        }
                 except Exception:
                     pending_data = {}
             
@@ -224,7 +231,8 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
             pending_data[new_key] = {
                 "title": candidate_title,
                 "type": candidate_type,
-                "summary": candidate_summary
+                "summary": candidate_summary,
+                "timestamp": time.time()
             }
             
             with open(pending_path, "w", encoding="utf-8") as f:

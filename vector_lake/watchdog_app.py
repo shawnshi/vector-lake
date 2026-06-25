@@ -46,6 +46,9 @@ class WikiIndexHandler(FileSystemEventHandler):
 
         now = time.time()
         with self.lock:
+            if len(self.last_triggered) > 1000:
+                self.last_triggered = {k: v for k, v in self.last_triggered.items() if (now - v) <= DEBOUNCE_SECONDS * 2}
+            
             if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
                 return
             self.last_triggered[filepath] = now
@@ -88,6 +91,9 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
 
         now = time.time()
         with self.lock:
+            if len(self.last_triggered) > 1000:
+                self.last_triggered = {k: v for k, v in self.last_triggered.items() if (now - v) <= DEBOUNCE_SECONDS * 2}
+            
             if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
                 return
             self.last_triggered[filepath] = now
@@ -100,7 +106,7 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
             if os.path.exists(sync_script):
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
-                subprocess.run([sys.executable, sync_script], capture_output=True, env=env)
+                subprocess.run([sys.executable, sync_script], capture_output=True, env=env, timeout=180)
         except Exception as e:
             log.error(f"Failed to trigger sync_focus.py: {e}")
 
@@ -121,8 +127,9 @@ def index_worker_loop():
         try:
             if consecutive_failures >= max_failures:
                 write_status("halted", 0, index_queue.qsize(), "Index Worker Halted", "Max consecutive failures reached")
-                log.error("Index Worker Halted due to repeated failures.")
+                log.error("Index Worker Halted. Entering 60s cooldown before retry.")
                 time.sleep(60)
+                consecutive_failures = 0
                 continue
 
             write_status("idle", 0, index_queue.qsize(), "Waiting for index tasks", "")
@@ -218,7 +225,7 @@ def scheduled_lint_loop():
                         decay_script = os.path.expanduser("~/.gemini/scripts/metadata_decay_daemon.py")
                         if os.path.exists(decay_script):
                             log.info("Running Metadata Decay Daemon...")
-                            res = subprocess.run([sys.executable, decay_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            res = subprocess.run([sys.executable, decay_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
                             if res.returncode != 0:
                                 log.error(f"Metadata Decay Daemon failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Decay Daemon Failed", res.stderr)
@@ -226,7 +233,7 @@ def scheduled_lint_loop():
                         sync_timeline_script = os.path.expanduser("~/.gemini/scripts/sync_timeline_db.py")
                         if os.path.exists(sync_timeline_script):
                             log.info("Running Timeline DB Sync Daemon...")
-                            res = subprocess.run([sys.executable, sync_timeline_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            res = subprocess.run([sys.executable, sync_timeline_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
                             if res.returncode != 0:
                                 log.error(f"Timeline Sync Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Timeline Sync Failed", res.stderr)
@@ -234,7 +241,7 @@ def scheduled_lint_loop():
                         scout_script = os.path.expanduser("~/.gemini/scripts/missing_evidence_scout.py")
                         if os.path.exists(scout_script):
                             log.info("Running Missing Evidence Scout...")
-                            res = subprocess.run([sys.executable, scout_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            res = subprocess.run([sys.executable, scout_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
                             if res.returncode != 0:
                                 log.error(f"Missing Evidence Scout Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Scout Failed", res.stderr)
@@ -243,7 +250,7 @@ def scheduled_lint_loop():
                         overview_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/compile_domain_overviews.py")
                         if os.path.exists(overview_script):
                             log.info("Running Domain Overview Compiler...")
-                            res = subprocess.run([sys.executable, overview_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            res = subprocess.run([sys.executable, overview_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
                             if res.returncode != 0:
                                 log.error(f"Domain Overview Compiler Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Overview Compiler Failed", res.stderr)
@@ -253,7 +260,7 @@ def scheduled_lint_loop():
                         semantic_dedup_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/semantic_dedup_daemon.py")
                         if os.path.exists(semantic_dedup_script):
                             log.info("Running Semantic Deduplication Daemon...")
-                            res = subprocess.run([sys.executable, semantic_dedup_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            res = subprocess.run([sys.executable, semantic_dedup_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
                             if res.returncode != 0:
                                 log.error(f"Semantic Deduplication Daemon Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Semantic Dedup Failed", res.stderr)
@@ -262,7 +269,7 @@ def scheduled_lint_loop():
                         janitor_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/launch_janitor_swarm.py")
                         if os.path.exists(janitor_script):
                             log.info("Launching Nighttime Janitor Swarm...")
-                            res = subprocess.run([sys.executable, janitor_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            res = subprocess.run([sys.executable, janitor_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
                             if res.returncode != 0:
                                 log.error(f"Janitor Swarm Launch Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Janitor Swarm Failed", res.stderr)
@@ -273,7 +280,7 @@ def scheduled_lint_loop():
                         clustering_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/community_clustering_daemon.py")
                         if os.path.exists(clustering_script):
                             log.info("Running Louvain Community Clustering Daemon...")
-                            res = subprocess.run([sys.executable, clustering_script], capture_output=True, text=True, encoding="utf-8", env=env)
+                            res = subprocess.run([sys.executable, clustering_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
                             if res.returncode != 0:
                                 log.error(f"Clustering Daemon Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Clustering Failed", res.stderr)

@@ -75,6 +75,12 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS wiki_search_index USING fts5(
+                node_key, title, summary, text,
+                tokenize='porter unicode61 remove_diacritics 1'
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS alias_registry (
                 key TEXT PRIMARY KEY,
                 value TEXT,
@@ -132,4 +138,37 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_events(event_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_entity ON timeline_events(entity_id)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_files (
+                filepath TEXT PRIMARY KEY,
+                file_hash TEXT,
+                processed_at TEXT
+            )
+        """)
 
+
+
+def upsert_search_index(node_key: str, title: str, summary: str, text: str):
+    conn = get_connection()
+    with conn:
+        # FTS5 doesn't support ON CONFLICT REPLACE directly, so we delete then insert.
+        conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+        conn.execute("""
+            INSERT INTO wiki_search_index (node_key, title, summary, text)
+            VALUES (?, ?, ?, ?)
+        """, (node_key, title, summary, text))
+
+def delete_search_index(node_key: str):
+    conn = get_connection()
+    with conn:
+        conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+
+def search_wiki(query: str, limit: int = 50) -> list[dict]:
+    conn = get_connection()
+    cur = conn.execute("""
+        SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
+        FROM wiki_search_index 
+        WHERE wiki_search_index MATCH ? 
+        ORDER BY rank LIMIT ?
+    """, (query, limit))
+    return [dict(row) for row in cur.fetchall()]

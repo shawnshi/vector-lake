@@ -10,6 +10,7 @@ from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
 from vector_lake import governance_store
+from vector_lake import db_store
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir
 from vector_lake.yaml_utils import load_yaml
 
@@ -125,122 +126,32 @@ def _tokenize(text: str) -> list[str]:
 
 def _build_bm25_index(index_data: dict):
     nodes = (index_data.get("nodes") or {})
-    inverted_index = defaultdict(dict)
-    doc_lengths = {}
-    total_docs = len(nodes)
-
-    if total_docs == 0:
-        index_data["bm25_index"] = {"inverted_index": {}, "doc_lengths": {}, "avgdl": 0, "total_docs": 0}
-        return
-
-    total_len = 0
     for node_key, node in nodes.items():
         aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
-        text_to_index = f"{node.get('title', '')} {aliases_str} {node.get('summary', '')}"
-        tokens = _tokenize(text_to_index)
-        token_counts = Counter(tokens)
-        doc_lengths[node_key] = len(tokens)
-        total_len += len(tokens)
-        for token, count in token_counts.items():
-            inverted_index[token][node_key] = count
-
-    avgdl = total_len / total_docs if total_docs else 0
-    index_data["bm25_index"] = {
-        "inverted_index": dict(inverted_index),
-        "doc_lengths": doc_lengths,
-        "avgdl": avgdl,
-        "total_docs": total_docs
-    }
+        text = f"{aliases_str} {node.get('raw_text', '')}"
+        db_store.upsert_search_index(node_key, node.get('title', ''), node.get('summary', ''), text)
 
 
-def _remove_node_from_bm25(index_data: dict, node_key: str, old_node: dict):
-    if "bm25_index" not in index_data:
-        return
-    bm25 = index_data["bm25_index"]
-    inverted_index = bm25.get("inverted_index", {})
-    doc_lengths = bm25.get("doc_lengths", {})
-    
-    if node_key not in doc_lengths:
-        return
-
-    aliases_str = " ".join(old_(node.get("aliases") or [])) if isinstance(old_node.get("aliases"), list) else ""
-    text_to_index = f"{old_node.get('title', '')} {aliases_str} {old_node.get('summary', '')}"
-    tokens = _tokenize(text_to_index)
-    
-    for token in set(tokens):
-        if token in inverted_index and node_key in inverted_index[token]:
-            del inverted_index[token][node_key]
-            if not inverted_index[token]:
-                del inverted_index[token]
-                
-    old_len = doc_lengths.pop(node_key)
-    old_total_docs = bm25.get("total_docs", 1)
-    bm25["total_docs"] = max(0, old_total_docs - 1)
-    
-    total_len = (bm25.get("avgdl", 0) * old_total_docs) - old_len
-    bm25["avgdl"] = (total_len / bm25["total_docs"]) if bm25["total_docs"] > 0 else 0
 
 
-def _add_node_to_bm25(index_data: dict, node_key: str, new_node: dict):
-    if "bm25_index" not in index_data:
-        index_data["bm25_index"] = {"inverted_index": {}, "doc_lengths": {}, "avgdl": 0, "total_docs": 0}
-        
-    bm25 = index_data["bm25_index"]
-    inverted_index = bm25.setdefault("inverted_index", {})
-    doc_lengths = bm25.setdefault("doc_lengths", {})
-    
-    if node_key in doc_lengths:
-        return # Prevent double adding
-
-    aliases_str = " ".join(new_(node.get("aliases") or [])) if isinstance(new_node.get("aliases"), list) else ""
-    text_to_index = f"{new_node.get('title', '')} {aliases_str} {new_node.get('summary', '')}"
-    tokens = _tokenize(text_to_index)
-    token_counts = Counter(tokens)
-    
-    for token, count in token_counts.items():
-        inverted_index.setdefault(token, {})[node_key] = count
-        
-    new_len = len(tokens)
-    doc_lengths[node_key] = new_len
-    
-    old_total_docs = bm25.get("total_docs", 0)
-    total_len = (bm25.get("avgdl", 0) * old_total_docs) + new_len
-    bm25["total_docs"] = old_total_docs + 1
-    bm25["avgdl"] = total_len / bm25["total_docs"]
-
-
-def _strip_legacy_embedded_payloads(index_data: dict | None) -> list[str]:
-    if not isinstance(index_data, dict):
-        return []
+def _strip_legacy_embedded_payloads(index_data: dict) -> list[str]:
     removed = []
-    for key in LEGACY_EMBEDDED_INDEX_KEYS:
+    # Strip any heavy artifacts that might have been saved in index.json previously
+    for key in ["bm25_index", "governance_queue", "alias_registry", "entities"]:
         if key in index_data:
-            index_data.pop(key, None)
+            del index_data[key]
             removed.append(key)
     return removed
 
 
-def _write_json_payload(output_path: str, payload: dict):
-    lock_path = output_path + ".lock"
+def _write_json_payload(output_path: str, data: dict):
+    temp_path = output_path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
     try:
-        with FileLock(lock_path, timeout=15):
-            temp_path = output_path + ".tmp"
-            with open(temp_path, "w", encoding="utf-8") as handle:
-                import datetime
-                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), default=lambda o: o.isoformat() if isinstance(o, (datetime.date, datetime.datetime)) else str(o))
-            import time
-            for attempt in range(5):
-                try:
-                    os.replace(temp_path, output_path)
-                    break
-                except PermissionError:
-                    time.sleep(0.5)
-            else:
-                log.error(f"FATAL: Could not replace {output_path} after 5 retries. Update lost!")
-                raise PermissionError(f"Could not write {output_path} due to persistent lock.")
-    except Timeout:
-        log.error(f"Timeout while acquiring lock for {output_path}")
-
+        os.replace(temp_path, output_path)
+    except PermissionError:
+        pass
 
 def _write_index(output_path: str, index_data: dict):
     removed = _strip_legacy_embedded_payloads(index_data)
@@ -474,8 +385,26 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
     edges = []
 
-    # Pre-compute links and sources sets for O(1) access inside the nested loop
-    node_links = {key: set((node.get("links") or [])) for key, node in nodes_dict.items()}
+    # Build alias resolution map: link string -> node_key
+    alias_map = {}
+    for k, node in nodes_dict.items():
+        alias_map[k] = k
+        if node.get("title"):
+            alias_map[node["title"]] = k
+        for alias in node.get("aliases", []):
+            alias_map[alias] = k
+
+    # Pre-compute resolved links and sources sets for O(1) access inside the nested loop
+    node_links = {}
+    for key, node in nodes_dict.items():
+        resolved_links = set()
+        for link in (node.get("links") or []):
+            if link in alias_map:
+                resolved_links.add(alias_map[link])
+            else:
+                resolved_links.add(link)
+        node_links[key] = resolved_links
+        
     node_sources = {key: set((node.get("sources") or [])) for key, node in nodes_dict.items()}
 
     for key_a in node_keys:
@@ -682,7 +611,9 @@ def update_index_items(filenames: list[str]):
                         index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
                         index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
                         log.warning(f"Schema violation in {filename} during partial update.")
-                        (index_data.get("nodes") or {}).pop(node_key, None)
+                        old_node = (index_data.get("nodes") or {}).pop(node_key, None)
+                        if old_node:
+                            db_store.delete_search_index(node_key)
                         index_data["weighted_edges"] = [
                             edge for edge in (index_data.get("weighted_edges") or [])
                             if edge["source"] != node_key and edge["target"] != node_key
@@ -695,7 +626,7 @@ def update_index_items(filenames: list[str]):
                         if not os.path.exists(filepath):
                             old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                             if old_node:
-                                _remove_node_from_bm25(index_data, node_key, old_node)
+                                db_store.delete_search_index(node_key)
                             index_data["weighted_edges"] = [
                                 edge for edge in (index_data.get("weighted_edges") or [])
                                 if edge["source"] != node_key and edge["target"] != node_key
@@ -712,11 +643,11 @@ def update_index_items(filenames: list[str]):
                                 index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing 'domain' or 'status'. Node excluded."})
                                 old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                                 if old_node:
-                                    _remove_node_from_bm25(index_data, node_key, old_node)
+                                    db_store.delete_search_index(node_key)
                             else:
                                 old_node = index_data["nodes"].get(node_key)
                                 if old_node:
-                                    _remove_node_from_bm25(index_data, node_key, old_node)
+                                    db_store.delete_search_index(node_key)
                                 
                                 index_data["nodes"][node_key] = node_data
                                 _add_node_to_bm25(index_data, node_key, node_data)

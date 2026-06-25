@@ -80,7 +80,8 @@ def _resolve_combined_item(identifier, resolution: str = "skip", change_manifest
     if not target:
         return None
 
-    return governance_store.resolve_governance_item(target["item_id"], resolution, change_manifest=change_manifest)
+    from vector_lake import governance_service
+    return governance_service.resolve_governance_item(target["item_id"], resolution, change_manifest=change_manifest)
 
 
 def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip", change_manifest: dict = None):

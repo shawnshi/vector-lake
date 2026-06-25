@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_store
+from vector_lake import db_store
 from vector_lake.wiki_utils import get_index_path, get_purpose_path, get_wiki_dir
 
 
@@ -380,59 +381,24 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         return "No valid search tokens."
 
     scored = []
-    bm25_index = index_data.get("bm25_index")
     
-    if bm25_index and bm25_index.get("total_docs"):
-        base_scores = _score_bm25(tokens, bm25_index)
-        for node in nodes:
-            if domain and node.get("domain", "").lower() != domain.lower():
-                continue
-            if cluster and node.get("topic_cluster", "").lower() != cluster.lower():
-                continue
-            if not include_history and node.get("status", "").lower() in ("deprecated", "archived"):
-                continue
-            
-            score = base_scores.get(node["_key"], 0.0)
-            if score > 0:
-                if not include_history and node.get("status", "").lower() == "decayed" and intent != "temporal":
+    # PHASE 2 FTS5 QUERY
+    try:
+        fts_results = db_store.search_wiki(' '.join(tokens), limit=top_k * 5)
+        for row in fts_results:
+            key = row['node_key']
+            score = row['rank'] * -1.0  # SQLite BM25 is negative
+            if key in index_data.get('nodes', {}):
+                node = {'_key': key, **index_data['nodes'][key]}
+                if domain and node.get('domain', '').lower() != domain.lower(): continue
+                if cluster and node.get('topic_cluster', '').lower() != cluster.lower(): continue
+                if not include_history and node.get('status', '').lower() in ('deprecated', 'archived'): continue
+                
+                if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
                     score *= 0.2
                 scored.append((score, node))
-    else:
-        for node in nodes:
-            if domain and node.get("domain", "").lower() != domain.lower():
-                continue
-            if cluster and node.get("topic_cluster", "").lower() != cluster.lower():
-                continue
-            if not include_history and node.get("status", "").lower() in ("deprecated", "archived"):
-                continue
-
-            score = 0
-            title = (node.get("title") or "").lower()
-            summary = (node.get("summary") or "").lower()
-
-            for term in tokens:
-                if term in title:
-                    score += 10
-                if term in summary:
-                    score += 3
-
-            if score == 0:
-                filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
-                if os.path.exists(filepath):
-                    try:
-                        with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                            body_preview = handle.read(2000).lower()
-                        body_preview = re.sub(r"^---.*?---\s*", "", body_preview, flags=re.DOTALL)
-                        for term in tokens:
-                            if term in body_preview:
-                                score += 1
-                    except Exception:
-                        pass
-
-            if score > 0:
-                if not include_history and node.get("status", "").lower() == "decayed" and intent != "temporal":
-                    score *= 0.2
-                scored.append((score, node))
+    except Exception as e:
+        log.error(f"FTS5 Search failed: {e}")
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
