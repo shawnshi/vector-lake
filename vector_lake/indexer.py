@@ -308,18 +308,23 @@ def _parse_wiki_node(filepath: str, node_key: str):
 
 def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
                         links_a=None, links_b=None,
-                        sources_a=None, sources_b=None) -> float:
+                        sources_a=None, sources_b=None,
+                        type_a=None, type_b=None,
+                        decay_a=None, decay_b=None,
+                        align_a=None, align_b=None,
+                        triples_a=None, triples_b=None) -> float:
     """Calculates relevance score between two nodes. O(N^2) hot path."""
     score = 0.0
     key_a = node_a.get("_key", "")
     key_b = node_b.get("_key", "")
 
-    if links_a is None: links_a = set((node_a.get("links") or []))
-    if links_b is None: links_b = set((node_b.get("links") or []))
+    if links_a is None: links_a = frozenset((node_a.get("links") or []))
+    if links_b is None: links_b = frozenset((node_b.get("links") or []))
     
     if key_b in links_a:
         pred = "mentions"
-        for t in (node_a.get("triples") or []):
+        t_list = triples_a if triples_a is not None else (node_a.get("triples") or [])
+        for t in t_list:
             if t.get("target") == key_b:
                 pred = t.get("predicate", "mentions")
                 break
@@ -327,14 +332,15 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
         
     if key_a in links_b:
         pred = "mentions"
-        for t in (node_b.get("triples") or []):
+        t_list = triples_b if triples_b is not None else (node_b.get("triples") or [])
+        for t in t_list:
             if t.get("target") == key_a:
                 pred = t.get("predicate", "mentions")
                 break
         score += get_pred_weight(pred)
 
-    if sources_a is None: sources_a = set((node_a.get("sources") or []))
-    if sources_b is None: sources_b = set((node_b.get("sources") or []))
+    if sources_a is None: sources_a = frozenset((node_a.get("sources") or []))
+    if sources_b is None: sources_b = frozenset((node_b.get("sources") or []))
 
     shared_sources = len(sources_a & sources_b)
     if shared_sources:
@@ -351,8 +357,8 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
                     if degree > 1:
                         score += (1.0 / math.log(degree)) * RELEVANCE_WEIGHTS["common_neighbor"]
 
-    type_a = node_a.get("type", "concept").lower()
-    type_b = node_b.get("type", "concept").lower()
+    if type_a is None: type_a = node_a.get("type", "concept").lower()
+    if type_b is None: type_b = node_b.get("type", "concept").lower()
 
     type_a_dict = TYPE_AFFINITY.get(type_a)
     if type_a_dict:
@@ -361,14 +367,16 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
         affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
     score += affinity
 
-    decay_a = node_a.get("decay_weight", 1.0)
-    decay_b = node_b.get("decay_weight", 1.0)
+    if decay_a is None: decay_a = node_a.get("decay_weight", 1.0)
+    if decay_b is None: decay_b = node_b.get("decay_weight", 1.0)
     
-    align_a = node_a.get("alignment_score", 100.0) / 100.0
-    if align_a < 0.1: align_a = 0.1
+    if align_a is None:
+        align_a = node_a.get("alignment_score", 100.0) / 100.0
+        if align_a < 0.1: align_a = 0.1
 
-    align_b = node_b.get("alignment_score", 100.0) / 100.0
-    if align_b < 0.1: align_b = 0.1
+    if align_b is None:
+        align_b = node_b.get("alignment_score", 100.0) / 100.0
+        if align_b < 0.1: align_b = 0.1
     
     score *= math.sqrt(decay_a * decay_b)
     score *= math.sqrt(align_a * align_b)
@@ -396,6 +404,12 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
     # Pre-compute resolved links and sources sets for O(1) access inside the nested loop
     node_links = {}
+    node_types = {}
+    node_decays = {}
+    node_aligns = {}
+    node_triples = {}
+    node_sources = {}
+
     for key, node in nodes_dict.items():
         resolved_links = set()
         for link in (node.get("links") or []):
@@ -403,14 +417,25 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 resolved_links.add(alias_map[link])
             else:
                 resolved_links.add(link)
-        node_links[key] = resolved_links
+        node_links[key] = frozenset(resolved_links)
+
+        node_types[key] = node.get("type", "concept").lower()
+        node_decays[key] = node.get("decay_weight", 1.0)
         
-    node_sources = {key: set((node.get("sources") or [])) for key, node in nodes_dict.items()}
+        align = node.get("alignment_score", 100.0) / 100.0
+        if align < 0.1: align = 0.1
+        node_aligns[key] = align
+        node_triples[key] = node.get("triples") or []
+        node_sources[key] = frozenset((node.get("sources") or []))
 
     for key_a in node_keys:
         node_a = nodes_dict[key_a]
         links_a = node_links[key_a]
         sources_a = node_sources[key_a]
+        type_a = node_types[key_a]
+        decay_a = node_decays[key_a]
+        align_a = node_aligns[key_a]
+        triples_a = node_triples[key_a]
 
         for key_b in node_keys:
             if key_a >= key_b:
@@ -428,10 +453,19 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                     if not has_common_neighbor:
                         continue
 
+            type_b = node_types[key_b]
+            decay_b = node_decays[key_b]
+            align_b = node_aligns[key_b]
+            triples_b = node_triples[key_b]
+
             relevance = calculate_relevance(
                 node_a, node_b, nodes_dict,
                 links_a=links_a, links_b=links_b,
-                sources_a=sources_a, sources_b=sources_b
+                sources_a=sources_a, sources_b=sources_b,
+                type_a=type_a, type_b=type_b,
+                decay_a=decay_a, decay_b=decay_b,
+                align_a=align_a, align_b=align_b,
+                triples_a=triples_a, triples_b=triples_b
             )
             if relevance >= 1.5:
                 edges.append({
