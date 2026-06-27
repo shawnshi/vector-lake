@@ -89,6 +89,18 @@ def _default_queue_store() -> dict:
     }
 
 
+ALLOWED_TABLES = {
+    "entities", "claims", "evidence", "sources", "change_sets",
+    "governance_queue", "wiki_search_index", "alias_registry",
+    "operational_memory", "claim_graph_nodes", "claim_graph_edges",
+    "timeline_events", "processed_files"
+}
+
+def _validate_table_name(table_name: str):
+    """🛡️ Sentinel: Prevent SQL injection by validating table names against a strict whitelist."""
+    if table_name not in ALLOWED_TABLES:
+        raise ValueError(f"Security error: Invalid table name '{table_name}'. Expected one of {ALLOWED_TABLES}.")
+
 def initialize_meta_store():
     init_db()
 
@@ -104,6 +116,7 @@ def _count_wiki_pages() -> int:
 
 
 def _load_db_map(table_name: str, pk_col: str):
+    _validate_table_name(table_name)
     initialize_meta_store()
     conn = get_connection()
     store = _default_map_store(pk_col)
@@ -114,6 +127,7 @@ def _load_db_map(table_name: str, pk_col: str):
 
 
 def _load_db_queue(table_name: str, pk_col: str):
+    _validate_table_name(table_name)
     initialize_meta_store()
     conn = get_connection()
     store = _default_queue_store()
@@ -124,6 +138,7 @@ def _load_db_queue(table_name: str, pk_col: str):
 
 
 def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = None):
+    _validate_table_name(table_name)
     conn = get_connection()
     now = _utc_now()
     data["updated_at"] = now
@@ -157,6 +172,7 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
 
 
 def _save_db_queue(table_name: str, pk_col: str, data: dict):
+    _validate_table_name(table_name)
     conn = get_connection()
     now = _utc_now()
     data["updated_at"] = now

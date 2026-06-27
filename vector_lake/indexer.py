@@ -322,21 +322,25 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
     if links_b is None: links_b = frozenset((node_b.get("links") or []))
     
     if key_b in links_a:
-        pred = "mentions"
-        t_list = triples_a if triples_a is not None else (node_a.get("triples") or [])
-        for t in t_list:
-            if t.get("target") == key_b:
-                pred = t.get("predicate", "mentions")
-                break
+        if triples_a is not None:
+            pred = triples_a.get(key_b, "mentions")
+        else:
+            pred = "mentions"
+            for t in (node_a.get("triples") or []):
+                if t.get("target") == key_b:
+                    pred = t.get("predicate", "mentions")
+                    break
         score += get_pred_weight(pred)
         
     if key_a in links_b:
-        pred = "mentions"
-        t_list = triples_b if triples_b is not None else (node_b.get("triples") or [])
-        for t in t_list:
-            if t.get("target") == key_a:
-                pred = t.get("predicate", "mentions")
-                break
+        if triples_b is not None:
+            pred = triples_b.get(key_a, "mentions")
+        else:
+            pred = "mentions"
+            for t in (node_b.get("triples") or []):
+                if t.get("target") == key_a:
+                    pred = t.get("predicate", "mentions")
+                    break
         score += get_pred_weight(pred)
 
     if sources_a is None: sources_a = frozenset((node_a.get("sources") or []))
@@ -428,6 +432,14 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         node_triples[key] = node.get("triples") or []
         node_sources[key] = frozenset((node.get("sources") or []))
 
+    node_triples = {}
+    for key, node in nodes_dict.items():
+        td = {}
+        for t in (node.get("triples") or []):
+            if t.get("target"):
+                td[t["target"]] = t.get("predicate", "mentions")
+        node_triples[key] = td
+
     for key_a in node_keys:
         node_a = nodes_dict[key_a]
         links_a = node_links[key_a]
@@ -444,6 +456,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             node_b = nodes_dict[key_b]
             links_b = node_links[key_b]
             sources_b = node_sources[key_b]
+            triples_b = node_triples[key_b]
 
             has_direct = key_b in links_a or key_a in links_b
             if not has_direct:
@@ -636,6 +649,14 @@ def update_index_items(filenames: list[str]):
                 if isinstance(index_data.get("categories"), list):
                     index_data["categories"] = set(index_data["categories"])
 
+                all_nodes_triples = {}
+                for k, v in (index_data.get("nodes") or {}).items():
+                    td = {}
+                    for t in (v.get("triples") or []):
+                        if t.get("target"):
+                            td[t["target"]] = t.get("predicate", "mentions")
+                    all_nodes_triples[k] = td
+
                 for filename in valid_filenames:
                     filepath = os.path.join(wiki_dir, filename)
                     node_key = filename[:-3]
@@ -704,6 +725,13 @@ def update_index_items(filenames: list[str]):
                                 ]
                                 node_data["_key"] = node_key
                                 all_nodes = index_data["nodes"]
+
+                                td = {}
+                                for t in (node_data.get("triples") or []):
+                                    if t.get("target"):
+                                        td[t["target"]] = t.get("predicate", "mentions")
+                                all_nodes_triples[node_key] = td
+                                triples_a = td
                                 
                                 node_links = set((node_data.get("links") or []))
                                 node_sources = set((node_data.get("sources") or []))
@@ -713,6 +741,7 @@ def update_index_items(filenames: list[str]):
                                         
                                     other_links = set((other_node.get("links") or []))
                                     other_sources = set((other_node.get("sources") or []))
+                                    triples_b = all_nodes_triples.get(other_key)
                                     
                                     has_direct = other_key in node_links or node_key in other_links
                                     has_source_overlap = bool(node_sources & other_sources)
@@ -725,7 +754,8 @@ def update_index_items(filenames: list[str]):
                                     relevance = calculate_relevance(
                                         node_data, other_node, all_nodes,
                                         links_a=node_links, links_b=other_links,
-                                        sources_a=node_sources, sources_b=other_sources
+                                        sources_a=node_sources, sources_b=other_sources,
+                                        triples_a=triples_a, triples_b=triples_b
                                     )
                                     if relevance >= 1.5:
                                         index_data["weighted_edges"].append({
