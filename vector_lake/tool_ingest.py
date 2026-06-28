@@ -155,11 +155,15 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     response += "After invoking, you must STOP CALLING TOOLS and wait for them to finish."
     return response
 
-def finalize_ingest(files_written_str: str, raw_files_processed_json: str) -> str:
-    """Finalizes an ingest operation from a subagent."""
+def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str) -> str:
+    """Finalizes an ingest operation from a subagent using payload files."""
     try:
         from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError
-        files = json.loads(files_written_str)
+        with open(files_written_payload_file, "r", encoding="utf-8") as f:
+            files = json.load(f)
+        with open(raw_files_payload_file, "r", encoding="utf-8") as f:
+            processed_data = json.load(f)
+            
         wiki_dir = get_wiki_dir()
         
         files_written = []
@@ -184,7 +188,6 @@ def finalize_ingest(files_written_str: str, raw_files_processed_json: str) -> st
                 summary=f"Subagent ingest sync for {len(files_written)} page(s)"
             )
             
-        processed_data = json.loads(raw_files_processed_json)
         filepath = processed_data["filepath"]
         file_hash = processed_data["hash"]
         

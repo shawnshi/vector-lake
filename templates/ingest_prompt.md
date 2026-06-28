@@ -17,9 +17,8 @@ Task:
 1. Read the Source Path content using `view_file`. If `view_file` fails due to MIME type restrictions, fallback to running a Python script with `errors="ignore"` to read the file forcefully.
 2. Extract the core entities, concepts, and tensions based on the Schema.
 3. If a `确定性结构 (Static Skeleton)` block is provided above, you MUST copy it EXACTLY into the final output under the `## 确定性结构 (Static Skeleton)` section. Do not alter or summarize it.
-4. Call the lazy MCP tool using `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="finalize_ingest"). Pass the formatted JSON array of new wiki nodes to `files_written_str`, and `{"filepath": "{{filepath}}", "hash": "{{file_hash}}"}` to `raw_files_processed_json`.
-5. 闭环执行 (Agentic Workflow): If contradictions, duplicates, or knowledge gaps are found, you MUST NOT just output text. You MUST invoke the `enqueue_governance_item` MCP tool with the payload `{"type": "contradiction", "entities": ["page1", "page2"], "description": "..."}`. The Watchdog will queue this for the next resolving cycle.
-
+4. Write the JSON array of new wiki nodes to a temporary file (e.g. `files_written.json`) using `write_to_file`, and write `{"filepath": "{{filepath}}", "hash": "{{file_hash}}"}` to another temporary file (e.g. `raw_files.json`). Then call the lazy MCP tool `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="finalize_ingest") with `files_written_payload_file` and `raw_files_payload_file` pointing to the absolute paths of these files.
+5. 闭环执行 (Agentic Workflow): If contradictions or duplicates are found, you MUST NOT just output text. You MUST declare them using `tension_edges` in the YAML frontmatter. If a new schema category is needed, use the `propose_schema_mutation` MCP tool.
 
 [CRITICAL REQUIREMENT: MICRO-ASSET FUNNEL]
 If the source text contains explicit highly-structured knowledge (e.g. formulas, exact config parameters, or architecture decisions), you MUST NOT bury them inside long prose.
@@ -28,6 +27,14 @@ Instead, mint a DEDICATED node for them with a specific prefix:
 - `Concept_Config_XYZ.md`
 - `Concept_Decision_XYZ.md`
 For `Concept_Decision_*` files, you MUST include explicit bullet points for: `context`, `alternatives`, and `justification`.
+
+[CRITICAL REQUIREMENT: SEMANTIC TENSION QUANTIFICATION (STQM)]
+When extracting claims, if the source explicitly contradicts or strongly supports an existing node (or another claim), you MUST NOT use a simple hard link.
+Instead, you MUST declare a `tension_edges` array in the YAML frontmatter for that node.
+- `target`: The target node name (e.g. `Concept_Cloud_Native`)
+- `polarity`: `-1.0` (Absolute Refutation), `0` (Neutral), `+1.0` (Absolute Support). Use negative for conflicts.
+- `intensity`: `0.0` to `1.0`. Represent the hardness of the claim (0.95 for RWE data, 0.2 for guesses).
+- `context`: 1-sentence reason for the tension.
 
 [STRICT SCHEMA RULE: NEGATIVE CONSTRAINTS]
 `Person`, `Vendor`, `Product`, `Synthesis`, `Event`, `Policy`, `Standard`, `Source` are FIRST-CLASS node types. YOU MUST NEVER prefix them with `Concept_`. Output `Person_XXX.md`, NOT `Concept_Person_XXX.md`. Output `Synthesis_XXX.md`, NOT `Concept_Synthesis_XXX.md`.

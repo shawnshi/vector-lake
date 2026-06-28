@@ -67,9 +67,10 @@ graph LR
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
    - **API 熔断器 (Circuit Breaker)**：在 LLM 并发摄入时，通过带抖动的指数退避（Exponential Backoff with Jitter）与黑名单冷却机制，彻底消除死锁、配额枯竭与 429 限流风暴。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
-   - **两步思维链摄入**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns）并执行去重校验，再写盘，大幅提升提取保真度。
+   - **两步思维链摄入 (Payload-Based MCP)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns），并将长文本提纯为 JSON 制品落盘后通过 MCP 最终入湖，彻底根除 CLI 传参截断与 JSON 解析风暴。
+   - **语义张力量化模型 (STQM)**：图谱原生支持 `tension_edges` 张力边计算。强制所有 Agent 抽离争议与矛盾并结构化为冲突边，在 Query 时通过 Controversy Heatmap 直观展示领域盲区。
    - **跨类型 PIEA 与强制格式漏斗**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
-   - **无感异步全量索引 (Zero-Blocking Async Reindex)**：前台所有的重负载图谱变更（Query 合成、Delete 级联删除、Sync、Graph），全部被优化为仅写入极轻量的 `flag_reindex.lock` 信号。由 Watchdog 主循环在空闲时原子化消费并执行全量图谱重建，彻底杜绝前端 UI 线程的阻塞与卡顿。
+   - **无感异步全量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台重负载变更通过 `flag_reindex.lock` 信号异步削峰。同时，底层的 `_calculate_weighted_edges` 已升级为 O(V+E) 稀疏图遍历算法，彻底终结了万级节点下的 O(N²) 算力瓶颈与死锁现象。
    - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox)**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
    - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账（现已支持安全级无残留全量重建与泛型 `[Observation]` 标签智能回退提取）、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
    - **原生二进制向量引擎 (Native Binary Embeddings)**：将臃肿的纯文本 JSON 序列化彻底淘汰，重构为基于 C 层级的高性能 Pickle (`HIGHEST_PROTOCOL`) 二进制缓冲。大幅抹除了无用 I/O 载荷（体积暴降 60%），并将语义对比矩阵的加载时间从数秒降至毫秒级，根绝了内存爆栈风险。
@@ -247,12 +248,12 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/cli_app.py` | CLI 参数与命令路由 |
 | `vector_lake/tools.py` | Tool facade |
 | `vector_lake/tool_ingest.py` | Raw-source 批量扫描与 Subagent 摄取指令生成 |
-| `vector_lake/indexer.py` | `index.json` 生成，含 BM25 纯 Python 倒排索引 |
+| `vector_lake/indexer.py` | `index.json` 生成，使用 Sparse Graph Traversal 优化计算拓扑边 |
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
 | `vector_lake/tool_memory.py` | 基于 "Wiki-as-Database" 架构的运行态记忆物理写回 |
 | `vector_lake/governance_store.py` | canonical store、change set、operational memory、conflict resolver |
 | `vector_lake/governance_metrics.py` | debt metrics 和治理统计 |
-| `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + 引入 `jieba` 分词的 BM25 + Multi-Hop PPR) 与 Memory Packet |
+| `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR) 与 Memory Packet |
 | `vector_lake/tool_query.py` | query-to-page synthesis |
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |
 | `vector_lake/tool_review.py` | legacy/governance review surface |

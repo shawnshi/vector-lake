@@ -16,6 +16,13 @@ Perform bounded logical synthesis and generate the resulting Markdown synthesis 
 You MUST use the lazy MCP tool `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="write_wiki_page") to save your synthesis directly to the Wiki.
 DO NOT use native `write_to_file`. Make sure the filename starts with `Synthesis_`.
 
+[CRITICAL REQUIREMENT: CONTROVERSY HEATMAP (STQM)]
+You MUST analyze the `tension_edges` (if any) present in the retrieved context.
+If significant conflicts or strong support exist, you MUST include a section titled "## 争议热力矩阵 (Controversy Heatmap)" BEFORE the Gap Analysis.
+In this section, explicitly state:
+1. 🟢 共识区 (Green Zone): Areas of high support (polarity > 0, high intensity).
+2. 💥 激烈交火区 (Red Zone): Areas of severe conflict (polarity < 0, high intensity), detailing the opposing factions and their core arguments.
+
 [CRITICAL REQUIREMENT: GAP ANALYSIS]
 You MUST include a section titled "## 盲区与缺失度分析 (Gap Analysis)" at the end of your synthesis.
 In this section, explicitly state:

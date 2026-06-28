@@ -35,6 +35,11 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   created: "YYYY-MM-DD"
   updated: "YYYY-MM-DD"
   sources: ["raw/doc1.pdf", "raw/doc2.txt"]
+  tension_edges: # Optional: Semantic Tension Quantification Model (STQM)
+    - target: "Concept_Cloud_Native"
+      polarity: -1.0  # -1.0 (refute) to 1.0 (support)
+      intensity: 0.85 # 0.0 to 1.0
+      context: "This concept physically challenges the cloud-native assumption."
   ---
   ```
 - **Semantic Bidirectional Linking (SSOT Rule)**: ALL topological relations MUST be 100% and uniquely carried by Markdown semantic links. DO NOT use YAML arrays (like `parents`) for relationships. You MUST use strict relation-typed links from the Controlled Vocabulary: `[predicate:: [[Target_Entity_Name]]]`.
@@ -44,7 +49,11 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
    - Example: `此框架的设计 [falsifies:: [[Concept_Perfect_Design]]]`
 - **Inline Provenance (RAG Chunking Friendly)**: When summarizing or extracting claims from sources, you MUST use inline source anchors rather than bottom footnotes to ensure provenance survives RAG chunking.
    - Example: `The model achieves SOTA performance (Source: [[Source_Report_A]]).`
-- **Contradictions & Synthesis**: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction (e.g., "> **Conflict Note:** Source A claims X, but Source B claims Y.").
+- **Semantic Tension Quantification Model (STQM)**: When synthesizing documents that contradict or explicitly support existing knowledge, you MUST NOT just "hard link" them. You MUST generate a `tension_edges` array in the YAML frontmatter. This elevates the graph from static topology to a Controversy Heatmap.
+   - `polarity`: `-1.0` (Absolute Refutation/Conflict), `0` (Neutral), `+1.0` (Absolute Support).
+   - `intensity`: `0.0` to `1.0`. Represents the hardness of the claim (e.g., a casual guess is 0.2, a large-scale RWE clinical trial is 0.95).
+   - `context`: A dense, 1-sentence reason for the tension.
+- **Contradictions & Synthesis**: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction in the text AND map the physical collision using `tension_edges` in the YAML frontmatter.
 - **Temporal Rot Defense**: For fast-moving domains (like policies or tech releases), you MUST anchor claims to a specific time frame using inline brackets at the start of a bullet/paragraph (e.g., `[2024] The market is...` or `[2026-Q1] Agentic models dominate...`). This allows the system to algorithmically resolve contradictions by deprecating older historical claims in favor of newer ones.
 - **Epistemic Decay (TTL)**: For time-sensitive nodes (like news, market dynamics, product releases), actively assign a shorter `ttl` (e.g., 90 to 180 days). The system automatically tracks node age (days since `updated`) and applies an exponential decay weight: $D = 0.5 ^{age\_days / ttl}$. Default TTLs: Concept: 1825, Vendor/Product/Person/Event: 1095, Synthesis: 730, Source: 365. You may explicitly set `ttl` to override these defaults.
 - **Anti-Drift Forcefield & Computed Scores**: Scores such as `alignment_score`, `authority_score`, and `importance_score` are NO LONGER manually maintained by the LLM in YAML. They are automatically computed by the background Graph Indexer (based on PageRank, update frequency, TTL, and relevance to `purpose.md`) and written directly to `index.json` or `operational_memory.json`.

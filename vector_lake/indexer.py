@@ -258,6 +258,19 @@ def _parse_wiki_node(filepath: str, node_key: str):
     else:
         sources = []
 
+    # STQM: Extract tension edges from frontmatter
+    raw_tension_edges = fm_data.get("tension_edges", [])
+    tension_edges = []
+    if isinstance(raw_tension_edges, list):
+        for te in raw_tension_edges:
+            if isinstance(te, dict) and te.get("target"):
+                tension_edges.append({
+                    "target": str(te.get("target")).strip(),
+                    "polarity": float(te.get("polarity", 0.0)),
+                    "intensity": float(te.get("intensity", 0.0)),
+                    "context": str(te.get("context", "")).strip()
+                })
+
     alignment_score = 100.0  # V7.2: Removed manual LLM alignment_score scoring. Handled algorithmically.
 
     links = set()
@@ -298,6 +311,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "status": status,
         "aliases": aliases,
         "sources": sources,
+        "tension_edges": tension_edges,
         "links": sorted(links),
         "triples": triples,
         "summary": summary_text[:240],
@@ -462,6 +476,16 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         if align < 0.1: align = 0.1
         node_multipliers[key] = math.sqrt(decay * align)
 
+    source_to_nodes = {}
+    for key, sources in node_sources.items():
+        for source in sources:
+            source_to_nodes.setdefault(source, []).append(key)
+            
+    reverse_links = {}
+    for key, links in node_links.items():
+        for link in links:
+            reverse_links.setdefault(link, []).append(key)
+
     for key_a in node_keys:
         links_a = node_links[key_a]
         sources_a = node_sources[key_a]
@@ -469,20 +493,22 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         triples_a = node_triples[key_a]
         multiplier_a = node_multipliers[key_a]
 
-        for key_b in node_keys:
-            if key_a >= key_b:
+        candidates = set(links_a)
+        if key_a in reverse_links:
+            candidates.update(reverse_links[key_a])
+            
+        for source in sources_a:
+            candidates.update(source_to_nodes.get(source, []))
+            
+        for neighbor in links_a:
+            candidates.update(reverse_links.get(neighbor, []))
+
+        for key_b in candidates:
+            if key_a >= key_b or key_b not in node_links:
                 continue
 
             links_b = node_links[key_b]
             sources_b = node_sources[key_b]
-
-            has_direct = key_b in links_a or key_a in links_b
-            if not has_direct:
-                has_source_overlap = bool(sources_a & sources_b)
-                if not has_source_overlap:
-                    has_common_neighbor = bool(links_a & links_b)
-                    if not has_common_neighbor:
-                        continue
 
             type_b = node_types[key_b]
             triples_b = node_triples[key_b]

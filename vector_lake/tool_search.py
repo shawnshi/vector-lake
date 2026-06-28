@@ -132,36 +132,6 @@ def _expand_query_with_llm(query: str) -> list[str]:
                     tokens.add(word_lower)
     return list(tokens)
 
-import math
-
-def _score_bm25(query_tokens: list[str], bm25_index: dict) -> dict:
-    if not bm25_index or not bm25_index.get("total_docs"):
-        return {}
-    
-    inverted_index = bm25_index.get("inverted_index", {})
-    doc_lengths = bm25_index.get("doc_lengths", {})
-    avgdl = bm25_index.get("avgdl", 1.0)
-    total_docs = bm25_index.get("total_docs", 0)
-    
-    k1 = 1.5
-    b = 0.75
-    
-    scores = {}
-    for term in query_tokens:
-        doc_freqs = inverted_index.get(term, {})
-        n_q = len(doc_freqs)
-        if n_q == 0:
-            continue
-        
-        idf = math.log(1 + (total_docs - n_q + 0.5) / (n_q + 0.5))
-        
-        for doc_id, freq in doc_freqs.items():
-            dl = doc_lengths.get(doc_id, avgdl)
-            score = idf * (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * dl / avgdl))
-            scores[doc_id] = scores.get(doc_id, 0.0) + score
-            
-    return scores
-
 
 def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) -> str:
     state = memory.get("validity_state", "active")
@@ -486,10 +456,18 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
                 content = handle.read()
             snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:300]
+            
+        tension_edges = node.get("tension_edges", [])
+        tension_info = ""
+        if tension_edges:
+            tension_info = "  [Tension Edges]:\n"
+            for te in tension_edges:
+                tension_info += f"    -> {te.get('target')} (Polarity: {te.get('polarity')}, Intensity: {te.get('intensity')}): {te.get('context')}\n"
+                
         if as_xml:
-            result += f"<Evidence_Node ID='Wiki_{index}' Source='{node['_key']}.md'>{snippet}</Evidence_Node>\n"
+            result += f"<Evidence_Node ID='Wiki_{index}' Source='{node['_key']}.md'>\n{tension_info}{snippet}\n</Evidence_Node>\n"
         else:
-            result += f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n  {snippet}...\n\n"
+            result += f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
     return result
 
 
