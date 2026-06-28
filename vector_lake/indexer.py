@@ -409,10 +409,10 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     # Pre-compute resolved links and sources sets for O(1) access inside the nested loop
     node_links = {}
     node_types = {}
-    node_decays = {}
-    node_aligns = {}
     node_triples = {}
     node_sources = {}
+    node_degrees = {}
+    pred_weights = {}
 
     for key, node in nodes_dict.items():
         resolved_links = set()
@@ -424,39 +424,57 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         node_links[key] = frozenset(resolved_links)
 
         node_types[key] = node.get("type", "concept").lower()
-        node_decays[key] = node.get("decay_weight", 1.0)
         
-        align = node.get("alignment_score", 100.0) / 100.0
-        if align < 0.1: align = 0.1
-        node_aligns[key] = align
-        node_triples[key] = node.get("triples") or []
-        node_sources[key] = frozenset((node.get("sources") or []))
-
-    node_triples = {}
-    for key, node in nodes_dict.items():
         td = {}
         for t in (node.get("triples") or []):
             if t.get("target"):
-                td[t["target"]] = t.get("predicate", "mentions")
+                pred = t.get("predicate", "mentions")
+                if pred not in pred_weights:
+                    pred_weights[pred] = get_pred_weight(pred)
+                if t["target"] in alias_map:
+                    td[alias_map[t["target"]]] = pred
+                else:
+                    td[t["target"]] = pred
         node_triples[key] = td
 
+        node_sources[key] = frozenset((node.get("sources") or []))
+
+        links_len = len(node.get("links") or [])
+        if links_len > 1:
+            node_degrees[key] = (1.0 / math.log(links_len)) * RELEVANCE_WEIGHTS["common_neighbor"]
+        else:
+            node_degrees[key] = 0.0
+
+    if "mentions" not in pred_weights:
+        pred_weights["mentions"] = get_pred_weight("mentions")
+
+    type_affinity_precomputed = {}
+    for type_a, a_dict in TYPE_AFFINITY.items():
+        for type_b, affinity_val in a_dict.items():
+            type_affinity_precomputed[(type_a, type_b)] = affinity_val * RELEVANCE_WEIGHTS["type_affinity"]
+    default_affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
+    overlap_weight = RELEVANCE_WEIGHTS["source_overlap"]
+
+    node_multipliers = {}
+    for key, node in nodes_dict.items():
+        decay = node.get("decay_weight", 1.0)
+        align = node.get("alignment_score", 100.0) / 100.0
+        if align < 0.1: align = 0.1
+        node_multipliers[key] = math.sqrt(decay * align)
+
     for key_a in node_keys:
-        node_a = nodes_dict[key_a]
         links_a = node_links[key_a]
         sources_a = node_sources[key_a]
         type_a = node_types[key_a]
-        decay_a = node_decays[key_a]
-        align_a = node_aligns[key_a]
         triples_a = node_triples[key_a]
+        multiplier_a = node_multipliers[key_a]
 
         for key_b in node_keys:
             if key_a >= key_b:
                 continue
 
-            node_b = nodes_dict[key_b]
             links_b = node_links[key_b]
             sources_b = node_sources[key_b]
-            triples_b = node_triples[key_b]
 
             has_direct = key_b in links_a or key_a in links_b
             if not has_direct:
@@ -467,19 +485,34 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                         continue
 
             type_b = node_types[key_b]
-            decay_b = node_decays[key_b]
-            align_b = node_aligns[key_b]
             triples_b = node_triples[key_b]
+            multiplier_b = node_multipliers[key_b]
 
-            relevance = calculate_relevance(
-                node_a, node_b, nodes_dict,
-                links_a=links_a, links_b=links_b,
-                sources_a=sources_a, sources_b=sources_b,
-                type_a=type_a, type_b=type_b,
-                decay_a=decay_a, decay_b=decay_b,
-                align_a=align_a, align_b=align_b,
-                triples_a=triples_a, triples_b=triples_b
-            )
+            score = 0.0
+
+            if key_b in links_a:
+                pred = triples_a.get(key_b, "mentions")
+                score += pred_weights[pred]
+
+            if key_a in links_b:
+                pred = triples_b.get(key_a, "mentions")
+                score += pred_weights[pred]
+
+            shared_sources = len(sources_a & sources_b)
+            if shared_sources:
+                score += shared_sources * overlap_weight
+
+            common_neighbors = links_a & links_b
+            if common_neighbors:
+                for neighbor_key in common_neighbors:
+                    score += node_degrees.get(neighbor_key, 0.0)
+
+            affinity = type_affinity_precomputed.get((type_a, type_b), default_affinity)
+            score += affinity
+
+            score *= multiplier_a * multiplier_b
+            relevance = round(score, 3)
+
             if relevance >= 1.5:
                 edges.append({
                     "source": key_a,
