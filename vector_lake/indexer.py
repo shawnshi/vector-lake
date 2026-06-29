@@ -464,8 +464,9 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
     type_affinity_precomputed = {}
     for type_a, a_dict in TYPE_AFFINITY.items():
+        type_affinity_precomputed[type_a] = {}
         for type_b, affinity_val in a_dict.items():
-            type_affinity_precomputed[(type_a, type_b)] = affinity_val * RELEVANCE_WEIGHTS["type_affinity"]
+            type_affinity_precomputed[type_a][type_b] = affinity_val * RELEVANCE_WEIGHTS["type_affinity"]
     default_affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
     overlap_weight = RELEVANCE_WEIGHTS["source_overlap"]
 
@@ -492,6 +493,8 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         type_a = node_types[key_a]
         triples_a = node_triples[key_a]
         multiplier_a = node_multipliers[key_a]
+
+        affinity_dict_a = type_affinity_precomputed.get(type_a, {})
 
         candidates = set(links_a)
         if key_a in reverse_links:
@@ -524,16 +527,18 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 pred = triples_b.get(key_a, "mentions")
                 score += pred_weights[pred]
 
-            shared_sources = len(sources_a & sources_b)
-            if shared_sources:
-                score += shared_sources * overlap_weight
+            if not sources_a.isdisjoint(sources_b):
+                shared_sources = len(sources_a & sources_b)
+                if shared_sources:
+                    score += shared_sources * overlap_weight
 
-            common_neighbors = links_a & links_b
-            if common_neighbors:
-                for neighbor_key in common_neighbors:
-                    score += node_degrees.get(neighbor_key, 0.0)
+            if not links_a.isdisjoint(links_b):
+                common_neighbors = links_a & links_b
+                if common_neighbors:
+                    for neighbor_key in common_neighbors:
+                        score += node_degrees.get(neighbor_key, 0.0)
 
-            affinity = type_affinity_precomputed.get((type_a, type_b), default_affinity)
+            affinity = affinity_dict_a.get(type_b, default_affinity)
             score += affinity
 
             score *= multiplier_a * multiplier_b
