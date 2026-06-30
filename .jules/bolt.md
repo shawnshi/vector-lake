@@ -10,3 +10,7 @@
 ## 2026-06-27 - Inline Optimization & Precomputation in O(N^2) loops
 **Learning:** In `vector_lake/indexer.py`, isolating calculations out of the O(N^2) loop into O(1) structures (like precomputing link degrees, math.sqrt combinations, and static predicate weight evaluations) alongside eliminating the `calculate_relevance` function call overhead inside the tight loop provided massive latency improvements during heavy local graph generations.
 **Action:** Always precompute any values and multipliers in an outer O(N) loop and inline simple arithmetic logic directly inside O(N^2) hot paths when micro-optimizations are required for scale.
+
+## 2026-06-29 - O(N^2) Tuple Creation and Set Intersection
+**Learning:** In Vector Lake's inner loop (`_calculate_weighted_edges`), repeatedly accessing dictionaries with tuple keys (like `(type_a, type_b)`) incurs significant overhead due to tuple creation and hashing inside the hot path. Similarly, computing set intersections (`sources_a & sources_b`) creates new Python objects even when the intersection is empty.
+**Action:** Replace tuple-keyed dictionaries with nested dictionaries (`dict[type_a][type_b]`), allowing the outer key lookup to be hoisted out of the $O(N^2)$ loop. Guard set intersections with `.isdisjoint()`, which is heavily optimized in C and avoids allocating new set objects when there is no overlap.
