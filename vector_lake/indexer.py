@@ -439,16 +439,30 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
         node_types[key] = node.get("type", "concept").lower()
         
+        # Bolt Optimization: Precompute target weights directly to float values
+        # to eliminate costly string comparisons and dict lookups in the O(N^2) hot path below.
         td = {}
         for t in (node.get("triples") or []):
             if t.get("target"):
                 pred = t.get("predicate", "mentions")
                 if pred not in pred_weights:
                     pred_weights[pred] = get_pred_weight(pred)
+                weight = pred_weights[pred]
                 if t["target"] in alias_map:
-                    td[alias_map[t["target"]]] = pred
+                    td[alias_map[t["target"]]] = weight
                 else:
-                    td[t["target"]] = pred
+                    td[t["target"]] = weight
+
+        if "mentions" not in pred_weights:
+            pred_weights["mentions"] = get_pred_weight("mentions")
+        default_mention_weight = pred_weights["mentions"]
+
+        # Populate all existing links with the default mention weight
+        # so the inner loop can perform a direct O(1) float lookup.
+        for link in resolved_links:
+            if link not in td:
+                td[link] = default_mention_weight
+
         node_triples[key] = td
 
         node_sources[key] = frozenset((node.get("sources") or []))
@@ -519,13 +533,11 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
             score = 0.0
 
-            if key_b in links_a:
-                pred = triples_a.get(key_b, "mentions")
-                score += pred_weights[pred]
+            if key_b in triples_a:
+                score += triples_a[key_b]
 
-            if key_a in links_b:
-                pred = triples_b.get(key_a, "mentions")
-                score += pred_weights[pred]
+            if key_a in triples_b:
+                score += triples_b[key_a]
 
             if not sources_a.isdisjoint(sources_b):
                 shared_sources = len(sources_a & sources_b)
