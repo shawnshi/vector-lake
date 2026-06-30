@@ -43,12 +43,16 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   ---
   ```
 - **Semantic Bidirectional Linking (SSOT Rule)**: ALL topological relations MUST be 100% and uniquely carried by Markdown semantic links. DO NOT use YAML arrays (like `parents`) for relationships. You MUST use strict relation-typed links from the Controlled Vocabulary: `[predicate:: [[Target_Entity_Name]]]`.
-   - **Ontological**: `[is-a:: [[...]]]`, `[part-of:: [[...]]]`, `[evolved-from:: [[...]]]`
-   - **Strategic**: `[competes-with:: [[...]]]`, `[supplies-to:: [[...]]]`, `[blocks:: [[...]]]`
-   - **Epistemic**: `[validates:: [[...]]]`, `[falsifies:: [[...]]]`, `[depends-on:: [[...]]]`
+   - **Ontological & Creation**: [is-a::], [part-of::], [evolved-from::], [created::], [founded::], [authored::], [architected::]
+   - **Strategic & Power**: [competes-with::], [supplies-to::], [blocks::], [controls::], [manages::], [invested-in::], [allied-with::]
+   - **Epistemic**: [validates::], [falsifies::], [depends-on::]
+   - **Instantiation**: [instantiated-by::].
    - Example: `此框架的设计 [falsifies:: [[Concept_Perfect_Design]]]`
 - **Inline Provenance (RAG Chunking Friendly)**: When summarizing or extracting claims from sources, you MUST use inline source anchors rather than bottom footnotes to ensure provenance survives RAG chunking.
-   - Example: `The model achieves SOTA performance (Source: [[Source_Report_A]]).`
+    - Example: The model achieves SOTA performance (Source: [[Source_Report_A]])..
+   - Metrics & Assertions: For critical data parameters (revenue, thresholds, SLA), strictly use the inline metric syntax.
+   - {Metric: [Metric_Name]} [[Entity_Name]] [Value] (Source: [[Source_X]]).. Example:
+   -  {Metric: 2025_ARR} [[Vendor_Acme]] 1.2亿 (Source: [[Source_X]])..
 - **Semantic Tension Quantification Model (STQM)**: When synthesizing documents that contradict or explicitly support existing knowledge, you MUST NOT just "hard link" them. You MUST generate a `tension_edges` array in the YAML frontmatter. This elevates the graph from static topology to a Controversy Heatmap.
    - `polarity`: `-1.0` (Absolute Refutation/Conflict), `0` (Neutral), `+1.0` (Absolute Support).
    - `intensity`: `0.0` to `1.0`. Represents the hardness of the claim (e.g., a casual guess is 0.2, a large-scale RWE clinical trial is 0.95).
@@ -66,10 +70,10 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   - Strict Naming Protocol (`[ControlledType]_[MainName]-[SubName].md`):
     1. **Primary Naming Locale**: For multi-national entities, tech concepts, or open-source projects, MUST use the official English name (e.g., `Concept_Transformer.md` NOT `Concept_变形金刚.md`). For pure local entities, use Chinese or Pinyin (e.g., `Vendor_卫宁健康.md`). ALL discarded language variants MUST be written into `aliases: []`.
     2. **Prefix Lock**: Files MUST start with `Concept_`, `Vendor_`, `Product_`, `Person_`, `Event_`, `Policy_`, `Standard_`, `Source_`, or `Synthesis_` (system files like `overview.md` excluded). Legacy `Entity_` prefix is strictly forbidden.
-    2. **Suffix Lock**: Files MUST end with `.md`.
-    3. **Absolute Physical Character Set**: Only alphanumeric characters, Chinese characters, hyphens `-`, and a single underscore `_` (after the prefix) are allowed.
-    4. **Taxonomy Tyranny (No Spaces)**: Spaces, parentheses, slashes, and other invalid characters MUST be replaced by hyphens `-`. There MUST be exactly one underscore `_` separating the prefix and the main name.
-    5. **Anti-Cheat & Length**: The core name (after prefix) MUST NOT be a single character. Total filename MUST NOT exceed 120 characters.
+    3. **Suffix Lock**: Files MUST end with `.md`.
+    4. **Absolute Physical Character Set**: Only alphanumeric characters, Chinese characters, hyphens `-`, and a single underscore `_` (after the prefix) are allowed.
+    5. **Taxonomy Tyranny (No Spaces)**: Spaces, parentheses, slashes, and other invalid characters MUST be replaced by hyphens `-`. There MUST be exactly one underscore `_` separating the prefix and the main name.
+    6. **Anti-Cheat & Length**: The core name (after prefix) MUST NOT be a single character. Total filename MUST NOT exceed 120 characters.
   - Prefix rules:
     - `Source_*.md`: Summary pages for documents in `raw/`. **Deterministic naming**: the filename MUST be `Source_{raw_filename_stem}.md` (e.g., `raw/article/白皮书20260404.md` → `Source_白皮书20260404.md`). Each raw file maps to exactly ONE Source page. If a Source page already exists for a raw file, UPDATE it instead of creating a new one.
     - `Vendor_*.md`: Organizations, companies, hospitals, or institutions.
@@ -109,12 +113,17 @@ To prevent history noise and AST parsing failures during RAG/search, wiki files 
 
 > **Type-Bound H3 Slots Constraint (NO INVENTING NEW HEADINGS):**
 > You MUST use ONLY the following H3 headers based on the YAML `type`:
-> - If `Vendor`: `### 组织架构与商业模式 (Business Model)` | `### 核心护城河 (Moat)` | `### 脆弱点与阻力 (Risks)` | `### 关键产品线 (Key Products)` | `### 核心团队与权力拓扑 (Key Personnel)`
-> - If `Concept`: `### 物理机制 (Mechanism)` | `### 适用与失效边界 (Boundaries)` | `### 演进关联 (Evolution)`
-> - If `Product`: `### 核心价值流 (Value Stream)` | `### 技术栈与依赖 (Dependencies)`
-> - If `Person`: `### 核心主张与理念 (Key Stances)` | `### 利益纽带与权力网络 (Affiliations)` | `### 关键能力域 (Competencies)`
-> - If `Event`: `### 核心影响与转折 (Impact)` | `### 关键参与方 (Stakeholders)`
-> - If `Policy` or `Standard`: `### 核心约束与合规要求 (Compliance Mandates)` | `### 奖惩机制与市场影响 (Incentives & Penalties)` | `### 演进与废除条件 (Lifecycle)`
+> - If `Vendor`: `### 组织架构与商业模式 (Business Model)` | `### 核心护城河 (Moat)` | `### 市场占位与竞争态势 (Market & Competition)` | `### 生态位与战略联盟 (Ecosystem & Alliances)` | `### 关键产品线 (Key Products)` | `### 核心团队与权力拓扑 (Key Personnel)`
+> - If `Product`: `### 目标客群与应用边界 (Target ICP & Use Cases)` | `### 核心价值流 (Value Stream)` | `### 部署架构与底层依赖 (Architecture & Dependencies)` | `### 商业化与交付模式 (Monetization & Delivery)`
+> - If `Concept`: `### 物理机制 (Mechanism)` | `### 适用与失效边界 (Boundaries)` | `### 产业落地与代表实例 (Implementations)` | `### 演进关联 (Evolution)`
+> - If `Person`: `### 核心权责与控制域 (Mandates & Domain of Control)` | `### 关键造物与历史印记 (Key Artifacts & Legacy)` | `### 核心主张与商业/技术理念 (Key Stances & Philosophies)` | `### 利益纽带与权力拓扑 (Affiliations & Power Topology)`
+> - If `Event`: `### 动因与前置条件 (Catalysts & Preconditions)` | `### 核心影响与转折 (Impact)` | `### 关键参与方 (Stakeholders)` | `### 后续衍生与未决节点 (Fallout & Unresolved Issues)`
+> - If `Policy` or `Standard`: `### 管辖范围与适用对象 (Jurisdiction & Applicability)` | `### 核心约束与合规要求 (Compliance Mandates)` | `### 奖惩机制与市场影响 (Incentives & Penalties)` | `### 演进与废除条件 (Lifecycle)`
+
+> **STQM Explicit Mapping Constraint:**
+> If the YAML frontmatter contains a `tension_edges` array, you MUST instantiate the following H3 slot at the end of Section 1:
+> `### 认知张力与未决争议 (Controversies & Tensions)`
+> Unpack the polarities and semantic collisions mapping to `tension_edges` here using explicit natural language.
 
 *Rewrite Rule*: OVERWRITE this entire Section 1 whenever a new insight changes the core truth. Keep it lean, dense, and factual.
 
@@ -170,12 +179,12 @@ When executing a lint pass:
 2. Report redundant pages back to the user via audit report text. 
 3. Append a linting report to `log.md`.
 
-## 5. Style Guidelines
+## 6. Style Guidelines
 - High information density.
 - Professional, objective tone.
 - Omit conversational filler.
 
-## 6. Entity Linking Contract (图谱硬连接规范)
+## 7. Entity Linking Contract (图谱硬连接规范)
 
 To support Zero-LLM physical graph extraction and topological querying, all topological relations MUST be explicitly declared using semantic brackets. Natural language surrounding verbs are NOT parsed by the AST engine.
 
@@ -184,7 +193,7 @@ Example: `Acme AI [acquired:: [[Product_StartupX]]]` instead of "Acme AI acquire
 
 **Merge Constraint (禁止手工合并)**: ABSOLUTELY NO manual shell deletion or manual file merging of duplicate entity nodes. If a duplicate is found, you MUST use the MCP tool `resolve_governance_item` (with `resolution="merge"`) and submit a `change_manifest_json` for Sandboxed execution.
 
-## 7. Metadata Decay and Taxonomy Tyranny (防腐与分类学暴政)
+## 8. Metadata Decay and Taxonomy Tyranny (防腐与分类学暴政)
 
 To maintain a high signal-to-noise ratio in Vector Lake retrieval and prevent ontology collapse, strict rules govern YAML Frontmatter.
 
