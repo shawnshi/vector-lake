@@ -458,12 +458,23 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     if "mentions" not in pred_weights:
         pred_weights["mentions"] = get_pred_weight("mentions")
 
-    type_affinity_precomputed = {}
-    for type_a, a_dict in TYPE_AFFINITY.items():
-        type_affinity_precomputed[type_a] = {}
-        for type_b, affinity_val in a_dict.items():
-            type_affinity_precomputed[type_a][type_b] = affinity_val * RELEVANCE_WEIGHTS["type_affinity"]
     default_affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
+
+    # Pre-populate nested dictionary for ALL type combinations to allow fast O(1)
+    # direct dictionary lookups instead of expensive .get() fallbacks in the O(N^2) hot loop
+    all_types_observed = set(node_types.values())
+    all_types_precomp = set(TYPE_AFFINITY.keys()) | all_types_observed
+
+    type_affinity_precomputed = {}
+    for type_a in all_types_precomp:
+        type_affinity_precomputed[type_a] = {}
+        for type_b in all_types_precomp:
+            a_dict = TYPE_AFFINITY.get(type_a)
+            if a_dict:
+                affinity_val = a_dict.get(type_b, 0.5) * RELEVANCE_WEIGHTS["type_affinity"]
+            else:
+                affinity_val = default_affinity
+            type_affinity_precomputed[type_a][type_b] = affinity_val
     overlap_weight = RELEVANCE_WEIGHTS["source_overlap"]
 
     node_multipliers = {}
@@ -490,7 +501,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         triples_a = node_triples[key_a]
         multiplier_a = node_multipliers[key_a]
 
-        affinity_dict_a = type_affinity_precomputed.get(type_a, {})
+        affinity_dict_a = type_affinity_precomputed[type_a]
 
         candidates = set(links_a)
         if key_a in reverse_links:
@@ -524,18 +535,13 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 score += pred_weights[pred]
 
             if not sources_a.isdisjoint(sources_b):
-                shared_sources = len(sources_a & sources_b)
-                if shared_sources:
-                    score += shared_sources * overlap_weight
+                score += len(sources_a & sources_b) * overlap_weight
 
             if not links_a.isdisjoint(links_b):
-                common_neighbors = links_a & links_b
-                if common_neighbors:
-                    for neighbor_key in common_neighbors:
-                        score += node_degrees.get(neighbor_key, 0.0)
+                for neighbor_key in links_a & links_b:
+                    score += node_degrees.get(neighbor_key, 0.0)
 
-            affinity = affinity_dict_a.get(type_b, default_affinity)
-            score += affinity
+            score += affinity_dict_a[type_b]
 
             score *= multiplier_a * multiplier_b
             relevance = round(score, 3)

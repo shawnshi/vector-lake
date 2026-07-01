@@ -18,3 +18,7 @@
 ## 2026-07-01 - Optimizing YAML Parsing and Dumping with C Extensions
 **Learning:** The default pure Python yaml.safe_load and yaml.dump calls become a massive bottleneck when parsing thousands of Markdown files containing YAML frontmatter. PyYAML provides C-based LibYAML extensions (CSafeLoader, CSafeDumper) which execute drastically faster.
 **Action:** Create a utility wrapper yaml_utils.py that dynamically falls back to the high-performance LibYAML C extensions when available, and replace all pure Python yaml calls across critical paths with these wrapped load_yaml and dump_yaml helpers.
+
+## 2026-07-01 - [O(1) Hoisting in Vector Lake Indexer]
+**Learning:** In Vector Lake's indexer `_calculate_weighted_edges` function, the `type_affinity_precomputed.get(type_a, {})` was placed inside the outer O(N) loop, and further inner dictionary lookups for `affinity_dict_a.get(type_b, default_affinity)` occurred inside the inner O(N^2) loop.
+**Action:** When computing N^2 edges, pre-populate all potential dictionary lookup keys (even fallbacks) in a nested dictionary before the loop. This enables replacing `.get(key, fallback)` with direct array/dictionary lookups (`dict[key]`) within the hottest loop, yielding significant execution speedups.
