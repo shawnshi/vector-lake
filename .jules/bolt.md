@@ -14,3 +14,7 @@
 ## 2026-06-29 - O(N^2) Tuple Creation and Set Intersection
 **Learning:** In Vector Lake's inner loop (`_calculate_weighted_edges`), repeatedly accessing dictionaries with tuple keys (like `(type_a, type_b)`) incurs significant overhead due to tuple creation and hashing inside the hot path. Similarly, computing set intersections (`sources_a & sources_b`) creates new Python objects even when the intersection is empty.
 **Action:** Replace tuple-keyed dictionaries with nested dictionaries (`dict[type_a][type_b]`), allowing the outer key lookup to be hoisted out of the $O(N^2)$ loop. Guard set intersections with `.isdisjoint()`, which is heavily optimized in C and avoids allocating new set objects when there is no overlap.
+
+## 2026-07-01 - Optimizing YAML Parsing and Dumping with C Extensions
+**Learning:** The default pure Python yaml.safe_load and yaml.dump calls become a massive bottleneck when parsing thousands of Markdown files containing YAML frontmatter. PyYAML provides C-based LibYAML extensions (CSafeLoader, CSafeDumper) which execute drastically faster.
+**Action:** Create a utility wrapper yaml_utils.py that dynamically falls back to the high-performance LibYAML C extensions when available, and replace all pure Python yaml calls across critical paths with these wrapped load_yaml and dump_yaml helpers.
