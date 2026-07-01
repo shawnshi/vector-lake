@@ -12,7 +12,7 @@ from vector_lake import get_extension_root
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 
-FRONTMATTER_REGEX = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
+import io
 _META_DIR_CACHE = None
 
 SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
@@ -133,18 +133,24 @@ def normalize_sources(value) -> list[str]:
 
 
 def split_frontmatter(content: str) -> tuple[dict, str]:
-    match = FRONTMATTER_REGEX.match(content)
-    if not match:
+    if not content.startswith("---\n") and not content.startswith("---\r\n"):
         return {}, content
-
+    
+    parts = content.split("\n---", 1)
+    if len(parts) < 2:
+        return {}, content
+        
+    yaml_part = parts[0][4:] # strip leading "---\n"
+    body_part = parts[1].lstrip("- \n\r") # remove the rest of the closing separator and newlines
+    
     try:
-        frontmatter = load_yaml(match.group(1)) or {}
+        frontmatter = load_yaml(yaml_part) or {}
     except yaml.YAMLError:
         raise
 
     if not isinstance(frontmatter, dict):
         frontmatter = {}
-    return frontmatter, match.group(2)
+    return frontmatter, body_part
 
 
 def read_markdown_file(path: str | Path, errors: str = "replace") -> tuple[dict, str, str]:
@@ -154,14 +160,34 @@ def read_markdown_file(path: str | Path, errors: str = "replace") -> tuple[dict,
     return frontmatter, body, content
 
 
-def atomic_write_text(path: str | Path, content: str):
+def read_frontmatter_only(path: str | Path, errors: str = "replace") -> dict:
+    """Reads only the YAML frontmatter without loading the entire file body into memory."""
+    yaml_lines = []
+    with open(path, "r", encoding="utf-8", errors=errors) as handle:
+        first_line = handle.readline()
+        if not first_line.startswith("---"):
+            return {}
+        for line in handle:
+            if line.startswith("---"):
+                break
+            yaml_lines.append(line)
+    if not yaml_lines:
+        return {}
+    try:
+        frontmatter = load_yaml("".join(yaml_lines)) or {}
+        return frontmatter if isinstance(frontmatter, dict) else {}
+    except yaml.YAMLError:
+        return {}
+
+
+def atomic_write_text(path: str | Path, content: str, pre_parsed_frontmatter: dict | None = None):
     path = Path(path)
     
     # NEW: Trigger Defense Hook for wiki markdown files
     if path.name.endswith(".md") and "wiki" in path.parts:
         try:
             from vector_lake.defense_hook import verify_asset
-            frontmatter, _ = split_frontmatter(content)
+            frontmatter = pre_parsed_frontmatter if pre_parsed_frontmatter is not None else split_frontmatter(content)[0]
             verify_asset(content, path.name, frontmatter, get_index_path())
         except Exception as e:
             if type(e).__name__ == "DefenseHookException":
@@ -212,7 +238,7 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_val
                 raise SafeWriteError(f"STORM Synthesis Structural Violation: The file {filename} is missing mandatory H2 section '{header}'. Please strictly follow the references/storm_report_template.md structure.")
     yaml_block = dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
     backup_file(path)
-    atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}")
+    atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}", pre_parsed_frontmatter=frontmatter)
 
 
 def backup_file(path: str | Path, suffix: str = ".bak") -> Path | None:
@@ -243,7 +269,7 @@ class SafeWriteError(Exception):
 def _count_list_items(body: str, section_marker: str) -> int:
     count = 0
     in_section = False
-    for line in body.splitlines():
+    for line in io.StringIO(body):
         stripped = line.strip()
         if stripped.startswith("## "):
             in_section = section_marker in stripped

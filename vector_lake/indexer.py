@@ -11,7 +11,7 @@ from filelock import FileLock, Timeout
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake import db_store
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir
+from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file
 from vector_lake.yaml_utils import load_yaml
 
 try:
@@ -187,18 +187,16 @@ def is_graph_dirty(index_data: dict | None) -> bool:
 
 def _parse_wiki_node(filepath: str, node_key: str):
     try:
-        with open(filepath, "r", encoding="utf-8") as handle:
-            content = handle.read()
+        fm_data, body, _ = read_markdown_file(filepath)
     except (UnicodeDecodeError, OSError) as e:
         log.warning(f"Cannot read {os.path.basename(filepath)}: {e}")
         return None
-
-    frontmatter_match = re.search(r"^---\n(.*?)\n---", content, re.MULTILINE | re.DOTALL)
-    if not frontmatter_match:
+    except Exception as e:
+        log.warning(f"Failed to parse frontmatter in {os.path.basename(filepath)}: {e}")
         return None
 
-    fm_str = frontmatter_match.group(1)
-    fm_data = load_yaml(fm_str) or {}
+    if not fm_data:
+        return None
 
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
@@ -275,8 +273,6 @@ def _parse_wiki_node(filepath: str, node_key: str):
 
     links = set()
     triples = []
-    body = content[frontmatter_match.end() :]
-    
     # 1. Extract strict AST relations
     for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", body):
         predicate = match.group(1).strip()
