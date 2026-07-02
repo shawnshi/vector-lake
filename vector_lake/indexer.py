@@ -771,7 +771,9 @@ def update_index_items(filenames: list[str]):
                                     db_store.delete_search_index(node_key)
                                 
                                 index_data["nodes"][node_key] = node_data
-                                _add_node_to_bm25(index_data, node_key, node_data)
+                                aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
+                                text = f"{aliases_str} {node_data.get('raw_text', '')}"
+                                db_store.upsert_search_index(node_key, node_data.get('title', ''), node_data.get('summary', ''), text)
                                 
                                 if node_data["id"]:
                                     index_data["aliases"][node_data["id"]] = node_key
