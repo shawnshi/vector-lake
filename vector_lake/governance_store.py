@@ -46,13 +46,19 @@ VALIDITY_FACTORS = {
 
 
 _PURPOSE_VECTORS_CACHE = None
+_PURPOSE_VECTORS_MTIME = 0
 
 def get_purpose_vectors() -> dict:
-    global _PURPOSE_VECTORS_CACHE
-    if _PURPOSE_VECTORS_CACHE is not None:
-        return _PURPOSE_VECTORS_CACHE
-    
+    global _PURPOSE_VECTORS_CACHE, _PURPOSE_VECTORS_MTIME
     path = get_meta_dir() / "purpose_vectors.json"
+    
+    current_mtime = 0
+    if path.exists():
+        current_mtime = path.stat().st_mtime
+        
+    if _PURPOSE_VECTORS_CACHE is not None and _PURPOSE_VECTORS_MTIME == current_mtime:
+        return _PURPOSE_VECTORS_CACHE
+        
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -61,6 +67,8 @@ def get_purpose_vectors() -> dict:
             _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
     else:
         _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
+        
+    _PURPOSE_VECTORS_MTIME = current_mtime
     return _PURPOSE_VECTORS_CACHE
 
 
@@ -146,30 +154,34 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
         extra_cols = []
     
     with conn:
-        # V10.1 Diff-based Orphan Pruning (Delete missing keys)
         existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
         existing_keys = {row[0] for row in existing_keys_query}
         new_keys = set(data.get("items", {}).keys())
         keys_to_delete = existing_keys - new_keys
         
-        for k in keys_to_delete:
-            conn.execute(f"DELETE FROM {table_name} WHERE {pk_col} = ?", (k,))
+        if keys_to_delete:
+            conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
             
-        # V10.1 Insert or Update
-        for key, item in data.get("items", {}).items():
+        if data.get("items"):
             cols = [pk_col] + [c[0] for c in extra_cols] + ["data_json", "updated_at"]
             placeholders = ["?"] * len(cols)
-            params = [key]
-            for c_name, c_key, c_type in extra_cols:
-                val = item.get(c_key)
-                if c_type == float:
-                    params.append(float(val or 0.0))
-                else:
-                    params.append(str(val or ""))
-            params.append(json.dumps(item, ensure_ascii=False))
-            params.append(now)
-            conn.execute(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", params)
-
+            
+            all_vals = []
+            for key, item in data.get("items", {}).items():
+                params = [key]
+                for c_name, c_key, c_type in extra_cols:
+                    val = item.get(c_key)
+                    if c_type == float:
+                        params.append(float(val or 0.0))
+                    elif c_type == int:
+                        params.append(int(val or 0))
+                    else:
+                        params.append(str(val or ""))
+                params.append(json.dumps(item, ensure_ascii=False))
+                params.append(now)
+                all_vals.append(tuple(params))
+            
+            conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", all_vals)
 
 def _save_db_queue(table_name: str, pk_col: str, data: dict):
     _validate_table_name(table_name)
@@ -180,7 +192,6 @@ def _save_db_queue(table_name: str, pk_col: str, data: dict):
         # V10.1 Diff-based synchronization (Avoid full table wipe)
         for item in data.get("items", []):
             if not item.get(pk_col):
-                import uuid
                 item[pk_col] = uuid.uuid4().hex
                 
         existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
@@ -188,30 +199,37 @@ def _save_db_queue(table_name: str, pk_col: str, data: dict):
         new_keys = {item[pk_col] for item in data.get("items", [])}
         keys_to_delete = existing_keys - new_keys
         
-        for k in keys_to_delete:
-            conn.execute(f"DELETE FROM {table_name} WHERE {pk_col} = ?", (k,))
+        if keys_to_delete:
+            conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
             
-        for item in data.get("items", []):
-            k = item.get(pk_col)
-            conn.execute(f"INSERT OR REPLACE INTO {table_name} ({pk_col}, data_json, updated_at) VALUES (?, ?, ?)", 
-                         (k, json.dumps(item, ensure_ascii=False), now))
+        if data.get("items"):
+            all_vals = []
+            for item in data.get("items", []):
+                k = item.get(pk_col)
+                all_vals.append((k, json.dumps(item, ensure_ascii=False), now))
+            conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({pk_col}, data_json, updated_at) VALUES (?, ?, ?)", all_vals)
 
 
 def load_entities():
     return _load_db_map("entities", "entity_id")
 
 
-def query_entities(where_clause: str = None, params: tuple = None) -> dict:
-    # SECURE: where_clause MUST be parameterized (e.g. 'status = ?', ('active',))
-    if where_clause and params is None and "'" in where_clause:
-        log.warning(f"SQL Injection Risk: Hardcoded string detected in where_clause: {where_clause}")
+def query_entities(filters: dict = None) -> dict:
     initialize_meta_store()
     conn = get_connection()
     store = _default_map_store("entity_id")
     query = "SELECT data_json FROM entities"
-    if where_clause:
-        query += f" WHERE {where_clause}"
-    rows = conn.execute(query, params or ()).fetchall()
+    params = []
+    if filters:
+        clauses = []
+        for k, v in filters.items():
+            if k.endswith("!="):
+                clauses.append(f"{k[:-2]} != ?")
+            else:
+                clauses.append(f"{k} = ?")
+            params.append(v)
+        query += " WHERE " + " AND ".join(clauses)
+    rows = conn.execute(query, tuple(params)).fetchall()
     for row in rows:
         data = json.loads(row["data_json"])
         store["items"][data["entity_id"]] = data
@@ -245,17 +263,22 @@ def load_memory_objects():
     return _load_db_map("operational_memory", "memory_id")
 
 
-def query_memory_objects(where_clause: str = None, params: tuple = None) -> dict:
-    # SECURE: where_clause MUST be parameterized (e.g. 'status = ?', ('active',))
-    if where_clause and params is None and "'" in where_clause:
-        log.warning(f"SQL Injection Risk: Hardcoded string detected in where_clause: {where_clause}")
+def query_memory_objects(filters: dict = None) -> dict:
     initialize_meta_store()
     conn = get_connection()
     store = _default_map_store("memory_id")
     query = "SELECT data_json FROM operational_memory"
-    if where_clause:
-        query += f" WHERE {where_clause}"
-    rows = conn.execute(query, params or ()).fetchall()
+    params = []
+    if filters:
+        clauses = []
+        for k, v in filters.items():
+            if k.endswith("!="):
+                clauses.append(f"{k[:-2]} != ?")
+            else:
+                clauses.append(f"{k} = ?")
+            params.append(v)
+        query += " WHERE " + " AND ".join(clauses)
+    rows = conn.execute(query, tuple(params)).fetchall()
     for row in rows:
         data = json.loads(row["data_json"])
         store["items"][data["memory_id"]] = data
@@ -393,7 +416,7 @@ def _compact_claim_text(text: str, limit: int = 240) -> str:
 
 
 def _stable_id(prefix: str, value: str) -> str:
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=12).hexdigest()
     return f"{prefix}_{digest}"
 
 

@@ -262,6 +262,14 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/watchdog_app.py` | 增量监听后台服务，队列调度，定时自愈审计 (Scheduled Auto-Lint) |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
+| `vector_lake/db.py` | Legacy DB utils |
+| `vector_lake/db_store.py` | SQLite connection pooling, schema initialization, and WAL settings |
+| `vector_lake/defense_hook.py` | Pre-flight constraints and guardrails |
+| `vector_lake/skeleton_parser.py` | Parsers for structural validation |
+| `vector_lake/provenance.py` | Tracing entities to raw sources |
+| `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
+| `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
+| `vector_lake/yaml_utils.py` | YAML helpers |
 | `scripts/community_clustering_daemon.py` | Louvain Community Detection |
 | `schema.md` | Wiki 与运行态记忆契约 |
 | `commands/` | 面向 Agent 的宏大业务流定义 (research/review) |
@@ -281,7 +289,7 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 
 验证结果：
 
-- Unit tests：`Ran 8 tests ... OK`
+- Unit tests：`Ran 16 tests ... OK`
 - Compile：`python -m compileall vector_lake tests` OK
 - Doctor：healthy
 - Graph Build: Generated index.json with 8865 nodes | 43579 weighted edges | 182 errors.

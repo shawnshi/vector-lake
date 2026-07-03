@@ -4,6 +4,7 @@ import os
 import re
 from datetime import datetime, timezone
 
+import functools
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_store
@@ -47,6 +48,7 @@ def _classify_intent(query: str) -> str:
     return "general"
 
 
+@functools.lru_cache(maxsize=128)
 def _expand_query_with_llm(query: str) -> list[str]:
     expanded_terms = set([query])
     for key, expansions in QUERY_EXPANSION_DICT.items():

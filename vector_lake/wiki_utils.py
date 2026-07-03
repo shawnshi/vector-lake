@@ -136,12 +136,12 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
     if not content.startswith("---\n") and not content.startswith("---\r\n"):
         return {}, content
     
-    parts = content.split("\n---", 1)
-    if len(parts) < 2:
+    match = re.search(r'\r?\n---(?:\r?\n|$)', content)
+    if not match:
         return {}, content
         
-    yaml_part = parts[0][4:] # strip leading "---\n"
-    body_part = parts[1].lstrip("- \n\r") # remove the rest of the closing separator and newlines
+    yaml_part = content[4:match.start()]
+    body_part = content[match.end():]
     
     try:
         frontmatter = load_yaml(yaml_part) or {}

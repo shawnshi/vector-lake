@@ -9,14 +9,9 @@ def get_db_path() -> Path:
     return get_meta_dir() / "vector_lake.db"
 
 def get_connection() -> sqlite3.Connection:
-    if not hasattr(_LOCAL, "conn") or _LOCAL.conn is None:
+    if getattr(_LOCAL, "conn", None) is None:
         db_path = get_db_path()
-        conn = sqlite3.connect(str(db_path), timeout=30.0)
-        # Enable WAL mode for high concurrency
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        # Enable foreign keys
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         _LOCAL.conn = conn
     return _LOCAL.conn
@@ -28,6 +23,9 @@ def close_connection():
 
 def init_db():
     conn = get_connection()
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     with conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (

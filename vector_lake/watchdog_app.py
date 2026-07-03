@@ -4,9 +4,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-
 import json
-from pathlib import Path
 from vector_lake import get_extension_root
 
 # Load config
@@ -197,6 +195,9 @@ def index_worker_loop():
             log.error(f"Index worker error: {exc}")
             write_status("error", 0, index_queue.qsize(), "Index thread exception", str(exc))
             time.sleep(min(backoff_base ** consecutive_failures, 60))
+        finally:
+            from vector_lake.db_store import close_connection
+            close_connection()
 
 
 def scheduled_lint_loop():
@@ -222,7 +223,11 @@ def scheduled_lint_loop():
                         env = os.environ.copy()
                         env["PYTHONIOENCODING"] = "utf-8"
                         
-                        decay_script = os.path.expanduser("~/.gemini/scripts/metadata_decay_daemon.py")
+                        from vector_lake import get_extension_root
+                        plugin_dir = get_extension_root()
+                        gemini_root = plugin_dir.parent.parent.parent
+                        
+                        decay_script = str(gemini_root / "scripts" / "metadata_decay_daemon.py")
                         if os.path.exists(decay_script):
                             log.info("Running Metadata Decay Daemon...")
                             res = subprocess.run([sys.executable, decay_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
@@ -230,7 +235,7 @@ def scheduled_lint_loop():
                                 log.error(f"Metadata Decay Daemon failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Decay Daemon Failed", res.stderr)
 
-                        sync_timeline_script = os.path.expanduser("~/.gemini/scripts/sync_timeline_db.py")
+                        sync_timeline_script = str(gemini_root / "scripts" / "sync_timeline_db.py")
                         if os.path.exists(sync_timeline_script):
                             log.info("Running Timeline DB Sync Daemon...")
                             res = subprocess.run([sys.executable, sync_timeline_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
@@ -238,7 +243,7 @@ def scheduled_lint_loop():
                                 log.error(f"Timeline Sync Failed: {res.stderr}")
                                 write_status("error", 0, index_queue.qsize(), "Timeline Sync Failed", res.stderr)
 
-                        scout_script = os.path.expanduser("~/.gemini/scripts/missing_evidence_scout.py")
+                        scout_script = str(gemini_root / "scripts" / "missing_evidence_scout.py")
                         if os.path.exists(scout_script):
                             log.info("Running Missing Evidence Scout...")
                             res = subprocess.run([sys.executable, scout_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
@@ -247,7 +252,7 @@ def scheduled_lint_loop():
                                 write_status("error", 0, index_queue.qsize(), "Scout Failed", res.stderr)
 
                         # V7.2 Asynchronous Domain Overview Compilation
-                        overview_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/compile_domain_overviews.py")
+                        overview_script = str(plugin_dir / "scripts" / "compile_domain_overviews.py")
                         if os.path.exists(overview_script):
                             log.info("Running Domain Overview Compiler...")
                             res = subprocess.run([sys.executable, overview_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
@@ -257,7 +262,7 @@ def scheduled_lint_loop():
 
                         
                         # V7.2 Semantic Deduplication Daemon
-                        semantic_dedup_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/semantic_dedup_daemon.py")
+                        semantic_dedup_script = str(plugin_dir / "scripts" / "semantic_dedup_daemon.py")
                         if os.path.exists(semantic_dedup_script):
                             log.info("Running Semantic Deduplication Daemon...")
                             res = subprocess.run([sys.executable, semantic_dedup_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
@@ -266,7 +271,7 @@ def scheduled_lint_loop():
                                 write_status("error", 0, index_queue.qsize(), "Semantic Dedup Failed", res.stderr)
                                 
                         # V10 Autonomous Janitor Swarm (Nighttime Cleanup)
-                        janitor_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/launch_janitor_swarm.py")
+                        janitor_script = str(plugin_dir / "scripts" / "launch_janitor_swarm.py")
                         if os.path.exists(janitor_script):
                             log.info("Launching Nighttime Janitor Swarm...")
                             res = subprocess.run([sys.executable, janitor_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
@@ -277,7 +282,7 @@ def scheduled_lint_loop():
                                 log.info("Janitor Swarm successfully launched background agents.")
                         
                         # V9.0 Louvain Community Clustering Daemon
-                        clustering_script = os.path.expanduser("~/.gemini/config/plugins/vector-lake/scripts/community_clustering_daemon.py")
+                        clustering_script = str(plugin_dir / "scripts" / "community_clustering_daemon.py")
                         if os.path.exists(clustering_script):
                             log.info("Running Louvain Community Clustering Daemon...")
                             res = subprocess.run([sys.executable, clustering_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
@@ -313,6 +318,9 @@ def scheduled_lint_loop():
             log.error(f"Scheduled lint worker error: {exc}")
             write_status("error", 0, index_queue.qsize(), "Scheduled lint exception", str(exc))
             time.sleep(60)
+        finally:
+            from vector_lake.db_store import close_connection
+            close_connection()
 
 
 def start_watchdog():

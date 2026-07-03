@@ -10,8 +10,7 @@ Current boundary:
 - Page runtime index: `MEMORY/wiki/index.json`
 - Claim topology: `MEMORY/wiki/claim_graph.json`
 - Strategic intent: `MEMORY/purpose.md`
-- Canonical governance store: `MEMORY/wiki/.meta/*.json`
-- Fallback governance store: `data/v8_meta/*.json`
+- Canonical governance store: `MEMORY/wiki/.meta/vector_lake.db` (SQLite)
 - Agent runtime memory: `operational_memory.json`
 
 The durable architecture is:
@@ -70,6 +69,14 @@ Conflict rules:
 | `vector_lake/watchdog_app.py` | Real-time ingest watcher, background job orchestration, scheduled auto-lint |
 | `vector_lake/watchdog_status.py` | Status JSON telemetry broadcaster for the daemon |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
+| `vector_lake/db.py` | Legacy DB utils |
+| `vector_lake/db_store.py` | SQLite connection pooling, schema initialization, and WAL settings |
+| `vector_lake/defense_hook.py` | Pre-flight constraints and guardrails |
+| `vector_lake/skeleton_parser.py` | Parsers for structural validation |
+| `vector_lake/provenance.py` | Tracing entities to raw sources |
+| `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
+| `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
+| `vector_lake/yaml_utils.py` | YAML helpers |
 | `scripts/community_clustering_daemon.py` | V9.0 Louvain Community Detection and blind-spot self-healing |
 | `schema.md` | Wiki and runtime memory contract |
 | `commands/` | Macro-level workflows (e.g. research/review) for Agents |

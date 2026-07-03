@@ -11,7 +11,7 @@ def _utc_now() -> str:
 
 
 def _stable_id(prefix: str, value: str) -> str:
-    digest = hashlib.md5(value.encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=12).hexdigest()
     return f"{prefix}_{digest}"
 
 
@@ -254,8 +254,8 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             "updated_at": _jsonable(frontmatter.get("updated", now)),
             "source_page": page_name,
         }
+        claim_records.append(claim_record)
         if evidence_ids:
-            claim_records.append(claim_record)
             for evidence_record in evidence_records[-len(evidence_ids):]:
                 evidence_record["supports_claim_ids"].append(claim_id)
 

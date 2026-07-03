@@ -303,13 +303,14 @@ def propose_schema_mutation(new_category: str, payload_file: str, parent_categor
 
 
 @mcp.tool()
-def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str) -> str:
+def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str, dry_run: bool = False) -> str:
     """Batch replace occurrences of a string (usually a link) across all wiki pages.
     Use this when an entity's name changes but `rename_entity` failed to cover all cases.
     
     Args:
         old_text_payload_file: Absolute path to a file containing the exact string to search for (e.g. '[[Old Name]]').
         new_text_payload_file: Absolute path to a file containing the exact replacement string (e.g. '[[New Name]]').
+        dry_run: If True, only count how many files would be modified without actually changing them.
     """
     try:
         old_text = _read_payload(old_text_payload_file)
@@ -317,10 +318,15 @@ def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str) 
     except Exception as e:
         return str(e)
     
+    if old_text.strip() in ["", "---", "[[", "]]", "```", "#"]:
+        return f"Error: '{old_text}' is a structural syntax marker. Global replacement aborted to protect graph topology."
+        
     import os
     from vector_lake.wiki_utils import get_wiki_dir, atomic_write_text
     wiki_dir = get_wiki_dir()
     modified_count = 0
+    matched_files = []
+    
     for filename in os.listdir(wiki_dir):
         if not filename.endswith(".md"):
             continue
@@ -329,12 +335,16 @@ def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str) 
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
             if old_text in content:
-                new_content = content.replace(old_text, new_text)
-                atomic_write_text(filepath, new_content)
+                if not dry_run:
+                    new_content = content.replace(old_text, new_text)
+                    atomic_write_text(filepath, new_content)
                 modified_count += 1
+                matched_files.append(filename)
         except Exception as e:
             logging.error(f"Error processing {filename} for link replacement: {e}")
             
+    if dry_run:
+        return f"[DRY RUN] Would replace '{old_text}' with '{new_text}' in {modified_count} files: {', '.join(matched_files[:10])}..."
     return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files."
 
 @mcp.tool()
