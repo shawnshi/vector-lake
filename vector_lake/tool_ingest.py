@@ -159,11 +159,22 @@ def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str
     """Finalizes an ingest operation from a subagent using payload files."""
     try:
         from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError
-        with open(files_written_payload_file, "r", encoding="utf-8") as f:
-            files = json.load(f)
-        with open(raw_files_payload_file, "r", encoding="utf-8") as f:
-            processed_data = json.load(f)
-            
+        try:
+            files = json.loads(files_written_payload_file)
+            if isinstance(files, str):
+                files = json.loads(files)
+        except Exception:
+            with open(files_written_payload_file, "r", encoding="utf-8") as f:
+                files = json.load(f)
+                
+        try:
+            processed_data = json.loads(raw_files_payload_file)
+            if isinstance(processed_data, str):
+                processed_data = json.loads(processed_data)
+        except Exception:
+            with open(raw_files_payload_file, "r", encoding="utf-8") as f:
+                processed_data = json.load(f)
+                
         wiki_dir = get_wiki_dir()
         
         files_written = []
@@ -196,4 +207,4 @@ def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str
         
         return f"Successfully finalized ingestion for {filepath}."
     except Exception as e:
-        return f"Error finalizing ingestion: {e}"
+        import traceback; return f"Error finalizing ingestion: {e}\n{traceback.format_exc()}"

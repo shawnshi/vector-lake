@@ -68,7 +68,7 @@ def annotate_claim_validity(claim: dict, now=None) -> dict:
 
 
 def find_merge_candidates(limit: int = 20) -> list[dict]:
-    entities = list(governance_store.query_entities("status != 'Merged' AND type != 'system'")["items"].values())
+    entities = list(governance_store.query_entities("status != ? AND type != ?", ("Merged", "system"))["items"].values())
     candidates = []
 
     for index, left in enumerate(entities):

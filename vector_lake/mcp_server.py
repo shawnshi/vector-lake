@@ -223,11 +223,9 @@ def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str
         raw_files_payload_file: Absolute path to a temporary JSON file containing an object with 'filepath' and 'hash'.
     """
     try:
-        files_written_str = _read_payload(files_written_payload_file)
-        raw_files_processed_json = _read_payload(raw_files_payload_file)
+        return tools.finalize_ingest(files_written_payload_file, raw_files_payload_file)
     except Exception as e:
         return str(e)
-    return tools.finalize_ingest(files_written_str, raw_files_processed_json)
 
 @mcp.tool()
 def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_summary: str = "") -> str:

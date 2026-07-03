@@ -6,13 +6,13 @@ class DefenseHookException(Exception):
     pass
 
 VALID_H3_SLOTS = {
-    "vendor": ["### 组织架构与商业模式 (Business Model)", "### 核心护城河 (Moat)", "### 脆弱点与阻力 (Risks)", "### 关键产品线 (Key Products)", "### 核心团队与权力拓扑 (Key Personnel)"],
-    "concept": ["### 物理机制 (Mechanism)", "### 适用与失效边界 (Boundaries)", "### 演进关联 (Evolution)"],
-    "product": ["### 核心价值流 (Value Stream)", "### 技术栈与依赖 (Dependencies)"],
-    "person": ["### 核心主张与理念 (Key Stances)", "### 利益纽带与权力网络 (Affiliations)", "### 关键能力域 (Competencies)"],
-    "event": ["### 核心影响与转折 (Impact)", "### 关键参与方 (Stakeholders)"],
-    "policy": ["### 核心约束与合规要求 (Compliance Mandates)", "### 奖惩机制与市场影响 (Incentives & Penalties)", "### 演进与废除条件 (Lifecycle)"],
-    "standard": ["### 核心约束与合规要求 (Compliance Mandates)", "### 奖惩机制与市场影响 (Incentives & Penalties)", "### 演进与废除条件 (Lifecycle)"]
+    "vendor": ["### 组织架构与商业模式 (Business Model)", "### 核心护城河 (Moat)", "### 市场占位与竞争态势 (Market & Competition)", "### 生态位与战略联盟 (Ecosystem & Alliances)", "### 关键产品线 (Key Products)", "### 核心团队与权力拓扑 (Key Personnel)"],
+    "concept": ["### 物理机制 (Mechanism)", "### 适用与失效边界 (Boundaries)", "### 产业落地与代表实例 (Implementations)", "### 演进关联 (Evolution)"],
+    "product": ["### 目标客群与应用边界 (Target ICP & Use Cases)", "### 核心价值流 (Value Stream)", "### 部署架构与底层依赖 (Architecture & Dependencies)", "### 商业化与交付模式 (Monetization & Delivery)"],
+    "person": ["### 核心权责与控制域 (Mandates & Domain of Control)", "### 关键造物与历史印记 (Key Artifacts & Legacy)", "### 核心主张与商业/技术理念 (Key Stances & Philosophies)", "### 利益纽带与权力拓扑 (Affiliations & Power Topology)"],
+    "event": ["### 动因与前置条件 (Catalysts & Preconditions)", "### 核心影响与转折 (Impact)", "### 关键参与方 (Stakeholders)", "### 后续衍生与未决节点 (Fallout & Unresolved Issues)"],
+    "policy": ["### 管辖范围与适用对象 (Jurisdiction & Applicability)", "### 核心约束与合规要求 (Compliance Mandates)", "### 奖惩机制与市场影响 (Incentives & Penalties)", "### 演进与废除条件 (Lifecycle)"],
+    "standard": ["### 管辖范围与适用对象 (Jurisdiction & Applicability)", "### 核心约束与合规要求 (Compliance Mandates)", "### 奖惩机制与市场影响 (Incentives & Penalties)", "### 演进与废除条件 (Lifecycle)"]
 }
 
 def verify_asset(content: str, filename: str, frontmatter: dict, index_path: Path):
@@ -48,7 +48,7 @@ def verify_asset(content: str, filename: str, frontmatter: dict, index_path: Pat
             
             entities_in_index = set()
             for node_id, node_data in index_data.get("nodes", {}).items():
-                entities_in_index.add(node_data.get("name", "").lower())
+                entities_in_index.add(node_data.get("title", "").lower())
                 for alias in node_data.get("aliases", []):
                     entities_in_index.add(alias.lower())
                     

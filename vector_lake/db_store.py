@@ -37,6 +37,13 @@ def init_db():
                 updated_at TEXT
             )
         """)
+        try:
+            conn.execute("ALTER TABLE entities ADD COLUMN type TEXT")
+            conn.execute("ALTER TABLE entities ADD COLUMN status TEXT")
+            conn.execute("ALTER TABLE entities ADD COLUMN ttl INTEGER")
+            conn.execute("ALTER TABLE entities ADD COLUMN decay_weight REAL")
+        except Exception:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claims (
                 claim_id TEXT PRIMARY KEY,

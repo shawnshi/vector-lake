@@ -39,6 +39,7 @@ def lint_vector_lake(auto_fix: bool = False):
         "Uncategorized", "Artificial_Intelligence", "Healthcare_IT",
         "Strategy_and_Business", "System_Architecture",
         "Philosophy_and_Cognitive", "Biomedicine",
+        "Policy_and_Governance", "Entities_and_Actors",
     }
     valid_prefixes = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
     required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]

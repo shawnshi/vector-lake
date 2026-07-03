@@ -226,7 +226,7 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
 
             # If not found in index OR pending, register it as pending for other workers
             from vector_lake.wiki_utils import normalize_entity_name
-            new_key = normalize_entity_name(f"{type_capitalized}_{candidate_title}")
+            new_key = normalize_entity_name(f"{candidate_type.capitalize()}_{candidate_title}")
             
             pending_data[new_key] = {
                 "title": candidate_title,

@@ -202,6 +202,9 @@ def load_entities():
 
 
 def query_entities(where_clause: str = None, params: tuple = None) -> dict:
+    # SECURE: where_clause MUST be parameterized (e.g. 'status = ?', ('active',))
+    if where_clause and params is None and "'" in where_clause:
+        log.warning(f"SQL Injection Risk: Hardcoded string detected in where_clause: {where_clause}")
     initialize_meta_store()
     conn = get_connection()
     store = _default_map_store("entity_id")
@@ -213,6 +216,7 @@ def query_entities(where_clause: str = None, params: tuple = None) -> dict:
         data = json.loads(row["data_json"])
         store["items"][data["entity_id"]] = data
     return store
+
 
 
 def load_claims():
@@ -242,6 +246,9 @@ def load_memory_objects():
 
 
 def query_memory_objects(where_clause: str = None, params: tuple = None) -> dict:
+    # SECURE: where_clause MUST be parameterized (e.g. 'status = ?', ('active',))
+    if where_clause and params is None and "'" in where_clause:
+        log.warning(f"SQL Injection Risk: Hardcoded string detected in where_clause: {where_clause}")
     initialize_meta_store()
     conn = get_connection()
     store = _default_map_store("memory_id")
