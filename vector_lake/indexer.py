@@ -445,10 +445,14 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 pred = t.get("predicate", "mentions")
                 if pred not in pred_weights:
                     pred_weights[pred] = get_pred_weight(pred)
-                if t["target"] in alias_map:
-                    td[alias_map[t["target"]]] = pred
+                target = t["target"]
+                # ⚡ Bolt: Store the pre-calculated numeric weight directly in the triples dict
+                # instead of the string predicate name. This eliminates a secondary dictionary
+                # lookup during the expensive O(N^2) _calculate_weighted_edges inner loop.
+                if target in alias_map:
+                    td[alias_map[target]] = pred_weights[pred]
                 else:
-                    td[t["target"]] = pred
+                    td[target] = pred_weights[pred]
         node_triples[key] = td
 
         node_sources[key] = frozenset((node.get("sources") or []))
@@ -461,6 +465,8 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
     if "mentions" not in pred_weights:
         pred_weights["mentions"] = get_pred_weight("mentions")
+    # ⚡ Bolt: Cache the fallback mention weight to avoid lookups in the hot loop
+    mention_weight = pred_weights["mentions"]
 
     default_affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
 
@@ -531,12 +537,10 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             score = 0.0
 
             if key_b in links_a:
-                pred = triples_a.get(key_b, "mentions")
-                score += pred_weights[pred]
+                score += triples_a.get(key_b, mention_weight)
 
             if key_a in links_b:
-                pred = triples_b.get(key_a, "mentions")
-                score += pred_weights[pred]
+                score += triples_b.get(key_a, mention_weight)
 
             if not sources_a.isdisjoint(sources_b):
                 score += len(sources_a & sources_b) * overlap_weight
