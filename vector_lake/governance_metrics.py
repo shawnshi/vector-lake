@@ -71,35 +71,40 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
     entities = list(governance_store.query_entities({"status!=": "Merged", "type!=": "system"})["items"].values())
     candidates = []
 
-    for index, left in enumerate(entities):
-        left_name = str(left.get("canonical_name", ""))
-        if left.get("status") == "Merged" or left_name.startswith("Comm ") or left.get("type") == "system":
+    valid_entities = []
+    for e in entities:
+        name = str(e.get("canonical_name", ""))
+        if e.get("status") == "Merged" or name.startswith("Comm ") or e.get("type") == "system":
             continue
-        left_names = {left_name, *left.get("aliases", [])}
-        left_norms = {_normalized_name(name) for name in left_names if name}
-        left_tokens = {token for name in left_names for token in re.split(r"\W+", str(name).lower()) if token}
-        for right in entities[index + 1 :]:
-            right_name = str(right.get("canonical_name", ""))
-            if left["entity_id"] == right["entity_id"] or right.get("status") == "Merged" or right_name.startswith("Comm ") or right.get("type") == "system":
-                continue
+        names = frozenset({name, *e.get("aliases", [])})
+        norms = frozenset({_normalized_name(n) for n in names if n})
+        tokens = frozenset({token for n in names for token in re.split(r"\W+", str(n).lower()) if token})
+        valid_entities.append((e, names, norms, tokens))
 
-            right_names = {right_name, *right.get("aliases", [])}
-            right_norms = {_normalized_name(name) for name in right_names if name}
-            right_tokens = {token for name in right_names for token in re.split(r"\W+", str(name).lower()) if token}
+    for index, (left, left_names, left_norms, left_tokens) in enumerate(valid_entities):
+        for right, right_names, right_norms, right_tokens in valid_entities[index + 1 :]:
+            if left["entity_id"] == right["entity_id"]:
+                continue
 
             reasons = []
             score = 0
-            alias_overlap = (left_names & right_names) - {""}
-            if alias_overlap:
-                reasons.append(f"alias-overlap:{', '.join(sorted(alias_overlap)[:3])}")
-                score += 3
-            if left_norms & right_norms:
+
+            if not left_names.isdisjoint(right_names):
+                alias_overlap = (left_names & right_names) - {""}
+                if alias_overlap:
+                    reasons.append(f"alias-overlap:{', '.join(sorted(alias_overlap)[:3])}")
+                    score += 3
+
+            if not left_norms.isdisjoint(right_norms):
                 reasons.append("normalized-name-match")
                 score += 3
-            token_overlap = left_tokens & right_tokens
-            if len(token_overlap) >= 2:
-                reasons.append(f"token-overlap:{', '.join(sorted(token_overlap)[:4])}")
-                score += 1
+
+            if not left_tokens.isdisjoint(right_tokens):
+                token_overlap = left_tokens & right_tokens
+                if len(token_overlap) >= 2:
+                    reasons.append(f"token-overlap:{', '.join(sorted(token_overlap)[:4])}")
+                    score += 1
+
             if left.get("domain") == right.get("domain") and left.get("topic_cluster") == right.get("topic_cluster"):
                 score += 1
 
