@@ -7,3 +7,7 @@
 **Vulnerability:** CRITICAL SQL injection risk in `vector_lake/governance_store.py` where `table_name` was directly interpolated into SQL queries (e.g., `f"SELECT * FROM {table_name}"`) without any validation or parameterization.
 **Learning:** In SQLite, table names cannot be parameterized using `?`. Therefore, any dynamic construction of queries involving table names must use a strict allowlist. Without it, any exposed helper function could lead to arbitrary SQL execution.
 **Prevention:** Implement an `ALLOWED_TABLES` set containing all valid table names and a validation function `_validate_table_name` that raises a `ValueError` if an unexpected table name is provided. Call this validation at the entry point of all generic database operations.
+## 2024-05-18 - [SQL Injection via Dictionary Keys in WHERE Clauses]
+**Vulnerability:** Dictionary keys used for dynamic filtering were concatenated directly into SQL WHERE clauses (`f"{k} = ?"`), allowing an attacker to inject SQL by providing a malicious key in the `filters` dict.
+**Learning:** SQLite parameterization (`?`) only works for values, not for column names or structural elements. Dynamic column names must be validated or whitelisted before string interpolation.
+**Prevention:** Validate dynamically provided column names against an explicit allowlist or a strict regex (e.g., `^[a-zA-Z0-9_]+(!=)?$`) before embedding them in queries.
