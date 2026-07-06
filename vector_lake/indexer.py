@@ -360,12 +360,14 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
     if sources_a is None: sources_a = frozenset((node_a.get("sources") or []))
     if sources_b is None: sources_b = frozenset((node_b.get("sources") or []))
 
-    shared_sources = len(sources_a & sources_b)
-    if shared_sources:
+    # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) path
+    if not sources_a.isdisjoint(sources_b):
+        shared_sources = len(sources_a & sources_b)
         score += shared_sources * RELEVANCE_WEIGHTS["source_overlap"]
 
-    common_neighbors = links_a & links_b
-    if common_neighbors:
+    # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) path
+    if not links_a.isdisjoint(links_b):
+        common_neighbors = links_a & links_b
         for neighbor_key in common_neighbors:
             neighbor = all_nodes.get(neighbor_key)
             if neighbor:
@@ -538,9 +540,11 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 pred = triples_b.get(key_a, "mentions")
                 score += pred_weights[pred]
 
+            # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) hot path
             if not sources_a.isdisjoint(sources_b):
                 score += len(sources_a & sources_b) * overlap_weight
 
+            # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) hot path
             if not links_a.isdisjoint(links_b):
                 for neighbor_key in links_a & links_b:
                     score += node_degrees.get(neighbor_key, 0.0)
@@ -816,8 +820,9 @@ def update_index_items(filenames: list[str]):
                                     triples_b = all_nodes_triples.get(other_key)
                                     
                                     has_direct = other_key in node_links or node_key in other_links
-                                    has_source_overlap = bool(node_sources & other_sources)
-                                    has_common_neighbor = bool(node_links & other_links)
+                                    # Optimization: Replace bool(set1 & set2) with not isdisjoint() to prevent allocating a new set just to check for overlap
+                                    has_source_overlap = not node_sources.isdisjoint(other_sources)
+                                    has_common_neighbor = not node_links.isdisjoint(other_links)
                                     
                                     if not (has_direct or has_source_overlap or has_common_neighbor):
                                         continue
