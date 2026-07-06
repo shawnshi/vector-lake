@@ -461,6 +461,13 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         else:
             node_degrees[key] = 0.0
 
+    # Bolt Optimization: Pre-populate node_degrees with 0.0 for all unresolved links
+    # to avoid expensive dictionary .get() fallbacks in the O(N^2) inner loop.
+    for links in node_links.values():
+        for link in links:
+            if link not in node_degrees:
+                node_degrees[link] = 0.0
+
     if "mentions" not in pred_weights:
         pred_weights["mentions"] = get_pred_weight("mentions")
 
@@ -547,7 +554,8 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) hot path
             if not links_a.isdisjoint(links_b):
                 for neighbor_key in links_a & links_b:
-                    score += node_degrees.get(neighbor_key, 0.0)
+                    # Bolt Optimization: Direct lookup is faster than .get(key, 0.0) in hot loop
+                    score += node_degrees[neighbor_key]
 
             score += affinity_dict_a[type_b]
 
