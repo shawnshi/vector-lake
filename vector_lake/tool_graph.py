@@ -128,7 +128,7 @@ def _build_graph_payload(index_data: dict, claim_graph_data: dict | None = None)
     }
 
 
-def visualize_vector_lake():
+def visualize_vector_lake(output_dir: str = None):
     bootstrap = governance_store.ensure_canonical_store_populated()
     if bootstrap.get("bootstrapped"):
         tmp_dir = get_extension_root() / "tmp"
@@ -142,7 +142,12 @@ def visualize_vector_lake():
     claim_graph_path = str(get_claim_graph_path())
     lock_path = index_path + ".lock"
     template_path = str(extension_root / "templates" / "topology.html")
-    output_path = _graph_output_path(memory_dir)
+    
+    if output_dir:
+        output_path = os.path.join(output_dir, "vector_lake_graph.html")
+    else:
+        output_path = _graph_output_path(memory_dir)
+
 
     if not os.path.exists(index_path):
         return "Error: Lake is drying. index.json not found. Please ingest sources first."

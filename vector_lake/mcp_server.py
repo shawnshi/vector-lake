@@ -242,9 +242,13 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
     return tools.check_duplicate_entity(candidate_title, candidate_type, candidate_summary)
 
 @mcp.tool()
-def visualize_vector_lake() -> str:
+def visualize_vector_lake(output_dir: str = None) -> str:
     """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
-    return tools.visualize_vector_lake()
+    if output_dir:
+        abs_dir = os.path.abspath(output_dir)
+        if ".gemini" not in abs_dir:
+            return f"Error: Write operations must be contained within a .gemini path boundary to prevent path traversal."
+    return tools.visualize_vector_lake(output_dir)
 
 @mcp.tool()
 def write_wiki_page(filename: str, payload_file: str) -> str:

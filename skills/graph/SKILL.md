@@ -25,8 +25,8 @@ triggers: "Visualize graph, show topology, render vector lake, 3d network graph"
 
 <execution_workflow>
   <workflow>
-    [Step 1: Invocation] Prepare parameters for graph generation.
-    [Step 2: Rendering] Call the `visualize_vector_lake` tool via the MCP server to build the HTML file. Output should be placed in the `scratch/` directory for sandbox isolation.
+    [Step 1: Invocation] Prepare parameters for graph generation. Get your current conversation's absolute `scratch/` directory path.
+    [Step 2: Rendering] Call the `visualize_vector_lake` tool via the MCP server. You MUST pass `output_dir="<your-absolute-scratch-path>"` so the HTML file is built inside your sandbox isolation zone.
     [Step 3: Verification] Confirm the HTML artifact is successfully generated and provide the user with the absolute path.
   </workflow>
 
