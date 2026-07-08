@@ -2,14 +2,20 @@ import json
 import logging
 import os
 import re
+import subprocess
+import shutil
 from datetime import datetime, timezone
 
 import functools
+import math
+import pickle
+import ast
+import operator
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_store
 from vector_lake import db_store
-from vector_lake.wiki_utils import get_index_path, get_purpose_path, get_wiki_dir
+from vector_lake.wiki_utils import get_index_path, get_purpose_path, get_wiki_dir, get_meta_dir
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -37,6 +43,49 @@ QUERY_EXPANSION_DICT = {
     "医疗AI": ["临床Agent", "大模型医疗落地", "电子病历 智能化"],
 }
 
+
+def _calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(v1, v2))
+    norm1 = math.sqrt(sum(a * a for a in v1))
+    norm2 = math.sqrt(sum(a * a for a in v2))
+    return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+
+def _get_query_embedding(query: str) -> list[float]:
+    if not os.environ.get("GEMINI_API_KEY"):
+        return []
+    try:
+        from google import genai
+        client = genai.Client()
+        response = client.models.embed_content(
+            model="gemini-embedding-2",
+            contents=query
+        )
+        if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
+            return response.embeddings[0].values
+    except Exception as e:
+        log.warning(f"Failed to get query embedding: {e}")
+    return []
+
+def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> dict[str, float]:
+    cache_path = get_meta_dir() / "embeddings.pkl"
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, "rb") as f:
+            cache = pickle.load(f)
+    except Exception as e:
+        log.warning(f"Failed to load embeddings.pkl: {e}")
+        return {}
+        
+    embeddings = cache.get("embeddings", {})
+    scores = []
+    for key, data in embeddings.items():
+        if "vector" in data:
+            sim = _calculate_cosine_similarity(query_vector, data["vector"])
+            scores.append((key, sim))
+            
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return {key: sim for key, sim in scores[:limit] if sim > 0.5}
 
 def _classify_intent(query: str) -> str:
     temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
@@ -72,8 +121,13 @@ def _expand_query_with_llm(query: str) -> list[str]:
             pass
             
         prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a JSON array of strings. Query: '{query}'"
-        gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
+        gemini_exec_name = "gemini.cmd" if os.name == "nt" else "gemini"
+        gemini_exec = shutil.which(gemini_exec_name)
         
+        if not gemini_exec:
+            log.warning(f"Could not find {gemini_exec_name} in PATH. Skipping LLM expansion.")
+            return expanded_terms
+
         for model in models_to_try:
             cmd_args = [gemini_exec]
             if model and model not in ("default", ""):
@@ -322,6 +376,71 @@ def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]
     return candidates
 
 
+def _safe_eval(expr: str, context: dict) -> bool:
+    allowed_operators = {
+        ast.Eq: operator.eq,
+        ast.NotEq: operator.ne,
+        ast.Gt: operator.gt,
+        ast.Lt: operator.lt,
+        ast.GtE: operator.ge,
+        ast.LtE: operator.le,
+        ast.In: lambda a, b: a in b if b is not None else False,
+        ast.NotIn: lambda a, b: a not in b if b is not None else False,
+        ast.And: lambda a, b: a and b,
+        ast.Or: lambda a, b: a or b,
+        ast.Not: operator.not_,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        elif isinstance(node, ast.Name):
+            if node.id in context:
+                return context[node.id]
+            # Try to get from node if filter_expr assumes node dict (e.g. node.get)
+            # Actually, standard LLM output uses `type == 'vendor'` so node.id in context handles it.
+            return None
+        elif isinstance(node, ast.Compare):
+            left = _eval(node.left)
+            for op, comparator in zip(node.ops, node.comparators):
+                right = _eval(comparator)
+                if type(op) not in allowed_operators:
+                    raise ValueError(f"Unsupported operator: {type(op)}")
+                if not allowed_operators[type(op)](left, right):
+                    return False
+                left = right
+            return True
+        elif isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                return all(_eval(v) for v in node.values)
+            elif isinstance(node.op, ast.Or):
+                return any(_eval(v) for v in node.values)
+        elif isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return not _eval(node.operand)
+        elif isinstance(node, ast.Call):
+            # To support node.get('key') == 'value' or just get('key')
+            # The context is actually `node`. So get() refers to node.get.
+            if isinstance(node.func, ast.Attribute) and node.func.attr == 'get':
+                obj = _eval(node.func.value)
+                if isinstance(obj, dict) and node.args:
+                    key = _eval(node.args[0])
+                    default = _eval(node.args[1]) if len(node.args) > 1 else None
+                    return obj.get(key, default)
+            elif isinstance(node.func, ast.Name) and node.func.id == 'get':
+                if node.args:
+                    key = _eval(node.args[0])
+                    default = _eval(node.args[1]) if len(node.args) > 1 else None
+                    return context.get(key, default)
+        raise ValueError(f"Unsupported AST node: {type(node)}")
+
+    try:
+        tree = ast.parse(expr, mode='eval')
+        return bool(_eval(tree.body))
+    except Exception as e:
+        log.warning(f"Failed to safe_eval expression '{expr}': {e}")
+        return False
+
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
     normalized_mode = str(mode or "page").lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
@@ -354,31 +473,46 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     scored = []
     
-    # PHASE 2 FTS5 QUERY
+    # PHASE 2 FTS5 + VECTOR HYBRID QUERY
+    hybrid_scores = {}
+    
+    # 1. FTS5 Search
     try:
         fts_results = db_store.search_wiki(' '.join(tokens), limit=top_k * 5)
         for row in fts_results:
             key = row['node_key']
-            score = row['rank'] * -1.0  # SQLite BM25 is negative
-            if key in index_data.get('nodes', {}):
-                node = {'_key': key, **index_data['nodes'][key]}
-                if domain and node.get('domain', '').lower() != domain.lower(): continue
-                if cluster and node.get('topic_cluster', '').lower() != cluster.lower(): continue
-                if not include_history and node.get('status', '').lower() in ('deprecated', 'archived'): continue
-                
-                # V11.2 Hard Metadata Gate
-                if filter_expr:
-                    try:
-                        if not eval(filter_expr, {"__builtins__": {}}, node):
-                            continue
-                    except Exception as e:
-                        log.warning(f"Filter expr evaluation failed for node {key}: {e}")
-                
-                if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
-                    score *= 0.2
-                scored.append((score, node))
+            fts_score = row['rank'] * -1.0  # SQLite BM25 is negative
+            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + fts_score
     except Exception as e:
         log.error(f"FTS5 Search failed: {e}")
+
+    # 2. Vector Search (Hybrid blending)
+    query_vector = _get_query_embedding(query)
+    if query_vector:
+        vector_results = _get_vector_search_results(query_vector, limit=top_k * 5)
+        for key, sim in vector_results.items():
+            # scale similarity so it competes/blends with BM25. 
+            vec_score = (sim ** 2) * 15.0
+            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
+
+    for key, score in hybrid_scores.items():
+        if key in index_data.get('nodes', {}):
+            node = {'_key': key, **index_data['nodes'][key]}
+            if domain and node.get('domain', '').lower() != domain.lower(): continue
+            if cluster and node.get('topic_cluster', '').lower() != cluster.lower(): continue
+            if not include_history and node.get('status', '').lower() in ('deprecated', 'archived'): continue
+            
+            # V11.2 Hard Metadata Gate
+            if filter_expr:
+                try:
+                    if not _safe_eval(filter_expr, node):
+                        continue
+                except Exception as e:
+                    log.warning(f"Filter expr evaluation failed for node {key}: {e}")
+            
+            if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
+                score *= 0.2
+            scored.append((score, node))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 

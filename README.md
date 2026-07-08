@@ -87,6 +87,15 @@ graph LR
 - **上下文封印解除 (Context Chunk Expansion)**：废除旧版的暴力字符截断机制（`[:300]`），提取窗口扩容至 `[:2500]`，保证大模型能够完整读取极深层级的产品架构或实施细则。
 - **硬元数据过滤栅栏 (Hard Metadata Gates)**：在 MCP 的底层检索管线中注入了 `filter_expr` 强校验钩子。大模型可以通过结构化元数据在内存层面执行 SQL 式硬拦截（如 `status != 'decayed'`），从物理层阻断过期文件引发的合规性幻觉。
 - **底层技能重构 (Director XML Standard)**：全量 19 项底层 MCP 技能组件已 100% 升维至 V11.1 架构，标配 `<thought>` 暗盒缓冲与 `[FABLE 5 CHECKPOINT]` 核心拦截门控，全面免疫越权篡改。
+
+### 🛡️ V11.3 核心底层防爆与事务加固 (V11.3 Architecture Hardening)
+- **零信任动态沙箱 (Zero-Trust AST Sandbox)**：彻底根除搜索管线中的 `eval()` 逃逸与 RCE 漏洞，重构为基于抽象语法树 (AST) 的白名单解释器，精准拦截大模型注入恶意 Python 探针。
+- **原子级跨表嵌套事务 (Nested Transaction Atomicity)**：利用原生 SQLite 特性封装了无缝嵌套的 `transaction()` 上下文，彻底消灭 `governance_store` 跨表写入时的崩溃断层，根除脏数据写入。
+- **并行非阻塞看门狗 (Concurrent Watchdog)**：重写 `watchdog_app.py` 的任务调度矩阵，将 7 大串行脚本由 21 分钟的线性拥塞全部重构为 `subprocess.Popen` 并行竞速池，大幅拉升了多源情报监控的吞吐量。
+- **指令注入绝对防护 (Subprocess Injection Shield)**：针对底层 LLM 代理进程（`gemini.cmd`），强制启用 `shutil.which` 进行绝对物理路径寻址与防污染劫持，封杀命令注入链。
+- **沙盒路径穿透拦截 (Path Traversal Firewall)**：在 `mcp_server.py` 入口层构建物理边界巡检，强制验证读取对象必须处于 `.gemini` 工作区闭包内，保护操作系统敏感文件安全。
+- **重试补偿与幽灵更新阻断 (I/O Retry & Ghost Updates)**：写入文件时遭遇 `PermissionError` 锁定，会自动进入带指数退避的重试自愈；并在内存增量构建阶段显式强制落盘，彻底终结修改不生效的“幽灵更新”。
+
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：

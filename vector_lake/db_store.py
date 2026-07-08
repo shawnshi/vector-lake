@@ -21,6 +21,25 @@ def close_connection():
         _LOCAL.conn.close()
         _LOCAL.conn = None
 
+from contextlib import contextmanager
+
+@contextmanager
+def transaction():
+    conn = get_connection()
+    in_tx = getattr(_LOCAL, 'in_transaction', False)
+    if in_tx:
+        yield conn
+    else:
+        _LOCAL.in_transaction = True
+        try:
+            with conn:
+                # Provide explicitly the BEGIN IMMEDIATE if needed, but conn handles it on first write.
+                # However, explicit is safer for cross-table locks
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+        finally:
+            _LOCAL.in_transaction = False
+
 def init_db():
     conn = get_connection()
     conn.execute("PRAGMA journal_mode=WAL")

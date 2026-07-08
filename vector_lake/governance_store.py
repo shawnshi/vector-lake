@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from filelock import FileLock
 
 from vector_lake.claim_extractor import extract_page_objects
-from vector_lake.db_store import get_connection, init_db
+from vector_lake.db_store import get_connection, init_db, transaction
 from vector_lake.wiki_utils import (
     atomic_write_text,
     get_meta_dir,
@@ -153,7 +153,7 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
     if extra_cols is None:
         extra_cols = []
     
-    with conn:
+    with transaction():
         existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
         existing_keys = {row[0] for row in existing_keys_query}
         new_keys = set(data.get("items", {}).keys())
@@ -188,7 +188,7 @@ def _save_db_queue(table_name: str, pk_col: str, data: dict):
     conn = get_connection()
     now = _utc_now()
     data["updated_at"] = now
-    with conn:
+    with transaction():
         # V10.1 Diff-based synchronization (Avoid full table wipe)
         for item in data.get("items", []):
             if not item.get(pk_col):
@@ -1038,61 +1038,55 @@ def create_change_set(
 
 
 def apply_change_set(change_set: dict) -> dict:
-    entities = load_entities()
-    claims = load_claims()
-    evidence = load_evidence()
-    sources = load_sources()
+    with transaction():
+        entities = load_entities()
+        claims = load_claims()
+        evidence = load_evidence()
+        sources = load_sources()
+    
+        affected_pages = change_set.get("affected_pages", [])
+        affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
+    
+        if affected_page_keys:
+            proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
+            proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
 
-    affected_pages = change_set.get("affected_pages", [])
-    affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
+            # Prune claims no longer in the markdown
+            keys_to_remove = []
+            for k, v in claims.get("items", {}).items():
+                locator_page = v.get("locator", {}).get("page_key")
+                if locator_page in affected_page_keys and k not in proposed_claim_ids:
+                    keys_to_remove.append(k)
+            for k in keys_to_remove:
+                del claims["items"][k]
+                
+            # Prune evidence no longer in the markdown
+            keys_to_remove = []
+            for k, v in evidence.get("items", {}).items():
+                locator_page = v.get("locator", {}).get("page_key")
+                if locator_page in affected_page_keys and k not in proposed_evidence_ids:
+                    keys_to_remove.append(k)
+            for k in keys_to_remove:
+                del evidence["items"][k]
 
-    if affected_page_keys:
-        proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
-        proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
+        _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
+        _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
+        _upsert_map_records(evidence, change_set.get("proposed_evidence", []), "evidence_id")
+        _upsert_map_records(sources, change_set.get("proposed_source_updates", []), "source_id")
 
-        # Prune claims no longer in the markdown
-        keys_to_remove = []
-        for k, v in claims.get("items", {}).items():
-            locator_page = v.get("locator", {}).get("page_key")
-            if locator_page in affected_page_keys and k not in proposed_claim_ids:
-                keys_to_remove.append(k)
-        for k in keys_to_remove:
-            del claims["items"][k]
-            
-        # Prune evidence no longer in the markdown
-        keys_to_remove = []
-        for k, v in evidence.get("items", {}).items():
-            locator_page = v.get("locator", {}).get("page_key")
-            if locator_page in affected_page_keys and k not in proposed_evidence_ids:
-                keys_to_remove.append(k)
-        for k in keys_to_remove:
-            del evidence["items"][k]
-
-    _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
-    _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
-    _upsert_map_records(evidence, change_set.get("proposed_evidence", []), "evidence_id")
-    _upsert_map_records(sources, change_set.get("proposed_source_updates", []), "source_id")
-
-    save_entities(entities)
-    save_claims(claims)
-    save_evidence(evidence)
-    save_sources(sources)
-    save_graph_edges(change_set.get("proposed_edges", []))
-    rebuild_alias_registry()
-    try:
-        memory_store = rebuild_operational_memory()
-        change_set["operational_memory_count"] = len(memory_store.get("items", {}))
-        change_set["conflict_event_count"] = len(memory_store.get("conflict_events", []))
-    except Exception as exc:
-        log.warning(f"Operational memory rebuild failed for {change_set.get('change_set_id')}: {exc}")
-    # Obsolete view_builder block removed to prevent ImportError warnings
-    # try:
-    #     from vector_lake import view_builder
-    # 
-    #     change_set["view_rebuild"] = view_builder.rebuild_views_for_change_set(change_set)
-    # except Exception as exc:
-    #     log.warning(f"View rebuild failed for {change_set.get('change_set_id')}: {exc}")
-    return change_set
+        save_entities(entities)
+        save_claims(claims)
+        save_evidence(evidence)
+        save_sources(sources)
+        save_graph_edges(change_set.get("proposed_edges", []))
+        rebuild_alias_registry()
+        try:
+            memory_store = rebuild_operational_memory()
+            change_set["operational_memory_count"] = len(memory_store.get("items", {}))
+            change_set["conflict_event_count"] = len(memory_store.get("conflict_events", []))
+        except Exception as exc:
+            log.warning(f"Operational memory rebuild failed for {change_set.get('change_set_id')}: {exc}")
+        return change_set
 
 
 def publish_change_sets(limit: int | None = None) -> dict:

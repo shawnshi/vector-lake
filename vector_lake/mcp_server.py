@@ -41,9 +41,12 @@ def _read_payload(payload_file: str) -> str:
     if not payload_file:
         return ""
     import os
-    if not os.path.exists(payload_file):
+    abs_path = os.path.abspath(payload_file)
+    if ".gemini" not in abs_path:
+        raise ValueError(f"[Security Error] Payload file must be within the .gemini sandbox: {payload_file}")
+    if not os.path.exists(abs_path):
         raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Please use write_to_file to create it first.")
-    with open(payload_file, "r", encoding="utf-8", errors="ignore") as f:
+    with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
 @mcp.tool()

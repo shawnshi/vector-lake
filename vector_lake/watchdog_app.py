@@ -227,68 +227,39 @@ def scheduled_lint_loop():
                         plugin_dir = get_extension_root()
                         gemini_root = plugin_dir.parent.parent.parent
                         
-                        decay_script = str(gemini_root / "scripts" / "metadata_decay_daemon.py")
-                        if os.path.exists(decay_script):
-                            log.info("Running Metadata Decay Daemon...")
-                            res = subprocess.run([sys.executable, decay_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
-                            if res.returncode != 0:
-                                log.error(f"Metadata Decay Daemon failed: {res.stderr}")
-                                write_status("error", 0, index_queue.qsize(), "Decay Daemon Failed", res.stderr)
-
-                        sync_timeline_script = str(gemini_root / "scripts" / "sync_timeline_db.py")
-                        if os.path.exists(sync_timeline_script):
-                            log.info("Running Timeline DB Sync Daemon...")
-                            res = subprocess.run([sys.executable, sync_timeline_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
-                            if res.returncode != 0:
-                                log.error(f"Timeline Sync Failed: {res.stderr}")
-                                write_status("error", 0, index_queue.qsize(), "Timeline Sync Failed", res.stderr)
-
-                        scout_script = str(gemini_root / "scripts" / "missing_evidence_scout.py")
-                        if os.path.exists(scout_script):
-                            log.info("Running Missing Evidence Scout...")
-                            res = subprocess.run([sys.executable, scout_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
-                            if res.returncode != 0:
-                                log.error(f"Missing Evidence Scout Failed: {res.stderr}")
-                                write_status("error", 0, index_queue.qsize(), "Scout Failed", res.stderr)
-
-                        # V7.2 Asynchronous Domain Overview Compilation
-                        overview_script = str(plugin_dir / "scripts" / "compile_domain_overviews.py")
-                        if os.path.exists(overview_script):
-                            log.info("Running Domain Overview Compiler...")
-                            res = subprocess.run([sys.executable, overview_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
-                            if res.returncode != 0:
-                                log.error(f"Domain Overview Compiler Failed: {res.stderr}")
-                                write_status("error", 0, index_queue.qsize(), "Overview Compiler Failed", res.stderr)
-
+                        daemon_scripts = [
+                            ("Metadata Decay Daemon", str(gemini_root / "scripts" / "metadata_decay_daemon.py")),
+                            ("Timeline DB Sync Daemon", str(gemini_root / "scripts" / "sync_timeline_db.py")),
+                            ("Missing Evidence Scout", str(gemini_root / "scripts" / "missing_evidence_scout.py")),
+                            ("Domain Overview Compiler", str(plugin_dir / "scripts" / "compile_domain_overviews.py")),
+                            ("Semantic Deduplication Daemon", str(plugin_dir / "scripts" / "semantic_dedup_daemon.py")),
+                            ("Nighttime Janitor Swarm", str(plugin_dir / "scripts" / "launch_janitor_swarm.py")),
+                            ("Louvain Community Clustering Daemon", str(plugin_dir / "scripts" / "community_clustering_daemon.py"))
+                        ]
                         
-                        # V7.2 Semantic Deduplication Daemon
-                        semantic_dedup_script = str(plugin_dir / "scripts" / "semantic_dedup_daemon.py")
-                        if os.path.exists(semantic_dedup_script):
-                            log.info("Running Semantic Deduplication Daemon...")
-                            res = subprocess.run([sys.executable, semantic_dedup_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
-                            if res.returncode != 0:
-                                log.error(f"Semantic Deduplication Daemon Failed: {res.stderr}")
-                                write_status("error", 0, index_queue.qsize(), "Semantic Dedup Failed", res.stderr)
-                                
-                        # V10 Autonomous Janitor Swarm (Nighttime Cleanup)
-                        janitor_script = str(plugin_dir / "scripts" / "launch_janitor_swarm.py")
-                        if os.path.exists(janitor_script):
-                            log.info("Launching Nighttime Janitor Swarm...")
-                            res = subprocess.run([sys.executable, janitor_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
-                            if res.returncode != 0:
-                                log.error(f"Janitor Swarm Launch Failed: {res.stderr}")
-                                write_status("error", 0, index_queue.qsize(), "Janitor Swarm Failed", res.stderr)
-                            else:
-                                log.info("Janitor Swarm successfully launched background agents.")
+                        processes = []
+                        for name, script_path in daemon_scripts:
+                            if os.path.exists(script_path):
+                                log.info(f"Launching {name}...")
+                                p = subprocess.Popen(
+                                    [sys.executable, script_path], 
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                    text=True, encoding="utf-8", env=env
+                                )
+                                processes.append((name, p))
                         
-                        # V9.0 Louvain Community Clustering Daemon
-                        clustering_script = str(plugin_dir / "scripts" / "community_clustering_daemon.py")
-                        if os.path.exists(clustering_script):
-                            log.info("Running Louvain Community Clustering Daemon...")
-                            res = subprocess.run([sys.executable, clustering_script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
-                            if res.returncode != 0:
-                                log.error(f"Clustering Daemon Failed: {res.stderr}")
-                                write_status("error", 0, index_queue.qsize(), "Clustering Failed", res.stderr)
+                        for name, p in processes:
+                            try:
+                                stdout, stderr = p.communicate(timeout=180)
+                                if p.returncode != 0:
+                                    log.error(f"{name} Failed: {stderr}")
+                                    write_status("error", 0, index_queue.qsize(), f"{name} Failed", stderr)
+                                else:
+                                    log.info(f"{name} successfully completed.")
+                            except subprocess.TimeoutExpired:
+                                p.kill()
+                                log.error(f"{name} Timed Out after 180s")
+                                write_status("error", 0, index_queue.qsize(), f"{name} Timeout", "")
                     except Exception as e:
                         log.warning(f"Failed to run auxiliary daemons: {e}")
                         write_status("error", 0, index_queue.qsize(), "Auxiliary Daemons Error", str(e))

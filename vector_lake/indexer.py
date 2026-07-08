@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import yaml
@@ -152,10 +153,21 @@ def _write_json_payload(output_path: str, data: dict):
     temp_path = output_path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
-    try:
-        os.replace(temp_path, output_path)
-    except PermissionError:
-        pass
+    import time
+    for attempt in range(5):
+        try:
+            os.replace(temp_path, output_path)
+            return
+        except PermissionError as e:
+            if attempt < 4:
+                time.sleep(0.1 * (2 ** attempt))
+            else:
+                log.critical(f"Failed to write {output_path} due to file lock after 5 attempts. Index update aborted.")
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                raise e
 
 def _write_index(output_path: str, index_data: dict):
     removed = _strip_legacy_embedded_payloads(index_data)
@@ -860,15 +872,8 @@ def update_index_items(filenames: list[str]):
                 # Do not recompute heavy debt metrics on partial update
                 index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
                 index_data["schema_version"] = "8.0"
-                # V11.3: Eliminate I/O Paralysis
-                # Do not serialize the entire index.json synchronously. Drop an async flag.
-                from vector_lake import get_extension_root
-                flag_path = get_extension_root() / "tmp" / "flag_reindex.lock"
-                try:
-                    flag_path.parent.mkdir(parents=True, exist_ok=True)
-                    flag_path.touch(exist_ok=True)
-                except Exception:
-                    pass
+                # V11.3 Fixed: Write partial updates back to disk to prevent ghost updates
+                _write_index(output_path, index_data)
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
         return
