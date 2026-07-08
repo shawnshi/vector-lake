@@ -81,6 +81,12 @@ graph LR
    - **差分垃圾回收机制 (Diff-based GC)**：针对早期系统只增不减 (Append-Only) 的痛点，重构了同步层的级联清理逻辑。当用户在 Markdown 层面重命名/删除文件，或者删除某句特征断言时，系统会执行精确对比，物理上擦除 SQLite 中冗余的实体 (Entities)、声索 (Claims) 和证据 (Evidence)，保证图谱 0 负担。
    - **夜间拾荒者集群 (Janitor Swarm)**：全自动的语义去重重构框架。通过 `launch_janitor_swarm.py`，夜间守护进程会自动读取 SQLite 治理队列中的 pending merge 项，拉起 `tool_rename.py` 进行跨文件双链重命名、文件合并，并由 Diff GC 彻底抹除幽灵节点。
    - **MCP 沙箱安全网关 (JSON Sandbox Gateway)**：面向所有大模型 MCP Tool，将所有长文本/特殊符号参数转入 `--config_file` JSON 载荷逃逸机制，彻底封堵因命令行参数截断或特殊字符（如引号、换行符）导致的命令注入与崩溃。
+   
+### 🚀 V11.2 架构跃迁特性 (V11.2 Architecture Upgrades)
+- **多跳竞品并行检索 (Multi-Hop Parallel Retrieval)**：内置对比分析意图探针（Comparative Intent Sniffer），检测到对比意图时强制向大模型下发对称均衡搜索指令，消灭单次 Top-K 召回导致的信息倾斜。
+- **上下文封印解除 (Context Chunk Expansion)**：废除旧版的暴力字符截断机制（`[:300]`），提取窗口扩容至 `[:2500]`，保证大模型能够完整读取极深层级的产品架构或实施细则。
+- **硬元数据过滤栅栏 (Hard Metadata Gates)**：在 MCP 的底层检索管线中注入了 `filter_expr` 强校验钩子。大模型可以通过结构化元数据在内存层面执行 SQL 式硬拦截（如 `status != 'decayed'`），从物理层阻断过期文件引发的合规性幻觉。
+- **底层技能重构 (Director XML Standard)**：全量 19 项底层 MCP 技能组件已 100% 升维至 V11.1 架构，标配 `<thought>` 暗盒缓冲与 `[FABLE 5 CHECKPOINT]` 核心拦截门控，全面免疫越权篡改。
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
