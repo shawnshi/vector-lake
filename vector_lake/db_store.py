@@ -2,6 +2,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from vector_lake.wiki_utils import get_meta_dir
+import sqlite_vec
 
 _LOCAL = threading.local()
 
@@ -13,6 +14,12 @@ def get_connection() -> sqlite3.Connection:
         db_path = get_db_path()
         conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        
+        # Load sqlite-vec extension
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        
         _LOCAL.conn = conn
     return _LOCAL.conn
 
@@ -52,6 +59,12 @@ def init_db():
                 canonical_name TEXT,
                 data_json TEXT,
                 updated_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
+                entity_id TEXT PRIMARY KEY,
+                embedding float[3072]
             )
         """)
         try:
@@ -173,6 +186,16 @@ def init_db():
 
 
 def upsert_search_index(node_key: str, title: str, summary: str, text: str):
+    try:
+        import jieba
+        title_tok = " ".join(jieba.cut(title)) if title else ""
+        summary_tok = " ".join(jieba.cut(summary)) if summary else ""
+        text_tok = " ".join(jieba.cut(text)) if text else ""
+    except ImportError:
+        title_tok = " ".join(list(title)) if title else ""
+        summary_tok = " ".join(list(summary)) if summary else ""
+        text_tok = " ".join(list(text)) if text else ""
+
     conn = get_connection()
     with conn:
         # FTS5 doesn't support ON CONFLICT REPLACE directly, so we delete then insert.
@@ -180,7 +203,7 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
         conn.execute("""
             INSERT INTO wiki_search_index (node_key, title, summary, text)
             VALUES (?, ?, ?, ?)
-        """, (node_key, title, summary, text))
+        """, (node_key, title_tok, summary_tok, text_tok))
 
 def delete_search_index(node_key: str):
     conn = get_connection()
@@ -188,11 +211,17 @@ def delete_search_index(node_key: str):
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
+    try:
+        import jieba
+        query_tok = " ".join(jieba.cut(query)) if query else ""
+    except ImportError:
+        query_tok = " ".join(list(query)) if query else ""
+
     conn = get_connection()
     cur = conn.execute("""
         SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
         FROM wiki_search_index 
         WHERE wiki_search_index MATCH ? 
         ORDER BY rank LIMIT ?
-    """, (query, limit))
+    """, (query_tok, limit))
     return [dict(row) for row in cur.fetchall()]

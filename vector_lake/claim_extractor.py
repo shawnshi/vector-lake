@@ -54,50 +54,53 @@ def _clean_claim_text(text: str, limit: int = 360) -> str:
 
 
 def _iter_blocks(body: str) -> list[dict]:
+    import mistune
+    markdown = mistune.create_markdown(renderer='ast')
+    ast = markdown(body or "")
+    
     blocks = []
     current_heading = None
-    paragraph_lines = []
 
-    def flush_paragraph():
-        nonlocal paragraph_lines
-        if not paragraph_lines:
-            return
-        raw = " ".join(paragraph_lines)
-        text = _clean_claim_text(raw)
-        if text:
-            blocks.append({
-                "kind": "paragraph",
-                "heading": current_heading,
-                "text": text,
-                "raw_text": raw,
-            })
-        paragraph_lines = []
+    def extract_text(node) -> str:
+        if isinstance(node, dict):
+            if node.get("type") in ("softbreak", "hardbreak"):
+                return " "
+            text = node.get("raw", "")
+            for child in node.get("children", []):
+                text += extract_text(child)
+            return text
+        return ""
 
-    for raw_line in (body or "").splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            flush_paragraph()
-            continue
-        if stripped.startswith("#"):
-            flush_paragraph()
-            current_heading = _heading_to_text(stripped)
-            continue
-        if re.match(r"^[-*+]\s+", stripped):
-            flush_paragraph()
-            raw = re.sub(r"^[-*+]\s+", "", stripped)
-            text = _clean_claim_text(raw)
+    def process_node(node):
+        nonlocal current_heading
+        if node["type"] == "heading":
+            current_heading = extract_text(node).strip()
+        elif node["type"] == "paragraph":
+            raw_text = extract_text(node).strip()
+            text = _clean_claim_text(raw_text)
             if text:
                 blocks.append({
-                    "kind": "bullet",
+                    "kind": "paragraph",
                     "heading": current_heading,
                     "text": text,
-                    "raw_text": raw,
+                    "raw_text": raw_text,
                 })
-            continue
-        paragraph_lines.append(stripped)
+        elif node["type"] == "list":
+            for child in node.get("children", []):
+                if child["type"] == "list_item":
+                    raw_text = extract_text(child).strip()
+                    text = _clean_claim_text(raw_text)
+                    if text:
+                        blocks.append({
+                            "kind": "bullet",
+                            "heading": current_heading,
+                            "text": text,
+                            "raw_text": raw_text,
+                        })
 
-    flush_paragraph()
+    for node in ast:
+        process_node(node)
+
     return blocks
 
 
@@ -206,9 +209,10 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
 
         custom_claim_type = _claim_type_for_block(block["kind"])
         heading = block.get("heading") or title
-        if "编译事实" in heading:
+        heading_lower = (heading or "").lower()
+        if any(k in heading_lower for k in ["编译事实", "compiled truth", "事实", "truth"]):
             custom_claim_type = "compiled-truth"
-        elif "证据时间线" in heading:
+        elif any(k in heading_lower for k in ["证据时间线", "timeline", "证据", "时间线"]):
             custom_claim_type = "timeline-event"
 
         evidence_ids = []

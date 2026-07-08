@@ -541,28 +541,37 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         type_a = node_types[key_a]
         triples_a = node_triples[key_a]
         multiplier_a = node_multipliers[key_a]
-
         affinity_dict_a = type_affinity_precomputed[type_a]
 
-        candidates = set(links_a)
-        if key_a in reverse_links:
-            candidates.update(reverse_links[key_a])
-            
+        candidate_source_overlaps = {}
+        candidate_neighbor_scores = {}
+        
         for source in sources_a:
-            candidates.update(source_to_nodes.get(source, []))
-            
+            for key_b in source_to_nodes.get(source, []):
+                if key_a < key_b:
+                    candidate_source_overlaps[key_b] = candidate_source_overlaps.get(key_b, 0) + 1
+                    
         for neighbor in links_a:
-            candidates.update(reverse_links.get(neighbor, []))
+            for key_b in reverse_links.get(neighbor, []):
+                if key_a < key_b:
+                    candidate_neighbor_scores[key_b] = candidate_neighbor_scores.get(key_b, 0.0) + node_degrees[neighbor]
+
+        candidates = set(candidate_source_overlaps.keys())
+        candidates.update(candidate_neighbor_scores.keys())
+        
+        for key_b in links_a:
+            if key_a < key_b:
+                candidates.add(key_b)
+        
+        for key_b in reverse_links.get(key_a, []):
+            if key_a < key_b:
+                candidates.add(key_b)
 
         for key_b in candidates:
-            if key_a >= key_b or key_b not in node_links:
+            if key_b not in node_links:
                 continue
 
-            links_b = node_links[key_b]
-            sources_b = node_sources[key_b]
-
             type_b = node_types[key_b]
-            triples_b = node_triples[key_b]
             multiplier_b = node_multipliers[key_b]
 
             score = 0.0
@@ -570,18 +579,14 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             if key_b in links_a:
                 score += triples_a.get(key_b, mention_weight)
 
-            if key_a in links_b:
-                score += triples_b.get(key_a, mention_weight)
+            if key_a in node_links[key_b]:
+                score += node_triples[key_b].get(key_a, mention_weight)
 
-            # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) hot path
-            if not sources_a.isdisjoint(sources_b):
-                score += len(sources_a & sources_b) * overlap_weight
+            if key_b in candidate_source_overlaps:
+                score += candidate_source_overlaps[key_b] * overlap_weight
 
-            # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) hot path
-            if not links_a.isdisjoint(links_b):
-                for neighbor_key in links_a & links_b:
-                    # Bolt Optimization: Direct lookup is faster than .get(key, 0.0) in hot loop
-                    score += node_degrees[neighbor_key]
+            if key_b in candidate_neighbor_scores:
+                score += candidate_neighbor_scores[key_b]
 
             score += affinity_dict_a[type_b]
 
@@ -693,17 +698,20 @@ def generate_index():
             for category in node_data["categories"]:
                 index_data["categories"].add(category)
 
+    from vector_lake.db_store import transaction
     index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
     _apply_graph_topology(index_data)
-    _build_bm25_index(index_data)
-    index_data["categories"] = list(index_data["categories"])
-    index_data["governance_metrics"] = governance_metrics.compute_debt_metrics(skip_heavy=True)
-    index_data["schema_version"] = "8.0"
+    
+    with transaction():
+        _build_bm25_index(index_data)
+        index_data["categories"] = list(index_data["categories"])
+        index_data["governance_metrics"] = governance_metrics.compute_debt_metrics(skip_heavy=True)
+        index_data["schema_version"] = "8.0"
 
-    output_path = str(get_index_path())
-    claim_graph_path = str(get_claim_graph_path())
-    _write_claim_graph(claim_graph_path, governance_store.build_claim_graph_projection())
-    _write_index(output_path, index_data)
+        output_path = str(get_index_path())
+        claim_graph_path = str(get_claim_graph_path())
+        _write_claim_graph(claim_graph_path, governance_store.build_claim_graph_projection())
+        _write_index(output_path, index_data)
     log.info(
         f"Generated index.json with {len(index_data['nodes'])} nodes | "
         f"{len(index_data['weighted_edges'])} weighted edges | "
@@ -931,10 +939,20 @@ def refresh_graph_topology_if_dirty() -> bool:
                 temp_path = output_path + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as handle:
                     json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
-                try:
-                    os.replace(temp_path, output_path)
-                except PermissionError:
-                    pass
+                for attempt in range(5):
+                    try:
+                        os.replace(temp_path, output_path)
+                        break
+                    except PermissionError as e:
+                        if attempt < 4:
+                            time.sleep(0.1 * (2 ** attempt))
+                        else:
+                            log.error(f"Failed to write {output_path} due to file lock after 5 attempts. Graph refresh aborted.")
+                            try:
+                                os.remove(temp_path)
+                            except Exception:
+                                pass
+                            raise e
                 log.info("Graph topology partially refreshed and saved.")
                 return True
             return False

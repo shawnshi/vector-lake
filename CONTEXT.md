@@ -133,7 +133,7 @@ $env:PYTHONUTF8='1'; python -m compileall vector_lake tests
 
 ## 5. Current Validation Baseline
 
-Last verified: 2026-05-31.
+Last verified: 2026-07-08 (V11.5 Refactoring).
 
 - Unit tests: `Ran 8 tests ... OK`
 - Compile: `python -m compileall vector_lake tests` OK
@@ -167,3 +167,9 @@ The Vector Lake system is designed for high-concurrency ingestion and graph main
 - **Strict 7-Type Enforcement (V9.1)**: The PIEA interceptor actively strips nested/invalid prefixes (e.g., `Concept_Synthesis_` or `Entity_`) and forces LLM agents to save files using exact, canonical 7-type filenames (`vendor`, `product`, `person`, `event`, `concept`, `synthesis`, `source`). All backend algorithms are strictly aligned to this matrix.
 - **Cross-Type PIEA Deduplication (V9.1)**: `tool_piea.py` no longer segregates similarity checks by type. If an agent proposes `Vendor_Accenture` when `Concept_Accenture` already exists, it triggers a hard block and forces a timeline append, eradicating "Same Name, Multi-Type" pollution.
 - **Error Resilience**: Utilizes a global `global_task_lock` for thread safety and halts on consecutive failures to prevent cascading storms. Status telemetry and subprocess errors are emitted to `MEMORY/wiki/.meta/.watchdog_status.json`.
+- **AST-Based Parsing (V11.5)**: Replaced brittle Regex and string splitting with `mistune` Abstract Syntax Tree (AST) parsing, making extraction immune to Markdown stylistic variations or Markdown linting format changes.
+- **Native Vector Engine (V11.5)**: Integrated `sqlite-vec` extension for FTS5 + Vector hybrid search. Eliminated the `embeddings.pkl` O(N) memory bottleneck, offloading similarity calculation directly into the SQLite C-backend.
+- **O(V+E) Graph Indexing (V11.5)**: Eliminated catastrophic O(N²) CPU deadlocks during node overlapping frequency calculations by utilizing an inverted-index map. 
+- **Chinese Tokenization (V11.5)**: Implemented offline `jieba` pre-tokenization pipeline before SQLite `MATCH` execution, fixing the precision drop caused by `porter unicode61` character splitting.
+- **Subagent Concurrency Shield (V11.5)**: Migrated SDK LLM calls to Antigravity native subagents (`agy -p`) with `asyncio.Semaphore` physical throttling to entirely eliminate "process storms" and EOF rate limits.
+- **Cross-Storage Transactions (V11.5)**: Secured SQLite database writes and JSON file index updates within `db_store.transaction()` two-phase commit blocks and introduced exponential backoff for file locks.

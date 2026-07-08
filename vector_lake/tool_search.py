@@ -71,65 +71,52 @@ _VECTOR_CACHE = {
 }
 
 def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> dict[str, float]:
-    cache_path = get_meta_dir() / "embeddings.pkl"
-    if not cache_path.exists():
-        return {}
-    
     try:
-        import numpy as np
-    except ImportError:
-        np = None
-
-    try:
-        current_mtime = os.path.getmtime(cache_path)
-        if _VECTOR_CACHE["mtime"] != current_mtime or _VECTOR_CACHE["matrix"] is None:
-            with open(cache_path, "rb") as f:
-                cache = pickle.load(f)
-            embeddings = cache.get("embeddings", {})
-            
-            keys = []
-            vectors = []
-            for k, data in embeddings.items():
-                if "vector" in data:
-                    keys.append(k)
-                    vectors.append(data["vector"])
-            
-            _VECTOR_CACHE["keys"] = keys
-            if np is not None and vectors:
-                _VECTOR_CACHE["matrix"] = np.array(vectors, dtype=np.float32)
-                norms = np.linalg.norm(_VECTOR_CACHE["matrix"], axis=1, keepdims=True)
-                norms[norms == 0] = 1.0
-                _VECTOR_CACHE["matrix"] = _VECTOR_CACHE["matrix"] / norms
-            else:
-                _VECTOR_CACHE["matrix"] = vectors # fallback to list of lists
-                
-            _VECTOR_CACHE["mtime"] = current_mtime
-
-        keys = _VECTOR_CACHE["keys"]
-        matrix = _VECTOR_CACHE["matrix"]
+        from vector_lake.db_store import get_connection
+        import sqlite_vec
+        conn = get_connection()
+        query_blob = sqlite_vec.serialize_float32(query_vector)
+        # Using match because it's fast. It returns L2 distance.
+        # Cosine similarity for normalized vectors: 1 - L2^2 / 2
+        # But sqlite-vec also has vec_distance_cosine which returns cosine distance.
+        # We can just use match and sort by distance.
+        cursor = conn.execute(
+            "SELECT entity_id, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (query_blob, limit)
+        )
         
-        if not keys:
-            return {}
-
-        if np is not None and isinstance(matrix, np.ndarray):
-            q_vec = np.array(query_vector, dtype=np.float32)
-            q_norm = np.linalg.norm(q_vec)
-            if q_norm > 0:
-                q_vec = q_vec / q_norm
-            
-            # Fast vectorized dot product
-            sims = np.dot(matrix, q_vec)
-            
-            scores = [(keys[i], float(sims[i])) for i in range(len(keys))]
-        else:
-            # Fallback
-            scores = [(keys[i], calculate_cosine_similarity(query_vector, matrix[i])) for i in range(len(keys))]
-            
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return {key: sim for key, sim in scores[:limit] if sim > 0.5}
+        results = {}
+        for row in cursor.fetchall():
+            # distance is L2. convert to approx sim: 1 - (dist^2)/2
+            dist = row["distance"]
+            sim = 1.0 - (dist * dist) / 2.0
+            if sim > 0.5:
+                results[row["entity_id"]] = sim
+        return results
     except Exception as e:
-        log.warning(f"Failed to load or process embeddings.pkl: {e}")
+        log.warning(f"Failed to query vec_embeddings: {e}")
         return {}
+
+def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
+    try:
+        import jieba
+        query_tok = " ".join(jieba.cut(query)) if query else ""
+    except ImportError:
+        query_tok = " ".join(list(query)) if query else ""
+        
+    try:
+        from vector_lake.db_store import get_connection
+        conn = get_connection()
+        cur = conn.execute("""
+            SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
+            FROM wiki_search_index 
+            WHERE wiki_search_index MATCH ? 
+            ORDER BY rank LIMIT ?
+        """, (query_tok, limit))
+        return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        log.warning(f"Failed to query fts5: {e}")
+        return []
 
 def _classify_intent(query: str) -> str:
     temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
@@ -481,7 +468,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     
     # 1. FTS5 Search
     try:
-        fts_results = db_store.search_wiki(' '.join(tokens), limit=top_k * 5)
+        # Use expanded tokens as the query basis to preserve LLM synonym expansions
+        expanded_query = query + " " + " ".join(tokens)
+        fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
         for row in fts_results:
             key = row['node_key']
             fts_score = row['rank'] * -1.0  # SQLite BM25 is negative
