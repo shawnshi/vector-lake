@@ -128,13 +128,23 @@ def _tokenize(text: str) -> list[str]:
     for i in range(len(chinese_chars) - 1):
         tokens.append(chinese_chars[i] + chinese_chars[i+1])
     return tokens
+def _tokenize_for_fts(text: str) -> str:
+    if not text: return ""
+    try:
+        import jieba
+        return " ".join(jieba.cut(text))
+    except ImportError:
+        return text
 
 def _build_bm25_index(index_data: dict):
     nodes = (index_data.get("nodes") or {})
     for node_key, node in nodes.items():
         aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
         text = f"{aliases_str} {node.get('raw_text', '')}"
-        db_store.upsert_search_index(node_key, node.get('title', ''), node.get('summary', ''), text)
+        t_title = _tokenize_for_fts(node.get('title', ''))
+        t_summary = _tokenize_for_fts(node.get('summary', ''))
+        t_text = _tokenize_for_fts(text)
+        db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
 
 
 
@@ -805,7 +815,10 @@ def update_index_items(filenames: list[str]):
                                 index_data["nodes"][node_key] = node_data
                                 aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
                                 text = f"{aliases_str} {node_data.get('raw_text', '')}"
-                                db_store.upsert_search_index(node_key, node_data.get('title', ''), node_data.get('summary', ''), text)
+                                t_title = _tokenize_for_fts(node_data.get('title', ''))
+                                t_summary = _tokenize_for_fts(node_data.get('summary', ''))
+                                t_text = _tokenize_for_fts(text)
+                                db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
                                 
                                 if node_data["id"]:
                                     index_data["aliases"][node_data["id"]] = node_key

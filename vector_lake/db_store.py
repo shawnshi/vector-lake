@@ -101,7 +101,7 @@ def init_db():
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS wiki_search_index USING fts5(
                 node_key, title, summary, text,
-                tokenize='porter unicode61 remove_diacritics 1'
+                tokenize='unicode61 remove_diacritics 1'
             )
         """)
         conn.execute("""

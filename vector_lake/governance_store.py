@@ -16,6 +16,7 @@ from vector_lake.wiki_utils import (
     atomic_write_text,
     get_meta_dir,
     get_wiki_dir,
+    normalize_memory_key,
     read_markdown_file,
 )
 
@@ -323,11 +324,14 @@ def save_graph_edges(edges: list[dict]):
     if not edges: return
     conn = get_connection()
     with conn:
-        for edge in edges:
-            conn.execute(
-                "INSERT OR REPLACE INTO claim_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
-            )
+        records = [
+            (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
+            for edge in edges
+        ]
+        conn.executemany(
+            "INSERT OR REPLACE INTO claim_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
+            records
+        )
 
 
 def save_alias_registry(data):
@@ -335,8 +339,9 @@ def save_alias_registry(data):
     now = _utc_now()
     data["updated_at"] = now
     with conn:
-        for k, v in data.get("items", {}).items():
-            conn.execute("INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)", (k, v, now))
+        records = [(k, v, now) for k, v in data.get("items", {}).items()]
+        if records:
+            conn.executemany("INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)", records)
 
 
 def save_memory_objects(data):
@@ -451,11 +456,7 @@ def _dt_rank(value) -> float:
     return parsed.timestamp()
 
 
-def _normalize_memory_key(value: str) -> str:
-    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
-    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", normalized)
-    normalized = re.sub(r"_+", "_", normalized).strip("_")
-    return normalized[:96] or "general"
+
 
 
 def _query_terms(query: str) -> list[str]:
@@ -490,7 +491,7 @@ def infer_memory_type(claim: dict) -> str:
 def _infer_memory_key(claim: dict, memory_type: str) -> str:
     explicit = claim.get("memory_key") or claim.get("preference_key") or claim.get("decision_key") or claim.get("task_key")
     if explicit:
-        return _normalize_memory_key(explicit)
+        return normalize_memory_key(explicit)
 
     locator = claim.get("locator") or {}
     heading = locator.get("heading") or claim.get("source_page") or "general"
@@ -500,8 +501,8 @@ def _infer_memory_key(claim: dict, memory_type: str) -> str:
         heading = match.group(1)
 
     if memory_type == "fact":
-        return _normalize_memory_key(claim.get("claim_id") or text[:96])
-    return _normalize_memory_key(f"{memory_type}:{heading}")
+        return normalize_memory_key(claim.get("claim_id") or text[:96])
+    return normalize_memory_key(f"{memory_type}:{heading}")
 
 
 def _freshness_score(record: dict, now=None) -> float:

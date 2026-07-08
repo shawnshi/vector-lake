@@ -19,6 +19,22 @@ SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wik
 VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
 
+def normalize_memory_key(key: str) -> str:
+    """Canonical normalization function to strip noise from keys and aliases."""
+    normalized = re.sub(r"\s+", " ", str(key or "").strip().lower())
+    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized[:96] or "general"
+
+def calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
+    """Canonical cosine similarity for raw python floats."""
+    if not v1 or not v2 or len(v1) != len(v2): return 0.0
+    import math
+    dot = sum(a * b for a, b in zip(v1, v2))
+    norm1 = math.sqrt(sum(a * a for a in v1))
+    norm2 = math.sqrt(sum(a * a for a in v2))
+    return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+
 def normalize_entity_name(name: str) -> str:
     """Normalizes an entity name by replacing spaces and invalid chars with hyphens and collapsing multiples."""
     prefix = ""

@@ -43,12 +43,7 @@ QUERY_EXPANSION_DICT = {
     "医疗AI": ["临床Agent", "大模型医疗落地", "电子病历 智能化"],
 }
 
-
-def _calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
-    dot = sum(a * b for a, b in zip(v1, v2))
-    norm1 = math.sqrt(sum(a * a for a in v1))
-    norm2 = math.sqrt(sum(a * a for a in v2))
-    return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+from vector_lake.wiki_utils import calculate_cosine_similarity
 
 def _get_query_embedding(query: str) -> list[float]:
     if not os.environ.get("GEMINI_API_KEY"):
@@ -66,26 +61,72 @@ def _get_query_embedding(query: str) -> list[float]:
         log.warning(f"Failed to get query embedding: {e}")
     return []
 
+_VECTOR_CACHE = {
+    "mtime": 0.0,
+    "keys": [],
+    "matrix": None
+}
+
 def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> dict[str, float]:
     cache_path = get_meta_dir() / "embeddings.pkl"
     if not cache_path.exists():
         return {}
+    
     try:
-        with open(cache_path, "rb") as f:
-            cache = pickle.load(f)
-    except Exception as e:
-        log.warning(f"Failed to load embeddings.pkl: {e}")
-        return {}
-        
-    embeddings = cache.get("embeddings", {})
-    scores = []
-    for key, data in embeddings.items():
-        if "vector" in data:
-            sim = _calculate_cosine_similarity(query_vector, data["vector"])
-            scores.append((key, sim))
+        import numpy as np
+    except ImportError:
+        np = None
+
+    try:
+        current_mtime = os.path.getmtime(cache_path)
+        if _VECTOR_CACHE["mtime"] != current_mtime or _VECTOR_CACHE["matrix"] is None:
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+            embeddings = cache.get("embeddings", {})
             
-    scores.sort(key=lambda x: x[1], reverse=True)
-    return {key: sim for key, sim in scores[:limit] if sim > 0.5}
+            keys = []
+            vectors = []
+            for k, data in embeddings.items():
+                if "vector" in data:
+                    keys.append(k)
+                    vectors.append(data["vector"])
+            
+            _VECTOR_CACHE["keys"] = keys
+            if np is not None and vectors:
+                _VECTOR_CACHE["matrix"] = np.array(vectors, dtype=np.float32)
+                norms = np.linalg.norm(_VECTOR_CACHE["matrix"], axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                _VECTOR_CACHE["matrix"] = _VECTOR_CACHE["matrix"] / norms
+            else:
+                _VECTOR_CACHE["matrix"] = vectors # fallback to list of lists
+                
+            _VECTOR_CACHE["mtime"] = current_mtime
+
+        keys = _VECTOR_CACHE["keys"]
+        matrix = _VECTOR_CACHE["matrix"]
+        
+        if not keys:
+            return {}
+
+        if np is not None and isinstance(matrix, np.ndarray):
+            q_vec = np.array(query_vector, dtype=np.float32)
+            q_norm = np.linalg.norm(q_vec)
+            if q_norm > 0:
+                q_vec = q_vec / q_norm
+            
+            # Fast vectorized dot product
+            sims = np.dot(matrix, q_vec)
+            
+            scores = [(keys[i], float(sims[i])) for i in range(len(keys))]
+        else:
+            # Fallback
+            scores = [(keys[i], calculate_cosine_similarity(query_vector, matrix[i])) for i in range(len(keys))]
+            
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return {key: sim for key, sim in scores[:limit] if sim > 0.5}
+    except Exception as e:
+        log.warning(f"Failed to load or process embeddings.pkl: {e}")
+        return {}
 
 def _classify_intent(query: str) -> str:
     temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
@@ -441,6 +482,11 @@ def _safe_eval(expr: str, context: dict) -> bool:
         log.warning(f"Failed to safe_eval expression '{expr}': {e}")
         return False
 
+_INDEX_CACHE = {
+    "mtime": 0.0,
+    "data": None
+}
+
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
     normalized_mode = str(mode or "page").lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
@@ -455,9 +501,13 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     lock_path = index_path + ".lock"
 
     try:
-        with FileLock(lock_path, timeout=5):
-            with open(index_path, "r", encoding="utf-8") as handle:
-                index_data = json.load(handle)
+        current_mtime = os.path.getmtime(index_path)
+        if _INDEX_CACHE["mtime"] != current_mtime or _INDEX_CACHE["data"] is None:
+            with FileLock(lock_path, timeout=5):
+                with open(index_path, "r", encoding="utf-8") as handle:
+                    _INDEX_CACHE["data"] = json.load(handle)
+                    _INDEX_CACHE["mtime"] = current_mtime
+        index_data = _INDEX_CACHE["data"]
     except Timeout:
         log.warning("Timeout acquiring lock for index.json during search. System is busy.")
         return "System is currently busy syncing the knowledge base. Please try again in a few seconds."

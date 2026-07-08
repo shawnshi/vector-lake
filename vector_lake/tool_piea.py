@@ -7,7 +7,7 @@ from collections import Counter
 import os
 from filelock import FileLock
 from vector_lake import get_extension_root
-from vector_lake.wiki_utils import get_index_path
+from vector_lake.wiki_utils import get_index_path, normalize_memory_key
 
 log = logging.getLogger("vector-lake-piea")
 
@@ -35,14 +35,6 @@ def _calculate_cosine_similarity(text1: str, text2: str) -> float:
     if not denominator:
         return 0.0
     return float(numerator) / denominator
-
-
-def _normalize_memory_key(value: str) -> str:
-    """Normalize a string by converting to lowercase and replacing non-alphanumeric/CJK chars with underscores."""
-    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
-    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "_", normalized)
-    normalized = re.sub(r"_+", "_", normalized).strip("_")
-    return normalized[:96] or "general"
 
 
 def strip_name(name: str) -> str:
@@ -100,7 +92,7 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
         pass
 
     nodes = index_data.get("nodes", {})
-    candidate_norm = _normalize_memory_key(candidate_title)
+    candidate_norm = normalize_memory_key(candidate_title)
     if not candidate_summary:
         candidate_summary = candidate_title
 
@@ -112,7 +104,7 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
         # 1. Hard Normalization Match (Title or Aliases)
         aliases = node.get("aliases", [])
         if isinstance(aliases, list):
-            alias_norms = [_normalize_memory_key(a) for a in aliases]
+            alias_norms = [normalize_memory_key(a) for a in aliases]
             alias_stripped = [strip_name(a) for a in aliases]
         else:
             alias_norms = []
@@ -182,7 +174,7 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
             # Check against pending entities being created by other concurrent workers
             for key, node in pending_data.items():
                 existing_title = node.get("title", "")
-                existing_norm = _normalize_memory_key(existing_title)
+                existing_norm = normalize_memory_key(existing_title)
                 existing_type = node.get("type", "unknown")
                 
                 # 1. Hard Normalization Match (Pending)

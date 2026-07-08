@@ -27,11 +27,7 @@ CONCURRENCY_LIMIT = 20
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
-    dot = sum(a * b for a, b in zip(v1, v2))
-    norm1 = math.sqrt(sum(a * a for a in v1))
-    norm2 = math.sqrt(sum(a * a for a in v2))
-    return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+from vector_lake.wiki_utils import normalize_memory_key as strip_name, calculate_cosine_similarity
 
 async def llm_semantic_arbiter(client, sem: asyncio.Semaphore, left_name: str, left_summary: str, right_name: str, right_summary: str) -> bool:
     if not client:
@@ -90,15 +86,6 @@ def save_cache(cache: dict):
     with open(cache_path, "wb") as f:
         pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-def strip_name(name: str) -> str:
-    name = name.replace('.md', '')
-    for prefix in ['Concept_', 'Vendor_', 'Person_', 'Product_', 'Event_', 'Policy_', 'Standard_', 'Synthesis_', 'Source_']:
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-    for w in ['系统', '架构', '模型', '法则', '理论', '平台', 'System', 'Model', 'Theory', 'Platform', '与', '的']:
-        name = name.replace(w, '')
-    name = re.sub(r'[\s_\-\(\)]+', '', name)
-    return name.lower()
 
 async def async_run_daemon():
     has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
