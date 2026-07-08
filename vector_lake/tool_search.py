@@ -322,7 +322,7 @@ def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]
     return candidates
 
 
-def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page"):
+def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
     normalized_mode = str(mode or "page").lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
         return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history)
@@ -365,6 +365,14 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 if domain and node.get('domain', '').lower() != domain.lower(): continue
                 if cluster and node.get('topic_cluster', '').lower() != cluster.lower(): continue
                 if not include_history and node.get('status', '').lower() in ('deprecated', 'archived'): continue
+                
+                # V11.2 Hard Metadata Gate
+                if filter_expr:
+                    try:
+                        if not eval(filter_expr, {"__builtins__": {}}, node):
+                            continue
+                    except Exception as e:
+                        log.warning(f"Filter expr evaluation failed for node {key}: {e}")
                 
                 if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
                     score *= 0.2
@@ -457,7 +465,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         if os.path.exists(filepath):
             with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
                 content = handle.read()
-            snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:300]
+            snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:2500]  # V11.2: Expanded chunk limit
             
         tension_edges = node.get("tension_edges", [])
         tension_info = ""

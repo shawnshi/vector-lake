@@ -22,8 +22,14 @@ from vector_lake import get_extension_root
 def prepare_query_context(query_str: str, dry_run: bool = False):
     wiki_dir = str(get_wiki_dir())
     
+    # V11.2 Multi-Hop Parallel Retrieval detection
+    is_comparative = "vs" in query_str.lower() or "对比" in query_str
+    
     context = assemble_context(query_str)
     context_block = ""
+    
+    if is_comparative:
+        context_block += "\n[SYSTEM NOTE: This is a comparative query. Ensure equal retrieval weighting for both sides to avoid skew.]\n"
     if context.get("memory_packet"):
         context_block += (
             f"\n\n--- OPERATIONAL MEMORY PACKET "
