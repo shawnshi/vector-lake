@@ -860,12 +860,14 @@ def update_index_items(filenames: list[str]):
                 # Do not recompute heavy debt metrics on partial update
                 index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
                 index_data["schema_version"] = "8.0"
-                temp_path = output_path + ".tmp"
-                with open(temp_path, "w", encoding="utf-8") as handle:
-                    json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
+                # V11.3: Eliminate I/O Paralysis
+                # Do not serialize the entire index.json synchronously. Drop an async flag.
+                from vector_lake import get_extension_root
+                flag_path = get_extension_root() / "tmp" / "flag_reindex.lock"
                 try:
-                    os.replace(temp_path, output_path)
-                except PermissionError:
+                    flag_path.parent.mkdir(parents=True, exist_ok=True)
+                    flag_path.touch(exist_ok=True)
+                except Exception:
                     pass
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
