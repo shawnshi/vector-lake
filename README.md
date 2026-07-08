@@ -102,6 +102,12 @@ graph LR
 - **批处理防堵写入 (Executemany Bulk Inserts)**：将图谱边构建 (`save_graph_edges`) 与别名表更新中的低效 N+1 查询全数替换为底层 `conn.executemany`，网络拓扑的 I/O 写入性能提升超过 90%。
 - **全局规范化坍缩 (Canonical Normalization)**：彻底清理了多达 4 处重复造轮子的散落代码（如旧版 `strip_name` 等），统一收口于 `wiki_utils.py`。消灭了因子系统规则差异导致同一实体被映射为多个幽灵节点的隐患。
 
+### 🛡️ V11.5 原生子代理并发降维与沙箱免疫 (V11.5 Antigravity Native Subagent & Sandbox Immunity)
+- **原生 Subagent 免费调度 (Native Subagent Routing)**：全面废除了检索重排与后台去重模块中直连 `google-genai` 的昂贵 SDK API 调用，完全退回至通过 `agy -p` 程序化异步唤醒 Antigravity 原生子代理的架构。实现了零附加 API 成本的系统级 LLM 白嫖。
+- **全局线程信号量削峰 (Global Semaphore Storm Breaker)**：在所有原生子代理派生入口挂载了 `threading.Semaphore(3)` 线程锁与 `asyncio` 异步排队阀门。面对 100+ 的大并发检索洪峰，物理层面强行削峰至最大 3 并发排队，彻底终结了操作系统级的“进程风暴”与句柄耗尽雪崩死锁。
+- **参数数组防注入闭环 (Array Injection Shield)**：废除一切 Shell 级字符串组装，改用严密的抽象系统参数数组传递（无 `shell=True`）将 prompt 射入子系统。从物理底层彻底封堵了由于复杂文本与恶意识别符号导致的命令执行 (RCE) 逃逸漏洞。
+- **碎片黑洞湮灭引擎 (Debris Blackhole Eviction)**：执行了地毯式的僵尸垃圾回收，暴力清除了高达 4500+ 的历史死信文件、子代理单次通信 Markdown 残骸以及陈旧的 `.bak`，将文件系统的索引遍历负荷拉平至毫秒级绝对纯净态。
+
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：

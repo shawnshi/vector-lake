@@ -12,6 +12,9 @@ import pickle
 import ast
 import operator
 from filelock import FileLock, Timeout
+import threading
+
+AGY_SEMAPHORE = threading.Semaphore(3)
 
 from vector_lake import governance_store
 from vector_lake import db_store
@@ -146,52 +149,24 @@ def _expand_query_with_llm(query: str) -> list[str]:
             expanded_terms.update(expansions)
             
     try:
-        import subprocess, json
-        from vector_lake import get_extension_root
-        
-        models_to_try = ["gemini-flash-latest"]
-        try:
-            cfg_path = get_extension_root() / "config.json"
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                cascade = cfg.get("llm", {}).get("model_cascade", [])
-                for m in cascade:
-                    if m and m not in models_to_try:
-                        models_to_try.append(m)
-        except Exception:
-            pass
-            
-        prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a JSON array of strings. Query: '{query}'"
-        gemini_exec_name = "gemini.cmd" if os.name == "nt" else "gemini"
-        gemini_exec = shutil.which(gemini_exec_name)
-        
-        if not gemini_exec:
-            log.warning(f"Could not find {gemini_exec_name} in PATH. Skipping LLM expansion.")
-            return expanded_terms
-
-        for model in models_to_try:
-            cmd_args = [gemini_exec]
-            if model and model not in ("default", ""):
-                cmd_args.extend(["-m", model])
-            cmd_args.extend(["-p", "You are an expert search engine query expander.", "--approval-mode", "yolo"])
-
-            try:
-                result = subprocess.run(
-                    cmd_args,
-                    input=prompt.encode('utf-8'),
-                    capture_output=True,
-                    timeout=10
-                )
-                if result.returncode == 0:
-                    stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                    match = re.search(r"\[.*?\]", stdout_str, re.DOTALL)
-                    if match:
-                        terms = json.loads(match.group(0))
-                        expanded_terms.update([str(t) for t in terms])
-                        break
-            except Exception as e:
-                log.warning(f"Model {model} failed via subprocess: {e}")
-                
+        import json, time, shutil, subprocess
+        agy_exec = shutil.which("agy")
+        if agy_exec:
+            prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a JSON array of strings. Query: '{query}'"
+            for attempt in range(3):
+                try:
+                    with AGY_SEMAPHORE:
+                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=30)
+                    if result.returncode == 0:
+                        stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
+                        match = re.search(r"\[.*?\]", stdout_str, re.DOTALL)
+                        if match:
+                            terms = json.loads(match.group(0))
+                            expanded_terms.update([str(t) for t in terms])
+                            break
+                except Exception as e:
+                    log.warning(f"agy expansion failed on attempt {attempt+1}: {e}")
+                    time.sleep(1)
     except Exception as e:
         log.warning(f"LLM query expansion failed: {e}")
 
@@ -367,50 +342,28 @@ def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]
     )
     
     try:
-        import subprocess, json
-        from vector_lake import get_extension_root
-        gemini_exec = "gemini.cmd" if os.name == "nt" else "gemini"
-        
-        models_to_try = ["gemini-flash-latest"]
-        try:
-            cfg_path = get_extension_root() / "config.json"
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                cascade = cfg.get("llm", {}).get("model_cascade", [])
-                for m in cascade:
-                    if m and m not in models_to_try:
-                        models_to_try.append(m)
-        except Exception:
-            pass
-            
-        for model in models_to_try:
-            cmd_args = [gemini_exec]
-            if model and model not in ("default", ""):
-                cmd_args.extend(["-m", model])
-            cmd_args.extend(["-p", "You are an expert search engine reranker.", "--approval-mode", "yolo"])
-
-            try:
-                result = subprocess.run(
-                    cmd_args,
-                    input=prompt.encode('utf-8'),
-                    capture_output=True,
-                    timeout=15
-                )
-                if result.returncode == 0:
-                    stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                    match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
-                    if match:
-                        scores_dict = json.loads(match.group(0))
-                        new_scored = []
-                        for idx, (score, node) in enumerate(candidates):
-                            llm_score = float(scores_dict.get(str(idx), scores_dict.get(idx, 0)))
-                            new_score = score * 0.1 + llm_score * 10
-                            new_scored.append((new_score, node))
-                        new_scored.sort(key=lambda item: item[0], reverse=True)
-                        return new_scored
-            except Exception as e:
-                log.warning(f"Model {model} failed via subprocess: {e}")
-                
+        import json, time, shutil, subprocess
+        agy_exec = shutil.which("agy")
+        if agy_exec:
+            for attempt in range(3):
+                try:
+                    with AGY_SEMAPHORE:
+                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=30)
+                    if result.returncode == 0:
+                        stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
+                        match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
+                        if match:
+                            scores_dict = json.loads(match.group(0))
+                            new_scored = []
+                            for idx, (score, node) in enumerate(candidates):
+                                llm_score = float(scores_dict.get(str(idx), scores_dict.get(idx, 0)))
+                                new_score = score * 0.1 + llm_score * 10
+                                new_scored.append((new_score, node))
+                            new_scored.sort(key=lambda item: item[0], reverse=True)
+                            return new_scored
+                except Exception as e:
+                    log.warning(f"agy reranking failed on attempt {attempt+1}: {e}")
+                    time.sleep(1)
     except Exception as e:
         log.warning(f"LLM Reranking failed: {e}")
         

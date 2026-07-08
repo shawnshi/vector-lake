@@ -30,8 +30,12 @@ def _utc_now() -> str:
 from vector_lake.wiki_utils import normalize_memory_key as strip_name, calculate_cosine_similarity
 
 async def llm_semantic_arbiter(client, sem: asyncio.Semaphore, left_name: str, left_summary: str, right_name: str, right_summary: str) -> bool:
-    if not client:
+    import shutil
+    import asyncio
+    agy_exec = shutil.which("agy")
+    if not agy_exec:
         return True
+    
     prompt = f"""You are a strict Medical Knowledge Graph Ontology Arbiter.
 Analyze the following two entities:
 Entity 1: [{left_name}] - {left_summary}
@@ -42,16 +46,23 @@ If they are merely related (e.g., cause/effect, platform/paradigm, whole/part, c
 
 Answer with exactly one word: YES if they are the exact same concept and should be merged. NO if they are distinct concepts.
 """
-    async with sem:
+    for attempt in range(3):
         try:
-            response = await client.aio.models.generate_content(
-                model="gemini-3.5-flash",
-                contents=prompt
-            )
-            return "YES" in response.text.upper()
+            async with sem:
+                process = await asyncio.create_subprocess_exec(
+                    agy_exec, "-p", prompt,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+            if process.returncode == 0:
+                return "YES" in stdout.decode('utf-8', errors='replace').upper()
+            else:
+                log.error(f"agy arbiter failed: {stderr.decode('utf-8', errors='replace')}")
         except Exception as e:
-            log.error(f"LLM Arbiter failed: {e}")
-            return True
+            log.error(f"LLM Arbiter failed on attempt {attempt+1}: {e}")
+            await asyncio.sleep(1)
+    return True
 
 async def fetch_embedding(client, sem: asyncio.Semaphore, title: str, text_to_embed: str) -> list[float]:
     async with sem:
