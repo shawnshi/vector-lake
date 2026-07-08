@@ -3,7 +3,7 @@ name: graph
 version: 11.1.0
 tier: action-allowed
 description: 'Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.'
-triggers: 'Visualize graph', 'show topology', 'render vector lake', '3d network graph'
+triggers: "Visualize graph, show topology, render vector lake, 3d network graph"
 ---
 
 <system_instructions>
