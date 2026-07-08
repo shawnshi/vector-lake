@@ -165,14 +165,30 @@ async def async_run_daemon():
         if tasks:
             log.info(f"Generating new embeddings concurrently for {len(tasks)} entities...")
             results = await asyncio.gather(*tasks)
-            for (key, text_hash, title), vector in zip(keys_to_embed, results):
-                if vector:
-                    cached_embeddings[key] = {
-                        "hash": text_hash,
-                        "vector": vector,
-                        "title": title
-                    }
-                    updates_made = True
+            
+            # Write to vec_embeddings table
+            from vector_lake.db_store import get_connection, transaction
+            import sqlite_vec
+            
+            try:
+                with transaction() as conn:
+                    for (key, text_hash, title), vector in zip(keys_to_embed, results):
+                        if vector:
+                            cached_embeddings[key] = {
+                                "hash": text_hash,
+                                "vector": vector,
+                                "title": title
+                            }
+                            updates_made = True
+                            
+                            vector_blob = sqlite_vec.serialize_float32(vector)
+                            conn.execute(
+                                "INSERT OR REPLACE INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)",
+                                (key, vector_blob)
+                            )
+            except Exception as e:
+                log.error(f"Failed to insert into vec_embeddings: {e}")
+                
             if updates_made:
                 save_cache(cache)
 
