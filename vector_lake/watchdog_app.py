@@ -224,8 +224,9 @@ def scheduled_lint_loop():
                         env["PYTHONIOENCODING"] = "utf-8"
                         
                         from vector_lake import get_extension_root
+                        from pathlib import Path
                         plugin_dir = get_extension_root()
-                        gemini_root = plugin_dir.parent.parent.parent
+                        gemini_root = Path("~/.gemini").expanduser()
                         
                         daemon_scripts = [
                             ("Metadata Decay Daemon", str(gemini_root / "scripts" / "metadata_decay_daemon.py")),

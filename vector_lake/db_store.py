@@ -49,8 +49,13 @@ def transaction():
 
 def init_db():
     conn = get_connection()
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        in_tx = getattr(_LOCAL, 'in_transaction', False)
+        if not in_tx:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("PRAGMA foreign_keys=ON")
     with conn:
         conn.execute("""
@@ -67,13 +72,11 @@ def init_db():
                 embedding float[3072]
             )
         """)
-        try:
-            conn.execute("ALTER TABLE entities ADD COLUMN type TEXT")
-            conn.execute("ALTER TABLE entities ADD COLUMN status TEXT")
-            conn.execute("ALTER TABLE entities ADD COLUMN ttl INTEGER")
-            conn.execute("ALTER TABLE entities ADD COLUMN decay_weight REAL")
-        except Exception:
-            pass
+        for col, col_type in [("type", "TEXT"), ("status", "TEXT"), ("ttl", "INTEGER"), ("decay_weight", "REAL")]:
+            try:
+                conn.execute(f"ALTER TABLE entities ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claims (
                 claim_id TEXT PRIMARY KEY,
@@ -182,6 +185,17 @@ def init_db():
                 processed_at TEXT
             )
         """)
+        
+        # Add expression-based indexes for performance
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities (json_extract(data_json, '$.type'))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_status ON entities (json_extract(data_json, '$.status'))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON operational_memory (json_extract(data_json, '$.memory_type'))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_status ON operational_memory (json_extract(data_json, '$.status'))")
+        except sqlite3.OperationalError as e:
+            # Older SQLite versions might not support expression indexes
+            import logging
+            logging.getLogger("vector-lake-db").warning(f"Could not create JSON expression indexes: {e}")
 
 
 
@@ -197,7 +211,7 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
         text_tok = " ".join(list(text)) if text else ""
 
     conn = get_connection()
-    with conn:
+    with transaction():
         # FTS5 doesn't support ON CONFLICT REPLACE directly, so we delete then insert.
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("""
@@ -207,7 +221,7 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
 
 def delete_search_index(node_key: str):
     conn = get_connection()
-    with conn:
+    with transaction():
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:

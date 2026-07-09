@@ -138,12 +138,12 @@ def _expand_query_with_llm(query: str) -> list[str]:
     try:
         import json, time, shutil, subprocess
         agy_exec = shutil.which("agy")
-        if agy_exec:
+        if agy_exec and os.environ.get("VECTOR_LAKE_FAST_SEARCH") != "1":
             prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a JSON array of strings. Query: '{query}'"
-            for attempt in range(3):
+            for attempt in range(1):
                 try:
                     with AGY_SEMAPHORE:
-                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=30)
+                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=8)
                     if result.returncode == 0:
                         stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
                         match = re.search(r"\[.*?\]", stdout_str, re.DOTALL)
@@ -331,11 +331,11 @@ def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]
     try:
         import json, time, shutil, subprocess
         agy_exec = shutil.which("agy")
-        if agy_exec:
-            for attempt in range(3):
+        if agy_exec and os.environ.get("VECTOR_LAKE_FAST_SEARCH") != "1":
+            for attempt in range(1):
                 try:
                     with AGY_SEMAPHORE:
-                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=30)
+                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=8)
                     if result.returncode == 0:
                         stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
                         match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
@@ -443,14 +443,18 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     try:
         current_mtime = os.path.getmtime(index_path)
         if _INDEX_CACHE["mtime"] != current_mtime or _INDEX_CACHE["data"] is None:
-            with FileLock(lock_path, timeout=5):
-                with open(index_path, "r", encoding="utf-8") as handle:
-                    _INDEX_CACHE["data"] = json.load(handle)
-                    _INDEX_CACHE["mtime"] = current_mtime
+            import time
+            for attempt in range(3):
+                try:
+                    with open(index_path, "r", encoding="utf-8") as handle:
+                        _INDEX_CACHE["data"] = json.load(handle)
+                        _INDEX_CACHE["mtime"] = current_mtime
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise e
+                    time.sleep(0.2)
         index_data = _INDEX_CACHE["data"]
-    except Timeout:
-        log.warning("Timeout acquiring lock for index.json during search. System is busy.")
-        return "System is currently busy syncing the knowledge base. Please try again in a few seconds."
     except Exception as e:
         log.error(f"Failed to read index.json: {e}")
         return "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
@@ -633,19 +637,20 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     index_path = str(get_index_path())
     lock_path = index_path + ".lock"
     if os.path.exists(index_path):
-        try:
-            with FileLock(lock_path, timeout=5):
+        import time
+        for attempt in range(3):
+            try:
                 with open(index_path, "r", encoding="utf-8") as handle:
                     index_data = json.load(handle)
-            lines = []
-            for key, node in list(index_data.get("nodes", {}).items())[:50]:
-                lines.append(f"[{node.get('type', '?')}] {node.get('title', key)}")
-            index_summary = "\n".join(lines)[:index_budget]
-        except Timeout:
-            log.warning("Timeout acquiring lock for index.json during context assembly.")
-            index_summary = "[Index currently locked for update]"
-        except Exception:
-            pass
+                lines = []
+                for key, node in list(index_data.get("nodes", {}).items())[:50]:
+                    lines.append(f"[{node.get('type', '?')}] {node.get('title', key)}")
+                index_summary = "\n".join(lines)[:index_budget]
+                break
+            except Exception:
+                if attempt == 2:
+                    index_summary = "[Index read failed]"
+                time.sleep(0.2)
 
     purpose = ""
     try:

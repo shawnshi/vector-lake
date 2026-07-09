@@ -227,9 +227,9 @@ def query_entities(filters: dict = None) -> dict:
             if not re.match(r"^[a-zA-Z0-9_]+(!=)?$", k):
                 raise ValueError(f"Security error: Invalid filter key '{k}'. Keys must be alphanumeric.")
             if k.endswith("!="):
-                clauses.append(f"{k[:-2]} != ?")
+                clauses.append(f"json_extract(data_json, '$.{k[:-2]}') != ?")
             else:
-                clauses.append(f"{k} = ?")
+                clauses.append(f"json_extract(data_json, '$.{k}') = ?")
             params.append(v)
         query += " WHERE " + " AND ".join(clauses)
     rows = conn.execute(query, tuple(params)).fetchall()
@@ -278,9 +278,9 @@ def query_memory_objects(filters: dict = None) -> dict:
             if not re.match(r"^[a-zA-Z0-9_]+(!=)?$", k):
                 raise ValueError(f"Security error: Invalid filter key '{k}'. Keys must be alphanumeric.")
             if k.endswith("!="):
-                clauses.append(f"{k[:-2]} != ?")
+                clauses.append(f"json_extract(data_json, '$.{k[:-2]}') != ?")
             else:
-                clauses.append(f"{k} = ?")
+                clauses.append(f"json_extract(data_json, '$.{k}') = ?")
             params.append(v)
         query += " WHERE " + " AND ".join(clauses)
     rows = conn.execute(query, tuple(params)).fetchall()
@@ -323,7 +323,7 @@ def save_sources(data):
 def save_graph_edges(edges: list[dict]):
     if not edges: return
     conn = get_connection()
-    with conn:
+    with transaction():
         records = [
             (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
             for edge in edges
@@ -338,7 +338,7 @@ def save_alias_registry(data):
     conn = get_connection()
     now = _utc_now()
     data["updated_at"] = now
-    with conn:
+    with transaction():
         records = [(k, v, now) for k, v in data.get("items", {}).items()]
         if records:
             conn.executemany("INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)", records)
@@ -381,12 +381,12 @@ def upsert_entity(entity_id: str, data: dict):
         json.dumps(data, ensure_ascii=False),
         now
     ]
-    with conn:
+    with transaction():
         conn.execute(f"INSERT OR REPLACE INTO entities ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", params)
 
 def delete_entity(entity_id: str):
     conn = get_connection()
-    with conn:
+    with transaction():
         conn.execute("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
 # =============================================================================
 
@@ -700,6 +700,12 @@ def _resolve_memory_conflicts(store: dict) -> dict:
 def rebuild_operational_memory() -> dict:
     claims = annotated_claims()
     store = _default_map_store("memory_id")
+    
+    existing_store = load_memory_objects()
+    for mem_id, mem in existing_store.get("items", {}).items():
+        if not mem.get("source_claim_id"):
+            store["items"][mem_id] = mem
+            
     for claim in claims:
         memory = _memory_object_from_claim(claim)
         store["items"][memory["memory_id"]] = memory
@@ -736,31 +742,45 @@ def search_operational_memory(
     memory_types: list[str] | None = None,
     include_history: bool = False,
 ) -> list[dict]:
-    store = load_memory_objects()
-    if not store.get("items") and load_claims().get("items"):
-        store = rebuild_operational_memory()
+    initialize_meta_store()
+    conn = get_connection()
+    count_row = conn.execute("SELECT COUNT(*) as c FROM operational_memory").fetchone()
+    
+    if count_row and count_row["c"] == 0:
+        c_claims = conn.execute("SELECT COUNT(*) as c FROM claims").fetchone()
+        if c_claims and c_claims["c"] > 0:
+            rebuild_operational_memory()
 
     allowed_types = None
     if memory_types:
         allowed_types = {str(item).strip().lower().replace("-", "_") for item in memory_types}
 
+    sql_query = "SELECT data_json FROM operational_memory WHERE 1=1"
+    params = []
+    
+    if allowed_types:
+        placeholders = ",".join(["?"] * len(allowed_types))
+        sql_query += f" AND json_extract(data_json, '$.memory_type') IN ({placeholders})"
+        params.extend(allowed_types)
+        
+    hidden_states = {"archived", "expired", "superseded"}
+    if not include_history:
+        placeholders = ",".join(["?"] * len(hidden_states))
+        sql_query += f" AND LOWER(json_extract(data_json, '$.validity_state')) NOT IN ({placeholders})"
+        params.extend(hidden_states)
+
     terms = _query_terms(query)
     ranked = []
-    hidden_states = {"archived", "expired", "superseded"}
-    for memory in store.get("items", {}).values():
-        memory_type = str(memory.get("memory_type", "fact")).lower()
-        if allowed_types and memory_type not in allowed_types:
-            continue
-        state = str(memory.get("validity_state", "active")).lower()
-        if not include_history and state in hidden_states:
-            continue
+    
+    cursor = conn.execute(sql_query, tuple(params))
+    for row in cursor.fetchall():
+        memory = json.loads(row["data_json"])
         relevance = _memory_relevance(memory, terms)
         if relevance <= 0 and terms:
             continue
         score = relevance + (float(memory.get("memory_score", 0) or 0) * 5)
-        item = copy.deepcopy(memory)
-        item["retrieval_score"] = round(score, 4)
-        ranked.append(item)
+        memory["retrieval_score"] = round(score, 4)
+        ranked.append(memory)
 
     ranked.sort(
         key=lambda item: (

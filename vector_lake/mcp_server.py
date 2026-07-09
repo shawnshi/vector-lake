@@ -41,9 +41,12 @@ def _read_payload(payload_file: str) -> str:
     if not payload_file:
         return ""
     import os
-    abs_path = os.path.abspath(payload_file)
-    if ".gemini" not in abs_path:
+    from pathlib import Path
+    abs_path = Path(payload_file).resolve()
+    gemini_base = Path(os.path.expanduser("~/.gemini")).resolve()
+    if not abs_path.is_relative_to(gemini_base):
         raise ValueError(f"[Security Error] Payload file must be within the .gemini sandbox: {payload_file}")
+    abs_path = str(abs_path)
     if not os.path.exists(abs_path):
         raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Please use write_to_file to create it first.")
     with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -245,8 +248,11 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
 def visualize_vector_lake(output_dir: str = None) -> str:
     """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
     if output_dir:
-        abs_dir = os.path.abspath(output_dir)
-        if ".gemini" not in abs_dir:
+        from pathlib import Path
+        import os
+        abs_dir = Path(output_dir).resolve()
+        gemini_base = Path(os.path.expanduser("~/.gemini")).resolve()
+        if not abs_dir.is_relative_to(gemini_base):
             return f"Error: Write operations must be contained within a .gemini path boundary to prevent path traversal."
     return tools.visualize_vector_lake(output_dir)
 
@@ -290,21 +296,25 @@ def propose_schema_mutation(new_category: str, payload_file: str, parent_categor
         description = _read_payload(payload_file)
     except Exception as e:
         return str(e)
-    queue = load_governance_queue()
-    item_id = f"gov_{uuid.uuid4().hex[:12]}"
-    queue.setdefault("items", []).append({
-        "item_id": item_id,
-        "type": "schema-mutation",
-        "title": f"New Schema Category: {new_category}",
-        "description": f"Definition: {description}\nParent: {parent_category}",
-        "created_at": _utc_now(),
-        "status": "pending",
-        "source": "mcp-agent",
-        "affected_ids": [],
-        "search_queries": [],
-        "affected_pages": ["SCHEMA_CATEGORIES.md"],
-    })
-    save_governance_queue(queue)
+    from filelock import FileLock
+    from vector_lake.wiki_utils import get_meta_dir
+    lock_path = str(get_meta_dir() / "governance_queue.lock")
+    with FileLock(lock_path, timeout=10):
+        queue = load_governance_queue()
+        item_id = f"gov_{uuid.uuid4().hex[:12]}"
+        queue.setdefault("items", []).append({
+            "item_id": item_id,
+            "type": "schema-mutation",
+            "title": f"New Schema Category: {new_category}",
+            "description": f"Definition: {description}\nParent: {parent_category}",
+            "created_at": _utc_now(),
+            "status": "pending",
+            "source": "mcp-agent",
+            "affected_ids": [],
+            "search_queries": [],
+            "affected_pages": ["SCHEMA_CATEGORIES.md"],
+        })
+        save_governance_queue(queue)
     return f"Schema mutation proposed and logged as {item_id} for review."
 
 

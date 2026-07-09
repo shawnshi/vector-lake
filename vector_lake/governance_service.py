@@ -131,9 +131,18 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                     if right_bak and os.path.exists(right_bak):
                         os.remove(right_bak)
 
-        item["status"] = "resolved"
-        item["resolution"] = resolution
-        item["resolved_at"] = _utc_now()
-        governance_store.save_governance_queue(queue)
+        from filelock import FileLock
+        from vector_lake.wiki_utils import get_meta_dir
+        lock_path = str(get_meta_dir() / "governance_queue.lock")
+        with FileLock(lock_path, timeout=10):
+            current_queue = governance_store.load_governance_queue()
+            for q_item in current_queue.get("items", []):
+                if q_item.get("item_id") == item_id:
+                    q_item["status"] = "resolved"
+                    q_item["resolution"] = resolution
+                    q_item["resolved_at"] = _utc_now()
+                    item = q_item
+                    break
+            governance_store.save_governance_queue(current_queue)
         return item
     return None

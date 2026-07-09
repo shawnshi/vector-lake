@@ -308,7 +308,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
             triples.append({"predicate": predicate, "target": target})
             
     # 2. Catch legacy or plain links
-    for match in re.finditer(r"(?<!::\s)\[\[(.*?)\]\]", body):
+    for match in re.finditer(r"(?<!::)(?<!::\s)\[\[(.*?)\]\]", body):
         link_text = match.group(1).split("|")[0].strip().replace(".md", "")
         if link_text and "::" not in link_text:
             log.warning(f"Legacy/Un-typed link [[{link_text}]] found in {node_key}. Defaulting to [mentions::]")
@@ -337,6 +337,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "links": sorted(links),
         "triples": triples,
         "summary": summary_text[:240],
+        "raw_text": body,
         "decay_weight": round(decay_weight, 4),
         "alignment_score": round(alignment_score, 2),
     }

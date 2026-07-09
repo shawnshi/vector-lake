@@ -115,6 +115,13 @@ graph LR
 - **中文原质双轨分词引擎 (FTS5 + Jieba Pre-tokenization)**：废除 SQLite FTS5 自带导致中文崩盘的 `porter unicode61` 字符级碎屑拆解。利用 `jieba` 在入库和检索前进行离线白盒分词预处理，实现专业医疗名词的 100% 绝对命中率。
 - **跨界原子级两阶段提交 (Cross-Storage 2PC Atomicity)**：将底层 SQLite 数据库写盘与外部索引 `index.json` 落盘强制物理挂载至同一层面的事务块中，通过利用 `os.replace` 与 SQLite `with transaction()` 达成极严苛的跨存储一致性。
 - **文件系统无尽重试 (Exponential I/O Backoff)**：重塑了 `refresh_graph_topology_if_dirty` 中的并发写入锁逻辑，用指数退避（最高5次）替代了原先的“静默忽略”，从物理层级消灭了文件争用导致的拓扑损坏。
+
+### 🔒 V11.7 数据底座安全加固与无锁检索重构 (V11.7 Database Hardening & Lock-free Search)
+- **真·无锁高并发检索 (Lock-free Read Concurrency)**：彻底移除了 `tool_search.py` 读取 `index.json` 时的排他文件锁 (FileLock)。利用底层 `os.replace` 的系统级原子性，结合带短暂自旋退避的容错读取，使得大批量子代理并发调用检索 API 时不再陷入排队阻塞，彻底清除了检索高峰期抛出的 “System is busy” 崩溃错误，将读取性能推向极限。
+- **查询过滤 SQL 级下推 (SQL Pushdown Filtering)**：打破了早期伪“原子化”读取的幻想。针对 `search_operational_memory` 及各类实体查询，彻底摒弃了全量加载至 Python 内存字典后再做迭代过滤的 O(N) 重灾区。通过动态构建安全的表达式 SQL 查询，将状态 (`validity_state`) 与类型筛选下推至 SQLite 引擎，消除内存序列化暴涨导致的假死与 OOM 风险。
+- **防呆 Schema 与 JSON 索引跃迁 (Fail-safe Schema & JSON Indexing)**：重写了 `db_store.py` 中脆弱的静默 `except Exception: pass` 表结构迁移逻辑，精确收紧至 `sqlite3.OperationalError`。同时，为 `data_json` 列中的高频字段（`$.type`, `$.status`, `$.memory_type`）注入了基于表达式的 B 树索引 (Expression-based Indexes)，彻底扫除了图谱重构或批量扫描时由 SQLite 触发的全表扫描梦魇。
+- **动态寻址守护管线 (Dynamic Daemon Resolution)**：将 `watchdog_app.py` 中硬编码、极度脆弱的 `parent.parent` 相对路径定时任务唤醒机制，全面重构为基于 `~/.gemini` 的绝对路径动态寻址器。无论工作区如何漂移或被软链接代理，核心的图谱衰变 (`decay_daemon`) 与死链回收清洗机制都能坚韧执行。
+- **LLM 同步死锁解绑 (Synchronous LLM Unblocking)**：废除了 `_expand_query_with_llm` 中不可理喻的 30 秒硬超时同步等待与无限重试陷阱，将超时时限强制收紧至极短的 8 秒单次探测。并新增 `VECTOR_LAKE_FAST_SEARCH` 逃生舱，使得对于高频机械检索可以一键剥离大模型介入，归还毫秒级极致检索体验。
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：

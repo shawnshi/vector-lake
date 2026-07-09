@@ -217,7 +217,9 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
 
         evidence_ids = []
         for raw_ref, source_id in zip(sources, source_ids):
-            evidence_id = _stable_id("evidence", f"{page_key}:{block_index}:{raw_ref}:{cleaned_text}")
+            if len(sources) > 1 and page_type != "source" and raw_ref not in inline_sources:
+                continue
+            evidence_id = _stable_id("evidence", f"{page_key}:{raw_ref}:{cleaned_text}")
             evidence_ids.append(evidence_id)
             evidence_records.append({
                 "evidence_id": evidence_id,
@@ -235,7 +237,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             })
 
         claim_id = frontmatter.get("claim_id") if block_index == 1 else None
-        claim_id = claim_id or _stable_id("claim", f"{page_key}:{block_index}:{cleaned_text}")
+        claim_id = claim_id or _stable_id("claim", f"{page_key}:{cleaned_text}")
         claim_record = {
             "claim_id": claim_id,
             "claim_text": cleaned_text,
