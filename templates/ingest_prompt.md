@@ -17,7 +17,7 @@ Task:
 1. Read the Source Path content using `view_file`. If `view_file` fails due to MIME type restrictions, fallback to running a Python script with `errors="ignore"` to read the file forcefully.
 2. Extract the core entities, concepts, and tensions based on the Schema.
 3. If a `确定性结构 (Static Skeleton)` block is provided above, you MUST copy it EXACTLY into the final output under the `## 确定性结构 (Static Skeleton)` section. Do not alter or summarize it.
-4. Write the JSON array of new wiki nodes to a temporary file (e.g. `files_written.json`) using `write_to_file`, and write `{"filepath": "{{filepath}}", "hash": "{{file_hash}}"}` to another temporary file (e.g. `raw_files.json`). Then call the lazy MCP tool `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="finalize_ingest") with `files_written_payload_file` and `raw_files_payload_file` pointing to the absolute paths of these files.
+4. Write the JSON array of new wiki nodes to a temporary file (e.g. `files_written_{{file_hash}}.json`) using `write_to_file`, and write `{"filepath": "{{filepath}}", "hash": "{{file_hash}}"}` to another temporary file (e.g. `raw_files_{{file_hash}}.json`). Then call the lazy MCP tool `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="finalize_ingest") with `files_written_payload_file` and `raw_files_payload_file` pointing to the absolute paths of these files.
 5. 闭环执行 (Agentic Workflow): If contradictions or duplicates are found, you MUST NOT just output text. You MUST declare them using `tension_edges` in the YAML frontmatter. If a new schema category is needed, use the `propose_schema_mutation` MCP tool.
 
 [CRITICAL REQUIREMENT: MICRO-ASSET FUNNEL]
