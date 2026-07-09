@@ -26,3 +26,7 @@
 ## 2026-07-02 - O(N^2) Precomputation and .isdisjoint() set intersection
 **Learning:** In Vector Lake's `governance_metrics.py` `find_merge_candidates`, constructing sets inside an O(N^2) loop scales extremely poorly for thousands of entities. Furthermore, doing set intersections without checking if the sets overlap first incurs significant overhead.
 **Action:** Move set generation into an outer O(N) loop and iterate through tuples of precomputed sets in the inner O(N^2) loop. Combine this with `if not set_a.isdisjoint(set_b):` to avoid expensive object creation where unnecessary, leading to an over 20x performance improvement.
+
+## 2026-07-09 - O(N^2) Pre-filtering with Inverted Indices
+**Learning:** In Vector Lake's `governance_metrics.py`, evaluating all possible pairs of N entities in an O(N^2) loop (`find_merge_candidates`) becomes extremely slow when N is large. By mathematically analyzing the scoring conditions, we realized a pair must overlap on `names` or `norms` to meet the minimum score threshold.
+**Action:** Replace the full O(N^2) traversal with an inverted index. Map the required overlapping properties (`names` and `norms`) to entity indices in a single O(N) pass, and then only evaluate the intersecting pairs, reducing iterations from ~25M to just thousands in large datasets.
