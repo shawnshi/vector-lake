@@ -175,6 +175,15 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
                 all_vals.append(tuple(params))
             
             conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", all_vals)
+        
+        # V10.1 Diff-based synchronization (Avoid full table wipe)
+        existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
+        existing_keys = {row[0] for row in existing_keys_query}
+        new_keys = set(data.get("items", {}).keys())
+        keys_to_delete = existing_keys - new_keys
+        
+        if keys_to_delete:
+            conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
 
 def _save_db_queue(table_name: str, pk_col: str, data: dict):
     _validate_table_name(table_name)
@@ -1068,7 +1077,8 @@ def apply_change_set(change_set: dict) -> dict:
             # Prune claims no longer in the markdown
             keys_to_remove = []
             for k, v in claims.get("items", {}).items():
-                locator_page = v.get("locator", {}).get("page_key")
+                source_page = v.get("source_page", "")
+                locator_page = source_page[:-3] if source_page.endswith(".md") else source_page
                 if locator_page in affected_page_keys and k not in proposed_claim_ids:
                     keys_to_remove.append(k)
             if keys_to_remove:
@@ -1080,7 +1090,8 @@ def apply_change_set(change_set: dict) -> dict:
             # Prune evidence no longer in the markdown
             keys_to_remove = []
             for k, v in evidence.get("items", {}).items():
-                locator_page = v.get("locator", {}).get("page_key")
+                source_page = v.get("source_page", "")
+                locator_page = source_page[:-3] if source_page.endswith(".md") else source_page
                 if locator_page in affected_page_keys and k not in proposed_evidence_ids:
                     keys_to_remove.append(k)
             if keys_to_remove:

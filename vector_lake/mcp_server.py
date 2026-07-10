@@ -272,7 +272,10 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
     import os
     try:
         wiki_dir = get_wiki_dir()
-        file_path = os.path.join(wiki_dir, filename)
+        abs_wiki = os.path.abspath(wiki_dir)
+        file_path = os.path.abspath(os.path.join(abs_wiki, filename))
+        if not file_path.startswith(abs_wiki):
+            return "[Security Error] Path traversal detected."
         safe_write_markdown(file_path, content)
         from vector_lake.indexer import update_index_item
         update_index_item(filename)

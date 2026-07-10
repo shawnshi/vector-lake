@@ -79,26 +79,25 @@ def compile_overviews():
         top_nodes = domain_nodes[:50]
         tail_nodes = domain_nodes[50:]
 
-        overview_filename = f"Overview_{domain}.md"
+        overview_filename = f"Concept_Overview_{domain}.md"
         overview_path = os.path.join(wiki_dir, overview_filename)
 
         content = [
             f"# Domain Overview: {domain}",
             "",
             "*[System Directive: This is an automatically compiled read model of the domain based on node_score (Centrality * Freshness). Do not manually edit this file.]*",
-            ""
         ]
 
         # Inject Cross-Domain Gravity Anchors
         if domain in cross_domain_counts and cross_domain_counts[domain]:
             top_related = sorted(cross_domain_counts[domain].items(), key=lambda x: x[1], reverse=True)[:3]
-            links_str = ", ".join([f"[[Overview_{rd[0]}]] ({rd[1]}次跨域握手)" for rd in top_related])
+            links_str = ", ".join([f"[[Concept_Overview_{rd[0]}]] ({rd[1]}次跨域握手)" for rd in top_related])
             content.append(f"> 🔄 **强关联领域**: {links_str}")
             content.append("")
 
         content.append(f"**Total Nodes in Domain:** {len(domain_nodes)}")
         content.append("")
-
+        
         # Inject Rising Stars (updated within 7 days)
         recent_nodes = []
         for score, key, node in domain_nodes:
@@ -151,8 +150,8 @@ def compile_overviews():
             content.append("\n</details>")
 
         try:
-            with open(overview_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(content))
+            from vector_lake.wiki_utils import safe_write_markdown
+            safe_write_markdown(overview_path, "\n".join(content))
             log.info(f"Compiled {overview_filename} with {len(top_nodes)} top nodes and {len(tail_nodes)} tail nodes.")
         except Exception as e:
             log.error(f"Failed to write {overview_filename}: {e}")

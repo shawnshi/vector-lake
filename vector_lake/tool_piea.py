@@ -98,7 +98,7 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
 
     for key, node in nodes.items():
         existing_title = node.get("title", "").strip('"').strip("'")
-        existing_norm = _normalize_memory_key(existing_title)
+        existing_norm = normalize_memory_key(existing_title)
         existing_type = node.get("type", "unknown")
 
         # 1. Hard Normalization Match (Title or Aliases)

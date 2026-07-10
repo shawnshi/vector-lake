@@ -477,7 +477,10 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
         for row in fts_results:
             key = row['node_key']
-            fts_score = row['rank'] * -1.0  # SQLite BM25 is negative
+            raw_score = row.get('rank')
+            if raw_score is None:
+                raw_score = row.get('score', 0)
+            fts_score = raw_score * -1.0  # SQLite BM25 is negative
             hybrid_scores[key] = hybrid_scores.get(key, 0.0) + fts_score
     except Exception as e:
         log.error(f"FTS5 Search failed: {e}")

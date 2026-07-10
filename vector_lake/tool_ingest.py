@@ -99,7 +99,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     for filepath in files_to_process:
         file_hash = calculate_hash(filepath)
         if not file_hash: continue
-        if filepath in processed and processed[filepath].get("hash") == file_hash:
+        if filepath in processed and processed[filepath] == file_hash:
             continue
         pending_files.append((filepath, file_hash))
         

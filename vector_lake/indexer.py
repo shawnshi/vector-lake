@@ -703,16 +703,24 @@ def generate_index():
     index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
     _apply_graph_topology(index_data)
     
+    index_data["categories"] = list(index_data["categories"])
+    index_data["governance_metrics"] = governance_metrics.compute_debt_metrics(skip_heavy=True)
+    index_data["schema_version"] = "8.0"
+
+    output_path = str(get_index_path())
+    claim_graph_path = str(get_claim_graph_path())
+    tmp_output = output_path + ".tmp"
+    tmp_claim = claim_graph_path + ".tmp"
+    
+    _write_claim_graph(tmp_claim, governance_store.build_claim_graph_projection())
+    _write_index(tmp_output, index_data)
+
     with transaction():
         _build_bm25_index(index_data)
-        index_data["categories"] = list(index_data["categories"])
-        index_data["governance_metrics"] = governance_metrics.compute_debt_metrics(skip_heavy=True)
-        index_data["schema_version"] = "8.0"
 
-        output_path = str(get_index_path())
-        claim_graph_path = str(get_claim_graph_path())
-        _write_claim_graph(claim_graph_path, governance_store.build_claim_graph_projection())
-        _write_index(output_path, index_data)
+    os.replace(tmp_claim, claim_graph_path)
+    os.replace(tmp_output, output_path)
+
     log.info(
         f"Generated index.json with {len(index_data['nodes'])} nodes | "
         f"{len(index_data['weighted_edges'])} weighted edges | "

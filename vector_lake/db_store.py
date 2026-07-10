@@ -230,7 +230,7 @@ def delete_node_cascade(node_key: str):
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM entities WHERE entity_id = ?", (node_key,))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
-        conn.execute("DELETE FROM claims WHERE entity_id = ?", (node_key,))
+        conn.execute("DELETE FROM claims WHERE json_extract(data_json, '$.source_page') = ? OR json_extract(data_json, '$.source_page') = ?", (node_key, node_key + ".md"))
         conn.execute("DELETE FROM claim_graph_nodes WHERE node_id = ?", (node_key,))
         conn.execute("DELETE FROM claim_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
         conn.execute("DELETE FROM sources WHERE source_id = ?", (node_key,))
