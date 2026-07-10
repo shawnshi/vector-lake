@@ -35,8 +35,9 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                     left_path, right_path = None, None
                     
                     # AHE Phase 3: Snapshot state before mutation
-                    old_registry = governance_store.load_alias_registry()
-                    old_entities = governance_store.load_entities()
+                    old_right_alias = governance_store.get_alias(right_id)
+                    old_right_entity = governance_store.get_entity(right_id)
+                    old_left_entity = governance_store.get_entity(left_id)
                     
                     if left_name and right_name:
                         wiki_dir = get_wiki_dir()
@@ -74,22 +75,20 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                                 raise RuntimeError(f"LLM Semantic Merge failed: {e}") from e
 
                     # Update the alias registry to map right to left
-                    registry = governance_store.load_alias_registry()
-                    registry["items"][right_id] = left_id
-                    governance_store.save_alias_registry(registry)
+                    governance_store.upsert_alias(right_id, left_id)
                     
                     # Update entities file to mark right_id as merged/deprecated
-                    entities = governance_store.load_entities()
-                    if right_id in entities["items"]:
-                        entities["items"][right_id]["status"] = "Merged"
-                        entities["items"][right_id]["merged_into"] = left_id
-                        governance_store.save_entities(entities)
+                    right_entity = governance_store.get_entity(right_id)
+                    if right_entity:
+                        right_entity["status"] = "Merged"
+                        right_entity["merged_into"] = left_id
+                        governance_store.upsert_entity(right_id, right_entity)
 
                     # AHE Phase 3: Manifest Validation & Revert
                     if change_manifest:
                         try:
                             # Verify expectations
-                            if old_entities["items"].get(left_id, {}).get("merged_into") == right_id:
+                            if old_left_entity and old_left_entity.get("merged_into") == right_id:
                                 raise ValueError("Cycle detected: Target is already merged into Source.")
                             
                             # Verify against manifest thresholds (example: max expected dead links)
@@ -97,31 +96,23 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                                 # Quick cycle check in registry
                                 visited = set()
                                 current = right_id
-                                while current in registry["items"]:
+                                while current:
                                     if current in visited:
                                         raise ValueError("AHE Contract Failed: Alias cycle detected.")
                                     visited.add(current)
-                                    current = registry["items"][current]
+                                    current = governance_store.get_alias(current)
                         except Exception as e:
                             log.error(f"AHE Contract Failed: {e}. Executing ROLLBACK.")
                             
-                            r = governance_store.load_alias_registry()
-                            if right_id in old_registry["items"]:
-                                r["items"][right_id] = old_registry["items"][right_id]
-                            elif right_id in r["items"]:
-                                conn = governance_store.get_connection()
-                                conn.execute("DELETE FROM alias_registry WHERE key = ?", (right_id,))
-                                del r["items"][right_id]
-                            governance_store.save_alias_registry(r)
+                            if old_right_alias is not None:
+                                governance_store.upsert_alias(right_id, old_right_alias)
+                            else:
+                                governance_store.delete_alias(right_id)
                             
-                            e_store = governance_store.load_entities()
-                            if right_id in old_entities["items"]:
-                                e_store["items"][right_id] = old_entities["items"][right_id]
-                            elif right_id in e_store["items"]:
-                                conn = governance_store.get_connection()
-                                conn.execute("DELETE FROM entities WHERE entity_id = ?", (right_id,))
-                                del e_store["items"][right_id]
-                            governance_store.save_entities(e_store)
+                            if old_right_entity is not None:
+                                governance_store.upsert_entity(right_id, old_right_entity)
+                            else:
+                                governance_store.delete_entity(right_id)
                             
                             if left_bak and os.path.exists(left_bak):
                                 shutil.move(left_bak, left_path)

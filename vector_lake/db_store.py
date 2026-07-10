@@ -38,12 +38,13 @@ def transaction():
         yield conn
     else:
         _LOCAL.in_transaction = True
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            with conn:
-                # Provide explicitly the BEGIN IMMEDIATE if needed, but conn handles it on first write.
-                # However, explicit is safer for cross-table locks
-                conn.execute("BEGIN IMMEDIATE")
-                yield conn
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             _LOCAL.in_transaction = False
 
@@ -57,7 +58,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     conn.execute("PRAGMA foreign_keys=ON")
-    with conn:
+    with transaction():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (
                 entity_id TEXT PRIMARY KEY,
@@ -227,13 +228,18 @@ def delete_search_index(node_key: str):
 def delete_node_cascade(node_key: str):
     conn = get_connection()
     with transaction():
+        cur = conn.execute("SELECT entity_id FROM entities WHERE canonical_name = ?", (node_key,))
+        row = cur.fetchone()
+        ent_id = row[0] if row else node_key
+        
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
-        conn.execute("DELETE FROM entities WHERE entity_id = ?", (node_key,))
-        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
-        conn.execute("DELETE FROM claims WHERE json_extract(data_json, '$.source_page') = ? OR json_extract(data_json, '$.source_page') = ?", (node_key, node_key + ".md"))
-        conn.execute("DELETE FROM claim_graph_nodes WHERE node_id = ?", (node_key,))
-        conn.execute("DELETE FROM claim_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
+        conn.execute("DELETE FROM entities WHERE entity_id = ? OR canonical_name = ?", (ent_id, node_key))
+        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (ent_id,))
+        conn.execute("DELETE FROM claims WHERE json_extract(data_json, '$.source_page') IN (?, ?)", (node_key, node_key + ".md"))
+        conn.execute("DELETE FROM claim_graph_nodes WHERE node_id IN (?, ?)", (node_key, ent_id))
+        conn.execute("DELETE FROM claim_graph_edges WHERE source_id IN (?, ?) OR target_id IN (?, ?)", (node_key, ent_id, node_key, ent_id))
         conn.execute("DELETE FROM sources WHERE source_id = ?", (node_key,))
+        conn.execute("DELETE FROM timeline_events WHERE entity_id = ?", (ent_id,))
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
     try:

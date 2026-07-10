@@ -8,7 +8,7 @@ from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 log = logging.getLogger("vector-lake-gc")
 
 
-def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
+def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
     from vector_lake.governance_store import load_entities
     from vector_lake.db_store import get_connection
     
@@ -37,14 +37,14 @@ def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
             if file_path.exists():
                 mtime = os.path.getmtime(file_path)
                 if mtime < cutoff:
-                    orphans.append(file_path)
+                    orphans.append((file_path, node.get("id")))
 
     if dry_run:
         if not orphans:
             return f"[DRY-RUN] No orphan entities older than {days} days found."
-        lines = [f"[DRY-RUN] Found {len(orphans)} orphan entities older than {days} days (Degree <= 1):"]
-        for p in orphans[:20]:
-            lines.append(f"  - {p.name}")
+        lines = [f"[DRY-RUN] Found {len(orphans)} orphan entities older than {days} days (Degree <= 1). Re-run with dry_run=False to execute:"]
+        for p, nid in orphans[:20]:
+            lines.append(f"  - {p.name} (ID: {nid})")
         if len(orphans) > 20:
             lines.append(f"  ... and {len(orphans) - 20} more.")
         return "\n".join(lines)
@@ -53,14 +53,19 @@ def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
         return f"GC complete. No orphan entities older than {days} days found."
 
     deleted = 0
-    for path in orphans:
+    import shutil
+    backup_dir = wiki_dir.parent / "backup" / "gc"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    
+    for path, nid in orphans:
         try:
+            shutil.copy2(path, backup_dir / path.name)
             os.remove(path)
             deleted += 1
-            node_key = os.path.splitext(path.name)[0]
+            node_key = nid if nid else os.path.splitext(path.name)[0]
             from vector_lake import db_store
             db_store.delete_node_cascade(node_key)
-        except OSError as e:
-            log.warning(f"Failed to delete {path.name}: {e}")
+        except Exception as e:
+            log.error(f"Failed to GC {path.name}: {e}")
 
-    return f"GC complete. Deleted {deleted} orphan entities older than {days} days."
+    return f"GC complete. Deleted {deleted} orphan pages (backed up to {backup_dir})."

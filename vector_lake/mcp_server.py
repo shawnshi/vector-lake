@@ -49,7 +49,7 @@ def _read_payload(payload_file: str) -> str:
     abs_path = str(abs_path)
     if not os.path.exists(abs_path):
         raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Please use write_to_file to create it first.")
-    with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 @mcp.tool()
@@ -157,7 +157,7 @@ def trigger_audit_graph() -> str:
     return tools.audit_graph()
 
 @mcp.tool()
-def delete_source(raw_path: str, dry_run: bool = False) -> str:
+def delete_source(raw_path: str, dry_run: bool = True) -> str:
     """Cascade-delete a raw source and all related wiki pages.
     
     Args:
@@ -172,15 +172,16 @@ def doctor_vector_lake() -> str:
     return tools.doctor_vector_lake()
 
 @mcp.tool()
-def rename_entity(old_name: str, new_name: str) -> str:
-    """Safely renames a Vector Lake entity and automatically updates all global graph links.
+def rename_entity(old_name: str, new_name: str, dry_run: bool = True) -> str:
+    """Rename a Wiki entity (filename/frontmatter) and automatically update all referring markdown links.
     
     Args:
         old_name: Current name of the entity (e.g. 'Concept_Old-Name.md').
         new_name: New name for the entity (e.g. 'Concept_New-Name.md').
+        dry_run: Preview changes without writing to disk.
     """
     from vector_lake.tool_rename import rename_vector_lake_entity
-    return rename_vector_lake_entity(old_name, new_name)
+    return rename_vector_lake_entity(old_name, new_name, dry_run=dry_run)
 
 @mcp.tool()
 def trace_vector_lake(query_or_id: str) -> str:
@@ -202,7 +203,7 @@ def merge_suggestions_vector_lake(limit: int = 20, enqueue: bool = False) -> str
     return tools.merge_suggestions_vector_lake(limit=limit, enqueue=enqueue)
 
 @mcp.tool()
-def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
+def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
     """Automatically prune isolated or orphaned entities.
     
     Args:
@@ -271,12 +272,11 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
     from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError, get_wiki_dir
     import os
     try:
-        wiki_dir = get_wiki_dir()
-        abs_wiki = os.path.abspath(wiki_dir)
-        file_path = os.path.abspath(os.path.join(abs_wiki, filename))
-        if not file_path.startswith(abs_wiki):
+        wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
+        file_path = (wiki_dir / filename).resolve()
+        if not file_path.is_relative_to(wiki_dir):
             return "[Security Error] Path traversal detected."
-        safe_write_markdown(file_path, content)
+        safe_write_markdown(str(file_path), content)
         from vector_lake.indexer import update_index_item
         update_index_item(filename)
         from vector_lake.governance_store import sync_pages_to_canonical

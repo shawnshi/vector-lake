@@ -1,31 +1,40 @@
 import logging
 import os
+import shutil
+import json
+from pathlib import Path
 
 import yaml
 
 from vector_lake import indexer
 from vector_lake.wiki_utils import get_memory_dir, get_wiki_dir, normalize_sources, read_markdown_file, write_markdown_file
+from vector_lake.db_store import delete_node_cascade, get_connection
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-delete")
 
 
-def delete_source(raw_path: str, dry_run: bool = False) -> str:
-    wiki_dir = str(get_wiki_dir())
-    memory_dir = str(get_memory_dir())
+def delete_source(raw_path: str, dry_run: bool = True) -> str:
+    wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
+    memory_dir = Path(get_memory_dir()).resolve(strict=True)
+    raw_memory_dir = memory_dir / "raw"
+    
+    raw_path_obj = Path(raw_path).resolve()
+    if not raw_path_obj.is_relative_to(raw_memory_dir):
+        return f"[Security Error] The target '{raw_path}' is not within {raw_memory_dir}. Only raw sources can be deleted this way."
 
-    raw_basename = os.path.basename(raw_path)
-    raw_stem = os.path.splitext(raw_basename)[0]
+    raw_basename = raw_path_obj.name
+    raw_stem = raw_path_obj.stem
     try:
-        raw_ref = os.path.relpath(raw_path, memory_dir).replace("\\", "/")
+        raw_ref = str(raw_path_obj.relative_to(memory_dir)).replace("\\", "/")
     except ValueError:
-        raw_ref = raw_path.replace("\\", "/")
+        raw_ref = str(raw_path_obj).replace("\\", "/")
 
     raw_ref_lower = raw_ref.lower()
     raw_basename_lower = raw_basename.lower()
 
-    if not os.path.exists(wiki_dir):
+    if not wiki_dir.exists():
         return "Wiki directory not found."
 
     actions = []
@@ -67,18 +76,24 @@ def delete_source(raw_path: str, dry_run: bool = False) -> str:
 
     if dry_run:
         lines.append("")
-        lines.append("(Dry run — no changes made. Remove --dry-run to execute.)")
+        lines.append("(Dry run — no changes made. Re-run with dry_run=False to execute.)")
         return "\n".join(lines)
 
     deleted = 0
     updated = 0
     failures = []
+    
+    import shutil
+    backup_dir = wiki_dir.parent / "backup" / "delete"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    
     for action, filepath, _, frontmatter, body in actions:
         if action == "DELETE":
             try:
+                shutil.copy2(filepath, backup_dir / os.path.basename(filepath))
                 os.remove(filepath)
                 deleted += 1
-                log.info(f"Deleted: {filepath}")
+                log.info(f"Deleted (backed up): {filepath}")
                 # Cascading delete to sqlite
                 filename = os.path.basename(filepath)
                 node_key = os.path.splitext(filename)[0]

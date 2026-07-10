@@ -11,13 +11,14 @@ def bulk_reconcile(payload: str) -> str:
     except Exception as e:
         return f"[Sandbox JSON Error] Failed to parse payload: {e}"
     
-    dry_run = data.get("dry_run", False)
+    dry_run = data.get("dry_run", True)
     operations = data.get("operations", [])
     
     if not operations:
         return "No operations to perform."
 
-    wiki_dir = get_wiki_dir()
+    from pathlib import Path
+    wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
     md_files = [f for f in os.listdir(wiki_dir) if f.endswith('.md')]
     
     # Pre-flight
@@ -31,17 +32,23 @@ def bulk_reconcile(payload: str) -> str:
         if src.endswith('.md'): src = src[:-3]
         if tgt.endswith('.md'): tgt = tgt[:-3]
         
+        src_path = (wiki_dir / f"{src}.md").resolve()
+        tgt_path = (wiki_dir / f"{tgt}.md").resolve()
+        if not src_path.is_relative_to(wiki_dir) or not tgt_path.is_relative_to(wiki_dir):
+            return f"[Security Error] Source '{src}' or target '{tgt}' resolves outside wiki directory."
+        
         replace_map[src] = tgt
 
-    # Check cycles
-    for k, v in replace_map.items():
-        curr = v
+    # Check cycles and flatten transitive map (e.g. A->B, B->C becomes A->C)
+    for k in list(replace_map.keys()):
+        curr = replace_map[k]
         visited = {k}
         while curr in replace_map:
             if curr in visited:
                 return f"Error: Circular reference detected involving {curr}."
             visited.add(curr)
             curr = replace_map[curr]
+        replace_map[k] = curr
 
     if dry_run:
         return f"[DRY RUN] Validated {len(operations)} operations. No cycles detected. Would modify {len(md_files)} files."
@@ -55,8 +62,8 @@ def bulk_reconcile(payload: str) -> str:
         if src.endswith('.md'): src = src[:-3]
         if tgt.endswith('.md'): tgt = tgt[:-3]
         
-        src_path = os.path.join(wiki_dir, f"{src}.md")
-        tgt_path = os.path.join(wiki_dir, f"{tgt}.md")
+        src_path = str(wiki_dir / f"{src}.md")
+        tgt_path = str(wiki_dir / f"{tgt}.md")
 
         if os.path.exists(src_path):
             if os.path.exists(tgt_path) and action == "merge":

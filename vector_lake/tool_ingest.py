@@ -93,15 +93,37 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 if os.path.splitext(file)[1].lower() in supported_exts:
                     files_to_process.append(filepath)
                     
-    processed = get_processed_files()
+    from vector_lake.db_store import get_connection
+    conn = get_connection()
+    cur = conn.execute("SELECT filepath, file_hash, processed_at FROM processed_files")
+    processed = {row["filepath"]: {"hash": row["file_hash"], "processed_at": row["processed_at"]} for row in cur.fetchall()}
+    
     pending_files = []
     
     for filepath in files_to_process:
-        file_hash = calculate_hash(filepath)
-        if not file_hash: continue
-        if filepath in processed and processed[filepath] == file_hash:
-            continue
-        pending_files.append((filepath, file_hash))
+        try:
+            stat = os.stat(filepath)
+            mtime = stat.st_mtime
+            
+            if filepath in processed:
+                processed_at_str = processed[filepath]["processed_at"]
+                if processed_at_str:
+                    processed_at_dt = datetime.fromisoformat(processed_at_str.replace("Z", "+00:00"))
+                    if processed_at_dt.tzinfo is None:
+                        processed_at_dt = processed_at_dt.replace(tzinfo=timezone.utc)
+                    if mtime <= processed_at_dt.timestamp():
+                        continue
+                        
+                file_hash = calculate_hash(filepath)
+                if file_hash == processed[filepath]["hash"]:
+                    continue
+            else:
+                file_hash = calculate_hash(filepath)
+                
+            if file_hash:
+                pending_files.append((filepath, file_hash))
+        except OSError:
+            pass
         
     if not pending_files:
         return "No new files to ingest. System is fully synced."
@@ -192,12 +214,26 @@ def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str
             files_written.append(str(out_path))
             
         if files_written:
-            governance_store.sync_pages_to_canonical(
-                files_written,
-                origin="ingest-subagent",
-                auto_approve=True,
-                summary=f"Subagent ingest sync for {len(files_written)} page(s)"
-            )
+            try:
+                governance_store.sync_pages_to_canonical(
+                    files_written,
+                    origin="ingest-subagent",
+                    auto_approve=True,
+                    summary=f"Subagent ingest sync for {len(files_written)} page(s)"
+                )
+                from vector_lake.indexer import update_index_items
+                filenames_only = [os.path.basename(f) for f in files_written]
+                update_index_items(filenames_only)
+                
+                tmp_dir = get_extension_root() / "tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                with open(tmp_dir / "flag_reindex.lock", "w") as f:
+                    f.write("1")
+            except Exception as e:
+                for fw in files_written:
+                    try: os.remove(fw)
+                    except OSError: pass
+                raise Exception(f"Ingest aborted during canonical/index sync. Rolled back markdowns. Error: {e}")
             
         filepath = processed_data["filepath"]
         file_hash = processed_data["hash"]

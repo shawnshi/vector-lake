@@ -60,9 +60,7 @@ graph LR
 - **结构要求**：自由格式。专门保留给单篇文献精读、书籍伴读笔记、以及横向的战略纵览研报。不需要切割出“事实”与“时间线”，允许更灵活的文章长文组织形式。
 
 ## Quick Start
-
-1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。**系统已全面回归无 SDK 的纯净架构（Zero-SDK）**，抛弃了沉重的 `google-genai` 依赖。底层 LLM 推理深度依赖跨平台的 `gemini` CLI 工具（如 Windows 的 `gemini.cmd`），因此必须确保该工具在操作系统的 PATH 环境变量中。所有的模型调用均通过隔离的 `subprocess.run` 级联容灾模型链（Model Cascade）防崩溃执行。
-2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
+1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。底层 LLM 推理深度依赖 `google-genai` SDK 与 `agy` CLI 工具（两者并存），因此必须确保该工具在操作系统的 PATH 环境变量中。2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
 3. **后台监听与自治管理**：日常运行 `python watchdog_sync.py` 启动守护进程。它搭载了四大核心基建与防御系统：
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
    - **API 熔断器 (Circuit Breaker)**：在 LLM 并发摄入时，通过带抖动的指数退避（Exponential Backoff with Jitter）与黑名单冷却机制，彻底消除死锁、配额枯竭与 429 限流风暴。

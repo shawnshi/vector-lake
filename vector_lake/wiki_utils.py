@@ -239,7 +239,8 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_val
             pass
 
     filename = path.name
-    validate_wiki_filename(filename)
+    if not skip_validation:
+        validate_wiki_filename(filename)
     
     if filename.startswith("Synthesis_STORM_") and not skip_validation:
         required_headers = [

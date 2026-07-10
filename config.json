@@ -11,16 +11,5 @@
     ".md",
     ".txt"
   ],
-  "processed_files_path": "data/processed_files.json",
-  "llm": {
-    "model_cascade": [
-      "gemini-3-flash-preview",
-      "gemini-3.1-flash-lite",
- "gemini-3.1-pro-preview"
-    ],
-    "batch_size": 10,
-    "timeout_analysis": 60,
-    "timeout_generation": 90,
-    "timeout_query": 60
-  }
+  "processed_files_path": "data/processed_files.json"
 }

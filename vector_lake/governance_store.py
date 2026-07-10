@@ -389,6 +389,24 @@ def delete_entity(entity_id: str):
     conn = get_connection()
     with transaction():
         conn.execute("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
+
+def get_alias(key: str) -> str | None:
+    conn = get_connection()
+    row = conn.execute("SELECT value FROM alias_registry WHERE key = ?", (key,)).fetchone()
+    if row:
+        return row["value"]
+    return None
+
+def upsert_alias(key: str, value: str):
+    conn = get_connection()
+    now = _utc_now()
+    with transaction():
+        conn.execute("INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)", (key, value, now))
+
+def delete_alias(key: str):
+    conn = get_connection()
+    with transaction():
+        conn.execute("DELETE FROM alias_registry WHERE key = ?", (key,))
 # =============================================================================
 
 def _upsert_map_records(store: dict, records: list, key_name: str):

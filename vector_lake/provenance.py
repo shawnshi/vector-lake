@@ -10,14 +10,26 @@ def _tokenize(query: str) -> list[str]:
 
 def build_trace_for_query(query: str, top_k: int = 5) -> dict:
     tokens = _tokenize(query)
+    
+    # 1. Use FTS5 to find relevant source pages instead of O(N) full claim scan
+    from vector_lake.db_store import search_wiki
+    search_results = search_wiki(query, limit=10)
+    relevant_pages = {res["node_key"] for res in search_results}
+    
     claims = governance_store.load_claims()["items"].values()
     entities = governance_store.load_entities()["items"]
     sources = governance_store.load_sources()["items"]
 
     matches = []
     for claim in claims:
-        haystack = f"{claim.get('claim_text', '')} {claim.get('source_page', '')}".lower()
-        score = sum(1 for token in tokens if token in haystack)
+        # Boost score if the claim comes from a top FTS match
+        source_page = claim.get('source_page', '')
+        base_score = 5 if source_page in relevant_pages else 0
+        
+        haystack = f"{claim.get('claim_text', '')} {source_page}".lower()
+        match_score = sum(1 for token in tokens if token in haystack)
+        score = base_score + match_score
+        
         if score > 0:
             matches.append((score, claim))
     matches.sort(key=lambda item: item[0], reverse=True)

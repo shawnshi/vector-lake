@@ -83,14 +83,32 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
     changed_node_files = set([f.strip() for f in files_written_str.split(",") if f.strip()])
     
     valid_files = set()
+    import pathlib
+    wiki_path = pathlib.Path(wiki_dir).resolve()
+    
     for filename in changed_node_files:
+        # Boundary check to prevent path traversal
+        try:
+            target_path = (wiki_path / filename).resolve()
+            if not target_path.is_relative_to(wiki_path):
+                log.warning(f"Security: Path traversal attempt detected: {filename}")
+                continue
+        except Exception as e:
+            log.warning(f"Security: Invalid path {filename}: {e}")
+            continue
+
         # P1-3: Dynamic Ontology Prefix Checking
         prefix = filename.split('_')[0] + "_" if "_" in filename else ""
         if not prefix or not prefix[0].isupper() or not filename.endswith(".md"):
             log.warning(f"File {filename} missing standard prefix. Treating as Orphan.")
             new_filename = f"Orphan_{filename}" if not filename.startswith("Orphan_") else filename
-            if filename != new_filename and os.path.exists(os.path.join(wiki_dir, filename)):
-                os.rename(os.path.join(wiki_dir, filename), os.path.join(wiki_dir, new_filename))
+            new_target_path = (wiki_path / new_filename).resolve()
+            if not new_target_path.is_relative_to(wiki_path):
+                log.warning(f"Security: Path traversal attempt in renamed file: {new_filename}")
+                continue
+                
+            if filename != new_filename and target_path.exists():
+                os.rename(target_path, new_target_path)
                 filename = new_filename
         
         file_path = os.path.join(wiki_dir, filename)

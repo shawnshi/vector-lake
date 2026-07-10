@@ -99,20 +99,59 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
         log.info(f"Diary modified: {filename}. Triggering sync_focus.py...")
         import subprocess
         import sys
-        try:
-            sync_script = os.path.expanduser("~/.gemini/scripts/sync_focus.py")
-            if os.path.exists(sync_script):
-                env = os.environ.copy()
-                env["PYTHONIOENCODING"] = "utf-8"
-                subprocess.run([sys.executable, sync_script], capture_output=True, env=env, timeout=180)
-        except Exception as e:
-            log.error(f"Failed to trigger sync_focus.py: {e}")
+        
+        def run_sync():
+            try:
+                sync_script = os.path.expanduser("~/.gemini/scripts/sync_focus.py")
+                if os.path.exists(sync_script):
+                    env = os.environ.copy()
+                    env["PYTHONIOENCODING"] = "utf-8"
+                    subprocess.run([sys.executable, sync_script], capture_output=True, env=env, timeout=180)
+            except Exception as e:
+                log.error(f"Failed to trigger sync_focus.py: {e}")
+                
+        threading.Thread(target=run_sync, daemon=True).start()
 
     def on_created(self, event): self.handle_event(event)
     def on_modified(self, event): self.handle_event(event)
 
 
+class RawWatchdogHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.last_triggered = {}
+        self.lock = threading.Lock()
 
+    def handle_event(self, event):
+        if event.is_directory:
+            return
+        filepath = event.src_path
+        filename = os.path.basename(filepath)
+        # only md, pdf, txt, etc? Let's just say any file that doesn't start with .
+        if filename.startswith('.'):
+            return
+
+        now = time.time()
+        with self.lock:
+            if len(self.last_triggered) > 1000:
+                self.last_triggered = {k: v for k, v in self.last_triggered.items() if (now - v) <= DEBOUNCE_SECONDS * 2}
+            if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
+                return
+            self.last_triggered[filepath] = now
+
+        log.info(f"Raw source modified: {filename}. Triggering sync_vector_lake in worker pool...")
+        try:
+            from vector_lake.tool_sync import sync_vector_lake
+            # Run using ThreadPoolExecutor to prevent thread explosion
+            if not hasattr(self, "executor"):
+                import concurrent.futures
+                self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+            self.executor.submit(sync_vector_lake)
+        except Exception as e:
+            log.error(f"Failed to trigger sync_vector_lake: {e}")
+
+    def on_created(self, event): self.handle_event(event)
+    def on_modified(self, event): self.handle_event(event)
+    def on_moved(self, event): self.handle_event(event)
 from vector_lake.watchdog_status import write_status
 
 def index_worker_loop():
@@ -130,22 +169,23 @@ def index_worker_loop():
                 consecutive_failures = 0
                 continue
 
+            from vector_lake import get_extension_root
+            import os
+            flag_path = get_extension_root() / "tmp" / "flag_reindex.lock"
+            if os.path.exists(flag_path):
+                try:
+                    os.remove(flag_path)
+                    from vector_lake import indexer
+                    with global_task_lock:
+                        log.info("flag_reindex.lock detected. Generating full index asynchronously...")
+                        indexer.generate_index()
+                except Exception as e:
+                    log.error(f"Error handling flag_reindex.lock: {e}")
+            
             write_status("idle", 0, index_queue.qsize(), "Waiting for index tasks", "")
             try:
                 filename = index_queue.get(timeout=5.0)
             except queue.Empty:
-                from vector_lake import get_extension_root
-                import os
-                flag_path = get_extension_root() / "tmp" / "flag_reindex.lock"
-                if os.path.exists(flag_path):
-                    try:
-                        os.remove(flag_path)
-                        from vector_lake import indexer
-                        with global_task_lock:
-                            log.info("flag_reindex.lock detected. Generating full index asynchronously...")
-                            indexer.generate_index()
-                    except Exception as e:
-                        log.error(f"Error handling flag_reindex.lock: {e}")
                 continue
                 
             time.sleep(DEBOUNCE_SECONDS)
@@ -207,6 +247,7 @@ def scheduled_lint_loop():
 
     while True:
         try:
+            # DB connection opens only inside actual work blocks now
             now = time.localtime()
             
             # Run at 10:00 and 23:00
@@ -241,7 +282,7 @@ def scheduled_lint_loop():
                                 log.info(f"Launching {name}...")
                                 p = subprocess.Popen(
                                     [sys.executable, script_path], 
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, 
                                     text=True, encoding="utf-8", env=env
                                 )
                                 processes.append((name, p))
@@ -256,6 +297,7 @@ def scheduled_lint_loop():
                                     log.info(f"{name} successfully completed.")
                             except subprocess.TimeoutExpired:
                                 p.kill()
+                                p.wait()
                                 log.error(f"{name} Timed Out after 180s")
                                 write_status("error", 0, index_queue.qsize(), f"{name} Timeout", "")
                     except Exception as e:
@@ -282,14 +324,19 @@ def scheduled_lint_loop():
                     last_run_date_hour = current_date_hour
                     write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "")
             
-            time.sleep(30) # Poll every 30 seconds
+            # Calculate wait time till next minute to avoid tight spinning, or just sleep for 30 seconds
+            import datetime
+            now_dt = datetime.datetime.now()
+            # If we just ran at hour 10 or 23, sleep 60 seconds to push past min 0
+            if now.tm_hour in (10, 23) and now.tm_min == 0:
+                time.sleep(60)
+            else:
+                time.sleep(30)
+                
         except Exception as exc:
             log.error(f"Scheduled lint worker error: {exc}")
             write_status("error", 0, index_queue.qsize(), "Scheduled lint exception", str(exc))
             time.sleep(60)
-        finally:
-            from vector_lake.db_store import close_connection
-            close_connection()
 
 
 def start_watchdog():
@@ -311,6 +358,12 @@ def start_watchdog():
         diary_handler = DiaryWatchdogHandler()
         observer.schedule(diary_handler, diary_dir, recursive=False)
         log.info(f"Diary monitor active on directory: {diary_dir}")
+
+    raw_dir = os.path.expanduser("~/.gemini/MEMORY/raw")
+    if os.path.exists(raw_dir):
+        raw_handler = RawWatchdogHandler()
+        observer.schedule(raw_handler, raw_dir, recursive=True)
+        log.info(f"Raw source monitor active on directory: {raw_dir}")
 
     observer.start()
     log.info("Vector Lake Watchdog Agent is now running in Background Index/Lint mode.")

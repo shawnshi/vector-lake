@@ -3,26 +3,42 @@ import re
 from pathlib import Path
 from vector_lake.wiki_utils import get_wiki_dir, normalize_entity_name, read_markdown_file, write_markdown_file
 
-def rename_vector_lake_entity(old_name: str, new_name: str) -> str:
+def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True) -> str:
     """Safely renames an entity and updates all internal markdown links across the Wiki."""
-    wiki_dir = get_wiki_dir()
+    wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
     
     if not old_name.endswith(".md"):
         old_name += ".md"
     if not new_name.endswith(".md"):
         new_name += ".md"
         
-    old_path = wiki_dir / old_name
+    old_path = (wiki_dir / old_name).resolve()
+    if not old_path.is_relative_to(wiki_dir):
+        return f"[Security Error] Old entity '{old_name}' is outside the wiki directory."
     
     # 1. Validation
     if not old_path.exists():
         return f"Error: Old entity '{old_name}' does not exist."
         
     normalized_new_name = normalize_entity_name(new_name[:-3]) + ".md"
-    new_path = wiki_dir / normalized_new_name
+    new_path = (wiki_dir / normalized_new_name).resolve()
+    if not new_path.is_relative_to(wiki_dir):
+        return f"[Security Error] Target entity '{normalized_new_name}' is outside the wiki directory."
     
     if new_path.exists():
         return f"Error: Target entity '{normalized_new_name}' already exists. Use merge instead."
+        
+    if dry_run:
+        return f"[DRY-RUN] Would rename '{old_name}' to '{normalized_new_name}' and update links in other files."
+        
+    # Backup
+    import shutil
+    backup_dir = wiki_dir.parent / "backup" / "rename"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(old_path, backup_dir / old_name)
+    except Exception as e:
+        return f"Backup failed before rename: {str(e)}"
         
     # 2. Rename the file and update its frontmatter
     try:

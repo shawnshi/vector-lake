@@ -104,6 +104,13 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     except ImportError:
         query_tok = " ".join(list(query)) if query else ""
         
+    # Sanitize query_tok for FTS5 (remove special syntax characters)
+    import re
+    query_tok = re.sub(r'["*^&|()\-:\[\]{}]', ' ', query_tok)
+    # Ensure it's not empty or just spaces
+    if not query_tok.strip():
+        return []
+        
     try:
         from vector_lake.db_store import get_connection
         conn = get_connection()

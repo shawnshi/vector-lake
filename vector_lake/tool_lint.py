@@ -18,7 +18,7 @@ log = logging.getLogger("vector-lake-tool-lint")
 
 def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str):
     try:
-        write_markdown_file(filepath, frontmatter, body)
+        write_markdown_file(filepath, frontmatter, body, skip_validation=True)
     except Exception as e:
         log.warning(f"Failed to write fixed frontmatter to {filepath}: {e}")
 
@@ -100,16 +100,18 @@ def lint_vector_lake(auto_fix: bool = False):
             issues["naming"].append(f"{filename}: Does not start with valid prefix")
             if auto_fix:
                 new_filename = f"Concept_{filename}"
-                old_path = os.path.join(wiki_dir, filename)
-                new_path = os.path.join(wiki_dir, new_filename)
-                try:
-                    os.replace(old_path, new_path)
-                except Exception as e:
-                    log.error(f"Failed to rename {old_path} to {new_path}: {e}")
+                from vector_lake.wiki_utils import normalize_entity_name
+                normalized_new = normalize_entity_name(new_filename[:-3]) + ".md"
+                
+                from vector_lake.tool_rename import rename_vector_lake_entity
+                result = rename_vector_lake_entity(filename, normalized_new, dry_run=False)
+                if "Error" in result or "failed" in result.lower():
+                    log.error(f"Auto-fix rename failed for {filename}: {result}")
                     continue
-                renamed_files[filename] = new_filename
+                
+                renamed_files[filename] = normalized_new
                 all_keys.remove(filename[:-3])
-                all_keys.add(new_filename[:-3])
+                all_keys.add(normalized_new[:-3])
                 fixes_applied += 1
 
     # Update parsed dict if renaming occurred
@@ -154,7 +156,7 @@ def lint_vector_lake(auto_fix: bool = False):
     # 4. Broken Links (Stub Creation)
     for filename, data in parsed.items():
         for target in data["links"]:
-            if target not in all_keys:
+            if target not in all_keys and target not in alias_map:
                 issues["broken_links"].append(f"{filename} -> [[{target}]]: target does not exist")
                 if auto_fix:
                     stub_filename = f"Concept_{target}.md" if not target.startswith(valid_prefixes) else f"{target}.md"
@@ -172,7 +174,8 @@ def lint_vector_lake(auto_fix: bool = False):
                             "created": datetime.datetime.now().strftime("%Y-%m-%d"),
                             "updated": datetime.datetime.now().strftime("%Y-%m-%d")
                         }
-                        _write_fixed_frontmatter(stub_path, stub_fm, f"\n# {target}\n\nThis is an auto-generated stub page to prevent broken links from [[{filename[:-3]}]].\n")
+                        stub_body = f"\n# {target}\n\nThis is an auto-generated stub page to prevent broken links from [[{filename[:-3]}]].\n\n## 1. 编译事实\n- Auto-generated stub.\n\n## 2. 证据时间线\n- {datetime.datetime.now().strftime('%Y-%m-%d')}: Created stub.\n"
+                        _write_fixed_frontmatter(stub_path, stub_fm, stub_body)
                         all_keys.add(stub_filename[:-3])
                         fixes_applied += 1
 
