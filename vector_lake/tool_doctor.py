@@ -31,7 +31,7 @@ def doctor_vector_lake() -> str:
         checks.append((label, path.exists(), str(path)))
 
     index_exists = get_index_path().exists()
-    checks.append(("Index", True, str(get_index_path()) if index_exists else "Lake is drying (Empty)"))
+    checks.append(("Index", index_exists, str(get_index_path()) if index_exists else "Lake is drying (Empty)"))
     for label, path in [
         ("Meta", get_meta_dir()),
         ("SQLite DB", get_db_path()),

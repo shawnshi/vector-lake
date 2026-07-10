@@ -224,6 +224,17 @@ def delete_search_index(node_key: str):
     with transaction():
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
 
+def delete_node_cascade(node_key: str):
+    conn = get_connection()
+    with transaction():
+        conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+        conn.execute("DELETE FROM entities WHERE entity_id = ?", (node_key,))
+        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
+        conn.execute("DELETE FROM claims WHERE entity_id = ?", (node_key,))
+        conn.execute("DELETE FROM claim_graph_nodes WHERE node_id = ?", (node_key,))
+        conn.execute("DELETE FROM claim_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
+        conn.execute("DELETE FROM sources WHERE source_id = ?", (node_key,))
+
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
     try:
         import jieba
@@ -239,3 +250,22 @@ def search_wiki(query: str, limit: int = 50) -> list[dict]:
         ORDER BY rank LIMIT ?
     """, (query_tok, limit))
     return [dict(row) for row in cur.fetchall()]
+
+def get_processed_files() -> dict[str, str]:
+    conn = get_connection()
+    cur = conn.execute("SELECT filepath, file_hash FROM processed_files")
+    return {row["filepath"]: row["file_hash"] for row in cur.fetchall()}
+
+def mark_file_processed(filepath: str, file_hash: str):
+    from datetime import datetime, timezone
+    conn = get_connection()
+    now_str = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        conn.execute("""
+            INSERT INTO processed_files (filepath, file_hash, processed_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(filepath) DO UPDATE SET
+                file_hash = excluded.file_hash,
+                processed_at = excluded.processed_at
+        """, (filepath, file_hash, now_str))
+

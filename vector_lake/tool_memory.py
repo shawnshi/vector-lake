@@ -31,6 +31,10 @@ def update_operational_memory(memory_type: str, content: str) -> str:
 title: {title}
 type: concept
 memory_type: {memory_type}
+domain: system
+status: active
+sources:
+  - Operational_Memory
 ---
 # {title}
 

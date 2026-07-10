@@ -274,7 +274,11 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
         wiki_dir = get_wiki_dir()
         file_path = os.path.join(wiki_dir, filename)
         safe_write_markdown(file_path, content)
-        return f"Successfully wrote {filename}."
+        from vector_lake.indexer import update_index_item
+        update_index_item(filename)
+        from vector_lake.governance_store import sync_pages_to_canonical
+        sync_pages_to_canonical([file_path], origin="mcp-agent", auto_approve=True, summary=f"MCP write to {filename}")
+        return f"Successfully wrote {filename} and updated index."
     except SafeWriteError as e:
         return f"[Write Rejected] {str(e)}"
     except Exception as e:
@@ -362,7 +366,17 @@ def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str, 
             
     if dry_run:
         return f"[DRY RUN] Would replace '{old_text}' with '{new_text}' in {modified_count} files: {', '.join(matched_files[:10])}..."
-    return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files."
+    
+    from vector_lake.indexer import update_index_item
+    for filename in matched_files:
+        update_index_item(filename)
+        
+    from vector_lake.governance_store import sync_pages_to_canonical
+    abs_matched_files = [os.path.join(wiki_dir, f) for f in matched_files]
+    if abs_matched_files:
+        sync_pages_to_canonical(abs_matched_files, origin="mcp-agent", auto_approve=True, summary=f"Batch replace links")
+        
+    return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files and updated index."
 
 @mcp.tool()
 def bulk_reconciliation(payload_file: str) -> str:

@@ -32,6 +32,11 @@ def verify_asset(content: str, filename: str, frontmatter: dict, index_path: Pat
         if forbidden_key in frontmatter:
             raise DefenseHookException(f"SSOT Violation: Topological edge '{forbidden_key}' must not exist in YAML. Use Markdown semantic links instead. Fix the markdown format and try saving again.")
             
+    domain = frontmatter.get("domain")
+    status = frontmatter.get("status")
+    if not domain or not status:
+        raise DefenseHookException("Schema Violation: Missing required 'domain' or 'status' in frontmatter. Fix the markdown format and try saving again.")
+
     tags = frontmatter.get("tags", [])
     if isinstance(tags, list) and len(tags) > 3:
         raise DefenseHookException(f"Taxonomy Violation: Maximum 3 tags allowed, but found {len(tags)}. Compress your understanding. Fix the markdown format and try saving again.")

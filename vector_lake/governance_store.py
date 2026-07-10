@@ -155,14 +155,6 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
         extra_cols = []
     
     with transaction():
-        existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
-        existing_keys = {row[0] for row in existing_keys_query}
-        new_keys = set(data.get("items", {}).keys())
-        keys_to_delete = existing_keys - new_keys
-        
-        if keys_to_delete:
-            conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
-            
         if data.get("items"):
             cols = [pk_col] + [c[0] for c in extra_cols] + ["data_json", "updated_at"]
             placeholders = ["?"] * len(cols)
@@ -1021,6 +1013,7 @@ def create_change_set(
         "risk_level": "medium" if len(page_paths) > 3 else "low",
         "requires_human_review": not auto_approve,
         "affected_ids": sorted(set(affected_ids)),
+        "affected_pages": [os.path.basename(path) for path in page_paths],
         "proposed_entities": proposed_entities,
         "proposed_claims": proposed_claims,
         "proposed_evidence": proposed_evidence,
@@ -1078,8 +1071,11 @@ def apply_change_set(change_set: dict) -> dict:
                 locator_page = v.get("locator", {}).get("page_key")
                 if locator_page in affected_page_keys and k not in proposed_claim_ids:
                     keys_to_remove.append(k)
-            for k in keys_to_remove:
-                del claims["items"][k]
+            if keys_to_remove:
+                conn = get_connection()
+                conn.executemany("DELETE FROM claims WHERE claim_id = ?", [(k,) for k in keys_to_remove])
+                for k in keys_to_remove:
+                    del claims["items"][k]
                 
             # Prune evidence no longer in the markdown
             keys_to_remove = []
@@ -1087,8 +1083,11 @@ def apply_change_set(change_set: dict) -> dict:
                 locator_page = v.get("locator", {}).get("page_key")
                 if locator_page in affected_page_keys and k not in proposed_evidence_ids:
                     keys_to_remove.append(k)
-            for k in keys_to_remove:
-                del evidence["items"][k]
+            if keys_to_remove:
+                conn = get_connection()
+                conn.executemany("DELETE FROM evidence WHERE evidence_id = ?", [(k,) for k in keys_to_remove])
+                for k in keys_to_remove:
+                    del evidence["items"][k]
 
         _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
         _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
@@ -1099,6 +1098,9 @@ def apply_change_set(change_set: dict) -> dict:
         save_claims(claims)
         save_evidence(evidence)
         save_sources(sources)
+        if affected_page_keys:
+            conn = get_connection()
+            conn.executemany("DELETE FROM claim_graph_edges WHERE source_id = ?", [(k,) for k in affected_page_keys])
         save_graph_edges(change_set.get("proposed_edges", []))
         rebuild_alias_registry()
         try:

@@ -229,9 +229,6 @@ def scheduled_lint_loop():
                         gemini_root = Path("~/.gemini").expanduser()
                         
                         daemon_scripts = [
-                            ("Metadata Decay Daemon", str(gemini_root / "scripts" / "metadata_decay_daemon.py")),
-                            ("Timeline DB Sync Daemon", str(gemini_root / "scripts" / "sync_timeline_db.py")),
-                            ("Missing Evidence Scout", str(gemini_root / "scripts" / "missing_evidence_scout.py")),
                             ("Domain Overview Compiler", str(plugin_dir / "scripts" / "compile_domain_overviews.py")),
                             ("Semantic Deduplication Daemon", str(plugin_dir / "scripts" / "semantic_dedup_daemon.py")),
                             ("Nighttime Janitor Swarm", str(plugin_dir / "scripts" / "launch_janitor_swarm.py")),

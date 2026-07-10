@@ -79,6 +79,11 @@ def delete_source(raw_path: str, dry_run: bool = False) -> str:
                 os.remove(filepath)
                 deleted += 1
                 log.info(f"Deleted: {filepath}")
+                # Cascading delete to sqlite
+                filename = os.path.basename(filepath)
+                node_key = os.path.splitext(filename)[0]
+                from vector_lake import db_store
+                db_store.delete_node_cascade(node_key)
             except Exception as e:
                 failures.append(f"DELETE {filepath}: {e}")
                 log.warning(f"Failed to delete {filepath}: {e}")

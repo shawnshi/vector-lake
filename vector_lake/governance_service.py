@@ -109,6 +109,8 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                             if right_id in old_registry["items"]:
                                 r["items"][right_id] = old_registry["items"][right_id]
                             elif right_id in r["items"]:
+                                conn = governance_store.get_connection()
+                                conn.execute("DELETE FROM alias_registry WHERE key = ?", (right_id,))
                                 del r["items"][right_id]
                             governance_store.save_alias_registry(r)
                             
@@ -116,6 +118,8 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                             if right_id in old_entities["items"]:
                                 e_store["items"][right_id] = old_entities["items"][right_id]
                             elif right_id in e_store["items"]:
+                                conn = governance_store.get_connection()
+                                conn.execute("DELETE FROM entities WHERE entity_id = ?", (right_id,))
                                 del e_store["items"][right_id]
                             governance_store.save_entities(e_store)
                             

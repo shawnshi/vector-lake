@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from vector_lake import get_extension_root
-from vector_lake.db import get_processed_files, mark_file_processed
+from vector_lake.db_store import get_processed_files, mark_file_processed
 from vector_lake import governance_store
 from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
@@ -202,8 +202,7 @@ def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str
         filepath = processed_data["filepath"]
         file_hash = processed_data["hash"]
         
-        now = datetime.now(timezone.utc).isoformat()
-        mark_file_processed(filepath, file_hash, now)
+        mark_file_processed(filepath, file_hash)
         
         return f"Successfully finalized ingestion for {filepath}."
     except Exception as e:

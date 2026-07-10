@@ -9,25 +9,20 @@ log = logging.getLogger("vector-lake-gc")
 
 
 def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
-    index_path = get_index_path()
-    if not index_path.exists():
-        return "No index found. Please run 'python cli.py sync' first."
-
-    try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
-    except json.JSONDecodeError:
-        return "Failed to parse index.json."
-
-    nodes = index_data.get("nodes", {})
-    edges = index_data.get("weighted_edges", [])
-
+    from vector_lake.governance_store import load_entities
+    from vector_lake.db_store import get_connection
+    
+    entities = load_entities()
+    nodes = {key: val for key, val in entities.get("items", {}).items()}
+    
+    conn = get_connection()
+    edges = conn.execute("SELECT source_id, target_id FROM claim_graph_edges").fetchall()
+    
     degrees = {key: 0 for key in nodes.keys()}
-    for edge in edges:
-        if edge["source"] in degrees:
-            degrees[edge["source"]] += 1
-        if edge["target"] in degrees:
-            degrees[edge["target"]] += 1
+    for row in edges:
+        s, t = row[0], row[1]
+        if s in degrees: degrees[s] += 1
+        if t in degrees: degrees[t] += 1
 
     wiki_dir = get_wiki_dir()
     now = time.time()
@@ -62,6 +57,9 @@ def gc_vector_lake(days: int = 30, dry_run: bool = False) -> str:
         try:
             os.remove(path)
             deleted += 1
+            node_key = os.path.splitext(path.name)[0]
+            from vector_lake import db_store
+            db_store.delete_node_cascade(node_key)
         except OSError as e:
             log.warning(f"Failed to delete {path.name}: {e}")
 

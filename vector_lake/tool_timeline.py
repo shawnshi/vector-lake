@@ -2,26 +2,18 @@ import json
 from vector_lake.db_store import get_connection
 
 def search_timeline_events(entity_name: str = None, sentiment: str = None, action: str = None, limit: int = 10) -> str:
-    """Query the timeline_events SQLite table for strategic events."""
+    """Query the timeline-event claims from SQLite for strategic events."""
     conn = get_connection()
     cursor = conn.cursor()
     
-    query = "SELECT event_date, entity_title, action, sentiment, description, source_file FROM timeline_events WHERE 1=1"
+    query = "SELECT claim_text, data_json, updated_at FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
     params = []
     
     if entity_name:
-        query += " AND entity_title LIKE ?"
-        params.append(f"%{entity_name}%")
+        query += " AND (json_extract(data_json, '$.subject_entity_ids') LIKE ? OR claim_text LIKE ?)"
+        params.extend([f"%{entity_name}%", f"%{entity_name}%"])
         
-    if sentiment:
-        query += " AND sentiment = ?"
-        params.append(sentiment)
-        
-    if action:
-        query += " AND action = ?"
-        params.append(action)
-        
-    query += f" ORDER BY event_date DESC LIMIT {int(limit)}"
+    query += f" ORDER BY updated_at DESC LIMIT {int(limit)}"
     
     try:
         cursor.execute(query, params)
@@ -34,6 +26,10 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
         
     results = []
     for r in rows:
-        results.append(f"[{r['event_date']}] <{r['entity_title']}> (Action: {r['action']} | Sentiment: {r['sentiment']})\n  -> {r['description']}\n  Source: {r['source_file']}")
+        data = json.loads(r["data_json"])
+        date = data.get("temporal_anchor") or "Unknown Date"
+        entities = ", ".join(data.get("subject_entity_ids", []))
+        source = ", ".join(data.get("source_ids", []))
+        results.append(f"[{date}] <{entities}>\n  -> {r['claim_text']}\n  Source: {source}")
         
     return "\n\n".join(results)
