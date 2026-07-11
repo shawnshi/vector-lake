@@ -4,7 +4,8 @@ import logging
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_store
-from vector_lake.wiki_utils import get_index_path, get_purpose_path
+from vector_lake.wiki_utils import get_index_path
+from vector_lake.purpose_contract import PurposeContractError, render_strategy_directive
 
 log = logging.getLogger("vector-lake-tool-research")
 
@@ -52,15 +53,10 @@ def research_vector_lake(dry_run: bool = False):
     queries_str = "\n".join([f"- {q}" for q in all_queries])
 
     purpose_context = ""
-    purpose_path = str(get_purpose_path())
-    if os.path.exists(purpose_path):
-        purpose_context = "\nConsider the overarching purpose of the Wiki while searching:\n"
-        try:
-            with open(purpose_path, "r", encoding="utf-8") as f:
-                purpose_content = f.read()
-                purpose_context += "\n".join(["  > " + line for line in purpose_content.splitlines()[:10]])
-        except Exception:
-            pass
+    try:
+        purpose_context = "\nStrategic purpose contract:\n" + render_strategy_directive()
+    except PurposeContractError as exc:
+        return f"Strategic purpose contract is invalid: {exc}"
 
     if dry_run:
         directive = f"""[DRY RUN]: The following research topics were identified:

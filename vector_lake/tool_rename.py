@@ -46,7 +46,7 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
         try:
             shutil.copy2(old_path, backup_dir / old_name)
         except Exception as e:
-        return f"Backup failed before rename: {str(e)}"
+            return f"Backup failed before rename: {str(e)}"
             
         # 2. Rename the file and update its frontmatter
         try:
@@ -67,7 +67,7 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
             write_markdown_file(new_path, frontmatter, body)
             old_path.unlink()
         except Exception as e:
-        return f"Error during file rename: {str(e)}"
+            return f"Error during file rename: {str(e)}"
             
         # 3. Global Link Resolution
         old_display_name = old_core

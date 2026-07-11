@@ -15,6 +15,7 @@ from vector_lake.db_store import get_connection, init_db, transaction
 from vector_lake.wiki_utils import (
     atomic_write_text,
     get_meta_dir,
+    get_purpose_path,
     get_wiki_dir,
     normalize_memory_key,
     read_markdown_file,
@@ -52,21 +53,29 @@ _PURPOSE_VECTORS_MTIME = 0
 def get_purpose_vectors() -> dict:
     global _PURPOSE_VECTORS_CACHE, _PURPOSE_VECTORS_MTIME
     path = get_meta_dir() / "purpose_vectors.json"
+    purpose_path = get_purpose_path()
     
     current_mtime = 0
-    if path.exists():
-        current_mtime = path.stat().st_mtime
+    for candidate in (path, purpose_path):
+        if candidate.exists():
+            current_mtime = max(current_mtime, candidate.stat().st_mtime)
         
     if _PURPOSE_VECTORS_CACHE is not None and _PURPOSE_VECTORS_MTIME == current_mtime:
         return _PURPOSE_VECTORS_CACHE
         
-    if path.exists():
+    try:
+        from vector_lake.purpose_contract import purpose_vectors
+        _PURPOSE_VECTORS_CACHE = purpose_vectors()
+    except Exception:
+        _PURPOSE_VECTORS_CACHE = None
+
+    if _PURPOSE_VECTORS_CACHE is None and path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 _PURPOSE_VECTORS_CACHE = json.load(f)
         except Exception:
             _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
-    else:
+    elif _PURPOSE_VECTORS_CACHE is None:
         _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
         
     _PURPOSE_VECTORS_MTIME = current_mtime
@@ -1316,8 +1325,12 @@ def governance_projection() -> dict:
 def enqueue_governance_item(item_type: str, title: str, description: str, source: str, search_queries: list, affected_pages: list):
     import uuid
     queue = load_governance_queue()
+    for existing in queue["items"]:
+        if existing.get("status") == "pending" and existing.get("type") == item_type and existing.get("title") == title:
+            return existing.get("item_id")
+    item_id = f"gov_{uuid.uuid4().hex[:12]}"
     queue["items"].append({
-        "item_id": f"gov_{uuid.uuid4().hex[:12]}",
+        "item_id": item_id,
         "type": item_type,
         "title": title,
         "description": description,
@@ -1328,5 +1341,6 @@ def enqueue_governance_item(item_type: str, title: str, description: str, source
         "affected_pages": affected_pages,
     })
     save_governance_queue(queue)
+    return item_id
 
 

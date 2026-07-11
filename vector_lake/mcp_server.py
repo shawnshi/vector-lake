@@ -143,6 +143,15 @@ def trigger_autonomous_research(dry_run: bool = False) -> str:
     return tools.research_vector_lake(dry_run=dry_run)
 
 @mcp.tool()
+def review_strategic_purpose(as_of: str = "") -> str:
+    """Review due Standing Intelligence Requirements without changing the Wiki.
+
+    Args:
+        as_of: Optional YYYY-MM-DD date. Defaults to the current day.
+    """
+    return tools.review_strategic_purpose(as_of=as_of)
+
+@mcp.tool()
 def get_governance_debt(top: int = 20) -> str:
     """Show governance debt metrics.
     

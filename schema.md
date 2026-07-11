@@ -1,4 +1,4 @@
-# Vector Lake Schema & Governance (LLM-Wiki V8.0 Cognitive Pattern)
+# Vector Lake Schema & Governance (Schema V8.0; Strategic Contract V12.0)
 
 ## 1. Core Mandate
 [CRITICAL SYSTEM OVERRIDE]
@@ -13,7 +13,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
 - **`MEMORY/wiki/.meta/operational_memory.json`**: Machine-facing runtime memory compiled from claims. It is derived state, not hand-edited prose.
 - **`MEMORY/wiki/log.md`**: The append-only chronological log. Append an entry here for every ingest, query-to-page, or lint operation. Format: `## [YYYY-MM-DD HH:MM] <Action> | <Target>`
 - **`MEMORY/wiki/overview.md`**: Human-readable bird's-eye summary of ALL wiki topics. Updated after each ingest batch.
-- **`MEMORY/purpose.md`**: The wiki's strategic purpose anchor. Defines WHY this knowledge base exists, what questions it aims to answer, and what domains are in/out of scope. Injected into every LLM operation.
+- **`MEMORY/purpose.md`**: The versioned strategic-purpose control plane. Its YAML contract drives ingestion directives, retrieval context, autonomous research, operational-memory weighting, SIR review proposals, and synthesis thresholds.
 
 ## 3. Markdown Conventions
 - **YAML Frontmatter**: EVERY wiki page MUST contain YAML frontmatter with the following fields:
@@ -35,6 +35,8 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   created: "YYYY-MM-DD"
   updated: "YYYY-MM-DD"
   sources: ["raw/doc1.pdf", "raw/doc2.txt"]
+  strategic_scope: "core | edge" # Required for newly ingested nodes
+  evidence_tier: "code-availability | engineering-performance | commercial-commitment | production-acceptance"
   tension_edges: 
     - target: "Concept_Cloud_Native"
       polarity: -1.0  
@@ -50,8 +52,13 @@ Epistemic: [validates::], [falsifies::], [depends-on::]
 Instantiation: [instantiated-by::]
 Inline Provenance & Controlled Metrics (RAG Chunking Friendly):
 When summarizing or extracting claims, use inline source anchors rather than bottom footnotes. Example: The model achieves SOTA performance (Source: [[Source_Report_A]]).
-Controlled Metrics System: To enable exact cross-entity graph computations, metric assertions MUST use the syntax: - {Metric: [Controlled_Key]} [[Entity_Name]] [Value] (Source: [[Source_X]]).
-Med IT Allowed Metric Keys: MedIT_Revenue (医疗IT营收), Bids_Won (中标数/金额), Market_Share (市占率), EMR_Level (电子病历评级, 0-8), CHI_Level (互联互通成熟度), SLA (服务可用性). Example: - {Metric: EMR_Level} [[Institution_协和医院]] 7 (Source: [[Source_2025评级公告]]).
+Controlled Metrics System: To enable exact cross-entity graph computations, metric assertions MUST use the syntax: `- {Metric: [Controlled_Key]} [[Entity_Name]] [Value] (Source: [[Source_X]])`. A metric without an inline `Source_*` anchor is invalid.
+
+Core keys: `MedIT_Revenue` (CNY), `Market_Share` (ratio), `EMR_Level` (0-8), `CHI_Level`, `SLA` (ratio). `Bids_Won` is a legacy ambiguous key; use `Bid_Count` (count) or `Bid_Value_CNY` (CNY) for new facts.
+
+Medical IT evidence keys: `FHIR_OMOP_Center_Count` (count), `IT_Budget_Change_Pct` (percent), `Public_Cloud_Deployment_Ratio` (ratio), `Acceptance_Case_Count` (count), `Engineering_Test_RPS` (requests/s), `Engineering_Test_P99_MS` (ms), `Engineering_Test_Error_Rate_Pct` (percent), `GPU_Infrastructure_Cost_CNY` (CNY), `API_Access_Fee_CNY` (CNY), `Implementation_Duration_Days` (days), `Implementation_Cost_CNY` (CNY), `Project_Cancellation_Rate_Pct` (percent), `SaaS_Value_Share_Pct` (percent).
+
+Example: `- {Metric: EMR_Level} [[Institution_协和医院]] 7 (Source: [[Source_2025评级公告]])`.
 Semantic Tension Quantification Model (STQM): When synthesizing documents that contradict or explicitly support existing knowledge, generate a tension_edges array in the YAML frontmatter. (Polarity: -1.0 to 1.0, Intensity: 0.0 to 1.0, Context: 1-sentence reason).
 Contradictions & Synthesis: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction in the text AND map the physical collision using tension_edges.
 Temporal Rot Defense: Anchor claims to a specific time frame using inline brackets at the start of a bullet/paragraph (e.g., [2024] The market is...).
@@ -147,4 +154,4 @@ Rule 1: NEVER use an existing entity name as a tag.
 Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换).
 Rule 3: An entity MUST NOT have more than 3 tags.
 ***
-*(System Notification: V7.5 Medical IT Analyst Edition successfully compiled. New entity type `Institution` injected. Product slots specialized for Medical Value and Compliance. Controlled Metrics Dictionary enforced for cross-graph compute. Domain-specific topology edges (`integrates-with`, `deployed-at`, `complies-with`) registered to the semantic router. Ready for AST daemon deployment.)*
+*(System Notification: Schema V8.0 with Strategic Contract V12.0. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*

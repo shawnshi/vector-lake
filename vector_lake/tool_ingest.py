@@ -18,6 +18,13 @@ from vector_lake.wiki_utils import (
     get_index_path,
     normalize_raw_ref
 )
+from vector_lake.purpose_contract import (
+    PurposeContractError,
+    build_synthesis_proposals,
+    load_purpose_contract,
+    render_strategy_directive,
+    validate_ingest_payload,
+)
 
 log = logging.getLogger("vector-lake-ingest")
 
@@ -37,7 +44,11 @@ def calculate_hash(filepath: str) -> str:
         return ""
 
 def _read_purpose() -> str:
-    return ""
+    try:
+        return render_strategy_directive()
+    except PurposeContractError as exc:
+        log.error("Strategic purpose contract is unavailable: %s", exc)
+        return "[STRATEGIC PURPOSE CONTRACT UNAVAILABLE: halt and repair purpose.md before ingesting.]"
 
 def _read_overview() -> str:
     return ""
@@ -156,6 +167,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     except Exception: pass
     
     index_summary = _read_index_summary()
+    purpose_content = _read_purpose()
     
     subagent_prompts = []
     
@@ -178,7 +190,8 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
             .replace("{{canonical_name}}", canonical_name) \
             .replace("{{skeleton_block}}", skeleton_block) \
             .replace("{{schema_content}}", schema_content) \
-            .replace("{{index_summary}}", index_summary)
+            .replace("{{index_summary}}", index_summary) \
+            .replace("{{purpose_content}}", purpose_content)
 
         task_file.write_text(instructions, encoding="utf-8")
         
@@ -199,6 +212,8 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
     try:
         from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError
         files = files_written
+        contract = load_purpose_contract()
+        node_records = validate_ingest_payload(files, contract)
                 
         wiki_dir = get_wiki_dir()
         
@@ -262,6 +277,39 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         except Exception:
             pass
         
-        return f"Successfully finalized ingestion for {filepath}."
+        proposal_count = 0
+        if files_written:
+            try:
+                # Include existing nodes sharing the newly observed tension target,
+                # so independently ingested sources can converge on one proposal.
+                candidate_records = list(node_records)
+                target_names = {
+                    str(edge.get("target", "")).strip()
+                    for record in node_records
+                    for edge in record.get("tension_edges", [])
+                    if isinstance(edge, dict) and str(edge.get("target", "")).strip()
+                }
+                if target_names:
+                    with open(get_index_path(), "r", encoding="utf-8") as handle:
+                        index_nodes = json.load(handle).get("nodes", {}).values()
+                    for node in index_nodes:
+                        edges = node.get("tension_edges", [])
+                        if any(isinstance(edge, dict) and edge.get("target") in target_names for edge in edges):
+                            candidate_records.append({
+                                "filename": node.get("id", ""),
+                                "sources": node.get("sources", []),
+                                "tension_edges": edges,
+                            })
+                for proposal in build_synthesis_proposals(candidate_records, contract):
+                    governance_store.enqueue_governance_item(
+                        proposal["type"], proposal["title"], proposal["description"],
+                        ", ".join(proposal["sources"]), proposal["search_queries"], proposal["affected_pages"],
+                    )
+                    proposal_count += 1
+            except Exception as exc:
+                log.warning("Ingest completed, but Synthesis-Proposal evaluation failed: %s", exc)
+
+        suffix = f" Queued {proposal_count} Synthesis-Proposal(s)." if proposal_count else ""
+        return f"Successfully finalized ingestion for {filepath}.{suffix}"
     except Exception as e:
         import traceback; return f"Error finalizing ingestion: {e}\n{traceback.format_exc()}"

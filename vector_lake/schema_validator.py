@@ -20,6 +20,19 @@ VALID_H3_SLOTS = {
 
 VALID_TYPES = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
 
+# Metric keys double as a physical unit contract.  Keep legacy keys readable,
+# but use the unambiguous keys below for all newly compiled SIR evidence.
+CONTROLLED_METRICS = {
+    "MedIT_Revenue", "Bids_Won", "Market_Share", "EMR_Level", "CHI_Level", "SLA",
+    "Bid_Count", "Bid_Value_CNY", "FHIR_OMOP_Center_Count", "IT_Budget_Change_Pct",
+    "Public_Cloud_Deployment_Ratio", "Acceptance_Case_Count", "Engineering_Test_RPS",
+    "Engineering_Test_P99_MS", "Engineering_Test_Error_Rate_Pct",
+    "GPU_Infrastructure_Cost_CNY", "API_Access_Fee_CNY", "Implementation_Duration_Days",
+    "Implementation_Cost_CNY", "Project_Cancellation_Rate_Pct", "SaaS_Value_Share_Pct",
+}
+
+INLINE_SOURCE_ANCHOR = re.compile(r"\(Source:\s*\[\[Source_[^\]]+\]\](?:[^)]*)\)")
+
 def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Path = None):
     """
     Validates a Vector Lake Wiki node against the strict constraints of schema.md.
@@ -141,10 +154,18 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
 
         # Metric Constraint
         metric_matches = re.findall(r'\{Metric:\s*([^\}]+)\}', section_1_text)
-        valid_metrics = {"MedIT_Revenue", "Bids_Won", "Market_Share", "EMR_Level", "CHI_Level", "SLA"}
         for m in metric_matches:
-            if m.strip() not in valid_metrics:
-                raise SchemaViolationException(f"Schema Violation: Invalid Metric key '{m.strip()}'. Allowed keys: {list(valid_metrics)}.")
+            if m.strip() not in CONTROLLED_METRICS:
+                raise SchemaViolationException(f"Schema Violation: Invalid Metric key '{m.strip()}'. Allowed keys: {sorted(CONTROLLED_METRICS)}.")
+
+        # Metrics are hard evidence.  A number without an auditable primary
+        # source is not allowed to alter the Compiled Truth read model.
+        for line in section_1_text.splitlines():
+            if "{Metric:" in line and not INLINE_SOURCE_ANCHOR.search(line):
+                raise SchemaViolationException(
+                    "Schema Violation: Metric assertions require an inline "
+                    "'(Source: [[Source_*]])' anchor."
+                )
 
         # Event Store (Timeline) validation
         section_2_match = re.search(r'## 2\. 证据时间线.*', body, re.DOTALL)

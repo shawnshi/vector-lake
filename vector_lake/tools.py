@@ -13,6 +13,7 @@ from vector_lake.tool_search import assemble_context, search_vector_lake
 from vector_lake.tool_sync import sync_vector_lake
 from vector_lake.tool_trace import trace_vector_lake
 from vector_lake.tool_research import research_vector_lake
+from vector_lake.tool_purpose import review_strategic_purpose
 
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "prepare_query_context",
     "research_vector_lake",
     "review_vector_lake",
+    "review_strategic_purpose",
     "search_vector_lake",
     "sync_vector_lake",
     "trace_vector_lake",

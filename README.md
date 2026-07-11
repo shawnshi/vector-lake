@@ -8,7 +8,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 - `MEMORY/wiki`：人类可读的 Markdown 发布层，用于审计、浏览、复盘和长期资产沉淀。
 - `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
 - `MEMORY/wiki/.meta/vector_lake.db`：统一的 SQLite 底层引擎，不仅保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列，同时也作为 Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state` 存入 `operational_memory` 表。
-- `MEMORY/purpose.md` & `purpose_vectors.json`：战略意图引擎与最高系统宪法。硬编码了“破窗证伪阈值 (Falsification Threshold)”、“静默丢弃 (Silent Drop)”规则与“结构性张力连线”，强制所有 Agent 抛弃附和，保持冷酷的医疗数字化情报局审计立场。
+- `MEMORY/purpose.md`：版本化战略控制面。YAML 契约驱动摄取范围、证据等级、意图权重、SIR 复审和张力合成阈值；营销噪音与范围外资料不进入主图谱，但保留最小丢弃审计。`purpose_vectors.json` 仅保留为旧版回退，不再是权重主源。
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
 
@@ -177,13 +177,13 @@ graph LR
 
 ```text
 MEMORY/
-  purpose.md          <-- Strategic Intent & Epistemic Stance
+  purpose.md          <-- Versioned Strategic Purpose Contract & Epistemic Stance
   raw/
   wiki/
     *.md
     index.json
     .meta/
-      purpose_vectors.json <-- Compiled Intent Weights
+      purpose_vectors.json <-- Optional legacy fallback for intent weights
       vector_lake.db       <-- Unified SQLite Store (Entities, Claims, Graph, Timeline, Operational Memory)
 ```
 
@@ -307,6 +307,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR) 与 Memory Packet |
 | `vector_lake/tool_query.py` | query-to-page synthesis |
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |
+| `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |
 | `vector_lake/tool_review.py` | legacy/governance review surface |
 | `vector_lake/tool_doctor.py` | runtime 体检 |
 | `vector_lake/mcp_server.py` | Model Context Protocol (MCP) 后端服务入口 |

@@ -18,7 +18,7 @@ AGY_SEMAPHORE = threading.Semaphore(3)
 
 from vector_lake import governance_store
 from vector_lake import db_store
-from vector_lake.wiki_utils import get_index_path, get_purpose_path, get_wiki_dir, get_meta_dir
+from vector_lake.wiki_utils import get_index_path, get_wiki_dir, get_meta_dir
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -664,8 +664,8 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
 
     purpose = ""
     try:
-        with open(get_purpose_path(), "r", encoding="utf-8") as handle:
-            purpose = handle.read()
+        from vector_lake.purpose_contract import render_strategy_directive
+        purpose = render_strategy_directive()
     except Exception:
         pass
 
