@@ -102,7 +102,7 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
         import jieba
         query_tok = " ".join(jieba.cut(query)) if query else ""
     except ImportError:
-        query_tok = " ".join(list(query)) if query else ""
+        query_tok = query if query else ""
         
     # Sanitize query_tok for FTS5 (remove special syntax characters)
     import re

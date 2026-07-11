@@ -774,8 +774,40 @@ def update_index_items(filenames: list[str]):
     if not valid_filenames:
         return
 
-    output_path = str(get_index_path())
+    # Pre-parse and pre-embed to prevent holding FileLock during Network I/O
+    pre_parsed_data = {}
+    import os
+    try:
+        from google import genai
+        client = genai.Client() if os.environ.get("GEMINI_API_KEY") else None
+    except ImportError:
+        client = None
+
     wiki_dir = _wiki_dir()
+    for filename in valid_filenames:
+        filepath = os.path.join(wiki_dir, filename)
+        node_key = filename[:-3]
+        if not os.path.exists(filepath):
+            continue
+        try:
+            node_data = _parse_wiki_node(filepath, node_key)
+        except Exception:
+            node_data = None
+        if node_data:
+            pre_parsed_data[node_key] = node_data
+            if client:
+                try:
+                    embedding_content = f"{node_data.get('title', '')} {node_data.get('summary', '')} {node_data.get('raw_text', '')}"
+                    response = client.models.embed_content(
+                        model="gemini-embedding-2",
+                        contents=embedding_content[:15000]
+                    )
+                    if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
+                        node_data["_pre_embedded"] = response.embeddings[0].values
+                except Exception as e:
+                    log.warning(f"Pre-embedding failed for {node_key}: {e}")
+
+    output_path = str(get_index_path())
     if not os.path.exists(output_path):
         return generate_index()
 
@@ -783,174 +815,178 @@ def update_index_items(filenames: list[str]):
     needs_full_rebuild = False
     try:
         with FileLock(lock_path, timeout=15):
-            try:
-                index_data = _load_index_unlocked(output_path)
-            except json.JSONDecodeError:
-                needs_full_rebuild = True
-                index_data = None
-
-            if index_data is None:
-                needs_full_rebuild = True
-            else:
-                removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
-                if removed_legacy_keys:
-                    log.info(
-                        "Detected legacy embedded governance payloads in index.json "
-                        f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
-                    )
+            from vector_lake.db_store import transaction
+            with transaction():
+                try:
+                    index_data = _load_index_unlocked(output_path)
+                except json.JSONDecodeError:
                     needs_full_rebuild = True
                     index_data = None
-
-            if index_data is not None:
-                if isinstance(index_data.get("categories"), list):
-                    index_data["categories"] = set(index_data["categories"])
-
-                all_nodes_triples = {}
-                for k, v in (index_data.get("nodes") or {}).items():
-                    td = {}
-                    for t in (v.get("triples") or []):
-                        if t.get("target"):
-                            td[t["target"]] = t.get("predicate", "mentions")
-                    all_nodes_triples[k] = td
-
-                for filename in valid_filenames:
-                    filepath = os.path.join(wiki_dir, filename)
-                    node_key = filename[:-3]
-
-                    if not filename.startswith(VALID_PREFIXES) and filename not in ("index.md", "log.md"):
-                        index_data.setdefault("error_log", [])
-                        index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
-                        index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
-                        log.warning(f"Schema violation in {filename} during partial update.")
-                        old_node = (index_data.get("nodes") or {}).pop(node_key, None)
-                        if old_node:
-                            db_store.delete_search_index(node_key)
-                        index_data["weighted_edges"] = [
-                            edge for edge in (index_data.get("weighted_edges") or [])
-                            if edge["source"] != node_key and edge["target"] != node_key
-                        ]
-                    else:
-                        index_data["aliases"] = {key: value for key, value in (index_data.get("aliases") or {}).items() if value != node_key}
-                        index_data.setdefault("error_log", [])
-                        index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
-
-                        if not os.path.exists(filepath):
+    
+                if index_data is None:
+                    needs_full_rebuild = True
+                else:
+                    removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
+                    if removed_legacy_keys:
+                        log.info(
+                            "Detected legacy embedded governance payloads in index.json "
+                            f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+                        )
+                        needs_full_rebuild = True
+                        index_data = None
+    
+                if index_data is not None:
+                    if isinstance(index_data.get("categories"), list):
+                        index_data["categories"] = set(index_data["categories"])
+    
+                    all_nodes_triples = {}
+                    for k, v in (index_data.get("nodes") or {}).items():
+                        td = {}
+                        for t in (v.get("triples") or []):
+                            if t.get("target"):
+                                td[t["target"]] = t.get("predicate", "mentions")
+                        all_nodes_triples[k] = td
+    
+                    for filename in valid_filenames:
+                        filepath = os.path.join(wiki_dir, filename)
+                        node_key = filename[:-3]
+    
+                        if not filename.startswith(VALID_PREFIXES) and filename not in ("index.md", "log.md"):
+                            index_data.setdefault("error_log", [])
+                            index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
+                            index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
+                            log.warning(f"Schema violation in {filename} during partial update.")
                             old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                             if old_node:
-                                db_store.delete_search_index(node_key)
+                                db_store.delete_node_cascade(node_key)
                             index_data["weighted_edges"] = [
                                 edge for edge in (index_data.get("weighted_edges") or [])
                                 if edge["source"] != node_key and edge["target"] != node_key
                             ]
                         else:
-                            try:
-                                node_data = _parse_wiki_node(filepath, node_key)
-                            except yaml.YAMLError as e:
-                                index_data["error_log"].append({"file": filename, "error": str(e)})
-                                log.warning(f"YAML Error in {filename} during partial update.")
-                                node_data = None
-
-                            if node_data is None:
-                                index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing 'domain' or 'status'. Node excluded."})
+                            index_data["aliases"] = {key: value for key, value in (index_data.get("aliases") or {}).items() if value != node_key}
+                            index_data.setdefault("error_log", [])
+                            index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
+    
+                            if not os.path.exists(filepath):
                                 old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                                 if old_node:
-                                    db_store.delete_search_index(node_key)
-                            else:
-                                old_node = index_data["nodes"].get(node_key)
-                                if old_node:
-                                    db_store.delete_search_index(node_key)
-                                
-                                index_data["nodes"][node_key] = node_data
-                                aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
-                                text = f"{aliases_str} {node.get('raw_text', '')}"
-                                t_title = _tokenize_for_fts(node.get('title', ''))
-                                t_summary = _tokenize_for_fts(node.get('summary', ''))
-                                t_text = _tokenize_for_fts(text)
-                                db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
-                                
-                                # Issue 4 Fix: Missing embedding recalculation
-                                try:
-                                    import os
-                                    if os.environ.get("GEMINI_API_KEY"):
-                                        from google import genai
-                                        client = genai.Client()
-                                        embedding_content = f"{node.get('title', '')} {node.get('summary', '')} {node.get('raw_text', '')}"
-                                        response = client.models.embed_content(
-                                            model="gemini-embedding-2",
-                                            contents=embedding_content[:15000]
-                                        )
-                                        if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-                                            db_store.upsert_embedding(node_key, response.embeddings[0].values)
-                                except Exception as e:
-                                    log.warning(f"Failed to generate and upsert embedding for {node_key}: {e}")
-                                
-                                if node_data["id"]:
-                                    index_data["aliases"][node_data["id"]] = node_key
-                                index_data["aliases"][node_key] = node_key
-                                for alias in node_data["aliases"]:
-                                    index_data["aliases"][alias] = node_key
-
-                                if isinstance(node_data["categories"], list):
-                                    categories = set((index_data.get("categories") or []))
-                                    for category in node_data["categories"]:
-                                        categories.add(category)
-                                    index_data["categories"] = categories
-
+                                    db_store.delete_node_cascade(node_key)
                                 index_data["weighted_edges"] = [
                                     edge for edge in (index_data.get("weighted_edges") or [])
                                     if edge["source"] != node_key and edge["target"] != node_key
                                 ]
-                                node_data["_key"] = node_key
-                                all_nodes = index_data["nodes"]
-
-                                td = {}
-                                for t in (node.get("triples") or []):
-                                    if t.get("target"):
-                                        td[t["target"]] = t.get("predicate", "mentions")
-                                all_nodes_triples[node_key] = td
-                                triples_a = td
-                                
-                                node_links = set((node.get("links") or []))
-                                node_sources = set((node.get("sources") or []))
-                                for other_key, other_node in all_nodes.items():
-                                    if other_key == node_key:
-                                        continue
+                            else:
+                                node_data = pre_parsed_data.get(node_key)
+                                if node_data is None:
+                                    try:
+                                        node_data = _parse_wiki_node(filepath, node_key)
+                                    except Exception as e:
+                                        index_data["error_log"].append({"file": filename, "error": str(e)})
+                                        node_data = None
+    
+                                if node_data is None:
+                                    index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing 'domain' or 'status'. Node excluded."})
+                                    old_node = (index_data.get("nodes") or {}).pop(node_key, None)
+                                    if old_node:
+                                        db_store.delete_node_cascade(node_key)
+                                else:
+                                    old_node = index_data["nodes"].get(node_key)
+                                    if old_node:
+                                        db_store.delete_node_cascade(node_key)
+                                    
+                                    index_data["nodes"][node_key] = node_data
+                                    aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
+                                    text = f"{aliases_str} {node.get('raw_text', '')}"
+                                    t_title = _tokenize_for_fts(node.get('title', ''))
+                                    t_summary = _tokenize_for_fts(node.get('summary', ''))
+                                    t_text = _tokenize_for_fts(text)
+                                    db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
+                                    
+                                    # Issue 4 Fix: Missing embedding recalculation
+                                    if "_pre_embedded" in node_data:
+                                        db_store.upsert_embedding(node_key, node_data["_pre_embedded"])
+                                    
+                                    if node_data["id"]:
+                                        index_data["aliases"][node_data["id"]] = node_key
+                                    index_data["aliases"][node_key] = node_key
+                                    for alias in node_data["aliases"]:
+                                        index_data["aliases"][alias] = node_key
+    
+                                    if isinstance(node_data["categories"], list):
+                                        categories = set((index_data.get("categories") or []))
+                                        for category in node_data["categories"]:
+                                            categories.add(category)
+                                        index_data["categories"] = categories
+    
+                                    index_data["weighted_edges"] = [
+                                        edge for edge in (index_data.get("weighted_edges") or [])
+                                        if edge["source"] != node_key and edge["target"] != node_key
+                                    ]
+                                    # Preserve manual edges from SQLite
+                                    try:
+                                        conn = db_store.get_connection()
+                                        cursor = conn.cursor()
+                                        cursor.execute("SELECT source_id, target_id, weight FROM claim_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
+                                        for row in cursor.fetchall():
+                                            index_data["weighted_edges"].append({
+                                                "source": row["source_id"],
+                                                "target": row["target_id"],
+                                                "weight": float(row["weight"]) if row["weight"] else 1.0,
+                                            })
+                                    except Exception as e:
+                                        pass
+                                    node_data["_key"] = node_key
+                                    all_nodes = index_data["nodes"]
+    
+                                    td = {}
+                                    for t in (node.get("triples") or []):
+                                        if t.get("target"):
+                                            td[t["target"]] = t.get("predicate", "mentions")
+                                    all_nodes_triples[node_key] = td
+                                    triples_a = td
+                                    
+                                    node_links = set((node.get("links") or []))
+                                    node_sources = set((node.get("sources") or []))
+                                    for other_key, other_node in all_nodes.items():
+                                        if other_key == node_key:
+                                            continue
+                                            
+                                        other_links = set((other_node.get("links") or []))
+                                        other_sources = set((other_node.get("sources") or []))
+                                        triples_b = all_nodes_triples.get(other_key)
                                         
-                                    other_links = set((other_node.get("links") or []))
-                                    other_sources = set((other_node.get("sources") or []))
-                                    triples_b = all_nodes_triples.get(other_key)
-                                    
-                                    has_direct = other_key in node_links or node_key in other_links
-                                    # Optimization: Replace bool(set1 & set2) with not isdisjoint() to prevent allocating a new set just to check for overlap
-                                    has_source_overlap = not node_sources.isdisjoint(other_sources)
-                                    has_common_neighbor = not node_links.isdisjoint(other_links)
-                                    
-                                    if not (has_direct or has_source_overlap or has_common_neighbor):
-                                        continue
-
-                                    other_node["_key"] = other_key
-                                    relevance = calculate_relevance(
-                                        node_data, other_node, all_nodes,
-                                        links_a=node_links, links_b=other_links,
-                                        sources_a=node_sources, sources_b=other_sources,
-                                        triples_a=triples_a, triples_b=triples_b
-                                    )
-                                    if relevance >= 1.5:
-                                        index_data["weighted_edges"].append({
-                                            "source": min(node_key, other_key),
-                                            "target": max(node_key, other_key),
-                                            "weight": relevance,
-                                        })
-                                    other_node.pop("_key", None)
-                                node_data.pop("_key", None)
-
-                _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
-                index_data["categories"] = list((index_data.get("categories") or []))
-                # Do not recompute heavy debt metrics on partial update
-                index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
-                index_data["schema_version"] = "8.0"
-                # V11.3 Fixed: Write partial updates back to disk to prevent ghost updates
-                _write_index(output_path, index_data)
+                                        has_direct = other_key in node_links or node_key in other_links
+                                        # Optimization: Replace bool(set1 & set2) with not isdisjoint() to prevent allocating a new set just to check for overlap
+                                        has_source_overlap = not node_sources.isdisjoint(other_sources)
+                                        has_common_neighbor = not node_links.isdisjoint(other_links)
+                                        
+                                        if not (has_direct or has_source_overlap or has_common_neighbor):
+                                            continue
+    
+                                        other_node["_key"] = other_key
+                                        relevance = calculate_relevance(
+                                            node_data, other_node, all_nodes,
+                                            links_a=node_links, links_b=other_links,
+                                            sources_a=node_sources, sources_b=other_sources,
+                                            triples_a=triples_a, triples_b=triples_b
+                                        )
+                                        if relevance >= 1.5:
+                                            index_data["weighted_edges"].append({
+                                                "source": min(node_key, other_key),
+                                                "target": max(node_key, other_key),
+                                                "weight": relevance,
+                                            })
+                                        other_node.pop("_key", None)
+                                    node_data.pop("_key", None)
+    
+                    _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
+                    index_data["categories"] = list((index_data.get("categories") or []))
+                    # Do not recompute heavy debt metrics on partial update
+                    index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
+                    index_data["schema_version"] = "8.0"
+                    # V11.3 Fixed: Write partial updates back to disk to prevent ghost updates
+                    _write_index(output_path, index_data)
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")
         return
@@ -972,45 +1008,47 @@ def refresh_graph_topology_if_dirty() -> bool:
     lock_path = output_path + ".lock"
     try:
         with FileLock(lock_path, timeout=15):
-            try:
-                index_data = _load_index_unlocked(output_path)
-            except json.JSONDecodeError:
-                index_data = None
-
-            if index_data is None:
-                generate_index()
-                return True
-
-            removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
-            if removed_legacy_keys:
-                log.info(
-                    "Detected legacy embedded governance payloads during graph refresh "
-                    f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
-                )
-                generate_index()
-                return True
-
-            if is_graph_dirty(index_data):
-                _apply_graph_topology(index_data)
-                temp_path = output_path + ".tmp"
-                with open(temp_path, "w", encoding="utf-8") as handle:
-                    json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
-                for attempt in range(5):
-                    try:
-                        os.replace(temp_path, output_path)
-                        break
-                    except PermissionError as e:
-                        if attempt < 4:
-                            time.sleep(0.1 * (2 ** attempt))
-                        else:
-                            log.error(f"Failed to write {output_path} due to file lock after 5 attempts. Graph refresh aborted.")
-                            try:
-                                os.remove(temp_path)
-                            except Exception:
-                                pass
-                            raise e
-                log.info("Graph topology partially refreshed and saved.")
-                return True
+            from vector_lake.db_store import transaction
+            with transaction():
+                try:
+                    index_data = _load_index_unlocked(output_path)
+                except json.JSONDecodeError:
+                    index_data = None
+    
+                if index_data is None:
+                    generate_index()
+                    return True
+    
+                removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
+                if removed_legacy_keys:
+                    log.info(
+                        "Detected legacy embedded governance payloads during graph refresh "
+                        f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+                    )
+                    generate_index()
+                    return True
+    
+                if is_graph_dirty(index_data):
+                    _apply_graph_topology(index_data)
+                    temp_path = output_path + ".tmp"
+                    with open(temp_path, "w", encoding="utf-8") as handle:
+                        json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
+                    for attempt in range(5):
+                        try:
+                            os.replace(temp_path, output_path)
+                            break
+                        except PermissionError as e:
+                            if attempt < 4:
+                                time.sleep(0.1 * (2 ** attempt))
+                            else:
+                                log.error(f"Failed to write {output_path} due to file lock after 5 attempts. Graph refresh aborted.")
+                                try:
+                                    os.remove(temp_path)
+                                except Exception:
+                                    pass
+                                raise e
+                    log.info("Graph topology partially refreshed and saved.")
+                    return True
             return False
     except Timeout:
         log.error(f"Timeout while acquiring lock for {output_path}")

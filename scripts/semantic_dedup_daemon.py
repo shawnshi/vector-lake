@@ -34,7 +34,7 @@ async def llm_semantic_arbiter(client, sem: asyncio.Semaphore, left_name: str, l
     import asyncio
     agy_exec = shutil.which("agy")
     if not agy_exec:
-        return True
+        return False
     
     prompt = f"""You are a strict Medical Knowledge Graph Ontology Arbiter.
 Analyze the following two entities:
@@ -59,10 +59,11 @@ Answer with exactly one word: YES if they are the exact same concept and should 
                 return "YES" in stdout.decode('utf-8', errors='replace').upper()
             else:
                 log.error(f"agy arbiter failed: {stderr.decode('utf-8', errors='replace')}")
+                await asyncio.sleep(1)
         except Exception as e:
             log.error(f"LLM Arbiter failed on attempt {attempt+1}: {e}")
             await asyncio.sleep(1)
-    return True
+    return False
 
 async def fetch_embedding(client, sem: asyncio.Semaphore, title: str, text_to_embed: str) -> list[float]:
     async with sem:
@@ -206,6 +207,7 @@ async def async_run_daemon():
     arbiter_metadata = []
 
     for i in range(len(entity_keys)):
+        if i % 10 == 0: await asyncio.sleep(0) # Yield to prevent blocking
         left_key = entity_keys[i]
         left_node = entities[left_key]
         left_strip = left_node['_stripped']

@@ -207,9 +207,9 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
         summary_tok = " ".join(jieba.cut(summary)) if summary else ""
         text_tok = " ".join(jieba.cut(text)) if text else ""
     except ImportError:
-        title_tok = " ".join(list(title)) if title else ""
-        summary_tok = " ".join(list(summary)) if summary else ""
-        text_tok = " ".join(list(text)) if text else ""
+        title_tok = title if title else ""
+        summary_tok = summary if summary else ""
+        text_tok = text if text else ""
 
     conn = get_connection()
     with transaction():
@@ -221,7 +221,7 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
         """, (node_key, title_tok, summary_tok, text_tok))
 
 def upsert_embedding(entity_id: str, embedding: list[float]):
-    if not embedding or len(embedding) != 3072:
+    if not embedding:
         return
     import math
     norm = math.sqrt(sum(x*x for x in embedding))
@@ -263,7 +263,13 @@ def search_wiki(query: str, limit: int = 50) -> list[dict]:
         import jieba
         query_tok = " ".join(jieba.cut(query)) if query else ""
     except ImportError:
-        query_tok = " ".join(list(query)) if query else ""
+        query_tok = query if query else ""
+
+    query_tok = query_tok.strip()
+    if not query_tok:
+        return []
+        
+    query_esc = " ".join(f'"{t}"' for t in query_tok.split())
 
     conn = get_connection()
     cur = conn.execute("""
@@ -271,7 +277,7 @@ def search_wiki(query: str, limit: int = 50) -> list[dict]:
         FROM wiki_search_index 
         WHERE wiki_search_index MATCH ? 
         ORDER BY rank LIMIT ?
-    """, (query_tok, limit))
+    """, (query_esc, limit))
     return [dict(row) for row in cur.fetchall()]
 
 def get_processed_files() -> dict[str, str]:

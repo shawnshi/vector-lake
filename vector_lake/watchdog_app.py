@@ -89,8 +89,8 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
 
         now = time.time()
         with self.lock:
-            if len(self.last_triggered) > 1000:
-                self.last_triggered = {k: v for k, v in self.last_triggered.items() if (now - v) <= DEBOUNCE_SECONDS * 2}
+            if len(self.last_triggered) > 2000:
+                self.last_triggered.clear()
             
             if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
                 return
@@ -110,7 +110,10 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
             except Exception as e:
                 log.error(f"Failed to trigger sync_focus.py: {e}")
                 
-        threading.Thread(target=run_sync, daemon=True).start()
+        if not hasattr(self, "executor"):
+            import concurrent.futures
+            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        self.executor.submit(run_sync)
 
     def on_created(self, event): self.handle_event(event)
     def on_modified(self, event): self.handle_event(event)
@@ -125,6 +128,11 @@ class RawWatchdogHandler(FileSystemEventHandler):
         if event.is_directory:
             return
         filepath = event.src_path
+        
+        # Prevent Double-Trigger: Exclude privacy/Diary (handled by DiaryWatchdogHandler)
+        if "privacy" in filepath and "Diary" in filepath:
+            return
+            
         filename = os.path.basename(filepath)
         # only md, pdf, txt, etc? Let's just say any file that doesn't start with .
         if filename.startswith('.'):
@@ -132,8 +140,8 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
         now = time.time()
         with self.lock:
-            if len(self.last_triggered) > 1000:
-                self.last_triggered = {k: v for k, v in self.last_triggered.items() if (now - v) <= DEBOUNCE_SECONDS * 2}
+            if len(self.last_triggered) > 2000:
+                self.last_triggered.clear()
             if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
                 return
             self.last_triggered[filepath] = now
