@@ -257,6 +257,8 @@ def delete_node_cascade(node_key: str):
         conn.execute("DELETE FROM timeline_events WHERE entity_id = ?", (ent_id,))
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
+    import re
+    query = re.sub(r'[^\w\s\u4e00-\u9fa5]', ' ', query) if query else ""
     try:
         import jieba
         query_tok = " ".join(jieba.cut(query)) if query else ""
