@@ -32,6 +32,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   memory_key: "stable_runtime_key" 
   categories: ["System_Architecture"] 
   tags: ["tag1", "tag2"]
+  architecture_patterns: ["微服务", "数据飞轮"] # Allowed for technical traits
   created: "YYYY-MM-DD"
   updated: "YYYY-MM-DD"
   sources: ["raw/doc1.pdf", "raw/doc2.txt"]
@@ -46,7 +47,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   ```
 Semantic Bidirectional Linking (SSOT Rule): ALL topological relations MUST be 100% and uniquely carried by Markdown semantic links. DO NOT use YAML arrays (like parents) for relationships. You MUST use strict relation-typed links from the Controlled Vocabulary: [predicate:: [[Target_Entity_Name]]].
 Ontological & Creation: [is-a::], [part-of::], [evolved-from::], [created::], [founded::], [authored::], [architected::]
-Strategic & Power: [competes-with::], [supplies-to::], [supplied-by::], [blocks::], [controls::], [manages::], [invested-in::], [allied-with::]
+Strategic & Power: [competes-with::], [supplies-to::], [supplied-by::], [blocks::], [conflicts-with::], [controls::], [manages::], [invested-in::], [allied-with::]
 Integration & Deployment (Med IT Spec): [integrates-with::], [runs-on::], [deployed-at::], [complies-with::], [certified-by::]
 Epistemic: [validates::], [falsifies::], [depends-on::]
 Instantiation: [instantiated-by::]
@@ -60,9 +61,9 @@ Medical IT evidence keys: `FHIR_OMOP_Center_Count` (count), `IT_Budget_Change_Pc
 
 Example: `- {Metric: EMR_Level} [[Institution_协和医院]] 7 (Source: [[Source_2025评级公告]])`.
 Semantic Tension Quantification Model (STQM): When synthesizing documents that contradict or explicitly support existing knowledge, generate a tension_edges array in the YAML frontmatter. (Polarity: -1.0 to 1.0, Intensity: 0.0 to 1.0, Context: 1-sentence reason).
-Contradictions & Synthesis: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction in the text AND map the physical collision using tension_edges.
+Contradictions & Synthesis: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction in the text AND map the physical collision using tension_edges (or embed inline: [falsifies:: [[Target]] {intensity: 0.85}]).
 Temporal Rot Defense: Anchor claims to a specific time frame using inline brackets at the start of a bullet/paragraph (e.g., [2024] The market is...).
-Epistemic Decay (TTL): Actively assign a shorter ttl for time-sensitive nodes. Default TTLs: Concept: 1825, Vendor/Institution/Product/Person/Event: 1095, Synthesis: 730, Source: 365.
+Epistemic Decay (TTL): Actively assign a shorter ttl for time-sensitive nodes. Default TTLs: Tie strictly to pistemic-status (seed: 90, sprouting: 365, evergreen: 1825). Synthesis: 730, Source: 365.
 Operational Memory Split: Agent runtime state is stored in operational_memory.json. Trigger the MCP Tool update_operational_memory to register state.
 File Naming Policy & Ontology Lock:
 Strict Naming Protocol ([ControlledType]_[MainName]-[SubName].md).
@@ -151,7 +152,7 @@ Merge Constraint: ABSOLUTELY NO manual file merging. Use resolve_governance_item
 Metadata Decay Mechanism: Handled by AST daemon TTL expiration. Nodes marked [⏳ 过期警告] bypass standard RAG context.
 Taxonomy Tyranny:
 Rule 1: NEVER use an existing entity name as a tag.
-Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换).
+Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换). Use rchitecture_patterns in YAML for technical jargon.
 Rule 3: An entity MUST NOT have more than 3 tags.
 ***
 *(System Notification: Schema V8.0 with Strategic Contract V12.0. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*

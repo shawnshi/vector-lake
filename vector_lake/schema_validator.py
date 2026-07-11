@@ -9,7 +9,7 @@ class SchemaViolationException(Exception):
 
 VALID_H3_SLOTS = {
     "vendor": ["### 组织架构与商业模式 (Business Model)", "### 核心护城河 (Moat)", "### 市场占位与竞争态势 (Market & Competition)", "### 生态位与战略联盟 (Ecosystem & Alliances)", "### 关键产品线 (Key Products)", "### 核心团队与权力拓扑 (Key Personnel)"],
-    "institution": ["### 机构定位与核心诉求 (Positioning & Needs)", "### 数字化演进路线 (Digital Roadmap)", "### 核心供应商与生态锚定 (Key Suppliers & Lock-ins)"],
+    "institution": ["### 机构定位与核心诉求 (Positioning & Needs)", "### 数字化演进路线 (Digital Roadmap)", "### 核心供应商与生态锚定 (Key Suppliers & Lock-ins)", "### 预算流动与财务状况 (Budget & Financial Health)"],
     "concept": ["### 物理机制 (Mechanism)", "### 适用与失效边界 (Boundaries)", "### 产业落地与代表实例 (Implementations)", "### 演进关联 (Evolution)"],
     "product": ["### 目标客群与应用边界 (Target ICP & Use Cases)", "### 临床与管理价值流 (Clinical & Admin Value)", "### 部署架构与底层依赖 (Architecture & Dependencies)", "### 医疗合规与资质壁垒 (Compliance & Certifications)", "### 商业化与交付模式 (Monetization & Delivery)"],
     "person": ["### 核心权责与控制域 (Mandates & Domain of Control)", "### 关键造物与历史印记 (Key Artifacts & Legacy)", "### 核心主张与商业/技术理念 (Key Stances & Philosophies)", "### 利益纽带与权力拓扑 (Affiliations & Power Topology)"],
@@ -196,7 +196,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
         "is-a", "part-of", "evolved-from", "created", "founded", "authored", "architected",
         "competes-with", "supplies-to", "supplied-by", "blocks", "controls", "manages", "invested-in", "allied-with",
         "integrates-with", "runs-on", "deployed-at", "complies-with", "certified-by",
-        "validates", "falsifies", "depends-on", "instantiated-by", "mentions", "related_to", "has_part", "属于", "核心构件", "关联", "提及", "引用", "类似", "parent", "belongs_to", "instance_of", "peer", "see_also"
+        "validates", "falsifies", "depends-on", "instantiated-by", "mentions", "related_to", "has_part", "属于", "核心构件", "关联", "提及", "引用", "类似", "parent", "belongs_to", "instance_of", "peer", "see_also", "conflicts-with"
     } # Keeping backward compatible but standardized.
     
     for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", clean_body):
