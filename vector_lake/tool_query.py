@@ -181,6 +181,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     for target in broken_targets:
         node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")) else "concept"
         frontmatter = {
+            "id": target,
             "title": target.replace("_", " "),
             "type": node_type,
             "domain": "General",

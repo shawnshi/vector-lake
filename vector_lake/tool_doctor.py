@@ -12,7 +12,7 @@ from vector_lake.db_store import get_db_path
 
 
 def doctor_vector_lake() -> str:
-    governance_store.initialize_meta_store()
+    # initialize_meta_store() removed in SQLite refactor
     checks = []
 
     python_ok = sys.version_info >= (3, 10)

@@ -3,7 +3,7 @@ from vector_lake import governance_store
 
 
 def debt_vector_lake(top: int = 20) -> str:
-    governance_store.ensure_canonical_store_populated()
+    # ensure_canonical_store_populated() removed in SQLite refactor
     metrics = governance_metrics.compute_debt_metrics()
     merge_candidates = governance_metrics.find_merge_candidates(limit=top)
     lines = ["=== Vector Lake Debt Dashboard ==="]
