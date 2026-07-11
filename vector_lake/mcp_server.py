@@ -377,13 +377,19 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
     return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files and updated index."
 
 @mcp.tool()
-def bulk_reconciliation(operations: list, dry_run: bool = True) -> str:
+def bulk_reconciliation(payload_file: str, dry_run: bool = True) -> str:
     """Execute a batch of graph reconciliation operations (merge, replace_only, alias).
     
     Args:
-        operations: List of dictionaries. Each dict must have 'source_entity' and 'target_entity'.
+        payload_file: Absolute path to a temporary JSON file containing the operations array.
         dry_run: Whether to perform a dry run (default: True).
     """
+    import json
+    try:
+        content = _read_payload(payload_file)
+        operations = json.loads(content)
+    except Exception as e:
+        return str(e)
     from vector_lake.tool_bulk_reconciliation import bulk_reconcile
     return bulk_reconcile(operations, dry_run)
 

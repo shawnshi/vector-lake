@@ -7,8 +7,9 @@ class DefenseHookException(Exception):
 
 VALID_H3_SLOTS = {
     "vendor": ["### 组织架构与商业模式 (Business Model)", "### 核心护城河 (Moat)", "### 市场占位与竞争态势 (Market & Competition)", "### 生态位与战略联盟 (Ecosystem & Alliances)", "### 关键产品线 (Key Products)", "### 核心团队与权力拓扑 (Key Personnel)"],
+    "institution": ["### 机构定位与核心诉求 (Positioning & Needs)", "### 数字化演进路线 (Digital Roadmap)", "### 核心供应商与生态锚定 (Key Suppliers & Lock-ins)"],
     "concept": ["### 物理机制 (Mechanism)", "### 适用与失效边界 (Boundaries)", "### 产业落地与代表实例 (Implementations)", "### 演进关联 (Evolution)"],
-    "product": ["### 目标客群与应用边界 (Target ICP & Use Cases)", "### 核心价值流 (Value Stream)", "### 部署架构与底层依赖 (Architecture & Dependencies)", "### 商业化与交付模式 (Monetization & Delivery)"],
+    "product": ["### 目标客群与应用边界 (Target ICP & Use Cases)", "### 临床与管理价值流 (Clinical & Admin Value)", "### 部署架构与底层依赖 (Architecture & Dependencies)", "### 医疗合规与资质壁垒 (Compliance & Certifications)", "### 商业化与交付模式 (Monetization & Delivery)"],
     "person": ["### 核心权责与控制域 (Mandates & Domain of Control)", "### 关键造物与历史印记 (Key Artifacts & Legacy)", "### 核心主张与商业/技术理念 (Key Stances & Philosophies)", "### 利益纽带与权力拓扑 (Affiliations & Power Topology)"],
     "event": ["### 动因与前置条件 (Catalysts & Preconditions)", "### 核心影响与转折 (Impact)", "### 关键参与方 (Stakeholders)", "### 后续衍生与未决节点 (Fallout & Unresolved Issues)"],
     "policy": ["### 管辖范围与适用对象 (Jurisdiction & Applicability)", "### 核心约束与合规要求 (Compliance Mandates)", "### 奖惩机制与市场影响 (Incentives & Penalties)", "### 演进与废除条件 (Lifecycle)"],
@@ -77,8 +78,18 @@ def verify_asset(content: str, filename: str, frontmatter: dict, index_path: Pat
             section_1_text = section_1_match.group(0)
             h3_headers = re.findall(r'^###\s+(.*)$', section_1_text, re.MULTILINE)
             
-            allowed_slots = VALID_H3_SLOTS[doc_type]
+            allowed_slots = list(VALID_H3_SLOTS[doc_type])
+            if "tension_edges" in frontmatter and frontmatter["tension_edges"]:
+                allowed_slots.append("### 认知张力与未决争议 (Controversies & Tensions)")
+            
             for header in h3_headers:
                 header_cleaned = f"### {header.strip()}"
                 if header_cleaned not in allowed_slots:
                     raise DefenseHookException(f"Schema Violation: Invalid H3 header '{header_cleaned}' for type '{doc_type}'. Allowed slots: {allowed_slots}. Fix the markdown format and try saving again.")
+                    
+            # 4. Metric Constraint
+            metric_matches = re.findall(r'\{Metric:\s*([^\}]+)\}', section_1_text)
+            valid_metrics = {"MedIT_Revenue", "Bids_Won", "Market_Share", "EMR_Level", "CHI_Level", "SLA"}
+            for m in metric_matches:
+                if m.strip() not in valid_metrics:
+                    raise DefenseHookException(f"Schema Violation: Invalid Metric key '{m.strip()}'. Allowed keys: {list(valid_metrics)}.")
