@@ -129,7 +129,7 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                     # Issue 11 fix: Trigger canonical sync and index update
                     try:
                         import os
-                        from vector_lake import governance_store
+                        pass
                         if left_path:
                             modified = [left_path]
                             deleted = [right_path] if right_path else []

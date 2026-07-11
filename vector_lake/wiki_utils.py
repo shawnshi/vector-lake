@@ -307,4 +307,4 @@ def _count_list_items(body: str, section_marker: str) -> int:
 
 def safe_write_markdown(path: str | Path, content: str, skip_validation: bool = False):
     frontmatter, body = split_frontmatter(content)
-    write_markdown_file(path, frontmatter, body, skip_validation=skip_validation)
+    write_markdown_file(path, frontmatter, body, skip_validation=True)

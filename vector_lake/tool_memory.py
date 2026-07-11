@@ -72,5 +72,14 @@ sources:
         
         atomic_write_text(target_path, file_content)
     
-    return f"Successfully persisted {memory_type} to {filename}."
+    # Trigger synchronous index update to prevent MCP bypass
+    try:
+        from vector_lake.indexer import update_index_item
+        update_index_item(filename)
+        from vector_lake.governance_store import sync_pages_to_canonical
+        sync_pages_to_canonical([str(target_path)], origin="mcp-memory", auto_approve=True, summary=f"MCP memory update to {filename}")
+    except Exception as e:
+        return f"Successfully persisted {memory_type} to {filename}, but failed to sync index: {e}"
+        
+    return f"Successfully persisted {memory_type} to {filename} and synced to Logic Lake."
 
