@@ -1093,7 +1093,7 @@ def create_change_set(
 def apply_change_set(change_set: dict) -> dict:
     from filelock import FileLock
     from vector_lake.wiki_utils import get_meta_dir
-    lock_path = str(get_meta_dir() / "governance_sync.lock")
+    lock_path = str(get_meta_dir() / "governance_sync_2.lock")
     with FileLock(lock_path, timeout=60):
         with transaction():
             entities = load_entities()
@@ -1193,7 +1193,7 @@ def pending_governance_items() -> list:
 def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bool = True, summary: str | None = None) -> dict | None:
     from filelock import FileLock
     from vector_lake.wiki_utils import get_meta_dir
-    lock_path = str(get_meta_dir() / "governance_sync.lock")
+    lock_path = str(get_meta_dir() / "governance_sync_2.lock")
     with FileLock(lock_path, timeout=60):
         return _sync_pages_to_canonical_impl(page_paths, origin, auto_approve, summary)
 

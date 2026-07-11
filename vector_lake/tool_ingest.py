@@ -245,15 +245,16 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                         auto_approve=True,
                         summary=f"Subagent ingest sync for {len(files_written)} page(s)"
                     )
-                    from vector_lake.indexer import update_index_items
-                    filenames_only = [os.path.basename(f) for f in files_written]
-                    update_index_items(filenames_only)
                 
                 filepath = processed_data["filepath"]
                 file_hash = processed_data["hash"]
                 mark_file_processed(filepath, file_hash)
                 
             if files_written:
+                from vector_lake.indexer import update_index_items
+                filenames_only = [os.path.basename(f) for f in files_written]
+                update_index_items(filenames_only)
+
                 tmp_dir = get_extension_root() / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 with open(tmp_dir / "flag_reindex.lock", "w") as f:
