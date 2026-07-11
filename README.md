@@ -35,9 +35,10 @@ graph LR
 为了保持图谱检索的高信噪比与一致性，Wiki 目录下的 Markdown 文件必须遵循严格的**受控命名前缀**，并被划分为两种完全不同的文件组织结构规范。
 
 ### 1. 核心受控类型 (Prefixes)
-所有文件强制锁定以下前缀（禁用空格与其他非规范符号，格式如 `Vendor_卫宁健康.md`）：
-- **`Vendor_*`**：企业、医院、组织机构。
-- **`Product_*`**：产品、系统、软件架构。
+所有文件强制锁定以下前缀（禁用空格与其他非规范符号，格式如 `Institution_北京协和医院.md`）：
+- **`Institution_*`**：医疗机构、医院、医学院及科研院所实体。
+- **`Vendor_*`**：商业侧供应商、IT企业、设备厂商。
+- **`Product_*`**：医疗IT产品、系统、软件架构（强制包含资质合规槽位）。
 - **`Person_*`**：核心高管、研究员、关键人物。
 - **`Event_*`**：重要会议、行业突发事件。
 - **`Concept_*`**：抽象架构、理论、业务机制。
@@ -125,6 +126,11 @@ graph LR
 - **大模型网络层原子解锁 (Network Blockade Fix)**：剥离了全量索引 `_build_bm25_index` 与 SQLite `BEGIN IMMEDIATE` 事务之间的死锁关系。将 LLM 向量请求抽取至独立预计算阶段，彻底根除了由于网络抖动（如 Gemini API 响应缓慢）导致的 SQLite 库级排他锁灾难，保障了守护进程的绝对顺滑。
 - **零污染语法树解析罩 (AST Parser Hardening)**：为底层的 `_parse_wiki_node` 装备了严格的单/多行代码块洗刷管道。精准阻断了大模型代码示例块（如 Markdown Code Blocks）中包含的伪造断言（如 `[predicate:: [[fake_target]]]`）对主图谱的网络毒化，杜绝了幽灵脏边的数据穿透。
 - **O(V+E) 稀疏图遍历守护 (Topology Check)**：确认并锁定了 `_calculate_weighted_edges` 中的反向邻接表预裁剪算法，规避了直接全连接图的 O(N²) 大规模爆栈，为十万级节点突破保留了强健通道。
+
+### 🧬 V11.9 领域实体裂变与强约束产品架构 (V11.9 Domain Ontology Split & Strict Product Schema)
+- **医疗/商业实体分轨 (Institution-Vendor Schism)**：在底层图谱中正式将医疗机构与商业厂商剥离。通过全局链路的模糊推断重定向算法，将历史遗留的 `Vendor_医院` 前缀软链接无感物理重定向至新增的第一类合法实体 `Institution_`。彻底解除了科研节点与商业利润架构的冲突。
+- **Product 医疗行业特化防护 (Domain-Specific Schema)**：对 `Product` 节点执行了铁腕式的医疗槽位注入。所有医疗 IT 产品被强制要求挂载 `### 临床与管理价值流 (Clinical & Admin Value)`、`### 医疗合规与资质壁垒 (Compliance & Certifications)` 以及响应 STQM 的 `### 认知张力与未决争议 (Controversies & Tensions)`。防御任何未经过合规审计的野鸡架构非法入湖。
+- **批量图谱手术与断链自愈 (Mass Graph Surgery & Self-Healing)**：大幅升级了相似性合并管线。在相似节点去重合并时，底层脚本能自动扫略上万级文件的全局双链 `[[ ]]`，将所有指向废弃（或次级）节点的死链硬重定向至 Primary 基座，并将碎屑作为 alias 注入。真正实现了高度相似知识噪音的自动化坍缩与自愈。
 
 ### 🔌 Antigravity Orchestrator 深度集成
 
