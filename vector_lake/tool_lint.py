@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake.wiki_utils import get_wiki_dir, read_markdown_file, write_markdown_file
+from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -18,7 +19,7 @@ log = logging.getLogger("vector-lake-tool-lint")
 
 def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str):
     try:
-        write_markdown_file(filepath, frontmatter, body, skip_validation=True)
+        write_markdown_file(filepath, frontmatter, body, skip_validation=False)
     except Exception as e:
         log.warning(f"Failed to write fixed frontmatter to {filepath}: {e}")
 
@@ -45,7 +46,7 @@ def lint_vector_lake(auto_fix: bool = False):
     required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]
 
     files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]
-    issues = {key: [] for key in ["frontmatter", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment"]}
+    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment"]}
     fixes_applied = 0
 
     parsed = {}
@@ -168,13 +169,14 @@ def lint_vector_lake(auto_fix: bool = False):
                             "title": target,
                             "type": "concept",
                             "domain": "General",
-                            "status": "active",
+                            "status": "Active",
                             "epistemic-status": "seed",
                             "categories": ["Uncategorized"],
-                            "created": datetime.datetime.now().strftime("%Y-%m-%d"),
-                            "updated": datetime.datetime.now().strftime("%Y-%m-%d")
+                            "sources": [],
+                            "created": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z"),
+                            "updated": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z")
                         }
-                        stub_body = f"\n# {target}\n\nThis is an auto-generated stub page to prevent broken links from [[{filename[:-3]}]].\n\n## 1. 编译事实\n- Auto-generated stub.\n\n## 2. 证据时间线\n- {datetime.datetime.now().strftime('%Y-%m-%d')}: Created stub.\n"
+                        stub_body = f"\n# {target}\n\n## 1. 编译事实\n*[System Directive: This section represents the LATEST consensus.]*\n\nAuto-generated stub for {target}. (Last Reshaped: [[{datetime.datetime.now().strftime('%Y-%m-%d')}]])\n\n### 物理机制 (Mechanism)\n- [[{target}]] Auto-generated stub.\n\n---\n\n## 2. 证据时间线\n*[System Directive: This is the immutable event ledger.]*\n\n- [{datetime.datetime.now().strftime('%Y-%m-%d')}] [Observation] Created stub.\n"
                         _write_fixed_frontmatter(stub_path, stub_fm, stub_body)
                         all_keys.add(stub_filename[:-3])
                         fixes_applied += 1
@@ -238,6 +240,11 @@ def lint_vector_lake(auto_fix: bool = False):
         if auto_fix and changed:
             _write_fixed_frontmatter(data["path"], frontmatter, data["body"])
             fixes_applied += 1
+
+        try:
+            validate_schema(frontmatter, data["body"], filename)
+        except SchemaViolationException as e:
+            issues["schema"].append(f"{filename}: {str(e)}")
 
     # 6. Similarity Merge (>0.91)
     keys_list = sorted(list(all_keys))
@@ -416,6 +423,7 @@ def lint_vector_lake(auto_fix: bool = False):
         "semantic_gc": "11. Semantic Garbage Collection",
         "governance": "12. Governance Debt",
         "alignment": "13. Alignment Drift",
+        "schema": "14. Strict Schema Verification",
     }
 
     total_issues = sum(len(items) for items in issues.values())

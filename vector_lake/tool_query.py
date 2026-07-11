@@ -117,9 +117,8 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
             if filename.startswith("Synthesis_"):
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                if "盲区与缺失度分析" not in content and "Gap Analysis" not in content:
-                    os.remove(file_path)
-                    raise ValueError(f"VALIDATION_FAIL: {filename} is missing mandatory '盲区与缺失度分析' (Gap Analysis) section. Synthesis rejected.")
+                if "核心合成论点" not in content or "支撑拓扑" not in content:
+                    raise ValueError(f"VALIDATION_FAIL: {filename} is missing mandatory '核心合成论点' or '支撑拓扑' sections. Synthesis rejected.")
                     
             valid_files.add(filename)
             sanitize_wiki_node(file_path)
@@ -180,7 +179,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     stubs = 0
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     for target in broken_targets:
-        node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")) else "concept"
+        node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")) else "concept"
         frontmatter = {
             "title": target.replace("_", " "),
             "type": node_type,
@@ -190,14 +189,30 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
             "epistemic-status": "seed",
             "categories": ["Uncategorized"],
             "tags": ["auto-stub"],
-            "created": today,
-            "updated": today,
+            "created": f"{today}T00:00:00Z",
+            "updated": f"{today}T00:00:00Z",
             "sources": [],
         }
         body = (
             f"# {target.replace('_', ' ')}\n\n"
-            "> This is an auto-generated stub page. It was referenced by another wiki page but did not exist.\n"
-            "> Please expand with real content when information becomes available.\n"
+            f"## 1. 编译事实\n"
+            f"*[System Directive: This section represents the LATEST consensus.]*\n\n"
+            f"Auto-generated stub page for {target}. (Last Reshaped: [[{today}]])\n\n"
+        )
+        
+        # Add the first valid slot for the type
+        from vector_lake.schema_validator import VALID_H3_SLOTS
+        slots = VALID_H3_SLOTS.get(node_type, [])
+        if slots:
+            body += f"{slots[0]}\n- [[{target}]] Auto-generated stub.\n\n"
+        else:
+            body += f"### 基本信息 (General Information)\n- [[{target}]] Auto-generated stub.\n\n"
+            
+        body += (
+            f"---\n\n"
+            f"## 2. 证据时间线\n"
+            f"*[System Directive: This is the immutable event ledger.]*\n\n"
+            f"- [{today}] [Observation] Created stub.\n"
         )
         try:
             write_markdown_file(os.path.join(wiki_dir, f"{target}.md"), frontmatter, body)

@@ -14,6 +14,7 @@ from vector_lake import governance_store
 from vector_lake import db_store
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file
 from vector_lake.yaml_utils import load_yaml
+from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
 try:
     import networkx as nx
@@ -26,7 +27,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
 
-VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
+VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
 
 DEFAULT_TTL = {
     "source": 365,
@@ -47,7 +48,7 @@ RELEVANCE_WEIGHTS = {
     "type_affinity": 1.0,
 }
 
-PRED_WEIGHT_TAXONOMY = frozenset({"属于", "parent", "is_a", "belongs_to", "instance_of", "has_part", "核心构件"})
+PRED_WEIGHT_TAXONOMY = frozenset({"属于", "parent", "is-a", "belongs_to", "instance_of", "has_part", "核心构件"})
 PRED_WEIGHT_RELATION = frozenset({"类似", "related_to", "see_also", "peer", "关联"})
 PRED_WEIGHT_MENTION = frozenset({"mentions", "提及", "引用"})
 
@@ -247,6 +248,14 @@ def _parse_wiki_node(filepath: str, node_key: str):
     if not fm_data:
         return None
 
+    try:
+        validate_schema(fm_data, body, os.path.basename(filepath))
+    except SchemaViolationException as e:
+        log.warning(f"Schema violation in {os.path.basename(filepath)}: {e}")
+        # Note: In a real system we would append to error_log, but we only have node_key here.
+        # We will let generate_index log this as a warning.
+        return None
+
     node_id = fm_data.get("id", "")
     title = fm_data.get("title", node_key)
 
@@ -328,21 +337,12 @@ def _parse_wiki_node(filepath: str, node_key: str):
     clean_body = re.sub(r'```.*?```', '', body, flags=re.DOTALL)
     clean_body = re.sub(r'`.*?`', '', clean_body)
     
-    # 1. Extract strict AST relations
     for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", clean_body):
         predicate = match.group(1).strip()
         target = match.group(2).split("|")[0].strip().replace(".md", "")
         if target:
             links.add(target)
             triples.append({"predicate": predicate, "target": target})
-            
-    # 2. Catch legacy or plain links
-    for match in re.finditer(r"(?<!::)(?<!::\s)\[\[(.*?)\]\]", clean_body):
-        link_text = match.group(1).split("|")[0].strip().replace(".md", "")
-        if link_text and "::" not in link_text:
-            log.warning(f"Legacy/Un-typed link [[{link_text}]] found in {node_key}. Defaulting to [mentions::]")
-            links.add(link_text)
-            triples.append({"predicate": "mentions", "target": link_text})
             
     links.discard("")
 

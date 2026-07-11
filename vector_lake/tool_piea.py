@@ -39,7 +39,7 @@ def _calculate_cosine_similarity(text1: str, text2: str) -> float:
 
 def strip_name(name: str) -> str:
     name = name.replace('.md', '')
-    for prefix in ['Concept_', 'Vendor_', 'Person_', 'Product_', 'Event_', 'Policy_', 'Standard_', 'Synthesis_', 'Source_']:
+    for prefix in ['Concept_', 'Vendor_', 'Institution_', 'Person_', 'Product_', 'Event_', 'Policy_', 'Standard_', 'Synthesis_', 'Source_']:
         if name.startswith(prefix):
             name = name[len(prefix):]
     for w in ['系统', '架构', '模型', '法则', '理论', '平台', 'System', 'Model', 'Theory', 'Platform', '与', '的']:
@@ -57,7 +57,7 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
         candidate_summary: A brief summary of the entity to use for similarity matching.
     """
     # 1. Clean nested prefixes from candidate_title (e.g., "Concept_Person_XYZ" -> "XYZ")
-    candidate_title = re.sub(r'^(Concept|Vendor|Product|Person|Event|Source|Synthesis)[_-]+', '', candidate_title, flags=re.IGNORECASE).strip()
+    candidate_title = re.sub(r'^(Concept|Vendor|Institution|Product|Person|Event|Source|Synthesis)[_-]+', '', candidate_title, flags=re.IGNORECASE).strip()
     
     # 2. Normalize candidate_type (extract core type if nested, e.g., "concept_synthesis" -> "synthesis")
     candidate_type = candidate_type.strip().lower()
@@ -65,10 +65,11 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
     elif "person" in candidate_type: candidate_type = "person"
     elif "event" in candidate_type: candidate_type = "event"
     elif "vendor" in candidate_type: candidate_type = "vendor"
+    elif "institution" in candidate_type: candidate_type = "institution"
     elif "product" in candidate_type: candidate_type = "product"
     elif "concept" in candidate_type: candidate_type = "concept"
     
-    if candidate_type not in ("vendor", "product", "person", "event", "concept", "synthesis"):
+    if candidate_type not in ("vendor", "institution", "product", "person", "event", "concept", "synthesis"):
         return json.dumps({"is_duplicate": False, "reason": f"Type '{candidate_type}' does not require deduplication check."})
 
     index_path = get_index_path()

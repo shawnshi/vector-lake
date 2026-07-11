@@ -128,6 +128,7 @@ graph LR
 - **O(V+E) 稀疏图遍历守护 (Topology Check)**：确认并锁定了 `_calculate_weighted_edges` 中的反向邻接表预裁剪算法，规避了直接全连接图的 O(N²) 大规模爆栈，为十万级节点突破保留了强健通道。
 
 ### 🧬 V11.9 领域实体裂变与强约束产品架构 (V11.9 Domain Ontology Split & Strict Product Schema)
+- **单一真理模式 SchemaValidator (Single Source of Truth Validator)**：将散落在 `lint`、`ingest`、`extract`、`query` 等各个孤立环节的“多头”碎片化 Schema 校验，全面重构并收敛至纯函数引擎 `schema_validator.py`。从物理写入层（`defense_hook`）到读取索引（`indexer`）强制统一校验标准，彻底封杀“自愈测试通过但依然违规落盘”的幽灵漏水现象。
 - **医疗/商业实体分轨 (Institution-Vendor Schism)**：在底层图谱中正式将医疗机构与商业厂商剥离。通过全局链路的模糊推断重定向算法，将历史遗留的 `Vendor_医院` 前缀软链接无感物理重定向至新增的第一类合法实体 `Institution_`。彻底解除了科研节点与商业利润架构的冲突。
 - **Product 医疗行业特化防护 (Domain-Specific Schema)**：对 `Product` 节点执行了铁腕式的医疗槽位注入。所有医疗 IT 产品被强制要求挂载 `### 临床与管理价值流 (Clinical & Admin Value)`、`### 医疗合规与资质壁垒 (Compliance & Certifications)` 以及响应 STQM 的 `### 认知张力与未决争议 (Controversies & Tensions)`。防御任何未经过合规审计的野鸡架构非法入湖。
 - **批量图谱手术与断链自愈 (Mass Graph Surgery & Self-Healing)**：大幅升级了相似性合并管线。在相似节点去重合并时，底层脚本能自动扫略上万级文件的全局双链 `[[ ]]`，将所有指向废弃（或次级）节点的死链硬重定向至 Primary 基座，并将碎屑作为 alias 注入。真正实现了高度相似知识噪音的自动化坍缩与自愈。

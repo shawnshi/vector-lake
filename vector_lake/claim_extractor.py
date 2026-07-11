@@ -4,7 +4,10 @@ import re
 from datetime import datetime, timezone
 
 from vector_lake.wiki_utils import normalize_sources
+from vector_lake.schema_validator import validate_schema, SchemaViolationException
+import logging
 
+log = logging.getLogger("vector-lake-claim-extractor")
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -139,6 +142,20 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
     sources = normalize_sources(frontmatter.get("sources", []))
     summary = frontmatter.get("summary") or _body_summary(body)
     validity_defaults = _validity_defaults(frontmatter)
+
+    try:
+        validate_schema(frontmatter, body, page_name)
+    except SchemaViolationException as e:
+        log.warning(f"Validation failed for {page_name}, skipping extraction: {e}")
+        return {
+            "entities": [],
+            "claims": [],
+            "evidence": [],
+            "sources": [],
+            "edges": [],
+            "page_key": page_key,
+            "page_type": page_type,
+        }
 
     def _parse_temporal(text: str):
         match = re.match(r"^\[(20\d\d(?:-[H|Q]\d|-[0-1]\d)?)\]\s*", text)
@@ -331,10 +348,6 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         target = match.group(2).split("|")[0].strip().replace(".md", "")
         if target:
             page_edges.append({"source_id": page_key, "target_id": target, "relation": predicate, "weight": 1.0, "updated_at": now})
-    for match in re.finditer(r"(?<!::\s)\[\[(.*?)\]\]", body):
-        target = match.group(1).split("|")[0].strip().replace(".md", "")
-        if target and "::" not in target:
-            page_edges.append({"source_id": page_key, "target_id": target, "relation": "mentions", "weight": 1.0, "updated_at": now})
 
     return {
         "entities": entity_records,
