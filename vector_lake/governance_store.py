@@ -223,6 +223,8 @@ def query_entities(filters: dict = None) -> dict:
     if filters:
         clauses = []
         for k, v in filters.items():
+            if not re.match(r"^[a-zA-Z0-9_]+(!=)?$", k):
+                raise ValueError(f"Security error: Invalid filter key '{k}'.")
             if k.endswith("!="):
                 clauses.append(f"{k[:-2]} != ?")
             else:
@@ -272,6 +274,8 @@ def query_memory_objects(filters: dict = None) -> dict:
     if filters:
         clauses = []
         for k, v in filters.items():
+            if not re.match(r"^[a-zA-Z0-9_]+(!=)?$", k):
+                raise ValueError(f"Security error: Invalid filter key '{k}'.")
             if k.endswith("!="):
                 clauses.append(f"{k[:-2]} != ?")
             else:
