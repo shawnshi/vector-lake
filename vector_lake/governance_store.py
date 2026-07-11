@@ -1082,68 +1082,72 @@ def create_change_set(
 
 
 def apply_change_set(change_set: dict) -> dict:
-    with transaction():
-        entities = load_entities()
-        claims = load_claims()
-        evidence = load_evidence()
-        sources = load_sources()
+    from filelock import FileLock
+    from vector_lake.wiki_utils import get_meta_dir
+    lock_path = str(get_meta_dir() / "governance_sync.lock")
+    with FileLock(lock_path, timeout=60):
+        with transaction():
+            entities = load_entities()
+            claims = load_claims()
+            evidence = load_evidence()
+            sources = load_sources()
+        
+            affected_pages = change_set.get("affected_pages", [])
+            affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
+        
+            if affected_page_keys:
+                proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
+                proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
     
-        affected_pages = change_set.get("affected_pages", [])
-        affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
+                # Prune claims no longer in the markdown
+                keys_to_remove = []
+                for k, v in claims.get("items", {}).items():
+                    source_page = v.get("source_page", "")
+                    locator_page = source_page[:-3] if source_page.endswith(".md") else source_page
+                    if locator_page in affected_page_keys and k not in proposed_claim_ids:
+                        keys_to_remove.append(k)
+                if keys_to_remove:
+                    conn = get_connection()
+                    conn.executemany("DELETE FROM claims WHERE claim_id = ?", [(k,) for k in keys_to_remove])
+                    for k in keys_to_remove:
+                        del claims["items"][k]
+                    
+                # Prune evidence no longer in the markdown
+                keys_to_remove = []
+                for k, v in evidence.get("items", {}).items():
+                    source_page = v.get("source_page", "")
+                    locator_page = source_page[:-3] if source_page.endswith(".md") else source_page
+                    if locator_page in affected_page_keys and k not in proposed_evidence_ids:
+                        keys_to_remove.append(k)
+                if keys_to_remove:
+                    conn = get_connection()
+                    conn.executemany("DELETE FROM evidence WHERE evidence_id = ?", [(k,) for k in keys_to_remove])
+                    for k in keys_to_remove:
+                        del evidence["items"][k]
     
-        if affected_page_keys:
-            proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
-            proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
-
-            # Prune claims no longer in the markdown
-            keys_to_remove = []
-            for k, v in claims.get("items", {}).items():
-                source_page = v.get("source_page", "")
-                locator_page = source_page[:-3] if source_page.endswith(".md") else source_page
-                if locator_page in affected_page_keys and k not in proposed_claim_ids:
-                    keys_to_remove.append(k)
-            if keys_to_remove:
+            _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
+            _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
+            _upsert_map_records(evidence, change_set.get("proposed_evidence", []), "evidence_id")
+            _upsert_map_records(sources, change_set.get("proposed_source_updates", []), "source_id")
+    
+            save_entities(entities)
+            save_claims(claims)
+            save_evidence(evidence)
+            save_sources(sources)
+            if affected_page_keys:
                 conn = get_connection()
-                conn.executemany("DELETE FROM claims WHERE claim_id = ?", [(k,) for k in keys_to_remove])
-                for k in keys_to_remove:
-                    del claims["items"][k]
-                
-            # Prune evidence no longer in the markdown
-            keys_to_remove = []
-            for k, v in evidence.get("items", {}).items():
-                source_page = v.get("source_page", "")
-                locator_page = source_page[:-3] if source_page.endswith(".md") else source_page
-                if locator_page in affected_page_keys and k not in proposed_evidence_ids:
-                    keys_to_remove.append(k)
-            if keys_to_remove:
-                conn = get_connection()
-                conn.executemany("DELETE FROM evidence WHERE evidence_id = ?", [(k,) for k in keys_to_remove])
-                for k in keys_to_remove:
-                    del evidence["items"][k]
-
-        _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
-        _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
-        _upsert_map_records(evidence, change_set.get("proposed_evidence", []), "evidence_id")
-        _upsert_map_records(sources, change_set.get("proposed_source_updates", []), "source_id")
-
-        save_entities(entities)
-        save_claims(claims)
-        save_evidence(evidence)
-        save_sources(sources)
-        if affected_page_keys:
-            conn = get_connection()
-            conn.executemany("DELETE FROM claim_graph_edges WHERE source_id = ?", [(k,) for k in affected_page_keys])
-        save_graph_edges(change_set.get("proposed_edges", []))
-        rebuild_alias_registry()
-        try:
-            memory_store = rebuild_operational_memory()
-            change_set["operational_memory_count"] = len(memory_store.get("items", {}))
-            change_set["conflict_event_count"] = len(memory_store.get("conflict_events", []))
-        except Exception as exc:
-            log.warning(f"Operational memory rebuild failed for {change_set.get('change_set_id')}: {exc}")
-        return change_set
-
-
+                conn.executemany("DELETE FROM claim_graph_edges WHERE source_id = ?", [(k,) for k in affected_page_keys])
+            save_graph_edges(change_set.get("proposed_edges", []))
+            rebuild_alias_registry()
+            try:
+                memory_store = rebuild_operational_memory()
+                change_set["operational_memory_count"] = len(memory_store.get("items", {}))
+                change_set["conflict_event_count"] = len(memory_store.get("conflict_events", []))
+            except Exception as exc:
+                log.warning(f"Operational memory rebuild failed for {change_set.get('change_set_id')}: {exc}")
+            return change_set
+    
+    
 def publish_change_sets(limit: int | None = None) -> dict:
     change_sets = load_change_sets()
     published = 0
@@ -1178,6 +1182,13 @@ def pending_governance_items() -> list:
 
 
 def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bool = True, summary: str | None = None) -> dict | None:
+    from filelock import FileLock
+    from vector_lake.wiki_utils import get_meta_dir
+    lock_path = str(get_meta_dir() / "governance_sync.lock")
+    with FileLock(lock_path, timeout=60):
+        return _sync_pages_to_canonical_impl(page_paths, origin, auto_approve, summary)
+
+def _sync_pages_to_canonical_impl(page_paths: list[str], origin: str, auto_approve: bool = True, summary: str | None = None) -> dict | None:
     existing_paths = []
     deleted_paths = []
     for path in page_paths:

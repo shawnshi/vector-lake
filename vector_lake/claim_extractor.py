@@ -214,9 +214,27 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             custom_claim_type = "compiled-truth"
         elif any(k in heading_lower for k in ["证据时间线", "timeline", "证据", "时间线"]):
             custom_claim_type = "timeline-event"
+            
+        combined_sources = list(sources)
+        combined_source_ids = list(source_ids)
+        for isrc in inline_sources:
+            if isrc not in combined_sources:
+                combined_sources.append(isrc)
+                sid = _stable_id("source", isrc)
+                combined_source_ids.append(sid)
+                if not any(s["source_id"] == sid for s in source_records):
+                    source_records.append({
+                        "source_id": sid,
+                        "raw_ref": isrc,
+                        "canonical_source_page": f"Source_{os.path.splitext(os.path.basename(isrc))[0]}.md",
+                        "source_type": os.path.splitext(isrc)[1].lstrip(".").lower() or "md",
+                        "title": os.path.basename(isrc),
+                        "ingested_at": now,
+                        "content_hash": _stable_id("hash", isrc + page_name),
+                    })
 
         evidence_ids = []
-        for raw_ref, source_id in zip(sources, source_ids):
+        for raw_ref, source_id in zip(combined_sources, combined_source_ids):
             if len(sources) > 1 and page_type != "source" and raw_ref not in inline_sources:
                 continue
             evidence_id = _stable_id("evidence", f"{page_key}:{raw_ref}:{cleaned_text}")

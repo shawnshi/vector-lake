@@ -136,7 +136,27 @@ def _tokenize_for_fts(text: str) -> str:
     except ImportError:
         return text
 
-def _build_bm25_index(index_data: dict):
+def _compute_embeddings_unlocked(index_data: dict) -> dict:
+    embeddings_map = {}
+    import os
+    if os.environ.get("GEMINI_API_KEY"):
+        try:
+            from google import genai
+            client = genai.Client()
+            nodes = (index_data.get("nodes") or {})
+            for node_key, node in nodes.items():
+                embedding_content = f"{node.get('title', '')} {node.get('summary', '')} {node.get('raw_text', '')}"
+                response = client.models.embed_content(
+                    model="gemini-embedding-2",
+                    contents=embedding_content[:15000]
+                )
+                if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
+                    embeddings_map[node_key] = response.embeddings[0].values
+        except Exception as e:
+            log.warning(f"Failed to compute embeddings: {e}")
+    return embeddings_map
+
+def _build_bm25_index(index_data: dict, embeddings_map: dict):
     nodes = (index_data.get("nodes") or {})
     for node_key, node in nodes.items():
         aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
@@ -145,6 +165,9 @@ def _build_bm25_index(index_data: dict):
         t_summary = _tokenize_for_fts(node.get('summary', ''))
         t_text = _tokenize_for_fts(text)
         db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
+        
+        if node_key in embeddings_map:
+            db_store.upsert_embedding(node_key, embeddings_map[node_key])
 
 
 
@@ -299,8 +322,14 @@ def _parse_wiki_node(filepath: str, node_key: str):
 
     links = set()
     triples = []
+    
+    # Strip code blocks to prevent parsing AST links inside markdown code sections
+    import re
+    clean_body = re.sub(r'```.*?```', '', body, flags=re.DOTALL)
+    clean_body = re.sub(r'`.*?`', '', clean_body)
+    
     # 1. Extract strict AST relations
-    for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", body):
+    for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", clean_body):
         predicate = match.group(1).strip()
         target = match.group(2).split("|")[0].strip().replace(".md", "")
         if target:
@@ -308,7 +337,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
             triples.append({"predicate": predicate, "target": target})
             
     # 2. Catch legacy or plain links
-    for match in re.finditer(r"(?<!::)(?<!::\s)\[\[(.*?)\]\]", body):
+    for match in re.finditer(r"(?<!::)(?<!::\s)\[\[(.*?)\]\]", clean_body):
         link_text = match.group(1).split("|")[0].strip().replace(".md", "")
         if link_text and "::" not in link_text:
             log.warning(f"Legacy/Un-typed link [[{link_text}]] found in {node_key}. Defaulting to [mentions::]")
@@ -715,8 +744,10 @@ def generate_index():
     _write_claim_graph(tmp_claim, governance_store.build_claim_graph_projection())
     _write_index(tmp_output, index_data)
 
+    # PHASE 1 FIX: Compute embeddings OUTSIDE of DB transaction to prevent Network Blockade Deadlock
+    embeddings_map = _compute_embeddings_unlocked(index_data)
     with transaction():
-        _build_bm25_index(index_data)
+        _build_bm25_index(index_data, embeddings_map)
 
     os.replace(tmp_claim, claim_graph_path)
     os.replace(tmp_output, output_path)
@@ -830,12 +861,28 @@ def update_index_items(filenames: list[str]):
                                     db_store.delete_search_index(node_key)
                                 
                                 index_data["nodes"][node_key] = node_data
-                                aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
-                                text = f"{aliases_str} {node_data.get('raw_text', '')}"
-                                t_title = _tokenize_for_fts(node_data.get('title', ''))
-                                t_summary = _tokenize_for_fts(node_data.get('summary', ''))
+                                aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
+                                text = f"{aliases_str} {node.get('raw_text', '')}"
+                                t_title = _tokenize_for_fts(node.get('title', ''))
+                                t_summary = _tokenize_for_fts(node.get('summary', ''))
                                 t_text = _tokenize_for_fts(text)
                                 db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
+                                
+                                # Issue 4 Fix: Missing embedding recalculation
+                                try:
+                                    import os
+                                    if os.environ.get("GEMINI_API_KEY"):
+                                        from google import genai
+                                        client = genai.Client()
+                                        embedding_content = f"{node.get('title', '')} {node.get('summary', '')} {node.get('raw_text', '')}"
+                                        response = client.models.embed_content(
+                                            model="gemini-embedding-2",
+                                            contents=embedding_content[:15000]
+                                        )
+                                        if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
+                                            db_store.upsert_embedding(node_key, response.embeddings[0].values)
+                                except Exception as e:
+                                    log.warning(f"Failed to generate and upsert embedding for {node_key}: {e}")
                                 
                                 if node_data["id"]:
                                     index_data["aliases"][node_data["id"]] = node_key
@@ -857,14 +904,14 @@ def update_index_items(filenames: list[str]):
                                 all_nodes = index_data["nodes"]
 
                                 td = {}
-                                for t in (node_data.get("triples") or []):
+                                for t in (node.get("triples") or []):
                                     if t.get("target"):
                                         td[t["target"]] = t.get("predicate", "mentions")
                                 all_nodes_triples[node_key] = td
                                 triples_a = td
                                 
-                                node_links = set((node_data.get("links") or []))
-                                node_sources = set((node_data.get("sources") or []))
+                                node_links = set((node.get("links") or []))
+                                node_sources = set((node.get("sources") or []))
                                 for other_key, other_node in all_nodes.items():
                                     if other_key == node_key:
                                         continue

@@ -5,14 +5,9 @@ import logging
 from typing import Dict, List, Any
 from vector_lake.wiki_utils import get_wiki_dir, atomic_write_text
 
-def bulk_reconcile(payload: str) -> str:
-    try:
-        data = json.loads(payload)
-    except Exception as e:
-        return f"[Sandbox JSON Error] Failed to parse payload: {e}"
-    
-    dry_run = data.get("dry_run", True)
-    operations = data.get("operations", [])
+def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
+    if not isinstance(operations, list):
+        return f"[Sandbox JSON Error] Expected list of operations, got {type(operations)}"
     
     if not operations:
         return "No operations to perform."

@@ -98,40 +98,57 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     cur = conn.execute("SELECT filepath, file_hash, processed_at FROM processed_files")
     processed = {row["filepath"]: {"hash": row["file_hash"], "processed_at": row["processed_at"]} for row in cur.fetchall()}
     
-    pending_files = []
-    
-    for filepath in files_to_process:
-        try:
-            stat = os.stat(filepath)
-            mtime = stat.st_mtime
-            
-            if filepath in processed:
-                processed_at_str = processed[filepath]["processed_at"]
-                if processed_at_str:
-                    processed_at_dt = datetime.fromisoformat(processed_at_str.replace("Z", "+00:00"))
-                    if processed_at_dt.tzinfo is None:
-                        processed_at_dt = processed_at_dt.replace(tzinfo=timezone.utc)
-                    if mtime <= processed_at_dt.timestamp():
-                        continue
-                        
-                file_hash = calculate_hash(filepath)
-                if file_hash == processed[filepath]["hash"]:
-                    continue
-            else:
-                file_hash = calculate_hash(filepath)
-                
-            if file_hash:
-                pending_files.append((filepath, file_hash))
-        except OSError:
-            pass
-        
-    if not pending_files:
-        return "No new files to ingest. System is fully synced."
-
-    pending_files = pending_files[:batch_size]
-    
     tmp_dir = get_extension_root() / "tmp"
-    tmp_dir.mkdir(exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    processing_file = tmp_dir / "processing_files.json"
+    from filelock import FileLock
+    
+    with FileLock(str(processing_file) + ".lock", timeout=10):
+        try:
+            with open(processing_file, "r") as f:
+                currently_processing = json.load(f)
+        except Exception:
+            currently_processing = {}
+            
+        now_ts = datetime.now(timezone.utc).timestamp()
+        currently_processing = {k: v for k, v in currently_processing.items() if now_ts - v < 3600}
+        
+        pending_files = []
+        
+        for filepath in files_to_process:
+            try:
+                stat = os.stat(filepath)
+                mtime = stat.st_mtime
+                
+                if filepath in processed:
+                    processed_at_str = processed[filepath]["processed_at"]
+                    if processed_at_str:
+                        processed_at_dt = datetime.fromisoformat(processed_at_str.replace("Z", "+00:00"))
+                        if processed_at_dt.tzinfo is None:
+                            processed_at_dt = processed_at_dt.replace(tzinfo=timezone.utc)
+                        if mtime <= processed_at_dt.timestamp():
+                            continue
+                            
+                    file_hash = calculate_hash(filepath)
+                    if file_hash == processed[filepath]["hash"]:
+                        continue
+                else:
+                    file_hash = calculate_hash(filepath)
+                    
+                if file_hash and file_hash not in currently_processing:
+                    pending_files.append((filepath, file_hash))
+            except OSError:
+                pass
+        
+        if not pending_files:
+                return "No new files to ingest. System is fully synced."
+
+        pending_files = pending_files[:batch_size]
+        for _, fh in pending_files:
+                currently_processing[fh] = now_ts
+                
+        with open(processing_file, "w") as f:
+                json.dump(currently_processing, f)
     
     schema_content = ""
     try:
@@ -177,25 +194,11 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     response += "After invoking, you must STOP CALLING TOOLS and wait for them to finish."
     return response
 
-def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str) -> str:
-    """Finalizes an ingest operation from a subagent using payload files."""
+def finalize_ingest(files_written: list, processed_data: dict) -> str:
+    """Finalizes an ingest operation from a subagent using direct data."""
     try:
         from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError
-        try:
-            files = json.loads(files_written_payload_file)
-            if isinstance(files, str):
-                files = json.loads(files)
-        except Exception:
-            with open(files_written_payload_file, "r", encoding="utf-8") as f:
-                files = json.load(f)
-                
-        try:
-            processed_data = json.loads(raw_files_payload_file)
-            if isinstance(processed_data, str):
-                processed_data = json.loads(processed_data)
-        except Exception:
-            with open(raw_files_payload_file, "r", encoding="utf-8") as f:
-                processed_data = json.load(f)
+        files = files_written
                 
         wiki_dir = get_wiki_dir()
         
@@ -205,6 +208,9 @@ def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str
             fcontent = item["content"]
             out_path = wiki_dir / fname
             
+            if not out_path.resolve().is_relative_to(wiki_dir.resolve()):
+                raise SafeWriteError(f"Path traversal blocked: {fname}")
+            
             if "Concept_Decision_" in fname:
                 lower_content = fcontent.lower()
                 if not all(k in lower_content for k in ["context", "alternatives", "justification"]):
@@ -213,32 +219,48 @@ def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str
             safe_write_markdown(out_path, fcontent)
             files_written.append(str(out_path))
             
-        if files_written:
-            try:
-                governance_store.sync_pages_to_canonical(
-                    files_written,
-                    origin="ingest-subagent",
-                    auto_approve=True,
-                    summary=f"Subagent ingest sync for {len(files_written)} page(s)"
-                )
-                from vector_lake.indexer import update_index_items
-                filenames_only = [os.path.basename(f) for f in files_written]
-                update_index_items(filenames_only)
+        from vector_lake.db_store import transaction
+        
+        try:
+            with transaction():
+                if files_written:
+                    governance_store.sync_pages_to_canonical(
+                        files_written,
+                        origin="ingest-subagent",
+                        auto_approve=True,
+                        summary=f"Subagent ingest sync for {len(files_written)} page(s)"
+                    )
+                    from vector_lake.indexer import update_index_items
+                    filenames_only = [os.path.basename(f) for f in files_written]
+                    update_index_items(filenames_only)
                 
+                filepath = processed_data["filepath"]
+                file_hash = processed_data["hash"]
+                mark_file_processed(filepath, file_hash)
+                
+            if files_written:
                 tmp_dir = get_extension_root() / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 with open(tmp_dir / "flag_reindex.lock", "w") as f:
                     f.write("1")
-            except Exception as e:
-                for fw in files_written:
-                    try: os.remove(fw)
-                    except OSError: pass
-                raise Exception(f"Ingest aborted during canonical/index sync. Rolled back markdowns. Error: {e}")
-            
-        filepath = processed_data["filepath"]
-        file_hash = processed_data["hash"]
+        except Exception as e:
+            for fw in files_written:
+                try: os.remove(fw)
+                except OSError: pass
+            raise Exception(f"Ingest aborted during transactional commit. Rolled back markdowns. Error: {e}")
         
-        mark_file_processed(filepath, file_hash)
+        from filelock import FileLock
+        processing_file = get_extension_root() / "tmp" / "processing_files.json"
+        try:
+            with FileLock(str(processing_file) + ".lock", timeout=10):
+                with open(processing_file, "r") as f:
+                    currently_processing = json.load(f)
+                if file_hash in currently_processing:
+                    del currently_processing[file_hash]
+                with open(processing_file, "w") as f:
+                    json.dump(currently_processing, f)
+        except Exception:
+            pass
         
         return f"Successfully finalized ingestion for {filepath}."
     except Exception as e:

@@ -91,14 +91,16 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
         if action == "DELETE":
             try:
                 shutil.copy2(filepath, backup_dir / os.path.basename(filepath))
-                os.remove(filepath)
-                deleted += 1
-                log.info(f"Deleted (backed up): {filepath}")
-                # Cascading delete to sqlite
+                # Cascading delete to sqlite FIRST
                 filename = os.path.basename(filepath)
                 node_key = os.path.splitext(filename)[0]
                 from vector_lake import db_store
                 db_store.delete_node_cascade(node_key)
+                
+                # THEN remove physical file
+                os.remove(filepath)
+                deleted += 1
+                log.info(f"Deleted (backed up): {filepath}")
             except Exception as e:
                 failures.append(f"DELETE {filepath}: {e}")
                 log.warning(f"Failed to delete {filepath}: {e}")

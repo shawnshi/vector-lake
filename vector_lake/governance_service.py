@@ -126,6 +126,25 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                     if right_bak and os.path.exists(right_bak):
                         os.remove(right_bak)
 
+                    # Issue 11 fix: Trigger canonical sync and index update
+                    try:
+                        import os
+                        from vector_lake import governance_store
+                        if left_path:
+                            modified = [left_path]
+                            deleted = [right_path] if right_path else []
+                            governance_store.sync_pages_to_canonical(
+                                modified_paths=modified,
+                                deleted_paths=deleted,
+                                origin="semantic-merge",
+                                auto_approve=True,
+                                summary=f"Semantic merge resolved: {left_name} absorbed {right_name}"
+                            )
+                            from vector_lake.indexer import update_index_items
+                            update_index_items([os.path.basename(left_path)])
+                    except Exception as e:
+                        log.error(f"Failed to trigger canonical sync after merge: {e}")
+
         from filelock import FileLock
         from vector_lake.wiki_utils import get_meta_dir
         lock_path = str(get_meta_dir() / "governance_queue.lock")

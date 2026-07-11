@@ -7,8 +7,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 - `MEMORY/raw`：原始信源层，只读输入。
 - `MEMORY/wiki`：人类可读的 Markdown 发布层，用于审计、浏览、复盘和长期资产沉淀。
 - `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
-- `MEMORY/wiki/.meta/vector_lake.db`：统一的 SQLite 底层引擎，保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列。
-- `MEMORY/wiki/.meta/operational_memory.json`：Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state`。
+- `MEMORY/wiki/.meta/vector_lake.db`：统一的 SQLite 底层引擎，不仅保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列，同时也作为 Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state` 存入 `operational_memory` 表。
 - `MEMORY/purpose.md` & `purpose_vectors.json`：战略意图引擎与最高系统宪法。硬编码了“破窗证伪阈值 (Falsification Threshold)”、“静默丢弃 (Silent Drop)”规则与“结构性张力连线”，强制所有 Agent 抛弃附和，保持冷酷的医疗数字化情报局审计立场。
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
@@ -22,7 +21,7 @@ graph LR
     WIKI --> INDEX["index.json<br>page index + BM25"]
     WIKI --> META["vector_lake.db<br>SQLite Canonical Store"]
     META --> CLAIM["SQLite claim_graph_nodes<br>claim topology"]
-    META --> MEMORY["operational_memory.json<br>agent runtime memory"]
+    META --> MEMORY["SQLite operational_memory<br>agent runtime memory"]
     MEMORY --> PACKET["Memory Packet<br>selective context injection"]
     INDEX --> QUERY["search<br>LLM Expansion + BM25 + Graph Spreading"]
     CLAIM --> QUERY
@@ -43,6 +42,7 @@ graph LR
 - **`Event_*`**：重要会议、行业突发事件。
 - **`Concept_*`**：抽象架构、理论、业务机制。
 - **`Policy_*` / `Standard_*`**：政策法规、行业标准。
+- **`Overview_*`**：宏观主干与概念全景聚合节点。
 - **`Source_*`**：对应的 `raw/` 原始信源的一对一摘要节点。
 - **`Synthesis_*`**：人工或 LLM 生成的深度推演、跨界比较与调研长文。
 
@@ -50,7 +50,7 @@ graph LR
 根据文件的受控类型，内部的 Markdown 结构被严格限制为两类：
 
 #### A. 实体与概念类 (Dual-Schema Mandate)
-- **适用类型**：`Vendor_`, `Product_`, `Person_`, `Event_`, `Concept_`, `Policy_`, `Standard_`
+- **适用类型**：`Vendor_`, `Product_`, `Person_`, `Event_`, `Concept_`, `Policy_`, `Standard_`, `Overview_`
 - **结构要求**：采用严格的 CQRS 与事件溯源模式。物理上由 `---` 分隔为两部分：
   1. **`## 1. 编译事实 (Compiled Truth)`**：作为 Read Model，只保留当下最新鲜的终极共识。所有特征点强制分配到类型专属的 `###` 固化插槽（如 Vendor 的 `### 组织架构与商业模式`）。所有论点必须在句末附加内联来源出处。
   2. **`## 2. 证据时间线 (Timeline)`**：作为 Event Store，只能追加日志（Append-Only）。格式强制形如 `- [YYYY-MM-DD] [Event_Tag]...`，支撑上方“编译事实”的演进流。
@@ -67,7 +67,7 @@ graph LR
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
    - **两步思维链摄入 (Payload-Based MCP)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns），并将长文本提纯为 JSON 制品落盘后通过 MCP 最终入湖，彻底根除 CLI 传参截断与 JSON 解析风暴。
    - **语义张力量化模型 (STQM)**：图谱原生支持 `tension_edges` 张力边计算。强制所有 Agent 抽离争议与矛盾并结构化为冲突边，在 Query 时通过 Controversy Heatmap 直观展示领域盲区。
-   - **跨类型 PIEA 与强制格式漏斗**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 7 大规范类型（Vendor, Product, Person, Event, Concept, Synthesis, Source）严格落盘。
+   - **跨类型 PIEA 与强制格式漏斗**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 10 大规范类型（Vendor, Product, Person, Event, Concept, Policy, Standard, Synthesis, Source, Overview）严格落盘。
    - **无感异步全量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台重负载变更通过 `flag_reindex.lock` 信号异步削峰。同时，底层的 `_calculate_weighted_edges` 已升级为 O(V+E) 稀疏图遍历算法，彻底终结了万级节点下的 O(N²) 算力瓶颈与死锁现象。
    - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox)**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
    - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账（现已支持安全级无残留全量重建与泛型 `[Observation]` 标签智能回退提取）、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
@@ -120,6 +120,12 @@ graph LR
 - **防呆 Schema 与 JSON 索引跃迁 (Fail-safe Schema & JSON Indexing)**：重写了 `db_store.py` 中脆弱的静默 `except Exception: pass` 表结构迁移逻辑，精确收紧至 `sqlite3.OperationalError`。同时，为 `data_json` 列中的高频字段（`$.type`, `$.status`, `$.memory_type`）注入了基于表达式的 B 树索引 (Expression-based Indexes)，彻底扫除了图谱重构或批量扫描时由 SQLite 触发的全表扫描梦魇。
 - **动态寻址守护管线 (Dynamic Daemon Resolution)**：将 `watchdog_app.py` 中硬编码、极度脆弱的 `parent.parent` 相对路径定时任务唤醒机制，全面重构为基于 `~/.gemini` 的绝对路径动态寻址器。无论工作区如何漂移或被软链接代理，核心的图谱衰变 (`decay_daemon`) 与死链回收清洗机制都能坚韧执行。
 - **LLM 同步死锁解绑 (Synchronous LLM Unblocking)**：废除了 `_expand_query_with_llm` 中不可理喻的 30 秒硬超时同步等待与无限重试陷阱，将超时时限强制收紧至极短的 8 秒单次探测。并新增 `VECTOR_LAKE_FAST_SEARCH` 逃生舱，使得对于高频机械检索可以一键剥离大模型介入，归还毫秒级极致检索体验。
+
+### 🔧 V11.8 极速并发与抗污染引擎 (V11.8 Network Blockade & AST Sandbox)
+- **大模型网络层原子解锁 (Network Blockade Fix)**：剥离了全量索引 `_build_bm25_index` 与 SQLite `BEGIN IMMEDIATE` 事务之间的死锁关系。将 LLM 向量请求抽取至独立预计算阶段，彻底根除了由于网络抖动（如 Gemini API 响应缓慢）导致的 SQLite 库级排他锁灾难，保障了守护进程的绝对顺滑。
+- **零污染语法树解析罩 (AST Parser Hardening)**：为底层的 `_parse_wiki_node` 装备了严格的单/多行代码块洗刷管道。精准阻断了大模型代码示例块（如 Markdown Code Blocks）中包含的伪造断言（如 `[predicate:: [[fake_target]]]`）对主图谱的网络毒化，杜绝了幽灵脏边的数据穿透。
+- **O(V+E) 稀疏图遍历守护 (Topology Check)**：确认并锁定了 `_calculate_weighted_edges` 中的反向邻接表预裁剪算法，规避了直接全连接图的 O(N²) 大规模爆栈，为十万级节点突破保留了强健通道。
+
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
@@ -171,8 +177,7 @@ MEMORY/
     index.json
     .meta/
       purpose_vectors.json <-- Compiled Intent Weights
-      vector_lake.db       <-- Unified SQLite Store (Entities, Claims, Graph, Timeline)
-      operational_memory.json
+      vector_lake.db       <-- Unified SQLite Store (Entities, Claims, Graph, Timeline, Operational Memory)
 ```
 
 ## Commands
@@ -331,7 +336,7 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 - Unit tests：`Ran 16 tests ... OK`
 - Compile：`python -m compileall vector_lake tests` OK
 - Doctor：healthy
-- Graph Build: Generated index.json with 8865 nodes | 43579 weighted edges | 182 errors.
+- Graph Build: Generated index.json with 10536 nodes | 55236 weighted edges | 0 errors.
 - Operational memory smoke：OK
 - Debt snapshot：
   - `operational_memory_count: 13755`

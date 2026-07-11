@@ -31,72 +31,81 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
     if dry_run:
         return f"[DRY-RUN] Would rename '{old_name}' to '{normalized_new_name}' and update links in other files."
         
-    # Backup
-    import shutil
-    backup_dir = wiki_dir.parent / "backup" / "rename"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copy2(old_path, backup_dir / old_name)
-    except Exception as e:
+    from filelock import FileLock
+    from vector_lake.wiki_utils import get_meta_dir, atomic_write_text
+    from vector_lake.governance_store import sync_pages_to_canonical
+    
+    lock_path = str(get_meta_dir() / "governance_sync.lock")
+    affected_pages = []
+    
+    with FileLock(lock_path, timeout=60):
+        # Backup
+        import shutil
+        backup_dir = wiki_dir.parent / "backup" / "rename"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(old_path, backup_dir / old_name)
+        except Exception as e:
         return f"Backup failed before rename: {str(e)}"
-        
-    # 2. Rename the file and update its frontmatter
-    try:
-        frontmatter, body, _ = read_markdown_file(old_path)
-        # Update title if it matches the old core name
-        old_core = old_name.split("_", 1)[-1][:-3] if "_" in old_name else old_name[:-3]
-        new_core = normalized_new_name.split("_", 1)[-1][:-3] if "_" in normalized_new_name else normalized_new_name[:-3]
-        
-        if frontmatter.get("title") == old_core:
-            frontmatter["title"] = new_core
             
-        # Add old core to aliases if not present
-        aliases = frontmatter.get("aliases", [])
-        if old_core not in aliases:
-            aliases.append(old_core)
-        frontmatter["aliases"] = aliases
-        
-        write_markdown_file(new_path, frontmatter, body)
-        old_path.unlink()
-    except Exception as e:
+        # 2. Rename the file and update its frontmatter
+        try:
+            frontmatter, body, _ = read_markdown_file(old_path)
+            # Update title if it matches the old core name
+            old_core = old_name.split("_", 1)[-1][:-3] if "_" in old_name else old_name[:-3]
+            new_core = normalized_new_name.split("_", 1)[-1][:-3] if "_" in normalized_new_name else normalized_new_name[:-3]
+            
+            if frontmatter.get("title") == old_core:
+                frontmatter["title"] = new_core
+                
+            # Add old core to aliases if not present
+            aliases = frontmatter.get("aliases", [])
+            if old_core not in aliases:
+                aliases.append(old_core)
+            frontmatter["aliases"] = aliases
+            
+            write_markdown_file(new_path, frontmatter, body)
+            old_path.unlink()
+        except Exception as e:
         return f"Error during file rename: {str(e)}"
+            
+        # 3. Global Link Resolution
+        old_display_name = old_core
+        # Pattern to match [[old_name]] or [[old_name|...]] or [xxx:: [[old_name]]]
+        # We must match the exact filename without extension
+        old_filename_no_ext = old_name[:-3]
+        new_filename_no_ext = normalized_new_name[:-3]
         
-    # 3. Global Link Resolution
-    old_display_name = old_core
-    # Pattern to match [[old_name]] or [[old_name|...]] or [xxx:: [[old_name]]]
-    # We must match the exact filename without extension
-    old_filename_no_ext = old_name[:-3]
-    new_filename_no_ext = normalized_new_name[:-3]
-    
-    # Regex to find [[OldName]] or [[OldName|Alias]]
-    pattern_exact = re.compile(r'\[\[' + re.escape(old_filename_no_ext) + r'\]\]')
-    pattern_with_alias = re.compile(r'\[\[' + re.escape(old_filename_no_ext) + r'\|([^\]]+)\]\]')
-    
-    updated_files = 0
-    for root, _, files in os.walk(wiki_dir):
-        for file in files:
-            if not file.endswith(".md") or file in ["index.md", "log.md", "overview.md"]:
-                continue
-                
-            filepath = Path(root) / file
-            if filepath == new_path:
-                continue
-                
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
+        # Regex to find [[OldName]] or [[OldName|Alias]]
+        pattern_exact = re.compile(r'\[\[' + re.escape(old_filename_no_ext) + r'\]\]')
+        pattern_with_alias = re.compile(r'\[\[' + re.escape(old_filename_no_ext) + r'\|([^\]]+)\]\]')
+        
+        updated_files = 0
+        for root, _, files in os.walk(wiki_dir):
+            for file in files:
+                if not file.endswith(".md") or file in ["index.md", "log.md", "overview.md"]:
+                    continue
                     
-                new_content = content
-                # Replace [[Old_File]] -> [[New_File|Old_File]]
-                new_content = pattern_exact.sub(f'[[{new_filename_no_ext}|{old_display_name}]]', new_content)
-                # Replace [[Old_File|Alias]] -> [[New_File|Alias]]
-                new_content = pattern_with_alias.sub(r'[[' + new_filename_no_ext + r'|\1]]', new_content)
-                
-                if new_content != content:
-                    with open(filepath, "w", encoding="utf-8") as f:
-                        f.write(new_content)
+                filepath = Path(root) / file
+                if filepath == new_path:
+                    continue
+                    
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        
+                    new_content = content
+                    # Replace [[Old_File]] -> [[New_File|Old_File]]
+                    new_content = pattern_exact.sub(f'[[{new_filename_no_ext}|{old_display_name}]]', new_content)
+                    # Replace [[Old_File|Alias]] -> [[New_File|Alias]]
+                    new_content = pattern_with_alias.sub(r'[[' + new_filename_no_ext + r'|\1]]', new_content)
+                    
+                    if new_content != content:
+                        atomic_write_text(filepath, new_content)
+                    affected_pages.append(file)
                     updated_files += 1
-            except Exception:
-                pass
-                
-    return f"Successfully renamed '{old_name}' to '{normalized_new_name}'. Updated links in {updated_files} files."
+                except Exception:
+                    pass
+                    
+        return f"Successfully renamed '{old_name}' to '{normalized_new_name}'. Updated links in {updated_files} files."
+

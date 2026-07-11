@@ -220,10 +220,25 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
             VALUES (?, ?, ?, ?)
         """, (node_key, title_tok, summary_tok, text_tok))
 
+def upsert_embedding(entity_id: str, embedding: list[float]):
+    if not embedding or len(embedding) != 3072:
+        return
+    import math
+    norm = math.sqrt(sum(x*x for x in embedding))
+    if norm > 0:
+        embedding = [x/norm for x in embedding]
+    conn = get_connection()
+    import sqlite_vec
+    query_blob = sqlite_vec.serialize_float32(embedding)
+    with transaction():
+        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (entity_id,))
+        conn.execute("INSERT INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)", (entity_id, query_blob))
+
 def delete_search_index(node_key: str):
     conn = get_connection()
     with transaction():
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
+        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
 
 def delete_node_cascade(node_key: str):
     conn = get_connection()
@@ -275,3 +290,16 @@ def mark_file_processed(filepath: str, file_hash: str):
                 processed_at = excluded.processed_at
         """, (filepath, file_hash, now_str))
 
+
+
+def backup_database():
+    """Defend against single SQLite file SPOF."""
+    import shutil, time
+    from vector_lake.wiki_utils import get_extension_root
+    db_path = get_extension_root() / "vector_lake.db"
+    backup_dir = get_extension_root() / "backup"
+    backup_dir.mkdir(exist_ok=True)
+    backup_path = backup_dir / f"vector_lake_{int(time.time())}.db.bak"
+    if db_path.exists():
+        shutil.copy2(db_path, backup_path)
+    return str(backup_path)

@@ -222,15 +222,15 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     return tools.prepare_ingest_batch(batch_size=batch_size)
 
 @mcp.tool()
-def finalize_ingest(files_written_payload_file: str, raw_files_payload_file: str) -> str:
+def finalize_ingest(files_written: list, processed_data: dict) -> str:
     """Finalize ingestion batch after subagents have finished.
     
     Args:
-        files_written_payload_file: Absolute path to a temporary JSON file containing an array of objects with 'filename' and 'content'.
-        raw_files_payload_file: Absolute path to a temporary JSON file containing an object with 'filepath' and 'hash'.
+        files_written: List of dicts with 'filename' and 'content'.
+        processed_data: Dict with 'filepath' and 'hash'.
     """
     try:
-        return tools.finalize_ingest(files_written_payload_file, raw_files_payload_file)
+        return tools.finalize_ingest(files_written, processed_data)
     except Exception as e:
         return str(e)
 
@@ -327,20 +327,15 @@ def propose_schema_mutation(new_category: str, payload_file: str, parent_categor
 
 
 @mcp.tool()
-def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str, dry_run: bool = False) -> str:
+def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> str:
     """Batch replace occurrences of a string (usually a link) across all wiki pages.
     Use this when an entity's name changes but `rename_entity` failed to cover all cases.
     
     Args:
-        old_text_payload_file: Absolute path to a file containing the exact string to search for (e.g. '[[Old Name]]').
-        new_text_payload_file: Absolute path to a file containing the exact replacement string (e.g. '[[New Name]]').
+        old_text: The exact string to search for (e.g. '[[Old Name]]').
+        new_text: The exact replacement string (e.g. '[[New Name]]').
         dry_run: If True, only count how many files would be modified without actually changing them.
     """
-    try:
-        old_text = _read_payload(old_text_payload_file)
-        new_text = _read_payload(new_text_payload_file)
-    except Exception as e:
-        return str(e)
     
     if old_text.strip() in ["", "---", "[[", "]]", "```", "#"]:
         return f"Error: '{old_text}' is a structural syntax marker. Global replacement aborted to protect graph topology."
@@ -382,18 +377,15 @@ def batch_replace_links(old_text_payload_file: str, new_text_payload_file: str, 
     return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files and updated index."
 
 @mcp.tool()
-def bulk_reconciliation(payload_file: str) -> str:
+def bulk_reconciliation(operations: list, dry_run: bool = True) -> str:
     """Execute a batch of graph reconciliation operations (merge, replace_only, alias).
     
     Args:
-        payload_file: Absolute path to a temporary JSON file containing the operations array.
+        operations: List of dictionaries. Each dict must have 'source_entity' and 'target_entity'.
+        dry_run: Whether to perform a dry run (default: True).
     """
-    try:
-        payload = _read_payload(payload_file)
-    except Exception as e:
-        return str(e)
     from vector_lake.tool_bulk_reconciliation import bulk_reconcile
-    return bulk_reconcile(payload)
+    return bulk_reconcile(operations, dry_run)
 
 if __name__ == "__main__":
     mcp.run()

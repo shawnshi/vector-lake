@@ -16,7 +16,7 @@ import io
 _META_DIR_CACHE = None
 
 SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
-VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
+VALID_PREFIXES = ("Concept_", "Vendor_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "Overview_")
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
 
 def normalize_memory_key(key: str) -> str:
@@ -220,8 +220,16 @@ def ensure_parent_dir(path: str | Path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
+class SafeWriteError(Exception): pass
+
 def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_validation: bool = False):
     path = Path(path)
+    # Check traversal
+    try:
+        if path.resolve().is_relative_to(get_wiki_dir().resolve()) is False and "MEMORY" not in str(path):
+            raise SafeWriteError(f"Path traversal blocked: {path}")
+    except Exception:
+        pass
     if not skip_validation and path.exists():
         try:
             _, old_body, _ = read_markdown_file(path)

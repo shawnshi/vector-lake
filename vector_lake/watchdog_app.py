@@ -269,37 +269,6 @@ def scheduled_lint_loop():
                         plugin_dir = get_extension_root()
                         gemini_root = Path("~/.gemini").expanduser()
                         
-                        daemon_scripts = [
-                            ("Domain Overview Compiler", str(plugin_dir / "scripts" / "compile_domain_overviews.py")),
-                            ("Semantic Deduplication Daemon", str(plugin_dir / "scripts" / "semantic_dedup_daemon.py")),
-                            ("Nighttime Janitor Swarm", str(plugin_dir / "scripts" / "launch_janitor_swarm.py")),
-                            ("Louvain Community Clustering Daemon", str(plugin_dir / "scripts" / "community_clustering_daemon.py"))
-                        ]
-                        
-                        processes = []
-                        for name, script_path in daemon_scripts:
-                            if os.path.exists(script_path):
-                                log.info(f"Launching {name}...")
-                                p = subprocess.Popen(
-                                    [sys.executable, script_path], 
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, 
-                                    text=True, encoding="utf-8", env=env
-                                )
-                                processes.append((name, p))
-                        
-                        for name, p in processes:
-                            try:
-                                stdout, stderr = p.communicate(timeout=180)
-                                if p.returncode != 0:
-                                    log.error(f"{name} Failed: {stderr}")
-                                    write_status("error", 0, index_queue.qsize(), f"{name} Failed", stderr)
-                                else:
-                                    log.info(f"{name} successfully completed.")
-                            except subprocess.TimeoutExpired:
-                                p.kill()
-                                p.wait()
-                                log.error(f"{name} Timed Out after 180s")
-                                write_status("error", 0, index_queue.qsize(), f"{name} Timeout", "")
                     except Exception as e:
                         log.warning(f"Failed to run auxiliary daemons: {e}")
                         write_status("error", 0, index_queue.qsize(), "Auxiliary Daemons Error", str(e))
@@ -309,7 +278,7 @@ def scheduled_lint_loop():
                     with global_task_lock:
                         if indexer.refresh_graph_topology_if_dirty():
                             log.info("Graph topology refreshed during scheduled lint.")
-                        lint_vector_lake(auto_fix=True)
+                        lint_vector_lake(auto_fix=False)
                         
                         # Truncate WAL to prevent unbounded growth
                         from vector_lake.db_store import get_connection

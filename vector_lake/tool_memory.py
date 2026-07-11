@@ -45,25 +45,32 @@ sources:
 *[System Directive: Append-only ledger of historical state changes and events.]*
 """
 
-    if not target_path.exists():
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(target_path, scaffold)
+    from filelock import FileLock
+    lock_path = str(target_path) + ".lock"
+    with FileLock(lock_path, timeout=10):
+        if not target_path.exists():
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(target_path, scaffold)
+            
+        with open(target_path, "r", encoding="utf-8") as f:
+            file_content = f.read()
+            
+        # Update the 'updated' field in frontmatter
+        import re
+        from vector_lake.governance_store import _utc_now
+        file_content = re.sub(r'updated:.*?\n', f'updated: {_utc_now()}\n', file_content)
+        if 'updated:' not in file_content and '---\n' in file_content:
+            file_content = file_content.replace('---\n', f'---\nupdated: {_utc_now()}\n', 1)
+            
+        if not file_content.endswith("\n"):
+            file_content += "\n"
+            
+        clean_content = content.strip().replace("\n", "  \n")
+        new_entry = f"- [{now_str}] {clean_content} (Source: [[Operational_Memory]])\n"
         
-    with open(target_path, "r", encoding="utf-8") as f:
-        file_content = f.read()
+        file_content += new_entry
         
-    # Append to the end of the file (which falls under the Timeline section)
-    # Ensure it ends with a newline before appending
-    if not file_content.endswith("\n"):
-        file_content += "\n"
-        
-    # Format the memory entry
-    clean_content = content.strip().replace("\n", "  \n") # preserve internal newlines
-    new_entry = f"- [{now_str}] {clean_content} (Source: [[Operational_Memory]])\n"
-    
-    file_content += new_entry
-    
-    atomic_write_text(target_path, file_content)
+        atomic_write_text(target_path, file_content)
     
     return f"Successfully persisted {memory_type} to {filename}."
 
