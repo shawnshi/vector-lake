@@ -133,6 +133,12 @@ graph LR
 - **Product 医疗行业特化防护 (Domain-Specific Schema)**：对 `Product` 节点执行了铁腕式的医疗槽位注入。所有医疗 IT 产品被强制要求挂载 `### 临床与管理价值流 (Clinical & Admin Value)`、`### 医疗合规与资质壁垒 (Compliance & Certifications)` 以及响应 STQM 的 `### 认知张力与未决争议 (Controversies & Tensions)`。防御任何未经过合规审计的野鸡架构非法入湖。
 - **批量图谱手术与断链自愈 (Mass Graph Surgery & Self-Healing)**：大幅升级了相似性合并管线。在相似节点去重合并时，底层脚本能自动扫略上万级文件的全局双链 `[[ ]]`，将所有指向废弃（或次级）节点的死链硬重定向至 Primary 基座，并将碎屑作为 alias 注入。真正实现了高度相似知识噪音的自动化坍缩与自愈。
 
+### 🛡️ V11.10 原子突变编排与异步摄取管线 (V11.10 Unified Mutation & Async Ingestion)
+- **全局突变协调器 (Unified Mutation Coordinator)**：彻底摒弃了分散在各个 Tool（如 Rename/Delete/Memory）中的离散图谱写盘代码，统一引入 `mutation_coordinator.py` 执行图谱状态机的原子突变。强制贯彻预检查（Pre-flight assertions）、双向落盘（Markdown + SQLite）、以及实时出站更新（Outbox Updating）。
+- **Antigravity 异步摄取守护 (Async Ingestion Loop)**：将旧版阻塞式的同步 LLM 摄取模拟循环彻底淘汰。在 `ingest_worker.py` 中引入 `agy run --prompt` 开启真正脱离主进程的自治 Subagent 循环队列。大幅提高多文档摄取的吞吐率并实现了资源隔离。
+- **DefenseHook 与 PurposeGate 强制门控 (Strategic Gates)**：在 `defense_hook.py` 与 `purpose_contract.py` 中落地战略防御。强制校验运行态写入时的战略作用域 (`strategic_scope`) 与证据等级 (`evidence_tier`)，不符合契约标准（如营销软文或低质断言）的信源从物理上即被禁止进入底层知识图谱。
+- **空指针与悬空引用免疫 (Null Safety & Dangling Pointer Immunity)**：针对 `claim_extractor.py` 中由于遗留老旧节点（缺乏 Frontmatter 或 Null aliases）引发的 `TypeError` 中断，全面实施了空值安全与防御式解包。在同步节点与边时确保底层图谱扫描绝对畅通无阻，实现超 10,000+ 节点的全量稳态重建。
+
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
