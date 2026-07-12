@@ -139,6 +139,11 @@ graph LR
 - **DefenseHook 与 PurposeGate 强制门控 (Strategic Gates)**：在 `defense_hook.py` 与 `purpose_contract.py` 中落地战略防御。强制校验运行态写入时的战略作用域 (`strategic_scope`) 与证据等级 (`evidence_tier`)，不符合契约标准（如营销软文或低质断言）的信源从物理上即被禁止进入底层知识图谱。
 - **空指针与悬空引用免疫 (Null Safety & Dangling Pointer Immunity)**：针对 `claim_extractor.py` 中由于遗留老旧节点（缺乏 Frontmatter 或 Null aliases）引发的 `TypeError` 中断，全面实施了空值安全与防御式解包。在同步节点与边时确保底层图谱扫描绝对畅通无阻，实现超 10,000+ 节点的全量稳态重建。
 
+### 🏔️ V11.11 纯净重构与发件箱解耦 (V11.11 Pure Canonical Architecture & Outbox Decoupling)
+- **SQLite 增量发件箱 (Mutation Outbox)**：在 SQLite 底座新增 `mutation_outbox` 表，`mutation_coordinator` 将 Markdown 变更与出站意图一并提交为单个物理事务（Atomicity），消除写操作中断导致的派生层（FTS/图谱）数据断层。
+- **派生缓存彻底解耦 (Derived Cache Decoupling)**：`generate_index` 彻底斩断对物理 Markdown 文件的依赖，全量索引强制只通过 Canonical SQLite `entities` 表进行无损重建。阻止了被破坏或违规修改的脏 Markdown 污染上层逻辑图谱。
+- **全局单点写入口 (Omni-Write Entrypoint)**：将 `MCP 写入`、`GC 删除`、`Bulk Merge`、`Query Stub 注册` 与 `Watchdog 手动编辑` 五大旁路全部强制收编，统一送入 `execute_mutation_plan()` 管线，达成写入生命周期的绝对封闭。
+
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
