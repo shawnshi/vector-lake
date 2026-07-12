@@ -159,7 +159,11 @@ def _compute_embeddings_unlocked(index_data: dict) -> dict:
 
 def _build_bm25_index(index_data: dict, embeddings_map: dict):
     nodes = (index_data.get("nodes") or {})
-    for node_key, node in nodes.items():
+    total = len(nodes)
+    log.info(f"Building BM25 index for {total} nodes...")
+    for i, (node_key, node) in enumerate(nodes.items()):
+        if i % 1000 == 0:
+            log.info(f"Tokenized {i}/{total} nodes...")
         aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
         text = f"{aliases_str} {node.get('raw_text', '')}"
         t_title = _tokenize_for_fts(node.get('title', ''))

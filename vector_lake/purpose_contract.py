@@ -45,8 +45,8 @@ def _parse_node_frontmatter(content: str, filename: str) -> dict[str, Any]:
 
 
 def validate_purpose_contract(contract: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(contract.get("purpose_version"), str) or not contract["purpose_version"].strip():
-        raise PurposeContractError("purpose contract requires a non-empty purpose_version.")
+    if contract.get("purpose_version") != "12.0":
+        raise PurposeContractError("purpose contract requires purpose_version to be exactly '12.0'.")
 
     contract["intent_keywords"] = _as_string_list(contract.get("intent_keywords"), "intent_keywords")
     try:

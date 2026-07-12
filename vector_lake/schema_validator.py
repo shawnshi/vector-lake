@@ -50,6 +50,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
         raise SchemaViolationException("Schema Violation: Frontmatter must be a valid YAML object.")
 
     # 1.1 Required Fields
+    # strategic_scope and evidence_tier are highly recommended but we allow legacy files without them
     required_fields = ["id", "title", "type", "domain", "status", "epistemic-status", "categories", "updated", "sources"]
     for field in required_fields:
         if field not in frontmatter:
@@ -57,7 +58,6 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
             if filename.startswith("System_") and field in ["domain", "epistemic-status", "sources"]:
                 continue
             raise SchemaViolationException(f"Schema Violation: Missing required frontmatter field '{field}'.")
-
     # 1.2 Type Validation
     doc_type = frontmatter.get("type", "").lower()
     if doc_type not in VALID_TYPES:

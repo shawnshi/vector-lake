@@ -319,6 +319,9 @@ def scheduled_lint_loop():
 def start_watchdog():
     threading.Thread(target=index_worker_loop, daemon=True).start()
     threading.Thread(target=scheduled_lint_loop, daemon=True).start()
+    
+    from vector_lake.ingest_worker import start_worker
+    threading.Thread(target=start_worker, daemon=True).start()
 
     observer = Observer()
 

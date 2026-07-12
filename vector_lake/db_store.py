@@ -186,6 +186,18 @@ def init_db():
                 processed_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                task_type TEXT,
+                payload TEXT,
+                status TEXT,
+                retries INTEGER DEFAULT 0,
+                error_msg TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
         
         # Add expression-based indexes for performance
         try:
@@ -297,6 +309,46 @@ def mark_file_processed(filepath: str, file_hash: str):
                 file_hash = excluded.file_hash,
                 processed_at = excluded.processed_at
         """, (filepath, file_hash, now_str))
+
+def enqueue_job(task_type: str, payload: dict) -> str:
+    import uuid
+    import json
+    from datetime import datetime, timezone
+    conn = get_connection()
+    job_id = uuid.uuid4().hex
+    now_str = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        conn.execute("""
+            INSERT INTO jobs (job_id, task_type, payload, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (job_id, task_type, json.dumps(payload, ensure_ascii=False), "queued", now_str, now_str))
+    return job_id
+
+def get_pending_jobs(limit: int = 10) -> list[dict]:
+    import json
+    conn = get_connection()
+    cur = conn.execute("""
+        SELECT * FROM jobs 
+        WHERE status IN ('queued', 'dispatched') OR (status = 'failed' AND retries < 3)
+        ORDER BY created_at ASC LIMIT ?
+    """, (limit,))
+    return [dict(row) for row in cur.fetchall()]
+
+def update_job_status(job_id: str, status: str, error_msg: str = ""):
+    from datetime import datetime, timezone
+    conn = get_connection()
+    now_str = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        if status == "failed":
+            conn.execute("""
+                UPDATE jobs SET status = ?, error_msg = ?, updated_at = ?, retries = retries + 1
+                WHERE job_id = ?
+            """, (status, error_msg, now_str, job_id))
+        else:
+            conn.execute("""
+                UPDATE jobs SET status = ?, error_msg = ?, updated_at = ?
+                WHERE job_id = ?
+            """, (status, error_msg, now_str, job_id))
 
 
 

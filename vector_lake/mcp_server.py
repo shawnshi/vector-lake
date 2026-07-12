@@ -72,10 +72,9 @@ def sync_vector_lake() -> str:
     try:
         return tools.sync_vector_lake()
     except Exception as e:
-        logging.error(f"MCP Tool Exception (sync_vector_lake): {e}
-{traceback.format_exc()}")
-        return f"MCP Exception: {str(e)}
-{traceback.format_exc()}" 
+        import traceback
+        logging.error(f"MCP Tool Exception (sync_vector_lake): {e}\n{traceback.format_exc()}")
+        return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
 
 @mcp.tool()
 def lint_vector_lake(auto_fix: bool = False) -> str:
@@ -87,10 +86,9 @@ def lint_vector_lake(auto_fix: bool = False) -> str:
     try:
         return tools.lint_vector_lake(auto_fix=auto_fix)
     except Exception as e:
-        logging.error(f"MCP Tool Exception (lint_vector_lake): {e}
-{traceback.format_exc()}")
-        return f"MCP Exception: {str(e)}
-{traceback.format_exc()}" 
+        import traceback
+        logging.error(f"MCP Tool Exception (lint_vector_lake): {e}\n{traceback.format_exc()}")
+        return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
 
 @mcp.tool()
 def query_logic_lake(query_str: str) -> str:

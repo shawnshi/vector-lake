@@ -135,11 +135,11 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
     page_key = os.path.splitext(page_name)[0]
     title = frontmatter.get("title", page_key)
     page_type = str(frontmatter.get("type", "concept")).lower()
-    aliases = frontmatter.get("aliases", [])
+    aliases = frontmatter.get("aliases") or []
     if isinstance(aliases, str):
         aliases = [aliases]
-    aliases = [str(alias).strip() for alias in aliases if str(alias).strip()]
-    sources = normalize_sources(frontmatter.get("sources", []))
+    aliases = [str(alias).strip() for alias in aliases if alias and str(alias).strip()]
+    sources = normalize_sources(frontmatter.get("sources") or [])
     summary = frontmatter.get("summary") or _body_summary(body)
     validity_defaults = _validity_defaults(frontmatter)
 

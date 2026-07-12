@@ -171,10 +171,10 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     
     subagent_prompts = []
     
+    from vector_lake.db_store import enqueue_job
+    enqueued_count = 0
+    
     for i, (filepath, file_hash) in enumerate(pending_files):
-        task_id = uuid.uuid4().hex[:8]
-        task_file = tmp_dir / f"ingest_task_{task_id}.md"
-        
         canonical_name = canonical_source_name(filepath)
         skeleton_block = parse_static_skeleton(filepath)
         
@@ -193,19 +193,17 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
             .replace("{{index_summary}}", index_summary) \
             .replace("{{purpose_content}}", purpose_content)
 
-        task_file.write_text(instructions, encoding="utf-8")
+        payload = {
+            "filepath": filepath,
+            "hash": file_hash,
+            "canonical_name": canonical_name,
+            "instructions": instructions
+        }
         
-        subagent_prompts.append(f"""{{
-    "TypeName": "vector-lake-ingestor",
-    "Role": "Vector Lake Ingestor Task {i+1}",
-    "Prompt": "Read instructions from `{task_file}` and execute the ingestion. This file hash is {file_hash} and path is {filepath}."
-}}""")
+        enqueue_job("ingest", payload)
+        enqueued_count += 1
         
-    response = "I have found pending files to ingest. Please use the `invoke_subagent` tool with the following Subagents array to execute them natively in parallel:\\n\\n[\\n"
-    response += ",\\n".join(subagent_prompts)
-    response += "\\n]\\n\\n"
-    response += "After invoking, you must STOP CALLING TOOLS and wait for them to finish."
-    return response
+    return f"Successfully enqueued {enqueued_count} files for ingestion."
 
 def finalize_ingest(files_written: list, processed_data: dict) -> str:
     """Finalizes an ingest operation from a subagent using direct data."""

@@ -35,6 +35,8 @@ domain: system
 status: active
 sources:
   - Operational_Memory
+strategic_scope: core
+evidence_tier: derived
 ---
 # {title}
 

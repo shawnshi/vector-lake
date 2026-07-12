@@ -83,22 +83,15 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
     updated = 0
     failures = []
     
-    import shutil
-    backup_dir = wiki_dir.parent / "backup" / "delete"
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    from vector_lake.mutation_coordinator import execute_mutation_plan
+    import yaml
     
     for action, filepath, _, frontmatter, body in actions:
+        filename = os.path.basename(filepath)
         if action == "DELETE":
             try:
-                shutil.copy2(filepath, backup_dir / os.path.basename(filepath))
-                # Cascading delete to sqlite FIRST
-                filename = os.path.basename(filepath)
-                node_key = os.path.splitext(filename)[0]
-                from vector_lake import db_store
-                db_store.delete_node_cascade(node_key)
-                
-                # THEN remove physical file
-                os.remove(filepath)
+                # Backup logic is already in execute_mutation_plan, but let's keep it here for raw source tracking if needed
+                execute_mutation_plan(filename, is_delete=True)
                 deleted += 1
                 log.info(f"Deleted (backed up): {filepath}")
             except Exception as e:
@@ -106,7 +99,9 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
                 log.warning(f"Failed to delete {filepath}: {e}")
         elif action == "REMOVE_REF":
             try:
-                write_markdown_file(filepath, frontmatter, body)
+                fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
+                new_content = f"---\n{fm_str}---\n{body}"
+                execute_mutation_plan(filename, content=new_content, is_delete=False)
                 updated += 1
                 log.info(f"Removed source ref from: {filepath}")
             except Exception as e:
