@@ -163,6 +163,64 @@ The Vector Lake system is designed for high-concurrency ingestion and graph main
 - **API Circuit Breaker**: Protects against quota exhaustion and rate-limit thrashing during concurrent LLM ingestion. Features an exponential backoff with jitter and a 10-minute cooldown blacklist for hard API errors (e.g., 404, quota limits).
 - **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
 - **Lock-Free Auto-Lint**: Runs a highly-destructive, autonomous `lint_vector_lake(auto_fix=True)` daily at 10:00 AM and 23:00 PM. This offline routine merges duplicate nodes, archives decaying/contested pages (Semantic GC), and enforces schema compliance. Crucially, it executes purely deterministically without synchronous LLM calls, preventing hours-long thread locks.
+
+The following CLI commands remain the ground truth operating surface for *human operators*:
+
+```powershell
+python cli.py doctor
+python cli.py sync
+python cli.py search "query" --top_k 5
+python cli.py search "query" --mode memory --top_k 5
+python cli.py search "query" --mode claim --top_k 5
+python cli.py query "question" [--dry-run]
+python cli.py review
+python cli.py audit-graph
+python cli.py research [--dry-run]
+python cli.py debt --top 20
+python cli.py trace "<query-or-id>"
+python cli.py merge-suggestions --limit 20
+python cli.py graph
+python cli.py gc --days 30 --dry-run
+python cli.py delete "<raw-source-path>" --dry-run
+```
+
+For Windows validation, prefer:
+
+```powershell
+$env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v
+$env:PYTHONUTF8='1'; python -m compileall vector_lake tests
+```
+
+## 5. Current Validation Baseline
+
+Last verified: 2026-07-08 (V11.5 Refactoring).
+
+- Unit tests: `Ran 8 tests ... OK`
+- Compile: `python -m compileall vector_lake tests` OK
+- Doctor: healthy
+- `search --mode memory`: smoke OK
+- Debt snapshot:
+  - `operational_memory_count: 13755`
+  - `superseded_memory_count: 510`
+  - `conflicted_memory_count: 0`
+  - `memory_type_counts: {'fact': 11881, 'decision': 1393, 'task_state': 384, 'preference': 97}`
+
+## 6. Operating Rules
+
+1. Preserve the split: Markdown is for humans; `.meta` is canonical state; `operational_memory` is for Agents.
+2. Keep `schema.md`, `README.md`, `commands/`, and `agents/` aligned when the runtime surface changes.
+3. Do not hand-edit derived runtime files unless the task is explicitly data repair. Prefer rebuild paths.
+4. Use dry-run first for delete, gc, and any operation that removes assets.
+5. Treat lock contention as environmental state, not proof that a code patch failed. Note that `daemon_watchdog` and `sync` operations are protected by cross-process `filelock` to prevent meta and index corruption.
+6. Use `PYTHONUTF8=1` when scripts may print Chinese paths.
+7. Never silently include unrelated dirty files in a publish or commit scope.
+
+## 7. System Capabilities & Architecture Defenses
+The Vector Lake system is designed for high-concurrency ingestion and graph maintenance with several defensive mechanisms:
+- **Two-Track Watchdog**: Monitors raw sources for incremental ingestion (via CoT LLM agents) and wiki nodes for O(1) index updates. Now correctly hooks `on_deleted` and `on_moved` events to instantly reflect Semantic GC operations and prevent "ghost nodes".
+- **API Circuit Breaker**: Protects against quota exhaustion and rate-limit thrashing during concurrent LLM ingestion. Features an exponential backoff with jitter and a 10-minute cooldown blacklist for hard API errors (e.g., 404, quota limits).
+- **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
+- **Lock-Free Auto-Lint**: Runs a highly-destructive, autonomous `lint_vector_lake(auto_fix=True)` daily at 10:00 AM and 23:00 PM. This offline routine merges duplicate nodes, archives decaying/contested pages (Semantic GC), and enforces schema compliance. Crucially, it executes purely deterministically without synchronous LLM calls, preventing hours-long thread locks.
 - **Autonomous Sub-Daemons**: The lint loop silently orchestrates `metadata_decay_daemon.py` (TTL rot), `sync_timeline_db.py` (SQL timeline extraction), `missing_evidence_scout.py` (dispatching intelligence tasks to governance queue), **`semantic_dedup_daemon.py`** (pairwise semantic deduplication via Gemini embeddings), **`compile_domain_overviews.py`** (PageRank centrality compilations), and the V9.0 **`community_clustering_daemon.py`** (Louvain clustering to detect low-cohesion blind spots), culminating in a daily SQLite `WAL TRUNCATE` maintenance.
 - **Strategic Intent Engine (V12.0)**: Parses `MEMORY/purpose.md` as the primary source for intent keywords and weighting. The same contract is injected into ingestion, retrieval, and research; it validates `strategic_scope` and `evidence_tier` during ingest, exposes SIR review proposals, and creates de-duplicated `Synthesis-Proposal` queue items only after the configured independent-source and tension thresholds are met.
 - **Strict Two-Step CoT Ingestion (V9.0)**: Forces ingestion subagents to output an intermediate `analysis_buffer.json` (parsing tensions, consensus, unknowns) before writing Markdown, eliminating extraction omissions.
@@ -175,3 +233,4 @@ The Vector Lake system is designed for high-concurrency ingestion and graph main
 - **Chinese Tokenization (V11.5)**: Implemented offline `jieba` pre-tokenization pipeline before SQLite `MATCH` execution, fixing the precision drop caused by `porter unicode61` character splitting.
 - **Subagent Concurrency Shield (V11.5)**: Migrated SDK LLM calls to Antigravity native subagents (`agy -p`) with `asyncio.Semaphore` physical throttling to entirely eliminate "process storms" and EOF rate limits.
 - **Cross-Storage Transactions (V11.5)**: Secured SQLite database writes and JSON file index updates within `db_store.transaction()` two-phase commit blocks and introduced exponential backoff for file locks.
+- **Pure Canonical Architecture & Outbox (V11.11)**: Decoupled derived layer indexing from fragile file reads. Mutations from all bypasses (MCP, Bulk Merge, Garbage Collection, Stub generation) converge on a single `mutation_coordinator`, applying Markdown updates, SQLite canonical transactions, and Outbox persistence (`mutation_outbox`) in absolute atomicity. `generate_index` operates purely off the SQLite `entities` table, rendering dirty Markdown files incapable of polluting the logical knowledge graph.

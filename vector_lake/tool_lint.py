@@ -53,6 +53,7 @@ def lint_vector_lake(auto_fix: bool = False):
     id_map = {}
     alias_map = {}
     all_keys = set()
+    link_target_map = {}
     inbound_count = defaultdict(int)
 
     # First Pass: Read and parse
@@ -83,15 +84,24 @@ def lint_vector_lake(auto_fix: bool = False):
         if node_id:
             id_map.setdefault(str(node_id), []).append(filename)
 
+        link_target_map[node_key] = node_key
+        title = frontmatter.get("title")
+        if title:
+            link_target_map[str(title).strip()] = node_key
+
         aliases = frontmatter.get("aliases", [])
         if isinstance(aliases, str):
             aliases = [aliases]
         if isinstance(aliases, list):
             for alias in aliases:
-                alias_map.setdefault(str(alias).strip(), []).append(filename)
+                alias_str = str(alias).strip()
+                link_target_map[alias_str] = node_key
+                alias_map.setdefault(alias_str, []).append(filename)
 
-        for target in links:
-            inbound_count[target] += 1
+    for filename, data in parsed.items():
+        for target in data["links"]:
+            real_key = link_target_map.get(target, target)
+            inbound_count[real_key] += 1
 
     # Apply Auto-fixes iteratively
     # 1. Naming Compliance
@@ -121,8 +131,16 @@ def lint_vector_lake(auto_fix: bool = False):
         for fname, data in parsed.items():
             if fname in renamed_files:
                 new_fname = renamed_files[fname]
+                old_key = fname[:-3]
+                new_key = new_fname[:-3]
                 data["path"] = os.path.join(wiki_dir, new_fname)
                 new_parsed[new_fname] = data
+                
+                for t, rk in list(link_target_map.items()):
+                    if rk == old_key:
+                        link_target_map[t] = new_key
+                if old_key in inbound_count:
+                    inbound_count[new_key] += inbound_count.pop(old_key)
             else:
                 new_parsed[fname] = data
         parsed = new_parsed
@@ -157,7 +175,7 @@ def lint_vector_lake(auto_fix: bool = False):
     # 4. Broken Links (Stub Creation)
     for filename, data in parsed.items():
         for target in data["links"]:
-            if target not in all_keys and target not in alias_map:
+            if target not in link_target_map and target not in all_keys:
                 issues["broken_links"].append(f"{filename} -> [[{target}]]: target does not exist")
                 if auto_fix:
                     stub_filename = f"Concept_{target}.md" if not target.startswith(valid_prefixes) else f"{target}.md"

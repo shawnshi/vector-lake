@@ -41,11 +41,10 @@ def execute_mutation_plan(filename: str, content: str | None = None, is_delete: 
             if filepath.exists():
                 os.remove(filepath)
         else:
-            # Atomic write
-            temp_file = filepath.with_suffix(".md.tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
+            # Write directly
+            with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
-            os.replace(temp_file, filepath)
+
             
         # 4. SQLite Transaction
         with transaction():
@@ -83,7 +82,9 @@ def execute_mutation_plan(filename: str, content: str | None = None, is_delete: 
         log.error(f"Mutation failed for {filename}: {e}. Rolling back.")
         # Rollback markdown
         if has_backup and bak_path.exists():
-            os.replace(bak_path, filepath)
+            if filepath.exists():
+                os.remove(filepath)
+            shutil.move(str(bak_path), str(filepath))
         elif not is_delete and not has_backup and filepath.exists():
             os.remove(filepath)
             
