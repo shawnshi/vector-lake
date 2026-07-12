@@ -163,7 +163,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
 from vector_lake.watchdog_status import write_status
 
 def index_worker_loop():
-    log.info("Index Update Worker Thread started.")
+    log.info("Outbox Consumer Thread started.")
     consecutive_failures = 0
     max_failures = 5
     backoff_base = 2
@@ -171,77 +171,93 @@ def index_worker_loop():
     while True:
         try:
             if consecutive_failures >= max_failures:
-                write_status("halted", 0, index_queue.qsize(), "Index Worker Halted", "Max consecutive failures reached")
-                log.error("Index Worker Halted. Entering 60s cooldown before retry.")
+                write_status("halted", 0, index_queue.qsize(), "Outbox Consumer Halted", "Max consecutive failures reached")
+                log.error("Outbox Consumer Halted. Entering 60s cooldown before retry.")
                 time.sleep(60)
                 consecutive_failures = 0
                 continue
-
+                
             from vector_lake import get_extension_root
             import os
-            flag_path = get_extension_root() / "tmp" / "flag_reindex.lock"
-            if os.path.exists(flag_path):
-                try:
-                    os.remove(flag_path)
-                    from vector_lake import indexer
-                    with global_task_lock:
-                        log.info("flag_reindex.lock detected. Generating full index asynchronously...")
-                        indexer.generate_index()
-                except Exception as e:
-                    log.error(f"Error handling flag_reindex.lock: {e}")
+            flag_path = get_extension_root() / "tmp" / "outbox_signal.lock"
             
-            write_status("idle", 0, index_queue.qsize(), "Waiting for index tasks", "")
+            # Handle manual filesystem modifications from watchdog
+            pending_legacy = set()
+            wait_for_signal = True
             try:
-                filename = index_queue.get(timeout=5.0)
+                while True:
+                    pending_legacy.add(index_queue.get_nowait())
+                    index_queue.task_done()
             except queue.Empty:
+                pass
+                
+            if pending_legacy:
+                from vector_lake.mutation_coordinator import execute_mutation_plan
+                from vector_lake.wiki_utils import get_wiki_dir
+                wiki_dir = get_wiki_dir()
+                for fname in pending_legacy:
+                    fpath = os.path.join(wiki_dir, fname)
+                    try:
+                        if os.path.exists(fpath):
+                            with open(fpath, "r", encoding="utf-8") as f:
+                                execute_mutation_plan(fname, content=f.read(), is_delete=False)
+                        else:
+                            execute_mutation_plan(fname, is_delete=True)
+                    except Exception as e:
+                        log.error(f"Failed to process manual edit for {fname}: {e}")
+                wait_for_signal = False
+                
+            if wait_for_signal and not os.path.exists(flag_path):
+                time.sleep(1)
                 continue
                 
-            time.sleep(DEBOUNCE_SECONDS)
+            if os.path.exists(flag_path):
+                try: os.remove(flag_path)
+                except OSError: pass
 
-            pending_filenames = {filename}
-            while not index_queue.empty():
-                try:
-                    peek = index_queue.get_nowait()
-                    pending_filenames.add(peek)
-                    index_queue.task_done()
-                except queue.Empty:
-                    break
+            from vector_lake.db_store import get_connection, transaction
+            conn = get_connection()
+            rows = conn.execute("SELECT id, filename, mutation_type FROM mutation_outbox WHERE status = 'pending' ORDER BY id ASC LIMIT 50").fetchall()
+            
+            if not rows:
+                if pending_legacy:
+                    write_status("idle", 0, index_queue.qsize(), "Legacy queue drained", "")
+                continue
 
-            write_status("processing", 0, index_queue.qsize(), f"Updating index for {len(pending_filenames)} files", "")
+            write_status("processing", 0, index_queue.qsize(), f"Consuming {len(rows)} outbox mutations", "")
 
             from vector_lake import indexer
             from vector_lake import governance_store
-            from vector_lake.wiki_utils import get_wiki_dir
-            import os
-
-            wiki_dir = get_wiki_dir()
-            filepaths = []
-
+            
             with global_task_lock:
-                valid_filenames = list(pending_filenames)
-                indexer.update_index_items(valid_filenames)
-                for fname in valid_filenames:
-                    filepaths.append(str(os.path.join(wiki_dir, fname)))
-                log.info(f"O(1) Batched Index updated for {len(valid_filenames)} modified wiki nodes")
+                for row in rows:
+                    outbox_id = row["id"]
+                    filename = row["filename"]
+                    mutation_type = row["mutation_type"]
+                    try:
+                        if mutation_type == 'delete':
+                            node_key = filename[:-3] if filename.endswith(".md") else filename
+                            from vector_lake.db_store import delete_search_index
+                            delete_search_index(node_key)
+                        else:
+                            indexer.update_index_items([filename])
+                            
+                        with transaction():
+                            conn.execute("UPDATE mutation_outbox SET status = 'completed' WHERE id = ?", (outbox_id,))
+                    except Exception as e:
+                        log.error(f"Failed to process outbox item {outbox_id} for {filename}: {e}")
+                        with transaction():
+                            conn.execute("UPDATE mutation_outbox SET status = 'failed' WHERE id = ?", (outbox_id,))
+                        raise e
 
-                # Sync human modifications back to canonical JSON metadata
-                if filepaths:
-                    governance_store.sync_pages_to_canonical(
-                        filepaths,
-                        origin="watchdog",
-                        auto_approve=True,
-                        summary=f"Human/Watchdog modification sync for {len(filepaths)} page(s)"
-                    )
-                    log.info(f"Canonical metadata (JSON) synchronized for {len(filepaths)} modified node(s).")
+                log.info(f"O(1) Batched Index updated for {len(rows)} outbox mutations")
 
-            index_queue.task_done()
             consecutive_failures = 0
-            write_status("idle", 0, index_queue.qsize(), "Index update finished", "")
 
         except Exception as exc:
             consecutive_failures += 1
-            log.error(f"Index worker error: {exc}")
-            write_status("error", 0, index_queue.qsize(), "Index thread exception", str(exc))
+            log.error(f"Outbox worker error: {exc}")
+            write_status("error", 0, index_queue.qsize(), "Outbox consumer exception", str(exc))
             time.sleep(min(backoff_base ** consecutive_failures, 60))
         finally:
             from vector_lake.db_store import close_connection

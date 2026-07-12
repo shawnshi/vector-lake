@@ -216,52 +216,28 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         wiki_dir = get_wiki_dir()
         
         files_written = []
+        from vector_lake.mutation_coordinator import execute_mutation_plan
         for item in files:
             fname = os.path.basename(item["filename"])
             fcontent = item["content"]
-            out_path = wiki_dir / fname
-            
-            if not out_path.resolve().is_relative_to(wiki_dir.resolve()):
-                raise SafeWriteError(f"Path traversal blocked: {fname}")
             
             if "Concept_Decision_" in fname:
                 lower_content = fcontent.lower()
                 if not all(k in lower_content for k in ["context", "alternatives", "justification"]):
                     raise SafeWriteError(f"Decision nodes like {fname} MUST contain 'context', 'alternatives', and 'justification'.")
                     
-            safe_write_markdown(out_path, fcontent)
-            files_written.append(str(out_path))
+            execute_mutation_plan(fname, content=fcontent, is_delete=False)
+            files_written.append(str(wiki_dir / fname))
             
         from vector_lake.db_store import transaction
         
         try:
             with transaction():
-                if files_written:
-                    governance_store.sync_pages_to_canonical(
-                        files_written,
-                        origin="ingest-subagent",
-                        auto_approve=True,
-                        summary=f"Subagent ingest sync for {len(files_written)} page(s)"
-                    )
-                
                 filepath = processed_data["filepath"]
                 file_hash = processed_data["hash"]
                 mark_file_processed(filepath, file_hash)
-                
-            if files_written:
-                from vector_lake.indexer import update_index_items
-                filenames_only = [os.path.basename(f) for f in files_written]
-                update_index_items(filenames_only)
-
-                tmp_dir = get_extension_root() / "tmp"
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-                with open(tmp_dir / "flag_reindex.lock", "w") as f:
-                    f.write("1")
         except Exception as e:
-            for fw in files_written:
-                try: os.remove(fw)
-                except OSError: pass
-            raise Exception(f"Ingest aborted during transactional commit. Rolled back markdowns. Error: {e}")
+            raise Exception(f"Ingest aborted during mark_file_processed. Error: {e}")
         
         from filelock import FileLock
         processing_file = get_extension_root() / "tmp" / "processing_files.json"

@@ -7,7 +7,7 @@ import logging
 from vector_lake.db_store import transaction, backup_database
 from vector_lake.wiki_utils import get_wiki_dir, get_extension_root
 from vector_lake.defense_hook import verify_asset
-from vector_lake.indexer import update_index_items, delete_search_index
+from vector_lake.indexer import update_index_items
 
 log = logging.getLogger("vector-lake-mutation")
 
@@ -49,10 +49,14 @@ def execute_mutation_plan(filename: str, content: str | None = None, is_delete: 
             
         # 4. SQLite Transaction
         with transaction():
+            from vector_lake.db_store import get_connection
+            from vector_lake.governance_store import _utc_now
+            conn = get_connection()
             if is_delete:
                 from vector_lake.db_store import delete_node_cascade
                 node_key = filename[:-3] if filename.endswith(".md") else filename
                 delete_node_cascade(node_key)
+                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (filename, 'delete', _utc_now()))
             else:
                 from vector_lake.governance_store import sync_pages_to_canonical
                 sync_pages_to_canonical(
@@ -61,13 +65,13 @@ def execute_mutation_plan(filename: str, content: str | None = None, is_delete: 
                     auto_approve=True,
                     summary=f"Unified mutation applied to {filename}"
                 )
+                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (filename, 'update', _utc_now()))
                 
-        # 5. Outbox / Index Update
-        if is_delete:
-            node_key = filename[:-3] if filename.endswith(".md") else filename
-            delete_search_index(node_key)
-        else:
-            update_index_items([filename])
+        # 5. Signal Outbox Consumer
+        tmp_dir = get_extension_root() / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        with open(tmp_dir / "outbox_signal.lock", "w") as f:
+            f.write("1")
             
         # Cleanup backup
         if has_backup and bak_path.exists():

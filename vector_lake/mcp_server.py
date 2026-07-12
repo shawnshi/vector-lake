@@ -283,16 +283,9 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
     from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError, get_wiki_dir
     import os
     try:
-        wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
-        file_path = (wiki_dir / filename).resolve()
-        if not file_path.is_relative_to(wiki_dir):
-            return "[Security Error] Path traversal detected."
-        safe_write_markdown(str(file_path), content)
-        from vector_lake.indexer import update_index_item
-        update_index_item(filename)
-        from vector_lake.governance_store import sync_pages_to_canonical
-        sync_pages_to_canonical([file_path], origin="mcp-agent", auto_approve=True, summary=f"MCP write to {filename}")
-        return f"Successfully wrote {filename} and updated index."
+        from vector_lake.mutation_coordinator import execute_mutation_plan
+        execute_mutation_plan(filename, content=content, is_delete=False)
+        return f"Successfully wrote {filename} and queued index update."
     except SafeWriteError as e:
         return f"[Write Rejected] {str(e)}"
     except Exception as e:

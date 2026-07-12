@@ -126,24 +126,17 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                     if right_bak and os.path.exists(right_bak):
                         os.remove(right_bak)
 
-                    # Issue 11 fix: Trigger canonical sync and index update
+                    # Issue 11 fix: Trigger canonical sync and index update via coordinator
                     try:
-                        import os
-                        pass
-                        if left_path:
-                            modified = [left_path]
-                            deleted = [right_path] if right_path else []
-                            governance_store.sync_pages_to_canonical(
-                                modified_paths=modified,
-                                deleted_paths=deleted,
-                                origin="semantic-merge",
-                                auto_approve=True,
-                                summary=f"Semantic merge resolved: {left_name} absorbed {right_name}"
-                            )
-                            from vector_lake.indexer import update_index_items
-                            update_index_items([os.path.basename(left_path)])
+                        from vector_lake.mutation_coordinator import execute_mutation_plan
+                        if right_path and os.path.exists(right_path):
+                            execute_mutation_plan(os.path.basename(right_path), is_delete=True)
+                        if left_path and os.path.exists(left_path):
+                            with open(left_path, "r", encoding="utf-8") as f:
+                                left_content = f.read()
+                            execute_mutation_plan(os.path.basename(left_path), content=left_content, is_delete=False)
                     except Exception as e:
-                        log.error(f"Failed to trigger canonical sync after merge: {e}")
+                        log.error(f"Failed to trigger mutation coordinator after merge: {e}")
 
         from filelock import FileLock
         from vector_lake.wiki_utils import get_meta_dir

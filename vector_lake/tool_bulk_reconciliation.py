@@ -56,15 +56,19 @@ def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
             
         item = {
             "item_id": f"gov_{uuid.uuid4().hex[:12]}",
-            "type": "merge_suggestion",
+            "type": "merge",
             "title": f"Merge {src} into {tgt}",
             "description": f"Bulk reconcile tool requested merge of {src} into {tgt}.",
             "created_at": now_str,
             "status": "pending",
             "source": "bulk_reconcile",
             "affected_pages": [f"{src}.md", f"{tgt}.md"],
-            "merge_source": src,
-            "merge_target": tgt
+            "merge_candidate": {
+                "left_name": tgt,
+                "right_name": src,
+                "left_entity_id": f"entity_{tgt}",
+                "right_entity_id": f"entity_{src}"
+            }
         }
         queue.setdefault("items", []).append(item)
         enqueued += 1

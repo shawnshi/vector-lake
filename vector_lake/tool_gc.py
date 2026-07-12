@@ -60,10 +60,8 @@ def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
     for path, nid in orphans:
         try:
             shutil.copy2(path, backup_dir / path.name)
-            node_key = nid if nid else os.path.splitext(path.name)[0]
-            from vector_lake import db_store
-            db_store.delete_node_cascade(node_key)
-            os.remove(path)
+            from vector_lake.mutation_coordinator import execute_mutation_plan
+            execute_mutation_plan(path.name, is_delete=True)
             deleted += 1
         except Exception as e:
             log.error(f"Failed to GC {path.name}: {e}")

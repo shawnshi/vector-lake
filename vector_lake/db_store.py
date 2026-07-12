@@ -116,6 +116,15 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS mutation_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                mutation_type TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT
+            )
+        """)
+        conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS wiki_search_index USING fts5(
                 node_key, title, summary, text,
                 tokenize='unicode61 remove_diacritics 1'

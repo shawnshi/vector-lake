@@ -691,36 +691,45 @@ def _apply_graph_topology(index_data: dict):
 
 
 def generate_index():
-    wiki_dir = _wiki_dir()
-    if not os.path.exists(wiki_dir):
-        log.warning(f"Wiki directory not found at {wiki_dir}")
-        return
-
+    from vector_lake.db_store import get_connection
+    conn = get_connection()
     index_data = _empty_index_data()
-    files = [
-        name for name in os.listdir(wiki_dir) 
-        if name.endswith(".md") 
-        and name not in ("index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md")
-        and not name.startswith("System_")
-    ]
 
-    for filename in files:
-        filepath = os.path.join(wiki_dir, filename)
-        if not filename.startswith(VALID_PREFIXES) and filename not in ("index.md", "log.md"):
-            index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
-            log.warning(f"Schema violation in {filename}, bypassing index inclusion.")
-            continue
-
-        node_key = filename[:-3]
+    # Read from canonical SQLite instead of Markdown files
+    rows = conn.execute("SELECT entity_id, canonical_name, data_json FROM entities").fetchall()
+    
+    for row in rows:
+        canonical_name = row["canonical_name"]
         try:
-            node_data = _parse_wiki_node(filepath, node_key)
-        except yaml.YAMLError as e:
-            index_data["error_log"].append({"file": filename, "error": str(e)})
-            log.warning(f"YAML Error in {filename}, suppressing to error_log.")
+            entity_data = json.loads(row["data_json"])
+        except Exception as e:
+            log.warning(f"Failed to parse JSON for {canonical_name}: {e}")
             continue
-
-        if node_data is None:
-            continue
+            
+        node_key = canonical_name
+        
+        # Build node_data analogous to _parse_wiki_node output
+        node_data = {
+            "id": entity_data.get("id", node_key),
+            "title": entity_data.get("title", node_key.replace("_", " ")),
+            "summary": entity_data.get("summary", ""),
+            "raw_text": entity_data.get("raw_text", ""),
+            "type": entity_data.get("type", "concept"),
+            "domain": entity_data.get("domain", "General"),
+            "topic_cluster": entity_data.get("topic_cluster", "General"),
+            "status": entity_data.get("status", "Active"),
+            "epistemic_status": entity_data.get("epistemic-status", "draft"),
+            "categories": entity_data.get("categories", ["Uncategorized"]),
+            "tags": entity_data.get("tags", []),
+            "aliases": entity_data.get("aliases", []),
+            "relations": entity_data.get("relations", []),
+            "sources": entity_data.get("sources", []),
+            "outbound_links": entity_data.get("outbound_links", []),
+            "ttl": entity_data.get("ttl", 365),
+            "decay_weight": entity_data.get("decay_weight", 1.0),
+            "node_score": entity_data.get("decay_weight", 1.0),
+            "updated_at": entity_data.get("updated", "")
+        }
 
         index_data["nodes"][node_key] = node_data
         if node_data["id"]:
@@ -731,6 +740,13 @@ def generate_index():
         if isinstance(node_data["categories"], list):
             for category in node_data["categories"]:
                 index_data["categories"].add(category)
+
+    # Completely rebuild FTS and Embeddings
+    try:
+        embeddings_map = _compute_embeddings_unlocked(index_data)
+        _build_bm25_index(index_data, embeddings_map)
+    except Exception as e:
+        log.error(f"Failed to rebuild FTS/embeddings during full index generation: {e}")
 
     from vector_lake.db_store import transaction
     index_data["weighted_edges"] = _calculate_weighted_edges(index_data)

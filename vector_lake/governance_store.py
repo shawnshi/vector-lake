@@ -101,7 +101,7 @@ ALLOWED_TABLES = {
     "entities", "claims", "evidence", "sources", "change_sets",
     "governance_queue", "wiki_search_index", "alias_registry",
     "operational_memory", "claim_graph_nodes", "claim_graph_edges",
-    "timeline_events", "processed_files"
+    "timeline_events", "processed_files", "mutation_outbox"
 }
 
 def _validate_table_name(table_name: str):
@@ -1000,6 +1000,7 @@ def create_change_set(
         "risk_level": "medium" if len(page_paths) > 3 else "low",
         "requires_human_review": not auto_approve,
         "affected_ids": sorted(set(affected_ids)),
+        "affected_pages": [os.path.basename(path) for path in page_paths],
         "proposed_entities": proposed_entities,
         "proposed_claims": proposed_claims,
         "proposed_evidence": proposed_evidence,

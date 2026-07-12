@@ -124,23 +124,18 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
             sanitize_wiki_node(file_path)
             
     if valid_files:
-        # P0-1: Async Indexing Signal
-        tmp_dir = get_extension_root() / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        with open(tmp_dir / "flag_reindex.lock", "w") as f:
-            f.write("1")
+        from vector_lake.mutation_coordinator import execute_mutation_plan
+        for filename in valid_files:
+            file_path = os.path.join(wiki_dir, filename)
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            execute_mutation_plan(filename, content=content, is_delete=False)
             
         stubs_created = _generate_stubs_for_broken_links(wiki_dir, valid_files)
-        change_set = governance_store.sync_pages_to_canonical(
-            [os.path.join(wiki_dir, filename) for filename in valid_files],
-            origin="query",
-            auto_approve=True,
-            summary=f"Query synthesis for: {query_str[:80]}",
-        )
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
         return (
             f"Query finalization completed. {len(valid_files)} page(s) synced. {stubs_created} stub(s) generated.\n"
-            f"Canonical change set: {change_set['change_set_id'] if change_set else 'none'}\n\n{trace}"
+            f"Canonical change set: mutation_coordinator_handled\n\n{trace}"
         )
     return "Query finalization completed with no valid wiki files synced."
 
@@ -216,7 +211,10 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
             f"- [{today}] [Observation] Created stub.\n"
         )
         try:
-            write_markdown_file(os.path.join(wiki_dir, f"{target}.md"), frontmatter, body)
+            import yaml
+            from vector_lake.mutation_coordinator import execute_mutation_plan
+            frontmatter_str = "---\n" + yaml.dump(frontmatter, allow_unicode=True, sort_keys=False) + "---\n"
+            execute_mutation_plan(f"{target}.md", content=frontmatter_str + body, is_delete=False)
             stubs += 1
             existing_files.add(target)
             log.info(f"[Stub] Created seed page: {target}.md")
