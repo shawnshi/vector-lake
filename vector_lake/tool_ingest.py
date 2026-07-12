@@ -164,6 +164,9 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     schema_content = ""
     try:
         schema_content = (get_extension_root() / "schema.md").read_text(encoding="utf-8")
+        cat_path = get_extension_root() / "SCHEMA_CATEGORIES.md"
+        if cat_path.exists():
+            schema_content += "\n\n" + cat_path.read_text(encoding="utf-8")
     except Exception: pass
     
     index_summary = _read_index_summary()

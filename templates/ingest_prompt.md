@@ -46,3 +46,11 @@ Instead, you MUST declare a `tension_edges` array in the YAML frontmatter for th
 
 [CRITICAL SYSTEM OVERRIDE]
 You are not a creative writer; you are a strict Database Compiler. Your output Markdown is physically parsed by an AST logic engine. Any deviation from the `[predicate:: [[Target]]]` syntax, any invention of H3 headers, or any use of pronouns (it/they/he) in Section 1 will cause a fatal compilation crash. Write with the cold, dense precision of machine code.
+
+[FINAL COMPILATION CHECKLIST]
+Before you generate the JSON output, verify against these 5 physical constraints. Failure means fatal AST crash:
+1. **Filename (文件名)**: Does it use an exact allowed prefix (`Concept_`, `Vendor_`, `Institution_`, `Product_`, `Person_`, `Event_`, `Policy_`, `Standard_`, `Source_`, `Synthesis_`)? Is `Institution_` strictly used for hospitals/regulators and `Vendor_` for suppliers? 
+2. **H3 Slots (H3槽位)**: Did you invent any H3 headers? You MUST ONLY use the exact H3 strings defined in `schema.md` for that specific `type`.
+3. **Category (分类)**: Is the `categories` array using EXACTLY one of the 8 macro-domains defined in SCHEMA_CATEGORIES (e.g. `System_Architecture`, `Healthcare_IT`)? NEVER use `Uncategorized` or invent your own.
+4. **Tags (标签)**: Are there maximum 3 tags? Do they represent macro states (e.g. #院内系统替换) and NOT entity names?
+5. **YAML Frontmatter**: Are all required fields (`id`, `title`, `aliases`, `type`, `domain`, `topic_cluster`, `status`, `epistemic-status`, `ttl`, `memory_type`, `memory_key`, `categories`, `tags`, `strategic_scope`, `evidence_tier`) present and syntactically correct?
