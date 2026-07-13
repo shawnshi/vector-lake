@@ -238,7 +238,7 @@ def is_graph_dirty(index_data: dict | None) -> bool:
     return bool(graph_state.get("dirty"))
 
 
-def _parse_wiki_node(filepath: str, node_key: str):
+def _parse_wiki_node(filepath: str, node_key: str, now_utc: datetime | None = None):
     try:
         fm_data, body, _ = read_markdown_file(filepath)
     except (UnicodeDecodeError, OSError) as e:
@@ -291,7 +291,9 @@ def _parse_wiki_node(filepath: str, node_key: str):
         updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
         if updated_dt.tzinfo is None:
             updated_dt = updated_dt.replace(tzinfo=timezone.utc)
-        age_days = (datetime.now(timezone.utc) - updated_dt).days
+
+        # ⚡ Bolt: Use pre-computed now_utc to avoid repeated datetime.now calls in O(N) loops
+        age_days = ((now_utc or datetime.now(timezone.utc)) - updated_dt).days
         if age_days > 0 and ttl > 0:
             decay_weight = 0.5 ** (age_days / ttl)
     except Exception:
@@ -695,6 +697,7 @@ def generate_index():
     
     # Read from canonical Markdown files instead of SQLite to preserve full topology and text
     import os
+    now_utc = datetime.now(timezone.utc)
     for filename in os.listdir(wiki_dir):
         if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md") or filename.startswith("System_"):
             continue
@@ -703,7 +706,7 @@ def generate_index():
         node_key = filename[:-3]
         
         try:
-            node_data = _parse_wiki_node(filepath, node_key)
+            node_data = _parse_wiki_node(filepath, node_key, now_utc=now_utc)
         except Exception as e:
             log.warning(f"Failed to parse markdown for {node_key}: {e}")
             continue
@@ -779,13 +782,14 @@ def update_index_items(filenames: list[str]):
         client = None
 
     wiki_dir = _wiki_dir()
+    now_utc = datetime.now(timezone.utc)
     for filename in valid_filenames:
         filepath = os.path.join(wiki_dir, filename)
         node_key = filename[:-3]
         if not os.path.exists(filepath):
             continue
         try:
-            node_data = _parse_wiki_node(filepath, node_key)
+            node_data = _parse_wiki_node(filepath, node_key, now_utc=now_utc)
         except Exception:
             node_data = None
         if node_data:
@@ -875,7 +879,7 @@ def update_index_items(filenames: list[str]):
                                 node_data = pre_parsed_data.get(node_key)
                                 if node_data is None:
                                     try:
-                                        node_data = _parse_wiki_node(filepath, node_key)
+                                        node_data = _parse_wiki_node(filepath, node_key, now_utc=now_utc)
                                     except Exception as e:
                                         index_data["error_log"].append({"file": filename, "error": str(e)})
                                         node_data = None
