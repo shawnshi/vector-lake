@@ -276,17 +276,22 @@ def delete_search_index(node_key: str):
 def delete_node_cascade(node_key: str):
     conn = get_connection()
     with transaction():
-        cur = conn.execute("SELECT entity_id FROM entities WHERE entity_id = ? OR json_extract(data_json, '$.id') = ?", (node_key, node_key))
+        cur = conn.execute("SELECT entity_id, canonical_name FROM entities WHERE entity_id = ? OR canonical_name = ?", (node_key, node_key))
         row = cur.fetchone()
-        ent_id = row[0] if row else node_key
+        if row:
+            ent_id = row[0]
+            canon_name = row[1] if row[1] else node_key
+        else:
+            ent_id = node_key
+            canon_name = node_key
         
-        conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
-        conn.execute("DELETE FROM entities WHERE entity_id = ? OR canonical_name = ?", (ent_id, node_key))
+        conn.execute("DELETE FROM wiki_search_index WHERE node_key IN (?, ?)", (canon_name, ent_id))
+        conn.execute("DELETE FROM entities WHERE entity_id = ? OR canonical_name = ?", (ent_id, canon_name))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (ent_id,))
-        conn.execute("DELETE FROM claims WHERE json_extract(data_json, '$.source_page') IN (?, ?)", (node_key, node_key + ".md"))
-        conn.execute("DELETE FROM claim_graph_nodes WHERE node_id IN (?, ?)", (node_key, ent_id))
-        conn.execute("DELETE FROM claim_graph_edges WHERE source_id IN (?, ?) OR target_id IN (?, ?)", (node_key, ent_id, node_key, ent_id))
-        conn.execute("DELETE FROM sources WHERE source_id = ?", (node_key,))
+        conn.execute("DELETE FROM claims WHERE json_extract(data_json, '$.source_page') IN (?, ?, ?, ?)", (canon_name, canon_name + ".md", ent_id, ent_id + ".md"))
+        conn.execute("DELETE FROM claim_graph_nodes WHERE node_id IN (?, ?)", (canon_name, ent_id))
+        conn.execute("DELETE FROM claim_graph_edges WHERE source_id IN (?, ?) OR target_id IN (?, ?)", (canon_name, ent_id, canon_name, ent_id))
+        conn.execute("DELETE FROM sources WHERE source_id IN (?, ?)", (canon_name, ent_id))
         conn.execute("DELETE FROM timeline_events WHERE entity_id = ?", (ent_id,))
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:

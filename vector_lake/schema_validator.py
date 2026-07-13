@@ -20,6 +20,21 @@ VALID_H3_SLOTS = {
 
 VALID_TYPES = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
 
+VALID_CATEGORIES = {
+    "Uncategorized",
+    "Artificial_Intelligence",
+    "Healthcare_IT",
+    "Strategy_and_Business",
+    "System_Architecture",
+    "Philosophy_and_Cognitive",
+    "Biomedicine",
+    "Policy_and_Governance",
+    "Entities_and_Actors"
+}
+
+VALID_STATUS = {"Active", "Draft", "Superseded", "Deprecated", "Archived", "Contested"}
+VALID_EPISTEMIC_STATUS = {"seed", "sprouting", "evergreen"}
+
 # Metric keys double as a physical unit contract.  Keep legacy keys readable,
 # but use the unambiguous keys below for all newly compiled SIR evidence.
 CONTROLLED_METRICS = {
@@ -63,15 +78,25 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     if doc_type not in VALID_TYPES:
         raise SchemaViolationException(f"Schema Violation: Invalid type '{doc_type}'. Must be one of {VALID_TYPES}.")
 
+    # 1.2b Categories Validation
+    categories = frontmatter.get("categories", [])
+    if isinstance(categories, list):
+        for cat in categories:
+            if cat not in VALID_CATEGORIES:
+                raise SchemaViolationException(f"Schema Violation: Invalid category '{cat}'. Allowed categories: {VALID_CATEGORIES}.")
+    elif isinstance(categories, str):
+        if categories not in VALID_CATEGORIES:
+            raise SchemaViolationException(f"Schema Violation: Invalid category '{categories}'. Allowed categories: {VALID_CATEGORIES}.")
+
     # 1.3 Epistemic Status
     epistemic_status = str(frontmatter.get("epistemic-status", "")).lower()
-    if epistemic_status and epistemic_status not in {"seed", "sprouting", "evergreen"}:
-        raise SchemaViolationException(f"Schema Violation: epistemic-status '{epistemic_status}' is invalid. Allowed: seed, sprouting, evergreen.")
+    if epistemic_status and epistemic_status not in VALID_EPISTEMIC_STATUS:
+        raise SchemaViolationException(f"Schema Violation: epistemic-status '{epistemic_status}' is invalid. Allowed: {VALID_EPISTEMIC_STATUS}.")
 
     # 1.4 Status
     status = str(frontmatter.get("status", "")).title()
-    if status and status not in {"Active", "Draft", "Superseded", "Deprecated", "Archived", "Contested"}:
-        raise SchemaViolationException(f"Schema Violation: status '{status}' is invalid. Allowed: Active, Draft, Superseded, Deprecated, Archived, Contested.")
+    if status and status not in VALID_STATUS:
+        raise SchemaViolationException(f"Schema Violation: status '{status}' is invalid. Allowed: {VALID_STATUS}.")
 
     # 1.5 Tags Constraints
     tags = frontmatter.get("tags", [])

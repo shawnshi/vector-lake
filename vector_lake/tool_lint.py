@@ -33,16 +33,11 @@ def lint_vector_lake(auto_fix: bool = False):
         return "Wiki directory not found."
 
     skip_files = {"index.md", "log.md", "overview.md"}
-    valid_types = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
-    valid_status = {"active", "deprecated", "archived", "contested"}
-    valid_epistemic = {"seed", "sprouting", "evergreen"}
-    valid_categories = {
-        "Uncategorized", "Artificial_Intelligence", "Healthcare_IT",
-        "Strategy_and_Business", "System_Architecture",
-        "Philosophy_and_Cognitive", "Biomedicine",
-        "Policy_and_Governance", "Entities_and_Actors",
-    }
-    valid_prefixes = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
+    from vector_lake.schema_validator import VALID_TYPES as valid_types, VALID_CATEGORIES as valid_categories, VALID_STATUS, VALID_EPISTEMIC_STATUS
+    from vector_lake.wiki_utils import VALID_PREFIXES as valid_prefixes
+    
+    valid_status = {s.lower() for s in VALID_STATUS}
+    valid_epistemic = VALID_EPISTEMIC_STATUS
     required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]
 
     files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]

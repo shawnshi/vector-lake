@@ -12,7 +12,8 @@ from filelock import FileLock, Timeout
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake import db_store
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file
+from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file, VALID_PREFIXES
+
 from vector_lake.yaml_utils import load_yaml
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
@@ -26,8 +27,6 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
-
-VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
 
 DEFAULT_TTL = {
     "source": 365,
@@ -715,6 +714,8 @@ def generate_index():
         index_data["nodes"][node_key] = node_data
         if node_data["id"]:
             index_data["aliases"][node_data["id"]] = node_key
+        if node_data.get("title"):
+            index_data["aliases"][node_data["title"]] = node_key
         index_data["aliases"][node_key] = node_key
         for alias in node_data["aliases"]:
             index_data["aliases"][alias] = node_key
@@ -887,8 +888,7 @@ def update_index_items(filenames: list[str]):
                                 else:
                                     old_node = index_data["nodes"].get(node_key)
                                     if old_node:
-                                        db_store.delete_node_cascade(node_key)
-                                    
+                                        db_store.delete_search_index(node_key)
                                     index_data["nodes"][node_key] = node_data
                                     aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
                                     text = f"{aliases_str} {node_data.get('raw_text', '')}"
@@ -903,6 +903,8 @@ def update_index_items(filenames: list[str]):
                                     
                                     if node_data["id"]:
                                         index_data["aliases"][node_data["id"]] = node_key
+                                    if node_data.get("title"):
+                                        index_data["aliases"][node_data["title"]] = node_key
                                     index_data["aliases"][node_key] = node_key
                                     for alias in node_data["aliases"]:
                                         index_data["aliases"][alias] = node_key

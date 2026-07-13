@@ -375,12 +375,15 @@ def get_entity(entity_id: str) -> dict | None:
 def upsert_entity(entity_id: str, data: dict):
     conn = get_connection()
     now = _utc_now()
-    cols = ["entity_id", "type", "status", "data_json", "updated_at"]
+    cols = ["entity_id", "canonical_name", "type", "status", "ttl", "decay_weight", "data_json", "updated_at"]
     placeholders = ["?"] * len(cols)
     params = [
         entity_id,
+        str(data.get("canonical_name", "")),
         str(data.get("type", "")),
         str(data.get("status", "Active")),
+        float(data.get("ttl") or 0.0),
+        float(data.get("decay_weight") or 0.0),
         json.dumps(data, ensure_ascii=False),
         now
     ]
@@ -388,9 +391,8 @@ def upsert_entity(entity_id: str, data: dict):
         conn.execute(f"INSERT OR REPLACE INTO entities ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", params)
 
 def delete_entity(entity_id: str):
-    conn = get_connection()
-    with conn:
-        conn.execute("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
+    from vector_lake.db_store import delete_node_cascade
+    delete_node_cascade(entity_id)
 # =============================================================================
 
 def _upsert_map_records(store: dict, records: list, key_name: str):
@@ -963,6 +965,7 @@ def create_change_set(
     summary: str | None = None,
     auto_approve: bool = False,
     force: bool = False,
+    dry_run: bool = False,
 ) -> dict:
     initialize_meta_store()
     entities = load_entities()
@@ -1028,6 +1031,9 @@ def create_change_set(
             "canonical_targets": ["entities", "claims", "evidence", "sources", "operational_memory"],
         },
     }
+
+    if dry_run:
+        return change_set
 
     if auto_approve:
         apply_change_set(change_set)
@@ -1180,13 +1186,7 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
 
     initialize_meta_store()
     if dry_run:
-        preview = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration dry-run", auto_approve=False)
-        change_sets = load_change_sets()
-        change_sets["items"] = [item for item in change_sets["items"] if item["change_set_id"] != preview["change_set_id"]]
-        save_change_sets(change_sets)
-        queue = load_governance_queue()
-        queue["items"] = [item for item in queue["items"] if item.get("change_set_id") != preview["change_set_id"]]
-        save_governance_queue(queue)
+        preview = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration dry-run", auto_approve=False, dry_run=True)
         return {
             "dry_run": True,
             "pages_scanned": len(page_paths),
@@ -1195,19 +1195,6 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
             "evidence": len(preview["proposed_evidence"]),
             "sources": len(preview["proposed_source_updates"]),
         }
-
-    entities = _default_map_store("entity_id")
-    claims = _default_map_store("claim_id")
-    evidence = _default_map_store("evidence_id")
-    sources = _default_map_store("source_id")
-    alias_registry = _default_map_store("alias")
-    memory_objects = _default_map_store("memory_id")
-    save_entities(entities)
-    save_claims(claims)
-    save_evidence(evidence)
-    save_sources(sources)
-    save_alias_registry(alias_registry)
-    save_memory_objects(memory_objects)
 
     change_set = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration", auto_approve=True, force=True)
     change_sets = load_change_sets()
