@@ -142,27 +142,8 @@ def _expand_query_with_llm(query: str) -> list[str]:
         if key in query:
             expanded_terms.update(expansions)
             
-    try:
-        import json, time, shutil, subprocess
-        agy_exec = shutil.which("agy")
-        if agy_exec and os.environ.get("VECTOR_LAKE_FAST_SEARCH") != "1":
-            prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a JSON array of strings. Query: '{query}'"
-            for attempt in range(1):
-                try:
-                    with AGY_SEMAPHORE:
-                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=8)
-                    if result.returncode == 0:
-                        stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                        match = re.search(r"\[.*?\]", stdout_str, re.DOTALL)
-                        if match:
-                            terms = json.loads(match.group(0))
-                            expanded_terms.update([str(t) for t in terms])
-                            break
-                except Exception as e:
-                    log.warning(f"agy expansion failed on attempt {attempt+1}: {e}")
-                    time.sleep(1)
-    except Exception as e:
-        log.warning(f"LLM query expansion failed: {e}")
+    # LLM query expansion has been removed to prevent deadlocks.
+    # Agent should perform pre-expansion if needed before calling the tool.
 
     tokens = set()
     try:
@@ -309,58 +290,8 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
 
 
 def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
-    if not candidates or len(candidates) <= 3:
-        return candidates
-        
-    wiki_dir = str(get_wiki_dir())
-    candidate_prompts = []
-    
-    for idx, (score, node) in enumerate(candidates):
-        filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
-        snippet = ""
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                    content = handle.read()
-                snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:150].strip()
-            except Exception:
-                pass
-        title = node.get("title", node["_key"])
-        candidate_prompts.append(f"[{idx}] {title}: {snippet}")
-        
-    prompt = (
-        f"You are a relevance ranker. Score each of the following candidate documents from 0 to 10 "
-        f"based on its relevance to the query: '{query}'.\n"
-        f"Output ONLY a JSON dict where keys are the string IDs (e.g., '0', '1') and values are the integer scores.\n\n"
-        + "\n".join(candidate_prompts)
-    )
-    
-    try:
-        import json, time, shutil, subprocess
-        agy_exec = shutil.which("agy")
-        if agy_exec and os.environ.get("VECTOR_LAKE_FAST_SEARCH") != "1":
-            for attempt in range(1):
-                try:
-                    with AGY_SEMAPHORE:
-                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=8)
-                    if result.returncode == 0:
-                        stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                        match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
-                        if match:
-                            scores_dict = json.loads(match.group(0))
-                            new_scored = []
-                            for idx, (score, node) in enumerate(candidates):
-                                llm_score = float(scores_dict.get(str(idx), scores_dict.get(idx, 0)))
-                                new_score = score * 0.1 + llm_score * 10
-                                new_scored.append((new_score, node))
-                            new_scored.sort(key=lambda item: item[0], reverse=True)
-                            return new_scored
-                except Exception as e:
-                    log.warning(f"agy reranking failed on attempt {attempt+1}: {e}")
-                    time.sleep(1)
-    except Exception as e:
-        log.warning(f"LLM Reranking failed: {e}")
-        
+    # LLM reranking has been removed to prevent deadlocks.
+    # Returning candidates as-is. Agent should rerank based on context if necessary.
     return candidates
 
 

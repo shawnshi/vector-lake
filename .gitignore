@@ -11,3 +11,4 @@ tmp/
 tests_tmp/
 .env
 tests/
+*.db

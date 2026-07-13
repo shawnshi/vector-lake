@@ -331,13 +331,47 @@ def scheduled_lint_loop():
             write_status("error", 0, index_queue.qsize(), "Scheduled lint exception", str(exc))
             time.sleep(60)
 
+def scheduled_ingest_loop():
+    log.info("Scheduled Ingest Worker Thread started (Pulse every 30 minutes).")
+    # Initial delay to avoid slamming the system immediately on boot
+    time.sleep(60) 
+    while True:
+        try:
+            write_status("processing", 0, index_queue.qsize(), "Running Scheduled Ingest Pulse", "")
+            log.info("Triggering Scheduled Autonomous Ingest Pulse...")
+            
+            import subprocess
+            import sys
+            import shutil
+            import os
+            
+            agy_exec = shutil.which("agy")
+            if agy_exec:
+                prompt = "检查 vector-lake 的入湖队列。如果 prepare_ingest_batch 返回有新数据，则使用 invoke_subagent 拉起入湖子代理去执行并发清洗。如果没有新文件，请直接结束。"
+                env = os.environ.copy()
+                env["PYTHONIOENCODING"] = "utf-8"
+                # Fire and wait (bounded timeout to prevent ghost processes)
+                subprocess.run([agy_exec, "-p", prompt], capture_output=True, env=env, timeout=600)
+            
+            log.info("Scheduled Ingest Pulse completed.")
+            write_status("idle", 0, index_queue.qsize(), "Scheduled Ingest finished", "")
+            
+            # Sleep for 30 minutes
+            time.sleep(1800)
+                
+        except Exception as exc:
+            log.error(f"Scheduled ingest worker error: {exc}")
+            write_status("error", 0, index_queue.qsize(), "Scheduled ingest exception", str(exc))
+            time.sleep(300)
+
 
 def start_watchdog():
     threading.Thread(target=index_worker_loop, daemon=True).start()
     threading.Thread(target=scheduled_lint_loop, daemon=True).start()
+    threading.Thread(target=scheduled_ingest_loop, daemon=True).start()
     
-    from vector_lake.ingest_worker import start_worker
-    threading.Thread(target=start_worker, daemon=True).start()
+    # from vector_lake.ingest_worker import start_worker
+    # threading.Thread(target=start_worker, daemon=True).start()
 
     observer = Observer()
 

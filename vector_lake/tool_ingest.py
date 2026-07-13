@@ -197,7 +197,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
             .replace("{{purpose_content}}", purpose_content)
 
         payload = {
-            "filepath": filepath,
+            "filepath": str(filepath),
             "hash": file_hash,
             "canonical_name": canonical_name,
             "instructions": instructions
@@ -205,6 +205,10 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
         
         enqueue_job("ingest", payload)
         enqueued_count += 1
+        
+    if batch_size == 1 and enqueued_count == 1:
+        import json
+        return json.dumps(payload)
         
     return f"Successfully enqueued {enqueued_count} files for ingestion."
 

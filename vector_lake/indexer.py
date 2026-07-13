@@ -916,10 +916,10 @@ def update_index_items(filenames: list[str]):
                                         db_store.delete_node_cascade(node_key)
                                     
                                     index_data["nodes"][node_key] = node_data
-                                    aliases_str = " ".join((node.get("aliases") or [])) if isinstance(node.get("aliases"), list) else ""
-                                    text = f"{aliases_str} {node.get('raw_text', '')}"
-                                    t_title = _tokenize_for_fts(node.get('title', ''))
-                                    t_summary = _tokenize_for_fts(node.get('summary', ''))
+                                    aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
+                                    text = f"{aliases_str} {node_data.get('raw_text', '')}"
+                                    t_title = _tokenize_for_fts(node_data.get('title', ''))
+                                    t_summary = _tokenize_for_fts(node_data.get('summary', ''))
                                     t_text = _tokenize_for_fts(text)
                                     db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
                                     
@@ -960,14 +960,14 @@ def update_index_items(filenames: list[str]):
                                     all_nodes = index_data["nodes"]
     
                                     td = {}
-                                    for t in (node.get("triples") or []):
+                                    for t in (node_data.get("triples") or []):
                                         if t.get("target"):
                                             td[t["target"]] = t.get("predicate", "mentions")
                                     all_nodes_triples[node_key] = td
                                     triples_a = td
                                     
-                                    node_links = set((node.get("links") or []))
-                                    node_sources = set((node.get("sources") or []))
+                                    node_links = set((node_data.get("links") or []))
+                                    node_sources = set((node_data.get("sources") or []))
                                     for other_key, other_node in all_nodes.items():
                                         if other_key == node_key:
                                             continue

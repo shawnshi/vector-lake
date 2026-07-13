@@ -27,6 +27,7 @@ def close_connection():
     if hasattr(_LOCAL, "conn") and _LOCAL.conn is not None:
         _LOCAL.conn.close()
         _LOCAL.conn = None
+    _LOCAL.in_transaction = False
 
 from contextlib import contextmanager
 
@@ -37,8 +38,8 @@ def transaction():
     if in_tx:
         yield conn
     else:
-        _LOCAL.in_transaction = True
         conn.execute("BEGIN IMMEDIATE")
+        _LOCAL.in_transaction = True
         try:
             yield conn
             conn.commit()
@@ -324,13 +325,25 @@ def enqueue_job(task_type: str, payload: dict) -> str:
     import json
     from datetime import datetime, timezone
     conn = get_connection()
-    job_id = uuid.uuid4().hex
-    now_str = datetime.now(timezone.utc).isoformat()
+    payload_str = json.dumps(payload, ensure_ascii=False)
+    
     with transaction():
+        # Defensive Check: Prevent duplicate payload in queue
+        cur = conn.execute("""
+            SELECT job_id FROM jobs 
+            WHERE payload = ? AND status IN ('queued', 'dispatched')
+            LIMIT 1
+        """, (payload_str,))
+        existing = cur.fetchone()
+        if existing:
+            return existing["job_id"]
+
+        job_id = uuid.uuid4().hex
+        now_str = datetime.now(timezone.utc).isoformat()
         conn.execute("""
             INSERT INTO jobs (job_id, task_type, payload, status, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (job_id, task_type, json.dumps(payload, ensure_ascii=False), "queued", now_str, now_str))
+        """, (job_id, task_type, payload_str, "queued", now_str, now_str))
     return job_id
 
 def get_pending_jobs(limit: int = 10) -> list[dict]:
