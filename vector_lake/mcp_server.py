@@ -233,14 +233,27 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     return tools.prepare_ingest_batch(batch_size=batch_size)
 
 @mcp.tool()
-def finalize_ingest(files_written: list, processed_data: dict) -> str:
+def finalize_ingest(files_written: list = None, processed_data: dict = None, files_written_payload_file: str = "", raw_files_payload_file: str = "") -> str:
     """Finalize ingestion batch after subagents have finished.
     
     Args:
         files_written: List of dicts with 'filename' and 'content'.
         processed_data: Dict with 'filepath' and 'hash'.
+        files_written_payload_file: Absolute path to a JSON file containing the files_written list.
+        raw_files_payload_file: Absolute path to a JSON file containing the processed_data dict.
     """
+    import json
+    import os
     try:
+        if files_written_payload_file and os.path.exists(files_written_payload_file):
+            with open(files_written_payload_file, "r", encoding="utf-8") as f:
+                files_written = json.load(f)
+        if raw_files_payload_file and os.path.exists(raw_files_payload_file):
+            with open(raw_files_payload_file, "r", encoding="utf-8") as f:
+                processed_data = json.load(f)
+                
+        files_written = files_written or []
+        processed_data = processed_data or {}
         return tools.finalize_ingest(files_written, processed_data)
     except Exception as e:
         return str(e)

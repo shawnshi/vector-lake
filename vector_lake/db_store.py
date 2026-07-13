@@ -38,7 +38,18 @@ def transaction():
     if in_tx:
         yield conn
     else:
-        conn.execute("BEGIN IMMEDIATE")
+        max_retries = 60
+        for attempt in range(max_retries):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    import time
+                    import random
+                    time.sleep(0.5 + random.random())
+                    continue
+                raise
         _LOCAL.in_transaction = True
         try:
             yield conn
@@ -265,7 +276,7 @@ def delete_search_index(node_key: str):
 def delete_node_cascade(node_key: str):
     conn = get_connection()
     with transaction():
-        cur = conn.execute("SELECT entity_id FROM entities WHERE canonical_name = ?", (node_key,))
+        cur = conn.execute("SELECT entity_id FROM entities WHERE entity_id = ? OR json_extract(data_json, '$.id') = ?", (node_key, node_key))
         row = cur.fetchone()
         ent_id = row[0] if row else node_key
         

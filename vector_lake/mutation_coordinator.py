@@ -18,6 +18,10 @@ def execute_mutation_plan(filename: str, content: str | None = None, is_delete: 
     """
     wiki_dir = get_wiki_dir()
     filepath = wiki_dir / filename
+    import os
+    if not os.path.abspath(filepath).startswith(os.path.abspath(wiki_dir)):
+        raise ValueError(f"Security error: path traversal detected for {filename}")
+        
     tmp_dir = get_extension_root() / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     bak_path = tmp_dir / f"{filename}.bak"

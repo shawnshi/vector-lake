@@ -153,11 +153,12 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
     if extra_cols is None:
         extra_cols = []
     
-    with conn:
-        existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
-        existing_keys = {row[0] for row in existing_keys_query}
+    from vector_lake.db_store import transaction
+    with transaction():
+        existing_keys_query = conn.execute(f"SELECT {pk_col}, data_json FROM {table_name}").fetchall()
+        existing_map = {row[0]: row[1] for row in existing_keys_query}
         new_keys = set(data.get("items", {}).keys())
-        keys_to_delete = existing_keys - new_keys
+        keys_to_delete = set(existing_map.keys()) - new_keys
         
         if keys_to_delete:
             conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
@@ -168,6 +169,11 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
             
             all_vals = []
             for key, item in data.get("items", {}).items():
+                new_json = json.dumps(item, ensure_ascii=False)
+                # Skip SQLite I/O if the row hasn't changed at all
+                if key in existing_map and existing_map[key] == new_json:
+                    continue
+                    
                 params = [key]
                 for c_name, c_key, c_type in extra_cols:
                     val = item.get(c_key)
@@ -177,11 +183,13 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
                         params.append(int(val or 0))
                     else:
                         params.append(str(val or ""))
-                params.append(json.dumps(item, ensure_ascii=False))
+                params.append(new_json)
                 params.append(now)
                 all_vals.append(tuple(params))
-            
-            conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", all_vals)
+                
+            if all_vals:
+                conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", all_vals)
+
 
 def _save_db_queue(table_name: str, pk_col: str, data: dict):
     _validate_table_name(table_name)

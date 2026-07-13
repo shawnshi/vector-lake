@@ -64,14 +64,14 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
         raise SchemaViolationException(f"Schema Violation: Invalid type '{doc_type}'. Must be one of {VALID_TYPES}.")
 
     # 1.3 Epistemic Status
-    epistemic_status = frontmatter.get("epistemic-status")
+    epistemic_status = str(frontmatter.get("epistemic-status", "")).lower()
     if epistemic_status and epistemic_status not in {"seed", "sprouting", "evergreen"}:
         raise SchemaViolationException(f"Schema Violation: epistemic-status '{epistemic_status}' is invalid. Allowed: seed, sprouting, evergreen.")
 
     # 1.4 Status
-    status = frontmatter.get("status")
-    if status and status not in {"Active", "Draft", "Superseded", "Deprecated"}:
-        raise SchemaViolationException(f"Schema Violation: status '{status}' is invalid. Allowed: Active, Draft, Superseded, Deprecated.")
+    status = str(frontmatter.get("status", "")).title()
+    if status and status not in {"Active", "Draft", "Superseded", "Deprecated", "Archived", "Contested"}:
+        raise SchemaViolationException(f"Schema Violation: status '{status}' is invalid. Allowed: Active, Draft, Superseded, Deprecated, Archived, Contested.")
 
     # 1.5 Tags Constraints
     tags = frontmatter.get("tags", [])

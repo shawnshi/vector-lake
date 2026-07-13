@@ -84,13 +84,15 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
                 aliases.append(old_core)
             frontmatter["aliases"] = aliases
             
-            # Delete old file via mutation coordinator
-            execute_mutation_plan(old_name, is_delete=True)
-            
-            # Create new file via mutation coordinator
-            fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
-            new_content = f"---\n{fm_str}---\n{body}"
-            execute_mutation_plan(normalized_new_name, content=new_content, is_delete=False)
+            from vector_lake.db_store import transaction
+            with transaction():
+                # Delete old file via mutation coordinator
+                execute_mutation_plan(old_name, is_delete=True)
+                
+                # Create new file via mutation coordinator
+                fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
+                new_content = f"---\n{fm_str}---\n{body}"
+                execute_mutation_plan(normalized_new_name, content=new_content, is_delete=False)
             
         except Exception as e:
             return f"Error during file rename: {str(e)}"
