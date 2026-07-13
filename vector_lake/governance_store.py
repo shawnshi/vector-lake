@@ -757,19 +757,27 @@ def search_operational_memory(
         if relevance <= 0 and terms:
             continue
         score = relevance + (float(memory.get("memory_score", 0) or 0) * 5)
-        item = copy.deepcopy(memory)
-        item["retrieval_score"] = round(score, 4)
-        ranked.append(item)
+        # ⚡ Bolt: Store the score values as sort keys with a reference to the un-copied memory object.
+        # This delays expensive deepcopies until *after* top_k elements are selected.
+        ranked.append((
+            round(score, 4),
+            memory.get("memory_score", 0),
+            _dt_rank(memory.get("updated_at")),
+            memory
+        ))
 
     ranked.sort(
-        key=lambda item: (
-            item.get("retrieval_score", 0),
-            item.get("memory_score", 0),
-            _dt_rank(item.get("updated_at")),
-        ),
+        key=lambda item: (item[0], item[1], item[2]),
         reverse=True,
     )
-    return ranked[:top_k]
+
+    results = []
+    for score, memory_score, dt_rank, memory in ranked[:top_k]:
+        item = copy.deepcopy(memory)
+        item["retrieval_score"] = score
+        results.append(item)
+
+    return results
 
 
 def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
