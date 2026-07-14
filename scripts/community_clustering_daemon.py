@@ -148,7 +148,7 @@ def run_clustering():
             index_data["communities"] = part_L0
 
             wiki_dir = get_wiki_dir()
-            affected_pages = []
+            wiki_mutations = []
 
             def process_level(level_name, final_partition, diffs_info):
                 community_nodes = {}
@@ -238,9 +238,7 @@ aliases:
 {existing_summary}
 {unassimilated}
 """
-                    from vector_lake.wiki_utils import atomic_write_text
-                    atomic_write_text(index_filepath, content)
-                    affected_pages.append(index_filename)
+                    wiki_mutations.append({"filename": index_filename, "content": content})
 
             process_level("L0", part_L0, diffs_L0)
             process_level("L1", part_L1, diffs_L1)
@@ -248,17 +246,17 @@ aliases:
             # Clean up old legacy flat files safely
             legacy_files = glob.glob(str(wiki_dir / "System_Community_[0-9]*.md"))
             for old_file in legacy_files:
-                try: 
-                    os.remove(old_file)
-                    affected_pages.append(os.path.basename(old_file))
-                except OSError: pass
+                wiki_mutations.append(
+                    {"filename": os.path.basename(old_file), "is_delete": True}
+                )
+
+            if wiki_mutations:
+                from vector_lake.mutation_coordinator import execute_mutation_batch
+                execute_mutation_batch(wiki_mutations)
 
             with open(snapshot_file, "w", encoding="utf-8") as f:
                 json.dump({"partition_L0": part_L0, "partition_L1": part_L1}, f, ensure_ascii=False)
 
-            from vector_lake.governance_store import sync_pages_to_canonical
-            if affected_pages:
-                sync_pages_to_canonical(affected_pages, origin="community_clustering")
             _mark_graph_clean(index_data)
             from vector_lake.wiki_utils import atomic_write_text
             atomic_write_text(index_file, json.dumps(index_data, ensure_ascii=False, indent=2))

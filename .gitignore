@@ -8,7 +8,8 @@ data/
 .pytest_cache/
 .coverage
 tmp/
+brain/
+scratch/
+.codex/
 tests_tmp/
 .env
-tests/
-*.db

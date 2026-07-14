@@ -28,6 +28,76 @@ from vector_lake.purpose_contract import (
 
 log = logging.getLogger("vector-lake-ingest")
 
+def list_ingest_tasks(limit: int = 20, include_queued: bool = True) -> str:
+    """List ingest jobs that require operator or host-subagent action."""
+    from vector_lake.db_store import get_jobs_by_status
+
+    statuses = ["awaiting_subagent"]
+    if include_queued:
+        statuses.insert(0, "queued")
+    rows = get_jobs_by_status(statuses, limit=limit)
+    if not rows:
+        return "No queued or awaiting-subagent ingest jobs."
+    lines = ["=== Ingest Task Queue ==="]
+    for row in rows:
+        payload = {}
+        try:
+            payload = json.loads(row.get("payload") or "{}")
+        except Exception:
+            payload = {}
+        lines.append(
+            "- "
+            f"{row.get('job_id')} "
+            f"status={row.get('status')} retries={row.get('retries')} "
+            f"file={payload.get('filepath', '<unknown>')} "
+            f"task_packet={row.get('task_packet_path') or '<not-created>'}"
+        )
+    return "\n".join(lines)
+
+
+def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
+    """Lease task packets to the current host runtime and return structured work."""
+    from vector_lake.db_store import claim_subagent_jobs
+
+    claimed = claim_subagent_jobs(limit=limit, lease_seconds=lease_seconds)
+    tasks = []
+    for row in claimed:
+        task_packet = None
+        packet_path = row.get("task_packet_path")
+        if packet_path:
+            try:
+                task_packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                task_packet = {"error": f"Unreadable task packet: {exc}"}
+        if isinstance(task_packet, dict) and "error" not in task_packet:
+            metadata = task_packet.setdefault("metadata", {})
+            processed = metadata.setdefault("processed_data", {})
+            processed.update({
+                "job_id": row.get("job_id"),
+                "lease_owner": row.get("lease_owner"),
+                "lease_token": row.get("lease_token"),
+                "lease_generation": row.get("lease_generation"),
+            })
+        tasks.append({
+            "job_id": row.get("job_id"),
+            "status": row.get("status"),
+            "lease_until": row.get("lease_until"),
+            "lease_owner": row.get("lease_owner"),
+            "lease_token": row.get("lease_token"),
+            "lease_generation": row.get("lease_generation"),
+            "task_packet_path": packet_path,
+            "task_packet": task_packet,
+        })
+    return json.dumps(tasks, ensure_ascii=False, indent=2)
+
+
+def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
+    """Mark stale awaiting-subagent ingest jobs as failed so they can be retried explicitly."""
+    from vector_lake.db_store import expire_stale_subagent_jobs
+
+    expired = expire_stale_subagent_jobs(max_age_seconds=max_age_seconds)
+    return f"Expired {expired} awaiting-subagent ingest job(s)."
+
 def canonical_source_name(raw_path: str) -> str:
     basename = Path(raw_path).stem
     return f"Source_{basename}.md"
@@ -216,15 +286,24 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
 def finalize_ingest(files_written: list, processed_data: dict) -> str:
     """Finalizes an ingest operation from a subagent using direct data."""
     try:
-        from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError
+        from vector_lake.wiki_utils import SafeWriteError
+        from vector_lake.db_store import finalize_ingest_job, validate_ingest_job_finalization
+
         files = files_written
+        job_id = processed_data.get("job_id")
+        if not job_id:
+            raise ValueError("finalize_ingest requires a claimed job_id")
+        job_row = validate_ingest_job_finalization(str(job_id), processed_data)
+        lease_owner = str(processed_data.get("lease_owner") or "")
+        lease_token = str(processed_data.get("lease_token") or "")
+        lease_generation = int(processed_data.get("lease_generation"))
         contract = load_purpose_contract()
         node_records = validate_ingest_payload(files, contract)
                 
         wiki_dir = get_wiki_dir()
         
-        files_written = []
-        from vector_lake.mutation_coordinator import execute_mutation_plan
+        written_paths = []
+        mutations = []
         for item in files:
             fname = os.path.basename(item["filename"])
             if "filepath" in item and not item.get("content"):
@@ -236,19 +315,38 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                 lower_content = fcontent.lower()
                 if not all(k in lower_content for k in ["context", "alternatives", "justification"]):
                     raise SafeWriteError(f"Decision nodes like {fname} MUST contain 'context', 'alternatives', and 'justification'.")
-                    
-            execute_mutation_plan(fname, content=fcontent, is_delete=False)
-            files_written.append(str(wiki_dir / fname))
-            
-        from vector_lake.db_store import transaction
-        
-        try:
-            with transaction():
-                filepath = processed_data["filepath"]
-                file_hash = processed_data["hash"]
+
+            mutations.append({"filename": fname, "content": fcontent})
+            written_paths.append(str(wiki_dir / fname))
+
+        filepath = processed_data["filepath"]
+        file_hash = processed_data["hash"]
+        if mutations:
+            from vector_lake.mutation_coordinator import execute_mutation_batch
+
+            def mark_ingest_processed():
                 mark_file_processed(filepath, file_hash)
-        except Exception as e:
-            raise Exception(f"Ingest aborted during mark_file_processed. Error: {e}")
+                finalize_ingest_job(str(job_id), lease_owner, lease_token, lease_generation)
+
+            execute_mutation_batch(
+                mutations,
+                canonical_callback=mark_ingest_processed,
+            )
+        else:
+            from vector_lake.db_store import transaction
+
+            with transaction():
+                mark_file_processed(filepath, file_hash)
+                finalize_ingest_job(str(job_id), lease_owner, lease_token, lease_generation)
+
+        task_packet_path = job_row.get("task_packet_path") if job_row else None
+        if task_packet_path:
+            try:
+                from vector_lake.native_llm import remove_subagent_task
+
+                remove_subagent_task(task_packet_path)
+            except Exception as exc:
+                log.warning("Ingest finalized, but task packet cleanup failed: %s", exc)
         
         from filelock import FileLock
         import tempfile
@@ -266,7 +364,7 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             pass
         
         proposal_count = 0
-        if files_written:
+        if written_paths:
             try:
                 # Include existing nodes sharing the newly observed tension target,
                 # so independently ingested sources can converge on one proposal.

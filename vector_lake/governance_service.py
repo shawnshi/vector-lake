@@ -1,11 +1,10 @@
-import os
-import shutil
-import sys
-import subprocess
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from vector_lake import governance_store
+from vector_lake.mutation_coordinator import execute_mutation_batch
+from vector_lake.semantic_merge import merge_markdown_content
 from vector_lake.wiki_utils import get_wiki_dir, VALID_PREFIXES
 
 log = logging.getLogger("governance_service")
@@ -31,69 +30,33 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                 if left_id and right_id:
                     left_name = candidate.get("left_name")
                     right_name = candidate.get("right_name")
-                    left_bak, right_bak = None, None
                     left_path, right_path = None, None
-                    
-                    # AHE Phase 3: Snapshot state before mutation
-                    old_right_alias = governance_store.get_alias(right_id)
-                    old_right_entity = governance_store.get_entity(right_id)
                     old_left_entity = governance_store.get_entity(left_id)
                     
                     if left_name and right_name:
-                        wiki_dir = get_wiki_dir()
-                        script_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "semantic_merge.py")
-                        
+                        wiki_dir = get_wiki_dir().resolve()
+
                         def find_md_file(name):
-                            for prefix in VALID_PREFIXES:
-                                p = os.path.join(wiki_dir, f"{prefix}{name}.md")
-                                if os.path.exists(p): return p
-                            p = os.path.join(wiki_dir, f"{name}.md")
-                            if os.path.exists(p): return p
+                            if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+                                return None
+                            for candidate_name in [
+                                *(f"{prefix}{name}.md" for prefix in VALID_PREFIXES),
+                                f"{name}.md",
+                            ]:
+                                path = (wiki_dir / candidate_name).resolve()
+                                if path.parent == wiki_dir and path.exists():
+                                    return path
                             return None
                             
                         left_path = find_md_file(left_name)
                         right_path = find_md_file(right_name)
-                        
-                        if left_path and os.path.exists(left_path):
-                            left_bak = left_path + ".bak"
-                            shutil.copy2(left_path, left_bak)
-                        if right_path and os.path.exists(right_path):
-                            right_bak = right_path + ".bak"
-                            shutil.copy2(right_path, right_bak)
-                            
-                        if left_path and right_path and left_path != right_path and os.path.exists(script_path):
-                            log.info(f"Triggering LLM semantic merge: {left_name} <- {right_name}")
-                            env = os.environ.copy()
-                            env["PYTHONIOENCODING"] = "utf-8"
-                            try:
-                                subprocess.run([sys.executable, script_path, left_path, right_path], env=env, check=True)
-                            except subprocess.CalledProcessError as e:
-                                if left_bak and os.path.exists(left_bak):
-                                    shutil.move(left_bak, left_path)
-                                if right_bak and os.path.exists(right_bak):
-                                    shutil.move(right_bak, right_path)
-                                raise RuntimeError(f"LLM Semantic Merge failed: {e}") from e
 
-                    # Update the alias registry to map right to left
-                    governance_store.upsert_alias(right_id, left_id)
-                    
-                    # Update entities file to mark right_id as merged/deprecated
-                    right_entity = governance_store.get_entity(right_id)
-                    if right_entity:
-                        right_entity["status"] = "Merged"
-                        right_entity["merged_into"] = left_id
-                        governance_store.upsert_entity(right_id, right_entity)
-
-                    # AHE Phase 3: Manifest Validation & Revert
+                    # Validate every manifest constraint before canonical state changes.
                     if change_manifest:
                         try:
-                            # Verify expectations
                             if old_left_entity and old_left_entity.get("merged_into") == right_id:
                                 raise ValueError("Cycle detected: Target is already merged into Source.")
-                            
-                            # Verify against manifest thresholds (example: max expected dead links)
                             if change_manifest.get("allow_cycles", False) is False:
-                                # Quick cycle check in registry
                                 visited = set()
                                 current = right_id
                                 while current:
@@ -102,41 +65,26 @@ def resolve_governance_item(item_id: str, resolution: str = "skip", change_manif
                                     visited.add(current)
                                     current = governance_store.get_alias(current)
                         except Exception as e:
-                            log.error(f"AHE Contract Failed: {e}. Executing ROLLBACK.")
-                            
-                            if old_right_alias is not None:
-                                governance_store.upsert_alias(right_id, old_right_alias)
-                            else:
-                                governance_store.delete_alias(right_id)
-                            
-                            if old_right_entity is not None:
-                                governance_store.upsert_entity(right_id, old_right_entity)
-                            else:
-                                governance_store.delete_entity(right_id)
-                            
-                            if left_bak and os.path.exists(left_bak):
-                                shutil.move(left_bak, left_path)
-                            if right_bak and os.path.exists(right_bak):
-                                shutil.move(right_bak, right_path)
-                                
+                            log.error(f"AHE Contract Failed before mutation: {e}.")
                             raise RuntimeError(f"Manifest validation failed: {e}") from e
 
-                    if left_bak and os.path.exists(left_bak):
-                        os.remove(left_bak)
-                    if right_bak and os.path.exists(right_bak):
-                        os.remove(right_bak)
+                    if not left_path or not right_path or left_path == right_path:
+                        raise RuntimeError("Semantic merge requires two distinct existing wiki pages.")
 
-                    # Issue 11 fix: Trigger canonical sync and index update via coordinator
-                    try:
-                        from vector_lake.mutation_coordinator import execute_mutation_plan
-                        if right_path and os.path.exists(right_path):
-                            execute_mutation_plan(os.path.basename(right_path), is_delete=True)
-                        if left_path and os.path.exists(left_path):
-                            with open(left_path, "r", encoding="utf-8") as f:
-                                left_content = f.read()
-                            execute_mutation_plan(os.path.basename(left_path), content=left_content, is_delete=False)
-                    except Exception as e:
-                        log.error(f"Failed to trigger mutation coordinator after merge: {e}")
+                    left_content = Path(left_path).read_text(encoding="utf-8")
+                    right_content = Path(right_path).read_text(encoding="utf-8")
+                    merged_content = merge_markdown_content(left_content, right_content)
+
+                    def update_merge_registry():
+                        governance_store.upsert_alias(right_id, left_id)
+
+                    execute_mutation_batch(
+                        [
+                            {"filename": Path(left_path).name, "content": merged_content},
+                            {"filename": Path(right_path).name, "is_delete": True},
+                        ],
+                        canonical_callback=update_merge_registry,
+                    )
 
         from filelock import FileLock
         from vector_lake.wiki_utils import get_meta_dir

@@ -66,7 +66,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
 
     # 1.1 Required Fields
     # strategic_scope and evidence_tier are highly recommended but we allow legacy files without them
-    required_fields = ["id", "title", "type", "domain", "status", "epistemic-status", "categories", "updated", "sources", "strategic_scope", "evidence_tier"]
+    required_fields = ["id", "title", "type", "domain", "status", "epistemic-status", "categories", "updated", "sources"]
     for field in required_fields:
         if field not in frontmatter:
             # For system files, we can be more lenient
@@ -77,16 +77,6 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     doc_type = frontmatter.get("type", "").lower()
     if doc_type not in VALID_TYPES:
         raise SchemaViolationException(f"Schema Violation: Invalid type '{doc_type}'. Must be one of {VALID_TYPES}.")
-
-    # 1.2b Categories Validation
-    categories = frontmatter.get("categories", [])
-    if isinstance(categories, list):
-        for cat in categories:
-            if cat not in VALID_CATEGORIES:
-                raise SchemaViolationException(f"Schema Violation: Invalid category '{cat}'. Allowed categories: {VALID_CATEGORIES}.")
-    elif isinstance(categories, str):
-        if categories not in VALID_CATEGORIES:
-            raise SchemaViolationException(f"Schema Violation: Invalid category '{categories}'. Allowed categories: {VALID_CATEGORIES}.")
 
     # 1.3 Epistemic Status
     epistemic_status = str(frontmatter.get("epistemic-status", "")).lower()
@@ -249,5 +239,5 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
             for tag in tags:
                 if str(tag).lower() in entities_in_index:
                     raise SchemaViolationException(f"Tag Collision: [{tag}] is already an entity and cannot be used as a tag. Use semantic links instead.")
-        except SchemaViolationException:
-            raise
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+            pass

@@ -4,6 +4,7 @@ import math
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 
 import yaml
@@ -136,100 +137,6 @@ def _tokenize_for_fts(text: str) -> str:
     except ImportError:
         return text
 
-def _compute_embeddings_unlocked(index_data: dict, force: bool = False, skip_embeddings: bool = True) -> dict:
-    embeddings_map = {}
-    if skip_embeddings:
-        return embeddings_map
-        
-    import os
-    import time
-    if not os.environ.get("GEMINI_API_KEY"):
-        return embeddings_map
-        
-    try:
-        from google import genai
-        client = genai.Client()
-    except ImportError:
-        return embeddings_map
-
-    nodes = (index_data.get("nodes") or {})
-    pending_items = []
-    
-    existing = set()
-    if not force:
-        try:
-            from vector_lake.db_store import get_connection, transaction
-            conn = get_connection()
-            with transaction():
-                cur = conn.execute("SELECT entity_id FROM vec_embeddings")
-                existing = {row[0] for row in cur.fetchall()}
-        except Exception as e:
-            log.error(f"Failed to fetch existing embeddings, aborting incremental update to prevent cost explosion: {e}")
-            raise e
-
-    for node_key, node in nodes.items():
-        if not force and node_key in existing:
-            continue
-        embedding_content = f"{node.get('title', '')} {node.get('summary', '')} {node.get('raw_text', '')}"
-        pending_items.append((node_key, embedding_content[:15000]))
-        
-    if not pending_items:
-        return embeddings_map
-        
-    BATCH_SIZE = 100
-    MAX_CHARS_PER_BATCH = 400000
-    
-    batches = []
-    current_batch = []
-    current_chars = 0
-    
-    for item in pending_items:
-        chars = len(item[1])
-        if current_batch and (len(current_batch) >= BATCH_SIZE or current_chars + chars > MAX_CHARS_PER_BATCH):
-            batches.append(current_batch)
-            current_batch = []
-            current_chars = 0
-        current_batch.append(item)
-        current_chars += chars
-        
-    if current_batch:
-        batches.append(current_batch)
-        
-    log.info(f"Computing embeddings for {len(pending_items)} nodes in {len(batches)} batches...")
-    
-    for b_idx, batch in enumerate(batches):
-        texts = [x[1] for x in batch]
-        keys = [x[0] for x in batch]
-        
-        max_retries = 5
-        base_delay = 5.0
-        
-        for attempt in range(max_retries):
-            try:
-                response = client.models.embed_content(
-                    model="gemini-embedding-2",
-                    contents=texts
-                )
-                if hasattr(response, 'embeddings'):
-                    for i, emb in enumerate(response.embeddings):
-                        embeddings_map[keys[i]] = emb.values
-                break
-            except Exception as e:
-                err_msg = str(e)
-                if "429" in err_msg or "Too Many Requests" in err_msg or "quota" in err_msg.lower():
-                    if attempt < max_retries - 1:
-                        sleep_time = base_delay * (2 ** attempt)
-                        log.warning(f"Batch {b_idx+1}/{len(batches)} hit rate limit. Backing off for {sleep_time}s...")
-                        time.sleep(sleep_time)
-                        continue
-                log.error(f"Failed to embed batch {b_idx+1}: {e}")
-                break
-                
-        if b_idx < len(batches) - 1:
-            time.sleep(1.0)
-            
-    return embeddings_map
-
 def _build_bm25_index(index_data: dict, embeddings_map: dict):
     nodes = (index_data.get("nodes") or {})
     total = len(nodes)
@@ -260,6 +167,28 @@ def _strip_legacy_embedded_payloads(index_data: dict) -> list[str]:
     return removed
 
 
+def _strip_system_nodes(index_data: dict) -> list[str]:
+    """Keep System_ pages outside the user-facing search projection in warm and cold paths."""
+    nodes = index_data.get("nodes") or {}
+    removed = [str(key) for key in nodes if str(key).startswith("System_")]
+    if not removed:
+        return []
+    removed_set = set(removed)
+    for key in removed:
+        nodes.pop(key, None)
+    index_data["aliases"] = {
+        key: value
+        for key, value in (index_data.get("aliases") or {}).items()
+        if key not in removed_set and value not in removed_set
+    }
+    index_data["weighted_edges"] = [
+        edge
+        for edge in (index_data.get("weighted_edges") or [])
+        if edge.get("source") not in removed_set and edge.get("target") not in removed_set
+    ]
+    return removed
+
+
 def _write_json_payload(output_path: str, data: dict):
     temp_path = output_path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
@@ -279,6 +208,11 @@ def _write_json_payload(output_path: str, data: dict):
                 except Exception:
                     pass
                 raise e
+
+def _write_json_stage(stage_path: str, data: dict):
+    with open(stage_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+
 
 def _write_index(output_path: str, index_data: dict):
     removed = _strip_legacy_embedded_payloads(index_data)
@@ -448,6 +382,78 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "decay_weight": round(decay_weight, 4),
         "alignment_score": round(alignment_score, 2),
     })
+
+
+def _entity_to_index_node(entity_data: dict, entity_id: str = "") -> tuple[str, dict]:
+    """Project one canonical SQLite entity into the index read model."""
+    node_key = str(
+        entity_data.get("page_key")
+        or os.path.splitext(str(entity_data.get("source_page") or ""))[0]
+        or entity_data.get("canonical_name")
+        or entity_id
+    ).strip()
+    if not node_key:
+        raise ValueError("Canonical entity is missing page_key and fallback identity fields.")
+
+    node_type = str(entity_data.get("type") or entity_data.get("entity_type") or "concept").lower()
+    updated = str(entity_data.get("updated") or entity_data.get("updated_at") or "")
+    ttl = entity_data.get("ttl")
+    if not isinstance(ttl, (int, float)) or ttl <= 0:
+        ttl = DEFAULT_TTL.get(node_type, 1095)
+
+    decay_weight = entity_data.get("decay_weight")
+    if not isinstance(decay_weight, (int, float)):
+        decay_weight = 1.0
+        try:
+            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if updated_dt.tzinfo is None:
+                updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+            age_days = max(0, (datetime.now(timezone.utc) - updated_dt).days)
+            decay_weight = 0.5 ** (age_days / ttl)
+        except (TypeError, ValueError):
+            pass
+
+    categories = entity_data.get("categories") or []
+    if isinstance(categories, str):
+        categories = [categories]
+    aliases = entity_data.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    sources = entity_data.get("sources") or []
+    if isinstance(sources, str):
+        sources = [sources]
+    links = entity_data.get("links") or entity_data.get("outbound_links") or []
+    if isinstance(links, str):
+        links = [links]
+
+    title = str(entity_data.get("title") or entity_data.get("canonical_name") or node_key.replace("_", " "))
+    node_data = {
+        "id": entity_data.get("id") or entity_id or node_key,
+        "title": title,
+        "summary": entity_data.get("summary") or "",
+        "raw_text": entity_data.get("raw_text") or "",
+        "type": node_type,
+        "domain": entity_data.get("domain") or "General",
+        "topic_cluster": entity_data.get("topic_cluster") or "General",
+        "status": entity_data.get("status") or "Active",
+        "epistemic_status": entity_data.get("epistemic-status") or entity_data.get("epistemic_status") or "draft",
+        "categories": list(categories),
+        "tags": entity_data.get("tags") or [],
+        "aliases": list(aliases),
+        "relations": entity_data.get("relations") or [],
+        "sources": list(sources),
+        "tension_edges": entity_data.get("tension_edges") or [],
+        "links": list(links),
+        "outbound_links": list(links),
+        "triples": entity_data.get("triples") or [],
+        "ttl": ttl,
+        "decay_weight": round(float(decay_weight), 4),
+        "alignment_score": float(entity_data.get("alignment_score", 100.0)),
+        "node_score": round(float(decay_weight), 4),
+        "updated": updated,
+        "updated_at": updated,
+    }
+    return node_key, node_data
 
 
 def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
@@ -716,7 +722,10 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         from vector_lake.db_store import get_connection
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT source_id, target_id, weight FROM page_graph_edges")
+        cursor.execute(
+            "SELECT source_id, target_id, weight FROM claim_graph_edges "
+            "UNION SELECT source_id, target_id, weight FROM page_graph_edges"
+        )
         db_edges = cursor.fetchall()
         for row in db_edges:
             src = row["source_id"]
@@ -729,7 +738,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 })
     except Exception as e:
         import logging
-        logging.getLogger("vector-lake-indexer").debug(f"Could not load page_graph_edges from SQLite: {e}")
+        logging.getLogger("vector-lake-indexer").debug(f"Could not load graph edges from SQLite: {e}")
 
     edges.sort(key=lambda edge: edge["weight"], reverse=True)
 
@@ -767,49 +776,23 @@ def _apply_graph_topology(index_data: dict):
 def generate_index(skip_embeddings: bool = True):
     index_data = _empty_index_data()
     from vector_lake.governance_store import load_entities, load_claims
+    from vector_lake.db_store import get_connection
+    conn = get_connection()
     entities = load_entities().get("items", {})
     claims = load_claims().get("items", {})
 
-    claims_by_page = {}
-    for claim in claims.values():
-        page_key = claim.get("locator", {}).get("page_key")
-        if page_key:
-            claims_by_page.setdefault(page_key, []).append(claim)
-
-    for entity in entities.values():
-        page_key = entity.get("page_key")
-        if not page_key:
+    # Read from canonical SQLite instead of Markdown files
+    rows = conn.execute("SELECT entity_id, data_json FROM entities").fetchall()
+    
+    for row in rows:
+        try:
+            entity_data = json.loads(row["data_json"])
+            node_key, node_data = _entity_to_index_node(entity_data, row["entity_id"])
+        except Exception as e:
+            log.warning(f"Failed to project canonical entity {row['entity_id']}: {e}")
             continue
-            
-        node_key = page_key
-        page_claims = claims_by_page.get(page_key, [])
-        
-        raw_text = "\n".join(c.get("claim_text", "") for c in page_claims)
-        summary = ""
-        for c in page_claims:
-            if c.get("claim_type") == "summary":
-                summary = c.get("claim_text", "")
-                break
-                
-        node_data = {
-            "id": entity.get("entity_id"),
-            "title": entity.get("canonical_name"),
-            "type": entity.get("entity_type"),
-            "updated": entity.get("updated_at"),
-            "categories": entity.get("tags", []),
-            "domain": entity.get("domain", "General"),
-            "topic_cluster": entity.get("topic_cluster", "General"),
-            "status": entity.get("status", "Active"),
-            "aliases": entity.get("aliases", []),
-            "sources": [], 
-            "tension_edges": entity.get("tension_edges", []),
-            "links": [],
-            "triples": [],
-            "summary": summary[:240],
-            "raw_text": raw_text,
-            "decay_weight": entity.get("decay_weight", 1.0),
-            "alignment_score": 100.0,
-        }
+        if node_key.startswith("System_") or node_data.get("type") == "system":
+            continue
 
         index_data["nodes"][node_key] = node_data
         if node_data["id"]:
@@ -833,17 +816,26 @@ def generate_index(skip_embeddings: bool = True):
 
     output_path = str(get_index_path())
     claim_graph_path = str(get_claim_graph_path())
-    tmp_output = output_path + ".tmp"
-    tmp_claim = claim_graph_path + ".tmp"
+    stage_suffix = f".{uuid.uuid4().hex}.tmp"
+    tmp_output = output_path + stage_suffix
+    tmp_claim = claim_graph_path + stage_suffix
     
-    _write_claim_graph(tmp_claim, governance_store.build_claim_graph_projection())
-    _write_index(tmp_output, index_data)
+    _write_json_stage(tmp_claim, governance_store.build_claim_graph_projection())
+    removed = _strip_legacy_embedded_payloads(index_data)
+    if removed:
+        log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
+    _write_json_stage(tmp_output, index_data)
 
-    # PHASE 1 FIX: Compute embeddings OUTSIDE of DB transaction to prevent Network Blockade Deadlock
-    embeddings_map = _compute_embeddings_unlocked(index_data, skip_embeddings=skip_embeddings)
+    # Embeddings are a separate resumable projection. Index rebuilds never call an external API.
+    embeddings_map = {}
     with transaction():
+        conn.execute("DELETE FROM wiki_search_index")
+        db_store.delete_stale_embeddings(set(index_data["nodes"]))
         _build_bm25_index(index_data, embeddings_map)
 
+    for staged_path in (tmp_claim, tmp_output):
+        if not os.path.exists(staged_path):
+            raise FileNotFoundError(f"Missing staged projection file before publish: {staged_path}")
     os.replace(tmp_claim, claim_graph_path)
     os.replace(tmp_output, output_path)
 
@@ -869,55 +861,36 @@ def update_index_items(filenames: list[str]):
     if not valid_filenames:
         return
 
-    # Pre-parse and pre-embed to prevent holding FileLock during Network I/O
+    # Pre-parse canonical nodes. Embedding refresh is handled by the explicit backfill scheduler.
     pre_parsed_data = {}
-    from vector_lake.governance_store import load_entities, load_claims
-    entities = load_entities().get("items", {})
-    claims = load_claims().get("items", {})
+    canonical_load_errors = {}
+    import os
 
+    conn = db_store.get_connection()
     for filename in valid_filenames:
         node_key = filename[:-3]
-        
-        entity = None
-        for e in entities.values():
-            if e.get("page_key") == node_key:
-                entity = e
-                break
-                
-        if not entity:
+        try:
+            row = conn.execute(
+                "SELECT entity_id, data_json FROM entities "
+                "WHERE json_extract(data_json, '$.page_key') = ? LIMIT 1",
+                (node_key,),
+            ).fetchone()
+            if row:
+                projected_key, node_data = _entity_to_index_node(json.loads(row["data_json"]), row["entity_id"])
+                if projected_key != node_key:
+                    raise ValueError(f"Canonical page_key mismatch: expected {node_key}, got {projected_key}")
+            else:
+                node_data = None
+        except Exception as exc:
+            log.error(f"Failed to load canonical entity for {filename}: {exc}")
+            canonical_load_errors[filename] = str(exc)
             continue
-            
-        page_claims = [c for c in claims.values() if c.get("locator", {}).get("page_key") == node_key]
-        raw_text = "\n".join(c.get("claim_text", "") for c in page_claims)
-        summary = ""
-        for c in page_claims:
-            if c.get("claim_type") == "summary":
-                summary = c.get("claim_text", "")
-                break
-                
-        node_data = {
-            "id": entity.get("entity_id"),
-            "title": entity.get("canonical_name"),
-            "type": entity.get("entity_type"),
-            "updated": entity.get("updated_at"),
-            "categories": entity.get("tags", []),
-            "domain": entity.get("domain", "General"),
-            "topic_cluster": entity.get("topic_cluster", "General"),
-            "status": entity.get("status", "Active"),
-            "aliases": entity.get("aliases", []),
-            "sources": [], 
-            "tension_edges": entity.get("tension_edges", []),
-            "links": [],
-            "triples": [],
-            "summary": summary[:240],
-            "raw_text": raw_text,
-            "decay_weight": entity.get("decay_weight", 1.0),
-            "alignment_score": 100.0,
-        }
-        pre_parsed_data[node_key] = node_data
+        if node_data:
+            pre_parsed_data[node_key] = node_data
 
-    # V11 Fix: Removed synchronous embedding calculation.
-    # We now rely entirely on the background Embedding worker to fill in gaps asynchronously.
+    if canonical_load_errors:
+        detail = "; ".join(f"{name}: {error}" for name, error in sorted(canonical_load_errors.items()))
+        raise RuntimeError(f"Canonical index batch aborted; source rows could not be loaded: {detail}")
 
     output_path = str(get_index_path())
     if not os.path.exists(output_path):
@@ -938,6 +911,9 @@ def update_index_items(filenames: list[str]):
                 if index_data is None:
                     needs_full_rebuild = True
                 else:
+                    removed_system_keys = _strip_system_nodes(index_data)
+                    for system_key in removed_system_keys:
+                        db_store.delete_search_index(system_key)
                     removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
                     if removed_legacy_keys:
                         log.info(
@@ -960,7 +936,6 @@ def update_index_items(filenames: list[str]):
                         all_nodes_triples[k] = td
     
                     for filename in valid_filenames:
-                        filepath = os.path.join(wiki_dir, filename)
                         node_key = filename[:-3]
     
                         if not filename.startswith(VALID_PREFIXES) and filename not in ("index.md", "log.md"):
@@ -970,7 +945,7 @@ def update_index_items(filenames: list[str]):
                             log.warning(f"Schema violation in {filename} during partial update.")
                             old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                             if old_node:
-                                db_store.delete_node_cascade(node_key)
+                                db_store.delete_search_index(node_key)
                             index_data["weighted_edges"] = [
                                 edge for edge in (index_data.get("weighted_edges") or [])
                                 if edge["source"] != node_key and edge["target"] != node_key
@@ -980,32 +955,17 @@ def update_index_items(filenames: list[str]):
                             index_data.setdefault("error_log", [])
                             index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
     
-                            if not os.path.exists(filepath):
+                            node_data = pre_parsed_data.get(node_key)
+                            if node_data is None:
                                 old_node = (index_data.get("nodes") or {}).pop(node_key, None)
                                 if old_node:
-                                    db_store.delete_node_cascade(node_key)
+                                    db_store.delete_search_index(node_key)
                                 index_data["weighted_edges"] = [
                                     edge for edge in (index_data.get("weighted_edges") or [])
                                     if edge["source"] != node_key and edge["target"] != node_key
                                 ]
                             else:
-                                node_data = pre_parsed_data.get(node_key)
-                                if node_data is None:
-                                    try:
-                                        node_data = _parse_wiki_node(filepath, node_key)
-                                    except Exception as e:
-                                        index_data["error_log"].append({"file": filename, "error": str(e)})
-                                        node_data = None
-    
-                                if node_data is None:
-                                    index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing 'domain' or 'status'. Node excluded."})
-                                    old_node = (index_data.get("nodes") or {}).pop(node_key, None)
-                                    if old_node:
-                                        db_store.delete_node_cascade(node_key)
-                                else:
-                                    old_node = index_data["nodes"].get(node_key)
-                                    if old_node:
-                                        db_store.delete_search_index(node_key)
+                                if node_data is not None:
                                     index_data["nodes"][node_key] = node_data
                                     aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
                                     text = f"{aliases_str} {node_data.get('raw_text', '')}"
@@ -1013,10 +973,8 @@ def update_index_items(filenames: list[str]):
                                     t_summary = _tokenize_for_fts(node_data.get('summary', ''))
                                     t_text = _tokenize_for_fts(text)
                                     db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
-                                    
-                                    # Issue 4 Fix: Missing embedding recalculation
-                                    if "_pre_embedded" in node_data:
-                                        db_store.upsert_embedding(node_key, node_data["_pre_embedded"])
+                                    # The old vector is now stale; explicit backfill will replace it.
+                                    db_store.delete_embedding(node_key)
                                     
                                     if node_data["id"]:
                                         index_data["aliases"][node_data["id"]] = node_key
@@ -1040,7 +998,11 @@ def update_index_items(filenames: list[str]):
                                     try:
                                         conn = db_store.get_connection()
                                         cursor = conn.cursor()
-                                        cursor.execute("SELECT source_id, target_id, weight FROM page_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
+                                        cursor.execute(
+                                            "SELECT source_id, target_id, weight FROM claim_graph_edges WHERE source_id = ? OR target_id = ? "
+                                            "UNION SELECT source_id, target_id, weight FROM page_graph_edges WHERE source_id = ? OR target_id = ?",
+                                            (node_key, node_key, node_key, node_key),
+                                        )
                                         for row in cursor.fetchall():
                                             index_data["weighted_edges"].append({
                                                 "source": row["source_id"],
@@ -1100,9 +1062,9 @@ def update_index_items(filenames: list[str]):
                     index_data["schema_version"] = "8.0"
                     # V11.3 Fixed: Write partial updates back to disk to prevent ghost updates
                     _write_index(output_path, index_data)
+                    _write_claim_graph(str(get_claim_graph_path()), governance_store.build_claim_graph_projection())
     except Timeout:
-        log.error(f"Timeout while acquiring lock for {output_path}")
-        return
+        raise TimeoutError(f"Timeout while acquiring lock for {output_path}")
 
     if needs_full_rebuild:
         return generate_index()
@@ -1131,7 +1093,11 @@ def refresh_graph_topology_if_dirty() -> bool:
                 if index_data is None:
                     generate_index()
                     return True
-    
+
+                removed_system_keys = _strip_system_nodes(index_data)
+                for system_key in removed_system_keys:
+                    db_store.delete_search_index(system_key)
+
                 removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
                 if removed_legacy_keys:
                     log.info(

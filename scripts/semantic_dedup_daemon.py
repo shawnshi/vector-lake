@@ -29,46 +29,6 @@ def _utc_now() -> str:
 
 from vector_lake.wiki_utils import normalize_memory_key as strip_name, calculate_cosine_similarity
 
-async def llm_semantic_arbiter(client, sem: asyncio.Semaphore, left_name: str, left_summary: str, right_name: str, right_summary: str) -> bool:
-    import asyncio
-    
-    prompt = f"""You are a strict Medical Knowledge Graph Ontology Arbiter.
-Analyze the following two entities:
-Entity 1: [{left_name}] - {left_summary}
-Entity 2: [{right_name}] - {right_summary}
-
-Determine if these two entities are SEMANTICALLY EQUIVALENT (meaning they represent the exact same concept, e.g., one is an abbreviation of the other, or they are exact synonyms).
-If they are merely related (e.g., cause/effect, platform/paradigm, whole/part, competing frameworks), they are NOT equivalent.
-
-Answer with exactly one word: YES if they are the exact same concept and should be merged. NO if they are distinct concepts.
-"""
-    for attempt in range(3):
-        try:
-            async with sem:
-                response = await client.aio.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt
-                )
-                if response and response.text:
-                    return "YES" in response.text.upper()
-        except Exception as e:
-            log.error(f"LLM Arbiter failed on attempt {attempt+1}: {e}")
-            await asyncio.sleep(1)
-    return False
-
-async def fetch_embedding(client, sem: asyncio.Semaphore, title: str, text_to_embed: str) -> list[float]:
-    async with sem:
-        try:
-            response = await client.aio.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=text_to_embed
-            )
-            if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-                return response.embeddings[0].values
-        except Exception as e:
-            log.error(f"Failed to generate embedding for {title}: {e}")
-    return []
-
 def _get_cache_path():
     return get_meta_dir() / "embeddings.pkl"
 
@@ -91,18 +51,8 @@ def save_cache(cache: dict):
 
 
 async def async_run_daemon():
-    has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
-    if not has_api_key:
-        log.warning("GEMINI_API_KEY not set. Semantic dedup daemon will run in Local-Only mode.")
-
-    client = None
-    if has_api_key:
-        try:
-            from google import genai
-            client = genai.Client()
-        except ImportError:
-            log.warning("google-genai not installed. Falling back to Local-Only mode.")
-            has_api_key = False
+    if os.environ.get("GEMINI_API_KEY"):
+        log.info("Semantic dedup never calls the provider directly; use embedding-backfill for missing vectors.")
 
     index_path = get_index_path()
     if not index_path.exists():
@@ -130,59 +80,23 @@ async def async_run_daemon():
             if link in entities:
                 entities[link]["backlinks"].append(key)
 
-    cache = load_cache()
-    cached_embeddings = cache.setdefault("embeddings", {})
-    updates_made = False
-    
-    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    cached_embeddings = {}
+    try:
+        from array import array
+        from vector_lake.db_store import get_connection
 
-    if has_api_key and client:
-        log.info(f"Checking embeddings for {len(entities)} entities...")
-        tasks = []
-        keys_to_embed = []
-        
-        for key, node in entities.items():
-            title = node.get("title", key)
-            summary = node.get("summary") or title
-            text_to_embed = f"Title: {title}\nSummary: {summary}"
-            
-            text_hash = hashlib.sha256(text_to_embed.encode("utf-8")).hexdigest()
-            cached = cached_embeddings.get(key)
-            if cached and cached.get("hash") == text_hash and "vector" in cached:
+        for row in get_connection().execute("SELECT entity_id, embedding FROM vec_embeddings"):
+            key = str(row["entity_id"])
+            if key not in entities:
                 continue
-            
-            keys_to_embed.append((key, text_hash, title))
-            tasks.append(fetch_embedding(client, sem, title, text_to_embed))
-        
-        if tasks:
-            log.info(f"Generating new embeddings concurrently for {len(tasks)} entities...")
-            results = await asyncio.gather(*tasks)
-            
-            # Write to vec_embeddings table
-            from vector_lake.db_store import get_connection, transaction
-            import sqlite_vec
-            
-            try:
-                with transaction() as conn:
-                    for (key, text_hash, title), vector in zip(keys_to_embed, results):
-                        if vector:
-                            cached_embeddings[key] = {
-                                "hash": text_hash,
-                                "vector": vector,
-                                "title": title
-                            }
-                            updates_made = True
-                            
-                            vector_blob = sqlite_vec.serialize_float32(vector)
-                            conn.execute(
-                                "INSERT OR REPLACE INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)",
-                                (key, vector_blob)
-                            )
-            except Exception as e:
-                log.error(f"Failed to insert into vec_embeddings: {e}")
-                
-            if updates_made:
-                save_cache(cache)
+            values = array("f")
+            values.frombytes(bytes(row["embedding"]))
+            cached_embeddings[key] = {
+                "vector": list(values),
+                "title": entities[key].get("title", key),
+            }
+    except Exception as exc:
+        log.warning("Could not load SQLite embeddings; continuing with lexical/topology dedup: %s", exc)
 
     entity_keys = list(entities.keys())
     entity_keys.sort(key=lambda k: entities[k]['_stripped'])
@@ -194,9 +108,6 @@ async def async_run_daemon():
     log.info("Computing Multi-Layer Pairwise Similarities (Async)...")
     window_size = min(150, len(entity_keys))
     
-    arbiter_tasks = []
-    arbiter_metadata = []
-
     for i in range(len(entity_keys)):
         if i % 10 == 0: await asyncio.sleep(0) # Yield to prevent blocking
         left_key = entity_keys[i]
@@ -231,7 +142,7 @@ async def async_run_daemon():
                 final_score = min(final_score + 0.15, 0.99)
                 reasons.append(f"topology-jaccard:{round(jaccard, 2)}")
             
-            if has_api_key and left_key in cached_embeddings and right_key in cached_embeddings:
+            if left_key in cached_embeddings and right_key in cached_embeddings:
                 sim = calculate_cosine_similarity(cached_embeddings[left_key]["vector"], cached_embeddings[right_key]["vector"])
                 if sim >= SIMILARITY_THRESHOLD:
                     if sim > final_score: final_score = sim
@@ -239,21 +150,14 @@ async def async_run_daemon():
             
             if final_score >= ADVANCED_THRESHOLD:
                 if not reasons: reasons.append(f"lexical-similarity:{round(str_score, 3)}")
-                if client:
-                    arbiter_tasks.append(llm_semantic_arbiter(client, sem, left_title, left_node.get("summary", ""), right_title, right_node.get("summary", "")))
-                    arbiter_metadata.append({
-                        "pair_key": pair_key, "score": round(final_score, 3), "left_entity_id": left_key, "left_name": left_title,
-                        "right_entity_id": right_key, "right_name": right_title, "reasons": reasons
-                    })
-                    existing_pairs.add(pair_key)
-                else:
-                    candidates.append({
-                        "pair_key": pair_key, "score": round(final_score, 3), "left_entity_id": left_key, "left_name": left_title,
-                        "right_entity_id": right_key, "right_name": right_title, "reasons": reasons
-                    })
-                    existing_pairs.add(pair_key)
+                reasons.append("local-review-required")
+                candidates.append({
+                    "pair_key": pair_key, "score": round(final_score, 3), "left_entity_id": left_key, "left_name": left_title,
+                    "right_entity_id": right_key, "right_name": right_title, "reasons": reasons
+                })
+                existing_pairs.add(pair_key)
 
-        if has_api_key:
+        if cached_embeddings:
             left_data = cached_embeddings.get(left_key)
             if not left_data or "vector" not in left_data: continue
             
@@ -272,29 +176,11 @@ async def async_run_daemon():
                 if sim >= ADVANCED_THRESHOLD:
                     right_node = entities[right_key]
                     right_title = right_node.get('title', right_key)
-                    if client:
-                        arbiter_tasks.append(llm_semantic_arbiter(client, sem, left_title, left_node.get("summary", ""), right_title, right_node.get("summary", "")))
-                        arbiter_metadata.append({
-                            "pair_key": pair_key, "score": round(sim, 3), "left_entity_id": left_key, "left_name": left_title,
-                            "right_entity_id": right_key, "right_name": right_title, "reasons": [f"semantic-embedding-match:{round(sim, 3)}"]
-                        })
-                        existing_pairs.add(pair_key)
-                    else:
-                        candidates.append({
-                            "pair_key": pair_key, "score": round(sim, 3), "left_entity_id": left_key, "left_name": left_title,
-                            "right_entity_id": right_key, "right_name": right_title, "reasons": [f"semantic-embedding-match:{round(sim, 3)}"]
-                        })
-                        existing_pairs.add(pair_key)
-
-    if arbiter_tasks:
-        log.info(f"Running LLM Arbiter concurrently for {len(arbiter_tasks)} pairs...")
-        arbiter_results = await asyncio.gather(*arbiter_tasks)
-        for is_equiv, meta in zip(arbiter_results, arbiter_metadata):
-            if is_equiv:
-                meta["reasons"].append("llm-arbiter-approved")
-                candidates.append(meta)
-            else:
-                log.info(f"LLM Arbiter Rejected: {meta['left_name']} <> {meta['right_name']}")
+                    candidates.append({
+                        "pair_key": pair_key, "score": round(sim, 3), "left_entity_id": left_key, "left_name": left_title,
+                        "right_entity_id": right_key, "right_name": right_title, "reasons": [f"semantic-embedding-match:{round(sim, 3)}", "local-review-required"]
+                    })
+                    existing_pairs.add(pair_key)
 
     if candidates:
         log.info(f"Found {len(candidates)} new merge candidates. Enqueueing...")

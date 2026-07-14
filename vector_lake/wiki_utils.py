@@ -196,17 +196,28 @@ def read_frontmatter_only(path: str | Path, errors: str = "replace") -> dict:
         return {}
 
 
-def atomic_write_text(path: str | Path, content: str, pre_parsed_frontmatter: dict | None = None):
+def atomic_write_text(
+    path: str | Path,
+    content: str,
+    pre_parsed_frontmatter: dict | None = None,
+    validation_mode: str = "full",
+):
     path = Path(path)
+    if validation_mode not in {"full", "schema"}:
+        raise ValueError(f"Unsupported validation_mode: {validation_mode}")
     
     # NEW: Trigger Defense Hook for wiki markdown files
     if path.name.endswith(".md") and "wiki" in path.parts:
         try:
-            from vector_lake.defense_hook import verify_asset
             frontmatter = pre_parsed_frontmatter if pre_parsed_frontmatter is not None else split_frontmatter(content)[0]
-            verify_asset(content, path.name, frontmatter, get_index_path())
+            if validation_mode == "full":
+                from vector_lake.defense_hook import verify_asset
+                verify_asset(content, path.name, frontmatter, get_index_path())
+            else:
+                from vector_lake.schema_validator import validate_schema
+                validate_schema(frontmatter, content, path.name, get_index_path())
         except Exception as e:
-            if type(e).__name__ == "DefenseHookException":
+            if validation_mode == "schema" or type(e).__name__ == "DefenseHookException":
                 raise e # Bubble up the specific defense hook violation
             pass # Ignore other import or parsing errors to prevent system lockup
             
@@ -262,8 +273,12 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_val
             if header not in body:
                 raise SafeWriteError(f"STORM Synthesis Structural Violation: The file {filename} is missing mandatory H2 section '{header}'. Please strictly follow the references/storm_report_template.md structure.")
     yaml_block = dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    backup_file(path)
-    atomic_write_text(path, f"---\n{yaml_block}---\n{body.lstrip()}", pre_parsed_frontmatter=frontmatter)
+    full_content = f"---\n{yaml_block}---\n{body.lstrip()}"
+    expected_path = (get_wiki_dir() / filename).resolve()
+    if path.resolve() != expected_path:
+        raise SafeWriteError(f"Path traversal blocked: {path}")
+    from vector_lake.mutation_coordinator import execute_mutation_plan
+    execute_mutation_plan(filename, content=full_content, is_delete=False)
 
 
 def backup_file(path: str | Path, suffix: str = ".bak") -> Path | None:

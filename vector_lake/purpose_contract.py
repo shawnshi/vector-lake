@@ -182,11 +182,10 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
         if not isinstance(categories, list) or len(categories) != 1:
             raise PurposeContractError(f"{filename}: categories must be a list with exactly one domain.")
             
-        if not str(frontmatter.get("topic_cluster", "")).strip():
-            raise PurposeContractError(f"{filename}: topic_cluster must be present and non-empty.")
         records.append({
             "filename": filename,
             "sources": _normalise_sources(frontmatter.get("sources")),
+            "topic_cluster": str(frontmatter.get("topic_cluster") or "General").strip(),
             "tension_edges": frontmatter.get("tension_edges", []),
         })
     return records

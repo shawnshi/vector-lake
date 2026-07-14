@@ -1,95 +1,215 @@
-import os
-import json
-import shutil
-from pathlib import Path
+import hashlib
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Iterable
 
-from vector_lake.db_store import transaction, backup_database
-from vector_lake.wiki_utils import get_wiki_dir, get_extension_root
+from vector_lake import db_store
 from vector_lake.defense_hook import verify_asset
-from vector_lake.indexer import update_index_items
+from vector_lake.schema_validator import validate_schema
+from vector_lake.wiki_utils import (
+    atomic_write_text,
+    get_extension_root,
+    get_index_path,
+    get_wiki_dir,
+    split_frontmatter,
+    validate_wiki_filename,
+)
+
 
 log = logging.getLogger("vector-lake-mutation")
 
-def execute_mutation_plan(filename: str, content: str | None = None, is_delete: bool = False):
-    """
-    Unified Mutation Coordinator for vector_lake.
-    Pre-checks schema/purpose, performs atomic writes, SQLite transactions, and compensation.
-    """
-    wiki_dir = get_wiki_dir()
-    filepath = wiki_dir / filename
-    import os
-    if not os.path.abspath(filepath).startswith(os.path.abspath(wiki_dir)):
-        raise ValueError(f"Security error: path traversal detected for {filename}")
-        
-    tmp_dir = get_extension_root() / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    bak_path = tmp_dir / f"{filename}.bak"
-    
-    # 1. Pre-flight schema/purpose validation (if not deleting)
-    if not is_delete and content is not None:
-        from vector_lake.wiki_utils import split_frontmatter
-        fm, _ = split_frontmatter(content)
-        # verify_asset raises DefenseHookException if invalid
-        verify_asset(content, filename, fm, get_wiki_dir().parent / "index.json")
-        
-    # 2. Backup existing file
-    has_backup = False
-    if filepath.exists():
-        shutil.copy2(filepath, bak_path)
-        has_backup = True
-        
-    try:
-        # 3. Markdown Write
-        if is_delete:
-            if filepath.exists():
-                os.remove(filepath)
-        else:
-            # Write atomically
-            from vector_lake.wiki_utils import atomic_write_text
-            atomic_write_text(filepath, content, pre_parsed_frontmatter=fm if not is_delete else None)
 
-            
-        # 4. SQLite Transaction
-        with transaction():
-            from vector_lake.db_store import get_connection
-            from vector_lake.governance_store import _utc_now
-            conn = get_connection()
-            if is_delete:
-                from vector_lake.db_store import delete_node_cascade
-                node_key = filename[:-3] if filename.endswith(".md") else filename
-                delete_node_cascade(node_key)
-                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (filename, 'delete', _utc_now()))
-            else:
-                from vector_lake.governance_store import sync_pages_to_canonical
-                sync_pages_to_canonical(
-                    [str(filepath)],
-                    origin="mutation_coordinator",
-                    auto_approve=True,
-                    summary=f"Unified mutation applied to {filename}"
-                )
-                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (filename, 'update', _utc_now()))
-                
-        # 5. Signal Outbox Consumer
+def resolve_wiki_mutation_path(
+    filename: str,
+    allow_existing_legacy_name: bool = False,
+) -> Path:
+    """Resolve a single wiki basename and reject every traversal form."""
+    if not isinstance(filename, str) or not filename or filename != filename.strip():
+        raise ValueError("Mutation filename must be a non-empty trimmed string.")
+    if "\x00" in filename or "/" in filename or "\\" in filename:
+        raise ValueError("Mutation filename must be a basename without path separators.")
+    candidate_name = Path(filename)
+    if candidate_name.is_absolute() or candidate_name.name != filename or filename in {".", ".."}:
+        raise ValueError("Mutation filename must be a relative wiki basename.")
+    wiki_root = get_wiki_dir().resolve()
+    candidate = (wiki_root / filename).resolve()
+    if candidate.parent != wiki_root:
+        raise ValueError(f"Mutation path escapes wiki boundary: {filename}")
+    if not (allow_existing_legacy_name and candidate.exists()):
+        validate_wiki_filename(filename)
+    return candidate
+
+
+def materialize_markdown_projection(
+    filename: str,
+    mutation_type: str,
+    payload_text: str | None = None,
+    validation_mode: str = "full",
+) -> Path:
+    """Idempotently materialize the Markdown projection for one outbox row."""
+    filepath = resolve_wiki_mutation_path(
+        filename,
+        allow_existing_legacy_name=validation_mode == "schema",
+    )
+    if mutation_type == "delete":
+        if filepath.exists():
+            filepath.unlink()
+        return filepath
+    if mutation_type != "update":
+        raise ValueError(f"Unsupported mutation_type: {mutation_type}")
+    if payload_text is None:
+        if not filepath.exists():
+            raise ValueError(f"Outbox update for {filename} has no payload and no existing Markdown projection.")
+        payload_text = filepath.read_text(encoding="utf-8")
+    atomic_write_text(filepath, payload_text, validation_mode=validation_mode)
+    return filepath
+
+
+def _signal_outbox_consumer():
+    """Best-effort wake-up hint; correctness never depends on this file."""
+    try:
         tmp_dir = get_extension_root() / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        with open(tmp_dir / "outbox_signal.lock", "w") as f:
-            f.write("1")
-            
-        # Cleanup backup
-        if has_backup and bak_path.exists():
-            os.remove(bak_path)
-            
-        return True, "Mutation completed successfully."
-        
-    except Exception as e:
-        log.error(f"Mutation failed for {filename}: {e}. Rolling back.")
-        # Rollback markdown
-        if has_backup and bak_path.exists():
-            if filepath.exists():
-                os.remove(filepath)
-            shutil.move(str(bak_path), str(filepath))
-        elif not is_delete and not has_backup and filepath.exists():
-            os.remove(filepath)
-            
-        raise e
+        atomic_write_text(tmp_dir / "outbox_signal.lock", "1")
+    except OSError as exc:
+        log.warning(f"Could not write outbox wake-up hint: {exc}")
+
+
+def _prepare_mutations(
+    mutations: Iterable[dict],
+    validation_mode: str = "full",
+) -> list[dict]:
+    if validation_mode not in {"full", "schema"}:
+        raise ValueError(f"Unsupported validation_mode: {validation_mode}")
+    prepared = []
+    seen_filenames = set()
+    for mutation in mutations:
+        filename = mutation.get("filename")
+        content = mutation.get("content")
+        is_delete = bool(mutation.get("is_delete", False))
+        filepath = resolve_wiki_mutation_path(
+            filename,
+            allow_existing_legacy_name=validation_mode == "schema",
+        )
+        if filename in seen_filenames:
+            raise ValueError(f"A mutation batch cannot contain duplicate filenames: {filename}")
+        seen_filenames.add(filename)
+
+        mutation_type = "delete" if is_delete else "update"
+        if not is_delete:
+            if content is None:
+                raise ValueError("Update mutations require full Markdown content.")
+            frontmatter, _ = split_frontmatter(content)
+            if validation_mode == "full":
+                verify_asset(content, filename, frontmatter, get_index_path())
+            else:
+                validate_schema(frontmatter, content, filename, get_index_path())
+
+        prepared.append(
+            {
+                "filename": filename,
+                "content": content,
+                "filepath": filepath,
+                "mutation_type": mutation_type,
+                "idempotency_key": hashlib.sha256(
+                    (
+                        f"{mutation_type}\x00{filename}\x00{content or ''}"
+                        + (f"\x00validation={validation_mode}" if validation_mode != "full" else "")
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+    if not prepared:
+        raise ValueError("A mutation batch must contain at least one mutation.")
+    return prepared
+
+
+def execute_mutation_batch(
+    mutations: Iterable[dict],
+    canonical_callback: Callable[[], None] | None = None,
+    validation_mode: str = "full",
+):
+    """Commit canonical mutations atomically; schema mode is for bounded legacy maintenance."""
+    from vector_lake.runtime_health import enforce_runtime_write_health
+
+    enforce_runtime_write_health(validation_mode=validation_mode)
+    prepared = _prepare_mutations(mutations, validation_mode=validation_mode)
+    db_store.init_db()
+    outbox_ids = []
+    from vector_lake import governance_store
+
+    prepared_change_sets = []
+    for mutation in prepared:
+        if mutation["mutation_type"] != "update":
+            continue
+        filename = mutation["filename"]
+        change_set = governance_store.prepare_change_set_from_content(
+            filename,
+            mutation["content"],
+            origin="mutation_coordinator",
+            auto_approve=True,
+            summary=f"Canonical mutation for {filename}",
+        )
+        prepared_change_sets.append(change_set)
+
+    with db_store.transaction():
+        for mutation in prepared:
+            filename = mutation["filename"]
+            content = mutation["content"]
+            if mutation["mutation_type"] == "delete":
+                node_key = filename[:-3] if filename.endswith(".md") else filename
+                db_store.delete_node_cascade(node_key)
+        governance_store.apply_change_sets_batch(prepared_change_sets)
+        published_at = datetime.now(timezone.utc).isoformat()
+        for change_set in prepared_change_sets:
+            change_set["published_at"] = published_at
+        governance_store.record_prepared_change_sets(prepared_change_sets)
+
+        for mutation in prepared:
+            filename = mutation["filename"]
+            content = mutation["content"]
+            outbox_ids.append(
+                db_store.enqueue_mutation(
+                    filename,
+                    mutation["mutation_type"],
+                    payload_text=content,
+                    idempotency_key=mutation["idempotency_key"],
+                    validation_mode=validation_mode,
+                )
+            )
+        if canonical_callback is not None:
+            canonical_callback()
+
+    deferred = []
+    for mutation, outbox_id in zip(prepared, outbox_ids):
+        try:
+            materialize_markdown_projection(
+                mutation["filename"],
+                mutation["mutation_type"],
+                mutation["content"],
+                validation_mode=validation_mode,
+            )
+        except Exception as exc:
+            deferred.append(mutation["filename"])
+            log.error(
+                "Canonical mutation %s committed but projection failed for %s: %s",
+                outbox_id,
+                mutation["filepath"],
+                exc,
+            )
+
+    _signal_outbox_consumer()
+    projection_note = (
+        f"projections deferred for {', '.join(deferred)}"
+        if deferred
+        else "all Markdown projections materialized"
+    )
+    return True, f"Canonical mutation batch committed; outbox ids {outbox_ids}; {projection_note}."
+
+
+def execute_mutation_plan(filename: str, content: str | None = None, is_delete: bool = False):
+    """Commit one canonical mutation and durable intent before updating projections."""
+    return execute_mutation_batch(
+        [{"filename": filename, "content": content, "is_delete": is_delete}]
+    )

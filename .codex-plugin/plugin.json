@@ -1,0 +1,27 @@
+{
+  "name": "vector-lake",
+  "version": "11.13.0+codex.20260714",
+  "description": "Local file-first knowledge compiler with auditable Markdown, structured memory, and graph operations.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Vector Lake",
+    "shortDescription": "Compile and query local knowledge",
+    "longDescription": "Compile source material into auditable Markdown and structured memory, then query, review, and govern the resulting knowledge graph.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Search Vector Lake for relevant evidence",
+      "Review a Vector Lake knowledge entry",
+      "Audit Vector Lake governance health"
+    ]
+  }
+}

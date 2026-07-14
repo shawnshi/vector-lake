@@ -16,8 +16,8 @@ log = logging.getLogger("vector-lake-tool-delete")
 
 
 def delete_source(raw_path: str, dry_run: bool = True) -> str:
-    wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
-    memory_dir = Path(get_memory_dir()).resolve(strict=True)
+    wiki_dir = Path(get_wiki_dir()).resolve()
+    memory_dir = Path(get_memory_dir()).resolve()
     raw_memory_dir = memory_dir / "raw"
     
     raw_path_obj = Path(raw_path).resolve()
@@ -83,80 +83,27 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
     updated = 0
     failures = []
     
-    from vector_lake.db_store import transaction
-    from vector_lake.wiki_utils import atomic_write_text
-    from vector_lake.governance_store import sync_pages_to_canonical
-    from vector_lake.indexer import update_index_items, delete_index_items
-    import shutil
-    
-    backups = {}
-    tmp_dir = get_extension_root() / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    
-    deleted_files = []
-    updated_files = []
-    
-    try:
-        with transaction():
-            for action, filepath, _, frontmatter, body in actions:
-                filename = os.path.basename(filepath)
-                if action == "DELETE":
-                    try:
-                        bak_path = tmp_dir / f"{filename}.bak"
-                        shutil.copy2(filepath, bak_path)
-                        backups[filepath] = bak_path
-                        os.remove(filepath)
-                        deleted_files.append(filename)
-                        deleted += 1
-                        log.info(f"Deleted (backed up): {filepath}")
-                    except Exception as e:
-                        failures.append(f"DELETE {filepath}: {e}")
-                        log.warning(f"Failed to delete {filepath}: {e}")
-                elif action == "REMOVE_REF":
-                    try:
-                        bak_path = tmp_dir / f"{filename}.bak"
-                        shutil.copy2(filepath, bak_path)
-                        backups[filepath] = bak_path
-                        
-                        fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
-                        new_content = f"---\n{fm_str}---\n{body}"
-                        atomic_write_text(filepath, new_content)
-                        updated_files.append(filename)
-                        updated += 1
-                        log.info(f"Removed source ref from: {filepath}")
-                    except Exception as e:
-                        failures.append(f"REMOVE_REF {filepath}: {e}")
-                        log.warning(f"Failed to update {filepath}: {e}")
+    from vector_lake.mutation_coordinator import execute_mutation_batch
 
-            if failures:
-                raise Exception("Failures occurred during file operations, rolling back.")
+    mutations = []
+    for action, filepath, _, frontmatter, body in actions:
+        filename = os.path.basename(filepath)
+        if action == "DELETE":
+            mutations.append({"filename": filename, "is_delete": True})
+            deleted += 1
+        elif action == "REMOVE_REF":
+            fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
+            mutations.append({"filename": filename, "content": f"---\n{fm_str}---\n{body}"})
+            updated += 1
 
-            # Batch sync
-            if deleted_files or updated_files:
-                sync_pages_to_canonical(
-                    [os.path.join(wiki_dir, f) for f in updated_files],
-                    origin="tool_delete",
-                    auto_approve=True,
-                    summary=f"Cascade delete from {raw_path}",
-                    deleted_files=deleted_files
-                )
-                if updated_files:
-                    update_index_items(updated_files)
-                if deleted_files:
-                    delete_index_items(deleted_files)
-
-    except Exception as e:
-        for orig, bak in backups.items():
-            if bak.exists():
-                if os.path.exists(orig):
-                    os.remove(orig)
-                shutil.move(str(bak), str(orig))
-        failures.append(str(e))
-        log.error(f"Transaction failed, rolled back: {e}")
-    finally:
-        for bak in backups.values():
-            if bak.exists():
-                os.remove(bak)
+    if mutations:
+        try:
+            execute_mutation_batch(mutations)
+        except Exception as exc:
+            failures.append(f"ATOMIC_WIKI_CLEANUP: {exc}")
+            deleted = 0
+            updated = 0
+            log.warning("Atomic wiki cleanup failed: %s", exc)
 
     raw_deleted = False
     if failures:
@@ -169,14 +116,8 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
         except Exception as e:
             log.warning(f"Failed to delete raw source {raw_path}: {e}")
 
-    from vector_lake import get_extension_root
-    tmp_dir = get_extension_root() / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    with open(tmp_dir / "flag_reindex.lock", "w") as f:
-        f.write("1")
-        
     lines.append("")
-    lines.append(f"Executed: raw_deleted={raw_deleted}, wiki_deleted={deleted}, wiki_updated={updated}. Async index rebuild scheduled.")
+    lines.append(f"Executed: raw_deleted={raw_deleted}, wiki_deleted={deleted}, wiki_updated={updated}. Projection updates queued transactionally.")
     if failures:
         lines.append("Warnings:")
         for failure in failures:

@@ -1,66 +1,30 @@
-import sys
 import os
-import re
-import yaml
+import sys
+from pathlib import Path
 
-def load_yaml(yaml_str):
-    try:
-        return yaml.safe_load(yaml_str)
-    except yaml.YAMLError:
-        return {}
+from vector_lake.mutation_coordinator import execute_mutation_batch
+from vector_lake.semantic_merge import merge_markdown_content
+from vector_lake.wiki_utils import get_wiki_dir
 
 def merge_markdown_files(left_path, right_path):
-    with open(left_path, 'r', encoding='utf-8') as f:
-        left_content = f.read()
-    with open(right_path, 'r', encoding='utf-8') as f:
-        right_content = f.read()
+    wiki_root = get_wiki_dir().resolve()
+    left = Path(left_path).resolve()
+    right = Path(right_path).resolve()
+    if left.parent != wiki_root or right.parent != wiki_root:
+        raise ValueError("Semantic merge inputs must be direct children of the wiki directory.")
+    if left == right:
+        raise ValueError("Semantic merge inputs must be different pages.")
 
-    # Parse right
-    right_fm_match = re.search(r"^---\n(.*?)\n---", right_content, re.MULTILINE | re.DOTALL)
-    right_fm_str = right_fm_match.group(1) if right_fm_match else ""
-    right_fm = load_yaml(right_fm_str) or {}
-    right_body = right_content[right_fm_match.end():].strip() if right_fm_match else right_content.strip()
-    right_aliases = right_fm.get("aliases") or []
-    if not isinstance(right_aliases, list):
-        right_aliases = [right_aliases]
-        
-    # Also add the original title of right to aliases
-    right_title = right_fm.get("title", "")
-    if right_title and right_title not in right_aliases:
-        right_aliases.append(right_title)
-
-    # Parse left
-    left_fm_match = re.search(r"^---\n(.*?)\n---", left_content, re.MULTILINE | re.DOTALL)
-    if not left_fm_match:
-        print(f"Error: {left_path} has no valid frontmatter.")
-        sys.exit(1)
-        
-    left_fm_str = left_fm_match.group(1)
-    left_fm = load_yaml(left_fm_str) or {}
-    left_body = left_content[left_fm_match.end():].strip()
-    
-    left_aliases = left_fm.get("aliases") or []
-    if not isinstance(left_aliases, list):
-        left_aliases = [left_aliases]
-        
-    # Merge aliases
-    for alias in right_aliases:
-        if alias and alias not in left_aliases:
-            left_aliases.append(alias)
-            
-    left_fm["aliases"] = left_aliases
-
-    # Reconstruct left markdown
-    new_fm_str = yaml.dump(left_fm, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    new_left_content = f"---\n{new_fm_str}---\n{left_body}\n\n## Merged from {right_title}\n{right_body}\n"
-
-    # Write left
-    with open(left_path, 'w', encoding='utf-8') as f:
-        f.write(new_left_content)
-
-    # Delete right
-    os.remove(right_path)
-    print(f"Merged {right_path} into {left_path} and deleted right.")
+    left_content = left.read_text(encoding="utf-8")
+    right_content = right.read_text(encoding="utf-8")
+    merged_content = merge_markdown_content(left_content, right_content)
+    execute_mutation_batch(
+        [
+            {"filename": left.name, "content": merged_content},
+            {"filename": right.name, "is_delete": True},
+        ]
+    )
+    print(f"Merged {right} into {left} through the canonical mutation coordinator.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

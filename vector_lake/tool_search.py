@@ -2,8 +2,6 @@ import json
 import logging
 import os
 import re
-import subprocess
-import shutil
 from datetime import datetime, timezone
 
 import functools
@@ -12,9 +10,6 @@ import pickle
 import ast
 import operator
 from filelock import FileLock, Timeout
-import threading
-
-AGY_SEMAPHORE = threading.Semaphore(3)
 
 from vector_lake import governance_store
 from vector_lake import db_store
@@ -52,14 +47,10 @@ def _get_query_embedding(query: str) -> list[float]:
     if not os.environ.get("GEMINI_API_KEY"):
         return []
     try:
-        from google import genai
-        client = genai.Client()
-        response = client.models.embed_content(
-            model="gemini-embedding-2",
-            contents=query
-        )
-        if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-            return response.embeddings[0].values
+        from vector_lake.embedding_scheduler import embed_texts
+
+        embeddings = embed_texts([query])
+        return embeddings[0] if embeddings else []
     except Exception as e:
         log.warning(f"Failed to get query embedding: {e}")
     return []
@@ -136,14 +127,11 @@ def _classify_intent(query: str) -> str:
 
 
 @functools.lru_cache(maxsize=128)
-def _expand_query_with_llm(query: str) -> list[str]:
+def _expand_query_locally(query: str) -> list[str]:
     expanded_terms = set([query])
     for key, expansions in QUERY_EXPANSION_DICT.items():
         if key in query:
             expanded_terms.update(expansions)
-            
-    # LLM query expansion has been removed to prevent deadlocks.
-    # Agent should perform pre-expansion if needed before calling the tool.
 
     tokens = set()
     try:
@@ -289,9 +277,7 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     }
 
 
-def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
-    # LLM reranking has been removed to prevent deadlocks.
-    # Returning candidates as-is. Agent should rerank based on context if necessary.
+def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
     return candidates
 
 
@@ -399,7 +385,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     nodes = [{"_key": key, **value} for key, value in index_data.get("nodes", {}).items()]
     intent = _classify_intent(query)
-    tokens = _expand_query_with_llm(query)
+    tokens = _expand_query_locally(query)
     if not tokens:
         return "No valid search tokens."
 
@@ -511,8 +497,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         if len(candidate_pool) >= pool_size:
             break
             
-    # Phase 2: Lightweight LLM-as-a-Judge Reranking
-    reranked = _rerank_candidates_with_llm(query, candidate_pool)
+    # Phase 2: Local deterministic ranking. Text-model reranking is delegated
+    # to the host agent when explicitly requested, not performed by runtime code.
+    reranked = _rerank_candidates_locally(query, candidate_pool)
 
     # Phase 3: Final top_k extraction
     final_scored = []
