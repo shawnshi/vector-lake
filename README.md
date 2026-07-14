@@ -144,6 +144,13 @@ graph LR
 - **派生缓存彻底解耦 (Derived Cache Decoupling)**：`generate_index` 彻底斩断对物理 Markdown 文件的依赖，全量索引强制只通过 Canonical SQLite `entities` 表进行无损重建。阻止了被破坏或违规修改的脏 Markdown 污染上层逻辑图谱。
 - **全局单点写入口 (Omni-Write Entrypoint)**：将 `MCP 写入`、`GC 删除`、`Bulk Merge`、`Query Stub 注册` 与 `Watchdog 手动编辑` 五大旁路全部强制收编，统一送入 `execute_mutation_plan()` 管线，达成写入生命周期的绝对封闭。
 
+### 🛡️ V11.12 SDET 健壮性与 Antigravity 原生合规架构 (V11.12 SDET Robustness & AGY Compliance)
+- **环境锁死锁根除 (Environmental Lock Eradication)**：全面排查并废除了插件层级的写锁机制（如 `tmp` 目录下高频创建的 `in_progress.lock`）。将所有状态锁移至系统底层 `%TEMP%` 物理层，彻底消除了由于文件锁残留引发的死锁断层与环境锁死风险。
+- **数据面与控制面分离 (Data / Control Plane Isolation)**：完全服从 Antigravity 2.0 沙箱隔离规范。在 `tool_ingest` 与 `watchdog` 中废除了容易发生 JSON Payload 解析雪崩的长文本直传。大体积的网页内容与知识载荷现在强制绕道基于 `conversation_id` 物理隔离的 `brain/<id>/scratch/` 作为共享缓冲区指针。
+- **并行读写无损穿透 (Database Concurrency Survival)**：在底层的 Embedding 构建管线 `indexer.py` 中强制套用 `transaction()` 指数退避安全门。遭遇 SQLite 突发读写锁 (`database is locked`) 时不再触发导致灾难级重算的“吞没失败”黑洞，保障了千级实体规模下的查询完备性。
+- **阻塞陷阱重构 (Asynchronous Fire-and-Forget)**：剥离 `DiaryWatchdogHandler` 霸占线程池的线性 `subprocess.run` 陷阱，将其降维为纯异步 `Popen` 子进程唤起。释放了有限的 3 并发守护线程池，使外部文件变更响应突破延时阻塞。
+- **泛型语法树白名单 (AST Filter Purge)**：废弃了易受 Markdown 缩进污染的纯文本切分器。在 `claim_extractor.py` 中引入 `block_code` 脏节点屏障，使得 LLM 生成代码时的噪音（如 Python / Shell script 断言）在语法树层级即被拦截，保持图谱 100% 认知洁净。
+
 ### 🔌 Antigravity Orchestrator 深度集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
