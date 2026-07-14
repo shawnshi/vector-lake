@@ -11,12 +11,13 @@ from datetime import datetime, timezone
 from filelock import FileLock
 
 from vector_lake.claim_extractor import extract_page_objects
-from vector_lake.db_store import get_connection, init_db
+from vector_lake.db_store import get_connection, init_db, transaction
 from vector_lake.wiki_utils import (
     atomic_write_text,
     get_meta_dir,
     get_wiki_dir,
     read_markdown_file,
+    split_frontmatter,
 )
 
 
@@ -153,7 +154,7 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
     if extra_cols is None:
         extra_cols = []
     
-    with conn:
+    with transaction():
         existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
         existing_keys = {row[0] for row in existing_keys_query}
         new_keys = set(data.get("items", {}).keys())
@@ -188,7 +189,7 @@ def _save_db_queue(table_name: str, pk_col: str, data: dict):
     conn = get_connection()
     now = _utc_now()
     data["updated_at"] = now
-    with conn:
+    with transaction():
         # V10.1 Diff-based synchronization (Avoid full table wipe)
         for item in data.get("items", []):
             if not item.get(pk_col):
@@ -308,7 +309,15 @@ def save_entities(data):
 
 
 def save_claims(data):
-    _save_db_map("claims", "claim_id", data, [("claim_text", "claim_text", str), ("status", "status", str)])
+    conn = get_connection()
+    with transaction():
+        old_rows = conn.execute(
+            "SELECT claim_id, claim_text, data_json, updated_at FROM claims"
+        ).fetchall()
+        _save_db_map("claims", "claim_id", data, [("claim_text", "claim_text", str), ("status", "status", str)])
+        from vector_lake.tool_timeline import sync_timeline_events_for_claim_delta
+
+        sync_timeline_events_for_claim_delta(old_rows, list(data.get("items", {}).values()))
 
 
 def save_evidence(data):
@@ -322,7 +331,7 @@ def save_sources(data):
 def save_graph_edges(edges: list[dict]):
     if not edges: return
     conn = get_connection()
-    with conn:
+    with transaction():
         for edge in edges:
             conn.execute(
                 "INSERT OR REPLACE INTO claim_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -334,7 +343,12 @@ def save_alias_registry(data):
     conn = get_connection()
     now = _utc_now()
     data["updated_at"] = now
-    with conn:
+    with transaction():
+        existing_keys = {row["key"] for row in conn.execute("SELECT key FROM alias_registry")}
+        new_keys = set(data.get("items", {}))
+        stale_keys = existing_keys - new_keys
+        if stale_keys:
+            conn.executemany("DELETE FROM alias_registry WHERE key = ?", [(key,) for key in stale_keys])
         for k, v in data.get("items", {}).items():
             conn.execute("INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)", (k, v, now))
 
@@ -367,21 +381,22 @@ def get_entity(entity_id: str) -> dict | None:
 def upsert_entity(entity_id: str, data: dict):
     conn = get_connection()
     now = _utc_now()
-    cols = ["entity_id", "type", "status", "data_json", "updated_at"]
+    cols = ["entity_id", "canonical_name", "type", "status", "data_json", "updated_at"]
     placeholders = ["?"] * len(cols)
     params = [
         entity_id,
+        str(data.get("canonical_name") or data.get("title") or data.get("page_key") or entity_id),
         str(data.get("type", "")),
         str(data.get("status", "Active")),
         json.dumps(data, ensure_ascii=False),
         now
     ]
-    with conn:
+    with transaction():
         conn.execute(f"INSERT OR REPLACE INTO entities ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", params)
 
 def delete_entity(entity_id: str):
     conn = get_connection()
-    with conn:
+    with transaction():
         conn.execute("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
 # =============================================================================
 
@@ -389,6 +404,172 @@ def _upsert_map_records(store: dict, records: list, key_name: str):
     for record in records:
         key = record[key_name]
         store["items"][key] = record
+
+
+def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict]):
+    """Upsert only the records in one page-scoped canonical delta."""
+    if not records:
+        return
+    _validate_table_name(table_name)
+    conn = get_connection()
+    now = _utc_now()
+    if table_name == "entities":
+        conn.executemany(
+            "INSERT OR REPLACE INTO entities "
+            "(entity_id, canonical_name, type, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    record[key_name],
+                    str(record.get("canonical_name") or record.get("title") or record.get("page_key") or record[key_name]),
+                    str(record.get("type", "")),
+                    str(record.get("status", "Active")),
+                    json.dumps(record, ensure_ascii=False),
+                    now,
+                )
+                for record in records
+            ],
+        )
+        return
+    if table_name == "claims":
+        conn.executemany(
+            "INSERT OR REPLACE INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    record[key_name],
+                    str(record.get("claim_text", "")),
+                    str(record.get("status", "Active")),
+                    json.dumps(record, ensure_ascii=False),
+                    now,
+                )
+                for record in records
+            ],
+        )
+        return
+    conn.executemany(
+        f"INSERT OR REPLACE INTO {table_name} ({key_name}, data_json, updated_at) VALUES (?, ?, ?)",
+        [
+            (record[key_name], json.dumps(record, ensure_ascii=False), now)
+            for record in records
+        ],
+    )
+
+
+def _upsert_operational_memory_records(records: list[dict]):
+    if not records:
+        return
+    conn = get_connection()
+    now = _utc_now()
+    conn.executemany(
+        "INSERT OR REPLACE INTO operational_memory "
+        "(memory_id, memory_type, score, status, ttl, data_json, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                record["memory_id"],
+                str(record.get("memory_type", "fact")),
+                float(record.get("memory_score", 0.0) or 0.0),
+                str(record.get("status", "Active")),
+                float(record.get("ttl_days", 0.0) or 0.0),
+                json.dumps(record, ensure_ascii=False),
+                now,
+            )
+            for record in records
+        ],
+    )
+
+
+def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: list[dict]):
+    """Rebuild memory only for changed claims and their direct conflict peers."""
+    from vector_lake import governance_metrics
+
+    conn = get_connection()
+    proposed_claim_ids = {record["claim_id"] for record in proposed_claims}
+    changed_claim_ids = old_claim_ids | proposed_claim_ids
+    old_memories = []
+    if changed_claim_ids:
+        placeholders = ",".join("?" for _ in changed_claim_ids)
+        old_memories = [
+            json.loads(row["data_json"])
+            for row in conn.execute(
+                f"SELECT data_json FROM operational_memory "
+                f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
+                tuple(sorted(changed_claim_ids)),
+            ).fetchall()
+        ]
+        conn.execute(
+            f"DELETE FROM operational_memory "
+            f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
+            tuple(sorted(changed_claim_ids)),
+        )
+
+    new_memories = [
+        _memory_object_from_claim(governance_metrics.annotate_claim_validity(record))
+        for record in proposed_claims
+    ]
+    _upsert_operational_memory_records(new_memories)
+
+    related_claim_ids = set(changed_claim_ids)
+    impacted_keys = set()
+    for memory in [*old_memories, *new_memories]:
+        related_claim_ids.update(memory.get("contradicts_claim_ids", []))
+        if memory.get("memory_type") != "fact":
+            impacted_keys.add((memory.get("memory_type"), memory.get("memory_key")))
+
+    peer_rows = []
+    if related_claim_ids:
+        placeholders = ",".join("?" for _ in related_claim_ids)
+        peer_rows.extend(
+            conn.execute(
+                f"SELECT data_json FROM operational_memory "
+                f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
+                tuple(sorted(related_claim_ids)),
+            ).fetchall()
+        )
+    for memory_type, memory_key in sorted(impacted_keys):
+        peer_rows.extend(
+            conn.execute(
+                "SELECT data_json FROM operational_memory "
+                "WHERE memory_type = ? AND json_extract(data_json, '$.memory_key') = ?",
+                (memory_type, memory_key),
+            ).fetchall()
+        )
+
+    peer_store = _default_map_store("memory_id")
+    for row in peer_rows:
+        memory = json.loads(row["data_json"])
+        if (memory.get("conflict_resolution") or {}).get("state") == "superseded":
+            memory["validity_state"] = "active"
+            memory.pop("superseded_by", None)
+            memory.pop("conflict_resolution", None)
+            memory.update(score_memory_object(memory))
+        peer_store["items"][memory["memory_id"]] = memory
+    if peer_store["items"]:
+        _resolve_memory_conflicts(peer_store)
+        _upsert_operational_memory_records(list(peer_store["items"].values()))
+
+
+def _refresh_alias_delta(old_entity_ids: set[str], proposed_entities: list[dict]):
+    conn = get_connection()
+    affected_entity_ids = old_entity_ids | {record["entity_id"] for record in proposed_entities}
+    if affected_entity_ids:
+        placeholders = ",".join("?" for _ in affected_entity_ids)
+        conn.execute(
+            f"DELETE FROM alias_registry WHERE value IN ({placeholders})",
+            tuple(sorted(affected_entity_ids)),
+        )
+    now = _utc_now()
+    aliases = []
+    for entity in proposed_entities:
+        entity_id = entity["entity_id"]
+        aliases.append((str(entity.get("canonical_name") or entity.get("title") or entity_id), entity_id, now))
+        aliases.extend((str(alias), entity_id, now) for alias in entity.get("aliases", []) if alias)
+    if aliases:
+        conn.executemany(
+            "INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)",
+            aliases,
+        )
 
 
 def rebuild_alias_registry():
@@ -1013,79 +1194,220 @@ def create_change_set(
         },
     }
 
-    if auto_approve:
-        apply_change_set(change_set)
-        change_set["published_at"] = _utc_now()
-    else:
-        queue = load_governance_queue()
-        queue["items"].append({
-            "item_id": f"gov_{uuid.uuid4().hex[:12]}",
-            "type": "publish-candidate",
-            "title": change_set["summary"],
-            "description": f"Pending publish candidate from {origin}",
-            "created_at": change_set["created_at"],
-            "status": "pending",
-            "source": origin,
-            "affected_ids": change_set["affected_ids"],
-            "change_set_id": change_set["change_set_id"],
-            "search_queries": [],
-            "affected_pages": [os.path.basename(path) for path in page_paths],
-        })
-        save_governance_queue(queue)
+    with transaction():
+        if auto_approve:
+            apply_change_set(change_set)
+            change_set["published_at"] = _utc_now()
+        else:
+            queue = load_governance_queue()
+            queue["items"].append({
+                "item_id": f"gov_{uuid.uuid4().hex[:12]}",
+                "type": "publish-candidate",
+                "title": change_set["summary"],
+                "description": f"Pending publish candidate from {origin}",
+                "created_at": change_set["created_at"],
+                "status": "pending",
+                "source": origin,
+                "affected_ids": change_set["affected_ids"],
+                "change_set_id": change_set["change_set_id"],
+                "search_queries": [],
+                "affected_pages": [os.path.basename(path) for path in page_paths],
+            })
+            save_governance_queue(queue)
 
-    existing_change_sets["items"].append(change_set)
-    save_change_sets(existing_change_sets)
+        existing_change_sets["items"].append(change_set)
+        save_change_sets(existing_change_sets)
     return change_set
 
 
-def apply_change_set(change_set: dict) -> dict:
-    entities = load_entities()
-    claims = load_claims()
-    evidence = load_evidence()
-    sources = load_sources()
+def prepare_change_set_from_content(
+    filename: str,
+    content: str,
+    origin: str,
+    summary: str | None = None,
+    auto_approve: bool = False,
+) -> dict:
+    """Build one canonical change set without applying or persisting it."""
+    initialize_meta_store()
+    frontmatter, body = split_frontmatter(content)
+    extracted = extract_page_objects(filename, frontmatter, body)
+    if not extracted.get("entities") and not filename.startswith("System_"):
+        raise ValueError(f"No canonical entity could be extracted from {filename}.")
 
-    affected_pages = change_set.get("affected_pages", [])
-    affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
+    page_key = extracted["page_key"]
+    fingerprint = hashlib.sha1(content.encode("utf-8")).hexdigest()
+    idempotency_key = _stable_id("changeset_idem", "|".join([origin, page_key, fingerprint]))
 
+    proposed_entities = extracted.get("entities", [])
+    proposed_claims = extracted.get("claims", [])
+    return {
+        "change_set_id": f"changeset_{uuid.uuid4().hex[:12]}",
+        "idempotency_key": idempotency_key,
+        "origin": origin,
+        "created_at": _utc_now(),
+        "status": "published" if auto_approve else "pending",
+        "summary": summary or f"Sync page: {page_key}",
+        "risk_level": "low",
+        "requires_human_review": not auto_approve,
+        "affected_ids": sorted({
+            *[record["entity_id"] for record in proposed_entities],
+            *[record["claim_id"] for record in proposed_claims],
+        }),
+        "affected_pages": [filename],
+        "proposed_entities": proposed_entities,
+        "proposed_claims": proposed_claims,
+        "proposed_evidence": extracted.get("evidence", []),
+        "proposed_source_updates": extracted.get("sources", []),
+        "proposed_edges": extracted.get("edges", []),
+        "write_contract": {
+            "transactional": True,
+            "idempotent": True,
+            "canonical_targets": ["entities", "claims", "evidence", "sources", "operational_memory"],
+        },
+    }
+
+
+def record_prepared_change_sets(change_sets: list[dict]) -> int:
+    """Persist prepared change sets once without scanning the JSON history."""
+    if not change_sets:
+        return 0
+    conn = get_connection()
+    now = _utc_now()
+    added = 0
+    with transaction():
+        for change_set in change_sets:
+            idempotency_key = str(change_set.get("idempotency_key") or change_set["change_set_id"])
+            reserved = conn.execute(
+                "INSERT OR IGNORE INTO change_set_idempotency "
+                "(idempotency_key, change_set_id, created_at) VALUES (?, ?, ?)",
+                (idempotency_key, change_set["change_set_id"], now),
+            )
+            if not reserved.rowcount:
+                continue
+            conn.execute(
+                "INSERT INTO change_sets (change_set_id, data_json, updated_at) VALUES (?, ?, ?)",
+                (change_set["change_set_id"], json.dumps(change_set, ensure_ascii=False), now),
+            )
+            added += 1
+    return added
+
+
+def create_change_set_from_content(
+    filename: str,
+    content: str,
+    origin: str,
+    summary: str | None = None,
+    auto_approve: bool = False,
+) -> dict:
+    """Create a canonical change set without requiring Markdown to be written first."""
+    change_set = prepare_change_set_from_content(
+        filename,
+        content,
+        origin,
+        summary=summary,
+        auto_approve=auto_approve,
+    )
+    existing_change_sets = load_change_sets()
+    for existing in existing_change_sets["items"]:
+        if existing.get("idempotency_key") == change_set["idempotency_key"]:
+            duplicate = copy.deepcopy(existing)
+            duplicate["deduplicated"] = True
+            return duplicate
+
+    with transaction():
+        if auto_approve:
+            apply_change_sets_batch([change_set])
+            change_set["published_at"] = _utc_now()
+        else:
+            queue = load_governance_queue()
+            queue["items"].append({
+                "item_id": f"gov_{uuid.uuid4().hex[:12]}",
+                "type": "publish-candidate",
+                "title": change_set["summary"],
+                "description": f"Pending publish candidate from {origin}",
+                "created_at": change_set["created_at"],
+                "status": "pending",
+                "source": origin,
+                "affected_ids": change_set["affected_ids"],
+                "change_set_id": change_set["change_set_id"],
+                "search_queries": [],
+                "affected_pages": [filename],
+            })
+            save_governance_queue(queue)
+
+        record_prepared_change_sets([change_set])
+    return change_set
+
+
+def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
+    """Apply a page-scoped canonical delta inside an existing transaction."""
+    if not change_sets:
+        return []
+    affected_pages = {
+        page
+        for change_set in change_sets
+        for page in change_set.get("affected_pages", [])
+    }
+    affected_page_keys = {
+        page[:-3] if page.endswith(".md") else page
+        for page in affected_pages
+    }
+    proposed_entities = [record for item in change_sets for record in item.get("proposed_entities", [])]
+    proposed_claims = [record for item in change_sets for record in item.get("proposed_claims", [])]
+    proposed_evidence = [record for item in change_sets for record in item.get("proposed_evidence", [])]
+    proposed_sources = [record for item in change_sets for record in item.get("proposed_source_updates", [])]
+    proposed_edges = [record for item in change_sets for record in item.get("proposed_edges", [])]
+
+    conn = get_connection()
+    old_entity_ids: set[str] = set()
+    old_claim_ids: set[str] = set()
+    old_claim_rows = []
     if affected_page_keys:
-        proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
-        proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
+        affected_page_params = tuple(sorted(affected_page_keys))
+        placeholders = ",".join("?" for _ in affected_page_params)
+        old_entity_ids = {
+            row["entity_id"]
+            for row in conn.execute(
+                f"SELECT entity_id FROM entities WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
+                affected_page_params,
+            )
+        }
+        old_claim_rows = conn.execute(
+            f"SELECT claim_id, claim_text, data_json, updated_at FROM claims "
+            f"WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
+            affected_page_params,
+        ).fetchall()
+        old_claim_ids = {row["claim_id"] for row in old_claim_rows}
+        conn.execute(
+            f"DELETE FROM entities WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
+            affected_page_params,
+        )
+        conn.execute(
+            f"DELETE FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
+            affected_page_params,
+        )
+        conn.execute(
+            f"DELETE FROM evidence WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
+            affected_page_params,
+        )
+        conn.execute(
+            f"DELETE FROM claim_graph_edges WHERE source_id IN ({placeholders})",
+            affected_page_params,
+        )
 
-        # Prune claims no longer in the markdown
-        keys_to_remove = []
-        for k, v in claims.get("items", {}).items():
-            locator_page = v.get("locator", {}).get("page_key")
-            if locator_page in affected_page_keys and k not in proposed_claim_ids:
-                keys_to_remove.append(k)
-        for k in keys_to_remove:
-            del claims["items"][k]
-            
-        # Prune evidence no longer in the markdown
-        keys_to_remove = []
-        for k, v in evidence.get("items", {}).items():
-            locator_page = v.get("locator", {}).get("page_key")
-            if locator_page in affected_page_keys and k not in proposed_evidence_ids:
-                keys_to_remove.append(k)
-        for k in keys_to_remove:
-            del evidence["items"][k]
+    _upsert_canonical_records("entities", "entity_id", proposed_entities)
+    _upsert_canonical_records("claims", "claim_id", proposed_claims)
+    _upsert_canonical_records("evidence", "evidence_id", proposed_evidence)
+    _upsert_canonical_records("sources", "source_id", proposed_sources)
+    _refresh_alias_delta(old_entity_ids, proposed_entities)
+    _refresh_operational_memory_delta(old_claim_ids, proposed_claims)
+    from vector_lake.tool_timeline import sync_timeline_events_for_claim_delta
 
-    _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
-    _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
-    _upsert_map_records(evidence, change_set.get("proposed_evidence", []), "evidence_id")
-    _upsert_map_records(sources, change_set.get("proposed_source_updates", []), "source_id")
-
-    save_entities(entities)
-    save_claims(claims)
-    save_evidence(evidence)
-    save_sources(sources)
-    save_graph_edges(change_set.get("proposed_edges", []))
-    rebuild_alias_registry()
-    try:
-        memory_store = rebuild_operational_memory()
-        change_set["operational_memory_count"] = len(memory_store.get("items", {}))
-        change_set["conflict_event_count"] = len(memory_store.get("conflict_events", []))
-    except Exception as exc:
-        log.warning(f"Operational memory rebuild failed for {change_set.get('change_set_id')}: {exc}")
+    sync_timeline_events_for_claim_delta(old_claim_rows, proposed_claims)
+    save_graph_edges(proposed_edges)
+    memory_count = conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0]
+    for change_set in change_sets:
+        change_set["operational_memory_count"] = int(memory_count)
     # Obsolete view_builder block removed to prevent ImportError warnings
     # try:
     #     from vector_lake import view_builder
@@ -1093,6 +1415,17 @@ def apply_change_set(change_set: dict) -> dict:
     #     change_set["view_rebuild"] = view_builder.rebuild_views_for_change_set(change_set)
     # except Exception as exc:
     #     log.warning(f"View rebuild failed for {change_set.get('change_set_id')}: {exc}")
+    return change_sets
+
+
+def apply_change_sets_batch(change_sets: list[dict]) -> list[dict]:
+    """Atomically apply page-scoped canonical and derived projection deltas."""
+    with transaction():
+        return _apply_change_sets_batch_unchecked(change_sets)
+
+
+def apply_change_set(change_set: dict) -> dict:
+    apply_change_sets_batch([change_set])
     return change_set
 
 
@@ -1162,52 +1495,38 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
         if name.endswith(".md") and name not in ("index.md", "log.md", "overview.md"):
             page_paths.append(str(wiki_dir / name))
 
-    initialize_meta_store()
     if dry_run:
-        preview = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration dry-run", auto_approve=False)
-        change_sets = load_change_sets()
-        change_sets["items"] = [item for item in change_sets["items"] if item["change_set_id"] != preview["change_set_id"]]
-        save_change_sets(change_sets)
-        queue = load_governance_queue()
-        queue["items"] = [item for item in queue["items"] if item.get("change_set_id") != preview["change_set_id"]]
-        save_governance_queue(queue)
+        counts = {"entities": 0, "claims": 0, "evidence": 0, "sources": 0, "valid_pages": 0}
+        for page_path in page_paths:
+            frontmatter, body, _ = read_markdown_file(page_path)
+            extracted = extract_page_objects(page_path, frontmatter, body)
+            if extracted.get("entities") or os.path.basename(page_path).startswith("System_"):
+                counts["valid_pages"] += 1
+            counts["entities"] += len(extracted.get("entities", []))
+            counts["claims"] += len(extracted.get("claims", []))
+            counts["evidence"] += len(extracted.get("evidence", []))
+            counts["sources"] += len(extracted.get("sources", []))
         return {
             "dry_run": True,
             "pages_scanned": len(page_paths),
-            "entities": len(preview["proposed_entities"]),
-            "claims": len(preview["proposed_claims"]),
-            "evidence": len(preview["proposed_evidence"]),
-            "sources": len(preview["proposed_source_updates"]),
+            **counts,
         }
 
-    entities = _default_map_store("entity_id")
-    claims = _default_map_store("claim_id")
-    evidence = _default_map_store("evidence_id")
-    sources = _default_map_store("source_id")
-    alias_registry = _default_map_store("alias")
-    memory_objects = _default_map_store("memory_id")
-    save_entities(entities)
-    save_claims(claims)
-    save_evidence(evidence)
-    save_sources(sources)
-    save_alias_registry(alias_registry)
-    save_memory_objects(memory_objects)
-
+    initialize_meta_store()
     change_set = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration", auto_approve=True, force=True)
-    change_sets = load_change_sets()
-    for item in change_sets["items"]:
-        if item["change_set_id"] == change_set["change_set_id"]:
-            item["status"] = "published"
-            item["published_at"] = _utc_now()
-    save_change_sets(change_sets)
+    migrated_page_keys = {item.get("page_key") for item in change_set.get("proposed_entities", []) if item.get("page_key")}
+    canonical_page_keys = {item.get("page_key") for item in load_entities()["items"].values() if item.get("page_key")}
+    stale_entities = canonical_page_keys - migrated_page_keys
 
     return {
         "dry_run": False,
+        "change_set_id": change_set["change_set_id"],
         "pages_scanned": len(page_paths),
         "entities": len(load_entities()["items"]),
         "claims": len(load_claims()["items"]),
         "evidence": len(load_evidence()["items"]),
         "sources": len(load_sources()["items"]),
+        "stale_entities_preserved": len(stale_entities),
     }
 
 

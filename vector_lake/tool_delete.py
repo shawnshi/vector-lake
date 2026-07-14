@@ -83,30 +83,27 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
     updated = 0
     failures = []
     
-    from vector_lake.mutation_coordinator import execute_mutation_plan
-    import yaml
-    
+    from vector_lake.mutation_coordinator import execute_mutation_batch
+
+    mutations = []
     for action, filepath, _, frontmatter, body in actions:
         filename = os.path.basename(filepath)
         if action == "DELETE":
-            try:
-                # Backup logic is already in execute_mutation_plan, but let's keep it here for raw source tracking if needed
-                execute_mutation_plan(filename, is_delete=True)
-                deleted += 1
-                log.info(f"Deleted (backed up): {filepath}")
-            except Exception as e:
-                failures.append(f"DELETE {filepath}: {e}")
-                log.warning(f"Failed to delete {filepath}: {e}")
+            mutations.append({"filename": filename, "is_delete": True})
+            deleted += 1
         elif action == "REMOVE_REF":
-            try:
-                fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
-                new_content = f"---\n{fm_str}---\n{body}"
-                execute_mutation_plan(filename, content=new_content, is_delete=False)
-                updated += 1
-                log.info(f"Removed source ref from: {filepath}")
-            except Exception as e:
-                failures.append(f"REMOVE_REF {filepath}: {e}")
-                log.warning(f"Failed to update {filepath}: {e}")
+            fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
+            mutations.append({"filename": filename, "content": f"---\n{fm_str}---\n{body}"})
+            updated += 1
+
+    if mutations:
+        try:
+            execute_mutation_batch(mutations)
+        except Exception as exc:
+            failures.append(f"ATOMIC_WIKI_CLEANUP: {exc}")
+            deleted = 0
+            updated = 0
+            log.warning("Atomic wiki cleanup failed: %s", exc)
 
     raw_deleted = False
     if failures:
@@ -119,14 +116,8 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
         except Exception as e:
             log.warning(f"Failed to delete raw source {raw_path}: {e}")
 
-    from vector_lake import get_extension_root
-    tmp_dir = get_extension_root() / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    with open(tmp_dir / "flag_reindex.lock", "w") as f:
-        f.write("1")
-        
     lines.append("")
-    lines.append(f"Executed: raw_deleted={raw_deleted}, wiki_deleted={deleted}, wiki_updated={updated}. Async index rebuild scheduled.")
+    lines.append(f"Executed: raw_deleted={raw_deleted}, wiki_deleted={deleted}, wiki_updated={updated}. Projection updates queued transactionally.")
     if failures:
         lines.append("Warnings:")
         for failure in failures:

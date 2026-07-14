@@ -44,6 +44,13 @@ Usage Examples:
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available wiki operations")
 
     subparsers.add_parser("sync", help="[INGEST] Generates MCP ingestion instructions for Native Subagents.")
+    ingest_tasks_parser = subparsers.add_parser("ingest-tasks", help="[INGEST] List or expire subagent ingest tasks.")
+    ingest_tasks_parser.add_argument("--limit", type=int, default=20, help="Maximum number of jobs to list.")
+    ingest_tasks_parser.add_argument("--awaiting-only", action="store_true", help="Hide queued jobs and show only awaiting-subagent jobs.")
+    ingest_tasks_parser.add_argument("--expire-stale", action="store_true", help="Expire stale awaiting-subagent jobs instead of listing.")
+    ingest_tasks_parser.add_argument("--claim", action="store_true", help="Lease awaiting task packets to this host runtime.")
+    ingest_tasks_parser.add_argument("--max-age-seconds", type=int, default=86400, help="Age threshold for --expire-stale.")
+    ingest_tasks_parser.add_argument("--lease-seconds", type=int, default=3600, help="Lease duration for --claim.")
 
     lint_parser = subparsers.add_parser("lint", help="[LINT] Run self-healing audit on the Wiki nodes.")
     lint_parser.add_argument("--auto-fix", action="store_true", help="Automatically fix issues such as decaying notes.")
@@ -61,6 +68,28 @@ Usage Examples:
     query_parser.add_argument("--dry-run", action="store_true", help="Output Markdown to stdout only without persisting to disk.")
 
     subparsers.add_parser("graph", help="[GRAPH] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.")
+    timeline_rebuild_parser = subparsers.add_parser("timeline-rebuild", help="[TIMELINE] Rebuild timeline_events from timeline-event claims.")
+    timeline_rebuild_parser.add_argument("--apply", action="store_true", help="Persist the rebuilt projection. Defaults to dry-run.")
+    timeline_rebuild_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of claims to project.")
+
+    projection_report_parser = subparsers.add_parser("projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift.")
+    projection_report_parser.add_argument("--limit", type=int, default=20, help="Sample size per drift bucket.")
+
+    canonical_backfill_parser = subparsers.add_parser("canonical-backfill", help="[MAINTENANCE] Backfill missing canonical rows from Wiki pages.")
+    canonical_backfill_parser.add_argument("--apply", action="store_true", help="Persist the backfill. Defaults to dry-run.")
+    canonical_backfill_parser.add_argument("--limit", type=int, default=50, help="Maximum number of missing pages to process.")
+
+    index_rebuild_parser = subparsers.add_parser("projection-rebuild-index", help="[MAINTENANCE] Rebuild index projection from canonical SQLite.")
+    index_rebuild_parser.add_argument("--apply", action="store_true", help="Persist rebuilt index projection. Defaults to dry-run.")
+
+    embedding_backfill_parser = subparsers.add_parser("embedding-backfill", help="[MAINTENANCE] Backfill missing vector embeddings under rate limits.")
+    embedding_backfill_parser.add_argument("--apply", action="store_true", help="Persist embeddings. Defaults to dry-run.")
+    embedding_backfill_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of nodes to embed.")
+    embedding_backfill_parser.add_argument("--include-existing", action="store_true", help="Re-embed nodes that already have vectors.")
+
+    wiki_restore_parser = subparsers.add_parser("wiki-restore", help="[MAINTENANCE] Restore missing Wiki pages from canonical metadata.")
+    wiki_restore_parser.add_argument("--apply", action="store_true", help="Persist restored Markdown pages. Defaults to dry-run.")
+    wiki_restore_parser.add_argument("--limit", type=int, default=10, help="Maximum number of canonical-only pages to restore.")
 
     review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.")
     review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve", "ground"], help="Action: 'list' (default), 'resolve', or 'ground'.")
@@ -101,14 +130,21 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        requires_key = ["sync", "query"]
-        if args.command in requires_key and not os.environ.get("GEMINI_API_KEY"):
-            print(f"ERROR: Command '{args.command}' requires GEMINI_API_KEY to be set.", file=sys.stderr)
-            print("Please configure it in your environment or ~/.gemini/.env file.", file=sys.stderr)
-            return 1
-
         if args.command == "sync":
             print(tools.sync_vector_lake())
+        elif args.command == "ingest-tasks":
+            if getattr(args, "expire_stale", False):
+                print(tools.expire_ingest_tasks(getattr(args, "max_age_seconds", 86400)))
+            elif getattr(args, "claim", False):
+                print(tools.claim_ingest_tasks(
+                    limit=getattr(args, "limit", 20),
+                    lease_seconds=getattr(args, "lease_seconds", 3600),
+                ))
+            else:
+                print(tools.list_ingest_tasks(
+                    limit=getattr(args, "limit", 20),
+                    include_queued=not getattr(args, "awaiting_only", False),
+                ))
         elif args.command == "search":
             print(tools.search_vector_lake(
                 args.query,
@@ -124,6 +160,31 @@ def main() -> int:
             print(tools.prepare_query_context(args.query_str, getattr(args, "dry_run", False)))
         elif args.command == "graph":
             print(tools.visualize_vector_lake())
+        elif args.command == "timeline-rebuild":
+            print(tools.rebuild_timeline_events_from_claims(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", None),
+            ))
+        elif args.command == "projection-report":
+            print(tools.projection_diff_report(limit=getattr(args, "limit", 20)))
+        elif args.command == "canonical-backfill":
+            print(tools.canonical_backfill_missing_wiki(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", 50),
+            ))
+        elif args.command == "projection-rebuild-index":
+            print(tools.rebuild_index_projection(dry_run=not getattr(args, "apply", False)))
+        elif args.command == "embedding-backfill":
+            print(tools.embedding_backfill_projection(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", None),
+                include_existing=getattr(args, "include_existing", False),
+            ))
+        elif args.command == "wiki-restore":
+            print(tools.restore_missing_wiki_from_canonical(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", 10),
+            ))
         elif args.command == "review":
             print(tools.review_vector_lake(action=args.action, index=args.index, resolution=getattr(args, "resolution", "skip")))
         elif args.command == "audit-graph":

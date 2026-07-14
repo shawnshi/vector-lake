@@ -1,15 +1,17 @@
 import importlib
 import os
-import shutil
 import sys
 import ast
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from vector_lake import governance_store
 from vector_lake.wiki_utils import get_index_path, get_memory_dir, get_raw_dir, get_wiki_dir, get_meta_dir
 from vector_lake.db_store import get_db_path, get_connection
 from vector_lake import get_extension_root
+from vector_lake.native_llm import native_llm_ready
+from vector_lake.runtime_health import assess_runtime_health
 
 def _check_ast(module_path: Path) -> tuple[bool, str]:
     if not module_path.exists():
@@ -31,7 +33,7 @@ def doctor_vector_lake() -> str:
     checks.append(("Python", python_ok, f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"))
 
     has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
-    checks.append(("GEMINI_API_KEY", has_api_key, "Set" if has_api_key else "Missing"))
+    checks.append(("GEMINI_API_KEY", True, "Set" if has_api_key else "Not set (optional; embeddings disabled)"))
 
     # 2. Dependencies
     dependencies = {
@@ -54,9 +56,8 @@ def doctor_vector_lake() -> str:
         except ImportError:
             checks.append((package_name, False, "missing"))
             
-    # Check agy CLI
-    agy_ok = shutil.which("agy") is not None
-    checks.append(("agy CLI", agy_ok, "available" if agy_ok else "missing in PATH"))
+    llm_ok, llm_detail = native_llm_ready()
+    checks.append(("Subagent Text Runtime", True, llm_detail if llm_ok else llm_detail))
 
     # 3. Paths & Basic Files
     for label, path in [("MEMORY", get_memory_dir()), ("Raw", get_raw_dir()), ("Wiki", get_wiki_dir())]:
@@ -77,18 +78,39 @@ def doctor_vector_lake() -> str:
     # 5. MCP Discovery / Import check
     try:
         from vector_lake.mcp_server import mcp
-        tools_count = len(mcp._tools) if hasattr(mcp, "_tools") else 0
-        checks.append(("MCP Server", True, f"Import OK, {tools_count} tools exposed"))
+        manager = getattr(mcp, "_tool_manager", None)
+        registered = getattr(manager, "_tools", {}) if manager is not None else {}
+        tools_count = len(registered) if registered is not None else 0
+        checks.append(("MCP Server", tools_count > 0, f"Import OK, {tools_count} tools exposed"))
     except Exception as e:
         checks.append(("MCP Server", False, f"Startup Exception: {e}"))
 
     # 6. Watchdog Heartbeat
-    status_path = get_extension_root() / "tmp" / "watchdog_status.json"
+    status_path = get_meta_dir() / ".watchdog_status.json"
     if status_path.exists():
         try:
             with open(status_path, "r", encoding="utf-8") as f:
                 status = json.load(f)
-            checks.append(("Watchdog Status", True, f"[{status.get('state', 'unknown')}] {status.get('message', '')}"))
+            updated_at = status.get("updated_at")
+            age_seconds = None
+            if updated_at:
+                updated_dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+                if updated_dt.tzinfo is None:
+                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                age_seconds = max(0, int((datetime.now(timezone.utc) - updated_dt).total_seconds()))
+            unhealthy_components = [
+                name
+                for name, component in (status.get("components") or {}).items()
+                if str(component.get("status", "")).lower() in {"error", "halted"}
+            ]
+            heartbeat_ok = (
+                age_seconds is not None
+                and age_seconds <= 120
+                and str(status.get("status", "")).lower() not in {"error", "halted"}
+                and not unhealthy_components
+            )
+            detail = f"[{status.get('status', 'unknown')}] {status.get('current_action', '')}; age={age_seconds if age_seconds is not None else 'unknown'}s"
+            checks.append(("Watchdog Status", heartbeat_ok, detail))
         except Exception as e:
             checks.append(("Watchdog Status", False, f"Parse error: {e}"))
     else:
@@ -96,19 +118,66 @@ def doctor_vector_lake() -> str:
 
     # 7. State Projection Consistency
     try:
-        # Wiki Files
-        wiki_files_count = len([f for f in get_wiki_dir().glob("*.md") if f.is_file()])
-        # JSON Index
+        excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
+        wiki_keys = {
+            path.stem for path in get_wiki_dir().glob("*.md")
+            if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
+        }
         with open(get_index_path(), "r", encoding="utf-8") as f:
-            index_nodes = len(json.load(f).get("nodes", {}))
-        # SQLite
+            index_keys = {
+                key for key in json.load(f).get("nodes", {})
+                if not str(key).startswith("System_")
+            }
         conn = get_connection()
-        sqlite_entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-        
-        # Simple heuristic: if difference > 50, flag as inconsistent
-        diff = max(abs(wiki_files_count - index_nodes), abs(wiki_files_count - sqlite_entities), abs(index_nodes - sqlite_entities))
-        consistent = diff <= 50
-        checks.append(("State Consistency", consistent, f"Wiki:{wiki_files_count} JSON:{index_nodes} SQLite:{sqlite_entities}"))
+        canonical_keys = {
+            row["page_key"] for row in conn.execute(
+                "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
+                "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
+            )
+            if not str(row["page_key"]).startswith("System_")
+        }
+        missing_index = canonical_keys - index_keys
+        extra_index = index_keys - canonical_keys
+        missing_canonical = wiki_keys - canonical_keys
+        extra_canonical = canonical_keys - wiki_keys
+        consistent = not (missing_index or extra_index or missing_canonical or extra_canonical)
+        checks.append((
+            "State Consistency",
+            consistent,
+            f"Wiki:{len(wiki_keys)} JSON:{len(index_keys)} SQLite:{len(canonical_keys)} "
+            f"missing_index:{len(missing_index)} extra_index:{len(extra_index)} "
+            f"missing_canonical:{len(missing_canonical)} extra_canonical:{len(extra_canonical)}",
+        ))
+
+        outbox_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute("SELECT status, COUNT(*) AS count FROM mutation_outbox GROUP BY status")
+        }
+        outbox_ok = outbox_counts.get("failed", 0) == 0
+        checks.append(("Mutation Outbox", outbox_ok, json.dumps(outbox_counts, ensure_ascii=False, sort_keys=True)))
+
+        terminal_jobs = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
+        ).fetchone()[0]
+        queued_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'queued'").fetchone()[0]
+        awaiting_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'").fetchone()[0]
+        checks.append((
+            "Ingest Jobs",
+            terminal_jobs == 0,
+            f"queued:{queued_jobs} awaiting_subagent:{awaiting_jobs} terminal_failed:{terminal_jobs}",
+        ))
+
+        health = assess_runtime_health(deep_projection_checks=True)
+        checks.append((
+            "Write Gate",
+            health["ok"],
+            (
+                "clean"
+                + (f"; warnings: {'; '.join(health['warnings'])}" if health["warnings"] else "")
+                if health["ok"]
+                else "; ".join(health["issues"])
+            ),
+        ))
     except Exception as e:
         checks.append(("State Consistency", False, f"Check failed: {e}"))
 

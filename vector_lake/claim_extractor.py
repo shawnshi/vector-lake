@@ -177,23 +177,56 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
     evidence_records = []
     claim_records = []
 
-    if page_type != "source":
-        entity_id = frontmatter.get("entity_id") or _stable_id("entity", page_key)
-        subject_entity_ids.append(entity_id)
-        entity_records.append({
-            "entity_id": entity_id,
-            "canonical_name": title,
-            "entity_type": page_type,
-            "status": frontmatter.get("status", "Active"),
-            "aliases": aliases,
-            "domain": frontmatter.get("domain", "General"),
-            "topic_cluster": frontmatter.get("topic_cluster", "General"),
-            "tags": _jsonable(frontmatter.get("tags", [])),
-            "page_key": page_key,
-            "created_at": _jsonable(frontmatter.get("created", now)),
-            "updated_at": _jsonable(frontmatter.get("updated", now)),
-            "source_page": page_name,
-        })
+    clean_body = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+    clean_body = re.sub(r"`.*?`", "", clean_body)
+    triples = []
+    links = set()
+    page_edges = []
+    for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", clean_body):
+        predicate = match.group(1).strip()
+        target = match.group(2).split("|")[0].strip().replace(".md", "")
+        if target:
+            links.add(target)
+            triples.append({"predicate": predicate, "target": target})
+            page_edges.append({
+                "source_id": page_key,
+                "target_id": target,
+                "relation": predicate,
+                "weight": 1.0,
+                "updated_at": now,
+            })
+
+    entity_id = frontmatter.get("entity_id") or _stable_id("entity", page_key)
+    subject_entity_ids.append(entity_id)
+    entity_records.append({
+        "entity_id": entity_id,
+        "id": frontmatter.get("id") or entity_id,
+        "page_key": page_key,
+        "canonical_name": title,
+        "title": title,
+        "type": page_type,
+        "entity_type": page_type,
+        "status": frontmatter.get("status", "Active"),
+        "epistemic-status": frontmatter.get("epistemic-status", "draft"),
+        "aliases": aliases,
+        "domain": frontmatter.get("domain", "General"),
+        "topic_cluster": frontmatter.get("topic_cluster", "General"),
+        "categories": _jsonable(frontmatter.get("categories", [])),
+        "tags": _jsonable(frontmatter.get("tags", [])),
+        "sources": sources,
+        "tension_edges": _jsonable(frontmatter.get("tension_edges", [])),
+        "relations": _jsonable(frontmatter.get("relations", [])),
+        "links": sorted(links),
+        "outbound_links": sorted(links),
+        "triples": triples,
+        "summary": summary,
+        "raw_text": body,
+        "ttl": frontmatter.get("ttl"),
+        "created_at": _jsonable(frontmatter.get("created", now)),
+        "updated": _jsonable(frontmatter.get("updated", now)),
+        "updated_at": _jsonable(frontmatter.get("updated", now)),
+        "source_page": page_name,
+    })
 
     source_ids = []
     for raw_ref in sources:
@@ -341,13 +374,6 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             claim_records.append(summary_claim)
             for evidence_record in evidence_records[-len(summary_evidence_ids):]:
                 evidence_record["supports_claim_ids"].append(summary_claim_id)
-
-    page_edges = []
-    for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", body):
-        predicate = match.group(1).strip()
-        target = match.group(2).split("|")[0].strip().replace(".md", "")
-        if target:
-            page_edges.append({"source_id": page_key, "target_id": target, "relation": predicate, "weight": 1.0, "updated_at": now})
 
     return {
         "entities": entity_records,

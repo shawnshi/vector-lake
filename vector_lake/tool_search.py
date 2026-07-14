@@ -2,8 +2,6 @@ import json
 import logging
 import os
 import re
-import subprocess
-import shutil
 from datetime import datetime, timezone
 
 import functools
@@ -12,9 +10,6 @@ import pickle
 import ast
 import operator
 from filelock import FileLock, Timeout
-import threading
-
-AGY_SEMAPHORE = threading.Semaphore(3)
 
 from vector_lake import governance_store
 from vector_lake import db_store
@@ -52,14 +47,10 @@ def _get_query_embedding(query: str) -> list[float]:
     if not os.environ.get("GEMINI_API_KEY"):
         return []
     try:
-        from google import genai
-        client = genai.Client()
-        response = client.models.embed_content(
-            model="gemini-embedding-2",
-            contents=query
-        )
-        if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-            return response.embeddings[0].values
+        from vector_lake.embedding_scheduler import embed_texts
+
+        embeddings = embed_texts([query])
+        return embeddings[0] if embeddings else []
     except Exception as e:
         log.warning(f"Failed to get query embedding: {e}")
     return []
@@ -136,33 +127,11 @@ def _classify_intent(query: str) -> str:
 
 
 @functools.lru_cache(maxsize=128)
-def _expand_query_with_llm(query: str) -> list[str]:
+def _expand_query_locally(query: str) -> list[str]:
     expanded_terms = set([query])
     for key, expansions in QUERY_EXPANSION_DICT.items():
         if key in query:
             expanded_terms.update(expansions)
-            
-    try:
-        import json, time, shutil, subprocess
-        agy_exec = shutil.which("agy")
-        if agy_exec and os.environ.get("VECTOR_LAKE_FAST_SEARCH") != "1":
-            prompt = f"Expand the following search query into 5 to 8 precise, distinct keywords or synonyms (including English/Chinese terms if relevant). Output ONLY a JSON array of strings. Query: '{query}'"
-            for attempt in range(1):
-                try:
-                    with AGY_SEMAPHORE:
-                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=8)
-                    if result.returncode == 0:
-                        stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                        match = re.search(r"\[.*?\]", stdout_str, re.DOTALL)
-                        if match:
-                            terms = json.loads(match.group(0))
-                            expanded_terms.update([str(t) for t in terms])
-                            break
-                except Exception as e:
-                    log.warning(f"agy expansion failed on attempt {attempt+1}: {e}")
-                    time.sleep(1)
-    except Exception as e:
-        log.warning(f"LLM query expansion failed: {e}")
 
     tokens = set()
     try:
@@ -308,59 +277,7 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     }
 
 
-def _rerank_candidates_with_llm(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
-    if not candidates or len(candidates) <= 3:
-        return candidates
-        
-    wiki_dir = str(get_wiki_dir())
-    candidate_prompts = []
-    
-    for idx, (score, node) in enumerate(candidates):
-        filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
-        snippet = ""
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                    content = handle.read()
-                snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:150].strip()
-            except Exception:
-                pass
-        title = node.get("title", node["_key"])
-        candidate_prompts.append(f"[{idx}] {title}: {snippet}")
-        
-    prompt = (
-        f"You are a relevance ranker. Score each of the following candidate documents from 0 to 10 "
-        f"based on its relevance to the query: '{query}'.\n"
-        f"Output ONLY a JSON dict where keys are the string IDs (e.g., '0', '1') and values are the integer scores.\n\n"
-        + "\n".join(candidate_prompts)
-    )
-    
-    try:
-        import json, time, shutil, subprocess
-        agy_exec = shutil.which("agy")
-        if agy_exec and os.environ.get("VECTOR_LAKE_FAST_SEARCH") != "1":
-            for attempt in range(1):
-                try:
-                    with AGY_SEMAPHORE:
-                        result = subprocess.run([agy_exec, "-p", prompt], capture_output=True, timeout=8)
-                    if result.returncode == 0:
-                        stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
-                        match = re.search(r"\{.*?\}", stdout_str, re.DOTALL)
-                        if match:
-                            scores_dict = json.loads(match.group(0))
-                            new_scored = []
-                            for idx, (score, node) in enumerate(candidates):
-                                llm_score = float(scores_dict.get(str(idx), scores_dict.get(idx, 0)))
-                                new_score = score * 0.1 + llm_score * 10
-                                new_scored.append((new_score, node))
-                            new_scored.sort(key=lambda item: item[0], reverse=True)
-                            return new_scored
-                except Exception as e:
-                    log.warning(f"agy reranking failed on attempt {attempt+1}: {e}")
-                    time.sleep(1)
-    except Exception as e:
-        log.warning(f"LLM Reranking failed: {e}")
-        
+def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
     return candidates
 
 
@@ -468,7 +385,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     nodes = [{"_key": key, **value} for key, value in index_data.get("nodes", {}).items()]
     intent = _classify_intent(query)
-    tokens = _expand_query_with_llm(query)
+    tokens = _expand_query_locally(query)
     if not tokens:
         return "No valid search tokens."
 
@@ -580,8 +497,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         if len(candidate_pool) >= pool_size:
             break
             
-    # Phase 2: Lightweight LLM-as-a-Judge Reranking
-    reranked = _rerank_candidates_with_llm(query, candidate_pool)
+    # Phase 2: Local deterministic ranking. Text-model reranking is delegated
+    # to the host agent when explicitly requested, not performed by runtime code.
+    reranked = _rerank_candidates_locally(query, candidate_pool)
 
     # Phase 3: Final top_k extraction
     final_scored = []

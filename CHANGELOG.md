@@ -1,3 +1,12 @@
+# Vector Lake 11.13.0
+
+- Ingest Subagent 领取协议增加 owner/token/generation fencing，最终完成使用事务内 CAS。
+- Timeline 由 Claim 事务增量维护，查询使用稳定事件 ID 校验投影并在漂移时回退 canonical。
+- Outbox 合并索引批次、抑制受管投影自写事件，并优先于旧文件事件队列执行。
+- Embedding 使用 SQLite 跨进程滚动 RPM/TPM 窗口；索引重建和增量索引不再调用外部 API。
+- 修复 GC page_key、Operational Memory 赢家删除、System 节点冷/热漂移和 payload 沙盒边界。
+- 新增 Windows Python 3.13 CI；本地回归基线为 110 项测试。
+
 # 🚀 Vector Lake 综合更新草案 (合并 Jules PRs)
 
 以下是将 google-labs-jules 提交的多个针对性能和安全相关的 Pull Requests 内容进行**合并处理**后，生成的最终综合更新说明（Release Draft）：

@@ -1,18 +1,38 @@
 import time
 import logging
 import json
-import os
-from pathlib import Path
 
-from vector_lake.db_store import get_pending_jobs, update_job_status
-from vector_lake import get_extension_root
-from vector_lake.tool_ingest import finalize_ingest
+from vector_lake.db_store import claim_pending_jobs, get_connection, mark_job_awaiting_subagent, update_job_status
+from vector_lake.native_llm import create_subagent_task
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ingest-worker")
 
+
+def _ingest_finalization_proven(filepath: str, file_hash: str) -> bool:
+    row = get_connection().execute(
+        "SELECT file_hash FROM processed_files WHERE filepath = ?",
+        (filepath,),
+    ).fetchone()
+    return bool(row and row["file_hash"] == file_hash)
+
+
+def _subagent_ingest_prompt(instructions: str) -> str:
+    return (
+        instructions
+        + "\n\n[CURRENT-ENVIRONMENT SUBAGENT HANDOFF]\n"
+        + "You are the host environment subagent completing this Vector Lake ingest task.\n"
+        + "Do not use external model APIs from Vector Lake library code.\n"
+        + "Return or persist ONLY a JSON array. Each item must be an object with exactly these keys:\n"
+        + "- filename: target wiki filename\n"
+        + "- content: complete Markdown content, including YAML frontmatter\n"
+        + "If the source should be rejected by the strategic purpose contract, return an empty JSON array: [].\n"
+        + "After producing the JSON array, call the Vector Lake finalize_ingest tool or CLI-compatible finalize path with the processed_data object from this task packet.\n"
+    )
+
+
 def process_jobs():
-    jobs = get_pending_jobs(limit=10)
+    jobs = claim_pending_jobs(limit=1, lease_seconds=3600)
     if not jobs:
         return
 
@@ -22,7 +42,6 @@ def process_jobs():
         payload = json.loads(job["payload"])
         
         try:
-            update_job_status(job_id, "dispatched")
             log.info(f"Dispatched job {job_id} of type {task_type}")
             
             if task_type == "ingest":
@@ -30,35 +49,25 @@ def process_jobs():
                 file_hash = payload["hash"]
                 instructions = payload["instructions"]
                 canonical_name = payload["canonical_name"]
-                
-                import subprocess
-                import tempfile
-                import os
-                
-                log.info(f"Invoking AgY agent for job {job_id} on {filepath}...")
-                # Write instructions to a temp file to avoid escaping issues in CLI
-                with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md", encoding="utf-8") as f:
-                    f.write(instructions)
-                    temp_path = f.name
-                
-                try:
-                    # Run the agent in print mode with auto-approvals
-                    proc = subprocess.run([
-                        "powershell", "-Command", 
-                        f'agy run --prompt (Get-Content "{temp_path}" -Raw) --dangerously-skip-permissions'
-                    ], capture_output=True, text=True, check=False)
-                    
-                    if proc.returncode == 0:
-                        update_job_status(job_id, "finalized")
-                        log.info(f"Finalized job {job_id} via agent.")
-                        # log.debug(f"Agent output: {proc.stdout}")
-                    else:
-                        raise Exception(f"Agent failed with code {proc.returncode}: {proc.stderr}\n{proc.stdout}")
-                finally:
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
+
+                processed_data = {
+                    "filepath": filepath,
+                    "hash": file_hash,
+                    "canonical_name": canonical_name,
+                    "job_id": job_id,
+                }
+                task_path = create_subagent_task(
+                    "ingest",
+                    _subagent_ingest_prompt(instructions),
+                    "JSON array consumable by finalize_ingest(files_written, processed_data)",
+                    {
+                        "job_id": job_id,
+                        "processed_data": processed_data,
+                        "finalize_tool": "finalize_ingest",
+                    },
+                )
+                mark_job_awaiting_subagent(job_id, str(task_path))
+                log.info(f"Created subagent ingest task for job {job_id}: {task_path}")
                 
             else:
                 update_job_status(job_id, "failed", f"Unknown task_type {task_type}")

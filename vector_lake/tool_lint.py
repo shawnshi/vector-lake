@@ -34,7 +34,7 @@ def lint_vector_lake(auto_fix: bool = False):
 
     skip_files = {"index.md", "log.md", "overview.md"}
     valid_types = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
-    valid_status = {"active", "deprecated", "archived", "contested"}
+    valid_status = {"active", "draft", "superseded", "deprecated"}
     valid_epistemic = {"seed", "sprouting", "evergreen"}
     valid_categories = {
         "Uncategorized", "Artificial_Intelligence", "Healthcare_IT",
@@ -191,6 +191,8 @@ def lint_vector_lake(auto_fix: bool = False):
                             "epistemic-status": "seed",
                             "categories": ["Uncategorized"],
                             "sources": [],
+                            "strategic_scope": "edge",
+                            "evidence_tier": "derived",
                             "created": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z"),
                             "updated": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z")
                         }
@@ -208,12 +210,18 @@ def lint_vector_lake(auto_fix: bool = False):
         if missing:
             issues["frontmatter"].append(f"{filename}: Missing fields: {', '.join(missing)}")
             if auto_fix:
+                if not frontmatter.get("id"): frontmatter["id"] = _generate_id()
                 if not frontmatter.get("title"): frontmatter["title"] = filename[:-3]
+                if not frontmatter.get("type"): frontmatter["type"] = filename.split("_", 1)[0].lower()
                 if not frontmatter.get("domain"): frontmatter["domain"] = "General"
                 if not frontmatter.get("topic_cluster"): frontmatter["topic_cluster"] = "General"
-                if not frontmatter.get("status"): frontmatter["status"] = "active"
+                if not frontmatter.get("status"): frontmatter["status"] = "Active"
                 if not frontmatter.get("epistemic-status"): frontmatter["epistemic-status"] = "seed"
                 if not frontmatter.get("categories"): frontmatter["categories"] = ["Uncategorized"]
+                if not frontmatter.get("updated"): frontmatter["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                if "sources" not in frontmatter: frontmatter["sources"] = []
+                if not frontmatter.get("strategic_scope"): frontmatter["strategic_scope"] = "edge"
+                if not frontmatter.get("evidence_tier"): frontmatter["evidence_tier"] = "derived"
                 changed = True
 
         file_type = str(frontmatter.get("type", "")).lower()
@@ -227,7 +235,7 @@ def lint_vector_lake(auto_fix: bool = False):
         if status and status not in valid_status:
             issues["type_status"].append(f"{filename}: Invalid status '{status}'")
             if auto_fix:
-                frontmatter["status"] = "active"
+                frontmatter["status"] = "Active"
                 changed = True
 
         epistemic = str(frontmatter.get("epistemic-status", "")).lower()
@@ -324,7 +332,8 @@ def lint_vector_lake(auto_fix: bool = False):
                     
                     # Delete Secondary
                     try:
-                        os.remove(s_data["path"])
+                        from vector_lake.mutation_coordinator import execute_mutation_plan
+                        execute_mutation_plan(secondary, is_delete=True)
                     except Exception as e:
                         log.error(f"Failed to delete merged secondary {s_data['path']}: {e}")
                     
@@ -379,8 +388,8 @@ def lint_vector_lake(auto_fix: bool = False):
         alignment_score = frontmatter.get("alignment_score")
         if isinstance(alignment_score, (int, float)) and alignment_score < 60:
             node_status = str(frontmatter.get("status", "")).lower()
-            if node_status not in ["contested", "misaligned"]:
-                issues["alignment"].append(f"{filename}: Alignment Score {alignment_score} < 60 but status is '{node_status}', MUST be 'Contested'")
+            if node_status == "active":
+                issues["alignment"].append(f"{filename}: Alignment Score {alignment_score} < 60 while status is Active; review for Draft, Superseded, or Deprecated.")
 
     # 7. Semantic Garbage Collection (Auto-GC)
     archive_dir = os.path.join(wiki_dir, ".archive")
@@ -402,7 +411,7 @@ def lint_vector_lake(auto_fix: bool = False):
             except (ValueError, TypeError):
                 pass
                 
-        is_contested = node_status in ["contested", "unsupported", "misaligned"]
+        is_contested = node_status in ["superseded", "deprecated"]
         has_low_inbound = inbound_count.get(node_key, 0) <= 1
         is_empty = len(data["body"].strip()) < 50 and not filename.startswith("Source_")
         
@@ -412,7 +421,10 @@ def lint_vector_lake(auto_fix: bool = False):
                 if not os.path.exists(archive_dir):
                     os.makedirs(archive_dir)
                 try:
-                    shutil.move(data["path"], os.path.join(archive_dir, filename))
+                    archive_path = os.path.join(archive_dir, filename)
+                    shutil.copy2(data["path"], archive_path)
+                    from vector_lake.mutation_coordinator import execute_mutation_plan
+                    execute_mutation_plan(filename, is_delete=True)
                     fixes_applied += 1
                     log.info(f"[Semantic GC] Archived stale node: {filename}")
                 except Exception as e:

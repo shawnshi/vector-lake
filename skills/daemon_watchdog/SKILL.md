@@ -27,7 +27,7 @@ triggers: 'When the user requests to start the Vector Lake daemon, watchdog, or 
 <execution_workflow>
   <workflow>
     1. Pre-launch checks: Verify the command parameters and environment readiness.
-    2. Launch Daemon: Use `run_command` to execute `$env:PYTHONIOENCODING="utf-8"; python C:\Users\shich\.gemini\config\plugins\vector-lake\watchdog_sync.py` with `WaitMsBeforeAsync` set to `2000`.
+    2. Launch Daemon: Resolve the installed plugin from `$env:USERPROFILE\.codex\plugins\vector-lake`, then execute its `watchdog_sync.py` with `PYTHONIOENCODING=utf-8` and `WaitMsBeforeAsync=2000`.
     3. Sandbox Isolation: Route any temporary monitoring logs or state checks to the `scratch/` directory.
     4. Registration: Update the operational state in the knowledge graph.
     5. Checkpoint: [Fable 5 Checkpoint] Enforce user approval if the command fails to start or exits prematurely.

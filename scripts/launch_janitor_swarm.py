@@ -1,8 +1,8 @@
 import os
-import re
+import json
 import math
-import subprocess
 import sys
+from datetime import datetime, timezone
 
 # Add vector_lake plugin path
 plugin_dir = os.path.expanduser(r"~\.gemini\config\plugins\vector-lake")
@@ -31,7 +31,12 @@ def main():
     num_shards = math.ceil(len(merge_items) / SHARD_SIZE)
     print(f"Found {len(merge_items)} pending merge alerts. Sharding into {num_shards} clusters (Max {SHARD_SIZE} per shard)...")
 
-    processes = []
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "native-manifest",
+        "shard_size": SHARD_SIZE,
+        "shards": [],
+    }
     
     for i in range(num_shards):
         shard_items = merge_items[i * SHARD_SIZE : (i + 1) * SHARD_SIZE]
@@ -50,23 +55,18 @@ def main():
                 f.write(f"  Title: {item.get('title', '')}\n")
                 f.write(f"  Description: {item.get('description', '')}\n\n")
 
-        print(f"Launching Swarm Janitor Subagent for Shard {i+1}...")
-        
-        prompt = f"Please read the instructions in {shard_file} and execute the cleanup. Do not stop until the entire shard is processed."
-        
-        try:
-            p = subprocess.Popen(
-                ["agy", "-p", prompt],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=os.environ.copy()
-            )
-            processes.append(p)
-        except FileNotFoundError:
-            print("Error: 'agy' CLI command not found. Ensure Antigravity is in PATH.")
-            return
+        manifest["shards"].append({
+            "index": i + 1,
+            "path": shard_file,
+            "item_ids": [item.get("item_id", "Unknown") for item in shard_items],
+        })
+        print(f"Prepared native janitor shard {i+1}: {shard_file}")
 
-    print(f"\n[Success] {num_shards} Janitor Subagents launched in the background!")
+    manifest_file = os.path.join(TMP_DIR, "janitor_manifest.json")
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f"\n[OK] Prepared {num_shards} native janitor shard(s). Manifest: {manifest_file}")
+    print("No external agent process was launched. Resolve shards through the governance queue or explicit merge tooling.")
 
 if __name__ == "__main__":
     main()

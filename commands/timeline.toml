@@ -1,0 +1,7 @@
+description = "Search chronologically ordered events in the Vector Lake timeline database."
+prompt = """
+Please use the `search_timeline` MCP tool from the `vector-lake-mcp` server.
+Map the user's request to the optional `entity_name`, `sentiment`, and `action` parameters.
+Use `limit` to bound the result set; default to 10 when the user does not specify a limit.
+Return only events supported by the tool response and preserve chronological order.
+"""

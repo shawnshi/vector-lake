@@ -27,6 +27,43 @@ def search_timeline(entity_name: str = "", sentiment: str = "", action: str = ""
     )
 
 @mcp.tool()
+def rebuild_timeline_events(dry_run: bool = True, limit: int = 0) -> str:
+    """Rebuild the timeline_events projection from timeline-event claims."""
+    return tools.rebuild_timeline_events_from_claims(
+        dry_run=dry_run,
+        limit=limit if limit and limit > 0 else None,
+    )
+
+@mcp.tool()
+def projection_report(limit: int = 20) -> str:
+    """Report drift between Wiki pages, SQLite canonical entities, and index.json."""
+    return tools.projection_diff_report(limit=limit)
+
+@mcp.tool()
+def canonical_backfill(dry_run: bool = True, limit: int = 50) -> str:
+    """Backfill missing SQLite canonical rows from existing Wiki pages."""
+    return tools.canonical_backfill_missing_wiki(dry_run=dry_run, limit=limit)
+
+@mcp.tool()
+def projection_rebuild_index(dry_run: bool = True) -> str:
+    """Rebuild index.json, FTS, embeddings, and claim_graph from SQLite canonical state."""
+    return tools.rebuild_index_projection(dry_run=dry_run)
+
+@mcp.tool()
+def embedding_backfill(dry_run: bool = True, limit: int = 0, include_existing: bool = False) -> str:
+    """Backfill missing vector embeddings under RPM/TPM rate limits."""
+    return tools.embedding_backfill_projection(
+        dry_run=dry_run,
+        limit=limit if limit and limit > 0 else None,
+        include_existing=include_existing,
+    )
+
+@mcp.tool()
+def wiki_restore(dry_run: bool = True, limit: int = 10) -> str:
+    """Restore missing Wiki Markdown pages from canonical metadata."""
+    return tools.restore_missing_wiki_from_canonical(dry_run=dry_run, limit=limit)
+
+@mcp.tool()
 def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
     """Search the Vector Lake index.
     
@@ -42,13 +79,32 @@ def _read_payload(payload_file: str) -> str:
         return ""
     import os
     from pathlib import Path
+    from vector_lake import get_extension_root
+
     abs_path = Path(payload_file).resolve()
-    gemini_base = Path(os.path.expanduser("~/.gemini")).resolve()
-    if not abs_path.is_relative_to(gemini_base):
-        raise ValueError(f"[Security Error] Payload file must be within the .gemini sandbox: {payload_file}")
-    abs_path = str(abs_path)
-    if not os.path.exists(abs_path):
+    configured_root = os.environ.get("VECTOR_LAKE_PAYLOAD_ROOT")
+    if configured_root:
+        allowed = abs_path.is_relative_to(Path(configured_root).expanduser().resolve())
+    else:
+        allowed = False
+        brain_roots = [
+            (get_extension_root() / "brain").resolve(),
+            Path(os.path.expanduser("~/.codex/brain")).resolve(),
+        ]
+        for root in brain_roots:
+            if not abs_path.is_relative_to(root):
+                continue
+            relative_parts = abs_path.relative_to(root).parts
+            if len(relative_parts) >= 3 and relative_parts[1].lower() == "scratch":
+                allowed = True
+                break
+    if not allowed:
+        raise ValueError(f"[Security Error] Payload file must be within an approved agent sandbox: {payload_file}")
+    if not abs_path.exists() or not abs_path.is_file():
         raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Please use write_to_file to create it first.")
+    max_bytes = max(1, int(os.environ.get("VECTOR_LAKE_PAYLOAD_MAX_BYTES", str(5 * 1024 * 1024))))
+    if abs_path.stat().st_size > max_bytes:
+        raise ValueError(f"[Sandbox Error] Payload file exceeds {max_bytes} bytes: {payload_file}")
     with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
@@ -233,14 +289,44 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     return tools.prepare_ingest_batch(batch_size=batch_size)
 
 @mcp.tool()
-def finalize_ingest(files_written: list, processed_data: dict) -> str:
-    """Finalize ingestion batch after subagents have finished.
+def list_ingest_tasks(limit: int = 20, include_queued: bool = True) -> str:
+    """List queued or awaiting-subagent ingest jobs."""
+    return tools.list_ingest_tasks(limit=limit, include_queued=include_queued)
+
+@mcp.tool()
+def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
+    """Lease awaiting ingest task packets to the current-environment subagent host."""
+    return tools.claim_ingest_tasks(limit=limit, lease_seconds=lease_seconds)
+
+@mcp.tool()
+def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
+    """Expire stale awaiting-subagent ingest jobs so they can be retried deliberately."""
+    return tools.expire_ingest_tasks(max_age_seconds=max_age_seconds)
+
+@mcp.tool()
+def finalize_ingest(
+    files_written: list = None,
+    processed_data: dict = None,
+    files_written_payload_file: str = "",
+    raw_files_payload_file: str = "",
+) -> str:
+    """Finalize ingestion after a subagent has produced validated wiki pages.
     
     Args:
-        files_written: List of dicts with 'filename' and 'content'.
-        processed_data: Dict with 'filepath' and 'hash'.
+        files_written: Direct list of dicts with 'filename' and 'content'.
+        processed_data: Direct dict with 'filepath' and 'hash'.
+        files_written_payload_file: Sandbox JSON file containing files_written.
+        raw_files_payload_file: Sandbox JSON file containing processed_data.
     """
     try:
+        import json
+        if files_written_payload_file or raw_files_payload_file:
+            if not files_written_payload_file or not raw_files_payload_file:
+                return "Error: Both payload files are required when using the file-based ingest contract."
+            files_written = json.loads(_read_payload(files_written_payload_file))
+            processed_data = json.loads(_read_payload(raw_files_payload_file))
+        if not isinstance(files_written, list) or not isinstance(processed_data, dict):
+            return "Error: finalize_ingest requires a files list and processed-data object."
         return tools.finalize_ingest(files_written, processed_data)
     except Exception as e:
         return str(e)
@@ -263,9 +349,9 @@ def visualize_vector_lake(output_dir: str = None) -> str:
         from pathlib import Path
         import os
         abs_dir = Path(output_dir).resolve()
-        gemini_base = Path(os.path.expanduser("~/.gemini")).resolve()
-        if not abs_dir.is_relative_to(gemini_base):
-            return f"Error: Write operations must be contained within a .gemini path boundary to prevent path traversal."
+        allowed_roots = [Path(os.path.expanduser("~/.gemini")).resolve(), Path(os.path.expanduser("~/.codex")).resolve()]
+        if not any(abs_dir.is_relative_to(root) for root in allowed_roots):
+            return "Error: Write operations must be contained within an approved agent sandbox."
     return tools.visualize_vector_lake(output_dir)
 
 @mcp.tool()
@@ -345,10 +431,12 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
         return f"Error: '{old_text}' is a structural syntax marker. Global replacement aborted to protect graph topology."
         
     import os
-    from vector_lake.wiki_utils import get_wiki_dir, atomic_write_text
+    from vector_lake.wiki_utils import get_wiki_dir
+    from vector_lake.mutation_coordinator import execute_mutation_batch
     wiki_dir = get_wiki_dir()
     modified_count = 0
     matched_files = []
+    mutations = []
     
     for filename in os.listdir(wiki_dir):
         if not filename.endswith(".md"):
@@ -358,9 +446,7 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
             if old_text in content:
-                if not dry_run:
-                    new_content = content.replace(old_text, new_text)
-                    atomic_write_text(filepath, new_content)
+                mutations.append({"filename": filename, "content": content.replace(old_text, new_text)})
                 modified_count += 1
                 matched_files.append(filename)
         except Exception as e:
@@ -368,17 +454,10 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
             
     if dry_run:
         return f"[DRY RUN] Would replace '{old_text}' with '{new_text}' in {modified_count} files: {', '.join(matched_files[:10])}..."
-    
-    from vector_lake.indexer import update_index_item
-    for filename in matched_files:
-        update_index_item(filename)
-        
-    from vector_lake.governance_store import sync_pages_to_canonical
-    abs_matched_files = [os.path.join(wiki_dir, f) for f in matched_files]
-    if abs_matched_files:
-        sync_pages_to_canonical(abs_matched_files, origin="mcp-agent", auto_approve=True, summary=f"Batch replace links")
-        
-    return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files and updated index."
+
+    if mutations:
+        execute_mutation_batch(mutations)
+    return f"Successfully replaced '{old_text}' with '{new_text}' in {modified_count} files and queued projections."
 
 @mcp.tool()
 def bulk_reconciliation(payload_file: str, dry_run: bool = True) -> str:

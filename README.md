@@ -20,10 +20,10 @@ graph LR
     INGEST --> WIKI["MEMORY/wiki<br>Markdown pages"]
     WIKI --> INDEX["index.json<br>page index + BM25"]
     WIKI --> META["vector_lake.db<br>SQLite Canonical Store"]
-    META --> CLAIM["SQLite claim_graph_nodes<br>claim topology"]
+    META --> CLAIM["SQLite claim_graph_edges<br>governed topology"]
     META --> MEMORY["SQLite operational_memory<br>agent runtime memory"]
     MEMORY --> PACKET["Memory Packet<br>selective context injection"]
-    INDEX --> QUERY["search<br>LLM Expansion + BM25 + Graph Spreading"]
+    INDEX --> QUERY["search<br>Local Expansion + BM25 + Graph Spreading"]
     CLAIM --> QUERY
     PACKET --> QUERY
 ```
@@ -61,17 +61,17 @@ graph LR
 - **结构要求**：自由格式。专门保留给单篇文献精读、书籍伴读笔记、以及横向的战略纵览研报。不需要切割出“事实”与“时间线”，允许更灵活的文章长文组织形式。
 
 ## Quick Start
-1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。底层 LLM 推理深度依赖 `google-genai` SDK 与 `agy` CLI 工具（两者并存），因此必须确保该工具在操作系统的 PATH 环境变量中。2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
+1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。非 embedding 文本推理不由插件直接调用外部 API；需要推理的后台任务会生成当前环境 subagent 任务包。`GEMINI_API_KEY` 只影响 embedding。2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
 3. **后台监听与自治管理**：日常运行 `python watchdog_sync.py` 启动守护进程。它搭载了四大核心基建与防御系统：
    - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
-   - **API 熔断器 (Circuit Breaker)**：在 LLM 并发摄入时，通过带抖动的指数退避（Exponential Backoff with Jitter）与黑名单冷却机制，彻底消除死锁、配额枯竭与 429 限流风暴。
+   - **写入健康门 (Write Health Gate)**：普通写入会先检查 watchdog 心跳、outbox 失败项和 Wiki/index/SQLite 投影漂移；严重不一致时阻断继续写入，维护修复可显式使用 schema 模式或人工 override。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
    - **两步思维链摄入 (Payload-Based MCP)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns），并将长文本提纯为 JSON 制品落盘后通过 MCP 最终入湖，彻底根除 CLI 传参截断与 JSON 解析风暴。
    - **语义张力量化模型 (STQM)**：图谱原生支持 `tension_edges` 张力边计算。强制所有 Agent 抽离争议与矛盾并结构化为冲突边，在 Query 时通过 Controversy Heatmap 直观展示领域盲区。
-   - **跨类型 PIEA 与强制格式漏斗**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过返回强制指令强迫 LLM 按照 10 大规范类型（Vendor, Product, Person, Event, Concept, Policy, Standard, Synthesis, Source, Overview）严格落盘。
-   - **无感异步全量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台重负载变更通过 `flag_reindex.lock` 信号异步削峰。同时，底层的 `_calculate_weighted_edges` 已升级为 O(V+E) 稀疏图遍历算法，彻底终结了万级节点下的 O(N²) 算力瓶颈与死锁现象。
+   - **跨类型 PIEA 与强制格式漏斗**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过 schema gate 强制 10 大规范类型（Vendor, Product, Person, Event, Concept, Policy, Standard, Synthesis, Source, Overview）严格落盘。
+   - **持久化增量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台变更写入 durable outbox，Watchdog 合并批次后一次更新索引；底层 `_calculate_weighted_edges` 使用稀疏图遍历，并限制每个节点的投影边数。
    - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox)**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
-   - **全自动自愈与战术闭环 (Autonomous Sub-Daemons)**：每天 10:00 和 23:00 执行的后台任务。包含无锁图谱排误、`metadata_decay_daemon.py` 降权超期知识、`sync_timeline_db.py` 提取时序流水账（现已支持安全级无残留全量重建与泛型 `[Observation]` 标签智能回退提取）、`missing_evidence_scout.py` 自动扫描缺失证据并抛入治理队列、**`semantic_dedup_daemon.py` (成对语义去重计算)**、**`compile_domain_overviews.py` (PageRank 中心度预编译)**，以及新增的 **`community_clustering_daemon.py` (Louvain 聚类与知识盲区自发探索)**。最后以 `SQLite WAL TRUNCATE` 结束，保证存储十年不膨胀。
+   - **定时确定性维护 (Scheduled Deterministic Maintenance)**：每天 10:00 和 23:00 刷新脏图拓扑、执行只读 lint，并进行 SQLite WAL checkpoint。研究、去重、聚类等独立脚本不会被此循环隐式启动。
    - **原生二进制向量引擎 (Native Binary Embeddings)**：将臃肿的纯文本 JSON 序列化彻底淘汰，重构为基于 C 层级的高性能 Pickle (`HIGHEST_PROTOCOL`) 二进制缓冲。大幅抹除了无用 I/O 载荷（体积暴降 60%），并将语义对比矩阵的加载时间从数秒降至毫秒级，根绝了内存爆栈风险。
    - **本体免疫型排重 (Ontology-Immune Deduplication)**：在去重守护进程中注入了严格的前缀屏障，自动豁免 `Source_` 等具有时序不可变性的物理原始信源，从根源上彻底斩断了“因文档相似度过高而将不同日期研报强行合并”的灾难性合并幻觉，令治理队列（Governance Queue）保持绝对纯净。
    - **全态前缀契约闭环 (Omni-State Prefix Compliance)**：全面拉齐并修正了所有后台异步批处理守护进程（如语义去重器和死链自愈系统）对 `Policy_`、`Standard_` 和 `Synthesis_` 等全部 9 大核心一等公民 (First-Class) 前缀的精确捕获与清洗机制，彻底根除了前缀“盲区”导致的同质化噪音与分类退化。
@@ -90,9 +90,9 @@ graph LR
 ### 🛡️ V11.3 核心底层防爆与事务加固 (V11.3 Architecture Hardening)
 - **零信任动态沙箱 (Zero-Trust AST Sandbox)**：彻底根除搜索管线中的 `eval()` 逃逸与 RCE 漏洞，重构为基于抽象语法树 (AST) 的白名单解释器，精准拦截大模型注入恶意 Python 探针。
 - **原子级跨表嵌套事务 (Nested Transaction Atomicity)**：利用原生 SQLite 特性封装了无缝嵌套的 `transaction()` 上下文，彻底消灭 `governance_store` 跨表写入时的崩溃断层，根除脏数据写入。
-- **并行非阻塞看门狗 (Concurrent Watchdog)**：重写 `watchdog_app.py` 的任务调度矩阵，将 7 大串行脚本由 21 分钟的线性拥塞全部重构为 `subprocess.Popen` 并行竞速池，大幅拉升了多源情报监控的吞吐量。
-- **指令注入绝对防护 (Subprocess Injection Shield)**：针对底层 LLM 代理进程（`gemini.cmd`），强制启用 `shutil.which` 进行绝对物理路径寻址与防污染劫持，封杀命令注入链。
-- **沙盒路径穿透拦截 (Path Traversal Firewall)**：在 `mcp_server.py` 入口层构建物理边界巡检，强制验证读取对象必须处于 `.gemini` 工作区闭包内，保护操作系统敏感文件安全。
+- **单实例并发看门狗 (Single-Instance Watchdog)**：文件监听、outbox 消费和定时维护使用独立线程；进程级文件锁阻止同一知识库启动多个 watchdog，组件健康状态互不覆盖。
+- **指令注入防护 (Command Injection Shield)**：运行路径不再通过 shell 拼接外部文本模型命令；长文本输入通过 sandbox payload 文件和 MCP 参数传递，wiki mutation 只接受单层受控文件名。
+- **沙盒路径穿透拦截 (Path Traversal Firewall)**：`mcp_server.py` 只接受 `.gemini`、`.codex` 或显式配置的 agent sandbox 内的 payload；wiki mutation 只接受经过严格命名校验的单层文件名。
 - **重试补偿与幽灵更新阻断 (I/O Retry & Ghost Updates)**：写入文件时遭遇 `PermissionError` 锁定，会自动进入带指数退避的重试自愈；并在内存增量构建阶段显式强制落盘，彻底终结修改不生效的“幽灵更新”。
 
 ### ⚡ V11.4 性能降维与检索引擎重构 (V11.4 Performance & Query Engine)
@@ -102,7 +102,7 @@ graph LR
 - **全局规范化坍缩 (Canonical Normalization)**：彻底清理了多达 4 处重复造轮子的散落代码（如旧版 `strip_name` 等），统一收口于 `wiki_utils.py`。消灭了因子系统规则差异导致同一实体被映射为多个幽灵节点的隐患。
 
 ### 🛡️ V11.5 原生子代理并发降维与沙箱免疫 (V11.5 Antigravity Native Subagent & Sandbox Immunity)
-- **原生 Subagent 免费调度 (Native Subagent Routing)**：全面废除了检索重排与后台去重模块中直连 `google-genai` 的昂贵 SDK API 调用，完全退回至通过 `agy -p` 程序化异步唤醒 Antigravity 原生子代理的架构。实现了零附加 API 成本的系统级 LLM 白嫖。
+- **当前环境 subagent 边界 (Current-Environment Subagent Boundary)**：非 embedding 文本推理不再走 `google-genai` 文本生成 API。检索扩展和重排使用本地确定性规则；摄取任务由 `ingest_worker.py` 生成 subagent 任务包，等待宿主环境显式处理。
 - **全局线程信号量削峰 (Global Semaphore Storm Breaker)**：在所有原生子代理派生入口挂载了 `threading.Semaphore(3)` 线程锁与 `asyncio` 异步排队阀门。面对 100+ 的大并发检索洪峰，物理层面强行削峰至最大 3 并发排队，彻底终结了操作系统级的“进程风暴”与句柄耗尽雪崩死锁。
 - **参数数组防注入闭环 (Array Injection Shield)**：废除一切 Shell 级字符串组装，改用严密的抽象系统参数数组传递（无 `shell=True`）将 prompt 射入子系统。从物理底层彻底封堵了由于复杂文本与恶意识别符号导致的命令执行 (RCE) 逃逸漏洞。
 - **碎片黑洞湮灭引擎 (Debris Blackhole Eviction)**：执行了地毯式的僵尸垃圾回收，暴力清除了高达 4500+ 的历史死信文件、子代理单次通信 Markdown 残骸以及陈旧的 `.bak`，将文件系统的索引遍历负荷拉平至毫秒级绝对纯净态。
@@ -112,15 +112,15 @@ graph LR
 - **抽象语法树重装解析 (AST-Based Markdown Parsing)**：移除所有脆弱的正则匹配 (Regex) 与字符串分割提取。接入 `mistune` 构建强壮的 Markdown 抽象语法树 (AST) 遍历管线，无论外界格式如何扭曲，提取逻辑永不阻断。
 - **图谱 O(V+E) 稀疏遍历 (Inverted Index Optimization)**：彻底消除大图谱边权计算 (Edge Topology Calculation) 中的 O(N²) 双重循环笛卡尔积死锁。利用反向索引计算共享重叠源，算力开销断崖式暴跌。
 - **中文原质双轨分词引擎 (FTS5 + Jieba Pre-tokenization)**：废除 SQLite FTS5 自带导致中文崩盘的 `porter unicode61` 字符级碎屑拆解。利用 `jieba` 在入库和检索前进行离线白盒分词预处理，实现专业医疗名词的 100% 绝对命中率。
-- **跨界原子级两阶段提交 (Cross-Storage 2PC Atomicity)**：将底层 SQLite 数据库写盘与外部索引 `index.json` 落盘强制物理挂载至同一层面的事务块中，通过利用 `os.replace` 与 SQLite `with transaction()` 达成极严苛的跨存储一致性。
+- **Canonical Commit + Recoverable Projections**：SQLite canonical 变更与 durable outbox intent 在同一事务提交；`Markdown / FTS / index.json / claim_graph.json` 作为可重放投影，在提交后原子替换并由 outbox 自动恢复。
 - **文件系统无尽重试 (Exponential I/O Backoff)**：重塑了 `refresh_graph_topology_if_dirty` 中的并发写入锁逻辑，用指数退避（最高5次）替代了原先的“静默忽略”，从物理层级消灭了文件争用导致的拓扑损坏。
 
 ### 🔒 V11.7 数据底座安全加固与无锁检索重构 (V11.7 Database Hardening & Lock-free Search)
 - **真·无锁高并发检索 (Lock-free Read Concurrency)**：彻底移除了 `tool_search.py` 读取 `index.json` 时的排他文件锁 (FileLock)。利用底层 `os.replace` 的系统级原子性，结合带短暂自旋退避的容错读取，使得大批量子代理并发调用检索 API 时不再陷入排队阻塞，彻底清除了检索高峰期抛出的 “System is busy” 崩溃错误，将读取性能推向极限。
 - **查询过滤 SQL 级下推 (SQL Pushdown Filtering)**：打破了早期伪“原子化”读取的幻想。针对 `search_operational_memory` 及各类实体查询，彻底摒弃了全量加载至 Python 内存字典后再做迭代过滤的 O(N) 重灾区。通过动态构建安全的表达式 SQL 查询，将状态 (`validity_state`) 与类型筛选下推至 SQLite 引擎，消除内存序列化暴涨导致的假死与 OOM 风险。
 - **防呆 Schema 与 JSON 索引跃迁 (Fail-safe Schema & JSON Indexing)**：重写了 `db_store.py` 中脆弱的静默 `except Exception: pass` 表结构迁移逻辑，精确收紧至 `sqlite3.OperationalError`。同时，为 `data_json` 列中的高频字段（`$.type`, `$.status`, `$.memory_type`）注入了基于表达式的 B 树索引 (Expression-based Indexes)，彻底扫除了图谱重构或批量扫描时由 SQLite 触发的全表扫描梦魇。
-- **动态寻址守护管线 (Dynamic Daemon Resolution)**：将 `watchdog_app.py` 中硬编码、极度脆弱的 `parent.parent` 相对路径定时任务唤醒机制，全面重构为基于 `~/.gemini` 的绝对路径动态寻址器。无论工作区如何漂移或被软链接代理，核心的图谱衰变 (`decay_daemon`) 与死链回收清洗机制都能坚韧执行。
-- **LLM 同步死锁解绑 (Synchronous LLM Unblocking)**：废除了 `_expand_query_with_llm` 中不可理喻的 30 秒硬超时同步等待与无限重试陷阱，将超时时限强制收紧至极短的 8 秒单次探测。并新增 `VECTOR_LAKE_FAST_SEARCH` 逃生舱，使得对于高频机械检索可以一键剥离大模型介入，归还毫秒级极致检索体验。
+- **动态寻址守护管线 (Dynamic Daemon Resolution)**：daemon 从当前插件根或 Python module 启动，不依赖旧 `.gemini/config/plugins` 安装路径；状态写入 `MEMORY/wiki/.meta/.watchdog_status.json`。
+- **本地检索路径收敛 (Local Search Boundary)**：检索扩展收口到 `_expand_query_locally` 的词典、分词与字符级召回逻辑；运行时不再执行同步文本模型调用，`VECTOR_LAKE_FAST_SEARCH` 只保留为兼容开关。
 
 ### 🔧 V11.8 极速并发与抗污染引擎 (V11.8 Network Blockade & AST Sandbox)
 - **大模型网络层原子解锁 (Network Blockade Fix)**：剥离了全量索引 `_build_bm25_index` 与 SQLite `BEGIN IMMEDIATE` 事务之间的死锁关系。将 LLM 向量请求抽取至独立预计算阶段，彻底根除了由于网络抖动（如 Gemini API 响应缓慢）导致的 SQLite 库级排他锁灾难，保障了守护进程的绝对顺滑。
@@ -134,15 +134,15 @@ graph LR
 - **批量图谱手术与断链自愈 (Mass Graph Surgery & Self-Healing)**：大幅升级了相似性合并管线。在相似节点去重合并时，底层脚本能自动扫略上万级文件的全局双链 `[[ ]]`，将所有指向废弃（或次级）节点的死链硬重定向至 Primary 基座，并将碎屑作为 alias 注入。真正实现了高度相似知识噪音的自动化坍缩与自愈。
 
 ### 🛡️ V11.10 原子突变编排与异步摄取管线 (V11.10 Unified Mutation & Async Ingestion)
-- **全局突变协调器 (Unified Mutation Coordinator)**：彻底摒弃了分散在各个 Tool（如 Rename/Delete/Memory）中的离散图谱写盘代码，统一引入 `mutation_coordinator.py` 执行图谱状态机的原子突变。强制贯彻预检查（Pre-flight assertions）、双向落盘（Markdown + SQLite）、以及实时出站更新（Outbox Updating）。
-- **Antigravity 异步摄取守护 (Async Ingestion Loop)**：将旧版阻塞式的同步 LLM 摄取模拟循环彻底淘汰。在 `ingest_worker.py` 中引入 `agy run --prompt` 开启真正脱离主进程的自治 Subagent 循环队列。大幅提高多文档摄取的吞吐率并实现了资源隔离。
+- **全局突变协调器 (Unified Mutation Coordinator)**：Rename/Delete/Memory/批量替换等写入口统一先做 schema、purpose 与路径校验，再原子提交 canonical change set 和 outbox intent；投影写入失败不会回滚已提交事实，而由 worker 重放恢复。
+- **subagent 任务包摄取 (Subagent Task Packet Ingestion)**：`ingest_worker.py` 生成隔离任务包并将 job 标记为 `awaiting_subagent`；宿主通过 `claim_ingest_tasks` 租约领取，完成后调用 `finalize_ingest`。提交必须匹配原任务的文件路径、哈希和 canonical 名称，成功后原子更新 `processed_files`、完成 job 并清理任务包。
 - **DefenseHook 与 PurposeGate 强制门控 (Strategic Gates)**：在 `defense_hook.py` 与 `purpose_contract.py` 中落地战略防御。强制校验运行态写入时的战略作用域 (`strategic_scope`) 与证据等级 (`evidence_tier`)，不符合契约标准（如营销软文或低质断言）的信源从物理上即被禁止进入底层知识图谱。
 - **空指针与悬空引用免疫 (Null Safety & Dangling Pointer Immunity)**：针对 `claim_extractor.py` 中由于遗留老旧节点（缺乏 Frontmatter 或 Null aliases）引发的 `TypeError` 中断，全面实施了空值安全与防御式解包。在同步节点与边时确保底层图谱扫描绝对畅通无阻，实现超 10,000+ 节点的全量稳态重建。
 
 ### 🏔️ V11.11 纯净重构与发件箱解耦 (V11.11 Pure Canonical Architecture & Outbox Decoupling)
-- **SQLite 增量发件箱 (Mutation Outbox)**：在 SQLite 底座新增 `mutation_outbox` 表，`mutation_coordinator` 将 Markdown 变更与出站意图一并提交为单个物理事务（Atomicity），消除写操作中断导致的派生层（FTS/图谱）数据断层。
-- **派生缓存彻底解耦 (Derived Cache Decoupling)**：`generate_index` 彻底斩断对物理 Markdown 文件的依赖，全量索引强制只通过 Canonical SQLite `entities` 表进行无损重建。阻止了被破坏或违规修改的脏 Markdown 污染上层逻辑图谱。
-- **全局单点写入口 (Omni-Write Entrypoint)**：将 `MCP 写入`、`GC 删除`、`Bulk Merge`、`Query Stub 注册` 与 `Watchdog 手动编辑` 五大旁路全部强制收编，统一送入 `execute_mutation_plan()` 管线，达成写入生命周期的绝对封闭。
+- **SQLite 增量发件箱 (Mutation Outbox)**：canonical 更新/删除与 outbox payload 同事务提交。worker 无需信号文件即可轮询，使用 lease 领取、有限重试、退避和终态失败记录完成恢复。
+- **派生缓存解耦 (Derived Cache Decoupling)**：`generate_index` 和增量索引只读取 SQLite `entities`；节点键固定为 `page_key`，展示名只作为标题或 alias。
+- **统一写入口 (Unified Write Entrypoint)**：MCP 写入、运行态记忆、批量链接替换、rename、delete、lint stub 和 watchdog 手工编辑均汇入 `execute_mutation_batch()`；跨页面操作只提交一次 canonical 事务。
 
 ### 🔌 Antigravity Orchestrator 深度集成
 
@@ -151,7 +151,8 @@ graph LR
 2. **Dream Cycle 梦境联通**：系统的夜间清洗引擎 (`mentat-dream-cycle`) 现已被设定为每日凌晨 3 点 Cron 守护进程。提取日间短期记忆 (`hot_facts.md`) 时，系统强制利用 `Query_Vector_Lake` 探针查询重叠度，决定是【合并 Merge】还是【新建 Create】，从物理层斩断了垃圾增量。
 
 4. **日常搜索**：使用 `python cli.py search "<keyword>"` 或 `python cli.py query "<question>"` 检索编译后的知识网络。
-5. **周期治理**：定期执行 `python cli.py review` 处理冲突队列，执行 `python cli.py doctor` 检查健康度。
+5. **摄取队列**：使用 `python cli.py ingest-tasks` 查看 queued / awaiting-subagent 作业；宿主 subagent 完成后通过 `finalize_ingest` 入湖。
+6. **周期治理**：定期执行 `python cli.py review` 处理冲突队列，执行 `python cli.py doctor` 检查健康度。
 
 ## Operational Memory
 
@@ -203,6 +204,8 @@ MEMORY/
 > **Note**: Vector Lake 现已全面接入 MCP (Model Context Protocol)。大语言模型 Agent 将直接通过 `vector_lake/mcp_server.py` 调用底层 Tool 接口，不再需要通过终端模拟。
 > 
 > **Gemini CLI Slash Commands**: 我们已将常用功能映射为快捷指令（在聊天框输入 `/` 触发）：
+> 以下 `/...` 入口属于 Gemini CLI 的 `commands/*.toml` 兼容层。Codex 不加载插件自定义 slash command；在 Codex 中使用 `$vector-lake:query`、`$vector-lake:timeline` 等同名技能，或直接要求调用对应 MCP 工具。
+>
 > - `/vl_sync`：自动调度 Ingestor 子智能体执行图谱知识的异步增量同步
 > - `/search`：语义搜索向量湖索引
 > - `/query`：深度逻辑推理与查询
@@ -290,17 +293,38 @@ python cli.py gc --days 30 --dry-run
 python cli.py delete "<raw-source-path>" --dry-run
 ```
 
+投影与 canonical 维护：
+
+```powershell
+python cli.py projection-report --limit 20
+python cli.py canonical-backfill --limit 100
+python cli.py canonical-backfill --apply --limit 100
+python cli.py timeline-rebuild --apply
+python cli.py projection-rebuild-index --apply
+python cli.py embedding-backfill --limit 200
+python cli.py embedding-backfill --apply --limit 200
+python cli.py wiki-restore --apply --limit 10
+```
+
+这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影。
+
 ## Config
 
-`config.json` 控制运行范围和模型调用：
+`config.json` 与环境变量共同控制运行范围和模型调用：
 
 - `target_directories`：raw source 扫描路径。
 - `exclude_paths`：排除目录。
 - `supported_extensions`：当前启用的输入扩展名。
 - `processed_files_path`：已处理 raw 文件记录。
-- `llm.model_cascade`：CLI 模型降级链（例如 `["gemini-2.5-pro", "gemini-3.1-pro-preview"]`），单模型报错自动 fallback。
-- `llm.batch_size`：批处理规模。
-- `llm.timeout_analysis / timeout_generation / timeout_query`：LLM 调用超时。
+- `subagent.task_packet_path`：当前环境 subagent 任务包路径。
+- `timeline.projection_rebuild`：从 timeline-event claims 重建 `timeline_events` 投影。
+- `embedding.model`：embedding 模型配置；非 embedding 文本推理不由插件直接调用外部 API。
+- `VECTOR_LAKE_EMBEDDING_RPM` / `VECTOR_LAKE_EMBEDDING_TPM`：embedding 调度限额，默认分别为 `3000` 和 `1000000`。
+- `VECTOR_LAKE_EMBEDDING_UTILIZATION`：安全水位，默认 `0.8`，即按 2400 RPM / 800k TPM 调度。
+- `VECTOR_LAKE_EMBEDDING_MAX_BATCH_ITEMS` / `VECTOR_LAKE_EMBEDDING_MAX_BATCH_TOKENS`：单批条数与 token 上限，默认 `100` / `200000`。
+- `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
+- 所有进程通过 SQLite 滚动窗口共享 RPM/TPM 预算；索引重建和增量索引不调用 embedding API，内容变更后的旧向量由显式 `embedding-backfill` 补齐。
+- Ingest 完成必须提交领取阶段返回的 `job_id`、`lease_owner`、`lease_token` 和 `lease_generation`；过期 Worker 的结果会被最终 CAS 拒绝。
 
 ## Module Map
 
@@ -315,7 +339,7 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/tool_memory.py` | 基于 "Wiki-as-Database" 架构的运行态记忆物理写回 |
 | `vector_lake/governance_store.py` | canonical store、change set、operational memory、conflict resolver |
 | `vector_lake/governance_metrics.py` | debt metrics 和治理统计 |
-| `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR) 与 Memory Packet |
+| `vector_lake/tool_search.py` | 混合检索管线 (Local Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR) 与 Memory Packet |
 | `vector_lake/tool_query.py` | query-to-page synthesis |
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |

@@ -1,0 +1,285 @@
+import pytest
+
+from vector_lake import db_store, governance_store
+from vector_lake.mutation_coordinator import execute_mutation_batch, execute_mutation_plan
+
+
+def _write_purpose_contract(memory_dir):
+    (memory_dir / "purpose.md").write_text(
+        """---
+purpose_version: "12.0"
+intent_keywords: [test]
+intent_weight_boost: 0.1
+scope:
+  core: [test]
+  edge: [edge]
+  excluded: [excluded]
+  marketing_noise: [noise]
+evidence_tiers:
+  primary: Primary evidence
+  derived: Derived operational evidence
+sir_registry:
+  - id: SIR_TEST
+    status: active
+    review_after: 2099-01-01
+    signal_keywords: [test]
+synthesis_policy:
+  min_distinct_sources: 2
+  min_tension_intensity: 0.5
+---
+Test purpose.
+""",
+        encoding="utf-8",
+    )
+
+
+def _source_content():
+    return """---
+id: source_test
+title: Test Source
+type: source
+domain: General
+status: Active
+epistemic-status: seed
+categories: [Source]
+updated: 2026-07-13T00:00:00+00:00
+sources: [raw/test.pdf]
+strategic_scope: core
+evidence_tier: primary
+---
+Primary source content.
+"""
+
+
+def _named_source_content(entity_id: str, title: str, body: str = "Primary source content."):
+    return f"""---
+id: {entity_id}
+title: {title}
+type: source
+domain: General
+status: Active
+epistemic-status: seed
+categories: [Source]
+updated: 2026-07-13T00:00:00+00:00
+sources: [raw/test.pdf]
+strategic_scope: core
+evidence_tier: primary
+---
+{body}
+"""
+
+
+@pytest.mark.parametrize("filename", ["../escape.md", "C:\\escape.md", "System_/../../escape.md", "subdir/Concept_Test.md"])
+def test_mutation_rejects_paths_outside_wiki(isolated_memory, filename):
+    _write_purpose_contract(isolated_memory)
+    with pytest.raises(ValueError, match="filename|path|boundary|basename"):
+        execute_mutation_plan(filename, content=_source_content())
+    assert not (isolated_memory.parent / "escape.md").exists()
+
+
+def test_mutation_commits_canonical_and_durable_intent_before_projection(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+
+    ok, message = execute_mutation_plan("Source_Test.md", content=_source_content())
+
+    assert ok is True
+    assert "committed" in message.lower()
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    assert target.read_text(encoding="utf-8") == _source_content()
+    conn = db_store.get_connection()
+    entity = conn.execute(
+        "SELECT data_json FROM entities WHERE json_extract(data_json, '$.page_key') = 'Source_Test'"
+    ).fetchone()
+    assert entity is not None
+    outbox = conn.execute(
+        "SELECT status, payload_text FROM mutation_outbox WHERE filename = 'Source_Test.md'"
+    ).fetchone()
+    assert outbox["status"] == "pending"
+    assert outbox["payload_text"] == _source_content()
+
+
+def test_mutation_rolls_back_canonical_when_outbox_enqueue_fails(isolated_memory, monkeypatch):
+    _write_purpose_contract(isolated_memory)
+
+    def fail_enqueue(*_args, **_kwargs):
+        raise RuntimeError("injected outbox failure")
+
+    monkeypatch.setattr(db_store, "enqueue_mutation", fail_enqueue)
+    with pytest.raises(RuntimeError, match="injected outbox failure"):
+        execute_mutation_plan("Source_Test.md", content=_source_content())
+
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT 1 FROM entities").fetchone() is None
+    assert not (isolated_memory / "wiki" / "Source_Test.md").exists()
+
+
+def test_mutation_batch_rolls_back_all_pages_and_callback(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    left_original = _named_source_content("source_left", "Left Source")
+    right_original = _named_source_content("source_right", "Right Source")
+    execute_mutation_plan("Source_Left.md", content=left_original)
+    execute_mutation_plan("Source_Right.md", content=right_original)
+    conn = db_store.get_connection()
+    conn.execute("DELETE FROM mutation_outbox")
+    conn.commit()
+
+    def fail_callback():
+        raise RuntimeError("injected registry failure")
+
+    with pytest.raises(RuntimeError, match="injected registry failure"):
+        execute_mutation_batch(
+            [
+                {
+                    "filename": "Source_Left.md",
+                    "content": _named_source_content("source_left", "Left Source", "Revised."),
+                },
+                {"filename": "Source_Right.md", "is_delete": True},
+            ],
+            canonical_callback=fail_callback,
+        )
+
+    assert (isolated_memory / "wiki" / "Source_Left.md").read_text(encoding="utf-8") == left_original
+    assert (isolated_memory / "wiki" / "Source_Right.md").read_text(encoding="utf-8") == right_original
+    assert conn.execute(
+        "SELECT 1 FROM entities WHERE json_extract(data_json, '$.page_key') = 'Source_Right'"
+    ).fetchone() is not None
+    assert conn.execute("SELECT 1 FROM mutation_outbox").fetchone() is None
+
+
+def test_mutation_batch_updates_derived_state_without_full_rebuild(isolated_memory, monkeypatch):
+    _write_purpose_contract(isolated_memory)
+    alias_calls = 0
+    memory_calls = 0
+    real_alias_rebuild = governance_store.rebuild_alias_registry
+    real_memory_rebuild = governance_store.rebuild_operational_memory
+
+    def count_alias_rebuild():
+        nonlocal alias_calls
+        alias_calls += 1
+        return real_alias_rebuild()
+
+    def count_memory_rebuild():
+        nonlocal memory_calls
+        memory_calls += 1
+        return real_memory_rebuild()
+
+    monkeypatch.setattr(governance_store, "rebuild_alias_registry", count_alias_rebuild)
+    monkeypatch.setattr(governance_store, "rebuild_operational_memory", count_memory_rebuild)
+    execute_mutation_batch(
+        [
+            {
+                "filename": "Source_Left.md",
+                "content": _named_source_content("source_left", "Left Source"),
+            },
+            {
+                "filename": "Source_Right.md",
+                "content": _named_source_content("source_right", "Right Source"),
+            },
+        ]
+    )
+
+    assert alias_calls == 0
+    assert memory_calls == 0
+    conn = db_store.get_connection()
+    alias_row = conn.execute("SELECT value FROM alias_registry WHERE key = 'Left Source'").fetchone()
+    assert alias_row is not None
+    assert conn.execute("SELECT 1 FROM entities WHERE entity_id = ?", (alias_row[0],)).fetchone() is not None
+    assert conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0] > 0
+
+
+def test_page_scoped_mutation_does_not_rewrite_unrelated_canonical_rows(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    execute_mutation_batch(
+        [
+            {"filename": "Source_Left.md", "content": _named_source_content("source_left", "Left Source")},
+            {"filename": "Source_Right.md", "content": _named_source_content("source_right", "Right Source")},
+        ]
+    )
+    conn = db_store.get_connection()
+    before = {
+        table: conn.execute(
+            f"SELECT updated_at, data_json FROM {table} WHERE json_extract(data_json, '$.locator.page_key') = 'Source_Right' LIMIT 1"
+            if table in {"claims", "evidence"}
+            else f"SELECT updated_at, data_json FROM {table} WHERE json_extract(data_json, '$.page_key') = 'Source_Right' LIMIT 1"
+        ).fetchone()
+        for table in ("entities", "claims", "evidence")
+    }
+
+    execute_mutation_plan(
+        "Source_Left.md",
+        content=_named_source_content("source_left", "Left Source", "Revised left content."),
+    )
+
+    for table, old_row in before.items():
+        assert old_row is not None
+        new_row = conn.execute(
+            f"SELECT updated_at, data_json FROM {table} WHERE json_extract(data_json, '$.locator.page_key') = 'Source_Right' LIMIT 1"
+            if table in {"claims", "evidence"}
+            else f"SELECT updated_at, data_json FROM {table} WHERE json_extract(data_json, '$.page_key') = 'Source_Right' LIMIT 1"
+        ).fetchone()
+        assert tuple(new_row) == tuple(old_row)
+
+
+def test_record_prepared_change_sets_does_not_load_full_history(isolated_memory, monkeypatch):
+    db_store.init_db()
+    change_set = {
+        "change_set_id": "changeset_delta",
+        "idempotency_key": "delta-key",
+        "status": "published",
+    }
+    monkeypatch.setattr(governance_store, "load_change_sets", lambda: (_ for _ in ()).throw(AssertionError("full history load")))
+
+    assert governance_store.record_prepared_change_sets([change_set]) == 1
+    assert governance_store.record_prepared_change_sets([change_set]) == 0
+    assert db_store.get_connection().execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == 1
+
+
+def test_schema_validation_mode_allows_bounded_legacy_maintenance(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    legacy_content = _named_source_content("source_legacy", "Legacy Source").replace(
+        "evidence_tier: primary\n",
+        "",
+    )
+
+    with pytest.raises(Exception, match="evidence_tier"):
+        execute_mutation_plan("Source_Legacy.md", content=legacy_content)
+
+    ok, message = execute_mutation_batch(
+        [{"filename": "Source_Legacy.md", "content": legacy_content}],
+        validation_mode="schema",
+    )
+
+    assert ok is True
+    assert "committed" in message.lower()
+    assert (isolated_memory / "wiki" / "Source_Legacy.md").exists()
+    row = db_store.get_connection().execute(
+        "SELECT validation_mode FROM mutation_outbox WHERE filename = 'Source_Legacy.md'"
+    ).fetchone()
+    assert row["validation_mode"] == "schema"
+
+
+def test_mutation_batch_rejects_unknown_validation_mode(isolated_memory):
+    with pytest.raises(ValueError, match="validation_mode"):
+        execute_mutation_batch([], validation_mode="bypass")
+
+
+def test_schema_mode_updates_existing_legacy_filename_but_cannot_create_one(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    legacy_name = "Source_-Legacy.md"
+    legacy_path = isolated_memory / "wiki" / legacy_name
+    content = _named_source_content("source_legacy_name", "Legacy Name")
+    legacy_path.write_text(content, encoding="utf-8")
+
+    updated = content.replace("Primary source content.", "Updated source content.")
+    execute_mutation_batch(
+        [{"filename": legacy_name, "content": updated}],
+        validation_mode="schema",
+    )
+    assert legacy_path.read_text(encoding="utf-8") == updated
+
+    legacy_path.unlink()
+    with pytest.raises(ValueError, match="Naming"):
+        execute_mutation_batch(
+            [{"filename": legacy_name, "content": updated}],
+            validation_mode="schema",
+        )

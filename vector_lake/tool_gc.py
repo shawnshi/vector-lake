@@ -13,7 +13,10 @@ def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
     from vector_lake.db_store import get_connection
     
     entities = load_entities()
-    nodes = {key: val for key, val in entities.get("items", {}).items()}
+    nodes = {
+        str(node.get("page_key") or entity_id): (str(entity_id), node)
+        for entity_id, node in entities.get("items", {}).items()
+    }
     
     conn = get_connection()
     edges = conn.execute("SELECT source_id, target_id FROM claim_graph_edges").fetchall()
@@ -29,15 +32,15 @@ def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
     cutoff = now - (days * 86400)
 
     orphans = []
-    for key, node in nodes.items():
-        if node.get("type") not in ("vendor", "product", "person", "event"):
+    for page_key, (entity_id, node) in nodes.items():
+        if str(node.get("type") or "").lower() not in ("vendor", "product", "person", "event"):
             continue
-        if degrees[key] <= 1:
-            file_path = wiki_dir / f"{key}.md"
+        if degrees[page_key] <= 1:
+            file_path = wiki_dir / f"{page_key}.md"
             if file_path.exists():
                 mtime = os.path.getmtime(file_path)
                 if mtime < cutoff:
-                    orphans.append((file_path, node.get("id")))
+                    orphans.append((file_path, entity_id))
 
     if dry_run:
         if not orphans:
