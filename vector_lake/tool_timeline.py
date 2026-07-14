@@ -6,14 +6,14 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
     conn = get_connection()
     cursor = conn.cursor()
     
-    query = "SELECT claim_text, data_json, updated_at FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
+    query = "SELECT claim_text, data_json, updated_at FROM timeline_events WHERE 1=1"
     params = []
     
     if entity_name:
-        query += " AND (json_extract(data_json, '$.subject_entity_ids') LIKE ? OR claim_text LIKE ?)"
+        query += " AND (entity_id LIKE ? OR claim_text LIKE ?)"
         params.extend([f"%{entity_name}%", f"%{entity_name}%"])
         
-    query += f" ORDER BY updated_at DESC LIMIT {int(limit)}"
+    query += f" ORDER BY event_date DESC, updated_at DESC LIMIT {int(limit)}"
     
     try:
         cursor.execute(query, params)

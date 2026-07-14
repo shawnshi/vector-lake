@@ -673,12 +673,22 @@ def _resolve_memory_conflicts(store: dict) -> dict:
     for memory in items.values():
         if memory.get("memory_type") == "fact":
             continue
-        if str(memory.get("validity_state", "")).lower() in {"expired", "archived", "superseded"}:
+        if str(memory.get("validity_state", "")).lower() in {"expired", "archived"}:
             continue
         grouped.setdefault((memory.get("memory_type"), memory.get("memory_key")), []).append(memory)
 
     for (memory_type, memory_key), candidates in grouped.items():
+        # Reset validity state so superseded ones can compete again
+        for c in candidates:
+            if c.get("validity_state") == "superseded":
+                c["validity_state"] = "active"
+                c.pop("superseded_by", None)
+                c.pop("conflict_resolution", None)
+                
         if len(candidates) <= 1:
+            if len(candidates) == 1 and candidates[0].get("validity_state") != "active":
+                candidates[0]["validity_state"] = "active"
+                candidates[0].update(score_memory_object(candidates[0]))
             continue
         ordered = sorted(candidates, key=_rank_memory_for_conflict, reverse=True)
         winner = ordered[0]
@@ -1001,13 +1011,14 @@ def create_change_set(
         "changeset_idem",
         "|".join([origin, *sorted(page_summaries), *sorted(page_fingerprints)]),
     )
-    existing_change_sets = load_change_sets()
     if not force:
-        for existing in existing_change_sets["items"]:
-            if existing.get("idempotency_key") == idempotency_key:
-                duplicate = copy.deepcopy(existing)
-                duplicate["deduplicated"] = True
-                return duplicate
+        from vector_lake.db_store import get_connection
+        conn = get_connection()
+        row = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.idempotency_key') = ?", (idempotency_key,)).fetchone()
+        if row:
+            duplicate = json.loads(row[0])
+            duplicate["deduplicated"] = True
+            return duplicate
 
     change_set = {
         "change_set_id": f"changeset_{uuid.uuid4().hex[:12]}",
@@ -1055,8 +1066,11 @@ def create_change_set(
         })
         save_governance_queue(queue)
 
-    existing_change_sets["items"].append(change_set)
-    save_change_sets(existing_change_sets)
+    from vector_lake.db_store import get_connection, transaction
+    conn = get_connection()
+    with transaction():
+        conn.execute("INSERT OR REPLACE INTO change_sets (change_set_id, data_json, updated_at) VALUES (?, ?, ?)", 
+                     (change_set["change_set_id"], json.dumps(change_set, ensure_ascii=False), _utc_now()))
     return change_set
 
 
@@ -1069,6 +1083,7 @@ def apply_change_set(change_set: dict) -> dict:
     affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
     
     with transaction():
+        affected_memory_keys = set()
         if affected_page_keys:
             proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
             proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
@@ -1076,13 +1091,33 @@ def apply_change_set(change_set: dict) -> dict:
             page_keys_tuple = tuple(affected_page_keys)
             placeholders = ",".join(["?"] * len(page_keys_tuple))
 
-            # Prune claims
+            # Prune claims and timeline events
             if proposed_claim_ids:
                 claim_ids_tuple = tuple(proposed_claim_ids)
                 claim_placeholders = ",".join(["?"] * len(claim_ids_tuple))
+                
+                # We need to find affected memory keys before deleting
+                rows = conn.execute(f"SELECT data_json FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders}) AND claim_id NOT IN ({claim_placeholders})", page_keys_tuple + claim_ids_tuple).fetchall()
+                for r in rows:
+                    c = json.loads(r[0])
+                    mtype = infer_memory_type(c)
+                    if mtype in ("preference", "decision"):
+                        affected_memory_keys.add((mtype, _infer_memory_key(c, mtype)))
+                        
                 conn.execute(f"DELETE FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders}) AND claim_id NOT IN ({claim_placeholders})", page_keys_tuple + claim_ids_tuple)
+                conn.execute(f"DELETE FROM timeline_events WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders}) AND claim_id NOT IN ({claim_placeholders})", page_keys_tuple + claim_ids_tuple)
+                conn.execute(f"DELETE FROM operational_memory WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders}) AND json_extract(data_json, '$.source_claim_id') NOT IN ({claim_placeholders})", page_keys_tuple + claim_ids_tuple)
             else:
+                rows = conn.execute(f"SELECT data_json FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})", page_keys_tuple).fetchall()
+                for r in rows:
+                    c = json.loads(r[0])
+                    mtype = infer_memory_type(c)
+                    if mtype in ("preference", "decision"):
+                        affected_memory_keys.add((mtype, _infer_memory_key(c, mtype)))
+                        
                 conn.execute(f"DELETE FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})", page_keys_tuple)
+                conn.execute(f"DELETE FROM timeline_events WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})", page_keys_tuple)
+                conn.execute(f"DELETE FROM operational_memory WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})", page_keys_tuple)
 
             # Prune evidence
             if proposed_evidence_ids:
@@ -1108,9 +1143,33 @@ def apply_change_set(change_set: dict) -> dict:
         proposed_claims = change_set.get("proposed_claims", [])
         if proposed_claims:
             vals = []
+            timeline_vals = []
+            mem_vals = []
             for item in proposed_claims:
                 vals.append((item["claim_id"], item.get("claim_text", ""), json.dumps(item, ensure_ascii=False), now))
+                if item.get("claim_type") == "timeline-event":
+                    event_date = item.get("temporal_anchor") or "Unknown"
+                    for e_id in item.get("subject_entity_ids", []):
+                        timeline_vals.append((event_date, e_id, item["claim_id"], item.get("claim_text", ""), ",".join(item.get("source_ids", [])), json.dumps(item, ensure_ascii=False), now))
+                
+                # Also create the memory object
+                mtype = infer_memory_type(item)
+                if mtype in ("preference", "decision"):
+                    affected_memory_keys.add((mtype, _infer_memory_key(item, mtype)))
+                
+                mem = _memory_object_from_claim(item)
+                mem_vals.append((
+                    mem["memory_id"], mem["memory_type"], mem.get("memory_score", 0.0), 
+                    mem.get("status", "Active"), mem.get("ttl", 0.0), json.dumps(mem, ensure_ascii=False), now
+                ))
+
             conn.executemany("INSERT OR REPLACE INTO claims (claim_id, claim_text, data_json, updated_at) VALUES (?, ?, ?, ?)", vals)
+            conn.executemany("INSERT OR REPLACE INTO operational_memory (memory_id, memory_type, score, status, ttl, data_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", mem_vals)
+            
+            if timeline_vals:
+                for t in timeline_vals:
+                    conn.execute("DELETE FROM timeline_events WHERE claim_id = ? AND entity_id = ?", (t[2], t[1]))
+                conn.executemany("INSERT INTO timeline_events (event_date, entity_id, claim_id, claim_text, source_ids, data_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", timeline_vals)
 
         # Upsert Evidence
         proposed_evidence = change_set.get("proposed_evidence", [])
@@ -1131,8 +1190,25 @@ def apply_change_set(change_set: dict) -> dict:
     save_graph_edges(change_set.get("proposed_edges", []))
     
     # O(1) incremental rebuilds
-    # In V11 architecture, we skip the O(N) full memory rebuild on every micro-change
-    # We leave that for the daily gc/lint job or background worker.
+    if affected_memory_keys:
+        for mtype, mkey in affected_memory_keys:
+            rows = conn.execute("SELECT data_json FROM operational_memory WHERE json_extract(data_json, '$.memory_type') = ? AND json_extract(data_json, '$.memory_key') = ?", (mtype, mkey)).fetchall()
+            group_store = {"items": {}}
+            for r in rows:
+                m = json.loads(r[0])
+                group_store["items"][m["memory_id"]] = m
+            
+            group_store = _resolve_memory_conflicts(group_store)
+            
+            mem_vals = []
+            for m in group_store["items"].values():
+                mem_vals.append((
+                    m["memory_id"], m["memory_type"], m.get("memory_score", 0.0), 
+                    m.get("status", "Active"), m.get("ttl", 0.0), json.dumps(m, ensure_ascii=False), _utc_now()
+                ))
+            if mem_vals:
+                conn.executemany("INSERT OR REPLACE INTO operational_memory (memory_id, memory_type, score, status, ttl, data_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", mem_vals)
+
     change_set["operational_memory_count"] = 0
     change_set["conflict_event_count"] = 0
 
@@ -1140,20 +1216,27 @@ def apply_change_set(change_set: dict) -> dict:
 
 
 def publish_change_sets(limit: int | None = None) -> dict:
-    change_sets = load_change_sets()
+    from vector_lake.db_store import get_connection, transaction
+    conn = get_connection()
+    rows = conn.execute("SELECT change_set_id, data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
+    
     published = 0
     published_ids = []
-    for change_set in change_sets["items"]:
-        if change_set.get("status") != "pending":
-            continue
+    
+    for row in rows:
+        change_set = json.loads(row[1])
         apply_change_set(change_set)
         change_set["status"] = "published"
         change_set["published_at"] = _utc_now()
+        
+        with transaction():
+            conn.execute("UPDATE change_sets SET data_json = ?, updated_at = ? WHERE change_set_id = ?", 
+                         (json.dumps(change_set, ensure_ascii=False), _utc_now(), change_set["change_set_id"]))
+            
         published += 1
         published_ids.append(change_set["change_set_id"])
         if limit is not None and published >= limit:
             break
-    save_change_sets(change_sets)
 
     queue = load_governance_queue()
     for item in queue["items"]:
@@ -1163,9 +1246,11 @@ def publish_change_sets(limit: int | None = None) -> dict:
     save_governance_queue(queue)
     return {"published": published, "change_set_ids": published_ids}
 
-
 def pending_change_sets() -> list:
-    return [item for item in load_change_sets()["items"] if item.get("status") == "pending"]
+    from vector_lake.db_store import get_connection
+    conn = get_connection()
+    rows = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
+    return [json.loads(r[0]) for r in rows]
 
 
 def pending_governance_items() -> list:

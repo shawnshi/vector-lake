@@ -237,19 +237,20 @@ def index_worker_loop():
             from vector_lake import governance_store
             
             with global_task_lock:
-                for row in rows:
-                    outbox_id = row["id"]
-                    filename = row["filename"]
-                    mutation_type = row["mutation_type"]
-                    try:
-                        indexer.update_index_items([filename])
-                        with transaction():
-                            conn.execute("UPDATE mutation_outbox SET status = 'completed' WHERE id = ?", (outbox_id,))
-                    except Exception as e:
-                        log.error(f"Failed to process outbox item {outbox_id} for {filename}: {e}")
-                        with transaction():
-                            conn.execute("UPDATE mutation_outbox SET status = 'failed' WHERE id = ?", (outbox_id,))
-                        raise e
+                filenames = [row["filename"] for row in rows]
+                outbox_ids = [row["id"] for row in rows]
+                
+                try:
+                    indexer.update_index_items(filenames)
+                    with transaction():
+                        ids_str = ",".join("?" for _ in outbox_ids)
+                        conn.execute(f"UPDATE mutation_outbox SET status = 'completed' WHERE id IN ({ids_str})", outbox_ids)
+                except Exception as e:
+                    log.error(f"Failed to process outbox batch: {e}")
+                    with transaction():
+                        ids_str = ",".join("?" for _ in outbox_ids)
+                        conn.execute(f"UPDATE mutation_outbox SET status = 'failed' WHERE id IN ({ids_str})", outbox_ids)
+                    raise e
 
                 log.info(f"O(1) Batched Index updated for {len(rows)} outbox mutations")
 

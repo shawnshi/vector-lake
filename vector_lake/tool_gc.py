@@ -13,7 +13,7 @@ def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
     from vector_lake.db_store import get_connection
     
     entities = load_entities()
-    nodes = {key: val for key, val in entities.get("items", {}).items()}
+    nodes = {val.get("canonical_name", key): val for key, val in entities.get("items", {}).items()}
     
     conn = get_connection()
     edges = conn.execute("SELECT source_id, target_id FROM page_graph_edges").fetchall()
@@ -65,5 +65,15 @@ def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
             deleted += 1
         except Exception as e:
             log.error(f"Failed to GC {path.name}: {e}")
+
+    try:
+        from vector_lake.db_store import transaction
+        import datetime
+        cutoff_dt = datetime.datetime.utcfromtimestamp(cutoff).isoformat() + "Z"
+        with transaction():
+            conn.execute("DELETE FROM change_sets WHERE updated_at < ?", (cutoff_dt,))
+        log.info(f"Database GC: Pruned change_sets older than {cutoff_dt}")
+    except Exception as e:
+        log.error(f"Failed to GC change_sets table: {e}")
 
     return f"GC complete. Deleted {deleted} orphan pages (backed up to {backup_dir})."

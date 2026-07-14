@@ -148,6 +148,13 @@ graph LR
 - **环境锁死锁根除 (Environmental Lock Eradication)**：全面排查并废除了插件层级的写锁机制（如 `tmp` 目录下高频创建的 `in_progress.lock`）。将所有状态锁移至系统底层 `%TEMP%` 物理层，彻底消除了由于文件锁残留引发的死锁断层与环境锁死风险。
 - **数据面与控制面分离 (Data / Control Plane Isolation)**：完全服从 Antigravity 2.0 沙箱隔离规范。在 `tool_ingest` 与 `watchdog` 中废除了容易发生 JSON Payload 解析雪崩的长文本直传。大体积的网页内容与知识载荷现在强制绕道基于 `conversation_id` 物理隔离的 `brain/<id>/scratch/` 作为共享缓冲区指针。
 - **并行读写无损穿透 (Database Concurrency Survival)**：在底层的 Embedding 构建管线 `indexer.py` 中强制套用 `transaction()` 指数退避安全门。遭遇 SQLite 突发读写锁 (`database is locked`) 时不再触发导致灾难级重算的“吞没失败”黑洞，保障了千级实体规模下的查询完备性。
+
+### 🚄 V11.13 O(1) 事务跃迁与全局并发调度重构 (V11.13 O(1) Transaction & Concurrent Scheduling)
+- **单记录 O(1) 内存重算 (O(1) Operational Memory Rebuild)**：废除旧架构下 `apply_change_sets_batch()` 每逢小更新即触发 1 万节点全库锁定的灾难级设计。在 SQLite 核心通过追踪 `affected_memory_keys` 并局部触发变更重算，实现了运行时 Memory 与 Timeline 的真 O(1) 增量构建，极大缓解了跨线程死锁与卡顿。
+- **Timeline 增量追踪基建 (Incremental Timeline Base)**：斩断 `tool_timeline.py` 每次强行从 `claims` 库 O(N) 遍历过滤时序事件的高危漏查设计。引入统一的 `timeline_events` O(1) 事件表，使得时间线能够与 Change Set 同步持久化，做到确定性追踪，再无历史丢失风险。
+- **全局并发限流防爆屏障 (Global Concurrency Rate Limit Barrier)**：阻断了 `indexer.py` (generate_index) 在图谱重构或全库扫描时隐式触发大模型 Embedding 的恶性 API 并发，将其严格抽离至少数派专职调度进程。终结了节点重构、查询、与全量索引并发时引发的指数级 API 费用爆发与封禁。
+- **出站引擎全局批处理 (Global Batch Outbox Engine)**：重写 `watchdog_app.py` 中的 `mutation_outbox` 工作流。将极度低效的逐文件步进式同步调用（`update_index_items([filename])`），全面进化为跨进程数组归集批处理（Batched Array Execution），将万级高频碎步写入转化为单个大型原子事务。
+- **差分历史审计降维与 GC (Diff GC for Change Sets)**：将 SQLite 库内无休止膨胀的 `change_sets` 流水，接入系统级的 `tool_gc.py` 管线。按设定日历生命周期自动发起 `DELETE` 定时清道夫任务，实现长期知识湖存储的绝对瘦身。
 - **阻塞陷阱重构 (Asynchronous Fire-and-Forget)**：剥离 `DiaryWatchdogHandler` 霸占线程池的线性 `subprocess.run` 陷阱，将其降维为纯异步 `Popen` 子进程唤起。释放了有限的 3 并发守护线程池，使外部文件变更响应突破延时阻塞。
 - **泛型语法树白名单 (AST Filter Purge)**：废弃了易受 Markdown 缩进污染的纯文本切分器。在 `claim_extractor.py` 中引入 `block_code` 脏节点屏障，使得 LLM 生成代码时的噪音（如 Python / Shell script 断言）在语法树层级即被拦截，保持图谱 100% 认知洁净。
 

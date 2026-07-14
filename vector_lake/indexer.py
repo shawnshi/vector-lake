@@ -136,8 +136,11 @@ def _tokenize_for_fts(text: str) -> str:
     except ImportError:
         return text
 
-def _compute_embeddings_unlocked(index_data: dict, force: bool = False) -> dict:
+def _compute_embeddings_unlocked(index_data: dict, force: bool = False, skip_embeddings: bool = True) -> dict:
     embeddings_map = {}
+    if skip_embeddings:
+        return embeddings_map
+        
     import os
     import time
     if not os.environ.get("GEMINI_API_KEY"):
@@ -161,7 +164,8 @@ def _compute_embeddings_unlocked(index_data: dict, force: bool = False) -> dict:
                 cur = conn.execute("SELECT entity_id FROM vec_embeddings")
                 existing = {row[0] for row in cur.fetchall()}
         except Exception as e:
-            log.error(f"Failed to fetch existing embeddings: {e}")
+            log.error(f"Failed to fetch existing embeddings, aborting incremental update to prevent cost explosion: {e}")
+            raise e
 
     for node_key, node in nodes.items():
         if not force and node_key in existing:
@@ -760,7 +764,7 @@ def _apply_graph_topology(index_data: dict):
         node["node_score"] = round(node.get("decay_weight", 1.0), 4)
 
 
-def generate_index():
+def generate_index(skip_embeddings: bool = True):
     index_data = _empty_index_data()
     from vector_lake.governance_store import load_entities, load_claims
     entities = load_entities().get("items", {})
@@ -836,7 +840,7 @@ def generate_index():
     _write_index(tmp_output, index_data)
 
     # PHASE 1 FIX: Compute embeddings OUTSIDE of DB transaction to prevent Network Blockade Deadlock
-    embeddings_map = _compute_embeddings_unlocked(index_data)
+    embeddings_map = _compute_embeddings_unlocked(index_data, skip_embeddings=skip_embeddings)
     with transaction():
         _build_bm25_index(index_data, embeddings_map)
 
