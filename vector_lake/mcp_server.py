@@ -318,6 +318,8 @@ def finalize_ingest(
         files_written_payload_file: Sandbox JSON file containing files_written.
         raw_files_payload_file: Sandbox JSON file containing processed_data.
     """
+    import json
+    import os
     try:
         import json
         if files_written_payload_file or raw_files_payload_file:

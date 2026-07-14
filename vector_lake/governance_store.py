@@ -101,7 +101,7 @@ def _default_queue_store() -> dict:
 ALLOWED_TABLES = {
     "entities", "claims", "evidence", "sources", "change_sets",
     "governance_queue", "wiki_search_index", "alias_registry",
-    "operational_memory", "claim_graph_nodes", "claim_graph_edges",
+    "operational_memory", "claim_graph_nodes", "claim_graph_edges", "page_graph_edges",
     "timeline_events", "processed_files", "mutation_outbox"
 }
 
@@ -155,10 +155,10 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
         extra_cols = []
     
     with transaction():
-        existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
-        existing_keys = {row[0] for row in existing_keys_query}
+        existing_rows = conn.execute(f"SELECT {pk_col}, data_json FROM {table_name}").fetchall()
+        existing_map = {row[0]: row["data_json"] for row in existing_rows}
         new_keys = set(data.get("items", {}).keys())
-        keys_to_delete = existing_keys - new_keys
+        keys_to_delete = set(existing_map.keys()) - new_keys
         
         if keys_to_delete:
             conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
@@ -169,6 +169,11 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
             
             all_vals = []
             for key, item in data.get("items", {}).items():
+                new_json = json.dumps(item, ensure_ascii=False)
+                # Skip SQLite I/O if the row hasn't changed at all
+                if key in existing_map and existing_map[key] == new_json:
+                    continue
+                    
                 params = [key]
                 for c_name, c_key, c_type in extra_cols:
                     val = item.get(c_key)
@@ -178,11 +183,13 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
                         params.append(int(val or 0))
                     else:
                         params.append(str(val or ""))
-                params.append(json.dumps(item, ensure_ascii=False))
+                params.append(new_json)
                 params.append(now)
                 all_vals.append(tuple(params))
-            
-            conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", all_vals)
+                
+            if all_vals:
+                conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", all_vals)
+
 
 def _save_db_queue(table_name: str, pk_col: str, data: dict):
     _validate_table_name(table_name)
@@ -333,9 +340,14 @@ def save_graph_edges(edges: list[dict]):
     conn = get_connection()
     with transaction():
         for edge in edges:
+            params = (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
             conn.execute(
                 "INSERT OR REPLACE INTO claim_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
+                params,
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO page_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
+                params,
             )
 
 
@@ -381,13 +393,15 @@ def get_entity(entity_id: str) -> dict | None:
 def upsert_entity(entity_id: str, data: dict):
     conn = get_connection()
     now = _utc_now()
-    cols = ["entity_id", "canonical_name", "type", "status", "data_json", "updated_at"]
+    cols = ["entity_id", "canonical_name", "type", "status", "ttl", "decay_weight", "data_json", "updated_at"]
     placeholders = ["?"] * len(cols)
     params = [
         entity_id,
         str(data.get("canonical_name") or data.get("title") or data.get("page_key") or entity_id),
         str(data.get("type", "")),
         str(data.get("status", "Active")),
+        float(data.get("ttl") or 0.0),
+        float(data.get("decay_weight") or 0.0),
         json.dumps(data, ensure_ascii=False),
         now
     ]
@@ -844,12 +858,22 @@ def _resolve_memory_conflicts(store: dict) -> dict:
     for memory in items.values():
         if memory.get("memory_type") == "fact":
             continue
-        if str(memory.get("validity_state", "")).lower() in {"expired", "archived", "superseded"}:
+        if str(memory.get("validity_state", "")).lower() in {"expired", "archived"}:
             continue
         grouped.setdefault((memory.get("memory_type"), memory.get("memory_key")), []).append(memory)
 
     for (memory_type, memory_key), candidates in grouped.items():
+        # Reset validity state so superseded ones can compete again
+        for c in candidates:
+            if c.get("validity_state") == "superseded":
+                c["validity_state"] = "active"
+                c.pop("superseded_by", None)
+                c.pop("conflict_resolution", None)
+                
         if len(candidates) <= 1:
+            if len(candidates) == 1 and candidates[0].get("validity_state") != "active":
+                candidates[0]["validity_state"] = "active"
+                candidates[0].update(score_memory_object(candidates[0]))
             continue
         ordered = sorted(candidates, key=_rank_memory_for_conflict, reverse=True)
         winner = ordered[0]
@@ -938,19 +962,27 @@ def search_operational_memory(
         if relevance <= 0 and terms:
             continue
         score = relevance + (float(memory.get("memory_score", 0) or 0) * 5)
-        item = copy.deepcopy(memory)
-        item["retrieval_score"] = round(score, 4)
-        ranked.append(item)
+        # ⚡ Bolt: Store the score values as sort keys with a reference to the un-copied memory object.
+        # This delays expensive deepcopies until *after* top_k elements are selected.
+        ranked.append((
+            round(score, 4),
+            memory.get("memory_score", 0),
+            _dt_rank(memory.get("updated_at")),
+            memory
+        ))
 
     ranked.sort(
-        key=lambda item: (
-            item.get("retrieval_score", 0),
-            item.get("memory_score", 0),
-            _dt_rank(item.get("updated_at")),
-        ),
+        key=lambda item: (item[0], item[1], item[2]),
         reverse=True,
     )
-    return ranked[:top_k]
+
+    results = []
+    for score, memory_score, dt_rank, memory in ranked[:top_k]:
+        item = copy.deepcopy(memory)
+        item["retrieval_score"] = score
+        results.append(item)
+
+    return results
 
 
 def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
@@ -1128,6 +1160,7 @@ def create_change_set(
     summary: str | None = None,
     auto_approve: bool = False,
     force: bool = False,
+    dry_run: bool = False,
 ) -> dict:
     initialize_meta_store()
     entities = load_entities()
@@ -1163,13 +1196,14 @@ def create_change_set(
         "changeset_idem",
         "|".join([origin, *sorted(page_summaries), *sorted(page_fingerprints)]),
     )
-    existing_change_sets = load_change_sets()
     if not force:
-        for existing in existing_change_sets["items"]:
-            if existing.get("idempotency_key") == idempotency_key:
-                duplicate = copy.deepcopy(existing)
-                duplicate["deduplicated"] = True
-                return duplicate
+        from vector_lake.db_store import get_connection
+        conn = get_connection()
+        row = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.idempotency_key') = ?", (idempotency_key,)).fetchone()
+        if row:
+            duplicate = json.loads(row[0])
+            duplicate["deduplicated"] = True
+            return duplicate
 
     change_set = {
         "change_set_id": f"changeset_{uuid.uuid4().hex[:12]}",
@@ -1394,6 +1428,10 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             f"DELETE FROM claim_graph_edges WHERE source_id IN ({placeholders})",
             affected_page_params,
         )
+        conn.execute(
+            f"DELETE FROM page_graph_edges WHERE source_id IN ({placeholders})",
+            affected_page_params,
+        )
 
     _upsert_canonical_records("entities", "entity_id", proposed_entities)
     _upsert_canonical_records("claims", "claim_id", proposed_claims)
@@ -1430,20 +1468,27 @@ def apply_change_set(change_set: dict) -> dict:
 
 
 def publish_change_sets(limit: int | None = None) -> dict:
-    change_sets = load_change_sets()
+    from vector_lake.db_store import get_connection, transaction
+    conn = get_connection()
+    rows = conn.execute("SELECT change_set_id, data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
+    
     published = 0
     published_ids = []
-    for change_set in change_sets["items"]:
-        if change_set.get("status") != "pending":
-            continue
+    
+    for row in rows:
+        change_set = json.loads(row[1])
         apply_change_set(change_set)
         change_set["status"] = "published"
         change_set["published_at"] = _utc_now()
+        
+        with transaction():
+            conn.execute("UPDATE change_sets SET data_json = ?, updated_at = ? WHERE change_set_id = ?", 
+                         (json.dumps(change_set, ensure_ascii=False), _utc_now(), change_set["change_set_id"]))
+            
         published += 1
         published_ids.append(change_set["change_set_id"])
         if limit is not None and published >= limit:
             break
-    save_change_sets(change_sets)
 
     queue = load_governance_queue()
     for item in queue["items"]:
@@ -1453,9 +1498,11 @@ def publish_change_sets(limit: int | None = None) -> dict:
     save_governance_queue(queue)
     return {"published": published, "change_set_ids": published_ids}
 
-
 def pending_change_sets() -> list:
-    return [item for item in load_change_sets()["items"] if item.get("status") == "pending"]
+    from vector_lake.db_store import get_connection
+    conn = get_connection()
+    rows = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
+    return [json.loads(r[0]) for r in rows]
 
 
 def pending_governance_items() -> list:

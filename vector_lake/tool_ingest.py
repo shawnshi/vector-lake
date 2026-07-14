@@ -179,7 +179,8 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     cur = conn.execute("SELECT filepath, file_hash, processed_at FROM processed_files")
     processed = {row["filepath"]: {"hash": row["file_hash"], "processed_at": row["processed_at"]} for row in cur.fetchall()}
     
-    tmp_dir = get_extension_root() / "tmp"
+    import tempfile
+    tmp_dir = Path(tempfile.gettempdir()) / "vector_lake_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     processing_file = tmp_dir / "processing_files.json"
     from filelock import FileLock
@@ -267,7 +268,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
             .replace("{{purpose_content}}", purpose_content)
 
         payload = {
-            "filepath": filepath,
+            "filepath": str(filepath),
             "hash": file_hash,
             "canonical_name": canonical_name,
             "instructions": instructions
@@ -275,6 +276,10 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
         
         enqueue_job("ingest", payload)
         enqueued_count += 1
+        
+    if batch_size == 1 and enqueued_count == 1:
+        import json
+        return json.dumps(payload)
         
     return f"Successfully enqueued {enqueued_count} files for ingestion."
 
@@ -301,6 +306,9 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         mutations = []
         for item in files:
             fname = os.path.basename(item["filename"])
+            if "filepath" in item and not item.get("content"):
+                with open(item["filepath"], "r", encoding="utf-8") as f:
+                    item["content"] = f.read()
             fcontent = item["content"]
             
             if "Concept_Decision_" in fname:
@@ -341,7 +349,9 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                 log.warning("Ingest finalized, but task packet cleanup failed: %s", exc)
         
         from filelock import FileLock
-        processing_file = get_extension_root() / "tmp" / "processing_files.json"
+        import tempfile
+        tmp_dir = Path(tempfile.gettempdir()) / "vector_lake_tmp"
+        processing_file = tmp_dir / "processing_files.json"
         try:
             with FileLock(str(processing_file) + ".lock", timeout=10):
                 with open(processing_file, "r") as f:

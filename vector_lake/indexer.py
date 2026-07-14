@@ -13,7 +13,8 @@ from filelock import FileLock, Timeout
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake import db_store
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file
+from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file, VALID_PREFIXES
+
 from vector_lake.yaml_utils import load_yaml
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
@@ -27,8 +28,6 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-indexer")
-
-VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")
 
 DEFAULT_TTL = {
     "source": 365,
@@ -363,7 +362,8 @@ def _parse_wiki_node(filepath: str, node_key: str):
     summary_text = re.sub(r"\[\[([^\]]*?\|)?([^\]]*?)\]\]", r"\2", summary_text)
     summary_text = summary_text.strip().replace("\n", " ")
 
-    return {
+    from vector_lake.wiki_utils import enforce_entity_dict
+    return enforce_entity_dict({
         "id": node_id,
         "title": title,
         "type": node_type,
@@ -381,7 +381,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "raw_text": body,
         "decay_weight": round(decay_weight, 4),
         "alignment_score": round(alignment_score, 2),
-    }
+    })
 
 
 def _entity_to_index_node(entity_data: dict, entity_id: str = "") -> tuple[str, dict]:
@@ -722,7 +722,10 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         from vector_lake.db_store import get_connection
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT source_id, target_id, weight FROM claim_graph_edges")
+        cursor.execute(
+            "SELECT source_id, target_id, weight FROM claim_graph_edges "
+            "UNION SELECT source_id, target_id, weight FROM page_graph_edges"
+        )
         db_edges = cursor.fetchall()
         for row in db_edges:
             src = row["source_id"]
@@ -735,7 +738,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 })
     except Exception as e:
         import logging
-        logging.getLogger("vector-lake-indexer").debug(f"Could not load claim_graph_edges from SQLite: {e}")
+        logging.getLogger("vector-lake-indexer").debug(f"Could not load graph edges from SQLite: {e}")
 
     edges.sort(key=lambda edge: edge["weight"], reverse=True)
 
@@ -770,10 +773,13 @@ def _apply_graph_topology(index_data: dict):
         node["node_score"] = round(node.get("decay_weight", 1.0), 4)
 
 
-def generate_index():
+def generate_index(skip_embeddings: bool = True):
+    index_data = _empty_index_data()
+    from vector_lake.governance_store import load_entities, load_claims
     from vector_lake.db_store import get_connection
     conn = get_connection()
-    index_data = _empty_index_data()
+    entities = load_entities().get("items", {})
+    claims = load_claims().get("items", {})
 
     # Read from canonical SQLite instead of Markdown files
     rows = conn.execute("SELECT entity_id, data_json FROM entities").fetchall()
@@ -791,10 +797,12 @@ def generate_index():
         index_data["nodes"][node_key] = node_data
         if node_data["id"]:
             index_data["aliases"][node_data["id"]] = node_key
+        if node_data.get("title"):
+            index_data["aliases"][node_data["title"]] = node_key
         index_data["aliases"][node_key] = node_key
-        for alias in node_data["aliases"]:
+        for alias in node_data.get("aliases", []):
             index_data["aliases"][alias] = node_key
-        if isinstance(node_data["categories"], list):
+        if isinstance(node_data.get("categories"), list):
             for category in node_data["categories"]:
                 index_data["categories"].add(category)
 
@@ -970,6 +978,8 @@ def update_index_items(filenames: list[str]):
                                     
                                     if node_data["id"]:
                                         index_data["aliases"][node_data["id"]] = node_key
+                                    if node_data.get("title"):
+                                        index_data["aliases"][node_data["title"]] = node_key
                                     index_data["aliases"][node_key] = node_key
                                     for alias in node_data["aliases"]:
                                         index_data["aliases"][alias] = node_key
@@ -988,7 +998,11 @@ def update_index_items(filenames: list[str]):
                                     try:
                                         conn = db_store.get_connection()
                                         cursor = conn.cursor()
-                                        cursor.execute("SELECT source_id, target_id, weight FROM claim_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
+                                        cursor.execute(
+                                            "SELECT source_id, target_id, weight FROM claim_graph_edges WHERE source_id = ? OR target_id = ? "
+                                            "UNION SELECT source_id, target_id, weight FROM page_graph_edges WHERE source_id = ? OR target_id = ?",
+                                            (node_key, node_key, node_key, node_key),
+                                        )
                                         for row in cursor.fetchall():
                                             index_data["weighted_edges"].append({
                                                 "source": row["source_id"],

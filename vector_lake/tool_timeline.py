@@ -175,7 +175,7 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
     params = []
     
     if entity_name:
-        query += " AND (json_extract(data_json, '$.subject_entity_ids') LIKE ? OR claim_text LIKE ?)"
+        query += " AND (entity_id LIKE ? OR claim_text LIKE ?)"
         params.extend([f"%{entity_name}%", f"%{entity_name}%"])
     if sentiment:
         query += " AND COALESCE(json_extract(data_json, '$.sentiment'), 'neutral') = ?"

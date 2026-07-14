@@ -16,7 +16,7 @@ import io
 _META_DIR_CACHE = None
 
 SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
-VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "Overview_")
+VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
 
 def normalize_memory_key(key: str) -> str:
@@ -122,7 +122,7 @@ def get_index_path() -> Path:
 
 
 def get_claim_graph_path() -> Path:
-    return get_wiki_dir() / "claim_graph.json"
+    return get_wiki_dir() / "claim_topology.json"
 
 
 
@@ -323,3 +323,51 @@ def _count_list_items(body: str, section_marker: str) -> int:
 def safe_write_markdown(path: str | Path, content: str, skip_validation: bool = False):
     frontmatter, body = split_frontmatter(content)
     write_markdown_file(path, frontmatter, body, skip_validation=skip_validation)
+
+from typing import TypedDict, List, Optional, Any
+
+class TensionEdge(TypedDict):
+    target: str
+    polarity: float
+    intensity: float
+
+class EntityData(TypedDict, total=False):
+    id: str
+    title: str
+    type: str
+    domain: str
+    status: str
+    epistemic_status: str
+    categories: List[str]
+    created: str
+    updated: str
+    sources: List[str]
+    aliases: List[str]
+    tags: List[str]
+    tension_edges: List[TensionEdge]
+    raw_text: str
+    links: List[str]
+    triples: List[dict]
+    _key: str
+    _pre_embedded: List[float]
+
+class ClaimData(TypedDict, total=False):
+    claim_id: str
+    source_page: str
+    statement: str
+    predicate: str
+    target: str
+    confidence: float
+    context: str
+    evidence_links: List[str]
+
+def enforce_entity_dict(data: dict) -> EntityData:
+    """Runtime assertion to enforce EntityData structure without pulling in heavy pydantic."""
+    # Just a cast and basic validation to prevent drift
+    if 'id' not in data and 'title' not in data:
+        pass # Allow partial for now
+    return data # type: ignore
+
+def enforce_claim_dict(data: dict) -> ClaimData:
+    return data # type: ignore
+

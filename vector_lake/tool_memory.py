@@ -29,6 +29,7 @@ updated: {now_iso}
 sources: [Operational_Memory]
 strategic_scope: core
 evidence_tier: derived
+topic_cluster: Operational_Memory
 ---
 # {title}
 
@@ -70,6 +71,7 @@ def update_operational_memory(memory_type: str, content: str) -> str:
             frontmatter.setdefault("sources", ["Operational_Memory"])
             frontmatter.setdefault("strategic_scope", "core")
             frontmatter.setdefault("evidence_tier", "derived")
+            frontmatter.setdefault("topic_cluster", "Operational_Memory")
             if "### 物理机制 (Mechanism)" not in body:
                 body = body.replace(
                     "## 2. 证据时间线",

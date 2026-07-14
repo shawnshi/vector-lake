@@ -157,8 +157,13 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
     permitted_tiers = set(contract["evidence_tiers"])
     records = []
     for item in items:
-        if not isinstance(item, dict) or "filename" not in item or "content" not in item:
-            raise PurposeContractError("Each ingest item requires filename and content.")
+        if not isinstance(item, dict) or "filename" not in item:
+            raise PurposeContractError("Each ingest item requires filename.")
+        if "filepath" in item and not item.get("content"):
+            with open(item["filepath"], "r", encoding="utf-8") as f:
+                item["content"] = f.read()
+        if "content" not in item:
+            raise PurposeContractError("Each ingest item requires content or filepath.")
         filename = Path(str(item["filename"])).name
         content = str(item["content"])
         frontmatter = _parse_node_frontmatter(content, filename)
@@ -168,9 +173,19 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
         evidence_tier = str(frontmatter.get("evidence_tier", "")).strip()
         if evidence_tier not in permitted_tiers:
             raise PurposeContractError(f"{filename}: evidence_tier must be one of {sorted(permitted_tiers)}.")
+            
+        aliases = frontmatter.get("aliases")
+        if aliases is not None and not isinstance(aliases, list):
+            raise PurposeContractError(f"{filename}: aliases must be a list.")
+            
+        categories = frontmatter.get("categories")
+        if not isinstance(categories, list) or len(categories) != 1:
+            raise PurposeContractError(f"{filename}: categories must be a list with exactly one domain.")
+            
         records.append({
             "filename": filename,
             "sources": _normalise_sources(frontmatter.get("sources")),
+            "topic_cluster": str(frontmatter.get("topic_cluster") or "General").strip(),
             "tension_edges": frontmatter.get("tension_edges", []),
         })
     return records

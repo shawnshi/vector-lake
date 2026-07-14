@@ -24,6 +24,10 @@ def _job_idempotency_key(task_type: str, payload: dict | None) -> str | None:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def get_db_path() -> Path:
+    import os
+    override = os.environ.get("VECTOR_LAKE_DB_PATH")
+    if override:
+        return Path(override)
     return get_meta_dir() / "vector_lake.db"
 
 def get_connection() -> sqlite3.Connection:
@@ -44,6 +48,7 @@ def close_connection():
     if hasattr(_LOCAL, "conn") and _LOCAL.conn is not None:
         _LOCAL.conn.close()
         _LOCAL.conn = None
+    _LOCAL.in_transaction = False
 
 from contextlib import contextmanager
 
@@ -54,8 +59,19 @@ def transaction():
     if in_tx:
         yield conn
     else:
+        max_retries = 60
+        for attempt in range(max_retries):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    import time
+                    import random
+                    time.sleep(0.5 + random.random())
+                    continue
+                raise
         _LOCAL.in_transaction = True
-        conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
             conn.commit()
@@ -64,6 +80,9 @@ def transaction():
             raise
         finally:
             _LOCAL.in_transaction = False
+
+_INIT_DB_DONE = False
+_INIT_LOCK = threading.Lock()
 
 def init_db():
     db_path = get_db_path()
@@ -230,6 +249,16 @@ def _init_db_once(db_key: str):
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claim_graph_edges (
+                source_id TEXT,
+                target_id TEXT,
+                relation TEXT,
+                weight REAL,
+                updated_at TEXT,
+                PRIMARY KEY (source_id, target_id, relation)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS page_graph_edges (
                 source_id TEXT,
                 target_id TEXT,
                 relation TEXT,

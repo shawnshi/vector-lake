@@ -4,15 +4,6 @@ import math
 import sys
 from datetime import datetime, timezone
 
-# Add vector_lake plugin path
-plugin_dir = os.path.expanduser(r"~\.gemini\config\plugins\vector-lake")
-sys.path.append(plugin_dir)
-
-from vector_lake.governance_store import load_governance_queue
-
-SHARD_SIZE = 50
-TMP_DIR = os.path.join(plugin_dir, "tmp", "janitor_shards")
-
 def main():
     queue = load_governance_queue()
     items = queue.get("items", [])
