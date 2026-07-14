@@ -114,7 +114,7 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
         file_path = os.path.join(wiki_dir, filename)
         if os.path.exists(file_path):
             # P1-2: Quality Gate for Gap Analysis
-        if filename.startswith("Synthesis_"):
+            if filename.startswith("Synthesis_"):
                 # Synthesis structure is already validated by execute_mutation_plan during subagent write_wiki_page
                 pass
             valid_files.add(filename)

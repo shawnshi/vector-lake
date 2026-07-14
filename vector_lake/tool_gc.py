@@ -16,7 +16,7 @@ def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
     nodes = {key: val for key, val in entities.get("items", {}).items()}
     
     conn = get_connection()
-    edges = conn.execute("SELECT source_id, target_id FROM claim_graph_edges").fetchall()
+    edges = conn.execute("SELECT source_id, target_id FROM page_graph_edges").fetchall()
     
     degrees = {key: 0 for key in nodes.keys()}
     for row in edges:

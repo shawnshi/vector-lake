@@ -249,7 +249,5 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
             for tag in tags:
                 if str(tag).lower() in entities_in_index:
                     raise SchemaViolationException(f"Tag Collision: [{tag}] is already an entity and cannot be used as a tag. Use semantic links instead.")
-        except SchemaViolationException as e:
-            raise e
-        except Exception:
-            pass
+        except SchemaViolationException:
+            raise

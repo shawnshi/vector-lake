@@ -122,7 +122,7 @@ def get_index_path() -> Path:
 
 
 def get_claim_graph_path() -> Path:
-    return get_wiki_dir() / "claim_graph.json"
+    return get_wiki_dir() / "claim_topology.json"
 
 
 

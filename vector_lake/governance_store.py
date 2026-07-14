@@ -100,7 +100,7 @@ def _default_queue_store() -> dict:
 ALLOWED_TABLES = {
     "entities", "claims", "evidence", "sources", "change_sets",
     "governance_queue", "wiki_search_index", "alias_registry",
-    "operational_memory", "claim_graph_nodes", "claim_graph_edges",
+    "operational_memory", "", "page_graph_edges",
     "timeline_events", "processed_files", "mutation_outbox"
 }
 
@@ -333,7 +333,7 @@ def save_graph_edges(edges: list[dict]):
     with conn:
         for edge in edges:
             conn.execute(
-                "INSERT OR REPLACE INTO claim_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO page_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
                 (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
             )
 

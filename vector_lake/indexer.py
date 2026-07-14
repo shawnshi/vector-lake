@@ -712,7 +712,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         from vector_lake.db_store import get_connection
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT source_id, target_id, weight FROM claim_graph_edges")
+        cursor.execute("SELECT source_id, target_id, weight FROM page_graph_edges")
         db_edges = cursor.fetchall()
         for row in db_edges:
             src = row["source_id"]
@@ -725,7 +725,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 })
     except Exception as e:
         import logging
-        logging.getLogger("vector-lake-indexer").debug(f"Could not load claim_graph_edges from SQLite: {e}")
+        logging.getLogger("vector-lake-indexer").debug(f"Could not load page_graph_edges from SQLite: {e}")
 
     edges.sort(key=lambda edge: edge["weight"], reverse=True)
 
@@ -1036,7 +1036,7 @@ def update_index_items(filenames: list[str]):
                                     try:
                                         conn = db_store.get_connection()
                                         cursor = conn.cursor()
-                                        cursor.execute("SELECT source_id, target_id, weight FROM claim_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
+                                        cursor.execute("SELECT source_id, target_id, weight FROM page_graph_edges WHERE source_id = ? OR target_id = ?", (node_key, node_key))
                                         for row in cursor.fetchall():
                                             index_data["weighted_edges"].append({
                                                 "source": row["source_id"],

@@ -184,7 +184,7 @@ def init_db():
             pass
         pass
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS claim_graph_edges (
+            CREATE TABLE IF NOT EXISTS page_graph_edges (
                 source_id TEXT,
                 target_id TEXT,
                 relation TEXT,
@@ -299,7 +299,7 @@ def delete_node_cascade(node_key: str):
         conn.execute("DELETE FROM entities WHERE entity_id = ? OR canonical_name = ?", (ent_id, canon_name))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (ent_id,))
         conn.execute("DELETE FROM claims WHERE json_extract(data_json, '$.source_page') IN (?, ?, ?, ?)", (canon_name, canon_name + ".md", ent_id, ent_id + ".md"))
-        conn.execute("DELETE FROM claim_graph_edges WHERE source_id IN (?, ?) OR target_id IN (?, ?)", (canon_name, ent_id, canon_name, ent_id))
+        conn.execute("DELETE FROM page_graph_edges WHERE source_id IN (?, ?) OR target_id IN (?, ?)", (canon_name, ent_id, canon_name, ent_id))
         conn.execute("DELETE FROM sources WHERE source_id IN (?, ?)", (canon_name, ent_id))
         conn.execute("DELETE FROM timeline_events WHERE entity_id = ?", (ent_id,))
 

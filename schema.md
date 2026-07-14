@@ -63,7 +63,7 @@ Semantic Tension Quantification Model (STQM): When synthesizing documents that c
 Contradictions & Synthesis: If new information contradicts existing wiki content, DO NOT just overwrite it silently. Explicitly document the contradiction in the text AND map the physical collision using tension_edges (or embed inline: [falsifies:: [[Target]] {intensity: 0.85}]).
 Temporal Rot Defense: Anchor claims to a specific time frame using inline brackets at the start of a bullet/paragraph (e.g., [2024] The market is...).
 Epistemic Decay (TTL): Actively assign a shorter ttl for time-sensitive nodes. Default TTLs: Tie strictly to pistemic-status (seed: 90, sprouting: 365, evergreen: 1825). Synthesis: 730, Source: 365.
-Operational Memory Split: Agent runtime state is stored in operational_memory.json. Trigger the MCP Tool update_operational_memory to register state.
+Operational Memory Split: Agent runtime state is stored in `vector_lake.db`. Trigger the MCP Tool `update_operational_memory` to register state.
 File Naming Policy & Ontology Lock:
 Strict Naming Protocol ([ControlledType]_[MainName]-[SubName].md).
 Allowed prefixes: Concept_, Vendor_ (Supply Side ONLY), Institution_ (Demand/Regulator ONLY), Product_, Person_, Event_, Policy_, Standard_, Source_, Synthesis_. Legacy Entity_ is forbidden.
@@ -116,7 +116,7 @@ Format Constraint: These files MUST adhere to the "Compiled Truth | Timeline" ph
 
 > **Syntax Constraint:** 
 > Every entry MUST start with `- [YYYY-MM-DD] [Event_Tag]`. 
-> Valid Tags: `[Release]`, `[Pivot]`, `[Conflict]`, `[Validation]`, `[Observation]`, `[Decision]`, `[Execution]`, `[Outcome]`.
+> Valid tags: `[Release]`, `[Pivot]`, `[Conflict]`, `[Validation]`, `[Observation]`, `[Decision]`, `[Execution]`, `[Outcome]`.
 > Every entry MUST end with an inline Source anchor.
 
 - [YYYY-MM-DD] [Event_Tag] Event description, raw extract, or dialogue summary. [validates:: [[Target_Entity]]] (Source: [[Source_X]])
