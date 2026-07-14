@@ -100,20 +100,15 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
         import subprocess
         import sys
         
-        def run_sync():
-            try:
-                sync_script = os.path.expanduser("~/.gemini/scripts/sync_focus.py")
-                if os.path.exists(sync_script):
-                    env = os.environ.copy()
-                    env["PYTHONIOENCODING"] = "utf-8"
-                    subprocess.run([sys.executable, sync_script], capture_output=True, env=env, timeout=180)
-            except Exception as e:
-                log.error(f"Failed to trigger sync_focus.py: {e}")
-                
-        if not hasattr(self, "executor"):
-            import concurrent.futures
-            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        self.executor.submit(run_sync)
+        try:
+            sync_script = os.path.expanduser("~/.gemini/scripts/sync_focus.py")
+            if os.path.exists(sync_script):
+                env = os.environ.copy()
+                env["PYTHONIOENCODING"] = "utf-8"
+                # Use Popen for fire-and-forget instead of blocking run
+                subprocess.Popen([sys.executable, sync_script], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log.error(f"Failed to trigger sync_focus.py: {e}")
 
     def on_created(self, event): self.handle_event(event)
     def on_modified(self, event): self.handle_event(event)
@@ -134,8 +129,8 @@ class RawWatchdogHandler(FileSystemEventHandler):
             return
             
         filename = os.path.basename(filepath)
-        # only md, pdf, txt, etc? Let's just say any file that doesn't start with .
-        if filename.startswith('.'):
+        # only md, pdf, txt, etc? Let's just say any file that doesn't start with . and doesn't end with .tmp
+        if filename.startswith('.') or filename.endswith('.tmp'):
             return
 
         now = time.time()
@@ -153,7 +148,8 @@ class RawWatchdogHandler(FileSystemEventHandler):
             if not hasattr(self, "executor"):
                 import concurrent.futures
                 self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-            self.executor.submit(sync_vector_lake)
+            future = self.executor.submit(sync_vector_lake)
+            future.add_done_callback(lambda f: log.error(f"sync_vector_lake Failed: {f.exception()}") if f.exception() else None)
         except Exception as e:
             log.error(f"Failed to trigger sync_vector_lake: {e}")
 
@@ -177,9 +173,12 @@ def index_worker_loop():
                 consecutive_failures = 0
                 continue
                 
-            from vector_lake import get_extension_root
+            import tempfile
             import os
-            flag_path = get_extension_root() / "tmp" / "outbox_signal.lock"
+            from pathlib import Path
+            tmp_dir = Path(tempfile.gettempdir()) / "vector_lake_tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            flag_path = tmp_dir / "outbox_signal.lock"
             
             # Handle manual filesystem modifications from watchdog
             pending_legacy = set()
@@ -192,17 +191,23 @@ def index_worker_loop():
                 pass
                 
             if pending_legacy:
-                from vector_lake.mutation_coordinator import execute_mutation_plan
+                from vector_lake.db_store import transaction, get_connection
+                from vector_lake.governance_store import sync_pages_to_canonical, _utc_now
                 from vector_lake.wiki_utils import get_wiki_dir
                 wiki_dir = get_wiki_dir()
+                conn = get_connection()
                 for fname in pending_legacy:
                     fpath = os.path.join(wiki_dir, fname)
                     try:
-                        if os.path.exists(fpath):
-                            with open(fpath, "r", encoding="utf-8") as f:
-                                execute_mutation_plan(fname, content=f.read(), is_delete=False)
-                        else:
-                            execute_mutation_plan(fname, is_delete=True)
+                        with transaction():
+                            if os.path.exists(fpath):
+                                sync_pages_to_canonical([fpath], origin="watchdog", auto_approve=True, summary=f"Manual update: {fname}")
+                                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (fname, 'update', _utc_now()))
+                            else:
+                                from vector_lake.db_store import delete_node_cascade
+                                node_key = fname[:-3] if fname.endswith(".md") else fname
+                                delete_node_cascade(node_key)
+                                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (fname, 'delete', _utc_now()))
                     except Exception as e:
                         log.error(f"Failed to process manual edit for {fname}: {e}")
                 wait_for_signal = False
@@ -328,6 +333,21 @@ def scheduled_lint_loop():
             time.sleep(60)
 
 def start_watchdog():
+    import msvcrt
+    import sys
+    from vector_lake import get_extension_root
+    
+    lock_file_path = get_extension_root() / "tmp" / "watchdog_instance.lock"
+    lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    lock_file = open(lock_file_path, 'w')
+    try:
+        # Request an exclusive, non-blocking lock. If another instance holds it, raises OSError.
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        log.warning("Watchdog is already running (lock held by another instance). Exiting.")
+        sys.exit(0)
+
     threading.Thread(target=index_worker_loop, daemon=True).start()
     threading.Thread(target=scheduled_lint_loop, daemon=True).start()
     
@@ -359,11 +379,21 @@ def start_watchdog():
     observer.start()
     log.info("Vector Lake Watchdog Agent is now running in Background Index/Lint mode.")
     try:
+        last_heartbeat = 0
         while True:
+            now = time.time()
+            if now - last_heartbeat >= 30:
+                write_status("running", 0, index_queue.qsize(), "Watchdog Heartbeat", "")
+                last_heartbeat = now
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("Termination signal received. Shutting down Watchdog...")
         observer.stop()
+    finally:
+        try:
+            lock_file.close()
+        except Exception:
+            pass
     observer.join()
 
 if __name__ == "__main__":

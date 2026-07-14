@@ -45,9 +45,9 @@ def execute_mutation_plan(filename: str, content: str | None = None, is_delete: 
             if filepath.exists():
                 os.remove(filepath)
         else:
-            # Write directly
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(content)
+            # Write atomically
+            from vector_lake.wiki_utils import atomic_write_text
+            atomic_write_text(filepath, content, pre_parsed_frontmatter=fm if not is_delete else None)
 
             
         # 4. SQLite Transaction

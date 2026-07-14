@@ -7,6 +7,10 @@ import sqlite_vec
 _LOCAL = threading.local()
 
 def get_db_path() -> Path:
+    import os
+    override = os.environ.get("VECTOR_LAKE_DB_PATH")
+    if override:
+        return Path(override)
     return get_meta_dir() / "vector_lake.db"
 
 def get_connection() -> sqlite3.Connection:

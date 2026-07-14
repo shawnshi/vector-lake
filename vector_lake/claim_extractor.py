@@ -66,6 +66,8 @@ def _iter_blocks(body: str) -> list[dict]:
 
     def extract_text(node) -> str:
         if isinstance(node, dict):
+            if node.get("type") == "block_code":
+                return " "
             if node.get("type") in ("softbreak", "hardbreak"):
                 return " "
             text = node.get("raw", "")
@@ -180,6 +182,18 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
     if page_type != "source":
         entity_id = frontmatter.get("entity_id") or _stable_id("entity", page_key)
         subject_entity_ids.append(entity_id)
+        raw_tension_edges = frontmatter.get("tension_edges", [])
+        tension_edges = []
+        if isinstance(raw_tension_edges, list):
+            for te in raw_tension_edges:
+                if isinstance(te, dict) and te.get("target"):
+                    tension_edges.append({
+                        "target": str(te.get("target")).strip(),
+                        "polarity": float(te.get("polarity", 0.0)),
+                        "intensity": float(te.get("intensity", 0.0)),
+                        "context": str(te.get("context", "")).strip()
+                    })
+
         entity_records.append({
             "entity_id": entity_id,
             "canonical_name": title,
@@ -189,6 +203,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             "domain": frontmatter.get("domain", "General"),
             "topic_cluster": frontmatter.get("topic_cluster", "General"),
             "tags": _jsonable(frontmatter.get("tags", [])),
+            "tension_edges": tension_edges,
             "page_key": page_key,
             "created_at": _jsonable(frontmatter.get("created", now)),
             "updated_at": _jsonable(frontmatter.get("updated", now)),

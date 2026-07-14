@@ -136,24 +136,94 @@ def _tokenize_for_fts(text: str) -> str:
     except ImportError:
         return text
 
-def _compute_embeddings_unlocked(index_data: dict) -> dict:
+def _compute_embeddings_unlocked(index_data: dict, force: bool = False) -> dict:
     embeddings_map = {}
     import os
-    if os.environ.get("GEMINI_API_KEY"):
+    import time
+    if not os.environ.get("GEMINI_API_KEY"):
+        return embeddings_map
+        
+    try:
+        from google import genai
+        client = genai.Client()
+    except ImportError:
+        return embeddings_map
+
+    nodes = (index_data.get("nodes") or {})
+    pending_items = []
+    
+    existing = set()
+    if not force:
         try:
-            from google import genai
-            client = genai.Client()
-            nodes = (index_data.get("nodes") or {})
-            for node_key, node in nodes.items():
-                embedding_content = f"{node.get('title', '')} {node.get('summary', '')} {node.get('raw_text', '')}"
+            from vector_lake.db_store import get_connection, transaction
+            conn = get_connection()
+            with transaction():
+                cur = conn.execute("SELECT entity_id FROM vec_embeddings")
+                existing = {row[0] for row in cur.fetchall()}
+        except Exception as e:
+            log.error(f"Failed to fetch existing embeddings: {e}")
+
+    for node_key, node in nodes.items():
+        if not force and node_key in existing:
+            continue
+        embedding_content = f"{node.get('title', '')} {node.get('summary', '')} {node.get('raw_text', '')}"
+        pending_items.append((node_key, embedding_content[:15000]))
+        
+    if not pending_items:
+        return embeddings_map
+        
+    BATCH_SIZE = 100
+    MAX_CHARS_PER_BATCH = 400000
+    
+    batches = []
+    current_batch = []
+    current_chars = 0
+    
+    for item in pending_items:
+        chars = len(item[1])
+        if current_batch and (len(current_batch) >= BATCH_SIZE or current_chars + chars > MAX_CHARS_PER_BATCH):
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+        current_batch.append(item)
+        current_chars += chars
+        
+    if current_batch:
+        batches.append(current_batch)
+        
+    log.info(f"Computing embeddings for {len(pending_items)} nodes in {len(batches)} batches...")
+    
+    for b_idx, batch in enumerate(batches):
+        texts = [x[1] for x in batch]
+        keys = [x[0] for x in batch]
+        
+        max_retries = 5
+        base_delay = 5.0
+        
+        for attempt in range(max_retries):
+            try:
                 response = client.models.embed_content(
                     model="gemini-embedding-2",
-                    contents=embedding_content[:15000]
+                    contents=texts
                 )
-                if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-                    embeddings_map[node_key] = response.embeddings[0].values
-        except Exception as e:
-            log.warning(f"Failed to compute embeddings: {e}")
+                if hasattr(response, 'embeddings'):
+                    for i, emb in enumerate(response.embeddings):
+                        embeddings_map[keys[i]] = emb.values
+                break
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg or "Too Many Requests" in err_msg or "quota" in err_msg.lower():
+                    if attempt < max_retries - 1:
+                        sleep_time = base_delay * (2 ** attempt)
+                        log.warning(f"Batch {b_idx+1}/{len(batches)} hit rate limit. Backing off for {sleep_time}s...")
+                        time.sleep(sleep_time)
+                        continue
+                log.error(f"Failed to embed batch {b_idx+1}: {e}")
+                break
+                
+        if b_idx < len(batches) - 1:
+            time.sleep(1.0)
+            
     return embeddings_map
 
 def _build_bm25_index(index_data: dict, embeddings_map: dict):
@@ -691,25 +761,50 @@ def _apply_graph_topology(index_data: dict):
 
 def generate_index():
     index_data = _empty_index_data()
-    wiki_dir = _wiki_dir()
-    
-    # Read from canonical Markdown files instead of SQLite to preserve full topology and text
-    import os
-    for filename in os.listdir(wiki_dir):
-        if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md") or filename.startswith("System_"):
-            continue
-        
-        filepath = os.path.join(wiki_dir, filename)
-        node_key = filename[:-3]
-        
-        try:
-            node_data = _parse_wiki_node(filepath, node_key)
-        except Exception as e:
-            log.warning(f"Failed to parse markdown for {node_key}: {e}")
+    from vector_lake.governance_store import load_entities, load_claims
+    entities = load_entities().get("items", {})
+    claims = load_claims().get("items", {})
+
+    claims_by_page = {}
+    for claim in claims.values():
+        page_key = claim.get("locator", {}).get("page_key")
+        if page_key:
+            claims_by_page.setdefault(page_key, []).append(claim)
+
+    for entity in entities.values():
+        page_key = entity.get("page_key")
+        if not page_key:
             continue
             
-        if not node_data:
-            continue
+        node_key = page_key
+        page_claims = claims_by_page.get(page_key, [])
+        
+        raw_text = "\n".join(c.get("claim_text", "") for c in page_claims)
+        summary = ""
+        for c in page_claims:
+            if c.get("claim_type") == "summary":
+                summary = c.get("claim_text", "")
+                break
+                
+        node_data = {
+            "id": entity.get("entity_id"),
+            "title": entity.get("canonical_name"),
+            "type": entity.get("entity_type"),
+            "updated": entity.get("updated_at"),
+            "categories": entity.get("tags", []),
+            "domain": entity.get("domain", "General"),
+            "topic_cluster": entity.get("topic_cluster", "General"),
+            "status": entity.get("status", "Active"),
+            "aliases": entity.get("aliases", []),
+            "sources": [], 
+            "tension_edges": entity.get("tension_edges", []),
+            "links": [],
+            "triples": [],
+            "summary": summary[:240],
+            "raw_text": raw_text,
+            "decay_weight": entity.get("decay_weight", 1.0),
+            "alignment_score": 100.0,
+        }
 
         index_data["nodes"][node_key] = node_data
         if node_data["id"]:
@@ -717,9 +812,9 @@ def generate_index():
         if node_data.get("title"):
             index_data["aliases"][node_data["title"]] = node_key
         index_data["aliases"][node_key] = node_key
-        for alias in node_data["aliases"]:
+        for alias in node_data.get("aliases", []):
             index_data["aliases"][alias] = node_key
-        if isinstance(node_data["categories"], list):
+        if isinstance(node_data.get("categories"), list):
             for category in node_data["categories"]:
                 index_data["categories"].add(category)
 
@@ -771,36 +866,56 @@ def update_index_items(filenames: list[str]):
 
     # Pre-parse and pre-embed to prevent holding FileLock during Network I/O
     pre_parsed_data = {}
-    import os
-    try:
-        from google import genai
-        client = genai.Client() if os.environ.get("GEMINI_API_KEY") else None
-    except ImportError:
-        client = None
+    from vector_lake.governance_store import load_entities, load_claims
+    entities = load_entities().get("items", {})
+    claims = load_claims().get("items", {})
 
-    wiki_dir = _wiki_dir()
     for filename in valid_filenames:
-        filepath = os.path.join(wiki_dir, filename)
         node_key = filename[:-3]
-        if not os.path.exists(filepath):
+        
+        entity = None
+        for e in entities.values():
+            if e.get("page_key") == node_key:
+                entity = e
+                break
+                
+        if not entity:
             continue
-        try:
-            node_data = _parse_wiki_node(filepath, node_key)
-        except Exception:
-            node_data = None
-        if node_data:
-            pre_parsed_data[node_key] = node_data
-            if client:
-                try:
-                    embedding_content = f"{node_data.get('title', '')} {node_data.get('summary', '')} {node_data.get('raw_text', '')}"
-                    response = client.models.embed_content(
-                        model="gemini-embedding-2",
-                        contents=embedding_content[:15000]
-                    )
-                    if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-                        node_data["_pre_embedded"] = response.embeddings[0].values
-                except Exception as e:
-                    log.warning(f"Pre-embedding failed for {node_key}: {e}")
+            
+        page_claims = [c for c in claims.values() if c.get("locator", {}).get("page_key") == node_key]
+        raw_text = "\n".join(c.get("claim_text", "") for c in page_claims)
+        summary = ""
+        for c in page_claims:
+            if c.get("claim_type") == "summary":
+                summary = c.get("claim_text", "")
+                break
+                
+        node_data = {
+            "id": entity.get("entity_id"),
+            "title": entity.get("canonical_name"),
+            "type": entity.get("entity_type"),
+            "updated": entity.get("updated_at"),
+            "categories": entity.get("tags", []),
+            "domain": entity.get("domain", "General"),
+            "topic_cluster": entity.get("topic_cluster", "General"),
+            "status": entity.get("status", "Active"),
+            "aliases": entity.get("aliases", []),
+            "sources": [], 
+            "tension_edges": entity.get("tension_edges", []),
+            "links": [],
+            "triples": [],
+            "summary": summary[:240],
+            "raw_text": raw_text,
+            "decay_weight": entity.get("decay_weight", 1.0),
+            "alignment_score": 100.0,
+        }
+        pre_parsed_data[node_key] = node_data
+
+    if pre_parsed_data:
+        mock_index = {"nodes": pre_parsed_data}
+        new_embs = _compute_embeddings_unlocked(mock_index, force=True)
+        for nk, emb in new_embs.items():
+            pre_parsed_data[nk]["_pre_embedded"] = emb
 
     output_path = str(get_index_path())
     if not os.path.exists(output_path):
