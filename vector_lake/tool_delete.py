@@ -16,8 +16,8 @@ log = logging.getLogger("vector-lake-tool-delete")
 
 
 def delete_source(raw_path: str, dry_run: bool = True) -> str:
-    wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
-    memory_dir = Path(get_memory_dir()).resolve(strict=True)
+    wiki_dir = Path(get_wiki_dir()).resolve()
+    memory_dir = Path(get_memory_dir()).resolve()
     raw_memory_dir = memory_dir / "raw"
     
     raw_path_obj = Path(raw_path).resolve()
