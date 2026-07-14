@@ -383,7 +383,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         log.error(f"Failed to read index.json: {e}")
         return "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
 
-    nodes = [{"_key": key, **value} for key, value in index_data.get("nodes", {}).items()]
+    # ⚡ Bolt: Removed unused O(N) list comprehension of all index nodes to eliminate unnecessary memory allocation and CPU overhead in the search hot path.
     intent = _classify_intent(query)
     tokens = _expand_query_locally(query)
     if not tokens:
