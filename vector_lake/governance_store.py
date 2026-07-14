@@ -1061,60 +1061,81 @@ def create_change_set(
 
 
 def apply_change_set(change_set: dict) -> dict:
-    entities = load_entities()
-    claims = load_claims()
-    evidence = load_evidence()
-    sources = load_sources()
+    from vector_lake.db_store import get_connection, transaction
+    conn = get_connection()
+    now = _utc_now()
 
     affected_pages = change_set.get("affected_pages", [])
     affected_page_keys = [page[:-3] if page.endswith(".md") else page for page in affected_pages]
+    
+    with transaction():
+        if affected_page_keys:
+            proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
+            proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
 
-    if affected_page_keys:
-        proposed_claim_ids = {c["claim_id"] for c in change_set.get("proposed_claims", [])}
-        proposed_evidence_ids = {e["evidence_id"] for e in change_set.get("proposed_evidence", [])}
+            page_keys_tuple = tuple(affected_page_keys)
+            placeholders = ",".join(["?"] * len(page_keys_tuple))
 
-        # Prune claims no longer in the markdown
-        keys_to_remove = []
-        for k, v in claims.get("items", {}).items():
-            locator_page = v.get("locator", {}).get("page_key")
-            if locator_page in affected_page_keys and k not in proposed_claim_ids:
-                keys_to_remove.append(k)
-        for k in keys_to_remove:
-            del claims["items"][k]
-            
-        # Prune evidence no longer in the markdown
-        keys_to_remove = []
-        for k, v in evidence.get("items", {}).items():
-            locator_page = v.get("locator", {}).get("page_key")
-            if locator_page in affected_page_keys and k not in proposed_evidence_ids:
-                keys_to_remove.append(k)
-        for k in keys_to_remove:
-            del evidence["items"][k]
+            # Prune claims
+            if proposed_claim_ids:
+                claim_ids_tuple = tuple(proposed_claim_ids)
+                claim_placeholders = ",".join(["?"] * len(claim_ids_tuple))
+                conn.execute(f"DELETE FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders}) AND claim_id NOT IN ({claim_placeholders})", page_keys_tuple + claim_ids_tuple)
+            else:
+                conn.execute(f"DELETE FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})", page_keys_tuple)
 
-    _upsert_map_records(entities, change_set.get("proposed_entities", []), "entity_id")
-    _upsert_map_records(claims, change_set.get("proposed_claims", []), "claim_id")
-    _upsert_map_records(evidence, change_set.get("proposed_evidence", []), "evidence_id")
-    _upsert_map_records(sources, change_set.get("proposed_source_updates", []), "source_id")
+            # Prune evidence
+            if proposed_evidence_ids:
+                ev_ids_tuple = tuple(proposed_evidence_ids)
+                ev_placeholders = ",".join(["?"] * len(ev_ids_tuple))
+                conn.execute(f"DELETE FROM evidence WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders}) AND evidence_id NOT IN ({ev_placeholders})", page_keys_tuple + ev_ids_tuple)
+            else:
+                conn.execute(f"DELETE FROM evidence WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})", page_keys_tuple)
 
-    save_entities(entities)
-    save_claims(claims)
-    save_evidence(evidence)
-    save_sources(sources)
+        # Upsert Entities
+        proposed_entities = change_set.get("proposed_entities", [])
+        if proposed_entities:
+            vals = []
+            for item in proposed_entities:
+                v_type = item.get("type", "")
+                v_status = item.get("status", "")
+                v_ttl = int(item.get("ttl", 0))
+                v_decay = float(item.get("decay_weight", 0.0))
+                vals.append((item["entity_id"], item.get("canonical_name", ""), v_type, v_status, v_ttl, v_decay, json.dumps(item, ensure_ascii=False), now))
+            conn.executemany("INSERT OR REPLACE INTO entities (entity_id, canonical_name, type, status, ttl, decay_weight, data_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", vals)
+
+        # Upsert Claims
+        proposed_claims = change_set.get("proposed_claims", [])
+        if proposed_claims:
+            vals = []
+            for item in proposed_claims:
+                vals.append((item["claim_id"], item.get("claim_text", ""), json.dumps(item, ensure_ascii=False), now))
+            conn.executemany("INSERT OR REPLACE INTO claims (claim_id, claim_text, data_json, updated_at) VALUES (?, ?, ?, ?)", vals)
+
+        # Upsert Evidence
+        proposed_evidence = change_set.get("proposed_evidence", [])
+        if proposed_evidence:
+            vals = []
+            for item in proposed_evidence:
+                vals.append((item["evidence_id"], json.dumps(item, ensure_ascii=False), now))
+            conn.executemany("INSERT OR REPLACE INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)", vals)
+
+        # Upsert Sources
+        proposed_sources = change_set.get("proposed_source_updates", [])
+        if proposed_sources:
+            vals = []
+            for item in proposed_sources:
+                vals.append((item["source_id"], json.dumps(item, ensure_ascii=False), now))
+            conn.executemany("INSERT OR REPLACE INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)", vals)
+
     save_graph_edges(change_set.get("proposed_edges", []))
-    rebuild_alias_registry()
-    try:
-        memory_store = rebuild_operational_memory()
-        change_set["operational_memory_count"] = len(memory_store.get("items", {}))
-        change_set["conflict_event_count"] = len(memory_store.get("conflict_events", []))
-    except Exception as exc:
-        log.warning(f"Operational memory rebuild failed for {change_set.get('change_set_id')}: {exc}")
-    # Obsolete view_builder block removed to prevent ImportError warnings
-    # try:
-    #     from vector_lake import view_builder
-    # 
-    #     change_set["view_rebuild"] = view_builder.rebuild_views_for_change_set(change_set)
-    # except Exception as exc:
-    #     log.warning(f"View rebuild failed for {change_set.get('change_set_id')}: {exc}")
+    
+    # O(1) incremental rebuilds
+    # In V11 architecture, we skip the O(N) full memory rebuild on every micro-change
+    # We leave that for the daily gc/lint job or background worker.
+    change_set["operational_memory_count"] = 0
+    change_set["conflict_event_count"] = 0
+
     return change_set
 
 

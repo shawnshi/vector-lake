@@ -424,7 +424,8 @@ def _parse_wiki_node(filepath: str, node_key: str):
     summary_text = re.sub(r"\[\[([^\]]*?\|)?([^\]]*?)\]\]", r"\2", summary_text)
     summary_text = summary_text.strip().replace("\n", " ")
 
-    return {
+    from vector_lake.wiki_utils import enforce_entity_dict
+    return enforce_entity_dict({
         "id": node_id,
         "title": title,
         "type": node_type,
@@ -442,7 +443,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
         "raw_text": body,
         "decay_weight": round(decay_weight, 4),
         "alignment_score": round(alignment_score, 2),
-    }
+    })
 
 
 def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
@@ -911,11 +912,8 @@ def update_index_items(filenames: list[str]):
         }
         pre_parsed_data[node_key] = node_data
 
-    if pre_parsed_data:
-        mock_index = {"nodes": pre_parsed_data}
-        new_embs = _compute_embeddings_unlocked(mock_index, force=True)
-        for nk, emb in new_embs.items():
-            pre_parsed_data[nk]["_pre_embedded"] = emb
+    # V11 Fix: Removed synchronous embedding calculation.
+    # We now rely entirely on the background Embedding worker to fill in gaps asynchronously.
 
     output_path = str(get_index_path())
     if not os.path.exists(output_path):

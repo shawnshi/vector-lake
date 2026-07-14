@@ -288,7 +288,8 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
 
         claim_id = frontmatter.get("claim_id") if block_index == 1 else None
         claim_id = claim_id or _stable_id("claim", f"{page_key}:{cleaned_text}")
-        claim_record = {
+        from vector_lake.wiki_utils import enforce_claim_dict
+        claim_record = enforce_claim_dict({
             "claim_id": claim_id,
             "claim_text": cleaned_text,
             "claim_type": custom_claim_type,
@@ -309,7 +310,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             "created_at": _jsonable(frontmatter.get("created", now)),
             "updated_at": _jsonable(frontmatter.get("updated", now)),
             "source_page": page_name,
-        }
+        })
         claim_records.append(claim_record)
         if evidence_ids:
             for evidence_record in evidence_records[-len(evidence_ids):]:
@@ -335,7 +336,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             })
 
         summary_claim_id = _stable_id("claim", f"{page_key}:summary:{cleaned_summary}")
-        summary_claim = {
+        summary_claim = enforce_claim_dict({
             "claim_id": summary_claim_id,
             "claim_text": cleaned_summary,
             "claim_type": "summary",
@@ -351,7 +352,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             "created_at": _jsonable(frontmatter.get("created", now)),
             "updated_at": _jsonable(frontmatter.get("updated", now)),
             "source_page": page_name,
-        }
+        })
         if summary_evidence_ids:
             claim_records.append(summary_claim)
             for evidence_record in evidence_records[-len(summary_evidence_ids):]:

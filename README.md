@@ -191,7 +191,13 @@ graph LR
 
 `query` 会优先生成 Memory Packet，再按预算拼接相关 wiki 页面。Memory Packet 包含当前偏好、决策、任务状态、相关事实、冲突/陈旧告警和证据指针。
 
-## Storage Layout
+## Storage Layout & Architecture
+
+Vector Lake adopts a hybrid CQRS-like architecture with O(1) incremental native SQLite syncing.
+
+- **Markdown (Source of Truth)**: `wiki/*.md` and `raw/*.md`.
+- **Database (Read Model & Fast Mutations)**: `vector_lake.db` containing unified SQLite entities, claims, graph edges, and operational memory.
+- **Concurrency & Atomicity**: Multi-page operations and mutations utilize a centralized `MutationCoordinator` wrapped in SQLite transactions (`BEGIN IMMEDIATE`) with filesystem-level backups (`*.bak`) and auto-rollback to ensure transactional integrity across all background workers, CLI invocations, and MCP actions.
 
 ```text
 MEMORY/
@@ -320,20 +326,21 @@ python cli.py delete "<raw-source-path>" --dry-run
 | `vector_lake/indexer.py` | `index.json` 生成，使用 Sparse Graph Traversal 优化计算拓扑边 |
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
 | `vector_lake/tool_memory.py` | 基于 "Wiki-as-Database" 架构的运行态记忆物理写回 |
-| `vector_lake/governance_store.py` | canonical store、change set、operational memory、conflict resolver |
+| `vector_lake/governance_store.py` | canonical store, change set, operational memory, conflict resolver. Now implements O(1) native SQLite JSON mutations. |
 | `vector_lake/governance_metrics.py` | debt metrics 和治理统计 |
 | `vector_lake/tool_search.py` | 混合检索管线 (LLM Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR) 与 Memory Packet |
-| `vector_lake/tool_query.py` | query-to-page synthesis |
+| `vector_lake/tool_query.py` | query-to-page synthesis (directly validates and syncs via MutationCoordinator) |
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |
 | `vector_lake/tool_review.py` | legacy/governance review surface |
 | `vector_lake/tool_doctor.py` | runtime 体检 |
-| `vector_lake/mcp_server.py` | Model Context Protocol (MCP) 后端服务入口 |
+| `vector_lake/mcp_server.py` | Model Context Protocol (MCP) 后端服务入口 (with atomic multi-page replacements) |
 | `vector_lake/watchdog_app.py` | 增量监听后台服务，队列调度，定时自愈审计 (Scheduled Auto-Lint) |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
 | `vector_lake/db.py` | Legacy DB utils |
-| `vector_lake/db_store.py` | SQLite connection pooling, schema initialization, and WAL settings |
+| `vector_lake/db_store.py` | SQLite connection pooling, schema init logic, `_INIT_LOCK` guarding, and WAL settings |
+| `vector_lake/mutation_coordinator.py`| Centralized mutation orchestrator enabling atomic multi-file edits and rollback across system boundaries |
 | `vector_lake/defense_hook.py` | Pre-flight constraints and guardrails |
 | `vector_lake/skeleton_parser.py` | Parsers for structural validation |
 | `vector_lake/provenance.py` | Tracing entities to raw sources |

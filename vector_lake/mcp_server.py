@@ -358,33 +358,52 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
         return f"Error: '{old_text}' is a structural syntax marker. Global replacement aborted to protect graph topology."
         
     import os
-    from vector_lake.wiki_utils import get_wiki_dir, atomic_write_text
+    import shutil
+    import logging
+    from vector_lake.wiki_utils import get_wiki_dir, atomic_write_text, get_extension_root
     wiki_dir = get_wiki_dir()
     modified_count = 0
     matched_files = []
-    
-    for filename in os.listdir(wiki_dir):
-        if not filename.endswith(".md"):
-            continue
-        filepath = os.path.join(wiki_dir, filename)
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
-            if old_text in content:
-                if not dry_run:
-                    new_content = content.replace(old_text, new_text)
-                    atomic_write_text(filepath, new_content)
-                modified_count += 1
-                matched_files.append(filename)
-        except Exception as e:
-            logging.error(f"Error processing {filename} for link replacement: {e}")
-            
-    if dry_run:
-        return f"[DRY RUN] Would replace '{old_text}' with '{new_text}' in {modified_count} files: {', '.join(matched_files[:10])}..."
-    
-    from vector_lake.indexer import update_index_item
-    for filename in matched_files:
-        update_index_item(filename)
+    backups = {}
+    tmp_dir = get_extension_root() / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    from vector_lake.db_store import transaction
+    try:
+        with transaction():
+            for filename in os.listdir(wiki_dir):
+                if not filename.endswith(".md"):
+                    continue
+                filepath = os.path.join(wiki_dir, filename)
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    if old_text in content:
+                        if not dry_run:
+                            new_content = content.replace(old_text, new_text)
+                            bak_path = tmp_dir / f"{filename}.bak"
+                            shutil.copy2(filepath, bak_path)
+                            backups[filepath] = bak_path
+                            atomic_write_text(filepath, new_content)
+                        modified_count += 1
+                        matched_files.append(filename)
+                except Exception as e:
+                    logging.error(f"Error processing {filename} for link replacement: {e}")
+
+            if dry_run:
+                return f"[DRY RUN] Would replace '{old_text}' with '{new_text}' in {modified_count} files: {', '.join(matched_files[:10])}..."
+
+            from vector_lake.indexer import update_index_items
+            if matched_files:
+                update_index_items(matched_files)
+    except Exception as e:
+        for orig, bak in backups.items():
+            if bak.exists():
+                shutil.move(str(bak), str(orig))
+        raise e
+    finally:
+        for bak in backups.values():
+            if bak.exists():
+                os.remove(bak)        
         
     from vector_lake.governance_store import sync_pages_to_canonical
     abs_matched_files = [os.path.join(wiki_dir, f) for f in matched_files]

@@ -83,30 +83,80 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
     updated = 0
     failures = []
     
-    from vector_lake.mutation_coordinator import execute_mutation_plan
-    import yaml
+    from vector_lake.db_store import transaction
+    from vector_lake.wiki_utils import atomic_write_text
+    from vector_lake.governance_store import sync_pages_to_canonical
+    from vector_lake.indexer import update_index_items, delete_index_items
+    import shutil
     
-    for action, filepath, _, frontmatter, body in actions:
-        filename = os.path.basename(filepath)
-        if action == "DELETE":
-            try:
-                # Backup logic is already in execute_mutation_plan, but let's keep it here for raw source tracking if needed
-                execute_mutation_plan(filename, is_delete=True)
-                deleted += 1
-                log.info(f"Deleted (backed up): {filepath}")
-            except Exception as e:
-                failures.append(f"DELETE {filepath}: {e}")
-                log.warning(f"Failed to delete {filepath}: {e}")
-        elif action == "REMOVE_REF":
-            try:
-                fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
-                new_content = f"---\n{fm_str}---\n{body}"
-                execute_mutation_plan(filename, content=new_content, is_delete=False)
-                updated += 1
-                log.info(f"Removed source ref from: {filepath}")
-            except Exception as e:
-                failures.append(f"REMOVE_REF {filepath}: {e}")
-                log.warning(f"Failed to update {filepath}: {e}")
+    backups = {}
+    tmp_dir = get_extension_root() / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    
+    deleted_files = []
+    updated_files = []
+    
+    try:
+        with transaction():
+            for action, filepath, _, frontmatter, body in actions:
+                filename = os.path.basename(filepath)
+                if action == "DELETE":
+                    try:
+                        bak_path = tmp_dir / f"{filename}.bak"
+                        shutil.copy2(filepath, bak_path)
+                        backups[filepath] = bak_path
+                        os.remove(filepath)
+                        deleted_files.append(filename)
+                        deleted += 1
+                        log.info(f"Deleted (backed up): {filepath}")
+                    except Exception as e:
+                        failures.append(f"DELETE {filepath}: {e}")
+                        log.warning(f"Failed to delete {filepath}: {e}")
+                elif action == "REMOVE_REF":
+                    try:
+                        bak_path = tmp_dir / f"{filename}.bak"
+                        shutil.copy2(filepath, bak_path)
+                        backups[filepath] = bak_path
+                        
+                        fm_str = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
+                        new_content = f"---\n{fm_str}---\n{body}"
+                        atomic_write_text(filepath, new_content)
+                        updated_files.append(filename)
+                        updated += 1
+                        log.info(f"Removed source ref from: {filepath}")
+                    except Exception as e:
+                        failures.append(f"REMOVE_REF {filepath}: {e}")
+                        log.warning(f"Failed to update {filepath}: {e}")
+
+            if failures:
+                raise Exception("Failures occurred during file operations, rolling back.")
+
+            # Batch sync
+            if deleted_files or updated_files:
+                sync_pages_to_canonical(
+                    [os.path.join(wiki_dir, f) for f in updated_files],
+                    origin="tool_delete",
+                    auto_approve=True,
+                    summary=f"Cascade delete from {raw_path}",
+                    deleted_files=deleted_files
+                )
+                if updated_files:
+                    update_index_items(updated_files)
+                if deleted_files:
+                    delete_index_items(deleted_files)
+
+    except Exception as e:
+        for orig, bak in backups.items():
+            if bak.exists():
+                if os.path.exists(orig):
+                    os.remove(orig)
+                shutil.move(str(bak), str(orig))
+        failures.append(str(e))
+        log.error(f"Transaction failed, rolled back: {e}")
+    finally:
+        for bak in backups.values():
+            if bak.exists():
+                os.remove(bak)
 
     raw_deleted = False
     if failures:

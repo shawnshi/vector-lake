@@ -66,7 +66,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
 
     # 1.1 Required Fields
     # strategic_scope and evidence_tier are highly recommended but we allow legacy files without them
-    required_fields = ["id", "title", "type", "domain", "status", "epistemic-status", "categories", "updated", "sources"]
+    required_fields = ["id", "title", "type", "domain", "status", "epistemic-status", "categories", "updated", "sources", "strategic_scope", "evidence_tier"]
     for field in required_fields:
         if field not in frontmatter:
             # For system files, we can be more lenient
@@ -249,5 +249,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
             for tag in tags:
                 if str(tag).lower() in entities_in_index:
                     raise SchemaViolationException(f"Tag Collision: [{tag}] is already an entity and cannot be used as a tag. Use semantic links instead.")
+        except SchemaViolationException as e:
+            raise e
         except Exception:
             pass

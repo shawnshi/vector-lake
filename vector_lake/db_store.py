@@ -64,15 +64,25 @@ def transaction():
         finally:
             _LOCAL.in_transaction = False
 
+_INIT_DB_DONE = False
+_INIT_LOCK = threading.Lock()
+
 def init_db():
-    conn = get_connection()
-    try:
-        in_tx = getattr(_LOCAL, 'in_transaction', False)
-        if not in_tx:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-    except sqlite3.OperationalError:
-        pass
+    global _INIT_DB_DONE
+    if _INIT_DB_DONE:
+        return
+    with _INIT_LOCK:
+        if _INIT_DB_DONE:
+            return
+        
+        conn = get_connection()
+        try:
+            in_tx = getattr(_LOCAL, 'in_transaction', False)
+            if not in_tx:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError:
+            pass
     conn.execute("PRAGMA foreign_keys=ON")
     with transaction():
         conn.execute("""
@@ -172,13 +182,7 @@ def init_db():
             conn.execute("ALTER TABLE operational_memory ADD COLUMN ttl REAL")
         except sqlite3.OperationalError:
             pass
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS claim_graph_nodes (
-                node_id TEXT PRIMARY KEY,
-                data_json TEXT,
-                updated_at TEXT
-            )
-        """)
+        pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claim_graph_edges (
                 source_id TEXT,
@@ -234,6 +238,8 @@ def init_db():
             # Older SQLite versions might not support expression indexes
             import logging
             logging.getLogger("vector-lake-db").warning(f"Could not create JSON expression indexes: {e}")
+            
+        _INIT_DB_DONE = True
 
 
 
@@ -293,7 +299,6 @@ def delete_node_cascade(node_key: str):
         conn.execute("DELETE FROM entities WHERE entity_id = ? OR canonical_name = ?", (ent_id, canon_name))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (ent_id,))
         conn.execute("DELETE FROM claims WHERE json_extract(data_json, '$.source_page') IN (?, ?, ?, ?)", (canon_name, canon_name + ".md", ent_id, ent_id + ".md"))
-        conn.execute("DELETE FROM claim_graph_nodes WHERE node_id IN (?, ?)", (canon_name, ent_id))
         conn.execute("DELETE FROM claim_graph_edges WHERE source_id IN (?, ?) OR target_id IN (?, ?)", (canon_name, ent_id, canon_name, ent_id))
         conn.execute("DELETE FROM sources WHERE source_id IN (?, ?)", (canon_name, ent_id))
         conn.execute("DELETE FROM timeline_events WHERE entity_id = ?", (ent_id,))

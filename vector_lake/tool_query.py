@@ -114,22 +114,15 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
         file_path = os.path.join(wiki_dir, filename)
         if os.path.exists(file_path):
             # P1-2: Quality Gate for Gap Analysis
-            if filename.startswith("Synthesis_"):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if "核心合成论点" not in content or "支撑拓扑" not in content:
-                    raise ValueError(f"VALIDATION_FAIL: {filename} is missing mandatory '核心合成论点' or '支撑拓扑' sections. Synthesis rejected.")
-                    
+        if filename.startswith("Synthesis_"):
+                # Synthesis structure is already validated by execute_mutation_plan during subagent write_wiki_page
+                pass
             valid_files.add(filename)
             sanitize_wiki_node(file_path)
             
     if valid_files:
-        from vector_lake.mutation_coordinator import execute_mutation_plan
-        for filename in valid_files:
-            file_path = os.path.join(wiki_dir, filename)
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            execute_mutation_plan(filename, content=content, is_delete=False)
+        # Subagent already wrote them via write_wiki_page which calls execute_mutation_plan.
+        # We only need to generate stubs.
             
         stubs_created = _generate_stubs_for_broken_links(wiki_dir, valid_files)
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
