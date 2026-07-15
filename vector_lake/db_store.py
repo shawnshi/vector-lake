@@ -882,6 +882,12 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     supplied_source_hash = str(processed_data.get("source_hash") or "")
     if supplied_source_hash != expected_source_hash:
         raise ValueError(f"Job {job_id} source_hash does not match its queued payload")
+    expected_contract_version = payload.get("ingest_contract_version")
+    if expected_contract_version is not None and (
+        str(processed_data.get("ingest_contract_version") or "")
+        != str(expected_contract_version)
+    ):
+        raise ValueError(f"Job {job_id} ingest_contract_version does not match its queued payload")
     result = dict(row)
     result["parsed_payload"] = payload
     return result

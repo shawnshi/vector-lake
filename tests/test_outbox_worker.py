@@ -1,8 +1,13 @@
 import json
 
-from vector_lake import db_store, indexer, mutation_coordinator
+from vector_lake import db_store, governance_store, indexer, mutation_coordinator
 from vector_lake.mutation_coordinator import execute_mutation_plan
-from vector_lake.watchdog_app import WikiIndexHandler, index_queue, process_mutation_outbox_batch
+from vector_lake.watchdog_app import (
+    WikiIndexHandler,
+    index_queue,
+    process_legacy_projection_batch,
+    process_mutation_outbox_batch,
+)
 
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
 
@@ -78,3 +83,26 @@ def test_watchdog_ignores_managed_projection_event(isolated_memory):
     WikiIndexHandler().queue_path(str(target))
 
     assert index_queue.empty()
+
+
+def test_watchdog_promotes_manual_projection_edit_to_canonical_and_outbox(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    execute_mutation_plan("Source_Test.md", content=_source_content())
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    edited = target.read_text(encoding="utf-8").replace(
+        "Primary source content.",
+        "Manually revised source content.",
+    )
+    target.write_text(edited, encoding="utf-8")
+
+    stats = process_legacy_projection_batch(["Source_Test.md"])
+
+    assert stats == {"completed": 1, "failed": 0}
+    assert governance_store.canonical_page_versions({"Source_Test"})["Source_Test"] == (
+        governance_store.canonical_page_version_from_content("Source_Test.md", edited)
+    )
+    outbox = db_store.get_connection().execute(
+        "SELECT mutation_type, payload_text FROM mutation_outbox ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert outbox["mutation_type"] == "update"
+    assert outbox["payload_text"] == edited

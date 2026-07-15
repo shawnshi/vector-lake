@@ -1224,6 +1224,7 @@ def create_change_set(
     claims = load_claims()
     evidence = load_evidence()
     sources = load_sources()
+    existing_change_sets = load_change_sets()
 
     proposed_entities = []
     proposed_claims = []
