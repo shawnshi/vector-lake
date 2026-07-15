@@ -124,6 +124,7 @@ def _read_purpose() -> str:
         return "[STRATEGIC PURPOSE CONTRACT UNAVAILABLE: halt and repair purpose.md before ingesting.]"
 
 INTEGRATION_DISPOSITIONS = {"integrated", "standalone", "rejected"}
+INGEST_CONTRACT_VERSION = 2
 INTEGRATION_PREDICATES = {"validates", "falsifies", "depends-on", "mentions", "related_to"}
 INTEGRATION_EVENT_TAGS = {
     "Release", "Pivot", "Conflict", "Validation", "Observation", "Decision", "Execution", "Outcome"
@@ -261,17 +262,24 @@ def _read_canonical_target_content(filename: str, expected_version: str) -> str:
     candidates = []
     target_path = get_wiki_dir() / filename
     if target_path.exists():
-        candidates.append(("markdown projection", target_path.read_text(encoding="utf-8")))
+        candidates.append(("markdown projection", target_path.read_text(encoding="utf-8"), "full"))
     init_db()
     rows = get_connection().execute(
-        "SELECT payload_text FROM mutation_outbox "
+        "SELECT payload_text, validation_mode FROM mutation_outbox "
         "WHERE filename = ? AND mutation_type = 'update' AND payload_text IS NOT NULL "
-        "ORDER BY id DESC LIMIT 20",
+        "ORDER BY id DESC",
         (filename,),
-    ).fetchall()
-    candidates.extend(("mutation outbox", str(row["payload_text"])) for row in rows)
+    )
+    candidates.extend(
+        (
+            "mutation outbox",
+            str(row["payload_text"]),
+            str(row["validation_mode"] or "full"),
+        )
+        for row in rows
+    )
     seen = set()
-    for _origin, content in candidates:
+    for origin, content, validation_mode in candidates:
         fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest()
         if fingerprint in seen:
             continue
@@ -281,6 +289,15 @@ def _read_canonical_target_content(filename: str, expected_version: str) -> str:
         except Exception:
             continue
         if content_version == expected_version:
+            if not target_path.exists() and origin == "mutation outbox":
+                from vector_lake.mutation_coordinator import materialize_markdown_projection
+
+                materialize_markdown_projection(
+                    filename,
+                    "update",
+                    content,
+                    validation_mode=validation_mode if validation_mode in {"full", "schema"} else "full",
+                )
             return content
     raise ValueError(
         f"No canonical-aligned Markdown snapshot is available for {filename}; "
@@ -388,9 +405,6 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
         if target == canonical_name or target in submitted_names or target in seen_targets:
             raise ValueError(f"integration target is duplicated or conflicts with submitted files: {target}")
         seen_targets.add(target)
-        target_path = get_wiki_dir() / target
-        if not target_path.exists():
-            raise ValueError(f"integration target does not exist: {target}")
         target_key = target[:-3]
         actual_hash = governance_store.canonical_page_versions({target_key}).get(target_key)
         expected_hash = str(relation.get("target_hash") or "")
@@ -495,7 +509,10 @@ def requeue_legacy_ingest_jobs() -> int:
             payload = json.loads(row["payload"] or "{}")
         except json.JSONDecodeError:
             continue
-        if "source_hash" in payload:
+        if (
+            "source_hash" in payload
+            and str(payload.get("ingest_contract_version") or "") == str(INGEST_CONTRACT_VERSION)
+        ):
             continue
         filepath = str(payload.get("filepath") or "")
         file_hash = str(payload.get("hash") or "")
@@ -507,6 +524,7 @@ def requeue_legacy_ingest_jobs() -> int:
             canonical_key,
             "",
         )
+        payload["ingest_contract_version"] = INGEST_CONTRACT_VERSION
         payload["instructions"] = _build_ingest_instructions(filepath, file_hash, canonical_name)
         migrations.append((str(row["job_id"]), payload, str(row["task_packet_path"] or "")))
 
@@ -635,6 +653,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
             "hash": file_hash,
             "canonical_name": canonical_name,
             "source_hash": source_hash,
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
             "instructions": instructions
         }
         

@@ -235,6 +235,41 @@ def process_mutation_outbox_batch(
                 stats["completed"] += 1
     return stats
 
+
+def process_legacy_projection_batch(filenames) -> dict:
+    """Promote bounded manual Markdown edits into canonical state and durable outbox rows."""
+    from vector_lake import db_store, governance_store
+    from vector_lake.wiki_utils import get_wiki_dir
+
+    stats = {"completed": 0, "failed": 0}
+    wiki_dir = get_wiki_dir()
+    for filename in dict.fromkeys(str(item) for item in filenames):
+        target = wiki_dir / filename
+        try:
+            with db_store.transaction():
+                if target.exists():
+                    payload_text = target.read_text(encoding="utf-8")
+                    governance_store.sync_pages_to_canonical(
+                        [str(target)],
+                        origin="watchdog",
+                        auto_approve=True,
+                        summary=f"Manual update: {filename}",
+                    )
+                    db_store.enqueue_mutation(
+                        filename,
+                        "update",
+                        payload_text=payload_text,
+                    )
+                else:
+                    node_key = filename[:-3] if filename.endswith(".md") else filename
+                    db_store.delete_node_cascade(node_key)
+                    db_store.enqueue_mutation(filename, "delete")
+            stats["completed"] += 1
+        except Exception as exc:
+            stats["failed"] += 1
+            log.error("Failed to process manual edit for %s: %s", filename, exc)
+    return stats
+
 def index_worker_loop():
     log.info("Outbox Consumer Thread started.")
     consecutive_failures = 0
@@ -294,30 +329,13 @@ def index_worker_loop():
                     "",
                     component="outbox",
                 )
-                from vector_lake.mutation_coordinator import execute_mutation_plan
-                from vector_lake.wiki_utils import get_wiki_dir
-                wiki_dir = get_wiki_dir()
-                conn = get_connection()
-                for fname in pending_legacy:
-                    fpath = os.path.join(wiki_dir, fname)
-                    try:
-                        with transaction():
-                            if os.path.exists(fpath):
-                                sync_pages_to_canonical([fpath], origin="watchdog", auto_approve=True, summary=f"Manual update: {fname}")
-                                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (fname, 'update', _utc_now()))
-                            else:
-                                from vector_lake.db_store import delete_node_cascade
-                                node_key = fname[:-3] if fname.endswith(".md") else fname
-                                delete_node_cascade(node_key)
-                                conn.execute("INSERT INTO mutation_outbox (filename, mutation_type, created_at) VALUES (?, ?, ?)", (fname, 'delete', _utc_now()))
-                    except Exception as e:
-                        log.error(f"Failed to process manual edit for {fname}: {e}")
+                legacy_stats = process_legacy_projection_batch(pending_legacy)
                 write_status(
-                    "idle",
-                    len(pending_legacy),
+                    "error" if legacy_stats["failed"] else "idle",
+                    legacy_stats["completed"],
                     index_queue.qsize(),
-                    "Legacy projection batch completed",
-                    "",
+                    f"Legacy projection batch completed: {legacy_stats}",
+                    f"{legacy_stats['failed']} manual edit(s) failed" if legacy_stats["failed"] else "",
                     component="outbox",
                 )
             elif not stats["claimed"]:

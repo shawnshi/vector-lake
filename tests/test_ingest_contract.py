@@ -10,6 +10,8 @@ from vector_lake import db_store, governance_store, mcp_server, mutation_coordin
 from vector_lake.ingest_worker import _ingest_finalization_proven, process_jobs
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.tool_ingest import (
+    INGEST_CONTRACT_VERSION,
+    _read_canonical_target_content,
     _read_relevant_index_context,
     claim_ingest_tasks,
     list_ingest_tasks,
@@ -128,6 +130,7 @@ def test_ingest_worker_creates_subagent_task_packet(isolated_memory):
         "hash": "native-hash",
         "canonical_name": "Source_Native.md",
         "source_hash": "native-source-version",
+        "ingest_contract_version": INGEST_CONTRACT_VERSION,
         "instructions": "compile this source",
     }
     job_id = db_store.enqueue_job("ingest", payload)
@@ -147,6 +150,7 @@ def test_ingest_worker_creates_subagent_task_packet(isolated_memory):
     assert task["metadata"]["job_id"] == job_id
     assert task["metadata"]["processed_data"]["filepath"] == "raw/native.md"
     assert task["metadata"]["processed_data"]["source_hash"] == "native-source-version"
+    assert task["metadata"]["processed_data"]["ingest_contract_version"] == INGEST_CONTRACT_VERSION
     assert task["metadata"]["processed_data"]["job_id"] == job_id
     assert "CURRENT-ENVIRONMENT SUBAGENT HANDOFF" in task["prompt"]
     listed = list_ingest_tasks(limit=5, include_queued=False)
@@ -174,6 +178,8 @@ def test_ingest_worker_rebuilds_legacy_awaiting_packet_before_dispatch(isolated_
         "filepath": str(raw_path),
         "hash": "legacy-awaiting-hash",
         "canonical_name": "Source_Legacy-Awaiting.md",
+        "source_hash": "stale-but-present",
+        "ingest_contract_version": 1,
         "instructions": "legacy prompt without integration disposition",
     }
     job_id = db_store.enqueue_job("ingest", payload)
@@ -191,6 +197,7 @@ def test_ingest_worker_rebuilds_legacy_awaiting_packet_before_dispatch(isolated_
     rebuilt = json.loads(row["payload"])
     assert row["status"] == "awaiting_subagent"
     assert rebuilt["source_hash"] == ""
+    assert rebuilt["ingest_contract_version"] == INGEST_CONTRACT_VERSION
     assert "semantic disposition" in rebuilt["instructions"]
     assert "canonical SQLite version tokens" in rebuilt["instructions"]
     assert row["task_packet_path"] != str(old_task)
@@ -299,6 +306,42 @@ def test_finalize_ingest_rejects_source_hash_not_bound_to_job_payload(isolated_m
 
     assert result.startswith("Error finalizing ingestion")
     assert "source_hash does not match" in result
+
+
+def test_finalize_ingest_rejects_contract_version_not_bound_to_job_payload(isolated_memory, monkeypatch):
+    db_store.init_db()
+    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: [])
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": "raw/contract-version.md",
+            "hash": "contract-version-hash",
+            "canonical_name": "Source_Contract-Version.md",
+            "source_hash": "",
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        },
+    )
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+
+    result = mcp_server.tools.finalize_ingest(
+        [],
+        {
+            "filepath": "raw/contract-version.md",
+            "hash": "contract-version-hash",
+            "canonical_name": "Source_Contract-Version.md",
+            "source_hash": "",
+            "ingest_contract_version": 1,
+            "job_id": job_id,
+            "lease_owner": claim["lease_owner"],
+            "lease_token": claim["lease_token"],
+            "lease_generation": claim["lease_generation"],
+        },
+    )
+
+    assert result.startswith("Error finalizing ingestion")
+    assert "ingest_contract_version does not match" in result
 
 
 def test_finalize_ingest_marks_subagent_job_finalized(isolated_memory, monkeypatch):
@@ -783,6 +826,71 @@ def test_integration_uses_canonical_outbox_snapshot_when_markdown_projection_is_
     updated_target = target_path.read_text(encoding="utf-8")
     assert "Canonical V2 content must survive integration." in updated_target
     assert "The source supports the canonical V2 target content." in updated_target
+
+
+def test_canonical_target_snapshot_searches_beyond_twenty_newer_outbox_rows(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    execute_mutation_plan("Concept_Target.md", content=_concept_content())
+    expected_content = (isolated_memory / "wiki" / "Concept_Target.md").read_text(encoding="utf-8")
+    expected_version = governance_store.canonical_page_versions({"Concept_Target"})["Concept_Target"]
+    for index in range(25):
+        db_store.enqueue_mutation(
+            "Concept_Target.md",
+            "update",
+            _concept_content(f"Noise Snapshot {index}"),
+            idempotency_key=f"noise-snapshot-{index}",
+        )
+
+    recovered = _read_canonical_target_content("Concept_Target.md", expected_version)
+
+    assert recovered == expected_content
+
+
+def test_integration_recovers_missing_target_projection_from_canonical_outbox(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    target_path = isolated_memory / "wiki" / "Concept_Target.md"
+    execute_mutation_plan("Concept_Target.md", content=_concept_content())
+    target_version = governance_store.canonical_page_versions({"Concept_Target"})["Concept_Target"]
+    target_path.unlink()
+    payload = {
+        "filepath": "raw/missing-projection.md",
+        "hash": "missing-projection",
+        "canonical_name": "Source_Missing-Projection.md",
+        "source_hash": "",
+        "ingest_contract_version": INGEST_CONTRACT_VERSION,
+    }
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+
+    result = mcp_server.tools.finalize_ingest(
+        [{"filename": "Source_Missing-Projection.md", "content": _source_content()}],
+        {
+            **payload,
+            "integration": {
+                "disposition": "integrated",
+                "relations": [{
+                    "target": "Concept_Target.md",
+                    "target_hash": target_version,
+                    "predicate": "validates",
+                    "evidence": "The recovered target is supported by this source.",
+                    "confidence": 0.92,
+                    "event_date": "2026-07-16",
+                    "event_tag": "Validation",
+                }],
+            },
+            "job_id": job_id,
+            "lease_owner": claim["lease_owner"],
+            "lease_token": claim["lease_token"],
+            "lease_generation": claim["lease_generation"],
+        },
+    )
+
+    assert result.startswith("Successfully finalized ingestion")
+    assert target_path.exists()
+    target = target_path.read_text(encoding="utf-8")
+    assert "Target compiled truth." in target
+    assert "(Source: [[Source_Missing-Projection]])" in target
 
 
 def test_reingest_replaces_relation_evidence_without_duplicate_anchors(isolated_memory):

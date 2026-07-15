@@ -67,6 +67,7 @@ def process_jobs():
                     "hash": file_hash,
                     "canonical_name": canonical_name,
                     "source_hash": str(payload.get("source_hash") or ""),
+                    "ingest_contract_version": payload.get("ingest_contract_version"),
                     "job_id": job_id,
                 }
                 task_path = create_subagent_task(
