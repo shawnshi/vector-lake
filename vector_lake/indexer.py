@@ -566,6 +566,11 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     node_degrees = {}
     pred_weights = {}
 
+    if "mentions" not in pred_weights:
+        pred_weights["mentions"] = get_pred_weight("mentions")
+    # ⚡ Bolt: Cache the fallback mention weight to avoid lookups in the hot loop
+    mention_weight = pred_weights["mentions"]
+
     for key, node in nodes_dict.items():
         resolved_links = set()
         for link in (node.get("links") or []):
@@ -577,7 +582,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
         node_types[key] = node.get("type", "concept").lower()
         
-        td = {}
+        td = {link: mention_weight for link in resolved_links}
         for t in (node.get("triples") or []):
             if t.get("target"):
                 pred = t.get("predicate", "mentions")
@@ -607,11 +612,6 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         for link in links:
             if link not in node_degrees:
                 node_degrees[link] = 0.0
-
-    if "mentions" not in pred_weights:
-        pred_weights["mentions"] = get_pred_weight("mentions")
-    # ⚡ Bolt: Cache the fallback mention weight to avoid lookups in the hot loop
-    mention_weight = pred_weights["mentions"]
 
     default_affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
 
@@ -644,10 +644,12 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         for source in sources:
             source_to_nodes.setdefault(source, []).append(key)
             
-    reverse_links = {}
+    _temp_reverse_links = {}
     for key, links in node_links.items():
         for link in links:
-            reverse_links.setdefault(link, []).append(key)
+            _temp_reverse_links.setdefault(link, []).append(key)
+
+    reverse_links = {k: frozenset(v) for k, v in _temp_reverse_links.items()}
 
     for key_a in node_keys:
         links_a = node_links[key_a]
@@ -656,6 +658,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         triples_a = node_triples[key_a]
         multiplier_a = node_multipliers[key_a]
         affinity_dict_a = type_affinity_precomputed[type_a]
+        reverse_links_a = reverse_links.get(key_a, frozenset())
 
         candidate_source_overlaps = {}
         candidate_neighbor_scores = {}
@@ -691,10 +694,10 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             score = 0.0
 
             if key_b in links_a:
-                score += triples_a.get(key_b, mention_weight)
+                score += triples_a[key_b]
 
-            if key_a in node_links[key_b]:
-                score += node_triples[key_b].get(key_a, mention_weight)
+            if key_b in reverse_links_a:
+                score += node_triples[key_b][key_a]
 
             if key_b in candidate_source_overlaps:
                 score += candidate_source_overlaps[key_b] * overlap_weight
