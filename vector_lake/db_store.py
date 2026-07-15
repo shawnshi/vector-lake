@@ -339,6 +339,7 @@ def _init_db_once(db_key: str):
             ("idempotency_key", "TEXT"),
             ("task_packet_path", "TEXT"),
             ("completed_at", "TEXT"),
+            ("result_json", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} {column_type}")
@@ -877,6 +878,10 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     supplied_name = str(processed_data.get("canonical_name") or "")
     if expected_name and supplied_name != expected_name:
         raise ValueError(f"Job {job_id} canonical_name does not match its queued payload")
+    expected_source_hash = str(payload.get("source_hash") or "")
+    supplied_source_hash = str(processed_data.get("source_hash") or "")
+    if supplied_source_hash != expected_source_hash:
+        raise ValueError(f"Job {job_id} source_hash does not match its queued payload")
     result = dict(row)
     result["parsed_payload"] = payload
     return result
@@ -887,18 +892,21 @@ def finalize_ingest_job(
     lease_owner: str,
     lease_token: str,
     lease_generation: int,
+    result_data: dict | None = None,
 ):
     """Mark a validated subagent job complete inside the caller's transaction."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    result_json = json.dumps(result_data or {}, ensure_ascii=False, sort_keys=True)
     cursor = conn.execute(
         "UPDATE jobs SET status = 'finalized', completed_at = ?, updated_at = ?, "
-        "lease_until = NULL, lease_owner = NULL, lease_token = NULL, error_msg = '' "
+        "lease_until = NULL, lease_owner = NULL, lease_token = NULL, error_msg = '', result_json = ? "
         "WHERE job_id = ? AND status = 'subagent_processing' "
         "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? AND lease_until > ?",
         (
             now,
             now,
+            result_json,
             str(job_id),
             str(lease_owner),
             str(lease_token),

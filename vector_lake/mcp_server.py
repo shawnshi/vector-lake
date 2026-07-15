@@ -314,7 +314,7 @@ def finalize_ingest(
     
     Args:
         files_written: Direct list of dicts with 'filename' and 'content'.
-        processed_data: Direct dict with 'filepath' and 'hash'.
+        processed_data: Claimed job dict with filepath/hash/source_hash/lease fields plus an integration disposition manifest.
         files_written_payload_file: Sandbox JSON file containing files_written.
         raw_files_payload_file: Sandbox JSON file containing processed_data.
     """

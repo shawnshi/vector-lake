@@ -13,17 +13,18 @@ Wiki Rules & Schema:
 Strategic Purpose Contract:
 {{purpose_content}}
 
-Existing Index Summary:
+Source-Relevant Existing Node Candidates (searched across the complete index):
 {{index_summary}}
 
 Task:
 1. Read the Source Path content using `view_file`. If `view_file` fails due to MIME type restrictions, fallback to running a Python script with `errors="ignore"` to read the file forcefully.
-2. Extract the core entities, concepts, and tensions based on the Schema.
+2. Extract the core entities, concepts, and tensions based on the Schema. Evaluate the source-relevant candidates above before deciding that the source is standalone.
    - Before writing a node, classify it as `strategic_scope: core` or `strategic_scope: edge`; excluded or marketing-only material must not become a Wiki node.
    - Every new node MUST declare an `evidence_tier` from the Strategic Purpose Contract. A metric must carry an inline `(Source: [[Source_*]])` anchor on the same line.
 3. If a `确定性结构 (Static Skeleton)` block is provided above, you MUST copy it EXACTLY into the final output under the `## 确定性结构 (Static Skeleton)` section. Do not alter or summarize it.
-4. Write the parsed Markdown content for each new node directly to temporary `.md` files in your `scratch/` directory (e.g., `scratch/Concept_XYZ.md`) using `write_to_file`. Then, create a JSON array mapping these files like `[{"filename": "Concept_XYZ.md", "filepath": "/absolute/path/to/scratch/Concept_XYZ.md"}]` and write this JSON array to a payload file (e.g. `files_written_{{file_hash}}.json`). Also write `{"filepath": "{{filepath}}", "hash": "{{file_hash}}"}` to another payload file. Finally, call the lazy MCP tool `call_mcp_tool` (ServerName="vector-lake-mcp", ToolName="finalize_ingest") with `files_written_payload_file` and `raw_files_payload_file` pointing to the absolute paths of these JSON files.
-5. 闭环执行 (Agentic Workflow): If contradictions or duplicates are found, you MUST NOT just output text. You MUST declare them using `tension_edges` in the YAML frontmatter. If a new schema category is needed, use the `propose_schema_mutation` MCP tool.
+4. Write the parsed Markdown content for each new node directly to temporary `.md` files in your isolated `scratch/` directory. Create a JSON array such as `[{"filename": "Concept_XYZ.md", "filepath": "/absolute/path/to/scratch/Concept_XYZ.md"}]`. Preserve the complete claimed `processed_data` object from the task packet, including `job_id`, lease fields, `canonical_name`, and `source_hash`; never reconstruct a reduced object. Call `finalize_ingest` with these two payloads.
+5. Before calling `finalize_ingest`, extend the claimed `processed_data` with exactly one semantic disposition: `integrated` with `relations` (`target`, candidate `target_hash`, `predicate`, `evidence`, `confidence`, `event_date`, `event_tag`); `standalone` with an auditable `reason`; or `rejected` with an auditable `reason` and an empty files array. Candidate `target_hash` and task-packet `source_hash` are canonical SQLite version tokens, not Markdown file hashes. Do not rewrite existing target pages; the finalize tool applies transaction-boundary version checks and guarded relation upserts. Missing disposition, empty integrated relations, stale version tokens, or silent empty output are fatal contract errors.
+6. 闭环执行 (Agentic Workflow): If contradictions or duplicates are found, you MUST NOT just output text. You MUST declare them using `tension_edges` in the YAML frontmatter. If a new schema category is needed, use the `propose_schema_mutation` MCP tool.
 
 [CRITICAL REQUIREMENT: MICRO-ASSET FUNNEL]
 If the source text contains explicit highly-structured knowledge (e.g. formulas, exact config parameters, or architecture decisions), you MUST NOT bury them inside long prose.

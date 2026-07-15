@@ -26,12 +26,16 @@ def _subagent_ingest_prompt(instructions: str) -> str:
         + "Return or persist ONLY a JSON array. Each item must be an object with exactly these keys:\n"
         + "- filename: target wiki filename\n"
         + "- content: complete Markdown content, including YAML frontmatter\n"
-        + "If the source should be rejected by the strategic purpose contract, return an empty JSON array: [].\n"
-        + "After producing the JSON array, call the Vector Lake finalize_ingest tool or CLI-compatible finalize path with the processed_data object from this task packet.\n"
+        + "Add processed_data.integration with disposition integrated, standalone, or rejected.\n"
+        + "Preserve the task packet source_hash. Integrated relations must use candidate canonical target_hash values; standalone and rejected require an auditable reason.\n"
+        + "After producing both payloads, call the Vector Lake finalize_ingest tool or CLI-compatible finalize path with the processed_data object from this task packet.\n"
     )
 
 
 def process_jobs():
+    from vector_lake.tool_ingest import requeue_legacy_ingest_jobs
+
+    requeue_legacy_ingest_jobs()
     jobs = claim_pending_jobs(limit=1, lease_seconds=3600)
     if not jobs:
         return
@@ -62,6 +66,7 @@ def process_jobs():
                     "filepath": filepath,
                     "hash": file_hash,
                     "canonical_name": canonical_name,
+                    "source_hash": str(payload.get("source_hash") or ""),
                     "job_id": job_id,
                 }
                 task_path = create_subagent_task(

@@ -88,6 +88,10 @@ def _prepare_mutations(
         filename = mutation.get("filename")
         content = mutation.get("content")
         is_delete = bool(mutation.get("is_delete", False))
+        has_expected_version = "expected_version" in mutation
+        expected_version = mutation.get("expected_version")
+        if has_expected_version and not isinstance(expected_version, str):
+            raise ValueError("expected_version must be a string when supplied.")
         filepath = resolve_wiki_mutation_path(
             filename,
             allow_existing_legacy_name=validation_mode == "schema",
@@ -112,9 +116,16 @@ def _prepare_mutations(
                 "content": content,
                 "filepath": filepath,
                 "mutation_type": mutation_type,
+                "has_expected_version": has_expected_version,
+                "expected_version": expected_version,
                 "idempotency_key": hashlib.sha256(
                     (
                         f"{mutation_type}\x00{filename}\x00{content or ''}"
+                        + (
+                            f"\x00expected_version={expected_version}"
+                            if has_expected_version
+                            else ""
+                        )
                         + (f"\x00validation={validation_mode}" if validation_mode != "full" else "")
                     ).encode("utf-8")
                 ).hexdigest(),
@@ -154,6 +165,27 @@ def execute_mutation_batch(
         prepared_change_sets.append(change_set)
 
     with db_store.transaction():
+        versioned = [mutation for mutation in prepared if mutation["has_expected_version"]]
+        if versioned:
+            page_keys = {
+                mutation["filename"][:-3]
+                if mutation["filename"].endswith(".md")
+                else mutation["filename"]
+                for mutation in versioned
+            }
+            current_versions = governance_store.canonical_page_versions(page_keys)
+            for mutation in versioned:
+                filename = mutation["filename"]
+                page_key = filename[:-3] if filename.endswith(".md") else filename
+                expected = mutation["expected_version"]
+                current = current_versions.get(page_key)
+                if (expected == "" and current is not None) or (
+                    expected != "" and current != expected
+                ):
+                    raise ValueError(
+                        f"Canonical version conflict for {filename}: "
+                        f"expected {expected or '<absent>'}, current {current or '<absent>'}"
+                    )
         for mutation in prepared:
             filename = mutation["filename"]
             content = mutation["content"]

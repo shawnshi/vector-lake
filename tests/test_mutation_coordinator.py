@@ -1,3 +1,7 @@
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from vector_lake import db_store, governance_store
@@ -111,6 +115,90 @@ def test_mutation_rolls_back_canonical_when_outbox_enqueue_fails(isolated_memory
     conn = db_store.get_connection()
     assert conn.execute("SELECT 1 FROM entities").fetchone() is None
     assert not (isolated_memory / "wiki" / "Source_Test.md").exists()
+
+
+def test_mutation_rejects_interleaved_canonical_update_at_commit_boundary(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    original = _source_content()
+    execute_mutation_plan("Source_Test.md", content=original)
+    expected = governance_store.canonical_page_versions({"Source_Test"})["Source_Test"]
+    outbox_before = db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0]
+    real_prepare = governance_store.prepare_change_set_from_content
+    injected = False
+
+    def prepare_then_inject_concurrent_update(*args, **kwargs):
+        nonlocal injected
+        change_set = real_prepare(*args, **kwargs)
+        if not injected:
+            injected = True
+            row = db_store.get_connection().execute(
+                "SELECT entity_id, data_json FROM entities "
+                "WHERE json_extract(data_json, '$.page_key') = 'Source_Test' LIMIT 1"
+            ).fetchone()
+            data = json.loads(row["data_json"])
+            data["raw_text"] = "Concurrent canonical update."
+            governance_store.upsert_entity(row["entity_id"], data)
+        return change_set
+
+    monkeypatch.setattr(
+        governance_store,
+        "prepare_change_set_from_content",
+        prepare_then_inject_concurrent_update,
+    )
+    with pytest.raises(ValueError, match="Canonical version conflict"):
+        execute_mutation_batch([
+            {
+                "filename": "Source_Test.md",
+                "content": original.replace("Primary source content.", "Desired update."),
+                "expected_version": expected,
+            }
+        ])
+
+    assert injected is True
+    assert (isolated_memory / "wiki" / "Source_Test.md").read_text(encoding="utf-8") == original
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0] == outbox_before
+    current = db_store.get_connection().execute(
+        "SELECT data_json FROM entities "
+        "WHERE json_extract(data_json, '$.page_key') = 'Source_Test' LIMIT 1"
+    ).fetchone()
+    assert json.loads(current["data_json"])["raw_text"] == "Concurrent canonical update."
+
+
+def test_two_sqlite_writers_with_same_expected_version_cannot_both_commit(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    original = _source_content()
+    execute_mutation_plan("Source_Test.md", content=original)
+    expected = governance_store.canonical_page_versions({"Source_Test"})["Source_Test"]
+    barrier = threading.Barrier(2)
+
+    def race(body):
+        barrier.wait(timeout=5)
+        try:
+            execute_mutation_batch([{
+                "filename": "Source_Test.md",
+                "content": original.replace("Primary source content.", body),
+                "expected_version": expected,
+            }])
+            return "committed"
+        except ValueError as exc:
+            assert "Canonical version conflict" in str(exc)
+            return "conflict"
+        finally:
+            db_store.close_connection()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(race, ["Writer A.", "Writer B."]))
+
+    assert sorted(results) == ["committed", "conflict"]
+    projection = (isolated_memory / "wiki" / "Source_Test.md").read_text(encoding="utf-8")
+    assert ("Writer A." in projection) != ("Writer B." in projection)
 
 
 def test_mutation_batch_rolls_back_all_pages_and_callback(isolated_memory):

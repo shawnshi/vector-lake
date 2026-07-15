@@ -390,6 +390,63 @@ def get_entity(entity_id: str) -> dict | None:
         return json.loads(row["data_json"])
     return None
 
+
+def _canonical_entity_rows_version(page_rows: list[tuple[str, str]]) -> str:
+    normalized_rows = []
+    for entity_id, raw in page_rows:
+        data = json.loads(raw)
+        # extract_page_objects supplies wall-clock time when legacy pages omit `created`.
+        # That fallback is storage metadata, not page state, so it cannot participate in CAS.
+        data.pop("created_at", None)
+        normalized = json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        normalized_rows.append((entity_id, normalized))
+    serialized = "\x1e".join(
+        f"{entity_id}\x1f{raw}" for entity_id, raw in sorted(normalized_rows)
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def canonical_page_version_from_content(filename: str, content: str) -> str:
+    """Calculate the canonical entity version that full Markdown would produce."""
+    frontmatter, body = split_frontmatter(content)
+    extracted = extract_page_objects(filename, frontmatter, body)
+    rows = [
+        (str(record["entity_id"]), json.dumps(record, ensure_ascii=False))
+        for record in extracted.get("entities", [])
+    ]
+    if not rows:
+        return ""
+    return _canonical_entity_rows_version(rows)
+
+
+def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]:
+    """Return deterministic version tokens for the current canonical page state."""
+    init_db()
+    requested = set(page_keys) if page_keys is not None else None
+    rows_by_page: dict[str, list[tuple[str, str]]] = {}
+    rows = get_connection().execute(
+        "SELECT entity_id, data_json FROM entities ORDER BY entity_id"
+    ).fetchall()
+    for row in rows:
+        raw = str(row["data_json"])
+        try:
+            page_key = str(json.loads(raw).get("page_key") or "")
+        except (TypeError, ValueError):
+            continue
+        if not page_key or (requested is not None and page_key not in requested):
+            continue
+        rows_by_page.setdefault(page_key, []).append((str(row["entity_id"]), raw))
+
+    return {
+        page_key: _canonical_entity_rows_version(page_rows)
+        for page_key, page_rows in rows_by_page.items()
+    }
+
 def upsert_entity(entity_id: str, data: dict):
     conn = get_connection()
     now = _utc_now()

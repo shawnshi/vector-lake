@@ -135,7 +135,7 @@ graph LR
 
 ### 🛡️ V11.10 原子突变编排与异步摄取管线 (V11.10 Unified Mutation & Async Ingestion)
 - **全局突变协调器 (Unified Mutation Coordinator)**：Rename/Delete/Memory/批量替换等写入口统一先做 schema、purpose 与路径校验，再原子提交 canonical change set 和 outbox intent；投影写入失败不会回滚已提交事实，而由 worker 重放恢复。
-- **subagent 任务包摄取 (Subagent Task Packet Ingestion)**：`ingest_worker.py` 生成隔离任务包并将 job 标记为 `awaiting_subagent`；宿主通过 `claim_ingest_tasks` 租约领取，完成后调用 `finalize_ingest`。提交必须匹配原任务的文件路径、哈希和 canonical 名称，成功后原子更新 `processed_files`、完成 job 并清理任务包。
+- **subagent 任务包摄取 (Subagent Task Packet Ingestion)**：`ingest_worker.py` 生成隔离任务包并将 job 标记为 `awaiting_subagent`；宿主通过 `claim_ingest_tasks` 租约领取。任务包从完整索引中提供来源相关候选（包括 `Synthesis_*`）和 canonical 版本令牌，并固定待写 Source 的起始版本。`finalize_ingest` 要求 `integrated`、`standalone`、`rejected` 三种可审计语义处置之一；`integrated` 在同一 mutation batch 中写入 Source 类型化关系和目标页证据或支撑拓扑。提交事务会再次校验 Source 与目标版本，拒绝并发覆盖；目标 Markdown 必须与 canonical 对齐，投影滞后时从匹配版本的 durable outbox 恢复基线。重复入湖按稳定关系标识替换并清理全部历史重复锚点。部署前遗留的 `awaiting_subagent` 任务包会在 worker 领取前重建为新契约。成功后原子更新 `processed_files`、完成 job 并清理任务包。
 - **DefenseHook 与 PurposeGate 强制门控 (Strategic Gates)**：在 `defense_hook.py` 与 `purpose_contract.py` 中落地战略防御。强制校验运行态写入时的战略作用域 (`strategic_scope`) 与证据等级 (`evidence_tier`)，不符合契约标准（如营销软文或低质断言）的信源从物理上即被禁止进入底层知识图谱。
 - **空指针与悬空引用免疫 (Null Safety & Dangling Pointer Immunity)**：针对 `claim_extractor.py` 中由于遗留老旧节点（缺乏 Frontmatter 或 Null aliases）引发的 `TypeError` 中断，全面实施了空值安全与防御式解包。在同步节点与边时确保底层图谱扫描绝对畅通无阻，实现超 10,000+ 节点的全量稳态重建。
 
