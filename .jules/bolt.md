@@ -9,3 +9,11 @@
 ## 2024-07-14 - Unused O(N) Array Allocations in Search Hot Path
 **Learning:** Codebase sometimes retains expensive list comprehensions iterating over the entire global index inside search functions (e.g. `nodes = [...]` in `tool_search.py`), which are never consumed.
 **Action:** Always check if variables returned from O(N) operations in hot paths are actually used before optimizing them.
+
+## 2024-05-24 - Avoid dictionary copies and nested comprehensions in O(N) paths
+**Learning:** In `compute_debt_metrics`, calling `annotate_claim_validity` on every claim created thousands of unnecessary dictionary copies just to read one field. Additionally, building `source_ids_with_claims` via a nested list comprehension iterated over all claims a second time.
+**Action:** When only specific fields are needed, call the underlying function (`infer_claim_validity`) instead of the wrapper that copies dictionaries. Aggregate secondary data (`source_ids_with_claims.update()`) within the same single pass loop to avoid redundant O(N) iterations.
+
+## 2024-05-24 - Use defaultdict for fast incrementing instead of .get()
+**Learning:** Initializing frequencies with `dict.get(key, 0) + 1` incurs overhead for missing keys.
+**Action:** Use `collections.defaultdict(int)` to allow `dict[key] += 1` for O(1) increments.
