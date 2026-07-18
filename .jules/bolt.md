@@ -9,3 +9,7 @@
 ## 2024-07-14 - Unused O(N) Array Allocations in Search Hot Path
 **Learning:** Codebase sometimes retains expensive list comprehensions iterating over the entire global index inside search functions (e.g. `nodes = [...]` in `tool_search.py`), which are never consumed.
 **Action:** Always check if variables returned from O(N) operations in hot paths are actually used before optimizing them.
+
+## 2024-08-01 - Avoid allocating unnecessary dictionaries for read-only aggregation in O(N) loops
+**Learning:** When aggregating data from objects in Python hot loops (like `compute_debt_metrics`), wrapping the original object in an enrichment function (e.g., `annotate_claim_validity`) might instantiate a full copy of the dictionary (e.g., `dict(claim)`). If only a few fields are needed for aggregation, this causes massive, unnecessary memory allocations in O(N) paths.
+**Action:** When refactoring to eliminate the enrichment overhead, do not remove the enrichment function completely if downstream logic inside the same loop depends on the enriched fields (e.g., `validity_state` default overrides). Instead, apply the underlying logic to retrieve the required values directly without mutating or copying the entire dictionary, or preserve the object shape if required.

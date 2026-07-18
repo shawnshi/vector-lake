@@ -1,4 +1,5 @@
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from vector_lake import governance_store
@@ -174,7 +175,9 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         memory_store = governance_store.rebuild_operational_memory()
     memory_items = list(memory_store.get("items", {}).values())
 
-    validity_state_counts = {}
+    # ⚡ Bolt: Use defaultdict(int) to reduce dictionary lookup overhead.
+    # Measurement: Eliminates dictionary miss handling overhead in the hot loop.
+    validity_state_counts = defaultdict(int)
     unsupported_claim_count = 0
     conflicted_claim_count = 0
     stale_claim_count = 0
@@ -183,9 +186,13 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
     provisional_claim_count = 0
     high_centrality_low_confidence = 0
 
+    # ⚡ Bolt: Consolidate source_ids collection into the main loop via set().update().
+    # Measurement: Eliminates a secondary O(N) loop iterating over all claims and their sources.
+    source_ids_with_claims = set()
+
     for claim in claims:
         state = claim.get("validity_state", "active")
-        validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
+        validity_state_counts[state] += 1
         if state == "unsupported":
             unsupported_claim_count += 1
         if state == "conflicted":
@@ -201,7 +208,8 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         if float(claim.get("confidence", 0)) < 0.5 and len(claim.get("subject_entity_ids", [])) > 0:
             high_centrality_low_confidence += 1
 
-    source_ids_with_claims = {source_id for claim in claims for source_id in claim.get("source_ids", [])}
+        source_ids_with_claims.update(claim.get("source_ids", []))
+
     orphan_source_count = len([source for source in sources if source["source_id"] not in source_ids_with_claims])
     pending_items = [item for item in queue if item.get("status") == "pending"]
     merge_candidates = [] if skip_heavy else find_merge_candidates(limit=20)
