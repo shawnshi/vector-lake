@@ -9,8 +9,8 @@ from vector_lake.defense_hook import verify_asset
 from vector_lake.schema_validator import validate_schema
 from vector_lake.wiki_utils import (
     atomic_write_text,
-    get_extension_root,
     get_index_path,
+    get_outbox_signal_path,
     get_wiki_dir,
     split_frontmatter,
     validate_wiki_filename,
@@ -69,9 +69,9 @@ def materialize_markdown_projection(
 def _signal_outbox_consumer():
     """Best-effort wake-up hint; correctness never depends on this file."""
     try:
-        tmp_dir = get_extension_root() / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(tmp_dir / "outbox_signal.lock", "1")
+        signal_path = get_outbox_signal_path()
+        signal_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(signal_path, "1")
     except OSError as exc:
         log.warning(f"Could not write outbox wake-up hint: {exc}")
 
@@ -108,7 +108,10 @@ def _prepare_mutations(
             if validation_mode == "full":
                 verify_asset(content, filename, frontmatter, get_index_path())
             else:
-                validate_schema(frontmatter, content, filename, get_index_path())
+                # Schema mode is a bounded legacy-maintenance path. Dynamic
+                # tag/entity collision checks belong to full writes because
+                # existing pages may predate the current index taxonomy.
+                validate_schema(frontmatter, content, filename)
 
         prepared.append(
             {
@@ -140,6 +143,7 @@ def execute_mutation_batch(
     mutations: Iterable[dict],
     canonical_callback: Callable[[], None] | None = None,
     validation_mode: str = "full",
+    origin: str = "mutation_coordinator",
 ):
     """Commit canonical mutations atomically; schema mode is for bounded legacy maintenance."""
     from vector_lake.runtime_health import enforce_runtime_write_health
@@ -158,13 +162,20 @@ def execute_mutation_batch(
         change_set = governance_store.prepare_change_set_from_content(
             filename,
             mutation["content"],
-            origin="mutation_coordinator",
+            origin=origin,
             auto_approve=True,
             summary=f"Canonical mutation for {filename}",
         )
         prepared_change_sets.append(change_set)
 
     with db_store.transaction():
+        page_keys = {
+            mutation["filename"][:-3]
+            if mutation["filename"].endswith(".md")
+            else mutation["filename"]
+            for mutation in prepared
+        }
+        base_versions = governance_store.canonical_page_versions(page_keys)
         versioned = [mutation for mutation in prepared if mutation["has_expected_version"]]
         if versioned:
             page_keys = {
@@ -208,6 +219,10 @@ def execute_mutation_batch(
                     payload_text=content,
                     idempotency_key=mutation["idempotency_key"],
                     validation_mode=validation_mode,
+                    base_version=base_versions.get(
+                        filename[:-3] if filename.endswith(".md") else filename,
+                        "",
+                    ),
                 )
             )
         if canonical_callback is not None:
@@ -216,12 +231,16 @@ def execute_mutation_batch(
     deferred = []
     for mutation, outbox_id in zip(prepared, outbox_ids):
         try:
-            materialize_markdown_projection(
-                mutation["filename"],
-                mutation["mutation_type"],
-                mutation["content"],
-                validation_mode=validation_mode,
-            )
+            with db_store.transaction():
+                if not db_store.mutation_outbox_is_latest_intent(outbox_id):
+                    deferred.append(mutation["filename"])
+                    continue
+                materialize_markdown_projection(
+                    mutation["filename"],
+                    mutation["mutation_type"],
+                    mutation["content"],
+                    validation_mode=validation_mode,
+                )
         except Exception as exc:
             deferred.append(mutation["filename"])
             log.error(

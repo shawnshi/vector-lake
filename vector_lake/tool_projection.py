@@ -8,23 +8,34 @@ canonical history.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from vector_lake import governance_store, indexer
 from vector_lake.claim_extractor import extract_page_objects
-from vector_lake.db_store import backup_database, get_connection, get_db_path, init_db
-from vector_lake.schema_validator import VALID_H3_SLOTS
+from vector_lake.db_store import backup_database, enqueue_mutation, get_connection, get_db_path, init_db, transaction
+from vector_lake.mutation_coordinator import materialize_markdown_projection
+from vector_lake.schema_validator import VALID_H3_SLOTS, validate_schema
 from vector_lake.yaml_utils import dump_yaml
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_meta_dir, get_wiki_dir, read_markdown_file
+from vector_lake.wiki_utils import (
+    get_claim_graph_path,
+    get_index_path,
+    get_meta_dir,
+    get_wiki_dir,
+    read_markdown_file,
+    split_frontmatter,
+)
 
 
 EXCLUDED_WIKI_FILES = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
+log = logging.getLogger("vector-lake-projection")
 
 
 def _utc_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _wiki_keys() -> set[str]:
@@ -183,6 +194,115 @@ def canonical_backfill_missing_wiki(dry_run: bool = True, limit: int = 50) -> st
     )
 
 
+def _canonical_content_drift_candidates(limit: int = 0) -> dict:
+    """Return schema-valid Wiki pages whose canonical entity version differs."""
+    canonical_versions = governance_store.canonical_page_versions()
+    candidates: list[dict] = []
+    invalid: list[str] = []
+    total_bytes = 0
+    total_drift = 0
+    selected_limit = max(0, int(limit))
+    for path in sorted(get_wiki_dir().glob("*.md")):
+        page_key = path.stem
+        if page_key.startswith("System_") or page_key not in canonical_versions:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+            observed_version = governance_store.canonical_page_version_from_content(path.name, content)
+        except Exception as exc:
+            invalid.append(f"{path.name}: parse error: {exc}")
+            continue
+        if observed_version == canonical_versions[page_key]:
+            continue
+        total_drift += 1
+        total_bytes += len(content.encode("utf-8"))
+        try:
+            frontmatter, body = split_frontmatter(content)
+            validate_schema(frontmatter, body, path.name)
+        except Exception as exc:
+            invalid.append(f"{path.name}: schema error: {exc}")
+            continue
+        if selected_limit == 0 or len(candidates) < selected_limit:
+            candidates.append(
+                {
+                    "filename": path.name,
+                    "content": content,
+                    "expected_version": canonical_versions[page_key],
+                }
+            )
+    return {
+        "total_drift": total_drift,
+        "total_bytes": total_bytes,
+        "candidates": candidates,
+        "invalid": invalid,
+    }
+
+
+def reconcile_canonical_content_from_wiki(
+    dry_run: bool = True,
+    limit: int = 0,
+    batch_size: int = 100,
+    backup_reference: str = "",
+) -> str:
+    """Promote schema-valid richer Wiki content into canonical state without rewriting the pages."""
+    preview = _canonical_content_drift_candidates(limit=limit)
+    candidates = preview["candidates"]
+    lines = [
+        "[DRY RUN] Canonical content reconciliation" if dry_run else "Canonical content reconciliation",
+        f"drift_pages: {preview['total_drift']}",
+        f"selected_pages: {len(candidates)}",
+        f"selected_limit: {max(0, int(limit))}",
+        f"total_drift_bytes: {preview['total_bytes']}",
+        f"invalid_pages: {len(preview['invalid'])}",
+    ]
+    if candidates:
+        lines.append("sample: " + ", ".join(item["filename"] for item in candidates[:10]))
+    if preview["invalid"]:
+        lines.append("invalid sample: " + ", ".join(preview["invalid"][:10]))
+    if dry_run:
+        return "\n".join(lines)
+    if preview["invalid"]:
+        raise RuntimeError(
+            "Canonical reconciliation refused because one or more drift pages failed validation: "
+            + "; ".join(preview["invalid"][:10])
+        )
+    if not candidates:
+        return "No canonical/Wiki content drift to reconcile."
+
+    if backup_reference:
+        backup_path = Path(backup_reference).expanduser().resolve()
+        if not backup_path.is_file():
+            raise FileNotFoundError(f"Verified backup reference does not exist: {backup_path}")
+        backup_label = str(backup_path)
+    else:
+        backup_label = create_maintenance_backup("canonical_content_reconcile")
+
+    from vector_lake.mutation_coordinator import execute_mutation_batch
+
+    chunk_size = max(1, int(batch_size))
+    committed = 0
+    for offset in range(0, len(candidates), chunk_size):
+        batch = candidates[offset:offset + chunk_size]
+        execute_mutation_batch(
+            batch,
+            validation_mode="schema",
+            origin="canonical-content-reconcile",
+        )
+        committed += len(batch)
+        log.info("Canonical content reconciliation committed %s/%s pages", committed, len(candidates))
+
+    from vector_lake.watchdog_app import process_mutation_outbox_batch
+
+    outbox = process_mutation_outbox_batch(limit=max(1, committed))
+    after = _canonical_content_drift_candidates(limit=0)
+    return (
+        f"Reconciled {committed} wiki page(s) into canonical state; "
+        f"remaining_drift={after['total_drift']}; "
+        f"outbox_completed={outbox['completed']}; outbox_failed={outbox['failed']}; "
+        f"backup={backup_label}"
+    )
+
+
 def rebuild_index_projection(dry_run: bool = True) -> str:
     """Rebuild index.json / FTS / claim_graph from SQLite canonical state."""
     diff = _diff_sets()
@@ -282,7 +402,8 @@ def _frontmatter_from_entity(entity: dict) -> dict:
 
 
 def _body_from_entity(entity: dict, frontmatter: dict) -> str:
-    raw_text = str(entity.get("raw_text") or "").strip()
+    raw_text = str(entity.get("raw_text") or "")
+    normalized_raw_text = raw_text.strip()
     entity_type = str(frontmatter.get("type") or "concept").lower()
     title = str(frontmatter.get("title") or entity.get("canonical_name") or entity.get("page_key"))
     restored_note = (
@@ -290,7 +411,7 @@ def _body_from_entity(entity: dict, frontmatter: dict) -> str:
         "需要后续补充原始证据与完整编译事实。"
     )
     if entity_type == "source":
-        return raw_text or restored_note
+        return raw_text if normalized_raw_text else restored_note
     if entity_type == "synthesis":
         return raw_text or (
             "## 核心合成论点 (Core Synthesized Claims)\n\n"
@@ -298,7 +419,7 @@ def _body_from_entity(entity: dict, frontmatter: dict) -> str:
             "## 支撑拓扑 (Supporting Topology)\n\n"
             "- [mentions:: [[Concept_Agent_Code_Cleanliness]]]\n"
         )
-    if raw_text and "## 1. 编译事实" in raw_text and "## 2. 证据时间线" in raw_text:
+    if normalized_raw_text and "## 1. 编译事实" in raw_text and "## 2. 证据时间线" in raw_text:
         return raw_text
     slot = (VALID_H3_SLOTS.get(entity_type) or VALID_H3_SLOTS["concept"])[0]
     restored_at = datetime.now(timezone.utc).date().isoformat()
@@ -326,6 +447,7 @@ def restore_missing_wiki_from_canonical(dry_run: bool = True, limit: int = 10) -
     backup_dir = create_maintenance_backup("wiki_restore")
     restored = 0
     skipped: list[str] = []
+    unsafe_versions: list[str] = []
     wiki_dir = get_wiki_dir()
     for page_key in page_keys:
         entity = _canonical_entity_by_page_key(page_key)
@@ -339,9 +461,29 @@ def restore_missing_wiki_from_canonical(dry_run: bool = True, limit: int = 10) -
         frontmatter = _frontmatter_from_entity(entity)
         body = _body_from_entity(entity, frontmatter)
         content = f"---\n{dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)}---\n{body}"
-        path.write_text(content, encoding="utf-8")
+        canonical_version = governance_store.canonical_page_versions({page_key}).get(page_key)
+        restored_version = governance_store.canonical_page_version_from_content(path.name, content)
+        if not canonical_version or restored_version != canonical_version:
+            unsafe_versions.append(page_key)
+            continue
+        with transaction():
+            enqueue_mutation(
+                path.name,
+                "update",
+                payload_text=content,
+                idempotency_key=f"projection-restore:{page_key}:{canonical_version}:{uuid.uuid4().hex}",
+                validation_mode="schema",
+            )
+            materialize_markdown_projection(
+                path.name,
+                "update",
+                content,
+                validation_mode="schema",
+            )
         restored += 1
     result = f"Restored {restored} missing wiki page(s) from canonical metadata; backup={backup_dir}"
     if skipped:
         result += f"; skipped={', '.join(skipped[:10])}"
+    if unsafe_versions:
+        result += f"; unsafe-version={','.join(unsafe_versions[:10])}"
     return result

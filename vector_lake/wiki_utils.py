@@ -15,6 +15,61 @@ from vector_lake.yaml_utils import load_yaml, dump_yaml
 import io
 _META_DIR_CACHE = None
 
+WIKI_LINK_PATTERN = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+_FENCE_OPEN = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)")
+
+
+def markdown_fenced_code_spans(content: str) -> list[tuple[int, int]]:
+    """Return top-level fenced-code spans using CommonMark-compatible fences."""
+    spans: list[tuple[int, int]] = []
+    opened: tuple[int, str, int] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        if opened is None:
+            match = _FENCE_OPEN.match(line)
+            if match:
+                mark = match.group("mark")
+                opened = (offset, mark[0], len(mark))
+        else:
+            start, marker, length = opened
+            if re.fullmatch(
+                rf"[ \t]{{0,3}}{re.escape(marker)}{{{length},}}[ \t]*(?:\r?\n)?",
+                line,
+            ):
+                spans.append((start, offset + len(line)))
+                opened = None
+        offset += len(line)
+    if opened is not None:
+        spans.append((opened[0], len(content)))
+    return spans
+
+
+def _inside_inline_code(content: str, start: int) -> bool:
+    line_start = content.rfind("\n", 0, start) + 1
+    prefix = content[line_start:start]
+    delimiter = None
+    for match in re.finditer(r"`+", prefix):
+        width = len(match.group(0))
+        if delimiter is None:
+            delimiter = width
+        elif width == delimiter:
+            delimiter = None
+    return delimiter is not None
+
+
+def iter_wiki_link_matches(content: str):
+    """Yield Wiki-link matches outside fenced and inline code literals."""
+    spans = iter(markdown_fenced_code_spans(content))
+    current = next(spans, None)
+    for match in WIKI_LINK_PATTERN.finditer(content):
+        while current is not None and match.start() >= current[1]:
+            current = next(spans, None)
+        if current is not None and current[0] <= match.start() < current[1]:
+            continue
+        if _inside_inline_code(content, match.start()):
+            continue
+        yield match
+
 SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
 VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
@@ -90,8 +145,14 @@ def get_raw_dir() -> Path:
 
 def get_meta_dir() -> Path:
     global _META_DIR_CACHE
-    if _META_DIR_CACHE is not None:
+    if isinstance(_META_DIR_CACHE, Path):
         return _META_DIR_CACHE
+
+    memory_key = str(get_memory_dir())
+    if isinstance(_META_DIR_CACHE, dict) and memory_key in _META_DIR_CACHE:
+        return _META_DIR_CACHE[memory_key]
+    if not isinstance(_META_DIR_CACHE, dict):
+        _META_DIR_CACHE = {}
 
     primary = get_wiki_dir() / ".meta"
     fallback = get_extension_root() / "data" / "v8_meta"
@@ -103,12 +164,12 @@ def get_meta_dir() -> Path:
             with open(probe, "w", encoding="utf-8") as handle:
                 handle.write("probe")
             probe.unlink()
-            _META_DIR_CACHE = candidate
+            _META_DIR_CACHE[memory_key] = candidate
             return candidate
         except OSError:
             continue
 
-    _META_DIR_CACHE = fallback
+    _META_DIR_CACHE[memory_key] = fallback
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback
 
@@ -122,7 +183,15 @@ def get_index_path() -> Path:
 
 
 def get_claim_graph_path() -> Path:
+    return get_wiki_dir() / "claim_graph.json"
+
+
+def get_legacy_claim_graph_path() -> Path:
     return get_wiki_dir() / "claim_topology.json"
+
+
+def get_outbox_signal_path() -> Path:
+    return get_meta_dir() / "outbox_signal.lock"
 
 
 
@@ -215,7 +284,7 @@ def atomic_write_text(
                 verify_asset(content, path.name, frontmatter, get_index_path())
             else:
                 from vector_lake.schema_validator import validate_schema
-                validate_schema(frontmatter, content, path.name, get_index_path())
+                validate_schema(frontmatter, content, path.name)
         except Exception as e:
             if validation_mode == "schema" or type(e).__name__ == "DefenseHookException":
                 raise e # Bubble up the specific defense hook violation

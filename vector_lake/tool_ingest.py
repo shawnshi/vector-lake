@@ -16,6 +16,8 @@ from vector_lake import governance_store
 from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
     get_memory_dir,
+    get_meta_dir,
+    get_raw_dir,
     get_wiki_dir,
     get_index_path,
     normalize_raw_ref,
@@ -102,8 +104,17 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     return f"Expired {expired} awaiting-subagent ingest job(s)."
 
 def canonical_source_name(raw_path: str) -> str:
-    basename = Path(raw_path).stem
-    return f"Source_{basename}.md"
+    path = Path(raw_path).resolve()
+    try:
+        relative = path.relative_to(get_raw_dir().resolve()).with_suffix("")
+        parts = relative.parts
+    except ValueError:
+        parts = (path.stem,)
+    safe_parts = []
+    for part in parts:
+        safe = re.sub(r"[^0-9A-Za-z_\-\u3400-\u9fff]+", "-", str(part)).strip("-_")
+        safe_parts.append(safe or "source")
+    return f"Source_{'__'.join(safe_parts)}.md"
 
 def calculate_hash(filepath: str) -> str:
     hasher = hashlib.md5()
@@ -155,6 +166,8 @@ def _normalise_search_text(value: str) -> str:
 def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
     """Return deterministic source-relevant candidates from the complete index."""
     index_path = get_index_path()
+    if not index_path.exists():
+        return ""
     try:
         source_text = Path(filepath).read_text(encoding="utf-8", errors="replace")[:200_000]
         source_norm = _normalise_search_text(f"{Path(filepath).stem} {source_text}")
@@ -551,7 +564,7 @@ def requeue_legacy_ingest_jobs() -> int:
                 log.warning("Could not remove superseded ingest packet: %s", packet_path)
     return len(migrations)
 
-def prepare_ingest_batch(batch_size: int = 5) -> str:
+def prepare_ingest_batch(batch_size: int = 5, candidate_paths: list[str] | None = None) -> str:
     """Native Antigravity Agentic subagent orchestration."""
     config_path = get_extension_root() / "config.json"
     try:
@@ -560,36 +573,61 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     except Exception:
         config = {}
         
-    target_dirs = [str((get_extension_root() / d).resolve()) for d in config.get("target_directories", [])]
+    target_dirs = []
+    for configured in config.get("target_directories", []):
+        configured_path = Path(configured)
+        target_dirs.append(
+            (configured_path if configured_path.is_absolute() else get_extension_root() / configured_path).resolve()
+        )
+    isolated_raw = get_raw_dir().resolve()
+    if isolated_raw not in target_dirs:
+        target_dirs.append(isolated_raw)
     exclude_paths = config.get("exclude_paths", [])
     supported_exts = set(config.get("supported_extensions", [".md", ".txt"]))
     
-    files_to_process = []
-    for target_dir in target_dirs:
-        folder = Path(target_dir)
-        if not folder.exists(): continue
-        for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for file in files:
-                if file.startswith('~') or file.startswith('.'): continue
-                
-                filepath = os.path.join(root, file)
-                path_str = filepath.replace("\\", "/")
-                if any(exclude in path_str for exclude in exclude_paths):
-                    continue
+    def allowed_path(path: Path) -> bool:
+        if not path.is_file() or path.name.startswith(("~", ".")):
+            return False
+        if path.suffix.lower() not in supported_exts:
+            return False
+        for target_dir in target_dirs:
+            try:
+                relative = path.resolve().relative_to(target_dir)
+            except ValueError:
+                continue
+            relative_text = relative.as_posix()
+            return not any(
+                str(exclude).replace("\\", "/") in relative_text
+                for exclude in exclude_paths
+            )
+        return False
 
-                if os.path.splitext(file)[1].lower() in supported_exts:
-                    files_to_process.append(filepath)
+    files_to_process = []
+    if candidate_paths is not None:
+        files_to_process = sorted({
+            str(Path(candidate).resolve())
+            for candidate in candidate_paths
+            if allowed_path(Path(candidate))
+        })
+    else:
+        for target_dir in target_dirs:
+            if not target_dir.exists():
+                continue
+            for root, dirs, files in os.walk(target_dir):
+                dirs[:] = [directory for directory in dirs if not directory.startswith('.')]
+                for filename in files:
+                    path = Path(root) / filename
+                    if allowed_path(path):
+                        files_to_process.append(str(path.resolve()))
                     
-    from vector_lake.db_store import get_connection
+    from vector_lake.db_store import get_connection, init_db
+    init_db()
     conn = get_connection()
     cur = conn.execute("SELECT filepath, file_hash, processed_at FROM processed_files")
     processed = {row["filepath"]: {"hash": row["file_hash"], "processed_at": row["processed_at"]} for row in cur.fetchall()}
     
-    import tempfile
-    tmp_dir = Path(tempfile.gettempdir()) / "vector_lake_tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    processing_file = tmp_dir / "processing_files.json"
+    processing_file = get_meta_dir() / "processing_files.json"
+    processing_file.parent.mkdir(parents=True, exist_ok=True)
     from filelock import FileLock
     
     with FileLock(str(processing_file) + ".lock", timeout=10):
@@ -624,8 +662,11 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 else:
                     file_hash = calculate_hash(filepath)
                     
-                if file_hash and file_hash not in currently_processing:
-                    pending_files.append((filepath, file_hash))
+                processing_key = hashlib.sha256(
+                    f"{Path(filepath).resolve()}\0{file_hash}".encode("utf-8")
+                ).hexdigest()
+                if file_hash and processing_key not in currently_processing:
+                    pending_files.append((filepath, file_hash, processing_key))
             except OSError:
                 pass
         
@@ -633,8 +674,8 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 return "No new files to ingest. System is fully synced."
 
         pending_files = pending_files[:batch_size]
-        for _, fh in pending_files:
-                currently_processing[fh] = now_ts
+        for _, _, processing_key in pending_files:
+                currently_processing[processing_key] = now_ts
                 
         with open(processing_file, "w") as f:
                 json.dump(currently_processing, f)
@@ -642,7 +683,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     from vector_lake.db_store import enqueue_job
     enqueued_count = 0
     
-    for filepath, file_hash in pending_files:
+    for filepath, file_hash, _processing_key in pending_files:
         canonical_name = canonical_source_name(filepath)
         canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
         source_hash = governance_store.canonical_page_versions({canonical_key}).get(canonical_key, "")
@@ -661,7 +702,6 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
         enqueued_count += 1
         
     if batch_size == 1 and enqueued_count == 1:
-        import json
         return json.dumps(payload)
         
     return f"Successfully enqueued {enqueued_count} files for ingestion."

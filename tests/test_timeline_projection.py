@@ -1,7 +1,11 @@
 import json
 
 from vector_lake import db_store, governance_store
-from vector_lake.tool_timeline import rebuild_timeline_events_from_claims, search_timeline_events
+from vector_lake.tool_timeline import (
+    rebuild_timeline_events_from_claims,
+    search_timeline_events,
+    timeline_projection_parity,
+)
 
 
 def test_timeline_projection_rebuilds_from_claims(isolated_memory):
@@ -79,6 +83,70 @@ def test_timeline_projection_tracks_add_update_and_type_conversion(isolated_memo
     restored = _claim("claim_delta", "Source_Delta", "Restored timeline value")
     _apply_page("Source_Delta", [restored])
     assert conn.execute("SELECT description FROM timeline_events").fetchone()[0] == "Restored timeline value"
+
+
+def test_timeline_fallback_uses_payload_updated_at_not_storage_timestamp(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    claim = _claim("claim_payload_date", "Source_PayloadDate", "Payload dated event")
+    claim["temporal_anchor"] = None
+    claim["updated_at"] = "2026-06-02"
+
+    _apply_page("Source_PayloadDate", [claim])
+    original_event = conn.execute(
+        "SELECT id, event_date FROM timeline_events WHERE description = ?",
+        (claim["claim_text"],),
+    ).fetchone()
+    assert original_event["event_date"] == "2026-06-02"
+
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE claims SET updated_at = ? WHERE claim_id = ?",
+            ("2026-07-19T05:21:01.669360+00:00", claim["claim_id"]),
+        )
+
+    assert timeline_projection_parity() == {
+        "canonical": 1,
+        "projection": 1,
+        "missing": 0,
+        "extra": 0,
+    }
+    rebuild_timeline_events_from_claims(dry_run=False)
+    rebuilt_event = conn.execute(
+        "SELECT id, event_date FROM timeline_events WHERE description = ?",
+        (claim["claim_text"],),
+    ).fetchone()
+    assert rebuilt_event["id"] == original_event["id"]
+    assert rebuilt_event["event_date"] == "2026-06-02"
+    assert timeline_projection_parity()["missing"] == 0
+    assert timeline_projection_parity()["extra"] == 0
+
+
+def test_timeline_fallback_without_any_payload_date_is_stable(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    claim = _claim("claim_unknown_date", "Source_UnknownDate", "Undated event")
+    claim["temporal_anchor"] = None
+    claim.pop("updated_at")
+
+    _apply_page("Source_UnknownDate", [claim])
+
+    event_before = conn.execute(
+        "SELECT id, event_date FROM timeline_events WHERE description = ?",
+        (claim["claim_text"],),
+    ).fetchone()
+    assert event_before["event_date"] == "Unknown Date"
+    assert timeline_projection_parity()["missing"] == 0
+    assert timeline_projection_parity()["extra"] == 0
+
+    rebuild_timeline_events_from_claims(dry_run=False)
+    event_after = conn.execute(
+        "SELECT id, event_date FROM timeline_events WHERE description = ?",
+        (claim["claim_text"],),
+    ).fetchone()
+    assert event_after["id"] == event_before["id"]
+    assert timeline_projection_parity()["missing"] == 0
+    assert timeline_projection_parity()["extra"] == 0
 
 
 def test_page_delete_only_removes_its_own_timeline_event(isolated_memory):

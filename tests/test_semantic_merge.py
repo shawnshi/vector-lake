@@ -28,3 +28,24 @@ def test_semantic_merge_is_pure_and_preserves_source_aliases():
     assert "Left body." in body
     assert "## Merged from Right" in body
     assert "Right body." in body
+
+
+def test_semantic_merge_inserts_source_before_timeline_and_demotes_headings():
+    left = _content(
+        "source_left",
+        "Left",
+        "## 1. 编译事实\n\nLeft facts.\n\n## 2. 证据时间线\n\n- [2026-07-16] [Observation] Left event.",
+    )
+    right = _content(
+        "source_right",
+        "Right",
+        "# Right title\n\n## 1. 编译事实\n\n- Right fact.",
+    )
+
+    merged = merge_markdown_content(left, right, source_key="Source_Right")
+    frontmatter, body = split_frontmatter(merged)
+
+    assert frontmatter["aliases"] == ["Source_Right", "Right"]
+    assert body.index("## Merged from Right") < body.index("## 2. 证据时间线")
+    assert "**Right title**" in body
+    assert "**1. 编译事实**" in body

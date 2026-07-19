@@ -12,6 +12,7 @@ from vector_lake.db_store import get_db_path, get_connection
 from vector_lake import get_extension_root
 from vector_lake.native_llm import native_llm_ready
 from vector_lake.runtime_health import assess_runtime_health
+from vector_lake.tokenizer_runtime import load_tokenizer
 
 def _check_ast(module_path: Path) -> tuple[bool, str]:
     if not module_path.exists():
@@ -46,12 +47,18 @@ def doctor_vector_lake() -> str:
         "dotenv": "python-dotenv",
         "mcp": "mcp",
         "sqlite_vec": "sqlite-vec",
-        "jieba": "jieba",
+        "rjieba": "rjieba",
         "mistune": "mistune"
     }
     for module_name, package_name in dependencies.items():
         try:
-            importlib.import_module(module_name)
+            if module_name == "rjieba":
+                load_tokenizer()
+            elif module_name == "google.genai":
+                if importlib.util.find_spec(module_name) is None:
+                    raise ImportError(module_name)
+            else:
+                importlib.import_module(module_name)
             checks.append((package_name, True, "installed"))
         except ImportError:
             checks.append((package_name, False, "missing"))

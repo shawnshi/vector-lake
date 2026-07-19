@@ -45,6 +45,15 @@ def canonical_backfill(dry_run: bool = True, limit: int = 50) -> str:
     return tools.canonical_backfill_missing_wiki(dry_run=dry_run, limit=limit)
 
 @mcp.tool()
+def canonical_reconcile_content(dry_run: bool = True, limit: int = 0, batch_size: int = 100) -> str:
+    """Reconcile schema-valid Wiki content into canonical state after an explicit maintenance review."""
+    return tools.reconcile_canonical_content_from_wiki(
+        dry_run=dry_run,
+        limit=limit,
+        batch_size=batch_size,
+    )
+
+@mcp.tool()
 def projection_rebuild_index(dry_run: bool = True) -> str:
     """Rebuild index.json, FTS, embeddings, and claim_graph from SQLite canonical state."""
     return tools.rebuild_index_projection(dry_run=dry_run)
@@ -380,7 +389,7 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
         return f"Error writing file: {str(e)}"
 
 import uuid
-from vector_lake.governance_store import load_governance_queue, save_governance_queue, _utc_now
+from vector_lake.governance_store import insert_governance_item_if_absent, _utc_now
 
 @mcp.tool()
 def propose_schema_mutation(new_category: str, payload_file: str, parent_category: str = "Uncategorized") -> str:
@@ -395,13 +404,8 @@ def propose_schema_mutation(new_category: str, payload_file: str, parent_categor
         description = _read_payload(payload_file)
     except Exception as e:
         return str(e)
-    from filelock import FileLock
-    from vector_lake.wiki_utils import get_meta_dir
-    lock_path = str(get_meta_dir() / "governance_queue.lock")
-    with FileLock(lock_path, timeout=10):
-        queue = load_governance_queue()
-        item_id = f"gov_{uuid.uuid4().hex[:12]}"
-        queue.setdefault("items", []).append({
+    item_id = f"gov_{uuid.uuid4().hex[:12]}"
+    insert_governance_item_if_absent({
             "item_id": item_id,
             "type": "schema-mutation",
             "title": f"New Schema Category: {new_category}",
@@ -413,7 +417,6 @@ def propose_schema_mutation(new_category: str, payload_file: str, parent_categor
             "search_queries": [],
             "affected_pages": ["SCHEMA_CATEGORIES.md"],
         })
-        save_governance_queue(queue)
     return f"Schema mutation proposed and logged as {item_id} for review."
 
 

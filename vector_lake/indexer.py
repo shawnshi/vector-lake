@@ -48,6 +48,81 @@ RELEVANCE_WEIGHTS = {
     "type_affinity": 1.0,
 }
 
+MAX_EDGES_PER_NODE = 15
+EDGE_CANDIDATE_MULTIPLIER = 4
+INDEX_PARITY_FIELDS = (
+    "id", "title", "summary", "raw_text", "type", "domain", "topic_cluster",
+    "status", "epistemic_status", "categories", "tags", "aliases", "relations",
+    "sources", "tension_edges", "links", "outbound_links", "triples", "updated",
+    "updated_at",
+)
+
+
+def _bounded_node_edge_candidates(
+    source: str,
+    weighted_targets: list[tuple[float, str]],
+    limit: int | None = None,
+) -> list[dict]:
+    """Retain a deterministic bounded edge frontier before global pruning."""
+    candidate_limit = limit or (MAX_EDGES_PER_NODE * EDGE_CANDIDATE_MULTIPLIER)
+    strongest = sorted(weighted_targets, key=lambda item: (-item[0], item[1]))[:candidate_limit]
+    return [
+        {"source": source, "target": target, "weight": weight}
+        for weight, target in strongest
+    ]
+
+
+def _index_node_signature(node: dict) -> str:
+    stable = {field: node.get(field) for field in INDEX_PARITY_FIELDS}
+    return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def index_projection_matches_canonical(filenames: list[str]) -> bool:
+    """Prove that selected canonical pages are already reflected in index.json."""
+    page_keys = {
+        filename[:-3]
+        for filename in filenames
+        if filename.endswith(".md") and not filename.startswith("System_")
+    }
+    if not page_keys or not get_index_path().exists():
+        return False
+    lock_path = str(get_index_path()) + ".lock"
+    try:
+        with FileLock(lock_path, timeout=15):
+            index_data = _load_index_unlocked(str(get_index_path()))
+    except (Timeout, OSError, json.JSONDecodeError):
+        return False
+    nodes = index_data.get("nodes") or {}
+    expected: dict[str, set[str]] = {page_key: set() for page_key in page_keys}
+    conn = db_store.get_connection()
+    ordered = sorted(page_keys)
+    for offset in range(0, len(ordered), 500):
+        batch = ordered[offset:offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            "SELECT entity_id, data_json FROM entities "
+            f"WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
+            tuple(batch),
+        ).fetchall()
+        for row in rows:
+            entity = json.loads(row["data_json"])
+            projected_key, projected = _entity_to_index_node(entity, str(row["entity_id"]))
+            if projected_key in expected:
+                expected[projected_key].add(_index_node_signature(projected))
+    aliases = index_data.get("aliases") or {}
+    edges = index_data.get("weighted_edges") or []
+    for page_key, signatures in expected.items():
+        observed = nodes.get(page_key)
+        if signatures:
+            if observed is None or _index_node_signature(observed) not in signatures:
+                return False
+        else:
+            if observed is not None or page_key in aliases or page_key in aliases.values():
+                return False
+            if any(edge.get("source") == page_key or edge.get("target") == page_key for edge in edges):
+                return False
+    return True
+
 PRED_WEIGHT_TAXONOMY = frozenset({"属于", "parent", "is-a", "belongs_to", "instance_of", "has_part", "核心构件"})
 PRED_WEIGHT_RELATION = frozenset({"类似", "related_to", "see_also", "peer", "关联"})
 PRED_WEIGHT_MENTION = frozenset({"mentions", "提及", "引用"})
@@ -132,8 +207,8 @@ def _tokenize(text: str) -> list[str]:
 def _tokenize_for_fts(text: str) -> str:
     if not text: return ""
     try:
-        import jieba
-        return " ".join(jieba.cut(text))
+        from vector_lake.tokenizer_runtime import tokenize_for_fts
+        return tokenize_for_fts(text)
     except ImportError:
         return text
 
@@ -214,10 +289,36 @@ def _write_json_stage(stage_path: str, data: dict):
         json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
 
 
+def _deduplicate_weighted_edges(edges: list[dict]) -> list[dict]:
+    """Collapse repeated undirected edges and retain the strongest weight."""
+    strongest: dict[tuple[str, str], dict] = {}
+    for edge in edges:
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if not source or not target or source == target:
+            continue
+        left, right = sorted((source, target))
+        normalized = dict(edge)
+        normalized["source"] = left
+        normalized["target"] = right
+        try:
+            normalized["weight"] = float(edge.get("weight", 1.0))
+        except (TypeError, ValueError):
+            normalized["weight"] = 1.0
+        current = strongest.get((left, right))
+        if current is None or normalized["weight"] > current["weight"]:
+            strongest[(left, right)] = normalized
+    return sorted(
+        strongest.values(),
+        key=lambda edge: (-edge["weight"], edge["source"], edge["target"]),
+    )
+
+
 def _write_index(output_path: str, index_data: dict):
     removed = _strip_legacy_embedded_payloads(index_data)
     if removed:
         log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
+    index_data["weighted_edges"] = _deduplicate_weighted_edges(index_data.get("weighted_edges") or [])
     _write_json_payload(output_path, index_data)
 
 
@@ -684,6 +785,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             if key_a < key_b:
                 candidates.add(key_b)
 
+        weighted_targets = []
         for key_b in candidates:
             if key_b not in node_links:
                 continue
@@ -711,11 +813,8 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             relevance = round(score, 3)
 
             if relevance >= 1.5:
-                edges.append({
-                    "source": key_a,
-                    "target": key_b,
-                    "weight": relevance,
-                })
+                weighted_targets.append((relevance, key_b))
+        edges.extend(_bounded_node_edge_candidates(key_a, weighted_targets))
 
     for node in nodes_dict.values():
         node.pop("_key", None)
@@ -743,10 +842,9 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         import logging
         logging.getLogger("vector-lake-indexer").debug(f"Could not load graph edges from SQLite: {e}")
 
-    edges.sort(key=lambda edge: edge["weight"], reverse=True)
+    edges = _deduplicate_weighted_edges(edges)
 
     # --- Top-K Edge Pruning to prevent Force Collapse ---
-    MAX_EDGES_PER_NODE = 15
     node_edge_counts = {k: 0 for k in node_keys}
     pruned_edges = []
     
@@ -776,13 +874,10 @@ def _apply_graph_topology(index_data: dict):
         node["node_score"] = round(node.get("decay_weight", 1.0), 4)
 
 
-def generate_index(skip_embeddings: bool = True):
+def _generate_index_unlocked(skip_embeddings: bool = True):
     index_data = _empty_index_data()
-    from vector_lake.governance_store import load_entities, load_claims
     from vector_lake.db_store import get_connection
     conn = get_connection()
-    entities = load_entities().get("items", {})
-    claims = load_claims().get("items", {})
 
     # Read from canonical SQLite instead of Markdown files
     rows = conn.execute("SELECT entity_id, data_json FROM entities").fetchall()
@@ -850,6 +945,66 @@ def generate_index(skip_embeddings: bool = True):
     return output_path
 
 
+def generate_index(skip_embeddings: bool = True):
+    """Build and publish every index projection under the shared publish lock."""
+    output_path = str(get_index_path())
+    try:
+        with FileLock(output_path + ".lock", timeout=15):
+            return _generate_index_unlocked(skip_embeddings=skip_embeddings)
+    except Timeout as exc:
+        raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
+
+
+def _claim_graph_signatures(items: list[dict]) -> set[str]:
+    return {
+        json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for item in items
+    }
+
+
+def claim_graph_projection_parity() -> dict[str, int]:
+    """Compare exact claim-graph node and edge payloads with canonical SQLite."""
+    expected = governance_store.build_claim_graph_projection()
+    claim_graph_path = str(get_claim_graph_path())
+    output_path = str(get_index_path())
+    try:
+        with FileLock(output_path + ".lock", timeout=15):
+            if os.path.exists(claim_graph_path):
+                with open(claim_graph_path, "r", encoding="utf-8") as handle:
+                    observed = json.load(handle)
+            else:
+                observed = {"nodes": [], "links": []}
+    except Timeout as exc:
+        raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
+
+    expected_nodes = _claim_graph_signatures(expected.get("nodes") or [])
+    observed_nodes = _claim_graph_signatures(observed.get("nodes") or [])
+    expected_edges = _claim_graph_signatures(expected.get("edges") or [])
+    observed_edges = _claim_graph_signatures(observed.get("edges") or [])
+    return {
+        "canonical_nodes": len(expected_nodes),
+        "projection_nodes": len(observed_nodes),
+        "missing_nodes": len(expected_nodes - observed_nodes),
+        "extra_nodes": len(observed_nodes - expected_nodes),
+        "canonical_edges": len(expected_edges),
+        "projection_edges": len(observed_edges),
+        "missing_edges": len(expected_edges - observed_edges),
+        "extra_edges": len(observed_edges - expected_edges),
+    }
+
+
+def refresh_claim_graph_projection() -> str:
+    """Publish claim_graph.json independently under the shared projection lock."""
+    output_path = str(get_index_path())
+    claim_graph_path = str(get_claim_graph_path())
+    try:
+        with FileLock(output_path + ".lock", timeout=15):
+            _write_claim_graph(claim_graph_path, governance_store.build_claim_graph_projection())
+    except Timeout as exc:
+        raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
+    return claim_graph_path
+
+
 def update_index_items(filenames: list[str]):
     if not filenames:
         return
@@ -864,10 +1019,21 @@ def update_index_items(filenames: list[str]):
     if not valid_filenames:
         return
 
+    incremental_limit = max(
+        1,
+        int(os.environ.get("VECTOR_LAKE_INCREMENTAL_INDEX_LIMIT", "250")),
+    )
+    if len(valid_filenames) > incremental_limit:
+        log.info(
+            "Incremental index batch has %s items, above limit %s; using one full rebuild.",
+            len(valid_filenames),
+            incremental_limit,
+        )
+        return generate_index()
+
     # Pre-parse canonical nodes. Embedding refresh is handled by the explicit backfill scheduler.
     pre_parsed_data = {}
     canonical_load_errors = {}
-    import os
 
     conn = db_store.get_connection()
     for filename in valid_filenames:
@@ -1094,7 +1260,7 @@ def refresh_graph_topology_if_dirty() -> bool:
                     index_data = None
     
                 if index_data is None:
-                    generate_index()
+                    _generate_index_unlocked()
                     return True
 
                 removed_system_keys = _strip_system_nodes(index_data)
@@ -1107,7 +1273,7 @@ def refresh_graph_topology_if_dirty() -> bool:
                         "Detected legacy embedded governance payloads during graph refresh "
                         f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
                     )
-                    generate_index()
+                    _generate_index_unlocked()
                     return True
     
                 if is_graph_dirty(index_data):

@@ -9,7 +9,7 @@ from filelock import FileLock, Timeout
 from vector_lake import get_extension_root
 from vector_lake import indexer
 from vector_lake import governance_store
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_memory_dir
+from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_legacy_claim_graph_path, get_memory_dir
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -139,6 +139,8 @@ def visualize_vector_lake(output_dir: str = None):
     memory_dir = str(get_memory_dir())
     index_path = str(get_index_path())
     claim_graph_path = str(get_claim_graph_path())
+    if not os.path.exists(claim_graph_path) and get_legacy_claim_graph_path().exists():
+        claim_graph_path = str(get_legacy_claim_graph_path())
     lock_path = index_path + ".lock"
     template_path = str(extension_root / "templates" / "topology.html")
     
@@ -230,15 +232,13 @@ def audit_graph() -> str:
 
     if items:
         from vector_lake import governance_store
-        queue = governance_store.load_governance_queue()
-        
-        existing_titles = {item.get("title") for item in queue.get("items", [])}
-        new_items = [item for item in items if item["title"] not in existing_titles]
-        
-        if new_items:
-            queue.setdefault("items", []).extend(new_items)
-            governance_store.save_governance_queue(queue)
-            return f"Audit complete. Pushed {len(new_items)} new graph topology insights into the async review queue ({len(items) - len(new_items)} duplicates skipped)."
+        created = sum(
+            1
+            for item in items
+            if governance_store.insert_governance_item_if_absent(item, ("title",))
+        )
+        if created:
+            return f"Audit complete. Pushed {created} new graph topology insights into the async review queue ({len(items) - created} duplicates skipped)."
         else:
             return f"Audit complete. No new actionable insights found ({len(items)} existing insights already in queue)."
     return "Audit complete. No actionable insights found."

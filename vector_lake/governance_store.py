@@ -269,6 +269,26 @@ def load_alias_registry():
     return store
 
 
+def get_alias(key: str) -> str | None:
+    """Return one alias target without loading the complete registry."""
+    initialize_meta_store()
+    row = get_connection().execute(
+        "SELECT value FROM alias_registry WHERE key = ?",
+        (key,),
+    ).fetchone()
+    return row["value"] if row else None
+
+
+def upsert_alias(key: str, value: str) -> None:
+    """Persist one alias mapping and participate in any surrounding transaction."""
+    now = _utc_now()
+    with transaction():
+        get_connection().execute(
+            "INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, now),
+        )
+
+
 def load_memory_objects():
     return _load_db_map("operational_memory", "memory_id")
 
@@ -378,7 +398,131 @@ def save_change_sets(data):
     _save_db_queue("change_sets", "change_set_id", data)
 
 def save_governance_queue(data):
-    _save_db_queue("governance_queue", "item_id", data)
+    """Compatibility writer that upserts the supplied rows without deleting peers."""
+    init_db()
+    now = _utc_now()
+    data["updated_at"] = now
+    values = []
+    for item in data.get("items", []):
+        if not item.get("item_id"):
+            item["item_id"] = uuid.uuid4().hex
+        values.append((item["item_id"], json.dumps(item, ensure_ascii=False), now))
+    if not values:
+        return
+    with transaction():
+        get_connection().executemany(
+            "INSERT OR REPLACE INTO governance_queue (item_id, data_json, updated_at) VALUES (?, ?, ?)",
+            values,
+        )
+
+
+def get_governance_item(item_id: str) -> dict | None:
+    init_db()
+    row = get_connection().execute(
+        "SELECT data_json FROM governance_queue WHERE item_id = ?",
+        (str(item_id),),
+    ).fetchone()
+    return json.loads(row["data_json"]) if row else None
+
+
+def upsert_governance_item(item: dict, insert_only: bool = False) -> bool:
+    """Persist one governance item without replacing unrelated queue rows."""
+    item_id = str(item.get("item_id") or "")
+    if not item_id:
+        raise ValueError("Governance items require item_id.")
+    init_db()
+    now = _utc_now()
+    statement = "INSERT OR IGNORE" if insert_only else "INSERT OR REPLACE"
+    with transaction():
+        result = get_connection().execute(
+            f"{statement} INTO governance_queue (item_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (item_id, json.dumps(item, ensure_ascii=False), now),
+        )
+    return bool(result.rowcount)
+
+
+def update_governance_item(
+    item_id: str,
+    updates: dict,
+    expected_statuses: set[str] | None = None,
+) -> dict | None:
+    """Apply a serialized read-modify-write to one governance row."""
+    init_db()
+    with transaction():
+        row = get_connection().execute(
+            "SELECT data_json FROM governance_queue WHERE item_id = ?",
+            (str(item_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        item = json.loads(row["data_json"])
+        if expected_statuses is not None and str(item.get("status")) not in expected_statuses:
+            return None
+        item.update(copy.deepcopy(updates))
+        get_connection().execute(
+            "UPDATE governance_queue SET data_json = ?, updated_at = ? WHERE item_id = ?",
+            (json.dumps(item, ensure_ascii=False), _utc_now(), str(item_id)),
+        )
+        return item
+
+
+_GOVERNANCE_DEDUP_FIELDS = {
+    "pair_key",
+    "title",
+    "change_set_id",
+    "merge_source",
+    "merge_target",
+}
+
+
+def insert_governance_item_if_absent(
+    item: dict,
+    dedup_fields: tuple[str, ...] = (),
+) -> bool:
+    """Atomically insert one item unless a row with the same business key exists."""
+    invalid = set(dedup_fields) - _GOVERNANCE_DEDUP_FIELDS
+    if invalid:
+        raise ValueError(f"Unsupported governance dedup fields: {sorted(invalid)}")
+    item_id = str(item.get("item_id") or "")
+    if not item_id:
+        raise ValueError("Governance items require item_id.")
+    init_db()
+    with transaction():
+        if dedup_fields and all(item.get(field) is not None for field in dedup_fields):
+            clauses = [f"json_extract(data_json, '$.{field}') = ?" for field in dedup_fields]
+            values = [item[field] for field in dedup_fields]
+            existing = get_connection().execute(
+                "SELECT 1 FROM governance_queue WHERE " + " AND ".join(clauses) + " LIMIT 1",
+                values,
+            ).fetchone()
+            if existing:
+                return False
+        result = get_connection().execute(
+            "INSERT OR IGNORE INTO governance_queue (item_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (item_id, json.dumps(item, ensure_ascii=False), _utc_now()),
+        )
+        return bool(result.rowcount)
+
+
+def update_governance_items_by_field(field: str, value: str, updates: dict) -> int:
+    if field not in _GOVERNANCE_DEDUP_FIELDS:
+        raise ValueError(f"Unsupported governance selector: {field}")
+    init_db()
+    updated = 0
+    with transaction():
+        rows = get_connection().execute(
+            f"SELECT item_id, data_json FROM governance_queue WHERE json_extract(data_json, '$.{field}') = ?",
+            (value,),
+        ).fetchall()
+        for row in rows:
+            item = json.loads(row["data_json"])
+            item.update(copy.deepcopy(updates))
+            get_connection().execute(
+                "UPDATE governance_queue SET data_json = ?, updated_at = ? WHERE item_id = ?",
+                (json.dumps(item, ensure_ascii=False), _utc_now(), row["item_id"]),
+            )
+            updated += 1
+    return updated
 
 # =============================================================================
 # V10.1 TARGETED ATOMIC CRUD (Replaces load_all -> save_all pattern)
@@ -429,9 +573,25 @@ def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]
     init_db()
     requested = set(page_keys) if page_keys is not None else None
     rows_by_page: dict[str, list[tuple[str, str]]] = {}
-    rows = get_connection().execute(
-        "SELECT entity_id, data_json FROM entities ORDER BY entity_id"
-    ).fetchall()
+    conn = get_connection()
+    if requested:
+        rows = []
+        ordered = sorted(requested)
+        for offset in range(0, len(ordered), 500):
+            batch = ordered[offset : offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(
+                conn.execute(
+                    "SELECT entity_id, data_json FROM entities "
+                    f"WHERE json_extract(data_json, '$.page_key') IN ({placeholders}) "
+                    "ORDER BY entity_id",
+                    tuple(batch),
+                ).fetchall()
+            )
+    else:
+        rows = conn.execute(
+            "SELECT entity_id, data_json FROM entities ORDER BY entity_id"
+        ).fetchall()
     for row in rows:
         raw = str(row["data_json"])
         try:
@@ -486,9 +646,17 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
     now = _utc_now()
     if table_name == "entities":
         conn.executemany(
-            "INSERT OR REPLACE INTO entities "
+            "INSERT INTO entities "
             "(entity_id, canonical_name, type, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(entity_id) DO UPDATE SET "
+            "canonical_name = excluded.canonical_name, type = excluded.type, "
+            "status = excluded.status, data_json = excluded.data_json, "
+            "updated_at = excluded.updated_at "
+            "WHERE entities.canonical_name IS NOT excluded.canonical_name "
+            "OR entities.type IS NOT excluded.type "
+            "OR entities.status IS NOT excluded.status "
+            "OR entities.data_json IS NOT excluded.data_json",
             [
                 (
                     record[key_name],
@@ -504,8 +672,14 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
         return
     if table_name == "claims":
         conn.executemany(
-            "INSERT OR REPLACE INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(claim_id) DO UPDATE SET "
+            "claim_text = excluded.claim_text, status = excluded.status, "
+            "data_json = excluded.data_json, updated_at = excluded.updated_at "
+            "WHERE claims.claim_text IS NOT excluded.claim_text "
+            "OR claims.status IS NOT excluded.status "
+            "OR claims.data_json IS NOT excluded.data_json",
             [
                 (
                     record[key_name],
@@ -519,7 +693,10 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
         )
         return
     conn.executemany(
-        f"INSERT OR REPLACE INTO {table_name} ({key_name}, data_json, updated_at) VALUES (?, ?, ?)",
+        f"INSERT INTO {table_name} ({key_name}, data_json, updated_at) VALUES (?, ?, ?) "
+        f"ON CONFLICT({key_name}) DO UPDATE SET "
+        "data_json = excluded.data_json, updated_at = excluded.updated_at "
+        f"WHERE {table_name}.data_json IS NOT excluded.data_json",
         [
             (record[key_name], json.dumps(record, ensure_ascii=False), now)
             for record in records
@@ -623,7 +800,24 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
 
 def _refresh_alias_delta(old_entity_ids: set[str], proposed_entities: list[dict]):
     conn = get_connection()
-    affected_entity_ids = old_entity_ids | {record["entity_id"] for record in proposed_entities}
+    proposed_entity_ids = {record["entity_id"] for record in proposed_entities}
+    affected_entity_ids = old_entity_ids | proposed_entity_ids
+    # Merge redirects use a deleted entity ID as the alias key. A later update
+    # to the surviving target must not erase those durable identity redirects.
+    # Preserve them only while their target entity survives this page delta;
+    # true entity deletion still removes every alias that points at it.
+    identity_redirects = []
+    if proposed_entity_ids:
+        placeholders = ",".join("?" for _ in proposed_entity_ids)
+        identity_redirects = [
+            (str(row["key"]), str(row["value"]), str(row["updated_at"] or _utc_now()))
+            for row in conn.execute(
+                f"SELECT key, value, updated_at FROM alias_registry "
+                f"WHERE value IN ({placeholders})",
+                tuple(sorted(proposed_entity_ids)),
+            ).fetchall()
+            if str(row["key"]).startswith("entity_")
+        ]
     if affected_entity_ids:
         placeholders = ",".join("?" for _ in affected_entity_ids)
         conn.execute(
@@ -640,6 +834,11 @@ def _refresh_alias_delta(old_entity_ids: set[str], proposed_entities: list[dict]
         conn.executemany(
             "INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)",
             aliases,
+        )
+    if identity_redirects:
+        conn.executemany(
+            "INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)",
+            identity_redirects,
         )
 
 
@@ -1046,18 +1245,52 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
     max_degree = 12
     entity_window = 6
     source_window = 4
-    entities = load_entities()["items"]
-    sources = load_sources()["items"]
-    claims = annotated_claims()
-    
-    # Sort claims by update time to ensure we keep the most recent/relevant if limiting
-    claims.sort(key=lambda c: _dt_rank(c.get("updated_at")), reverse=True)
-
     if limit_nodes is None:
         limit_nodes = 2500  # Hard cap to prevent 3D-force-graph from freezing the browser
+    from vector_lake import governance_metrics
 
-    if limit_nodes is not None:
-        claims = claims[:limit_nodes]
+    claim_rows = get_connection().execute(
+        "SELECT data_json FROM claims ORDER BY "
+        "COALESCE(json_extract(data_json, '$.updated_at'), "
+        "json_extract(data_json, '$.created_at'), "
+        "json_extract(data_json, '$.temporal_anchor'), '') DESC, "
+        "claim_id ASC LIMIT ?",
+        (max(1, int(limit_nodes)),),
+    ).fetchall()
+    claims = [
+        governance_metrics.annotate_claim_validity(json.loads(row["data_json"]))
+        for row in claim_rows
+    ]
+    referenced_entity_ids = {
+        str(entity_id)
+        for claim in claims
+        for entity_id in claim.get("subject_entity_ids", [])
+    }
+    referenced_source_ids = {
+        str(source_id)
+        for claim in claims
+        for source_id in claim.get("source_ids", [])
+    }
+
+    def load_referenced(table_name: str, id_column: str, ids: set[str]) -> dict[str, dict]:
+        records = {}
+        ordered = sorted(ids)
+        for offset in range(0, len(ordered), 500):
+            batch = ordered[offset:offset + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            rows = get_connection().execute(
+                f"SELECT {id_column}, data_json FROM {table_name} "
+                f"WHERE {id_column} IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                records[str(row[id_column])] = json.loads(row["data_json"])
+        return records
+
+    entities = load_referenced("entities", "entity_id", referenced_entity_ids)
+    sources = load_referenced("sources", "source_id", referenced_source_ids)
 
     nodes = []
     claim_ids = {claim["claim_id"] for claim in claims}
@@ -1177,21 +1410,39 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
 def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
     from vector_lake import governance_metrics
 
-    suggestions = governance_metrics.find_merge_candidates(limit=limit)
-    if not enqueue:
-        return {"created": 0, "suggestions": suggestions}
-
-    queue = load_governance_queue()
-    existing_pairs = {
-        item.get("pair_key")
-        for item in queue["items"]
-        if item.get("type") == "merge"
+    report = governance_metrics.find_merge_candidate_report(
+        limit=limit,
+        run_preflight=True,
+        decision="merge" if enqueue else None,
+    )
+    suggestions = report["suggestions"]
+    eligible = [
+        suggestion
+        for suggestion in suggestions
+        if suggestion.get("decision") == "merge"
+        and suggestion.get("preflight_state") == "passed"
+        and suggestion.get("left_version")
+        and suggestion.get("right_version")
+        and suggestion.get("left_projection_hash")
+        and suggestion.get("right_projection_hash")
+    ]
+    result = {
+        "created": 0,
+        "candidate_pool_size": report["candidate_pool_size"],
+        "actionable_pool_size": report["actionable_pool_size"],
+        "decision_counts": report["decision_counts"],
+        "selected_decision_counts": report["selected_decision_counts"],
+        "returned_count": report["returned_count"],
+        "eligible_count": len(eligible),
+        "skipped_count": len(suggestions) - len(eligible),
+        "suggestions": suggestions,
     }
+    if not enqueue:
+        return result
+
     created = 0
-    for suggestion in suggestions:
-        if suggestion["pair_key"] in existing_pairs:
-            continue
-        queue["items"].append({
+    for suggestion in eligible:
+        item = {
             "item_id": f"gov_{uuid.uuid4().hex[:12]}",
             "type": "merge",
             "title": f"Merge candidate: {suggestion['left_name']} <> {suggestion['right_name']}",
@@ -1202,13 +1453,16 @@ def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
             "pair_key": suggestion["pair_key"],
             "affected_ids": [suggestion["left_entity_id"], suggestion["right_entity_id"]],
             "search_queries": [suggestion["left_name"], suggestion["right_name"]],
-            "affected_pages": [],
+            "affected_pages": [
+                f"{suggestion['left_page_key']}.md",
+                f"{suggestion['right_page_key']}.md",
+            ],
             "merge_candidate": suggestion,
-        })
-        existing_pairs.add(suggestion["pair_key"])
-        created += 1
-    save_governance_queue(queue)
-    return {"created": created, "suggestions": suggestions}
+        }
+        if insert_governance_item_if_absent(item, ("pair_key",)):
+            created += 1
+    result["created"] = created
+    return result
 
 
 def create_change_set(
@@ -1220,12 +1474,6 @@ def create_change_set(
     dry_run: bool = False,
 ) -> dict:
     initialize_meta_store()
-    entities = load_entities()
-    claims = load_claims()
-    evidence = load_evidence()
-    sources = load_sources()
-    existing_change_sets = load_change_sets()
-
     proposed_entities = []
     proposed_claims = []
     proposed_evidence = []
@@ -1291,8 +1539,7 @@ def create_change_set(
             apply_change_set(change_set)
             change_set["published_at"] = _utc_now()
         else:
-            queue = load_governance_queue()
-            queue["items"].append({
+            item = {
                 "item_id": f"gov_{uuid.uuid4().hex[:12]}",
                 "type": "publish-candidate",
                 "title": change_set["summary"],
@@ -1304,11 +1551,10 @@ def create_change_set(
                 "change_set_id": change_set["change_set_id"],
                 "search_queries": [],
                 "affected_pages": [os.path.basename(path) for path in page_paths],
-            })
-            save_governance_queue(queue)
+            }
+            insert_governance_item_if_absent(item, ("change_set_id",))
 
-        existing_change_sets["items"].append(change_set)
-        save_change_sets(existing_change_sets)
+        record_prepared_change_sets([change_set])
     return change_set
 
 
@@ -1399,20 +1645,22 @@ def create_change_set_from_content(
         summary=summary,
         auto_approve=auto_approve,
     )
-    existing_change_sets = load_change_sets()
-    for existing in existing_change_sets["items"]:
-        if existing.get("idempotency_key") == change_set["idempotency_key"]:
-            duplicate = copy.deepcopy(existing)
-            duplicate["deduplicated"] = True
-            return duplicate
+    existing = get_connection().execute(
+        "SELECT data_json FROM change_sets "
+        "WHERE json_extract(data_json, '$.idempotency_key') = ? LIMIT 1",
+        (change_set["idempotency_key"],),
+    ).fetchone()
+    if existing:
+        duplicate = json.loads(existing["data_json"])
+        duplicate["deduplicated"] = True
+        return duplicate
 
     with transaction():
         if auto_approve:
             apply_change_sets_batch([change_set])
             change_set["published_at"] = _utc_now()
         else:
-            queue = load_governance_queue()
-            queue["items"].append({
+            item = {
                 "item_id": f"gov_{uuid.uuid4().hex[:12]}",
                 "type": "publish-candidate",
                 "title": change_set["summary"],
@@ -1424,8 +1672,8 @@ def create_change_set_from_content(
                 "change_set_id": change_set["change_set_id"],
                 "search_queries": [],
                 "affected_pages": [filename],
-            })
-            save_governance_queue(queue)
+            }
+            insert_governance_item_if_absent(item, ("change_set_id",))
 
         record_prepared_change_sets([change_set])
     return change_set
@@ -1548,12 +1796,12 @@ def publish_change_sets(limit: int | None = None) -> dict:
         if limit is not None and published >= limit:
             break
 
-    queue = load_governance_queue()
-    for item in queue["items"]:
-        if item.get("change_set_id") in published_ids:
-            item["status"] = "published"
-            item["resolved_at"] = _utc_now()
-    save_governance_queue(queue)
+    for change_set_id in published_ids:
+        update_governance_items_by_field(
+            "change_set_id",
+            change_set_id,
+            {"status": "published", "resolved_at": _utc_now()},
+        )
     return {"published": published, "change_set_ids": published_ids}
 
 def pending_change_sets() -> list:
@@ -1680,8 +1928,7 @@ def governance_projection() -> dict:
 
 def enqueue_governance_item(item_type: str, title: str, description: str, source: str, search_queries: list, affected_pages: list):
     import uuid
-    queue = load_governance_queue()
-    queue["items"].append({
+    item = {
         "item_id": f"gov_{uuid.uuid4().hex[:12]}",
         "type": item_type,
         "title": title,
@@ -1691,7 +1938,8 @@ def enqueue_governance_item(item_type: str, title: str, description: str, source
         "source": source,
         "search_queries": search_queries,
         "affected_pages": affected_pages,
-    })
-    save_governance_queue(queue)
+    }
+    upsert_governance_item(item, insert_only=True)
+    return item
 
 
