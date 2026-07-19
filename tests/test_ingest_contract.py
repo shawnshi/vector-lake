@@ -15,8 +15,60 @@ from vector_lake.tool_ingest import (
     _read_relevant_index_context,
     claim_ingest_tasks,
     list_ingest_tasks,
+    prepare_ingest_batch,
 )
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
+
+
+def test_candidate_ingest_is_path_scoped_and_nested_names_do_not_collide(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_dir = isolated_memory / "raw"
+    left = raw_dir / "team-a" / "report.txt"
+    right = raw_dir / "team-b" / "report.txt"
+    unrelated = raw_dir / "unrelated.txt"
+    for path, text in ((left, "left"), (right, "right"), (unrelated, "unrelated")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    enqueued = []
+    monkeypatch.setattr(
+        db_store,
+        "enqueue_job",
+        lambda task_type, payload: enqueued.append((task_type, payload)) or f"job-{len(enqueued)}",
+    )
+
+    prepare_ingest_batch(batch_size=2, candidate_paths=[str(left), str(right)])
+
+    assert [item[1]["canonical_name"] for item in enqueued] == [
+        "Source_team-a__report.md",
+        "Source_team-b__report.md",
+    ]
+    assert {item[1]["filepath"] for item in enqueued} == {str(left), str(right)}
+    assert all(item[1]["filepath"] != str(unrelated) for item in enqueued)
+
+
+def test_same_content_at_different_paths_is_tracked_independently(isolated_memory, monkeypatch):
+    raw_dir = isolated_memory / "raw"
+    left = raw_dir / "team-a" / "shared.txt"
+    right = raw_dir / "team-b" / "shared.txt"
+    for path in (left, right):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("same content", encoding="utf-8")
+    enqueued = []
+    monkeypatch.setattr(
+        db_store,
+        "enqueue_job",
+        lambda task_type, payload: enqueued.append((task_type, payload)) or f"job-{len(enqueued)}",
+    )
+
+    prepare_ingest_batch(batch_size=1, candidate_paths=[str(left)])
+    prepare_ingest_batch(batch_size=1, candidate_paths=[str(right)])
+
+    assert [item[1]["canonical_name"] for item in enqueued] == [
+        "Source_team-a__shared.md",
+        "Source_team-b__shared.md",
+    ]
 
 
 def _concept_content(title="Target Concept"):

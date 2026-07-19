@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from vector_lake import db_store, governance_store
+from vector_lake import db_store, governance_store, indexer
 from vector_lake.mutation_coordinator import execute_mutation_batch, execute_mutation_plan
 
 
@@ -210,6 +210,7 @@ def test_mutation_batch_rolls_back_all_pages_and_callback(isolated_memory):
     conn = db_store.get_connection()
     conn.execute("DELETE FROM mutation_outbox")
     conn.commit()
+    indexer.refresh_claim_graph_projection()
 
     def fail_callback():
         raise RuntimeError("injected registry failure")
@@ -273,6 +274,29 @@ def test_mutation_batch_updates_derived_state_without_full_rebuild(isolated_memo
     assert alias_row is not None
     assert conn.execute("SELECT 1 FROM entities WHERE entity_id = ?", (alias_row[0],)).fetchone() is not None
     assert conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0] > 0
+
+
+def test_page_update_preserves_merge_identity_redirect(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    execute_mutation_batch(
+        [{"filename": "Source_Left.md", "content": _named_source_content("source_left", "Left Source")}]
+    )
+    conn = db_store.get_connection()
+    target_id = conn.execute(
+        "SELECT entity_id FROM entities WHERE json_extract(data_json, '$.page_key') = 'Source_Left'"
+    ).fetchone()[0]
+    governance_store.upsert_alias("entity_deleted_source", target_id)
+
+    execute_mutation_batch(
+        [
+            {
+                "filename": "Source_Left.md",
+                "content": _named_source_content("source_left", "Left Source", "Updated body."),
+            }
+        ]
+    )
+
+    assert governance_store.get_alias("entity_deleted_source") == target_id
 
 
 def test_page_scoped_mutation_does_not_rewrite_unrelated_canonical_rows(isolated_memory):
@@ -344,6 +368,28 @@ def test_schema_validation_mode_allows_bounded_legacy_maintenance(isolated_memor
         "SELECT validation_mode FROM mutation_outbox WHERE filename = 'Source_Legacy.md'"
     ).fetchone()
     assert row["validation_mode"] == "schema"
+
+
+def test_schema_maintenance_preserves_legacy_tag_entity_collision(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    index_path = isolated_memory / "wiki" / "index.json"
+    index_path.write_text(
+        json.dumps({"nodes": {"Concept_Agentic-AI": {"title": "Agentic AI", "aliases": []}}}),
+        encoding="utf-8",
+    )
+    legacy_content = _named_source_content("source_tag_collision", "Tag Collision").replace(
+        "categories: [Source]\n",
+        "categories: [Source]\ntags: [Agentic AI]\n",
+    )
+
+    ok, message = execute_mutation_batch(
+        [{"filename": "Source_Tag-Collision.md", "content": legacy_content}],
+        validation_mode="schema",
+    )
+
+    assert ok is True
+    assert "committed" in message.lower()
+    assert (isolated_memory / "wiki" / "Source_Tag-Collision.md").read_text(encoding="utf-8") == legacy_content
 
 
 def test_mutation_batch_rejects_unknown_validation_mode(isolated_memory):

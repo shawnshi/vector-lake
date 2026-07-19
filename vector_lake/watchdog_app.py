@@ -28,6 +28,17 @@ log = logging.getLogger("watchdog_sync")
 
 DEBOUNCE_SECONDS = 3.0
 index_queue = queue.Queue()
+
+
+def _watch_directories() -> dict[str, Path]:
+    from vector_lake.wiki_utils import get_raw_dir, get_wiki_dir
+
+    raw_dir = get_raw_dir()
+    return {
+        "wiki": get_wiki_dir(),
+        "raw": raw_dir,
+        "diary": raw_dir / "privacy" / "Diary",
+    }
 global_task_lock = threading.Lock()
 
 
@@ -129,12 +140,79 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
 class RawWatchdogHandler(FileSystemEventHandler):
     def __init__(self):
         self.last_triggered = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.executor = None
+        self.sync_future = None
+        self.pending_paths = set()
+        self.pending_overflow = False
+        self.shutting_down = False
+
+    def _run_ingest(self, paths, overflow):
+        from vector_lake.tool_ingest import prepare_ingest_batch
+
+        return prepare_ingest_batch(
+            batch_size=50 if overflow else max(1, len(paths)),
+            candidate_paths=None if overflow else paths,
+        )
+
+    def _submit_pending_locked(self):
+        if self.shutting_down:
+            return
+        if self.sync_future is not None and not self.sync_future.done():
+            return
+        if not self.pending_paths and not self.pending_overflow:
+            return
+        import concurrent.futures
+
+        if self.executor is None:
+            self.executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="vector-lake-raw-ingest",
+            )
+        paths = sorted(self.pending_paths)
+        overflow = self.pending_overflow
+        self.pending_paths.clear()
+        self.pending_overflow = False
+        future = self.executor.submit(self._run_ingest, paths, overflow)
+        self.sync_future = future
+        future.add_done_callback(self._ingest_done)
+
+    def _ingest_done(self, future):
+        try:
+            error = future.exception()
+        except Exception as exc:
+            error = exc
+        if error:
+            log.error(f"Raw ingest preparation failed: {error}")
+        with self.lock:
+            if self.sync_future is future:
+                self.sync_future = None
+            if not self.shutting_down:
+                self._submit_pending_locked()
+
+    def shutdown(self):
+        with self.lock:
+            self.shutting_down = True
+            executor = self.executor
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+        with self.lock:
+            paths = sorted(self.pending_paths)
+            overflow = self.pending_overflow
+            self.pending_paths.clear()
+            self.pending_overflow = False
+            self.executor = None
+            self.sync_future = None
+        if paths or overflow:
+            try:
+                self._run_ingest(paths, overflow)
+            except Exception as exc:
+                log.error(f"Raw ingest shutdown drain failed: {exc}")
 
     def handle_event(self, event):
         if event.is_directory:
             return
-        filepath = event.src_path
+        filepath = getattr(event, "dest_path", None) or event.src_path
         
         # Prevent Double-Trigger: Exclude privacy/Diary (handled by DiaryWatchdogHandler)
         if "privacy" in filepath and "Diary" in filepath:
@@ -147,23 +225,21 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
         now = time.time()
         with self.lock:
+            if self.shutting_down:
+                return
             if len(self.last_triggered) > 2000:
                 self.last_triggered.clear()
             if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
                 return
             self.last_triggered[filepath] = now
+            max_pending = max(1, int(os.environ.get("VECTOR_LAKE_RAW_EVENT_BUFFER", "500")))
+            if len(self.pending_paths) < max_pending:
+                self.pending_paths.add(str(Path(filepath).resolve()))
+            else:
+                self.pending_overflow = True
+            self._submit_pending_locked()
 
-        log.info(f"Raw source modified: {filename}. Triggering sync_vector_lake in worker pool...")
-        try:
-            from vector_lake.tool_sync import sync_vector_lake
-            # Run using ThreadPoolExecutor to prevent thread explosion
-            if not hasattr(self, "executor"):
-                import concurrent.futures
-                self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-            future = self.executor.submit(sync_vector_lake)
-            future.add_done_callback(lambda f: log.error(f"sync_vector_lake Failed: {f.exception()}") if f.exception() else None)
-        except Exception as e:
-            log.error(f"Failed to trigger sync_vector_lake: {e}")
+        log.info(f"Raw source modified: {filename}. Scheduled path-scoped ingest preparation.")
 
     def on_created(self, event): self.handle_event(event)
     def on_modified(self, event): self.handle_event(event)
@@ -181,13 +257,21 @@ def process_mutation_outbox_batch(
     from vector_lake.mutation_coordinator import materialize_markdown_projection
     from vector_lake.wiki_utils import get_wiki_dir
 
-    rows = db_store.claim_mutation_outbox(limit=limit)
+    lease_seconds = max(120, min(3600, max(1, int(limit))))
+    rows = db_store.claim_mutation_outbox(limit=limit, lease_seconds=lease_seconds)
     stats = {"claimed": len(rows), "completed": 0, "retrying": 0, "failed": 0}
     ready_for_index = []
     for row in rows:
         outbox_id = int(row["id"])
         filename = row["filename"]
+        lease_args = (
+            row["lease_owner"],
+            row["lease_token"],
+            int(row["lease_generation"]),
+        )
         try:
+            if not db_store.mutation_outbox_lease_is_current(outbox_id, *lease_args):
+                continue
             target = get_wiki_dir() / filename
             already_materialized = (
                 not target.exists()
@@ -199,46 +283,76 @@ def process_mutation_outbox_batch(
                 )
             )
             if not already_materialized:
-                materialize_markdown_projection(
-                    filename,
-                    row["mutation_type"],
-                    row.get("payload_text"),
-                    validation_mode=row.get("validation_mode") or "full",
-                )
-            ready_for_index.append((outbox_id, filename))
+                with db_store.transaction():
+                    if not db_store.mutation_outbox_lease_is_current(outbox_id, *lease_args):
+                        continue
+                    materialize_markdown_projection(
+                        filename,
+                        row["mutation_type"],
+                        row.get("payload_text"),
+                        validation_mode=row.get("validation_mode") or "full",
+                    )
+            if db_store.mutation_outbox_lease_is_current(outbox_id, *lease_args):
+                ready_for_index.append((row, filename))
         except Exception as exc:
             status = db_store.fail_mutation_outbox(
                 outbox_id,
                 str(exc),
+                *lease_args,
                 max_attempts=max_attempts,
                 backoff_base=backoff_base,
             )
-            stats["failed" if status == "failed" else "retrying"] += 1
+            if status != "stale":
+                stats["failed" if status == "failed" else "retrying"] += 1
             log.error(f"Outbox item {outbox_id} failed for {filename}; status={status}: {exc}")
     if ready_for_index:
-        filenames = list(dict.fromkeys(filename for _, filename in ready_for_index))
+        current_rows = [
+            (row, filename)
+            for row, filename in ready_for_index
+            if db_store.mutation_outbox_lease_is_current(
+                int(row["id"]),
+                row["lease_owner"],
+                row["lease_token"],
+                int(row["lease_generation"]),
+            )
+        ]
+        filenames = list(dict.fromkeys(filename for _, filename in current_rows))
         try:
-            indexer.update_index_items(filenames)
+            if filenames:
+                if indexer.index_projection_matches_canonical(filenames):
+                    indexer.refresh_claim_graph_projection()
+                else:
+                    indexer.update_index_items(filenames)
         except Exception as exc:
-            for outbox_id, filename in ready_for_index:
+            for row, filename in current_rows:
+                outbox_id = int(row["id"])
                 status = db_store.fail_mutation_outbox(
                     outbox_id,
                     str(exc),
+                    row["lease_owner"],
+                    row["lease_token"],
+                    int(row["lease_generation"]),
                     max_attempts=max_attempts,
                     backoff_base=backoff_base,
                 )
-                stats["failed" if status == "failed" else "retrying"] += 1
+                if status != "stale":
+                    stats["failed" if status == "failed" else "retrying"] += 1
                 log.error(f"Outbox index batch failed for {filename}; status={status}: {exc}")
         else:
-            for outbox_id, _ in ready_for_index:
-                db_store.complete_mutation_outbox(outbox_id)
-                stats["completed"] += 1
+            for row, _ in current_rows:
+                if db_store.complete_mutation_outbox(
+                    int(row["id"]),
+                    row["lease_owner"],
+                    row["lease_token"],
+                    int(row["lease_generation"]),
+                ):
+                    stats["completed"] += 1
     return stats
 
 
 def process_legacy_projection_batch(filenames) -> dict:
     """Promote bounded manual Markdown edits into canonical state and durable outbox rows."""
-    from vector_lake import db_store, governance_store
+    from vector_lake.mutation_coordinator import execute_mutation_batch
     from vector_lake.wiki_utils import get_wiki_dir
 
     stats = {"completed": 0, "failed": 0}
@@ -246,24 +360,10 @@ def process_legacy_projection_batch(filenames) -> dict:
     for filename in dict.fromkeys(str(item) for item in filenames):
         target = wiki_dir / filename
         try:
-            with db_store.transaction():
-                if target.exists():
-                    payload_text = target.read_text(encoding="utf-8")
-                    governance_store.sync_pages_to_canonical(
-                        [str(target)],
-                        origin="watchdog",
-                        auto_approve=True,
-                        summary=f"Manual update: {filename}",
-                    )
-                    db_store.enqueue_mutation(
-                        filename,
-                        "update",
-                        payload_text=payload_text,
-                    )
-                else:
-                    node_key = filename[:-3] if filename.endswith(".md") else filename
-                    db_store.delete_node_cascade(node_key)
-                    db_store.enqueue_mutation(filename, "delete")
+            mutation = {"filename": filename, "is_delete": not target.exists()}
+            if target.exists():
+                mutation["content"] = target.read_text(encoding="utf-8")
+            execute_mutation_batch([mutation], validation_mode="schema", origin="watchdog")
             stats["completed"] += 1
         except Exception as exc:
             stats["failed"] += 1
@@ -285,16 +385,12 @@ def index_worker_loop():
                 consecutive_failures = 0
                 continue
                 
-            import tempfile
-            import os
-            from pathlib import Path
-            tmp_dir = Path(tempfile.gettempdir()) / "vector_lake_tmp"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            flag_path = tmp_dir / "outbox_signal.lock"
+            from vector_lake.wiki_utils import get_outbox_signal_path
+            flag_path = get_outbox_signal_path()
             
             # The signal is only a latency hint. Durable rows are always polled.
-            if os.path.exists(flag_path):
-                try: os.remove(flag_path)
+            if flag_path.exists():
+                try: flag_path.unlink()
                 except OSError: pass
 
             with global_task_lock:
@@ -423,22 +519,22 @@ def _start_watchdog_locked():
     threading.Thread(target=start_worker, daemon=True).start()
 
     observer = Observer()
+    raw_handler = None
+    watch_dirs = _watch_directories()
 
-    from vector_lake.wiki_utils import get_wiki_dir
-
-    wiki_dir = str(get_wiki_dir())
+    wiki_dir = str(watch_dirs["wiki"])
     if os.path.exists(wiki_dir):
         wiki_handler = WikiIndexHandler()
         observer.schedule(wiki_handler, wiki_dir, recursive=False)
         log.info(f"Wiki AST monitor active on directory: {wiki_dir}")
 
-    diary_dir = os.path.expanduser("~/.gemini/MEMORY/raw/privacy/Diary")
+    diary_dir = str(watch_dirs["diary"])
     if os.path.exists(diary_dir):
         diary_handler = DiaryWatchdogHandler()
         observer.schedule(diary_handler, diary_dir, recursive=False)
         log.info(f"Diary monitor active on directory: {diary_dir}")
 
-    raw_dir = os.path.expanduser("~/.gemini/MEMORY/raw")
+    raw_dir = str(watch_dirs["raw"])
     if os.path.exists(raw_dir):
         raw_handler = RawWatchdogHandler()
         observer.schedule(raw_handler, raw_dir, recursive=True)
@@ -458,12 +554,10 @@ def _start_watchdog_locked():
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("Termination signal received. Shutting down Watchdog...")
-        observer.stop()
     finally:
-        try:
-            lock_file.close()
-        except Exception:
-            pass
+        observer.stop()
+        if raw_handler is not None:
+            raw_handler.shutdown()
     observer.join()
 
 

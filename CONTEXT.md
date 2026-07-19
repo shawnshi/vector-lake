@@ -11,17 +11,18 @@ Current boundary:
 - Claim topology: `MEMORY/wiki/claim_graph.json`
 - Strategic intent: `MEMORY/purpose.md` (YAML contract parsed by `purpose_contract.py`)
 - Canonical governance store: `MEMORY/wiki/.meta/vector_lake.db` (SQLite)
-- Agent runtime memory: `operational_memory.json`
+- Agent runtime memory: SQLite `operational_memory` table
 
 The durable architecture is:
 
 ```text
-raw source -> Markdown wiki -> canonical claims/evidence -> operational memory -> Memory Packet -> query context
+raw source -> page-scoped coordinator -> SQLite canonical + fenced outbox -> Markdown/index/claim_graph projections
+SQLite canonical -> operational memory -> Memory Packet -> query context
 ```
 
 ## 2. Runtime Model
 
-Markdown remains the sovereign, inspectable publication layer. Agent memory is compiled, scored, and selectively injected. **(V7.2+ Mandate: All new operational memory MUST be persisted directly into Markdown Wiki nodes via the Dual-Schema layout, specifically under the `## 2. 证据时间线 (Evidence Timeline)` section to prevent index-rebuild data loss.)**
+Markdown remains the inspectable publication layer. SQLite is the transactional canonical layer. New operational memory enters through the coordinator and preserves its Markdown evidence timeline so projections can be rebuilt without applying synthesized restore text back into canonical state.
 
 Operational memory types:
 
@@ -59,7 +60,9 @@ Conflict rules:
 | `vector_lake/claim_extractor.py` | Page-to-entity/claim/evidence/source extraction |
 | `vector_lake/tool_memory.py` | Wiki-as-Database operational memory persistence via MCP |
 | `vector_lake/governance_store.py` | Canonical store, change sets, operational memory, conflict resolver |
-| `vector_lake/governance_metrics.py` | Debt and health metrics |
+| `vector_lake/governance_metrics.py` | Debt, health metrics, and merge-candidate report orchestration |
+| `vector_lake/merge_analysis.py` | Unicode-safe duplicate recall, evidence scoring, four-state decisions, component grouping, and merge preflight |
+| `vector_lake/tokenizer_runtime.py` | Shared rjieba boundary for consistent index and query tokenization |
 | `vector_lake/tool_search.py` | Hybrid search (local query expansion + BM25 + Graph Traversal), Memory Packet assembly |
 | `vector_lake/tool_query.py` | Query synthesis with Memory Packet first |
 | `vector_lake/tool_research.py` | Autonomous deep research and graph insight processing |
@@ -139,17 +142,7 @@ $env:PYTHONUTF8='1'; python -m compileall vector_lake tests
 
 ## 5. Current Validation Baseline
 
-Last verified: 2026-07-08 (V11.5 Refactoring).
-
-- Unit tests: `Ran 8 tests ... OK`
-- Compile: `python -m compileall vector_lake tests` OK
-- Doctor: healthy
-- `search --mode memory`: smoke OK
-- Debt snapshot:
-  - `operational_memory_count: 13755`
-  - `superseded_memory_count: 510`
-  - `conflicted_memory_count: 0`
-  - `memory_type_counts: {'fact': 11881, 'decision': 1393, 'task_state': 384, 'preference': 97}`
+The checked baseline is produced by the current CI commands rather than a fixed test or data count. Run the full pytest suite with warnings promoted to errors, `pip check`, `git diff --check`, read-only lint, and deep doctor before release. Runtime data counts are diagnostic snapshots and must not be copied into this contract as permanent expectations.
 
 ## 6. Operating Rules
 
@@ -163,8 +156,10 @@ Last verified: 2026-07-08 (V11.5 Refactoring).
 
 ## 7. System Capabilities & Architecture Defenses
 The Vector Lake system is designed for high-concurrency ingestion and graph maintenance with several defensive mechanisms:
-- **Two-Track Watchdog**: Monitors raw sources for incremental ingestion by creating host-subagent task packets and monitors wiki nodes for O(1) index updates. It hooks `on_deleted` and `on_moved` events to reflect Semantic GC operations and prevent ghost nodes.
-- **Write Health Gate**: Ordinary mutations are blocked when watchdog heartbeat, mutation outbox, or Wiki/index/SQLite projection consistency is unhealthy. Bounded repairs can use schema mode or an explicit operator override. Runtime health checks are read-only when the SQLite file already exists, so doctor/write-gate checks do not take a schema-migration write lock during watchdog batches.
+- **Two-Track Watchdog**: Raw changes are path-scoped and coalesced through one worker; Wiki changes enter a bounded legacy queue and are promoted through the coordinator.
+- **Write Health Gate**: Ordinary mutations run deep key-and-content parity checks across Wiki, index, and canonical state. Drift on settled projections blocks writes. An active outbox row is treated as managed recovery only when its payload version exactly matches canonical state. Bounded repairs can use schema mode or an explicit operator override.
+- **Fenced Outbox**: Claims carry owner, token, and generation. Same-page newer intents supersede older active rows without deleting history, and workers revalidate before materializing Markdown and before indexing.
+- **Row-Level Governance Queue**: Enqueue, deduplication, publish, and resolve update only their target rows; unrelated concurrent items are preserved.
 - **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
 - **Scheduled Read-Only Lint**: At 10:00 and 23:00 the watchdog refreshes dirty graph topology, runs `lint_vector_lake(auto_fix=False)`, and checkpoints the SQLite WAL. Destructive repair remains an explicit operator action.
 
@@ -222,7 +217,7 @@ Last verified: 2026-07-08 (V11.5 Refactoring).
 ## 7. System Capabilities & Architecture Defenses
 The Vector Lake system is designed for high-concurrency ingestion and graph maintenance with several defensive mechanisms:
 - **Two-Track Watchdog**: Monitors raw sources for incremental ingestion by creating host-subagent task packets and monitors wiki nodes for O(1) index updates. It hooks `on_deleted` and `on_moved` events to reflect Semantic GC operations and prevent ghost nodes.
-- **Write Health Gate**: Ordinary mutations are blocked when watchdog heartbeat, mutation outbox, or Wiki/index/SQLite projection consistency is unhealthy. Bounded repairs can use schema mode or an explicit operator override. Runtime health checks are read-only when the SQLite file already exists, so doctor/write-gate checks do not take a schema-migration write lock during watchdog batches.
+- **Write Health Gate**: Ordinary mutations are blocked when watchdog heartbeat, mutation outbox, or Wiki/index/SQLite key-and-content consistency is unhealthy. Active projection work is exempted only when the newest outbox payload matches the canonical version. Bounded repairs can use schema mode or an explicit operator override. Runtime health checks are read-only when the SQLite file already exists, so doctor/write-gate checks do not take a schema-migration write lock during watchdog batches.
 - **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
 - **Scheduled Read-Only Lint**: At 10:00 and 23:00 the watchdog refreshes dirty graph topology, runs `lint_vector_lake(auto_fix=False)`, and checkpoints the SQLite WAL. It does not merge, archive, or rewrite Wiki pages.
 - **Explicit Auxiliary Jobs**: Research, timeline rebuild, semantic deduplication, overview compilation, and community clustering are operator-invoked workflows. The watchdog does not silently launch those scripts.
@@ -235,9 +230,9 @@ The Vector Lake system is designed for high-concurrency ingestion and graph main
 - **Native Vector Engine (V11.5)**: Integrated `sqlite-vec` extension for FTS5 + Vector hybrid search. Eliminated the `embeddings.pkl` O(N) memory bottleneck, offloading similarity calculation directly into the SQLite C-backend.
 - **Rate-Aware Embedding Scheduler**: Gemini embeddings are a resumable projection. All processes reserve requests and tokens through one SQLite rolling window, validate response cardinality and 3072-dimensional vectors, use an explicit HTTP timeout, and record resumable batch progress. Index rebuild and incremental index maintenance never invoke the embedding API.
 - **O(V+E) Graph Indexing (V11.5)**: Eliminated catastrophic O(N²) CPU deadlocks during node overlapping frequency calculations by utilizing an inverted-index map. 
-- **Chinese Tokenization (V11.5)**: Implemented offline `jieba` pre-tokenization pipeline before SQLite `MATCH` execution, fixing the precision drop caused by `porter unicode61` character splitting.
+- **Chinese Tokenization (V11.5)**: Uses the maintained `rjieba` binding for the same offline tokenization path during SQLite indexing and `MATCH` queries.
 - **Subagent Text Runtime Boundary (V11.13)**: Search expansion and reranking are deterministic; ingest creates current-environment subagent task packets; semantic dedupe no longer calls a text arbiter. `google-genai` remains only for embedding paths when `GEMINI_API_KEY` is configured.
 - **Canonical Transaction Boundary**: SQLite canonical changes and durable outbox intent commit together. Markdown, FTS, `index.json`, and `claim_graph.json` are recoverable projections written after commit.
-- **Pure Canonical Architecture & Outbox (V11.11)**: Mutation entrypoints converge on `mutation_coordinator`; the outbox is polled even when the wake-up signal is missing, claims rows with leases, retries transient failures, and records terminal errors. Full and incremental index paths read SQLite entities and identify nodes by `page_key`.
+- **Pure Canonical Architecture & Outbox (V11.11)**: Mutation entrypoints converge on `mutation_coordinator`; the outbox is polled even when the wake-up signal is missing, claims rows with leases, retries transient failures, and records terminal errors. Replaying an old idempotency key after a newer same-page intent creates a new causal intent. Full and incremental index paths read SQLite entities and identify nodes by `page_key`.
 - **Fenced Subagent Completion**: Ingest claims issue owner/token/generation credentials. Finalization validates them before work and repeats a compare-and-set inside the canonical transaction, so expired workers cannot commit late results.
 - **Timeline Projection Parity**: Claim deltas update Timeline rows in the same transaction. Queries verify stable event-ID parity and fall back to canonical claims whenever the projection is incomplete; deep Doctor checks report exact missing/extra counts.

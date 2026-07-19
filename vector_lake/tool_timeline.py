@@ -12,7 +12,12 @@ def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> d
     sources = data.get("source_ids") or []
     if isinstance(sources, str):
         sources = [sources]
-    event_date = data.get("temporal_anchor") or data.get("event_date") or row["updated_at"] or "Unknown Date"
+    event_date = (
+        data.get("temporal_anchor")
+        or data.get("event_date")
+        or data.get("updated_at")
+        or "Unknown Date"
+    )
     description = row["claim_text"]
     entity_id = entities[0] if entities else ""
     stable_raw = "\0".join([str(row["claim_id"]), str(event_date), str(description)])

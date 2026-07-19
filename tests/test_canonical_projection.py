@@ -140,3 +140,34 @@ def test_migration_dry_run_does_not_create_or_modify_sqlite(isolated_memory):
     assert result["pages_scanned"] == 1
     assert result["entities"] == 1
     assert not db_path.exists()
+
+
+def test_identical_claim_upsert_preserves_storage_updated_at(isolated_memory, monkeypatch):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_stable_storage_time",
+        "claim_text": "Stable claim",
+        "status": "Active",
+        "source_ids": [],
+        "evidence_ids": [],
+    }
+    times = iter(("2026-07-19T00:00:00+00:00", "2026-07-19T01:00:00+00:00", "2026-07-19T02:00:00+00:00"))
+    monkeypatch.setattr(governance_store, "_utc_now", lambda: next(times))
+
+    with db_store.transaction():
+        governance_store._upsert_canonical_records("claims", "claim_id", [claim])
+    with db_store.transaction():
+        governance_store._upsert_canonical_records("claims", "claim_id", [dict(claim)])
+    unchanged = db_store.get_connection().execute(
+        "SELECT updated_at FROM claims WHERE claim_id = ?", (claim["claim_id"],)
+    ).fetchone()["updated_at"]
+
+    changed = dict(claim, claim_text="Changed claim")
+    with db_store.transaction():
+        governance_store._upsert_canonical_records("claims", "claim_id", [changed])
+    changed_at = db_store.get_connection().execute(
+        "SELECT updated_at FROM claims WHERE claim_id = ?", (claim["claim_id"],)
+    ).fetchone()["updated_at"]
+
+    assert unchanged == "2026-07-19T00:00:00+00:00"
+    assert changed_at == "2026-07-19T02:00:00+00:00"

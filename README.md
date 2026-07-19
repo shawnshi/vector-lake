@@ -7,7 +7,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 - `MEMORY/raw`：原始信源层，只读输入。
 - `MEMORY/wiki`：人类可读的 Markdown 发布层，用于审计、浏览、复盘和长期资产沉淀。
 - `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
-- `MEMORY/wiki/.meta/vector_lake.db`：统一的 SQLite 底层引擎，不仅保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列，同时也作为 Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state` 存入 `operational_memory` 表。
+- `MEMORY/wiki/.meta/vector_lake.db`：SQLite canonical 存储，保存实体、断言、证据、信源、图拓扑、变更集、治理队列、outbox 和 `operational_memory`。
 - `MEMORY/purpose.md`：版本化战略控制面。YAML 契约驱动摄取范围、证据等级、意图权重、SIR 复审和张力合成阈值；营销噪音与范围外资料不进入主图谱，但保留最小丢弃审计。`purpose_vectors.json` 仅保留为旧版回退，不再是权重主源。
 
 如果 `MEMORY/wiki/.meta` 不可写，运行时会回退到仓库内 `data/v8_meta/`。
@@ -17,9 +17,12 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 ```mermaid
 graph LR
     RAW["MEMORY/raw<br>Immutable sources"] --> INGEST["Native Subagents<br>Asynchronous Ingestion Pipeline"]
-    INGEST --> WIKI["MEMORY/wiki<br>Markdown pages"]
-    WIKI --> INDEX["index.json<br>page index + BM25"]
-    WIKI --> META["vector_lake.db<br>SQLite Canonical Store"]
+    INGEST --> MUTATION["Mutation Coordinator<br>page-scoped transaction"]
+    WIKI["MEMORY/wiki<br>Markdown projection"] -->|manual legacy input| MUTATION
+    MUTATION --> META["vector_lake.db<br>SQLite Canonical Store"]
+    META --> OUTBOX["Fenced Outbox<br>latest intent per page"]
+    OUTBOX --> WIKI
+    OUTBOX --> INDEX["index.json + FTS<br>search projection"]
     META --> CLAIM["SQLite claim_graph_edges<br>governed topology"]
     META --> MEMORY["SQLite operational_memory<br>agent runtime memory"]
     MEMORY --> PACKET["Memory Packet<br>selective context injection"]
@@ -63,8 +66,8 @@ graph LR
 ## Quick Start
 1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。非 embedding 文本推理不由插件直接调用外部 API；需要推理的后台任务会生成当前环境 subagent 任务包。`GEMINI_API_KEY` 只影响 embedding。2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
 3. **后台监听与自治管理**：日常运行 `python watchdog_sync.py` 启动守护进程。它搭载了四大核心基建与防御系统：
-   - **双轨看门狗 (Two-Track Watchdog)**：不仅监听增量文件生成，还实现了对 `on_deleted` 与 `on_moved` 事件的瞬间捕捉，彻底消除因 Semantic GC 产生的图谱“幽灵节点”。
-   - **写入健康门 (Write Health Gate)**：普通写入会先检查 watchdog 心跳、outbox 失败项和 Wiki/index/SQLite 投影漂移；严重不一致时阻断继续写入，维护修复可显式使用 schema 模式或人工 override。
+   - **双轨看门狗 (Two-Track Watchdog)**：监听增量文件生成以及 `on_deleted`、`on_moved` 事件；原始文件移动事件按目标路径处理，Wiki 删除或移动事件同步更新索引。
+   - **写入健康门 (Write Health Gate)**：普通写入会检查 watchdog 心跳、outbox 失败项、投影键和内容一致性；已结清投影发生漂移时阻断继续写入。若最新 active outbox payload 与 canonical 版本相同，则该页暂记为受管恢复，允许 worker 完成投影。维护修复可显式使用 schema 模式或人工 override。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
    - **两步思维链摄入 (Payload-Based MCP)**：Agent 强制先输出分析缓冲（Tension, Consensus, Unknowns），并将长文本提纯为 JSON 制品落盘后通过 MCP 最终入湖，彻底根除 CLI 传参截断与 JSON 解析风暴。
    - **语义张力量化模型 (STQM)**：图谱原生支持 `tension_edges` 张力边计算。强制所有 Agent 抽离争议与矛盾并结构化为冲突边，在 Query 时通过 Controversy Heatmap 直观展示领域盲区。
@@ -97,7 +100,7 @@ graph LR
 
 ### ⚡ V11.4 性能降维与检索引擎重构 (V11.4 Performance & Query Engine)
 - **真·O(1) 向量点积引擎 (Numpy Vectorization)**：淘汰了原始的纯 Python `for` 循环暴力余弦扫描，引入了基于 Numpy 的全矩阵运算。搜索时直接加载缓存特征矩阵 (`_VECTOR_CACHE`)，将耗时从线性级的数百毫秒极速降至毫秒级，彻底消灭 GC 爆栈风险。
-- **全分词中文双轨召回 (Jieba-FTS5 Hybrid)**：废除了底层 SQLite 导致中文断句崩溃的 `porter` 英语词干分词器，改为在数据入库前通过 `jieba` 执行硬分词，再交由 `unicode61` 索引。将复杂中文领域专有名词的精确匹配召回率提升至 100%。
+- **全分词中文双轨召回 (rjieba-FTS5 Hybrid)**：废除了底层 SQLite 导致中文断句崩溃的 `porter` 英语词干分词器，改为在数据入库前通过 `rjieba` 执行硬分词，再交由 `unicode61` 索引。
 - **批处理防堵写入 (Executemany Bulk Inserts)**：将图谱边构建 (`save_graph_edges`) 与别名表更新中的低效 N+1 查询全数替换为底层 `conn.executemany`，网络拓扑的 I/O 写入性能提升超过 90%。
 - **全局规范化坍缩 (Canonical Normalization)**：彻底清理了多达 4 处重复造轮子的散落代码（如旧版 `strip_name` 等），统一收口于 `wiki_utils.py`。消灭了因子系统规则差异导致同一实体被映射为多个幽灵节点的隐患。
 
@@ -111,7 +114,7 @@ graph LR
 - **C 级向量底座换发 (sqlite-vec Integration)**：彻底废弃基于 Python Pickle 序列化与内存常驻的 O(N) 线性扫描机制。全量集成原生 `sqlite-vec` 向量引擎，将 10,000+ 高维 Embedding 下推至 SQLite 底层执行 SIMD 硬件级余弦相似度极速检索。
 - **抽象语法树重装解析 (AST-Based Markdown Parsing)**：移除所有脆弱的正则匹配 (Regex) 与字符串分割提取。接入 `mistune` 构建强壮的 Markdown 抽象语法树 (AST) 遍历管线，无论外界格式如何扭曲，提取逻辑永不阻断。
 - **图谱 O(V+E) 稀疏遍历 (Inverted Index Optimization)**：彻底消除大图谱边权计算 (Edge Topology Calculation) 中的 O(N²) 双重循环笛卡尔积死锁。利用反向索引计算共享重叠源，算力开销断崖式暴跌。
-- **中文原质双轨分词引擎 (FTS5 + Jieba Pre-tokenization)**：废除 SQLite FTS5 自带导致中文崩盘的 `porter unicode61` 字符级碎屑拆解。利用 `jieba` 在入库和检索前进行离线白盒分词预处理，实现专业医疗名词的 100% 绝对命中率。
+- **中文原质双轨分词引擎 (FTS5 + rjieba Pre-tokenization)**：废除 SQLite FTS5 自带导致中文崩盘的 `porter unicode61` 字符级碎屑拆解。索引和查询共用 `rjieba` 分词边界，避免中文词项表示漂移。
 - **Canonical Commit + Recoverable Projections**：SQLite canonical 变更与 durable outbox intent 在同一事务提交；`Markdown / FTS / index.json / claim_graph.json` 作为可重放投影，在提交后原子替换并由 outbox 自动恢复。
 - **文件系统无尽重试 (Exponential I/O Backoff)**：重塑了 `refresh_graph_topology_if_dirty` 中的并发写入锁逻辑，用指数退避（最高5次）替代了原先的“静默忽略”，从物理层级消灭了文件争用导致的拓扑损坏。
 
@@ -153,7 +156,7 @@ graph LR
 - **单记录 O(1) 内存重算 (O(1) Operational Memory Rebuild)**：废除旧架构下 `apply_change_sets_batch()` 每逢小更新即触发 1 万节点全库锁定的灾难级设计。在 SQLite 核心通过追踪 `affected_memory_keys` 并局部触发变更重算，实现了运行时 Memory 与 Timeline 的真 O(1) 增量构建，极大缓解了跨线程死锁与卡顿。
 - **Timeline 增量追踪基建 (Incremental Timeline Base)**：斩断 `tool_timeline.py` 每次强行从 `claims` 库 O(N) 遍历过滤时序事件的高危漏查设计。引入统一的 `timeline_events` O(1) 事件表，使得时间线能够与 Change Set 同步持久化，做到确定性追踪，再无历史丢失风险。
 - **全局并发限流防爆屏障 (Global Concurrency Rate Limit Barrier)**：阻断了 `indexer.py` (generate_index) 在图谱重构或全库扫描时隐式触发大模型 Embedding 的恶性 API 并发，将其严格抽离至少数派专职调度进程。终结了节点重构、查询、与全量索引并发时引发的指数级 API 费用爆发与封禁。
-- **出站引擎全局批处理 (Global Batch Outbox Engine)**：重写 `watchdog_app.py` 中的 `mutation_outbox` 工作流。将极度低效的逐文件步进式同步调用（`update_index_items([filename])`），全面进化为跨进程数组归集批处理（Batched Array Execution），将万级高频碎步写入转化为单个大型原子事务。
+- **出站引擎全局批处理 (Global Batch Outbox Engine)**：重写 `watchdog_app.py` 中的 `mutation_outbox` 工作流。逐文件同步调用（`update_index_items([filename])`）改为跨进程数组归集批处理（Batched Array Execution），将高频碎步写入合并为较少的原子批次。
 - **差分历史审计降维与 GC (Diff GC for Change Sets)**：将 SQLite 库内无休止膨胀的 `change_sets` 流水，接入系统级的 `tool_gc.py` 管线。按设定日历生命周期自动发起 `DELETE` 定时清道夫任务，实现长期知识湖存储的绝对瘦身。
 - **阻塞陷阱重构 (Asynchronous Fire-and-Forget)**：剥离 `DiaryWatchdogHandler` 霸占线程池的线性 `subprocess.run` 陷阱，将其降维为纯异步 `Popen` 子进程唤起。释放了有限的 3 并发守护线程池，使外部文件变更响应突破延时阻塞。
 - **泛型语法树白名单 (AST Filter Purge)**：废弃了易受 Markdown 缩进污染的纯文本切分器。在 `claim_extractor.py` 中引入 `block_code` 脏节点屏障，使得 LLM 生成代码时的噪音（如 Python / Shell script 断言）在语法树层级即被拦截，保持图谱 100% 认知洁净。
@@ -305,6 +308,10 @@ python cli.py trace "<query-or-id>"
 python cli.py merge-suggestions --limit 20
 ```
 
+Merge preview balances `merge`, `alias`, `review`, and `keep_separate` decisions.
+Queue creation accepts only two-page `merge` candidates that passed semantic/schema
+preflight and carry both canonical-version and Markdown-projection hashes.
+
 图谱与清理：
 
 ```powershell
@@ -326,7 +333,7 @@ python cli.py embedding-backfill --apply --limit 200
 python cli.py wiki-restore --apply --limit 10
 ```
 
-这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影。
+这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只执行 projection-only 恢复，重建内容无法生成相同 canonical 版本时会拒绝写入。
 
 ## Config
 
@@ -335,6 +342,7 @@ python cli.py wiki-restore --apply --limit 10
 - `target_directories`：raw source 扫描路径。
 - `exclude_paths`：排除目录。
 - `supported_extensions`：当前启用的输入扩展名。
+- Raw watchdog 对单个变更使用候选路径摄取；高峰期由单飞 worker 和有界路径集合合并事件，溢出时触发一次补偿扫描。
 - `processed_files_path`：已处理 raw 文件记录。
 - `subagent.task_packet_path`：当前环境 subagent 任务包路径。
 - `timeline.projection_rebuild`：从 timeline-event claims 重建 `timeline_events` 投影。
@@ -345,6 +353,9 @@ python cli.py wiki-restore --apply --limit 10
 - `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
 - 所有进程通过 SQLite 滚动窗口共享 RPM/TPM 预算；索引重建和增量索引不调用 embedding API，内容变更后的旧向量由显式 `embedding-backfill` 补齐。
 - Ingest 完成必须提交领取阶段返回的 `job_id`、`lease_owner`、`lease_token` 和 `lease_generation`；过期 Worker 的结果会被最终 CAS 拒绝。
+- Mutation outbox 也使用 `lease_owner / lease_token / lease_generation`；同页新意图会保留旧记录并把旧状态改为 `superseded`，旧 worker 在写 Markdown 和索引前都会重新校验租约。若历史 idempotency key 在同页较新意图之后再次出现，系统会创建更晚的新 intent，而不是返回已经过时的历史行。
+- Raw ingest 的处理中登记键由规范化绝对路径与内容 hash 共同生成；内容相同但路径不同的来源独立排队，避免丢失来源关系。
+- 治理队列通过单行 SQLite 操作插入和解析，业务键去重不再采用整表 load/save。
 
 ## Module Map
 
@@ -358,7 +369,9 @@ python cli.py wiki-restore --apply --limit 10
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
 | `vector_lake/tool_memory.py` | 基于 "Wiki-as-Database" 架构的运行态记忆物理写回 |
 | `vector_lake/governance_store.py` | canonical store, change set, operational memory, conflict resolver. Now implements O(1) native SQLite JSON mutations. |
-| `vector_lake/governance_metrics.py` | debt metrics 和治理统计 |
+| `vector_lake/governance_metrics.py` | debt metrics、治理统计与候选报告编排 |
+| `vector_lake/merge_analysis.py` | Unicode-safe 候选召回、证据评分、四态裁决、连通分组与合并预检 |
+| `vector_lake/tokenizer_runtime.py` | rjieba 统一分词边界，保证索引与查询词项一致 |
 | `vector_lake/tool_search.py` | 混合检索管线 (Local Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR) 与 Memory Packet |
 | `vector_lake/tool_query.py` | query-to-page synthesis |
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |

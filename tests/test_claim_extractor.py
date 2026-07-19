@@ -110,5 +110,32 @@ This page mentions OtherPage and defines [is-a:: [[Category]]].
         self.assertEqual(result["entities"][0]["page_key"], "Source_Primary")
         self.assertEqual(result["entities"][0]["type"], "source")
 
+    def test_system_directives_and_footnotes_are_not_claims(self):
+        fm = {
+            "id": "concept_filter",
+            "title": "Claim Filter",
+            "type": "concept",
+            "domain": "General",
+            "status": "Active",
+            "epistemic-status": "seed",
+            "categories": [],
+            "updated": "2026-07-18T00:00:00+00:00",
+            "sources": [],
+        }
+        body = """## 1. 编译事实
+[System Directive: This section represents the latest consensus.]
+
+This is a real claim.[^1]
+
+[^1]: Source_Primary, supporting citation.
+
+## 2. 证据时间线
+"""
+
+        result = extract_page_objects("Concept_Filter.md", fm, body)
+        claim_texts = [claim["claim_text"] for claim in result["claims"]]
+
+        self.assertEqual(claim_texts, ["This is a real claim.[^1]"])
+
 if __name__ == "__main__":
     unittest.main()

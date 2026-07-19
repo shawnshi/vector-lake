@@ -1,0 +1,208 @@
+import json
+
+from vector_lake import db_store, governance_store
+from vector_lake.governance_metrics import (
+    claim_governance_version,
+    compute_debt_metrics,
+    infer_claim_validity,
+)
+
+
+def test_source_only_claim_is_provisional_not_unsupported():
+    validity = infer_claim_validity({
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": ["source_primary"],
+        "evidence_ids": [],
+    })
+
+    assert validity == {
+        "validity_state": "provisional",
+        "reasons": ["source_only_without_block_evidence"],
+    }
+
+
+def test_claim_without_source_or_evidence_is_unsupported():
+    validity = infer_claim_validity({
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+    })
+
+    assert validity == {
+        "validity_state": "unsupported",
+        "reasons": ["missing_evidence_and_source"],
+    }
+
+
+def test_debt_metrics_stream_rows_without_full_store_loads(isolated_memory, monkeypatch):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_streaming",
+        "claim_text": "Streaming debt metric",
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+        "subject_entity_ids": [],
+    }
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-19T00:00:00+00:00"),
+        )
+    for name in ("load_claims", "load_sources", "load_governance_queue", "load_memory_objects"):
+        monkeypatch.setattr(
+            governance_store,
+            name,
+            lambda: (_ for _ in ()).throw(AssertionError("full store load")),
+        )
+
+    metrics = compute_debt_metrics(skip_heavy=True)
+
+    assert metrics["unsupported_claim_count"] == 1
+    assert metrics["managed_unsupported_claim_count"] == 0
+    assert metrics["unmanaged_unsupported_claim_count"] == 1
+    assert metrics["validity_state_counts"]["unsupported"] == 1
+
+
+def test_acknowledged_evidence_gap_is_managed_debt(isolated_memory):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_acknowledged",
+        "claim_text": "Claim awaiting evidence",
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+        "subject_entity_ids": [],
+    }
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-19T00:00:00+00:00"),
+        )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": "gov_evidence_claim_acknowledged",
+            "type": "evidence-gap",
+            "status": "acknowledged",
+            "claim_id": claim["claim_id"],
+            "claim_version": claim_governance_version(claim),
+            "owner": "test-owner",
+            "due_at": "2099-01-01T00:00:00+00:00",
+        },
+        insert_only=True,
+    )
+
+    metrics = compute_debt_metrics(skip_heavy=True)
+
+    assert metrics["unsupported_claim_count"] == 1
+    assert metrics["managed_unsupported_claim_count"] == 1
+    assert metrics["unmanaged_unsupported_claim_count"] == 0
+
+
+def test_stale_claim_version_does_not_count_as_managed_debt(isolated_memory):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_version_changed",
+        "claim_text": "Current claim text",
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+        "subject_entity_ids": [],
+    }
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-19T00:00:00+00:00"),
+        )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": "gov_stale_claim_version",
+            "type": "evidence-gap",
+            "status": "acknowledged",
+            "claim_id": claim["claim_id"],
+            "claim_version": "stale-version",
+            "owner": "test-owner",
+            "due_at": "2099-01-01T00:00:00+00:00",
+        }
+    )
+
+    metrics = compute_debt_metrics(skip_heavy=True)
+
+    assert metrics["managed_unsupported_claim_count"] == 0
+    assert metrics["unmanaged_unsupported_claim_count"] == 1
+
+
+def test_expired_missing_link_target_is_not_managed_debt(isolated_memory):
+    db_store.init_db()
+    governance_store.upsert_governance_item(
+        {
+            "item_id": "gov_missing_link_current",
+            "type": "missing-link-target",
+            "status": "acknowledged",
+            "owner": "test-owner",
+            "due_at": "2099-01-01T00:00:00+00:00",
+        }
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": "gov_missing_link_expired",
+            "type": "missing-link-target",
+            "status": "acknowledged",
+            "owner": "test-owner",
+            "due_at": "2000-01-01T00:00:00+00:00",
+        }
+    )
+
+    metrics = compute_debt_metrics(skip_heavy=True)
+
+    assert metrics["acknowledged_missing_link_target_count"] == 2
+    assert metrics["managed_missing_link_target_count"] == 1
+    assert metrics["unmanaged_missing_link_target_count"] == 1
+
+
+def test_claim_graph_projection_loads_only_bounded_claim_rows(isolated_memory, monkeypatch):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_graph_streaming",
+        "claim_text": "Bounded graph claim",
+        "claim_type": "claim",
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+        "subject_entity_ids": [],
+        "updated_at": "2026-07-19T00:00:00+00:00",
+    }
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), claim["updated_at"]),
+        )
+    monkeypatch.setattr(
+        governance_store,
+        "annotated_claims",
+        lambda: (_ for _ in ()).throw(AssertionError("full claim load")),
+    )
+    monkeypatch.setattr(
+        governance_store,
+        "load_entities",
+        lambda: (_ for _ in ()).throw(AssertionError("full entity load")),
+    )
+    monkeypatch.setattr(
+        governance_store,
+        "load_sources",
+        lambda: (_ for _ in ()).throw(AssertionError("full source load")),
+    )
+
+    graph = governance_store.build_claim_graph_projection(limit_nodes=10)
+
+    assert [node["id"] for node in graph["nodes"]] == ["claim_graph_streaming"]

@@ -45,15 +45,11 @@ def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
         return f"[DRY RUN] Validated {len(operations)} operations. No cycles detected. Would enqueue {len(operations)} merge tasks to the governance queue."
 
     # Enqueue to governance queue
-    queue = governance_store.load_governance_queue()
     enqueued = 0
     now_str = datetime.now(timezone.utc).isoformat()
     
     for src, tgt in replace_map.items():
         # Prevent duplicating items
-        if any(item.get("merge_source") == src and item.get("merge_target") == tgt for item in queue.get("items", [])):
-            continue
-            
         item = {
             "item_id": f"gov_{uuid.uuid4().hex[:12]}",
             "type": "merge",
@@ -62,6 +58,8 @@ def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
             "created_at": now_str,
             "status": "pending",
             "source": "bulk_reconcile",
+            "merge_source": src,
+            "merge_target": tgt,
             "affected_pages": [f"{src}.md", f"{tgt}.md"],
             "merge_candidate": {
                 "left_name": tgt,
@@ -70,10 +68,10 @@ def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
                 "right_entity_id": f"entity_{src}"
             }
         }
-        queue.setdefault("items", []).append(item)
-        enqueued += 1
-
-    if enqueued > 0:
-        governance_store.save_governance_queue(queue)
+        if governance_store.insert_governance_item_if_absent(
+            item,
+            ("merge_source", "merge_target"),
+        ):
+            enqueued += 1
 
     return f"Success: Enqueued {enqueued} merge suggestions to the governance queue. Awaiting Mentat review."

@@ -1,3 +1,4 @@
+import atexit
 import hashlib
 import json
 import sqlite3
@@ -10,6 +11,8 @@ import sqlite_vec
 _LOCAL = threading.local()
 _INIT_LOCK = threading.Lock()
 _INITIALIZED_DB_PATHS: set[str] = set()
+_CONNECTIONS_LOCK = threading.RLock()
+_CONNECTIONS: dict[int, sqlite3.Connection] = {}
 
 
 def _job_idempotency_key(task_type: str, payload: dict | None) -> str | None:
@@ -31,8 +34,21 @@ def get_db_path() -> Path:
     return get_meta_dir() / "vector_lake.db"
 
 def get_connection() -> sqlite3.Connection:
-    if getattr(_LOCAL, "conn", None) is None:
-        db_path = get_db_path()
+    db_path = get_db_path().resolve()
+    db_key = str(db_path)
+    conn = getattr(_LOCAL, "conn", None)
+    with _CONNECTIONS_LOCK:
+        tracked = conn is not None and id(conn) in _CONNECTIONS
+    if conn is not None and (
+        getattr(_LOCAL, "db_key", None) != db_key or not tracked
+    ):
+        if tracked:
+            close_connection()
+        else:
+            _LOCAL.conn = None
+            _LOCAL.db_key = None
+        conn = None
+    if conn is None:
         conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         
@@ -42,13 +58,40 @@ def get_connection() -> sqlite3.Connection:
         conn.enable_load_extension(False)
         
         _LOCAL.conn = conn
-    return _LOCAL.conn
+        _LOCAL.db_key = db_key
+        with _CONNECTIONS_LOCK:
+            _CONNECTIONS[id(conn)] = conn
+    return conn
 
 def close_connection():
-    if hasattr(_LOCAL, "conn") and _LOCAL.conn is not None:
-        _LOCAL.conn.close()
+    conn = getattr(_LOCAL, "conn", None)
+    if conn is not None:
+        with _CONNECTIONS_LOCK:
+            _CONNECTIONS.pop(id(conn), None)
+        conn.close()
         _LOCAL.conn = None
+        _LOCAL.db_key = None
     _LOCAL.in_transaction = False
+
+
+def close_all_connections() -> None:
+    """Close tracked SQLite handles, including handles owned by worker threads."""
+    with _CONNECTIONS_LOCK:
+        connections = list(_CONNECTIONS.values())
+        _CONNECTIONS.clear()
+    for conn in connections:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    local_conn = getattr(_LOCAL, "conn", None)
+    if local_conn is not None and id(local_conn) not in _CONNECTIONS:
+        _LOCAL.conn = None
+        _LOCAL.db_key = None
+    _LOCAL.in_transaction = False
+
+
+atexit.register(close_all_connections)
 
 from contextlib import contextmanager
 
@@ -187,8 +230,13 @@ def _init_db_once(db_key: str):
             ("started_at", "TEXT"),
             ("completed_at", "TEXT"),
             ("lease_until", "TEXT"),
+            ("lease_owner", "TEXT"),
+            ("lease_token", "TEXT"),
+            ("lease_generation", "INTEGER DEFAULT 0"),
+            ("superseded_by", "INTEGER"),
             ("idempotency_key", "TEXT"),
             ("validation_mode", "TEXT DEFAULT 'full'"),
+            ("base_version", "TEXT"),
         ]
         for column_name, column_type in outbox_columns:
             try:
@@ -197,16 +245,43 @@ def _init_db_once(db_key: str):
                 if "duplicate column name" not in str(exc).lower():
                     raise
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mutation_outbox_filename_status "
+            "ON mutation_outbox(filename, status, id DESC)"
+        )
+        conn.execute(
             "UPDATE mutation_outbox SET available_at = created_at "
             "WHERE available_at IS NULL"
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'superseded', "
+            "superseded_by = ("
+            "  SELECT MAX(newer.id) FROM mutation_outbox AS newer "
+            "  WHERE newer.filename = mutation_outbox.filename "
+            "    AND newer.status IN ('pending', 'processing') "
+            "    AND newer.id > mutation_outbox.id"
+            "), completed_at = COALESCE(completed_at, ?), lease_until = NULL, "
+            "lease_owner = NULL, lease_token = NULL "
+            "WHERE status IN ('pending', 'processing') AND EXISTS ("
+            "  SELECT 1 FROM mutation_outbox AS newer "
+            "  WHERE newer.filename = mutation_outbox.filename "
+            "    AND newer.status IN ('pending', 'processing') "
+            "    AND newer.id > mutation_outbox.id"
+            ")",
+            (now,),
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mutation_outbox_ready "
             "ON mutation_outbox(status, available_at, lease_until, id)"
         )
+        conn.execute("DROP INDEX IF EXISTS idx_mutation_outbox_idempotency")
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mutation_outbox_idempotency "
-            "ON mutation_outbox(idempotency_key) WHERE idempotency_key IS NOT NULL"
+            "CREATE INDEX IF NOT EXISTS idx_mutation_outbox_idempotency_lookup "
+            "ON mutation_outbox(idempotency_key, id DESC) WHERE idempotency_key IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mutation_outbox_filename_status "
+            "ON mutation_outbox(filename, status, id DESC)"
         )
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS wiki_search_index USING fts5(
@@ -377,10 +452,10 @@ def _init_db_once(db_key: str):
 
 def upsert_search_index(node_key: str, title: str, summary: str, text: str):
     try:
-        import jieba
-        title_tok = " ".join(jieba.cut(title)) if title else ""
-        summary_tok = " ".join(jieba.cut(summary)) if summary else ""
-        text_tok = " ".join(jieba.cut(text)) if text else ""
+        from vector_lake.tokenizer_runtime import tokenize_for_fts
+        title_tok = tokenize_for_fts(title)
+        summary_tok = tokenize_for_fts(summary)
+        text_tok = tokenize_for_fts(text)
     except ImportError:
         title_tok = title if title else ""
         summary_tok = summary if summary else ""
@@ -536,6 +611,7 @@ def enqueue_mutation(
     payload_text: str | None = None,
     idempotency_key: str | None = None,
     validation_mode: str = "full",
+    base_version: str | None = None,
 ) -> int:
     if mutation_type not in {"update", "delete"}:
         raise ValueError(f"Unsupported mutation_type: {mutation_type}")
@@ -545,27 +621,57 @@ def enqueue_mutation(
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     with transaction():
+        current_id = None
         if idempotency_key:
             existing = conn.execute(
-                "SELECT id, status FROM mutation_outbox WHERE idempotency_key = ?",
+                "SELECT id, status FROM mutation_outbox WHERE idempotency_key = ? "
+                "ORDER BY id DESC LIMIT 1",
                 (idempotency_key,),
             ).fetchone()
             if existing:
-                if existing["status"] == "failed":
-                    conn.execute(
-                        "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
-                        "last_error = NULL, available_at = ?, lease_until = NULL WHERE id = ?",
-                        (now, existing["id"]),
-                    )
-                return int(existing["id"])
-        cursor = conn.execute(
-            "INSERT INTO mutation_outbox "
-            "(filename, mutation_type, payload_text, status, attempt_count, created_at, available_at, "
-            "idempotency_key, validation_mode) "
-            "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?)",
-            (filename, mutation_type, payload_text, now, now, idempotency_key, validation_mode),
+                newer = conn.execute(
+                    "SELECT id FROM mutation_outbox WHERE filename = ? AND id > ? "
+                    "AND status != 'superseded' ORDER BY id DESC LIMIT 1",
+                    (filename, existing["id"]),
+                ).fetchone()
+                if newer is None:
+                    if existing["status"] == "failed":
+                        conn.execute(
+                            "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
+                            "last_error = NULL, available_at = ?, completed_at = NULL, "
+                            "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+                            "superseded_by = NULL WHERE id = ?",
+                            (now, existing["id"]),
+                        )
+                        current_id = int(existing["id"])
+                    else:
+                        return int(existing["id"])
+        if current_id is None:
+            cursor = conn.execute(
+                "INSERT INTO mutation_outbox "
+                "(filename, mutation_type, payload_text, status, attempt_count, created_at, available_at, "
+                "idempotency_key, validation_mode, base_version) "
+                "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)",
+                (
+                    filename,
+                    mutation_type,
+                    payload_text,
+                    now,
+                    now,
+                    idempotency_key,
+                    validation_mode,
+                    base_version,
+                ),
+            )
+            current_id = int(cursor.lastrowid)
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'superseded', superseded_by = ?, "
+            "completed_at = COALESCE(completed_at, ?), lease_until = NULL, "
+            "lease_owner = NULL, lease_token = NULL "
+            "WHERE filename = ? AND id != ? AND status IN ('pending', 'processing')",
+            (current_id, now, filename, current_id),
         )
-        return int(cursor.lastrowid)
+        return current_id
 
 
 def is_managed_projection_state(
@@ -576,25 +682,53 @@ def is_managed_projection_state(
     """Return whether a filesystem event matches the latest durable projection intent."""
     init_db()
     row = get_connection().execute(
-        "SELECT mutation_type, payload_text FROM mutation_outbox "
-        "WHERE filename = ? ORDER BY id DESC LIMIT 1",
+        "SELECT mutation_type, payload_text, status FROM mutation_outbox "
+        "WHERE filename = ? AND status != 'superseded' ORDER BY id DESC LIMIT 1",
         (str(filename),),
     ).fetchone()
-    if row is None or str(row["mutation_type"]) != str(mutation_type):
+    if row is None:
+        return False
+    if str(row["mutation_type"]) != str(mutation_type):
         return False
     if mutation_type == "delete":
         return True
     return row["payload_text"] == payload_text
 
 
-def claim_mutation_outbox(limit: int = 50, lease_seconds: int = 120) -> list[dict]:
+def claim_mutation_outbox(
+    limit: int = 50,
+    lease_seconds: int = 120,
+    lease_owner: str | None = None,
+) -> list[dict]:
     """Atomically claim ready rows, including abandoned processing leases."""
+    import os
+    import secrets
+    import socket
+
     init_db()
     conn = get_connection()
+    owner = lease_owner or os.environ.get("VECTOR_LAKE_OUTBOX_RUN_ID") or f"{socket.gethostname()}:{os.getpid()}"
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
     lease_until = (now_dt + timedelta(seconds=max(1, lease_seconds))).isoformat()
     with transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'superseded', "
+            "superseded_by = ("
+            "  SELECT MAX(newer.id) FROM mutation_outbox AS newer "
+            "  WHERE newer.filename = mutation_outbox.filename "
+            "    AND newer.status IN ('pending', 'processing') "
+            "    AND newer.id > mutation_outbox.id"
+            "), completed_at = COALESCE(completed_at, ?), lease_until = NULL, "
+            "lease_owner = NULL, lease_token = NULL "
+            "WHERE status IN ('pending', 'processing') AND EXISTS ("
+            "  SELECT 1 FROM mutation_outbox AS newer "
+            "  WHERE newer.filename = mutation_outbox.filename "
+            "    AND newer.status IN ('pending', 'processing') "
+            "    AND newer.id > mutation_outbox.id"
+            ")",
+            (now,),
+        )
         rows = conn.execute(
             "SELECT id FROM mutation_outbox WHERE "
             "(status = 'pending' AND COALESCE(available_at, created_at, '') <= ?) OR "
@@ -605,64 +739,128 @@ def claim_mutation_outbox(limit: int = 50, lease_seconds: int = 120) -> list[dic
         ids = [int(row["id"]) for row in rows]
         if not ids:
             return []
-        placeholders = ",".join("?" for _ in ids)
-        conn.execute(
-            f"UPDATE mutation_outbox SET status = 'processing', "
-            f"attempt_count = COALESCE(attempt_count, 0) + 1, started_at = ?, "
-            f"lease_until = ? WHERE id IN ({placeholders})",
-            [now, lease_until, *ids],
-        )
+        claimed_ids = []
+        for outbox_id in ids:
+            token = secrets.token_hex(16)
+            claimed = conn.execute(
+                "UPDATE mutation_outbox SET status = 'processing', "
+                "attempt_count = COALESCE(attempt_count, 0) + 1, started_at = ?, "
+                "lease_until = ?, lease_owner = ?, lease_token = ?, "
+                "lease_generation = COALESCE(lease_generation, 0) + 1 "
+                "WHERE id = ? AND ((status = 'pending' AND COALESCE(available_at, created_at, '') <= ?) "
+                "OR (status = 'processing' AND COALESCE(lease_until, '') <= ?))",
+                (now, lease_until, owner, token, outbox_id, now, now),
+            )
+            if claimed.rowcount:
+                claimed_ids.append(outbox_id)
+        if not claimed_ids:
+            return []
+        placeholders = ",".join("?" for _ in claimed_ids)
         claimed = conn.execute(
             f"SELECT * FROM mutation_outbox WHERE id IN ({placeholders}) ORDER BY id ASC",
-            ids,
+            claimed_ids,
         ).fetchall()
         return [dict(row) for row in claimed]
 
 
-def complete_mutation_outbox(outbox_id: int):
+def mutation_outbox_lease_is_current(
+    outbox_id: int,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+) -> bool:
+    now = datetime.now(timezone.utc).isoformat()
+    row = get_connection().execute(
+        "SELECT 1 FROM mutation_outbox WHERE id = ? AND status = 'processing' "
+        "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+        "AND COALESCE(lease_until, '') > ?",
+        (outbox_id, lease_owner, lease_token, int(lease_generation), now),
+    ).fetchone()
+    return row is not None
+
+
+def mutation_outbox_is_latest_intent(outbox_id: int) -> bool:
+    row = get_connection().execute(
+        "SELECT 1 FROM mutation_outbox AS current WHERE current.id = ? "
+        "AND current.status != 'superseded' AND NOT EXISTS ("
+        "  SELECT 1 FROM mutation_outbox AS newer "
+        "  WHERE newer.filename = current.filename AND newer.id > current.id "
+        "    AND newer.status != 'superseded'"
+        ")",
+        (int(outbox_id),),
+    ).fetchone()
+    return row is not None
+
+
+def complete_mutation_outbox(
+    outbox_id: int,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+) -> bool:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     with transaction():
-        conn.execute(
+        updated = conn.execute(
             "UPDATE mutation_outbox SET status = 'completed', completed_at = ?, "
-            "lease_until = NULL, last_error = NULL WHERE id = ?",
-            (now, outbox_id),
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL, last_error = NULL "
+            "WHERE id = ? AND status = 'processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? AND COALESCE(lease_until, '') > ?",
+            (now, outbox_id, lease_owner, lease_token, int(lease_generation), now),
         )
+    return bool(updated.rowcount)
 
 
 def fail_mutation_outbox(
     outbox_id: int,
     error: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
     max_attempts: int = 3,
     backoff_base: float = 2.0,
 ) -> str:
     conn = get_connection()
-    row = conn.execute(
-        "SELECT attempt_count FROM mutation_outbox WHERE id = ?",
-        (outbox_id,),
-    ).fetchone()
-    if row is None:
-        raise KeyError(f"Unknown mutation_outbox id: {outbox_id}")
-    attempts = int(row["attempt_count"] or 0)
     now_dt = datetime.now(timezone.utc)
-    terminal = attempts >= max(1, int(max_attempts))
-    status = "failed" if terminal else "pending"
-    delay_seconds = 0.0 if terminal else max(0.0, float(backoff_base)) * (2 ** max(0, attempts - 1))
-    available_at = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
+    now = now_dt.isoformat()
     with transaction():
-        conn.execute(
+        row = conn.execute(
+            "SELECT attempt_count FROM mutation_outbox WHERE id = ? AND status = 'processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (outbox_id, lease_owner, lease_token, int(lease_generation), now),
+        ).fetchone()
+        if row is None:
+            return "stale"
+        attempts = int(row["attempt_count"] or 0)
+        terminal = attempts >= max(1, int(max_attempts))
+        status = "failed" if terminal else "pending"
+        delay_seconds = 0.0 if terminal else max(0.0, float(backoff_base)) * (2 ** max(0, attempts - 1))
+        available_at = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
+        updated = conn.execute(
             "UPDATE mutation_outbox SET status = ?, last_error = ?, available_at = ?, "
-            "lease_until = NULL WHERE id = ?",
-            (status, str(error)[:4000], available_at, outbox_id),
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL WHERE id = ? "
+            "AND status = 'processing' AND lease_owner = ? AND lease_token = ? "
+            "AND lease_generation = ? AND COALESCE(lease_until, '') > ?",
+            (
+                status,
+                str(error)[:4000],
+                available_at,
+                outbox_id,
+                lease_owner,
+                lease_token,
+                int(lease_generation),
+                now,
+            ),
         )
-    return status
+        return status if updated.rowcount else "stale"
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
     import re
     query = re.sub(r'[^\w\s\u4e00-\u9fa5]', ' ', query) if query else ""
     try:
-        import jieba
-        query_tok = " ".join(jieba.cut(query)) if query else ""
+        from vector_lake.tokenizer_runtime import tokenize_for_fts
+        query_tok = tokenize_for_fts(query)
     except ImportError:
         query_tok = query if query else ""
 

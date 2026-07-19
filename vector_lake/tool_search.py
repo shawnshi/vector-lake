@@ -9,6 +9,7 @@ import math
 import pickle
 import ast
 import operator
+from xml.sax.saxutils import escape, quoteattr
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_store
@@ -18,6 +19,10 @@ from vector_lake.wiki_utils import get_index_path, get_wiki_dir, get_meta_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-search")
+
+
+class SearchIndexError(RuntimeError):
+    """The durable search projection exists but cannot be decoded safely."""
 
 TOKEN_BUDGET = {
     "operational_memory": 0.30,
@@ -90,8 +95,8 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> di
 
 def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     try:
-        import jieba
-        query_tok = " ".join(jieba.cut(query)) if query else ""
+        from vector_lake.tokenizer_runtime import tokenize_for_fts
+        query_tok = tokenize_for_fts(query)
     except ImportError:
         query_tok = query if query else ""
         
@@ -135,18 +140,14 @@ def _expand_query_locally(query: str) -> list[str]:
 
     tokens = set()
     try:
-        import jieba
-        for term in QUERY_EXPANSION_DICT.keys():
-            jieba.add_word(term)
-        for expansions in QUERY_EXPANSION_DICT.values():
-            for exp in expansions:
-                jieba.add_word(exp)
+        from vector_lake.tokenizer_runtime import segment_text
     except ImportError:
-        jieba = None
+        segment_text = None
 
     for term in expanded_terms:
-        if jieba and CJK_REGEX.search(term):
-            for word in jieba.lcut(term):
+        if segment_text and CJK_REGEX.search(term):
+            tokens.add(term.lower())
+            for word in segment_text(term):
                 word_lower = word.lower()
                 if word_lower not in STOP_WORDS and word_lower.strip():
                     tokens.add(word_lower)
@@ -176,10 +177,11 @@ def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) ->
     source = memory.get("source_page") or memory.get("source_claim_id") or "operational_memory"
     if as_xml:
         attrs = (
-            f"ID='Memory_{index}' Type='{memory_type}' State='{state}' "
-            f"Score='{score}' Source='{source}'"
+            f"ID={quoteattr(f'Memory_{index}')} Type={quoteattr(str(memory_type))} "
+            f"State={quoteattr(str(state))} Score={quoteattr(str(score))} "
+            f"Source={quoteattr(str(source))}"
         )
-        return f"<Memory_Item {attrs}>{text}</Memory_Item>\n"
+        return f"<Memory_Item {attrs}>{escape(text)}</Memory_Item>\n"
     return (
         f"- **{memory_type}:{memory.get('memory_key', memory.get('memory_id'))}** "
         f"(score: {score:.2f}, state: {state})\n"
@@ -196,8 +198,12 @@ def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool =
         memory_types=memory_types,
     )
     if not memories:
-        return "No operational memory matched the query."
-    return "".join(_format_memory_result(memory, as_xml=as_xml, index=index) for index, memory in enumerate(memories))
+        return "<MemoryResults />" if as_xml else "No operational memory matched the query."
+    formatted = "".join(
+        _format_memory_result(memory, as_xml=as_xml, index=index)
+        for index, memory in enumerate(memories)
+    )
+    return f"<MemoryResults>\n{formatted}</MemoryResults>" if as_xml else formatted
 
 
 def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
@@ -381,7 +387,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         index_data = _INDEX_CACHE["data"]
     except Exception as e:
         log.error(f"Failed to read index.json: {e}")
-        return "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
+        raise SearchIndexError("The knowledge base index could not be read safely.") from e
 
     # ⚡ Bolt: Removed unused O(N) list comprehension of all index nodes to eliminate unnecessary memory allocation and CPU overhead in the search hot path.
     intent = _classify_intent(query)
@@ -533,10 +539,15 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 tension_info += f"    -> {te.get('target')} (Polarity: {te.get('polarity')}, Intensity: {te.get('intensity')}): {te.get('context')}\n"
                 
         if as_xml:
-            result += f"<Evidence_Node ID='Wiki_{index}' Source='{node['_key']}.md'>\n{tension_info}{snippet}\n</Evidence_Node>\n"
+            source_name = f"{node['_key']}.md"
+            result += (
+                f"<Evidence_Node ID={quoteattr(f'Wiki_{index}')} "
+                f"Source={quoteattr(source_name)}>\n"
+                f"{escape(tension_info + snippet)}\n</Evidence_Node>\n"
+            )
         else:
             result += f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
-    return result
+    return f"<EvidenceResults>\n{result}</EvidenceResults>" if as_xml else result
 
 
 def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:

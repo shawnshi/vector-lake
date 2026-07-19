@@ -56,6 +56,16 @@ def _clean_claim_text(text: str, limit: int = 360) -> str:
     return cleaned[:limit]
 
 
+def _is_non_claim_block(raw_text: str, cleaned_text: str) -> bool:
+    raw = str(raw_text or "").strip()
+    cleaned = str(cleaned_text or "").strip().lower()
+    if "system directive:" in cleaned:
+        return True
+    if re.match(r"^\[\^[^\]]+\]:", raw):
+        return True
+    return False
+
+
 def _iter_blocks(body: str) -> list[dict]:
     import mistune
     markdown = mistune.create_markdown(renderer='ast')
@@ -83,7 +93,7 @@ def _iter_blocks(body: str) -> list[dict]:
         elif node["type"] == "paragraph":
             raw_text = extract_text(node).strip()
             text = _clean_claim_text(raw_text)
-            if text:
+            if text and not _is_non_claim_block(raw_text, text):
                 blocks.append({
                     "kind": "paragraph",
                     "heading": current_heading,
@@ -95,7 +105,7 @@ def _iter_blocks(body: str) -> list[dict]:
                 if child["type"] == "list_item":
                     raw_text = extract_text(child).strip()
                     text = _clean_claim_text(raw_text)
-                    if text:
+                    if text and not _is_non_claim_block(raw_text, text):
                         blocks.append({
                             "kind": "bullet",
                             "heading": current_heading,

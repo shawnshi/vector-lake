@@ -15,6 +15,7 @@ from vector_lake.tool_trace import trace_vector_lake
 from vector_lake.tool_timeline import rebuild_timeline_events_from_claims
 from vector_lake.tool_projection import (
     canonical_backfill_missing_wiki,
+    reconcile_canonical_content_from_wiki,
     embedding_backfill_projection,
     projection_diff_report,
     rebuild_index_projection,
@@ -42,6 +43,7 @@ __all__ = [
     "prepare_ingest_batch",
     "prepare_query_context",
     "canonical_backfill_missing_wiki",
+    "reconcile_canonical_content_from_wiki",
     "embedding_backfill_projection",
     "projection_diff_report",
     "rebuild_index_projection",

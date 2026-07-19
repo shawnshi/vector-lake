@@ -5,16 +5,55 @@ import random
 import re
 import string
 from collections import defaultdict
-from difflib import SequenceMatcher
 
 from vector_lake import governance_metrics
 from vector_lake import governance_store
-from vector_lake.wiki_utils import get_wiki_dir, read_markdown_file, write_markdown_file
+from vector_lake.merge_analysis import filename_candidate_pairs, normalize_name
+from vector_lake.wiki_utils import (
+    get_wiki_dir,
+    iter_wiki_link_matches,
+    read_markdown_file,
+    write_markdown_file,
+)
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-lint")
+
+_TEMPORAL_LINK = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _register_link_target(
+    exact_map: dict[str, str],
+    normalized_map: dict[str, set[str]],
+    label: str,
+    node_key: str,
+) -> None:
+    cleaned = str(label or "").strip()
+    if not cleaned:
+        return
+    exact_map[cleaned] = node_key
+    normalized = normalize_name(cleaned)
+    if normalized:
+        normalized_map[normalized].add(node_key)
+
+
+def _resolve_link_target(
+    target: str,
+    exact_map: dict[str, str],
+    normalized_map: dict[str, set[str]],
+) -> str | None:
+    cleaned = str(target or "").strip()
+    if not cleaned or _TEMPORAL_LINK.fullmatch(cleaned):
+        return None
+    exact = exact_map.get(cleaned)
+    if exact:
+        return exact
+    matches = normalized_map.get(normalize_name(cleaned), set())
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
 
 
 def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str):
@@ -46,7 +85,7 @@ def lint_vector_lake(auto_fix: bool = False):
     required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]
 
     files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]
-    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment"]}
+    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "reviewed_orphan", "similarity", "decay", "semantic_gc", "governance", "managed_governance", "alignment"]}
     fixes_applied = 0
 
     parsed = {}
@@ -54,6 +93,7 @@ def lint_vector_lake(auto_fix: bool = False):
     alias_map = {}
     all_keys = set()
     link_target_map = {}
+    normalized_link_target_map = defaultdict(set)
     inbound_count = defaultdict(int)
 
     # First Pass: Read and parse
@@ -71,11 +111,10 @@ def lint_vector_lake(auto_fix: bool = False):
             issues["frontmatter"].append(f"{filename}: Missing YAML frontmatter entirely")
             continue
 
-        links = set()
-        for match in re.finditer(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]", content):
-            links.add(match.group(1).strip().replace(".md", ""))
-        for match in re.finditer(r"\[[^\[\]]+?::\s*\[\[([^\]]+?)\]\]\]", content):
-            links.add(match.group(1).strip().split("|")[0].strip().replace(".md", ""))
+        links = {
+            match.group(1).strip().replace(".md", "")
+            for match in iter_wiki_link_matches(content)
+        }
         links.discard("")
 
         parsed[filename] = {"fm": frontmatter, "body": body, "links": links, "path": filepath}
@@ -84,10 +123,20 @@ def lint_vector_lake(auto_fix: bool = False):
         if node_id:
             id_map.setdefault(str(node_id), []).append(filename)
 
-        link_target_map[node_key] = node_key
+        _register_link_target(
+            link_target_map,
+            normalized_link_target_map,
+            node_key,
+            node_key,
+        )
         title = frontmatter.get("title")
         if title:
-            link_target_map[str(title).strip()] = node_key
+            _register_link_target(
+                link_target_map,
+                normalized_link_target_map,
+                str(title),
+                node_key,
+            )
 
         aliases = frontmatter.get("aliases", [])
         if isinstance(aliases, str):
@@ -95,13 +144,23 @@ def lint_vector_lake(auto_fix: bool = False):
         if isinstance(aliases, list):
             for alias in aliases:
                 alias_str = str(alias).strip()
-                link_target_map[alias_str] = node_key
+                _register_link_target(
+                    link_target_map,
+                    normalized_link_target_map,
+                    alias_str,
+                    node_key,
+                )
                 alias_map.setdefault(alias_str, []).append(filename)
 
     for filename, data in parsed.items():
         for target in data["links"]:
-            real_key = link_target_map.get(target, target)
-            inbound_count[real_key] += 1
+            real_key = _resolve_link_target(
+                target,
+                link_target_map,
+                normalized_link_target_map,
+            )
+            if real_key:
+                inbound_count[real_key] += 1
 
     # Apply Auto-fixes iteratively
     # 1. Naming Compliance
@@ -172,34 +231,19 @@ def lint_vector_lake(auto_fix: bool = False):
                             _write_fixed_frontmatter(parsed[fname]["path"], parsed[fname]["fm"], parsed[fname]["body"])
                             fixes_applied += 1
 
-    # 4. Broken Links (Stub Creation)
+    # 4. Broken Links. Missing targets require explicit governance; creating
+    # empty stubs would turn a topology error into unsupported fake knowledge.
     for filename, data in parsed.items():
         for target in data["links"]:
-            if target not in link_target_map and target not in all_keys:
+            if _TEMPORAL_LINK.fullmatch(target):
+                continue
+            resolved_target = _resolve_link_target(
+                target,
+                link_target_map,
+                normalized_link_target_map,
+            )
+            if not resolved_target:
                 issues["broken_links"].append(f"{filename} -> [[{target}]]: target does not exist")
-                if auto_fix:
-                    stub_filename = f"Concept_{target}.md" if not target.startswith(valid_prefixes) else f"{target}.md"
-                    stub_filename = re.sub(r'[\\/*?:"<>|]', "_", stub_filename)
-                    stub_path = os.path.join(wiki_dir, stub_filename)
-                    if not os.path.exists(stub_path):
-                        stub_fm = {
-                            "id": _generate_id(),
-                            "title": target,
-                            "type": "concept",
-                            "domain": "General",
-                            "status": "Active",
-                            "epistemic-status": "seed",
-                            "categories": ["Uncategorized"],
-                            "sources": [],
-                            "strategic_scope": "edge",
-                            "evidence_tier": "derived",
-                            "created": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z"),
-                            "updated": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z")
-                        }
-                        stub_body = f"\n# {target}\n\n## 1. 编译事实\n*[System Directive: This section represents the LATEST consensus.]*\n\nAuto-generated stub for {target}. (Last Reshaped: [[{datetime.datetime.now().strftime('%Y-%m-%d')}]])\n\n### 物理机制 (Mechanism)\n- [[{target}]] Auto-generated stub.\n\n---\n\n## 2. 证据时间线\n*[System Directive: This is the immutable event ledger.]*\n\n- [{datetime.datetime.now().strftime('%Y-%m-%d')}] [Observation] Created stub.\n"
-                        _write_fixed_frontmatter(stub_path, stub_fm, stub_body)
-                        all_keys.add(stub_filename[:-3])
-                        fixes_applied += 1
 
     # 5. Frontmatter, Type, Status, Category
     for filename, data in parsed.items():
@@ -272,80 +316,46 @@ def lint_vector_lake(auto_fix: bool = False):
         except SchemaViolationException as e:
             issues["schema"].append(f"{filename}: {str(e)}")
 
-    # 6. Similarity Merge (>0.91)
-    keys_list = sorted(list(all_keys))
-    merged_keys = set()
-    for index, key_a in enumerate(keys_list):
-        if key_a in merged_keys: continue
-        for other_index in range(index + 1, min(index + 50, len(keys_list))):
-            key_b = keys_list[other_index]
-            if key_b in merged_keys: continue
-            
-            prefix_a = key_a.split("_")[0] if "_" in key_a else ""
-            prefix_b = key_b.split("_")[0] if "_" in key_b else ""
-            if prefix_a != prefix_b:
-                continue
-            name_a = key_a.split("_", 1)[1] if "_" in key_a else key_a
-            name_b = key_b.split("_", 1)[1] if "_" in key_b else key_b
-            ratio = SequenceMatcher(None, name_a.lower(), name_b.lower()).ratio()
-            
-            if ratio > 0.91 and key_a != key_b:
-                issues["similarity"].append(f"Duplicate: {key_a}.md <-> {key_b}.md ({ratio:.0%})")
-                if False: # auto_fix disabled for similarity merge by Mentat
-                    # Determine Primary vs Secondary based on 'updated' date
-                    file_a = f"{key_a}.md"
-                    file_b = f"{key_b}.md"
-                    if file_a not in parsed or file_b not in parsed: continue
-                    
-                    fm_a = parsed[file_a]["fm"]
-                    fm_b = parsed[file_b]["fm"]
-                    date_a = fm_a.get("updated", "")
-                    date_b = fm_b.get("updated", "")
-                    
-                    if date_b > date_a:
-                        primary, secondary = file_b, file_a
-                        p_key, s_key = key_b, key_a
-                    else:
-                        primary, secondary = file_a, file_b
-                        p_key, s_key = key_a, key_b
-                    
-                    p_data = parsed[primary]
-                    s_data = parsed[secondary]
-                    
-                    # Append Body
-                    new_body = p_data["body"] + f"\n\n---\n## Auto-Merged from {s_key}\n\n" + s_data["body"]
-                    p_data["body"] = new_body
-                    
-                    # Append Alias
-                    p_aliases = p_data["fm"].get("aliases", [])
-                    if isinstance(p_aliases, str): p_aliases = [p_aliases]
-                    if s_key not in p_aliases: p_aliases.append(s_key)
-                    s_aliases = s_data["fm"].get("aliases", [])
-                    if isinstance(s_aliases, str): s_aliases = [s_aliases]
-                    for alias in s_aliases:
-                        if alias not in p_aliases: p_aliases.append(alias)
-                    p_data["fm"]["aliases"] = p_aliases
-                    p_data["fm"]["updated"] = datetime.datetime.now().strftime("%Y-%m-%d")
-                    
-                    # Write Primary
-                    _write_fixed_frontmatter(p_data["path"], p_data["fm"], p_data["body"])
-                    
-                    # Delete Secondary
-                    try:
-                        from vector_lake.mutation_coordinator import execute_mutation_plan
-                        execute_mutation_plan(secondary, is_delete=True)
-                    except Exception as e:
-                        log.error(f"Failed to delete merged secondary {s_data['path']}: {e}")
-                    
-                    merged_keys.add(s_key)
-                    fixes_applied += 1
+    # 6. Filename similarity candidates. Actual merge decisions use governance analysis.
+    for key_a, key_b, ratio in filename_candidate_pairs(all_keys):
+        issues["similarity"].append(
+            f"Candidate: {key_a}.md <-> {key_b}.md ({ratio:.0%})"
+        )
 
     # Remaining checks (Orphans, Decay, Governance, Alignment)
     for filename in files:
-        if filename[:-3] in merged_keys: continue
         node_key = filename[:-3]
         if inbound_count.get(node_key, 0) == 0 and not filename.startswith("Source_"):
-            issues["orphan"].append(f"{filename}: No inbound links (orphan)")
+            topology_status = str(
+                parsed.get(filename, {}).get("fm", {}).get("topology_status", "")
+            ).strip().lower()
+            review_due = str(
+                parsed.get(filename, {}).get("fm", {}).get("topology_review_due", "")
+            ).strip()
+            review_owner = str(
+                parsed.get(filename, {}).get("fm", {}).get("topology_review_owner", "")
+            ).strip()
+            review_basis = str(
+                parsed.get(filename, {}).get("fm", {}).get("topology_review_basis", "")
+            ).strip()
+            try:
+                due_is_current = (
+                    datetime.date.fromisoformat(review_due)
+                    >= datetime.datetime.now(datetime.timezone.utc).date()
+                )
+            except ValueError:
+                due_is_current = False
+            if (
+                topology_status == "acknowledged-orphan"
+                and review_owner
+                and review_basis == "no-resolvable-inbound-links"
+                and due_is_current
+            ):
+                issues["reviewed_orphan"].append(
+                    f"{filename}: Acknowledged orphan; owner={review_owner}; due={review_due}"
+                )
+            else:
+                issues["orphan"].append(f"{filename}: No inbound links (orphan)")
 
     DEFAULT_TTL = {
         "source": 365,
@@ -361,7 +371,6 @@ def lint_vector_lake(auto_fix: bool = False):
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     for filename, data in parsed.items():
-        if filename[:-3] in merged_keys: continue
         frontmatter = data["fm"]
         updated_str = str(frontmatter.get("updated", ""))
         if not updated_str:
@@ -395,7 +404,6 @@ def lint_vector_lake(auto_fix: bool = False):
     archive_dir = os.path.join(wiki_dir, ".archive")
     import shutil
     for filename, data in parsed.items():
-        if filename[:-3] in merged_keys: continue
         frontmatter = data["fm"]
         node_status = str(frontmatter.get("status", "")).lower()
         node_key = filename[:-3]
@@ -432,8 +440,23 @@ def lint_vector_lake(auto_fix: bool = False):
 
     governance_store.initialize_meta_store()
     metrics = governance_metrics.compute_debt_metrics()
-    if metrics["unsupported_claim_count"] > 0:
-        issues["governance"].append(f"Unsupported claims: {metrics['unsupported_claim_count']}")
+    if metrics["unmanaged_unsupported_claim_count"] > 0:
+        issues["governance"].append(
+            f"Unmanaged unsupported claims: {metrics['unmanaged_unsupported_claim_count']}"
+        )
+    if metrics["managed_unsupported_claim_count"] > 0:
+        issues["managed_governance"].append(
+            f"Acknowledged evidence-gap claims (owner/due/version bound): {metrics['managed_unsupported_claim_count']}"
+        )
+    if metrics["unmanaged_missing_link_target_count"] > 0:
+        issues["governance"].append(
+            f"Unmanaged missing-link targets: {metrics['unmanaged_missing_link_target_count']}"
+        )
+    if metrics["managed_missing_link_target_count"] > 0:
+        issues["managed_governance"].append(
+            "Acknowledged missing-link targets (owner/due bound): "
+            f"{metrics['managed_missing_link_target_count']}"
+        )
     if metrics["stale_claim_count"] > 0:
         issues["governance"].append(f"Stale claims: {metrics['stale_claim_count']}")
     if metrics["pending_change_set_count"] > 0:
@@ -448,19 +471,39 @@ def lint_vector_lake(auto_fix: bool = False):
         "alias_conflict": "6. Alias Conflicts",
         "broken_links": "7. Broken Links",
         "orphan": "8. Orphan Pages",
+        "reviewed_orphan": "8b. Acknowledged Orphan Debt",
         "similarity": "9. Filename Similarity",
         "decay": "10. Knowledge Decay",
         "semantic_gc": "11. Semantic Garbage Collection",
         "governance": "12. Governance Debt",
+        "managed_governance": "12b. Managed Governance Debt",
         "alignment": "13. Alignment Drift",
         "schema": "14. Strict Schema Verification",
     }
 
-    total_issues = sum(len(items) for items in issues.values())
-    lines = ["=== Vector Lake Lint Report ===", f"Scanned: {len(files)} files | Issues: {total_issues} | Auto-fixed: {fixes_applied}", ""]
+    informational_checks = {"similarity", "reviewed_orphan", "managed_governance"}
+    total_issues = sum(
+        len(items)
+        for key, items in issues.items()
+        if key not in informational_checks
+    )
+    managed_debt_count = (
+        len(issues["reviewed_orphan"])
+        + int(metrics["managed_unsupported_claim_count"])
+        + int(metrics["managed_missing_link_target_count"])
+    )
+    lines = [
+        "=== Vector Lake Lint Report ===",
+        f"Scanned: {len(files)} files | Issues: {total_issues} | Managed debt: {managed_debt_count} | Auto-fixed: {fixes_applied}",
+        "",
+    ]
     for key, name in check_names.items():
         items = issues[key]
-        lines.append(f"{name}: {'[PASS]' if not items else f'[FAIL: {len(items)}]'}")
+        if key in informational_checks:
+            state = "[PASS]" if not items else f"[INFO: {len(items)}]"
+        else:
+            state = "[PASS]" if not items else f"[FAIL: {len(items)}]"
+        lines.append(f"{name}: {state}")
         for item in items[:10]:
             lines.append(f"    {item}")
         if len(items) > 10:

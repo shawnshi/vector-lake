@@ -4,9 +4,44 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+_INDEX_PARITY_FIELDS = (
+    "id",
+    "title",
+    "summary",
+    "raw_text",
+    "type",
+    "domain",
+    "topic_cluster",
+    "status",
+    "epistemic_status",
+    "categories",
+    "tags",
+    "aliases",
+    "relations",
+    "sources",
+    "tension_edges",
+    "links",
+    "outbound_links",
+    "triples",
+    "updated",
+    "updated_at",
+)
+
+_CACHE_LOCK = threading.RLock()
+_CANONICAL_CACHE: dict[str, Any] = {"key": None, "value": None}
+_INDEX_CACHE: dict[str, Any] = {"key": None, "value": None}
+_WIKI_VERSION_CACHE: dict[str, tuple[tuple[int, int, int], str | None, str | None]] = {}
+
+
+def _index_projection_signature(node: dict[str, Any]) -> str:
+    stable_projection = {field: node.get(field) for field in _INDEX_PARITY_FIELDS}
+    return json.dumps(stable_projection, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _parse_dt(value: Any):
@@ -19,6 +54,98 @@ def _parse_dt(value: Any):
         return parsed
     except Exception:
         return None
+
+
+def _canonical_snapshot(conn, db_path: Path) -> dict[str, list[tuple[str, dict[str, Any], str]]]:
+    """Load canonical entities once for an unchanged database generation."""
+    generation = conn.execute(
+        "SELECT COUNT(*) AS count, MAX(updated_at) AS latest, "
+        "COALESCE(SUM(LENGTH(data_json)), 0) AS bytes FROM entities"
+    ).fetchone()
+    key = (
+        str(db_path.resolve()),
+        int(generation["count"] or 0),
+        str(generation["latest"] or ""),
+        int(generation["bytes"] or 0),
+    )
+    with _CACHE_LOCK:
+        if _CANONICAL_CACHE.get("key") == key:
+            return _CANONICAL_CACHE["value"]
+
+    by_page: dict[str, list[tuple[str, dict[str, Any], str]]] = {}
+    for row in conn.execute("SELECT entity_id, data_json FROM entities ORDER BY entity_id"):
+        raw = str(row["data_json"])
+        try:
+            entity = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        page_key = str(entity.get("page_key") or "")
+        if not page_key or page_key.startswith("System_"):
+            continue
+        by_page.setdefault(page_key, []).append((str(row["entity_id"]), entity, raw))
+    with _CACHE_LOCK:
+        _CANONICAL_CACHE.update({"key": key, "value": by_page})
+    return by_page
+
+
+def _index_snapshot(index_path: Path) -> tuple[dict[str, Any], Exception | None]:
+    """Parse index.json once for an unchanged file identity."""
+    try:
+        stat = index_path.stat()
+        key = (str(index_path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+    except OSError as exc:
+        return {"nodes": {}}, exc
+    with _CACHE_LOCK:
+        if _INDEX_CACHE.get("key") == key:
+            return _INDEX_CACHE["value"], None
+    try:
+        value = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"nodes": {}}, exc
+    with _CACHE_LOCK:
+        _INDEX_CACHE.update({"key": key, "value": value})
+    return value, None
+
+
+def _wiki_projection_version(governance_store, path: Path) -> tuple[str | None, str | None]:
+    """Return a page version using a stat-keyed, process-local parse cache."""
+    cache_key = str(path.resolve())
+    try:
+        stat = path.stat()
+        identity = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+    except OSError as exc:
+        return None, str(exc)
+    with _CACHE_LOCK:
+        cached = _WIKI_VERSION_CACHE.get(cache_key)
+        if cached and cached[0] == identity:
+            return cached[1], cached[2]
+    try:
+        version = governance_store.canonical_page_version_from_content(
+            path.name,
+            path.read_text(encoding="utf-8"),
+        )
+        error = None
+    except Exception as exc:
+        version = None
+        error = str(exc)
+    with _CACHE_LOCK:
+        _WIKI_VERSION_CACHE[cache_key] = (identity, version, error)
+    return version, error
+
+
+def _prune_wiki_version_cache(active_paths: set[str]) -> None:
+    with _CACHE_LOCK:
+        stale = [key for key in _WIKI_VERSION_CACHE if key not in active_paths]
+        for key in stale:
+            _WIKI_VERSION_CACHE.pop(key, None)
+
+
+def _clear_health_caches_for_tests() -> None:
+    """Reset process-local caches; intentionally private to runtime tests."""
+    with _CACHE_LOCK:
+        _CANONICAL_CACHE.update({"key": None, "value": None})
+        _INDEX_CACHE.update({"key": None, "value": None})
+        _WIKI_VERSION_CACHE.clear()
 
 
 def assess_runtime_health(
@@ -123,24 +250,21 @@ def assess_runtime_health(
         path.stem for path in wiki_dir.glob("*.md")
         if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
     } if wiki_dir.exists() else set()
-    canonical_keys = {
-        row["page_key"] for row in conn.execute(
-            "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
-            "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
-        )
-        if row["page_key"] and not str(row["page_key"]).startswith("System_")
-    }
+    canonical_entities_by_page = _canonical_snapshot(conn, db_path)
+    canonical_keys = set(canonical_entities_by_page)
     index_path = get_index_path()
     index_available = index_path.exists()
+    index_data: dict[str, Any] = {"nodes": {}}
     if index_path.exists():
-        try:
+        index_data, index_error = _index_snapshot(index_path)
+        if index_error is None:
             index_keys = {
-                key for key in json.loads(index_path.read_text(encoding="utf-8")).get("nodes", {})
+                key for key in index_data.get("nodes", {})
                 if not str(key).startswith("System_")
             }
-        except Exception as exc:
+        else:
             index_keys = set()
-            issues.append(f"index_unreadable:{exc}")
+            issues.append(f"index_unreadable:{index_error}")
     else:
         index_keys = set()
         warnings.append("index_missing")
@@ -163,6 +287,150 @@ def assess_runtime_health(
             f"missing_canonical={drift['missing_canonical']},"
             f"extra_canonical={drift['extra_canonical']}"
         )
+
+    if deep_projection_checks:
+        from vector_lake import governance_store
+        from vector_lake.claim_extractor import extract_page_objects
+        from vector_lake.indexer import _entity_to_index_node, claim_graph_projection_parity
+        from vector_lake.wiki_utils import split_frontmatter
+
+        active_projection_rows = conn.execute(
+            "SELECT filename, mutation_type, payload_text, base_version "
+            "FROM mutation_outbox WHERE status IN ('pending', 'processing') "
+            "ORDER BY id DESC"
+        ).fetchall()
+        active_projection_intents = {}
+        for row in active_projection_rows:
+            page_key = Path(str(row["filename"])).stem
+            active_projection_intents.setdefault(page_key, row)
+
+        wiki_content_drift: list[str] = []
+        unreadable_wiki: list[str] = []
+        shared_wiki_keys = wiki_keys & canonical_keys
+        canonical_versions = {
+            page_key: governance_store._canonical_entity_rows_version(
+                [(entity_id, raw) for entity_id, _, raw in canonical_entities_by_page[page_key]]
+            )
+            for page_key in shared_wiki_keys
+        }
+        managed_base_versions = {}
+        for page_key, row in active_projection_intents.items():
+            if page_key not in canonical_versions:
+                continue
+            if str(row["mutation_type"]) != "update" or row["payload_text"] is None:
+                continue
+            base_version = row["base_version"]
+            if base_version is None:
+                continue
+            try:
+                payload_version = governance_store.canonical_page_version_from_content(
+                    str(row["filename"]),
+                    str(row["payload_text"]),
+                )
+            except Exception:
+                continue
+            if payload_version == canonical_versions.get(page_key):
+                managed_base_versions[page_key] = str(base_version)
+        active_wiki_paths = {
+            str((wiki_dir / f"{page_key}.md").resolve())
+            for page_key in shared_wiki_keys
+        }
+        _prune_wiki_version_cache(active_wiki_paths)
+        managed_reconciliation_drift: set[str] = set()
+        managed_wiki_pages: set[str] = set()
+        for page_key in sorted(shared_wiki_keys):
+            path = wiki_dir / f"{page_key}.md"
+            observed, observed_error = _wiki_projection_version(governance_store, path)
+            if observed_error is not None:
+                unreadable_wiki.append(page_key)
+                continue
+            if observed != canonical_versions.get(page_key):
+                if observed == managed_base_versions.get(page_key):
+                    managed_reconciliation_drift.add(page_key)
+                    managed_wiki_pages.add(page_key)
+                else:
+                    wiki_content_drift.append(page_key)
+
+        index_content_drift: list[str] = []
+        for page_key in sorted(index_keys & canonical_keys):
+            node = index_data.get("nodes", {}).get(page_key) or {}
+            expected_signatures = set()
+            for entity_id, entity, _ in canonical_entities_by_page.get(page_key, []):
+                try:
+                    projected_key, projected_node = _entity_to_index_node(entity, entity_id)
+                except Exception:
+                    continue
+                if projected_key == page_key:
+                    expected_signatures.add(_index_projection_signature(projected_node))
+            if _index_projection_signature(node) not in expected_signatures:
+                managed_index = False
+                if page_key in managed_wiki_pages:
+                    try:
+                        path = wiki_dir / f"{page_key}.md"
+                        content = path.read_text(encoding="utf-8")
+                        frontmatter, body = split_frontmatter(content)
+                        observed_entities = extract_page_objects(
+                            path.name,
+                            frontmatter,
+                            body,
+                        ).get("entities", [])
+                        observed_signatures = {
+                            _index_projection_signature(projected_node)
+                            for entity in observed_entities
+                            for projected_key, projected_node in [
+                                _entity_to_index_node(entity, str(entity.get("entity_id") or ""))
+                            ]
+                            if projected_key == page_key
+                        }
+                        managed_index = _index_projection_signature(node) in observed_signatures
+                    except Exception:
+                        managed_index = False
+                if managed_index:
+                    managed_reconciliation_drift.add(page_key)
+                else:
+                    index_content_drift.append(page_key)
+
+        content_drift = {
+            "wiki_canonical": len(wiki_content_drift),
+            "index_canonical": len(index_content_drift),
+            "unreadable_wiki": len(unreadable_wiki),
+            "wiki_samples": wiki_content_drift[:10],
+            "index_samples": index_content_drift[:10],
+            "unreadable_samples": unreadable_wiki[:10],
+            "managed_reconciliation": len(managed_reconciliation_drift),
+            "managed_reconciliation_samples": sorted(managed_reconciliation_drift)[:10],
+        }
+        detail["projection_content_drift"] = content_drift
+        if wiki_content_drift or index_content_drift or unreadable_wiki:
+            issues.append(
+                "projection_content_drift:"
+                f"wiki_canonical={len(wiki_content_drift)},"
+                f"index_canonical={len(index_content_drift)},"
+                f"unreadable_wiki={len(unreadable_wiki)}"
+            )
+        if managed_reconciliation_drift:
+            warnings.append(f"projection_reconciliation_pending:{len(managed_reconciliation_drift)}")
+
+        try:
+            claim_graph_drift = claim_graph_projection_parity()
+            detail["claim_graph_projection_drift"] = claim_graph_drift
+            if any(
+                claim_graph_drift[key]
+                for key in ("missing_nodes", "extra_nodes", "missing_edges", "extra_edges")
+            ):
+                message = (
+                    "claim_graph_projection_drift:"
+                    f"missing_nodes={claim_graph_drift['missing_nodes']},"
+                    f"extra_nodes={claim_graph_drift['extra_nodes']},"
+                    f"missing_edges={claim_graph_drift['missing_edges']},"
+                    f"extra_edges={claim_graph_drift['extra_edges']}"
+                )
+                if active_projection_rows:
+                    warnings.append("claim_graph_reconciliation_pending:" + message)
+                else:
+                    issues.append(message)
+        except Exception as exc:
+            issues.append(f"claim_graph_projection_unavailable:{exc}")
 
     strict_timeline_parity = os.environ.get("VECTOR_LAKE_TIMELINE_PARITY_BLOCKING") == "1"
     if deep_projection_checks or strict_timeline_parity:
@@ -188,7 +456,7 @@ def enforce_runtime_write_health(validation_mode: str = "full"):
         return
     if validation_mode == "schema":
         return
-    health = assess_runtime_health()
+    health = assess_runtime_health(deep_projection_checks=True)
     if not health["ok"]:
         raise RuntimeError(
             "Vector Lake write gate blocked this mutation because runtime health is not clean. "
