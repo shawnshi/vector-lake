@@ -5,6 +5,7 @@ import os
 import re
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import yaml
@@ -761,18 +762,18 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         affinity_dict_a = type_affinity_precomputed[type_a]
         reverse_links_a = reverse_links.get(key_a, frozenset())
 
-        candidate_source_overlaps = {}
-        candidate_neighbor_scores = {}
+        candidate_source_overlaps = defaultdict(int)
+        candidate_neighbor_scores = defaultdict(float)
         
         for source in sources_a:
             for key_b in source_to_nodes.get(source, []):
                 if key_a < key_b:
-                    candidate_source_overlaps[key_b] = candidate_source_overlaps.get(key_b, 0) + 1
+                    candidate_source_overlaps[key_b] += 1
                     
         for neighbor in links_a:
             for key_b in reverse_links.get(neighbor, []):
                 if key_a < key_b:
-                    candidate_neighbor_scores[key_b] = candidate_neighbor_scores.get(key_b, 0.0) + node_degrees[neighbor]
+                    candidate_neighbor_scores[key_b] += node_degrees[neighbor]
 
         candidates = set(candidate_source_overlaps.keys())
         candidates.update(candidate_neighbor_scores.keys())
