@@ -3,24 +3,20 @@ import json
 import hashlib
 import logging
 import re
-import uuid
-import subprocess
-import sys
+import traceback
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
 
 from vector_lake import get_extension_root
-from vector_lake.db_store import get_processed_files, mark_file_processed
+from vector_lake.db_store import mark_file_processed
 from vector_lake import governance_store
 from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
-    get_memory_dir,
     get_meta_dir,
     get_raw_dir,
     get_wiki_dir,
     get_index_path,
-    normalize_raw_ref,
     validate_wiki_filename,
 )
 from vector_lake.purpose_contract import (
@@ -840,4 +836,4 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             f"Integration disposition: {integration_disposition}.{suffix}"
         )
     except Exception as e:
-        import traceback; return f"Error finalizing ingestion: {e}\n{traceback.format_exc()}"
+        return f"Error finalizing ingestion: {e}\n{traceback.format_exc()}"

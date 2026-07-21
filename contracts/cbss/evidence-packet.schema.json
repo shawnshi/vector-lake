@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector-lake.local/contracts/cbss/evidence-packet.schema.json",
+  "title": "Vector Lake CBSS EvidencePacket",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "packet_id",
+    "generated_at",
+    "contract_version",
+    "packet_type",
+    "disposition",
+    "claim",
+    "evidence",
+    "sources",
+    "assessments",
+    "provenance"
+  ],
+  "properties": {
+    "packet_id": {"type": "string", "pattern": "^ep_[0-9a-f]{24}$"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "contract_version": {"const": "1.1"},
+    "packet_type": {"const": "claim_evidence"},
+    "disposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "accepted_fact", "authority_required"],
+      "properties": {
+        "state": {"const": "claim_candidate"},
+        "accepted_fact": {"const": false},
+        "authority_required": {"const": true}
+      }
+    },
+    "claim": {
+      "type": "object",
+      "required": ["claim_id", "claim_text", "validity_state", "validity_reasons"],
+      "properties": {
+        "claim_id": {"type": "string", "minLength": 1},
+        "claim_text": {"type": "string"},
+        "validity_state": {"type": "string"},
+        "validity_reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "evidence": {"type": "array", "items": {"type": "object"}},
+    "sources": {"type": "array", "items": {"type": "object"}},
+    "assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "assessment_id",
+          "claim_id",
+          "assessment_type",
+          "outcome",
+          "actor_id",
+          "method_version",
+          "reason",
+          "recorded_at"
+        ],
+        "properties": {
+          "assessment_id": {"type": "string", "minLength": 1},
+          "claim_id": {"type": "string", "minLength": 1},
+          "assessment_type": {"type": "string", "minLength": 1},
+          "outcome": {
+            "enum": ["supported", "unsupported", "contradicted", "inconclusive", "needs_review"]
+          },
+          "actor_id": {"type": "string", "minLength": 1},
+          "method_version": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1},
+          "recorded_at": {"type": "string", "format": "date-time"}
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_store",
+        "source_page",
+        "canonical_page_version",
+        "evidence_complete",
+        "source_complete",
+        "source_integrity_complete",
+        "raw_locator_complete",
+        "assessment_complete",
+        "lineage_safe",
+        "evidence_text_export",
+        "warnings"
+      ],
+      "properties": {
+        "canonical_store": {"const": "sqlite"},
+        "source_page": {"type": "string"},
+        "canonical_page_version": {"type": "string"},
+        "evidence_complete": {"type": "boolean"},
+        "source_complete": {"type": "boolean"},
+        "source_integrity_complete": {"type": "boolean"},
+        "raw_locator_complete": {"type": "boolean"},
+        "assessment_complete": {"type": "boolean"},
+        "lineage_safe": {"type": "boolean"},
+        "evidence_text_export": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["included", "actor_id", "purpose"],
+          "properties": {
+            "included": {"type": "boolean"},
+            "actor_id": {"type": ["string", "null"]},
+            "purpose": {"type": ["string", "null"]}
+          }
+        },
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -3,6 +3,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from vector_lake.wiki_utils import get_meta_dir
@@ -92,8 +93,6 @@ def close_all_connections() -> None:
 
 
 atexit.register(close_all_connections)
-
-from contextlib import contextmanager
 
 @contextmanager
 def transaction():
@@ -192,6 +191,137 @@ def _init_db_once(db_key: str):
                 updated_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                sha256 TEXT,
+                byte_size INTEGER,
+                mime_type TEXT,
+                storage_uri TEXT,
+                integrity_status TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_artifacts_source "
+            "ON source_artifacts(source_id, recorded_at)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS extraction_runs (
+                run_id TEXT PRIMARY KEY,
+                page_key TEXT NOT NULL,
+                input_fingerprint TEXT NOT NULL,
+                extractor_name TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_extraction_runs_page "
+            "ON extraction_runs(page_key, recorded_at)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS claim_versions (
+                claim_version_id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL,
+                claim_family_id TEXT NOT NULL,
+                page_key TEXT,
+                version_no INTEGER NOT NULL,
+                record_hash TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(claim_family_id, record_hash)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_versions_family "
+            "ON claim_versions(claim_family_id, version_no)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS evidence_versions (
+                evidence_version_id TEXT PRIMARY KEY,
+                evidence_id TEXT NOT NULL,
+                evidence_family_id TEXT NOT NULL,
+                page_key TEXT,
+                version_no INTEGER NOT NULL,
+                record_hash TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(evidence_family_id, record_hash)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_evidence_versions_family "
+            "ON evidence_versions(evidence_family_id, version_no)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS entity_identities (
+                entity_id TEXT PRIMARY KEY,
+                page_key TEXT NOT NULL UNIQUE,
+                canonical_name TEXT,
+                identity_origin TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS claim_assessments (
+                assessment_id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL,
+                assessment_type TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                method_version TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_assessments_claim "
+            "ON claim_assessments(claim_id, recorded_at)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS critical_decision_registry (
+                decision_id TEXT PRIMARY KEY,
+                registry_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                risk_weight REAL NOT NULL,
+                verification TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_registry (
+                schema_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                dialect_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                schema_hash TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (schema_id, version)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS quality_evaluation_runs (
+                evaluation_id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                dataset_version TEXT NOT NULL,
+                evaluator_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quality_runs_dataset "
+            "ON quality_evaluation_runs(dataset_id, dataset_version, recorded_at)"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS change_sets (
                 change_set_id TEXT PRIMARY KEY,
@@ -559,7 +689,7 @@ def delete_node_cascade(node_key: str):
     conn = get_connection()
     with transaction():
         rows = conn.execute(
-            "SELECT entity_id FROM entities "
+            "SELECT entity_id, canonical_name, data_json FROM entities "
             "WHERE entity_id = ? OR canonical_name = ? "
             "OR json_extract(data_json, '$.page_key') = ?",
             (node_key, node_key, node_key),
@@ -573,6 +703,117 @@ def delete_node_cascade(node_key: str):
             "json_extract(data_json, '$.source_page') IN (?, ?)",
             (node_key, node_key, node_key + ".md"),
         ).fetchall()
+        old_evidence_rows = conn.execute(
+            "SELECT evidence_id, data_json, updated_at FROM evidence WHERE "
+            "json_extract(data_json, '$.locator.page_key') = ?",
+            (node_key,),
+        ).fetchall()
+
+        # Deleting a canonical page must also close every durable projection that
+        # can otherwise make the removed content look current.  Keep the history,
+        # but turn it into an explicit tombstone inside this same transaction.
+        now = datetime.now(timezone.utc).isoformat()
+        claim_ids = sorted({str(row["claim_id"]) for row in old_claim_rows})
+        memory_params: list[str] = [node_key, node_key + ".md"]
+        memory_where = "json_extract(data_json, '$.source_page') IN (?, ?)"
+        if claim_ids:
+            claim_placeholders = ",".join("?" for _ in claim_ids)
+            memory_where += (
+                " OR json_extract(data_json, '$.source_claim_id') "
+                f"IN ({claim_placeholders})"
+            )
+            memory_params.extend(claim_ids)
+        memory_rows = conn.execute(
+            f"SELECT memory_id, data_json FROM operational_memory WHERE {memory_where}",
+            memory_params,
+        ).fetchall()
+        for memory_row in memory_rows:
+            try:
+                memory = json.loads(memory_row["data_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                memory = {"memory_id": memory_row["memory_id"]}
+            reasons = memory.get("validity_reasons") or []
+            if not isinstance(reasons, list):
+                reasons = [str(reasons)]
+            if "source_claim_deleted" not in reasons:
+                reasons.append("source_claim_deleted")
+            memory.update(
+                {
+                    "status": "Archived",
+                    "validity_state": "archived",
+                    "validity_reasons": reasons,
+                    "deleted_at": now,
+                    "updated_at": now,
+                }
+            )
+            conn.execute(
+                "UPDATE operational_memory SET status = 'Archived', data_json = ?, updated_at = ? "
+                "WHERE memory_id = ?",
+                (json.dumps(memory, ensure_ascii=False), now, memory_row["memory_id"]),
+            )
+
+        from vector_lake.governance_store import _append_version_records
+
+        deleted_claims = []
+        for row in old_claim_rows:
+            record = json.loads(row["data_json"] or "{}")
+            record.setdefault("claim_id", row["claim_id"])
+            record.update({"status": "Archived", "lifecycle_state": "deleted", "deleted_at": now})
+            deleted_claims.append(record)
+        deleted_evidence = []
+        for row in old_evidence_rows:
+            record = json.loads(row["data_json"] or "{}")
+            record.setdefault("evidence_id", row["evidence_id"])
+            record.update({"status": "Archived", "lifecycle_state": "deleted", "deleted_at": now})
+            deleted_evidence.append(record)
+        _append_version_records(
+            "claim_versions",
+            "claim_id",
+            "claim_family_id",
+            "claimfamily",
+            "claim_version",
+            deleted_claims,
+        )
+        _append_version_records(
+            "evidence_versions",
+            "evidence_id",
+            "evidence_family_id",
+            "evidencefamily",
+            "evidence_version",
+            deleted_evidence,
+        )
+
+        for entity_row in rows:
+            try:
+                identity = json.loads(entity_row["data_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                identity = {}
+            identity.update(
+                {
+                    "entity_id": entity_row["entity_id"],
+                    "page_key": node_key,
+                    "canonical_name": entity_row["canonical_name"],
+                    "lifecycle_state": "deleted",
+                    "deleted_at": now,
+                }
+            )
+            conn.execute(
+                "INSERT INTO entity_identities "
+                "(entity_id, page_key, canonical_name, identity_origin, data_json, recorded_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(entity_id) DO UPDATE SET "
+                "canonical_name = excluded.canonical_name, data_json = excluded.data_json, "
+                "updated_at = excluded.updated_at",
+                (
+                    entity_row["entity_id"],
+                    node_key,
+                    entity_row["canonical_name"],
+                    str(identity.get("identity_origin") or "deletion_backfill"),
+                    json.dumps(identity, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
 
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute(f"DELETE FROM vec_embeddings WHERE entity_id IN ({placeholders})", related_ids)
@@ -950,7 +1191,6 @@ def claim_pending_jobs(limit: int = 10, lease_seconds: int = 300) -> list[dict]:
         return [dict(row) for row in claimed]
 
 def get_pending_jobs(limit: int = 10) -> list[dict]:
-    import json
     conn = get_connection()
     cur = conn.execute("""
         SELECT * FROM jobs 

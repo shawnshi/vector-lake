@@ -17,6 +17,13 @@ from pathlib import Path
 from vector_lake import governance_store, indexer
 from vector_lake.claim_extractor import extract_page_objects
 from vector_lake.db_store import backup_database, enqueue_mutation, get_connection, get_db_path, init_db, transaction
+from vector_lake.evidence_foundation import (
+    build_extraction_run,
+    evidence_independence,
+    resolve_source_artifact,
+    source_locator_for,
+    version_family_id,
+)
 from vector_lake.mutation_coordinator import materialize_markdown_projection
 from vector_lake.schema_validator import VALID_H3_SLOTS, validate_schema
 from vector_lake.yaml_utils import dump_yaml
@@ -300,6 +307,318 @@ def reconcile_canonical_content_from_wiki(
         f"remaining_drift={after['total_drift']}; "
         f"outbox_completed={outbox['completed']}; outbox_failed={outbox['failed']}; "
         f"backup={backup_label}"
+    )
+
+
+def _canonical_foundation_snapshot() -> dict:
+    """Load canonical rows once so a backfill scan does not repeat JSON table scans."""
+    conn = get_connection()
+    entities_by_page: dict[str, list[dict]] = {}
+    claims_by_page: dict[str, list[dict]] = {}
+    evidence_by_page: dict[str, list[dict]] = {}
+    sources_by_id: dict[str, dict] = {}
+    for row in conn.execute("SELECT data_json FROM entities"):
+        record = json.loads(row["data_json"])
+        page_key = str(record.get("page_key") or "")
+        if page_key:
+            entities_by_page.setdefault(page_key, []).append(record)
+    for row in conn.execute("SELECT data_json FROM claims"):
+        record = json.loads(row["data_json"])
+        page_key = str((record.get("locator") or {}).get("page_key") or "")
+        if page_key:
+            claims_by_page.setdefault(page_key, []).append(record)
+    for row in conn.execute("SELECT data_json FROM evidence"):
+        record = json.loads(row["data_json"])
+        page_key = str((record.get("locator") or {}).get("page_key") or "")
+        if page_key:
+            evidence_by_page.setdefault(page_key, []).append(record)
+    for row in conn.execute("SELECT source_id, data_json FROM sources"):
+        sources_by_id[str(row["source_id"])] = json.loads(row["data_json"])
+    return {
+        "entities_by_page": entities_by_page,
+        "claims_by_page": claims_by_page,
+        "evidence_by_page": evidence_by_page,
+        "sources_by_id": sources_by_id,
+    }
+
+
+def _legacy_foundation_payload(
+    path: Path,
+    frontmatter: dict,
+    body: str,
+    snapshot: dict,
+) -> dict:
+    """Derive foundation metadata around legacy IDs without reinterpreting claim text."""
+    page_key = path.stem
+    entities = list(snapshot["entities_by_page"].get(page_key) or [])
+    if not entities:
+        raise ValueError("canonical entity row is missing")
+    claims = list(snapshot["claims_by_page"].get(page_key) or [])
+    evidence = list(snapshot["evidence_by_page"].get(page_key) or [])
+    source_ids = {
+        str(source_id)
+        for claim in claims
+        for source_id in (claim.get("source_ids") or [])
+        if str(source_id)
+    }
+    source_ids.update(
+        str(record.get("source_id"))
+        for record in evidence
+        if str(record.get("source_id") or "")
+    )
+    sources = [
+        snapshot["sources_by_id"][source_id]
+        for source_id in sorted(source_ids)
+        if source_id in snapshot["sources_by_id"]
+    ]
+    artifacts = [
+        resolve_source_artifact(
+            str(source.get("raw_ref") or ""),
+            source_id=str(source["source_id"]),
+            metadata=source,
+        )
+        for source in sources
+        if str(source.get("raw_ref") or "")
+    ]
+    artifact_by_source = {str(item["source_id"]): item for item in artifacts}
+    extraction_run = build_extraction_run(
+        page_key=page_key,
+        body=body,
+        artifact_ids=[str(item["artifact_id"]) for item in artifacts],
+        frontmatter=frontmatter,
+        extractor_name="vector_lake.foundation_backfill",
+        extractor_version="1.0",
+    )
+
+    proposed_claims = []
+    for claim in claims:
+        locator = dict(claim.get("locator") or {})
+        proposed_claims.append({
+            "claim_id": claim["claim_id"],
+            "claim_family_id": version_family_id("claimfamily", page_key, locator),
+            "confidence_kind": "legacy_prior",
+            "calibrated_probability": None,
+            "assessment_status": "unreviewed",
+            "extractor_name": "vector_lake.foundation_backfill",
+            "extractor_version": "1.0",
+            "extraction_run_id": extraction_run["run_id"],
+        })
+
+    proposed_evidence = []
+    for record in evidence:
+        locator = dict(record.get("locator") or {})
+        source_id = str(record.get("source_id") or "")
+        source = snapshot["sources_by_id"].get(source_id) or {}
+        raw_ref = str(source.get("raw_ref") or "")
+        artifact = artifact_by_source.get(source_id)
+        proposed = {
+            "evidence_id": record["evidence_id"],
+            "evidence_family_id": version_family_id(
+                "evidencefamily",
+                page_key,
+                {**locator, "source_id": source_id, "kind": record.get("evidence_type")},
+            ),
+            "projection_locator": locator,
+            "extraction_run_id": extraction_run["run_id"],
+        }
+        if artifact is not None:
+            proposed["artifact_id"] = artifact["artifact_id"]
+            proposed["source_locator"] = source_locator_for(frontmatter, raw_ref)
+            proposed.update(
+                evidence_independence(raw_ref, path.name, artifact["generation_parent_refs"])
+            )
+        else:
+            proposed.update({
+                "source_locator": {
+                    "kind": "unresolved",
+                    "source_id": source_id,
+                    "reason": "canonical-source-or-raw-reference-missing",
+                },
+                "independence_status": "unknown_missing_source",
+                "lineage_safe": False,
+            })
+        proposed_evidence.append(proposed)
+
+    proposed_sources = []
+    for source in sources:
+        artifact = artifact_by_source.get(str(source["source_id"]))
+        if artifact is None:
+            continue
+        proposed_sources.append({
+            "source_id": source["source_id"],
+            "artifact_id": artifact["artifact_id"],
+            "content_hash": artifact.get("content_hash"),
+            "hash_algorithm": artifact.get("hash_algorithm"),
+            "byte_size": artifact.get("byte_size"),
+            "mime_type": artifact.get("mime_type"),
+            "storage_uri": artifact.get("storage_uri"),
+            "integrity_status": artifact.get("integrity_status"),
+            "classification": artifact.get("classification"),
+            "retention_policy": artifact.get("retention_policy"),
+            "legal_hold": artifact.get("legal_hold"),
+            "lineage_id": artifact.get("lineage_id"),
+            "generation_parent_refs": artifact.get("generation_parent_refs"),
+        })
+    return {
+        "page_key": page_key,
+        "entities": entities,
+        "claims": proposed_claims,
+        "evidence": proposed_evidence,
+        "sources": proposed_sources,
+        "source_artifacts": artifacts,
+        "extraction_runs": [extraction_run],
+    }
+
+
+def _payload_needs_foundation_backfill(extracted: dict, existing_run_ids: set[str], snapshot: dict) -> bool:
+    run_id = str(extracted["extraction_runs"][0]["run_id"])
+    if run_id not in existing_run_ids:
+        return True
+    record_specs = (
+        ("claims", "claim_id", governance_store._CLAIM_FOUNDATION_FIELDS),
+        ("evidence", "evidence_id", governance_store._EVIDENCE_FOUNDATION_FIELDS),
+        ("sources", "source_id", governance_store._SOURCE_FOUNDATION_FIELDS),
+    )
+    current_maps = {
+        "claims": {
+            str(record["claim_id"]): record
+            for record in snapshot["claims_by_page"].get(extracted["page_key"], [])
+        },
+        "evidence": {
+            str(record["evidence_id"]): record
+            for record in snapshot["evidence_by_page"].get(extracted["page_key"], [])
+        },
+        "sources": snapshot["sources_by_id"],
+    }
+    for table_name, key_field, fields in record_specs:
+        for proposed in extracted.get(table_name) or []:
+            current = current_maps[table_name].get(str(proposed[key_field])) or {}
+            if any(field not in current for field in fields if field in proposed):
+                return True
+            if table_name == "sources":
+                proposed_hash = str(proposed.get("content_hash") or "")
+                current_hash = str(current.get("content_hash") or "")
+                if proposed.get("integrity_status") == "verified" and len(proposed_hash) == 64 and len(current_hash) != 64:
+                    return True
+    return False
+
+
+def _evidence_foundation_backfill_candidates(limit: int = 500) -> dict:
+    """Extract current page revisions and select runs absent from the foundation ledger."""
+    init_db()
+    conn = get_connection()
+    existing_run_ids = {
+        str(row["run_id"])
+        for row in conn.execute("SELECT run_id FROM extraction_runs")
+    }
+    snapshot = _canonical_foundation_snapshot()
+    canonical_keys = set(snapshot["entities_by_page"])
+    selected: list[dict] = []
+    invalid: list[str] = []
+    pending_pages = 0
+    current_pages = 0
+    selected_limit = max(0, int(limit))
+    for path in sorted(get_wiki_dir().glob("*.md")):
+        if (
+            not path.is_file()
+            or path.name in EXCLUDED_WIKI_FILES
+            or path.name.startswith("System_")
+            or path.stem not in canonical_keys
+        ):
+            continue
+        try:
+            frontmatter, body, _ = read_markdown_file(path)
+            extracted = _legacy_foundation_payload(path, frontmatter, body, snapshot)
+            runs = list(extracted.get("extraction_runs") or [])
+            if len(runs) != 1:
+                raise ValueError(f"expected one extraction run, received {len(runs)}")
+        except Exception as exc:
+            invalid.append(f"{path.name}: {exc}")
+            continue
+        if not _payload_needs_foundation_backfill(extracted, existing_run_ids, snapshot):
+            current_pages += 1
+            continue
+        pending_pages += 1
+        if selected_limit == 0 or len(selected) < selected_limit:
+            selected.append(extracted)
+    return {
+        "canonical_pages": len(canonical_keys),
+        "current_pages": current_pages,
+        "pending_pages": pending_pages,
+        "selected": selected,
+        "invalid": invalid,
+    }
+
+
+def evidence_foundation_backfill(
+    dry_run: bool = True,
+    limit: int = 500,
+    batch_size: int = 100,
+    backup_reference: str = "",
+) -> str:
+    """Backfill auditable foundation metadata without replacing canonical content."""
+    preview = _evidence_foundation_backfill_candidates(limit=limit)
+    selected = preview["selected"]
+    lines = [
+        "[DRY RUN] Evidence-foundation backfill" if dry_run else "Evidence-foundation backfill",
+        f"canonical_pages: {preview['canonical_pages']}",
+        f"current_pages: {preview['current_pages']}",
+        f"pending_pages: {preview['pending_pages']}",
+        f"selected_pages: {len(selected)}",
+        f"selected_limit: {max(0, int(limit))}",
+        f"invalid_pages: {len(preview['invalid'])}",
+    ]
+    if selected:
+        lines.append("sample: " + ", ".join(item["page_key"] for item in selected[:10]))
+    if preview["invalid"]:
+        lines.append("invalid sample: " + "; ".join(preview["invalid"][:10]))
+    if dry_run:
+        return "\n".join(lines)
+    if preview["invalid"]:
+        raise RuntimeError(
+            "Evidence-foundation backfill refused because one or more canonical Wiki pages "
+            "could not be extracted: " + "; ".join(preview["invalid"][:10])
+        )
+    if not selected:
+        return "No pending evidence-foundation page revisions to backfill."
+
+    if backup_reference:
+        backup_path = Path(backup_reference).expanduser().resolve()
+        if not backup_path.is_file():
+            raise FileNotFoundError(f"Verified backup reference does not exist: {backup_path}")
+        backup_label = str(backup_path)
+    else:
+        backup_label = create_maintenance_backup("evidence_foundation_backfill")
+
+    totals = {
+        "pages": 0,
+        "updated_claims": 0,
+        "updated_evidence": 0,
+        "updated_sources": 0,
+        "source_artifacts": 0,
+    }
+    chunk_size = max(1, int(batch_size))
+    for offset in range(0, len(selected), chunk_size):
+        batch = selected[offset:offset + chunk_size]
+        with transaction():
+            results = [
+                governance_store.backfill_evidence_foundation_records(extracted)
+                for extracted in batch
+            ]
+        totals["pages"] += len(results)
+        for result in results:
+            for key in ("updated_claims", "updated_evidence", "updated_sources", "source_artifacts"):
+                totals[key] += int(result[key])
+        log.info("Evidence-foundation backfill committed %s/%s pages", totals["pages"], len(selected))
+
+    remaining = max(0, int(preview["pending_pages"]) - totals["pages"])
+    return (
+        f"Backfilled {totals['pages']} page revision(s); "
+        f"updated_claims={totals['updated_claims']}; "
+        f"updated_evidence={totals['updated_evidence']}; "
+        f"updated_sources={totals['updated_sources']}; "
+        f"source_artifacts={totals['source_artifacts']}; "
+        f"remaining_pending={remaining}; backup={backup_label}"
     )
 
 

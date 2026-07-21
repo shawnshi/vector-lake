@@ -168,6 +168,49 @@ def test_expired_missing_link_target_is_not_managed_debt(isolated_memory):
     assert metrics["unmanaged_missing_link_target_count"] == 1
 
 
+def test_source_referenced_through_evidence_is_not_counted_as_orphan(isolated_memory):
+    db_store.init_db()
+    source = {"source_id": "source_via_evidence"}
+    evidence = {
+        "evidence_id": "evidence_source_ref",
+        "source_id": source["source_id"],
+    }
+    with db_store.transaction():
+        conn = db_store.get_connection()
+        conn.execute(
+            "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (source["source_id"], json.dumps(source), "2026-07-21"),
+        )
+        conn.execute(
+            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (evidence["evidence_id"], json.dumps(evidence), "2026-07-21"),
+        )
+
+    metrics = compute_debt_metrics(skip_heavy=True)
+
+    assert metrics["orphan_source_count"] == 0
+
+
+def test_claim_governance_version_ignores_foundation_backfill_metadata():
+    claim = {
+        "claim_id": "claim_1",
+        "claim_text": "Stable business claim",
+        "evidence_ids": [],
+        "source_ids": [],
+    }
+    before = claim_governance_version(claim)
+    claim.update({
+        "claim_family_id": "claimfamily_1",
+        "confidence_kind": "legacy_prior",
+        "calibrated_probability": None,
+        "assessment_status": "unreviewed",
+        "extractor_name": "vector_lake.foundation_backfill",
+        "extractor_version": "1.0",
+        "extraction_run_id": "extractrun_1",
+    })
+    assert claim_governance_version(claim) == before
+
+
 def test_claim_graph_projection_loads_only_bounded_claim_rows(isolated_memory, monkeypatch):
     db_store.init_db()
     claim = {

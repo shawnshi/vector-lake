@@ -56,7 +56,7 @@ def _parse_dt(value: Any):
         return None
 
 
-def _canonical_snapshot(conn, db_path: Path) -> dict[str, list[tuple[str, dict[str, Any], str]]]:
+def _canonical_snapshot(conn, db_path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
     """Load canonical entities once for an unchanged database generation."""
     generation = conn.execute(
         "SELECT COUNT(*) AS count, MAX(updated_at) AS latest, "
@@ -72,7 +72,7 @@ def _canonical_snapshot(conn, db_path: Path) -> dict[str, list[tuple[str, dict[s
         if _CANONICAL_CACHE.get("key") == key:
             return _CANONICAL_CACHE["value"]
 
-    by_page: dict[str, list[tuple[str, dict[str, Any], str]]] = {}
+    by_page: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for row in conn.execute("SELECT entity_id, data_json FROM entities ORDER BY entity_id"):
         raw = str(row["data_json"])
         try:
@@ -82,7 +82,7 @@ def _canonical_snapshot(conn, db_path: Path) -> dict[str, list[tuple[str, dict[s
         page_key = str(entity.get("page_key") or "")
         if not page_key or page_key.startswith("System_"):
             continue
-        by_page.setdefault(page_key, []).append((str(row["entity_id"]), entity, raw))
+        by_page.setdefault(page_key, []).append((str(row["entity_id"]), entity))
     with _CACHE_LOCK:
         _CANONICAL_CACHE.update({"key": key, "value": by_page})
     return by_page
@@ -308,8 +308,8 @@ def assess_runtime_health(
         unreadable_wiki: list[str] = []
         shared_wiki_keys = wiki_keys & canonical_keys
         canonical_versions = {
-            page_key: governance_store._canonical_entity_rows_version(
-                [(entity_id, raw) for entity_id, _, raw in canonical_entities_by_page[page_key]]
+            page_key: governance_store._canonical_entity_records_version(
+                canonical_entities_by_page[page_key]
             )
             for page_key in shared_wiki_keys
         }
@@ -355,7 +355,7 @@ def assess_runtime_health(
         for page_key in sorted(index_keys & canonical_keys):
             node = index_data.get("nodes", {}).get(page_key) or {}
             expected_signatures = set()
-            for entity_id, entity, _ in canonical_entities_by_page.get(page_key, []):
+            for entity_id, entity in canonical_entities_by_page.get(page_key, []):
                 try:
                     projected_key, projected_node = _entity_to_index_node(entity, entity_id)
                 except Exception:
@@ -449,6 +449,357 @@ def assess_runtime_health(
                 warnings.append(message)
 
     return {"ok": not issues, "issues": issues, "warnings": warnings, "detail": detail}
+
+
+def _evidence_foundation_metrics(conn) -> dict[str, Any]:
+    """Summarize strict evidence-chain coverage without promoting legacy claims."""
+    def count(sql: str) -> int:
+        row = conn.execute(sql).fetchone()
+        return int(row[0] or 0)
+
+    claim_total = count("SELECT COUNT(*) FROM claims")
+    evidence_total = count("SELECT COUNT(*) FROM evidence")
+    source_total = count("SELECT COUNT(*) FROM sources")
+    metrics = {
+        "claim_total": claim_total,
+        "claim_with_evidence_refs": count(
+            "SELECT COUNT(*) FROM claims WHERE "
+            "COALESCE(json_array_length(json_extract(data_json, '$.evidence_ids')), 0) > 0"
+        ),
+        "claim_with_extraction_run": count(
+            "SELECT COUNT(*) FROM claims WHERE "
+            "NULLIF(json_extract(data_json, '$.extraction_run_id'), '') IS NOT NULL"
+        ),
+        "claim_with_supported_assessment": count(
+            "SELECT COUNT(DISTINCT c.claim_id) FROM claims AS c "
+            "JOIN claim_assessments AS a ON a.claim_id = c.claim_id "
+            "WHERE a.outcome = 'supported'"
+        ),
+        "evidence_total": evidence_total,
+        "evidence_with_raw_locator": count(
+            "SELECT COUNT(*) FROM evidence WHERE "
+            "json_type(data_json, '$.source_locator') = 'object' AND "
+            "COALESCE(json_extract(data_json, '$.source_locator.kind'), 'unresolved') != 'unresolved'"
+        ),
+        "evidence_lineage_safe": count(
+            "SELECT COUNT(*) FROM evidence WHERE "
+            "json_extract(data_json, '$.lineage_safe') = 1"
+        ),
+        "source_total": source_total,
+        "source_integrity_verified": count(
+            "SELECT COUNT(*) FROM sources WHERE "
+            "json_extract(data_json, '$.integrity_status') = 'verified' AND "
+            "length(json_extract(data_json, '$.content_hash')) = 64"
+        ),
+        "source_artifact_total": count("SELECT COUNT(*) FROM source_artifacts"),
+        "source_artifact_verified": count(
+            "SELECT COUNT(*) FROM source_artifacts WHERE "
+            "integrity_status = 'verified' AND length(sha256) = 64"
+        ),
+        "extraction_run_total": count("SELECT COUNT(*) FROM extraction_runs"),
+    }
+
+    def ratio(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator, 4) if denominator else 1.0
+
+    metrics.update(
+        {
+            "claim_evidence_coverage": ratio(metrics["claim_with_evidence_refs"], claim_total),
+            "claim_extraction_coverage": ratio(metrics["claim_with_extraction_run"], claim_total),
+            "claim_assessment_coverage": ratio(
+                metrics["claim_with_supported_assessment"], claim_total
+            ),
+            "evidence_raw_locator_coverage": ratio(
+                metrics["evidence_with_raw_locator"], evidence_total
+            ),
+            "evidence_lineage_coverage": ratio(metrics["evidence_lineage_safe"], evidence_total),
+            "source_integrity_coverage": ratio(
+                metrics["source_integrity_verified"], source_total
+            ),
+        }
+    )
+    return metrics
+
+
+def _assess_decision_scope(
+    conn,
+    decision_id: str,
+    index_data: dict[str, Any],
+    initial_issues: list[str],
+) -> dict[str, Any]:
+    """Evaluate only evidence and governance debt mapped to one verified decision."""
+    from vector_lake.decision_registry import get_critical_decision
+
+    issues = list(initial_issues)
+    warnings: list[str] = []
+    detail: dict[str, Any] = {"scope": "critical_decision", "decision_id": decision_id}
+    decision = get_critical_decision(decision_id)
+    if not decision or not decision.get("registry_verified") or decision.get("status") != "active":
+        issues.append(f"critical_decision_unverified:{decision_id}")
+        detail["decision"] = decision
+    else:
+        detail["decision"] = decision
+
+    graph_state = dict((index_data or {}).get("graph_state") or {})
+    detail["graph_state"] = graph_state
+    if graph_state.get("dirty") is True:
+        warnings.append(
+            f"global_graph_debt_outside_decision_scope:{graph_state.get('reason') or 'unknown'}"
+        )
+    elif not graph_state:
+        warnings.append("graph_state_missing")
+
+    scoped_pending = []
+    for row in conn.execute(
+        "SELECT item_id, data_json FROM governance_queue "
+        "WHERE json_extract(data_json, '$.status') = 'pending'"
+    ).fetchall():
+        item = json.loads(row["data_json"])
+        if decision_id in list(item.get("critical_decision_refs") or []):
+            scoped_pending.append(str(row["item_id"]))
+    detail["scoped_pending_governance_ids"] = scoped_pending
+    if scoped_pending:
+        issues.append(f"decision_governance_pending:{len(scoped_pending)}")
+
+    claim_refs = list((decision or {}).get("claim_refs") or [])
+    detail["claim_refs"] = claim_refs
+    claim_checks = []
+    if decision and not claim_refs:
+        issues.append("decision_claim_scope_missing")
+    for claim_id in claim_refs:
+        check = {
+            "claim_id": claim_id,
+            "claim_exists": False,
+            "evidence_complete": False,
+            "source_integrity_complete": False,
+            "raw_locator_complete": False,
+            "lineage_safe": False,
+            "assessment_supported": False,
+        }
+        row = conn.execute(
+            "SELECT data_json FROM claims WHERE claim_id = ?", (claim_id,)
+        ).fetchone()
+        if row is None:
+            issues.append(f"decision_claim_missing:{claim_id}")
+            claim_checks.append(check)
+            continue
+        check["claim_exists"] = True
+        claim = json.loads(row["data_json"])
+        evidence_ids = list(dict.fromkeys(claim.get("evidence_ids") or []))
+        source_ids = list(dict.fromkeys(claim.get("source_ids") or []))
+        evidence_records = []
+        for evidence_id in evidence_ids:
+            evidence_row = conn.execute(
+                "SELECT data_json FROM evidence WHERE evidence_id = ?", (evidence_id,)
+            ).fetchone()
+            if evidence_row is not None:
+                evidence = json.loads(evidence_row["data_json"])
+                evidence_records.append(evidence)
+                source_id = str(evidence.get("source_id") or "")
+                if source_id and source_id not in source_ids:
+                    source_ids.append(source_id)
+        check["evidence_complete"] = bool(evidence_ids) and len(evidence_records) == len(evidence_ids)
+        check["raw_locator_complete"] = bool(evidence_records) and all(
+            isinstance(record.get("source_locator"), dict)
+            and record["source_locator"].get("kind") != "unresolved"
+            for record in evidence_records
+        )
+        check["lineage_safe"] = bool(evidence_records) and all(
+            record.get("lineage_safe") is True for record in evidence_records
+        )
+        source_records = []
+        for source_id in source_ids:
+            source_row = conn.execute(
+                "SELECT data_json FROM sources WHERE source_id = ?", (source_id,)
+            ).fetchone()
+            if source_row is not None:
+                source_records.append(json.loads(source_row["data_json"]))
+        check["source_integrity_complete"] = bool(source_ids) and len(source_records) == len(source_ids) and all(
+            record.get("integrity_status") == "verified"
+            and isinstance(record.get("content_hash"), str)
+            and len(record["content_hash"]) == 64
+            for record in source_records
+        )
+        check["assessment_supported"] = conn.execute(
+            "SELECT 1 FROM claim_assessments WHERE claim_id = ? AND outcome = 'supported' LIMIT 1",
+            (claim_id,),
+        ).fetchone() is not None
+        for field in (
+            "evidence_complete",
+            "source_integrity_complete",
+            "raw_locator_complete",
+            "lineage_safe",
+            "assessment_supported",
+        ):
+            if not check[field]:
+                issues.append(f"decision_claim_{field}_failed:{claim_id}")
+        claim_checks.append(check)
+    detail["claim_checks"] = claim_checks
+    detail["global_debt_policy"] = "reported_only_when_not_mapped_to_decision"
+    status = "not_ready" if issues else ("degraded" if warnings else "ready")
+    return {
+        "ready": status == "ready",
+        "status": status,
+        "issues": issues,
+        "warnings": warnings,
+        "detail": detail,
+    }
+
+
+def assess_semantic_readiness(
+    index_data: dict[str, Any] | None = None,
+    decision_id: str | None = None,
+) -> dict[str, Any]:
+    """Assess whether governed knowledge is ready for decision-support use.
+
+    This surface is deliberately separate from runtime health. Semantic debt
+    never blocks canonical repair writes, while infrastructure health never
+    implies that claims or topology are ready for business decisions.
+    """
+    from vector_lake.db_store import get_connection, get_db_path, init_db
+    from vector_lake.wiki_utils import get_index_path
+
+    issues: list[str] = []
+    warnings: list[str] = []
+    detail: dict[str, Any] = {}
+    try:
+        if not get_db_path().exists():
+            init_db()
+        conn = get_connection()
+    except Exception as exc:
+        return {
+            "ready": False,
+            "status": "not_ready",
+            "issues": [f"database_unavailable:{exc}"],
+            "warnings": [],
+            "detail": {},
+        }
+
+    if index_data is None:
+        index_path = get_index_path()
+        if index_path.exists():
+            index_data, index_error = _index_snapshot(index_path)
+            if index_error is not None:
+                issues.append(f"index_unreadable:{index_error}")
+        else:
+            index_data = {}
+            issues.append("index_missing")
+
+    normalized_decision_id = str(decision_id or "").strip()
+    if normalized_decision_id:
+        return _assess_decision_scope(
+            conn,
+            normalized_decision_id,
+            dict(index_data or {}),
+            issues,
+        )
+
+    graph_state = dict((index_data or {}).get("graph_state") or {})
+    detail["graph_state"] = graph_state
+    if graph_state.get("dirty") is True:
+        issues.append(f"graph_topology_dirty:{graph_state.get('reason') or 'unknown'}")
+    elif not graph_state:
+        warnings.append("graph_state_missing")
+    detail["graph_insight_count"] = len((index_data or {}).get("graph_insights") or [])
+
+    pending_rows = conn.execute(
+        "SELECT json_extract(data_json, '$.type') AS item_type, COUNT(*) AS count "
+        "FROM governance_queue WHERE json_extract(data_json, '$.status') = 'pending' "
+        "GROUP BY item_type"
+    ).fetchall()
+    pending_by_type = {
+        str(row["item_type"] or "unknown"): int(row["count"] or 0)
+        for row in pending_rows
+    }
+    pending_total = sum(pending_by_type.values())
+    critical_types = {"contradiction", "evidence-gap", "publish-candidate"}
+    critical_pending = sum(pending_by_type.get(item_type, 0) for item_type in critical_types)
+    detail["pending_governance_by_type"] = pending_by_type
+    detail["pending_governance_total"] = pending_total
+    detail["critical_pending_governance"] = critical_pending
+    max_pending = max(
+        0,
+        int(os.environ.get("VECTOR_LAKE_MAX_PENDING_GOVERNANCE_ITEMS", "500")),
+    )
+    if critical_pending:
+        issues.append(f"critical_governance_pending:{critical_pending}")
+    if pending_total > max_pending:
+        issues.append(f"governance_backlog:{pending_total}>{max_pending}")
+    elif pending_total:
+        warnings.append(f"governance_pending:{pending_total}")
+
+    validity_counts = {
+        str(row["validity_state"] or "unknown"): int(row["count"] or 0)
+        for row in conn.execute(
+            "SELECT json_extract(data_json, '$.validity_state') AS validity_state, "
+            "COUNT(*) AS count FROM operational_memory GROUP BY validity_state"
+        )
+    }
+    detail["runtime_validity_state_counts"] = validity_counts
+    unsupported = validity_counts.get("unsupported", 0)
+    max_unsupported = max(
+        0,
+        int(os.environ.get("VECTOR_LAKE_MAX_UNSUPPORTED_RUNTIME_CLAIMS", "0")),
+    )
+    if unsupported > max_unsupported:
+        issues.append(f"unsupported_runtime_claims:{unsupported}>{max_unsupported}")
+    if validity_counts.get("provisional", 0):
+        warnings.append(f"provisional_runtime_claims:{validity_counts['provisional']}")
+    if validity_counts.get("expired", 0):
+        warnings.append(f"expired_runtime_claims:{validity_counts['expired']}")
+
+    foundation = _evidence_foundation_metrics(conn)
+    detail["evidence_foundation"] = foundation
+    coverage_thresholds = {
+        "claim_evidence_coverage": "VECTOR_LAKE_MIN_CLAIM_EVIDENCE_COVERAGE",
+        "claim_extraction_coverage": "VECTOR_LAKE_MIN_CLAIM_EXTRACTION_COVERAGE",
+        "claim_assessment_coverage": "VECTOR_LAKE_MIN_CLAIM_ASSESSMENT_COVERAGE",
+        "evidence_raw_locator_coverage": "VECTOR_LAKE_MIN_EVIDENCE_LOCATOR_COVERAGE",
+        "evidence_lineage_coverage": "VECTOR_LAKE_MIN_EVIDENCE_LINEAGE_COVERAGE",
+        "source_integrity_coverage": "VECTOR_LAKE_MIN_SOURCE_INTEGRITY_COVERAGE",
+    }
+    denominator_by_metric = {
+        "claim_evidence_coverage": foundation["claim_total"],
+        "claim_extraction_coverage": foundation["claim_total"],
+        "claim_assessment_coverage": foundation["claim_total"],
+        "evidence_raw_locator_coverage": foundation["evidence_total"],
+        "evidence_lineage_coverage": foundation["evidence_total"],
+        "source_integrity_coverage": foundation["source_total"],
+    }
+    for metric, env_name in coverage_thresholds.items():
+        threshold = min(1.0, max(0.0, float(os.environ.get(env_name, "0.95"))))
+        coverage = float(foundation[metric])
+        if denominator_by_metric[metric] and coverage < threshold:
+            warnings.append(f"{metric}_low:{coverage:.4f}<{threshold:.4f}")
+
+    awaiting_row = conn.execute(
+        "SELECT COUNT(*) AS count, MIN(updated_at) AS oldest "
+        "FROM jobs WHERE status = 'awaiting_subagent'"
+    ).fetchone()
+    awaiting_count = int(awaiting_row["count"] or 0)
+    detail["awaiting_subagent_jobs"] = awaiting_count
+    oldest_awaiting = _parse_dt(awaiting_row["oldest"])
+    if oldest_awaiting is not None:
+        awaiting_age = max(
+            0,
+            int((datetime.now(timezone.utc) - oldest_awaiting).total_seconds()),
+        )
+        detail["oldest_awaiting_subagent_age_seconds"] = awaiting_age
+        max_age = max(
+            60,
+            int(os.environ.get("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_AGE_SECONDS", "86400")),
+        )
+        if awaiting_age > max_age:
+            issues.append(f"semantic_ingest_backlog:oldest={awaiting_age}s>{max_age}s")
+
+    status = "not_ready" if issues else ("degraded" if warnings else "ready")
+    return {
+        "ready": status == "ready",
+        "status": status,
+        "issues": issues,
+        "warnings": warnings,
+        "detail": detail,
+    }
 
 
 def enforce_runtime_write_health(validation_mode: str = "full"):

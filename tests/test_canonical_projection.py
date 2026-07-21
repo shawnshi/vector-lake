@@ -92,9 +92,61 @@ def test_delete_cascade_locates_entity_by_page_key(isolated_memory):
     with db_store.transaction():
         conn.execute("INSERT INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)", ("Acme", "entity_acme", "now"))
         conn.execute("INSERT INTO wiki_search_index (node_key, title, summary, text) VALUES (?, ?, ?, ?)", ("Vendor_Acme", "Acme", "", "body"))
+        claim = {
+            "claim_id": "claim_acme",
+            "claim_text": "Acme is active.",
+            "status": "Active",
+            "locator": {"page_key": "Vendor_Acme", "heading": "Facts", "block_index": 1},
+            "source_page": "Vendor_Acme.md",
+            "evidence_ids": ["evidence_acme"],
+            "source_ids": [],
+            "subject_entity_ids": ["entity_acme"],
+        }
+        conn.execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("claim_acme", claim["claim_text"], "Active", json.dumps(claim), "now"),
+        )
         conn.execute(
             "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
-            ("evidence_acme", json.dumps({"locator": {"page_key": "Vendor_Acme"}}), "now"),
+            (
+                "evidence_acme",
+                json.dumps({
+                    "evidence_id": "evidence_acme",
+                    "source_id": "source_acme",
+                    "locator": {"page_key": "Vendor_Acme", "heading": "Facts", "block_index": 1},
+                    "evidence_text": "Acme evidence.",
+                }),
+                "now",
+            ),
+        )
+        memory = {
+            "memory_id": "memory_acme",
+            "memory_type": "fact",
+            "text": "Acme is active.",
+            "source_claim_id": "claim_acme",
+            "source_page": "Vendor_Acme.md",
+            "validity_state": "active",
+            "validity_reasons": [],
+            "memory_score": 0.9,
+        }
+        conn.execute(
+            "INSERT INTO operational_memory (memory_id, memory_type, score, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("memory_acme", "fact", 0.9, "Active", json.dumps(memory), "now"),
+        )
+        conn.execute(
+            "INSERT INTO entity_identities "
+            "(entity_id, page_key, canonical_name, identity_origin, data_json, recorded_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "entity_acme",
+                "Vendor_Acme",
+                "Acme Inc",
+                "explicit",
+                json.dumps({"entity_id": "entity_acme", "page_key": "Vendor_Acme"}),
+                "now",
+                "now",
+            ),
         )
 
     result = db_store.delete_node_cascade("Vendor_Acme")
@@ -104,6 +156,32 @@ def test_delete_cascade_locates_entity_by_page_key(isolated_memory):
     assert conn.execute("SELECT 1 FROM alias_registry WHERE value = 'entity_acme'").fetchone() is None
     assert conn.execute("SELECT 1 FROM wiki_search_index WHERE node_key = 'Vendor_Acme'").fetchone() is None
     assert conn.execute("SELECT 1 FROM evidence WHERE evidence_id = 'evidence_acme'").fetchone() is None
+    archived_memory = json.loads(
+        conn.execute(
+            "SELECT data_json FROM operational_memory WHERE memory_id = 'memory_acme'"
+        ).fetchone()["data_json"]
+    )
+    assert archived_memory["validity_state"] == "archived"
+    assert "source_claim_deleted" in archived_memory["validity_reasons"]
+    assert governance_store.search_operational_memory("Acme") == []
+    claim_version = json.loads(
+        conn.execute(
+            "SELECT data_json FROM claim_versions WHERE claim_id = 'claim_acme' ORDER BY version_no DESC"
+        ).fetchone()["data_json"]
+    )
+    evidence_version = json.loads(
+        conn.execute(
+            "SELECT data_json FROM evidence_versions WHERE evidence_id = 'evidence_acme' ORDER BY version_no DESC"
+        ).fetchone()["data_json"]
+    )
+    identity = json.loads(
+        conn.execute(
+            "SELECT data_json FROM entity_identities WHERE entity_id = 'entity_acme'"
+        ).fetchone()["data_json"]
+    )
+    assert claim_version["lifecycle_state"] == "deleted"
+    assert evidence_version["lifecycle_state"] == "deleted"
+    assert identity["lifecycle_state"] == "deleted"
 
 
 def test_full_rebuild_keeps_same_name_entities_and_clears_stale_fts(isolated_memory, monkeypatch):

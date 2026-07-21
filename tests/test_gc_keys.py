@@ -47,3 +47,24 @@ def test_gc_does_not_delete_high_degree_page_key(isolated_memory):
     result = gc_vector_lake(days=30, dry_run=True)
 
     assert "No orphan entities" in result
+
+
+def test_gc_prunes_history_even_when_no_orphan_pages(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO change_sets (change_set_id, data_json, updated_at) VALUES (?, ?, ?)",
+            ("changeset_old", "{}", "2000-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO change_set_idempotency (idempotency_key, change_set_id, created_at) "
+            "VALUES (?, ?, ?)",
+            ("idem_old", "changeset_old", "2000-01-01T00:00:00+00:00"),
+        )
+
+    result = gc_vector_lake(days=30, dry_run=False)
+
+    assert "Pruned 1 change set(s) and 1 idempotency key(s)" in result
+    assert conn.execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM change_set_idempotency").fetchone()[0] == 0

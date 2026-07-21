@@ -40,13 +40,7 @@ def process_jobs():
     if not jobs:
         return
 
-    import subprocess
-    import tempfile
-    import os
 
-    dispatched_jobs = []
-    temp_files = []
-    
     # Pre-process jobs
     for job in jobs:
         job_id = job["job_id"]

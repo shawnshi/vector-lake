@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector-lake.local/contracts/cbss/semantic-readiness.schema.json",
+  "title": "Vector Lake SemanticReadiness",
+  "description": "Read-only readiness signal for consumers. It is separate from infrastructure health and never authorizes a business decision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ready", "status", "issues", "warnings", "detail"],
+  "properties": {
+    "ready": {"type": "boolean"},
+    "status": {"enum": ["ready", "degraded", "not_ready"]},
+    "issues": {"type": "array", "items": {"type": "string"}},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "detail": {"type": "object"}
+  }
+}

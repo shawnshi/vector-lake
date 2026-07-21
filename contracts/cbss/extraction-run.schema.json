@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector-lake.local/contracts/cbss/extraction-run.schema.json",
+  "title": "Vector Lake ExtractionRun",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["run_id", "page_key", "input_fingerprint", "source_artifact_ids", "extractor_name", "extractor_version", "parser_name", "parser_version"],
+  "properties": {
+    "run_id": {"type": "string", "pattern": "^extractrun_[0-9a-f]{24}$"},
+    "page_key": {"type": "string", "minLength": 1},
+    "input_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_artifact_ids": {"type": "array", "items": {"type": "string"}},
+    "extractor_name": {"type": "string", "minLength": 1},
+    "extractor_version": {"type": "string", "minLength": 1},
+    "parser_name": {"type": "string", "minLength": 1},
+    "parser_version": {"type": "string", "minLength": 1},
+    "model_name": {"type": ["string", "null"]},
+    "model_version": {"type": ["string", "null"]},
+    "prompt_version": {"type": ["string", "null"]},
+    "recorded_at": {"type": "string", "format": "date-time"}
+  }
+}

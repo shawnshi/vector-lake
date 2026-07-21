@@ -5,7 +5,8 @@ import pytest
 from vector_lake import mcp_server
 from vector_lake.schema_validator import SchemaViolationException, validate_schema
 from vector_lake.tool_rename import rename_vector_lake_entity
-from vector_lake.wiki_utils import get_wiki_dir
+from vector_lake.claim_extractor import _stable_id
+from vector_lake.wiki_utils import get_wiki_dir, split_frontmatter
 
 
 def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
@@ -33,6 +34,8 @@ def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
     ]
     assert captured[0][0]["is_delete"] is True
     assert "[[Concept_New|Old]]" in captured[0][2]["content"]
+    renamed_frontmatter, _ = split_frontmatter(captured[0][1]["content"])
+    assert renamed_frontmatter["entity_id"] == _stable_id("entity", "Concept_Old")
 
 
 def test_batch_replace_links_commits_once(isolated_memory, monkeypatch):

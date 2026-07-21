@@ -4,6 +4,8 @@ from pathlib import Path
 
 import yaml
 
+from vector_lake.claim_extractor import _stable_id
+from vector_lake.db_store import get_connection, get_db_path
 from vector_lake.mutation_coordinator import execute_mutation_batch
 from vector_lake.wiki_utils import get_wiki_dir, normalize_entity_name, read_markdown_file
 
@@ -27,6 +29,21 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
         return f"Error: Target entity '{normalized_new_name}' already exists. Use merge instead."
 
     frontmatter, body, _ = read_markdown_file(old_path)
+    preserved_entity_id = str(frontmatter.get("entity_id") or "").strip()
+    if not preserved_entity_id and get_db_path().exists():
+        try:
+            row = get_connection().execute(
+                "SELECT entity_id FROM entities "
+                "WHERE json_extract(data_json, '$.page_key') = ? LIMIT 1",
+                (old_name[:-3],),
+            ).fetchone()
+            if row is not None:
+                preserved_entity_id = str(row["entity_id"])
+        except Exception:
+            preserved_entity_id = ""
+    # The fallback is the legacy identity of the old page, never the new name.
+    # Persisting it in frontmatter prevents subsequent renames from changing it.
+    frontmatter["entity_id"] = preserved_entity_id or _stable_id("entity", old_name[:-3])
     old_core = old_name.split("_", 1)[-1][:-3] if "_" in old_name else old_name[:-3]
     new_core = normalized_new_name.split("_", 1)[-1][:-3] if "_" in normalized_new_name else normalized_new_name[:-3]
     if frontmatter.get("title") == old_core:

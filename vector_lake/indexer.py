@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import math
 import os
@@ -7,7 +8,6 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-import yaml
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
@@ -15,7 +15,6 @@ from vector_lake import governance_store
 from vector_lake import db_store
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file, VALID_PREFIXES
 
-from vector_lake.yaml_utils import load_yaml
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
 try:
@@ -50,6 +49,8 @@ RELEVANCE_WEIGHTS = {
 
 MAX_EDGES_PER_NODE = 15
 EDGE_CANDIDATE_MULTIPLIER = 4
+MAX_SOURCE_FANOUT = 250
+MAX_GRAPH_INSIGHTS = 25
 INDEX_PARITY_FIELDS = (
     "id", "title", "summary", "raw_text", "type", "domain", "topic_cluster",
     "status", "epistemic_status", "categories", "tags", "aliases", "relations",
@@ -70,6 +71,45 @@ def _bounded_node_edge_candidates(
         {"source": source, "target": target, "weight": weight}
         for weight, target in strongest
     ]
+
+
+def _normalize_graph_source(source: object) -> str:
+    value = str(source or "").strip().replace("\\", "/")
+    if value.startswith("[[") and value.endswith("]]" ):
+        value = value[2:-2].split("|", 1)[0]
+    value = value.rsplit("/", 1)[-1]
+    if value.lower().endswith(".md"):
+        value = value[:-3]
+    return re.sub(r"[\W_]+", "_", value.lower(), flags=re.UNICODE).strip("_")
+
+
+def _is_informative_graph_source(source: object) -> bool:
+    """Reject provenance placeholders that must never imply semantic similarity."""
+    normalized = _normalize_graph_source(source)
+    if not normalized:
+        return False
+    return normalized not in {
+        "auto_fixed",
+        "source_auto_fixed",
+        "source_generated",
+        "source_placeholder",
+        "source_stub",
+        "source_unknown",
+        "unknown",
+    }
+
+
+def _graph_source_index(nodes_dict: dict[str, dict]) -> dict[str, list[str]]:
+    source_to_nodes: dict[str, list[str]] = {}
+    for node_key, node in nodes_dict.items():
+        for source in set(node.get("sources") or []):
+            if _is_informative_graph_source(source):
+                source_to_nodes.setdefault(str(source), []).append(node_key)
+    return {
+        source: sorted(node_keys)
+        for source, node_keys in source_to_nodes.items()
+        if len(node_keys) <= MAX_SOURCE_FANOUT
+    }
 
 
 def _index_node_signature(node: dict) -> str:
@@ -190,7 +230,6 @@ def _load_index_unlocked(output_path: str) -> dict | None:
         return json.load(handle)
 
 
-from collections import Counter, defaultdict
 
 def _tokenize(text: str) -> list[str]:
     if not text:
@@ -205,7 +244,8 @@ def _tokenize(text: str) -> list[str]:
         tokens.append(chinese_chars[i] + chinese_chars[i+1])
     return tokens
 def _tokenize_for_fts(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     try:
         from vector_lake.tokenizer_runtime import tokenize_for_fts
         return tokenize_for_fts(text)
@@ -314,11 +354,37 @@ def _deduplicate_weighted_edges(edges: list[dict]) -> list[dict]:
     )
 
 
+def _prune_weighted_edges(
+    edges: list[dict],
+    node_keys: set[str] | None = None,
+    max_edges_per_node: int = MAX_EDGES_PER_NODE,
+) -> list[dict]:
+    """Enforce one deterministic degree budget on every index publication path."""
+    counts: dict[str, int] = {}
+    pruned: list[dict] = []
+    for edge in _deduplicate_weighted_edges(edges):
+        source = edge["source"]
+        target = edge["target"]
+        if node_keys is not None and (source not in node_keys or target not in node_keys):
+            continue
+        if counts.get(source, 0) >= max_edges_per_node:
+            continue
+        if counts.get(target, 0) >= max_edges_per_node:
+            continue
+        pruned.append(edge)
+        counts[source] = counts.get(source, 0) + 1
+        counts[target] = counts.get(target, 0) + 1
+    return pruned
+
+
 def _write_index(output_path: str, index_data: dict):
     removed = _strip_legacy_embedded_payloads(index_data)
     if removed:
         log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
-    index_data["weighted_edges"] = _deduplicate_weighted_edges(index_data.get("weighted_edges") or [])
+    index_data["weighted_edges"] = _prune_weighted_edges(
+        index_data.get("weighted_edges") or [],
+        set((index_data.get("nodes") or {}).keys()),
+    )
     _write_json_payload(output_path, index_data)
 
 
@@ -333,10 +399,10 @@ def _mark_graph_dirty(index_data: dict, reason: str):
     graph_state["updated_at"] = _utc_now()
 
 
-def _mark_graph_clean(index_data: dict):
+def _mark_graph_clean(index_data: dict, reason: str = "Topology analysis complete"):
     graph_state = index_data.setdefault("graph_state", {})
     graph_state["dirty"] = False
-    graph_state["reason"] = ""
+    graph_state["reason"] = reason
     graph_state["updated_at"] = _utc_now()
 
 
@@ -569,8 +635,10 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
     key_a = node_a.get("_key", "")
     key_b = node_b.get("_key", "")
 
-    if links_a is None: links_a = frozenset((node_a.get("links") or []))
-    if links_b is None: links_b = frozenset((node_b.get("links") or []))
+    if links_a is None:
+        links_a = frozenset((node_a.get("links") or []))
+    if links_b is None:
+        links_b = frozenset((node_b.get("links") or []))
     
     if key_b in links_a:
         if triples_a is not None:
@@ -594,8 +662,10 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
                     break
         score += get_pred_weight(pred)
 
-    if sources_a is None: sources_a = frozenset((node_a.get("sources") or []))
-    if sources_b is None: sources_b = frozenset((node_b.get("sources") or []))
+    if sources_a is None:
+        sources_a = frozenset((node_a.get("sources") or []))
+    if sources_b is None:
+        sources_b = frozenset((node_b.get("sources") or []))
 
     # Optimization: Use isdisjoint() guard to prevent expensive set allocations in O(N^2) path
     if not sources_a.isdisjoint(sources_b):
@@ -614,8 +684,10 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
                     if degree > 1:
                         score += (1.0 / math.log(degree)) * RELEVANCE_WEIGHTS["common_neighbor"]
 
-    if type_a is None: type_a = node_a.get("type", "concept").lower()
-    if type_b is None: type_b = node_b.get("type", "concept").lower()
+    if type_a is None:
+        type_a = node_a.get("type", "concept").lower()
+    if type_b is None:
+        type_b = node_b.get("type", "concept").lower()
 
     type_a_dict = TYPE_AFFINITY.get(type_a)
     if type_a_dict:
@@ -624,16 +696,20 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
         affinity = 0.5 * RELEVANCE_WEIGHTS["type_affinity"]
     score += affinity
 
-    if decay_a is None: decay_a = node_a.get("decay_weight", 1.0)
-    if decay_b is None: decay_b = node_b.get("decay_weight", 1.0)
+    if decay_a is None:
+        decay_a = node_a.get("decay_weight", 1.0)
+    if decay_b is None:
+        decay_b = node_b.get("decay_weight", 1.0)
     
     if align_a is None:
         align_a = node_a.get("alignment_score", 100.0) / 100.0
-        if align_a < 0.1: align_a = 0.1
+        if align_a < 0.1:
+            align_a = 0.1
 
     if align_b is None:
         align_b = node_b.get("alignment_score", 100.0) / 100.0
-        if align_b < 0.1: align_b = 0.1
+        if align_b < 0.1:
+            align_b = 0.1
     
     score *= math.sqrt(decay_a * decay_b)
     score *= math.sqrt(align_a * align_b)
@@ -737,13 +813,11 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     for key, node in nodes_dict.items():
         decay = node.get("decay_weight", 1.0)
         align = node.get("alignment_score", 100.0) / 100.0
-        if align < 0.1: align = 0.1
+        if align < 0.1:
+            align = 0.1
         node_multipliers[key] = math.sqrt(decay * align)
 
-    source_to_nodes = {}
-    for key, sources in node_sources.items():
-        for source in sources:
-            source_to_nodes.setdefault(source, []).append(key)
+    source_to_nodes = _graph_source_index(nodes_dict)
             
     _temp_reverse_links = {}
     for key, links in node_links.items():
@@ -842,36 +916,157 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         import logging
         logging.getLogger("vector-lake-indexer").debug(f"Could not load graph edges from SQLite: {e}")
 
-    edges = _deduplicate_weighted_edges(edges)
+    return _prune_weighted_edges(edges, set(node_keys))
 
-    # --- Top-K Edge Pruning to prevent Force Collapse ---
-    node_edge_counts = {k: 0 for k in node_keys}
-    pruned_edges = []
-    
-    for edge in edges:
-        src = edge["source"]
-        tgt = edge["target"]
-        if node_edge_counts.get(src, 0) < MAX_EDGES_PER_NODE and node_edge_counts.get(tgt, 0) < MAX_EDGES_PER_NODE:
-            pruned_edges.append(edge)
-            node_edge_counts[src] += 1
-            node_edge_counts[tgt] += 1
 
-    return pruned_edges
+def _initialize_graph_topology_pending(index_data: dict, reason: str) -> None:
+    """Invalidate derived topology while keeping deterministic search-safe defaults."""
+    _mark_graph_dirty(index_data, reason)
+    index_data["communities"] = {}
+    index_data["community_labels"] = {}
+    index_data["graph_insights"] = []
+    for node in (index_data.get("nodes") or {}).values():
+        node["centrality_score"] = 1.0
+        node["node_score"] = round(float(node.get("decay_weight", 1.0) or 0.0), 4)
+
+
+def _stable_community_id(members: list[str]) -> str:
+    payload = "\0".join(sorted(members))
+    return "community_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _apply_graph_topology(index_data: dict):
-    if "graph_state" not in index_data:
-        index_data["graph_state"] = {}
-    index_data["graph_state"]["dirty"] = True
-    index_data["graph_state"]["reason"] = "Index generated, awaiting async clustering"
-    index_data["graph_state"]["updated_at"] = _utc_now()
-    
-    # Initialize basic node scores so BM25 doesn't crash
-    node_keys = list(index_data["nodes"].keys())
+    """Compute bounded, deterministic topology without mutating Wiki or governance state."""
+    nodes_dict = index_data.get("nodes") or {}
+    node_keys = sorted(nodes_dict)
+    index_data["weighted_edges"] = _prune_weighted_edges(
+        index_data.get("weighted_edges") or [],
+        set(node_keys),
+    )
+
+    adjacency: dict[str, dict[str, float]] = {key: {} for key in node_keys}
+    for edge in index_data["weighted_edges"]:
+        source = edge["source"]
+        target = edge["target"]
+        weight = max(0.0, float(edge.get("weight", 1.0) or 0.0))
+        adjacency[source][target] = max(weight, adjacency[source].get(target, 0.0))
+        adjacency[target][source] = max(weight, adjacency[target].get(source, 0.0))
+
+    weighted_degrees = {
+        key: sum(neighbors.values())
+        for key, neighbors in adjacency.items()
+    }
+    nonzero_degrees = [value for value in weighted_degrees.values() if value > 0]
+    average_weighted_degree = (
+        sum(nonzero_degrees) / len(nonzero_degrees)
+        if nonzero_degrees
+        else 1.0
+    )
     for node_key in node_keys:
-        node = index_data["nodes"][node_key]
-        node["centrality_score"] = 1.0
-        node["node_score"] = round(node.get("decay_weight", 1.0), 4)
+        relative_degree = weighted_degrees[node_key] / average_weighted_degree
+        centrality = min(5.0, relative_degree) if relative_degree > 0 else 0.1
+        node = nodes_dict[node_key]
+        node["centrality_score"] = round(centrality, 4)
+        decay = float(node.get("decay_weight", 1.0) or 0.0)
+        node["node_score"] = round(decay * centrality, 4)
+
+    components: list[list[str]] = []
+    unseen = set(node_keys)
+    while unseen:
+        root = min(unseen)
+        stack = [root]
+        unseen.remove(root)
+        component = []
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency[current]:
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    stack.append(neighbor)
+        components.append(sorted(component))
+    components.sort(key=lambda members: (-len(members), members[0] if members else ""))
+
+    raw_partition: dict[str, object] = {}
+    if nx is not None and community_louvain is not None and index_data["weighted_edges"]:
+        graph = nx.Graph()
+        graph.add_nodes_from(node_keys)
+        graph.add_weighted_edges_from(
+            (
+                edge["source"],
+                edge["target"],
+                float(edge.get("weight", 1.0) or 1.0),
+            )
+            for edge in index_data["weighted_edges"]
+        )
+        try:
+            raw_partition = community_louvain.best_partition(
+                graph,
+                weight="weight",
+                random_state=0,
+            )
+        except Exception as exc:
+            log.warning("Louvain topology analysis failed; using connected components: %s", exc)
+
+    if not raw_partition:
+        raw_partition = {
+            node_key: component_index
+            for component_index, members in enumerate(components)
+            for node_key in members
+        }
+
+    grouped: dict[object, list[str]] = {}
+    for node_key in node_keys:
+        grouped.setdefault(raw_partition.get(node_key, node_key), []).append(node_key)
+
+    communities: dict[str, str] = {}
+    labels: dict[str, str] = {}
+    for members in grouped.values():
+        members = sorted(members)
+        community_id = _stable_community_id(members)
+        for node_key in members:
+            communities[node_key] = community_id
+        hubs = sorted(
+            members,
+            key=lambda key: (-weighted_degrees.get(key, 0.0), key),
+        )[:2]
+        hub_titles = [str(nodes_dict[key].get("title") or key) for key in hubs]
+        labels[community_id] = " / ".join(hub_titles) or community_id
+
+    insights: list[dict] = []
+    isolated_nodes = [key for key in node_keys if not adjacency[key]]
+    for node_key in isolated_nodes[:15]:
+        insights.append({
+            "type": "isolated_node",
+            "node": node_key,
+            "description": f"{node_key} has no retained semantic graph edges.",
+        })
+    for members in (members for members in components if 1 < len(members) <= 5):
+        if len(insights) >= 23:
+            break
+        insights.append({
+            "type": "sparse_community",
+            "nodes": members,
+            "description": f"Sparse component contains {len(members)} nodes.",
+        })
+    if len(components) > 1 and len(insights) < MAX_GRAPH_INSIGHTS:
+        largest_size = len(components[0]) if components else 0
+        insights.append({
+            "type": "fragmented_graph",
+            "nodes": components[0][:5] if components else [],
+            "description": (
+                f"Graph contains {len(components)} connected components; "
+                f"the largest contains {largest_size} of {len(node_keys)} nodes."
+            ),
+        })
+
+    index_data["communities"] = communities
+    index_data["community_labels"] = labels
+    index_data["graph_insights"] = insights[:MAX_GRAPH_INSIGHTS]
+    _mark_graph_clean(
+        index_data,
+        reason=f"Topology analysis complete: {len(labels)} communities",
+    )
 
 
 def _generate_index_unlocked(skip_embeddings: bool = True):
@@ -906,7 +1101,10 @@ def _generate_index_unlocked(skip_embeddings: bool = True):
 
     from vector_lake.db_store import transaction
     index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
-    _apply_graph_topology(index_data)
+    _initialize_graph_topology_pending(
+        index_data,
+        "Index generated, awaiting bounded topology analysis",
+    )
     
     index_data["categories"] = list(index_data["categories"])
     index_data["governance_metrics"] = governance_metrics.compute_debt_metrics(skip_heavy=True)
@@ -1103,6 +1301,9 @@ def update_index_items(filenames: list[str]):
                             if t.get("target"):
                                 td[t["target"]] = t.get("predicate", "mentions")
                         all_nodes_triples[k] = td
+                    source_preview = dict(index_data.get("nodes") or {})
+                    source_preview.update(pre_parsed_data)
+                    allowed_graph_sources = set(_graph_source_index(source_preview))
     
                     for filename in valid_filenames:
                         node_key = filename[:-3]
@@ -1178,7 +1379,7 @@ def update_index_items(filenames: list[str]):
                                                 "target": row["target_id"],
                                                 "weight": float(row["weight"]) if row["weight"] else 1.0,
                                             })
-                                    except Exception as e:
+                                    except Exception:
                                         pass
                                     node_data["_key"] = node_key
                                     all_nodes = index_data["nodes"]
@@ -1191,13 +1392,21 @@ def update_index_items(filenames: list[str]):
                                     triples_a = td
                                     
                                     node_links = set((node_data.get("links") or []))
-                                    node_sources = set((node_data.get("sources") or []))
+                                    node_sources = {
+                                        source
+                                        for source in (node_data.get("sources") or [])
+                                        if str(source) in allowed_graph_sources
+                                    }
                                     for other_key, other_node in all_nodes.items():
                                         if other_key == node_key:
                                             continue
                                             
                                         other_links = set((other_node.get("links") or []))
-                                        other_sources = set((other_node.get("sources") or []))
+                                        other_sources = {
+                                            source
+                                            for source in (other_node.get("sources") or [])
+                                            if str(source) in allowed_graph_sources
+                                        }
                                         triples_b = all_nodes_triples.get(other_key)
                                         
                                         has_direct = other_key in node_links or node_key in other_links
@@ -1224,7 +1433,10 @@ def update_index_items(filenames: list[str]):
                                         other_node.pop("_key", None)
                                     node_data.pop("_key", None)
     
-                    _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
+                    _initialize_graph_topology_pending(
+                        index_data,
+                        f"Partial batch update for {len(valid_filenames)} items",
+                    )
                     index_data["categories"] = list((index_data.get("categories") or []))
                     # Do not recompute heavy debt metrics on partial update
                     index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
@@ -1277,6 +1489,7 @@ def refresh_graph_topology_if_dirty() -> bool:
                     return True
     
                 if is_graph_dirty(index_data):
+                    index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
                     _apply_graph_topology(index_data)
                     temp_path = output_path + ".tmp"
                     with open(temp_path, "w", encoding="utf-8") as handle:

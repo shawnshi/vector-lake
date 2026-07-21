@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector-lake.local/contracts/cbss/source-artifact.schema.json",
+  "title": "Vector Lake SourceArtifact",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["artifact_id", "source_id", "raw_ref", "content_hash", "hash_algorithm", "byte_size", "integrity_status", "classification", "retention_policy", "legal_hold", "lineage_id", "generation_parent_refs"],
+  "properties": {
+    "artifact_id": {"type": "string", "pattern": "^artifact_[0-9a-f]{24}$"},
+    "source_id": {"type": "string", "minLength": 1},
+    "raw_ref": {"type": "string", "minLength": 1},
+    "content_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "hash_algorithm": {"enum": ["sha256", null]},
+    "byte_size": {"type": ["integer", "null"], "minimum": 0},
+    "mime_type": {"type": ["string", "null"]},
+    "storage_uri": {"type": ["string", "null"]},
+    "integrity_status": {"enum": ["verified", "unverified"]},
+    "classification": {"type": "string", "minLength": 1},
+    "retention_policy": {"type": "string", "minLength": 1},
+    "legal_hold": {"type": "boolean"},
+    "lineage_id": {"type": "string", "minLength": 1},
+    "generation_parent_refs": {"type": "array", "items": {"type": "string"}}
+  }
+}

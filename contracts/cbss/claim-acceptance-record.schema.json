@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector-lake.local/contracts/cbss/claim-acceptance-record.schema.json",
+  "title": "CBSS ClaimAcceptanceRecord",
+  "description": "A CBSS-owned authority decision over a Vector Lake claim candidate. Vector Lake exports the referenced EvidencePacket but does not persist this record as AcceptedFact state.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "acceptance_id",
+    "claim_id",
+    "evidence_packet_id",
+    "disposition",
+    "authority",
+    "recorded_at",
+    "reason"
+  ],
+  "properties": {
+    "acceptance_id": {"type": "string", "minLength": 1},
+    "claim_id": {"type": "string", "minLength": 1},
+    "evidence_packet_id": {"type": "string", "pattern": "^ep_[0-9a-f]{24}$"},
+    "disposition": {"enum": ["accepted", "rejected", "deferred", "revoked"]},
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_id", "role", "scope"],
+      "properties": {
+        "actor_id": {"type": "string", "minLength": 1},
+        "role": {"type": "string", "minLength": 1},
+        "scope": {"type": "string", "minLength": 1}
+      }
+    },
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "valid_from": {"type": ["string", "null"], "format": "date-time"},
+    "valid_to": {"type": ["string", "null"], "format": "date-time"},
+    "reason": {"type": "string", "minLength": 1},
+    "replaces_acceptance_id": {"type": ["string", "null"]}
+  }
+}

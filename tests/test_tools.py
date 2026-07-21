@@ -1,6 +1,5 @@
 import unittest
 from unittest.mock import patch, MagicMock
-from pathlib import Path
 
 from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.tool_debt import debt_vector_lake

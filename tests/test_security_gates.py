@@ -1,6 +1,3 @@
-import pytest
-import os
-from pathlib import Path
 from vector_lake.tool_delete import delete_source
 from vector_lake.tool_rename import rename_vector_lake_entity
 from vector_lake.tool_bulk_reconciliation import bulk_reconcile

@@ -2,12 +2,10 @@ import json
 import logging
 import os
 import webbrowser
-from pathlib import Path
 
 from filelock import FileLock, Timeout
 
 from vector_lake import get_extension_root
-from vector_lake import indexer
 from vector_lake import governance_store
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_legacy_claim_graph_path, get_memory_dir
 

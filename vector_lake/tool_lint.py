@@ -224,7 +224,8 @@ def lint_vector_lake(auto_fix: bool = False):
                 for fname in filenames[1:]:
                     if fname in parsed:
                         aliases = parsed[fname]["fm"].get("aliases", [])
-                        if isinstance(aliases, str): aliases = [aliases]
+                        if isinstance(aliases, str):
+                            aliases = [aliases]
                         if alias in aliases:
                             aliases.remove(alias)
                             parsed[fname]["fm"]["aliases"] = aliases
@@ -254,18 +255,30 @@ def lint_vector_lake(auto_fix: bool = False):
         if missing:
             issues["frontmatter"].append(f"{filename}: Missing fields: {', '.join(missing)}")
             if auto_fix:
-                if not frontmatter.get("id"): frontmatter["id"] = _generate_id()
-                if not frontmatter.get("title"): frontmatter["title"] = filename[:-3]
-                if not frontmatter.get("type"): frontmatter["type"] = filename.split("_", 1)[0].lower()
-                if not frontmatter.get("domain"): frontmatter["domain"] = "General"
-                if not frontmatter.get("topic_cluster"): frontmatter["topic_cluster"] = "General"
-                if not frontmatter.get("status"): frontmatter["status"] = "Active"
-                if not frontmatter.get("epistemic-status"): frontmatter["epistemic-status"] = "seed"
-                if not frontmatter.get("categories"): frontmatter["categories"] = ["Uncategorized"]
-                if not frontmatter.get("updated"): frontmatter["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                if "sources" not in frontmatter: frontmatter["sources"] = []
-                if not frontmatter.get("strategic_scope"): frontmatter["strategic_scope"] = "edge"
-                if not frontmatter.get("evidence_tier"): frontmatter["evidence_tier"] = "derived"
+                if not frontmatter.get("id"):
+                    frontmatter["id"] = _generate_id()
+                if not frontmatter.get("title"):
+                    frontmatter["title"] = filename[:-3]
+                if not frontmatter.get("type"):
+                    frontmatter["type"] = filename.split("_", 1)[0].lower()
+                if not frontmatter.get("domain"):
+                    frontmatter["domain"] = "General"
+                if not frontmatter.get("topic_cluster"):
+                    frontmatter["topic_cluster"] = "General"
+                if not frontmatter.get("status"):
+                    frontmatter["status"] = "Active"
+                if not frontmatter.get("epistemic-status"):
+                    frontmatter["epistemic-status"] = "seed"
+                if not frontmatter.get("categories"):
+                    frontmatter["categories"] = ["Uncategorized"]
+                if not frontmatter.get("updated"):
+                    frontmatter["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                if "sources" not in frontmatter:
+                    frontmatter["sources"] = []
+                if not frontmatter.get("strategic_scope"):
+                    frontmatter["strategic_scope"] = "edge"
+                if not frontmatter.get("evidence_tier"):
+                    frontmatter["evidence_tier"] = "derived"
                 changed = True
 
         file_type = str(frontmatter.get("type", "")).lower()
@@ -290,7 +303,8 @@ def lint_vector_lake(auto_fix: bool = False):
                 changed = True
 
         categories = frontmatter.get("categories", [])
-        if isinstance(categories, str): categories = [categories]
+        if isinstance(categories, str):
+            categories = [categories]
         if isinstance(categories, list):
             new_cats = []
             for category in categories:
@@ -298,7 +312,8 @@ def lint_vector_lake(auto_fix: bool = False):
                     issues["category"].append(f"{filename}: Invalid category '{category}'")
                     if auto_fix:
                         changed = True
-                        if "Uncategorized" not in new_cats: new_cats.append("Uncategorized")
+                        if "Uncategorized" not in new_cats:
+                            new_cats.append("Uncategorized")
                 else:
                     new_cats.append(category)
             if auto_fix and not new_cats:

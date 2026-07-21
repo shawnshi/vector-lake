@@ -1,7 +1,7 @@
 import json
 import os
 import logging
-from filelock import FileLock, Timeout
+from filelock import FileLock
 
 from vector_lake import governance_store
 from vector_lake.wiki_utils import get_index_path

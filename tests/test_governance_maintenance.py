@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from vector_lake import db_store, governance_store
 from vector_lake.governance_metrics import claim_governance_version, compute_debt_metrics
@@ -102,6 +101,50 @@ def test_missing_link_registration_refreshes_expired_debt(isolated_memory):
     assert result["registered"] == 1
     assert item["owner"] == "vector-lake-governance"
     assert item["due_at"] > "2000-01-01T00:00:00+00:00"
+
+
+def test_legacy_topology_queue_cleanup_preserves_human_and_decision_scoped_items(
+    isolated_memory,
+):
+    db_store.init_db()
+    for item in (
+        {
+            "item_id": "gov_legacy_topology",
+            "type": "community_naming",
+            "status": "pending",
+            "source": "indexer",
+            "affected_pages": ["System_Community_L0_1.md"],
+        },
+        {
+            "item_id": "gov_decision_topology",
+            "type": "community_naming",
+            "status": "pending",
+            "source": "indexer",
+            "affected_pages": ["System_Community_L0_2.md"],
+            "critical_decision_refs": ["CD-001"],
+        },
+        {
+            "item_id": "gov_human_suggestion",
+            "type": "suggestion",
+            "status": "pending",
+            "source": "human",
+        },
+    ):
+        governance_store.upsert_governance_item(item)
+
+    preview = maintenance.retire_legacy_topology_queue(dry_run=True)
+    result = maintenance.retire_legacy_topology_queue(dry_run=False)
+    items = {
+        item["item_id"]: item
+        for item in governance_store.load_governance_queue()["items"]
+    }
+
+    assert preview["candidate_count"] == 1
+    assert preview["protected_count"] == 1
+    assert result["retired_count"] == 1
+    assert items["gov_legacy_topology"]["status"] == "superseded"
+    assert items["gov_decision_topology"]["status"] == "pending"
+    assert items["gov_human_suggestion"]["status"] == "pending"
 
 
 def test_broken_link_repair_preserves_fenced_source_payload(
@@ -300,3 +343,68 @@ def test_unsupported_claim_registration_closes_unmanaged_debt(isolated_memory):
     assert metrics["unsupported_claim_count"] == 1
     assert metrics["managed_unsupported_claim_count"] == 1
     assert metrics["unmanaged_unsupported_claim_count"] == 0
+
+
+def test_orphan_source_classification_is_non_destructive_and_resumable(isolated_memory):
+    db_store.init_db()
+    (isolated_memory / "raw" / "recoverable.md").write_text("raw", encoding="utf-8")
+    (isolated_memory / "raw" / "raw-only.md").write_text("raw", encoding="utf-8")
+    (isolated_memory / "wiki" / "Source_Recoverable.md").write_text("projection", encoding="utf-8")
+    (isolated_memory / "wiki" / "Source_Projection-Only.md").write_text("projection", encoding="utf-8")
+    sources = [
+        {
+            "source_id": "source_recoverable",
+            "raw_ref": "raw/recoverable.md",
+            "canonical_source_page": "Source_Recoverable.md",
+        },
+        {
+            "source_id": "source_raw_only",
+            "raw_ref": "raw/raw-only.md",
+            "canonical_source_page": "Source_Raw-Only.md",
+        },
+        {
+            "source_id": "source_projection_only",
+            "raw_ref": "raw/missing.md",
+            "canonical_source_page": "Source_Projection-Only.md",
+        },
+        {
+            "source_id": "source_unresolved",
+            "raw_ref": "raw/missing-too.md",
+            "canonical_source_page": "Source_Missing.md",
+        },
+        {
+            "source_id": "source_referenced",
+            "raw_ref": "raw/referenced.md",
+            "canonical_source_page": "Source_Referenced.md",
+        },
+    ]
+    with db_store.transaction():
+        for source in sources:
+            db_store.get_connection().execute(
+                "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
+                (source["source_id"], json.dumps(source), "2026-07-21T00:00:00+00:00"),
+            )
+        evidence = {
+            "evidence_id": "evidence_referenced",
+            "source_id": "source_referenced",
+            "locator": {"page_key": "Concept_Test"},
+        }
+        db_store.get_connection().execute(
+            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (evidence["evidence_id"], json.dumps(evidence), "2026-07-21T00:00:00+00:00"),
+        )
+
+    preview = maintenance.classify_orphan_source_debt(dry_run=True)
+    assert preview["orphan_sources"] == 4
+    assert preview["buckets"] == {
+        "unreferenced_but_recoverable": 1,
+        "raw_only": 1,
+        "projection_only_missing_raw": 1,
+        "unresolved_missing_raw_and_page": 1,
+    }
+    applied = maintenance.classify_orphan_source_debt(dry_run=False)
+    assert applied["registered"] == 4
+    assert db_store.get_connection().execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 5
+    second = maintenance.classify_orphan_source_debt(dry_run=True)
+    assert second["already_managed"] == 4
+    assert second["to_register"] == 0

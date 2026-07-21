@@ -28,10 +28,10 @@ def _summarize_values(values, limit: int = 5) -> str:
 def _combined_pending_items() -> list[dict]:
     combined = []
     for item in governance_store.pending_governance_items():
-        enriched = dict(item)
+        enriched = governance_store.normalize_governance_item(item)
         enriched["queue_kind"] = "governance"
         combined.append(enriched)
-    combined.sort(key=lambda item: item.get("created_at") or item.get("created") or "")
+    combined.sort(key=governance_store.governance_priority_sort_key)
     return combined
 
 
@@ -56,6 +56,12 @@ def _format_combined_report(items: list[dict]) -> str:
         icon = type_icons.get(item.get("type"), "[*]")
         lines.append(f"  [{index}] {icon} **{item.get('title', 'Untitled')}** ({item.get('type', 'unknown')})")
         lines.append(f"      ID: {item.get('item_id', 'unknown')}")
+        lines.append(f"      Priority: {item.get('priority', 'P2')}")
+        if item.get("critical_decision_refs"):
+            lines.append(
+                "      Critical decisions: "
+                + _summarize_values(item["critical_decision_refs"], limit=5)
+            )
         lines.append(f"      Source: {item.get('source', 'unknown')}")
         if item.get("description"):
             lines.append(f"      {_truncate_text(item['description'])}")

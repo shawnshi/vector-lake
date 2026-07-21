@@ -1,14 +1,10 @@
 import logging
 import os
-import shutil
-import json
 from pathlib import Path
 
 import yaml
 
-from vector_lake import indexer
-from vector_lake.wiki_utils import get_memory_dir, get_wiki_dir, normalize_sources, read_markdown_file, write_markdown_file
-from vector_lake.db_store import delete_node_cascade, get_connection
+from vector_lake.wiki_utils import get_memory_dir, get_wiki_dir, normalize_sources, read_markdown_file
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

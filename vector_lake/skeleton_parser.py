@@ -1,7 +1,6 @@
 import os
 import json
 import ast
-import yaml
 from vector_lake.yaml_utils import load_yaml
 
 def parse_static_skeleton(filepath: str) -> str:

@@ -1,7 +1,6 @@
 import os
 import unittest
 from pathlib import Path
-import pytest
 
 from vector_lake import governance_store, wiki_utils
 from vector_lake.tool_search import build_memory_packet, search_vector_lake
@@ -131,6 +130,148 @@ class TestOperationalMemory(unittest.TestCase):
         self.assertEqual(preference["validity_state"], "active")
         self.assertNotIn("superseded_by", preference)
         self.assertFalse(any(item.get("source_claim_id") == "claim_new" for item in memories))
+
+    def test_search_excludes_template_artifacts_and_audit_reports_them(self):
+        store = governance_store.load_memory_objects()
+        store["items"] = {
+            "memory_stub": {
+                "memory_id": "memory_stub",
+                "memory_type": "fact",
+                "memory_key": "generated_stub",
+                "text": "This is an auto-generated stub page to prevent broken links from Concept_X.",
+                "source_page": "Concept_X.md",
+                "validity_state": "active",
+                "memory_score": 1.0,
+            },
+            "memory_real": {
+                "memory_id": "memory_real",
+                "memory_type": "fact",
+                "memory_key": "durable_fact",
+                "text": "Concept X has a verified owner.",
+                "source_page": "Concept_X.md",
+                "validity_state": "active",
+                "memory_score": 0.8,
+            },
+            "memory_mixed": {
+                "memory_id": "memory_mixed",
+                "memory_type": "fact",
+                "memory_key": "mixed_page",
+                "text": "[System Directive: latest consensus.] Concept X uses signed records.",
+                "source_page": "Concept_X.md",
+                "validity_state": "active",
+                "memory_score": 0.7,
+            },
+        }
+        governance_store.save_memory_objects(store)
+
+        current = governance_store.search_operational_memory("Concept X", top_k=10)
+        forensic = governance_store.search_operational_memory(
+            "Concept X", top_k=10, include_polluted=True
+        )
+        preview = governance_store.remediate_operational_memory_pollution(dry_run=True)
+
+        self.assertEqual(
+            {item["memory_id"] for item in current}, {"memory_real", "memory_mixed"}
+        )
+        self.assertEqual(
+            {item["memory_id"] for item in forensic},
+            {"memory_real", "memory_mixed", "memory_stub"},
+        )
+        self.assertEqual(preview["candidate_count"], 1)
+        self.assertEqual(preview["reason_counts"], {"generated_stub": 1})
+
+    def test_rebuild_preserves_archived_artifact_without_reactivating_claim(self):
+        claim = {
+            "claim_id": "claim_legacy_stub",
+            "claim_text": "This is an auto-generated stub page to prevent broken links from Concept_X.",
+            "status": "Active",
+            "source_page": "Concept_X.md",
+            "evidence_ids": [],
+            "source_ids": [],
+        }
+        claims = governance_store.load_claims()
+        claims["items"] = {claim["claim_id"]: claim}
+        governance_store.save_claims(claims)
+        legacy = {
+            "memory_id": "memory_legacy_stub",
+            "memory_type": "fact",
+            "text": claim["claim_text"],
+            "source_claim_id": claim["claim_id"],
+            "source_page": claim["source_page"],
+            "validity_state": "archived",
+            "validity_reasons": ["infrastructure_artifact:generated_stub"],
+            "memory_score": 0.0,
+        }
+        store = governance_store.load_memory_objects()
+        store["items"] = {legacy["memory_id"]: legacy}
+        governance_store.save_memory_objects(store)
+
+        rebuilt = governance_store.rebuild_operational_memory()
+
+        self.assertEqual(set(rebuilt["items"]), {"memory_legacy_stub"})
+        self.assertEqual(
+            rebuilt["items"]["memory_legacy_stub"]["validity_state"], "archived"
+        )
+        self.assertEqual(
+            governance_store.remediate_operational_memory_pollution(dry_run=True)[
+                "candidate_count"
+            ],
+            0,
+        )
+
+    def test_page_delta_preserves_archived_infrastructure_history(self):
+        claim = {
+            "claim_id": "claim_delta_stub",
+            "claim_text": "This is an auto-generated stub page to prevent broken links from Concept_Y.",
+            "status": "Active",
+            "source_page": "Concept_Delta.md",
+            "evidence_ids": [],
+            "source_ids": [],
+            "locator": {"page_key": "Concept_Delta", "heading": "Mechanism"},
+        }
+        claims = governance_store.load_claims()
+        claims["items"] = {claim["claim_id"]: claim}
+        governance_store.save_claims(claims)
+        memory = governance_store._memory_object_from_claim(claim)
+        memory.update({
+            "validity_state": "archived",
+            "validity_reasons": ["infrastructure_artifact:generated_stub"],
+            "memory_score": 0.0,
+        })
+        store = governance_store.load_memory_objects()
+        store["items"] = {memory["memory_id"]: memory}
+        governance_store.save_memory_objects(store)
+
+        governance_store.apply_change_sets_batch([{
+            "affected_pages": ["Concept_Delta.md"],
+            "proposed_entities": [],
+            "proposed_claims": [],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }])
+
+        memories = governance_store.load_memory_objects()["items"].values()
+        archived = [
+            item for item in memories
+            if item.get("source_claim_id") == "claim_delta_stub"
+        ]
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0]["validity_state"], "archived")
+
+    def test_single_typed_memory_keeps_unsupported_validity(self):
+        memory = {
+            "memory_id": "memory_unsupported_preference",
+            "memory_type": "preference",
+            "memory_key": "deployment_target",
+            "validity_state": "unsupported",
+            "memory_score": 0.2,
+        }
+        store = {"items": {memory["memory_id"]: memory}}
+
+        governance_store._resolve_memory_conflicts(store)
+
+        self.assertEqual(memory["validity_state"], "unsupported")
 
 
 if __name__ == "__main__":

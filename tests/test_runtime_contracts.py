@@ -84,3 +84,40 @@ def test_corrupt_search_index_raises_typed_runtime_error(isolated_memory):
 
     with pytest.raises(SearchIndexError, match="could not be read"):
         search_vector_lake("test")
+
+
+def test_dirty_graph_is_excluded_from_search_expansion(isolated_memory, monkeypatch):
+    import json
+    from vector_lake import tool_search
+
+    wiki_dir = get_wiki_dir()
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    (wiki_dir / "Concept_Seed.md").write_text("# Seed", encoding="utf-8")
+    (wiki_dir / "Concept_Expanded.md").write_text("# Expanded", encoding="utf-8")
+    index_path = wiki_dir / "index.json"
+    index_path.write_text(
+        json.dumps({
+            "nodes": {
+                "Concept_Seed": {"title": "Seed", "type": "concept", "status": "Active"},
+                "Concept_Expanded": {"title": "Expanded", "type": "concept", "status": "Active"},
+            },
+            "weighted_edges": [
+                {"source": "Concept_Seed", "target": "Concept_Expanded", "weight": 5.0}
+            ],
+            "graph_state": {"dirty": True},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_get_fts_search_results",
+        lambda *args, **kwargs: [{"node_key": "Concept_Seed", "rank": -1.0}],
+    )
+    monkeypatch.setattr(tool_search, "_get_query_embedding", lambda *_: None)
+    monkeypatch.setattr(tool_search, "_expand_query_locally", lambda *_: ["seed"])
+    tool_search._INDEX_CACHE.update({"mtime": 0.0, "data": None})
+
+    dirty_result = tool_search.search_vector_lake("seed", top_k=2)
+
+    assert "Seed" in dirty_result
+    assert "Expanded" not in dirty_result

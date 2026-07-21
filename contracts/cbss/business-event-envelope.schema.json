@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector-lake.local/contracts/cbss/business-event-envelope.schema.json",
+  "title": "CBSS BusinessEventEnvelope",
+  "description": "A CBSS-owned business event contract. It is distinct from Vector Lake Markdown timelines and timeline_events projections.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "aggregate_id",
+    "event_type",
+    "event_sequence",
+    "valid_time",
+    "recorded_time",
+    "causation_id",
+    "correlation_id",
+    "actor",
+    "authority",
+    "schema_version",
+    "payload_hash",
+    "evidence_refs",
+    "payload"
+  ],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "aggregate_id": {"type": "string", "minLength": 1},
+    "event_type": {"type": "string", "minLength": 1},
+    "event_sequence": {"type": "integer", "minimum": 1},
+    "valid_time": {"type": "string", "format": "date-time"},
+    "recorded_time": {"type": "string", "format": "date-time"},
+    "causation_id": {"type": ["string", "null"]},
+    "correlation_id": {"type": "string", "minLength": 1},
+    "actor": {"type": "object"},
+    "authority": {"type": "object"},
+    "schema_version": {"type": "string", "minLength": 1},
+    "payload_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_refs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "payload": {"type": "object"}
+  }
+}

@@ -1,5 +1,3 @@
-import re
-import json
 from pathlib import Path
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 from vector_lake.purpose_contract import validate_ingest_payload, load_purpose_contract, PurposeContractError

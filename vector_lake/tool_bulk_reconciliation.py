@@ -1,4 +1,3 @@
-import os
 import uuid
 from datetime import datetime, timezone
 from vector_lake.wiki_utils import get_wiki_dir
@@ -21,8 +20,10 @@ def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
         tgt = op.get("target_entity")
         if not src or not tgt:
             return "Error: Each operation must have source_entity and target_entity."
-        if src.endswith('.md'): src = src[:-3]
-        if tgt.endswith('.md'): tgt = tgt[:-3]
+        if src.endswith('.md'):
+            src = src[:-3]
+        if tgt.endswith('.md'):
+            tgt = tgt[:-3]
         
         src_path = (wiki_dir / f"{src}.md").resolve()
         tgt_path = (wiki_dir / f"{tgt}.md").resolve()

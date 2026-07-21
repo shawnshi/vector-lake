@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 import threading
 import uuid
@@ -6,6 +7,7 @@ from pathlib import Path
 from vector_lake.wiki_utils import get_meta_dir
 
 _status_lock = threading.Lock()
+log = logging.getLogger("vector-lake-watchdog-status")
 
 def get_status_file() -> Path:
     return get_meta_dir() / ".watchdog_status.json"
@@ -17,7 +19,7 @@ def write_status(
     current_action: str = "",
     last_error: str = "",
     component: str = "watchdog",
-):
+) -> bool:
     status_file = get_status_file()
     status_file.parent.mkdir(parents=True, exist_ok=True)
     temp_file = status_file.with_name(f".watchdog_status_{uuid.uuid4().hex}.tmp")
@@ -58,14 +60,22 @@ def write_status(
                 with open(temp_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
                 temp_file.replace(status_file)
-                break
-            except PermissionError:
+                return True
+            except PermissionError as exc:
+                last_exception = exc
                 time.sleep(0.1)
             except Exception:
-                break
+                log.exception("Failed to publish watchdog status to %s", status_file)
+                return False
             finally:
                 if temp_file.exists():
                     try:
                         temp_file.unlink()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.warning("Failed to remove watchdog status temp file %s: %s", temp_file, exc)
+        log.error(
+            "Failed to publish watchdog status to %s after retries: %s",
+            status_file,
+            last_exception,
+        )
+        return False

@@ -1,6 +1,7 @@
 from vector_lake.tool_delete import delete_source
-from vector_lake.tool_doctor import doctor_vector_lake
+from vector_lake.tool_doctor import doctor_vector_lake, semantic_readiness_vector_lake
 from vector_lake.tool_debt import debt_vector_lake
+from vector_lake.tool_evidence import build_evidence_packet, export_evidence_packet
 from vector_lake.tool_gc import gc_vector_lake
 from vector_lake.tool_graph import audit_graph, visualize_vector_lake
 from vector_lake.tool_lint import lint_vector_lake
@@ -15,6 +16,7 @@ from vector_lake.tool_trace import trace_vector_lake
 from vector_lake.tool_timeline import rebuild_timeline_events_from_claims
 from vector_lake.tool_projection import (
     canonical_backfill_missing_wiki,
+    evidence_foundation_backfill,
     reconcile_canonical_content_from_wiki,
     embedding_backfill_projection,
     projection_diff_report,
@@ -23,6 +25,11 @@ from vector_lake.tool_projection import (
 )
 from vector_lake.tool_research import research_vector_lake
 from vector_lake.tool_purpose import review_strategic_purpose
+from vector_lake.tool_governance_maintenance import (
+    classify_orphan_source_debt,
+    cleanup_operational_memory,
+    retire_legacy_topology_queue,
+)
 
 
 __all__ = [
@@ -30,9 +37,14 @@ __all__ = [
     "audit_graph",
     "check_duplicate_entity",
     "claim_ingest_tasks",
+    "classify_orphan_source_debt",
+    "cleanup_operational_memory",
+    "retire_legacy_topology_queue",
     "delete_source",
     "debt_vector_lake",
     "doctor_vector_lake",
+    "build_evidence_packet",
+    "export_evidence_packet",
     "finalize_ingest",
     "expire_ingest_tasks",
     "finalize_query_synthesis",
@@ -43,6 +55,7 @@ __all__ = [
     "prepare_ingest_batch",
     "prepare_query_context",
     "canonical_backfill_missing_wiki",
+    "evidence_foundation_backfill",
     "reconcile_canonical_content_from_wiki",
     "embedding_backfill_projection",
     "projection_diff_report",
@@ -51,6 +64,7 @@ __all__ = [
     "research_vector_lake",
     "review_vector_lake",
     "review_strategic_purpose",
+    "semantic_readiness_vector_lake",
     "rebuild_timeline_events_from_claims",
     "search_vector_lake",
     "sync_vector_lake",

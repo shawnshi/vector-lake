@@ -26,9 +26,11 @@ from vector_lake.watchdog_app import process_mutation_outbox_batch
 from vector_lake.wiki_utils import (
     WIKI_LINK_PATTERN,
     get_wiki_dir,
+    get_memory_dir,
     iter_wiki_link_matches,
     markdown_fenced_code_spans,
     read_markdown_file,
+    normalize_raw_ref,
 )
 
 
@@ -40,6 +42,71 @@ _MANAGED_STATUSES = {"acknowledged"}
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def cleanup_operational_memory(dry_run: bool = True, limit: int = 0) -> str:
+    """Expose the bounded operational-memory cleanup with preview as the default."""
+    result = governance_store.remediate_operational_memory_pollution(
+        dry_run=dry_run,
+        limit=max(0, int(limit)),
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def retire_legacy_topology_queue(dry_run: bool = True) -> dict:
+    """Retire old indexer-generated naming work without touching human decisions."""
+    items = governance_store.load_governance_queue().get("items", [])
+    candidates = []
+    protected = []
+    for item in items:
+        if (
+            item.get("type") != "community_naming"
+            or item.get("status") != "pending"
+            or item.get("source") != "indexer"
+        ):
+            continue
+        affected = list(item.get("affected_pages") or [])
+        is_legacy_surface = bool(affected) and all(
+            str(page).startswith("System_Community") for page in affected
+        )
+        if not is_legacy_surface:
+            continue
+        if item.get("critical_decision_refs"):
+            protected.append(str(item.get("item_id") or ""))
+            continue
+        candidates.append(item)
+
+    result = {
+        "dry_run": dry_run,
+        "candidate_count": len(candidates),
+        "protected_count": len(protected),
+        "sample_ids": [str(item.get("item_id") or "") for item in candidates[:20]],
+    }
+    if dry_run or not candidates:
+        return result
+    now = _utc_now()
+    conn = db_store.get_connection()
+    updates = []
+    for item in candidates:
+        archived = dict(item)
+        archived.update(
+            {
+                "status": "superseded",
+                "resolution": "legacy_topology_generation_retired",
+                "resolved_at": now,
+                "updated_at": now,
+            }
+        )
+        updates.append(
+            (json.dumps(archived, ensure_ascii=False), now, item.get("item_id"))
+        )
+    with db_store.transaction():
+        conn.executemany(
+            "UPDATE governance_queue SET data_json = ?, updated_at = ? WHERE item_id = ?",
+            updates,
+        )
+    result["retired_count"] = len(updates)
+    return result
 
 
 def _stable_item_id(prefix: str, value: str) -> str:
@@ -516,6 +583,154 @@ def register_unsupported_claim_debt(dry_run: bool = True) -> dict:
         "already_managed": len(rows) - len(pending),
         "registered": created,
     }
+
+
+def _source_version(source: dict) -> str:
+    payload = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _source_raw_exists(raw_ref: str) -> bool:
+    normalized = normalize_raw_ref(raw_ref)
+    if not normalized:
+        return False
+    memory_dir = get_memory_dir().resolve()
+    raw_path = Path(normalized)
+    candidate = raw_path.resolve() if raw_path.is_absolute() else (memory_dir / raw_path).resolve()
+    return candidate.is_relative_to(memory_dir) and candidate.is_file()
+
+
+def _source_projection_exists(source: dict) -> bool:
+    page = str(source.get("canonical_source_page") or "").strip()
+    if not page:
+        return False
+    filename = page if page.endswith(".md") else f"{page}.md"
+    return (get_wiki_dir() / filename).is_file()
+
+
+def classify_orphan_source_debt(dry_run: bool = True) -> dict:
+    """Classify unreferenced sources and register explicit, non-destructive debt."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    referenced = {
+        str(source_id)
+        for row in conn.execute("SELECT data_json FROM claims")
+        for source_id in (json.loads(row["data_json"]).get("source_ids") or [])
+        if str(source_id)
+    }
+    referenced.update(
+        str(source_id)
+        for row in conn.execute("SELECT data_json FROM evidence")
+        for source_id in [json.loads(row["data_json"]).get("source_id")]
+        if str(source_id or "")
+    )
+    existing = {
+        str(item.get("source_id") or ""): item
+        for row in conn.execute(
+            "SELECT data_json FROM governance_queue "
+            "WHERE json_extract(data_json, '$.type') = 'orphan-source' "
+            "AND json_extract(data_json, '$.status') = 'acknowledged'"
+        )
+        for item in [json.loads(row["data_json"])]
+        if item.get("source_id")
+    }
+    buckets: dict[str, list[dict]] = {
+        "unreferenced_but_recoverable": [],
+        "raw_only": [],
+        "projection_only_missing_raw": [],
+        "unresolved_missing_raw_and_page": [],
+    }
+    for row in conn.execute("SELECT source_id, data_json FROM sources"):
+        source_id = str(row["source_id"])
+        if source_id in referenced:
+            continue
+        source = json.loads(row["data_json"])
+        raw_exists = _source_raw_exists(str(source.get("raw_ref") or ""))
+        projection_exists = _source_projection_exists(source)
+        if raw_exists and projection_exists:
+            bucket = "unreferenced_but_recoverable"
+        elif raw_exists:
+            bucket = "raw_only"
+        elif projection_exists:
+            bucket = "projection_only_missing_raw"
+        else:
+            bucket = "unresolved_missing_raw_and_page"
+        source["_orphan_bucket"] = bucket
+        buckets[bucket].append(source)
+
+    now_dt = datetime.now(timezone.utc)
+    pending: list[dict] = []
+    for bucket_sources in buckets.values():
+        for source in bucket_sources:
+            item = existing.get(str(source.get("source_id") or "")) or {}
+            try:
+                due_at = datetime.fromisoformat(str(item.get("due_at") or "").replace("Z", "+00:00"))
+                if due_at.tzinfo is None:
+                    due_at = due_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                due_at = None
+            if not (
+                str(item.get("owner") or "").strip()
+                and due_at is not None
+                and due_at >= now_dt
+                and item.get("classification") == source["_orphan_bucket"]
+                and item.get("source_version") == _source_version(
+                    {key: value for key, value in source.items() if key != "_orphan_bucket"}
+                )
+            ):
+                pending.append(source)
+
+    result = {
+        "dry_run": dry_run,
+        "orphan_sources": sum(len(items) for items in buckets.values()),
+        "already_managed": sum(len(items) for items in buckets.values()) - len(pending),
+        "to_register": len(pending),
+        "buckets": {key: len(items) for key, items in buckets.items()},
+        "samples": {
+            key: [str(item.get("source_id") or "") for item in items[:10]]
+            for key, items in buckets.items()
+        },
+    }
+    if dry_run:
+        return result
+
+    due_at = (now_dt + timedelta(days=30)).isoformat()
+    resolutions = {
+        "unreferenced_but_recoverable": "reingest-or-link-required",
+        "raw_only": "projection-rebuild-required",
+        "projection_only_missing_raw": "raw-source-recovery-required",
+        "unresolved_missing_raw_and_page": "source-provenance-research-required",
+    }
+    registered = 0
+    for source in pending:
+        source_id = str(source.get("source_id") or "")
+        bucket = str(source.pop("_orphan_bucket"))
+        registered += int(
+            governance_store.upsert_governance_item(
+                {
+                    "item_id": _stable_item_id("orphan_source", source_id),
+                    "type": "orphan-source",
+                    "status": "acknowledged",
+                    "title": f"Orphan source: {source_id}",
+                    "source_id": source_id,
+                    "source_version": _source_version(source),
+                    "classification": bucket,
+                    "raw_ref": str(source.get("raw_ref") or ""),
+                    "canonical_source_page": str(source.get("canonical_source_page") or ""),
+                    "resolution": resolutions[bucket],
+                    "owner": "vector-lake-governance",
+                    "due_at": due_at,
+                    "source": "orphan-source-governance",
+                    "affected_pages": [str(source.get("canonical_source_page"))]
+                    if source.get("canonical_source_page") else [],
+                    "search_queries": [str(source.get("title") or source_id)],
+                    "acknowledged_at": now_dt.isoformat(),
+                },
+                insert_only=False,
+            )
+        )
+    result.update({"registered": registered, "due_at": due_at})
+    return result
 
 
 def restore_fenced_code_from_backup(

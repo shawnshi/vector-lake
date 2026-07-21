@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 import json
 from vector_lake import get_extension_root
+from vector_lake.watchdog_status import write_status
 
 # Load config
 CONFIG_PATH = get_extension_root() / "config.json"
@@ -241,10 +242,14 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
         log.info(f"Raw source modified: {filename}. Scheduled path-scoped ingest preparation.")
 
-    def on_created(self, event): self.handle_event(event)
-    def on_modified(self, event): self.handle_event(event)
-    def on_moved(self, event): self.handle_event(event)
-from vector_lake.watchdog_status import write_status
+    def on_created(self, event):
+        self.handle_event(event)
+
+    def on_modified(self, event):
+        self.handle_event(event)
+
+    def on_moved(self, event):
+        self.handle_event(event)
 
 
 def process_mutation_outbox_batch(
@@ -390,8 +395,10 @@ def index_worker_loop():
             
             # The signal is only a latency hint. Durable rows are always polled.
             if flag_path.exists():
-                try: flag_path.unlink()
-                except OSError: pass
+                try:
+                    flag_path.unlink()
+                except OSError:
+                    pass
 
             with global_task_lock:
                 stats = process_mutation_outbox_batch(limit=50)
@@ -459,46 +466,67 @@ def index_worker_loop():
             close_connection()
 
 
+def expire_stale_ingest_jobs_for_watchdog() -> int:
+    """Run the bounded ingest expiry used by the hourly scheduler."""
+    from vector_lake.db_store import expire_stale_subagent_jobs
+
+    max_age_seconds = max(
+        60,
+        int(os.environ.get("VECTOR_LAKE_INGEST_TASK_MAX_AGE_SECONDS", "86400")),
+    )
+    return expire_stale_subagent_jobs(max_age_seconds=max_age_seconds)
+
+
 def scheduled_lint_loop():
     log.info("Scheduled Lint Worker Thread started.")
     last_run_date_hour = ""
-    last_snapshot_minute = -1
+    last_expiry_date_hour = ""
 
     while True:
         try:
             # DB connection opens only inside actual work blocks now
             now = time.localtime()
+
+            # Expire abandoned subagent work once per hour instead of waiting
+            # for a manual CLI invocation or one of the twice-daily lint runs.
+            current_date_hour = f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
+            if now.tm_min == 0 and current_date_hour != last_expiry_date_hour:
+                from vector_lake.db_store import close_connection
+
+                try:
+                    expired = expire_stale_ingest_jobs_for_watchdog()
+                    log.info("Hourly ingest expiry completed: %s stale job(s).", expired)
+                    last_expiry_date_hour = current_date_hour
+                finally:
+                    close_connection()
             
             # Run at 10:00 and 23:00
             if now.tm_hour in (10, 23) and now.tm_min == 0:
-                current_date_hour = f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
                 if current_date_hour != last_run_date_hour:
                     write_status("processing", 0, index_queue.qsize(), "Running Scheduled Auto-Lint", "", component="scheduler")
                     log.info("Triggering Scheduled Autonomous Auto-Lint...")
-                    
+
                     from vector_lake.tool_lint import lint_vector_lake
                     from vector_lake import indexer
-                    with global_task_lock:
-                        if indexer.refresh_graph_topology_if_dirty():
-                            log.info("Graph topology refreshed during scheduled lint.")
-                        lint_vector_lake(auto_fix=False)
-                        
-                        # Truncate WAL to prevent unbounded growth
-                        from vector_lake.db_store import get_connection
-                        try:
+                    from vector_lake.db_store import close_connection, get_connection
+                    try:
+                        with global_task_lock:
+                            if indexer.refresh_graph_topology_if_dirty():
+                                log.info("Graph topology refreshed during scheduled lint.")
+                            lint_vector_lake(auto_fix=False)
+
+                            # Truncate WAL to prevent unbounded growth
                             conn = get_connection()
                             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                             log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
-                        except Exception as e:
-                            log.error(f"Failed to truncate WAL: {e}")
+                    finally:
+                        close_connection()
                     
                     log.info("Scheduled Autonomous Auto-Lint completed.")
                     last_run_date_hour = current_date_hour
                     write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "", component="scheduler")
             
             # Calculate wait time till next minute to avoid tight spinning, or just sleep for 30 seconds
-            import datetime
-            now_dt = datetime.datetime.now()
             # If we just ran at hour 10 or 23, sleep 60 seconds to push past min 0
             if now.tm_hour in (10, 23) and now.tm_min == 0:
                 time.sleep(60)

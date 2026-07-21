@@ -30,8 +30,18 @@ def _normalized_name(value: str) -> str:
 
 def claim_governance_version(claim: dict) -> str:
     stable = dict(claim)
-    stable.pop("validity_state", None)
-    stable.pop("validity_reasons", None)
+    for field in (
+        "validity_state",
+        "validity_reasons",
+        "claim_family_id",
+        "confidence_kind",
+        "calibrated_probability",
+        "assessment_status",
+        "extractor_name",
+        "extractor_version",
+        "extraction_run_id",
+    ):
+        stable.pop(field, None)
     payload = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -278,6 +288,15 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
             provisional_claim_count += 1
         if float(claim.get("confidence", 0)) < 0.5 and len(claim.get("subject_entity_ids", [])) > 0:
             high_centrality_low_confidence += 1
+
+    # Evidence is a first-class source reference. Counting only claim.source_ids
+    # falsely labels sources as orphaned when the claim reaches them through an
+    # Evidence record.
+    for row in conn.execute("SELECT data_json FROM evidence"):
+        evidence = json.loads(row["data_json"])
+        source_id = str(evidence.get("source_id") or "").strip()
+        if source_id:
+            source_ids_with_claims.add(source_id)
 
     orphan_source_count = sum(
         1

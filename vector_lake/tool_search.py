@@ -5,16 +5,12 @@ import re
 from datetime import datetime, timezone
 
 import functools
-import math
-import pickle
 import ast
 import operator
 from xml.sax.saxutils import escape, quoteattr
-from filelock import FileLock, Timeout
 
 from vector_lake import governance_store
-from vector_lake import db_store
-from vector_lake.wiki_utils import get_index_path, get_wiki_dir, get_meta_dir
+from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -46,7 +42,6 @@ QUERY_EXPANSION_DICT = {
     "医疗AI": ["临床Agent", "大模型医疗落地", "电子病历 智能化"],
 }
 
-from vector_lake.wiki_utils import calculate_cosine_similarity
 
 def _get_query_embedding(query: str) -> list[float]:
     if not os.environ.get("GEMINI_API_KEY"):
@@ -125,9 +120,11 @@ def _classify_intent(query: str) -> str:
     temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
     entity_keywords = {"是谁", "哪里", "谁在", "who is", "where is", "公司", "人员", "关联", "图谱", "网络"}
     for kw in temporal_keywords:
-        if kw in query.lower(): return "temporal"
+        if kw in query.lower():
+            return "temporal"
     for kw in entity_keywords:
-        if kw in query.lower(): return "entity"
+        if kw in query.lower():
+            return "entity"
     return "general"
 
 
@@ -368,8 +365,6 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
         return "Lake is drying. No index.json found, please ingest sources first."
-    lock_path = index_path + ".lock"
-
     try:
         current_mtime = os.path.getmtime(index_path)
         if _INDEX_CACHE["mtime"] != current_mtime or _INDEX_CACHE["data"] is None:
@@ -427,9 +422,12 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     for key, score in hybrid_scores.items():
         if key in index_data.get('nodes', {}):
             node = {'_key': key, **index_data['nodes'][key]}
-            if domain and node.get('domain', '').lower() != domain.lower(): continue
-            if cluster and node.get('topic_cluster', '').lower() != cluster.lower(): continue
-            if not include_history and node.get('status', '').lower() in ('deprecated', 'archived'): continue
+            if domain and node.get('domain', '').lower() != domain.lower():
+                continue
+            if cluster and node.get('topic_cluster', '').lower() != cluster.lower():
+                continue
+            if not include_history and node.get('status', '').lower() in ('deprecated', 'archived'):
+                continue
             
             # V11.2 Hard Metadata Gate
             if filter_expr:
@@ -447,7 +445,8 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     # P2-1: Dynamic Graph Expansion via Multi-hop PPR (Personalized PageRank)
     top_keys = {node["_key"] for _, node in scored[:5]}
-    if top_keys and index_data.get("weighted_edges"):
+    graph_ready = (index_data.get("graph_state") or {}).get("dirty") is False
+    if top_keys and graph_ready and index_data.get("weighted_edges"):
         # Build adjacency list
         adj = {}
         for edge in index_data["weighted_edges"]:
@@ -551,7 +550,6 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
 
 def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
-    base_memory_budget = int(max_chars * TOKEN_BUDGET["operational_memory"])
     index_budget = int(max_chars * TOKEN_BUDGET["index_summary"])
     
     # P2-2: Dynamic Sliding Window for Budget
@@ -574,7 +572,6 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
 
     index_summary = ""
     index_path = str(get_index_path())
-    lock_path = index_path + ".lock"
     if os.path.exists(index_path):
         import time
         for attempt in range(3):

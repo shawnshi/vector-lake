@@ -56,7 +56,7 @@ def build_trace_for_query(query: str, top_k: int = 5) -> dict:
 def format_trace(trace: dict) -> str:
     if not trace.get("items"):
         return "No provenance trace found."
-    lines = [f"=== Provenance Trace ===", f"Query: {trace.get('query', '')}", ""]
+    lines = ["=== Provenance Trace ===", f"Query: {trace.get('query', '')}", ""]
     for index, item in enumerate(trace["items"], start=1):
         lines.append(f"[{index}] {item['claim_id']}")
         lines.append(f"  Claim: {item['claim_text']}")

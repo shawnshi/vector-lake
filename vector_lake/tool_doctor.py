@@ -6,12 +6,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vector_lake import governance_store
 from vector_lake.wiki_utils import get_index_path, get_memory_dir, get_raw_dir, get_wiki_dir, get_meta_dir
 from vector_lake.db_store import get_db_path, get_connection
 from vector_lake import get_extension_root
 from vector_lake.native_llm import native_llm_ready
-from vector_lake.runtime_health import assess_runtime_health
+from vector_lake.runtime_health import assess_runtime_health, assess_semantic_readiness
 from vector_lake.tokenizer_runtime import load_tokenizer
 
 def _check_ast(module_path: Path) -> tuple[bool, str]:
@@ -28,6 +27,13 @@ def _check_ast(module_path: Path) -> tuple[bool, str]:
 
 def doctor_vector_lake() -> str:
     checks = []
+    semantic_readiness = {
+        "ready": False,
+        "status": "not_ready",
+        "issues": ["semantic_readiness_not_assessed"],
+        "warnings": [],
+        "detail": {},
+    }
 
     # 1. Environment & Config
     python_ok = sys.version_info >= (3, 10)
@@ -131,8 +137,9 @@ def doctor_vector_lake() -> str:
             if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
         }
         with open(get_index_path(), "r", encoding="utf-8") as f:
+            index_data = json.load(f)
             index_keys = {
-                key for key in json.load(f).get("nodes", {})
+                key for key in index_data.get("nodes", {})
                 if not str(key).startswith("System_")
             }
         conn = get_connection()
@@ -185,8 +192,16 @@ def doctor_vector_lake() -> str:
                 else "; ".join(health["issues"])
             ),
         ))
+        semantic_readiness = assess_semantic_readiness(index_data=index_data)
     except Exception as e:
         checks.append(("State Consistency", False, f"Check failed: {e}"))
+        semantic_readiness = {
+            "ready": False,
+            "status": "not_ready",
+            "issues": [f"semantic_readiness_check_failed:{e}"],
+            "warnings": [],
+            "detail": {},
+        }
 
     lines = ["=== Vector Lake Doctor ==="]
     all_ok = True
@@ -194,7 +209,27 @@ def doctor_vector_lake() -> str:
         lines.append(f"[{'OK' if ok else 'FAIL'}] {label}: {detail}")
         all_ok = all_ok and ok
     lines.append("")
-    lines.append("Summary: healthy" if all_ok else "Summary: issues detected")
+    lines.append("Infrastructure Summary: healthy" if all_ok else "Infrastructure Summary: issues detected")
+    lines.append(f"Semantic Readiness: {semantic_readiness['status']}")
+    if semantic_readiness["issues"]:
+        lines.append("Semantic issues: " + "; ".join(semantic_readiness["issues"]))
+    if semantic_readiness["warnings"]:
+        lines.append("Semantic warnings: " + "; ".join(semantic_readiness["warnings"]))
+    lines.append(
+        "Summary: infrastructure healthy; semantic readiness " + semantic_readiness["status"]
+        if all_ok
+        else "Summary: infrastructure issues detected; semantic readiness " + semantic_readiness["status"]
+    )
     lines.append(f"VECTOR_LAKE_MEMORY_DIR={os.environ.get('VECTOR_LAKE_MEMORY_DIR', '<default>')}")
     return "\n".join(lines)
+
+
+def semantic_readiness_vector_lake(decision_id: str | None = None) -> str:
+    """Return the machine-readable semantic readiness report."""
+    return json.dumps(
+        assess_semantic_readiness(decision_id=decision_id),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 

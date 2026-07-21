@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector-lake.local/contracts/cbss/claim-assessment.schema.json",
+  "title": "Vector Lake ClaimAssessment",
+  "description": "A review result over a Claim candidate. It is not an AcceptedFact authority decision.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["assessment_id", "claim_id", "assessment_type", "outcome", "actor_id", "method_version", "reason", "recorded_at"],
+  "properties": {
+    "assessment_id": {"type": "string", "pattern": "^assessment_[0-9a-f]{24}$"},
+    "claim_id": {"type": "string", "minLength": 1},
+    "assessment_type": {"type": "string", "minLength": 1},
+    "outcome": {"enum": ["supported", "unsupported", "contradicted", "inconclusive", "needs_review"]},
+    "actor_id": {"type": "string", "minLength": 1},
+    "method_version": {"type": "string", "minLength": 1},
+    "reason": {"type": "string", "minLength": 1},
+    "details": {"type": "object"},
+    "recorded_at": {"type": "string", "format": "date-time"}
+  }
+}

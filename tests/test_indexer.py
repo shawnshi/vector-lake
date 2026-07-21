@@ -2,7 +2,10 @@ import unittest
 import json
 from unittest.mock import patch
 from vector_lake.indexer import (
+    MAX_EDGES_PER_NODE,
+    _apply_graph_topology,
     _bounded_node_edge_candidates,
+    _calculate_weighted_edges,
     index_projection_matches_canonical,
     _entity_to_index_node,
     _strip_legacy_embedded_payloads,
@@ -57,6 +60,68 @@ class TestIndexer(unittest.TestCase):
                 written["weighted_edges"],
                 [{"source": "Concept_A", "target": "Concept_B", "weight": 3.0}],
             )
+
+    def test_index_write_enforces_global_degree_cap(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "index.json"
+            targets = [f"Concept_Target-{index:03d}" for index in range(80)]
+            data = {
+                "nodes": {"Concept_Hub": {}, **{target: {} for target in targets}},
+                "aliases": {},
+                "weighted_edges": [
+                    {
+                        "source": "Concept_Hub",
+                        "target": target,
+                        "weight": float(100 - index),
+                    }
+                    for index, target in enumerate(targets)
+                ],
+            }
+
+            _write_index(str(output), data)
+
+            written = json.loads(output.read_text(encoding="utf-8"))
+            hub_edges = [
+                edge
+                for edge in written["weighted_edges"]
+                if "Concept_Hub" in (edge["source"], edge["target"])
+            ]
+            self.assertEqual(len(hub_edges), MAX_EDGES_PER_NODE)
+
+    def test_topology_analysis_marks_graph_clean_and_surfaces_isolate(self):
+        index_data = {
+            "nodes": {
+                "Concept_A": {"title": "A", "decay_weight": 1.0},
+                "Concept_B": {"title": "B", "decay_weight": 1.0},
+                "Concept_C": {"title": "C", "decay_weight": 0.8},
+                "Concept_Isolated": {"title": "Isolated", "decay_weight": 1.0},
+            },
+            "weighted_edges": [
+                {"source": "Concept_A", "target": "Concept_B", "weight": 3.0},
+                {"source": "Concept_B", "target": "Concept_C", "weight": 2.0},
+            ],
+            "communities": {},
+            "community_labels": {},
+            "graph_insights": [],
+            "graph_state": {"dirty": True, "reason": "test"},
+        }
+
+        _apply_graph_topology(index_data)
+
+        self.assertFalse(index_data["graph_state"]["dirty"])
+        self.assertEqual(set(index_data["communities"]), set(index_data["nodes"]))
+        self.assertTrue(index_data["community_labels"])
+        self.assertTrue(
+            any(
+                insight.get("type") == "isolated_node"
+                and insight.get("node") == "Concept_Isolated"
+                for insight in index_data["graph_insights"]
+            )
+        )
+        self.assertGreater(index_data["nodes"]["Concept_B"]["centrality_score"], 0)
     def test_get_pred_weight(self):
         # Taxonomy weights
         self.assertEqual(get_pred_weight("is_a"), 3.0)
@@ -167,6 +232,27 @@ def test_full_index_rebuild_does_not_load_duplicate_canonical_snapshots(isolated
     governance_store.upsert_entity(row["entity_id"], changed)
 
     assert index_projection_matches_canonical(["Concept_Streaming-Index.md"]) is False
+
+
+def test_generic_source_does_not_create_similarity_clique(isolated_memory):
+    from vector_lake import db_store
+
+    db_store.init_db()
+    index_data = {
+        "nodes": {
+            f"Concept_Node-{index:03d}": {
+                "type": "concept",
+                "sources": ["[[Source_Auto_Fixed]]"],
+                "links": [],
+                "triples": [],
+                "decay_weight": 1.0,
+                "alignment_score": 100.0,
+            }
+            for index in range(40)
+        }
+    }
+
+    assert _calculate_weighted_edges(index_data) == []
 
 
 def test_full_index_rebuild_uses_shared_projection_publish_lock(

@@ -1,11 +1,13 @@
 from mcp.server.fastmcp import FastMCP
 import sys
 import logging
+import uuid
 
 # Global lock against stdout pollution
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', force=True)
-from vector_lake import tools, tool_memory
-from vector_lake.tool_timeline import search_timeline_events
+from vector_lake import tools, tool_memory  # noqa: E402
+from vector_lake.governance_store import insert_governance_item_if_absent, _utc_now  # noqa: E402
+from vector_lake.tool_timeline import search_timeline_events  # noqa: E402
 
 mcp = FastMCP("vector-lake")
 
@@ -53,6 +55,16 @@ def canonical_reconcile_content(dry_run: bool = True, limit: int = 0, batch_size
         batch_size=batch_size,
     )
 
+
+@mcp.tool()
+def evidence_foundation_backfill(dry_run: bool = True, limit: int = 500, batch_size: int = 100) -> str:
+    """Backfill missing auditable evidence metadata without replacing canonical content."""
+    return tools.evidence_foundation_backfill(
+        dry_run=dry_run,
+        limit=limit,
+        batch_size=batch_size,
+    )
+
 @mcp.tool()
 def projection_rebuild_index(dry_run: bool = True) -> str:
     """Rebuild index.json, FTS, embeddings, and claim_graph from SQLite canonical state."""
@@ -72,6 +84,38 @@ def wiki_restore(dry_run: bool = True, limit: int = 10) -> str:
     """Restore missing Wiki Markdown pages from canonical metadata."""
     return tools.restore_missing_wiki_from_canonical(dry_run=dry_run, limit=limit)
 
+
+@mcp.tool()
+def operational_memory_cleanup(dry_run: bool = True, limit: int = 0) -> str:
+    """Preview or archive known generated/template artifacts in operational memory."""
+    return tools.cleanup_operational_memory(dry_run=dry_run, limit=limit)
+
+
+@mcp.tool()
+def topology_queue_cleanup(dry_run: bool = True) -> str:
+    """Preview or retire old indexer-generated community naming work."""
+    import json
+
+    return json.dumps(
+        tools.retire_legacy_topology_queue(dry_run=dry_run),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def orphan_source_classify(dry_run: bool = True) -> str:
+    """Classify unreferenced sources and optionally register explicit remediation debt."""
+    import json
+
+    return json.dumps(
+        tools.classify_orphan_source_debt(dry_run=dry_run),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
 @mcp.tool()
 def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
     """Search the Vector Lake index.
@@ -82,6 +126,57 @@ def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
         mode: Search mode, can be 'page', 'memory', or 'claim'.
     """
     return tools.search_vector_lake(query, top_k, mode=mode)
+
+
+@mcp.tool()
+def export_evidence_packet(
+    claim_id: str,
+    include_evidence_text: bool = False,
+    max_evidence_text_chars: int = 2000,
+    actor_id: str = "",
+    purpose: str = "",
+) -> str:
+    """Export a read-only CBSS EvidencePacket for one canonical claim.
+
+    The packet remains a claim candidate. It never promotes a Vector Lake claim
+    to an AcceptedFact and defaults to hashes and locators instead of raw text.
+    """
+    return tools.export_evidence_packet(
+        claim_id,
+        include_evidence_text=include_evidence_text,
+        max_evidence_text_chars=max_evidence_text_chars,
+        actor_id=actor_id,
+        purpose=purpose,
+    )
+
+
+@mcp.tool()
+def semantic_readiness(decision_id: str = "") -> str:
+    """Report semantic readiness separately from infrastructure health."""
+    return tools.semantic_readiness_vector_lake(decision_id or None)
+
+
+@mcp.tool()
+def sync_critical_decision_registry(
+    payload_file: str,
+    expected_sha256: str,
+    actor_id: str,
+) -> str:
+    """Import an operator-pinned CriticalDecisionRegistry snapshot from the approved sandbox."""
+    import json
+    from vector_lake.decision_registry import sync_verified_registry_document
+
+    payload_text = _read_payload(payload_file)
+    return json.dumps(
+        sync_verified_registry_document(
+            payload_text,
+            expected_sha256=expected_sha256,
+            actor_id=actor_id,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 
 def _read_payload(payload_file: str) -> str:
     if not payload_file:
@@ -328,7 +423,6 @@ def finalize_ingest(
         raw_files_payload_file: Sandbox JSON file containing processed_data.
     """
     import json
-    import os
     try:
         import json
         if files_written_payload_file or raw_files_payload_file:
@@ -377,8 +471,7 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
         content = _read_payload(payload_file)
     except Exception as e:
         return str(e)
-    from vector_lake.wiki_utils import safe_write_markdown, SafeWriteError, get_wiki_dir
-    import os
+    from vector_lake.wiki_utils import SafeWriteError
     try:
         from vector_lake.mutation_coordinator import execute_mutation_plan
         execute_mutation_plan(filename, content=content, is_delete=False)
@@ -387,9 +480,6 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
         return f"[Write Rejected] {str(e)}"
     except Exception as e:
         return f"Error writing file: {str(e)}"
-
-import uuid
-from vector_lake.governance_store import insert_governance_item_if_absent, _utc_now
 
 @mcp.tool()
 def propose_schema_mutation(new_category: str, payload_file: str, parent_category: str = "Uncategorized") -> str:

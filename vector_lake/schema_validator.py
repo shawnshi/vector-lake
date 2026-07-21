@@ -2,7 +2,6 @@ import re
 import json
 from datetime import datetime
 from pathlib import Path
-from vector_lake.yaml_utils import load_yaml
 
 class SchemaViolationException(Exception):
     pass
@@ -148,9 +147,8 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
 
         section_1_text = section_1_match.group(0)
         
-        # Pronoun constraint check
-        pronouns = ["它", "他们", "he", "she", "it", "they"]
-        # A simple check: we warn or throw if we see standalone "它" ? 
+        # A simple check could flag standalone pronouns, but structural checks
+        # avoid false positives in Chinese.
         # For now, let's just do structural checks to avoid false positives in Chinese.
         
         # H3 Slots
@@ -191,7 +189,8 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
             valid_tags = {"[Release]", "[Pivot]", "[Conflict]", "[Validation]", "[Observation]", "[Decision]", "[Execution]", "[Outcome]"}
             for bullet in bullets:
                 # Bypass pure text instructions or quotes
-                if bullet.startswith("[YYYY-MM-DD]") or "Event_Tag" in bullet: continue
+                if bullet.startswith("[YYYY-MM-DD]") or "Event_Tag" in bullet:
+                    continue
                 # Match strict timeline start
                 if not re.match(r'^\[\d{4}-\d{2}-\d{2}\]', bullet):
                     raise SchemaViolationException(f"Schema Violation: Timeline entry '{bullet[:20]}...' must start with [YYYY-MM-DD].")

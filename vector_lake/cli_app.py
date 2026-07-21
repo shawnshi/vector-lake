@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import os
 import sys
 
@@ -38,6 +39,7 @@ Usage Examples:
   python cli.py review resolve review_ab12cd34ef56
   python cli.py delete "/path/to/raw/file.pdf" --dry-run
   python cli.py doctor
+  python cli.py evidence-packet "claim_id"
 """,
     )
 
@@ -79,6 +81,23 @@ Usage Examples:
     canonical_backfill_parser.add_argument("--apply", action="store_true", help="Persist the backfill. Defaults to dry-run.")
     canonical_backfill_parser.add_argument("--limit", type=int, default=50, help="Maximum number of missing pages to process.")
 
+    foundation_backfill_parser = subparsers.add_parser(
+        "evidence-foundation-backfill",
+        help="[MAINTENANCE] Backfill missing evidence-foundation metadata without replacing canonical content.",
+    )
+    foundation_backfill_parser.add_argument(
+        "--apply", action="store_true", help="Persist the backfill. Defaults to dry-run."
+    )
+    foundation_backfill_parser.add_argument(
+        "--limit", type=int, default=500, help="Maximum page revisions per run; zero means all."
+    )
+    foundation_backfill_parser.add_argument(
+        "--batch-size", type=int, default=100, help="Atomic page count per transaction."
+    )
+    foundation_backfill_parser.add_argument(
+        "--backup-reference", default="", help="Existing verified SQLite backup to reuse."
+    )
+
     index_rebuild_parser = subparsers.add_parser("projection-rebuild-index", help="[MAINTENANCE] Rebuild index projection from canonical SQLite.")
     index_rebuild_parser.add_argument("--apply", action="store_true", help="Persist rebuilt index projection. Defaults to dry-run.")
 
@@ -91,6 +110,31 @@ Usage Examples:
     wiki_restore_parser.add_argument("--apply", action="store_true", help="Persist restored Markdown pages. Defaults to dry-run.")
     wiki_restore_parser.add_argument("--limit", type=int, default=10, help="Maximum number of canonical-only pages to restore.")
 
+    memory_cleanup_parser = subparsers.add_parser(
+        "memory-cleanup",
+        help="[MAINTENANCE] Preview or archive generated template artifacts in operational memory.",
+    )
+    memory_cleanup_parser.add_argument(
+        "--apply", action="store_true", help="Archive detected artifacts. Defaults to dry-run."
+    )
+    memory_cleanup_parser.add_argument(
+        "--limit", type=int, default=0, help="Maximum rows to archive; zero means all candidates."
+    )
+    topology_cleanup_parser = subparsers.add_parser(
+        "topology-queue-cleanup",
+        help="[MAINTENANCE] Preview or retire legacy indexer-generated community naming items.",
+    )
+    topology_cleanup_parser.add_argument(
+        "--apply", action="store_true", help="Retire matching legacy items. Defaults to dry-run."
+    )
+    orphan_source_parser = subparsers.add_parser(
+        "orphan-source-classify",
+        help="[MAINTENANCE] Classify unreferenced canonical sources and register non-destructive debt.",
+    )
+    orphan_source_parser.add_argument(
+        "--apply", action="store_true", help="Register classified debt. Defaults to dry-run."
+    )
+
     review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.")
     review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve", "ground"], help="Action: 'list' (default), 'resolve', or 'ground'.")
     review_parser.add_argument("index", nargs="?", default="-1", help="Index or item_id of review item to resolve (for 'resolve' action).")
@@ -98,6 +142,15 @@ Usage Examples:
 
     subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.")
     subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")
+    readiness_parser = subparsers.add_parser(
+        "readiness",
+        help="[READINESS] Report semantic readiness separately from runtime health.",
+    )
+    readiness_parser.add_argument(
+        "--decision-id",
+        default=None,
+        help="Evaluate only a verified CriticalDecisionRegistry scope.",
+    )
 
     research_parser = subparsers.add_parser("research", help="[RESEARCH] Autonomously scan graph gaps and governance queue to formulate web research directives.")
     research_parser.add_argument("--dry-run", action="store_true", help="Preview the research queries without the SYSTEM DIRECTIVE execution hook.")
@@ -108,6 +161,33 @@ Usage Examples:
 
     trace_parser = subparsers.add_parser("trace", help="[TRACE] Show provenance trace for a query or identifier.")
     trace_parser.add_argument("query_or_id", help="Query text or object identifier.")
+
+    evidence_parser = subparsers.add_parser(
+        "evidence-packet",
+        help="[EVIDENCE] Export a read-only CBSS EvidencePacket for one canonical claim.",
+    )
+    evidence_parser.add_argument("claim_id", help="Canonical claim identifier.")
+    evidence_parser.add_argument(
+        "--include-text",
+        action="store_true",
+        help="Include bounded evidence text. The default exports hashes and locators only.",
+    )
+    evidence_parser.add_argument(
+        "--max-text-chars",
+        type=int,
+        default=2000,
+        help="Per-evidence text limit when --include-text is used (default: 2000, max: 10000).",
+    )
+    evidence_parser.add_argument(
+        "--actor-id",
+        default="",
+        help="Required operator identifier when --include-text is used.",
+    )
+    evidence_parser.add_argument(
+        "--purpose",
+        default="",
+        help="Required bounded export purpose when --include-text is used.",
+    )
 
     merge_parser = subparsers.add_parser("merge-suggestions", help="[MERGE] Detect and enqueue candidate entity merges.")
     merge_parser.add_argument("--limit", type=int, default=20, help="Maximum number of merge candidates to surface.")
@@ -172,6 +252,13 @@ def main() -> int:
                 dry_run=not getattr(args, "apply", False),
                 limit=getattr(args, "limit", 50),
             ))
+        elif args.command == "evidence-foundation-backfill":
+            print(tools.evidence_foundation_backfill(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", 500),
+                batch_size=getattr(args, "batch_size", 100),
+                backup_reference=getattr(args, "backup_reference", ""),
+            ))
         elif args.command == "projection-rebuild-index":
             print(tools.rebuild_index_projection(dry_run=not getattr(args, "apply", False)))
         elif args.command == "embedding-backfill":
@@ -185,18 +272,45 @@ def main() -> int:
                 dry_run=not getattr(args, "apply", False),
                 limit=getattr(args, "limit", 10),
             ))
+        elif args.command == "memory-cleanup":
+            print(tools.cleanup_operational_memory(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", 0),
+            ))
+        elif args.command == "topology-queue-cleanup":
+            print(tools.retire_legacy_topology_queue(
+                dry_run=not getattr(args, "apply", False)
+            ))
+        elif args.command == "orphan-source-classify":
+            print(json.dumps(
+                tools.classify_orphan_source_debt(
+                    dry_run=not getattr(args, "apply", False)
+                ),
+                ensure_ascii=False,
+                indent=2,
+            ))
         elif args.command == "review":
             print(tools.review_vector_lake(action=args.action, index=args.index, resolution=getattr(args, "resolution", "skip")))
         elif args.command == "audit-graph":
             print(tools.audit_graph())
         elif args.command == "doctor":
             print(tools.doctor_vector_lake())
+        elif args.command == "readiness":
+            print(tools.semantic_readiness_vector_lake(getattr(args, "decision_id", None)))
         elif args.command == "research":
             print(tools.research_vector_lake(getattr(args, "dry_run", False)))
         elif args.command == "debt":
             print(tools.debt_vector_lake(getattr(args, "top", 20)))
         elif args.command == "trace":
             print(tools.trace_vector_lake(args.query_or_id))
+        elif args.command == "evidence-packet":
+            print(tools.export_evidence_packet(
+                args.claim_id,
+                include_evidence_text=getattr(args, "include_text", False),
+                max_evidence_text_chars=getattr(args, "max_text_chars", 2000),
+                actor_id=getattr(args, "actor_id", ""),
+                purpose=getattr(args, "purpose", ""),
+            ))
         elif args.command == "merge-suggestions":
             print(tools.merge_suggestions_vector_lake(limit=getattr(args, "limit", 20), enqueue=not getattr(args, "preview", False)))
         elif args.command == "delete":

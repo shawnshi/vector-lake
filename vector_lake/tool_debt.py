@@ -1,5 +1,4 @@
 from vector_lake import governance_metrics
-from vector_lake import governance_store
 
 
 def debt_vector_lake(top: int = 20) -> str:

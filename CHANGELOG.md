@@ -1,3 +1,22 @@
+# Unreleased
+
+- Replaced placeholder graph analysis with bounded topology computation, deterministic communities, a global degree cap, and dirty-graph retrieval isolation.
+- Added cascade tombstones for operational memory, Claim/Evidence versions, and entity identities when canonical pages are deleted.
+- Added preview-first cleanup for generated memory artifacts and obsolete indexer community-naming work, preserving mixed-content and decision-scoped records.
+- Decoupled change-set retention from orphan-page deletion, paired idempotency cleanup, hourly stale-ingest expiry, and observable watchdog-status failures.
+- Added global evidence-foundation coverage to semantic readiness and SHA-256-pinned CriticalDecisionRegistry import receipts.
+- Added verified SourceArtifact byte hashes, raw-source locators, deterministic ExtractionRun records, and explicit lineage/independence flags; missing sources now remain `unverified` instead of receiving placeholder hashes.
+- Added append-only Claim/Evidence version tables and an entity-identity registry; rename operations persist the old entity ID in frontmatter.
+- Added append-only ClaimAssessment, immutable schema/dialect registration, quality-evaluation runs, and EvidencePacket 1.1 export authorization for evidence text.
+- Critical-decision references now require an active registry record accepted by a caller-provided verifier before automatic P0 ranking, and semantic readiness can be evaluated for one mapped decision scope.
+- Corrected Timeline documentation: it is a governed, rebuildable knowledge projection, not a CBSS business Event Store.
+- Added a read-only CBSS `EvidencePacket` export over canonical Claim/Evidence/Source records; evidence text remains opt-in and bounded.
+- Split infrastructure health from semantic readiness so governance debt and claim validity are visible without changing the write gate.
+- Added explicit governance priority and `critical_decision_refs` ordering, including read-time normalization for legacy queue rows.
+- Added CBSS boundary contracts for claim acceptance, critical-decision registry, business events, and semantic readiness.
+- Reduced deep projection-check cost by deriving canonical versions from entity-only page extraction instead of rebuilding all claim and evidence records.
+- Removed stale authority-source, module-map, fixed-test-count, and fixed-runtime-count claims from operator documentation.
+
 # Vector Lake 11.13.0
 
 - Ingest Subagent 领取协议增加 owner/token/generation fencing，最终完成使用事务内 CAS。

@@ -112,8 +112,8 @@ Format Constraint: These files MUST adhere to the "Compiled Truth | Timeline" ph
 
 ---
 
-## 2. 证据时间线 (Timeline - EVENT STORE)
-*[System Directive: This is the immutable event ledger. All facts in Section 1 MUST trace back to entries here.]*
+## 2. 证据时间线 (Knowledge Evidence Timeline)
+*[System Directive: This is a governed knowledge-evidence projection, not a business Event Store. Entries normally append, but governed correction and supersession remain possible. Claims in Section 1 SHOULD trace to source-backed evidence records.]*
 
 > **Syntax Constraint:** 
 > Every entry MUST start with `- [YYYY-MM-DD] [Event_Tag]`. 

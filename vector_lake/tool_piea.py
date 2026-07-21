@@ -4,7 +4,6 @@ import logging
 import math
 import re
 from collections import Counter
-import os
 from filelock import FileLock
 from vector_lake import get_extension_root
 from vector_lake.wiki_utils import get_index_path, normalize_memory_key
@@ -61,13 +60,20 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
     
     # 2. Normalize candidate_type (extract core type if nested, e.g., "concept_synthesis" -> "synthesis")
     candidate_type = candidate_type.strip().lower()
-    if "synthesis" in candidate_type: candidate_type = "synthesis"
-    elif "person" in candidate_type: candidate_type = "person"
-    elif "event" in candidate_type: candidate_type = "event"
-    elif "vendor" in candidate_type: candidate_type = "vendor"
-    elif "institution" in candidate_type: candidate_type = "institution"
-    elif "product" in candidate_type: candidate_type = "product"
-    elif "concept" in candidate_type: candidate_type = "concept"
+    if "synthesis" in candidate_type:
+        candidate_type = "synthesis"
+    elif "person" in candidate_type:
+        candidate_type = "person"
+    elif "event" in candidate_type:
+        candidate_type = "event"
+    elif "vendor" in candidate_type:
+        candidate_type = "vendor"
+    elif "institution" in candidate_type:
+        candidate_type = "institution"
+    elif "product" in candidate_type:
+        candidate_type = "product"
+    elif "concept" in candidate_type:
+        candidate_type = "concept"
     
     if candidate_type not in ("vendor", "institution", "product", "person", "event", "concept", "synthesis"):
         return json.dumps({"is_duplicate": False, "reason": f"Type '{candidate_type}' does not require deduplication check."})

@@ -5,14 +5,14 @@ import re
 import shutil
 import string
 import uuid
+import io
 from pathlib import Path
+from typing import List, TypedDict
 
 import yaml
 from vector_lake import get_extension_root
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
-
-import io
 _META_DIR_CACHE = None
 
 WIKI_LINK_PATTERN = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
@@ -83,7 +83,8 @@ def normalize_memory_key(key: str) -> str:
 
 def calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
     """Canonical cosine similarity for raw python floats."""
-    if not v1 or not v2 or len(v1) != len(v2): return 0.0
+    if not v1 or not v2 or len(v1) != len(v2):
+        return 0.0
     import math
     dot = sum(a * b for a, b in zip(v1, v2))
     norm1 = math.sqrt(sum(a * a for a in v1))
@@ -300,7 +301,8 @@ def ensure_parent_dir(path: str | Path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-class SafeWriteError(Exception): pass
+class SafeWriteError(Exception):
+    pass
 
 def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_validation: bool = False):
     path = Path(path)
@@ -372,9 +374,6 @@ def sanitize_wiki_node(filepath: str | Path):
     write_markdown_file(filepath, frontmatter, body, skip_validation=False)
 
 
-class SafeWriteError(Exception):
-    pass
-
 def _count_list_items(body: str, section_marker: str) -> int:
     count = 0
     in_section = False
@@ -392,8 +391,6 @@ def _count_list_items(body: str, section_marker: str) -> int:
 def safe_write_markdown(path: str | Path, content: str, skip_validation: bool = False):
     frontmatter, body = split_frontmatter(content)
     write_markdown_file(path, frontmatter, body, skip_validation=skip_validation)
-
-from typing import TypedDict, List, Optional, Any
 
 class TensionEdge(TypedDict):
     target: str

@@ -1,23 +1,17 @@
 import datetime
+import hashlib
 import logging
 import os
 import re
+import time
 
-from vector_lake import governance_store
-from vector_lake import indexer
-from vector_lake import provenance
+from vector_lake import get_extension_root, provenance
 from vector_lake.tool_search import assemble_context
-from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, write_markdown_file, normalize_entity_name
+from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, normalize_entity_name
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-query")
-
-
-import time
-import json
-import hashlib
-from vector_lake import get_extension_root
 
 def prepare_query_context(query_str: str, dry_run: bool = False):
     wiki_dir = str(get_wiki_dir())
@@ -49,7 +43,6 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
     tmp_dir.mkdir(parents=True, exist_ok=True)
     
     # Create a unique hash for this query with anti-collision
-    import time
     import uuid
     unique_str = f"{query_str}_{time.time()}_{uuid.uuid4().hex}"
     query_hash = hashlib.md5(unique_str.encode("utf-8")).hexdigest()[:12]

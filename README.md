@@ -33,6 +33,16 @@ graph LR
 
 核心原则：**Markdown 是人类界面，`.meta` 是事实底座，`operational_memory` 是 Agent 运行层。**
 
+## CBSS Integration Boundary
+
+Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candidate、溯源和检索上下文，不承载 CBSS 的业务执行状态机。
+
+- Vector Lake 负责：canonical Claim/Evidence/Source、知识投影、证据包导出和治理候选排序。
+- CBSS 负责：权限确认、AcceptedFact 生命周期、Aggregate、Command、可执行 Policy、Decision、ActionRequest、ExecutionResult、业务 Event Ledger、补偿和业务系统对账。
+- `EvidencePacket` 始终是待确认的 claim candidate；它不会把断言自动升级为 AcceptedFact。证据正文导出还必须提供 `actor_id` 与受限用途 `purpose`。
+- Vector Lake Timeline 只用于知识变更与溯源，不得当作 CBSS 业务 Event Ledger。
+- 接口契约位于 `contracts/cbss/`。
+
 ## 📂 受控类型与文件结构规范 (Controlled Types & File Structures)
 
 为了保持图谱检索的高信噪比与一致性，Wiki 目录下的 Markdown 文件必须遵循严格的**受控命名前缀**，并被划分为两种完全不同的文件组织结构规范。
@@ -57,7 +67,7 @@ graph LR
 - **适用类型**：`Vendor_`, `Product_`, `Person_`, `Event_`, `Concept_`, `Policy_`, `Standard_`, `Overview_`
 - **结构要求**：采用严格的 CQRS 与事件溯源模式。物理上由 `---` 分隔为两部分：
   1. **`## 1. 编译事实 (Compiled Truth)`**：作为 Read Model，只保留当下最新鲜的终极共识。所有特征点强制分配到类型专属的 `###` 固化插槽（如 Vendor 的 `### 组织架构与商业模式`）。所有论点必须在句末附加内联来源出处。
-  2. **`## 2. 证据时间线 (Timeline)`**：作为 Event Store，只能追加日志（Append-Only）。格式强制形如 `- [YYYY-MM-DD] [Event_Tag]...`，支撑上方“编译事实”的演进流。
+  2. **`## 2. 证据时间线 (Timeline)`**：这是知识证据投影，不是业务 Event Store。正常写入采用追加方式，但允许通过受治理变更执行纠错与 supersession。格式形如 `- [YYYY-MM-DD] [Event_Tag]...`。
 
 #### B. 豁免类 (Free-Form)
 - **适用类型**：`Source_`, `Synthesis_`
@@ -74,7 +84,7 @@ graph LR
    - **跨类型 PIEA 与强制格式漏斗**：入口级拦截器现已实现全局跨类型查重（杜绝同一名称多态存活）。内置正则自动清洗违规嵌套前缀（如 `Concept_Synthesis_`），并通过 schema gate 强制 10 大规范类型（Vendor, Product, Person, Event, Concept, Policy, Standard, Synthesis, Source, Overview）严格落盘。
    - **持久化增量索引与稀疏图遍历 (Sparse Graph Traversal)**：前台变更写入 durable outbox，Watchdog 合并批次后一次更新索引；底层 `_calculate_weighted_edges` 使用稀疏图遍历，并限制每个节点的投影边数。
    - **跨平台 I/O 引擎韧性 (I/O Resilience Sandbox)**：后台所有的自动化巡检子脚本拉起，均被强制注入隔离的 `$env:PYTHONIOENCODING="utf-8"` 沙箱环境，从根源上斩断中文 Windows 平台极易引发的 `UnicodeDecodeError` 守护进程静默崩溃死锁隐患。
-   - **定时确定性维护 (Scheduled Deterministic Maintenance)**：每天 10:00 和 23:00 刷新脏图拓扑、执行只读 lint，并进行 SQLite WAL checkpoint。研究、去重、聚类等独立脚本不会被此循环隐式启动。
+   - **定时确定性维护 (Scheduled Deterministic Maintenance)**：每小时回收超时的 subagent ingest 任务；每天 10:00 和 23:00 刷新脏图拓扑、执行只读 lint，并进行 SQLite WAL checkpoint。研究、去重、聚类等独立脚本不会被此循环隐式启动。
    - **原生二进制向量引擎 (Native Binary Embeddings)**：将臃肿的纯文本 JSON 序列化彻底淘汰，重构为基于 C 层级的高性能 Pickle (`HIGHEST_PROTOCOL`) 二进制缓冲。大幅抹除了无用 I/O 载荷（体积暴降 60%），并将语义对比矩阵的加载时间从数秒降至毫秒级，根绝了内存爆栈风险。
    - **本体免疫型排重 (Ontology-Immune Deduplication)**：在去重守护进程中注入了严格的前缀屏障，自动豁免 `Source_` 等具有时序不可变性的物理原始信源，从根源上彻底斩断了“因文档相似度过高而将不同日期研报强行合并”的灾难性合并幻觉，令治理队列（Governance Queue）保持绝对纯净。
    - **全态前缀契约闭环 (Omni-State Prefix Compliance)**：全面拉齐并修正了所有后台异步批处理守护进程（如语义去重器和死链自愈系统）对 `Policy_`、`Standard_` 和 `Synthesis_` 等全部 9 大核心一等公民 (First-Class) 前缀的精确捕获与清洗机制，彻底根除了前缀“盲区”导致的同质化噪音与分类退化。
@@ -145,6 +155,7 @@ graph LR
 ### 🏔️ V11.11 纯净重构与发件箱解耦 (V11.11 Pure Canonical Architecture & Outbox Decoupling)
 - **SQLite 增量发件箱 (Mutation Outbox)**：canonical 更新/删除与 outbox payload 同事务提交。worker 无需信号文件即可轮询，使用 lease 领取、有限重试、退避和终态失败记录完成恢复。
 - **派生缓存解耦 (Derived Cache Decoupling)**：`generate_index` 和增量索引只读取 SQLite `entities`；节点键固定为 `page_key`，展示名只作为标题或 alias。
+- **深度校验限载 (Bounded Deep Validation)**：canonical 页面版本只提取实体投影，不再为一致性检查重建断言和证据记录；版本哈希字段保持不变。
 - **统一写入口 (Unified Write Entrypoint)**：MCP 写入、运行态记忆、批量链接替换、rename、delete、lint stub 和 watchdog 手工编辑均汇入 `execute_mutation_batch()`；跨页面操作只提交一次 canonical 事务。
 
 ### 🛡️ V11.12 SDET 健壮性与 Antigravity 原生合规架构 (V11.12 SDET Robustness & AGY Compliance)
@@ -154,7 +165,7 @@ graph LR
 
 ### 🚄 V11.13 O(1) 事务跃迁与全局并发调度重构 (V11.13 O(1) Transaction & Concurrent Scheduling)
 - **单记录 O(1) 内存重算 (O(1) Operational Memory Rebuild)**：废除旧架构下 `apply_change_sets_batch()` 每逢小更新即触发 1 万节点全库锁定的灾难级设计。在 SQLite 核心通过追踪 `affected_memory_keys` 并局部触发变更重算，实现了运行时 Memory 与 Timeline 的真 O(1) 增量构建，极大缓解了跨线程死锁与卡顿。
-- **Timeline 增量追踪基建 (Incremental Timeline Base)**：斩断 `tool_timeline.py` 每次强行从 `claims` 库 O(N) 遍历过滤时序事件的高危漏查设计。引入统一的 `timeline_events` O(1) 事件表，使得时间线能够与 Change Set 同步持久化，做到确定性追踪，再无历史丢失风险。
+- **Timeline 增量追踪基建 (Incremental Timeline Base)**：避免 `tool_timeline.py` 每次从 `claims` 库 O(N) 遍历时序 Claim。`timeline_events` 是可重建的知识时间线投影，与 Change Set 增量同步；它不是 CBSS 业务 Event Ledger，也不提供业务事件不可变性承诺。
 - **全局并发限流防爆屏障 (Global Concurrency Rate Limit Barrier)**：阻断了 `indexer.py` (generate_index) 在图谱重构或全库扫描时隐式触发大模型 Embedding 的恶性 API 并发，将其严格抽离至少数派专职调度进程。终结了节点重构、查询、与全量索引并发时引发的指数级 API 费用爆发与封禁。
 - **出站引擎全局批处理 (Global Batch Outbox Engine)**：重写 `watchdog_app.py` 中的 `mutation_outbox` 工作流。逐文件同步调用（`update_index_items([filename])`）改为跨进程数组归集批处理（Batched Array Execution），将高频碎步写入合并为较少的原子批次。
 - **差分历史审计降维与 GC (Diff GC for Change Sets)**：将 SQLite 库内无休止膨胀的 `change_sets` 流水，接入系统级的 `tool_gc.py` 管线。按设定日历生命周期自动发起 `DELETE` 定时清道夫任务，实现长期知识湖存储的绝对瘦身。
@@ -169,7 +180,7 @@ graph LR
 
 4. **日常搜索**：使用 `python cli.py search "<keyword>"` 或 `python cli.py query "<question>"` 检索编译后的知识网络。
 5. **摄取队列**：使用 `python cli.py ingest-tasks` 查看 queued / awaiting-subagent 作业；宿主 subagent 完成后通过 `finalize_ingest` 入湖。
-6. **周期治理**：定期执行 `python cli.py review` 处理冲突队列，执行 `python cli.py doctor` 检查健康度。
+6. **周期治理**：定期执行 `python cli.py review` 处理冲突队列；执行 `python cli.py doctor` 检查基础设施健康；执行 `python cli.py readiness` 检查语义就绪度。
 
 ## Operational Memory
 
@@ -206,8 +217,9 @@ graph LR
 
 Vector Lake adopts a hybrid CQRS-like architecture with O(1) incremental native SQLite syncing.
 
-- **Markdown (Source of Truth)**: `wiki/*.md` and `raw/*.md`.
-- **Database (Read Model & Fast Mutations)**: `vector_lake.db` containing unified SQLite entities, claims, graph edges, and operational memory.
+- **SQLite (Canonical Store)**: `vector_lake.db` contains entities, claims, evidence, sources, graph edges, governance state, and operational memory.
+- **Markdown (Human-Audit Projection)**: `wiki/*.md` is the inspectable publication surface; `raw/*.md` is immutable source input.
+- **Derived Projections**: `index.json`, FTS, `claim_graph.json`, Timeline, and operational-memory packets can be rebuilt from canonical state and governed source material.
 - **Concurrency & Atomicity**: Multi-page operations and mutations utilize a centralized `MutationCoordinator` wrapped in SQLite transactions (`BEGIN IMMEDIATE`) with filesystem-level backups (`*.bak`) and auto-rollback to ensure transactional integrity across all background workers, CLI invocations, and MCP actions.
 
 ```text
@@ -252,6 +264,18 @@ MEMORY/
 
 ```powershell
 python cli.py doctor
+```
+
+语义就绪度（与基础设施健康分开）：
+
+```powershell
+python cli.py readiness
+```
+
+导出只读证据包（默认不返回证据正文）：
+
+```powershell
+python cli.py evidence-packet "<claim_id>"
 ```
 
 编译 raw sources：
@@ -331,9 +355,13 @@ python cli.py projection-rebuild-index --apply
 python cli.py embedding-backfill --limit 200
 python cli.py embedding-backfill --apply --limit 200
 python cli.py wiki-restore --apply --limit 10
+python cli.py memory-cleanup
+python cli.py memory-cleanup --apply
+python cli.py topology-queue-cleanup
+python cli.py topology-queue-cleanup --apply
 ```
 
-这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只执行 projection-only 恢复，重建内容无法生成相同 canonical 版本时会拒绝写入。
+这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只执行 projection-only 恢复，重建内容无法生成相同 canonical 版本时会拒绝写入。`memory-cleanup` 归档精确匹配的模板与迁移元数据；`topology-queue-cleanup` 仅归档旧索引器生成、且未绑定关键决策的社区命名项。
 
 ## Config
 
@@ -377,12 +405,17 @@ python cli.py wiki-restore --apply --limit 10
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |
 | `vector_lake/tool_review.py` | legacy/governance review surface |
-| `vector_lake/tool_doctor.py` | runtime 体检 |
+| `vector_lake/tool_doctor.py` | 基础设施体检与独立语义就绪度报告 |
+| `vector_lake/runtime_health.py` | 基础设施健康和语义就绪度的独立只读评估器 |
+| `vector_lake/tool_evidence.py` | 按 Claim ID 导出只读 `EvidencePacket` |
+| `vector_lake/evidence_foundation.py` | 校验 SourceArtifact 字节完整性、原始定位、抽取运行与谱系 |
+| `vector_lake/claim_assessment.py` | 追加式 ClaimAssessment；不产生 AcceptedFact |
+| `vector_lake/decision_registry.py` | 同步外部已验证 CriticalDecisionRegistry 并支持决策范围就绪度 |
+| `vector_lake/quality_registry.py` | 登记不可变 schema/dialect 版本与 golden dataset 评估结果 |
 | `vector_lake/mcp_server.py` | Model Context Protocol (MCP) 后端服务入口 (with atomic multi-page replacements) |
 | `vector_lake/watchdog_app.py` | 增量监听后台服务，队列调度，定时自愈审计 (Scheduled Auto-Lint) |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
-| `vector_lake/db.py` | Legacy DB utils |
 | `vector_lake/db_store.py` | SQLite connection pooling, schema init logic, `_INIT_LOCK` guarding, and WAL settings |
 | `vector_lake/mutation_coordinator.py`| Centralized mutation orchestrator enabling atomic multi-file edits and rollback across system boundaries |
 | `vector_lake/defense_hook.py` | Pre-flight constraints and guardrails |
@@ -394,32 +427,22 @@ python cli.py wiki-restore --apply --limit 10
 | `scripts/community_clustering_daemon.py` | Louvain Community Detection |
 | `schema.md` | Wiki 与运行态记忆契约 |
 | `commands/` | 面向 Agent 的宏大业务流定义 (research/review) |
-| `agents/` | ingestor / synthesizer agent 契约 |
+| `contracts/cbss/` | Vector Lake 与 CBSS 的证据、权限确认、业务事件及就绪度契约 |
 
 ## Validation
 
-最近验证基线（当前最新态）：
+验证基线由当前命令生成，不在文档中固化测试数量或运行态数据计数：
 
 ```powershell
-$env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v
-$env:PYTHONUTF8='1'; python -m compileall vector_lake tests
+$env:PYTHONIOENCODING='utf-8'; python -m pytest -q -p no:cacheprovider
+$env:PYTHONIOENCODING='utf-8'; python -m compileall -q vector_lake tests
 $env:PYTHONUTF8='1'; python cli.py doctor
-$env:PYTHONUTF8='1'; python cli.py search "deployment target" --mode memory --top_k 3
-$env:PYTHONUTF8='1'; python cli.py debt --top 1
+$env:PYTHONUTF8='1'; python cli.py readiness
+$env:PYTHONUTF8='1'; python cli.py projection-report --limit 5
+$env:PYTHONUTF8='1'; python cli.py evidence-packet "<claim_id>"
 ```
 
-验证结果：
-
-- Unit tests：`Ran 16 tests ... OK`
-- Compile：`python -m compileall vector_lake tests` OK
-- Doctor：healthy
-- Graph Build: Generated index.json with 10536 nodes | 55236 weighted edges | 0 errors.
-- Operational memory smoke：OK
-- Debt snapshot：
-  - `operational_memory_count: 13755`
-  - `superseded_memory_count: 510`
-  - `conflicted_memory_count: 0`
-  - `memory_type_counts: {'fact': 11881, 'decision': 1393, 'task_state': 384, 'preference': 97}`
+发布证据应记录每次运行的实际结果。`doctor` 健康不代表语义就绪；`readiness` 可以因治理积压、拓扑待刷新或断言有效性问题返回 `degraded` / `not_ready`，但不会阻塞基础设施修复。
 
 ## Notes
 

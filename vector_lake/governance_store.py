@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 
 from filelock import FileLock
 
-from vector_lake.claim_extractor import extract_page_objects
+from vector_lake.claim_extractor import classify_non_claim_text, extract_page_objects
 from vector_lake.db_store import get_connection, init_db, transaction
+from vector_lake.evidence_foundation import version_family_id
 from vector_lake.wiki_utils import (
-    atomic_write_text,
     get_meta_dir,
     get_wiki_dir,
     read_markdown_file,
@@ -177,9 +177,9 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
                 params = [key]
                 for c_name, c_key, c_type in extra_cols:
                     val = item.get(c_key)
-                    if c_type == float:
+                    if c_type is float:
                         params.append(float(val or 0.0))
-                    elif c_type == int:
+                    elif c_type is int:
                         params.append(int(val or 0))
                     else:
                         params.append(str(val or ""))
@@ -356,7 +356,8 @@ def save_sources(data):
 
 
 def save_graph_edges(edges: list[dict]):
-    if not edges: return
+    if not edges:
+        return
     conn = get_connection()
     with transaction():
         for edge in edges:
@@ -404,6 +405,7 @@ def save_governance_queue(data):
     data["updated_at"] = now
     values = []
     for item in data.get("items", []):
+        item = normalize_governance_item(item)
         if not item.get("item_id"):
             item["item_id"] = uuid.uuid4().hex
         values.append((item["item_id"], json.dumps(item, ensure_ascii=False), now))
@@ -427,6 +429,7 @@ def get_governance_item(item_id: str) -> dict | None:
 
 def upsert_governance_item(item: dict, insert_only: bool = False) -> bool:
     """Persist one governance item without replacing unrelated queue rows."""
+    item = normalize_governance_item(item)
     item_id = str(item.get("item_id") or "")
     if not item_id:
         raise ValueError("Governance items require item_id.")
@@ -474,6 +477,64 @@ _GOVERNANCE_DEDUP_FIELDS = {
     "merge_target",
 }
 
+_GOVERNANCE_PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+_GOVERNANCE_DEFAULT_PRIORITY = {
+    "contradiction": "P1",
+    "evidence-gap": "P1",
+    "publish-candidate": "P1",
+    "merge": "P2",
+    "duplicate": "P2",
+    "missing-page": "P2",
+    "missing-link-target": "P2",
+    "suggestion": "P3",
+    "community_naming": "P3",
+}
+
+
+def normalize_governance_item(item: dict) -> dict:
+    """Attach deterministic priority metadata without guessing from prose."""
+    normalized = copy.deepcopy(item)
+    raw_refs = normalized.get("critical_decision_refs")
+    refs = []
+    if isinstance(raw_refs, list):
+        refs = list(
+            dict.fromkeys(
+                str(reference).strip()
+                for reference in raw_refs
+                if str(reference).strip()
+            )
+        )
+    explicit_priority = str(normalized.get("priority") or "").upper()
+    from vector_lake.decision_registry import verified_decision_refs
+
+    verified_refs = verified_decision_refs(refs)
+    if explicit_priority in _GOVERNANCE_PRIORITY_ORDER:
+        priority = explicit_priority
+    elif verified_refs:
+        priority = "P0"
+    else:
+        priority = _GOVERNANCE_DEFAULT_PRIORITY.get(str(normalized.get("type") or ""), "P2")
+    normalized["priority"] = priority
+    normalized["priority_score"] = (4 - _GOVERNANCE_PRIORITY_ORDER[priority]) * 100
+    normalized["critical_decision_refs"] = refs
+    normalized["verified_critical_decision_refs"] = verified_refs
+    normalized["unverified_critical_decision_refs"] = [
+        reference for reference in refs if reference not in verified_refs
+    ]
+    normalized["decision_relevance"] = (
+        "critical" if verified_refs else ("unverified" if refs else "unscored")
+    )
+    return normalized
+
+
+def governance_priority_sort_key(item: dict) -> tuple:
+    normalized = normalize_governance_item(item)
+    return (
+        _GOVERNANCE_PRIORITY_ORDER[normalized["priority"]],
+        str(normalized.get("created_at") or normalized.get("created") or ""),
+        str(normalized.get("item_id") or ""),
+    )
+
 
 def insert_governance_item_if_absent(
     item: dict,
@@ -483,6 +544,7 @@ def insert_governance_item_if_absent(
     invalid = set(dedup_fields) - _GOVERNANCE_DEDUP_FIELDS
     if invalid:
         raise ValueError(f"Unsupported governance dedup fields: {sorted(invalid)}")
+    item = normalize_governance_item(item)
     item_id = str(item.get("item_id") or "")
     if not item_id:
         raise ValueError("Governance items require item_id.")
@@ -535,10 +597,10 @@ def get_entity(entity_id: str) -> dict | None:
     return None
 
 
-def _canonical_entity_rows_version(page_rows: list[tuple[str, str]]) -> str:
+def _canonical_entity_records_version(page_records: list[tuple[str, dict]]) -> str:
     normalized_rows = []
-    for entity_id, raw in page_rows:
-        data = json.loads(raw)
+    for entity_id, record in page_records:
+        data = dict(record)
         # extract_page_objects supplies wall-clock time when legacy pages omit `created`.
         # That fallback is storage metadata, not page state, so it cannot participate in CAS.
         data.pop("created_at", None)
@@ -555,24 +617,30 @@ def _canonical_entity_rows_version(page_rows: list[tuple[str, str]]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _canonical_entity_rows_version(page_rows: list[tuple[str, str]]) -> str:
+    return _canonical_entity_records_version(
+        [(entity_id, json.loads(raw)) for entity_id, raw in page_rows]
+    )
+
+
 def canonical_page_version_from_content(filename: str, content: str) -> str:
     """Calculate the canonical entity version that full Markdown would produce."""
     frontmatter, body = split_frontmatter(content)
-    extracted = extract_page_objects(filename, frontmatter, body)
-    rows = [
-        (str(record["entity_id"]), json.dumps(record, ensure_ascii=False))
+    extracted = extract_page_objects(filename, frontmatter, body, entity_only=True)
+    records = [
+        (str(record["entity_id"]), record)
         for record in extracted.get("entities", [])
     ]
-    if not rows:
+    if not records:
         return ""
-    return _canonical_entity_rows_version(rows)
+    return _canonical_entity_records_version(records)
 
 
 def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]:
     """Return deterministic version tokens for the current canonical page state."""
     init_db()
     requested = set(page_keys) if page_keys is not None else None
-    rows_by_page: dict[str, list[tuple[str, str]]] = {}
+    records_by_page: dict[str, list[tuple[str, dict]]] = {}
     conn = get_connection()
     if requested:
         rows = []
@@ -595,16 +663,17 @@ def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]
     for row in rows:
         raw = str(row["data_json"])
         try:
-            page_key = str(json.loads(raw).get("page_key") or "")
+            record = json.loads(raw)
+            page_key = str(record.get("page_key") or "")
         except (TypeError, ValueError):
             continue
         if not page_key or (requested is not None and page_key not in requested):
             continue
-        rows_by_page.setdefault(page_key, []).append((str(row["entity_id"]), raw))
+        records_by_page.setdefault(page_key, []).append((str(row["entity_id"]), record))
 
     return {
-        page_key: _canonical_entity_rows_version(page_rows)
-        for page_key, page_rows in rows_by_page.items()
+        page_key: _canonical_entity_records_version(page_records)
+        for page_key, page_records in records_by_page.items()
     }
 
 def upsert_entity(entity_id: str, data: dict):
@@ -704,6 +773,302 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
     )
 
 
+def _canonical_record_json(record: dict) -> str:
+    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _record_family(record: dict, family_field: str, family_prefix: str) -> tuple[str, str]:
+    locator = dict(record.get("locator") or record.get("projection_locator") or {})
+    page_key = str(locator.get("page_key") or "")
+    family_id = str(record.get(family_field) or "")
+    if not family_id:
+        if page_key:
+            if record.get("source_id"):
+                locator["source_id"] = record.get("source_id")
+            if family_field == "evidence_family_id":
+                locator["kind"] = record.get("evidence_type")
+            family_id = version_family_id(family_prefix, page_key, locator)
+        else:
+            family_id = _stable_id(family_prefix, str(record.get("claim_id") or record.get("evidence_id")))
+    return family_id, page_key
+
+
+def _append_version_records(
+    table_name: str,
+    id_field: str,
+    family_field: str,
+    family_prefix: str,
+    version_prefix: str,
+    records: list[dict],
+) -> int:
+    """Append distinct content versions without rewriting earlier observations."""
+    if table_name not in {"claim_versions", "evidence_versions"}:
+        raise ValueError(f"Unsupported version table: {table_name}")
+    conn = get_connection()
+    added = 0
+    for record in records:
+        record_id = str(record.get(id_field) or "")
+        if not record_id:
+            continue
+        family_id, page_key = _record_family(record, family_field, family_prefix)
+        serialized = _canonical_record_json(record)
+        record_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        version_id = _stable_id(version_prefix, f"{family_id}:{record_hash}")
+        row = conn.execute(
+            f"SELECT COALESCE(MAX(version_no), 0) + 1 AS next_version FROM {table_name} "
+            f"WHERE {family_field} = ?",
+            (family_id,),
+        ).fetchone()
+        result = conn.execute(
+            f"INSERT OR IGNORE INTO {table_name} "
+            f"({version_prefix}_id, {id_field}, {family_field}, page_key, version_no, "
+            "record_hash, data_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                version_id,
+                record_id,
+                family_id,
+                page_key,
+                int(row["next_version"]),
+                record_hash,
+                serialized,
+                _utc_now(),
+            ),
+        )
+        added += int(bool(result.rowcount))
+    return added
+
+
+def _upsert_foundation_records(
+    entities: list[dict],
+    source_artifacts: list[dict],
+    extraction_runs: list[dict],
+) -> None:
+    conn = get_connection()
+    now = _utc_now()
+    for entity in entities:
+        entity_id = str(entity.get("entity_id") or "")
+        page_key = str(entity.get("page_key") or "")
+        if not entity_id or not page_key:
+            continue
+        identity_origin = str(entity.get("identity_origin") or "").strip()
+        if not identity_origin:
+            identity_origin = (
+                "legacy_page_key"
+                if entity_id == _stable_id("entity", page_key)
+                else "explicit"
+            )
+        conn.execute(
+            "INSERT INTO entity_identities "
+            "(entity_id, page_key, canonical_name, identity_origin, data_json, recorded_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(entity_id) DO UPDATE SET page_key = excluded.page_key, "
+            "canonical_name = excluded.canonical_name, data_json = excluded.data_json, "
+            "updated_at = excluded.updated_at",
+            (
+                entity_id,
+                page_key,
+                str(entity.get("canonical_name") or entity.get("title") or page_key),
+                identity_origin,
+                _canonical_record_json(entity),
+                now,
+                now,
+            ),
+        )
+    for artifact in source_artifacts:
+        conn.execute(
+            "INSERT INTO source_artifacts "
+            "(artifact_id, source_id, sha256, byte_size, mime_type, storage_uri, "
+            "integrity_status, data_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(artifact_id) DO UPDATE SET data_json = excluded.data_json, "
+            "integrity_status = excluded.integrity_status, storage_uri = excluded.storage_uri",
+            (
+                artifact["artifact_id"],
+                artifact["source_id"],
+                artifact.get("sha256"),
+                artifact.get("byte_size"),
+                artifact.get("mime_type"),
+                artifact.get("storage_uri"),
+                artifact.get("integrity_status", "unverified"),
+                _canonical_record_json(artifact),
+                now,
+            ),
+        )
+    for run in extraction_runs:
+        conn.execute(
+            "INSERT OR IGNORE INTO extraction_runs "
+            "(run_id, page_key, input_fingerprint, extractor_name, extractor_version, "
+            "data_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                run["run_id"],
+                run["page_key"],
+                run["input_fingerprint"],
+                run["extractor_name"],
+                run["extractor_version"],
+                _canonical_record_json(run),
+                str(run.get("recorded_at") or now),
+            ),
+        )
+
+
+_CLAIM_FOUNDATION_FIELDS = (
+    "claim_family_id",
+    "confidence_kind",
+    "calibrated_probability",
+    "assessment_status",
+    "extractor_name",
+    "extractor_version",
+    "extraction_run_id",
+)
+_EVIDENCE_FOUNDATION_FIELDS = (
+    "evidence_family_id",
+    "artifact_id",
+    "projection_locator",
+    "source_locator",
+    "extraction_run_id",
+    "independence_status",
+    "lineage_safe",
+)
+_SOURCE_FOUNDATION_FIELDS = (
+    "artifact_id",
+    "content_hash",
+    "hash_algorithm",
+    "byte_size",
+    "mime_type",
+    "storage_uri",
+    "integrity_status",
+    "classification",
+    "retention_policy",
+    "legal_hold",
+    "lineage_id",
+    "generation_parent_refs",
+)
+
+
+def _merge_missing_record_fields(current: dict, proposed: dict, fields: tuple[str, ...]) -> bool:
+    """Add absent foundation fields without overwriting reviewed canonical values."""
+    changed = False
+    for field in fields:
+        if field in current or field not in proposed:
+            continue
+        current[field] = copy.deepcopy(proposed[field])
+        changed = True
+    return changed
+
+
+def _merge_source_foundation_fields(current: dict, proposed: dict) -> bool:
+    changed = _merge_missing_record_fields(current, proposed, _SOURCE_FOUNDATION_FIELDS)
+    proposed_hash = str(proposed.get("content_hash") or "")
+    current_hash = str(current.get("content_hash") or "")
+    if (
+        proposed.get("integrity_status") == "verified"
+        and len(proposed_hash) == 64
+        and len(current_hash) != 64
+    ):
+        if current_hash and "legacy_content_hash" not in current:
+            current["legacy_content_hash"] = current_hash
+        current["content_hash"] = proposed_hash
+        current["hash_algorithm"] = "sha256"
+        current["integrity_status"] = "verified"
+        changed = True
+    return changed
+
+
+def backfill_evidence_foundation_records(extracted: dict) -> dict:
+    """Merge one extracted page's foundation metadata into existing canonical rows.
+
+    The caller owns the transaction.  Missing canonical claim/evidence/source IDs
+    abort the page so an extraction run can never mark a partial backfill complete.
+    """
+    conn = get_connection()
+    page_key = str(extracted.get("page_key") or "")
+    runs = list(extracted.get("extraction_runs") or [])
+    if not page_key or len(runs) != 1:
+        raise ValueError("Evidence-foundation backfill requires one page and one extraction run.")
+
+    record_specs = (
+        ("claims", "claim_id", _CLAIM_FOUNDATION_FIELDS, list(extracted.get("claims") or [])),
+        ("evidence", "evidence_id", _EVIDENCE_FOUNDATION_FIELDS, list(extracted.get("evidence") or [])),
+        ("sources", "source_id", _SOURCE_FOUNDATION_FIELDS, list(extracted.get("sources") or [])),
+    )
+    merged_by_table: dict[str, list[dict]] = {"claims": [], "evidence": [], "sources": []}
+    changed_by_table = {"claims": 0, "evidence": 0, "sources": 0}
+    for table_name, key_field, fields, proposed_records in record_specs:
+        for proposed in proposed_records:
+            record_id = str(proposed.get(key_field) or "")
+            row = conn.execute(
+                f"SELECT data_json FROM {table_name} WHERE {key_field} = ?",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"Cannot backfill {page_key}: extracted {table_name} ID {record_id!r} "
+                    "is absent from canonical state."
+                )
+            current = json.loads(row["data_json"])
+            if (
+                _merge_source_foundation_fields(current, proposed)
+                if table_name == "sources"
+                else _merge_missing_record_fields(current, proposed, fields)
+            ):
+                merged_by_table[table_name].append(current)
+                changed_by_table[table_name] += 1
+
+    changed_claims = merged_by_table["claims"]
+    changed_evidence = merged_by_table["evidence"]
+    if changed_claims:
+        current_claim_ids = tuple(record["claim_id"] for record in changed_claims)
+        placeholders = ",".join("?" for _ in current_claim_ids)
+        old_claims = [
+            json.loads(row["data_json"])
+            for row in conn.execute(
+                f"SELECT data_json FROM claims WHERE claim_id IN ({placeholders})",
+                current_claim_ids,
+            )
+        ]
+        _append_version_records(
+            "claim_versions", "claim_id", "claim_family_id", "claimfamily",
+            "claim_version", old_claims,
+        )
+    if changed_evidence:
+        current_evidence_ids = tuple(record["evidence_id"] for record in changed_evidence)
+        placeholders = ",".join("?" for _ in current_evidence_ids)
+        old_evidence = [
+            json.loads(row["data_json"])
+            for row in conn.execute(
+                f"SELECT data_json FROM evidence WHERE evidence_id IN ({placeholders})",
+                current_evidence_ids,
+            )
+        ]
+        _append_version_records(
+            "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
+            "evidence_version", old_evidence,
+        )
+
+    for table_name, key_field, _, _ in record_specs:
+        _upsert_canonical_records(table_name, key_field, merged_by_table[table_name])
+    _upsert_foundation_records(
+        list(extracted.get("entities") or []),
+        list(extracted.get("source_artifacts") or []),
+        runs,
+    )
+    _append_version_records(
+        "claim_versions", "claim_id", "claim_family_id", "claimfamily",
+        "claim_version", changed_claims,
+    )
+    _append_version_records(
+        "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
+        "evidence_version", changed_evidence,
+    )
+    return {
+        "page_key": page_key,
+        "run_id": runs[0]["run_id"],
+        "updated_claims": changed_by_table["claims"],
+        "updated_evidence": changed_by_table["evidence"],
+        "updated_sources": changed_by_table["sources"],
+        "source_artifacts": len(extracted.get("source_artifacts") or []),
+    }
+
+
 def _upsert_operational_memory_records(records: list[dict]):
     if not records:
         return
@@ -736,6 +1101,7 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
     proposed_claim_ids = {record["claim_id"] for record in proposed_claims}
     changed_claim_ids = old_claim_ids | proposed_claim_ids
     old_memories = []
+    archived_artifact_memories = []
     if changed_claim_ids:
         placeholders = ",".join("?" for _ in changed_claim_ids)
         old_memories = [
@@ -745,6 +1111,15 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
                 f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
                 tuple(sorted(changed_claim_ids)),
             ).fetchall()
+        ]
+        archived_artifact_memories = [
+            memory
+            for memory in old_memories
+            if str(memory.get("validity_state") or "").lower() == "archived"
+            and any(
+                str(reason).startswith("infrastructure_artifact:")
+                for reason in (memory.get("validity_reasons") or [])
+            )
         ]
         conn.execute(
             f"DELETE FROM operational_memory "
@@ -757,6 +1132,9 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
         for record in proposed_claims
     ]
     _upsert_operational_memory_records(new_memories)
+    # Archived infrastructure observations are forensic history. A page rewrite
+    # or merge must not silently erase them when their legacy claim disappears.
+    _upsert_operational_memory_records(archived_artifact_memories)
 
     related_claim_ids = set(changed_claim_ids)
     impacted_keys = set()
@@ -1127,9 +1505,6 @@ def _resolve_memory_conflicts(store: dict) -> dict:
                 c.pop("conflict_resolution", None)
                 
         if len(candidates) <= 1:
-            if len(candidates) == 1 and candidates[0].get("validity_state") != "active":
-                candidates[0]["validity_state"] = "active"
-                candidates[0].update(score_memory_object(candidates[0]))
             continue
         ordered = sorted(candidates, key=_rank_memory_for_conflict, reverse=True)
         winner = ordered[0]
@@ -1160,7 +1535,19 @@ def _resolve_memory_conflicts(store: dict) -> dict:
 def rebuild_operational_memory() -> dict:
     claims = annotated_claims()
     store = _default_map_store("memory_id")
+    existing = load_memory_objects()
+    for memory_id, memory in existing.get("items", {}).items():
+        reasons = memory.get("validity_reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
+        if (
+            str(memory.get("validity_state") or "").lower() == "archived"
+            and any(str(reason).startswith("infrastructure_artifact:") for reason in reasons)
+        ):
+            store["items"][memory_id] = memory
     for claim in claims:
+        if classify_non_claim_text(str(claim.get("claim_text") or "")):
+            continue
         memory = _memory_object_from_claim(claim)
         store["items"][memory["memory_id"]] = memory
     store = _resolve_memory_conflicts(store)
@@ -1195,6 +1582,7 @@ def search_operational_memory(
     top_k: int = 12,
     memory_types: list[str] | None = None,
     include_history: bool = False,
+    include_polluted: bool = False,
 ) -> list[dict]:
     store = load_memory_objects()
     if not store.get("items") and load_claims().get("items"):
@@ -1210,6 +1598,8 @@ def search_operational_memory(
     for memory in store.get("items", {}).values():
         memory_type = str(memory.get("memory_type", "fact")).lower()
         if allowed_types and memory_type not in allowed_types:
+            continue
+        if not include_polluted and classify_non_claim_text(str(memory.get("text") or "")):
             continue
         state = str(memory.get("validity_state", "active")).lower()
         if not include_history and state in hidden_states:
@@ -1239,6 +1629,85 @@ def search_operational_memory(
         results.append(item)
 
     return results
+
+
+def remediate_operational_memory_pollution(
+    dry_run: bool = True,
+    limit: int = 0,
+    sample_size: int = 20,
+) -> dict:
+    """Preview or archive known infrastructure artifacts in operational memory."""
+    store = load_memory_objects()
+    candidates: list[tuple[dict, str]] = []
+    reason_counts: dict[str, int] = {}
+    for memory in store.get("items", {}).values():
+        reason = classify_non_claim_text(str(memory.get("text") or ""))
+        reasons = memory.get("validity_reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
+        if not reason or (
+            str(memory.get("validity_state") or "").lower() == "archived"
+            and f"infrastructure_artifact:{reason}" in reasons
+        ):
+            continue
+        candidates.append((memory, reason))
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    candidates.sort(key=lambda item: str(item[0].get("memory_id") or ""))
+    selected = candidates[:limit] if limit > 0 else candidates
+    result = {
+        "dry_run": dry_run,
+        "candidate_count": len(candidates),
+        "selected_count": len(selected),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "sample": [
+            {
+                "memory_id": memory.get("memory_id"),
+                "source_page": memory.get("source_page"),
+                "reason": reason,
+                "text": " ".join(str(memory.get("text") or "").split())[:180],
+            }
+            for memory, reason in selected[: max(0, sample_size)]
+        ],
+    }
+    if dry_run or not selected:
+        return result
+
+    now = _utc_now()
+    updates = []
+    for memory, reason in selected:
+        archived = copy.deepcopy(memory)
+        reasons = archived.get("validity_reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
+        marker = f"infrastructure_artifact:{reason}"
+        if marker not in reasons:
+            reasons.append(marker)
+        archived.update(
+            {
+                "status": "Archived",
+                "validity_state": "archived",
+                "validity_reasons": reasons,
+                "archived_at": now,
+                "updated_at": now,
+            }
+        )
+        updates.append(
+            (
+                "Archived",
+                json.dumps(archived, ensure_ascii=False),
+                now,
+                archived.get("memory_id"),
+            )
+        )
+    with transaction():
+        get_connection().executemany(
+            "UPDATE operational_memory SET status = ?, data_json = ?, updated_at = ? "
+            "WHERE memory_id = ?",
+            updates,
+        )
+    result["archived_count"] = len(updates)
+    return result
 
 
 def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
@@ -1478,6 +1947,8 @@ def create_change_set(
     proposed_claims = []
     proposed_evidence = []
     proposed_source_updates = []
+    proposed_source_artifacts = []
+    proposed_extraction_runs = []
     proposed_edges = []
     affected_ids = []
     page_summaries = []
@@ -1493,6 +1964,8 @@ def create_change_set(
         proposed_claims.extend(extracted["claims"])
         proposed_evidence.extend(extracted["evidence"])
         proposed_source_updates.extend(extracted["sources"])
+        proposed_source_artifacts.extend(extracted.get("source_artifacts", []))
+        proposed_extraction_runs.extend(extracted.get("extraction_runs", []))
         proposed_edges.extend(extracted.get("edges", []))
         affected_ids.extend([record["entity_id"] for record in extracted["entities"]])
         affected_ids.extend([record["claim_id"] for record in extracted["claims"]])
@@ -1526,11 +1999,17 @@ def create_change_set(
         "proposed_claims": proposed_claims,
         "proposed_evidence": proposed_evidence,
         "proposed_source_updates": proposed_source_updates,
+        "proposed_source_artifacts": proposed_source_artifacts,
+        "proposed_extraction_runs": proposed_extraction_runs,
         "proposed_edges": proposed_edges,
         "write_contract": {
             "transactional": True,
             "idempotent": True,
-            "canonical_targets": ["entities", "claims", "evidence", "sources", "operational_memory"],
+            "canonical_targets": [
+                "entities", "claims", "evidence", "sources", "operational_memory",
+                "source_artifacts", "extraction_runs", "claim_versions",
+                "evidence_versions", "entity_identities",
+            ],
         },
     }
 
@@ -1596,11 +2075,17 @@ def prepare_change_set_from_content(
         "proposed_claims": proposed_claims,
         "proposed_evidence": extracted.get("evidence", []),
         "proposed_source_updates": extracted.get("sources", []),
+        "proposed_source_artifacts": extracted.get("source_artifacts", []),
+        "proposed_extraction_runs": extracted.get("extraction_runs", []),
         "proposed_edges": extracted.get("edges", []),
         "write_contract": {
             "transactional": True,
             "idempotent": True,
-            "canonical_targets": ["entities", "claims", "evidence", "sources", "operational_memory"],
+            "canonical_targets": [
+                "entities", "claims", "evidence", "sources", "operational_memory",
+                "source_artifacts", "extraction_runs", "claim_versions",
+                "evidence_versions", "entity_identities",
+            ],
         },
     }
 
@@ -1696,12 +2181,20 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     proposed_claims = [record for item in change_sets for record in item.get("proposed_claims", [])]
     proposed_evidence = [record for item in change_sets for record in item.get("proposed_evidence", [])]
     proposed_sources = [record for item in change_sets for record in item.get("proposed_source_updates", [])]
+    proposed_source_artifacts = [
+        record for item in change_sets for record in item.get("proposed_source_artifacts", [])
+    ]
+    proposed_extraction_runs = [
+        record for item in change_sets for record in item.get("proposed_extraction_runs", [])
+    ]
     proposed_edges = [record for item in change_sets for record in item.get("proposed_edges", [])]
 
     conn = get_connection()
     old_entity_ids: set[str] = set()
     old_claim_ids: set[str] = set()
     old_claim_rows = []
+    old_claim_records = []
+    old_evidence_records = []
     if affected_page_keys:
         affected_page_params = tuple(sorted(affected_page_keys))
         placeholders = ",".join("?" for _ in affected_page_params)
@@ -1718,6 +2211,21 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             affected_page_params,
         ).fetchall()
         old_claim_ids = {row["claim_id"] for row in old_claim_rows}
+        old_claim_records = [json.loads(row["data_json"]) for row in old_claim_rows]
+        old_evidence_rows = conn.execute(
+            f"SELECT data_json FROM evidence "
+            f"WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
+            affected_page_params,
+        ).fetchall()
+        old_evidence_records = [json.loads(row["data_json"]) for row in old_evidence_rows]
+        _append_version_records(
+            "claim_versions", "claim_id", "claim_family_id", "claimfamily",
+            "claim_version", old_claim_records,
+        )
+        _append_version_records(
+            "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
+            "evidence_version", old_evidence_records,
+        )
         conn.execute(
             f"DELETE FROM entities WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
             affected_page_params,
@@ -1743,6 +2251,19 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     _upsert_canonical_records("claims", "claim_id", proposed_claims)
     _upsert_canonical_records("evidence", "evidence_id", proposed_evidence)
     _upsert_canonical_records("sources", "source_id", proposed_sources)
+    _upsert_foundation_records(
+        proposed_entities,
+        proposed_source_artifacts,
+        proposed_extraction_runs,
+    )
+    _append_version_records(
+        "claim_versions", "claim_id", "claim_family_id", "claimfamily",
+        "claim_version", proposed_claims,
+    )
+    _append_version_records(
+        "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
+        "evidence_version", proposed_evidence,
+    )
     _refresh_alias_delta(old_entity_ids, proposed_entities)
     _refresh_operational_memory_delta(old_claim_ids, proposed_claims)
     from vector_lake.tool_timeline import sync_timeline_events_for_claim_delta
@@ -1926,7 +2447,16 @@ def governance_projection() -> dict:
     }
 
 
-def enqueue_governance_item(item_type: str, title: str, description: str, source: str, search_queries: list, affected_pages: list):
+def enqueue_governance_item(
+    item_type: str,
+    title: str,
+    description: str,
+    source: str,
+    search_queries: list,
+    affected_pages: list,
+    priority: str | None = None,
+    critical_decision_refs: list[str] | None = None,
+):
     import uuid
     item = {
         "item_id": f"gov_{uuid.uuid4().hex[:12]}",
@@ -1938,7 +2468,11 @@ def enqueue_governance_item(item_type: str, title: str, description: str, source
         "source": source,
         "search_queries": search_queries,
         "affected_pages": affected_pages,
+        "critical_decision_refs": critical_decision_refs or [],
     }
+    if priority is not None:
+        item["priority"] = priority
+    item = normalize_governance_item(item)
     upsert_governance_item(item, insert_only=True)
     return item
 

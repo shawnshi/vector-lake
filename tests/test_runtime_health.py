@@ -5,7 +5,7 @@ import pytest
 
 from vector_lake import db_store, governance_store, indexer
 from vector_lake.mutation_coordinator import execute_mutation_plan
-from vector_lake.runtime_health import assess_runtime_health
+from vector_lake.runtime_health import assess_runtime_health, assess_semantic_readiness
 from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.watchdog_status import get_status_file, write_status
 
@@ -302,6 +302,16 @@ def test_deep_health_detects_equal_count_timeline_id_drift_without_blocking(isol
     assert any("timeline_projection_drift" in warning for warning in health["warnings"])
 
 
+def test_watchdog_status_reports_publish_failure(monkeypatch, tmp_path):
+    import vector_lake.watchdog_status as watchdog_status
+
+    target = tmp_path / "status-target"
+    target.mkdir()
+    monkeypatch.setattr(watchdog_status, "get_status_file", lambda: target)
+
+    assert watchdog_status.write_status("idle", 0, 0, "probe") is False
+
+
 def test_deep_health_and_doctor_reject_equal_key_wiki_content_drift(isolated_memory):
     from vector_lake.watchdog_app import process_mutation_outbox_batch
 
@@ -492,3 +502,258 @@ def test_pending_outbox_does_not_hide_conflicting_manual_wiki_edit(isolated_memo
     assert health["ok"] is False
     assert health["detail"]["projection_content_drift"]["wiki_canonical"] == 1
     assert health["detail"]["projection_content_drift"]["managed_reconciliation"] == 0
+
+
+def test_semantic_readiness_can_be_ready_when_runtime_has_no_semantic_debt(isolated_memory):
+    db_store.init_db()
+
+    readiness = assess_semantic_readiness(
+        index_data={"nodes": {}, "graph_state": {"dirty": False, "reason": "fresh"}}
+    )
+
+    assert readiness == {
+        "ready": True,
+        "status": "ready",
+        "issues": [],
+        "warnings": [],
+        "detail": {
+            "graph_state": {"dirty": False, "reason": "fresh"},
+            "graph_insight_count": 0,
+            "pending_governance_by_type": {},
+            "pending_governance_total": 0,
+            "critical_pending_governance": 0,
+            "runtime_validity_state_counts": {},
+            "evidence_foundation": {
+                "claim_total": 0,
+                "claim_with_evidence_refs": 0,
+                "claim_with_extraction_run": 0,
+                "claim_with_supported_assessment": 0,
+                "evidence_total": 0,
+                "evidence_with_raw_locator": 0,
+                "evidence_lineage_safe": 0,
+                "source_total": 0,
+                "source_integrity_verified": 0,
+                "source_artifact_total": 0,
+                "source_artifact_verified": 0,
+                "extraction_run_total": 0,
+                "claim_evidence_coverage": 1.0,
+                "claim_extraction_coverage": 1.0,
+                "claim_assessment_coverage": 1.0,
+                "evidence_raw_locator_coverage": 1.0,
+                "evidence_lineage_coverage": 1.0,
+                "source_integrity_coverage": 1.0,
+            },
+            "awaiting_subagent_jobs": 0,
+        },
+    }
+
+
+def test_global_semantic_readiness_surfaces_evidence_foundation_coverage(isolated_memory):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_legacy_gap",
+        "claim_text": "Legacy claim without evidence foundation.",
+        "status": "Active",
+        "evidence_ids": [],
+    }
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-21"),
+        )
+
+    readiness = assess_semantic_readiness(
+        index_data={"nodes": {}, "graph_state": {"dirty": False, "reason": "fresh"}}
+    )
+
+    coverage = readiness["detail"]["evidence_foundation"]
+    assert readiness["status"] == "degraded"
+    assert coverage["claim_total"] == 1
+    assert coverage["claim_evidence_coverage"] == 0.0
+    assert "claim_evidence_coverage_low:0.0000<0.9500" in readiness["warnings"]
+
+
+def test_semantic_readiness_reports_topology_claim_governance_and_ingest_debt(
+    isolated_memory, monkeypatch
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    old = "2000-01-01T00:00:00+00:00"
+    memory = {
+        "memory_id": "memory_unsupported",
+        "memory_type": "fact",
+        "validity_state": "unsupported",
+    }
+    governance_item = {
+        "item_id": "gov_critical",
+        "type": "contradiction",
+        "status": "pending",
+    }
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO operational_memory "
+            "(memory_id, memory_type, score, data_json, updated_at, status, ttl) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (memory["memory_id"], "fact", 1.0, json.dumps(memory), old, "Active", 365),
+        )
+        conn.execute(
+            "INSERT INTO governance_queue (item_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (governance_item["item_id"], json.dumps(governance_item), old),
+        )
+        conn.execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, created_at, updated_at, available_at) "
+            "VALUES (?, 'ingest', '{}', 'awaiting_subagent', ?, ?, ?)",
+            ("job_semantic_old", old, old, old),
+        )
+    monkeypatch.setenv("VECTOR_LAKE_MAX_PENDING_GOVERNANCE_ITEMS", "0")
+    monkeypatch.setenv("VECTOR_LAKE_MAX_UNSUPPORTED_RUNTIME_CLAIMS", "0")
+    monkeypatch.setenv("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_AGE_SECONDS", "60")
+
+    readiness = assess_semantic_readiness(
+        index_data={
+            "nodes": {},
+            "graph_state": {"dirty": True, "reason": "awaiting async clustering"},
+        }
+    )
+
+    assert readiness["ready"] is False
+    assert readiness["status"] == "not_ready"
+    assert any(issue.startswith("graph_topology_dirty:") for issue in readiness["issues"])
+    assert "critical_governance_pending:1" in readiness["issues"]
+    assert "governance_backlog:1>0" in readiness["issues"]
+    assert "unsupported_runtime_claims:1>0" in readiness["issues"]
+    assert any(issue.startswith("semantic_ingest_backlog:") for issue in readiness["issues"])
+
+
+def test_decision_scoped_readiness_uses_verified_registry_and_ignores_unmapped_debt(
+    isolated_memory,
+):
+    from vector_lake.claim_assessment import record_claim_assessment
+    from vector_lake.decision_registry import sync_critical_decision_registry
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    claim = {
+        "claim_id": "claim_decision_ready",
+        "claim_text": "Decision evidence is complete.",
+        "status": "Active",
+        "evidence_ids": ["evidence_decision_ready"],
+        "source_ids": ["source_decision_ready"],
+    }
+    evidence = {
+        "evidence_id": "evidence_decision_ready",
+        "source_id": "source_decision_ready",
+        "source_locator": {"kind": "text", "paragraph": 2},
+        "lineage_safe": True,
+    }
+    source = {
+        "source_id": "source_decision_ready",
+        "integrity_status": "verified",
+        "content_hash": "a" * 64,
+    }
+    unrelated = {
+        "item_id": "gov_unrelated",
+        "type": "contradiction",
+        "status": "pending",
+        "critical_decision_refs": ["CD-OTHER"],
+    }
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-21"),
+        )
+        conn.execute(
+            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (evidence["evidence_id"], json.dumps(evidence), "2026-07-21"),
+        )
+        conn.execute(
+            "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (source["source_id"], json.dumps(source), "2026-07-21"),
+        )
+        conn.execute(
+            "INSERT INTO governance_queue (item_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (unrelated["item_id"], json.dumps(unrelated), "2026-07-21"),
+        )
+    record_claim_assessment(
+        claim["claim_id"],
+        assessment_type="evidence_review",
+        outcome="supported",
+        actor_id="reviewer:test",
+        method_version="review-v1",
+        reason="Verified for the scoped decision.",
+    )
+    sync_critical_decision_registry({
+        "contract_version": "1.0",
+        "decisions": [{
+            "decision_id": "CD-READY-001",
+            "title": "Ready decision",
+            "owner": "owner:test",
+            "status": "active",
+            "risk_weight": 80,
+            "evidence_requirements": ["verified claim"],
+            "claim_refs": [claim["claim_id"]],
+            "verification": "cbss-registry-signature:test",
+        }],
+    }, verification_validator=lambda decision: decision["verification"].startswith(
+        "cbss-registry-signature:"
+    ))
+
+    readiness = assess_semantic_readiness(
+        index_data={"graph_state": {"dirty": False}},
+        decision_id="CD-READY-001",
+    )
+
+    assert readiness["ready"] is True
+    assert readiness["status"] == "ready"
+    assert readiness["detail"]["scoped_pending_governance_ids"] == []
+    assert all(
+        value is True
+        for key, value in readiness["detail"]["claim_checks"][0].items()
+        if key != "claim_id"
+    )
+
+
+def test_decision_scoped_readiness_rejects_unverified_registry_reference(isolated_memory):
+    db_store.init_db()
+
+    readiness = assess_semantic_readiness(
+        index_data={"graph_state": {"dirty": False}},
+        decision_id="CD-MISSING",
+    )
+
+    assert readiness["ready"] is False
+    assert "critical_decision_unverified:CD-MISSING" in readiness["issues"]
+
+
+def test_doctor_labels_infrastructure_and_semantic_status_separately(
+    isolated_memory, monkeypatch
+):
+    from vector_lake import tool_doctor
+
+    (isolated_memory / "wiki" / "index.json").write_text(
+        json.dumps({"nodes": {}, "graph_state": {"dirty": False}}),
+        encoding="utf-8",
+    )
+    db_store.init_db()
+
+    monkeypatch.setattr(
+        tool_doctor,
+        "assess_semantic_readiness",
+        lambda index_data=None: {
+            "ready": False,
+            "status": "not_ready",
+            "issues": ["critical_governance_pending:2"],
+            "warnings": ["provisional_runtime_claims:3"],
+            "detail": {},
+        },
+    )
+
+    doctor = tool_doctor.doctor_vector_lake()
+
+    assert "Infrastructure Summary:" in doctor
+    assert "Semantic Readiness: not_ready" in doctor
+    assert "Semantic issues: critical_governance_pending:2" in doctor
+    assert "Summary: infrastructure " in doctor
