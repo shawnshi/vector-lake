@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -234,7 +234,8 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
     governance_store.initialize_meta_store()
     conn = governance_store.get_connection()
     now = _utc_now()
-    validity_state_counts = {}
+    # ⚡ Bolt: Use defaultdict(int) to reduce dictionary lookup overhead for missing keys in the hot loop
+    validity_state_counts = defaultdict(int)
     unsupported_claim_count = 0
     managed_unsupported_claim_count = 0
     conflicted_claim_count = 0
@@ -263,7 +264,7 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         source_ids_with_claims.update(str(item) for item in raw_claim.get("source_ids", []))
         claim = annotate_claim_validity(raw_claim, now=now)
         state = claim.get("validity_state", "active")
-        validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
+        validity_state_counts[state] += 1
         if state == "unsupported":
             unsupported_claim_count += 1
             managed_item = managed_claim_items.get(str(claim.get("claim_id") or ""))
@@ -377,6 +378,6 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         "superseded_memory_count": memory_validity_counts.get("superseded", 0),
         "conflicted_memory_count": memory_validity_counts.get("conflicted", 0),
         "memory_type_counts": memory_type_counts,
-        "validity_state_counts": validity_state_counts,
+        "validity_state_counts": dict(validity_state_counts),
     }
 
