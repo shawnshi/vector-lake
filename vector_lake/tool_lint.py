@@ -15,7 +15,7 @@ from vector_lake.wiki_utils import (
     read_markdown_file,
     write_markdown_file,
 )
-from vector_lake.schema_validator import validate_schema, SchemaViolationException
+from vector_lake.schema_validator import SchemaViolationException, VALID_STATUS, validate_schema
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -73,7 +73,7 @@ def lint_vector_lake(auto_fix: bool = False):
 
     skip_files = {"index.md", "log.md", "overview.md"}
     valid_types = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
-    valid_status = {"active", "draft", "superseded", "deprecated"}
+    valid_status = {status.lower() for status in VALID_STATUS}
     valid_epistemic = {"seed", "sprouting", "evergreen"}
     valid_categories = {
         "Uncategorized", "Artificial_Intelligence", "Healthcare_IT",

@@ -25,7 +25,7 @@ You are the autonomous maintainer of the Vector Lake Wiki (`MEMORY/wiki/`). Your
   type: "vendor | product | institution | person | event | concept | policy | standard | source | synthesis" # Updated: 'institution' separated from 'vendor'
   domain: "Medical_IT"  
   topic_cluster: "General" 
-  status: "Active | Draft | Superseded | Deprecated"
+  status: "Active | Draft | Superseded | Deprecated | Archived | Contested"
   epistemic-status: "seed | sprouting | evergreen" 
   ttl: 365 
   memory_type: "fact | preference | decision | task_state" 

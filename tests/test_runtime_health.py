@@ -623,8 +623,87 @@ def test_semantic_readiness_reports_topology_claim_governance_and_ingest_debt(
     assert any(issue.startswith("graph_topology_dirty:") for issue in readiness["issues"])
     assert "critical_governance_pending:1" in readiness["issues"]
     assert "governance_backlog:1>0" in readiness["issues"]
-    assert "unsupported_runtime_claims:1>0" in readiness["issues"]
+    assert "unmanaged_unsupported_runtime_claims:1>0" in readiness["issues"]
     assert any(issue.startswith("semantic_ingest_backlog:") for issue in readiness["issues"])
+
+
+def test_semantic_readiness_treats_acknowledged_unsupported_claim_as_managed_debt(
+    isolated_memory, monkeypatch
+):
+    from vector_lake.governance_metrics import claim_governance_version
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    claim = {
+        "claim_id": "claim_managed_unsupported",
+        "claim_text": "Legacy claim awaiting evidence remediation.",
+        "status": "Active",
+        "evidence_ids": [],
+        "source_ids": [],
+    }
+    memory = {
+        "memory_id": "memory_managed_unsupported",
+        "memory_type": "fact",
+        "source_claim_id": claim["claim_id"],
+        "validity_state": "unsupported",
+    }
+    governance_item = {
+        "item_id": "gov_managed_unsupported",
+        "type": "evidence-gap",
+        "status": "acknowledged",
+        "claim_id": claim["claim_id"],
+        "claim_version": claim_governance_version(claim),
+        "owner": "test-owner",
+        "due_at": "2099-01-01T00:00:00+00:00",
+    }
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                claim["claim_id"],
+                claim["claim_text"],
+                "Active",
+                json.dumps(claim),
+                "2026-07-21",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO operational_memory "
+            "(memory_id, memory_type, score, data_json, updated_at, status, ttl) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                memory["memory_id"],
+                "fact",
+                1.0,
+                json.dumps(memory),
+                "2026-07-21",
+                "Active",
+                365,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO governance_queue (item_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (governance_item["item_id"], json.dumps(governance_item), "2026-07-21"),
+        )
+    monkeypatch.setenv("VECTOR_LAKE_MAX_UNSUPPORTED_RUNTIME_CLAIMS", "0")
+
+    readiness = assess_semantic_readiness(
+        index_data={"nodes": {}, "graph_state": {"dirty": False, "reason": "fresh"}}
+    )
+
+    assert readiness["ready"] is False
+    assert readiness["status"] == "degraded"
+    assert not any(
+        issue.startswith("unmanaged_unsupported_runtime_claims:")
+        for issue in readiness["issues"]
+    )
+    assert "managed_unsupported_runtime_claims:1" in readiness["warnings"]
+    assert readiness["detail"]["runtime_unsupported_governance"] == {
+        "total": 1,
+        "managed": 1,
+        "unmanaged": 0,
+    }
 
 
 def test_decision_scoped_readiness_uses_verified_registry_and_ignores_unmapped_debt(

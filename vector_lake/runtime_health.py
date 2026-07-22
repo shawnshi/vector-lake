@@ -521,6 +521,60 @@ def _evidence_foundation_metrics(conn) -> dict[str, Any]:
     return metrics
 
 
+def _runtime_unsupported_governance(conn) -> dict[str, int]:
+    """Classify unsupported runtime memories by active claim governance."""
+    from vector_lake.governance_metrics import claim_governance_version
+
+    unsupported_rows = conn.execute(
+        "SELECT memory_id, NULLIF(json_extract(data_json, '$.source_claim_id'), '') "
+        "AS source_claim_id FROM operational_memory "
+        "WHERE json_extract(data_json, '$.validity_state') = 'unsupported'"
+    ).fetchall()
+    if not unsupported_rows:
+        return {"total": 0, "managed": 0, "unmanaged": 0}
+
+    claims_by_id = {
+        str(row["claim_id"]): json.loads(row["data_json"])
+        for row in conn.execute(
+            "SELECT c.claim_id, c.data_json FROM claims AS c JOIN ("
+            "SELECT DISTINCT json_extract(data_json, '$.source_claim_id') AS claim_id "
+            "FROM operational_memory "
+            "WHERE json_extract(data_json, '$.validity_state') = 'unsupported'"
+            ") AS runtime_claims ON runtime_claims.claim_id = c.claim_id"
+        )
+    }
+    governance_by_claim: dict[str, list[dict[str, Any]]] = {}
+    for row in conn.execute(
+        "SELECT data_json FROM governance_queue "
+        "WHERE json_extract(data_json, '$.type') = 'evidence-gap' "
+        "AND json_extract(data_json, '$.status') = 'acknowledged' "
+        "AND json_extract(data_json, '$.claim_id') IS NOT NULL"
+    ):
+        item = json.loads(row["data_json"])
+        claim_id = str(item.get("claim_id") or "")
+        governance_by_claim.setdefault(claim_id, []).append(item)
+
+    now = datetime.now(timezone.utc)
+    managed = 0
+    for row in unsupported_rows:
+        claim_id = str(row["source_claim_id"] or "")
+        claim = claims_by_id.get(claim_id)
+        if claim is None:
+            continue
+        claim_version = claim_governance_version(claim)
+        if any(
+            str(item.get("owner") or "").strip()
+            and (due_at := _parse_dt(item.get("due_at"))) is not None
+            and due_at >= now
+            and str(item.get("claim_version") or "") == claim_version
+            for item in governance_by_claim.get(claim_id, [])
+        ):
+            managed += 1
+
+    total = len(unsupported_rows)
+    return {"total": total, "managed": managed, "unmanaged": total - managed}
+
+
 def _assess_decision_scope(
     conn,
     decision_id: str,
@@ -654,7 +708,9 @@ def assess_semantic_readiness(
 
     This surface is deliberately separate from runtime health. Semantic debt
     never blocks canonical repair writes, while infrastructure health never
-    implies that claims or topology are ready for business decisions.
+    implies that claims or topology are ready for business decisions. An
+    unsupported runtime claim blocks only while it lacks active, version-bound
+    governance ownership.
     """
     from vector_lake.db_store import get_connection, get_db_path, init_db
     from vector_lake.wiki_utils import get_index_path
@@ -737,12 +793,26 @@ def assess_semantic_readiness(
     }
     detail["runtime_validity_state_counts"] = validity_counts
     unsupported = validity_counts.get("unsupported", 0)
-    max_unsupported = max(
-        0,
-        int(os.environ.get("VECTOR_LAKE_MAX_UNSUPPORTED_RUNTIME_CLAIMS", "0")),
-    )
-    if unsupported > max_unsupported:
-        issues.append(f"unsupported_runtime_claims:{unsupported}>{max_unsupported}")
+    if unsupported:
+        unsupported_governance = _runtime_unsupported_governance(conn)
+        detail["runtime_unsupported_governance"] = unsupported_governance
+        max_unmanaged = max(
+            0,
+            int(
+                os.environ.get(
+                    "VECTOR_LAKE_MAX_UNMANAGED_UNSUPPORTED_RUNTIME_CLAIMS",
+                    os.environ.get("VECTOR_LAKE_MAX_UNSUPPORTED_RUNTIME_CLAIMS", "0"),
+                )
+            ),
+        )
+        unmanaged = unsupported_governance["unmanaged"]
+        if unmanaged > max_unmanaged:
+            issues.append(
+                f"unmanaged_unsupported_runtime_claims:{unmanaged}>{max_unmanaged}"
+            )
+        managed = unsupported_governance["managed"]
+        if managed:
+            warnings.append(f"managed_unsupported_runtime_claims:{managed}")
     if validity_counts.get("provisional", 0):
         warnings.append(f"provisional_runtime_claims:{validity_counts['provisional']}")
     if validity_counts.get("expired", 0):
