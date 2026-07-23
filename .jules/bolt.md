@@ -9,3 +9,6 @@
 ## 2024-07-14 - Unused O(N) Array Allocations in Search Hot Path
 **Learning:** Codebase sometimes retains expensive list comprehensions iterating over the entire global index inside search functions (e.g. `nodes = [...]` in `tool_search.py`), which are never consumed.
 **Action:** Always check if variables returned from O(N) operations in hot paths are actually used before optimizing them.
+## 2024-05-24 - Use defaultdict over dict.get() for high-frequency counting loops
+**Learning:** In Vector Lake, `compute_debt_metrics` iterates over thousands of claims and increments dictionary counters. `dict.get(key, 0) + 1` incurs function call overhead, missing key handling, addition, and re-assignment on every single loop iteration.
+**Action:** When counting frequencies inside hot paths, prefer `collections.defaultdict(int)`. This eliminates the missing key check and reduces the operation to an in-place `+= 1` allocation, saving CPU cycles during bulk operations. Cast back to `dict()` before returning if downstream consumers require standard dictionary semantics.
