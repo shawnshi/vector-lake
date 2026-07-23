@@ -500,7 +500,8 @@
 
             const href = nodeHref(node);
             const safeName = escapeHTML(node.name || node.id);
-            const safeHref = href ? encodeURI(href) : null;
+            const isSafeProtocol = href && /^(https?|file|\/|\#)/i.test(href);
+            const safeHref = isSafeProtocol ? encodeURI(href) : null;
             document.getElementById('info-title').innerHTML = safeHref ? `<a href="${safeHref}" target="_blank">${safeName}</a>` : safeName;
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
