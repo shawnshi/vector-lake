@@ -1,6 +1,17 @@
+import hashlib
 import json
+import os
 
-from vector_lake import db_store, governance_store, indexer, mutation_coordinator
+import pytest
+
+from vector_lake import (
+    db_store,
+    governance_service,
+    governance_store,
+    indexer,
+    mutation_coordinator,
+    wiki_utils,
+)
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.watchdog_app import (
     WikiIndexHandler,
@@ -109,6 +120,125 @@ def test_worker_skips_duplicate_markdown_projection(isolated_memory, monkeypatch
     assert stats["completed"] == 1
 
 
+def test_worker_projection_cas_does_not_overwrite_manual_edit(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    target = isolated_memory / "wiki" / "Source_CAS.md"
+    base = _source_content()
+    manual = base.replace("Primary source content.", "Manual concurrent edit.")
+    target.write_text(manual, encoding="utf-8")
+    base_hash = hashlib.sha256(base.encode("utf-8")).hexdigest()
+    outbox_id = db_store.enqueue_mutation(
+        "Source_CAS.md",
+        "update",
+        payload_text=base,
+        idempotency_key="projection-cas",
+        validation_mode="schema",
+        projection_base_hash=base_hash,
+    )
+    monkeypatch.setattr(
+        indexer,
+        "update_index_items",
+        lambda filenames: (_ for _ in ()).throw(
+            AssertionError("CAS-conflicted projection must not be indexed")
+        ),
+    )
+
+    stats = process_mutation_outbox_batch(
+        limit=1,
+        max_attempts=1,
+        backoff_base=0,
+    )
+
+    assert stats == {"claimed": 1, "completed": 0, "retrying": 0, "failed": 1}
+    assert target.read_text(encoding="utf-8") == manual
+    row = db_store.get_connection().execute(
+        "SELECT status, last_error, projection_base_hash FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert "compare-and-swap conflict" in row["last_error"]
+    assert row["projection_base_hash"] == base_hash
+
+
+@pytest.mark.skipif(os.name != "nt", reason="ReplaceFileW CAS is Windows-specific")
+def test_worker_projection_cas_rolls_back_edit_injected_after_hash(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    target = isolated_memory / "wiki" / "Source_CAS-Race.md"
+    base = _named_source_content("CAS Race", "Known base content.")
+    replacement = _named_source_content("CAS Race", "Recovered content.")
+    manual = _named_source_content("CAS Race", "Manual edit after hash read.")
+    target.write_text(base, encoding="utf-8")
+    base_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+    outbox_id = db_store.enqueue_mutation(
+        target.name,
+        "update",
+        payload_text=replacement,
+        idempotency_key="projection-cas-after-hash",
+        validation_mode="schema",
+        projection_base_hash=base_hash,
+    )
+    journal_id = "journal_projection_cas_after_hash"
+    item_id = "gov_projection_cas_after_hash"
+    db_store.record_merge_journal(
+        journal_id,
+        item_id,
+        {"outbox_ids": [outbox_id]},
+        status="projection_pending",
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": item_id,
+            "type": "merge",
+            "status": "projection_pending",
+            "merge_candidate": {},
+            "merge_journal_id": journal_id,
+            "merge_outbox_ids": [outbox_id],
+        }
+    )
+
+    real_replace = wiki_utils._replace_file_with_backup
+    injected = False
+
+    def inject_edit_after_hash(replaced_path, replacement_path, backup_path):
+        nonlocal injected
+        if not injected:
+            injected = True
+            replaced_path.write_text(manual, encoding="utf-8")
+        return real_replace(replaced_path, replacement_path, backup_path)
+
+    monkeypatch.setattr(
+        wiki_utils,
+        "_replace_file_with_backup",
+        inject_edit_after_hash,
+    )
+    stats = process_mutation_outbox_batch(
+        limit=1,
+        max_attempts=1,
+        backoff_base=0,
+    )
+
+    assert injected is True
+    assert stats == {"claimed": 1, "completed": 0, "retrying": 0, "failed": 1}
+    assert target.read_text(encoding="utf-8") == manual
+    assert not list(target.parent.glob(f"{target.name}.*.cas-*"))
+    row = db_store.get_connection().execute(
+        "SELECT status, last_error FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert "compare-and-swap conflict" in row["last_error"]
+
+    pending = governance_service.resolve_governance_item(item_id, resolution="merge")
+    assert pending["status"] == "projection_pending"
+    assert pending["merge_outbox_statuses"] == {outbox_id: "failed"}
+
+
 def test_worker_does_not_materialize_or_index_after_lease_is_superseded(
     isolated_memory,
     monkeypatch,
@@ -162,6 +292,26 @@ def test_watchdog_ignores_managed_projection_event(isolated_memory):
 
     WikiIndexHandler().queue_path(str(target))
 
+    assert index_queue.empty()
+
+
+def test_watchdog_ignores_managed_projection_event_with_mixed_newlines(
+    isolated_memory,
+):
+    _write_purpose_contract(isolated_memory)
+    while not index_queue.empty():
+        index_queue.get_nowait()
+        index_queue.task_done()
+    mixed = _source_content().replace(
+        "Primary source content.\n",
+        "Primary source content.\r\n\r\nSecond line.\n",
+    )
+    execute_mutation_plan("Source_Mixed-Newlines.md", content=mixed)
+    target = isolated_memory / "wiki" / "Source_Mixed-Newlines.md"
+
+    WikiIndexHandler().queue_path(str(target))
+
+    assert target.read_bytes() == mixed.encode("utf-8")
     assert index_queue.empty()
 
 

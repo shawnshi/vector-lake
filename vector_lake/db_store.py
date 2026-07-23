@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from vector_lake.wiki_utils import get_meta_dir
+from vector_lake.wiki_utils import get_meta_dir, normalize_semantic_text
 import sqlite_vec
 
 _LOCAL = threading.local()
@@ -117,7 +117,7 @@ def transaction():
         try:
             yield conn
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         finally:
@@ -344,6 +344,20 @@ def _init_db_once(db_key: str):
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS merge_journal (
+                journal_id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_merge_journal_item "
+            "ON merge_journal(item_id, updated_at)"
+        )
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS mutation_outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 filename TEXT,
@@ -367,6 +381,7 @@ def _init_db_once(db_key: str):
             ("idempotency_key", "TEXT"),
             ("validation_mode", "TEXT DEFAULT 'full'"),
             ("base_version", "TEXT"),
+            ("projection_base_hash", "TEXT"),
         ]
         for column_name, column_type in outbox_columns:
             try:
@@ -853,6 +868,7 @@ def enqueue_mutation(
     idempotency_key: str | None = None,
     validation_mode: str = "full",
     base_version: str | None = None,
+    projection_base_hash: str | None = None,
 ) -> int:
     if mutation_type not in {"update", "delete"}:
         raise ValueError(f"Unsupported mutation_type: {mutation_type}")
@@ -890,9 +906,9 @@ def enqueue_mutation(
         if current_id is None:
             cursor = conn.execute(
                 "INSERT INTO mutation_outbox "
-                "(filename, mutation_type, payload_text, status, attempt_count, created_at, available_at, "
-                "idempotency_key, validation_mode, base_version) "
-                "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)",
+            "(filename, mutation_type, payload_text, status, attempt_count, created_at, available_at, "
+            "idempotency_key, validation_mode, base_version, projection_base_hash) "
+            "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)",
                 (
                     filename,
                     mutation_type,
@@ -902,6 +918,7 @@ def enqueue_mutation(
                     idempotency_key,
                     validation_mode,
                     base_version,
+                    projection_base_hash,
                 ),
             )
             current_id = int(cursor.lastrowid)
@@ -933,13 +950,18 @@ def is_managed_projection_state(
         return False
     if mutation_type == "delete":
         return True
-    return row["payload_text"] == payload_text
+    if row["payload_text"] is None or payload_text is None:
+        return row["payload_text"] == payload_text
+    return normalize_semantic_text(row["payload_text"]) == normalize_semantic_text(
+        payload_text
+    )
 
 
 def claim_mutation_outbox(
     limit: int = 50,
     lease_seconds: int = 120,
     lease_owner: str | None = None,
+    outbox_ids: list[int] | None = None,
 ) -> list[dict]:
     """Atomically claim ready rows, including abandoned processing leases."""
     import os
@@ -970,13 +992,20 @@ def claim_mutation_outbox(
             ")",
             (now,),
         )
-        rows = conn.execute(
-            "SELECT id FROM mutation_outbox WHERE "
-            "(status = 'pending' AND COALESCE(available_at, created_at, '') <= ?) OR "
-            "(status = 'processing' AND COALESCE(lease_until, '') <= ?) "
-            "ORDER BY id ASC LIMIT ?",
-            (now, now, max(1, int(limit))),
-        ).fetchall()
+        requested_ids = sorted({int(value) for value in (outbox_ids or [])})
+        query = (
+            "SELECT id FROM mutation_outbox WHERE ((status = 'pending' "
+            "AND COALESCE(available_at, created_at, '') <= ?) OR "
+            "(status = 'processing' AND COALESCE(lease_until, '') <= ?))"
+        )
+        params: list = [now, now]
+        if requested_ids:
+            placeholders = ",".join("?" for _ in requested_ids)
+            query += f" AND id IN ({placeholders})"
+            params.extend(requested_ids)
+        query += " ORDER BY id ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, tuple(params)).fetchall()
         ids = [int(row["id"]) for row in rows]
         if not ids:
             return []
@@ -1031,6 +1060,86 @@ def mutation_outbox_is_latest_intent(outbox_id: int) -> bool:
         (int(outbox_id),),
     ).fetchone()
     return row is not None
+
+
+def mutation_outbox_statuses(outbox_ids: list[int]) -> dict[int, str]:
+    ids = sorted({int(value) for value in outbox_ids})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = get_connection().execute(
+        f"SELECT id, status FROM mutation_outbox WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return {int(row["id"]): str(row["status"]) for row in rows}
+
+
+def record_merge_journal(
+    journal_id: str,
+    item_id: str,
+    data: dict,
+    status: str = "prepared",
+) -> dict:
+    """Persist an immutable pre-merge snapshot inside the caller transaction."""
+    now = datetime.now(timezone.utc).isoformat()
+    payload = dict(data)
+    payload.setdefault("journal_id", str(journal_id))
+    payload.setdefault("item_id", str(item_id))
+    payload.setdefault("created_at", now)
+    with transaction():
+        get_connection().execute(
+            "INSERT OR IGNORE INTO merge_journal "
+            "(journal_id, item_id, status, data_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(journal_id),
+                str(item_id),
+                str(status),
+                json.dumps(payload, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+    return get_merge_journal(journal_id) or payload
+
+
+def update_merge_journal(journal_id: str, updates: dict, status: str | None = None) -> dict | None:
+    """Update merge execution metadata without replacing the pre-merge snapshot."""
+    with transaction():
+        row = get_connection().execute(
+            "SELECT status, data_json FROM merge_journal WHERE journal_id = ?",
+            (str(journal_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["data_json"] or "{}")
+        payload.update(dict(updates))
+        next_status = str(status or row["status"])
+        now = datetime.now(timezone.utc).isoformat()
+        get_connection().execute(
+            "UPDATE merge_journal SET status = ?, data_json = ?, updated_at = ? "
+            "WHERE journal_id = ?",
+            (next_status, json.dumps(payload, ensure_ascii=False), now, str(journal_id)),
+        )
+    return {**payload, "status": next_status}
+
+
+def get_merge_journal(journal_id: str) -> dict | None:
+    row = get_connection().execute(
+        "SELECT status, data_json, created_at, updated_at FROM merge_journal WHERE journal_id = ?",
+        (str(journal_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row["data_json"] or "{}")
+    payload.update(
+        {
+            "status": str(row["status"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+    )
+    return payload
 
 
 def complete_mutation_outbox(

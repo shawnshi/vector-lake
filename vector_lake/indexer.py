@@ -117,8 +117,12 @@ def _index_node_signature(node: dict) -> str:
     return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def index_projection_matches_canonical(filenames: list[str]) -> bool:
+def index_projection_matches_canonical(
+    filenames: list[str],
+    allowed_alias_redirects: dict[str, str] | None = None,
+) -> bool:
     """Prove that selected canonical pages are already reflected in index.json."""
+    allowed_alias_redirects = allowed_alias_redirects or {}
     page_keys = {
         filename[:-3]
         for filename in filenames
@@ -157,7 +161,15 @@ def index_projection_matches_canonical(filenames: list[str]) -> bool:
             if observed is None or _index_node_signature(observed) not in signatures:
                 return False
         else:
-            if observed is not None or page_key in aliases or page_key in aliases.values():
+            alias_value = aliases.get(page_key)
+            expected_redirect = allowed_alias_redirects.get(page_key)
+            if observed is not None:
+                return False
+            if alias_value is not None and alias_value != expected_redirect:
+                return False
+            if expected_redirect is not None and alias_value != expected_redirect:
+                return False
+            if page_key in aliases.values():
                 return False
             if any(edge.get("source") == page_key or edge.get("target") == page_key for edge in edges):
                 return False

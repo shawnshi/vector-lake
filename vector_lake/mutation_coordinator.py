@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -20,6 +21,10 @@ from vector_lake.wiki_utils import (
 log = logging.getLogger("vector-lake-mutation")
 
 
+def _filename_identity(filename: str) -> str:
+    return unicodedata.normalize("NFKC", filename).casefold()
+
+
 def resolve_wiki_mutation_path(
     filename: str,
     allow_existing_legacy_name: bool = False,
@@ -27,7 +32,12 @@ def resolve_wiki_mutation_path(
     """Resolve a single wiki basename and reject every traversal form."""
     if not isinstance(filename, str) or not filename or filename != filename.strip():
         raise ValueError("Mutation filename must be a non-empty trimmed string.")
-    if "\x00" in filename or "/" in filename or "\\" in filename:
+    security_name = unicodedata.normalize("NFKC", filename)
+    if any(
+        marker in candidate
+        for candidate in (filename, security_name)
+        for marker in ("\x00", "/", "\\")
+    ):
         raise ValueError("Mutation filename must be a basename without path separators.")
     candidate_name = Path(filename)
     if candidate_name.is_absolute() or candidate_name.name != filename or filename in {".", ".."}:
@@ -46,6 +56,7 @@ def materialize_markdown_projection(
     mutation_type: str,
     payload_text: str | None = None,
     validation_mode: str = "full",
+    projection_base_hash: str | None = None,
 ) -> Path:
     """Idempotently materialize the Markdown projection for one outbox row."""
     filepath = resolve_wiki_mutation_path(
@@ -54,6 +65,12 @@ def materialize_markdown_projection(
     )
     if mutation_type == "delete":
         if filepath.exists():
+            if projection_base_hash is not None:
+                current_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
+                if current_hash != projection_base_hash:
+                    raise RuntimeError(
+                        f"Projection compare-and-swap conflict for {filename}."
+                    )
             filepath.unlink()
         return filepath
     if mutation_type != "update":
@@ -62,7 +79,12 @@ def materialize_markdown_projection(
         if not filepath.exists():
             raise ValueError(f"Outbox update for {filename} has no payload and no existing Markdown projection.")
         payload_text = filepath.read_text(encoding="utf-8")
-    atomic_write_text(filepath, payload_text, validation_mode=validation_mode)
+    atomic_write_text(
+        filepath,
+        payload_text,
+        validation_mode=validation_mode,
+        expected_current_hash=projection_base_hash,
+    )
     return filepath
 
 
@@ -83,22 +105,55 @@ def _prepare_mutations(
     if validation_mode not in {"full", "schema"}:
         raise ValueError(f"Unsupported validation_mode: {validation_mode}")
     prepared = []
-    seen_filenames = set()
+    seen_filenames: dict[str, str] = {}
+    existing_filenames: dict[str, set[str]] = {}
+    for existing_path in get_wiki_dir().glob("*.md"):
+        existing_filenames.setdefault(
+            _filename_identity(existing_path.name),
+            set(),
+        ).add(existing_path.name)
     for mutation in mutations:
         filename = mutation.get("filename")
+        if not isinstance(filename, str):
+            raise ValueError("Mutation filename must be a non-empty trimmed string.")
+        filename_identity = _filename_identity(filename)
+        if filename_identity in seen_filenames:
+            raise ValueError(
+                "A mutation batch cannot contain duplicate filenames: "
+                f"{seen_filenames[filename_identity]} and {filename}"
+            )
+        existing_aliases = existing_filenames.get(filename_identity, set())
+        if len(existing_aliases) > 1:
+            raise ValueError(
+                "Mutation filename has multiple Unicode/case-equivalent existing pages: "
+                + ", ".join(sorted(existing_aliases))
+            )
+        if existing_aliases and filename not in existing_aliases:
+            existing_name = next(iter(existing_aliases))
+            raise ValueError(
+                f"Mutation filename is an alias of existing page: "
+                f"{filename} -> {existing_name}"
+            )
         content = mutation.get("content")
         is_delete = bool(mutation.get("is_delete", False))
         has_expected_version = "expected_version" in mutation
         expected_version = mutation.get("expected_version")
+        projection_base_hash = mutation.get("expected_projection_hash")
         if has_expected_version and not isinstance(expected_version, str):
             raise ValueError("expected_version must be a string when supplied.")
+        if projection_base_hash is not None and (
+            not isinstance(projection_base_hash, str)
+            or len(projection_base_hash) != 64
+            or any(character not in "0123456789abcdef" for character in projection_base_hash.casefold())
+        ):
+            raise ValueError("expected_projection_hash must be a 64-character SHA-256 hex digest.")
+        if is_delete and projection_base_hash is not None:
+            raise ValueError("expected_projection_hash is supported only for update mutations.")
         filepath = resolve_wiki_mutation_path(
             filename,
             allow_existing_legacy_name=validation_mode == "schema",
         )
-        if filename in seen_filenames:
-            raise ValueError(f"A mutation batch cannot contain duplicate filenames: {filename}")
-        seen_filenames.add(filename)
+        seen_filenames[filename_identity] = filename
 
         mutation_type = "delete" if is_delete else "update"
         if not is_delete:
@@ -121,6 +176,7 @@ def _prepare_mutations(
                 "mutation_type": mutation_type,
                 "has_expected_version": has_expected_version,
                 "expected_version": expected_version,
+                "projection_base_hash": projection_base_hash,
                 "idempotency_key": hashlib.sha256(
                     (
                         f"{mutation_type}\x00{filename}\x00{content or ''}"
@@ -130,6 +186,11 @@ def _prepare_mutations(
                             else ""
                         )
                         + (f"\x00validation={validation_mode}" if validation_mode != "full" else "")
+                        + (
+                            f"\x00projection_base_hash={projection_base_hash}"
+                            if projection_base_hash is not None
+                            else ""
+                        )
                     ).encode("utf-8")
                 ).hexdigest(),
             }
@@ -144,6 +205,9 @@ def execute_mutation_batch(
     canonical_callback: Callable[[], None] | None = None,
     validation_mode: str = "full",
     origin: str = "mutation_coordinator",
+    return_details: bool = False,
+    transaction_callback: Callable[[list[int]], None] | None = None,
+    precondition_callback: Callable[[], None] | None = None,
 ):
     """Commit canonical mutations atomically; schema mode is for bounded legacy maintenance."""
     from vector_lake.runtime_health import enforce_runtime_write_health
@@ -197,6 +261,8 @@ def execute_mutation_batch(
                         f"Canonical version conflict for {filename}: "
                         f"expected {expected or '<absent>'}, current {current or '<absent>'}"
                     )
+        if precondition_callback is not None:
+            precondition_callback()
         for mutation in prepared:
             filename = mutation["filename"]
             content = mutation["content"]
@@ -223,10 +289,13 @@ def execute_mutation_batch(
                         filename[:-3] if filename.endswith(".md") else filename,
                         "",
                     ),
+                    projection_base_hash=mutation["projection_base_hash"],
                 )
             )
         if canonical_callback is not None:
             canonical_callback()
+        if transaction_callback is not None:
+            transaction_callback(list(outbox_ids))
 
     deferred = []
     for mutation, outbox_id in zip(prepared, outbox_ids):
@@ -240,6 +309,7 @@ def execute_mutation_batch(
                     mutation["mutation_type"],
                     mutation["content"],
                     validation_mode=validation_mode,
+                    projection_base_hash=mutation["projection_base_hash"],
                 )
         except Exception as exc:
             deferred.append(mutation["filename"])
@@ -256,7 +326,15 @@ def execute_mutation_batch(
         if deferred
         else "all Markdown projections materialized"
     )
-    return True, f"Canonical mutation batch committed; outbox ids {outbox_ids}; {projection_note}."
+    message = f"Canonical mutation batch committed; outbox ids {outbox_ids}; {projection_note}."
+    if return_details:
+        return {
+            "ok": True,
+            "message": message,
+            "outbox_ids": outbox_ids,
+            "deferred": deferred,
+        }
+    return True, message
 
 
 def execute_mutation_plan(filename: str, content: str | None = None, is_delete: bool = False):

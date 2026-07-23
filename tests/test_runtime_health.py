@@ -10,6 +10,33 @@ from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.watchdog_status import get_status_file, write_status
 
 
+def test_canonical_entity_version_ignores_transport_only_raw_text_differences():
+    lf_record = {
+        "entity_id": "entity_transport",
+        "page_key": "Source_Transport",
+        "raw_text": "line one\nline two\n",
+    }
+    crlf_record = {
+        **lf_record,
+        "raw_text": "\ufeffline one\r\nline two\r\n",
+    }
+    changed_record = {
+        **lf_record,
+        "raw_text": "line one\nchanged\n",
+    }
+
+    lf_version = governance_store._canonical_entity_records_version(
+        [("entity_transport", lf_record)]
+    )
+
+    assert governance_store._canonical_entity_records_version(
+        [("entity_transport", crlf_record)]
+    ) == lf_version
+    assert governance_store._canonical_entity_records_version(
+        [("entity_transport", changed_record)]
+    ) != lf_version
+
+
 def _write_purpose_contract(memory_dir):
     (memory_dir / "purpose.md").write_text(
         """---

@@ -50,6 +50,22 @@ def test_pending_projection_event_is_managed_only_when_payload_matches(isolated_
     assert db_store.is_managed_projection_state(
         "Concept_Managed.md", "update", "manual conflicting payload"
     ) is False
+    assert db_store.is_managed_projection_state(
+        "Concept_Managed.md", "update", "canonical payload\r\n"
+    ) is False
+
+    db_store.enqueue_mutation(
+        "Concept_Mixed-Newlines.md",
+        "update",
+        payload_text="frontmatter\nbody\r\nnext\rline\n",
+        idempotency_key="managed-mixed-newlines",
+        base_version="old-version",
+    )
+    assert db_store.is_managed_projection_state(
+        "Concept_Mixed-Newlines.md",
+        "update",
+        "frontmatter\r\nbody\nnext\nline\r\n",
+    ) is True
 
 
 def test_outbox_retries_then_dead_letters(isolated_memory):
@@ -265,6 +281,7 @@ def test_init_db_migrates_legacy_outbox(isolated_memory):
         "lease_generation",
         "superseded_by",
         "idempotency_key",
+        "projection_base_hash",
     } <= columns
     legacy = db_store.get_connection().execute("SELECT status, available_at FROM mutation_outbox").fetchone()
     assert legacy["status"] == "pending"

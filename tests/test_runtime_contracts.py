@@ -1,8 +1,10 @@
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import anyio
 import pytest
 
-from vector_lake import governance_store, mutation_coordinator
+from vector_lake import governance_store, mcp_server, mutation_coordinator
 from vector_lake.tool_search import SearchIndexError, format_operational_memory_results, search_vector_lake
 from vector_lake.watchdog_app import _watch_directories
 from vector_lake.wiki_utils import (
@@ -75,6 +77,53 @@ def test_meta_dir_cache_is_keyed_by_active_memory_root(tmp_path, monkeypatch):
 
 def test_claim_graph_uses_documented_canonical_filename(isolated_memory):
     assert get_claim_graph_path() == get_wiki_dir() / "claim_graph.json"
+
+
+def test_mcp_runtime_guard_detects_source_revision_drift(tmp_path):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_text("VALUE = 1\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=0,
+    )
+
+    initial = guard.status(force=True)
+    source_path.write_text("VALUE = 2\n", encoding="utf-8")
+    changed = guard.status(force=True)
+
+    assert initial["stale"] is False
+    assert changed["stale"] is True
+    assert changed["loaded_revision"] != changed["current_revision"]
+    with pytest.raises(RuntimeError, match="restart"):
+        guard.assert_current()
+
+
+def test_mcp_server_uses_reload_aware_dispatch():
+    assert isinstance(mcp_server.mcp, mcp_server.ReloadAwareFastMCP)
+    status = mcp_server.mcp_runtime_status()
+
+    assert '"restart_required": false' in status
+
+
+def test_reload_aware_dispatch_rejects_stale_source_tree(tmp_path):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_text("VALUE = 1\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=0,
+    )
+    server = mcp_server.ReloadAwareFastMCP(
+        "runtime-test",
+        runtime_guard=guard,
+    )
+    source_path.write_text("VALUE = 2\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="restart"):
+        anyio.run(server.call_tool, "any_tool", {})
 
 
 def test_corrupt_search_index_raises_typed_runtime_error(isolated_memory):

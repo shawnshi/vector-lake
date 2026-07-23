@@ -1,3 +1,4 @@
+import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -6,6 +7,7 @@ import pytest
 
 from vector_lake import db_store, governance_store, indexer
 from vector_lake.mutation_coordinator import execute_mutation_batch, execute_mutation_plan
+from vector_lake.wiki_utils import atomic_write_text
 
 
 def _write_purpose_contract(memory_dir):
@@ -79,6 +81,85 @@ def test_mutation_rejects_paths_outside_wiki(isolated_memory, filename):
     with pytest.raises(ValueError, match="filename|path|boundary|basename"):
         execute_mutation_plan(filename, content=_source_content())
     assert not (isolated_memory.parent / "escape.md").exists()
+
+
+def test_atomic_write_preserves_mixed_newline_bytes(isolated_memory):
+    target = isolated_memory / "scratch" / "mixed-newlines.txt"
+    content = "frontmatter\nbody-crlf\r\nnext-cr\rlast\n"
+
+    atomic_write_text(target, content)
+
+    assert target.read_bytes() == content.encode("utf-8")
+
+
+def test_atomic_write_projection_compare_and_swap_preserves_manual_edit(
+    isolated_memory,
+):
+    target = isolated_memory / "scratch" / "projection-cas.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("known base", encoding="utf-8")
+    expected_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+    target.write_text("manual edit", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="compare-and-swap conflict"):
+        atomic_write_text(
+            target,
+            "replacement",
+            expected_current_hash=expected_hash,
+        )
+
+    assert target.read_text(encoding="utf-8") == "manual edit"
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("Source_ALPHA.md", "Source_alpha.md"),
+        ("Source_Café.md", "Source_Cafe\u0301.md"),
+    ],
+)
+def test_mutation_batch_rejects_case_or_unicode_equivalent_filenames(
+    isolated_memory,
+    first,
+    second,
+):
+    _write_purpose_contract(isolated_memory)
+    wiki_dir = isolated_memory / "wiki"
+    wiki_dir.mkdir(exist_ok=True)
+    (wiki_dir / first).write_text("legacy projection", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate filenames"):
+        execute_mutation_batch(
+            [
+                {"filename": first, "content": _source_content()},
+                {"filename": second, "content": _source_content()},
+            ],
+            validation_mode="schema",
+        )
+
+
+@pytest.mark.parametrize(
+    ("existing", "requested"),
+    [
+        ("Source_alpha.md", "Source_ALPHA.md"),
+        ("Source_Café.md", "Source_Cafe\u0301.md"),
+    ],
+)
+def test_mutation_rejects_case_or_unicode_alias_of_existing_page(
+    isolated_memory,
+    existing,
+    requested,
+):
+    _write_purpose_contract(isolated_memory)
+    wiki_dir = isolated_memory / "wiki"
+    wiki_dir.mkdir(exist_ok=True)
+    (wiki_dir / existing).write_text("legacy projection", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="alias of existing"):
+        execute_mutation_batch(
+            [{"filename": requested, "content": _source_content()}],
+            validation_mode="schema",
+        )
 
 
 def test_mutation_commits_canonical_and_durable_intent_before_projection(isolated_memory):

@@ -25,6 +25,7 @@ _GENERIC_SOURCE_MARKERS = {
     "sourcetemplate",
 }
 _DECISION_ORDER = {"merge": 0, "alias": 1, "review": 2, "keep_separate": 3}
+WikiBacklinkIndex = dict[str, tuple[tuple[str, str, str], ...]]
 
 
 def strip_entity_prefix(value: str) -> str:
@@ -38,6 +39,71 @@ def normalize_name(value: str) -> str:
     """Normalize identity text without discarding non-ASCII letters or digits."""
     text = unicodedata.normalize("NFKC", strip_entity_prefix(value)).casefold()
     return "".join(character for character in text if character.isalnum())
+
+
+def normalize_page_key_identity(value: str) -> str:
+    """Return a conservative identity key for case-insensitive Wiki references."""
+    text = unicodedata.normalize("NFKC", str(value or "").strip())
+    if text.casefold().endswith(".md"):
+        text = text[:-3]
+    return text.casefold()
+
+
+def normalize_source_identity(value: str) -> str:
+    """Normalize a durable source reference without collapsing path boundaries."""
+    text = str(value or "").strip().replace("\\", "/")
+    if text.startswith("[[") and text.endswith("]]" ):
+        text = text[2:-2].split("|", 1)[0].strip()
+    if text.startswith("MEMORY/"):
+        text = text[len("MEMORY/") :]
+    return text
+
+
+def build_wiki_backlink_index(wiki_dir: Path) -> WikiBacklinkIndex:
+    """Scan Wiki links once and index normalized targets for batch preflight."""
+    from vector_lake.wiki_utils import iter_wiki_link_matches
+
+    backlinks: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    for candidate_path in sorted(Path(wiki_dir).glob("*.md")):
+        candidate_bytes = candidate_path.read_bytes()
+        candidate_content = candidate_bytes.decode("utf-8")
+        projection_hash = hashlib.sha256(candidate_bytes).hexdigest()
+        source_identity = normalize_page_key_identity(candidate_path.stem)
+        target_identities = {
+            normalize_page_key_identity(match.group(1))
+            for match in iter_wiki_link_matches(candidate_content)
+            if normalize_page_key_identity(match.group(1))
+        }
+        for target_identity in target_identities:
+            backlinks[target_identity].append(
+                (
+                    source_identity,
+                    candidate_path.stem,
+                    projection_hash,
+                )
+            )
+    return {
+        target_identity: tuple(entries)
+        for target_identity, entries in backlinks.items()
+    }
+
+
+def source_identity_candidate_pairs(
+    page_sources: dict[str, object],
+) -> list[tuple[str, str, str]]:
+    """Return page pairs that name the same concrete raw artifact."""
+    buckets: dict[str, list[str]] = defaultdict(list)
+    for page_key, values in page_sources.items():
+        for value in _string_list(values):
+            identity = normalize_source_identity(value)
+            if identity.startswith("raw/"):
+                buckets[identity].append(str(page_key))
+
+    pairs = []
+    for identity, page_keys in buckets.items():
+        for left, right in combinations(sorted(set(page_keys)), 2):
+            pairs.append((left, right, identity))
+    return sorted(pairs)
 
 
 def _string_list(value) -> list[str]:
@@ -119,6 +185,15 @@ def _record(entity: dict) -> dict:
         "alias_norms": alias_norms,
         "tokens": frozenset(token for value in variants for token in _tokens(value)),
         "sources": _stable_sources(entity),
+        "source_identities": frozenset(
+            identity
+            for value in [
+                *_string_list(entity.get("sources")),
+                *_string_list(entity.get("source_ids")),
+            ]
+            for identity in [normalize_source_identity(value)]
+            if identity.startswith("raw/")
+        ),
         "body": body,
         "body_fingerprint": _body_fingerprint(body),
         "revision_base": _revision_base(page_key),
@@ -181,6 +256,18 @@ def _plural_equivalent(left_norm: str, right_norm: str) -> bool:
 
 def _canonical_rank(record: dict) -> tuple:
     entity = record["entity"]
+    entity_type = str(entity.get("type") or entity.get("entity_type") or "").casefold()
+    categories = {str(item).casefold() for item in _string_list(entity.get("categories"))}
+    is_backlog_source = entity_type == "source" and (
+        str(entity.get("topic_cluster") or "").casefold() == "raw_ingest_backlog"
+        or "raw_ingest_backlog" in categories
+        or "historical awaiting_subagent backlog" in record["body"]
+    )
+    stable_source_identity = int(
+        entity_type != "source"
+        or not _REVISION_HASH_SUFFIX.search(str(record["page_key"] or ""))
+    )
+    curated_source = int(entity_type != "source" or not is_backlog_source)
     status = str(entity.get("status", "")).casefold()
     status_score = 3 if status == "active" else 2 if status == "draft" else 0
     page_key_score = int(bool(record["page_key"]) and "/" not in record["page_key"] and "\\" not in record["page_key"])
@@ -189,6 +276,8 @@ def _canonical_rank(record: dict) -> tuple:
     source_score = min(len(record["sources"]), 5)
     inbound_score = int(entity.get("inbound_count") or entity.get("inlinks") or 0)
     return (
+        curated_source,
+        stable_source_identity,
         status_score,
         page_key_score,
         non_stub_body,
@@ -203,6 +292,7 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
     normalized_overlap = left["norms"] & right["norms"]
     alias_overlap = left["alias_norms"] & right["alias_norms"]
     stable_source_overlap = left["sources"] & right["sources"]
+    raw_identity_overlap = left["source_identities"] & right["source_identities"]
     token_overlap = left["tokens"] & right["tokens"]
     similarity = _name_similarity(left, right)
     body_similarity = 0.0
@@ -235,6 +325,7 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
     left_type = str(left["entity"].get("type") or left["entity"].get("entity_type") or "").casefold()
     right_type = str(right["entity"].get("type") or right["entity"].get("entity_type") or "").casefold()
     type_conflict = bool(left_type and right_type and left_type != right_type)
+    both_sources = left_type == right_type == "source"
 
     reasons = []
     evidence_score = round(similarity * 45)
@@ -253,6 +344,9 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
     if stable_source_overlap:
         reasons.append("stable-source-overlap")
         evidence_score += min(15, 5 * len(stable_source_overlap))
+    if raw_identity_overlap:
+        reasons.append("exact-raw-identity:" + ", ".join(sorted(raw_identity_overlap)[:2]))
+        evidence_score += 25
     if content_fingerprint_match:
         reasons.append("content-fingerprint-match")
         evidence_score += 20
@@ -286,7 +380,7 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
         reasons.append("entity-type-conflict")
 
     source_identity_evidence = bool(
-        stable_source_overlap
+        raw_identity_overlap
         or content_fingerprint_match
         or revision_suffix_match
         or body_similarity >= 0.90
@@ -295,6 +389,15 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
     if type_conflict and "source" in {left_type, right_type}:
         decision = "keep_separate"
         evidence_score = min(evidence_score, 25)
+    elif both_sources and not raw_identity_overlap:
+        if left["source_identities"] and right["source_identities"]:
+            reasons.append("source-raw-identity-mismatch")
+        else:
+            reasons.append("source-raw-identity-missing")
+        decision = "review"
+        evidence_score = min(evidence_score, 70)
+    elif both_sources and raw_identity_overlap:
+        decision = "merge"
     elif revision_suffix_match and left_type == right_type:
         decision = "merge"
     elif numeric_conflict:
@@ -370,6 +473,27 @@ def _candidate_index_pairs(records: list[dict], fuzzy_threshold: float = 0.82, w
             if norm:
                 norm_buckets[norm].append(index)
     for indices in norm_buckets.values():
+        pairs.update(combinations(sorted(set(indices)), 2))
+
+    revision_buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    source_identity_buckets: dict[str, list[int]] = defaultdict(list)
+    page_key_indices: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, record in enumerate(records):
+        entity_type = str(record["entity"].get("type") or record["entity"].get("entity_type") or "").casefold()
+        page_key_indices[(entity_type, str(record["page_key"] or ""))].append(index)
+    for index, record in enumerate(records):
+        entity_type = str(record["entity"].get("type") or record["entity"].get("entity_type") or "").casefold()
+        page_key = str(record["page_key"] or "")
+        revision_base = _revision_base(page_key)
+        if entity_type == "source" and revision_base and revision_base != page_key:
+            revision_buckets[(entity_type, revision_base)].append(index)
+            revision_buckets[(entity_type, revision_base)].extend(
+                page_key_indices.get((entity_type, revision_base), [])
+            )
+        if entity_type == "source":
+            for identity in record["source_identities"]:
+                source_identity_buckets[identity].append(index)
+    for indices in [*revision_buckets.values(), *source_identity_buckets.values()]:
         pairs.update(combinations(sorted(set(indices)), 2))
 
     type_buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
@@ -513,6 +637,15 @@ def filename_candidate_pairs(
         for left, right in combinations(keys, 2):
             pairs[tuple(sorted((left, right)))] = 1.0
 
+    revision_buckets: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for page_key, prefix, _normalized in records:
+        revision_buckets[(prefix, _revision_base(page_key))].append(page_key)
+    for keys in revision_buckets.values():
+        if len(keys) < 2 or not any(_REVISION_HASH_SUFFIX.search(key) for key in keys):
+            continue
+        for left, right in combinations(sorted(set(keys)), 2):
+            pairs[tuple(sorted((left, right)))] = 1.0
+
     prefix_buckets: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
     for page_key, prefix, normalized in records:
         prefix_buckets[(prefix, normalized[:2])].append((normalized, page_key))
@@ -530,7 +663,11 @@ def filename_candidate_pairs(
     return [(left, right, ratio) for (left, right), ratio in sorted(pairs.items())]
 
 
-def preflight_suggestion(suggestion: dict, wiki_dir: Path) -> dict:
+def preflight_suggestion(
+    suggestion: dict,
+    wiki_dir: Path,
+    backlink_index: WikiBacklinkIndex | None = None,
+) -> dict:
     """Run the same semantic merge and schema validation used by execution."""
     checked = dict(suggestion)
     checked["preflight_errors"] = []
@@ -541,7 +678,12 @@ def preflight_suggestion(suggestion: dict, wiki_dir: Path) -> dict:
     target_key = str(checked.get("left_page_key") or "")
     source_key = str(checked.get("right_page_key") or "")
     try:
-        if not target_key or not source_key or target_key == source_key:
+        if (
+            not target_key
+            or not source_key
+            or normalize_page_key_identity(target_key)
+            == normalize_page_key_identity(source_key)
+        ):
             raise ValueError("Merge preflight requires two distinct page keys.")
         if any(separator in target_key or separator in source_key for separator in ("/", "\\")):
             raise ValueError("Merge preflight page keys must be basenames.")
@@ -549,13 +691,15 @@ def preflight_suggestion(suggestion: dict, wiki_dir: Path) -> dict:
         source_path = (Path(wiki_dir).resolve() / f"{source_key}.md").resolve()
         if target_path.parent != Path(wiki_dir).resolve() or source_path.parent != Path(wiki_dir).resolve():
             raise ValueError("Merge preflight path escapes the wiki directory.")
+        if target_path == source_path:
+            raise ValueError("Merge preflight requires two distinct physical pages.")
         if not target_path.exists() or not source_path.exists():
             missing = [path.name for path in (target_path, source_path) if not path.exists()]
             raise FileNotFoundError("Missing wiki page(s): " + ", ".join(missing))
 
         from vector_lake.schema_validator import validate_schema
         from vector_lake.semantic_merge import merge_markdown_content
-        from vector_lake.wiki_utils import split_frontmatter
+        from vector_lake.wiki_utils import get_memory_dir, split_frontmatter
 
         target_bytes = target_path.read_bytes()
         source_bytes = source_path.read_bytes()
@@ -569,6 +713,79 @@ def preflight_suggestion(suggestion: dict, wiki_dir: Path) -> dict:
             raise ValueError("Source Markdown projection changed before preflight.")
         checked["left_projection_hash"] = target_hash
         checked["right_projection_hash"] = source_hash
+
+        target_frontmatter, _target_body = split_frontmatter(target_bytes.decode("utf-8"))
+        source_frontmatter, _source_body = split_frontmatter(source_bytes.decode("utf-8"))
+        if (
+            str(target_frontmatter.get("type") or "").casefold() == "source"
+            and str(source_frontmatter.get("type") or "").casefold() == "source"
+        ):
+            target_identities = {
+                normalize_source_identity(value)
+                for value in _string_list(target_frontmatter.get("sources"))
+                if normalize_source_identity(value).startswith("raw/")
+            }
+            source_identities = {
+                normalize_source_identity(value)
+                for value in _string_list(source_frontmatter.get("sources"))
+                if normalize_source_identity(value).startswith("raw/")
+            }
+            approved_identity = normalize_source_identity(
+                checked.get("approved_source_identity") or ""
+            )
+            overlap = target_identities & source_identities
+            if approved_identity:
+                if approved_identity not in target_identities | source_identities:
+                    raise ValueError("Approved Source identity is absent from both merge pages.")
+                overlap.add(approved_identity)
+            if len(overlap) != 1:
+                raise ValueError("Source merge requires exactly one approved canonical raw identity.")
+            raw_identity = next(iter(overlap))
+            if target_identities | source_identities != {raw_identity}:
+                raise ValueError(
+                    "Source merge pages must resolve to one canonical raw identity."
+                )
+            memory_root = get_memory_dir().resolve()
+            raw_root = (memory_root / "raw").resolve()
+            raw_path = (memory_root / Path(raw_identity)).resolve()
+            if not raw_path.is_relative_to(raw_root) or not raw_path.is_file():
+                raise ValueError(f"Source raw identity is missing or outside raw root: {raw_identity}")
+            artifact_hash = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+            for frontmatter in (target_frontmatter, source_frontmatter):
+                metadata_map = frontmatter.get("source_artifacts") or {}
+                if not isinstance(metadata_map, dict):
+                    raise ValueError("source_artifacts must be a mapping.")
+                metadata = metadata_map.get(raw_identity) or {}
+                if not isinstance(metadata, dict):
+                    raise ValueError(f"source_artifacts metadata must be a mapping for {raw_identity}.")
+                declared_hash = str(metadata.get("sha256") or metadata.get("content_hash") or "")
+                if declared_hash and declared_hash != artifact_hash:
+                    raise ValueError(f"Source artifact hash changed for {raw_identity}.")
+            checked["source_identity"] = raw_identity
+            checked["source_artifact_hash"] = artifact_hash
+
+            if backlink_index is None:
+                backlink_index = build_wiki_backlink_index(wiki_dir)
+            excluded_pages = {
+                normalize_page_key_identity(target_key),
+                normalize_page_key_identity(source_key),
+            }
+            backlinks = [
+                {
+                    "page_key": page_key,
+                    "projection_hash": projection_hash,
+                }
+                for page_identity, page_key, projection_hash in backlink_index.get(
+                    normalize_page_key_identity(source_key),
+                    (),
+                )
+                if page_identity not in excluded_pages
+            ]
+            checked["backlink_manifest"] = backlinks
+            if backlinks:
+                raise ValueError(
+                    f"Source merge has {len(backlinks)} direct backlink(s); rewrite is required before merge."
+                )
 
         merged_content = merge_markdown_content(
             target_bytes.decode("utf-8"),

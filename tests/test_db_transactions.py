@@ -53,6 +53,20 @@ def test_targeted_alias_accessors_participate_in_transactions(isolated_memory):
     assert governance_store.get_alias("entity_rollback") is None
 
 
+def test_base_exception_rolls_back_and_releases_transaction_state(isolated_memory):
+    db_store.init_db()
+
+    with pytest.raises(KeyboardInterrupt, match="interrupt transaction"):
+        with db_store.transaction():
+            governance_store.upsert_alias("entity_interrupted", "entity_target")
+            raise KeyboardInterrupt("interrupt transaction")
+
+    assert governance_store.get_alias("entity_interrupted") is None
+    with db_store.transaction():
+        governance_store.upsert_alias("entity_after_interrupt", "entity_target")
+    assert governance_store.get_alias("entity_after_interrupt") == "entity_target"
+
+
 def test_connection_reopens_when_database_path_changes(tmp_path, monkeypatch):
     first = tmp_path / "first.db"
     second = tmp_path / "second.db"

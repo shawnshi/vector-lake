@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from vector_lake import get_extension_root
 from vector_lake.db_store import mark_file_processed
 from vector_lake import governance_store
+from vector_lake.merge_analysis import normalize_source_identity
 from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
     get_meta_dir,
@@ -99,8 +100,72 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     expired = expire_stale_subagent_jobs(max_age_seconds=max_age_seconds)
     return f"Expired {expired} awaiting-subagent ingest job(s)."
 
-def canonical_source_name(raw_path: str) -> str:
+_HASH_SUFFIX = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)
+
+
+def _raw_identity_for_path(raw_path: str) -> str:
     path = Path(raw_path).resolve()
+    try:
+        relative = path.relative_to(get_raw_dir().resolve())
+        return normalize_source_identity(f"raw/{relative.as_posix()}")
+    except ValueError:
+        return normalize_source_identity(str(path))
+
+
+def _source_identity_index() -> dict[str, str]:
+    """Map exact raw identities to deterministic existing Source filenames."""
+    items = governance_store.query_entities(
+        {"status!=": "Merged", "type": "source"}
+    )["items"].values()
+    wiki_dir = get_wiki_dir()
+    selected: dict[str, tuple[tuple[int, int, int, str], str]] = {}
+    for entity in items:
+        page_key = str(entity.get("page_key") or "").strip().removesuffix(".md")
+        if not page_key or not (wiki_dir / f"{page_key}.md").is_file():
+            continue
+        categories = {
+            str(value).casefold()
+            for value in (
+                entity.get("categories")
+                if isinstance(entity.get("categories"), list)
+                else [entity.get("categories")]
+            )
+            if value
+        }
+        is_backlog = (
+            str(entity.get("topic_cluster") or "").casefold() == "raw_ingest_backlog"
+            or "raw_ingest_backlog" in categories
+        )
+        rank = (
+            int(not is_backlog),
+            int(not _HASH_SUFFIX.search(page_key)),
+            int(str(entity.get("status") or "").casefold() == "active"),
+            page_key.casefold(),
+        )
+        sources = entity.get("sources") or []
+        if not isinstance(sources, list):
+            sources = [sources]
+        for source in sources:
+            identity = normalize_source_identity(source)
+            if not identity.startswith("raw/"):
+                continue
+            current = selected.get(identity)
+            if current is None or rank[:3] > current[0][:3] or (
+                rank[:3] == current[0][:3] and rank[3] < current[0][3]
+            ):
+                selected[identity] = (rank, f"{page_key}.md")
+    return {identity: filename for identity, (_rank, filename) in selected.items()}
+
+
+def canonical_source_name(
+    raw_path: str,
+    source_identity_index: dict[str, str] | None = None,
+) -> str:
+    path = Path(raw_path).resolve()
+    identity_index = _source_identity_index() if source_identity_index is None else source_identity_index
+    existing = identity_index.get(_raw_identity_for_path(raw_path))
+    if existing:
+        return existing
     try:
         relative = path.relative_to(get_raw_dir().resolve()).with_suffix("")
         parts = relative.parts
@@ -679,8 +744,9 @@ def prepare_ingest_batch(batch_size: int = 5, candidate_paths: list[str] | None 
     from vector_lake.db_store import enqueue_job
     enqueued_count = 0
     
+    source_identity_index = _source_identity_index()
     for filepath, file_hash, _processing_key in pending_files:
-        canonical_name = canonical_source_name(filepath)
+        canonical_name = canonical_source_name(filepath, source_identity_index)
         canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
         source_hash = governance_store.canonical_page_versions({canonical_key}).get(canonical_key, "")
         instructions = _build_ingest_instructions(filepath, file_hash, canonical_name)

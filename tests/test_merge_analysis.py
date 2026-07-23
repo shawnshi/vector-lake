@@ -2,6 +2,7 @@ from vector_lake.merge_analysis import (
     analyze_entities,
     filename_candidate_pairs,
     normalize_name,
+    source_identity_candidate_pairs,
 )
 
 
@@ -51,6 +52,49 @@ def test_filename_candidates_recall_punctuation_variants_without_raw_sort_window
     pairs = filename_candidate_pairs(keys)
 
     assert any({left, right} == {"Concept_A_B", "Concept_AB"} for left, right, _ in pairs)
+
+
+def test_filename_candidates_recall_hash_revision_siblings_regardless_of_name_length():
+    keys = {
+        "Source_2605-14892v2",
+        "Source_2605-14892v2-0dadf455",
+        "Source_AI-Agent-为什么是AIGC最后的杀手锏",
+        "Source_AI-Agent-为什么是AIGC最后的杀手锏-9b4f8b4c",
+    }
+
+    pairs = filename_candidate_pairs(keys)
+
+    assert any(
+        {left, right}
+        == {"Source_2605-14892v2", "Source_2605-14892v2-0dadf455"}
+        for left, right, _ in pairs
+    )
+    assert any(
+        {left, right}
+        == {
+            "Source_AI-Agent-为什么是AIGC最后的杀手锏",
+            "Source_AI-Agent-为什么是AIGC最后的杀手锏-9b4f8b4c",
+        }
+        for left, right, _ in pairs
+    )
+
+
+def test_source_identity_candidates_recall_same_raw_path_with_different_names():
+    pairs = source_identity_candidate_pairs(
+        {
+            "Source_Curated": ["raw/team/report.md"],
+            "Source_Historical-abcdef12": ["MEMORY/raw/team/report.md"],
+            "Source_Unrelated": ["raw/team/other.md"],
+        }
+    )
+
+    assert pairs == [
+        (
+            "Source_Curated",
+            "Source_Historical-abcdef12",
+            "raw/team/report.md",
+        )
+    ]
 
 
 def test_overview_singular_plural_is_not_hard_excluded():
@@ -162,17 +206,24 @@ def test_source_exact_name_without_identity_evidence_requires_review():
     pair = _pair_for(analyze_entities(entities, limit=None), "source_a", "source_b")
 
     assert pair["decision"] == "review"
-    assert "source-identity-evidence-missing" in pair["reasons"]
+    assert "source-raw-identity-missing" in pair["reasons"]
 
 
 def test_source_revision_hash_is_strong_identity_evidence():
     entities = [
-        _entity("source_a", "Quarterly Report", type="source", page_key="Source_Report"),
+        _entity(
+            "source_a",
+            "Quarterly Report",
+            type="source",
+            page_key="Source_Report",
+            sources=["raw/reports/quarterly.md"],
+        ),
         _entity(
             "source_b",
             "Quarterly Report",
             type="source",
             page_key="Source_Report-ab12cd34",
+            sources=["raw/reports/quarterly.md"],
         ),
     ]
 
@@ -189,14 +240,14 @@ def test_source_revision_hash_overrides_low_surface_name_similarity():
             "Source 2601.06002v2",
             type="source",
             page_key="Source_2601-06002v2",
-            sources=["Source_Arxiv"],
+            sources=["raw/Huggingface-Daily-Papers/2601.06002v2.md"],
         ),
         _entity(
             "source_b",
             "2601.06002v2",
             type="source",
             page_key="Source_2601-06002v2-e68c5390",
-            sources=["Source_Arxiv"],
+            sources=["raw/Huggingface-Daily-Papers/2601.06002v2.md"],
         ),
     ]
 
@@ -204,6 +255,68 @@ def test_source_revision_hash_overrides_low_surface_name_similarity():
 
     assert pair["decision"] == "merge"
     assert "revision-suffix-match" in pair["reasons"]
+
+
+def test_source_revision_merge_keeps_curated_unsuffixed_target_when_backlog_body_is_longer():
+    entities = [
+        _entity(
+            "source_curated",
+            "paper-river-Multi-Agent-LIFE-Progression",
+            type="source",
+            page_key="Source_2605-14892v2",
+            topic_cluster="Multi-Agent",
+            sources=["raw/Huggingface-Daily-Papers/2605.14892v2.md"],
+            raw_text="Curated analysis.",
+        ),
+        _entity(
+            "source_backlog",
+            "2605.14892v2",
+            type="source",
+            page_key="Source_2605-14892v2-0dadf455",
+            topic_cluster="Raw_Ingest_Backlog",
+            categories=["Raw_Ingest_Backlog"],
+            sources=["raw/Huggingface-Daily-Papers/2605.14892v2.md"],
+            raw_text="Raw preview. " * 1000,
+        ),
+    ]
+
+    pair = _pair_for(
+        analyze_entities(entities, limit=None),
+        "source_curated",
+        "source_backlog",
+    )
+
+    assert pair["decision"] == "merge"
+    assert pair["left_entity_id"] == "source_curated"
+    assert pair["left_page_key"] == "Source_2605-14892v2"
+
+
+def test_source_revision_suffix_without_exact_raw_identity_requires_review():
+    entities = [
+        _entity(
+            "source_left",
+            "Quarterly Report",
+            type="source",
+            page_key="Source_Report",
+            sources=["raw/reports/quarterly-a.md"],
+        ),
+        _entity(
+            "source_right",
+            "Quarterly Report",
+            type="source",
+            page_key="Source_Report-ab12cd34",
+            sources=["raw/reports/quarterly-b.md"],
+        ),
+    ]
+
+    pair = _pair_for(
+        analyze_entities(entities, limit=None),
+        "source_left",
+        "source_right",
+    )
+
+    assert pair["decision"] == "review"
+    assert "source-raw-identity-mismatch" in pair["reasons"]
 
 
 def test_duplicate_component_larger_than_two_requires_review():

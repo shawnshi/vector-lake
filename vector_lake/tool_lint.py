@@ -8,7 +8,11 @@ from collections import defaultdict
 
 from vector_lake import governance_metrics
 from vector_lake import governance_store
-from vector_lake.merge_analysis import filename_candidate_pairs, normalize_name
+from vector_lake.merge_analysis import (
+    filename_candidate_pairs,
+    normalize_name,
+    source_identity_candidate_pairs,
+)
 from vector_lake.wiki_utils import (
     get_wiki_dir,
     iter_wiki_link_matches,
@@ -332,9 +336,23 @@ def lint_vector_lake(auto_fix: bool = False):
             issues["schema"].append(f"{filename}: {str(e)}")
 
     # 6. Filename similarity candidates. Actual merge decisions use governance analysis.
+    similarity_pairs = set()
     for key_a, key_b, ratio in filename_candidate_pairs(all_keys):
+        similarity_pairs.add(tuple(sorted((key_a, key_b))))
         issues["similarity"].append(
             f"Candidate: {key_a}.md <-> {key_b}.md ({ratio:.0%})"
+        )
+    page_sources = {
+        filename[:-3]: data["fm"].get("sources") or []
+        for filename, data in parsed.items()
+        if str(data["fm"].get("type") or "").casefold() == "source"
+    }
+    for key_a, key_b, raw_identity in source_identity_candidate_pairs(page_sources):
+        pair_key = tuple(sorted((key_a, key_b)))
+        if pair_key in similarity_pairs:
+            continue
+        issues["similarity"].append(
+            f"Candidate: {key_a}.md <-> {key_b}.md (same raw source: {raw_identity})"
         )
 
     # Remaining checks (Orphans, Decay, Governance, Alignment)

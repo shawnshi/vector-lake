@@ -1,4 +1,6 @@
 import datetime
+import ctypes
+import hashlib
 import os
 import random
 import re
@@ -17,6 +19,95 @@ _META_DIR_CACHE = None
 
 WIKI_LINK_PATTERN = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 _FENCE_OPEN = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)")
+
+
+def normalize_semantic_text(content: str) -> str:
+    """Normalize transport-only text differences for semantic parity checks."""
+    return content.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def semantic_text_hash(content: str) -> str:
+    return hashlib.sha256(normalize_semantic_text(content).encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else ""
+
+
+def _replace_file_with_backup(
+    replaced_path: Path,
+    replacement_path: Path,
+    backup_path: Path,
+) -> None:
+    """Atomically replace a Windows file while retaining the displaced version."""
+    if os.name != "nt":
+        raise RuntimeError(
+            "Projection compare-and-swap replacement is unavailable on this platform."
+        )
+    replace_file = ctypes.WinDLL("kernel32", use_last_error=True).ReplaceFileW
+    replace_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    replace_file.restype = ctypes.c_int
+    if not replace_file(
+        str(replaced_path),
+        str(replacement_path),
+        str(backup_path),
+        0,
+        None,
+        None,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _replace_prepared_file_compare_and_swap(
+    path: Path,
+    temp_path: Path,
+    expected_current_hash: str,
+) -> None:
+    """Replace ``path`` and roll back if the atomically displaced file drifted."""
+    actual_hash = _file_sha256(path)
+    if actual_hash != expected_current_hash:
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}: "
+            f"expected {expected_current_hash or '<absent>'}, "
+            f"current {actual_hash or '<absent>'}"
+        )
+    if not path.exists():
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}: "
+            "an existing projection is required."
+        )
+
+    desired_hash = _file_sha256(temp_path)
+    backup_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.cas-backup")
+    rollback_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.cas-rollback")
+    _replace_file_with_backup(path, temp_path, backup_path)
+    displaced_hash = _file_sha256(backup_path)
+    if displaced_hash == expected_current_hash:
+        backup_path.unlink()
+        return
+
+    try:
+        _replace_file_with_backup(path, backup_path, rollback_path)
+    except BaseException as exc:
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}; "
+            f"the raced projection is preserved at {backup_path}."
+        ) from exc
+
+    rollback_hash = _file_sha256(rollback_path)
+    if rollback_hash == desired_hash:
+        rollback_path.unlink()
+    raise RuntimeError(
+        f"Projection compare-and-swap conflict for {path.name}: "
+        f"expected {expected_current_hash}, current {displaced_hash}."
+    )
 
 
 def markdown_fenced_code_spans(content: str) -> list[tuple[int, int]]:
@@ -271,6 +362,7 @@ def atomic_write_text(
     content: str,
     pre_parsed_frontmatter: dict | None = None,
     validation_mode: str = "full",
+    expected_current_hash: str | None = None,
 ):
     path = Path(path)
     if validation_mode not in {"full", "schema"}:
@@ -293,9 +385,20 @@ def atomic_write_text(
             
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        handle.write(content)
-    os.replace(temp_path, path)
+    try:
+        with open(temp_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        if expected_current_hash is not None:
+            _replace_prepared_file_compare_and_swap(
+                path,
+                temp_path,
+                expected_current_hash,
+            )
+        else:
+            os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 def ensure_parent_dir(path: str | Path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)

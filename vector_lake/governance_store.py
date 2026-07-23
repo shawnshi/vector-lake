@@ -16,6 +16,7 @@ from vector_lake.evidence_foundation import version_family_id
 from vector_lake.wiki_utils import (
     get_meta_dir,
     get_wiki_dir,
+    normalize_semantic_text,
     read_markdown_file,
     split_frontmatter,
 )
@@ -604,6 +605,8 @@ def _canonical_entity_records_version(page_records: list[tuple[str, dict]]) -> s
         # extract_page_objects supplies wall-clock time when legacy pages omit `created`.
         # That fallback is storage metadata, not page state, so it cannot participate in CAS.
         data.pop("created_at", None)
+        if isinstance(data.get("raw_text"), str):
+            data["raw_text"] = normalize_semantic_text(data["raw_text"])
         normalized = json.dumps(
             data,
             ensure_ascii=False,
@@ -706,6 +709,62 @@ def _upsert_map_records(store: dict, records: list, key_name: str):
         store["items"][key] = record
 
 
+def _merge_reingested_provenance_record(
+    current: dict,
+    proposed: dict,
+    *,
+    preserve_ingested_at: bool = False,
+) -> dict:
+    """Refresh derived fields without erasing durable review/provenance metadata."""
+    merged = copy.deepcopy(current)
+    merged.update(copy.deepcopy(proposed))
+    if preserve_ingested_at and current.get("ingested_at"):
+        merged["ingested_at"] = current["ingested_at"]
+    for field in ("classification", "retention_policy"):
+        current_value = current.get(field)
+        if current_value not in (None, "", "unspecified"):
+            merged[field] = copy.deepcopy(current_value)
+    if current.get("legal_hold") is True:
+        merged["legal_hold"] = True
+    parent_refs = list(
+        dict.fromkeys(
+            [
+                *list(current.get("generation_parent_refs") or []),
+                *list(proposed.get("generation_parent_refs") or []),
+            ]
+        )
+    )
+    if parent_refs:
+        merged["generation_parent_refs"] = parent_refs
+    return merged
+
+
+def _merge_reingested_source_records(
+    conn,
+    key_name: str,
+    records: list[dict],
+) -> list[dict]:
+    record_ids = sorted({str(record[key_name]) for record in records})
+    placeholders = ",".join("?" for _ in record_ids)
+    existing = {
+        str(row[key_name]): json.loads(row["data_json"] or "{}")
+        for row in conn.execute(
+            f"SELECT {key_name}, data_json FROM sources WHERE {key_name} IN ({placeholders})",
+            record_ids,
+        ).fetchall()
+    }
+    return [
+        _merge_reingested_provenance_record(
+            existing[str(record[key_name])],
+            record,
+            preserve_ingested_at=True,
+        )
+        if str(record[key_name]) in existing
+        else copy.deepcopy(record)
+        for record in records
+    ]
+
+
 def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict]):
     """Upsert only the records in one page-scoped canonical delta."""
     if not records:
@@ -761,6 +820,8 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
             ],
         )
         return
+    if table_name == "sources":
+        records = _merge_reingested_source_records(conn, key_name, records)
     conn.executemany(
         f"INSERT INTO {table_name} ({key_name}, data_json, updated_at) VALUES (?, ?, ?) "
         f"ON CONFLICT({key_name}) DO UPDATE SET "
@@ -875,21 +936,35 @@ def _upsert_foundation_records(
             ),
         )
     for artifact in source_artifacts:
+        existing_row = conn.execute(
+            "SELECT data_json FROM source_artifacts WHERE artifact_id = ?",
+            (artifact["artifact_id"],),
+        ).fetchone()
+        durable_artifact = (
+            _merge_reingested_provenance_record(
+                json.loads(existing_row["data_json"] or "{}"),
+                artifact,
+            )
+            if existing_row is not None
+            else copy.deepcopy(artifact)
+        )
         conn.execute(
             "INSERT INTO source_artifacts "
             "(artifact_id, source_id, sha256, byte_size, mime_type, storage_uri, "
             "integrity_status, data_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(artifact_id) DO UPDATE SET data_json = excluded.data_json, "
-            "integrity_status = excluded.integrity_status, storage_uri = excluded.storage_uri",
+            "ON CONFLICT(artifact_id) DO UPDATE SET source_id = excluded.source_id, "
+            "sha256 = excluded.sha256, byte_size = excluded.byte_size, "
+            "mime_type = excluded.mime_type, storage_uri = excluded.storage_uri, "
+            "integrity_status = excluded.integrity_status, data_json = excluded.data_json",
             (
-                artifact["artifact_id"],
-                artifact["source_id"],
-                artifact.get("sha256"),
-                artifact.get("byte_size"),
-                artifact.get("mime_type"),
-                artifact.get("storage_uri"),
-                artifact.get("integrity_status", "unverified"),
-                _canonical_record_json(artifact),
+                durable_artifact["artifact_id"],
+                durable_artifact["source_id"],
+                durable_artifact.get("sha256"),
+                durable_artifact.get("byte_size"),
+                durable_artifact.get("mime_type"),
+                durable_artifact.get("storage_uri"),
+                durable_artifact.get("integrity_status", "unverified"),
+                _canonical_record_json(durable_artifact),
                 now,
             ),
         )

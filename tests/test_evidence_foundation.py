@@ -140,6 +140,112 @@ def test_change_application_keeps_append_only_claim_and_evidence_versions(isolat
     assert conn.execute("SELECT COUNT(*) FROM extraction_runs").fetchone()[0] == 2
 
 
+def test_source_reingest_preserves_durable_metadata_while_refreshing_artifact(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "source.txt"
+    raw_path.write_text("source-v1", encoding="utf-8")
+    first = governance_store.prepare_change_set_from_content(
+        "Concept_Evidence-Foundation.md",
+        _content("Version one.", "raw/source.txt"),
+        "test",
+    )
+    governance_store.apply_change_set(first)
+
+    conn = db_store.get_connection()
+    source_row = conn.execute("SELECT source_id, data_json FROM sources").fetchone()
+    source = json.loads(source_row["data_json"])
+    source.update(
+        {
+            "ingested_at": "2026-01-01T00:00:00+00:00",
+            "classification": "restricted",
+            "retention_policy": "retain-7-years",
+            "legal_hold": True,
+            "legacy_content_hash": "legacy-reviewed-hash",
+            "reviewed_provenance": {"reviewer": "human-board"},
+            "generation_parent_refs": ["raw/parent-a.md"],
+        }
+    )
+    artifact_row = conn.execute(
+        "SELECT artifact_id, data_json FROM source_artifacts"
+    ).fetchone()
+    artifact = json.loads(artifact_row["data_json"])
+    artifact.update(
+        {
+            "classification": "restricted",
+            "retention_policy": "retain-7-years",
+            "legal_hold": True,
+            "reviewed_provenance": {"reviewer": "human-board"},
+            "generation_parent_refs": ["raw/parent-a.md"],
+        }
+    )
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE sources SET data_json = ? WHERE source_id = ?",
+            (
+                json.dumps(source, ensure_ascii=False),
+                source_row["source_id"],
+            ),
+        )
+        conn.execute(
+            "UPDATE source_artifacts SET data_json = ? WHERE artifact_id = ?",
+            (
+                json.dumps(artifact, ensure_ascii=False),
+                artifact_row["artifact_id"],
+            ),
+        )
+
+    second = governance_store.prepare_change_set_from_content(
+        "Concept_Evidence-Foundation.md",
+        _content("Version two.", "raw/source.txt"),
+        "test",
+    )
+    governance_store.apply_change_set(second)
+    reingested_artifact = json.loads(
+        conn.execute(
+            "SELECT data_json FROM source_artifacts WHERE artifact_id = ?",
+            (artifact_row["artifact_id"],),
+        ).fetchone()["data_json"]
+    )
+    assert reingested_artifact["reviewed_provenance"] == {
+        "reviewer": "human-board"
+    }
+    assert reingested_artifact["classification"] == "restricted"
+    assert reingested_artifact["retention_policy"] == "retain-7-years"
+    assert reingested_artifact["legal_hold"] is True
+    assert reingested_artifact["generation_parent_refs"] == ["raw/parent-a.md"]
+
+    raw_path.write_text("source-v2-with-new-bytes", encoding="utf-8")
+    third = governance_store.prepare_change_set_from_content(
+        "Concept_Evidence-Foundation.md",
+        _content("Version three.", "raw/source.txt"),
+        "test",
+    )
+    governance_store.apply_change_set(third)
+
+    expected_hash = hashlib.sha256(b"source-v2-with-new-bytes").hexdigest()
+    refreshed_source = json.loads(
+        conn.execute(
+            "SELECT data_json FROM sources WHERE source_id = ?",
+            (source_row["source_id"],),
+        ).fetchone()["data_json"]
+    )
+    refreshed_artifact_row = conn.execute(
+        "SELECT sha256, byte_size, data_json FROM source_artifacts WHERE artifact_id = ?",
+        (refreshed_source["artifact_id"],),
+    ).fetchone()
+    assert refreshed_source["content_hash"] == expected_hash
+    assert refreshed_source["ingested_at"] == "2026-01-01T00:00:00+00:00"
+    assert refreshed_source["legacy_content_hash"] == "legacy-reviewed-hash"
+    assert refreshed_source["classification"] == "restricted"
+    assert refreshed_source["retention_policy"] == "retain-7-years"
+    assert refreshed_source["legal_hold"] is True
+    assert refreshed_source["reviewed_provenance"] == {"reviewer": "human-board"}
+    assert refreshed_source["generation_parent_refs"] == ["raw/parent-a.md"]
+    assert refreshed_artifact_row["sha256"] == expected_hash
+    assert refreshed_artifact_row["byte_size"] == len(b"source-v2-with-new-bytes")
+
+
 def test_entity_identity_registry_tracks_explicit_identity(isolated_memory):
     db_store.init_db()
     content = _content("Stable identity.")

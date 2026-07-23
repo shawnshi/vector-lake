@@ -13,6 +13,7 @@ from vector_lake.tool_ingest import (
     INGEST_CONTRACT_VERSION,
     _read_canonical_target_content,
     _read_relevant_index_context,
+    canonical_source_name,
     claim_ingest_tasks,
     list_ingest_tasks,
     prepare_ingest_batch,
@@ -69,6 +70,24 @@ def test_same_content_at_different_paths_is_tracked_independently(isolated_memor
         "Source_team-a__shared.md",
         "Source_team-b__shared.md",
     ]
+
+
+def test_canonical_source_name_reuses_existing_source_identity_for_same_raw_path(
+    isolated_memory,
+):
+    _write_purpose_contract(isolated_memory)
+    raw_path = isolated_memory / "raw" / "team-a" / "report.md"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text("updated source", encoding="utf-8")
+    content = (
+        _source_content()
+        .replace("id: source_test", "id: source_legacy")
+        .replace("title: Test Source", "title: Legacy Source")
+        .replace("sources: [raw/test.pdf]", "sources: [raw/team-a/report.md]")
+    )
+    execute_mutation_plan("Source_Legacy-Report.md", content=content)
+
+    assert canonical_source_name(str(raw_path)) == "Source_Legacy-Report.md"
 
 
 def _concept_content(title="Target Concept"):
@@ -827,10 +846,22 @@ def test_integration_uses_canonical_outbox_snapshot_when_markdown_projection_is_
     real_materialize = mutation_coordinator.materialize_markdown_projection
     fail_projection = True
 
-    def fail_once_for_target(filename, mutation_type, payload_text=None, validation_mode="full"):
+    def fail_once_for_target(
+        filename,
+        mutation_type,
+        payload_text=None,
+        validation_mode="full",
+        projection_base_hash=None,
+    ):
         if fail_projection and filename == "Concept_Target.md":
             raise OSError("injected projection failure")
-        return real_materialize(filename, mutation_type, payload_text, validation_mode)
+        return real_materialize(
+            filename,
+            mutation_type,
+            payload_text,
+            validation_mode,
+            projection_base_hash,
+        )
 
     monkeypatch.setattr(
         mutation_coordinator,

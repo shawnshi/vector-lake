@@ -4,7 +4,12 @@ import hashlib
 import json
 
 from vector_lake import governance_store
-from vector_lake.merge_analysis import analyze_entities, normalize_name, preflight_suggestion
+from vector_lake.merge_analysis import (
+    analyze_entities,
+    build_wiki_backlink_index,
+    normalize_name,
+    preflight_suggestion,
+)
 from vector_lake.wiki_utils import get_wiki_dir
 
 
@@ -163,8 +168,13 @@ def find_merge_candidate_report(
 
     if run_preflight:
         wiki_dir = get_wiki_dir()
+        backlink_index = build_wiki_backlink_index(wiki_dir)
         suggestions = [
-            preflight_suggestion(suggestion, wiki_dir)
+            preflight_suggestion(
+                suggestion,
+                wiki_dir,
+                backlink_index=backlink_index,
+            )
             for suggestion in suggestions
         ]
         checked_page_keys = {

@@ -256,14 +256,18 @@ def process_mutation_outbox_batch(
     limit: int = 50,
     max_attempts: int = 3,
     backoff_base: float = 2.0,
+    outbox_ids: list[int] | None = None,
 ) -> dict:
     """Process one durable outbox batch; per-row failures never abort peers."""
     from vector_lake import db_store, indexer
     from vector_lake.mutation_coordinator import materialize_markdown_projection
-    from vector_lake.wiki_utils import get_wiki_dir
+    from vector_lake.wiki_utils import get_wiki_dir, normalize_semantic_text
 
     lease_seconds = max(120, min(3600, max(1, int(limit))))
-    rows = db_store.claim_mutation_outbox(limit=limit, lease_seconds=lease_seconds)
+    claim_kwargs = {"limit": limit, "lease_seconds": lease_seconds}
+    if outbox_ids is not None:
+        claim_kwargs["outbox_ids"] = outbox_ids
+    rows = db_store.claim_mutation_outbox(**claim_kwargs)
     stats = {"claimed": len(rows), "completed": 0, "retrying": 0, "failed": 0}
     ready_for_index = []
     for row in rows:
@@ -284,7 +288,8 @@ def process_mutation_outbox_batch(
                 else (
                     row.get("payload_text") is not None
                     and target.exists()
-                    and target.read_text(encoding="utf-8") == row.get("payload_text")
+                    and normalize_semantic_text(target.read_text(encoding="utf-8"))
+                    == normalize_semantic_text(row.get("payload_text"))
                 )
             )
             if not already_materialized:
@@ -296,6 +301,7 @@ def process_mutation_outbox_batch(
                         row["mutation_type"],
                         row.get("payload_text"),
                         validation_mode=row.get("validation_mode") or "full",
+                        projection_base_hash=row.get("projection_base_hash"),
                     )
             if db_store.mutation_outbox_lease_is_current(outbox_id, *lease_args):
                 ready_for_index.append((row, filename))

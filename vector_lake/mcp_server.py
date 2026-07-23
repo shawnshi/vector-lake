@@ -1,7 +1,106 @@
-from mcp.server.fastmcp import FastMCP
-import sys
+import hashlib
+import json
 import logging
+import os
+from pathlib import Path
+import sys
+import threading
+import time
 import uuid
+from datetime import datetime, timezone
+
+from mcp.server.fastmcp import FastMCP
+
+
+def _source_tree_revision(source_root: Path) -> str:
+    """Hash loaded Python sources so long-running MCPs can detect code drift."""
+    digest = hashlib.sha256()
+    for source_path in sorted(source_root.rglob("*.py")):
+        try:
+            source_bytes = source_path.read_bytes()
+        except FileNotFoundError:
+            continue
+        digest.update(source_path.relative_to(source_root).as_posix().encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(source_bytes)
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+class MCPRuntimeGuard:
+    """Fail closed when the running MCP no longer matches its source tree."""
+
+    def __init__(
+        self,
+        source_root: Path,
+        check_interval_seconds: float | None = None,
+    ):
+        self.source_root = Path(source_root).resolve()
+        if check_interval_seconds is None:
+            try:
+                check_interval_seconds = float(
+                    os.environ.get(
+                        "VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS",
+                        "5",
+                    )
+                )
+            except ValueError:
+                check_interval_seconds = 5.0
+        self.check_interval_seconds = max(0.0, check_interval_seconds)
+        self.loaded_at = datetime.now(timezone.utc).isoformat()
+        self.loaded_revision = _source_tree_revision(self.source_root)
+        self._current_revision = self.loaded_revision
+        self._last_checked = time.monotonic()
+        self._lock = threading.Lock()
+
+    def status(self, force: bool = False) -> dict:
+        with self._lock:
+            now = time.monotonic()
+            if (
+                force
+                or now - self._last_checked >= self.check_interval_seconds
+            ):
+                self._current_revision = _source_tree_revision(self.source_root)
+                self._last_checked = now
+            stale = self._current_revision != self.loaded_revision
+            return {
+                "pid": os.getpid(),
+                "loaded_at": self.loaded_at,
+                "source_root": str(self.source_root),
+                "loaded_revision": self.loaded_revision,
+                "current_revision": self._current_revision,
+                "stale": stale,
+                "restart_required": stale,
+                "check_interval_seconds": self.check_interval_seconds,
+            }
+
+    def assert_current(self) -> None:
+        status = self.status()
+        if status["stale"]:
+            raise RuntimeError(
+                "Vector Lake MCP source changed after process startup; "
+                "restart the MCP connector before invoking tools."
+            )
+
+
+class ReloadAwareFastMCP(FastMCP):
+    """FastMCP dispatcher that refuses stale-code tool execution."""
+
+    def __init__(
+        self,
+        *args,
+        runtime_guard: MCPRuntimeGuard | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.runtime_guard = runtime_guard or MCPRuntimeGuard(
+            Path(__file__).resolve().parent
+        )
+
+    async def call_tool(self, name: str, arguments: dict):
+        if name != "mcp_runtime_status":
+            self.runtime_guard.assert_current()
+        return await super().call_tool(name, arguments)
 
 # Global lock against stdout pollution
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', force=True)
@@ -9,7 +108,18 @@ from vector_lake import tools, tool_memory  # noqa: E402
 from vector_lake.governance_store import insert_governance_item_if_absent, _utc_now  # noqa: E402
 from vector_lake.tool_timeline import search_timeline_events  # noqa: E402
 
-mcp = FastMCP("vector-lake")
+mcp = ReloadAwareFastMCP("vector-lake")
+
+
+@mcp.tool()
+def mcp_runtime_status() -> str:
+    """Report whether this MCP process still matches the on-disk source tree."""
+    return json.dumps(
+        mcp.runtime_guard.status(force=True),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 
 @mcp.tool()
 def search_timeline(entity_name: str = "", sentiment: str = "", action: str = "", limit: int = 10) -> str:

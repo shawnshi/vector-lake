@@ -234,6 +234,31 @@ def test_full_index_rebuild_does_not_load_duplicate_canonical_snapshots(isolated
     assert index_projection_matches_canonical(["Concept_Streaming-Index.md"]) is False
 
 
+def test_index_projection_allows_only_explicit_merge_alias_redirect(
+    isolated_memory,
+):
+    from vector_lake import db_store
+    from vector_lake.wiki_utils import get_index_path
+
+    db_store.init_db()
+    get_index_path().write_text(
+        json.dumps(
+            {
+                "nodes": {},
+                "aliases": {"Source_Alpha-ab12cd34": "Source_Alpha"},
+                "weighted_edges": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert index_projection_matches_canonical(["Source_Alpha-ab12cd34.md"]) is False
+    assert index_projection_matches_canonical(
+        ["Source_Alpha-ab12cd34.md"],
+        allowed_alias_redirects={"Source_Alpha-ab12cd34": "Source_Alpha"},
+    ) is True
+
+
 def test_generic_source_does_not_create_similarity_clique(isolated_memory):
     from vector_lake import db_store
 
