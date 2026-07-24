@@ -139,6 +139,24 @@
                 .replace(/'/g, "&#039;");
         }
 
+        function sanitizeURL(url) {
+            if (!url) return null;
+            const strUrl = String(url).trim();
+            try {
+                const parsed = new URL(strUrl, 'http://localhost');
+                const protocol = parsed.protocol.toLowerCase();
+                if (['http:', 'https:', 'file:'].indexOf(protocol) !== -1) {
+                    return encodeURI(strUrl);
+                }
+                return '#';
+            } catch (e) {
+                if (strUrl.startsWith('/') || strUrl.startsWith('#') || !/^[a-zA-Z0-9\-\.]+:/i.test(strUrl)) {
+                    return encodeURI(strUrl);
+                }
+                return '#';
+            }
+        }
+
         const rawData = %%GRAPH_DATA%%;
         const memoryBasePath = "%%MEMORY_BASE_PATH%%";
 
@@ -500,7 +518,7 @@
 
             const href = nodeHref(node);
             const safeName = escapeHTML(node.name || node.id);
-            const safeHref = href ? encodeURI(href) : null;
+            const safeHref = href ? sanitizeURL(href) : null;
             document.getElementById('info-title').innerHTML = safeHref ? `<a href="${safeHref}" target="_blank">${safeName}</a>` : safeName;
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
@@ -545,7 +563,7 @@
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
                 const li = document.createElement('li');
                 const a = document.createElement('a');
-                a.href = hrefValue;
+                a.href = sanitizeURL(hrefValue);
                 a.target = '_blank';
                 a.textContent = source;
                 li.appendChild(a);
