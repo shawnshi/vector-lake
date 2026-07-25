@@ -142,19 +142,13 @@
         function sanitizeURL(url) {
             if (!url) return null;
             const strUrl = String(url).trim();
-            try {
-                const parsed = new URL(strUrl, 'http://localhost');
-                const protocol = parsed.protocol.toLowerCase();
-                if (['http:', 'https:', 'file:'].indexOf(protocol) !== -1) {
-                    return encodeURI(strUrl);
-                }
-                return '#';
-            } catch (e) {
-                if (strUrl.startsWith('/') || strUrl.startsWith('#') || !/^[a-zA-Z0-9\-\.]+:/i.test(strUrl)) {
-                    return encodeURI(strUrl);
-                }
-                return '#';
+            if (!strUrl) return null;
+            const schemeMatch = strUrl.match(/^([a-z][a-z0-9+.-]*):/i);
+            if (schemeMatch) {
+                const scheme = schemeMatch[1].toLowerCase();
+                if (!['http', 'https', 'file'].includes(scheme)) return null;
             }
+            return encodeURI(strUrl);
         }
 
         const rawData = %%GRAPH_DATA%%;
@@ -517,9 +511,20 @@
             Graph.cameraPosition({ x: targetX * ratio, y: targetY * ratio, z: targetZ * ratio }, lookAtPos, 1200);
 
             const href = nodeHref(node);
-            const safeName = escapeHTML(node.name || node.id);
             const safeHref = href ? sanitizeURL(href) : null;
-            document.getElementById('info-title').innerHTML = safeHref ? `<a href="${safeHref}" target="_blank">${safeName}</a>` : safeName;
+            const titleElement = document.getElementById('info-title');
+            const titleText = String(node.name || node.id || '');
+            titleElement.replaceChildren();
+            if (safeHref) {
+                const titleLink = document.createElement('a');
+                titleLink.href = safeHref;
+                titleLink.target = '_blank';
+                titleLink.rel = 'noopener noreferrer';
+                titleLink.textContent = titleText;
+                titleElement.appendChild(titleLink);
+            } else {
+                titleElement.textContent = titleText;
+            }
             selectedNode = node;
             Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
 
@@ -562,11 +567,19 @@
             (Array.isArray(node.sources) ? node.sources : []).forEach(source => {
                 const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
                 const li = document.createElement('li');
-                const a = document.createElement('a');
-                a.href = sanitizeURL(hrefValue);
-                a.target = '_blank';
-                a.textContent = source;
-                li.appendChild(a);
+                const safeSourceHref = sanitizeURL(hrefValue);
+                if (safeSourceHref) {
+                    const a = document.createElement('a');
+                    a.href = safeSourceHref;
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    a.textContent = source;
+                    li.appendChild(a);
+                } else {
+                    const span = document.createElement('span');
+                    span.textContent = source;
+                    li.appendChild(span);
+                }
                 sources.appendChild(li);
             });
             if (sources.children.length === 0) sources.innerHTML = '<li>None</li>';
