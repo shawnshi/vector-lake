@@ -1,6 +1,7 @@
 import json
 import hashlib
 import logging
+from collections import defaultdict
 import math
 import os
 import re
@@ -372,20 +373,21 @@ def _prune_weighted_edges(
     max_edges_per_node: int = MAX_EDGES_PER_NODE,
 ) -> list[dict]:
     """Enforce one deterministic degree budget on every index publication path."""
-    counts: dict[str, int] = {}
+    # ⚡ Bolt: Use defaultdict(int) to optimize high-frequency counting
+    counts: dict[str, int] = defaultdict(int)
     pruned: list[dict] = []
     for edge in _deduplicate_weighted_edges(edges):
         source = edge["source"]
         target = edge["target"]
         if node_keys is not None and (source not in node_keys or target not in node_keys):
             continue
-        if counts.get(source, 0) >= max_edges_per_node:
+        if counts[source] >= max_edges_per_node:
             continue
-        if counts.get(target, 0) >= max_edges_per_node:
+        if counts[target] >= max_edges_per_node:
             continue
         pruned.append(edge)
-        counts[source] = counts.get(source, 0) + 1
-        counts[target] = counts.get(target, 0) + 1
+        counts[source] += 1
+        counts[target] += 1
     return pruned
 
 
@@ -847,18 +849,19 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
         affinity_dict_a = type_affinity_precomputed[type_a]
         reverse_links_a = reverse_links.get(key_a, frozenset())
 
-        candidate_source_overlaps = {}
-        candidate_neighbor_scores = {}
+        # ⚡ Bolt: Use defaultdict(int) and defaultdict(float) for faster frequency counting
+        candidate_source_overlaps = defaultdict(int)
+        candidate_neighbor_scores = defaultdict(float)
         
         for source in sources_a:
             for key_b in source_to_nodes.get(source, []):
                 if key_a < key_b:
-                    candidate_source_overlaps[key_b] = candidate_source_overlaps.get(key_b, 0) + 1
+                    candidate_source_overlaps[key_b] += 1
                     
         for neighbor in links_a:
             for key_b in reverse_links.get(neighbor, []):
                 if key_a < key_b:
-                    candidate_neighbor_scores[key_b] = candidate_neighbor_scores.get(key_b, 0.0) + node_degrees[neighbor]
+                    candidate_neighbor_scores[key_b] += node_degrees[neighbor]
 
         candidates = set(candidate_source_overlaps.keys())
         candidates.update(candidate_neighbor_scores.keys())

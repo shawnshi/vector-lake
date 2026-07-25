@@ -1,3 +1,4 @@
+from collections import defaultdict
 import json
 import logging
 import os
@@ -37,12 +38,13 @@ def _build_page_graph(index_data: dict) -> dict:
     weighted_edges = index_data.get("weighted_edges", [])
     aliases = index_data.get("aliases", {})
 
-    links_count = {key: 0 for key in nodes_dict}
+    # ⚡ Bolt: Use defaultdict(int) to optimize high-frequency counting
+    links_count = defaultdict(int, {key: 0 for key in nodes_dict})
     for key, node in nodes_dict.items():
         for target in node.get("links", []):
             target_key = aliases.get(target, target)
             if target_key in nodes_dict:
-                links_count[target_key] = links_count.get(target_key, 0) + 1
+                links_count[target_key] += 1
             links_count[key] += 1
 
     graph_nodes = []

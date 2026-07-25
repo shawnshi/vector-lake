@@ -1,3 +1,4 @@
+from collections import defaultdict
 import copy
 import hashlib
 import json
@@ -1600,10 +1601,12 @@ def _resolve_memory_conflicts(store: dict) -> dict:
         })
 
     store["conflict_events"] = conflict_events
-    store["memory_type_counts"] = {}
+    # ⚡ Bolt: Use defaultdict(int) to optimize high-frequency counting
+    store["memory_type_counts"] = defaultdict(int)
     for memory in items.values():
         memory_type = memory.get("memory_type", "fact")
-        store["memory_type_counts"][memory_type] = store["memory_type_counts"].get(memory_type, 0) + 1
+        store["memory_type_counts"][memory_type] += 1
+    store["memory_type_counts"] = dict(store["memory_type_counts"])
     return store
 
 
@@ -1714,7 +1717,8 @@ def remediate_operational_memory_pollution(
     """Preview or archive known infrastructure artifacts in operational memory."""
     store = load_memory_objects()
     candidates: list[tuple[dict, str]] = []
-    reason_counts: dict[str, int] = {}
+    # ⚡ Bolt: Use defaultdict(int) to optimize high-frequency counting
+    reason_counts: dict[str, int] = defaultdict(int)
     for memory in store.get("items", {}).values():
         reason = classify_non_claim_text(str(memory.get("text") or ""))
         reasons = memory.get("validity_reasons") or []
@@ -1726,7 +1730,7 @@ def remediate_operational_memory_pollution(
         ):
             continue
         candidates.append((memory, reason))
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        reason_counts[reason] += 1
 
     candidates.sort(key=lambda item: str(item[0].get("memory_id") or ""))
     selected = candidates[:limit] if limit > 0 else candidates
@@ -1913,25 +1917,27 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
     for source_id, target_id in sorted(contradiction_pairs):
         _record_edge(source_id, target_id, "contradiction", 4.0, force=True)
 
-    entity_pair_counts = {}
+    # ⚡ Bolt: Use defaultdict(int) to optimize high-frequency counting
+    entity_pair_counts = defaultdict(int)
     for claim_ids_for_entity in entity_buckets.values():
         ordered_ids = sorted(set(claim_ids_for_entity))
         for index, left_id in enumerate(ordered_ids):
             for right_id in ordered_ids[index + 1 : index + 1 + entity_window]:
                 edge_key = tuple(sorted((left_id, right_id)))
-                entity_pair_counts[edge_key] = entity_pair_counts.get(edge_key, 0) + 1
+                entity_pair_counts[edge_key] += 1
 
     for (source_id, target_id), shared_count in sorted(entity_pair_counts.items(), key=lambda item: (-item[1], item[0])):
         weight = 2.5 + min(shared_count, 3) * 0.5
         _record_edge(source_id, target_id, "shared-entity", weight)
 
-    source_pair_counts = {}
+    # ⚡ Bolt: Use defaultdict(int) to optimize high-frequency counting
+    source_pair_counts = defaultdict(int)
     for claim_ids_for_source in source_buckets.values():
         ordered_ids = sorted(set(claim_ids_for_source))
         for index, left_id in enumerate(ordered_ids):
             for right_id in ordered_ids[index + 1 : index + 1 + source_window]:
                 edge_key = tuple(sorted((left_id, right_id)))
-                source_pair_counts[edge_key] = source_pair_counts.get(edge_key, 0) + 1
+                source_pair_counts[edge_key] += 1
 
     for (source_id, target_id), shared_count in sorted(source_pair_counts.items(), key=lambda item: (-item[1], item[0])):
         if (source_id, target_id) in edge_records:

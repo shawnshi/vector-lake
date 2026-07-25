@@ -9,3 +9,7 @@
 ## 2024-07-14 - Unused O(N) Array Allocations in Search Hot Path
 **Learning:** Codebase sometimes retains expensive list comprehensions iterating over the entire global index inside search functions (e.g. `nodes = [...]` in `tool_search.py`), which are never consumed.
 **Action:** Always check if variables returned from O(N) operations in hot paths are actually used before optimizing them.
+
+## 2024-05-25 - Use defaultdict for high-frequency counting loops
+**Learning:** Initializing missing dictionary keys with `.get(key, 0) + 1` in O(N) or O(N^2) loops incurs significant overhead from default value creation and function calls in Python.
+**Action:** Replace high-frequency dictionary counting logic with `collections.defaultdict(int)` and `+= 1` to achieve O(1) in-place addition. Convert it back to a standard `dict` when returning the object to avoid serialization side effects.
