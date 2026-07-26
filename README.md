@@ -74,8 +74,9 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 - **结构要求**：自由格式。专门保留给单篇文献精读、书籍伴读笔记、以及横向的战略纵览研报。不需要切割出“事实”与“时间线”，允许更灵活的文章长文组织形式。
 
 ## Quick Start
-1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。非 embedding 文本推理不由插件直接调用外部 API；需要推理的后台任务会生成当前环境 subagent 任务包。`GEMINI_API_KEY` 只影响 embedding。2. **单次编译**：执行 `python cli.py sync`，将 raw sources 编译为可读的 Markdown Wiki 并构建事实底座。
-3. **后台监听与自治管理**：日常运行 `python watchdog_sync.py` 启动守护进程。它搭载了四大核心基建与防御系统：
+1. **环境配置**：检查 `config.json`，确保 `target_directories` 路径正确，`supported_extensions` 配置了允许扫描的后缀。非 embedding 文本推理不由插件直接调用外部 API；需要推理的后台任务会生成当前环境 subagent 任务包。`GEMINI_API_KEY` 只影响 embedding。
+2. **单次摄取扫描**：执行 `python cli.py sync`，扫描 raw sources、跳过已处理内容并生成当前环境的 subagent 任务包。宿主完成任务后，通过 MCP `finalize_ingest` 提交经校验的 Wiki 结果。
+3. **后台监听与自治管理**：日常运行 `python watchdog_sync.py` 启动守护进程。它包含以下关键运行机制：
    - **双轨看门狗 (Two-Track Watchdog)**：监听增量文件生成以及 `on_deleted`、`on_moved` 事件；原始文件移动事件按目标路径处理，Wiki 删除或移动事件同步更新索引。
    - **写入健康门 (Write Health Gate)**：普通写入会检查 watchdog 心跳、outbox 失败项、投影键和内容一致性；已结清投影发生漂移时阻断继续写入。若最新 active outbox payload 与 canonical 版本相同，则该页暂记为受管恢复，允许 worker 完成投影。维护修复可显式使用 schema 模式或人工 override。
    - **I/O 批处理防抖 (I/O Debouncing)**：将 BM25 的 O(1) 内存更新合并打包，单批次文件修改仅触发一次 `index.json` 的写盘，彻底消灭 O(N) 的磁盘 I/O 磨损。
@@ -172,7 +173,7 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 - **阻塞陷阱重构 (Asynchronous Fire-and-Forget)**：剥离 `DiaryWatchdogHandler` 霸占线程池的线性 `subprocess.run` 陷阱，将其降维为纯异步 `Popen` 子进程唤起。释放了有限的 3 并发守护线程池，使外部文件变更响应突破延时阻塞。
 - **泛型语法树白名单 (AST Filter Purge)**：废弃了易受 Markdown 缩进污染的纯文本切分器。在 `claim_extractor.py` 中引入 `block_code` 脏节点屏障，使得 LLM 生成代码时的噪音（如 Python / Shell script 断言）在语法树层级即被拦截，保持图谱 100% 认知洁净。
 
-### 🔌 Antigravity Orchestrator 深度集成
+### Workflow Orchestrator 集成
 
 在当前的架构中，Vector Lake 已作为基础“义体感官”深度接入全局流：
 1. **Query_Vector_Lake 探针**：所有微角色 (Micro-Personas) 只要在 Python 编排器中注册了 `tools=["Query_Vector_Lake"]`，在多步推演时都会自动暂停并向图谱核实现有事实，打破了大模型的“信息孤岛”幻觉。
@@ -186,7 +187,7 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 
 运行态记忆由 `vector_lake/governance_store.py` 从 canonical claims 编译生成。它解决的问题是：Agent 常常只需要一个事实、偏好、决策或任务状态，不应该每次加载整页 Markdown。
 
-> **"Wiki-as-Database" 写回范式**：Agent 在运行态生成的新记忆，**严禁**直接写入 SQLite。它们必须通过 `update_operational_memory` 工具，按严格的 **Dual-Schema（双架构）** 规范，即 `# 1. 编译实体特征 (Compiled Truth)` 与 `## 2. 证据时间线 (Evidence Timeline)`，物理追加到相应的 Wiki 实体文件（如 `Concept_UserPreferences.md`）的时间线下方。这确保了在图谱完全重建时，Agent 记忆依然通过 Markdown 原质保留。
+> **受控写入范式**：Agent 通过 `update_operational_memory` 提交运行态记忆，不直接编辑 SQLite 或 Wiki。Mutation Coordinator 在 canonical 事务中写入变更与 durable outbox，再由 worker 更新 Markdown、索引和其他可重建投影。
 
 内置类型：
 
@@ -395,7 +396,7 @@ python cli.py topology-queue-cleanup --apply
 | `vector_lake/tool_ingest.py` | Raw-source 批量扫描与 Subagent 摄取指令生成 |
 | `vector_lake/indexer.py` | `index.json` 生成，使用 Sparse Graph Traversal 优化计算拓扑边 |
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
-| `vector_lake/tool_memory.py` | 基于 "Wiki-as-Database" 架构的运行态记忆物理写回 |
+| `vector_lake/tool_memory.py` | 运行态记忆的受控写入入口 |
 | `vector_lake/governance_store.py` | canonical store, change set, operational memory, conflict resolver. Now implements O(1) native SQLite JSON mutations. |
 | `vector_lake/governance_metrics.py` | debt metrics、治理统计与候选报告编排 |
 | `vector_lake/merge_analysis.py` | Unicode-safe 候选召回、证据评分、四态裁决、连通分组与合并预检 |
@@ -434,7 +435,7 @@ python cli.py topology-queue-cleanup --apply
 验证基线由当前命令生成，不在文档中固化测试数量或运行态数据计数：
 
 ```powershell
-$env:PYTHONIOENCODING='utf-8'; python -m pytest -q -p no:cacheprovider
+$env:PYTHONIOENCODING='utf-8'; python -m pytest -q -p no:cacheprovider tests
 $env:PYTHONIOENCODING='utf-8'; python -m compileall -q vector_lake tests
 $env:PYTHONUTF8='1'; python cli.py doctor
 $env:PYTHONUTF8='1'; python cli.py readiness
