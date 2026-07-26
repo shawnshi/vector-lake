@@ -517,6 +517,13 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     """Expire stale awaiting-subagent ingest jobs so they can be retried deliberately."""
     return tools.expire_ingest_tasks(max_age_seconds=max_age_seconds)
 
+
+@mcp.tool()
+def reconcile_ingest_tasks(dry_run: bool = True, limit: int = 0) -> str:
+    """Classify and safely recover abandoned or terminal ingest tasks."""
+    return tools.reconcile_ingest_job_debt(dry_run=dry_run, limit=limit)
+
+
 @mcp.tool()
 def finalize_ingest(
     files_written: list = None,

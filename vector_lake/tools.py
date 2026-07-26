@@ -7,7 +7,14 @@ from vector_lake.tool_graph import audit_graph, visualize_vector_lake
 from vector_lake.tool_lint import lint_vector_lake
 from vector_lake.tool_merge import merge_suggestions_vector_lake
 from vector_lake.tool_piea import check_duplicate_entity
-from vector_lake.tool_ingest import claim_ingest_tasks, expire_ingest_tasks, list_ingest_tasks, prepare_ingest_batch, finalize_ingest
+from vector_lake.tool_ingest import (
+    claim_ingest_tasks,
+    expire_ingest_tasks,
+    finalize_ingest,
+    list_ingest_tasks,
+    prepare_ingest_batch,
+    reconcile_ingest_job_debt,
+)
 from vector_lake.tool_query import prepare_query_context, finalize_query_synthesis
 from vector_lake.tool_review import review_vector_lake
 from vector_lake.tool_search import assemble_context, search_vector_lake
@@ -53,6 +60,7 @@ __all__ = [
     "merge_suggestions_vector_lake",
     "list_ingest_tasks",
     "prepare_ingest_batch",
+    "reconcile_ingest_job_debt",
     "prepare_query_context",
     "canonical_backfill_missing_wiki",
     "evidence_foundation_backfill",

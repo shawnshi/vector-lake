@@ -73,16 +73,58 @@ def create_subagent_task(
     return task_path
 
 
-def remove_subagent_task(task_path: str | Path) -> bool:
-    """Delete a completed task packet only when it is inside the isolated brain tree."""
+def remove_subagent_task(
+    task_path: str | Path,
+    *,
+    expected_job_id: str | None = None,
+    expected_task_type: str | None = None,
+    expected_task_id: str | None = None,
+) -> bool:
+    """Delete one verified packet from an exact per-run subagent task directory."""
     from vector_lake import get_extension_root
 
     candidate = Path(task_path).resolve()
-    task_root = (get_extension_root() / "brain").resolve()
-    if candidate.suffix.lower() != ".json" or not candidate.is_relative_to(task_root):
+    brain_root = (get_extension_root() / "brain").resolve()
+    try:
+        relative = candidate.relative_to(brain_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Refusing to remove task packet outside isolated brain tree: {candidate}"
+        ) from exc
+    if (
+        candidate.suffix.lower() != ".json"
+        or len(relative.parts) != 4
+        or relative.parts[1:3] != ("scratch", "subagent_tasks")
+    ):
         raise ValueError(f"Refusing to remove task packet outside isolated brain tree: {candidate}")
+    if expected_task_id and candidate.stem != str(expected_task_id):
+        raise ValueError(
+            f"Task packet filename does not match expected task id: {candidate}"
+        )
     if not candidate.exists():
         return False
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Task packet is unreadable: {candidate}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Task packet payload is not an object: {candidate}")
+    packet_task_id = str(payload.get("task_id") or "")
+    if not packet_task_id or packet_task_id != candidate.stem:
+        raise ValueError(f"Task packet identity does not match its filename: {candidate}")
+    if expected_task_id and packet_task_id != str(expected_task_id):
+        raise ValueError(f"Task packet id does not match cleanup intent: {candidate}")
+    if expected_task_type and str(payload.get("task_type") or "") != str(expected_task_type):
+        raise ValueError(f"Task packet type does not match cleanup intent: {candidate}")
+    if expected_job_id:
+        metadata = payload.get("metadata")
+        packet_job_id = (
+            str(metadata.get("job_id") or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        if packet_job_id != str(expected_job_id):
+            raise ValueError(f"Task packet job id does not match cleanup intent: {candidate}")
     candidate.unlink()
     return True
 

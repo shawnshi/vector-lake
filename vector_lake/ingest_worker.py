@@ -33,8 +33,12 @@ def _subagent_ingest_prompt(instructions: str) -> str:
 
 
 def process_jobs():
-    from vector_lake.tool_ingest import requeue_legacy_ingest_jobs
+    from vector_lake.tool_ingest import (
+        process_ingest_task_cleanup,
+        requeue_legacy_ingest_jobs,
+    )
 
+    process_ingest_task_cleanup(limit=20)
     requeue_legacy_ingest_jobs()
     jobs = claim_pending_jobs(limit=1, lease_seconds=3600)
     if not jobs:

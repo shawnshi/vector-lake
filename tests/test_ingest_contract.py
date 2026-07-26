@@ -15,8 +15,11 @@ from vector_lake.tool_ingest import (
     _read_relevant_index_context,
     canonical_source_name,
     claim_ingest_tasks,
+    calculate_hash,
     list_ingest_tasks,
     prepare_ingest_batch,
+    process_ingest_task_cleanup,
+    reconcile_ingest_job_debt,
 )
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
 
@@ -1189,6 +1192,393 @@ def test_init_db_migrates_legacy_jobs_without_changing_payload(isolated_memory):
         "status": "awaiting_subagent",
         "lease_generation": 0,
     }
+
+
+def test_reconcile_ingest_job_debt_recovers_terminal_and_retires_safe_debt(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-reconcile")
+    raw_dir = isolated_memory / "raw"
+    current = raw_dir / "current.md"
+    processed = raw_dir / "processed.md"
+    missing = raw_dir / "missing.md"
+    current.write_text("current", encoding="utf-8")
+    processed.write_text("processed", encoding="utf-8")
+    current_hash = calculate_hash(str(current))
+    processed_hash = calculate_hash(str(processed))
+
+    terminal_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": str(current),
+            "hash": current_hash,
+            "canonical_name": "Source_Current.md",
+            "source_hash": "",
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        },
+    )
+    missing_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": str(missing),
+            "hash": "missing",
+            "canonical_name": "Source_Missing.md",
+            "source_hash": "",
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        },
+    )
+    processed_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": str(processed),
+            "hash": processed_hash,
+            "canonical_name": "Source_Processed.md",
+            "source_hash": "",
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        },
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    packets = {}
+    for job_id in (terminal_id, missing_id, processed_id):
+        packet = create_subagent_task(
+            "ingest",
+            "test",
+            "JSON array",
+            {"job_id": job_id},
+        )
+        packets[job_id] = packet
+        db_store.mark_job_awaiting_subagent(job_id, str(packet))
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (terminal_id,),
+        )
+    db_store.mark_file_processed(str(processed), processed_hash)
+
+    preview = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+    assert preview["counts"] == {
+        "cancel_missing_raw": 1,
+        "complete_already_processed": 1,
+        "requeue_current": 1,
+    }
+    assert db_store.get_connection().execute(
+        "SELECT status FROM jobs WHERE job_id = ?",
+        (terminal_id,),
+    ).fetchone()[0] == "failed"
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+
+    rows = {
+        row["job_id"]: dict(row)
+        for row in db_store.get_connection().execute(
+            "SELECT job_id, status, retries, task_packet_path, idempotency_key "
+            "FROM jobs WHERE job_id IN (?, ?, ?)",
+            (terminal_id, missing_id, processed_id),
+        )
+    }
+    assert result["terminal_failed_after"] == 0
+    assert Path(result["backup"]).is_dir()
+    assert rows[terminal_id]["status"] == "queued"
+    assert rows[terminal_id]["retries"] == 0
+    assert rows[missing_id]["status"] == "cancelled"
+    assert rows[missing_id]["idempotency_key"] is None
+    assert rows[processed_id]["status"] == "completed"
+    assert all(row["task_packet_path"] is None for row in rows.values())
+    assert result["cleanup"]["completed"] == 3
+    assert result["cleanup"]["failed"] == 0
+    assert all(packet.exists() is False for packet in packets.values())
+    cleanup_rows = db_store.get_connection().execute(
+        "SELECT status FROM ingest_task_cleanup ORDER BY cleanup_id"
+    ).fetchall()
+    assert [row["status"] for row in cleanup_rows] == [
+        "completed",
+        "completed",
+        "completed",
+    ]
+
+
+def test_reconcile_ingest_job_debt_deduplicates_current_raw_identity(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "drift.md"
+    raw_path.write_text("current", encoding="utf-8")
+    jobs = []
+    for old_hash in ("old-a", "old-b"):
+        job_id = db_store.enqueue_job(
+            "ingest",
+            {
+                "filepath": str(raw_path),
+                "hash": old_hash,
+                "canonical_name": "Source_Drift.md",
+                "source_hash": "",
+                "ingest_contract_version": INGEST_CONTRACT_VERSION,
+            },
+        )
+        db_store.mark_job_awaiting_subagent(job_id, "")
+        jobs.append(job_id)
+
+    preview = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+    assert preview["counts"] == {
+        "requeue_current": 1,
+        "supersede_duplicate": 1,
+    }
+
+    reconcile_ingest_job_debt(dry_run=False, limit=0)
+
+    rows = db_store.get_connection().execute(
+        "SELECT job_id, status, idempotency_key, payload FROM jobs "
+        "WHERE job_id IN (?, ?) ORDER BY status",
+        jobs,
+    ).fetchall()
+    assert [row["status"] for row in rows] == ["queued", "superseded"]
+    queued = next(row for row in rows if row["status"] == "queued")
+    assert queued["idempotency_key"]
+    assert json.loads(queued["payload"])["hash"] == calculate_hash(str(raw_path))
+    superseded = next(row for row in rows if row["status"] == "superseded")
+    assert superseded["idempotency_key"] is None
+
+
+def test_reconcile_preview_does_not_create_missing_database(isolated_memory):
+    db_path = db_store.get_db_path()
+    assert db_path.exists() is False
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+
+    assert result["preview_error"].startswith("database_missing:")
+    assert db_path.exists() is False
+
+
+def test_reconcile_preview_does_not_migrate_legacy_schema(isolated_memory):
+    db_path = db_store.get_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, task_type TEXT, payload TEXT, "
+        "status TEXT, retries INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE processed_files (filepath TEXT PRIMARY KEY, file_hash TEXT)"
+    )
+    connection.commit()
+    connection.close()
+    before = db_path.read_bytes()
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+
+    assert result["preview_error"].startswith("schema_not_ready:")
+    assert db_path.read_bytes() == before
+    connection = sqlite3.connect(db_path)
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    connection.close()
+    assert "lease_generation" not in columns
+
+
+def test_reconcile_preview_missing_canonical_name_stays_read_only(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_path = isolated_memory / "raw" / "preview-no-canonical.md"
+    raw_path.write_text("current", encoding="utf-8")
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": str(raw_path),
+            "hash": "stale",
+            "source_hash": "",
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        },
+    )
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    connection = db_store.get_connection()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.execute("PRAGMA journal_mode=DELETE")
+    db_store.close_all_connections()
+    db_path = db_store.get_db_path()
+    before = db_path.read_bytes()
+    wal_path = Path(f"{db_path}-wal")
+    shm_path = Path(f"{db_path}-shm")
+    assert wal_path.exists() is False
+    assert shm_path.exists() is False
+
+    def fail_if_governance_initializes():
+        raise AssertionError("dry-run entered mutable governance initialization")
+
+    monkeypatch.setattr(
+        governance_store,
+        "initialize_meta_store",
+        fail_if_governance_initializes,
+    )
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+
+    assert result["preview_error"] == ""
+    assert result["counts"] == {"requeue_current": 1}
+    assert db_path.read_bytes() == before
+    assert wal_path.exists() is False
+    assert shm_path.exists() is False
+
+
+def test_reconcile_cas_does_not_take_concurrently_claimed_job(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-cas")
+    raw_path = isolated_memory / "raw" / "cas.md"
+    raw_path.write_text("current", encoding="utf-8")
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": str(raw_path),
+            "hash": "stale",
+            "canonical_name": "Source_CAS.md",
+            "source_hash": "",
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        },
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    packet = create_subagent_task(
+        "ingest",
+        "test",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    db_store.mark_job_awaiting_subagent(job_id, str(packet))
+    backup_dir = isolated_memory / "wiki" / ".meta" / "backups" / "cas"
+    backup_dir.mkdir(parents=True)
+
+    def claim_during_backup(_label):
+        claimed = db_store.claim_subagent_jobs(
+            limit=1,
+            lease_seconds=60,
+            lease_owner="concurrent-review",
+        )
+        assert [row["job_id"] for row in claimed] == [job_id]
+        return str(backup_dir)
+
+    monkeypatch.setattr(
+        "vector_lake.tool_projection.create_maintenance_backup",
+        claim_during_backup,
+    )
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+
+    row = db_store.get_connection().execute(
+        "SELECT status, task_packet_path, lease_owner FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "subagent_processing"
+    assert row["task_packet_path"] == str(packet)
+    assert row["lease_owner"] == "concurrent-review"
+    assert result["applied_counts"] == {}
+    assert result["concurrent_skips"][0]["job_id"] == job_id
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM ingest_task_cleanup"
+    ).fetchone()[0] == 0
+    assert packet.exists()
+    packet.unlink()
+
+
+def test_ingest_task_cleanup_replays_after_delete_failure(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-cleanup-replay")
+    raw_path = isolated_memory / "raw" / "cleanup.md"
+    raw_path.write_text("current", encoding="utf-8")
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": str(raw_path),
+            "hash": "stale",
+            "canonical_name": "Source_Cleanup.md",
+            "source_hash": "",
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        },
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    packet = create_subagent_task(
+        "ingest",
+        "test",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    db_store.mark_job_awaiting_subagent(job_id, str(packet))
+
+    def fail_delete(*_args, **_kwargs):
+        raise OSError("injected cleanup failure")
+
+    with monkeypatch.context() as cleanup_patch:
+        cleanup_patch.setattr(
+            "vector_lake.native_llm.remove_subagent_task",
+            fail_delete,
+        )
+        result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    row = db_store.get_connection().execute(
+        "SELECT status, task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    cleanup = db_store.get_connection().execute(
+        "SELECT status FROM ingest_task_cleanup WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert result["cleanup"]["failed"] == 1
+    assert row["status"] == "queued"
+    assert row["task_packet_path"] == str(packet)
+    assert cleanup["status"] == "failed"
+
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE ingest_task_cleanup SET available_at = "
+            "'2000-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+    replay = process_ingest_task_cleanup(limit=20)
+    row = db_store.get_connection().execute(
+        "SELECT task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    cleanup = db_store.get_connection().execute(
+        "SELECT status FROM ingest_task_cleanup WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert replay["completed"] == 1
+    assert row["task_packet_path"] is None
+    assert cleanup["status"] == "completed"
+    assert packet.exists() is False
+
+
+def test_remove_subagent_task_rejects_cross_session_identity(
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-session-b")
+    from vector_lake.native_llm import create_subagent_task, remove_subagent_task
+
+    packet = create_subagent_task(
+        "ingest",
+        "test",
+        "JSON array",
+        {"job_id": "job-b"},
+    )
+
+    with pytest.raises(ValueError, match="job id does not match"):
+        remove_subagent_task(
+            packet,
+            expected_job_id="job-a",
+            expected_task_type="ingest",
+            expected_task_id=packet.stem,
+        )
+
+    assert packet.exists()
+    packet.unlink()
 
 
 def test_concurrent_subagent_claim_has_single_winner(isolated_memory):

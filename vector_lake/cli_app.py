@@ -51,6 +51,8 @@ Usage Examples:
     ingest_tasks_parser.add_argument("--awaiting-only", action="store_true", help="Hide queued jobs and show only awaiting-subagent jobs.")
     ingest_tasks_parser.add_argument("--expire-stale", action="store_true", help="Expire stale awaiting-subagent jobs instead of listing.")
     ingest_tasks_parser.add_argument("--claim", action="store_true", help="Lease awaiting task packets to this host runtime.")
+    ingest_tasks_parser.add_argument("--repair-debt", action="store_true", help="Classify and recover abandoned ingest jobs.")
+    ingest_tasks_parser.add_argument("--apply", action="store_true", help="Apply --repair-debt after creating a maintenance backup.")
     ingest_tasks_parser.add_argument("--max-age-seconds", type=int, default=86400, help="Age threshold for --expire-stale.")
     ingest_tasks_parser.add_argument("--lease-seconds", type=int, default=3600, help="Lease duration for --claim.")
 
@@ -213,7 +215,12 @@ def main() -> int:
         if args.command == "sync":
             print(tools.sync_vector_lake())
         elif args.command == "ingest-tasks":
-            if getattr(args, "expire_stale", False):
+            if getattr(args, "repair_debt", False):
+                print(tools.reconcile_ingest_job_debt(
+                    dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", 20),
+                ))
+            elif getattr(args, "expire_stale", False):
                 print(tools.expire_ingest_tasks(getattr(args, "max_age_seconds", 86400)))
             elif getattr(args, "claim", False):
                 print(tools.claim_ingest_tasks(

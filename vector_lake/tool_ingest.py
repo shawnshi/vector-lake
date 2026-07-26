@@ -3,6 +3,7 @@ import json
 import hashlib
 import logging
 import re
+import sqlite3
 import traceback
 from collections import Counter
 from pathlib import Path
@@ -99,6 +100,566 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
 
     expired = expire_stale_subagent_jobs(max_age_seconds=max_age_seconds)
     return f"Expired {expired} awaiting-subagent ingest job(s)."
+
+
+def process_ingest_task_cleanup(limit: int = 20) -> dict:
+    """Replay durable task-packet cleanup without clearing unverified pointers."""
+    from vector_lake import db_store
+    from vector_lake.native_llm import remove_subagent_task
+
+    result = {"claimed": 0, "completed": 0, "failed": 0, "errors": []}
+    rows = db_store.claim_ingest_task_cleanup(limit=max(1, int(limit)))
+    result["claimed"] = len(rows)
+    for row in rows:
+        cleanup_id = int(row["cleanup_id"])
+        lease_args = (
+            str(row["lease_owner"]),
+            str(row["lease_token"]),
+            int(row["lease_generation"]),
+        )
+        try:
+            remove_subagent_task(
+                str(row["task_packet_path"]),
+                expected_job_id=str(row["job_id"]),
+                expected_task_type="ingest",
+                expected_task_id=str(row["expected_task_id"]),
+            )
+            if not db_store.complete_ingest_task_cleanup(cleanup_id, *lease_args):
+                raise RuntimeError("cleanup lease changed before completion")
+            result["completed"] += 1
+        except (OSError, RuntimeError, ValueError) as exc:
+            db_store.fail_ingest_task_cleanup(
+                cleanup_id,
+                *lease_args,
+                error=str(exc),
+            )
+            result["failed"] += 1
+            result["errors"].append(
+                f"cleanup_id={cleanup_id} path={row['task_packet_path']}: {exc}"
+            )
+    return result
+
+
+def _open_ingest_debt_preview_connection():
+    """Open the existing state read-only; previews never initialize or migrate it."""
+    from vector_lake import db_store
+
+    db_path = db_store.get_db_path().resolve()
+    if not db_path.is_file():
+        return None, f"database_missing:{db_path}"
+    connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    required = {
+        "jobs": {
+            "job_id",
+            "task_type",
+            "payload",
+            "status",
+            "retries",
+            "created_at",
+            "updated_at",
+            "available_at",
+            "lease_until",
+            "lease_owner",
+            "lease_token",
+            "lease_generation",
+            "idempotency_key",
+            "task_packet_path",
+        },
+        "processed_files": {"filepath", "file_hash"},
+        "entities": {"data_json"},
+    }
+    for table, columns in required.items():
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if exists is None:
+            connection.close()
+            return None, f"schema_not_ready:missing_table:{table}"
+        available = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        missing = sorted(columns - available)
+        if missing:
+            connection.close()
+            return None, f"schema_not_ready:{table}:missing_columns:{','.join(missing)}"
+    return connection, ""
+
+
+def _source_identity_index_from_connection(connection) -> dict[str, str]:
+    """Build the source identity map from an already-open read-only connection."""
+    items = []
+    for row in connection.execute(
+        "SELECT data_json FROM entities ORDER BY entity_id"
+    ):
+        try:
+            item = json.loads(str(row["data_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(item, dict)
+            and str(item.get("type") or "").casefold() == "source"
+            and str(item.get("status") or "").casefold() != "merged"
+        ):
+            items.append(item)
+    wiki_dir = get_wiki_dir()
+    selected: dict[str, tuple[tuple[int, int, int, str], str]] = {}
+    for entity in items:
+        page_key = str(entity.get("page_key") or "").strip().removesuffix(".md")
+        if not page_key or not (wiki_dir / f"{page_key}.md").is_file():
+            continue
+        categories = {
+            str(value).casefold()
+            for value in (
+                entity.get("categories")
+                if isinstance(entity.get("categories"), list)
+                else [entity.get("categories")]
+            )
+            if value
+        }
+        is_backlog = (
+            str(entity.get("topic_cluster") or "").casefold() == "raw_ingest_backlog"
+            or "raw_ingest_backlog" in categories
+        )
+        rank = (
+            int(not is_backlog),
+            int(not _HASH_SUFFIX.search(page_key)),
+            int(str(entity.get("status") or "").casefold() == "active"),
+            page_key.casefold(),
+        )
+        sources = entity.get("sources") or []
+        if not isinstance(sources, list):
+            sources = [sources]
+        for source in sources:
+            identity = normalize_source_identity(source)
+            if not identity.startswith("raw/"):
+                continue
+            current = selected.get(identity)
+            if current is None or rank[:3] > current[0][:3] or (
+                rank[:3] == current[0][:3] and rank[3] < current[0][3]
+            ):
+                selected[identity] = (rank, f"{page_key}.md")
+    return {
+        identity: filename
+        for identity, (_rank, filename) in selected.items()
+    }
+
+
+def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
+    """Classify and safely recover abandoned ingest jobs without discarding valid work."""
+    from vector_lake import db_store
+
+    preview_error = ""
+    if dry_run:
+        conn, preview_error = _open_ingest_debt_preview_connection()
+        if conn is None:
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "selected_jobs": 0,
+                    "counts": {},
+                    "backup": "",
+                    "preview_error": preview_error,
+                    "cleanup": {
+                        "claimed": 0,
+                        "completed": 0,
+                        "failed": 0,
+                        "errors": [],
+                    },
+                    "concurrent_skips": [],
+                    "samples": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+    else:
+        db_store.init_db()
+        conn = db_store.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE task_type = 'ingest' AND "
+        "(status = 'awaiting_subagent' OR (status = 'failed' AND retries >= 3)) "
+        "ORDER BY created_at, job_id"
+    ).fetchall()
+    selected_limit = max(0, int(limit))
+    if selected_limit:
+        rows = rows[:selected_limit]
+
+    processed = {
+        str(row["filepath"]): str(row["file_hash"] or "")
+        for row in conn.execute("SELECT filepath, file_hash FROM processed_files")
+    }
+    existing_by_key = {
+        str(row["idempotency_key"]): dict(row)
+        for row in conn.execute(
+            "SELECT job_id, status, retries, created_at, idempotency_key FROM jobs "
+            "WHERE idempotency_key IS NOT NULL"
+        )
+    }
+    plans: list[dict] = []
+    requeue_groups: dict[str, list[dict]] = {}
+    preview_source_identity_index = None
+
+    for row in rows:
+        record = dict(row)
+        expected_state = {
+            "status": record.get("status"),
+            "retries": int(record.get("retries") or 0),
+            "lease_generation": int(record.get("lease_generation") or 0),
+            "task_packet_path": record.get("task_packet_path"),
+            "lease_until": record.get("lease_until"),
+            "lease_owner": record.get("lease_owner"),
+            "lease_token": record.get("lease_token"),
+            "updated_at": record.get("updated_at"),
+            "payload": record.get("payload"),
+            "idempotency_key": record.get("idempotency_key"),
+        }
+        try:
+            payload = json.loads(record.get("payload") or "{}")
+        except json.JSONDecodeError:
+            payload = None
+        if not isinstance(payload, dict):
+            plans.append({
+                "job_id": record["job_id"],
+                "action": "blocked_invalid_payload",
+                "reason": "payload is not a JSON object",
+                "expected_state": expected_state,
+            })
+            continue
+
+        raw_value = str(payload.get("filepath") or "").strip()
+        if not raw_value:
+            plans.append({
+                "job_id": record["job_id"],
+                "action": "blocked_invalid_payload",
+                "reason": "filepath is missing",
+                "expected_state": expected_state,
+            })
+            continue
+        raw_path = Path(raw_value)
+        if not raw_path.is_absolute():
+            raw_path = get_raw_dir().parent / raw_path
+        raw_path = raw_path.resolve()
+        packet_path = str(record.get("task_packet_path") or "")
+
+        if not raw_path.is_file():
+            plans.append({
+                "job_id": record["job_id"],
+                "action": "cancel_missing_raw",
+                "reason": f"raw source is missing: {raw_path}",
+                "packet_path": packet_path,
+                "expected_state": expected_state,
+            })
+            continue
+
+        current_hash = calculate_hash(str(raw_path))
+        if not current_hash:
+            plans.append({
+                "job_id": record["job_id"],
+                "action": "blocked_unreadable_raw",
+                "reason": f"raw source cannot be hashed: {raw_path}",
+                "expected_state": expected_state,
+            })
+            continue
+
+        processed_hash = processed.get(str(raw_path)) or processed.get(raw_value)
+        if processed_hash == current_hash:
+            plans.append({
+                "job_id": record["job_id"],
+                "action": "complete_already_processed",
+                "reason": "processed_files already records the current raw hash",
+                "packet_path": packet_path,
+                "expected_state": expected_state,
+            })
+            continue
+
+        payload_hash = str(payload.get("hash") or "")
+        contract_current = (
+            str(payload.get("ingest_contract_version") or "")
+            == str(INGEST_CONTRACT_VERSION)
+        )
+        needs_requeue = (
+            record.get("status") == "failed"
+            or payload_hash != current_hash
+            or not contract_current
+        )
+        if not needs_requeue:
+            plans.append({
+                "job_id": record["job_id"],
+                "action": "leave_awaiting",
+                "reason": "current task packet still matches the raw source",
+                "expected_state": expected_state,
+            })
+            continue
+
+        canonical_name = str(payload.get("canonical_name") or "").strip()
+        if not canonical_name:
+            if dry_run:
+                if preview_source_identity_index is None:
+                    preview_source_identity_index = (
+                        _source_identity_index_from_connection(conn)
+                    )
+                canonical_name = canonical_source_name(
+                    str(raw_path),
+                    source_identity_index=preview_source_identity_index,
+                )
+            else:
+                canonical_name = canonical_source_name(str(raw_path))
+        canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
+        refreshed_fields = {
+            "filepath": str(raw_path),
+            "hash": current_hash,
+            "canonical_name": canonical_name,
+            "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        }
+        if dry_run:
+            refreshed_fields.update({
+                "source_hash": str(payload.get("source_hash") or ""),
+                "instructions": str(payload.get("instructions") or ""),
+            })
+        else:
+            refreshed_fields.update({
+                "source_hash": governance_store.canonical_page_versions(
+                    {canonical_key}
+                ).get(canonical_key, ""),
+                "instructions": _build_ingest_instructions(
+                    str(raw_path),
+                    current_hash,
+                    canonical_name,
+                ),
+            })
+        refreshed = dict(payload)
+        refreshed.update(refreshed_fields)
+        target_key = db_store._job_idempotency_key("ingest", refreshed)
+        candidate = {
+            "job_id": record["job_id"],
+            "action": "requeue_current",
+            "reason": (
+                "terminal failure"
+                if record.get("status") == "failed"
+                else "raw hash or ingest contract changed"
+            ),
+            "packet_path": packet_path,
+            "payload": refreshed,
+            "target_key": target_key,
+            "created_at": str(record.get("created_at") or ""),
+            "expected_state": expected_state,
+        }
+        requeue_groups.setdefault(str(target_key), []).append(candidate)
+
+    for target_key, candidates in requeue_groups.items():
+        existing = existing_by_key.get(target_key)
+        candidate_ids = {item["job_id"] for item in candidates}
+        if existing and existing["job_id"] not in candidate_ids:
+            owner_id = str(existing["job_id"])
+            for item in candidates:
+                item.update({
+                    "action": "supersede_duplicate",
+                    "reason": f"current ingest identity is already owned by {owner_id}",
+                    "owner_job_id": owner_id,
+                })
+                plans.append(item)
+            continue
+
+        owner = None
+        if existing and existing["job_id"] in candidate_ids:
+            owner = next(
+                item for item in candidates if item["job_id"] == existing["job_id"]
+            )
+        if owner is None:
+            owner = max(candidates, key=lambda item: (item["created_at"], item["job_id"]))
+        plans.append(owner)
+        for item in candidates:
+            if item["job_id"] == owner["job_id"]:
+                continue
+            item.update({
+                "action": "supersede_duplicate",
+                "reason": f"duplicate current ingest identity; owner={owner['job_id']}",
+                "owner_job_id": owner["job_id"],
+            })
+            plans.append(item)
+
+    plans.sort(key=lambda item: str(item["job_id"]))
+    counts = Counter(item["action"] for item in plans)
+    result = {
+        "dry_run": bool(dry_run),
+        "selected_jobs": len(rows),
+        "counts": dict(sorted(counts.items())),
+        "backup": "",
+        "preview_error": preview_error,
+        "cleanup": {
+            "claimed": 0,
+            "completed": 0,
+            "failed": 0,
+            "errors": [],
+        },
+        "concurrent_skips": [],
+        "samples": [
+            {
+                "job_id": item["job_id"],
+                "action": item["action"],
+                "reason": item["reason"],
+            }
+            for item in plans[:20]
+        ],
+    }
+    if dry_run:
+        conn.close()
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    mutating_actions = {
+        "cancel_missing_raw",
+        "complete_already_processed",
+        "requeue_current",
+        "supersede_duplicate",
+    }
+    if not any(item["action"] in mutating_actions for item in plans):
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    from vector_lake.tool_projection import create_maintenance_backup
+
+    result["backup"] = create_maintenance_backup("ingest_job_debt")
+    now = datetime.now(timezone.utc).isoformat()
+    applied_counts: Counter = Counter()
+    with db_store.transaction():
+        for item in plans:
+            action = item["action"]
+            job_id = item["job_id"]
+            packet_path = str(item.get("packet_path") or "")
+            expected = item.get("expected_state") or {}
+            cas_where = (
+                "job_id = ? AND status IS ? AND retries = ? "
+                "AND COALESCE(lease_generation, 0) = ? "
+                "AND task_packet_path IS ? AND lease_until IS ? "
+                "AND lease_owner IS ? AND lease_token IS ? "
+                "AND updated_at IS ? AND payload IS ? AND idempotency_key IS ?"
+            )
+            cas_values = (
+                job_id,
+                expected.get("status"),
+                int(expected.get("retries") or 0),
+                int(expected.get("lease_generation") or 0),
+                expected.get("task_packet_path"),
+                expected.get("lease_until"),
+                expected.get("lease_owner"),
+                expected.get("lease_token"),
+                expected.get("updated_at"),
+                expected.get("payload"),
+                expected.get("idempotency_key"),
+            )
+            cursor = None
+            if action == "cancel_missing_raw":
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', retries = 0, error_msg = ?, "
+                    "updated_at = ?, completed_at = ?, available_at = ?, "
+                    "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+                    "idempotency_key = NULL, result_json = ? "
+                    f"WHERE {cas_where}",
+                    (
+                        item["reason"],
+                        now,
+                        now,
+                        now,
+                        json.dumps({"maintenance": action}, sort_keys=True),
+                        *cas_values,
+                    ),
+                )
+            elif action == "complete_already_processed":
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'completed', retries = 0, error_msg = '', "
+                    "updated_at = ?, completed_at = ?, available_at = ?, "
+                    "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+                    f"result_json = ? WHERE {cas_where}",
+                    (
+                        now,
+                        now,
+                        now,
+                        json.dumps({"maintenance": action}, sort_keys=True),
+                        *cas_values,
+                    ),
+                )
+            elif action == "supersede_duplicate":
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'superseded', retries = 0, error_msg = ?, "
+                    "updated_at = ?, completed_at = ?, available_at = ?, "
+                    "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+                    "idempotency_key = NULL, result_json = ? "
+                    f"WHERE {cas_where}",
+                    (
+                        item["reason"],
+                        now,
+                        now,
+                        now,
+                        json.dumps(
+                            {
+                                "maintenance": action,
+                                "owner_job_id": item.get("owner_job_id"),
+                            },
+                            sort_keys=True,
+                        ),
+                        *cas_values,
+                    ),
+                )
+            elif action == "requeue_current":
+                owner = conn.execute(
+                    "SELECT job_id FROM jobs WHERE idempotency_key = ? AND job_id <> ?",
+                    (item["target_key"], job_id),
+                ).fetchone()
+                if owner is not None:
+                    result["concurrent_skips"].append({
+                        "job_id": job_id,
+                        "reason": (
+                            "current ingest identity acquired concurrently by "
+                            f"{owner['job_id']}"
+                        ),
+                    })
+                    continue
+                cursor = conn.execute(
+                    "UPDATE jobs SET payload = ?, status = 'queued', retries = 0, "
+                    "error_msg = ?, updated_at = ?, completed_at = NULL, available_at = ?, "
+                    "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+                    "idempotency_key = ?, result_json = NULL "
+                    f"WHERE {cas_where}",
+                    (
+                        json.dumps(item["payload"], ensure_ascii=False, sort_keys=True),
+                        f"Recovered by ingest debt reconciliation: {item['reason']}",
+                        now,
+                        now,
+                        item["target_key"],
+                        *cas_values,
+                    ),
+                )
+            if cursor is None or cursor.rowcount != 1:
+                if action in mutating_actions:
+                    result["concurrent_skips"].append({
+                        "job_id": job_id,
+                        "reason": "job state changed after preview; no mutation applied",
+                    })
+                continue
+            applied_counts[action] += 1
+            if packet_path:
+                db_store.enqueue_ingest_task_cleanup(job_id, packet_path)
+
+    result["applied_counts"] = dict(sorted(applied_counts.items()))
+    result["cleanup"] = process_ingest_task_cleanup(
+        limit=max(20, sum(applied_counts.values()))
+    )
+
+    result["terminal_failed_after"] = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
+        ).fetchone()[0]
+    )
+    result["awaiting_after"] = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'"
+        ).fetchone()[0]
+    )
+    result["queued_after"] = int(
+        conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'queued'").fetchone()[0]
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 _HASH_SUFFIX = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)
 
@@ -605,25 +1166,34 @@ def requeue_legacy_ingest_jobs() -> int:
     if not migrations:
         return 0
     now = datetime.now(timezone.utc).isoformat()
+    migrated = 0
     with db_store.transaction():
-        for job_id, payload, _packet_path in migrations:
-            conn.execute(
+        for job_id, payload, packet_path in migrations:
+            cursor = conn.execute(
                 "UPDATE jobs SET payload = ?, status = 'queued', retries = 0, "
                 "error_msg = 'Legacy ingest packet rebuilt for the integration contract', "
-                "available_at = ?, updated_at = ?, task_packet_path = NULL, "
+                "available_at = ?, updated_at = ?, "
                 "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
-                "WHERE job_id = ? AND status = 'awaiting_subagent'",
-                (json.dumps(payload, ensure_ascii=False), now, now, job_id),
+                "WHERE job_id = ? AND status = 'awaiting_subagent' "
+                "AND task_packet_path IS ?",
+                (
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    now,
+                    job_id,
+                    packet_path or None,
+                ),
             )
-    from vector_lake.native_llm import remove_subagent_task
-
-    for _job_id, _payload, packet_path in migrations:
-        if packet_path:
-            try:
-                remove_subagent_task(packet_path)
-            except OSError:
-                log.warning("Could not remove superseded ingest packet: %s", packet_path)
-    return len(migrations)
+            if cursor.rowcount != 1:
+                continue
+            migrated += 1
+            if packet_path:
+                db_store.enqueue_ingest_task_cleanup(job_id, packet_path)
+    if migrated:
+        cleanup = process_ingest_task_cleanup(limit=max(20, migrated))
+        for error in cleanup["errors"]:
+            log.warning("Could not remove superseded ingest packet: %s", error)
+    return migrated
 
 def prepare_ingest_batch(batch_size: int = 5, candidate_paths: list[str] | None = None) -> str:
     """Native Antigravity Agentic subagent orchestration."""
@@ -822,6 +1392,13 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                     lease_generation,
                     result_data={"integration": processed_data.get("integration")},
                 )
+                if job_row.get("task_packet_path"):
+                    from vector_lake import db_store
+
+                    db_store.enqueue_ingest_task_cleanup(
+                        str(job_id),
+                        str(job_row["task_packet_path"]),
+                    )
 
             execute_mutation_batch(
                 mutations,
@@ -839,15 +1416,17 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                     lease_generation,
                     result_data={"integration": processed_data.get("integration")},
                 )
+                if job_row.get("task_packet_path"):
+                    from vector_lake import db_store
 
-        task_packet_path = job_row.get("task_packet_path") if job_row else None
-        if task_packet_path:
-            try:
-                from vector_lake.native_llm import remove_subagent_task
+                    db_store.enqueue_ingest_task_cleanup(
+                        str(job_id),
+                        str(job_row["task_packet_path"]),
+                    )
 
-                remove_subagent_task(task_packet_path)
-            except Exception as exc:
-                log.warning("Ingest finalized, but task packet cleanup failed: %s", exc)
+        cleanup = process_ingest_task_cleanup(limit=20)
+        for error in cleanup["errors"]:
+            log.warning("Ingest finalized, but task packet cleanup failed: %s", error)
         
         from filelock import FileLock
         import tempfile

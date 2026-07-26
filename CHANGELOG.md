@@ -1,5 +1,6 @@
 # Unreleased
 
+- Added read-only-preview ingest-job debt reconciliation with backups, lease-fenced CAS updates, replayable verified task-packet cleanup, missing-raw retirement, processed-job closure, current-hash requeue, and duplicate-current-identity supersession.
 - Replaced placeholder graph analysis with bounded topology computation, deterministic communities, a global degree cap, and dirty-graph retrieval isolation.
 - Added cascade tombstones for operational memory, Claim/Evidence versions, and entity identities when canonical pages are deleted.
 - Added preview-first cleanup for generated memory artifacts and obsolete indexer community-naming work, preserving mixed-content and decision-scoped records.

@@ -575,6 +575,30 @@ def _init_db_once(db_key: str):
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
             "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
         )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_task_cleanup (
+                cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                task_packet_path TEXT NOT NULL,
+                expected_task_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                available_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                lease_until TEXT,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_generation INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(job_id, task_packet_path)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingest_task_cleanup_ready "
+            "ON ingest_task_cleanup(status, available_at, lease_until, cleanup_id)"
+        )
         
         # Add expression-based indexes for performance
         try:
@@ -1330,6 +1354,188 @@ def mark_job_awaiting_subagent(job_id: str, task_packet_path: str):
             "lease_token = NULL WHERE job_id = ?",
             (task_packet_path, f"Subagent task packet: {task_packet_path}", now_str, job_id),
         )
+
+
+def enqueue_ingest_task_cleanup(job_id: str, task_packet_path: str) -> int:
+    """Persist cleanup intent before a job releases its current task packet."""
+    packet_path = str(Path(task_packet_path).resolve())
+    expected_task_id = Path(packet_path).stem
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO ingest_task_cleanup ("
+        "job_id, task_packet_path, expected_task_id, status, attempt_count, "
+        "last_error, available_at, created_at, updated_at"
+        ") VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?, ?) "
+        "ON CONFLICT(job_id, task_packet_path) DO UPDATE SET "
+        "status = CASE WHEN ingest_task_cleanup.status IN ('completed', 'processing') "
+        "THEN ingest_task_cleanup.status ELSE 'pending' END, "
+        "last_error = CASE WHEN ingest_task_cleanup.status IN ('completed', 'processing') "
+        "THEN ingest_task_cleanup.last_error ELSE NULL END, "
+        "available_at = CASE WHEN ingest_task_cleanup.status IN ('completed', 'processing') "
+        "THEN ingest_task_cleanup.available_at ELSE excluded.available_at END, "
+        "updated_at = excluded.updated_at, "
+        "lease_until = CASE WHEN ingest_task_cleanup.status = 'processing' "
+        "THEN ingest_task_cleanup.lease_until ELSE NULL END, "
+        "lease_owner = CASE WHEN ingest_task_cleanup.status = 'processing' "
+        "THEN ingest_task_cleanup.lease_owner ELSE NULL END, "
+        "lease_token = CASE WHEN ingest_task_cleanup.status = 'processing' "
+        "THEN ingest_task_cleanup.lease_token ELSE NULL END",
+        (str(job_id), packet_path, expected_task_id, now, now, now),
+    )
+    row = conn.execute(
+        "SELECT cleanup_id FROM ingest_task_cleanup "
+        "WHERE job_id = ? AND task_packet_path = ?",
+        (str(job_id), packet_path),
+    ).fetchone()
+    return int(row["cleanup_id"])
+
+
+def claim_ingest_task_cleanup(
+    limit: int = 20,
+    lease_seconds: int = 300,
+    lease_owner: str | None = None,
+) -> list[dict]:
+    """Lease replayable task-packet cleanup intents."""
+    import os
+    import secrets
+    import socket
+
+    init_db()
+    conn = get_connection()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    lease_until = (now_dt + timedelta(seconds=max(1, int(lease_seconds)))).isoformat()
+    owner = str(lease_owner or f"{socket.gethostname()}:{os.getpid()}")
+    claimed: list[dict] = []
+    with transaction():
+        rows = conn.execute(
+            "SELECT cleanup_id FROM ingest_task_cleanup WHERE "
+            "((status IN ('pending', 'failed') AND available_at <= ?) OR "
+            "(status = 'processing' AND COALESCE(lease_until, '') <= ?)) "
+            "ORDER BY cleanup_id ASC LIMIT ?",
+            (now, now, max(1, int(limit))),
+        ).fetchall()
+        for row in rows:
+            cleanup_id = int(row["cleanup_id"])
+            token = secrets.token_urlsafe(32)
+            cursor = conn.execute(
+                "UPDATE ingest_task_cleanup SET status = 'processing', "
+                "lease_until = ?, lease_owner = ?, lease_token = ?, "
+                "lease_generation = lease_generation + 1, updated_at = ? "
+                "WHERE cleanup_id = ? AND ("
+                "(status IN ('pending', 'failed') AND available_at <= ?) OR "
+                "(status = 'processing' AND COALESCE(lease_until, '') <= ?))",
+                (lease_until, owner, token, now, cleanup_id, now, now),
+            )
+            if cursor.rowcount != 1:
+                continue
+            claimed_row = conn.execute(
+                "SELECT * FROM ingest_task_cleanup WHERE cleanup_id = ?",
+                (cleanup_id,),
+            ).fetchone()
+            if claimed_row is not None:
+                claimed.append(dict(claimed_row))
+    return claimed
+
+
+def complete_ingest_task_cleanup(
+    cleanup_id: int,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+) -> bool:
+    """Complete one cleanup lease and clear only its still-current job pointer."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        row = conn.execute(
+            "SELECT job_id, task_packet_path FROM ingest_task_cleanup "
+            "WHERE cleanup_id = ? AND status = 'processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND lease_until > ?",
+            (
+                int(cleanup_id),
+                str(lease_owner),
+                str(lease_token),
+                int(lease_generation),
+                now,
+            ),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE jobs SET task_packet_path = NULL "
+            "WHERE job_id = ? AND task_packet_path = ?",
+            (str(row["job_id"]), str(row["task_packet_path"])),
+        )
+        cursor = conn.execute(
+            "UPDATE ingest_task_cleanup SET status = 'completed', "
+            "completed_at = ?, updated_at = ?, last_error = NULL, "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+            "WHERE cleanup_id = ? AND status = 'processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ?",
+            (
+                now,
+                now,
+                int(cleanup_id),
+                str(lease_owner),
+                str(lease_token),
+                int(lease_generation),
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def fail_ingest_task_cleanup(
+    cleanup_id: int,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+    error: str,
+) -> bool:
+    """Release a failed cleanup lease for bounded replay."""
+    conn = get_connection()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    with transaction():
+        row = conn.execute(
+            "SELECT attempt_count FROM ingest_task_cleanup "
+            "WHERE cleanup_id = ? AND status = 'processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND lease_until > ?",
+            (
+                int(cleanup_id),
+                str(lease_owner),
+                str(lease_token),
+                int(lease_generation),
+                now,
+            ),
+        ).fetchone()
+        if row is None:
+            return False
+        attempt_count = int(row["attempt_count"] or 0) + 1
+        available_at = (
+            now_dt + timedelta(seconds=min(300, 2 ** min(attempt_count, 8)))
+        ).isoformat()
+        cursor = conn.execute(
+            "UPDATE ingest_task_cleanup SET status = 'failed', "
+            "attempt_count = ?, last_error = ?, available_at = ?, updated_at = ?, "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+            "WHERE cleanup_id = ? AND status = 'processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ?",
+            (
+                attempt_count,
+                str(error)[:2000],
+                available_at,
+                now,
+                int(cleanup_id),
+                str(lease_owner),
+                str(lease_token),
+                int(lease_generation),
+            ),
+        )
+        return cursor.rowcount == 1
 
 
 def claim_subagent_jobs(
