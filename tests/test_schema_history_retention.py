@@ -1,0 +1,934 @@
+import hashlib
+import json
+import sqlite3
+from datetime import datetime, timezone
+
+import pytest
+
+from vector_lake import db_store, governance_store
+from vector_lake.tool_governance_maintenance import history_retention_maintenance
+
+
+OLD = "2020-01-01T00:00:00+00:00"
+
+
+def _record_hash(record: dict) -> str:
+    payload = governance_store._canonical_record_json(record)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _seed_version_family(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    object_id: str,
+    family_id: str,
+    page_key: str,
+) -> list[str]:
+    if kind == "claim":
+        table = "claim_versions"
+        version_field = "claim_version_id"
+        id_field = "claim_id"
+        family_field = "claim_family_id"
+        canonical_table = "claims"
+    else:
+        table = "evidence_versions"
+        version_field = "evidence_version_id"
+        id_field = "evidence_id"
+        family_field = "evidence_family_id"
+        canonical_table = "evidence"
+
+    version_ids = []
+    records = []
+    for version_no in range(1, 4):
+        record = {
+            id_field: object_id,
+            family_field: family_id,
+            "locator": {"page_key": page_key, "block_index": version_no},
+            "text": f"{kind}-version-{version_no}",
+        }
+        version_id = f"{kind}_version_{object_id}_{version_no}"
+        conn.execute(
+            f"INSERT INTO {table} "
+            f"({version_field}, {id_field}, {family_field}, page_key, version_no, "
+            "record_hash, data_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                version_id,
+                object_id,
+                family_id,
+                page_key,
+                version_no,
+                _record_hash(record),
+                governance_store._canonical_record_json(record),
+                OLD,
+            ),
+        )
+        version_ids.append(version_id)
+        records.append(record)
+
+    current_record = records[0]
+    if canonical_table == "claims":
+        conn.execute(
+            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, 'Active', ?, ?)",
+            (
+                object_id,
+                current_record["text"],
+                json.dumps(current_record, ensure_ascii=False),
+                OLD,
+            ),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (object_id, json.dumps(current_record, ensure_ascii=False), OLD),
+        )
+    identity = {
+        "record_kind": kind,
+        "record_id": object_id,
+        "page_key": page_key,
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO canonical_identities "
+        "(record_kind, record_id, page_key, identity_origin, data_json, recorded_at) "
+        "VALUES (?, ?, ?, 'test_seed', ?, ?)",
+        (
+            kind,
+            object_id,
+            page_key,
+            governance_store._canonical_record_json(identity),
+            OLD,
+        ),
+    )
+    return version_ids
+
+
+def _insert_job(
+    conn: sqlite3.Connection,
+    job_id: str,
+    status: str,
+    *,
+    at: str,
+    retries: int = 0,
+    page_key: str = "PageJob",
+    task_packet_path: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO jobs "
+        "(job_id, task_type, payload, status, retries, created_at, updated_at, "
+        "available_at, task_packet_path, completed_at) "
+        "VALUES (?, 'ingest', ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            job_id,
+            json.dumps({"page_key": page_key}),
+            status,
+            retries,
+            at,
+            at,
+            at,
+            task_packet_path,
+            at if status not in {"queued", "dispatched", "awaiting_subagent"} else None,
+        ),
+    )
+
+
+def _insert_cleanup(
+    conn: sqlite3.Connection,
+    job_id: str,
+    status: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO ingest_task_cleanup "
+        "(job_id, task_packet_path, expected_task_id, status, available_at, "
+        "created_at, updated_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            job_id,
+            f"C:/scratch/{job_id}.json",
+            f"task-{job_id}",
+            status,
+            OLD,
+            OLD,
+            OLD,
+            OLD if status == "completed" else None,
+        ),
+    )
+
+
+def _exists(
+    conn: sqlite3.Connection,
+    table: str,
+    key: str,
+    value: object,
+) -> bool:
+    return bool(
+        conn.execute(
+            f"SELECT 1 FROM {table} WHERE {key} = ?",
+            (value,),
+        ).fetchone()
+    )
+
+
+def _downgrade_identity_registry_to_v1(path) -> None:
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DROP TRIGGER IF EXISTS trg_canonical_identities_append_only_update")
+        conn.execute("DROP TRIGGER IF EXISTS trg_canonical_identities_append_only_delete")
+        conn.execute("DROP TABLE canonical_identities")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 2")
+        conn.execute("PRAGMA user_version = 1")
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+def test_schema_v2_checksum_is_derived_from_normalized_ddl_contract():
+    contract = db_store._CANONICAL_IDENTITIES_SCHEMA_V2
+    checksum = db_store._SCHEMA_MIGRATIONS[2][1]
+
+    assert checksum == db_store._schema_contract_checksum(contract)
+    assert checksum == db_store._schema_contract_checksum(
+        tuple(f"  {statement}\n" for statement in contract)
+    )
+    changed_contract = (
+        contract[0].replace("page_key TEXT NOT NULL", "page_key TEXT"),
+        *contract[1:],
+    )
+    assert db_store._schema_contract_checksum(changed_contract) != checksum
+
+@pytest.mark.parametrize(
+    ("damage", "issue"),
+    [
+        (
+            "missing_table",
+            "canonical_identity_schema_missing:table:canonical_identities",
+        ),
+        (
+            "missing_index",
+            "canonical_identity_schema_missing:index:idx_canonical_identities_page",
+        ),
+        (
+            "wrong_trigger",
+            "canonical_identity_schema_sql_mismatch:"
+            "trg_canonical_identities_append_only_delete",
+        ),
+        (
+            "missing_constraint",
+            "canonical_identity_schema_sql_mismatch:canonical_identities",
+        ),
+    ],
+)
+def test_schema_inspection_and_init_reject_identity_contract_damage(
+    isolated_memory,
+    damage,
+    issue,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    with db_store.transaction() as conn:
+        if damage == "missing_table":
+            conn.execute("DROP TABLE canonical_identities")
+        elif damage == "missing_index":
+            conn.execute("DROP INDEX idx_canonical_identities_page")
+        elif damage == "wrong_trigger":
+            conn.execute(
+                "DROP TRIGGER trg_canonical_identities_append_only_delete"
+            )
+            conn.execute(
+                "CREATE TRIGGER trg_canonical_identities_append_only_delete "
+                "BEFORE INSERT ON canonical_identities BEGIN SELECT 1; END"
+            )
+        else:
+            conn.execute("DROP TABLE canonical_identities")
+            conn.execute(
+                db_store._CANONICAL_IDENTITIES_SCHEMA_V2[0].replace(
+                    "CHECK(length(trim(page_key)) > 0),",
+                    "",
+                )
+            )
+            for statement in db_store._CANONICAL_IDENTITIES_SCHEMA_V2[1:]:
+                conn.execute(statement)
+
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is False
+    assert state["status"] == "invalid"
+    assert issue in state["issues"]
+
+    with pytest.raises(RuntimeError, match="identity contract is invalid"):
+        db_store.init_db()
+    db_store.close_all_connections()
+
+    after = db_store.inspect_schema_migration_state(path)
+    assert issue in after["issues"]
+
+def test_schema_ledger_is_durable_and_read_only_inspection_is_current(isolated_memory):
+    db_store.init_db()
+    path = db_store.get_db_path()
+
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is True
+    assert state["status"] == "ready"
+    assert state["user_version"] == db_store._SCHEMA_VERSION == 2
+    assert [item["version"] for item in state["ledger"]] == [1, 2]
+    assert [item["name"] for item in state["ledger"]] == [
+        db_store._SCHEMA_MIGRATIONS[version][0] for version in (1, 2)
+    ]
+    assert [item["checksum"] for item in state["ledger"]] == [
+        db_store._SCHEMA_MIGRATIONS[version][1] for version in (1, 2)
+    ]
+    assert all(item["applied_at"] for item in state["ledger"])
+
+
+def test_schema_v2_backfills_current_and_version_identity_owners(isolated_memory):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-migrated",
+            family_id="claim-family-migrated",
+            page_key="PageMigrated",
+        )
+        _seed_version_family(
+            conn,
+            kind="evidence",
+            object_id="evidence-migrated",
+            family_id="evidence-family-migrated",
+            page_key="PageMigrated",
+        )
+    _downgrade_identity_registry_to_v1(path)
+
+    db_store.init_db()
+    rows = db_store.get_connection().execute(
+        "SELECT record_kind, record_id, page_key, identity_origin "
+        "FROM canonical_identities ORDER BY record_kind, record_id"
+    ).fetchall()
+
+    assert [tuple(row) for row in rows] == [
+        ("claim", "claim-migrated", "PageMigrated", "schema_v2_backfill"),
+        ("evidence", "evidence-migrated", "PageMigrated", "schema_v2_backfill"),
+    ]
+    assert db_store.inspect_schema_migration_state(path)["ready"] is True
+
+
+@pytest.mark.parametrize("surviving_surface", ["current", "version"])
+def test_schema_v2_backfills_current_only_or_version_only_identity(
+    isolated_memory,
+    surviving_surface,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-one-surface",
+            family_id="claim-family-one-surface",
+            page_key="PageOneSurface",
+        )
+        if surviving_surface == "current":
+            conn.execute(
+                "DELETE FROM claim_versions WHERE claim_id = 'claim-one-surface'"
+            )
+        else:
+            conn.execute("DELETE FROM claims WHERE claim_id = 'claim-one-surface'")
+    _downgrade_identity_registry_to_v1(path)
+
+    db_store.init_db()
+    owner = db_store.get_connection().execute(
+        "SELECT page_key, identity_origin FROM canonical_identities "
+        "WHERE record_kind = 'claim' AND record_id = 'claim-one-surface'"
+    ).fetchone()
+
+    assert tuple(owner) == ("PageOneSurface", "schema_v2_backfill")
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("missing", "missing an identity registry owner"),
+        ("inconsistent", "registry page 'PageOther'"),
+    ],
+)
+def test_existing_schema_v2_rejects_missing_or_inconsistent_identity_coverage(
+    isolated_memory,
+    damage,
+    message,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-v2-damaged",
+            family_id="claim-family-v2-damaged",
+            page_key="PageOriginal",
+        )
+        if damage == "missing":
+            conn.execute(
+                "DROP TRIGGER trg_canonical_identities_append_only_delete"
+            )
+            conn.execute(
+                "DELETE FROM canonical_identities WHERE record_kind = 'claim' "
+                "AND record_id = 'claim-v2-damaged'"
+            )
+            conn.execute(db_store._CANONICAL_IDENTITIES_SCHEMA_V2[4])
+        else:
+            conn.execute(
+                "DROP TRIGGER trg_canonical_identities_append_only_update"
+            )
+            identity = {
+                "record_kind": "claim",
+                "record_id": "claim-v2-damaged",
+                "page_key": "PageOther",
+            }
+            conn.execute(
+                "UPDATE canonical_identities SET page_key = ?, data_json = ? "
+                "WHERE record_kind = 'claim' AND record_id = 'claim-v2-damaged'",
+                (
+                    "PageOther",
+                    governance_store._canonical_record_json(identity),
+                ),
+            )
+            conn.execute(db_store._CANONICAL_IDENTITIES_SCHEMA_V2[3])
+
+    state = db_store.inspect_schema_migration_state(path)
+    assert state["ready"] is False
+    assert any(
+        issue.startswith("canonical_identity_integrity:")
+        for issue in state["issues"]
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        db_store.init_db()
+
+
+def test_existing_schema_v2_allows_registry_only_historical_identity(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    identity = {
+        "record_kind": "claim",
+        "record_id": "claim-registry-only",
+        "page_key": "PageDeleted",
+    }
+    with db_store.transaction() as conn:
+        conn.execute(
+            "INSERT INTO canonical_identities "
+            "(record_kind, record_id, page_key, identity_origin, data_json, recorded_at) "
+            "VALUES ('claim', 'claim-registry-only', 'PageDeleted', "
+            "'historical_test', ?, '2026-07-27T00:00:00+00:00')",
+            (governance_store._canonical_record_json(identity),),
+        )
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+    db_store.init_db()
+
+    assert db_store.get_connection().execute(
+        "SELECT page_key FROM canonical_identities WHERE record_kind = 'claim' "
+        "AND record_id = 'claim-registry-only'"
+    ).fetchone()["page_key"] == "PageDeleted"
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("invalid_json", "invalid identity JSON"),
+        ("conflicting_page", "conflicting page ownership"),
+    ],
+)
+def test_schema_v2_backfill_fails_closed_and_rolls_back(
+    isolated_memory,
+    damage,
+    message,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-damaged",
+            family_id="claim-family-damaged",
+            page_key="PageOriginal",
+        )
+        if damage == "invalid_json":
+            conn.execute(
+                "UPDATE claim_versions SET data_json = '{' "
+                "WHERE claim_id = 'claim-damaged' AND version_no = 2"
+            )
+        else:
+            record = {
+                "claim_id": "claim-damaged",
+                "claim_family_id": "claim-family-damaged",
+                "locator": {"page_key": "PageOther", "block_index": 2},
+            }
+            conn.execute(
+                "UPDATE claim_versions SET page_key = ?, data_json = ? "
+                "WHERE claim_id = ? AND version_no = 2",
+                (
+                    "PageOther",
+                    governance_store._canonical_record_json(record),
+                    "claim-damaged",
+                ),
+            )
+    _downgrade_identity_registry_to_v1(path)
+
+    with pytest.raises(RuntimeError, match=message):
+        db_store.init_db()
+    db_store.close_all_connections()
+
+    raw = sqlite3.connect(path)
+    try:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'canonical_identities'"
+        ).fetchone() is None
+        assert raw.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,)]
+    finally:
+        raw.close()
+
+def test_read_only_schema_inspection_and_retention_preview_do_not_create_database(
+    isolated_memory,
+):
+    path = db_store.peek_db_path()
+    assert not path.exists()
+
+    state = db_store.inspect_schema_migration_state()
+    preview = json.loads(history_retention_maintenance())
+
+    assert state["status"] == "missing"
+    assert state["issues"] == ["database_missing"]
+    assert preview["dry_run"] is True
+    assert preview["applied"] is False
+    assert preview["preview_error"] == "schema_not_ready:missing"
+    assert not path.exists()
+
+
+def test_schema_migration_failure_rolls_back_ledger_and_user_version(isolated_memory):
+    path = db_store.peek_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE VIEW entities AS SELECT 'entity' AS entity_id")
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        db_store.init_db()
+    db_store.close_all_connections()
+
+    raw = sqlite3.connect(path)
+    try:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 0
+        tables = {
+            row[0]
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    finally:
+        raw.close()
+    assert "schema_migrations" not in tables
+    assert "vec_embeddings" not in tables
+
+
+def test_add_column_ignores_only_explicit_duplicate_column_error():
+    class FailingConnection:
+        def __init__(self, message: str):
+            self.message = message
+
+        def execute(self, _sql: str):
+            raise sqlite3.OperationalError(self.message)
+
+    db_store._add_column_if_missing(
+        FailingConnection("duplicate column name: status"),
+        "entities",
+        "status",
+        "TEXT",
+    )
+    with pytest.raises(sqlite3.OperationalError, match="malformed"):
+        db_store._add_column_if_missing(
+            FailingConnection("database disk image is malformed"),
+            "entities",
+            "status",
+            "TEXT",
+        )
+
+
+def test_history_retention_preview_and_apply_are_bounded_and_reference_safe(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    recent = datetime.now(timezone.utc).isoformat()
+
+    with db_store.transaction():
+        change_sets = {
+            "cs-terminal-old": {"status": "published"},
+            "cs-terminal-keep": {"status": "published"},
+            "cs-referenced-old": {"status": "published"},
+            "cs-active-old": {
+                "status": "pending",
+                "affected_pages": ["PagePending.md"],
+                "proposed_claims": [
+                    {
+                        "claim_id": "claim-pending",
+                        "claim_family_id": "claim-family-pending",
+                        "locator": {"page_key": "PagePending"},
+                    }
+                ],
+                "proposed_evidence": [
+                    {
+                        "evidence_id": "evidence-pending",
+                        "evidence_family_id": "evidence-family-pending",
+                        "locator": {"page_key": "PagePending"},
+                    }
+                ],
+            },
+        }
+        for change_set_id, body in change_sets.items():
+            body = {"change_set_id": change_set_id, **body}
+            at = recent if change_set_id == "cs-terminal-keep" else OLD
+            conn.execute(
+                "INSERT INTO change_sets (change_set_id, data_json, updated_at) "
+                "VALUES (?, ?, ?)",
+                (change_set_id, json.dumps(body), at),
+            )
+            conn.execute(
+                "INSERT INTO change_set_idempotency "
+                "(idempotency_key, change_set_id, created_at) VALUES (?, ?, ?)",
+                (f"idem-{change_set_id}", change_set_id, at),
+            )
+        queue = {
+            "item_id": "queue-ref",
+            "status": "pending",
+            "change_set_id": "cs-referenced-old",
+        }
+        conn.execute(
+            "INSERT INTO governance_queue (item_id, data_json, updated_at) "
+            "VALUES ('queue-ref', ?, ?)",
+            (json.dumps(queue), OLD),
+        )
+
+        _insert_job(conn, "job-terminal-keep", "completed", at=recent)
+        _insert_job(conn, "job-terminal-old", "completed", at=OLD)
+        _insert_job(conn, "job-failed-exhausted", "failed", at=OLD, retries=3)
+        _insert_job(conn, "job-active", "queued", at=OLD, page_key="PageActive")
+        _insert_job(conn, "job-failed-retry", "failed", at=OLD, retries=2)
+        _insert_job(
+            conn,
+            "job-packet",
+            "completed",
+            at=OLD,
+            task_packet_path="C:/scratch/job-packet.json",
+        )
+        _insert_job(conn, "job-cleanup-pending", "completed", at=OLD)
+        _insert_cleanup(conn, "job-cleanup-pending", "pending")
+        _insert_job(conn, "job-cleanup-completed", "completed", at=OLD)
+        _insert_cleanup(conn, "job-cleanup-completed", "completed")
+
+        def insert_outbox(filename: str, status: str, at: str) -> int:
+            cursor = conn.execute(
+                "INSERT INTO mutation_outbox "
+                "(filename, mutation_type, status, created_at, available_at, completed_at) "
+                "VALUES (?, 'update', ?, ?, ?, ?)",
+                (filename, status, at, at, at if status != "pending" else None),
+            )
+            return int(cursor.lastrowid)
+
+        outbox_keep = insert_outbox("PageKeep.md", "completed", recent)
+        outbox_old = insert_outbox("PageOld.md", "completed", OLD)
+        outbox_failed = insert_outbox("PageFailed.md", "failed", OLD)
+        outbox_referenced = insert_outbox("PageReferenced.md", "completed", OLD)
+        outbox_active = insert_outbox("PageActive.md", "pending", OLD)
+        conn.execute(
+            "UPDATE mutation_outbox SET superseded_by = ? WHERE id = ?",
+            (outbox_referenced, outbox_active),
+        )
+
+        claim_safe = _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-safe",
+            family_id="claim-family-safe",
+            page_key="PageSafe",
+        )
+        claim_active = _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-active",
+            family_id="claim-family-active",
+            page_key="PageActive",
+        )
+        claim_pending = _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-pending",
+            family_id="claim-family-pending",
+            page_key="PagePending",
+        )
+        evidence_safe = _seed_version_family(
+            conn,
+            kind="evidence",
+            object_id="evidence-safe",
+            family_id="evidence-family-safe",
+            page_key="PageSafe",
+        )
+        evidence_active = _seed_version_family(
+            conn,
+            kind="evidence",
+            object_id="evidence-active",
+            family_id="evidence-family-active",
+            page_key="PageActive",
+        )
+        evidence_pending = _seed_version_family(
+            conn,
+            kind="evidence",
+            object_id="evidence-pending",
+            family_id="evidence-family-pending",
+            page_key="PagePending",
+        )
+
+        conn.execute(
+            "INSERT INTO embedding_runs "
+            "(run_id, status, model, started_at, updated_at) "
+            "VALUES ('embedding-run', 'completed', 'test', ?, ?)",
+            (OLD, OLD),
+        )
+        conn.execute(
+            "INSERT INTO embedding_rate_reservations "
+            "(reservation_id, reserved_at, token_count) VALUES ('reservation', 1.0, 10)"
+        )
+
+    options = {
+        "ttl_days": 1,
+        "batch_size": 100,
+        "keep_change_sets": 1,
+        "keep_terminal_jobs": 1,
+        "keep_terminal_outbox": 1,
+        "keep_versions_per_family": 1,
+    }
+    counts_before = {
+        table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in (
+            "change_sets",
+            "jobs",
+            "mutation_outbox",
+            "claim_versions",
+            "evidence_versions",
+            "canonical_identities",
+            "embedding_runs",
+            "embedding_rate_reservations",
+        )
+    }
+
+    preview = json.loads(history_retention_maintenance(dry_run=True, **options))
+
+    assert preview["applied"] is False
+    assert preview["selected_counts"] == {
+        "change_sets": 1,
+        "jobs": 3,
+        "mutation_outbox": 2,
+        "claim_versions": 1,
+        "evidence_versions": 1,
+    }
+    assert preview["selected_samples"]["change_sets"] == ["cs-terminal-old"]
+    assert set(preview["selected_samples"]["jobs"]) == {
+        "job-terminal-old",
+        "job-failed-exhausted",
+        "job-cleanup-completed",
+    }
+    assert set(preview["selected_samples"]["mutation_outbox"]) == {
+        outbox_old,
+        outbox_failed,
+    }
+    assert preview["selected_samples"]["claim_versions"] == [claim_safe[1]]
+    assert preview["selected_samples"]["evidence_versions"] == [evidence_safe[1]]
+    assert counts_before == {
+        table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in counts_before
+    }
+
+    applied = json.loads(history_retention_maintenance(dry_run=False, **options))
+
+    assert applied["applied"] is True
+    assert applied["deleted_counts"] == preview["selected_counts"]
+    assert not _exists(conn, "change_sets", "change_set_id", "cs-terminal-old")
+    assert _exists(conn, "change_sets", "change_set_id", "cs-terminal-keep")
+    assert _exists(conn, "change_sets", "change_set_id", "cs-referenced-old")
+    assert _exists(conn, "change_sets", "change_set_id", "cs-active-old")
+    assert not _exists(
+        conn,
+        "change_set_idempotency",
+        "change_set_id",
+        "cs-terminal-old",
+    )
+    assert _exists(
+        conn,
+        "change_set_idempotency",
+        "change_set_id",
+        "cs-referenced-old",
+    )
+
+    for job_id in (
+        "job-terminal-old",
+        "job-failed-exhausted",
+        "job-cleanup-completed",
+    ):
+        assert not _exists(conn, "jobs", "job_id", job_id)
+    for job_id in (
+        "job-terminal-keep",
+        "job-active",
+        "job-failed-retry",
+        "job-packet",
+        "job-cleanup-pending",
+    ):
+        assert _exists(conn, "jobs", "job_id", job_id)
+    assert not _exists(
+        conn,
+        "ingest_task_cleanup",
+        "job_id",
+        "job-cleanup-completed",
+    )
+    assert _exists(conn, "ingest_task_cleanup", "job_id", "job-cleanup-pending")
+
+    assert not _exists(conn, "mutation_outbox", "id", outbox_old)
+    assert not _exists(conn, "mutation_outbox", "id", outbox_failed)
+    assert _exists(conn, "mutation_outbox", "id", outbox_keep)
+    assert _exists(conn, "mutation_outbox", "id", outbox_referenced)
+    assert _exists(conn, "mutation_outbox", "id", outbox_active)
+
+    assert not _exists(conn, "claim_versions", "claim_version_id", claim_safe[1])
+    assert _exists(conn, "claim_versions", "claim_version_id", claim_safe[0])
+    assert _exists(conn, "claim_versions", "claim_version_id", claim_safe[2])
+    assert all(
+        _exists(conn, "claim_versions", "claim_version_id", version_id)
+        for version_id in claim_active + claim_pending
+    )
+    assert not _exists(
+        conn,
+        "evidence_versions",
+        "evidence_version_id",
+        evidence_safe[1],
+    )
+    assert _exists(
+        conn,
+        "evidence_versions",
+        "evidence_version_id",
+        evidence_safe[0],
+    )
+    assert _exists(
+        conn,
+        "evidence_versions",
+        "evidence_version_id",
+        evidence_safe[2],
+    )
+    assert all(
+        _exists(conn, "evidence_versions", "evidence_version_id", version_id)
+        for version_id in evidence_active + evidence_pending
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM canonical_identities").fetchone()[0]
+        == counts_before["canonical_identities"]
+    )
+    assert conn.execute("SELECT COUNT(*) FROM embedding_runs").fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM embedding_rate_reservations").fetchone()[0]
+        == 1
+    )
+
+
+def test_schema_inspection_returns_invalid_when_read_only_connect_fails(
+    isolated_memory,
+    monkeypatch,
+):
+    path = db_store.peek_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"present")
+
+    def fail_connect(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(db_store.sqlite3, "connect", fail_connect)
+
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is False
+    assert state["status"] == "invalid"
+    assert state["issues"] == ["schema_inspection_failed:unable to open database file"]
+
+
+def test_history_retention_fails_closed_on_unknown_references_and_timestamps(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    cutoff = datetime.now(timezone.utc).isoformat()
+
+    with db_store.transaction():
+        for change_set_id, updated_at in (
+            ("cs-valid-old", OLD),
+            ("cs-invalid-time", "not-a-date"),
+        ):
+            conn.execute(
+                "INSERT INTO change_sets (change_set_id, data_json, updated_at) "
+                "VALUES (?, ?, ?)",
+                (
+                    change_set_id,
+                    json.dumps({"change_set_id": change_set_id, "status": "published"}),
+                    updated_at,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO governance_queue (item_id, data_json, updated_at) "
+            "VALUES ('malformed-queue', '{', ?)",
+            (OLD,),
+        )
+        _insert_job(conn, "job-invalid-time", "completed", at="not-a-date")
+        conn.execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, created_at, updated_at) "
+            "VALUES ('job-malformed-active', 'ingest', '{', 'queued', 0, ?, ?)",
+            (OLD, OLD),
+        )
+        conn.execute(
+            "INSERT INTO mutation_outbox "
+            "(filename, mutation_type, status, created_at, available_at, completed_at) "
+            "VALUES ('InvalidTime.md', 'update', 'completed', ?, ?, ?)",
+            ("not-a-date", "not-a-date", "not-a-date"),
+        )
+        _seed_version_family(
+            conn,
+            kind="claim",
+            object_id="claim-blocked",
+            family_id="claim-family-blocked",
+            page_key="PageBlocked",
+        )
+
+    plan = governance_store.plan_history_retention(
+        conn,
+        cutoff=cutoff,
+        batch_size=100,
+        keep_change_sets=0,
+        keep_terminal_jobs=0,
+        keep_terminal_outbox=0,
+        keep_versions_per_family=1,
+    )
+
+    assert plan["selected_ids"]["change_sets"] == []
+    assert plan["selected_ids"]["jobs"] == []
+    assert plan["selected_ids"]["mutation_outbox"] == []
+    assert plan["selected_ids"]["claim_versions"] == []
+    assert plan["active_protection_counts"]["block_version_retention"] == 1
+    assert (
+        plan["version_skip_counts"]["claim_versions"]["blocked_by_unknown_active_work"]
+        == 1
+    )

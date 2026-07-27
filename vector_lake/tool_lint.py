@@ -14,6 +14,7 @@ from vector_lake.merge_analysis import (
     source_identity_candidate_pairs,
 )
 from vector_lake.wiki_utils import (
+    SYSTEM_WHITELIST,
     get_wiki_dir,
     iter_wiki_link_matches,
     read_markdown_file,
@@ -26,6 +27,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vector-lake-tool-lint")
 
 _TEMPORAL_LINK = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _frontmatter_integrity_error(content: str, frontmatter: dict) -> str | None:
+    if not content.startswith(("---\n", "---\r\n")):
+        return "Missing YAML frontmatter opening delimiter"
+    if re.search(r"\r?\n---(?:\r?\n|$)", content) is None:
+        return "Missing YAML frontmatter closing delimiter"
+    if not frontmatter:
+        return "Empty or non-mapping YAML frontmatter"
+    return None
+
+
+def _compact_exception(exc: Exception) -> str:
+    detail = " ".join(str(exc).split())
+    if not detail:
+        detail = exc.__class__.__name__
+    return detail
 
 
 def _register_link_target(
@@ -75,7 +93,7 @@ def lint_vector_lake(auto_fix: bool = False):
     if not os.path.exists(wiki_dir):
         return "Wiki directory not found."
 
-    skip_files = {"index.md", "log.md", "overview.md"}
+    skip_files = {name.casefold() for name in SYSTEM_WHITELIST}
     valid_types = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
     valid_status = {status.lower() for status in VALID_STATUS}
     valid_epistemic = {"seed", "sprouting", "evergreen"}
@@ -88,7 +106,13 @@ def lint_vector_lake(auto_fix: bool = False):
     valid_prefixes = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
     required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]
 
-    files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]
+    files = sorted(
+        name
+        for name in os.listdir(wiki_dir)
+        if name.casefold().endswith(".md")
+        and name.casefold() not in skip_files
+        and os.path.isfile(os.path.join(wiki_dir, name))
+    )
     issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "reviewed_orphan", "similarity", "decay", "semantic_gc", "governance", "managed_governance", "alignment"]}
     fixes_applied = 0
 
@@ -107,16 +131,22 @@ def lint_vector_lake(auto_fix: bool = False):
         all_keys.add(node_key)
         try:
             frontmatter, body, content = read_markdown_file(filepath)
-        except Exception:
-            issues["frontmatter"].append(f"{filename}: Cannot read file")
+        except Exception as exc:
+            issues["frontmatter"].append(
+                f"{filename}: Cannot parse YAML frontmatter: "
+                f"{_compact_exception(exc)}"
+            )
             continue
 
-        if not content.startswith("---"):
-            issues["frontmatter"].append(f"{filename}: Missing YAML frontmatter entirely")
+        integrity_error = _frontmatter_integrity_error(content, frontmatter)
+        if integrity_error:
+            issues["frontmatter"].append(
+                f"{filename}: {integrity_error}"
+            )
             continue
 
         links = {
-            match.group(1).strip().replace(".md", "")
+            re.sub(r"(?i)\.md$", "", match.group(1).strip())
             for match in iter_wiki_link_matches(content)
         }
         links.discard("")

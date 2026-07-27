@@ -52,7 +52,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     Validates a Vector Lake Wiki node against the strict constraints of schema.md.
     Raises SchemaViolationException on any failure.
     """
-    if not filename.endswith(".md"):
+    if not filename.casefold().endswith(".md"):
         return
 
     # Skip system meta files

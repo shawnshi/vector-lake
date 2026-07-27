@@ -7,18 +7,33 @@ import yaml
 from vector_lake.claim_extractor import _stable_id
 from vector_lake.db_store import get_connection, get_db_path
 from vector_lake.mutation_coordinator import execute_mutation_batch
-from vector_lake.wiki_utils import get_wiki_dir, normalize_entity_name, read_markdown_file
+from vector_lake.wiki_utils import (
+    get_wiki_dir,
+    iter_markdown_files,
+    normalize_entity_name,
+    read_markdown_file,
+)
 
 
 def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True) -> str:
     """Atomically rename an entity and update every exact internal link."""
     wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
-    old_name = old_name if old_name.endswith(".md") else f"{old_name}.md"
-    new_name = new_name if new_name.endswith(".md") else f"{new_name}.md"
+    old_name = old_name if old_name.casefold().endswith(".md") else f"{old_name}.md"
+    new_name = new_name if new_name.casefold().endswith(".md") else f"{new_name}.md"
     old_path = (wiki_dir / old_name).resolve()
     if not old_path.is_relative_to(wiki_dir):
         return f"[Security Error] Old entity '{old_name}' is outside the wiki directory."
-    if not old_path.exists():
+    matches = [
+        path.resolve()
+        for path in iter_markdown_files(wiki_dir)
+        if path.name.casefold() == old_name.casefold()
+    ]
+    if len(matches) > 1:
+        return f"Error: Old entity '{old_name}' is ambiguous."
+    if matches:
+        old_path = matches[0]
+        old_name = old_path.name
+    elif not old_path.exists():
         return f"Error: Old entity '{old_name}' does not exist."
 
     normalized_new_name = normalize_entity_name(new_name[:-3]) + ".md"
@@ -71,7 +86,10 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
     updated_files = 0
     for root, _, files in os.walk(wiki_dir):
         for filename in files:
-            if not filename.endswith(".md") or filename in {"index.md", "log.md", "overview.md"}:
+            if (
+                not filename.casefold().endswith(".md")
+                or filename.casefold() in {"index.md", "log.md", "overview.md"}
+            ):
                 continue
             path = Path(root) / filename
             if path in {old_path, new_path}:

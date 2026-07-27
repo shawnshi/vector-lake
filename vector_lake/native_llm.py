@@ -39,12 +39,19 @@ def native_llm_ready() -> tuple[bool, str]:
     return False, "text generation is delegated to current-environment subagent task packets"
 
 
-def _task_root() -> Path:
+def get_subagent_scratch_dir() -> Path:
+    """Return the isolated scratch directory for the active host-agent run."""
     from vector_lake import get_extension_root
 
     run_id = os.environ.get("VECTOR_LAKE_SUBAGENT_RUN_ID", _DEFAULT_RUN_ID)
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "subagent-runtime"
-    root = get_extension_root() / "brain" / safe_run_id / "scratch" / "subagent_tasks"
+    root = get_extension_root() / "brain" / safe_run_id / "scratch"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _task_root() -> Path:
+    root = get_subagent_scratch_dir() / "subagent_tasks"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

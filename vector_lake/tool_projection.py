@@ -6,6 +6,8 @@ canonical history.
 """
 
 from __future__ import annotations
+import hashlib
+import sqlite3
 
 import json
 import logging
@@ -14,9 +16,20 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from filelock import FileLock, Timeout
+
 from vector_lake import governance_store, indexer
 from vector_lake.claim_extractor import extract_page_objects
-from vector_lake.db_store import backup_database, enqueue_mutation, get_connection, get_db_path, init_db, transaction
+from vector_lake.db_store import (
+    backup_database,
+    enqueue_mutation,
+    get_connection,
+    get_db_path,
+    init_db,
+    inspect_schema_migration_state,
+    peek_db_path,
+    transaction,
+)
 from vector_lake.evidence_foundation import (
     build_extraction_run,
     evidence_independence,
@@ -24,63 +37,191 @@ from vector_lake.evidence_foundation import (
     source_locator_for,
     version_family_id,
 )
+from vector_lake.index_snapshot import load_index_snapshot
 from vector_lake.mutation_coordinator import materialize_markdown_projection
 from vector_lake.schema_validator import VALID_H3_SLOTS, validate_schema
 from vector_lake.yaml_utils import dump_yaml
 from vector_lake.wiki_utils import (
     get_claim_graph_path,
     get_index_path,
+    get_legacy_claim_graph_path,
     get_meta_dir,
     get_wiki_dir,
+    iter_markdown_files,
     read_markdown_file,
     split_frontmatter,
 )
 
 
-EXCLUDED_WIKI_FILES = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
+EXCLUDED_WIKI_FILES = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
 log = logging.getLogger("vector-lake-projection")
+
+
+def _strip_markdown_suffix(value: str) -> str:
+    text = str(value)
+    return text[:-3] if text.casefold().endswith(".md") else text
+
+
+def _wiki_path_map() -> dict[str, Path]:
+    return {path.stem: path for path in iter_markdown_files(get_wiki_dir())}
 
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
-def _wiki_keys() -> set[str]:
-    wiki_dir = get_wiki_dir()
-    if not wiki_dir.exists():
-        return set()
-    return {
-        path.stem
-        for path in wiki_dir.glob("*.md")
-        if path.is_file() and path.name not in EXCLUDED_WIKI_FILES and not path.name.startswith("System_")
-    }
-
-
-def _canonical_keys() -> set[str]:
-    if not get_db_path().exists():
-        init_db()
-    conn = get_connection()
-    return {
-        row["page_key"]
-        for row in conn.execute(
-            "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
-            "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
+def _read_backup_runtime_generations(
+    database_path: Path,
+) -> tuple[dict[str, int] | None, str | None]:
+    """Read the generation ledger from the copied database, never the live handle."""
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
         )
-        if row["page_key"] and not str(row["page_key"]).startswith("System_")
+        table_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'runtime_generations'"
+        ).fetchone()
+        if not table_exists:
+            return None, "backup-database-has-no-runtime-generation-registry"
+        rows = connection.execute(
+            "SELECT surface, generation FROM runtime_generations ORDER BY surface"
+        ).fetchall()
+        return {str(surface): int(generation) for surface, generation in rows}, None
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return None, f"backup-runtime-generation-read-failed:{exc}"
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _canonical_projection_consistency(
+    database_generations: dict[str, int] | None,
+    database_error: str | None,
+    projection_binding: dict | None,
+) -> dict:
+    covered = list(indexer.CANONICAL_PROJECTION_SURFACES)
+    scope = {
+        "verification_scope": "tracked-canonical-projection-surfaces",
+        "covered_surfaces": covered,
     }
+    if projection_binding is None:
+        return {
+            "status": "not_applicable",
+            "reason": "projection-pair-absent",
+            **scope,
+        }
+    if database_generations is None:
+        return {
+            "status": "unverifiable",
+            "reason": database_error or "backup-runtime-generations-unavailable",
+            **scope,
+        }
+    if projection_binding.get("status") != "verified":
+        return {
+            "status": "unverifiable",
+            "reason": projection_binding.get("reason")
+            or "projection-canonical-generation-unverifiable",
+            **scope,
+        }
+    expected = projection_binding["runtime_generations"]
+    observed = {
+        surface: database_generations.get(surface)
+        for surface in indexer.CANONICAL_PROJECTION_SURFACES
+    }
+    if any(value is None for value in observed.values()):
+        return {
+            "status": "unverifiable",
+            "reason": "backup-runtime-generation-coverage-incomplete",
+            **scope,
+            "projection_runtime_generations": expected,
+            "database_runtime_generations": observed,
+        }
+    if observed != expected:
+        return {
+            "status": "unverifiable",
+            "reason": "backup-and-projection-runtime-generations-do-not-match",
+            **scope,
+            "projection_runtime_generations": expected,
+            "database_runtime_generations": observed,
+        }
+    return {
+        "status": "verified",
+        "reason": "runtime-generations-match",
+        **scope,
+        "canonical_generation_token": projection_binding["token"],
+        "projection_runtime_generations": expected,
+        "database_runtime_generations": observed,
+    }
+
+
+def _wiki_keys() -> set[str]:
+    return {
+        page_key
+        for page_key, path in _wiki_path_map().items()
+        if path.name.casefold() not in EXCLUDED_WIKI_FILES
+        and not path.name.casefold().startswith("system_")
+    }
+
+
+def _canonical_keys(*, allow_initialize: bool = False) -> set[str]:
+    path = peek_db_path()
+    if not path.exists():
+        if not allow_initialize:
+            return set()
+        init_db()
+        conn = get_connection()
+        close_after = False
+    else:
+        schema_state = inspect_schema_migration_state(path)
+        if not schema_state["ready"]:
+            raise RuntimeError(
+                "database schema is not ready: "
+                + "; ".join(schema_state["issues"])
+            )
+        if allow_initialize:
+            init_db()
+            conn = get_connection()
+            close_after = False
+        else:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            close_after = True
+    try:
+        return {
+            row["page_key"]
+            for row in conn.execute(
+                "SELECT json_extract(data_json, '$.page_key') AS page_key "
+                "FROM entities WHERE json_extract(data_json, '$.page_key') "
+                "IS NOT NULL"
+            )
+            if row["page_key"]
+            and not str(row["page_key"]).startswith("System_")
+        }
+    finally:
+        if close_after:
+            conn.close()
 
 
 def _index_keys() -> set[str]:
     index_path = get_index_path()
     if not index_path.exists():
         return set()
-    data = json.loads(index_path.read_text(encoding="utf-8"))
+    data = load_index_snapshot(index_path)
     return {key for key in data.get("nodes", {}) if not str(key).startswith("System_")}
 
 
-def _diff_sets() -> dict[str, set[str]]:
+def _diff_sets(*, allow_initialize: bool = False) -> dict[str, set[str]]:
     wiki = _wiki_keys()
-    canonical = _canonical_keys()
+    canonical = _canonical_keys(allow_initialize=allow_initialize)
     index = _index_keys()
     return {
         "wiki": wiki,
@@ -93,26 +234,139 @@ def _diff_sets() -> dict[str, set[str]]:
     }
 
 
-def create_maintenance_backup(label: str = "maintenance") -> str:
-    """Create a consistent SQLite backup and copy recoverable projections."""
-    backup_dir = get_meta_dir() / "backups" / f"{label}_{_utc_stamp()}"
-    backup_dir.mkdir(parents=True, exist_ok=False)
+def _copy_projection_pair_to_backup(
+    backup_dir: Path,
+) -> tuple[list[str], str | None, dict | None]:
+    """Validate and copy one projection generation under the publish lock."""
+    index_path = get_index_path()
+    claim_graph_path = get_claim_graph_path()
+    legacy_claim_graph_path = get_legacy_claim_graph_path()
     copied: list[str] = []
-    if get_db_path().exists():
-        target = backup_dir / get_db_path().name
-        backup_database(target)
-        copied.append(target.name)
-    for path in [get_index_path(), get_claim_graph_path()]:
-        if Path(path).exists():
-            target = backup_dir / Path(path).name
-            shutil.copy2(path, target)
+    try:
+        with FileLock(str(index_path) + ".lock", timeout=15):
+            index_exists = index_path.exists()
+            claim_graph_exists = claim_graph_path.exists()
+            if not index_exists and not claim_graph_exists:
+                if legacy_claim_graph_path.exists():
+                    raise indexer.ProjectionPairContractError(
+                        "Legacy claim_topology.json cannot be backed up without a "
+                        "generation-bound index/claim-graph pair; run sync first."
+                    )
+                return copied, None, None
+            if index_exists != claim_graph_exists:
+                raise indexer.ProjectionPairContractError(
+                    "Index/claim-graph projection pair is incomplete; run sync before backup."
+                )
+
+            with open(index_path, "r", encoding="utf-8") as handle:
+                index_data = json.load(handle)
+            with open(claim_graph_path, "r", encoding="utf-8") as handle:
+                claim_graph_data = json.load(handle)
+            generation = indexer.validate_projection_pair(index_data, claim_graph_data)
+            manifest = index_data[indexer.PROJECTION_MANIFEST_KEY]
+            if "canonical_generation" not in manifest:
+                raise indexer.ProjectionPairContractError(
+                    "Legacy projection manifest has no canonical_generation; "
+                    "run a full rebuild before backup."
+                )
+            canonical_generation = indexer.projection_canonical_generation(
+                index_data,
+                claim_graph_data,
+            )
+
+            for path in (index_path, claim_graph_path):
+                target = backup_dir / path.name
+                shutil.copy2(path, target)
+                copied.append(target.name)
+
+            with open(backup_dir / index_path.name, "r", encoding="utf-8") as handle:
+                copied_index = json.load(handle)
+            with open(
+                backup_dir / claim_graph_path.name,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                copied_claim_graph = json.load(handle)
+            copied_generation = indexer.validate_projection_pair(
+                copied_index,
+                copied_claim_graph,
+            )
+            copied_canonical_generation = indexer.projection_canonical_generation(
+                copied_index,
+                copied_claim_graph,
+            )
+            if (
+                copied_generation != generation
+                or copied_canonical_generation != canonical_generation
+            ):
+                raise indexer.ProjectionPairContractError(
+                    "Copied projection generation changed during backup."
+                )
+            return copied, generation, copied_canonical_generation
+    except Timeout as exc:
+        raise TimeoutError(
+            f"Timeout while acquiring projection publish lock for {index_path}"
+        ) from exc
+
+
+def create_maintenance_backup(label: str = "maintenance") -> str:
+    """Publish a complete SQLite/projection backup from a private staging directory."""
+    backup_root = get_meta_dir() / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_name = f"{label}_{_utc_stamp()}"
+    backup_dir = backup_root / backup_name
+    stage_dir = backup_root / f".{backup_name}.{uuid.uuid4().hex}.tmp"
+    stage_dir.mkdir(parents=False, exist_ok=False)
+    copied: list[str] = []
+    database_generations = None
+    database_generation_error = "backup-database-absent"
+    try:
+        if get_db_path().exists():
+            target = stage_dir / get_db_path().name
+            backup_database(target)
             copied.append(target.name)
-    manifest = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "label": label,
-        "copied": copied,
-    }
-    (backup_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            database_generations, database_generation_error = (
+                _read_backup_runtime_generations(target)
+            )
+        (
+            projection_files,
+            projection_generation,
+            projection_canonical_generation,
+        ) = _copy_projection_pair_to_backup(stage_dir)
+        copied.extend(projection_files)
+        consistency = _canonical_projection_consistency(
+            database_generations,
+            database_generation_error,
+            projection_canonical_generation,
+        )
+        artifact_sha256 = {
+            name: hashlib.sha256((stage_dir / name).read_bytes()).hexdigest()
+            for name in sorted(copied)
+        }
+        manifest = {
+            "manifest_version": 3,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "label": label,
+            "copied": copied,
+            "artifact_sha256": artifact_sha256,
+            "database_runtime_generations": database_generations,
+            "database_runtime_generation_error": database_generation_error,
+            "projection_generation": projection_generation,
+            "projection_canonical_generation": projection_canonical_generation,
+            "canonical_projection_consistency": consistency,
+            "restorable_as_consistent_canonical_projection_snapshot": (
+                consistency["status"] == "verified"
+            ),
+            "complete": True,
+        }
+        (stage_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        stage_dir.replace(backup_dir)
+    except Exception:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
     return str(backup_dir)
 
 
@@ -138,13 +392,16 @@ def projection_diff_report(limit: int = 20) -> str:
 
 
 def _preview_backfill_pages(page_keys: list[str]) -> dict:
-    wiki_dir = get_wiki_dir()
+    wiki_paths = _wiki_path_map()
     valid = 0
     invalid: list[str] = []
     proposed_entities = 0
     proposed_claims = 0
     for page_key in page_keys:
-        path = wiki_dir / f"{page_key}.md"
+        path = wiki_paths.get(page_key)
+        if path is None:
+            invalid.append(f"{page_key}: projection file not found")
+            continue
         try:
             frontmatter, body, _ = read_markdown_file(path)
             extracted = extract_page_objects(str(path), frontmatter, body)
@@ -168,7 +425,7 @@ def _preview_backfill_pages(page_keys: list[str]) -> dict:
 
 def canonical_backfill_missing_wiki(dry_run: bool = True, limit: int = 50) -> str:
     """Backfill SQLite canonical rows from Wiki pages missing in canonical."""
-    diff = _diff_sets()
+    diff = _diff_sets(allow_initialize=not dry_run)
     page_keys = sorted(diff["missing_canonical"])[: max(1, int(limit))]
     preview = _preview_backfill_pages(page_keys)
     if dry_run:
@@ -191,8 +448,9 @@ def canonical_backfill_missing_wiki(dry_run: bool = True, limit: int = 50) -> st
     from vector_lake.mutation_coordinator import execute_mutation_batch
 
     mutations = []
+    wiki_paths = _wiki_path_map()
     for page_key in page_keys:
-        path = get_wiki_dir() / f"{page_key}.md"
+        path = wiki_paths[page_key]
         mutations.append({"filename": path.name, "content": path.read_text(encoding="utf-8")})
     _, detail = execute_mutation_batch(mutations, validation_mode="schema")
     return (
@@ -209,7 +467,7 @@ def _canonical_content_drift_candidates(limit: int = 0) -> dict:
     total_bytes = 0
     total_drift = 0
     selected_limit = max(0, int(limit))
-    for path in sorted(get_wiki_dir().glob("*.md")):
+    for path in sorted(iter_markdown_files(get_wiki_dir()), key=lambda path: path.name):
         page_key = path.stem
         if page_key.startswith("System_") or page_key not in canonical_versions:
             continue
@@ -518,11 +776,11 @@ def _evidence_foundation_backfill_candidates(limit: int = 500) -> dict:
     pending_pages = 0
     current_pages = 0
     selected_limit = max(0, int(limit))
-    for path in sorted(get_wiki_dir().glob("*.md")):
+    for path in sorted(iter_markdown_files(get_wiki_dir()), key=lambda path: path.name):
         if (
             not path.is_file()
-            or path.name in EXCLUDED_WIKI_FILES
-            or path.name.startswith("System_")
+            or path.name.casefold() in EXCLUDED_WIKI_FILES
+            or path.name.casefold().startswith("system_")
             or path.stem not in canonical_keys
         ):
             continue
@@ -624,7 +882,7 @@ def evidence_foundation_backfill(
 
 def rebuild_index_projection(dry_run: bool = True) -> str:
     """Rebuild index.json / FTS / claim_graph from SQLite canonical state."""
-    diff = _diff_sets()
+    diff = _diff_sets(allow_initialize=not dry_run)
     if dry_run:
         return (
             "[DRY RUN] Would rebuild index.json, wiki_search_index, and claim_graph.json "
@@ -648,7 +906,7 @@ def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None
     index_path = get_index_path()
     if not index_path.exists():
         return "index.json not found; run projection-rebuild-index first."
-    index_data = json.loads(index_path.read_text(encoding="utf-8"))
+    index_data = load_index_snapshot(index_path)
     result = embedding_backfill(
         index_data,
         dry_run=dry_run,
@@ -699,7 +957,9 @@ def _iso_datetime(value: str | None) -> str:
 
 
 def _frontmatter_from_entity(entity: dict) -> dict:
-    page_key = str(entity.get("page_key") or entity.get("source_page") or "").replace(".md", "")
+    page_key = _strip_markdown_suffix(
+        str(entity.get("page_key") or entity.get("source_page") or "")
+    )
     inferred_type = page_key.split("_", 1)[0].lower() if "_" in page_key else "concept"
     entity_type = str(entity.get("type") or entity.get("entity_type") or inferred_type or "concept").lower()
     categories = entity.get("categories") or [entity_type.capitalize()]
@@ -753,7 +1013,7 @@ def _body_from_entity(entity: dict, frontmatter: dict) -> str:
 
 def restore_missing_wiki_from_canonical(dry_run: bool = True, limit: int = 10) -> str:
     """Restore Markdown projection files for canonical rows whose Wiki page is missing."""
-    diff = _diff_sets()
+    diff = _diff_sets(allow_initialize=not dry_run)
     page_keys = sorted(diff["extra_canonical"])[: max(1, int(limit))]
     if dry_run:
         return (

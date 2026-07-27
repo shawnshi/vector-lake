@@ -19,6 +19,7 @@ from vector_lake.wiki_utils import (
     get_raw_dir,
     get_wiki_dir,
     get_index_path,
+    iter_markdown_files,
     validate_wiki_filename,
 )
 from vector_lake.purpose_contract import (
@@ -30,6 +31,12 @@ from vector_lake.purpose_contract import (
 )
 
 log = logging.getLogger("vector-lake-ingest")
+
+
+def _strip_markdown_suffix(value: str) -> str:
+    text = str(value)
+    return text[:-3] if text.casefold().endswith(".md") else text
+
 
 def list_ingest_tasks(limit: int = 20, include_queued: bool = True) -> str:
     """List ingest jobs that require operator or host-subagent action."""
@@ -140,6 +147,225 @@ def process_ingest_task_cleanup(limit: int = 20) -> dict:
     return result
 
 
+def _resolved_task_packet_path(value: str | Path) -> str:
+    return str(Path(value).resolve())
+
+
+def reconcile_orphan_ingest_task_packets(
+    dry_run: bool = True,
+    min_age_seconds: int = 86400,
+    limit: int = 0,
+) -> str:
+    """Preview or remove old ingest packets that no durable row references.
+
+    Only structurally valid ingest packets for known jobs are candidates. Current
+    job pointers, pending cleanup intents, recent packets, unknown jobs, and all
+    non-ingest task types remain untouched.
+    """
+    from vector_lake import db_store
+    try:
+        age_floor = int(min_age_seconds)
+        selected_limit = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cleanup age and limit must be integers") from exc
+    if age_floor < 0:
+        raise ValueError("min_age_seconds must be zero or greater")
+    if selected_limit < 0:
+        raise ValueError("limit must be zero or greater")
+
+
+    preview_error = ""
+    if dry_run:
+        conn, preview_error = _open_ingest_debt_preview_connection()
+        if conn is None:
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "scanned": 0,
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "removed": 0,
+                    "protected": {},
+                    "errors": [],
+                    "samples": [],
+                    "preview_error": preview_error,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+    else:
+        schema_connection, preview_error = _open_ingest_debt_preview_connection()
+        if schema_connection is None:
+            return json.dumps(
+                {
+                    "dry_run": False,
+                    "scanned": 0,
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "removed": 0,
+                    "protected": {},
+                    "errors": [],
+                    "samples": [],
+                    "preview_error": preview_error,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        schema_connection.close()
+        conn = db_store.get_connection()
+
+    jobs = {
+        str(row["job_id"]): dict(row)
+        for row in conn.execute(
+            "SELECT job_id, status, task_packet_path FROM jobs"
+        )
+    }
+    current_paths = {
+        _resolved_task_packet_path(row["task_packet_path"])
+        for row in jobs.values()
+        if row.get("task_packet_path")
+    }
+    pending_cleanup_paths = {
+        _resolved_task_packet_path(row["task_packet_path"])
+        for row in conn.execute(
+            "SELECT task_packet_path FROM ingest_task_cleanup "
+            "WHERE status <> 'completed'"
+        )
+        if row["task_packet_path"]
+    }
+    protected: Counter = Counter()
+    errors: list[str] = []
+    candidates: list[dict] = []
+    scanned = 0
+    now = datetime.now(timezone.utc)
+    task_root = get_extension_root() / "brain"
+    for packet_path in sorted(
+        task_root.glob("*/scratch/subagent_tasks/*.json"),
+        key=lambda path: str(path).casefold(),
+    ):
+        if not packet_path.is_file():
+            continue
+        scanned += 1
+        resolved = _resolved_task_packet_path(packet_path)
+        if resolved in current_paths:
+            protected["current_job_pointer"] += 1
+            continue
+        if resolved in pending_cleanup_paths:
+            protected["pending_cleanup"] += 1
+            continue
+        try:
+            packet = json.loads(packet_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            protected["unreadable"] += 1
+            errors.append(f"{packet_path}: {exc}")
+            continue
+        if not isinstance(packet, dict):
+            protected["invalid_payload"] += 1
+            continue
+        task_id = str(packet.get("task_id") or "")
+        if not task_id or task_id != packet_path.stem:
+            protected["invalid_identity"] += 1
+            continue
+        if str(packet.get("task_type") or "") != "ingest":
+            protected["non_ingest"] += 1
+            continue
+        metadata = packet.get("metadata")
+        job_id = (
+            str(metadata.get("job_id") or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        job = jobs.get(job_id)
+        if not job_id or job is None:
+            protected["unknown_job"] += 1
+            continue
+        try:
+            created_at = datetime.fromisoformat(
+                str(packet.get("created_at") or "").replace("Z", "+00:00")
+            )
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            protected["invalid_created_at"] += 1
+            continue
+        age_seconds = max(0, int((now - created_at).total_seconds()))
+        if age_seconds < age_floor:
+            protected["recent"] += 1
+            continue
+        candidates.append(
+            {
+                "path": resolved,
+                "task_id": task_id,
+                "job_id": job_id,
+                "job_status": str(job.get("status") or ""),
+                "age_seconds": age_seconds,
+            }
+        )
+
+    candidates.sort(key=lambda item: (item["age_seconds"], item["path"]), reverse=True)
+    candidate_count = len(candidates)
+    selected = candidates[:selected_limit] if selected_limit else candidates
+    result = {
+        "dry_run": bool(dry_run),
+        "scanned": scanned,
+        "candidate_count": candidate_count,
+        "selected_count": len(selected),
+        "removed": 0,
+        "protected": dict(sorted(protected.items())),
+        "errors": errors[:100],
+        "samples": [
+            {
+                "job_id": item["job_id"],
+                "job_status": item["job_status"],
+                "age_seconds": item["age_seconds"],
+                "path": item["path"],
+            }
+            for item in selected[:20]
+        ],
+        "preview_error": preview_error,
+    }
+    if dry_run:
+        conn.close()
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    from vector_lake.native_llm import remove_subagent_task
+
+    for item in selected:
+        with db_store.transaction(max_wait_seconds=5):
+            current = conn.execute(
+                "SELECT task_packet_path FROM jobs WHERE job_id = ?",
+                (item["job_id"],),
+            ).fetchone()
+            current_path = (
+                _resolved_task_packet_path(current["task_packet_path"])
+                if current is not None and current["task_packet_path"]
+                else ""
+            )
+            pending = conn.execute(
+                "SELECT 1 FROM ingest_task_cleanup "
+                "WHERE task_packet_path = ? AND status <> 'completed' LIMIT 1",
+                (item["path"],),
+            ).fetchone()
+            if current is None or current_path == item["path"] or pending is not None:
+                protected["changed_after_scan"] += 1
+                continue
+            try:
+                removed = remove_subagent_task(
+                    item["path"],
+                    expected_job_id=item["job_id"],
+                    expected_task_type="ingest",
+                    expected_task_id=item["task_id"],
+                )
+                result["removed"] += int(bool(removed))
+                if not removed:
+                    protected["missing_after_scan"] += 1
+            except (OSError, RuntimeError, ValueError) as exc:
+                errors.append(f"{item['path']}: {exc}")
+    result["protected"] = dict(sorted(protected.items()))
+    result["errors"] = errors[:100]
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 def _open_ingest_debt_preview_connection():
     """Open the existing state read-only; previews never initialize or migrate it."""
     from vector_lake import db_store
@@ -166,6 +392,7 @@ def _open_ingest_debt_preview_connection():
             "idempotency_key",
             "task_packet_path",
         },
+        "ingest_task_cleanup": {"task_packet_path", "status"},
         "processed_files": {"filepath", "file_hash"},
         "entities": {"data_json"},
     }
@@ -205,10 +432,12 @@ def _source_identity_index_from_connection(connection) -> dict[str, str]:
         ):
             items.append(item)
     wiki_dir = get_wiki_dir()
+    wiki_paths = {path.stem: path for path in iter_markdown_files(wiki_dir)}
     selected: dict[str, tuple[tuple[int, int, int, str], str]] = {}
     for entity in items:
-        page_key = str(entity.get("page_key") or "").strip().removesuffix(".md")
-        if not page_key or not (wiki_dir / f"{page_key}.md").is_file():
+        page_key = _strip_markdown_suffix(str(entity.get("page_key") or "").strip())
+        wiki_path = wiki_paths.get(page_key)
+        if not page_key or wiki_path is None:
             continue
         categories = {
             str(value).casefold()
@@ -240,7 +469,7 @@ def _source_identity_index_from_connection(connection) -> dict[str, str]:
             if current is None or rank[:3] > current[0][:3] or (
                 rank[:3] == current[0][:3] and rank[3] < current[0][3]
             ):
-                selected[identity] = (rank, f"{page_key}.md")
+                selected[identity] = (rank, wiki_path.name)
     return {
         identity: filename
         for identity, (_rank, filename) in selected.items()
@@ -406,7 +635,7 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
                 )
             else:
                 canonical_name = canonical_source_name(str(raw_path))
-        canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
+        canonical_key = _strip_markdown_suffix(canonical_name)
         refreshed_fields = {
             "filepath": str(raw_path),
             "hash": current_hash,
@@ -679,10 +908,12 @@ def _source_identity_index() -> dict[str, str]:
         {"status!=": "Merged", "type": "source"}
     )["items"].values()
     wiki_dir = get_wiki_dir()
+    wiki_paths = {path.stem: path for path in iter_markdown_files(wiki_dir)}
     selected: dict[str, tuple[tuple[int, int, int, str], str]] = {}
     for entity in items:
-        page_key = str(entity.get("page_key") or "").strip().removesuffix(".md")
-        if not page_key or not (wiki_dir / f"{page_key}.md").is_file():
+        page_key = _strip_markdown_suffix(str(entity.get("page_key") or "").strip())
+        wiki_path = wiki_paths.get(page_key)
+        if not page_key or wiki_path is None:
             continue
         categories = {
             str(value).casefold()
@@ -714,7 +945,7 @@ def _source_identity_index() -> dict[str, str]:
             if current is None or rank[:3] > current[0][:3] or (
                 rank[:3] == current[0][:3] and rank[3] < current[0][3]
             ):
-                selected[identity] = (rank, f"{page_key}.md")
+                selected[identity] = (rank, wiki_path.name)
     return {identity: filename for identity, (_rank, filename) in selected.items()}
 
 
@@ -1024,7 +1255,7 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
 
     submitted_names = {os.path.basename(str(item.get("filename", ""))) for item in files}
     source_content = str(source_item.get("content") or "").rstrip()
-    source_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
+    source_key = _strip_markdown_suffix(canonical_name)
     graph_heading = "## Graph Integration"
     if graph_heading not in source_content:
         source_content += f"\n\n{graph_heading}\n"
@@ -1154,7 +1385,7 @@ def requeue_legacy_ingest_jobs() -> int:
         canonical_name = str(payload.get("canonical_name") or "")
         if not filepath or not file_hash or not canonical_name or not Path(filepath).exists():
             continue
-        canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
+        canonical_key = _strip_markdown_suffix(canonical_name)
         payload["source_hash"] = governance_store.canonical_page_versions({canonical_key}).get(
             canonical_key,
             "",
@@ -1317,7 +1548,7 @@ def prepare_ingest_batch(batch_size: int = 5, candidate_paths: list[str] | None 
     source_identity_index = _source_identity_index()
     for filepath, file_hash, _processing_key in pending_files:
         canonical_name = canonical_source_name(filepath, source_identity_index)
-        canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
+        canonical_key = _strip_markdown_suffix(canonical_name)
         source_hash = governance_store.canonical_page_versions({canonical_key}).get(canonical_key, "")
         instructions = _build_ingest_instructions(filepath, file_hash, canonical_name)
 

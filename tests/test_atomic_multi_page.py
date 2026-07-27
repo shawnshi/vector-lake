@@ -11,11 +11,11 @@ from vector_lake.wiki_utils import get_wiki_dir, split_frontmatter
 
 def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
     wiki_dir = get_wiki_dir()
-    (wiki_dir / "Concept_Old.md").write_text(
+    (wiki_dir / "Concept_Old.MD").write_text(
         "---\ntitle: Old\naliases: []\n---\nOld body [[Concept_Old]].\n",
         encoding="utf-8",
     )
-    (wiki_dir / "Concept_Ref.md").write_text("ref [[Concept_Old]]", encoding="utf-8")
+    (wiki_dir / "Concept_Ref.MD").write_text("ref [[Concept_Old]]", encoding="utf-8")
     captured = []
 
     def fake_batch(mutations):
@@ -28,9 +28,9 @@ def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
     assert result.startswith("Successfully renamed")
     assert len(captured) == 1
     assert [item["filename"] for item in captured[0]] == [
-        "Concept_Old.md",
+        "Concept_Old.MD",
         "Concept_New.md",
-        "Concept_Ref.md",
+        "Concept_Ref.MD",
     ]
     assert captured[0][0]["is_delete"] is True
     assert "[[Concept_New|Old]]" in captured[0][2]["content"]
@@ -41,7 +41,7 @@ def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
 def test_batch_replace_links_commits_once(isolated_memory, monkeypatch):
     wiki_dir = get_wiki_dir()
     (wiki_dir / "Concept_A.md").write_text("[[Old]]", encoding="utf-8")
-    (wiki_dir / "Concept_B.md").write_text("x [[Old]] y", encoding="utf-8")
+    (wiki_dir / "Concept_B.MD").write_text("x [[Old]] y", encoding="utf-8")
     captured = []
 
     def fake_batch(mutations):

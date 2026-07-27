@@ -1,6 +1,10 @@
 import unittest
 import json
+import time
 from unittest.mock import patch
+
+import pytest
+from filelock import FileLock, Timeout
 from vector_lake.indexer import (
     MAX_EDGES_PER_NODE,
     _apply_graph_topology,
@@ -309,7 +313,7 @@ def test_full_index_rebuild_uses_shared_projection_publish_lock(
 
 
 def test_claim_graph_projection_has_independent_parity_and_refresh(isolated_memory):
-    from vector_lake import db_store
+    from vector_lake import db_store, governance_store
 
     db_store.init_db()
     claim = {
@@ -320,14 +324,22 @@ def test_claim_graph_projection_has_independent_parity_and_refresh(isolated_memo
         "evidence_ids": [],
         "subject_entity_ids": [],
         "updated_at": "2026-07-19T00:00:00+00:00",
+        "locator": {"page_key": "Concept_Graph-Refresh"},
     }
-    conn = db_store.get_connection()
-    with db_store.transaction():
-        conn.execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], claim["status"], json.dumps(claim), claim["updated_at"]),
+
+    def publish_claim():
+        governance_store.apply_change_set(
+            {
+                "affected_pages": ["Concept_Graph-Refresh.md"],
+                "proposed_entities": [],
+                "proposed_claims": [claim],
+                "proposed_evidence": [],
+                "proposed_source_updates": [],
+                "proposed_edges": [],
+            }
         )
+
+    publish_claim()
 
     refresh_claim_graph_projection()
     assert claim_graph_projection_parity()["missing_nodes"] == 0
@@ -344,11 +356,8 @@ def test_claim_graph_projection_has_independent_parity_and_refresh(isolated_memo
     assert claim_graph_projection_parity()["extra_edges"] == 0
 
     claim["claim_text"] = "Changed graph claim"
-    with db_store.transaction():
-        conn.execute(
-            "UPDATE claims SET claim_text = ?, data_json = ?, updated_at = ? WHERE claim_id = ?",
-            (claim["claim_text"], json.dumps(claim), "2026-07-19T01:00:00+00:00", claim["claim_id"]),
-        )
+    claim["updated_at"] = "2026-07-19T01:00:00+00:00"
+    publish_claim()
     drift = claim_graph_projection_parity()
     assert drift["missing_nodes"] == 1
     assert drift["extra_nodes"] == 1
@@ -382,17 +391,31 @@ def test_claim_graph_window_ignores_storage_timestamp_churn(isolated_memory):
             "subject_entity_ids": [],
         },
     ]
+    for claim, page_key in zip(
+        claims,
+        ("Concept_Business-Newer", "Concept_Business-Older"),
+    ):
+        claim["locator"] = {"page_key": page_key}
+    governance_store.apply_change_set(
+        {
+            "affected_pages": [
+                "Concept_Business-Newer.md",
+                "Concept_Business-Older.md",
+            ],
+            "proposed_entities": [],
+            "proposed_claims": claims,
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
     conn = db_store.get_connection()
     with db_store.transaction():
-        for claim, storage_time in zip(
-            claims,
-            ("2000-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00"),
-        ):
-            conn.execute(
-                "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (claim["claim_id"], claim["claim_text"], claim["status"], json.dumps(claim), storage_time),
-            )
+        conn.execute(
+            "UPDATE claims SET updated_at = CASE claim_id "
+            "WHEN 'claim_business_newer' THEN '2000-01-01T00:00:00+00:00' "
+            "ELSE '2099-01-01T00:00:00+00:00' END"
+        )
 
     before = governance_store.build_claim_graph_projection(limit_nodes=1)
     with db_store.transaction():
@@ -405,3 +428,272 @@ def test_claim_graph_window_ignores_storage_timestamp_churn(isolated_memory):
 
     assert [node["id"] for node in before["nodes"]] == ["claim_business_newer"]
     assert [node["id"] for node in after["nodes"]] == ["claim_business_newer"]
+
+
+def test_claim_graph_parity_does_not_wait_for_publish_lock(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import governance_store
+    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+
+    expected = {"nodes": [{"id": "claim"}], "edges": []}
+    monkeypatch.setattr(
+        governance_store,
+        "build_claim_graph_projection",
+        lambda: expected,
+    )
+    claim_graph_path = get_claim_graph_path()
+    claim_graph_path.parent.mkdir(parents=True, exist_ok=True)
+    claim_graph_path.write_text(json.dumps(expected), encoding="utf-8")
+
+    publish_lock = FileLock(str(get_index_path()) + ".lock")
+    publish_lock.acquire(timeout=0)
+    started = time.monotonic()
+    try:
+        parity = claim_graph_projection_parity()
+    finally:
+        elapsed = time.monotonic() - started
+        publish_lock.release()
+
+    assert elapsed < 0.25
+    assert parity["missing_nodes"] == 0
+    assert parity["extra_nodes"] == 0
+
+
+def test_projection_pair_publishes_shared_manifest_and_rotates_generation(
+    isolated_memory,
+):
+    from vector_lake import db_store, indexer
+    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+
+    db_store.init_db()
+    indexer.generate_index()
+
+    first_index = json.loads(get_index_path().read_text(encoding="utf-8"))
+    first_graph = json.loads(get_claim_graph_path().read_text(encoding="utf-8"))
+    first_generation = indexer.validate_projection_pair(first_index, first_graph)
+    first_binding = indexer.projection_canonical_generation(
+        first_index,
+        first_graph,
+    )
+    assert first_index[indexer.PROJECTION_MANIFEST_KEY] == first_graph[
+        indexer.PROJECTION_MANIFEST_KEY
+    ]
+    assert first_binding["status"] == "verified"
+    assert first_binding["runtime_generations"] == (
+        indexer.canonical_runtime_generation_snapshot()
+    )
+
+    indexer.refresh_claim_graph_projection()
+
+    refreshed_index = json.loads(get_index_path().read_text(encoding="utf-8"))
+    refreshed_graph = json.loads(
+        get_claim_graph_path().read_text(encoding="utf-8")
+    )
+    refreshed_generation = indexer.validate_projection_pair(
+        refreshed_index,
+        refreshed_graph,
+    )
+    refreshed_binding = indexer.projection_canonical_generation(
+        refreshed_index,
+        refreshed_graph,
+    )
+    assert refreshed_generation != first_generation
+    assert refreshed_binding == first_binding
+
+
+def test_projection_pair_rejects_tampered_canonical_generation_token(
+    isolated_memory,
+):
+    from vector_lake import db_store, indexer
+    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+
+    db_store.init_db()
+    indexer.generate_index()
+    index_data = json.loads(get_index_path().read_text(encoding="utf-8"))
+    claim_graph = json.loads(get_claim_graph_path().read_text(encoding="utf-8"))
+    index_data[indexer.PROJECTION_MANIFEST_KEY]["canonical_generation"][
+        "token"
+    ] = "tampered"
+    claim_graph[indexer.PROJECTION_MANIFEST_KEY]["canonical_generation"][
+        "token"
+    ] = "tampered"
+
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="token does not match",
+    ):
+        indexer.validate_projection_pair(index_data, claim_graph)
+
+
+def test_full_projection_rebuild_rejects_moving_canonical_generation(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import db_store, governance_store, indexer
+    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+
+    db_store.init_db()
+    real_builder = governance_store.build_claim_graph_projection
+
+    def mutate_during_build():
+        governance_store.upsert_entity(
+            "entity_racing_projection",
+            {
+                "entity_id": "entity_racing_projection",
+                "canonical_name": "Racing Projection",
+                "page_key": "Concept_Racing-Projection",
+            },
+        )
+        return real_builder()
+
+    monkeypatch.setattr(
+        governance_store,
+        "build_claim_graph_projection",
+        mutate_during_build,
+    )
+
+    with pytest.raises(
+        indexer.ProjectionCanonicalGenerationChanged,
+        match="generation changed",
+    ):
+        indexer.generate_index()
+
+    assert not get_index_path().exists()
+    assert not get_claim_graph_path().exists()
+
+
+def test_incremental_projection_marks_unproven_generation_unverifiable(
+    isolated_memory,
+):
+    from vector_lake import db_store, governance_store, indexer
+    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+
+    db_store.init_db()
+    indexer.generate_index()
+    governance_store.upsert_entity(
+        "entity_incremental_generation",
+        {
+            "entity_id": "entity_incremental_generation",
+            "canonical_name": "Incremental Generation",
+            "entity_type": "concept",
+            "page_key": "Concept_Incremental-Generation",
+        },
+    )
+
+    indexer.update_index_items(["Concept_Incremental-Generation.md"])
+
+    index_data = json.loads(get_index_path().read_text(encoding="utf-8"))
+    claim_graph = json.loads(get_claim_graph_path().read_text(encoding="utf-8"))
+    binding = indexer.projection_canonical_generation(index_data, claim_graph)
+    assert binding["status"] == "unverifiable"
+    assert binding["reason"] == (
+        "existing-index-generation-does-not-match-current-canonical-generation"
+    )
+
+
+def test_graph_reader_fails_closed_for_legacy_and_mismatched_projection_pairs(
+    isolated_memory,
+):
+    from vector_lake import indexer
+    from vector_lake.tool_graph import _read_projection_pair
+    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+
+    index_path = get_index_path()
+    claim_graph_path = get_claim_graph_path()
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps({"nodes": {}, "weighted_edges": []}),
+        encoding="utf-8",
+    )
+    claim_graph_path.write_text(
+        json.dumps({"nodes": [], "edges": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="Legacy index/claim-graph projections",
+    ):
+        _read_projection_pair(str(index_path), str(claim_graph_path))
+
+    index_manifest = {
+        "contract": indexer.PROJECTION_CONTRACT,
+        "version": indexer.PROJECTION_CONTRACT_VERSION,
+        "generation": "generation-index",
+        "published_at": "2026-07-27T00:00:00+00:00",
+    }
+    graph_manifest = {
+        **index_manifest,
+        "generation": "generation-graph",
+    }
+    index_path.write_text(
+        json.dumps({"nodes": {}, indexer.PROJECTION_MANIFEST_KEY: index_manifest}),
+        encoding="utf-8",
+    )
+    claim_graph_path.write_text(
+        json.dumps(
+            {"nodes": [], "edges": [], indexer.PROJECTION_MANIFEST_KEY: graph_manifest}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="generations do not match",
+    ):
+        _read_projection_pair(str(index_path), str(claim_graph_path))
+
+    claim_graph_path.write_text(
+        json.dumps(
+            {"nodes": [], "edges": [], indexer.PROJECTION_MANIFEST_KEY: index_manifest}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="no canonical_generation",
+    ):
+        _read_projection_pair(
+            str(index_path),
+            str(claim_graph_path),
+        )
+
+
+def test_graph_reader_observes_shared_publish_lock(isolated_memory):
+    from vector_lake import indexer
+    from vector_lake.tool_graph import _read_projection_pair
+    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+
+    index_path = get_index_path()
+    claim_graph_path = get_claim_graph_path()
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "contract": indexer.PROJECTION_CONTRACT,
+        "version": indexer.PROJECTION_CONTRACT_VERSION,
+        "generation": "locked-generation",
+        "published_at": "2026-07-27T00:00:00+00:00",
+    }
+    index_path.write_text(
+        json.dumps({"nodes": {}, indexer.PROJECTION_MANIFEST_KEY: manifest}),
+        encoding="utf-8",
+    )
+    claim_graph_path.write_text(
+        json.dumps(
+            {"nodes": [], "edges": [], indexer.PROJECTION_MANIFEST_KEY: manifest}
+        ),
+        encoding="utf-8",
+    )
+
+    publish_lock = FileLock(str(index_path) + ".lock")
+    publish_lock.acquire(timeout=0)
+    try:
+        with pytest.raises(Timeout):
+            _read_projection_pair(
+                str(index_path),
+                str(claim_graph_path),
+                lock_timeout=0,
+            )
+    finally:
+        publish_lock.release()

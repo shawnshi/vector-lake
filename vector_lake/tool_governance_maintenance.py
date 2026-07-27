@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import shutil
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -27,6 +28,7 @@ from vector_lake.wiki_utils import (
     WIKI_LINK_PATTERN,
     get_wiki_dir,
     get_memory_dir,
+    iter_markdown_files,
     iter_wiki_link_matches,
     markdown_fenced_code_spans,
     read_markdown_file,
@@ -40,8 +42,32 @@ _TOPOLOGY_STATUS = "acknowledged-orphan"
 _MANAGED_STATUSES = {"acknowledged"}
 
 
+def _strip_markdown_suffix(value: str) -> str:
+    text = str(value)
+    return text[:-3] if text.casefold().endswith(".md") else text
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def operational_memory_search_index_maintenance(
+    dry_run: bool = True,
+    batch_size: int = 256,
+) -> str:
+    """Preview derived-index status or explicitly advance one bounded batch."""
+    before = governance_store.operational_memory_search_index_status()
+    result = {
+        "dry_run": bool(dry_run),
+        "batch_size": max(0, int(batch_size)),
+        "before": before,
+    }
+    if not dry_run:
+        result["maintenance"] = governance_store.maintain_operational_memory_search_index(
+            batch_size=batch_size,
+        )
+        result["after"] = governance_store.operational_memory_search_index_status()
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 def cleanup_operational_memory(dry_run: bool = True, limit: int = 0) -> str:
@@ -52,6 +78,182 @@ def cleanup_operational_memory(dry_run: bool = True, limit: int = 0) -> str:
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
+
+_HISTORY_RETENTION_REQUIRED_TABLES = frozenset(
+    {
+        "change_sets",
+        "change_set_idempotency",
+        "governance_queue",
+        "jobs",
+        "ingest_task_cleanup",
+        "mutation_outbox",
+        "claim_versions",
+        "evidence_versions",
+        "claims",
+        "evidence",
+    }
+)
+
+
+def _validate_history_retention_options(
+    *,
+    ttl_days: int,
+    batch_size: int,
+    keep_change_sets: int,
+    keep_terminal_jobs: int,
+    keep_terminal_outbox: int,
+    keep_versions_per_family: int,
+) -> dict[str, int]:
+    options = {
+        "ttl_days": int(ttl_days),
+        "batch_size": int(batch_size),
+        "keep_change_sets": int(keep_change_sets),
+        "keep_terminal_jobs": int(keep_terminal_jobs),
+        "keep_terminal_outbox": int(keep_terminal_outbox),
+        "keep_versions_per_family": int(keep_versions_per_family),
+    }
+    if options["ttl_days"] < 1:
+        raise ValueError("ttl_days must be positive")
+    if not 1 <= options["batch_size"] <= 10_000:
+        raise ValueError("batch_size must be between 1 and 10000")
+    for name in (
+        "keep_change_sets",
+        "keep_terminal_jobs",
+        "keep_terminal_outbox",
+    ):
+        if options[name] < 0:
+            raise ValueError(f"{name} must be zero or positive")
+    if options["keep_versions_per_family"] < 1:
+        raise ValueError("keep_versions_per_family must be positive")
+    return options
+
+
+def _history_retention_plan(
+    conn: sqlite3.Connection,
+    *,
+    cutoff: str,
+    options: dict[str, int],
+) -> dict:
+    tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = sorted(_HISTORY_RETENTION_REQUIRED_TABLES - tables)
+    if missing:
+        raise RuntimeError(f"schema_not_ready:missing_tables:{','.join(missing)}")
+    return governance_store.plan_history_retention(
+        conn,
+        cutoff=cutoff,
+        batch_size=options["batch_size"],
+        keep_change_sets=options["keep_change_sets"],
+        keep_terminal_jobs=options["keep_terminal_jobs"],
+        keep_terminal_outbox=options["keep_terminal_outbox"],
+        keep_versions_per_family=options["keep_versions_per_family"],
+    )
+
+
+def _public_history_retention_result(
+    *,
+    dry_run: bool,
+    schema_state: dict,
+    plan: dict | None = None,
+    deleted_counts: dict[str, int] | None = None,
+    preview_error: str | None = None,
+) -> str:
+    result = {
+        "dry_run": bool(dry_run),
+        "applied": not dry_run and preview_error is None,
+        "schema_state": schema_state,
+    }
+    if plan is not None:
+        selected = plan.get("selected_ids") or {}
+        result.update(
+            {key: value for key, value in plan.items() if key != "selected_ids"}
+        )
+        result["selected_samples"] = {
+            table_name: list(values)[:20]
+            for table_name, values in selected.items()
+        }
+    if deleted_counts is not None:
+        result["deleted_counts"] = deleted_counts
+    if preview_error is not None:
+        result["preview_error"] = preview_error
+    return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def history_retention_maintenance(
+    dry_run: bool = True,
+    ttl_days: int = 30,
+    batch_size: int = 500,
+    keep_change_sets: int = 1000,
+    keep_terminal_jobs: int = 1000,
+    keep_terminal_outbox: int = 1000,
+    keep_versions_per_family: int = 2,
+) -> str:
+    """Preview or explicitly apply one bounded, reference-safe retention batch."""
+    options = _validate_history_retention_options(
+        ttl_days=ttl_days,
+        batch_size=batch_size,
+        keep_change_sets=keep_change_sets,
+        keep_terminal_jobs=keep_terminal_jobs,
+        keep_terminal_outbox=keep_terminal_outbox,
+        keep_versions_per_family=keep_versions_per_family,
+    )
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=options["ttl_days"])
+    ).isoformat()
+    path = db_store.peek_db_path() if dry_run else db_store.get_db_path()
+
+    if dry_run:
+        schema_state = db_store.inspect_schema_migration_state(path)
+        if not schema_state["ready"]:
+            return _public_history_retention_result(
+                dry_run=True,
+                schema_state=schema_state,
+                preview_error=f"schema_not_ready:{schema_state['status']}",
+            )
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            plan = _history_retention_plan(conn, cutoff=cutoff, options=options)
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            return _public_history_retention_result(
+                dry_run=True,
+                schema_state=schema_state,
+                preview_error=str(exc),
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+        return _public_history_retention_result(
+            dry_run=True,
+            schema_state=schema_state,
+            plan=plan,
+        )
+
+    db_store.init_db()
+    schema_state = db_store.inspect_schema_migration_state(path)
+    if not schema_state["ready"]:
+        raise RuntimeError(f"schema_not_ready:{schema_state['status']}")
+    with db_store.transaction():
+        conn = db_store.get_connection()
+        plan = _history_retention_plan(conn, cutoff=cutoff, options=options)
+        deleted_counts = governance_store.apply_history_retention_plan(conn, plan)
+    schema_state = db_store.inspect_schema_migration_state(path)
+    return _public_history_retention_result(
+        dry_run=False,
+        schema_state=schema_state,
+        plan=plan,
+        deleted_counts=deleted_counts,
+    )
 
 def retire_legacy_topology_queue(dry_run: bool = True) -> dict:
     """Retire old indexer-generated naming work without touching human decisions."""
@@ -115,10 +317,14 @@ def _stable_item_id(prefix: str, value: str) -> str:
 
 
 def _wiki_files() -> list[Path]:
+    excluded = {"index.md", "log.md", "overview.md"}
     return sorted(
-        path
-        for path in get_wiki_dir().glob("*.md")
-        if path.is_file() and path.name not in {"index.md", "log.md", "overview.md"}
+        (
+            path
+            for path in iter_markdown_files(get_wiki_dir())
+            if path.name.casefold() not in excluded
+        ),
+        key=lambda path: path.name,
     )
 
 
@@ -216,7 +422,7 @@ def analyze_broken_link_governance(
     for path in _wiki_files():
         _, _, content = read_markdown_file(path)
         for match in iter_wiki_link_matches(content):
-            target = match.group(1).strip().replace(".md", "")
+            target = _strip_markdown_suffix(match.group(1).strip())
             if not target or _TEMPORAL_LINK.fullmatch(target):
                 continue
             if _resolve_link_target(target, exact_map, normalized_map):
@@ -324,7 +530,7 @@ def repair_broken_link_governance(
     changed_paths: list[Path] = []
 
     def replace(match: re.Match) -> str:
-        target = match.group(1).strip().replace(".md", "")
+        target = _strip_markdown_suffix(match.group(1).strip())
         label = match.group(2)
         if target in mapping:
             mapped = mapping[target]
@@ -444,7 +650,7 @@ def _unreviewed_orphans() -> list[Path]:
         frontmatter, _, content = read_markdown_file(path)
         parsed[path] = frontmatter
         for match in iter_wiki_link_matches(content):
-            target = match.group(1).strip().replace(".md", "")
+            target = _strip_markdown_suffix(match.group(1).strip())
             resolved = _resolve_link_target(target, exact_map, normalized_map)
             if resolved:
                 inbound[resolved] += 1
@@ -604,8 +810,11 @@ def _source_projection_exists(source: dict) -> bool:
     page = str(source.get("canonical_source_page") or "").strip()
     if not page:
         return False
-    filename = page if page.endswith(".md") else f"{page}.md"
-    return (get_wiki_dir() / filename).is_file()
+    page_key = _strip_markdown_suffix(page)
+    return any(
+        path.stem == page_key
+        for path in iter_markdown_files(get_wiki_dir())
+    )
 
 
 def classify_orphan_source_debt(dry_run: bool = True) -> dict:
@@ -754,7 +963,7 @@ def restore_fenced_code_from_backup(
     missing = {str(item["target"]) for item in report.get("missing_targets", [])}
 
     def old_repair(match: re.Match) -> str:
-        target = match.group(1).strip().replace(".md", "")
+        target = _strip_markdown_suffix(match.group(1).strip())
         label = match.group(2)
         if target in mapping:
             return f"[[{mapping[target]}|{label}]]" if label else f"[[{mapping[target]}]]"
@@ -765,7 +974,7 @@ def restore_fenced_code_from_backup(
     mutations = []
     changed_paths = []
     restored_blocks = 0
-    for original_path in sorted(source_root.glob("*.md")):
+    for original_path in sorted(iter_markdown_files(source_root), key=lambda path: path.name):
         live_path = get_wiki_dir() / original_path.name
         if not live_path.exists():
             continue
@@ -838,10 +1047,10 @@ def reconcile_missing_link_items_from_backup(
     items = [(str(row["item_id"]), json.loads(row["data_json"])) for row in rows]
     target_items = {str(item.get("target_label") or ""): (item_id, item) for item_id, item in items}
     occurrences: dict[str, dict] = defaultdict(lambda: {"count": 0, "files": set()})
-    for path in sorted(source_root.glob("*.md")):
+    for path in sorted(iter_markdown_files(source_root), key=lambda path: path.name):
         content = path.read_text(encoding="utf-8")
         for match in iter_wiki_link_matches(content):
-            target = match.group(1).strip().replace(".md", "")
+            target = _strip_markdown_suffix(match.group(1).strip())
             if target not in target_items:
                 continue
             occurrences[target]["count"] += 1

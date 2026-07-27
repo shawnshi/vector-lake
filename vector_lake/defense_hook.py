@@ -13,7 +13,7 @@ def verify_asset(content: str, filename: str, frontmatter: dict, index_path: Pat
         validate_schema(frontmatter, content, filename, index_path)
         
         # Unified PurposeGate: Enforce strategic scope and evidence tier on all wiki content
-        if filename.endswith(".md") and not filename.startswith("System_") and not filename.startswith("Orphan_"):
+        if filename.casefold().endswith(".md") and not filename.startswith("System_") and not filename.startswith("Orphan_"):
             contract = load_purpose_contract()
             item = {"filename": filename, "content": content}
             validate_ingest_payload([item], contract)

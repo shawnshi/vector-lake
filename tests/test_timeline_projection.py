@@ -249,3 +249,104 @@ def test_apply_change_set_rolls_back_claim_when_timeline_projection_fails(isolat
     conn = db_store.get_connection()
     assert conn.execute("SELECT COUNT(*) FROM claims WHERE claim_id = ?", (claim["claim_id"],)).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM timeline_events").fetchone()[0] == 0
+
+
+def test_timeline_parity_detects_same_id_payload_drift(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    current = _claim("claim_payload_drift", "Source_Drift", "Canonical payload")
+    _apply_page("Source_Drift", [current])
+    event_id = conn.execute("SELECT id FROM timeline_events").fetchone()["id"]
+
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE timeline_events SET description = ?, action = ? WHERE id = ?",
+            ("Stale projected payload", "stale-action", event_id),
+        )
+
+    assert timeline_projection_parity() == {
+        "canonical": 1,
+        "projection": 1,
+        "missing": 1,
+        "extra": 1,
+    }
+    output = search_timeline_events(limit=10)
+    assert "Canonical payload" in output
+    assert "Stale projected payload" not in output
+
+
+def test_timeline_parity_ignores_extraction_timestamp_drift(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    current = _claim("claim_extracted_at", "Source_ExtractedAt", "Stable payload")
+    _apply_page("Source_ExtractedAt", [current])
+
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE timeline_events SET extracted_at = ?",
+            ("2000-01-01T00:00:00+00:00",),
+        )
+
+    assert timeline_projection_parity() == {
+        "canonical": 1,
+        "projection": 1,
+        "missing": 0,
+        "extra": 0,
+    }
+
+
+def test_timeline_dirty_fallback_filters_by_canonical_entity_fields(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    entity = {
+        "entity_id": "entity_acme",
+        "canonical_name": "Acme Hospital",
+        "title": "Acme Medical Center",
+        "page_key": "Institution_Acme",
+        "aliases": ["Acme Alias"],
+        "locator": {"page_key": "Institution_Acme"},
+    }
+    claim = _claim(
+        "claim_entity_fallback",
+        "Source_EntityFallback",
+        "Canonical event without a display name in its text",
+    )
+    claim["subject_entity_ids"] = [entity["entity_id"]]
+
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                entity["entity_id"],
+                entity["canonical_name"],
+                json.dumps(entity),
+                "2026-07-14T00:00:00+00:00",
+            ),
+        )
+    _apply_page("Source_EntityFallback", [claim])
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE timeline_events SET description = ?",
+            ("Dirty projected event",),
+        )
+
+    for search_term in (
+        "Acme Hospital",
+        "Acme Medical Center",
+        "Acme Alias",
+        "Institution_Acme",
+        "Source_EntityFallback",
+    ):
+        output = search_timeline_events(entity_name=search_term, limit=5)
+        assert "Canonical event without a display name in its text" in output
+        assert "Dirty projected event" not in output
+        assert "no such column" not in output
+
+    assert (
+        search_timeline_events(entity_name="Unrelated Entity", limit=5)
+        == "No timeline events found matching the criteria."
+    )

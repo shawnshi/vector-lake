@@ -17,12 +17,6 @@ from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wik
 
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
-try:
-    import networkx as nx
-    from community import community_louvain
-except ImportError:
-    nx = None
-    community_louvain = None
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -57,6 +51,31 @@ INDEX_PARITY_FIELDS = (
     "sources", "tension_edges", "links", "outbound_links", "triples", "updated",
     "updated_at",
 )
+PROJECTION_MANIFEST_KEY = "projection_manifest"
+PROJECTION_CONTRACT = "index-claim-graph-pair"
+PROJECTION_CONTRACT_VERSION = 1
+
+CANONICAL_PROJECTION_SURFACES = (
+    "change_sets",
+    "claim_graph_edges",
+    "claims",
+    "entities",
+    "evidence",
+    "governance_queue",
+    "operational_memory",
+    "page_graph_edges",
+    "sources",
+)
+CANONICAL_GENERATION_ALGORITHM = "runtime-generations-sha256-v1"
+
+def _load_louvain_runtime():
+    try:
+        import networkx as nx
+        from community import community_louvain
+    except ImportError:
+        return None, None
+    return nx, community_louvain
+
 
 
 def _bounded_node_edge_candidates(
@@ -73,13 +92,16 @@ def _bounded_node_edge_candidates(
     ]
 
 
+def _strip_markdown_suffix(value: str) -> str:
+    text = str(value)
+    return text[:-3] if text.casefold().endswith(".md") else text
+
+
 def _normalize_graph_source(source: object) -> str:
     value = str(source or "").strip().replace("\\", "/")
     if value.startswith("[[") and value.endswith("]]" ):
         value = value[2:-2].split("|", 1)[0]
-    value = value.rsplit("/", 1)[-1]
-    if value.lower().endswith(".md"):
-        value = value[:-3]
+    value = _strip_markdown_suffix(value.rsplit("/", 1)[-1])
     return re.sub(r"[\W_]+", "_", value.lower(), flags=re.UNICODE).strip("_")
 
 
@@ -126,7 +148,8 @@ def index_projection_matches_canonical(
     page_keys = {
         filename[:-3]
         for filename in filenames
-        if filename.endswith(".md") and not filename.startswith("System_")
+        if filename.casefold().endswith(".md")
+        and not filename.casefold().startswith("system_")
     }
     if not page_keys or not get_index_path().exists():
         return False
@@ -389,7 +412,7 @@ def _prune_weighted_edges(
     return pruned
 
 
-def _write_index(output_path: str, index_data: dict):
+def _prepare_index_payload(index_data: dict):
     removed = _strip_legacy_embedded_payloads(index_data)
     if removed:
         log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
@@ -397,11 +420,318 @@ def _write_index(output_path: str, index_data: dict):
         index_data.get("weighted_edges") or [],
         set((index_data.get("nodes") or {}).keys()),
     )
+
+
+def _write_index(output_path: str, index_data: dict):
+    _prepare_index_payload(index_data)
+
     _write_json_payload(output_path, index_data)
 
 
 def _write_claim_graph(output_path: str, claim_graph_data: dict):
     _write_json_payload(output_path, claim_graph_data)
+
+
+class ProjectionPairContractError(RuntimeError):
+    """Raised when index and claim-graph projections cannot form one snapshot."""
+
+
+class ProjectionCanonicalGenerationChanged(RuntimeError):
+    """Raised when canonical rows change while a projection is materialized."""
+
+
+def canonical_runtime_generation_snapshot() -> dict[str, int]:
+    """Read the tracked canonical generations used by the projection pair."""
+    connection = db_store.get_connection()
+    dirty_reader = getattr(connection, "generation_dirty_snapshot", None)
+    if callable(dirty_reader):
+        dirty_surfaces = set(dirty_reader())
+        if dirty_surfaces.intersection(CANONICAL_PROJECTION_SURFACES):
+            raise ProjectionPairContractError(
+                "Cannot bind a projection to uncommitted canonical mutations."
+            )
+    placeholders = ", ".join("?" for _ in CANONICAL_PROJECTION_SURFACES)
+    rows = connection.execute(
+        f"SELECT surface, generation FROM runtime_generations "
+        f"WHERE surface IN ({placeholders})",
+        CANONICAL_PROJECTION_SURFACES,
+    ).fetchall()
+    snapshot = {str(row["surface"]): int(row["generation"]) for row in rows}
+    missing = set(CANONICAL_PROJECTION_SURFACES) - set(snapshot)
+    if missing:
+        raise ProjectionPairContractError(
+            "Canonical runtime-generation registry is incomplete: "
+            + ", ".join(sorted(missing))
+        )
+    return {
+        surface: snapshot[surface]
+        for surface in CANONICAL_PROJECTION_SURFACES
+    }
+
+
+def _canonical_generation_token(snapshot: dict[str, int]) -> str:
+    payload = json.dumps(
+        snapshot,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _verified_canonical_generation(snapshot: dict[str, int]) -> dict:
+    normalized = {
+        surface: int(snapshot[surface])
+        for surface in CANONICAL_PROJECTION_SURFACES
+    }
+    return {
+        "status": "verified",
+        "algorithm": CANONICAL_GENERATION_ALGORITHM,
+        "token": _canonical_generation_token(normalized),
+        "runtime_generations": normalized,
+    }
+
+
+def _unverifiable_canonical_generation(reason: str) -> dict:
+    return {
+        "status": "unverifiable",
+        "algorithm": CANONICAL_GENERATION_ALGORITHM,
+        "token": None,
+        "runtime_generations": {},
+        "reason": str(reason),
+    }
+
+
+def _validate_canonical_generation_binding(manifest: dict) -> dict:
+    binding = manifest.get("canonical_generation")
+    if binding is None:
+        return _unverifiable_canonical_generation(
+            "legacy-projection-manifest-has-no-canonical-generation"
+        )
+    if not isinstance(binding, dict):
+        raise ProjectionPairContractError(
+            "Projection canonical-generation binding is malformed."
+        )
+    status = binding.get("status")
+    if (
+        binding.get("algorithm") != CANONICAL_GENERATION_ALGORITHM
+        or status not in {"verified", "unverifiable"}
+    ):
+        raise ProjectionPairContractError(
+            "Unsupported projection canonical-generation binding."
+        )
+    if status == "unverifiable":
+        if (
+            binding.get("token") is not None
+            or binding.get("runtime_generations") not in ({}, None)
+            or not isinstance(binding.get("reason"), str)
+            or not binding["reason"]
+        ):
+            raise ProjectionPairContractError(
+                "Unverifiable projection canonical-generation binding is malformed."
+            )
+        return dict(binding)
+
+    snapshot = binding.get("runtime_generations")
+    if not isinstance(snapshot, dict) or set(snapshot) != set(
+        CANONICAL_PROJECTION_SURFACES
+    ):
+        raise ProjectionPairContractError(
+            "Verified projection canonical-generation coverage is incomplete."
+        )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in snapshot.values()
+    ):
+        raise ProjectionPairContractError(
+            "Verified projection canonical-generation values are invalid."
+        )
+    normalized = {
+        surface: snapshot[surface]
+        for surface in CANONICAL_PROJECTION_SURFACES
+    }
+    if binding.get("token") != _canonical_generation_token(normalized):
+        raise ProjectionPairContractError(
+            "Projection canonical-generation token does not match its snapshot."
+        )
+    return {
+        "status": "verified",
+        "algorithm": CANONICAL_GENERATION_ALGORITHM,
+        "token": binding["token"],
+        "runtime_generations": normalized,
+    }
+
+
+def _new_projection_manifest(canonical_generation: dict | None = None) -> dict:
+    candidate = (
+        canonical_generation
+        if canonical_generation is not None
+        else _unverifiable_canonical_generation(
+            "publisher-did-not-prove-full-canonical-generation"
+        )
+    )
+    normalized = _validate_canonical_generation_binding(
+        {"canonical_generation": candidate}
+    )
+    return {
+        "contract": PROJECTION_CONTRACT,
+        "version": PROJECTION_CONTRACT_VERSION,
+        "generation": uuid.uuid4().hex,
+        "published_at": _utc_now(),
+        "canonical_generation": normalized,
+    }
+
+
+def validate_projection_pair(index_data: dict, claim_graph_data: dict) -> str:
+    """Return the shared generation or reject a legacy/inconsistent pair.
+
+    Legacy readers fail closed; the next generate/refresh publish upgrades both files.
+    """
+    index_manifest = index_data.get(PROJECTION_MANIFEST_KEY)
+    graph_manifest = claim_graph_data.get(PROJECTION_MANIFEST_KEY)
+    if index_manifest is None and graph_manifest is None:
+        raise ProjectionPairContractError(
+            "Legacy index/claim-graph projections have no shared generation; "
+            "run sync or rebuild the index once to migrate them."
+        )
+    if not isinstance(index_manifest, dict) or not isinstance(graph_manifest, dict):
+        raise ProjectionPairContractError(
+            "Index/claim-graph projection manifest is missing or malformed; "
+            "run sync to rebuild both projections."
+        )
+    if index_manifest != graph_manifest:
+        raise ProjectionPairContractError(
+            "Index and claim-graph projection generations do not match; "
+            "run sync to rebuild both projections."
+        )
+    if (
+        index_manifest.get("contract") != PROJECTION_CONTRACT
+        or index_manifest.get("version") != PROJECTION_CONTRACT_VERSION
+        or not isinstance(index_manifest.get("generation"), str)
+        or not index_manifest["generation"]
+        or not isinstance(index_manifest.get("published_at"), str)
+        or not index_manifest["published_at"]
+    ):
+        raise ProjectionPairContractError(
+            "Unsupported index/claim-graph projection manifest; "
+            "run sync to migrate both projections."
+        )
+    _validate_canonical_generation_binding(index_manifest)
+    return index_manifest["generation"]
+
+
+def projection_canonical_generation(
+    index_data: dict,
+    claim_graph_data: dict,
+) -> dict:
+    """Return the pair's validated canonical binding, including legacy uncertainty."""
+    validate_projection_pair(index_data, claim_graph_data)
+    return _validate_canonical_generation_binding(
+        index_data[PROJECTION_MANIFEST_KEY]
+    )
+
+
+def _canonical_generation_for_existing_index(
+    index_data: dict,
+    before: dict[str, int],
+    after: dict[str, int],
+) -> dict:
+    if before != after:
+        return _unverifiable_canonical_generation(
+            "canonical-generation-changed-during-projection-refresh"
+        )
+    manifest = index_data.get(PROJECTION_MANIFEST_KEY)
+    if not isinstance(manifest, dict):
+        return _unverifiable_canonical_generation(
+            "existing-index-has-no-valid-projection-manifest"
+        )
+    existing = _validate_canonical_generation_binding(manifest)
+    if (
+        existing["status"] == "verified"
+        and existing["runtime_generations"] == before
+    ):
+        return existing
+    return _unverifiable_canonical_generation(
+        "existing-index-generation-does-not-match-current-canonical-generation"
+    )
+
+
+def _cleanup_projection_stages(*stage_paths: str):
+    for stage_path in stage_paths:
+        try:
+            os.remove(stage_path)
+        except FileNotFoundError:
+            pass
+
+
+def _stage_projection_pair(
+    output_path: str,
+    index_data: dict,
+    claim_graph_data: dict,
+    canonical_generation: dict | None = None,
+) -> tuple[str, str, dict]:
+    """Serialize both files with one generation before either is published."""
+    manifest = _new_projection_manifest(canonical_generation)
+    index_data[PROJECTION_MANIFEST_KEY] = dict(manifest)
+    claim_graph_data[PROJECTION_MANIFEST_KEY] = dict(manifest)
+    _prepare_index_payload(index_data)
+
+    claim_graph_path = str(get_claim_graph_path())
+    stage_suffix = f".{manifest['generation']}.tmp"
+    tmp_output = output_path + stage_suffix
+    tmp_claim = claim_graph_path + stage_suffix
+    try:
+        _write_json_stage(tmp_claim, claim_graph_data)
+        _write_json_stage(tmp_output, index_data)
+    except Exception:
+        _cleanup_projection_stages(tmp_claim, tmp_output)
+        raise
+    return tmp_output, tmp_claim, manifest
+
+
+def _replace_projection_stage(stage_path: str, output_path: str):
+    for attempt in range(5):
+        try:
+            os.replace(stage_path, output_path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1 * (2 ** attempt))
+
+
+def _publish_staged_projection_pair(
+    output_path: str,
+    tmp_output: str,
+    tmp_claim: str,
+):
+    """Publish graph first and index last as the pair's commit marker."""
+    claim_graph_path = str(get_claim_graph_path())
+    for staged_path in (tmp_claim, tmp_output):
+        if not os.path.exists(staged_path):
+            raise FileNotFoundError(
+                f"Missing staged projection file before publish: {staged_path}"
+            )
+    try:
+        _replace_projection_stage(tmp_claim, claim_graph_path)
+        _replace_projection_stage(tmp_output, output_path)
+    finally:
+        _cleanup_projection_stages(tmp_claim, tmp_output)
+
+
+def _publish_projection_pair(
+    output_path: str,
+    index_data: dict,
+    claim_graph_data: dict,
+    canonical_generation: dict | None = None,
+) -> dict:
+    tmp_output, tmp_claim, manifest = _stage_projection_pair(
+        output_path,
+        index_data,
+        claim_graph_data,
+        canonical_generation,
+    )
+    _publish_staged_projection_pair(output_path, tmp_output, tmp_claim)
+    return manifest
 
 
 def _mark_graph_dirty(index_data: dict, reason: str):
@@ -529,7 +859,7 @@ def _parse_wiki_node(filepath: str, node_key: str):
     
     for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", clean_body):
         predicate = match.group(1).strip()
-        target = match.group(2).split("|")[0].strip().replace(".md", "")
+        target = _strip_markdown_suffix(match.group(2).split("|")[0].strip())
         if target:
             links.add(target)
             triples.append({"predicate": predicate, "target": target})
@@ -1000,7 +1330,10 @@ def _apply_graph_topology(index_data: dict):
     components.sort(key=lambda members: (-len(members), members[0] if members else ""))
 
     raw_partition: dict[str, object] = {}
-    if nx is not None and community_louvain is not None and index_data["weighted_edges"]:
+    nx, community_louvain = (
+        _load_louvain_runtime() if index_data["weighted_edges"] else (None, None)
+    )
+    if nx is not None and community_louvain is not None:
         graph = nx.Graph()
         graph.add_nodes_from(node_keys)
         graph.add_weighted_edges_from(
@@ -1085,6 +1418,7 @@ def _generate_index_unlocked(skip_embeddings: bool = True):
     index_data = _empty_index_data()
     from vector_lake.db_store import get_connection
     conn = get_connection()
+    canonical_before = canonical_runtime_generation_snapshot()
 
     # Read from canonical SQLite instead of Markdown files
     rows = conn.execute("SELECT entity_id, data_json FROM entities").fetchall()
@@ -1123,29 +1457,30 @@ def _generate_index_unlocked(skip_embeddings: bool = True):
     index_data["schema_version"] = "8.0"
 
     output_path = str(get_index_path())
-    claim_graph_path = str(get_claim_graph_path())
-    stage_suffix = f".{uuid.uuid4().hex}.tmp"
-    tmp_output = output_path + stage_suffix
-    tmp_claim = claim_graph_path + stage_suffix
-    
-    _write_json_stage(tmp_claim, governance_store.build_claim_graph_projection())
-    removed = _strip_legacy_embedded_payloads(index_data)
-    if removed:
-        log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
-    _write_json_stage(tmp_output, index_data)
+    claim_graph_data = governance_store.build_claim_graph_projection()
+    canonical_after = canonical_runtime_generation_snapshot()
+    if canonical_before != canonical_after:
+        raise ProjectionCanonicalGenerationChanged(
+            "Canonical runtime generation changed while rebuilding projections; retry."
+        )
+    tmp_output, tmp_claim, _ = _stage_projection_pair(
+        output_path,
+        index_data,
+        claim_graph_data,
+        _verified_canonical_generation(canonical_before),
+    )
 
     # Embeddings are a separate resumable projection. Index rebuilds never call an external API.
     embeddings_map = {}
-    with transaction():
-        conn.execute("DELETE FROM wiki_search_index")
-        db_store.delete_stale_embeddings(set(index_data["nodes"]))
-        _build_bm25_index(index_data, embeddings_map)
-
-    for staged_path in (tmp_claim, tmp_output):
-        if not os.path.exists(staged_path):
-            raise FileNotFoundError(f"Missing staged projection file before publish: {staged_path}")
-    os.replace(tmp_claim, claim_graph_path)
-    os.replace(tmp_output, output_path)
+    try:
+        with transaction():
+            conn.execute("DELETE FROM wiki_search_index")
+            db_store.delete_stale_embeddings(set(index_data["nodes"]))
+            _build_bm25_index(index_data, embeddings_map)
+        _publish_staged_projection_pair(output_path, tmp_output, tmp_claim)
+    except Exception:
+        _cleanup_projection_stages(tmp_claim, tmp_output)
+        raise
 
     log.info(
         f"Generated index.json with {len(index_data['nodes'])} nodes | "
@@ -1172,20 +1507,47 @@ def _claim_graph_signatures(items: list[dict]) -> set[str]:
     }
 
 
+class ProjectionSnapshotChanged(RuntimeError):
+    """Raised when a projection changes repeatedly during a read snapshot."""
+
+
+def _projection_file_identity(path: str) -> tuple[int, int, int]:
+    stat = os.stat(path)
+    return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+
+
+def _read_claim_graph_snapshot(path: str) -> dict:
+    """Read an atomically published graph without waiting on the writer lock."""
+    if not os.path.exists(path):
+        return {"nodes": [], "edges": []}
+    last_error = None
+    for attempt in range(3):
+        try:
+            before = _projection_file_identity(path)
+            with open(path, "r", encoding="utf-8") as handle:
+                observed = json.load(handle)
+            after = _projection_file_identity(path)
+            if before == after:
+                return observed
+            last_error = ProjectionSnapshotChanged(
+                f"Projection changed while reading {path}"
+            )
+        except FileNotFoundError as exc:
+            if not os.path.exists(path):
+                return {"nodes": [], "edges": []}
+            last_error = exc
+        except (OSError, json.JSONDecodeError) as exc:
+            last_error = exc
+        if attempt < 2:
+            time.sleep(0.01)
+    assert last_error is not None
+    raise last_error
+
+
 def claim_graph_projection_parity() -> dict[str, int]:
     """Compare exact claim-graph node and edge payloads with canonical SQLite."""
     expected = governance_store.build_claim_graph_projection()
-    claim_graph_path = str(get_claim_graph_path())
-    output_path = str(get_index_path())
-    try:
-        with FileLock(output_path + ".lock", timeout=15):
-            if os.path.exists(claim_graph_path):
-                with open(claim_graph_path, "r", encoding="utf-8") as handle:
-                    observed = json.load(handle)
-            else:
-                observed = {"nodes": [], "links": []}
-    except Timeout as exc:
-        raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
+    observed = _read_claim_graph_snapshot(str(get_claim_graph_path()))
 
     expected_nodes = _claim_graph_signatures(expected.get("nodes") or [])
     observed_nodes = _claim_graph_signatures(observed.get("nodes") or [])
@@ -1204,12 +1566,28 @@ def claim_graph_projection_parity() -> dict[str, int]:
 
 
 def refresh_claim_graph_projection() -> str:
-    """Publish claim_graph.json independently under the shared projection lock."""
+    """Refresh the graph while publishing a new consistent projection pair."""
     output_path = str(get_index_path())
     claim_graph_path = str(get_claim_graph_path())
     try:
         with FileLock(output_path + ".lock", timeout=15):
-            _write_claim_graph(claim_graph_path, governance_store.build_claim_graph_projection())
+            index_data = _load_index_unlocked(output_path)
+            if index_data is None:
+                _generate_index_unlocked()
+            else:
+                canonical_before = canonical_runtime_generation_snapshot()
+                claim_graph_data = governance_store.build_claim_graph_projection()
+                canonical_after = canonical_runtime_generation_snapshot()
+                _publish_projection_pair(
+                    output_path,
+                    index_data,
+                    claim_graph_data,
+                    _canonical_generation_for_existing_index(
+                        index_data,
+                        canonical_before,
+                        canonical_after,
+                    ),
+                )
     except Timeout as exc:
         raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
     return claim_graph_path
@@ -1220,9 +1598,21 @@ def update_index_items(filenames: list[str]):
         return
 
     # Filter valid files
+    excluded = {
+        "index.md",
+        "log.md",
+        "overview.md",
+        "orphan_pages.md",
+        "wiki_link_stats.md",
+        "synthesis_log.md",
+    }
     valid_filenames = []
     for filename in filenames:
-        if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md") or filename.startswith("System_"):
+        if (
+            not filename.casefold().endswith(".md")
+            or filename.casefold() in excluded
+            or filename.casefold().startswith("system_")
+        ):
             continue
         valid_filenames.append(filename)
         
@@ -1320,7 +1710,10 @@ def update_index_items(filenames: list[str]):
                     for filename in valid_filenames:
                         node_key = filename[:-3]
     
-                        if not filename.startswith(VALID_PREFIXES) and filename not in ("index.md", "log.md"):
+                        if (
+                            not filename.startswith(VALID_PREFIXES)
+                            and filename.casefold() not in {"index.md", "log.md"}
+                        ):
                             index_data.setdefault("error_log", [])
                             index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
                             index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
@@ -1453,9 +1846,21 @@ def update_index_items(filenames: list[str]):
                     # Do not recompute heavy debt metrics on partial update
                     index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
                     index_data["schema_version"] = "8.0"
-                    # V11.3 Fixed: Write partial updates back to disk to prevent ghost updates
-                    _write_index(output_path, index_data)
-                    _write_claim_graph(str(get_claim_graph_path()), governance_store.build_claim_graph_projection())
+                    # Incremental coverage is verified only when the existing full
+                    # projection was already bound to the same canonical generation.
+                    canonical_before = canonical_runtime_generation_snapshot()
+                    claim_graph_data = governance_store.build_claim_graph_projection()
+                    canonical_after = canonical_runtime_generation_snapshot()
+                    _publish_projection_pair(
+                        output_path,
+                        index_data,
+                        claim_graph_data,
+                        _canonical_generation_for_existing_index(
+                            index_data,
+                            canonical_before,
+                            canonical_after,
+                        ),
+                    )
     except Timeout:
         raise TimeoutError(f"Timeout while acquiring lock for {output_path}")
 
@@ -1503,23 +1908,19 @@ def refresh_graph_topology_if_dirty() -> bool:
                 if is_graph_dirty(index_data):
                     index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
                     _apply_graph_topology(index_data)
-                    temp_path = output_path + ".tmp"
-                    with open(temp_path, "w", encoding="utf-8") as handle:
-                        json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
-                    for attempt in range(5):
-                        try:
-                            os.replace(temp_path, output_path)
-                            break
-                        except PermissionError as e:
-                            if attempt < 4:
-                                time.sleep(0.1 * (2 ** attempt))
-                            else:
-                                log.error(f"Failed to write {output_path} due to file lock after 5 attempts. Graph refresh aborted.")
-                                try:
-                                    os.remove(temp_path)
-                                except Exception:
-                                    pass
-                                raise e
+                    canonical_before = canonical_runtime_generation_snapshot()
+                    claim_graph_data = governance_store.build_claim_graph_projection()
+                    canonical_after = canonical_runtime_generation_snapshot()
+                    _publish_projection_pair(
+                        output_path,
+                        index_data,
+                        claim_graph_data,
+                        _canonical_generation_for_existing_index(
+                            index_data,
+                            canonical_before,
+                            canonical_after,
+                        ),
+                    )
                     log.info("Graph topology partially refreshed and saved.")
                     return True
             return False

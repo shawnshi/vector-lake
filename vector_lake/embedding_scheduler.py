@@ -13,9 +13,11 @@ from __future__ import annotations
 import math
 import os
 import re
+import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 from filelock import FileLock, Timeout
@@ -102,22 +104,64 @@ def estimate_embedding_tokens(text: str) -> int:
     return max(1, int(cjk_chars + math.ceil(latin_words * 1.3) + math.ceil(residual_chars / 2)))
 
 
-def existing_embedding_ids() -> set[str]:
+class EmbeddingInventoryUnavailable(RuntimeError):
+    """Raised when vector coverage cannot be established safely."""
+
+
+def existing_embedding_ids(
+    *,
+    read_only: bool = False,
+    allow_missing_database: bool = False,
+) -> set[str]:
+    conn = None
     try:
-        conn = db_store.get_connection()
-        return {row["entity_id"] for row in conn.execute("SELECT entity_id FROM vec_embeddings")}
-    except Exception:
-        return set()
+        if read_only:
+            path = db_store.peek_db_path()
+            if not path.is_file():
+                if allow_missing_database:
+                    return set()
+                raise FileNotFoundError(path)
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
+            conn.row_factory = sqlite3.Row
+            db_store._load_sqlite_vec_extension(conn)
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn = db_store.get_connection()
+        return {
+            row["entity_id"]
+            for row in conn.execute("SELECT entity_id FROM vec_embeddings")
+        }
+    except Exception as exc:
+        raise EmbeddingInventoryUnavailable(
+            "Cannot read the existing embedding inventory; refusing to treat "
+            "coverage as empty because that could trigger duplicate provider calls."
+        ) from exc
+    finally:
+        if read_only and conn is not None:
+            conn.close()
 
 
-def embedding_coverage(index_data: dict[str, Any]) -> dict[str, int]:
-    node_keys = set((index_data.get("nodes") or {}).keys())
-    existing = existing_embedding_ids()
+def embedding_coverage(
+    index_data: dict[str, Any],
+    existing: set[str] | None = None,
+) -> dict[str, int]:
+    existing = existing_embedding_ids() if existing is None else existing
+    node_keys = (index_data.get("nodes") or {}).keys()
+    node_count = 0
+    embedded = 0
+    for node_key in node_keys:
+        node_count += 1
+        if node_key in existing:
+            embedded += 1
     return {
-        "nodes": len(node_keys),
-        "embedded": len(node_keys & existing),
-        "missing": len(node_keys - existing),
-        "stale": len(existing - node_keys),
+        "nodes": node_count,
+        "embedded": embedded,
+        "missing": node_count - embedded,
+        "stale": len(existing) - embedded,
     }
 
 
@@ -127,24 +171,39 @@ def _candidate_items(
     include_existing: bool = False,
     limit: int | None = None,
     config: EmbeddingRateConfig | None = None,
-) -> list[dict[str, Any]]:
+    existing: set[str] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield deterministic candidates without retaining all candidate text."""
     config = config or load_embedding_rate_config()
-    existing = existing_embedding_ids() if not include_existing else set()
-    items: list[dict[str, Any]] = []
-    for node_key, node in sorted((index_data.get("nodes") or {}).items()):
-        if node_key in existing:
+    embedded_ids = (
+        set()
+        if include_existing
+        else (existing_embedding_ids() if existing is None else existing)
+    )
+    selected = 0
+    nodes = index_data.get("nodes") or {}
+    for node_key in sorted(nodes):
+        if node_key in embedded_ids:
             continue
+        node = nodes[node_key]
         text = embedding_text_for_node(node, max_chars=config.max_chars_per_item)
         if not text:
             continue
-        items.append({"node_key": node_key, "text": text, "tokens": estimate_embedding_tokens(text)})
-        if limit is not None and len(items) >= max(1, int(limit)):
+        yield {
+            "node_key": node_key,
+            "text": text,
+            "tokens": estimate_embedding_tokens(text),
+        }
+        selected += 1
+        if limit is not None and selected >= max(1, int(limit)):
             break
-    return items
 
 
-def _batch_items(items: list[dict[str, Any]], config: EmbeddingRateConfig) -> list[list[dict[str, Any]]]:
-    batches: list[list[dict[str, Any]]] = []
+def _batch_items(
+    items: Iterable[dict[str, Any]],
+    config: EmbeddingRateConfig,
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield one bounded request batch at a time."""
     current: list[dict[str, Any]] = []
     current_tokens = 0
     batch_token_cap = max(1, min(config.max_batch_tokens, config.effective_tpm))
@@ -154,14 +213,44 @@ def _batch_items(items: list[dict[str, Any]], config: EmbeddingRateConfig) -> li
             len(current) >= config.max_batch_items
             or current_tokens + item_tokens > batch_token_cap
         ):
-            batches.append(current)
+            yield current
             current = []
             current_tokens = 0
         current.append(item)
         current_tokens += item_tokens
     if current:
-        batches.append(current)
-    return batches
+        yield current
+
+
+def _candidate_plan(
+    index_data: dict[str, Any],
+    *,
+    include_existing: bool,
+    limit: int | None,
+    config: EmbeddingRateConfig,
+    existing: set[str],
+) -> tuple[int, int, int]:
+    """Count a plan with bounded memory, discarding each batch after use."""
+    candidates = 0
+    estimated_tokens = 0
+    estimated_requests = 0
+    items = _candidate_items(
+        index_data,
+        include_existing=include_existing,
+        limit=limit,
+        config=config,
+        existing=existing,
+    )
+    for batch in _batch_items(items, config):
+        candidates += len(batch)
+        estimated_tokens += sum(int(item["tokens"]) for item in batch)
+        estimated_requests += 1
+        del batch
+    return candidates, estimated_tokens, estimated_requests
+
+
+class EmbeddingRateLimitTimeout(TimeoutError):
+    """Raised when an interactive request cannot reserve quota promptly."""
 
 
 class MinuteRateLimiter:
@@ -170,18 +259,41 @@ class MinuteRateLimiter:
     def __init__(self, config: EmbeddingRateConfig):
         self.config = config
 
-    def reserve(self, request_tokens: int):
+    def reserve(
+        self,
+        request_tokens: int,
+        max_wait_seconds: float | None = None,
+    ):
         request_tokens = max(1, int(request_tokens))
+        deadline = (
+            None
+            if max_wait_seconds is None
+            else time.monotonic() + max(0.0, float(max_wait_seconds))
+        )
+
+        def remaining_wait() -> float | None:
+            if deadline is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EmbeddingRateLimitTimeout(
+                    "Embedding quota is busy; interactive request fell back "
+                    "to lexical search."
+                )
+            return remaining
         if request_tokens > self.config.effective_tpm:
             raise ValueError(
                 f"Embedding request tokens {request_tokens} exceed effective TPM {self.config.effective_tpm}"
             )
+        remaining_wait()
         db_store.init_db()
+        remaining_wait()
         while True:
             now = time.time()
             cutoff = now - 60.0
             wait_seconds = 0.0
-            with db_store.transaction():
+            with db_store.transaction(max_wait_seconds=remaining_wait()):
+                remaining_wait()
                 conn = db_store.get_connection()
                 conn.execute(
                     "DELETE FROM embedding_rate_reservations WHERE reserved_at <= ?",
@@ -197,14 +309,22 @@ class MinuteRateLimiter:
                     requests + 1 <= self.config.effective_rpm
                     and tokens + request_tokens <= self.config.effective_tpm
                 ):
+                    remaining_wait()
                     conn.execute(
                         "INSERT INTO embedding_rate_reservations "
                         "(reservation_id, reserved_at, token_count) VALUES (?, ?, ?)",
                         (uuid.uuid4().hex, now, request_tokens),
                     )
+                    remaining_wait()
                     return
                 oldest = float(row["oldest"] or now)
                 wait_seconds = max(0.01, oldest + 60.0 - now + 0.05)
+            remaining = remaining_wait()
+            if remaining is not None and wait_seconds > remaining:
+                raise EmbeddingRateLimitTimeout(
+                    "Embedding quota is busy; interactive request fell back "
+                    "to lexical search."
+                )
             time.sleep(wait_seconds)
 
 
@@ -221,11 +341,13 @@ def _provider_contents(contents: list[str]) -> list[Any]:
     ]
 
 
-def _create_client():
+def _create_client(timeout_ms: int | None = None):
     from google import genai
     from google.genai import types
 
-    timeout_ms = _env_int("VECTOR_LAKE_EMBEDDING_TIMEOUT_MS", 30_000)
+    if timeout_ms is None:
+        timeout_ms = _env_int("VECTOR_LAKE_EMBEDDING_TIMEOUT_MS", 30_000)
+    timeout_ms = max(1, int(timeout_ms))
     return genai.Client(http_options=types.HttpOptions(timeout=timeout_ms))
 
 
@@ -252,12 +374,16 @@ def _request_embeddings(
     request_tokens: int,
     config: EmbeddingRateConfig,
     limiter: MinuteRateLimiter,
+    max_wait_seconds: float | None = None,
 ) -> list[list[float]]:
     last_error: Exception | None = None
     provider_contents = _provider_contents(contents)
     for attempt in range(config.max_retries + 1):
         try:
-            limiter.reserve(request_tokens)
+            if max_wait_seconds is None:
+                limiter.reserve(request_tokens)
+            else:
+                limiter.reserve(request_tokens, max_wait_seconds=max_wait_seconds)
             response = client.models.embed_content(model=config.model, contents=provider_contents)
             return _validated_response_values(response, len(contents), config.dimension)
         except Exception as exc:
@@ -271,29 +397,67 @@ def _request_embeddings(
     raise last_error
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_texts(
+    texts: list[str],
+    *,
+    max_retries: int | None = None,
+    timeout_ms: int | None = None,
+    max_wait_seconds: float | None = None,
+) -> list[list[float]]:
     """Shared validated embedding entrypoint for small runtime requests."""
     if not texts or not os.environ.get("GEMINI_API_KEY"):
         return []
     config = load_embedding_rate_config()
+    if max_retries is not None:
+        config = replace(config, max_retries=max(0, int(max_retries)))
     normalized = [str(text)[:config.max_chars_per_item] for text in texts]
     tokens = sum(estimate_embedding_tokens(text) for text in normalized)
-    return _request_embeddings(
-        _create_client(),
-        normalized,
-        tokens,
-        config,
-        MinuteRateLimiter(config),
+    client = (
+        _create_client()
+        if timeout_ms is None
+        else _create_client(timeout_ms=timeout_ms)
     )
+    try:
+        return _request_embeddings(
+            client,
+            normalized,
+            tokens,
+            config,
+            MinuteRateLimiter(config),
+            max_wait_seconds=max_wait_seconds,
+        )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def embedding_backfill(index_data: dict[str, Any], dry_run: bool = True, limit: int | None = None, include_existing: bool = False) -> dict[str, Any]:
     """Backfill missing vector embeddings under Gemini RPM/TPM limits."""
     config = load_embedding_rate_config()
-    coverage_before = embedding_coverage(index_data)
-    items = _candidate_items(index_data, include_existing=include_existing, limit=limit, config=config)
-    batches = _batch_items(items, config)
-    estimated_tokens = sum(int(item["tokens"]) for item in items)
+    inventory_state = "ready"
+    if dry_run:
+        inventory_path = db_store.peek_db_path()
+        inventory_missing = not inventory_path.is_file()
+        existing = existing_embedding_ids(
+            read_only=True,
+            allow_missing_database=True,
+        )
+        if inventory_missing:
+            inventory_state = "database_missing"
+    else:
+        existing = existing_embedding_ids()
+    coverage_before = embedding_coverage(index_data, existing=existing)
+    candidates, estimated_tokens, estimated_requests = _candidate_plan(
+        index_data,
+        include_existing=include_existing,
+        limit=limit,
+        config=config,
+        existing=existing,
+    )
     plan = {
         "dry_run": dry_run,
         "model": config.model,
@@ -302,14 +466,19 @@ def embedding_backfill(index_data: dict[str, Any], dry_run: bool = True, limit: 
         "utilization": config.utilization,
         "effective_rpm": config.effective_rpm,
         "effective_tpm": config.effective_tpm,
-        "candidates": len(items),
+        "candidates": candidates,
         "estimated_tokens": estimated_tokens,
-        "estimated_requests": len(batches),
+        "estimated_requests": estimated_requests,
         "coverage_before": coverage_before,
+        "inventory_state": inventory_state,
         "embedded": 0,
         "failed_batches": 0,
     }
-    if dry_run or not items:
+    if inventory_state == "database_missing":
+        plan["preview_warning"] = (
+            "canonical embedding database is missing; preview assumes no existing vectors"
+        )
+    if dry_run or not candidates:
         return plan
     if not os.environ.get("GEMINI_API_KEY"):
         plan["skipped"] = "GEMINI_API_KEY not set"
@@ -322,17 +491,52 @@ def embedding_backfill(index_data: dict[str, Any], dry_run: bool = True, limit: 
         plan["skipped"] = "another embedding backfill is already running"
         return plan
 
+    try:
+        existing = existing_embedding_ids()
+        coverage_before = embedding_coverage(index_data, existing=existing)
+        candidates, estimated_tokens, estimated_requests = _candidate_plan(
+            index_data,
+            include_existing=include_existing,
+            limit=limit,
+            config=config,
+            existing=existing,
+        )
+    except BaseException:
+        lock.release()
+        raise
+    plan.update(
+        {
+            "candidates": candidates,
+            "estimated_tokens": estimated_tokens,
+            "estimated_requests": estimated_requests,
+            "coverage_before": coverage_before,
+        }
+    )
+    if not candidates:
+        plan["skipped"] = "no missing embeddings after lock acquisition"
+        lock.release()
+        return plan
+
     run_id = uuid.uuid4().hex
     plan["run_id"] = run_id
-    db_store.start_embedding_run(run_id, config.model, len(items))
+    db_store.start_embedding_run(run_id, config.model, candidates)
     last_error = ""
     consecutive_failures = 0
+    client = None
     try:
         client = _create_client()
         limiter = MinuteRateLimiter(config)
-        for batch in batches:
+        items = _candidate_items(
+            index_data,
+            include_existing=include_existing,
+            limit=limit,
+            config=config,
+            existing=existing,
+        )
+        for batch in _batch_items(items, config):
             contents = [item["text"] for item in batch]
             batch_tokens = sum(int(item["tokens"]) for item in batch)
+            values_list = None
             try:
                 values_list = _request_embeddings(client, contents, batch_tokens, config, limiter)
                 for item, values in zip(batch, values_list, strict=True):
@@ -344,6 +548,9 @@ def embedding_backfill(index_data: dict[str, Any], dry_run: bool = True, limit: 
                 plan["failed_batches"] += 1
                 plan["last_error"] = last_error
                 consecutive_failures += 1
+            finally:
+                values_list = None
+            del contents, batch
             db_store.update_embedding_run(
                 run_id,
                 plan["embedded"],
@@ -368,4 +575,10 @@ def embedding_backfill(index_data: dict[str, Any], dry_run: bool = True, limit: 
         db_store.finish_embedding_run(run_id, "failed", plan["embedded"], plan["failed_batches"], last_error)
         raise
     finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
         lock.release()

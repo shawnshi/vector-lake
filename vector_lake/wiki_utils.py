@@ -78,6 +78,19 @@ def _replace_prepared_file_compare_and_swap(
             f"expected {expected_current_hash or '<absent>'}, "
             f"current {actual_hash or '<absent>'}"
         )
+    if expected_current_hash == "":
+        try:
+            os.link(temp_path, path)
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"Projection compare-and-swap conflict for {path.name}: "
+                "expected <absent>, current projection appeared during create."
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"Projection compare-and-swap create failed for {path.name}: {exc}"
+            ) from exc
+        return
     if not path.exists():
         raise RuntimeError(
             f"Projection compare-and-swap conflict for {path.name}: "
@@ -108,6 +121,100 @@ def _replace_prepared_file_compare_and_swap(
         f"Projection compare-and-swap conflict for {path.name}: "
         f"expected {expected_current_hash}, current {displaced_hash}."
     )
+
+
+def _restore_displaced_file_noreplace(
+    displaced_path: Path,
+    path: Path,
+) -> None:
+    """Restore a displaced file without overwriting a concurrent replacement."""
+    try:
+        os.link(displaced_path, path)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}; "
+            f"the raced projection is preserved at {displaced_path}."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Projection compare-and-swap restore failed for {path.name}; "
+            f"the raced projection is preserved at {displaced_path}: {exc}"
+        ) from exc
+    try:
+        displaced_path.unlink()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Projection compare-and-swap restored {path.name}, but the "
+            f"duplicate raced projection remains at {displaced_path}: {exc}"
+        ) from exc
+
+
+def delete_file_compare_and_swap(
+    path: str | Path,
+    expected_current_hash: str | None,
+) -> bool:
+    """Atomically displace, verify, and delete only the expected file version."""
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    expected_hash = (
+        _file_sha256(path)
+        if expected_current_hash is None
+        else expected_current_hash
+    )
+    actual_hash = _file_sha256(path)
+    if actual_hash != expected_hash:
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}: "
+            f"expected {expected_hash or '<absent>'}, "
+            f"current {actual_hash or '<absent>'}."
+        )
+
+    displaced_path = path.with_name(
+        f"{path.name}.{uuid.uuid4().hex}.cas-delete"
+    )
+    try:
+        os.replace(path, displaced_path)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}: "
+            "the projection disappeared before atomic delete."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Projection compare-and-swap delete failed for {path.name}: {exc}"
+        ) from exc
+
+    displaced_hash = _file_sha256(displaced_path)
+    if displaced_hash != expected_hash:
+        try:
+            _restore_displaced_file_noreplace(displaced_path, path)
+        except RuntimeError as restore_error:
+            raise RuntimeError(
+                f"Projection compare-and-swap conflict for {path.name}: "
+                f"expected {expected_hash}, current {displaced_hash}; "
+                f"{restore_error}"
+            ) from restore_error
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}: "
+            f"expected {expected_hash}, current {displaced_hash}; "
+            "the raced projection was restored."
+        )
+
+    try:
+        displaced_path.unlink()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Projection delete could not be finalized for {path.name}; "
+            f"the expected projection is preserved at {displaced_path}: {exc}"
+        ) from exc
+    if path.exists():
+        raise RuntimeError(
+            f"Projection compare-and-swap conflict for {path.name}: "
+            "a concurrent projection appeared after delete and was preserved."
+        )
+    return True
 
 
 def markdown_fenced_code_spans(content: str) -> list[tuple[int, int]]:
@@ -200,7 +307,7 @@ def validate_wiki_filename(filename: str):
     if filename in SYSTEM_WHITELIST or filename.startswith("System_"):
         return
     
-    if not filename.endswith(".md"):
+    if not filename.casefold().endswith(".md"):
         raise ValueError(f"Invalid suffix: '{filename}' must end with .md")
         
     if not filename.startswith(VALID_PREFIXES):
@@ -209,7 +316,7 @@ def validate_wiki_filename(filename: str):
     if INVALID_CHARS_REGEX.search(filename):
         raise ValueError(f"Invalid characters: '{filename}' contains forbidden characters (e.g., brackets, slashes, spaces).")
         
-    if not re.match(r'^(Concept|Vendor|Institution|Product|Person|Event|Policy|Standard|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*\.md$', filename):
+    if not re.match(r'^(Concept|Vendor|Institution|Product|Person|Event|Policy|Standard|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*(?i:\.md)$', filename):
         raise ValueError(f"Strict Naming Violation: '{filename}' must match pattern [Type]_[MainName]-[SubName].md")
         
     core_name = filename.split("_", 1)[1][:-3] if "_" in filename else filename[:-3]
@@ -227,12 +334,72 @@ def get_memory_dir() -> Path:
     return (Path(os.path.expanduser("~")) / ".gemini" / "MEMORY").resolve()
 
 
+def _uses_legacy_default_memory_root() -> bool:
+    return get_memory_dir() == (
+        Path(os.path.expanduser("~")) / ".gemini" / "MEMORY"
+    ).resolve()
+
+
 def get_wiki_dir() -> Path:
     return get_memory_dir() / "wiki"
 
 
+def iter_markdown_files(directory: str | Path | None = None):
+    """Yield non-recursive Markdown files; callers own any required ordering."""
+    root = get_wiki_dir() if directory is None else Path(directory)
+    if not root.exists():
+        return
+    for path in root.iterdir():
+        if path.is_file() and path.suffix.casefold() == ".md":
+            yield path
+
+
 def get_raw_dir() -> Path:
     return get_memory_dir() / "raw"
+
+
+def peek_meta_dir() -> Path:
+    """Resolve the canonical meta path without creating or probing it."""
+    primary = get_wiki_dir() / ".meta"
+    fallback = get_extension_root() / "data" / "v8_meta"
+    explicit_value = os.environ.get("VECTOR_LAKE_META_DIR", "").strip()
+    explicit = (
+        Path(explicit_value).expanduser().resolve()
+        if explicit_value
+        else None
+    )
+    if explicit is not None:
+        if (
+            explicit == primary.resolve()
+            and _uses_legacy_default_memory_root()
+            and (fallback / "vector_lake.db").exists()
+            and not (primary / "vector_lake.db").exists()
+        ):
+            raise RuntimeError(
+                "Legacy fallback Vector Lake state exists while the configured "
+                f"primary meta directory is empty: {fallback}. Refusing to "
+                "inspect a path that would strand the existing canonical database."
+            )
+        return explicit
+
+    if (
+        _uses_legacy_default_memory_root()
+        and (fallback / "vector_lake.db").exists()
+        and not (primary / "vector_lake.db").exists()
+    ):
+        return fallback
+    return primary
+
+
+def _verify_writable_meta_dir(candidate: Path) -> Path:
+    candidate.mkdir(parents=True, exist_ok=True)
+    probe = candidate / f".probe_{uuid.uuid4().hex}"
+    try:
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("probe")
+    finally:
+        probe.unlink(missing_ok=True)
+    return candidate
 
 
 def get_meta_dir() -> Path:
@@ -240,30 +407,90 @@ def get_meta_dir() -> Path:
     if isinstance(_META_DIR_CACHE, Path):
         return _META_DIR_CACHE
 
-    memory_key = str(get_memory_dir())
-    if isinstance(_META_DIR_CACHE, dict) and memory_key in _META_DIR_CACHE:
-        return _META_DIR_CACHE[memory_key]
+    primary = get_wiki_dir() / ".meta"
+    fallback = get_extension_root() / "data" / "v8_meta"
+    explicit_value = os.environ.get("VECTOR_LAKE_META_DIR", "").strip()
+    explicit = (
+        Path(explicit_value).expanduser().resolve()
+        if explicit_value
+        else None
+    )
+    allow_existing_fallback = (
+        os.environ.get("VECTOR_LAKE_ALLOW_META_FALLBACK") == "1"
+    )
+    cache_key = (
+        str(get_memory_dir()),
+        str(explicit or ""),
+        allow_existing_fallback,
+    )
+    if isinstance(_META_DIR_CACHE, dict) and cache_key in _META_DIR_CACHE:
+        return _META_DIR_CACHE[cache_key]
     if not isinstance(_META_DIR_CACHE, dict):
         _META_DIR_CACHE = {}
 
-    primary = get_wiki_dir() / ".meta"
-    fallback = get_extension_root() / "data" / "v8_meta"
-
-    for candidate in (primary, fallback):
+    if explicit is not None:
+        if (
+            explicit == primary.resolve()
+            and _uses_legacy_default_memory_root()
+            and (fallback / "vector_lake.db").exists()
+            and not (primary / "vector_lake.db").exists()
+        ):
+            raise RuntimeError(
+                "Legacy fallback Vector Lake state exists while the configured "
+                f"primary meta directory is empty: {fallback}. Refusing to create "
+                "a second canonical database; migrate or select the fallback explicitly."
+            )
         try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            probe = candidate / f".probe_{uuid.uuid4().hex}"
-            with open(probe, "w", encoding="utf-8") as handle:
-                handle.write("probe")
-            probe.unlink()
-            _META_DIR_CACHE[memory_key] = candidate
-            return candidate
-        except OSError:
-            continue
+            selected = _verify_writable_meta_dir(explicit)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Configured VECTOR_LAKE_META_DIR is not writable: {explicit}"
+            ) from exc
+        _META_DIR_CACHE[cache_key] = selected
+        return selected
 
-    _META_DIR_CACHE[memory_key] = fallback
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+    if (
+        _uses_legacy_default_memory_root()
+        and (fallback / "vector_lake.db").exists()
+        and not (primary / "vector_lake.db").exists()
+    ):
+        try:
+            selected = _verify_writable_meta_dir(fallback)
+        except OSError as fallback_error:
+            raise RuntimeError(
+                "Legacy fallback Vector Lake state exists but is not writable: "
+                f"{fallback}"
+            ) from fallback_error
+        _META_DIR_CACHE[cache_key] = selected
+        return selected
+
+    try:
+        selected = _verify_writable_meta_dir(primary)
+    except OSError as primary_error:
+        if (primary / "vector_lake.db").exists() and not allow_existing_fallback:
+            raise RuntimeError(
+                "Canonical Vector Lake state already exists but its meta directory "
+                f"is not writable: {primary}. Refusing to select a different "
+                "database. Configure VECTOR_LAKE_META_DIR explicitly."
+            ) from primary_error
+        if not _uses_legacy_default_memory_root():
+            raise RuntimeError(
+                "The configured VECTOR_LAKE_MEMORY_DIR has no writable canonical "
+                f"meta directory: {primary}. Refusing the extension-global fallback; "
+                "configure VECTOR_LAKE_META_DIR explicitly."
+            ) from primary_error
+    else:
+        _META_DIR_CACHE[cache_key] = selected
+        return selected
+
+    try:
+        selected = _verify_writable_meta_dir(fallback)
+    except OSError as fallback_error:
+        raise RuntimeError(
+            f"Neither canonical meta directory is writable: {primary}; {fallback}"
+        ) from fallback_error
+    _META_DIR_CACHE[cache_key] = selected
+    return selected
 
 
 def get_purpose_path() -> Path:
@@ -315,7 +542,9 @@ def split_frontmatter(content: str) -> tuple[dict, str]:
     
     match = re.search(r'\r?\n---(?:\r?\n|$)', content)
     if not match:
-        return {}, content
+        raise yaml.YAMLError(
+            "Missing YAML frontmatter closing delimiter"
+        )
         
     yaml_part = content[4:match.start()]
     body_part = content[match.end():]
@@ -357,6 +586,52 @@ def read_frontmatter_only(path: str | Path, errors: str = "replace") -> dict:
         return {}
 
 
+_WINDOWS_RESERVED_COMPONENT = re.compile(
+    r"(?i)^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9]|lpt[1-9])(?:\..*)?$"
+)
+
+
+def _reject_ambiguous_windows_path(path: Path) -> None:
+    if os.name != "nt":
+        return
+    raw_path = str(path)
+    if (
+        len(raw_path) >= 4
+        and raw_path.startswith("\\\\")
+        and raw_path[2] in ".?"
+        and raw_path[3] in "\\/"
+    ):
+        raise ValueError(f"Ambiguous Windows path namespace is not allowed: {path}")
+    for component in path.parts:
+        if component == path.anchor:
+            continue
+        if component.rstrip(" .") != component:
+            raise ValueError(
+                f"Ambiguous Windows path component is not allowed: {component!r}"
+            )
+        if ":" in component:
+            raise ValueError(
+                f"Windows alternate data stream paths are not allowed: {component!r}"
+            )
+        if _WINDOWS_RESERVED_COMPONENT.fullmatch(component):
+            raise ValueError(
+                f"Reserved Windows path component is not allowed: {component!r}"
+            )
+
+
+def _is_canonical_wiki_markdown_path(path: Path) -> bool:
+    if path.suffix.casefold() != ".md":
+        return False
+    candidate_parent = path.parent.resolve(strict=False)
+    wiki_root = get_wiki_dir().resolve(strict=False)
+    parent_key = os.path.normcase(str(candidate_parent))
+    root_key = os.path.normcase(str(wiki_root))
+    try:
+        return os.path.commonpath((parent_key, root_key)) == root_key
+    except ValueError:
+        return False
+
+
 def atomic_write_text(
     path: str | Path,
     content: str,
@@ -365,23 +640,27 @@ def atomic_write_text(
     expected_current_hash: str | None = None,
 ):
     path = Path(path)
+    _reject_ambiguous_windows_path(path)
     if validation_mode not in {"full", "schema"}:
         raise ValueError(f"Unsupported validation_mode: {validation_mode}")
     
-    # NEW: Trigger Defense Hook for wiki markdown files
-    if path.name.endswith(".md") and "wiki" in path.parts:
-        try:
-            frontmatter = pre_parsed_frontmatter if pre_parsed_frontmatter is not None else split_frontmatter(content)[0]
-            if validation_mode == "full":
-                from vector_lake.defense_hook import verify_asset
-                verify_asset(content, path.name, frontmatter, get_index_path())
-            else:
-                from vector_lake.schema_validator import validate_schema
-                validate_schema(frontmatter, content, path.name)
-        except Exception as e:
-            if validation_mode == "schema" or type(e).__name__ == "DefenseHookException":
-                raise e # Bubble up the specific defense hook violation
-            pass # Ignore other import or parsing errors to prevent system lockup
+    # Validate canonical Wiki Markdown regardless of path spelling or casing.
+    if _is_canonical_wiki_markdown_path(path):
+        parsed_frontmatter, _ = split_frontmatter(content)
+        if (
+            pre_parsed_frontmatter is not None
+            and pre_parsed_frontmatter != parsed_frontmatter
+        ):
+            raise ValueError("Pre-parsed frontmatter does not match content")
+        frontmatter = parsed_frontmatter
+        if validation_mode == "full":
+            from vector_lake.defense_hook import verify_asset
+
+            verify_asset(content, path.name, frontmatter, get_index_path())
+        else:
+            from vector_lake.schema_validator import validate_schema
+
+            validate_schema(frontmatter, content, path.name)
             
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")

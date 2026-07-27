@@ -1,9 +1,8 @@
 import datetime
-import hashlib
+import uuid
 import logging
 import os
 import re
-import time
 
 from vector_lake import get_extension_root, provenance
 from vector_lake.tool_search import assemble_context
@@ -12,6 +11,12 @@ from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, normalize_e
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-query")
+
+
+def _strip_markdown_suffix(value: str) -> str:
+    text = str(value)
+    return text[:-3] if text.casefold().endswith(".md") else text
+
 
 def prepare_query_context(query_str: str, dry_run: bool = False):
     wiki_dir = str(get_wiki_dir())
@@ -38,22 +43,28 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
     if context["purpose"]:
         context_block += f"\n\n--- PURPOSE ---\n{context['purpose']}"
 
-    # Write context to a temporary payload file
-    tmp_dir = get_extension_root() / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create a unique hash for this query with anti-collision
-    import uuid
-    unique_str = f"{query_str}_{time.time()}_{uuid.uuid4().hex}"
-    query_hash = hashlib.md5(unique_str.encode("utf-8")).hexdigest()[:12]
-    payload_path = tmp_dir / f"query_context_{query_hash}.md"
-    
-    with open(payload_path, "w", encoding="utf-8") as f:
-        f.write(context_block)
-        
     if dry_run:
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
-        return f"[DRY RUN] Context assembled at {payload_path}\n\nTrace:\n{trace}"
+        return (
+            f"[DRY RUN] Context assembled in memory ({len(context_block)} chars)\n\n"
+            f"{context_block}\n\nTrace:\n{trace}"
+        )
+
+    from vector_lake.native_llm import get_subagent_scratch_dir
+
+    payload_dir = get_subagent_scratch_dir() / "query_contexts"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    cutoff = datetime.datetime.now().timestamp() - 86_400
+    for candidate in payload_dir.glob("query_context_*.md"):
+        try:
+            if candidate.stat().st_mtime < cutoff:
+                candidate.unlink()
+        except OSError as exc:
+            log.warning("Could not prune stale query context %s: %s", candidate, exc)
+
+    payload_path = payload_dir / f"query_context_{uuid.uuid4().hex[:12]}.md"
+    with open(payload_path, "w", encoding="utf-8") as handle:
+        handle.write(context_block)
 
     templates_dir = get_extension_root() / "templates"
     prompt_path = templates_dir / "query_prompt.md"
@@ -92,7 +103,7 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
 
         # P1-3: Dynamic Ontology Prefix Checking
         prefix = filename.split('_')[0] + "_" if "_" in filename else ""
-        if not prefix or not prefix[0].isupper() or not filename.endswith(".md"):
+        if not prefix or not prefix[0].isupper() or not filename.casefold().endswith(".md"):
             log.warning(f"File {filename} missing standard prefix. Treating as Orphan.")
             new_filename = f"Orphan_{filename}" if not filename.startswith("Orphan_") else filename
             new_target_path = (wiki_path / new_filename).resolve()
@@ -127,7 +138,11 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
 
 
 def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
-    existing_files = {name.replace(".md", "") for name in os.listdir(wiki_dir) if name.endswith(".md")}
+    existing_files = {
+        name[:-3]
+        for name in os.listdir(wiki_dir)
+        if name.casefold().endswith(".md")
+    }
     normalized_existing = {normalize_entity_name(f) for f in existing_files}
     broken_targets = set()
 
@@ -144,12 +159,14 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
         content = re.sub(r'`.*?`', '', content)
 
         for match in re.finditer(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]", content):
-            raw_target = match.group(1).strip().replace(".md", "")
+            raw_target = _strip_markdown_suffix(match.group(1).strip())
             target = normalize_entity_name(raw_target)
             if target and target not in normalized_existing and target not in existing_files:
                 broken_targets.add(target)
         for match in re.finditer(r"\[[^\[\]]+?::\s*\[\[([^\]]+?)\]\]\]", content):
-            raw_target = match.group(1).strip().split("|")[0].strip().replace(".md", "")
+            raw_target = _strip_markdown_suffix(
+                match.group(1).strip().split("|")[0].strip()
+            )
             target = normalize_entity_name(raw_target)
             if target and target not in normalized_existing and target not in existing_files:
                 broken_targets.add(target)

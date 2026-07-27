@@ -7,6 +7,11 @@ from filelock import FileLock, Timeout
 
 from vector_lake import get_extension_root
 from vector_lake import governance_store
+from vector_lake.indexer import (
+    PROJECTION_MANIFEST_KEY,
+    ProjectionPairContractError,
+    validate_projection_pair,
+)
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_legacy_claim_graph_path, get_memory_dir
 
 
@@ -126,6 +131,41 @@ def _build_graph_payload(index_data: dict, claim_graph_data: dict | None = None)
     }
 
 
+
+
+def _read_projection_pair(
+    index_path: str,
+    claim_graph_path: str,
+    lock_timeout: float = 5,
+) -> tuple[dict, dict]:
+    """Read and validate one projection generation under the publish lock."""
+    lock_path = index_path + ".lock"
+    with FileLock(lock_path, timeout=lock_timeout):
+        if not os.path.exists(index_path):
+            raise FileNotFoundError(index_path)
+        if not os.path.exists(claim_graph_path):
+            legacy_path = get_legacy_claim_graph_path()
+            if legacy_path.exists():
+                raise ProjectionPairContractError(
+                    "Legacy claim_topology.json cannot be paired with index.json; "
+                    "run sync to migrate both projections."
+                )
+            raise ProjectionPairContractError(
+                "claim_graph.json is missing; run sync to rebuild both projections."
+            )
+        with open(index_path, "r", encoding="utf-8") as handle:
+            index_data = json.load(handle)
+        with open(claim_graph_path, "r", encoding="utf-8") as handle:
+            claim_graph_data = json.load(handle)
+        validate_projection_pair(index_data, claim_graph_data)
+        manifest = index_data[PROJECTION_MANIFEST_KEY]
+        if "canonical_generation" not in manifest:
+            raise ProjectionPairContractError(
+                "Legacy projection manifest has no canonical_generation; run a full rebuild."
+            )
+        return index_data, claim_graph_data
+
+
 def visualize_vector_lake(output_dir: str = None):
     bootstrap = governance_store.ensure_canonical_store_populated()
     if bootstrap.get("bootstrapped"):
@@ -137,9 +177,6 @@ def visualize_vector_lake(output_dir: str = None):
     memory_dir = str(get_memory_dir())
     index_path = str(get_index_path())
     claim_graph_path = str(get_claim_graph_path())
-    if not os.path.exists(claim_graph_path) and get_legacy_claim_graph_path().exists():
-        claim_graph_path = str(get_legacy_claim_graph_path())
-    lock_path = index_path + ".lock"
     template_path = str(extension_root / "templates" / "topology.html")
     
     if output_dir:
@@ -154,24 +191,19 @@ def visualize_vector_lake(output_dir: str = None):
         return "Error: template not found."
 
     try:
-        with FileLock(lock_path, timeout=5):
-            with open(index_path, "r", encoding="utf-8") as handle:
-                index_data = json.load(handle)
+        index_data, claim_graph = _read_projection_pair(
+            index_path,
+            claim_graph_path,
+        )
     except Timeout:
-        log.warning("Timeout acquiring lock for index.json during graph generation. Falling back to read-only mode.")
-        try:
-            with open(index_path, "r", encoding="utf-8") as handle:
-                index_data = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            return "Error: System is busy generating the index. Please try again later."
-    except json.JSONDecodeError:
-        return "Error: Failed to parse index.json."
-
-    try:
-        with open(claim_graph_path, "r", encoding="utf-8") as handle:
-            claim_graph = json.load(handle)
+        log.warning("Timeout acquiring the graph projection publish lock.")
+        return "Error: System is busy publishing graph projections. Please try again later."
+    except ProjectionPairContractError as exc:
+        return f"Error: {exc}"
+    except FileNotFoundError:
+        return "Error: Lake is drying. index.json not found. Please ingest sources first."
     except (OSError, json.JSONDecodeError):
-        claim_graph = governance_store.build_claim_graph_projection()
+        return "Error: Failed to read a consistent graph projection pair."
 
     graph_data = _build_graph_payload(index_data, claim_graph)
 

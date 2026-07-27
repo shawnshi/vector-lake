@@ -9,14 +9,23 @@ class TestTools(unittest.TestCase):
     @patch('vector_lake.tool_doctor.get_raw_dir')
     @patch('vector_lake.tool_doctor.get_memory_dir')
     @patch('vector_lake.tool_doctor.get_index_path')
-    @patch('vector_lake.tool_doctor.get_meta_dir')
-    @patch('vector_lake.tool_doctor.get_db_path')
-    def test_doctor_vector_lake(self, mock_db, mock_meta, mock_idx, mock_mem, mock_raw, mock_wiki):
+    @patch('vector_lake.tool_doctor.peek_meta_dir')
+    @patch('vector_lake.tool_doctor.peek_db_path')
+    @patch('vector_lake.tool_doctor.inspect_schema_migration_state')
+    def test_doctor_vector_lake(self, mock_schema, mock_db, mock_meta, mock_idx, mock_mem, mock_raw, mock_wiki):
         for mock_path in [mock_wiki, mock_raw, mock_mem, mock_idx, mock_meta, mock_db]:
             m = MagicMock()
             m.exists.return_value = True
             m.__str__.return_value = "/mock/path"
             mock_path.return_value = m
+        mock_schema.return_value = {
+            "ready": True,
+            "user_version": 1,
+            "supported_version": 1,
+            "ledger": [{"version": 1}],
+            "issues": [],
+        }
+
 
         output = doctor_vector_lake()
         self.assertIn("=== Vector Lake Doctor ===", output)

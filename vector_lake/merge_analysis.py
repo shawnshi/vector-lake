@@ -61,10 +61,10 @@ def normalize_source_identity(value: str) -> str:
 
 def build_wiki_backlink_index(wiki_dir: Path) -> WikiBacklinkIndex:
     """Scan Wiki links once and index normalized targets for batch preflight."""
-    from vector_lake.wiki_utils import iter_wiki_link_matches
+    from vector_lake.wiki_utils import iter_markdown_files, iter_wiki_link_matches
 
     backlinks: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
-    for candidate_path in sorted(Path(wiki_dir).glob("*.md")):
+    for candidate_path in sorted(iter_markdown_files(wiki_dir), key=lambda path: path.name):
         candidate_bytes = candidate_path.read_bytes()
         candidate_content = candidate_bytes.decode("utf-8")
         projection_hash = hashlib.sha256(candidate_bytes).hexdigest()
@@ -687,9 +687,16 @@ def preflight_suggestion(
             raise ValueError("Merge preflight requires two distinct page keys.")
         if any(separator in target_key or separator in source_key for separator in ("/", "\\")):
             raise ValueError("Merge preflight page keys must be basenames.")
-        target_path = (Path(wiki_dir).resolve() / f"{target_key}.md").resolve()
-        source_path = (Path(wiki_dir).resolve() / f"{source_key}.md").resolve()
-        if target_path.parent != Path(wiki_dir).resolve() or source_path.parent != Path(wiki_dir).resolve():
+        from vector_lake.wiki_utils import iter_markdown_files
+
+        wiki_root = Path(wiki_dir).resolve()
+        wiki_paths = {
+            path.stem: path.resolve()
+            for path in iter_markdown_files(wiki_root)
+        }
+        target_path = wiki_paths.get(target_key, wiki_root / f"{target_key}.md")
+        source_path = wiki_paths.get(source_key, wiki_root / f"{source_key}.md")
+        if target_path.parent != wiki_root or source_path.parent != wiki_root:
             raise ValueError("Merge preflight path escapes the wiki directory.")
         if target_path == source_path:
             raise ValueError("Merge preflight requires two distinct physical pages.")

@@ -10,6 +10,7 @@ from vector_lake.defense_hook import verify_asset
 from vector_lake.schema_validator import validate_schema
 from vector_lake.wiki_utils import (
     atomic_write_text,
+    delete_file_compare_and_swap,
     get_index_path,
     get_outbox_signal_path,
     get_wiki_dir,
@@ -19,6 +20,10 @@ from vector_lake.wiki_utils import (
 
 
 log = logging.getLogger("vector-lake-mutation")
+
+
+def _markdown_page_key(filename: str) -> str:
+    return filename[:-3] if filename.casefold().endswith(".md") else filename
 
 
 def _filename_identity(filename: str) -> str:
@@ -65,13 +70,7 @@ def materialize_markdown_projection(
     )
     if mutation_type == "delete":
         if filepath.exists():
-            if projection_base_hash is not None:
-                current_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
-                if current_hash != projection_base_hash:
-                    raise RuntimeError(
-                        f"Projection compare-and-swap conflict for {filename}."
-                    )
-            filepath.unlink()
+            delete_file_compare_and_swap(filepath, projection_base_hash)
         return filepath
     if mutation_type != "update":
         raise ValueError(f"Unsupported mutation_type: {mutation_type}")
@@ -79,6 +78,11 @@ def materialize_markdown_projection(
         if not filepath.exists():
             raise ValueError(f"Outbox update for {filename} has no payload and no existing Markdown projection.")
         payload_text = filepath.read_text(encoding="utf-8")
+    if filepath.exists() and projection_base_hash is not None:
+        current_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
+        desired_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        if current_hash == desired_hash:
+            return filepath
     atomic_write_text(
         filepath,
         payload_text,
@@ -107,7 +111,11 @@ def _prepare_mutations(
     prepared = []
     seen_filenames: dict[str, str] = {}
     existing_filenames: dict[str, set[str]] = {}
-    for existing_path in get_wiki_dir().glob("*.md"):
+    wiki_dir = get_wiki_dir()
+    existing_paths = wiki_dir.iterdir() if wiki_dir.exists() else ()
+    for existing_path in existing_paths:
+        if not existing_path.is_file() or existing_path.suffix.casefold() != ".md":
+            continue
         existing_filenames.setdefault(
             _filename_identity(existing_path.name),
             set(),
@@ -141,18 +149,25 @@ def _prepare_mutations(
         projection_base_hash = mutation.get("expected_projection_hash")
         if has_expected_version and not isinstance(expected_version, str):
             raise ValueError("expected_version must be a string when supplied.")
-        if projection_base_hash is not None and (
+        if projection_base_hash not in {None, ""} and (
             not isinstance(projection_base_hash, str)
             or len(projection_base_hash) != 64
             or any(character not in "0123456789abcdef" for character in projection_base_hash.casefold())
         ):
-            raise ValueError("expected_projection_hash must be a 64-character SHA-256 hex digest.")
-        if is_delete and projection_base_hash is not None:
-            raise ValueError("expected_projection_hash is supported only for update mutations.")
+            raise ValueError("expected_projection_hash must be empty or a 64-character SHA-256 hex digest.")
         filepath = resolve_wiki_mutation_path(
             filename,
             allow_existing_legacy_name=validation_mode == "schema",
         )
+        if projection_base_hash is None:
+            projection_base_hash = (
+                hashlib.sha256(filepath.read_bytes()).hexdigest()
+                if filepath.exists()
+                else ""
+            )
+        else:
+            projection_base_hash = projection_base_hash.casefold()
+
         seen_filenames[filename_identity] = filename
 
         mutation_type = "delete" if is_delete else "update"
@@ -234,24 +249,20 @@ def execute_mutation_batch(
 
     with db_store.transaction():
         page_keys = {
-            mutation["filename"][:-3]
-            if mutation["filename"].endswith(".md")
-            else mutation["filename"]
+            _markdown_page_key(mutation["filename"])
             for mutation in prepared
         }
         base_versions = governance_store.canonical_page_versions(page_keys)
         versioned = [mutation for mutation in prepared if mutation["has_expected_version"]]
         if versioned:
             page_keys = {
-                mutation["filename"][:-3]
-                if mutation["filename"].endswith(".md")
-                else mutation["filename"]
+                _markdown_page_key(mutation["filename"])
                 for mutation in versioned
             }
             current_versions = governance_store.canonical_page_versions(page_keys)
             for mutation in versioned:
                 filename = mutation["filename"]
-                page_key = filename[:-3] if filename.endswith(".md") else filename
+                page_key = _markdown_page_key(filename)
                 expected = mutation["expected_version"]
                 current = current_versions.get(page_key)
                 if (expected == "" and current is not None) or (
@@ -267,7 +278,7 @@ def execute_mutation_batch(
             filename = mutation["filename"]
             content = mutation["content"]
             if mutation["mutation_type"] == "delete":
-                node_key = filename[:-3] if filename.endswith(".md") else filename
+                node_key = _markdown_page_key(filename)
                 db_store.delete_node_cascade(node_key)
         governance_store.apply_change_sets_batch(prepared_change_sets)
         published_at = datetime.now(timezone.utc).isoformat()
@@ -286,7 +297,7 @@ def execute_mutation_batch(
                     idempotency_key=mutation["idempotency_key"],
                     validation_mode=validation_mode,
                     base_version=base_versions.get(
-                        filename[:-3] if filename.endswith(".md") else filename,
+                        _markdown_page_key(filename),
                         "",
                     ),
                     projection_base_hash=mutation["projection_base_hash"],

@@ -1,5 +1,8 @@
 import json
+import sqlite3
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -82,9 +85,346 @@ Primary source content.
 """
 
 
+def test_write_health_gate_reuses_recent_unchanged_deep_check(monkeypatch):
+    from vector_lake import runtime_health
+
+    calls = []
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.setattr(
+        runtime_health,
+        "_write_health_surface_token",
+        lambda: "stable-surface",
+    )
+    monkeypatch.setattr(
+        runtime_health,
+        "assess_runtime_health",
+        lambda **kwargs: calls.append(kwargs) or {
+            "ok": True,
+            "issues": [],
+            "warnings": [],
+            "detail": {},
+        },
+    )
+    runtime_health._clear_health_caches_for_tests()
+
+    runtime_health.enforce_runtime_write_health()
+    runtime_health.enforce_runtime_write_health()
+
+    assert calls == [{"deep_projection_checks": True}]
+
+
+@pytest.mark.parametrize("configured", [None, "not-a-number"])
+def test_write_health_gate_is_strict_by_default_and_on_invalid_ttl(
+    monkeypatch,
+    configured,
+):
+    from vector_lake import runtime_health
+
+    calls = []
+    if configured is None:
+        monkeypatch.delenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", configured)
+    monkeypatch.setattr(
+        runtime_health,
+        "_write_health_surface_token",
+        lambda: "stable-surface",
+    )
+    monkeypatch.setattr(
+        runtime_health,
+        "assess_runtime_health",
+        lambda **kwargs: calls.append(kwargs) or {
+            "ok": True,
+            "issues": [],
+            "warnings": [],
+            "detail": {},
+        },
+    )
+    runtime_health._clear_health_caches_for_tests()
+
+    runtime_health.enforce_runtime_write_health()
+    runtime_health.enforce_runtime_write_health()
+
+    assert calls == [
+        {"deep_projection_checks": True},
+        {"deep_projection_checks": True},
+    ]
+
+
+def test_write_health_gate_invalidates_when_projection_identity_changes(monkeypatch):
+    from vector_lake import runtime_health
+
+    tokens = iter(["surface-a", "surface-a", "surface-b", "surface-b"])
+    calls = []
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.setattr(
+        runtime_health,
+        "_write_health_surface_token",
+        lambda: next(tokens),
+    )
+    monkeypatch.setattr(
+        runtime_health,
+        "assess_runtime_health",
+        lambda **kwargs: calls.append(kwargs) or {
+            "ok": True,
+            "issues": [],
+            "warnings": [],
+            "detail": {},
+        },
+    )
+    runtime_health._clear_health_caches_for_tests()
+
+    runtime_health.enforce_runtime_write_health()
+    runtime_health.enforce_runtime_write_health()
+
+    assert len(calls) == 2
+
+def test_write_health_gate_deep_check_is_single_flight(monkeypatch):
+    from vector_lake import runtime_health
+
+    calls = []
+    errors = []
+    started = threading.Event()
+    release = threading.Event()
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.setattr(
+        runtime_health,
+        "_write_health_surface_token",
+        lambda: "stable-surface",
+    )
+
+    def assess(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        assert release.wait(timeout=2)
+        return {"ok": True, "issues": [], "warnings": [], "detail": {}}
+
+    monkeypatch.setattr(runtime_health, "assess_runtime_health", assess)
+    runtime_health._clear_health_caches_for_tests()
+
+    def enforce():
+        try:
+            runtime_health.enforce_runtime_write_health()
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=enforce)
+    second = threading.Thread(target=enforce)
+    first.start()
+    assert started.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert errors == []
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert calls == [{"deep_projection_checks": True}]
+
+
+def test_write_health_gate_fails_closed_when_snapshot_keeps_changing(monkeypatch):
+    from vector_lake import runtime_health
+
+    tokens = iter(["surface-a", "surface-b", "surface-c"])
+    calls = []
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.setattr(
+        runtime_health,
+        "_write_health_surface_token",
+        lambda: next(tokens),
+    )
+    monkeypatch.setattr(
+        runtime_health,
+        "assess_runtime_health",
+        lambda **kwargs: calls.append(kwargs) or {
+            "ok": True,
+            "issues": [],
+            "warnings": [],
+            "detail": {},
+        },
+    )
+    runtime_health._clear_health_caches_for_tests()
+
+    with pytest.raises(RuntimeError, match="changed during validation"):
+        runtime_health.enforce_runtime_write_health()
+
+    assert len(calls) == 2
+
+
+def test_write_gate_migrates_existing_database_before_retry(isolated_memory, monkeypatch):
+    from vector_lake import runtime_health
+
+    old_db = isolated_memory / "wiki" / ".meta" / "legacy-runtime.db"
+    old_db.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(str(old_db))
+    legacy.execute("CREATE TABLE legacy_marker (value TEXT)")
+    legacy.commit()
+    legacy.close()
+
+    monkeypatch.setenv("VECTOR_LAKE_DB_PATH", str(old_db))
+    db_store.close_connection()
+    db_key = str(old_db.resolve())
+    db_store._INITIALIZED_DB_PATHS.discard(db_key)
+    runtime_health._clear_health_caches_for_tests()
+    calls = []
+
+    def assess(**kwargs):
+        calls.append(kwargs)
+        db_store.init_db()
+        return {
+            "ok": True,
+            "issues": [],
+            "warnings": [],
+            "detail": {},
+        }
+
+    monkeypatch.setattr(runtime_health, "assess_runtime_health", assess)
+    runtime_health.enforce_runtime_write_health()
+
+    surfaces = {
+        str(row[0])
+        for row in db_store.get_connection().execute("SELECT surface FROM runtime_generations")
+    }
+    assert {
+        "entities",
+        "claims",
+        "sources",
+        "timeline_events",
+        "mutation_outbox",
+        "jobs",
+    } <= surfaces
+    assert len(calls) == 1
+
+
+def test_write_health_token_changes_when_watchdog_becomes_stale(isolated_memory):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+    write_status("idle", 0, 0, "Watchdog heartbeat", "", component="watchdog")
+    fresh_token = runtime_health._write_health_surface_token()
+
+    status_path = get_status_file()
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    payload["updated_at"] = "2000-01-01T00:00:00+00:00"
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+    stale_token = runtime_health._write_health_surface_token()
+
+    assert stale_token != fresh_token
+
+def test_write_health_token_tracks_blocking_policy_changes(isolated_memory, monkeypatch):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+    monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_BACKLOG_BLOCKING", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_TIMELINE_PARITY_BLOCKING", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS", raising=False)
+    initial = runtime_health._write_health_surface_token()
+
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_BACKLOG_BLOCKING", "1")
+    backlog_blocking = runtime_health._write_health_surface_token()
+    monkeypatch.setenv("VECTOR_LAKE_TIMELINE_PARITY_BLOCKING", "1")
+    timeline_blocking = runtime_health._write_health_surface_token()
+    monkeypatch.setenv("VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS", "900")
+    ready_age_policy = runtime_health._write_health_surface_token()
+
+    assert len({initial, backlog_blocking, timeline_blocking, ready_age_policy}) == 4
+
+def test_write_health_token_does_not_enumerate_wiki_files(
+    isolated_memory, monkeypatch
+):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+
+    def fail_scandir(*_args, **_kwargs):
+        raise AssertionError("write-health token must not enumerate Wiki files")
+
+    monkeypatch.setattr(runtime_health.os, "scandir", fail_scandir)
+
+    assert runtime_health._write_health_surface_token()
+
+
+def test_write_health_tracks_pending_wiki_reconcile_marker(isolated_memory):
+    from vector_lake import runtime_health
+    from vector_lake.wiki_utils import get_meta_dir
+
+    db_store.init_db()
+    runtime_health._clear_health_caches_for_tests()
+    before = runtime_health._write_health_surface_token()
+    marker = get_meta_dir() / "wiki_reconcile_required.json"
+    marker.write_text(
+        json.dumps({"required": True, "generation": 7}),
+        encoding="utf-8",
+    )
+
+    pending = runtime_health._write_health_surface_token()
+    health = runtime_health.assess_runtime_health()
+
+    assert pending != before
+    assert health["ok"] is False
+    assert "wiki_reconcile_required:generation=7" in health["issues"]
+    assert health["detail"]["wiki_reconcile_generation"] == 7
+
+    marker.unlink()
+    assert runtime_health._write_health_surface_token() != pending
+
+
+def test_external_commit_invalidates_token_and_canonical_cache(isolated_memory):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    db_path = db_store.get_db_path()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) VALUES (?, ?, ?, ?)",
+            (
+                "entity_external",
+                "External",
+                '{"entity_id":"entity_external","page_key":"Concept_AA"}',
+                "2026-07-27T00:00:00+00:00",
+            ),
+        )
+    runtime_health._clear_health_caches_for_tests()
+    before_generation = int(
+        conn.execute(
+            "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+        ).fetchone()[0]
+    )
+    before_snapshot = runtime_health._canonical_snapshot(conn, db_path)
+    before_token = runtime_health._write_health_surface_token()
+
+    external = sqlite3.connect(str(db_path))
+    try:
+        external.execute(
+            "UPDATE entities SET data_json = ? WHERE entity_id = ?",
+            ('{"entity_id":"entity_external","page_key":"Concept_BB"}', "entity_external"),
+        )
+        external.commit()
+    finally:
+        external.close()
+
+    after_generation = int(
+        conn.execute(
+            "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+        ).fetchone()[0]
+    )
+    after_token = runtime_health._write_health_surface_token()
+    after_snapshot = runtime_health._canonical_snapshot(conn, db_path)
+
+    assert after_generation == before_generation
+    assert after_token != before_token
+    assert "Concept_AA" in before_snapshot
+    assert "Concept_BB" in after_snapshot
+    assert "Concept_AA" not in after_snapshot
+
+
 def test_write_health_gate_blocks_projection_drift_after_index_exists(isolated_memory):
     _write_purpose_contract(isolated_memory)
-    execute_mutation_plan("Source_Healthy.md", content=_source_content("source_healthy", "Healthy Source"))
+    execute_mutation_plan("Source_Healthy.MD", content=_source_content("source_healthy", "Healthy Source"))
     indexer.generate_index()
     assert assess_runtime_health()["ok"] is True
 
@@ -113,6 +453,40 @@ Orphan.
     assert any("projection_drift" in issue for issue in health["issues"])
     with pytest.raises(RuntimeError, match="write gate blocked"):
         execute_mutation_plan("Source_Blocked.md", content=_source_content("source_blocked", "Blocked Source"))
+
+
+def test_default_write_gate_detects_external_in_place_wiki_edit(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import runtime_health
+
+    _write_purpose_contract(isolated_memory)
+    execute_mutation_plan(
+        "Source_Healthy.md",
+        content=_source_content("source_healthy", "Healthy Source"),
+    )
+    indexer.generate_index()
+    runtime_health._clear_health_caches_for_tests()
+    monkeypatch.delenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", raising=False)
+    monkeypatch.setattr(
+        runtime_health,
+        "_write_health_surface_token",
+        lambda: "intentionally-stable-token",
+    )
+
+    runtime_health.enforce_runtime_write_health()
+    page = isolated_memory / "wiki" / "Source_Healthy.md"
+    page.write_text(
+        page.read_text(encoding="utf-8").replace(
+            "Primary source content.",
+            "Externally edited projection with different content.",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="write gate blocked"):
+        runtime_health.enforce_runtime_write_health()
 
 
 def test_schema_mode_bypasses_write_gate_for_bounded_repairs(isolated_memory):
@@ -303,17 +677,22 @@ def test_deep_health_detects_equal_count_timeline_id_drift_without_blocking(isol
         "temporal_anchor": "2026-07-14",
         "subject_entity_ids": [],
         "source_ids": [],
+        "locator": {"page_key": "Event_Timeline-Health"},
     }
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Event_Timeline-Health.md"],
+            "proposed_entities": [],
+            "proposed_claims": [claim],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
     with db_store.transaction():
         conn.execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "active", json.dumps(claim), "2026-07-14T00:00:00+00:00"),
-        )
-        conn.execute(
-            "INSERT INTO timeline_events "
-            "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("wrong-id", "2026-07-14", "old", "neutral", "Wrong event", "", "", "", "2026-07-14"),
+            "UPDATE timeline_events SET id = ?, action = ?, description = ?",
+            ("wrong-id", "old", "Wrong event"),
         )
     indexer.refresh_claim_graph_projection()
 
@@ -460,6 +839,86 @@ def test_subagent_backlog_is_visible_without_blocking_by_default(isolated_memory
 
     assert health["ok"] is True
     assert any("subagent_backlog" in warning for warning in health["warnings"])
+
+
+def test_ready_ingest_queue_age_detects_stalled_dispatch_worker(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    old = "2000-01-01T00:00:00+00:00"
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, created_at, updated_at, available_at) "
+            "VALUES ('stalled-ingest', 'ingest', '{}', 'queued', 0, ?, ?, ?)",
+            (old, old, old),
+        )
+    monkeypatch.setenv("VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS", "60")
+
+    health = assess_runtime_health()
+
+    assert health["ok"] is False
+    assert health["detail"]["ready_ingest_jobs"] == 1
+    assert health["detail"]["oldest_ready_ingest_age_seconds"] > 60
+    assert any(
+        issue.startswith("ingest_dispatch_stalled:count=1,")
+        for issue in health["issues"]
+    )
+
+
+def test_recently_expired_ingest_lease_uses_lease_age_not_job_age(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    old = "2000-01-01T00:00:00+00:00"
+    lease_until = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, created_at, updated_at, "
+            "available_at, lease_until) "
+            "VALUES ('recent-lease', 'ingest', '{}', 'dispatched', 0, ?, ?, ?, ?)",
+            (old, old, old, lease_until),
+        )
+    monkeypatch.setenv("VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS", "not-an-integer")
+
+    health = assess_runtime_health()
+
+    assert health["detail"]["ready_ingest_jobs"] == 1
+    assert health["detail"]["oldest_ready_ingest_age_seconds"] < 10
+    assert not any(
+        issue.startswith("ingest_dispatch_stalled:")
+        for issue in health["issues"]
+    )
+
+
+def test_long_expired_ingest_lease_is_reported_as_stalled(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    old = "2000-01-01T00:00:00+00:00"
+    lease_until = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, created_at, updated_at, "
+            "available_at, lease_until) "
+            "VALUES ('old-lease', 'ingest', '{}', 'dispatched', 0, ?, ?, ?, ?)",
+            (old, old, old, lease_until),
+        )
+    monkeypatch.setenv("VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS", "60")
+
+    health = assess_runtime_health()
+
+    assert health["detail"]["ready_ingest_jobs"] == 1
+    assert health["detail"]["oldest_ready_ingest_age_seconds"] >= 120
+    assert any(
+        issue.startswith("ingest_dispatch_stalled:count=1,")
+        for issue in health["issues"]
+    )
 
 
 def test_deep_health_reuses_unchanged_wiki_parse_and_invalidates_on_write(
@@ -740,19 +1199,20 @@ def test_decision_scoped_readiness_uses_verified_registry_and_ignores_unmapped_d
     from vector_lake.decision_registry import sync_critical_decision_registry
 
     db_store.init_db()
-    conn = db_store.get_connection()
     claim = {
         "claim_id": "claim_decision_ready",
         "claim_text": "Decision evidence is complete.",
         "status": "Active",
         "evidence_ids": ["evidence_decision_ready"],
         "source_ids": ["source_decision_ready"],
+        "locator": {"page_key": "Concept_Decision-Ready"},
     }
     evidence = {
         "evidence_id": "evidence_decision_ready",
         "source_id": "source_decision_ready",
         "source_locator": {"kind": "text", "paragraph": 2},
         "lineage_safe": True,
+        "locator": {"page_key": "Concept_Decision-Ready"},
     }
     source = {
         "source_id": "source_decision_ready",
@@ -765,24 +1225,17 @@ def test_decision_scoped_readiness_uses_verified_registry_and_ignores_unmapped_d
         "status": "pending",
         "critical_decision_refs": ["CD-OTHER"],
     }
-    with db_store.transaction():
-        conn.execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-21"),
-        )
-        conn.execute(
-            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (evidence["evidence_id"], json.dumps(evidence), "2026-07-21"),
-        )
-        conn.execute(
-            "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (source["source_id"], json.dumps(source), "2026-07-21"),
-        )
-        conn.execute(
-            "INSERT INTO governance_queue (item_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (unrelated["item_id"], json.dumps(unrelated), "2026-07-21"),
-        )
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Decision-Ready.md"],
+            "proposed_entities": [],
+            "proposed_claims": [claim],
+            "proposed_evidence": [evidence],
+            "proposed_source_updates": [source],
+            "proposed_edges": [],
+        }
+    )
+    governance_store.upsert_governance_item(unrelated)
     record_claim_assessment(
         claim["claim_id"],
         assessment_type="evidence_review",

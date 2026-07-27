@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from jsonschema.validators import Draft202012Validator
 
-from vector_lake import db_store
+from vector_lake import db_store, governance_store
 from vector_lake.claim_assessment import record_claim_assessment
 from vector_lake.cli_app import build_parser
 from vector_lake.tool_evidence import build_evidence_packet, export_evidence_packet
@@ -12,7 +12,6 @@ from vector_lake.tool_evidence import build_evidence_packet, export_evidence_pac
 
 def _insert_packet_records():
     db_store.init_db()
-    conn = db_store.get_connection()
     claim = {
         "claim_id": "claim_cbss_1",
         "claim_text": "Milestone M1 was accepted.",
@@ -30,7 +29,11 @@ def _insert_packet_records():
     evidence = {
         "evidence_id": "evidence_cbss_1",
         "source_id": "source_cbss_1",
-        "locator": {"page": 4, "paragraph": 2},
+        "locator": {
+            "page_key": "Concept_CBSS-Test",
+            "page": 4,
+            "paragraph": 2,
+        },
         "evidence_text": "Signed acceptance record " + ("x" * 40),
         "evidence_type": "document-block",
         "supports_claim_ids": ["claim_cbss_1"],
@@ -52,31 +55,16 @@ def _insert_packet_records():
         "type": "concept",
         "status": "Active",
     }
-    with db_store.transaction():
-        conn.execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], claim["status"], json.dumps(claim), claim["updated_at"]),
-        )
-        conn.execute(
-            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (evidence["evidence_id"], json.dumps(evidence), claim["updated_at"]),
-        )
-        conn.execute(
-            "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (source["source_id"], json.dumps(source), claim["updated_at"]),
-        )
-        conn.execute(
-            "INSERT INTO entities (entity_id, canonical_name, type, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                entity["entity_id"],
-                entity["canonical_name"],
-                entity["type"],
-                entity["status"],
-                json.dumps(entity),
-                claim["updated_at"],
-            ),
-        )
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_CBSS-Test.md"],
+            "proposed_entities": [entity],
+            "proposed_claims": [claim],
+            "proposed_evidence": [evidence],
+            "proposed_source_updates": [source],
+            "proposed_edges": [],
+        }
+    )
 
 
 def test_evidence_packet_is_read_only_candidate_without_text_by_default(isolated_memory):
@@ -138,12 +126,18 @@ def test_evidence_packet_reports_missing_references(isolated_memory):
         "confidence": 0.5,
         "evidence_ids": ["missing_evidence"],
         "source_ids": ["missing_source"],
+        "locator": {"page_key": "Concept_Missing-References"},
     }
-    with db_store.transaction():
-        db_store.get_connection().execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], claim["status"], json.dumps(claim), "2026-07-21"),
-        )
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Missing-References.md"],
+            "proposed_entities": [],
+            "proposed_claims": [claim],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
 
     packet = build_evidence_packet(claim["claim_id"])
 

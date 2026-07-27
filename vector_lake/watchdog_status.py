@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 import threading
 import uuid
@@ -42,13 +43,18 @@ def write_status(
                     "current_action": current_action,
                     "last_error": last_error,
                     "updated_at": now,
+                    "heartbeat_at": now,
+                    "process_id": os.getpid(),
+                    "thread_name": threading.current_thread().name,
+                    "thread_ident": threading.get_ident(),
                 }
-                priority = {"halted": 3, "error": 2, "processing": 1, "idle": 0}
+                priority = {"halted": 4, "stopped": 3, "error": 2, "processing": 1, "idle": 0}
                 aggregate = max(
                     components.values(),
                     key=lambda item: priority.get(str(item.get("status", "idle")), 0),
                 )
                 data = {
+                    "schema_version": 2,
                     "status": aggregate.get("status", "idle"),
                     "task_queue_size": task_queue_size,
                     "index_queue_size": index_queue_size,

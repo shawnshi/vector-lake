@@ -19,7 +19,7 @@ from tests.test_mutation_coordinator import _write_purpose_contract
 
 
 def test_find_md_file_uses_safe_page_key_when_title_contains_a_separator(tmp_path):
-    expected = tmp_path / "Source_Safe-Key.md"
+    expected = tmp_path / "Source_Safe-Key.MD"
     expected.write_text("# Safe\n", encoding="utf-8")
 
     assert governance_service._find_md_file(
@@ -112,7 +112,7 @@ def test_preflight_runs_semantic_merge_and_schema_validation(tmp_path: Path, mon
         ),
         encoding="utf-8",
     )
-    (wiki_dir / "Source_Alpha-Alt.md").write_text(
+    (wiki_dir / "Source_Alpha-Alt.MD").write_text(
         _source_content(
             "source_alpha_alt",
             "Alpha Alt",

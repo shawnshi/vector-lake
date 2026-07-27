@@ -315,18 +315,16 @@ def test_unsupported_claim_registration_closes_unmanaged_debt(isolated_memory):
         "subject_entity_ids": [],
         "locator": {"page_key": "Concept_Evidence-Debt"},
     }
-    with db_store.transaction():
-        db_store.get_connection().execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                claim["claim_id"],
-                claim["claim_text"],
-                claim["status"],
-                json.dumps(claim),
-                "2026-07-19T00:00:00+00:00",
-            ),
-        )
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Evidence-Debt.md"],
+            "proposed_entities": [],
+            "proposed_claims": [claim],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
 
     result = maintenance.register_unsupported_claim_debt(dry_run=False)
     metrics = compute_debt_metrics(skip_heavy=True)
@@ -378,21 +376,21 @@ def test_orphan_source_classification_is_non_destructive_and_resumable(isolated_
             "canonical_source_page": "Source_Referenced.md",
         },
     ]
-    with db_store.transaction():
-        for source in sources:
-            db_store.get_connection().execute(
-                "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
-                (source["source_id"], json.dumps(source), "2026-07-21T00:00:00+00:00"),
-            )
-        evidence = {
-            "evidence_id": "evidence_referenced",
-            "source_id": "source_referenced",
-            "locator": {"page_key": "Concept_Test"},
+    evidence = {
+        "evidence_id": "evidence_referenced",
+        "source_id": "source_referenced",
+        "locator": {"page_key": "Concept_Test"},
+    }
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Test.md"],
+            "proposed_entities": [],
+            "proposed_claims": [],
+            "proposed_evidence": [evidence],
+            "proposed_source_updates": sources,
+            "proposed_edges": [],
         }
-        db_store.get_connection().execute(
-            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (evidence["evidence_id"], json.dumps(evidence), "2026-07-21T00:00:00+00:00"),
-        )
+    )
 
     preview = maintenance.classify_orphan_source_debt(dry_run=True)
     assert preview["orphan_sources"] == 4

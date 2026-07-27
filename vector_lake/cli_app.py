@@ -25,6 +25,26 @@ def _load_env():
         dotenv.load_dotenv(env_path)
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("expected an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("expected zero or a positive integer")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("expected an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Vector Lake CLI Gateway",
@@ -47,13 +67,15 @@ Usage Examples:
 
     subparsers.add_parser("sync", help="[INGEST] Generates MCP ingestion instructions for Native Subagents.")
     ingest_tasks_parser = subparsers.add_parser("ingest-tasks", help="[INGEST] List or expire subagent ingest tasks.")
-    ingest_tasks_parser.add_argument("--limit", type=int, default=20, help="Maximum number of jobs to list.")
+    ingest_tasks_parser.add_argument("--limit", type=_nonnegative_int, default=20, help="Maximum number of jobs to list.")
     ingest_tasks_parser.add_argument("--awaiting-only", action="store_true", help="Hide queued jobs and show only awaiting-subagent jobs.")
     ingest_tasks_parser.add_argument("--expire-stale", action="store_true", help="Expire stale awaiting-subagent jobs instead of listing.")
     ingest_tasks_parser.add_argument("--claim", action="store_true", help="Lease awaiting task packets to this host runtime.")
     ingest_tasks_parser.add_argument("--repair-debt", action="store_true", help="Classify and recover abandoned ingest jobs.")
-    ingest_tasks_parser.add_argument("--apply", action="store_true", help="Apply --repair-debt after creating a maintenance backup.")
+    ingest_tasks_parser.add_argument("--cleanup-orphans", action="store_true", help="Preview old unreferenced ingest task packets.")
+    ingest_tasks_parser.add_argument("--apply", action="store_true", help="Apply the selected repair or cleanup operation.")
     ingest_tasks_parser.add_argument("--max-age-seconds", type=int, default=86400, help="Age threshold for --expire-stale.")
+    ingest_tasks_parser.add_argument("--min-age-seconds", type=_nonnegative_int, default=86400, help="Minimum age for --cleanup-orphans.")
     ingest_tasks_parser.add_argument("--lease-seconds", type=int, default=3600, help="Lease duration for --claim.")
 
     lint_parser = subparsers.add_parser("lint", help="[LINT] Run self-healing audit on the Wiki nodes.")
@@ -112,6 +134,22 @@ Usage Examples:
     wiki_restore_parser.add_argument("--apply", action="store_true", help="Persist restored Markdown pages. Defaults to dry-run.")
     wiki_restore_parser.add_argument("--limit", type=int, default=10, help="Maximum number of canonical-only pages to restore.")
 
+    memory_index_parser = subparsers.add_parser(
+        "memory-search-index",
+        help="[MAINTENANCE] Report or explicitly advance the optional operational-memory FTS index.",
+    )
+    memory_index_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Advance one bounded index batch. Defaults to read-only status.",
+    )
+    memory_index_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Maximum documents to synchronize when --apply is used (max: 10000).",
+    )
+
     memory_cleanup_parser = subparsers.add_parser(
         "memory-cleanup",
         help="[MAINTENANCE] Preview or archive generated template artifacts in operational memory.",
@@ -121,6 +159,48 @@ Usage Examples:
     )
     memory_cleanup_parser.add_argument(
         "--limit", type=int, default=0, help="Maximum rows to archive; zero means all candidates."
+    )
+    history_retention_parser = subparsers.add_parser(
+        "history-retention",
+        help="[MAINTENANCE] Preview or explicitly apply bounded history retention.",
+    )
+    history_retention_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete the selected history batch. Defaults to read-only preview.",
+    )
+    history_retention_parser.add_argument(
+        "--ttl-days", type=_positive_int, default=30, help="Minimum history age in days."
+    )
+    history_retention_parser.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=500,
+        help="Maximum rows selected per history table (max: 10000).",
+    )
+    history_retention_parser.add_argument(
+        "--keep-change-sets",
+        type=_nonnegative_int,
+        default=1000,
+        help="Always retain at least this many newest change sets.",
+    )
+    history_retention_parser.add_argument(
+        "--keep-terminal-jobs",
+        type=_nonnegative_int,
+        default=1000,
+        help="Always retain at least this many newest terminal jobs.",
+    )
+    history_retention_parser.add_argument(
+        "--keep-terminal-outbox",
+        type=_nonnegative_int,
+        default=1000,
+        help="Always retain at least this many newest terminal outbox rows.",
+    )
+    history_retention_parser.add_argument(
+        "--keep-versions-per-family",
+        type=_positive_int,
+        default=2,
+        help="Always retain the newest versions in each claim/evidence family.",
     )
     topology_cleanup_parser = subparsers.add_parser(
         "topology-queue-cleanup",
@@ -197,11 +277,20 @@ Usage Examples:
 
     delete_parser = subparsers.add_parser("delete", help="[DELETE] Cascade-delete a raw source and all related wiki pages.")
     delete_parser.add_argument("raw_path", help="Path to the raw source file to remove.")
-    delete_parser.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
+    delete_mode = delete_parser.add_mutually_exclusive_group()
+    delete_mode.add_argument("--apply", action="store_true", help="Execute the deletion. Defaults to dry-run.")
+    delete_mode.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
 
     gc_parser = subparsers.add_parser("gc", help="[GC] Automatically prune isolated/orphan entities.")
-    gc_parser.add_argument("--days", type=int, default=30, help="Prune entities older than this many days (default: 30).")
-    gc_parser.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
+    gc_parser.add_argument("--days", type=_positive_int, default=30, help="Prune entities older than this many days (default: 30; minimum: 1).")
+    gc_parser.add_argument(
+        "--confirm-orphans",
+        default=None,
+        help="Delete only the orphan candidate set matching this dry-run fingerprint. Requires --apply.",
+    )
+    gc_mode = gc_parser.add_mutually_exclusive_group()
+    gc_mode.add_argument("--apply", action="store_true", help="Execute garbage collection. Defaults to dry-run.")
+    gc_mode.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
     return parser
 
 
@@ -218,6 +307,12 @@ def main() -> int:
             if getattr(args, "repair_debt", False):
                 print(tools.reconcile_ingest_job_debt(
                     dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", 20),
+                ))
+            elif getattr(args, "cleanup_orphans", False):
+                print(tools.reconcile_orphan_ingest_task_packets(
+                    dry_run=not getattr(args, "apply", False),
+                    min_age_seconds=getattr(args, "min_age_seconds", 86400),
                     limit=getattr(args, "limit", 20),
                 ))
             elif getattr(args, "expire_stale", False):
@@ -279,10 +374,27 @@ def main() -> int:
                 dry_run=not getattr(args, "apply", False),
                 limit=getattr(args, "limit", 10),
             ))
+        elif args.command == "memory-search-index":
+            print(tools.operational_memory_search_index_maintenance(
+                dry_run=not getattr(args, "apply", False),
+                batch_size=getattr(args, "batch_size", 256),
+            ))
         elif args.command == "memory-cleanup":
             print(tools.cleanup_operational_memory(
                 dry_run=not getattr(args, "apply", False),
                 limit=getattr(args, "limit", 0),
+            ))
+        elif args.command == "history-retention":
+            print(tools.history_retention_maintenance(
+                dry_run=not getattr(args, "apply", False),
+                ttl_days=getattr(args, "ttl_days", 30),
+                batch_size=getattr(args, "batch_size", 500),
+                keep_change_sets=getattr(args, "keep_change_sets", 1000),
+                keep_terminal_jobs=getattr(args, "keep_terminal_jobs", 1000),
+                keep_terminal_outbox=getattr(args, "keep_terminal_outbox", 1000),
+                keep_versions_per_family=getattr(
+                    args, "keep_versions_per_family", 2
+                ),
             ))
         elif args.command == "topology-queue-cleanup":
             print(tools.retire_legacy_topology_queue(
@@ -321,9 +433,16 @@ def main() -> int:
         elif args.command == "merge-suggestions":
             print(tools.merge_suggestions_vector_lake(limit=getattr(args, "limit", 20), enqueue=not getattr(args, "preview", False)))
         elif args.command == "delete":
-            print(tools.delete_source(args.raw_path, dry_run=getattr(args, "dry_run", False)))
+            print(tools.delete_source(args.raw_path, dry_run=not getattr(args, "apply", False)))
         elif args.command == "gc":
-            print(tools.gc_vector_lake(days=getattr(args, "days", 30), dry_run=getattr(args, "dry_run", False)))
+            gc_kwargs = {
+                "days": getattr(args, "days", 30),
+                "dry_run": not getattr(args, "apply", False),
+            }
+            orphan_confirmation = getattr(args, "confirm_orphans", None)
+            if orphan_confirmation is not None:
+                gc_kwargs["orphan_confirmation"] = orphan_confirmation
+            print(tools.gc_vector_lake(**gc_kwargs))
     except Exception as exc:
         print(f"Error executing command '{args.command}': {exc}", file=sys.stderr)
         return 1

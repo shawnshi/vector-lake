@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from vector_lake.index_snapshot import (
+    clear_index_snapshot_cache_for_tests,
+    load_index_snapshot,
+)
+
 from typing import Any
 
 
@@ -34,8 +42,13 @@ _INDEX_PARITY_FIELDS = (
 )
 
 _CACHE_LOCK = threading.RLock()
+_WRITE_GATE_DEEP_LOCK = threading.Lock()
 _CANONICAL_CACHE: dict[str, Any] = {"key": None, "value": None}
-_INDEX_CACHE: dict[str, Any] = {"key": None, "value": None}
+_WRITE_GATE_CACHE: dict[str, Any] = {
+    "token": None,
+    "checked_at": 0.0,
+    "health": None,
+}
 _WIKI_VERSION_CACHE: dict[str, tuple[tuple[int, int, int], str | None, str | None]] = {}
 
 
@@ -55,18 +68,125 @@ def _parse_dt(value: Any):
     except Exception:
         return None
 
+def _bounded_env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+_RUNTIME_HEALTH_REQUIRED_COLUMNS = {
+    "entities": {"entity_id", "data_json"},
+    "claims": {"claim_id", "data_json", "status"},
+    "evidence": {"evidence_id", "data_json"},
+    "sources": {"source_id", "data_json"},
+    "source_artifacts": {"source_id", "data_json"},
+    "extraction_runs": {"run_id", "data_json"},
+    "claim_assessments": {"assessment_id", "claim_id", "outcome", "data_json"},
+    "governance_queue": {"item_id", "data_json"},
+    "mutation_outbox": {
+        "id",
+        "filename",
+        "status",
+        "mutation_type",
+        "payload_text",
+        "base_version",
+        "available_at",
+        "created_at",
+    },
+    "jobs": {
+        "task_type",
+        "status",
+        "retries",
+        "lease_until",
+        "available_at",
+        "created_at",
+        "updated_at",
+    },
+    "runtime_generations": {"surface", "generation"},
+    "operational_memory": {"memory_id", "data_json"},
+}
+
+
+class RuntimeDatabaseBlocked(RuntimeError):
+    """The runtime database cannot be inspected safely without mutation."""
+
+
+def _open_runtime_database_read_only():
+    """Open the existing database without creating or migrating it."""
+    from vector_lake.db_store import peek_db_path
+
+    db_path = peek_db_path().resolve()
+    if not db_path.is_file():
+        raise RuntimeDatabaseBlocked(f"database_missing:{db_path}")
+    try:
+        conn = sqlite3.connect(
+            f"{db_path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+    except sqlite3.Error as exc:
+        raise RuntimeDatabaseBlocked(f"database_read_only_open_failed:{exc}") from exc
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        available_tables = {str(row["name"]) for row in rows}
+        missing_tables = sorted(
+            set(_RUNTIME_HEALTH_REQUIRED_COLUMNS) - available_tables
+        )
+        missing_columns: list[str] = []
+        for table, required_columns in _RUNTIME_HEALTH_REQUIRED_COLUMNS.items():
+            if table not in available_tables:
+                continue
+            columns = {
+                str(row["name"])
+                for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            }
+            missing_columns.extend(
+                f"{table}.{column}"
+                for column in sorted(required_columns - columns)
+            )
+        if missing_tables or missing_columns:
+            parts = []
+            if missing_tables:
+                parts.append("missing_tables=" + ",".join(missing_tables))
+            if missing_columns:
+                parts.append("missing_columns=" + ",".join(missing_columns))
+            raise RuntimeDatabaseBlocked("schema_not_ready:" + ";".join(parts))
+        conn.execute("SELECT 1").fetchone()
+    except Exception:
+        conn.close()
+        raise
+    return conn, db_path
+
+def _sqlite_snapshot_identity(conn, db_path: Path) -> tuple:
+    identities = []
+    for path in (db_path, db_path.with_name(db_path.name + "-wal")):
+        try:
+            stat = path.stat()
+            identities.append((str(path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
+        except OSError:
+            identities.append((str(path.resolve()), "missing"))
+    data_version = int(
+        conn.execute("PRAGMA data_version").fetchone()[0]
+    )
+    return data_version, tuple(identities)
+
+
 
 def _canonical_snapshot(conn, db_path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
     """Load canonical entities once for an unchanged database generation."""
-    generation = conn.execute(
-        "SELECT COUNT(*) AS count, MAX(updated_at) AS latest, "
-        "COALESCE(SUM(LENGTH(data_json)), 0) AS bytes FROM entities"
+    generation_row = conn.execute(
+        "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
     ).fetchone()
     key = (
         str(db_path.resolve()),
-        int(generation["count"] or 0),
-        str(generation["latest"] or ""),
-        int(generation["bytes"] or 0),
+        int(generation_row["generation"] or 0),
+        _sqlite_snapshot_identity(conn, db_path),
     )
     with _CACHE_LOCK:
         if _CANONICAL_CACHE.get("key") == key:
@@ -89,22 +209,11 @@ def _canonical_snapshot(conn, db_path: Path) -> dict[str, list[tuple[str, dict[s
 
 
 def _index_snapshot(index_path: Path) -> tuple[dict[str, Any], Exception | None]:
-    """Parse index.json once for an unchanged file identity."""
+    """Load the process-wide shared index snapshot."""
     try:
-        stat = index_path.stat()
-        key = (str(index_path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
-    except OSError as exc:
-        return {"nodes": {}}, exc
-    with _CACHE_LOCK:
-        if _INDEX_CACHE.get("key") == key:
-            return _INDEX_CACHE["value"], None
-    try:
-        value = json.loads(index_path.read_text(encoding="utf-8"))
+        return load_index_snapshot(index_path), None
     except Exception as exc:
         return {"nodes": {}}, exc
-    with _CACHE_LOCK:
-        _INDEX_CACHE.update({"key": key, "value": value})
-    return value, None
 
 
 def _wiki_projection_version(governance_store, path: Path) -> tuple[str | None, str | None]:
@@ -133,6 +242,151 @@ def _wiki_projection_version(governance_store, path: Path) -> tuple[str | None, 
     return version, error
 
 
+def _write_health_surface_token() -> str:
+    """Hash cheap projection identities without reading page or index bodies.
+
+    Directory metadata catches Wiki create/delete/rename operations in O(1).
+    External in-place page edits do not reliably change directory metadata, so
+    write-health caching is opt-in and strict per-write validation is the
+    default.
+    """
+    from vector_lake.db_store import peek_db_path
+    from vector_lake.wiki_utils import (
+        get_claim_graph_path,
+        get_index_path,
+        get_legacy_claim_graph_path,
+        peek_meta_dir,
+        get_wiki_dir,
+    )
+
+    digest = hashlib.blake2b(digest_size=16)
+    wiki_dir = get_wiki_dir()
+    try:
+        stat = wiki_dir.stat()
+        wiki_identity = (
+            str(wiki_dir.resolve()),
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            stat.st_size,
+        )
+    except OSError:
+        wiki_identity = (str(wiki_dir.resolve()), "missing")
+    digest.update(repr(wiki_identity).encode("utf-8"))
+
+    for path in (
+        get_index_path(),
+        get_claim_graph_path(),
+        get_legacy_claim_graph_path(),
+        peek_meta_dir() / "wiki_reconcile_required.json",
+    ):
+        try:
+            stat = path.stat()
+            identity = (str(path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        except OSError:
+            identity = (str(path.resolve()), "missing")
+        digest.update(repr(identity).encode("utf-8"))
+
+    watchdog_status_path = peek_meta_dir() / ".watchdog_status.json"
+    try:
+        watchdog_status = json.loads(watchdog_status_path.read_text(encoding="utf-8"))
+        components = watchdog_status.get("components")
+        component_signature = ()
+        if isinstance(components, dict):
+            now_utc = datetime.now(timezone.utc)
+            component_max_age = _bounded_env_int(
+                "VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS",
+                default=120,
+                minimum=5,
+            )
+            component_signature = tuple(
+                sorted(
+                    (
+                        str(name),
+                        str(detail.get("status")),
+                        (
+                            (heartbeat := _parse_dt(
+                                detail.get("heartbeat_at") or detail.get("updated_at")
+                            ))
+                            is not None
+                            and max(0, int((now_utc - heartbeat).total_seconds()))
+                            <= component_max_age
+                        ),
+                    )
+                    for name, detail in components.items()
+                    if isinstance(detail, dict)
+                )
+            )
+        updated_at = _parse_dt(watchdog_status.get("updated_at"))
+        watchdog_age = None
+        if updated_at is not None:
+            watchdog_age = max(
+                0,
+                int((datetime.now(timezone.utc) - updated_at).total_seconds()),
+            )
+        watchdog_signature = (
+            str(watchdog_status.get("status")),
+            component_signature,
+            watchdog_age is not None and watchdog_age <= 120,
+        )
+    except FileNotFoundError:
+        watchdog_signature = ("missing",)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        watchdog_signature = ("unreadable", type(exc).__name__)
+    digest.update(repr(watchdog_signature).encode("utf-8"))
+
+    generation_surfaces = (
+        "entities",
+        "claims",
+        "sources",
+        "timeline_events",
+        "mutation_outbox",
+        "jobs",
+    )
+    policy_signature = (
+        os.environ.get("VECTOR_LAKE_OUTBOX_MAX_PENDING_AGE_SECONDS", "300"),
+        os.environ.get("VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS", "300"),
+        os.environ.get("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_JOBS", "500"),
+        os.environ.get("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_AGE_SECONDS", "86400"),
+        os.environ.get("VECTOR_LAKE_SUBAGENT_BACKLOG_BLOCKING") == "1",
+        os.environ.get("VECTOR_LAKE_TIMELINE_PARITY_BLOCKING") == "1",
+        os.environ.get("VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS", "120"),
+    )
+    digest.update(repr(policy_signature).encode("utf-8"))
+
+    conn = None
+    try:
+        db_path = peek_db_path()
+        if not db_path.exists():
+            raise FileNotFoundError(db_path)
+        conn, db_path = _open_runtime_database_read_only()
+        placeholders = ", ".join("?" for _ in generation_surfaces)
+        generation_rows = conn.execute(
+            f"SELECT surface, generation FROM runtime_generations WHERE surface IN ({placeholders})",
+            tuple(generation_surfaces),
+        ).fetchall()
+        generations = {
+            str(row["surface"]): int(row["generation"])
+            for row in generation_rows
+        }
+        missing = set(generation_surfaces) - set(generations)
+        if missing:
+            raise RuntimeError(f"missing runtime generations: {sorted(missing)}")
+        generation_signature = tuple(
+            (surface, generations[surface]) for surface in generation_surfaces
+        )
+        db_signature = (generation_signature, _sqlite_snapshot_identity(conn, db_path))
+        digest.update(repr(db_signature).encode("utf-8"))
+    except FileNotFoundError:
+        digest.update(b"database:missing")
+    except Exception as exc:
+        digest.update(f"database-error:{type(exc).__name__}".encode("ascii"))
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return digest.hexdigest()
+
+
 def _prune_wiki_version_cache(active_paths: set[str]) -> None:
     with _CACHE_LOCK:
         stale = [key for key in _WIKI_VERSION_CACHE if key not in active_paths]
@@ -142,32 +396,55 @@ def _prune_wiki_version_cache(active_paths: set[str]) -> None:
 
 def _clear_health_caches_for_tests() -> None:
     """Reset process-local caches; intentionally private to runtime tests."""
+    clear_index_snapshot_cache_for_tests()
     with _CACHE_LOCK:
         _CANONICAL_CACHE.update({"key": None, "value": None})
-        _INDEX_CACHE.update({"key": None, "value": None})
         _WIKI_VERSION_CACHE.clear()
+        _WRITE_GATE_CACHE.update({"token": None, "checked_at": 0.0, "health": None})
+
+def _recent_write_gate_health(token: str, cache_seconds: float):
+    if cache_seconds <= 0:
+        return None
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        if (
+            _WRITE_GATE_CACHE.get("token") == token
+            and now - float(_WRITE_GATE_CACHE.get("checked_at") or 0.0)
+            <= cache_seconds
+        ):
+            return _WRITE_GATE_CACHE.get("health")
+    return None
+
 
 
 def assess_runtime_health(
     max_watchdog_age_seconds: int = 120,
     deep_projection_checks: bool = False,
 ) -> dict[str, Any]:
-    from vector_lake.db_store import get_connection, get_db_path, init_db
-    from vector_lake.wiki_utils import get_index_path, get_meta_dir, get_wiki_dir
+    from vector_lake.wiki_utils import (
+        get_index_path,
+        get_wiki_dir,
+        iter_markdown_files,
+        peek_meta_dir,
+    )
 
     issues: list[str] = []
     warnings: list[str] = []
     detail: dict[str, Any] = {}
 
     try:
-        db_path = get_db_path()
-        if not db_path.exists():
-            init_db()
-        conn = get_connection()
-    except Exception as exc:
-        return {"ok": False, "issues": [f"database_unavailable:{exc}"], "warnings": [], "detail": {}}
+        conn, db_path = _open_runtime_database_read_only()
+    except RuntimeDatabaseBlocked as exc:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "issues": [f"database_blocked:{exc}"],
+            "warnings": [],
+            "detail": {"database_access": "read_only", "database_error": str(exc)},
+        }
 
     detail["db_path"] = str(db_path)
+    detail["database_access"] = "read_only"
 
     outbox_counts = {
         row["status"]: row["count"]
@@ -194,6 +471,38 @@ def assess_runtime_health(
     detail["terminal_failed_jobs"] = int(terminal_jobs)
     if terminal_jobs:
         issues.append(f"terminal_failed_jobs:{terminal_jobs}")
+    now_text = datetime.now(timezone.utc).isoformat()
+    ready_ingest_row = conn.execute(
+        "SELECT COUNT(*) AS count, "
+        "MIN(CASE WHEN status = 'dispatched' THEN lease_until "
+        "ELSE COALESCE(available_at, created_at) END) AS oldest "
+        "FROM jobs WHERE task_type = 'ingest' AND ("
+        "(status IN ('queued', 'failed') AND retries < 3 "
+        "AND COALESCE(available_at, created_at, '') <= ?) OR "
+        "(status = 'dispatched' AND COALESCE(lease_until, '') <= ?))",
+        (now_text, now_text),
+    ).fetchone()
+    ready_ingest_count = int(ready_ingest_row["count"] or 0)
+    detail["ready_ingest_jobs"] = ready_ingest_count
+    oldest_ready_ingest = _parse_dt(ready_ingest_row["oldest"])
+    if oldest_ready_ingest is not None:
+        ready_ingest_age = max(
+            0,
+            int(
+                (datetime.now(timezone.utc) - oldest_ready_ingest).total_seconds()
+            ),
+        )
+        detail["oldest_ready_ingest_age_seconds"] = ready_ingest_age
+        max_ready_age = _bounded_env_int(
+            "VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS",
+            default=300,
+            minimum=30,
+        )
+        if ready_ingest_age > max_ready_age:
+            issues.append(
+                f"ingest_dispatch_stalled:count={ready_ingest_count},"
+                f"oldest={ready_ingest_age}s"
+            )
     awaiting_row = conn.execute(
         "SELECT COUNT(*) AS count, MIN(updated_at) AS oldest FROM jobs WHERE status = 'awaiting_subagent'"
     ).fetchone()
@@ -217,24 +526,90 @@ def assess_runtime_health(
         else:
             warnings.append(message)
 
-    status_path = get_meta_dir() / ".watchdog_status.json"
+    meta_dir = peek_meta_dir()
+    reconcile_marker = meta_dir / "wiki_reconcile_required.json"
+    if reconcile_marker.exists():
+        try:
+            reconcile_state = json.loads(reconcile_marker.read_text(encoding="utf-8"))
+            generation = int(reconcile_state.get("generation", 0))
+            detail["wiki_reconcile_generation"] = generation
+            issues.append(f"wiki_reconcile_required:generation={generation}")
+        except Exception as exc:
+            issues.append(f"wiki_reconcile_marker_unreadable:{exc}")
+
+    status_path = meta_dir / ".watchdog_status.json"
     if status_path.exists():
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
+            now_utc = datetime.now(timezone.utc)
             updated_at = _parse_dt(status.get("updated_at"))
             age = None
             if updated_at is not None:
-                age = max(0, int((datetime.now(timezone.utc) - updated_at).total_seconds()))
+                age = max(0, int((now_utc - updated_at).total_seconds()))
             detail["watchdog_age_seconds"] = age
             detail["watchdog_status"] = status.get("status")
             if age is None or age > max_watchdog_age_seconds:
                 issues.append(f"watchdog_stale:{age if age is not None else 'unknown'}")
-            unhealthy_components = [
-                name
-                for name, component in (status.get("components") or {}).items()
-                if str(component.get("status", "")).lower() in {"error", "halted"}
-            ]
-            if str(status.get("status", "")).lower() in {"error", "halted"} or unhealthy_components:
+
+            components = status.get("components")
+            unhealthy_states = {"error", "halted", "stopped"}
+            unhealthy_components: list[str] = []
+            if isinstance(components, dict) and components:
+                component_max_age = _bounded_env_int(
+                    "VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS",
+                    default=max(5, int(max_watchdog_age_seconds)),
+                    minimum=5,
+                )
+                component_ages: dict[str, int | None] = {}
+                stale_components: list[str] = []
+                for name, raw_component in components.items():
+                    component = raw_component if isinstance(raw_component, dict) else {}
+                    heartbeat = _parse_dt(
+                        component.get("heartbeat_at") or component.get("updated_at")
+                    )
+                    component_age = (
+                        max(0, int((now_utc - heartbeat).total_seconds()))
+                        if heartbeat is not None
+                        else None
+                    )
+                    component_name = str(name)
+                    component_ages[component_name] = component_age
+                    if component_age is None or component_age > component_max_age:
+                        stale_components.append(component_name)
+                    if str(component.get("status", "")).lower() in unhealthy_states:
+                        unhealthy_components.append(component_name)
+
+                required_components = {
+                    item.strip()
+                    for item in os.environ.get(
+                        "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+                        "watchdog,outbox,scheduler,ingest",
+                    ).split(",")
+                    if item.strip()
+                }
+                missing_components = sorted(required_components - set(components))
+                detail["watchdog_component_max_age_seconds"] = component_max_age
+                detail["watchdog_component_ages_seconds"] = component_ages
+                detail["watchdog_missing_components"] = missing_components
+                for component_name in sorted(stale_components):
+                    component_age = component_ages[component_name]
+                    issues.append(
+                        "watchdog_component_stale:"
+                        f"{component_name}:"
+                        f"{component_age if component_age is not None else 'unknown'}"
+                    )
+                if missing_components:
+                    warnings.append(
+                        "watchdog_components_missing:" + ",".join(missing_components)
+                    )
+            else:
+                detail["watchdog_status_schema"] = "legacy"
+                warnings.append("watchdog_component_status_legacy")
+
+            if (
+                str(status.get("status", "")).lower() in unhealthy_states
+                or unhealthy_components
+            ):
                 issues.append(
                     "watchdog_unhealthy:"
                     + (",".join(sorted(unhealthy_components)) or str(status.get("status")))
@@ -244,12 +619,15 @@ def assess_runtime_health(
     else:
         warnings.append("watchdog_status_missing")
 
-    excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
+    excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
     wiki_dir = get_wiki_dir()
-    wiki_keys = {
-        path.stem for path in wiki_dir.glob("*.md")
-        if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
-    } if wiki_dir.exists() else set()
+    wiki_paths = {
+        path.stem: path
+        for path in iter_markdown_files(wiki_dir)
+        if path.name.casefold() not in excluded
+        and not path.name.casefold().startswith("system_")
+    }
+    wiki_keys = set(wiki_paths)
     canonical_entities_by_page = _canonical_snapshot(conn, db_path)
     canonical_keys = set(canonical_entities_by_page)
     index_path = get_index_path()
@@ -291,7 +669,11 @@ def assess_runtime_health(
     if deep_projection_checks:
         from vector_lake import governance_store
         from vector_lake.claim_extractor import extract_page_objects
-        from vector_lake.indexer import _entity_to_index_node, claim_graph_projection_parity
+        from vector_lake.indexer import (
+            ProjectionSnapshotChanged,
+            _entity_to_index_node,
+            claim_graph_projection_parity,
+        )
         from vector_lake.wiki_utils import split_frontmatter
 
         active_projection_rows = conn.execute(
@@ -332,14 +714,14 @@ def assess_runtime_health(
             if payload_version == canonical_versions.get(page_key):
                 managed_base_versions[page_key] = str(base_version)
         active_wiki_paths = {
-            str((wiki_dir / f"{page_key}.md").resolve())
+            str(wiki_paths[page_key].resolve())
             for page_key in shared_wiki_keys
         }
         _prune_wiki_version_cache(active_wiki_paths)
         managed_reconciliation_drift: set[str] = set()
         managed_wiki_pages: set[str] = set()
         for page_key in sorted(shared_wiki_keys):
-            path = wiki_dir / f"{page_key}.md"
+            path = wiki_paths[page_key]
             observed, observed_error = _wiki_projection_version(governance_store, path)
             if observed_error is not None:
                 unreadable_wiki.append(page_key)
@@ -366,7 +748,7 @@ def assess_runtime_health(
                 managed_index = False
                 if page_key in managed_wiki_pages:
                     try:
-                        path = wiki_dir / f"{page_key}.md"
+                        path = wiki_paths[page_key]
                         content = path.read_text(encoding="utf-8")
                         frontmatter, body = split_frontmatter(content)
                         observed_entities = extract_page_objects(
@@ -429,6 +811,8 @@ def assess_runtime_health(
                     warnings.append("claim_graph_reconciliation_pending:" + message)
                 else:
                     issues.append(message)
+        except ProjectionSnapshotChanged as exc:
+            warnings.append(f"claim_graph_projection_transient:{exc}")
         except Exception as exc:
             issues.append(f"claim_graph_projection_unavailable:{exc}")
 
@@ -448,7 +832,14 @@ def assess_runtime_health(
             else:
                 warnings.append(message)
 
-    return {"ok": not issues, "issues": issues, "warnings": warnings, "detail": detail}
+    conn.close()
+    return {
+        "ok": not issues,
+        "status": "blocked" if issues else ("degraded" if warnings else "ready"),
+        "issues": issues,
+        "warnings": warnings,
+        "detail": detail,
+    }
 
 
 def _evidence_foundation_metrics(conn) -> dict[str, Any]:
@@ -712,23 +1103,23 @@ def assess_semantic_readiness(
     unsupported runtime claim blocks only while it lacks active, version-bound
     governance ownership.
     """
-    from vector_lake.db_store import get_connection, get_db_path, init_db
     from vector_lake.wiki_utils import get_index_path
 
     issues: list[str] = []
     warnings: list[str] = []
     detail: dict[str, Any] = {}
     try:
-        if not get_db_path().exists():
-            init_db()
-        conn = get_connection()
-    except Exception as exc:
+        conn, db_path = _open_runtime_database_read_only()
+    except RuntimeDatabaseBlocked as exc:
         return {
             "ready": False,
             "status": "not_ready",
-            "issues": [f"database_unavailable:{exc}"],
+            "issues": [f"database_blocked:{exc}"],
             "warnings": [],
-            "detail": {},
+            "detail": {
+                "database_access": "read_only",
+                "database_error": str(exc),
+            },
         }
 
     if index_data is None:
@@ -743,12 +1134,14 @@ def assess_semantic_readiness(
 
     normalized_decision_id = str(decision_id or "").strip()
     if normalized_decision_id:
-        return _assess_decision_scope(
+        result = _assess_decision_scope(
             conn,
             normalized_decision_id,
             dict(index_data or {}),
             issues,
         )
+        conn.close()
+        return result
 
     graph_state = dict((index_data or {}).get("graph_state") or {})
     detail["graph_state"] = graph_state
@@ -863,6 +1256,7 @@ def assess_semantic_readiness(
             issues.append(f"semantic_ingest_backlog:oldest={awaiting_age}s>{max_age}s")
 
     status = "not_ready" if issues else ("degraded" if warnings else "ready")
+    conn.close()
     return {
         "ready": status == "ready",
         "status": status,
@@ -877,7 +1271,47 @@ def enforce_runtime_write_health(validation_mode: str = "full"):
         return
     if validation_mode == "schema":
         return
-    health = assess_runtime_health(deep_projection_checks=True)
+
+    # A full write is an explicitly authorized mutation path. It may bootstrap
+    # or migrate storage before the read-only health assessment; diagnostic
+    # callers never cross this boundary.
+    from vector_lake.db_store import init_db
+
+    init_db()
+    try:
+        cache_seconds = float(
+            os.environ.get("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "0")
+        )
+    except (TypeError, ValueError):
+        cache_seconds = 0.0
+    cache_seconds = max(0.0, min(30.0, cache_seconds))
+    token = _write_health_surface_token()
+    health = _recent_write_gate_health(token, cache_seconds)
+    if health is None:
+        with _WRITE_GATE_DEEP_LOCK:
+            health = _recent_write_gate_health(token, cache_seconds)
+            if health is None:
+                for attempt in range(2):
+                    health = assess_runtime_health(deep_projection_checks=True)
+                    token_after = _write_health_surface_token()
+                    if token_after == token:
+                        if health.get("ok") and cache_seconds > 0:
+                            with _CACHE_LOCK:
+                                _WRITE_GATE_CACHE.update({
+                                    "token": token,
+                                    "checked_at": time.monotonic(),
+                                    "health": health,
+                                })
+                        break
+                    if attempt == 1:
+                        raise RuntimeError(
+                            "Vector Lake write gate could not validate a stable runtime "
+                            "snapshot because projections changed during validation."
+                        )
+                    token = token_after
+                    health = _recent_write_gate_health(token, cache_seconds)
+                    if health is not None:
+                        break
     if not health["ok"]:
         raise RuntimeError(
             "Vector Lake write gate blocked this mutation because runtime health is not clean. "

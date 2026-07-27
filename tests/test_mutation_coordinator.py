@@ -1,9 +1,11 @@
 import hashlib
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import yaml
 
 from vector_lake import db_store, governance_store, indexer
 from vector_lake.mutation_coordinator import execute_mutation_batch, execute_mutation_plan
@@ -109,6 +111,178 @@ def test_atomic_write_projection_compare_and_swap_preserves_manual_edit(
         )
 
     assert target.read_text(encoding="utf-8") == "manual edit"
+
+
+@pytest.mark.parametrize("pre_parsed_frontmatter", [None, {"id": "trusted"}])
+def test_atomic_write_full_mode_propagates_yaml_error_without_replacing_target(
+    isolated_memory,
+    pre_parsed_frontmatter,
+):
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    original = _source_content()
+    target.write_text(original, encoding="utf-8")
+    malformed = "---\nid: [unterminated\n---\nbody\n"
+
+    with pytest.raises(yaml.YAMLError):
+        atomic_write_text(
+            target,
+            malformed,
+            pre_parsed_frontmatter=pre_parsed_frontmatter,
+            validation_mode="full",
+        )
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("validation_mode", ["full", "schema"])
+def test_atomic_write_rejects_unterminated_frontmatter_without_replacing_target(
+    isolated_memory,
+    validation_mode,
+):
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    original = _source_content()
+    target.write_text(original, encoding="utf-8")
+    malformed = "---\nid: source_test\nbody without closing delimiter\n"
+
+    with pytest.raises(yaml.YAMLError, match="Missing YAML frontmatter closing delimiter"):
+        atomic_write_text(
+            target,
+            malformed,
+            pre_parsed_frontmatter={"id": "source_test"},
+            validation_mode=validation_mode,
+        )
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path casing contract")
+@pytest.mark.parametrize("validation_mode", ["full", "schema"])
+def test_atomic_write_validates_case_alias_of_canonical_wiki_root(
+    isolated_memory,
+    validation_mode,
+):
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    alias_target = isolated_memory / "WIKI" / "Source_Test.md"
+    original = _source_content()
+    target.write_text(original, encoding="utf-8")
+    malformed = "---\nid: [unterminated\n---\nbody\n"
+
+    with pytest.raises(yaml.YAMLError):
+        atomic_write_text(
+            alias_target,
+            malformed,
+            validation_mode=validation_mode,
+        )
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path alias contract")
+@pytest.mark.parametrize(
+    ("directory_name", "filename"),
+    [
+        ("wiki", "Source_Test.md."),
+        ("wiki", "Source_Test.md "),
+        ("wiki.", "Source_Test.md"),
+        ("wiki", "Source_Test.md::$DATA"),
+    ],
+)
+def test_atomic_write_rejects_ambiguous_windows_path_aliases(
+    isolated_memory,
+    directory_name,
+    filename,
+):
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    alias_target = isolated_memory / directory_name / filename
+    original = _source_content()
+    target.write_text(original, encoding="utf-8")
+    malformed = "---\nid: [unterminated\n---\nbody\n"
+
+    with pytest.raises(ValueError, match="Windows path|Windows alternate"):
+        atomic_write_text(
+            alias_target,
+            malformed,
+            validation_mode="schema",
+        )
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows symlink contract")
+def test_atomic_write_validates_wiki_file_symlink_without_following_target(
+    isolated_memory,
+):
+    wiki_target = isolated_memory / "wiki" / "Source_Test.md"
+    external_target = isolated_memory / "scratch" / "external.md"
+    external_target.parent.mkdir(parents=True, exist_ok=True)
+    original = _source_content()
+    external_target.write_text(original, encoding="utf-8")
+    try:
+        wiki_target.symlink_to(external_target)
+    except OSError as exc:
+        pytest.skip(f"File symlinks unavailable: {exc}")
+
+    malformed = "---\nid: [unterminated\n---\nbody\n"
+    with pytest.raises(yaml.YAMLError):
+        atomic_write_text(
+            wiki_target,
+            malformed,
+            validation_mode="schema",
+        )
+
+    assert wiki_target.is_symlink()
+    assert external_target.read_text(encoding="utf-8") == original
+
+
+def test_atomic_write_full_mode_fails_closed_when_validator_crashes(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import defense_hook
+
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    original = _source_content()
+    replacement = _named_source_content(
+        "source_test",
+        "Test Source",
+        body="Replacement content.",
+    )
+    target.write_text(original, encoding="utf-8")
+
+    def fail_validation(*_args, **_kwargs):
+        raise RuntimeError("validator unavailable")
+
+    monkeypatch.setattr(defense_hook, "verify_asset", fail_validation)
+    with pytest.raises(RuntimeError, match="validator unavailable"):
+        atomic_write_text(target, replacement, validation_mode="full")
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("validation_mode", ["full", "schema"])
+def test_atomic_write_rejects_mismatched_preparsed_frontmatter(
+    isolated_memory,
+    validation_mode,
+):
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    original = _source_content()
+    target.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match content"):
+        atomic_write_text(
+            target,
+            original,
+            pre_parsed_frontmatter={"id": "trusted"},
+            validation_mode=validation_mode,
+        )
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
 
 
 @pytest.mark.parametrize(
@@ -496,5 +670,51 @@ def test_schema_mode_updates_existing_legacy_filename_but_cannot_create_one(isol
     with pytest.raises(ValueError, match="Naming"):
         execute_mutation_batch(
             [{"filename": legacy_name, "content": updated}],
+            validation_mode="schema",
+        )
+
+
+def test_uppercase_markdown_delete_uses_canonical_stem(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    filename = "Source_Upper.MD"
+    content = _named_source_content("source_upper", "Upper Source")
+
+    execute_mutation_plan(filename, content=content)
+
+    conn = db_store.get_connection()
+    assert conn.execute(
+        "SELECT 1 FROM entities "
+        "WHERE json_extract(data_json, '$.page_key') = ?",
+        ("Source_Upper",),
+    ).fetchone() is not None
+    assert (isolated_memory / "wiki" / filename).exists()
+
+    execute_mutation_batch(
+        [{"filename": filename, "is_delete": True}],
+        validation_mode="schema",
+    )
+
+    assert not (isolated_memory / "wiki" / filename).exists()
+    assert conn.execute(
+        "SELECT 1 FROM entities "
+        "WHERE json_extract(data_json, '$.page_key') = ?",
+        ("Source_Upper",),
+    ).fetchone() is None
+
+
+def test_prepare_detects_existing_uppercase_markdown_alias(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake.mutation_coordinator import _prepare_mutations
+
+    wiki_dir = isolated_memory / "wiki"
+    existing = wiki_dir / "Source_ALPHA.MD"
+    existing.write_text("legacy projection", encoding="utf-8")
+    monkeypatch.setattr(type(wiki_dir), "glob", lambda *_args, **_kwargs: ())
+
+    with pytest.raises(ValueError, match="alias of existing page"):
+        _prepare_mutations(
+            [{"filename": "Source_ALPHA.md", "is_delete": True}],
             validation_mode="schema",
         )

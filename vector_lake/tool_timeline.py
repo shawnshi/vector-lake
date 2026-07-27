@@ -4,6 +4,28 @@ from datetime import datetime, timezone
 from vector_lake.db_store import get_connection
 
 
+_STABLE_EVENT_PAYLOAD_FIELDS = (
+    "event_date",
+    "action",
+    "sentiment",
+    "description",
+    "entity_id",
+    "entity_title",
+    "source_file",
+)
+
+
+def _stable_event_payload_signature(event) -> str:
+    payload = {field: event[field] for field in _STABLE_EVENT_PAYLOAD_FIELDS}
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> dict:
     data = json.loads(row["data_json"])
     entities = data.get("subject_entity_ids") or []
@@ -49,6 +71,82 @@ def _entity_title_map(entity_ids: set[str]) -> dict[str, str]:
     return {str(row["entity_id"]): str(row["canonical_name"] or row["entity_id"]) for row in rows}
 
 
+def _locator_search_terms(locator) -> set[str]:
+    if not isinstance(locator, dict):
+        return set()
+    terms: set[str] = set()
+    for value in locator.values():
+        if isinstance(value, (str, int, float)):
+            terms.add(str(value))
+        elif isinstance(value, list):
+            terms.update(
+                str(item)
+                for item in value
+                if isinstance(item, (str, int, float))
+            )
+    return terms
+
+
+def _entity_search_term_map(entity_ids: set[str]) -> dict[str, set[str]]:
+    """Build canonical entity search terms without relying on denormalized claim columns."""
+    if not entity_ids:
+        return {}
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in entity_ids)
+    rows = conn.execute(
+        f"SELECT entity_id, canonical_name, data_json FROM entities "
+        f"WHERE entity_id IN ({placeholders})",
+        tuple(sorted(entity_ids)),
+    ).fetchall()
+    terms_by_id: dict[str, set[str]] = {
+        entity_id: {entity_id}
+        for entity_id in entity_ids
+    }
+    for row in rows:
+        entity_id = str(row["entity_id"])
+        terms = terms_by_id.setdefault(entity_id, {entity_id})
+        if row["canonical_name"]:
+            terms.add(str(row["canonical_name"]))
+        try:
+            data = json.loads(row["data_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            data = {}
+        for field in ("canonical_name", "title", "page_key", "name"):
+            if data.get(field):
+                terms.add(str(data[field]))
+        aliases = data.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        terms.update(str(alias) for alias in aliases if alias)
+        terms.update(_locator_search_terms(data.get("locator")))
+    return terms_by_id
+
+
+def _canonical_row_matches_entity(
+    row,
+    entity_name: str,
+    entity_terms: dict[str, set[str]],
+) -> bool:
+    """Match a canonical claim using its payload and referenced entity records."""
+    needle = str(entity_name).casefold()
+    data = json.loads(row["data_json"])
+    subjects = data.get("subject_entity_ids") or []
+    if isinstance(subjects, str):
+        subjects = [subjects]
+    terms = {
+        str(row["claim_text"] or ""),
+        str(data.get("title") or ""),
+        str(data.get("entity_title") or ""),
+        str(data.get("source_page") or ""),
+    }
+    terms.update(_locator_search_terms(data.get("locator")))
+    for subject in subjects:
+        subject_id = str(subject)
+        terms.add(subject_id)
+        terms.update(entity_terms.get(subject_id, ()))
+    return any(needle in term.casefold() for term in terms if term)
+
+
 def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: list[dict]) -> dict:
     """Apply a claim-scoped Timeline projection delta inside the caller's transaction."""
     conn = get_connection()
@@ -89,19 +187,50 @@ def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: 
 
 
 def timeline_projection_parity() -> dict:
-    """Compare the exact stable event IDs in canonical claims and the SQL projection."""
+    """Compare canonical timeline events with the SQL projection."""
     conn = get_connection()
     claim_rows = conn.execute(
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
         "WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
     ).fetchall()
-    expected_ids = {_event_from_claim_row(row)["id"] for row in claim_rows}
-    actual_ids = {str(row["id"]) for row in conn.execute("SELECT id FROM timeline_events")}
+
+    entity_ids: set[str] = set()
+    for row in claim_rows:
+        data = json.loads(row["data_json"])
+        subjects = data.get("subject_entity_ids") or []
+        if isinstance(subjects, str):
+            subjects = [subjects]
+        entity_ids.update(str(item) for item in subjects)
+    entity_titles = _entity_title_map(entity_ids)
+
+    expected_events = [
+        _event_from_claim_row(row, entity_titles=entity_titles)
+        for row in claim_rows
+    ]
+    actual_events = conn.execute(
+        "SELECT id, event_date, action, sentiment, description, entity_id, "
+        "entity_title, source_file FROM timeline_events"
+    ).fetchall()
+    expected_by_id = {
+        str(event["id"]): _stable_event_payload_signature(event)
+        for event in expected_events
+    }
+    actual_by_id = {
+        str(event["id"]): _stable_event_payload_signature(event)
+        for event in actual_events
+    }
+    expected_ids = set(expected_by_id)
+    actual_ids = set(actual_by_id)
+    payload_drift = {
+        event_id
+        for event_id in expected_ids & actual_ids
+        if expected_by_id[event_id] != actual_by_id[event_id]
+    }
     return {
         "canonical": len(expected_ids),
         "projection": len(actual_ids),
-        "missing": len(expected_ids - actual_ids),
-        "extra": len(actual_ids - expected_ids),
+        "missing": len(expected_ids - actual_ids) + len(payload_drift),
+        "extra": len(actual_ids - expected_ids) + len(payload_drift),
     }
 
 
@@ -178,19 +307,20 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
 
     query = "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
     params = []
-    
-    if entity_name:
-        query += " AND (entity_id LIKE ? OR claim_text LIKE ?)"
-        params.extend([f"%{entity_name}%", f"%{entity_name}%"])
     if sentiment:
         query += " AND COALESCE(json_extract(data_json, '$.sentiment'), 'neutral') = ?"
         params.append(sentiment)
     if action:
-        query += " AND COALESCE(json_extract(data_json, '$.action'), json_extract(data_json, '$.event_tag'), '') LIKE ?"
+        query += (
+            " AND COALESCE("
+            "json_extract(data_json, '$.action'), "
+            "json_extract(data_json, '$.event_tag'), "
+            "json_extract(data_json, '$.claim_type'), "
+            "'timeline-event') LIKE ?"
+        )
         params.append(f"%{action}%")
 
-    query += " ORDER BY updated_at DESC LIMIT ?"
-    params.append(max(1, int(limit)))
+    query += " ORDER BY updated_at DESC"
     
     try:
         cursor.execute(query, params)
@@ -198,15 +328,41 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
     except Exception as e:
         return f"Error executing timeline query: {e}"
         
+    if entity_name and rows:
+        entity_ids: set[str] = set()
+        for row in rows:
+            data = json.loads(row["data_json"])
+            subjects = data.get("subject_entity_ids") or []
+            if isinstance(subjects, str):
+                subjects = [subjects]
+            entity_ids.update(str(item) for item in subjects)
+        entity_terms = _entity_search_term_map(entity_ids)
+        rows = [
+            row
+            for row in rows
+            if _canonical_row_matches_entity(row, entity_name, entity_terms)
+        ]
+
+    rows = rows[:max(1, int(limit))]
     if not rows:
         return "No timeline events found matching the criteria."
-        
-    results = []
-    for r in rows:
-        data = json.loads(r["data_json"])
-        date = data.get("temporal_anchor") or "Unknown Date"
-        entities = ", ".join(data.get("subject_entity_ids", []))
-        source = ", ".join(data.get("source_ids", []))
-        results.append(f"[{date}] <{entities}>\n  -> {r['claim_text']}\n  Source: {source}")
-        
-    return "\n\n".join(results)
+
+    entity_ids: set[str] = set()
+    for row in rows:
+        data = json.loads(row["data_json"])
+        subjects = data.get("subject_entity_ids") or []
+        if isinstance(subjects, str):
+            subjects = [subjects]
+        entity_ids.update(str(item) for item in subjects)
+    entity_titles = _entity_title_map(entity_ids)
+    events = [
+        _event_from_claim_row(row, entity_titles=entity_titles)
+        for row in rows
+    ]
+    return "\n\n".join(
+        f"[{event['event_date']}] <{event['entity_title'] or event['entity_id']}>\n"
+        f"  -> {event['description']}\n"
+        f"  Action: {event['action']} | Sentiment: {event['sentiment']} | "
+        f"Source: {event['source_file']}"
+        for event in events
+    )

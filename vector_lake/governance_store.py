@@ -1,21 +1,29 @@
 import copy
+import heapq
 import hashlib
 import json
 import logging
 import math
 import os
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 
 from filelock import FileLock
 
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - minimal installations use stdlib JSON
+    _orjson = None
+
 from vector_lake.claim_extractor import classify_non_claim_text, extract_page_objects
-from vector_lake.db_store import get_connection, init_db, transaction
+from vector_lake.db_store import get_connection, init_db, peek_db_path, transaction
 from vector_lake.evidence_foundation import version_family_id
 from vector_lake.wiki_utils import (
     get_meta_dir,
     get_wiki_dir,
+    iter_markdown_files,
     normalize_semantic_text,
     read_markdown_file,
     split_frontmatter,
@@ -45,6 +53,20 @@ VALIDITY_FACTORS = {
     "expired": 0.0,
     "archived": 0.0,
 }
+
+class OperationalMemoryNotReady(RuntimeError):
+    """A read-only memory query cannot safely use the current projection."""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+        super().__init__(
+            f"Operational-memory projection unavailable: {self.reason}"
+        )
+
+
+
+class CanonicalIdOwnershipError(ValueError):
+    """Reject reuse or relocation of a globally unique canonical identifier."""
 
 
 _PURPOSE_VECTORS_CACHE = None
@@ -116,13 +138,12 @@ def initialize_meta_store():
 
 
 def _count_wiki_pages() -> int:
-    wiki_dir = get_wiki_dir()
-    if not wiki_dir.exists():
-        return 0
-    return len([
-        name for name in os.listdir(wiki_dir)
-        if name.endswith(".md") and name not in ("index.md", "log.md", "overview.md")
-    ])
+    excluded = {"index.md", "log.md", "overview.md"}
+    return sum(
+        1
+        for path in iter_markdown_files(get_wiki_dir())
+        if path.name.casefold() not in excluded
+    )
 
 
 def _load_db_map(table_name: str, pk_col: str):
@@ -148,6 +169,11 @@ def _load_db_queue(table_name: str, pk_col: str):
 
 
 def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = None):
+    if table_name in {"claims", "evidence"}:
+        raise CanonicalIdOwnershipError(
+            f"Full-map writes to {table_name} are disabled; "
+            "use an atomic canonical change set."
+        )
     _validate_table_name(table_name)
     conn = get_connection()
     now = _utc_now()
@@ -336,20 +362,16 @@ def save_entities(data):
     ])
 
 
-def save_claims(data):
-    conn = get_connection()
-    with transaction():
-        old_rows = conn.execute(
-            "SELECT claim_id, claim_text, data_json, updated_at FROM claims"
-        ).fetchall()
-        _save_db_map("claims", "claim_id", data, [("claim_text", "claim_text", str), ("status", "status", str)])
-        from vector_lake.tool_timeline import sync_timeline_events_for_claim_delta
-
-        sync_timeline_events_for_claim_delta(old_rows, list(data.get("items", {}).values()))
+def save_claims(_data):
+    raise CanonicalIdOwnershipError(
+        "Full-map claim writes are disabled; use an atomic canonical change set."
+    )
 
 
-def save_evidence(data):
-    _save_db_map("evidence", "evidence_id", data)
+def save_evidence(_data):
+    raise CanonicalIdOwnershipError(
+        "Full-map evidence writes are disabled; use an atomic canonical change set."
+    )
 
 
 def save_sources(data):
@@ -1090,6 +1112,39 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
 
     changed_claims = merged_by_table["claims"]
     changed_evidence = merged_by_table["evidence"]
+    affected_page_keys = {_normalized_owner_page(page_key)}
+    claim_owners = _proposed_id_owners(
+        changed_claims,
+        record_kind="claim",
+        id_field="claim_id",
+        affected_page_keys=affected_page_keys,
+    )
+    evidence_owners = _proposed_id_owners(
+        changed_evidence,
+        record_kind="evidence",
+        id_field="evidence_id",
+        affected_page_keys=affected_page_keys,
+    )
+    _validate_locator_id_ownership(
+        conn,
+        owners=claim_owners,
+        record_kind="claim",
+    )
+    _validate_locator_id_ownership(
+        conn,
+        owners=evidence_owners,
+        record_kind="evidence",
+    )
+    _register_locator_id_ownership(
+        conn,
+        owners=claim_owners,
+        record_kind="claim",
+    )
+    _register_locator_id_ownership(
+        conn,
+        owners=evidence_owners,
+        record_kind="evidence",
+    )
     if changed_claims:
         current_claim_ids = tuple(record["claim_id"] for record in changed_claims)
         placeholders = ",".join("?" for _ in current_claim_ids)
@@ -1239,7 +1294,7 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
 
     peer_store = _default_map_store("memory_id")
     for row in peer_rows:
-        memory = json.loads(row["data_json"])
+        memory = _decode_operational_memory_json(row["data_json"])
         if (memory.get("conflict_resolution") or {}).get("state") == "superseded":
             memory["validity_state"] = "active"
             memory.pop("superseded_by", None)
@@ -1630,7 +1685,97 @@ def rebuild_operational_memory() -> dict:
     return store
 
 
-def _memory_relevance(memory: dict, terms: list[str]) -> float:
+def _decode_operational_memory_json(payload: str) -> dict:
+    """Use the available fast decoder while preserving stdlib compatibility."""
+    if _orjson is not None:
+        try:
+            return _orjson.loads(payload)
+        except _orjson.JSONDecodeError:
+            pass
+    return json.loads(payload)
+
+
+class _ExactTermMatcher:
+    """Match all exact Unicode substrings in one regex-engine scan per field."""
+
+    __slots__ = (
+        "_pattern",
+        "_closure",
+        "_term_masks",
+        "_direct_masks",
+        "_empty_matches",
+        "_all_matches",
+    )
+
+    def __init__(self, terms: list[str]):
+        term_masks: dict[str, int] = {}
+        empty_matches = 0
+        for term_index, term in enumerate(terms):
+            term_mask = 1 << term_index
+            if not term:
+                empty_matches |= term_mask
+                continue
+            term_masks[term] = term_masks.get(term, 0) | term_mask
+
+        ordered_terms = sorted(term_masks, key=lambda term: (-len(term), term))
+        closure: dict[str, int] = {}
+        for matched_term in ordered_terms:
+            matched_mask = 0
+            for term, term_mask in term_masks.items():
+                if term in matched_term:
+                    matched_mask |= term_mask
+            closure[matched_term] = matched_mask
+
+        direct_masks = (
+            term_masks
+            if any(len(term) <= 2 for term in term_masks)
+            else None
+        )
+        self._pattern = (
+            re.compile(
+                "(?=(" + "|".join(re.escape(term) for term in ordered_terms) + "))"
+            )
+            if ordered_terms and direct_masks is None
+            else None
+        )
+        self._closure = closure
+        self._term_masks = term_masks
+        self._empty_matches = empty_matches
+        self._direct_masks = direct_masks
+        self._all_matches = (1 << len(terms)) - 1
+
+    def matched_term_count(self, text: str) -> int:
+        matched = self._empty_matches
+        if self._direct_masks is not None:
+            for term, term_mask in self._direct_masks.items():
+                if term in text:
+                    matched |= term_mask
+            return matched.bit_count()
+
+        if self._pattern is None or matched == self._all_matches:
+            return matched.bit_count()
+        stalled_matches = 0
+        for match in self._pattern.finditer(text):
+            previous = matched
+            matched |= self._closure[match.group(1)]
+            if matched == self._all_matches:
+                break
+            stalled_matches = stalled_matches + 1 if matched == previous else 0
+            if stalled_matches >= 32:
+                for term, term_mask in self._term_masks.items():
+                    if matched & term_mask == term_mask:
+                        continue
+                    if term in text:
+                        matched |= term_mask
+                break
+        return matched.bit_count()
+
+
+def _memory_relevance(
+    memory: dict,
+    terms: list[str],
+    matcher: _ExactTermMatcher | None = None,
+) -> float:
     if not terms:
         return 0.0
     haystacks = {
@@ -1639,6 +1784,14 @@ def _memory_relevance(memory: dict, terms: list[str]) -> float:
         "page": str(memory.get("source_page", "")).lower(),
         "type": str(memory.get("memory_type", "")).lower(),
     }
+    if matcher is not None:
+        return (
+            4.0 * matcher.matched_term_count(haystacks["key"])
+            + 3.0 * matcher.matched_term_count(haystacks["text"])
+            + matcher.matched_term_count(haystacks["page"])
+            + matcher.matched_term_count(haystacks["type"])
+        )
+
     score = 0.0
     for term in terms:
         if term in haystacks["key"]:
@@ -1652,6 +1805,676 @@ def _memory_relevance(memory: dict, terms: list[str]) -> float:
     return score
 
 
+_MEMORY_HIDDEN_STATES = frozenset({"archived", "expired", "superseded"})
+_MEMORY_QUERY_CHAR_LIMIT = 16_384
+_MEMORY_QUERY_TERM_LIMIT = 128
+_MEMORY_QUERY_TERM_CHAR_LIMIT = 512
+_MEMORY_MATCHER_PATTERN_CHAR_LIMIT = 8_192
+_MEMORY_CANDIDATE_TERM_LIMIT = 12
+_MEMORY_SEARCH_INDEX_DEFAULT_BATCH = 256
+_MEMORY_SEARCH_INDEX_MAX_BATCH = 10_000
+_MEMORY_SEARCH_INDEX_TABLES = frozenset({
+    "operational_memory_search_fts",
+    "operational_memory_search_docs",
+    "operational_memory_search_pending",
+    "operational_memory_search_state",
+})
+
+
+def _operational_memory_search_index_enabled() -> bool:
+    value = os.environ.get("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "0")
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _operational_memory_search_batch_size() -> int:
+    raw = os.environ.get(
+        "VECTOR_LAKE_OPERATIONAL_MEMORY_INDEX_BATCH",
+        str(_MEMORY_SEARCH_INDEX_DEFAULT_BATCH),
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = _MEMORY_SEARCH_INDEX_DEFAULT_BATCH
+    return max(0, min(_MEMORY_SEARCH_INDEX_MAX_BATCH, value))
+
+
+def _memory_search_index_schema_available(conn: sqlite3.Connection) -> bool:
+    placeholders = ", ".join("?" for _ in _MEMORY_SEARCH_INDEX_TABLES)
+    rows = conn.execute(
+        f"SELECT name FROM sqlite_master WHERE name IN ({placeholders})",
+        tuple(sorted(_MEMORY_SEARCH_INDEX_TABLES)),
+    ).fetchall()
+    return {str(row[0]) for row in rows} == _MEMORY_SEARCH_INDEX_TABLES
+
+
+def _memory_search_document_ids(
+    conn: sqlite3.Connection,
+    memory_ids: list[str],
+) -> dict[str, int]:
+    documents: dict[str, int] = {}
+    for offset in range(0, len(memory_ids), 900):
+        chunk = memory_ids[offset : offset + 900]
+        placeholders = ", ".join("?" for _ in chunk)
+        for row in conn.execute(
+            "SELECT memory_id, doc_id FROM operational_memory_search_docs "
+            f"WHERE memory_id IN ({placeholders})",
+            tuple(chunk),
+        ):
+            documents[str(row[0])] = int(row[1])
+    return documents
+
+
+def _delete_memory_search_documents(
+    conn: sqlite3.Connection,
+    memory_ids: list[str],
+) -> None:
+    if not memory_ids:
+        return
+    documents = _memory_search_document_ids(conn, memory_ids)
+    if not documents:
+        return
+    doc_ids = [(doc_id,) for doc_id in documents.values()]
+    conn.executemany(
+        "DELETE FROM operational_memory_search_fts WHERE rowid = ?",
+        doc_ids,
+    )
+    conn.executemany(
+        "DELETE FROM operational_memory_search_docs WHERE doc_id = ?",
+        doc_ids,
+    )
+
+
+def _upsert_memory_search_documents(
+    conn: sqlite3.Connection,
+    rows: list[tuple[str, str, str | None]],
+) -> None:
+    if not rows:
+        return
+    decoded = []
+    for memory_id, payload, updated_at in rows:
+        memory = _decode_operational_memory_json(payload)
+        decoded.append((
+            memory_id,
+            updated_at,
+            str(memory.get("memory_key", "")).lower(),
+            str(memory.get("text", "")).lower(),
+            str(memory.get("source_page", "")).lower(),
+            str(memory.get("memory_type", "fact")).lower(),
+        ))
+
+    memory_ids = [row[0] for row in decoded]
+    existing = _memory_search_document_ids(conn, memory_ids)
+    conn.executemany(
+        "INSERT OR IGNORE INTO operational_memory_search_docs "
+        "(memory_id, source_updated_at) VALUES (?, ?)",
+        [(row[0], row[1]) for row in decoded],
+    )
+    documents = _memory_search_document_ids(conn, memory_ids)
+    if len(documents) != len(set(memory_ids)):
+        raise sqlite3.IntegrityError(
+            "operational-memory search document mapping is incomplete"
+        )
+
+    if existing:
+        conn.executemany(
+            "DELETE FROM operational_memory_search_fts WHERE rowid = ?",
+            [(doc_id,) for doc_id in existing.values()],
+        )
+    conn.executemany(
+        "UPDATE operational_memory_search_docs SET source_updated_at = ? "
+        "WHERE doc_id = ?",
+        [(row[1], documents[row[0]]) for row in decoded],
+    )
+    conn.executemany(
+        "INSERT INTO operational_memory_search_fts "
+        "(rowid, key_text, memory_text, page_text, type_text) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (documents[row[0]], row[2], row[3], row[4], row[5])
+            for row in decoded
+        ],
+    )
+
+
+def _advance_operational_memory_search_index(
+    conn: sqlite3.Connection,
+    batch_size: int | None = None,
+) -> tuple[int, int]:
+    """Apply a bounded pending/backfill slice and return its durable cursor."""
+    if batch_size is None:
+        batch_size = _operational_memory_search_batch_size()
+    else:
+        batch_size = max(0, min(_MEMORY_SEARCH_INDEX_MAX_BATCH, int(batch_size)))
+    with transaction(max_wait_seconds=0.1):
+        state = conn.execute(
+            "SELECT backfill_cursor, backfill_target "
+            "FROM operational_memory_search_state WHERE singleton = 1"
+        ).fetchone()
+        if state is None:
+            raise sqlite3.OperationalError("operational-memory search state is missing")
+        cursor = int(state[0])
+        target = int(state[1])
+
+        pending_rows = conn.execute(
+            "SELECT p.memory_id, p.operation, om.data_json, om.updated_at "
+            "FROM operational_memory_search_pending AS p "
+            "LEFT JOIN operational_memory AS om ON om.memory_id = p.memory_id "
+            "ORDER BY p.rowid LIMIT ?",
+            (batch_size,),
+        ).fetchall()
+        _delete_memory_search_documents(
+            conn,
+            [
+                str(row[0])
+                for row in pending_rows
+                if str(row[1]) == "delete" or row[2] is None
+            ],
+        )
+        _upsert_memory_search_documents(
+            conn,
+            [
+                (str(row[0]), row[2], row[3])
+                for row in pending_rows
+                if str(row[1]) != "delete" and row[2] is not None
+            ],
+        )
+        if pending_rows:
+            conn.executemany(
+                "DELETE FROM operational_memory_search_pending WHERE memory_id = ?",
+                [(str(row[0]),) for row in pending_rows],
+            )
+
+        remaining = max(0, batch_size - len(pending_rows))
+        backfill_rows = []
+        if remaining and cursor < target:
+            backfill_rows = conn.execute(
+                "SELECT rowid, memory_id, data_json, updated_at "
+                "FROM operational_memory WHERE rowid > ? AND rowid <= ? "
+                "ORDER BY rowid LIMIT ?",
+                (cursor, target, remaining),
+            ).fetchall()
+            _upsert_memory_search_documents(
+                conn,
+                [(str(row[1]), row[2], row[3]) for row in backfill_rows],
+            )
+            cursor = int(backfill_rows[-1][0]) if backfill_rows else target
+
+        conn.execute(
+            "UPDATE operational_memory_search_state SET "
+            "backfill_cursor = ?, updated_at = ? WHERE singleton = 1",
+            (cursor, _utc_now()),
+        )
+    return cursor, target
+
+
+def _memory_fts_expression(terms: list[str]) -> str:
+    return " OR ".join(
+        f'"{term.replace(chr(34), chr(34) * 2)}"'
+        for term in terms
+    )
+
+
+def operational_memory_search_index_status() -> dict:
+    """Inspect derived-index progress without creating schema or changing state."""
+    configured = _operational_memory_search_index_enabled()
+    if not peek_db_path().exists():
+        return {
+            "configured": configured,
+            "available": False,
+            "ready": False,
+            "canonical_documents": 0,
+            "indexed_documents": 0,
+            "pending": 0,
+        }
+    conn = get_connection()
+    if not _memory_search_index_schema_available(conn):
+        canonical_documents = 0
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'operational_memory'"
+        ).fetchone():
+            canonical_documents = int(conn.execute(
+                "SELECT COUNT(*) FROM operational_memory"
+            ).fetchone()[0])
+        return {
+            "configured": configured,
+            "available": False,
+            "ready": False,
+            "canonical_documents": canonical_documents,
+            "indexed_documents": 0,
+            "pending": 0,
+        }
+    state = conn.execute(
+        "SELECT backfill_cursor, backfill_target, schema_version "
+        "FROM operational_memory_search_state WHERE singleton = 1"
+    ).fetchone()
+    cursor = int(state[0]) if state is not None else 0
+    target = int(state[1]) if state is not None else 0
+    pending = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_pending"
+    ).fetchone()[0])
+    indexed_documents = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_docs"
+    ).fetchone()[0])
+    canonical_documents = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_memory"
+    ).fetchone()[0])
+    return {
+        "configured": configured,
+        "available": True,
+        "ready": cursor >= target and pending == 0,
+        "schema_version": int(state[2]) if state is not None else None,
+        "backfill_cursor": cursor,
+        "backfill_target": target,
+        "canonical_documents": canonical_documents,
+        "indexed_documents": indexed_documents,
+        "pending": pending,
+    }
+
+
+def maintain_operational_memory_search_index(
+    batch_size: int | None = None,
+) -> dict:
+    """Explicitly advance the derived search index without hiding writes in search."""
+    initialize_meta_store()
+    conn = get_connection()
+    if (
+        not _operational_memory_search_index_enabled()
+        or not _memory_search_index_schema_available(conn)
+    ):
+        return {
+            "available": False,
+            "ready": False,
+            "indexed_documents": 0,
+            "pending": 0,
+        }
+    cursor, target = _advance_operational_memory_search_index(
+        conn,
+        batch_size=batch_size,
+    )
+    pending = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_pending"
+    ).fetchone()[0])
+    indexed_documents = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_docs"
+    ).fetchone()[0])
+    return {
+        "available": True,
+        "ready": cursor >= target and pending == 0,
+        "backfill_cursor": cursor,
+        "backfill_target": target,
+        "indexed_documents": indexed_documents,
+        "pending": pending,
+    }
+
+
+def _memory_sql_term_filter(terms: list[str], alias: str = "om") -> tuple[str, list[str]]:
+    search_text_sql = (
+        f"lower(COALESCE(json_extract({alias}.data_json, '$.memory_key'), '') || ' ' || "
+        f"COALESCE(json_extract({alias}.data_json, '$.text'), '') || ' ' || "
+        f"COALESCE(json_extract({alias}.data_json, '$.source_page'), '') || ' ' || "
+        f"COALESCE(json_extract({alias}.data_json, '$.memory_type'), ''))"
+    )
+    return (
+        "(" + " OR ".join(f"instr({search_text_sql}, ?) > 0" for _ in terms) + ")",
+        list(terms),
+    )
+
+
+def _indexed_operational_memory_rows(
+    conn: sqlite3.Connection,
+    terms: list[str],
+    allowed_types: set[str] | None,
+):
+    """Return exact-recall read-only candidates, or None without FTS schema."""
+    if (
+        not terms
+        or not _operational_memory_search_index_enabled()
+        or not _memory_search_index_schema_available(conn)
+    ):
+        return None
+
+    try:
+        state = conn.execute(
+            "SELECT backfill_cursor, backfill_target "
+            "FROM operational_memory_search_state WHERE singleton = 1"
+        ).fetchone()
+        if state is None:
+            return None
+        cursor = int(state[0])
+        target = int(state[1])
+        type_sql = ""
+        type_params: list[object] = []
+        if allowed_types:
+            placeholders = ", ".join("?" for _ in allowed_types)
+            type_sql = (
+                " AND lower(COALESCE(om.memory_type, 'fact')) "
+                f"IN ({placeholders})"
+            )
+            type_params = sorted(allowed_types)
+
+        candidate_queries: list[str] = []
+        candidate_params: list[object] = []
+        long_terms = [term for term in terms if len(term) >= 3]
+        short_terms = [term for term in terms if len(term) <= 2]
+        if long_terms:
+            candidate_queries.append(
+                "SELECT om.rowid AS source_rowid, om.data_json AS data_json "
+                "FROM operational_memory_search_fts "
+                "JOIN operational_memory_search_docs AS docs "
+                "ON docs.doc_id = operational_memory_search_fts.rowid "
+                "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
+                "WHERE operational_memory_search_fts MATCH ?" + type_sql
+            )
+            candidate_params.extend((_memory_fts_expression(long_terms), *type_params))
+        if short_terms:
+            short_filter, short_params = _memory_sql_term_filter(short_terms)
+            candidate_queries.append(
+                "SELECT om.rowid AS source_rowid, om.data_json AS data_json "
+                "FROM operational_memory AS om WHERE " + short_filter + type_sql
+            )
+            candidate_params.extend((*short_params, *type_params))
+
+        residual_filter, residual_params = _memory_sql_term_filter(terms)
+        candidate_queries.append(
+            "SELECT om.rowid AS source_rowid, om.data_json AS data_json "
+            "FROM operational_memory AS om WHERE ((om.rowid > ? AND om.rowid <= ?) "
+            "OR EXISTS (SELECT 1 FROM operational_memory_search_pending AS pending "
+            "WHERE pending.memory_id = om.memory_id "
+            "AND pending.operation = 'upsert')) AND "
+            + residual_filter
+            + type_sql
+        )
+        candidate_params.extend((
+            cursor,
+            target,
+            *residual_params,
+            *type_params,
+        ))
+        return conn.execute(
+            "SELECT data_json FROM (" + " UNION ".join(candidate_queries) + ") "
+            "ORDER BY source_rowid",
+            tuple(candidate_params),
+        )
+    except sqlite3.Error as exc:
+        log.warning(
+            "Operational-memory FTS unavailable; using compatibility prefilter: %s",
+            exc,
+        )
+        return None
+
+
+def _bounded_memory_query_terms(query: str) -> list[str]:
+    text = str(query or "")
+    if len(text) > _MEMORY_QUERY_CHAR_LIMIT:
+        raise ValueError(
+            "operational-memory query exceeds "
+            f"{_MEMORY_QUERY_CHAR_LIMIT} characters"
+        )
+    terms = _query_terms(text)
+    if any(len(term) > _MEMORY_QUERY_TERM_CHAR_LIMIT for term in terms):
+        raise ValueError(
+            "operational-memory query contains a term longer than "
+            f"{_MEMORY_QUERY_TERM_CHAR_LIMIT} characters"
+        )
+    return terms[:_MEMORY_QUERY_TERM_LIMIT]
+
+
+def _memory_term_matcher(terms: list[str]) -> _ExactTermMatcher | None:
+    if (
+        len(terms) > _MEMORY_CANDIDATE_TERM_LIMIT
+        and all(len(term) > 2 for term in terms)
+        and sum(map(len, terms)) <= _MEMORY_MATCHER_PATTERN_CHAR_LIMIT
+    ):
+        return _ExactTermMatcher(terms)
+    return None
+
+
+def _memory_candidate_terms(_query: str, terms: list[str]) -> list[str]:
+    """Return a bounded, complete SQL prefilter term set when possible.
+
+    Callers must use an unfiltered streaming scan when this bounded list cannot
+    cover every ranking term; dropping a tail term would create false negatives.
+    """
+    unique: list[str] = []
+    for candidate in terms:
+        if candidate and candidate not in unique:
+            unique.append(candidate)
+        if len(unique) >= _MEMORY_CANDIDATE_TERM_LIMIT:
+            break
+    return unique
+
+
+def _operational_memory_candidate_sql(
+    terms: list[str],
+    allowed_types: set[str] | None,
+    *,
+    broad: bool = False,
+) -> tuple[str, list[object]]:
+    """Build a streaming candidate query without hydrating the whole table."""
+    search_text_sql = (
+        "lower(COALESCE(json_extract(data_json, '$.memory_key'), '') || ' ' || "
+        "COALESCE(json_extract(data_json, '$.text'), '') || ' ' || "
+        "COALESCE(json_extract(data_json, '$.source_page'), '') || ' ' || "
+        "COALESCE(json_extract(data_json, '$.memory_type'), ''))"
+    )
+    term_clauses: list[str] = []
+    params: list[object] = []
+    for term in terms:
+        term_clauses.append(f"instr({search_text_sql}, ?) > 0")
+        params.append(term)
+
+    filters: list[str] = []
+    if term_clauses:
+        if broad or len(term_clauses) == 1:
+            filters.append(f"({' OR '.join(term_clauses)})")
+        else:
+            exact_clause = term_clauses[0]
+            supporting_clause = " AND ".join(term_clauses[1:])
+            filters.append(f"({exact_clause} OR ({supporting_clause}))")
+    if allowed_types:
+        placeholders = ", ".join("?" for _ in allowed_types)
+        filters.append(
+            "lower(COALESCE(memory_type, 'fact')) "
+            f"IN ({placeholders})"
+        )
+        params.extend(sorted(allowed_types))
+
+    where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+    sql = f"SELECT data_json FROM operational_memory {where_sql}"
+    return sql, params
+
+
+def _legacy_operational_memory_views(
+    query: str,
+    current_top_k: int,
+    history_top_k: int,
+    allowed_types: set[str] | None,
+    include_polluted: bool,
+) -> tuple[list[dict], list[dict]]:
+    """Compatibility scan with bounded result heaps for SQLite without JSON1."""
+    # Caller guarantees the canonical tables already exist; this path is read-only.
+    conn = get_connection()
+    terms = _bounded_memory_query_terms(query)
+    matcher = _memory_term_matcher(terms)
+    current_heap: list[tuple] = []
+    history_heap: list[tuple] = []
+
+    def push_ranked(
+        heap: list[tuple],
+        limit: int,
+        rank: tuple[float, float, float, int],
+        memory: dict,
+    ) -> None:
+        if limit <= 0:
+            return
+        entry = (*rank, memory)
+        if len(heap) < limit:
+            heapq.heappush(heap, entry)
+        elif rank > heap[0][:4]:
+            heapq.heapreplace(heap, entry)
+
+    sequence = 0
+    for row in conn.execute("SELECT data_json FROM operational_memory"):
+        memory = _decode_operational_memory_json(row["data_json"])
+        memory_type = str(memory.get("memory_type", "fact")).lower()
+        if allowed_types and memory_type not in allowed_types:
+            continue
+        if not include_polluted and classify_non_claim_text(
+            str(memory.get("text") or "")
+        ):
+            continue
+        relevance = _memory_relevance(memory, terms, matcher=matcher)
+        if relevance <= 0 and terms:
+            continue
+        memory_score = float(memory.get("memory_score", 0) or 0)
+        score = round(relevance + (memory_score * 5), 4)
+        rank = (
+            score,
+            memory_score,
+            _dt_rank(memory.get("updated_at")),
+            -sequence,
+        )
+        sequence += 1
+        push_ranked(history_heap, history_top_k, rank, memory)
+        state = str(memory.get("validity_state", "active")).lower()
+        if state not in _MEMORY_HIDDEN_STATES:
+            push_ranked(current_heap, current_top_k, rank, memory)
+
+    def materialize(heap: list[tuple]) -> list[dict]:
+        results: list[dict] = []
+        for score, _, _, _, memory in sorted(heap, reverse=True):
+            item = copy.deepcopy(memory)
+            item["retrieval_score"] = score
+            results.append(item)
+        return results
+
+    return materialize(current_heap), materialize(history_heap)
+
+def search_operational_memory_views(
+    query: str,
+    current_top_k: int = 12,
+    history_top_k: int = 12,
+    memory_types: list[str] | None = None,
+    include_polluted: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Return current and historical views from one streaming candidate scan."""
+    current_top_k = max(0, int(current_top_k))
+    history_top_k = max(0, int(history_top_k))
+    if current_top_k == 0 and history_top_k == 0:
+        return [], []
+
+    if not peek_db_path().exists():
+        raise OperationalMemoryNotReady("database_missing")
+    conn = get_connection()
+    required_tables = {"operational_memory", "claims"}
+    available_tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('operational_memory', 'claims')"
+        )
+    }
+    if available_tables != required_tables:
+        raise OperationalMemoryNotReady("schema_not_ready")
+    if not conn.execute("SELECT 1 FROM operational_memory LIMIT 1").fetchone():
+        if conn.execute("SELECT 1 FROM claims LIMIT 1").fetchone():
+            raise OperationalMemoryNotReady("projection_empty")
+        return [], []
+
+    allowed_types = None
+    if memory_types:
+        allowed_types = {
+            str(item).strip().lower().replace("-", "_")
+            for item in memory_types
+        }
+    terms = _bounded_memory_query_terms(query)
+    matcher = _memory_term_matcher(terms)
+    indexed_rows = _indexed_operational_memory_rows(conn, terms, allowed_types)
+    candidate_sql = None
+    candidate_params: list[object] = []
+    if indexed_rows is None:
+        candidate_terms = _memory_candidate_terms(query, terms)
+        prefilter_terms = (
+            candidate_terms if len(candidate_terms) == len(terms) else []
+        )
+        candidate_sql, candidate_params = _operational_memory_candidate_sql(
+            prefilter_terms,
+            allowed_types,
+            broad=True,
+        )
+
+    current_heap: list[tuple] = []
+    history_heap: list[tuple] = []
+
+    def push_ranked(
+        heap: list[tuple],
+        limit: int,
+        rank: tuple[float, float, float, int],
+        memory: dict,
+    ) -> None:
+        if limit <= 0:
+            return
+        entry = (*rank, memory)
+        if len(heap) < limit:
+            heapq.heappush(heap, entry)
+        elif rank > heap[0][:4]:
+            heapq.heapreplace(heap, entry)
+
+    def materialize(heap: list[tuple]) -> list[dict]:
+        results: list[dict] = []
+        for score, _, _, _, memory in sorted(heap, reverse=True):
+            item = copy.deepcopy(memory)
+            item["retrieval_score"] = score
+            results.append(item)
+        return results
+
+    try:
+        sequence = 0
+        rows = (
+            indexed_rows
+            if indexed_rows is not None
+            else conn.execute(candidate_sql, tuple(candidate_params))
+        )
+        for row in rows:
+            memory = _decode_operational_memory_json(row["data_json"])
+            if not include_polluted and classify_non_claim_text(
+                str(memory.get("text") or "")
+            ):
+                continue
+            relevance = _memory_relevance(memory, terms, matcher=matcher)
+            if relevance <= 0 and terms:
+                continue
+            memory_score = float(memory.get("memory_score", 0) or 0)
+            score = round(relevance + (memory_score * 5), 4)
+            rank = (
+                score,
+                memory_score,
+                _dt_rank(memory.get("updated_at")),
+                -sequence,
+            )
+            sequence += 1
+            push_ranked(history_heap, history_top_k, rank, memory)
+            state = str(memory.get("validity_state", "active")).lower()
+            if state not in _MEMORY_HIDDEN_STATES:
+                push_ranked(current_heap, current_top_k, rank, memory)
+    except sqlite3.OperationalError as exc:
+        log.warning(
+            "Operational-memory candidate query unavailable; using compatibility "
+            "scan: %s",
+            exc,
+        )
+        return _legacy_operational_memory_views(
+            query,
+            current_top_k,
+            history_top_k,
+            allowed_types,
+            include_polluted,
+        )
+
+    return materialize(current_heap), materialize(history_heap)
+
+
 def search_operational_memory(
     query: str,
     top_k: int = 12,
@@ -1659,51 +2482,14 @@ def search_operational_memory(
     include_history: bool = False,
     include_polluted: bool = False,
 ) -> list[dict]:
-    store = load_memory_objects()
-    if not store.get("items") and load_claims().get("items"):
-        store = rebuild_operational_memory()
-
-    allowed_types = None
-    if memory_types:
-        allowed_types = {str(item).strip().lower().replace("-", "_") for item in memory_types}
-
-    terms = _query_terms(query)
-    ranked = []
-    hidden_states = {"archived", "expired", "superseded"}
-    for memory in store.get("items", {}).values():
-        memory_type = str(memory.get("memory_type", "fact")).lower()
-        if allowed_types and memory_type not in allowed_types:
-            continue
-        if not include_polluted and classify_non_claim_text(str(memory.get("text") or "")):
-            continue
-        state = str(memory.get("validity_state", "active")).lower()
-        if not include_history and state in hidden_states:
-            continue
-        relevance = _memory_relevance(memory, terms)
-        if relevance <= 0 and terms:
-            continue
-        score = relevance + (float(memory.get("memory_score", 0) or 0) * 5)
-        # ⚡ Bolt: Store the score values as sort keys with a reference to the un-copied memory object.
-        # This delays expensive deepcopies until *after* top_k elements are selected.
-        ranked.append((
-            round(score, 4),
-            memory.get("memory_score", 0),
-            _dt_rank(memory.get("updated_at")),
-            memory
-        ))
-
-    ranked.sort(
-        key=lambda item: (item[0], item[1], item[2]),
-        reverse=True,
+    current, history = search_operational_memory_views(
+        query,
+        current_top_k=0 if include_history else top_k,
+        history_top_k=top_k if include_history else 0,
+        memory_types=memory_types,
+        include_polluted=include_polluted,
     )
-
-    results = []
-    for score, memory_score, dt_rank, memory in ranked[:top_k]:
-        item = copy.deepcopy(memory)
-        item["retrieval_score"] = score
-        results.append(item)
-
-    return results
+    return history if include_history else current
 
 
 def remediate_operational_memory_pollution(
@@ -2083,7 +2869,7 @@ def create_change_set(
             "canonical_targets": [
                 "entities", "claims", "evidence", "sources", "operational_memory",
                 "source_artifacts", "extraction_runs", "claim_versions",
-                "evidence_versions", "entity_identities",
+                "evidence_versions", "entity_identities", "canonical_identities",
             ],
         },
     }
@@ -2159,7 +2945,7 @@ def prepare_change_set_from_content(
             "canonical_targets": [
                 "entities", "claims", "evidence", "sources", "operational_memory",
                 "source_artifacts", "extraction_runs", "claim_versions",
-                "evidence_versions", "entity_identities",
+                "evidence_versions", "entity_identities", "canonical_identities",
             ],
         },
     }
@@ -2239,6 +3025,356 @@ def create_change_set_from_content(
     return change_set
 
 
+def _normalized_owner_page(value: object) -> str:
+    page_key = os.path.basename(str(value or "").strip())
+    return page_key[:-3] if page_key.casefold().endswith(".md") else page_key
+
+
+def _owner_record(
+    record: dict,
+    *,
+    record_kind: str,
+    record_id: str,
+) -> tuple[str, str]:
+    if record_kind == "entity":
+        page_key = _normalized_owner_page(record.get("page_key"))
+        if not page_key:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {record_kind}_id {record_id!r} has no page_key owner; "
+                "refusing an ambiguous global-ID write."
+            )
+        return page_key, page_key
+
+    locator = record.get("locator")
+    if not isinstance(locator, dict) or not locator:
+        raise CanonicalIdOwnershipError(
+            f"Canonical {record_kind}_id {record_id!r} has no locator owner; "
+            "refusing an ambiguous global-ID write."
+        )
+    normalized_locator = copy.deepcopy(locator)
+    page_key = _normalized_owner_page(normalized_locator.get("page_key"))
+    if not page_key:
+        raise CanonicalIdOwnershipError(
+            f"Canonical {record_kind}_id {record_id!r} has a locator without page_key; "
+            "refusing an ambiguous global-ID write."
+        )
+    # Headings and block positions are mutable projection details. The stable
+    # claim ownership boundary is its canonical page; cross-page reuse remains
+    # forbidden while same-page edits retain claim identity.
+    return page_key, page_key
+
+
+def _proposed_id_owners(
+    records: list[dict],
+    *,
+    record_kind: str,
+    id_field: str,
+    affected_page_keys: set[str],
+) -> dict[str, tuple[str, str]]:
+    owners: dict[str, tuple[str, str]] = {}
+    for record in records:
+        record_id = str(record.get(id_field) or "").strip()
+        if not record_id:
+            raise CanonicalIdOwnershipError(
+                f"Proposed canonical {record_kind} is missing required {id_field}."
+            )
+        owner = _owner_record(
+            record,
+            record_kind=record_kind,
+            record_id=record_id,
+        )
+        if owner[0] not in affected_page_keys:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {id_field} {record_id!r} declares owner {owner[0]!r}, "
+                f"outside affected pages {sorted(affected_page_keys)!r}."
+            )
+        prior = owners.get(record_id)
+        if prior is not None and prior != owner:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {id_field} {record_id!r} has conflicting proposed owners: "
+                f"{prior[1]!r} versus {owner[1]!r}."
+            )
+        owners[record_id] = owner
+    return owners
+
+
+def _rows_for_ids(
+    conn,
+    *,
+    select_prefix: str,
+    record_ids: set[str],
+):
+    ordered_ids = sorted(record_ids)
+    for offset in range(0, len(ordered_ids), 500):
+        batch = ordered_ids[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        yield from conn.execute(
+            f"{select_prefix} ({placeholders})",
+            tuple(batch),
+        ).fetchall()
+
+
+def _identity_registry_owner_page(
+    row,
+    *,
+    record_kind: str,
+    record_id: str,
+) -> str:
+    page_key = _normalized_owner_page(row["page_key"])
+    if not page_key or not str(row["identity_origin"] or "").strip():
+        raise CanonicalIdOwnershipError(
+            f"Canonical {record_kind}_id {record_id!r} has an invalid identity owner row."
+        )
+    try:
+        payload = json.loads(row["data_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise CanonicalIdOwnershipError(
+            f"Canonical {record_kind}_id {record_id!r} has invalid identity registry metadata."
+        ) from exc
+    expected = {
+        "record_kind": record_kind,
+        "record_id": record_id,
+        "page_key": page_key,
+    }
+    if not isinstance(payload, dict) or payload != expected:
+        raise CanonicalIdOwnershipError(
+            f"Canonical {record_kind}_id {record_id!r} has conflicting identity registry metadata."
+        )
+    return page_key
+
+
+def _register_locator_id_ownership(
+    conn,
+    *,
+    owners: dict[str, tuple[str, str]],
+    record_kind: str,
+) -> None:
+    """Reserve new IDs without ever rewriting an existing ownership row."""
+    if not owners:
+        return
+    if not conn.in_transaction:
+        raise RuntimeError("Canonical identity registration requires an active transaction")
+    now = _utc_now()
+    for record_id, owner in sorted(owners.items()):
+        page_key = owner[0]
+        row = conn.execute(
+            "SELECT page_key, identity_origin, data_json FROM canonical_identities "
+            "WHERE record_kind = ? AND record_id = ?",
+            (record_kind, record_id),
+        ).fetchone()
+        if row is not None:
+            registered_page = _identity_registry_owner_page(
+                row,
+                record_kind=record_kind,
+                record_id=record_id,
+            )
+            if registered_page != page_key:
+                raise CanonicalIdOwnershipError(
+                    f"Canonical {record_kind}_id {record_id!r} is reserved by "
+                    f"identity page {registered_page!r}, not {page_key!r}."
+                )
+            continue
+        payload = _canonical_record_json(
+            {
+                "record_kind": record_kind,
+                "record_id": record_id,
+                "page_key": page_key,
+            }
+        )
+        conn.execute(
+            "INSERT INTO canonical_identities "
+            "(record_kind, record_id, page_key, identity_origin, data_json, recorded_at) "
+            "VALUES (?, ?, ?, 'canonical_write', ?, ?)",
+            (record_kind, record_id, page_key, payload, now),
+        )
+        row = conn.execute(
+            "SELECT page_key, identity_origin, data_json FROM canonical_identities "
+            "WHERE record_kind = ? AND record_id = ?",
+            (record_kind, record_id),
+        ).fetchone()
+        if row is None:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {record_kind}_id {record_id!r} was not durably reserved."
+            )
+        registered_page = _identity_registry_owner_page(
+            row,
+            record_kind=record_kind,
+            record_id=record_id,
+        )
+        if registered_page != page_key:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {record_kind}_id {record_id!r} is reserved by identity page "
+                f"{registered_page!r}, not {page_key!r}."
+            )
+
+def _validate_locator_id_ownership(
+    conn,
+    *,
+    owners: dict[str, tuple[str, str]],
+    record_kind: str,
+) -> None:
+    if not owners:
+        return
+    table_specs = {
+        "claim": ("claims", "claim_id", "claim_versions"),
+        "evidence": ("evidence", "evidence_id", "evidence_versions"),
+    }
+    table_name, id_field, version_table = table_specs[record_kind]
+    record_ids = set(owners)
+    for row in _rows_for_ids(
+        conn,
+        select_prefix=(
+            "SELECT record_id, page_key, identity_origin, data_json "
+            "FROM canonical_identities "
+            f"WHERE record_kind = '{record_kind}' AND record_id IN"
+        ),
+        record_ids=record_ids,
+    ):
+        record_id = str(row["record_id"])
+        registered_page = _identity_registry_owner_page(
+            row,
+            record_kind=record_kind,
+            record_id=record_id,
+        )
+        proposed_page = owners[record_id][0]
+        if registered_page != proposed_page:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {id_field} {record_id!r} is reserved by identity page "
+                f"{registered_page!r}, not {proposed_page!r}."
+            )
+    for row in _rows_for_ids(
+        conn,
+        select_prefix=(
+            f"SELECT {id_field}, data_json FROM {table_name} WHERE {id_field} IN"
+        ),
+        record_ids=record_ids,
+    ):
+        record_id = str(row[id_field])
+        try:
+            existing = json.loads(row["data_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {id_field} {record_id!r} has invalid locator metadata."
+            ) from exc
+        existing_owner = _owner_record(
+            existing,
+            record_kind=record_kind,
+            record_id=record_id,
+        )
+        if owners[record_id] != existing_owner:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {id_field} {record_id!r} is owned by page "
+                f"{existing_owner[0]!r}, not {owners[record_id][0]!r}."
+            )
+
+    for row in _rows_for_ids(
+        conn,
+        select_prefix=(
+            f"SELECT {id_field}, page_key FROM {version_table} WHERE {id_field} IN"
+        ),
+        record_ids=record_ids,
+    ):
+        record_id = str(row[id_field])
+        historical_page = _normalized_owner_page(row["page_key"])
+        if not historical_page:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {id_field} {record_id!r} has a historical version "
+                "without page_key ownership."
+            )
+        proposed_page = owners[record_id][0]
+        if historical_page != proposed_page:
+            raise CanonicalIdOwnershipError(
+                f"Canonical {id_field} {record_id!r} is reserved by historical page "
+                f"{historical_page!r}, not {proposed_page!r}."
+            )
+
+def _validate_canonical_id_ownership(
+    conn,
+    *,
+    proposed_entities: list[dict],
+    proposed_claims: list[dict],
+    proposed_evidence: list[dict],
+    affected_page_keys: set[str],
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+    """Validate global-ID ownership before any page-scoped delete or upsert."""
+    entity_owners = _proposed_id_owners(
+        proposed_entities,
+        record_kind="entity",
+        id_field="entity_id",
+        affected_page_keys=affected_page_keys,
+    )
+    claim_owners = _proposed_id_owners(
+        proposed_claims,
+        record_kind="claim",
+        id_field="claim_id",
+        affected_page_keys=affected_page_keys,
+    )
+    evidence_owners = _proposed_id_owners(
+        proposed_evidence,
+        record_kind="evidence",
+        id_field="evidence_id",
+        affected_page_keys=affected_page_keys,
+    )
+
+    if entity_owners:
+        entity_ids = set(entity_owners)
+        for row in _rows_for_ids(
+            conn,
+            select_prefix=(
+                "SELECT entity_id, data_json FROM entities WHERE entity_id IN"
+            ),
+            record_ids=entity_ids,
+        ):
+            entity_id = str(row["entity_id"])
+            try:
+                existing = json.loads(row["data_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise CanonicalIdOwnershipError(
+                    f"Canonical entity_id {entity_id!r} has invalid owner metadata."
+                ) from exc
+            existing_owner = _owner_record(
+                existing,
+                record_kind="entity",
+                record_id=entity_id,
+            )
+            if entity_owners[entity_id] != existing_owner:
+                raise CanonicalIdOwnershipError(
+                    f"Canonical entity_id {entity_id!r} is owned by page "
+                    f"{existing_owner[0]!r}, not {entity_owners[entity_id][0]!r}."
+                )
+
+        for row in _rows_for_ids(
+            conn,
+            select_prefix=(
+                "SELECT entity_id, page_key FROM entity_identities WHERE entity_id IN"
+            ),
+            record_ids=entity_ids,
+        ):
+            entity_id = str(row["entity_id"])
+            identity_page = _normalized_owner_page(row["page_key"])
+            if not identity_page:
+                raise CanonicalIdOwnershipError(
+                    f"Canonical entity_id {entity_id!r} has an identity row "
+                    "without page_key ownership."
+                )
+            if entity_owners[entity_id][0] != identity_page:
+                raise CanonicalIdOwnershipError(
+                    f"Canonical entity_id {entity_id!r} is reserved by identity page "
+                    f"{identity_page!r}, not {entity_owners[entity_id][0]!r}."
+                )
+
+    _validate_locator_id_ownership(
+        conn,
+        owners=claim_owners,
+        record_kind="claim",
+    )
+    _validate_locator_id_ownership(
+        conn,
+        owners=evidence_owners,
+        record_kind="evidence",
+    )
+    return claim_owners, evidence_owners
+
 def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     """Apply a page-scoped canonical delta inside an existing transaction."""
     if not change_sets:
@@ -2249,7 +3385,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
         for page in change_set.get("affected_pages", [])
     }
     affected_page_keys = {
-        page[:-3] if page.endswith(".md") else page
+        _normalized_owner_page(page)
         for page in affected_pages
     }
     proposed_entities = [record for item in change_sets for record in item.get("proposed_entities", [])]
@@ -2265,6 +3401,23 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     proposed_edges = [record for item in change_sets for record in item.get("proposed_edges", [])]
 
     conn = get_connection()
+    claim_owners, evidence_owners = _validate_canonical_id_ownership(
+        conn,
+        proposed_entities=proposed_entities,
+        proposed_claims=proposed_claims,
+        proposed_evidence=proposed_evidence,
+        affected_page_keys=affected_page_keys,
+    )
+    _register_locator_id_ownership(
+        conn,
+        owners=claim_owners,
+        record_kind="claim",
+    )
+    _register_locator_id_ownership(
+        conn,
+        owners=evidence_owners,
+        record_kind="evidence",
+    )
     old_entity_ids: set[str] = set()
     old_claim_ids: set[str] = set()
     old_claim_rows = []
@@ -2425,7 +3578,7 @@ def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bo
     if deleted_paths:
         for path in deleted_paths:
             basename = os.path.basename(path)
-            if basename.endswith(".md"):
+            if basename.casefold().endswith(".md"):
                 page_key = basename[:-3]
                 entity_id = _stable_id("entity", page_key)
                 delete_entity(entity_id)
@@ -2439,10 +3592,12 @@ def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bo
 
 def migrate_existing_wiki(dry_run: bool = False) -> dict:
     wiki_dir = get_wiki_dir()
-    page_paths = []
-    for name in os.listdir(wiki_dir):
-        if name.endswith(".md") and name not in ("index.md", "log.md", "overview.md"):
-            page_paths.append(str(wiki_dir / name))
+    excluded = {"index.md", "log.md", "overview.md"}
+    page_paths = [
+        str(path)
+        for path in sorted(iter_markdown_files(wiki_dir), key=lambda item: item.name)
+        if path.name.casefold() not in excluded
+    ]
 
     if dry_run:
         counts = {"entities": 0, "claims": 0, "evidence": 0, "sources": 0, "valid_pages": 0}
@@ -2552,3 +3707,528 @@ def enqueue_governance_item(
     return item
 
 
+
+
+_HISTORY_TERMINAL_CHANGE_SET_STATUSES = (
+    "applied",
+    "cancelled",
+    "failed",
+    "published",
+    "rejected",
+    "superseded",
+)
+_HISTORY_TERMINAL_QUEUE_STATUSES = (
+    "cancelled",
+    "completed",
+    "dismissed",
+    "published",
+    "rejected",
+    "resolved",
+    "superseded",
+)
+_HISTORY_TERMINAL_JOB_STATUSES = (
+    "finalized",
+    "completed",
+    "cancelled",
+    "superseded",
+)
+_HISTORY_TERMINAL_OUTBOX_STATUSES = ("completed", "failed", "superseded")
+_HISTORY_RETENTION_TABLES = (
+    "change_sets",
+    "jobs",
+    "mutation_outbox",
+    "claim_versions",
+    "evidence_versions",
+)
+
+
+def _history_page_key(value: object) -> str:
+    page_key = os.path.basename(str(value or "").strip())
+    return page_key[:-3] if page_key.casefold().endswith(".md") else page_key
+
+
+def _history_json_object(value: object) -> dict:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    """Collect identifiers that unfinished work may still need."""
+    protected = {
+        "claim_ids": set(),
+        "claim_family_ids": set(),
+        "evidence_ids": set(),
+        "evidence_family_ids": set(),
+        "page_keys": set(),
+        "block_version_retention": set(),
+    }
+    terminal_change = ",".join("?" for _ in _HISTORY_TERMINAL_CHANGE_SET_STATUSES)
+    rows = conn.execute(
+        "SELECT data_json FROM change_sets WHERE "
+        "CASE WHEN json_valid(data_json) THEN "
+        "LOWER(COALESCE(json_extract(data_json, '$.status'), '')) ELSE '' END "
+        f"NOT IN ({terminal_change})",
+        _HISTORY_TERMINAL_CHANGE_SET_STATUSES,
+    ).fetchall()
+    for row in rows:
+        change_set = _history_json_object(row["data_json"])
+        if not change_set:
+            protected["block_version_retention"].add("malformed_change_set")
+            continue
+        for page in change_set.get("affected_pages") or []:
+            if page_key := _history_page_key(page):
+                protected["page_keys"].add(page_key)
+        for record in change_set.get("proposed_claims") or []:
+            if not isinstance(record, dict):
+                continue
+            if claim_id := str(record.get("claim_id") or ""):
+                protected["claim_ids"].add(claim_id)
+            if family_id := str(record.get("claim_family_id") or ""):
+                protected["claim_family_ids"].add(family_id)
+            locator = record.get("locator") or record.get("projection_locator") or {}
+            if isinstance(locator, dict):
+                if page_key := _history_page_key(locator.get("page_key")):
+                    protected["page_keys"].add(page_key)
+        for record in change_set.get("proposed_evidence") or []:
+            if not isinstance(record, dict):
+                continue
+            if evidence_id := str(record.get("evidence_id") or ""):
+                protected["evidence_ids"].add(evidence_id)
+            if family_id := str(record.get("evidence_family_id") or ""):
+                protected["evidence_family_ids"].add(family_id)
+            locator = record.get("locator") or record.get("projection_locator") or {}
+            if isinstance(locator, dict):
+                if page_key := _history_page_key(locator.get("page_key")):
+                    protected["page_keys"].add(page_key)
+
+    terminal_outbox = ",".join("?" for _ in _HISTORY_TERMINAL_OUTBOX_STATUSES)
+    for row in conn.execute(
+        "SELECT filename FROM mutation_outbox "
+        f"WHERE COALESCE(status, '') NOT IN ({terminal_outbox})",
+        _HISTORY_TERMINAL_OUTBOX_STATUSES,
+    ).fetchall():
+        if page_key := _history_page_key(row["filename"]):
+            protected["page_keys"].add(page_key)
+        else:
+            protected["block_version_retention"].add(
+                "missing_active_outbox_filename"
+            )
+
+    terminal_jobs = ",".join("?" for _ in _HISTORY_TERMINAL_JOB_STATUSES)
+    rows = conn.execute(
+        "SELECT payload FROM jobs WHERE status IS NULL OR "
+        "(status = 'failed' AND COALESCE(retries, 0) < 3) OR "
+        f"(status != 'failed' AND status NOT IN ({terminal_jobs}))",
+        _HISTORY_TERMINAL_JOB_STATUSES,
+    ).fetchall()
+    for row in rows:
+        payload = _history_json_object(row["payload"])
+        if not payload:
+            protected["block_version_retention"].add(
+                "malformed_active_job_payload"
+            )
+            continue
+        for field in ("canonical_name", "page_key"):
+            if page_key := _history_page_key(payload.get(field)):
+                protected["page_keys"].add(page_key)
+    return protected
+
+
+def _select_change_set_retention_candidates(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    batch_size: int,
+    keep_latest: int,
+) -> list[str]:
+    terminal = ",".join("?" for _ in _HISTORY_TERMINAL_CHANGE_SET_STATUSES)
+    queue_terminal = ",".join("?" for _ in _HISTORY_TERMINAL_QUEUE_STATUSES)
+    rows = conn.execute(
+        "WITH terminal AS ("
+        " SELECT change_set_id, COALESCE(updated_at, '') AS retained_at"
+        " FROM change_sets WHERE json_valid(data_json) "
+        " AND LOWER(COALESCE(json_extract(data_json, '$.status'), '')) "
+        f" IN ({terminal})"
+        "), ranked AS ("
+        " SELECT change_set_id, retained_at,"
+        " ROW_NUMBER() OVER (ORDER BY retained_at DESC, change_set_id DESC) AS retain_rank"
+        " FROM terminal"
+        ") SELECT candidate.change_set_id FROM ranked AS candidate "
+        "WHERE julianday(candidate.retained_at) IS NOT NULL "
+        "AND julianday(candidate.retained_at) < julianday(?) "
+        "AND candidate.retain_rank > ? "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM governance_queue "
+        " WHERE COALESCE(json_valid(data_json), 0) = 0"
+        ") AND NOT EXISTS ("
+        " SELECT 1 FROM governance_queue AS queue "
+        " WHERE json_valid(queue.data_json) "
+        " AND json_extract(queue.data_json, '$.change_set_id') = candidate.change_set_id "
+        " AND LOWER(COALESCE(json_extract(queue.data_json, '$.status'), '')) "
+        f" NOT IN ({queue_terminal})"
+        ") ORDER BY candidate.retained_at ASC, candidate.change_set_id ASC LIMIT ?",
+        (
+            *_HISTORY_TERMINAL_CHANGE_SET_STATUSES,
+            cutoff,
+            keep_latest,
+            *_HISTORY_TERMINAL_QUEUE_STATUSES,
+            batch_size,
+        ),
+    ).fetchall()
+    return [str(row["change_set_id"]) for row in rows]
+
+def _select_job_retention_candidates(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    batch_size: int,
+    keep_latest: int,
+) -> list[str]:
+    rows = conn.execute(
+        "WITH terminal AS ("
+        " SELECT job_id, task_packet_path,"
+        " COALESCE(completed_at, updated_at, created_at, '') AS retained_at"
+        " FROM jobs WHERE "
+        " status IN ('finalized', 'completed', 'cancelled', 'superseded') "
+        " OR (status = 'failed' AND COALESCE(retries, 0) >= 3)"
+        "), ranked AS ("
+        " SELECT job_id, task_packet_path, retained_at,"
+        " ROW_NUMBER() OVER (ORDER BY retained_at DESC, job_id DESC) AS retain_rank"
+        " FROM terminal"
+        ") SELECT candidate.job_id FROM ranked AS candidate "
+        "WHERE julianday(candidate.retained_at) IS NOT NULL "
+        "AND julianday(candidate.retained_at) < julianday(?) "
+        "AND candidate.retain_rank > ? "
+        "AND COALESCE(candidate.task_packet_path, '') = '' "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM ingest_task_cleanup AS cleanup "
+        " WHERE cleanup.job_id = candidate.job_id AND cleanup.status != 'completed'"
+        ") ORDER BY candidate.retained_at ASC, candidate.job_id ASC LIMIT ?",
+        (cutoff, keep_latest, batch_size),
+    ).fetchall()
+    return [str(row["job_id"]) for row in rows]
+
+def _select_outbox_retention_candidates(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    batch_size: int,
+    keep_latest: int,
+) -> list[int]:
+    terminal = ",".join("?" for _ in _HISTORY_TERMINAL_OUTBOX_STATUSES)
+    rows = conn.execute(
+        "WITH terminal AS ("
+        " SELECT id, COALESCE(completed_at, available_at, created_at, '') AS retained_at"
+        " FROM mutation_outbox "
+        f" WHERE status IN ({terminal})"
+        "), ranked AS ("
+        " SELECT id, retained_at,"
+        " ROW_NUMBER() OVER (ORDER BY retained_at DESC, id DESC) AS retain_rank"
+        " FROM terminal"
+        ") SELECT candidate.id FROM ranked AS candidate "
+        "WHERE julianday(candidate.retained_at) IS NOT NULL "
+        "AND julianday(candidate.retained_at) < julianday(?) "
+        "AND candidate.retain_rank > ? "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM mutation_outbox AS active "
+        " WHERE active.superseded_by = candidate.id "
+        f" AND COALESCE(active.status, '') NOT IN ({terminal})"
+        ") ORDER BY candidate.retained_at ASC, candidate.id ASC LIMIT ?",
+        (
+            *_HISTORY_TERMINAL_OUTBOX_STATUSES,
+            cutoff,
+            keep_latest,
+            *_HISTORY_TERMINAL_OUTBOX_STATUSES,
+            batch_size,
+        ),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+def _select_version_retention_candidates(
+    conn: sqlite3.Connection,
+    *,
+    table_name: str,
+    version_id_field: str,
+    id_field: str,
+    family_field: str,
+    canonical_table: str,
+    cutoff: str,
+    batch_size: int,
+    keep_per_family: int,
+    protected: dict[str, set[str]],
+) -> tuple[list[str], dict[str, int]]:
+    allowed = {
+        (
+            "claim_versions",
+            "claim_version_id",
+            "claim_id",
+            "claim_family_id",
+            "claims",
+        ),
+        (
+            "evidence_versions",
+            "evidence_version_id",
+            "evidence_id",
+            "evidence_family_id",
+            "evidence",
+        ),
+    }
+    identity = (
+        table_name,
+        version_id_field,
+        id_field,
+        family_field,
+        canonical_table,
+    )
+    if identity not in allowed:
+        raise ValueError(f"Unsupported history table: {table_name}")
+    if protected["block_version_retention"]:
+        return [], {
+            "active_work": 0,
+            "current_canonical": 0,
+            "malformed_canonical": 0,
+            "scanned": 0,
+            "blocked_by_unknown_active_work": len(
+                protected["block_version_retention"]
+            ),
+        }
+    rows = conn.execute(
+        f"WITH ranked AS ("
+        f" SELECT {version_id_field}, {id_field}, {family_field}, page_key, "
+        f" record_hash, recorded_at, version_no, "
+        f" ROW_NUMBER() OVER (PARTITION BY {family_field} "
+        f" ORDER BY version_no DESC, recorded_at DESC, {version_id_field} DESC) AS family_rank "
+        f" FROM {table_name}"
+        f") SELECT candidate.*, canonical.data_json AS current_data_json "
+        f"FROM ranked AS candidate LEFT JOIN {canonical_table} AS canonical "
+        f"ON canonical.{id_field} = candidate.{id_field} "
+        f"WHERE julianday(candidate.recorded_at) IS NOT NULL "
+        f"AND julianday(candidate.recorded_at) < julianday(?) "
+        f"AND candidate.family_rank > ? "
+        f"ORDER BY candidate.recorded_at ASC, candidate.{version_id_field} ASC",
+        (cutoff, keep_per_family),
+    )
+    protected_ids = protected[f"{id_field}s"]
+    protected_families = protected[f"{family_field}s"]
+    protected_pages = protected["page_keys"]
+    selected: list[str] = []
+    skipped = {
+        "active_work": 0,
+        "current_canonical": 0,
+        "malformed_canonical": 0,
+        "scanned": 0,
+        "blocked_by_unknown_active_work": 0,
+    }
+    for row in rows:
+        skipped["scanned"] += 1
+        page_key = _history_page_key(row["page_key"])
+        if (
+            str(row[id_field]) in protected_ids
+            or str(row[family_field]) in protected_families
+            or (page_key and page_key in protected_pages)
+        ):
+            skipped["active_work"] += 1
+            continue
+        current_data = row["current_data_json"]
+        if current_data is not None:
+            current_record = _history_json_object(current_data)
+            if not current_record:
+                skipped["malformed_canonical"] += 1
+                continue
+            current_hash = hashlib.sha256(
+                _canonical_record_json(current_record).encode("utf-8")
+            ).hexdigest()
+            if current_hash == str(row["record_hash"] or ""):
+                skipped["current_canonical"] += 1
+                continue
+        selected.append(str(row[version_id_field]))
+        if len(selected) >= batch_size:
+            break
+    return selected, skipped
+
+def plan_history_retention(
+    conn: sqlite3.Connection,
+    *,
+    cutoff: str,
+    batch_size: int = 500,
+    keep_change_sets: int = 1000,
+    keep_terminal_jobs: int = 1000,
+    keep_terminal_outbox: int = 1000,
+    keep_versions_per_family: int = 2,
+) -> dict:
+    """Select bounded history rows without mutating the supplied database."""
+    if batch_size < 1 or batch_size > 10_000:
+        raise ValueError("batch_size must be between 1 and 10000")
+    for name, value in (
+        ("keep_change_sets", keep_change_sets),
+        ("keep_terminal_jobs", keep_terminal_jobs),
+        ("keep_terminal_outbox", keep_terminal_outbox),
+    ):
+        if int(value) < 0:
+            raise ValueError(f"{name} must be zero or positive")
+    if keep_versions_per_family < 1:
+        raise ValueError("keep_versions_per_family must be positive")
+
+    protected = _history_active_protections(conn)
+    selected: dict[str, list] = {
+        "change_sets": _select_change_set_retention_candidates(
+            conn,
+            cutoff,
+            batch_size,
+            int(keep_change_sets),
+        ),
+        "jobs": _select_job_retention_candidates(
+            conn,
+            cutoff,
+            batch_size,
+            int(keep_terminal_jobs),
+        ),
+        "mutation_outbox": _select_outbox_retention_candidates(
+            conn,
+            cutoff,
+            batch_size,
+            int(keep_terminal_outbox),
+        ),
+    }
+    claim_versions, claim_skipped = _select_version_retention_candidates(
+        conn,
+        table_name="claim_versions",
+        version_id_field="claim_version_id",
+        id_field="claim_id",
+        family_field="claim_family_id",
+        canonical_table="claims",
+        cutoff=cutoff,
+        batch_size=batch_size,
+        keep_per_family=int(keep_versions_per_family),
+        protected=protected,
+    )
+    evidence_versions, evidence_skipped = _select_version_retention_candidates(
+        conn,
+        table_name="evidence_versions",
+        version_id_field="evidence_version_id",
+        id_field="evidence_id",
+        family_field="evidence_family_id",
+        canonical_table="evidence",
+        cutoff=cutoff,
+        batch_size=batch_size,
+        keep_per_family=int(keep_versions_per_family),
+        protected=protected,
+    )
+    selected["claim_versions"] = claim_versions
+    selected["evidence_versions"] = evidence_versions
+    table_counts = {
+        table_name: int(
+            conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        )
+        for table_name in _HISTORY_RETENTION_TABLES
+    }
+    return {
+        "cutoff": cutoff,
+        "rules": {
+            "batch_size_per_table": batch_size,
+            "keep_change_sets": int(keep_change_sets),
+            "keep_terminal_jobs": int(keep_terminal_jobs),
+            "keep_terminal_outbox": int(keep_terminal_outbox),
+            "keep_versions_per_family": int(keep_versions_per_family),
+        },
+        "table_counts_before": table_counts,
+        "selected_ids": selected,
+        "selected_counts": {
+            table_name: len(selected.get(table_name, []))
+            for table_name in _HISTORY_RETENTION_TABLES
+        },
+        "active_protection_counts": {
+            name: len(values) for name, values in protected.items()
+        },
+        "version_skip_counts": {
+            "claim_versions": claim_skipped,
+            "evidence_versions": evidence_skipped,
+        },
+    }
+
+
+def _delete_history_ids(
+    conn: sqlite3.Connection,
+    table_name: str,
+    key_name: str,
+    values: list,
+    *,
+    extra_predicate: str = "",
+) -> int:
+    if table_name not in {
+        "change_sets",
+        "change_set_idempotency",
+        "jobs",
+        "ingest_task_cleanup",
+        "mutation_outbox",
+        "claim_versions",
+        "evidence_versions",
+    }:
+        raise ValueError(f"Unsupported history deletion table: {table_name}")
+    deleted = 0
+    for offset in range(0, len(values), 400):
+        chunk = values[offset : offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        cursor = conn.execute(
+            f"DELETE FROM {table_name} WHERE {key_name} IN ({placeholders}) "
+            f"{extra_predicate}",
+            tuple(chunk),
+        )
+        deleted += int(cursor.rowcount or 0)
+    return deleted
+
+
+def apply_history_retention_plan(
+    conn: sqlite3.Connection,
+    plan: dict,
+) -> dict[str, int]:
+    """Delete a plan computed under the caller's current write transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError("History retention apply requires an active transaction")
+    selected = plan.get("selected_ids") or {}
+    unknown = set(selected) - set(_HISTORY_RETENTION_TABLES)
+    if unknown:
+        raise ValueError(f"Unsupported history plan tables: {sorted(unknown)}")
+
+    change_set_ids = list(selected.get("change_sets") or [])
+    job_ids = list(selected.get("jobs") or [])
+    _delete_history_ids(
+        conn,
+        "change_set_idempotency",
+        "change_set_id",
+        change_set_ids,
+    )
+    _delete_history_ids(
+        conn,
+        "ingest_task_cleanup",
+        "job_id",
+        job_ids,
+        extra_predicate="AND status = 'completed'",
+    )
+    return {
+        "change_sets": _delete_history_ids(
+            conn,
+            "change_sets",
+            "change_set_id",
+            change_set_ids,
+        ),
+        "jobs": _delete_history_ids(conn, "jobs", "job_id", job_ids),
+        "mutation_outbox": _delete_history_ids(
+            conn,
+            "mutation_outbox",
+            "id",
+            list(selected.get("mutation_outbox") or []),
+        ),
+        "claim_versions": _delete_history_ids(
+            conn,
+            "claim_versions",
+            "claim_version_id",
+            list(selected.get("claim_versions") or []),
+        ),
+        "evidence_versions": _delete_history_ids(
+            conn,
+            "evidence_versions",
+            "evidence_version_id",
+            list(selected.get("evidence_versions") or []),
+        ),
+    }

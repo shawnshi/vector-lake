@@ -1,15 +1,136 @@
+import asyncio
+from concurrent.futures import Future
+import functools
 import hashlib
 import json
+import inspect
 import logging
 import os
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
 import uuid
+import weakref
 from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
+
+
+
+class _DaemonThreadPoolExecutor:
+    """Small public-API executor whose running calls cannot hold process exit."""
+
+    _STOP = object()
+
+    def __init__(self, *, max_workers: int, thread_name_prefix: str) -> None:
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
+        self._max_workers = max_workers
+        self._thread_name_prefix = str(thread_name_prefix or "daemon-executor")
+        self._work_queue: queue.Queue = queue.Queue()
+        # Strong Thread references can keep Win32 handles joinable at interpreter
+        # teardown. Running threads remain reachable through threading itself.
+        self._threads = weakref.WeakSet()
+        self._state_lock = threading.Lock()
+        self._shutdown = False
+
+    def _start_workers_locked(self) -> None:
+        if self._threads:
+            return
+        for index in range(self._max_workers):
+            worker = threading.Thread(
+                name=f"{self._thread_name_prefix}_{index}",
+                target=self._worker,
+                daemon=True,
+            )
+            self._threads.add(worker)
+            worker.start()
+
+    @staticmethod
+    def _notify_terminal(terminal_callback) -> None:
+        if terminal_callback is None:
+            return
+        try:
+            terminal_callback()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Blocking executor terminal callback failed"
+            )
+
+    @staticmethod
+    def _run_item(future: Future, call) -> None:
+        """Run one item in a short-lived frame so results cannot linger idle."""
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            result = call()
+        except BaseException as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+
+    def _worker(self) -> None:
+        while True:
+            item = self._work_queue.get()
+            if item is self._STOP:
+                return
+            future, call, terminal_callback = item
+            try:
+                self._run_item(future, call)
+            finally:
+                self._notify_terminal(terminal_callback)
+                del item, future, call, terminal_callback
+
+    def _submit(self, fn, args, kwargs, terminal_callback) -> Future:
+        if not callable(fn):
+            raise TypeError("submitted work must be callable")
+        future = Future()
+        call = functools.partial(fn, *args, **kwargs)
+        with self._state_lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._start_workers_locked()
+            self._work_queue.put((future, call, terminal_callback))
+        return future
+
+    def submit_tracked(self, fn, terminal_callback) -> Future:
+        """Submit a zero-argument call and notify when it leaves the physical queue."""
+        if not callable(terminal_callback):
+            raise TypeError("terminal_callback must be callable")
+        return self._submit(fn, (), {}, terminal_callback)
+
+    def queued_work_items(self) -> int:
+        return self._work_queue.qsize()
+
+    def _cancel_queued_work_locked(self) -> None:
+        while True:
+            try:
+                future, _call, terminal_callback = self._work_queue.get_nowait()
+            except queue.Empty:
+                return
+            future.cancel()
+            self._notify_terminal(terminal_callback)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._state_lock:
+            first_shutdown = not self._shutdown
+            self._shutdown = True
+            threads = list(self._threads)
+            if first_shutdown:
+                if cancel_futures:
+                    self._cancel_queued_work_locked()
+                for _worker_index in threads:
+                    self._work_queue.put(self._STOP)
+        if wait:
+            for worker in threads:
+                worker.join()
+
+
+def _finalize_blocking_executor(executor: _DaemonThreadPoolExecutor) -> None:
+    """Stop an abandoned server executor without blocking garbage collection."""
+    executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _source_tree_revision(source_root: Path) -> str:
@@ -96,15 +217,199 @@ class ReloadAwareFastMCP(FastMCP):
         self.runtime_guard = runtime_guard or MCPRuntimeGuard(
             Path(__file__).resolve().parent
         )
+        try:
+            worker_count = int(os.environ.get("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "4"))
+        except (TypeError, ValueError):
+            worker_count = 4
+        worker_count = max(1, min(8, worker_count))
+        try:
+            queue_capacity = int(
+                os.environ.get(
+                    "VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY",
+                    str(worker_count),
+                )
+            )
+        except (TypeError, ValueError):
+            queue_capacity = worker_count
+        queue_capacity = max(0, min(64, queue_capacity))
+        try:
+            admission_timeout = float(
+                os.environ.get(
+                    "VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS",
+                    "0.05",
+                )
+            )
+        except (TypeError, ValueError):
+            admission_timeout = 0.05
+        self._blocking_worker_count = worker_count
+        self._blocking_queue_capacity = queue_capacity
+        self._blocking_admission_timeout = max(0.0, min(5.0, admission_timeout))
+        self._blocking_slots = threading.BoundedSemaphore(
+            worker_count + queue_capacity
+        )
+        self._blocking_inflight = 0
+        self._blocking_executor = _DaemonThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="vector-lake-mcp",
+        )
+        self._executor_shutdown_lock = threading.Lock()
+        self._executor_shutdown_started = False
+        self._executor_finalizer = weakref.finalize(
+            self,
+            _finalize_blocking_executor,
+            self._blocking_executor,
+        )
+
+    @staticmethod
+    def _cleanup_tool_connection(*, failed: bool) -> None:
+        try:
+            from vector_lake.db_store import cleanup_connection_after_tool_call
+
+            cleanup_connection_after_tool_call(failed=failed)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Failed to clean up a tool-local database connection",
+                exc_info=True,
+            )
+
+    @classmethod
+    def _invoke_blocking_tool(cls, fn, *fn_args, **fn_kwargs):
+        failed = True
+        try:
+            result = fn(*fn_args, **fn_kwargs)
+            failed = False
+            return result
+        finally:
+            cls._cleanup_tool_connection(failed=failed)
+
+    def _assert_accepting_calls(self) -> None:
+        with self._executor_shutdown_lock:
+            if self._executor_shutdown_started:
+                raise RuntimeError("Vector Lake MCP server is shutting down")
+
+    def _submit_blocking_call(self, call):
+        """Admit a bounded blocking call and fence it against shutdown."""
+        admitted = self._blocking_slots.acquire(
+            timeout=self._blocking_admission_timeout
+        )
+        if not admitted:
+            raise RuntimeError(
+                "Vector Lake MCP blocking executor is saturated; retry later"
+            )
+
+        released = False
+
+        def release_slot():
+            nonlocal released
+            with self._executor_shutdown_lock:
+                if released:
+                    return
+                released = True
+                self._blocking_inflight -= 1
+            self._blocking_slots.release()
+
+        with self._executor_shutdown_lock:
+            if self._executor_shutdown_started:
+                self._blocking_slots.release()
+                raise RuntimeError("Vector Lake MCP server is shutting down")
+            self._blocking_inflight += 1
+            try:
+                future = self._blocking_executor.submit_tracked(
+                    call,
+                    release_slot,
+                )
+            except BaseException:
+                self._blocking_inflight -= 1
+                self._blocking_slots.release()
+                raise
+
+        return future
+
+    async def _run_blocking_call(self, call):
+        future = self._submit_blocking_call(call)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+    def blocking_executor_status(self) -> dict:
+        with self._executor_shutdown_lock:
+            return {
+                "workers": self._blocking_worker_count,
+                "queue_capacity": self._blocking_queue_capacity,
+                "inflight": self._blocking_inflight,
+                "queued_items": self._blocking_executor.queued_work_items(),
+                "admission_timeout_seconds": self._blocking_admission_timeout,
+                "workers_daemon": all(
+                    worker.daemon for worker in self._blocking_executor._threads
+                ),
+                "running_workers": sum(
+                    worker.is_alive() for worker in self._blocking_executor._threads
+                ),
+                "shutdown_started": self._executor_shutdown_started,
+            }
+
+    def shutdown_blocking_executor(self, *, wait: bool = True) -> None:
+        """Idempotently stop this server's bounded blocking-tool executor."""
+        with self._executor_shutdown_lock:
+            first_shutdown = not self._executor_shutdown_started
+            self._executor_shutdown_started = True
+            if self._executor_finalizer.alive:
+                self._executor_finalizer.detach()
+        if first_shutdown or wait:
+            self._blocking_executor.shutdown(wait=wait, cancel_futures=True)
+
+    def tool(self, *args, **kwargs):
+        register = super().tool(*args, **kwargs)
+
+        def decorator(fn):
+            if inspect.iscoroutinefunction(fn):
+                @functools.wraps(fn)
+                async def managed_async_tool(*fn_args, **fn_kwargs):
+                    self._assert_accepting_calls()
+                    failed = True
+                    try:
+                        result = await fn(*fn_args, **fn_kwargs)
+                        failed = False
+                        return result
+                    finally:
+                        self._cleanup_tool_connection(failed=failed)
+
+                register(managed_async_tool)
+                return fn
+
+            @functools.wraps(fn)
+            async def threaded_tool(*fn_args, **fn_kwargs):
+                call = functools.partial(
+                    self._invoke_blocking_tool,
+                    fn,
+                    *fn_args,
+                    **fn_kwargs,
+                )
+                return await self._run_blocking_call(call)
+
+            register(threaded_tool)
+            return fn
+
+        return decorator
+
+    def run(self, transport="stdio", mount_path=None):
+        try:
+            return super().run(transport=transport, mount_path=mount_path)
+        finally:
+            self.shutdown_blocking_executor(wait=False)
 
     async def call_tool(self, name: str, arguments: dict):
+        self._assert_accepting_calls()
         if name != "mcp_runtime_status":
-            self.runtime_guard.assert_current()
+            await self._run_blocking_call(self.runtime_guard.assert_current)
         return await super().call_tool(name, arguments)
 
 # Global lock against stdout pollution
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', force=True)
-from vector_lake import tools, tool_memory  # noqa: E402
+from vector_lake import tool_memory  # noqa: E402
+from vector_lake import tools  # noqa: E402
 from vector_lake.governance_store import insert_governance_item_if_absent, _utc_now  # noqa: E402
 from vector_lake.tool_timeline import search_timeline_events  # noqa: E402
 
@@ -114,8 +419,10 @@ mcp = ReloadAwareFastMCP("vector-lake")
 @mcp.tool()
 def mcp_runtime_status() -> str:
     """Report whether this MCP process still matches the on-disk source tree."""
+    status = mcp.runtime_guard.status(force=True)
+    status["blocking_executor"] = mcp.blocking_executor_status()
     return json.dumps(
-        mcp.runtime_guard.status(force=True),
+        status,
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
@@ -196,10 +503,43 @@ def wiki_restore(dry_run: bool = True, limit: int = 10) -> str:
 
 
 @mcp.tool()
+def operational_memory_search_index(
+    dry_run: bool = True,
+    batch_size: int = 256,
+) -> str:
+    """Report status or explicitly advance one bounded operational-memory index batch."""
+    return tools.operational_memory_search_index_maintenance(
+        dry_run=dry_run,
+        batch_size=batch_size,
+    )
+
+
+@mcp.tool()
 def operational_memory_cleanup(dry_run: bool = True, limit: int = 0) -> str:
     """Preview or archive known generated/template artifacts in operational memory."""
     return tools.cleanup_operational_memory(dry_run=dry_run, limit=limit)
 
+
+@mcp.tool()
+def history_retention(
+    dry_run: bool = True,
+    ttl_days: int = 30,
+    batch_size: int = 500,
+    keep_change_sets: int = 1000,
+    keep_terminal_jobs: int = 1000,
+    keep_terminal_outbox: int = 1000,
+    keep_versions_per_family: int = 2,
+) -> str:
+    """Preview or explicitly apply one bounded, reference-safe history batch."""
+    return tools.history_retention_maintenance(
+        dry_run=dry_run,
+        ttl_days=ttl_days,
+        batch_size=batch_size,
+        keep_change_sets=keep_change_sets,
+        keep_terminal_jobs=keep_terminal_jobs,
+        keep_terminal_outbox=keep_terminal_outbox,
+        keep_versions_per_family=keep_versions_per_family,
+    )
 
 @mcp.tool()
 def topology_queue_cleanup(dry_run: bool = True) -> str:
@@ -484,14 +824,27 @@ def merge_suggestions_vector_lake(limit: int = 20, enqueue: bool = False) -> str
     return tools.merge_suggestions_vector_lake(limit=limit, enqueue=enqueue)
 
 @mcp.tool()
-def gc_vector_lake(days: int = 30, dry_run: bool = True) -> str:
+def gc_vector_lake(
+    days: int = 30,
+    dry_run: bool = True,
+    orphan_confirmation: str | None = None,
+) -> str:
     """Automatically prune isolated or orphaned entities.
     
     Args:
         days: Prune entities older than this many days (default: 30).
         dry_run: Preview what would be deleted without making changes.
+        orphan_confirmation: Exact fingerprint returned by a current dry-run;
+            orphan pages remain untouched when omitted.
     """
-    return tools.gc_vector_lake(days=days, dry_run=dry_run)
+    from vector_lake.tool_gc import validate_gc_days
+
+    days = validate_gc_days(days)
+    return tools.gc_vector_lake(
+        days=days,
+        dry_run=dry_run,
+        orphan_confirmation=orphan_confirmation,
+    )
 
 @mcp.tool()
 def prepare_ingest_batch(batch_size: int = 5) -> str:
@@ -522,6 +875,18 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
 def reconcile_ingest_tasks(dry_run: bool = True, limit: int = 0) -> str:
     """Classify and safely recover abandoned or terminal ingest tasks."""
     return tools.reconcile_ingest_job_debt(dry_run=dry_run, limit=limit)
+
+
+@mcp.tool()
+def reconcile_orphan_ingest_packets(
+    dry_run: bool = True,
+    min_age_seconds: int = 86400,
+    limit: int = 0,
+) -> str:
+    """Preview or remove old ingest task packets with no durable reference."""
+    return tools.reconcile_orphan_ingest_task_packets(
+        dry_run=dry_run, min_age_seconds=min_age_seconds, limit=limit
+    )
 
 
 @mcp.tool()
@@ -642,18 +1007,15 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
     if old_text.strip() in ["", "---", "[[", "]]", "```", "#"]:
         return f"Error: '{old_text}' is a structural syntax marker. Global replacement aborted to protect graph topology."
         
-    import os
-    from vector_lake.wiki_utils import get_wiki_dir
+    from vector_lake.wiki_utils import get_wiki_dir, iter_markdown_files
     from vector_lake.mutation_coordinator import execute_mutation_batch
     wiki_dir = get_wiki_dir()
     modified_count = 0
     matched_files = []
     mutations = []
     
-    for filename in os.listdir(wiki_dir):
-        if not filename.endswith(".md"):
-            continue
-        filepath = os.path.join(wiki_dir, filename)
+    for filepath in iter_markdown_files(wiki_dir):
+        filename = filepath.name
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()

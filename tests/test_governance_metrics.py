@@ -1,11 +1,23 @@
-import json
-
 from vector_lake import db_store, governance_store
 from vector_lake.governance_metrics import (
     claim_governance_version,
     compute_debt_metrics,
     infer_claim_validity,
 )
+
+
+def _publish_claim(claim: dict, page_key: str) -> None:
+    claim["locator"] = {"page_key": page_key}
+    governance_store.apply_change_set(
+        {
+            "affected_pages": [f"{page_key}.md"],
+            "proposed_entities": [],
+            "proposed_claims": [claim],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
 
 
 def test_source_only_claim_is_provisional_not_unsupported():
@@ -47,12 +59,7 @@ def test_debt_metrics_stream_rows_without_full_store_loads(isolated_memory, monk
         "evidence_ids": [],
         "subject_entity_ids": [],
     }
-    with db_store.transaction():
-        db_store.get_connection().execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-19T00:00:00+00:00"),
-        )
+    _publish_claim(claim, "Concept_Streaming-Metrics")
     for name in ("load_claims", "load_sources", "load_governance_queue", "load_memory_objects"):
         monkeypatch.setattr(
             governance_store,
@@ -79,12 +86,7 @@ def test_acknowledged_evidence_gap_is_managed_debt(isolated_memory):
         "evidence_ids": [],
         "subject_entity_ids": [],
     }
-    with db_store.transaction():
-        db_store.get_connection().execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-19T00:00:00+00:00"),
-        )
+    _publish_claim(claim, "Concept_Acknowledged-Debt")
     governance_store.upsert_governance_item(
         {
             "item_id": "gov_evidence_claim_acknowledged",
@@ -116,12 +118,7 @@ def test_stale_claim_version_does_not_count_as_managed_debt(isolated_memory):
         "evidence_ids": [],
         "subject_entity_ids": [],
     }
-    with db_store.transaction():
-        db_store.get_connection().execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-19T00:00:00+00:00"),
-        )
+    _publish_claim(claim, "Concept_Stale-Debt")
     governance_store.upsert_governance_item(
         {
             "item_id": "gov_stale_claim_version",
@@ -174,17 +171,18 @@ def test_source_referenced_through_evidence_is_not_counted_as_orphan(isolated_me
     evidence = {
         "evidence_id": "evidence_source_ref",
         "source_id": source["source_id"],
+        "locator": {"page_key": "Concept_Evidence-Source-Ref"},
     }
-    with db_store.transaction():
-        conn = db_store.get_connection()
-        conn.execute(
-            "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (source["source_id"], json.dumps(source), "2026-07-21"),
-        )
-        conn.execute(
-            "INSERT INTO evidence (evidence_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (evidence["evidence_id"], json.dumps(evidence), "2026-07-21"),
-        )
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Evidence-Source-Ref.md"],
+            "proposed_entities": [],
+            "proposed_claims": [],
+            "proposed_evidence": [evidence],
+            "proposed_source_updates": [source],
+            "proposed_edges": [],
+        }
+    )
 
     metrics = compute_debt_metrics(skip_heavy=True)
 
@@ -224,12 +222,7 @@ def test_claim_graph_projection_loads_only_bounded_claim_rows(isolated_memory, m
         "subject_entity_ids": [],
         "updated_at": "2026-07-19T00:00:00+00:00",
     }
-    with db_store.transaction():
-        db_store.get_connection().execute(
-            "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), claim["updated_at"]),
-        )
+    _publish_claim(claim, "Concept_Graph-Streaming")
     monkeypatch.setattr(
         governance_store,
         "annotated_claims",

@@ -1,8 +1,12 @@
-import json
 import logging
+import math
 import os
 import re
+import threading
+import time
+from collections import OrderedDict
 from datetime import datetime, timezone
+from itertools import islice
 
 import functools
 import ast
@@ -10,6 +14,12 @@ import operator
 from xml.sax.saxutils import escape, quoteattr
 
 from vector_lake import governance_store
+from vector_lake.index_snapshot import (
+    CompactGraphAdjacency,
+    get_cached_index_snapshot,
+    get_compact_graph_adjacency,
+    load_index_snapshot,
+)
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 
@@ -19,6 +29,15 @@ log = logging.getLogger("vector-lake-tool-search")
 
 class SearchIndexError(RuntimeError):
     """The durable search projection exists but cannot be decoded safely."""
+
+
+class SearchBackendError(RuntimeError):
+    """A search backend failed; expose only the backend identity to callers."""
+
+    def __init__(self, backend: str):
+        self.backend = str(backend)
+        super().__init__(f"Search backend unavailable: {self.backend}")
+
 
 TOKEN_BUDGET = {
     "operational_memory": 0.30,
@@ -43,17 +62,112 @@ QUERY_EXPANSION_DICT = {
 }
 
 
-def _get_query_embedding(query: str) -> list[float]:
-    if not os.environ.get("GEMINI_API_KEY"):
-        return []
-    try:
-        from vector_lake.embedding_scheduler import embed_texts
+_SEARCH_QUERY_CHAR_LIMIT = 16_384
+_SEARCH_TOP_K_LIMIT = 100
 
-        embeddings = embed_texts([query])
-        return embeddings[0] if embeddings else []
-    except Exception as e:
-        log.warning(f"Failed to get query embedding: {e}")
-    return []
+_QUERY_EMBEDDING_STATE_LOCK = threading.Lock()
+_QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
+_QUERY_EMBEDDING_KEY_LOCKS = tuple(threading.Lock() for _ in range(16))
+_QUERY_EMBEDDING_CACHE_KEYS: OrderedDict[
+    tuple[str, str, int, int], None
+] = OrderedDict()
+
+
+
+def _query_embedding_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_query_embedding(
+    query: str,
+    model: str,
+    timeout_ms: int,
+    max_wait_ms: int,
+) -> tuple[float, ...]:
+    del model  # The model remains part of the cache key.
+    from vector_lake.embedding_scheduler import embed_texts
+
+    embeddings = embed_texts(
+        [query],
+        max_retries=0,
+        timeout_ms=timeout_ms,
+        max_wait_seconds=max_wait_ms / 1000.0,
+    )
+    return tuple(embeddings[0]) if embeddings else ()
+
+
+def _reset_query_embedding_state_for_tests() -> None:
+    global _QUERY_EMBEDDING_FAILURE_UNTIL
+    _cached_query_embedding.cache_clear()
+    with _QUERY_EMBEDDING_STATE_LOCK:
+        _QUERY_EMBEDDING_CACHE_KEYS.clear()
+        _QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
+
+
+def _get_query_embedding(query: str) -> list[float]:
+    global _QUERY_EMBEDDING_FAILURE_UNTIL
+    normalized_query = str(query or "").strip()
+    if len(normalized_query) > _SEARCH_QUERY_CHAR_LIMIT:
+        raise ValueError(
+            f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters"
+        )
+    if not os.environ.get("GEMINI_API_KEY") or not normalized_query:
+        return []
+
+    timeout_ms = _query_embedding_int(
+        "VECTOR_LAKE_QUERY_EMBEDDING_TIMEOUT_MS",
+        2_000,
+    )
+    max_wait_ms = _query_embedding_int(
+        "VECTOR_LAKE_QUERY_EMBEDDING_MAX_WAIT_MS",
+        250,
+    )
+    model = os.environ.get(
+        "VECTOR_LAKE_EMBEDDING_MODEL",
+        "gemini-embedding-2",
+    )
+    cache_key = (normalized_query, model, timeout_ms, max_wait_ms)
+    key_lock = _QUERY_EMBEDDING_KEY_LOCKS[
+        hash(cache_key) % len(_QUERY_EMBEDDING_KEY_LOCKS)
+    ]
+
+    with key_lock:
+        now = time.monotonic()
+        with _QUERY_EMBEDDING_STATE_LOCK:
+            cache_known = cache_key in _QUERY_EMBEDDING_CACHE_KEYS
+            if not cache_known and now < _QUERY_EMBEDDING_FAILURE_UNTIL:
+                return []
+
+        try:
+            vector = list(
+                _cached_query_embedding(
+                    normalized_query,
+                    model,
+                    timeout_ms,
+                    max_wait_ms,
+                )
+            )
+            with _QUERY_EMBEDDING_STATE_LOCK:
+                if not cache_known:
+                    _QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
+                _QUERY_EMBEDDING_CACHE_KEYS[cache_key] = None
+                _QUERY_EMBEDDING_CACHE_KEYS.move_to_end(cache_key)
+                while len(_QUERY_EMBEDDING_CACHE_KEYS) > 64:
+                    _QUERY_EMBEDDING_CACHE_KEYS.popitem(last=False)
+            return vector
+        except Exception as exc:
+            cooldown = _query_embedding_int(
+                "VECTOR_LAKE_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS",
+                30,
+            )
+            with _QUERY_EMBEDDING_STATE_LOCK:
+                _QUERY_EMBEDDING_FAILURE_UNTIL = time.monotonic() + cooldown
+            log.warning(f"Failed to get query embedding: {exc}")
+            return []
 
 _VECTOR_CACHE = {
     "mtime": 0.0,
@@ -84,9 +198,9 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> di
             if sim > 0.5:
                 results[row["entity_id"]] = sim
         return results
-    except Exception as e:
-        log.warning(f"Failed to query vec_embeddings: {e}")
-        return {}
+    except Exception as exc:
+        log.warning("Failed to query vec_embeddings: %s", exc)
+        raise SearchBackendError("vector") from exc
 
 def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     try:
@@ -112,9 +226,9 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
             ORDER BY rank LIMIT ?
         """, (query_tok, limit))
         return [dict(row) for row in cur.fetchall()]
-    except Exception as e:
-        log.warning(f"Failed to query fts5: {e}")
-        return []
+    except Exception as exc:
+        log.warning("Failed to query fts5: %s", exc)
+        raise SearchBackendError("fts5") from exc
 
 def _classify_intent(query: str) -> str:
     temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
@@ -188,12 +302,19 @@ def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) ->
 
 
 def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool = False, include_history: bool = False, memory_types: list[str] | None = None) -> str:
-    memories = governance_store.search_operational_memory(
-        query,
-        top_k=top_k,
-        include_history=include_history,
-        memory_types=memory_types,
-    )
+    try:
+        memories = governance_store.search_operational_memory(
+            query,
+            top_k=top_k,
+            include_history=include_history,
+            memory_types=memory_types,
+        )
+    except governance_store.OperationalMemoryNotReady as exc:
+        if as_xml:
+            return f"<MemoryResults State='unavailable' Reason={quoteattr(exc.reason)}/>"
+        return (
+            f"Operational memory unavailable ({exc.reason}); run projection maintenance."
+        )
     if not memories:
         return "<MemoryResults />" if as_xml else "No operational memory matched the query."
     formatted = "".join(
@@ -204,8 +325,24 @@ def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool =
 
 
 def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
-    memories = governance_store.search_operational_memory(query, top_k=24, include_history=False)
-    historical = governance_store.search_operational_memory(query, top_k=12, include_history=True)
+    try:
+        memories, historical = governance_store.search_operational_memory_views(
+            query,
+            current_top_k=24,
+            history_top_k=12,
+        )
+    except governance_store.OperationalMemoryNotReady as exc:
+        packet = (
+            f"<MEMORY_PACKET status='unavailable' reason={quoteattr(exc.reason)}>\n"
+            "Operational-memory projection requires explicit maintenance.\n"
+            "</MEMORY_PACKET>"
+        )
+        return {
+            "packet": packet,
+            "memory_count": 0,
+            "warning_count": 1,
+            "omitted_count": 0,
+        }
     stale_or_conflicted = [
         item for item in historical
         if str(item.get("validity_state", "")).lower() in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
@@ -281,7 +418,32 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
 
 
 def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
-    return candidates
+    """Apply a deterministic semantic-text boost without an external model call."""
+    query_text = str(query or "").strip().casefold()
+    terms = {
+        str(term).strip().casefold()
+        for term in _expand_query_locally(query)
+        if str(term).strip()
+    }
+    reranked: list[tuple[float, int, dict]] = []
+    for position, (base_score, node) in enumerate(candidates):
+        key = str(node.get("_key") or "").casefold()
+        title = str(node.get("title") or "").casefold()
+        summary = str(node.get("summary") or "").casefold()
+        aliases = " ".join(map(str, node.get("aliases") or ())).casefold()
+        bonus = 0.0
+        if query_text and query_text in {key, title}:
+            bonus += 5.0
+        for term in terms:
+            if term in title or term in key:
+                bonus += 2.0
+            if term in aliases:
+                bonus += 1.0
+            if term in summary:
+                bonus += 0.5
+        reranked.append((float(base_score) + bonus, position, node))
+    reranked.sort(key=lambda item: (-item[0], item[1]))
+    return [(score, node) for score, _position, node in reranked]
 
 
 def _safe_eval(expr: str, context: dict) -> bool:
@@ -349,12 +511,185 @@ def _safe_eval(expr: str, context: dict) -> bool:
         log.warning(f"Failed to safe_eval expression '{expr}': {e}")
         return False
 
-_INDEX_CACHE = {
-    "mtime": 0.0,
-    "data": None
-}
+def _load_search_index(index_path: str | os.PathLike) -> dict:
+    """Load the shared snapshot with bounded retries around atomic replacement."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            return load_index_snapshot(index_path)
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.2)
+    assert last_error is not None
+    raise last_error
+
+
+def _graph_expansion_scores(
+    seed_keys: set[str],
+    weighted_edges: list[dict],
+    *,
+    hops: int = 2,
+    alpha: float = 0.85,
+    adjacency: CompactGraphAdjacency | None = None,
+) -> dict[str, float]:
+    """Run the bounded-hop walk without materializing whole-graph adjacency."""
+    ppr_scores = {key: 1.0 for key in seed_keys}
+    for _ in range(hops):
+        active_adjacency: dict[str, list[tuple[str, float]]] | None = None
+        if adjacency is None:
+            active_keys = set(ppr_scores)
+            active_adjacency = {}
+            for edge in weighted_edges:
+                source = edge["source"]
+                target = edge["target"]
+                weight = edge.get("weight", 1.0)
+                if source in active_keys:
+                    active_adjacency.setdefault(source, []).append((target, weight))
+                if target in active_keys:
+                    active_adjacency.setdefault(target, []).append((source, weight))
+
+        next_scores = {
+            key: (1 - alpha) if key in seed_keys else 0.0
+            for key in ppr_scores
+        }
+        for node, current_score in ppr_scores.items():
+            if adjacency is not None:
+                total_weight = adjacency.total_weight(node)
+                if not math.isfinite(total_weight) or total_weight <= 0:
+                    continue
+                for neighbor, weight in adjacency.iter_weighted_neighbors(node):
+                    next_scores[neighbor] = (
+                        next_scores.get(neighbor, 0.0)
+                        + alpha * current_score * (weight / total_weight)
+                    )
+            else:
+                assert active_adjacency is not None
+                neighbors = active_adjacency.get(node, ())
+                if not neighbors:
+                    continue
+                total_weight = sum(weight for _, weight in neighbors)
+                if not math.isfinite(total_weight) or total_weight <= 0:
+                    continue
+                for neighbor, weight in neighbors:
+                    next_scores[neighbor] = (
+                        next_scores.get(neighbor, 0.0)
+                        + alpha * current_score * (weight / total_weight)
+                    )
+        ppr_scores = next_scores
+    return ppr_scores
+
+
+def _search_node_is_eligible(
+    node: dict,
+    *,
+    domain: str | None,
+    cluster: str | None,
+    include_history: bool,
+    filter_expr: str | None,
+) -> bool:
+    """Apply the same metadata eligibility gate to every search candidate."""
+    if domain and str(node.get("domain") or "").casefold() != str(domain).casefold():
+        return False
+    if (
+        cluster
+        and str(node.get("topic_cluster") or "").casefold()
+        != str(cluster).casefold()
+    ):
+        return False
+    if (
+        not include_history
+        and str(node.get("status") or "").casefold()
+        in {"deprecated", "archived"}
+    ):
+        return False
+    if filter_expr:
+        try:
+            if not _safe_eval(filter_expr, node):
+                return False
+        except Exception as exc:
+            log.warning(
+                "Filter expr evaluation failed for node %s: %s",
+                node.get("_key", "<unknown>"),
+                exc,
+            )
+            return False
+    return True
+
+def _lexical_fallback_scores(
+    index_data: dict,
+    terms,
+    *,
+    limit: int,
+) -> dict[str, float]:
+    """Provide a deterministic index-only fallback when FTS is unavailable."""
+    normalized_terms = {
+        str(term).strip().casefold()
+        for term in terms
+        if str(term).strip()
+    }
+    if not normalized_terms:
+        return {}
+    scored: list[tuple[float, str]] = []
+    for key, node in index_data.get("nodes", {}).items():
+        fields = (
+            (str(key).casefold(), 4.0),
+            (str(node.get("title") or "").casefold(), 4.0),
+            (str(node.get("summary") or "").casefold(), 2.0),
+            (str(node.get("raw_text") or "").casefold(), 1.0),
+            (" ".join(map(str, node.get("aliases") or ())).casefold(), 1.0),
+        )
+        score = sum(
+            weight
+            for term in normalized_terms
+            for value, weight in fields
+            if term in value
+        )
+        if score > 0:
+            scored.append((score, str(key)))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return {key: score for score, key in scored[: max(1, int(limit))]}
+
+
+def _read_search_snippet(
+    path: str | os.PathLike,
+    *,
+    max_chars: int = 2_500,
+    max_frontmatter_chars: int = 65_536,
+) -> str:
+    """Read a bounded body snippet without materializing the whole Markdown file."""
+    if max_chars <= 0:
+        return ""
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        first_line = handle.readline(8_193)
+        if not first_line.lstrip("\ufeff").startswith("---"):
+            return (first_line + handle.read(max_chars))[:max_chars]
+        if len(first_line) > 8_192 and not first_line.endswith(("\n", "\r")):
+            raise SearchIndexError("Wiki frontmatter contains an oversized line.")
+        consumed = len(first_line)
+        while consumed <= max_frontmatter_chars:
+            line = handle.readline(8_193)
+            if not line:
+                return ""
+            if len(line) > 8_192 and not line.endswith(("\n", "\r")):
+                raise SearchIndexError("Wiki frontmatter contains an oversized line.")
+            consumed += len(line)
+            if line.strip() == "---":
+                return handle.read(max_chars)
+        raise SearchIndexError("Wiki frontmatter exceeds the bounded search limit.")
+
 
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
+    query = str(query or "").strip()
+    if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
+        raise ValueError(
+            f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters"
+        )
+    try:
+        top_k = int(top_k)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("top_k must be an integer") from exc
+    top_k = max(1, min(_SEARCH_TOP_K_LIMIT, top_k))
     normalized_mode = str(mode or "page").lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
         return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history)
@@ -366,23 +701,10 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     if not os.path.exists(index_path):
         return "Lake is drying. No index.json found, please ingest sources first."
     try:
-        current_mtime = os.path.getmtime(index_path)
-        if _INDEX_CACHE["mtime"] != current_mtime or _INDEX_CACHE["data"] is None:
-            import time
-            for attempt in range(3):
-                try:
-                    with open(index_path, "r", encoding="utf-8") as handle:
-                        _INDEX_CACHE["data"] = json.load(handle)
-                        _INDEX_CACHE["mtime"] = current_mtime
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise e
-                    time.sleep(0.2)
-        index_data = _INDEX_CACHE["data"]
-    except Exception as e:
-        log.error(f"Failed to read index.json: {e}")
-        raise SearchIndexError("The knowledge base index could not be read safely.") from e
+        index_data = _load_search_index(index_path)
+    except Exception as exc:
+        log.error(f"Failed to read index.json: {exc}")
+        raise SearchIndexError("The knowledge base index could not be read safely.") from exc
 
     # ⚡ Bolt: Removed unused O(N) list comprehension of all index nodes to eliminate unnecessary memory allocation and CPU overhead in the search hot path.
     intent = _classify_intent(query)
@@ -394,6 +716,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
     hybrid_scores = {}
+    backend_issues: list[str] = []
     
     # 1. FTS5 Search
     try:
@@ -407,36 +730,41 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 raw_score = row.get('score', 0)
             fts_score = raw_score * -1.0  # SQLite BM25 is negative
             hybrid_scores[key] = hybrid_scores.get(key, 0.0) + fts_score
-    except Exception as e:
-        log.error(f"FTS5 Search failed: {e}")
+    except Exception as exc:
+        backend = exc.backend if isinstance(exc, SearchBackendError) else "fts5"
+        backend_issues.append(backend)
+        log.error("FTS5 search failed; using index-only fallback: %s", exc)
+        hybrid_scores.update(
+            _lexical_fallback_scores(
+                index_data, [query, *tokens], limit=top_k * 5
+            )
+        )
 
     # 2. Vector Search (Hybrid blending)
     query_vector = _get_query_embedding(query)
+    if not query_vector and os.environ.get("GEMINI_API_KEY"):
+        backend_issues.append("query_embedding")
     if query_vector:
-        vector_results = _get_vector_search_results(query_vector, limit=top_k * 5)
-        for key, sim in vector_results.items():
-            # scale similarity so it competes/blends with BM25. 
-            vec_score = (sim ** 2) * 15.0
-            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
+        try:
+            vector_results = _get_vector_search_results(query_vector, limit=top_k * 5)
+            for key, sim in vector_results.items():
+                vec_score = (sim ** 2) * 15.0
+                hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
+        except SearchBackendError as exc:
+            backend_issues.append(exc.backend)
 
     for key, score in hybrid_scores.items():
         if key in index_data.get('nodes', {}):
             node = {'_key': key, **index_data['nodes'][key]}
-            if domain and node.get('domain', '').lower() != domain.lower():
+            if not _search_node_is_eligible(
+                node,
+                domain=domain,
+                cluster=cluster,
+                include_history=include_history,
+                filter_expr=filter_expr,
+            ):
                 continue
-            if cluster and node.get('topic_cluster', '').lower() != cluster.lower():
-                continue
-            if not include_history and node.get('status', '').lower() in ('deprecated', 'archived'):
-                continue
-            
-            # V11.2 Hard Metadata Gate
-            if filter_expr:
-                try:
-                    if not _safe_eval(filter_expr, node):
-                        continue
-                except Exception as e:
-                    log.warning(f"Filter expr evaluation failed for node {key}: {e}")
-            
+
             if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
                 score *= 0.2
             scored.append((score, node))
@@ -447,27 +775,12 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     top_keys = {node["_key"] for _, node in scored[:5]}
     graph_ready = (index_data.get("graph_state") or {}).get("dirty") is False
     if top_keys and graph_ready and index_data.get("weighted_edges"):
-        # Build adjacency list
-        adj = {}
-        for edge in index_data["weighted_edges"]:
-            s, t, w = edge["source"], edge["target"], edge.get("weight", 1.0)
-            adj.setdefault(s, []).append((t, w))
-            adj.setdefault(t, []).append((s, w))
-            
-        # PPR parameters
-        ppr_scores = {k: 1.0 for k in top_keys}
-        alpha = 0.85
-        
-        # 2-Hop Random Walk
-        for _ in range(2):
-            next_scores = {k: (1 - alpha) * 1.0 if k in top_keys else 0.0 for k in ppr_scores.keys()}
-            for node, current_score in ppr_scores.items():
-                neighbors = adj.get(node, [])
-                if neighbors:
-                    total_weight = sum(w for _, w in neighbors)
-                    for neighbor, w in neighbors:
-                        next_scores[neighbor] = next_scores.get(neighbor, 0.0) + alpha * current_score * (w / total_weight)
-            ppr_scores = next_scores
+        adjacency = get_compact_graph_adjacency(index_data)
+        ppr_scores = _graph_expansion_scores(
+            top_keys,
+            index_data["weighted_edges"],
+            adjacency=adjacency,
+        )
 
         existing_keys = {node["_key"] for _, node in scored}
         expansion_limit = 12 if intent == "entity" else 5
@@ -478,11 +791,24 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             reverse=True
         )
         
-        for expanded_key, ppr_weight in sorted_expansions[:expansion_limit]:
+        expansion_count = 0
+        for expanded_key, ppr_weight in sorted_expansions:
+            if expansion_count >= expansion_limit:
+                break
             expanded_node = index_data["nodes"].get(expanded_key)
             if expanded_node:
+                candidate = {"_key": expanded_key, **expanded_node}
+                if not _search_node_is_eligible(
+                    candidate,
+                    domain=domain,
+                    cluster=cluster,
+                    include_history=include_history,
+                    filter_expr=filter_expr,
+                ):
+                    continue
                 # Scale PPR weight to match BM25 range approximately
-                scored.append((ppr_weight * 15.0, {"_key": expanded_key, **expanded_node}))
+                scored.append((ppr_weight * 15.0, candidate))
+                expansion_count += 1
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
@@ -526,9 +852,11 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
         snippet = ""
         if os.path.exists(filepath):
-            with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
-                content = handle.read()
-            snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:2500]  # V11.2: Expanded chunk limit
+            try:
+                snippet = _read_search_snippet(filepath)
+            except SearchIndexError:
+                backend_issues.append("wiki_snippet")
+                snippet = "[Snippet unavailable]"
             
         tension_edges = node.get("tension_edges", [])
         tension_info = ""
@@ -546,7 +874,20 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             )
         else:
             result += f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
-    return f"<EvidenceResults>\n{result}</EvidenceResults>" if as_xml else result
+    issues = sorted(set(backend_issues))
+    if as_xml:
+        state = "degraded" if issues else "ok"
+        status = (
+            f"<SearchStatus State={quoteattr(state)} "
+            f"Backends={quoteattr(','.join(issues))}/>\n"
+        )
+        body = result or "<NoEvidence/>\n"
+        return f"<EvidenceResults>\n{status}{body}</EvidenceResults>"
+    if not result:
+        result = "No matching evidence found.\n"
+    if issues:
+        return f"[Search degraded: {', '.join(issues)}]\n{result}"
+    return result
 
 
 def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
@@ -573,20 +914,11 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     index_summary = ""
     index_path = str(get_index_path())
     if os.path.exists(index_path):
-        import time
-        for attempt in range(3):
-            try:
-                with open(index_path, "r", encoding="utf-8") as handle:
-                    index_data = json.load(handle)
-                lines = []
-                for key, node in list(index_data.get("nodes", {}).items())[:50]:
-                    lines.append(f"[{node.get('type', '?')}] {node.get('title', key)}")
-                index_summary = "\n".join(lines)[:index_budget]
-                break
-            except Exception:
-                if attempt == 2:
-                    index_summary = "[Index read failed]"
-                time.sleep(0.2)
+        index_data = get_cached_index_snapshot(index_path) or {}
+        lines = []
+        for key, node in islice(index_data.get("nodes", {}).items(), 50):
+            lines.append(f"[{node.get('type', '?')}] {node.get('title', key)}")
+        index_summary = "\n".join(lines)[:index_budget]
 
     purpose = ""
     try:

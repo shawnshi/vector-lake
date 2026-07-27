@@ -8,7 +8,10 @@
       ],
       "cwd": ".",
       "env": {
-        "PYTHONPATH": "."
+        "PYTHONPATH": ".",
+        "VECTOR_LAKE_META_DIR": "~/.gemini/MEMORY/wiki/.meta",
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1"
       }
     }
   }

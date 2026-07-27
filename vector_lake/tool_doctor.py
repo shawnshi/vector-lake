@@ -1,4 +1,5 @@
 import importlib
+import sqlite3
 import os
 import sys
 import ast
@@ -6,8 +7,15 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vector_lake.wiki_utils import get_index_path, get_memory_dir, get_raw_dir, get_wiki_dir, get_meta_dir
-from vector_lake.db_store import get_db_path, get_connection
+from vector_lake.wiki_utils import (
+    get_index_path,
+    get_memory_dir,
+    get_raw_dir,
+    get_wiki_dir,
+    iter_markdown_files,
+    peek_meta_dir,
+)
+from vector_lake.db_store import inspect_schema_migration_state, peek_db_path
 from vector_lake import get_extension_root
 from vector_lake.native_llm import native_llm_ready
 from vector_lake.runtime_health import assess_runtime_health, assess_semantic_readiness
@@ -25,6 +33,52 @@ def _check_ast(module_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Error: {e}"
 
+
+
+def _read_database_state(db_path: Path) -> dict:
+    """Read Doctor counters without creating, migrating, or retaining a connection."""
+    conn = sqlite3.connect(
+        f"{db_path.resolve().as_uri()}?mode=ro",
+        uri=True,
+        timeout=5.0,
+    )
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        canonical_keys = {
+            row["page_key"]
+            for row in conn.execute(
+                "SELECT json_extract(data_json, '$.page_key') AS page_key "
+                "FROM entities WHERE json_extract(data_json, '$.page_key') "
+                "IS NOT NULL"
+            )
+            if not str(row["page_key"]).startswith("System_")
+        }
+        outbox_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS count FROM mutation_outbox "
+                "GROUP BY status"
+            )
+        }
+        terminal_jobs = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
+        ).fetchone()[0]
+        queued_jobs = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'queued'"
+        ).fetchone()[0]
+        awaiting_jobs = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'"
+        ).fetchone()[0]
+        return {
+            "canonical_keys": canonical_keys,
+            "outbox_counts": outbox_counts,
+            "terminal_jobs": terminal_jobs,
+            "queued_jobs": queued_jobs,
+            "awaiting_jobs": awaiting_jobs,
+        }
+    finally:
+        conn.close()
 def doctor_vector_lake() -> str:
     checks = []
     semantic_readiness = {
@@ -40,7 +94,15 @@ def doctor_vector_lake() -> str:
     checks.append(("Python", python_ok, f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"))
 
     has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
-    checks.append(("GEMINI_API_KEY", True, "Set" if has_api_key else "Not set (optional; embeddings disabled)"))
+    checks.append((
+        "Gemini Embedding",
+        True if has_api_key else None,
+        (
+            "GEMINI_API_KEY is available"
+            if has_api_key
+            else "Unavailable: GEMINI_API_KEY is not inherited by this process"
+        ),
+    ))
 
     # 2. Dependencies
     dependencies = {
@@ -70,16 +132,31 @@ def doctor_vector_lake() -> str:
             checks.append((package_name, False, "missing"))
             
     llm_ok, llm_detail = native_llm_ready()
-    checks.append(("Subagent Text Runtime", True, llm_detail if llm_ok else llm_detail))
+    checks.append(("Subagent Text Runtime", True if llm_ok else None, llm_detail))
 
     # 3. Paths & Basic Files
+    meta_path = peek_meta_dir()
+    db_path = peek_db_path()
+    schema_state = inspect_schema_migration_state(db_path)
     for label, path in [("MEMORY", get_memory_dir()), ("Raw", get_raw_dir()), ("Wiki", get_wiki_dir())]:
         checks.append((label, path.exists(), str(path)))
 
     index_exists = get_index_path().exists()
     checks.append(("Index", index_exists, str(get_index_path()) if index_exists else "Lake is drying (Empty)"))
-    for label, path in [("Meta", get_meta_dir()), ("SQLite DB", get_db_path())]:
+    for label, path in [("Meta", meta_path), ("SQLite DB", db_path)]:
         checks.append((label, path.exists(), str(path)))
+    migration_detail = (
+        f"user_version={schema_state['user_version']}; "
+        f"supported={schema_state['supported_version']}; "
+        f"ledger_entries={len(schema_state['ledger'])}"
+    )
+    if schema_state["issues"]:
+        migration_detail += "; " + "; ".join(schema_state["issues"])
+    checks.append((
+        "Schema Migrations",
+        bool(schema_state["ready"]),
+        migration_detail,
+    ))
 
     # 4. AST Compilation Checks
     ext_root = get_extension_root()
@@ -99,7 +176,7 @@ def doctor_vector_lake() -> str:
         checks.append(("MCP Server", False, f"Startup Exception: {e}"))
 
     # 6. Watchdog Heartbeat
-    status_path = get_meta_dir() / ".watchdog_status.json"
+    status_path = meta_path / ".watchdog_status.json"
     if status_path.exists():
         try:
             with open(status_path, "r", encoding="utf-8") as f:
@@ -111,18 +188,62 @@ def doctor_vector_lake() -> str:
                 if updated_dt.tzinfo is None:
                     updated_dt = updated_dt.replace(tzinfo=timezone.utc)
                 age_seconds = max(0, int((datetime.now(timezone.utc) - updated_dt).total_seconds()))
-            unhealthy_components = [
-                name
-                for name, component in (status.get("components") or {}).items()
-                if str(component.get("status", "")).lower() in {"error", "halted"}
-            ]
+            unhealthy_states = {"error", "halted", "stopped"}
+            try:
+                component_max_age = max(
+                    5,
+                    int(
+                        os.environ.get(
+                            "VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS",
+                            "120",
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                component_max_age = 120
+            now_utc = datetime.now(timezone.utc)
+            unhealthy_components = []
+            stale_components = []
+            for name, raw_component in (status.get("components") or {}).items():
+                component = (
+                    raw_component if isinstance(raw_component, dict) else {}
+                )
+                component_state = str(component.get("status", "")).lower()
+                if component_state in unhealthy_states:
+                    unhealthy_components.append(str(name))
+                component_updated = component.get("heartbeat_at") or component.get(
+                    "updated_at"
+                )
+                component_dt = (
+                    datetime.fromisoformat(
+                        str(component_updated).replace("Z", "+00:00")
+                    )
+                    if component_updated
+                    else None
+                )
+                if component_dt is not None and component_dt.tzinfo is None:
+                    component_dt = component_dt.replace(tzinfo=timezone.utc)
+                component_age = (
+                    max(0, int((now_utc - component_dt).total_seconds()))
+                    if component_dt is not None
+                    else None
+                )
+                if component_age is None or component_age > component_max_age:
+                    stale_components.append(str(name))
             heartbeat_ok = (
                 age_seconds is not None
                 and age_seconds <= 120
-                and str(status.get("status", "")).lower() not in {"error", "halted"}
+                and str(status.get("status", "")).lower() not in unhealthy_states
                 and not unhealthy_components
+                and not stale_components
             )
-            detail = f"[{status.get('status', 'unknown')}] {status.get('current_action', '')}; age={age_seconds if age_seconds is not None else 'unknown'}s"
+            detail = (
+                f"[{status.get('status', 'unknown')}] "
+                f"{status.get('current_action', '')}; "
+                f"age={age_seconds if age_seconds is not None else 'unknown'}s; "
+                f"unhealthy={','.join(sorted(unhealthy_components)) or 'none'}; "
+                f"stale={','.join(sorted(stale_components)) or 'none'}"
+            )
             checks.append(("Watchdog Status", heartbeat_ok, detail))
         except Exception as e:
             checks.append(("Watchdog Status", False, f"Parse error: {e}"))
@@ -131,10 +252,12 @@ def doctor_vector_lake() -> str:
 
     # 7. State Projection Consistency
     try:
-        excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
+        excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
         wiki_keys = {
-            path.stem for path in get_wiki_dir().glob("*.md")
-            if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
+            path.stem
+            for path in iter_markdown_files(get_wiki_dir())
+            if path.name.casefold() not in excluded
+            and not path.name.casefold().startswith("system_")
         }
         with open(get_index_path(), "r", encoding="utf-8") as f:
             index_data = json.load(f)
@@ -142,14 +265,13 @@ def doctor_vector_lake() -> str:
                 key for key in index_data.get("nodes", {})
                 if not str(key).startswith("System_")
             }
-        conn = get_connection()
-        canonical_keys = {
-            row["page_key"] for row in conn.execute(
-                "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
-                "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
+        if not schema_state["ready"]:
+            raise RuntimeError(
+                "database schema is not ready: "
+                + "; ".join(schema_state["issues"])
             )
-            if not str(row["page_key"]).startswith("System_")
-        }
+        db_state = _read_database_state(db_path)
+        canonical_keys = db_state["canonical_keys"]
         missing_index = canonical_keys - index_keys
         extra_index = index_keys - canonical_keys
         missing_canonical = wiki_keys - canonical_keys
@@ -163,18 +285,13 @@ def doctor_vector_lake() -> str:
             f"missing_canonical:{len(missing_canonical)} extra_canonical:{len(extra_canonical)}",
         ))
 
-        outbox_counts = {
-            row["status"]: row["count"]
-            for row in conn.execute("SELECT status, COUNT(*) AS count FROM mutation_outbox GROUP BY status")
-        }
+        outbox_counts = db_state["outbox_counts"]
         outbox_ok = outbox_counts.get("failed", 0) == 0
         checks.append(("Mutation Outbox", outbox_ok, json.dumps(outbox_counts, ensure_ascii=False, sort_keys=True)))
 
-        terminal_jobs = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
-        ).fetchone()[0]
-        queued_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'queued'").fetchone()[0]
-        awaiting_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'").fetchone()[0]
+        terminal_jobs = db_state["terminal_jobs"]
+        queued_jobs = db_state["queued_jobs"]
+        awaiting_jobs = db_state["awaiting_jobs"]
         checks.append((
             "Ingest Jobs",
             terminal_jobs == 0,
@@ -205,20 +322,32 @@ def doctor_vector_lake() -> str:
 
     lines = ["=== Vector Lake Doctor ==="]
     all_ok = True
+    has_warnings = False
     for label, ok, detail in checks:
-        lines.append(f"[{'OK' if ok else 'FAIL'}] {label}: {detail}")
-        all_ok = all_ok and ok
+        if ok is None:
+            state = "WARN"
+            has_warnings = True
+        elif ok:
+            state = "OK"
+        else:
+            state = "FAIL"
+            all_ok = False
+        lines.append(f"[{state}] {label}: {detail}")
     lines.append("")
-    lines.append("Infrastructure Summary: healthy" if all_ok else "Infrastructure Summary: issues detected")
+    infrastructure_status = (
+        "issues detected"
+        if not all_ok
+        else ("healthy with warnings" if has_warnings else "healthy")
+    )
+    lines.append(f"Infrastructure Summary: {infrastructure_status}")
     lines.append(f"Semantic Readiness: {semantic_readiness['status']}")
     if semantic_readiness["issues"]:
         lines.append("Semantic issues: " + "; ".join(semantic_readiness["issues"]))
     if semantic_readiness["warnings"]:
         lines.append("Semantic warnings: " + "; ".join(semantic_readiness["warnings"]))
     lines.append(
-        "Summary: infrastructure healthy; semantic readiness " + semantic_readiness["status"]
-        if all_ok
-        else "Summary: infrastructure issues detected; semantic readiness " + semantic_readiness["status"]
+        f"Summary: infrastructure {infrastructure_status}; "
+        f"semantic readiness {semantic_readiness['status']}"
     )
     lines.append(f"VECTOR_LAKE_MEMORY_DIR={os.environ.get('VECTOR_LAKE_MEMORY_DIR', '<default>')}")
     return "\n".join(lines)

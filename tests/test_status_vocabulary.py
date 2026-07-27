@@ -53,3 +53,59 @@ def test_lint_still_rejects_status_outside_schema(isolated_memory):
     report = lint_vector_lake(auto_fix=False)
 
     assert "Invalid status 'unknown'" in report
+
+
+def test_lint_scans_uppercase_markdown_extension(isolated_memory):
+    wiki_dir = isolated_memory / "wiki"
+    (wiki_dir / "Source_Status-Uppercase.MD").write_text(
+        _source_page("Active", "Uppercase"),
+        encoding="utf-8",
+    )
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "Scanned: 1 files" in report
+    assert "Source_Status-Uppercase.MD" not in report.split(
+        "14. Strict Schema Verification", 1
+    )[1]
+
+
+def test_lint_reports_damaged_uppercase_frontmatter(isolated_memory):
+    wiki_dir = isolated_memory / "wiki"
+    (wiki_dir / "Concept_Damaged.MD").write_text(
+        "---\nid: broken\ncategories: [\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "Concept_Damaged.MD: Cannot parse YAML frontmatter" in report
+    assert "1. Frontmatter Completeness: [FAIL: 1]" in report
+
+
+def test_lint_reports_unterminated_frontmatter(isolated_memory):
+    wiki_dir = isolated_memory / "wiki"
+    (wiki_dir / "Concept_Unterminated.MD").write_text(
+        "---\nid: broken\ntitle: Broken\n",
+        encoding="utf-8",
+    )
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "Missing YAML frontmatter closing delimiter" in report
+
+
+def test_lint_strict_schema_validates_uppercase_markdown(isolated_memory):
+    wiki_dir = isolated_memory / "wiki"
+    content = _source_page("Active", "Missing-Updated").replace(
+        "updated: 2026-07-23\n",
+        "",
+    )
+    (wiki_dir / "Source_Status-Missing-Updated.MD").write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "Missing required frontmatter field 'updated'" in report

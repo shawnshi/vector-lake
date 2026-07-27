@@ -1,7 +1,11 @@
 import json
 import re
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -20,6 +24,7 @@ from vector_lake.tool_ingest import (
     prepare_ingest_batch,
     process_ingest_task_cleanup,
     reconcile_ingest_job_debt,
+    reconcile_orphan_ingest_task_packets,
 )
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
 
@@ -88,9 +93,9 @@ def test_canonical_source_name_reuses_existing_source_identity_for_same_raw_path
         .replace("title: Test Source", "title: Legacy Source")
         .replace("sources: [raw/test.pdf]", "sources: [raw/team-a/report.md]")
     )
-    execute_mutation_plan("Source_Legacy-Report.md", content=content)
+    execute_mutation_plan("Source_Legacy-Report.MD", content=content)
 
-    assert canonical_source_name(str(raw_path)) == "Source_Legacy-Report.md"
+    assert canonical_source_name(str(raw_path)) == "Source_Legacy-Report.MD"
 
 
 def _concept_content(title="Target Concept"):
@@ -180,6 +185,259 @@ def test_job_claim_uses_a_lease(isolated_memory):
     assert [job["job_id"] for job in first] == [job_id]
     assert second == []
 
+
+def test_dispatch_reclaim_fences_stale_handoff_and_failure_updates(
+    isolated_memory,
+):
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {"filepath": "raw/fenced-dispatch.md"},
+    )
+    stale = db_store.claim_pending_jobs(
+        limit=1,
+        lease_seconds=60,
+        lease_owner="dispatch-a",
+    )[0]
+    assert stale["lease_owner"] == "dispatch-a"
+    assert stale["lease_token"]
+    assert stale["lease_generation"] == 1
+
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET lease_until = '2000-01-01T00:00:00+00:00' "
+            "WHERE job_id = ?",
+            (job_id,),
+        )
+    current = db_store.claim_pending_jobs(
+        limit=1,
+        lease_seconds=60,
+        lease_owner="dispatch-b",
+    )[0]
+    assert current["lease_generation"] == stale["lease_generation"] + 1
+    assert current["lease_token"] != stale["lease_token"]
+
+    current_packet = isolated_memory / "current-dispatch-packet.json"
+    stale_packet = isolated_memory / "stale-dispatch-packet.json"
+    assert db_store.mark_job_awaiting_subagent(
+        job_id,
+        str(current_packet),
+        lease_owner=current["lease_owner"],
+        lease_token=current["lease_token"],
+        lease_generation=current["lease_generation"],
+    )
+    assert not db_store.mark_job_awaiting_subagent(
+        job_id,
+        str(stale_packet),
+        lease_owner=stale["lease_owner"],
+        lease_token=stale["lease_token"],
+        lease_generation=stale["lease_generation"],
+    )
+    assert not db_store.update_job_status(
+        job_id,
+        "failed",
+        "late failure",
+        lease_owner=stale["lease_owner"],
+        lease_token=stale["lease_token"],
+        lease_generation=stale["lease_generation"],
+    )
+
+    row = db_store.get_connection().execute(
+        "SELECT status, retries, task_packet_path, lease_generation "
+        "FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "status": "awaiting_subagent",
+        "retries": 0,
+        "task_packet_path": str(current_packet),
+        "lease_generation": current["lease_generation"],
+    }
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM ingest_task_cleanup WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()[0] == 0
+
+
+def test_dispatch_handoff_rechecks_expiry_after_waiting_for_write_lock(
+    isolated_memory,
+    monkeypatch,
+):
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {"filepath": "raw/lock-wait-dispatch.md"},
+    )
+    claim = db_store.claim_pending_jobs(
+        limit=1,
+        lease_seconds=60,
+        lease_owner="lock-wait-dispatch",
+    )[0]
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=0.05)).isoformat()
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET lease_until = ? WHERE job_id = ?",
+            (expires_at, job_id),
+        )
+    db_path = db_store.get_db_path()
+    db_store.close_connection()
+
+    locker = sqlite3.connect(str(db_path), timeout=0.1)
+    locker.execute("BEGIN IMMEDIATE")
+    real_transaction = db_store.transaction
+    waiting = threading.Event()
+
+    @contextmanager
+    def observed_transaction(*args, **kwargs):
+        waiting.set()
+        with real_transaction(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(db_store, "transaction", observed_transaction)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(
+                db_store.mark_job_awaiting_subagent,
+                job_id,
+                str(isolated_memory / "expired-after-lock-wait.json"),
+                lease_owner=claim["lease_owner"],
+                lease_token=claim["lease_token"],
+                lease_generation=claim["lease_generation"],
+            )
+            assert waiting.wait(timeout=1)
+            time.sleep(0.1)
+            locker.rollback()
+            assert result.result(timeout=2) is False
+    finally:
+        if locker.in_transaction:
+            locker.rollback()
+        locker.close()
+
+    row = db_store.get_connection().execute(
+        "SELECT status, task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(row) == {"status": "dispatched", "task_packet_path": None}
+
+def test_dispatch_lease_renewal_is_fenced(isolated_memory):
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {"filepath": "raw/renew-dispatch.md"},
+    )
+    claim = db_store.claim_pending_jobs(
+        limit=1,
+        lease_seconds=1,
+        lease_owner="dispatch-renew",
+    )[0]
+    original_until = claim["lease_until"]
+
+    assert db_store.renew_job_dispatch_lease(
+        job_id,
+        claim["lease_owner"],
+        claim["lease_token"],
+        claim["lease_generation"],
+        lease_seconds=60,
+    )
+    renewed = db_store.get_connection().execute(
+        "SELECT lease_until, lease_token, lease_generation FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert renewed["lease_until"] > original_until
+    assert renewed["lease_token"] == claim["lease_token"]
+    assert renewed["lease_generation"] == claim["lease_generation"]
+    assert not db_store.renew_job_dispatch_lease(
+        job_id,
+        claim["lease_owner"],
+        "stale-token",
+        claim["lease_generation"],
+        lease_seconds=60,
+    )
+
+
+def test_ingest_worker_does_not_overwrite_reclaimed_dispatch_packet(
+    isolated_memory,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-dispatch-race")
+    payload = {
+        "filepath": "raw/dispatch-race.md",
+        "hash": "dispatch-race-hash",
+        "canonical_name": "Source_Dispatch-Race.md",
+        "source_hash": "",
+        "ingest_contract_version": INGEST_CONTRACT_VERSION,
+        "instructions": "compile this source",
+    }
+    job_id = db_store.enqueue_job("ingest", payload)
+
+    import vector_lake.ingest_worker as ingest_worker
+
+    real_create = ingest_worker.create_subagent_task
+    packets = {}
+
+    def reclaim_during_packet_creation(*args, **kwargs):
+        stale_packet = real_create(*args, **kwargs)
+        with db_store.transaction():
+            db_store.get_connection().execute(
+                "UPDATE jobs SET lease_until = '2000-01-01T00:00:00+00:00' "
+                "WHERE job_id = ?",
+                (job_id,),
+            )
+        current = db_store.claim_pending_jobs(
+            limit=1,
+            lease_seconds=60,
+            lease_owner="replacement-dispatch",
+        )[0]
+        current_packet = real_create(
+            "ingest",
+            "replacement",
+            "JSON array",
+            {"job_id": job_id},
+        )
+        assert db_store.mark_job_awaiting_subagent(
+            job_id,
+            str(current_packet),
+            lease_owner=current["lease_owner"],
+            lease_token=current["lease_token"],
+            lease_generation=current["lease_generation"],
+        )
+        packets.update(stale=stale_packet, current=current_packet)
+        return stale_packet
+
+    monkeypatch.setattr(
+        ingest_worker,
+        "create_subagent_task",
+        reclaim_during_packet_creation,
+    )
+
+    process_jobs()
+
+    row = db_store.get_connection().execute(
+        "SELECT status, retries, task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    cleanup = db_store.get_connection().execute(
+        "SELECT status, task_packet_path FROM ingest_task_cleanup WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "status": "awaiting_subagent",
+        "retries": 0,
+        "task_packet_path": str(packets["current"]),
+    }
+    assert dict(cleanup) == {
+        "status": "pending",
+        "task_packet_path": str(packets["stale"].resolve()),
+    }
+
+    replay = process_ingest_task_cleanup(limit=20)
+
+    row = db_store.get_connection().execute(
+        "SELECT task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert replay["completed"] == 1
+    assert row["task_packet_path"] == str(packets["current"])
+    assert packets["stale"].exists() is False
+    assert packets["current"].exists()
+    packets["current"].unlink()
 
 def test_ingest_job_enqueue_is_idempotent_by_file_hash(isolated_memory):
     db_store.init_db()
@@ -1554,6 +1812,273 @@ def test_ingest_task_cleanup_replays_after_delete_failure(
     assert row["task_packet_path"] is None
     assert cleanup["status"] == "completed"
     assert packet.exists() is False
+
+
+def test_replacing_ingest_packet_persists_cleanup_without_clearing_new_pointer(
+    isolated_memory,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-packet-replace")
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {"filepath": "raw/replace.md", "hash": "hash"},
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    old_packet = create_subagent_task(
+        "ingest",
+        "old",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    new_packet = create_subagent_task(
+        "ingest",
+        "new",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    db_store.mark_job_awaiting_subagent(job_id, str(old_packet))
+    db_store.mark_job_awaiting_subagent(job_id, str(new_packet))
+
+    row = db_store.get_connection().execute(
+        "SELECT task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    cleanup = db_store.get_connection().execute(
+        "SELECT status, task_packet_path FROM ingest_task_cleanup WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["task_packet_path"] == str(new_packet)
+    assert dict(cleanup) == {
+        "status": "pending",
+        "task_packet_path": str(old_packet.resolve()),
+    }
+
+    replay = process_ingest_task_cleanup(limit=20)
+
+    row = db_store.get_connection().execute(
+        "SELECT task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert replay["completed"] == 1
+    assert row["task_packet_path"] == str(new_packet)
+    assert old_packet.exists() is False
+    assert new_packet.exists()
+    new_packet.unlink()
+
+
+def test_expiring_ingest_packet_persists_cleanup_before_retry(
+    isolated_memory,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-packet-expire")
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {"filepath": "raw/expire.md", "hash": "hash"},
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    packet = create_subagent_task(
+        "ingest",
+        "expire",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    db_store.mark_job_awaiting_subagent(job_id, str(packet))
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET updated_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE job_id = ?",
+            (job_id,),
+        )
+
+    assert db_store.expire_stale_subagent_jobs(max_age_seconds=1) == 1
+    row = db_store.get_connection().execute(
+        "SELECT status, retries, task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    cleanup = db_store.get_connection().execute(
+        "SELECT status FROM ingest_task_cleanup WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "status": "failed",
+        "retries": 1,
+        "task_packet_path": str(packet),
+    }
+    assert cleanup["status"] == "pending"
+
+    replay = process_ingest_task_cleanup(limit=20)
+
+    row = db_store.get_connection().execute(
+        "SELECT status, task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert replay["completed"] == 1
+    assert dict(row) == {"status": "failed", "task_packet_path": None}
+    assert packet.exists() is False
+
+
+def test_expiry_rolls_back_when_packet_cleanup_cannot_be_persisted(
+    isolated_memory,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-expire-rollback")
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {"filepath": "raw/expire-rollback.md", "hash": "hash"},
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    packet = create_subagent_task(
+        "ingest",
+        "expire rollback",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    db_store.mark_job_awaiting_subagent(job_id, str(packet))
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET updated_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE job_id = ?",
+            (job_id,),
+        )
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise sqlite3.OperationalError("injected cleanup persistence failure")
+
+    monkeypatch.setattr(db_store, "enqueue_ingest_task_cleanup", fail_cleanup)
+    with pytest.raises(sqlite3.OperationalError, match="injected cleanup"):
+        db_store.expire_stale_subagent_jobs(max_age_seconds=1)
+
+    row = db_store.get_connection().execute(
+        "SELECT status, retries, task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "status": "awaiting_subagent",
+        "retries": 0,
+        "task_packet_path": str(packet),
+    }
+    assert packet.exists()
+    packet.unlink()
+
+
+def test_orphan_ingest_packet_cleanup_is_preview_first_and_pointer_safe(
+    isolated_memory,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-orphan-cleanup")
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {"filepath": "raw/orphan.md", "hash": "hash"},
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    orphan = create_subagent_task(
+        "ingest",
+        "orphan",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    other_orphan = create_subagent_task(
+        "ingest",
+        "other orphan",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    current = create_subagent_task(
+        "ingest",
+        "current",
+        "JSON array",
+        {"job_id": job_id},
+    )
+    db_store.mark_job_awaiting_subagent(job_id, str(current))
+
+    preview = json.loads(
+        reconcile_orphan_ingest_task_packets(
+            dry_run=True,
+            min_age_seconds=0,
+        )
+    )
+
+    assert preview["candidate_count"] == 2
+    assert preview["selected_count"] == 2
+    assert preview["removed"] == 0
+    assert {sample["path"] for sample in preview["samples"]} == {
+        str(orphan.resolve()),
+        str(other_orphan.resolve()),
+    }
+    assert orphan.exists()
+    assert other_orphan.exists()
+    assert current.exists()
+
+    real_transaction = db_store.transaction
+    transaction_calls = []
+
+    @contextmanager
+    def observed_transaction(*args, **kwargs):
+        transaction_calls.append(1)
+        with real_transaction(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(db_store, "transaction", observed_transaction)
+    applied = json.loads(
+        reconcile_orphan_ingest_task_packets(
+            dry_run=False,
+            min_age_seconds=0,
+        )
+    )
+
+    row = db_store.get_connection().execute(
+        "SELECT task_packet_path FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert applied["candidate_count"] == 2
+    assert applied["removed"] == 2
+    assert len(transaction_calls) == 2
+    assert row["task_packet_path"] == str(current)
+    assert orphan.exists() is False
+    assert other_orphan.exists() is False
+    assert current.exists()
+    current.unlink()
+
+
+def test_orphan_ingest_packet_apply_does_not_create_missing_database(
+    isolated_memory,
+):
+    db_path = db_store.get_db_path()
+    assert db_path.exists() is False
+
+    result = json.loads(
+        reconcile_orphan_ingest_task_packets(dry_run=False, min_age_seconds=0)
+    )
+
+    assert result["preview_error"].startswith("database_missing:")
+    assert db_path.exists() is False
+
+
+def test_orphan_ingest_packet_apply_rejects_unmigrated_database(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DROP TABLE ingest_task_cleanup")
+
+    result = json.loads(
+        reconcile_orphan_ingest_task_packets(dry_run=False, min_age_seconds=0)
+    )
+
+    assert result["preview_error"] == (
+        "schema_not_ready:missing_table:ingest_task_cleanup"
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'ingest_task_cleanup'"
+        ).fetchone()
+        is None
+    )
 
 
 def test_remove_subagent_task_rejects_cross_session_identity(

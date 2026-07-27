@@ -13,6 +13,7 @@ from vector_lake.wiki_utils import (
     VALID_PREFIXES,
     get_memory_dir,
     get_wiki_dir,
+    iter_markdown_files,
     iter_wiki_link_matches,
     semantic_text_hash,
 )
@@ -47,12 +48,18 @@ def _find_md_file(wiki_dir: Path, page_key: str, name: str) -> Path | None:
         *(f"{prefix}{safe_name}.md" for prefix in VALID_PREFIXES if safe_name),
         f"{safe_name}.md" if safe_name else "",
     ]
+    casefold_matches: dict[str, list[Path]] = {}
+    for path in iter_markdown_files(wiki_dir):
+        casefold_matches.setdefault(path.name.casefold(), []).append(path.resolve())
     for candidate_name in candidate_names:
         if not candidate_name:
             continue
         path = (wiki_dir / candidate_name).resolve()
         if path.parent == wiki_dir and path.exists():
             return path
+        matches = casefold_matches.get(candidate_name.casefold(), [])
+        if len(matches) == 1 and matches[0].parent == wiki_dir:
+            return matches[0]
     return None
 
 
@@ -284,14 +291,15 @@ def _preserve_source_metadata(
 
 def _direct_backlinks(source_key: str, excluded: set[str]) -> list[str]:
     backlinks = []
-    for path in get_wiki_dir().glob("*.md"):
-        if path.name in excluded:
+    excluded_identities = {name.casefold() for name in excluded}
+    for path in iter_markdown_files(get_wiki_dir()):
+        if path.name.casefold() in excluded_identities:
             continue
         content = path.read_text(encoding="utf-8")
-        targets = {
-            match.group(1).strip().removesuffix(".md")
-            for match in iter_wiki_link_matches(content)
-        }
+        targets = set()
+        for match in iter_wiki_link_matches(content):
+            target = match.group(1).strip()
+            targets.add(target[:-3] if target.casefold().endswith(".md") else target)
         if source_key in targets:
             backlinks.append(path.name)
     return sorted(backlinks)
@@ -310,8 +318,14 @@ def _current_raw_artifact_hash(raw_identity: str) -> str:
 
 def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
     wiki_dir = get_wiki_dir()
-    target_name = f"{candidate['left_page_key']}.md"
-    source_name = f"{candidate['right_page_key']}.md"
+    target_name = str(
+        journal.get("target_filename")
+        or f"{candidate['left_page_key']}.md"
+    )
+    source_name = str(
+        journal.get("source_filename")
+        or f"{candidate['right_page_key']}.md"
+    )
     target_path = wiki_dir / target_name
     source_path = wiki_dir / source_name
     errors = []
