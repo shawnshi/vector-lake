@@ -282,7 +282,7 @@ def test_gc_symlink_candidate_is_blocked_before_retention_or_backup(
     assert "[BLOCKED]" in preview
     assert "symbolic link" in preview
     assert "[BLOCKED]" in result
-    assert "No changes made" in result
+    assert "no changes made" in result.casefold()
     assert page.is_symlink()
     assert external_target.read_text(encoding="utf-8") == "external vendor"
     assert (

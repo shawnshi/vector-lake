@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -572,7 +573,7 @@ def test_claim_rebuilds_packet_when_path_or_durable_binding_is_tampered(
         outside_dir = isolated_memory / "outside-controlled-task-root"
         outside_dir.mkdir()
         outside_path = outside_dir / bad_path.name
-        bad_path.replace(outside_path)
+        shutil.move(bad_path, outside_path)
         bad_path = outside_path
     elif tamper == "prompt":
         packet["prompt"] = "attacker-controlled prompt"
