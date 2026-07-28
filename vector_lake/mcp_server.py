@@ -5,6 +5,7 @@ import hashlib
 import json
 import inspect
 import logging
+import math
 import os
 from pathlib import Path
 import queue
@@ -25,16 +26,21 @@ class _DaemonThreadPoolExecutor:
     _STOP = object()
 
     def __init__(self, *, max_workers: int, thread_name_prefix: str) -> None:
-        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+        if (
+            isinstance(max_workers, bool)
+            or not isinstance(max_workers, int)
+            or max_workers < 1
+        ):
             raise ValueError("max_workers must be a positive integer")
         self._max_workers = max_workers
         self._thread_name_prefix = str(thread_name_prefix or "daemon-executor")
         self._work_queue: queue.Queue = queue.Queue()
-        # Strong Thread references can keep Win32 handles joinable at interpreter
-        # teardown. Running threads remain reachable through threading itself.
         self._threads = weakref.WeakSet()
         self._state_lock = threading.Lock()
         self._shutdown = False
+        self._queued_items = 0
+        self._running_workers = 0
+        self._shutdown_complete = threading.Event()
 
     def _start_workers_locked(self) -> None:
         if self._threads:
@@ -46,6 +52,7 @@ class _DaemonThreadPoolExecutor:
                 daemon=True,
             )
             self._threads.add(worker)
+            self._running_workers += 1
             worker.start()
 
     @staticmethod
@@ -72,16 +79,24 @@ class _DaemonThreadPoolExecutor:
             future.set_result(result)
 
     def _worker(self) -> None:
-        while True:
-            item = self._work_queue.get()
-            if item is self._STOP:
-                return
-            future, call, terminal_callback = item
-            try:
-                self._run_item(future, call)
-            finally:
-                self._notify_terminal(terminal_callback)
-                del item, future, call, terminal_callback
+        try:
+            while True:
+                item = self._work_queue.get()
+                if item is self._STOP:
+                    return
+                with self._state_lock:
+                    self._queued_items -= 1
+                future, call, terminal_callback = item
+                try:
+                    self._run_item(future, call)
+                finally:
+                    self._notify_terminal(terminal_callback)
+                    del item, future, call, terminal_callback
+        finally:
+            with self._state_lock:
+                self._running_workers -= 1
+                if self._shutdown and self._running_workers == 0:
+                    self._shutdown_complete.set()
 
     def _submit(self, fn, args, kwargs, terminal_callback) -> Future:
         if not callable(fn):
@@ -92,6 +107,7 @@ class _DaemonThreadPoolExecutor:
             if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown")
             self._start_workers_locked()
+            self._queued_items += 1
             self._work_queue.put((future, call, terminal_callback))
         return future
 
@@ -102,30 +118,75 @@ class _DaemonThreadPoolExecutor:
         return self._submit(fn, (), {}, terminal_callback)
 
     def queued_work_items(self) -> int:
-        return self._work_queue.qsize()
+        with self._state_lock:
+            return self._queued_items
 
-    def _cancel_queued_work_locked(self) -> None:
+    def status_snapshot(self) -> dict:
+        with self._state_lock:
+            threads = list(self._threads)
+            return {
+                "queued_items": self._queued_items,
+                "workers_daemon": all(worker.daemon for worker in threads),
+                "running_workers": self._running_workers,
+                "shutdown": self._shutdown,
+                "shutdown_completed": self._shutdown_complete.is_set(),
+            }
+
+    def _take_queued_work_locked(self) -> list:
+        cancelled = []
+        stop_count = 0
         while True:
             try:
-                future, _call, terminal_callback = self._work_queue.get_nowait()
+                item = self._work_queue.get_nowait()
             except queue.Empty:
-                return
+                break
+            if item is self._STOP:
+                stop_count += 1
+                continue
+            self._queued_items -= 1
+            cancelled.append(item)
+        for _stop in range(stop_count):
+            self._work_queue.put(self._STOP)
+        return cancelled
+
+    def _cancel_queued_work(self, queued_work: list) -> None:
+        for future, _call, terminal_callback in queued_work:
             future.cancel()
             self._notify_terminal(terminal_callback)
 
-    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+    def shutdown(
+        self,
+        wait: bool = True,
+        *,
+        cancel_futures: bool = False,
+        timeout: float | None = None,
+    ) -> bool:
+        if timeout is not None:
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("timeout must be a finite non-negative number") from exc
+            if not math.isfinite(timeout) or timeout < 0:
+                raise ValueError("timeout must be a finite non-negative number")
         with self._state_lock:
             first_shutdown = not self._shutdown
             self._shutdown = True
             threads = list(self._threads)
+            queued_work = self._take_queued_work_locked() if cancel_futures else []
             if first_shutdown:
-                if cancel_futures:
-                    self._cancel_queued_work_locked()
-                for _worker_index in threads:
+                for _worker in threads:
                     self._work_queue.put(self._STOP)
+            if not threads:
+                self._shutdown_complete.set()
+        self._cancel_queued_work(queued_work)
         if wait:
+            deadline = None if timeout is None else time.monotonic() + timeout
             for worker in threads:
-                worker.join()
+                remaining = None
+                if deadline is not None:
+                    remaining = max(0.0, deadline - time.monotonic())
+                worker.join(remaining)
+        return self._shutdown_complete.is_set()
 
 
 def _finalize_blocking_executor(executor: _DaemonThreadPoolExecutor) -> None:
@@ -160,10 +221,7 @@ class MCPRuntimeGuard:
         if check_interval_seconds is None:
             try:
                 check_interval_seconds = float(
-                    os.environ.get(
-                        "VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS",
-                        "5",
-                    )
+                    os.environ.get("VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS", "5")
                 )
             except ValueError:
                 check_interval_seconds = 5.0
@@ -177,10 +235,7 @@ class MCPRuntimeGuard:
     def status(self, force: bool = False) -> dict:
         with self._lock:
             now = time.monotonic()
-            if (
-                force
-                or now - self._last_checked >= self.check_interval_seconds
-            ):
+            if force or now - self._last_checked >= self.check_interval_seconds:
                 self._current_revision = _source_tree_revision(self.source_root)
                 self._last_checked = now
             stale = self._current_revision != self.loaded_revision
@@ -196,7 +251,7 @@ class MCPRuntimeGuard:
             }
 
     def assert_current(self) -> None:
-        status = self.status()
+        status = self.status(force=True)
         if status["stale"]:
             raise RuntimeError(
                 "Vector Lake MCP source changed after process startup; "
@@ -225,8 +280,7 @@ class ReloadAwareFastMCP(FastMCP):
         try:
             queue_capacity = int(
                 os.environ.get(
-                    "VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY",
-                    str(worker_count),
+                    "VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", str(worker_count)
                 )
             )
         except (TypeError, ValueError):
@@ -234,19 +288,25 @@ class ReloadAwareFastMCP(FastMCP):
         queue_capacity = max(0, min(64, queue_capacity))
         try:
             admission_timeout = float(
-                os.environ.get(
-                    "VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS",
-                    "0.05",
-                )
+                os.environ.get("VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS", "0.05")
             )
         except (TypeError, ValueError):
             admission_timeout = 0.05
+        if not math.isfinite(admission_timeout):
+            admission_timeout = 0.05
+        try:
+            shutdown_timeout = float(
+                os.environ.get("VECTOR_LAKE_MCP_SHUTDOWN_TIMEOUT_SECONDS", "5")
+            )
+        except (TypeError, ValueError):
+            shutdown_timeout = 5.0
+        if not math.isfinite(shutdown_timeout):
+            shutdown_timeout = 5.0
         self._blocking_worker_count = worker_count
         self._blocking_queue_capacity = queue_capacity
         self._blocking_admission_timeout = max(0.0, min(5.0, admission_timeout))
-        self._blocking_slots = threading.BoundedSemaphore(
-            worker_count + queue_capacity
-        )
+        self._blocking_shutdown_timeout = max(0.1, min(30.0, shutdown_timeout))
+        self._blocking_slots = threading.BoundedSemaphore(worker_count + queue_capacity)
         self._blocking_inflight = 0
         self._blocking_executor = _DaemonThreadPoolExecutor(
             max_workers=worker_count,
@@ -254,10 +314,9 @@ class ReloadAwareFastMCP(FastMCP):
         )
         self._executor_shutdown_lock = threading.Lock()
         self._executor_shutdown_started = False
+        self._executor_shutdown_timed_out = False
         self._executor_finalizer = weakref.finalize(
-            self,
-            _finalize_blocking_executor,
-            self._blocking_executor,
+            self, _finalize_blocking_executor, self._blocking_executor
         )
 
     @staticmethod
@@ -287,16 +346,7 @@ class ReloadAwareFastMCP(FastMCP):
             if self._executor_shutdown_started:
                 raise RuntimeError("Vector Lake MCP server is shutting down")
 
-    def _submit_blocking_call(self, call):
-        """Admit a bounded blocking call and fence it against shutdown."""
-        admitted = self._blocking_slots.acquire(
-            timeout=self._blocking_admission_timeout
-        )
-        if not admitted:
-            raise RuntimeError(
-                "Vector Lake MCP blocking executor is saturated; retry later"
-            )
-
+    def _submit_admitted_blocking_call(self, call):
         released = False
 
         def release_slot():
@@ -314,19 +364,36 @@ class ReloadAwareFastMCP(FastMCP):
                 raise RuntimeError("Vector Lake MCP server is shutting down")
             self._blocking_inflight += 1
             try:
-                future = self._blocking_executor.submit_tracked(
-                    call,
-                    release_slot,
-                )
+                return self._blocking_executor.submit_tracked(call, release_slot)
             except BaseException:
                 self._blocking_inflight -= 1
                 self._blocking_slots.release()
                 raise
 
-        return future
+    def _submit_blocking_call(self, call):
+        """Synchronously admit a bounded blocking call for non-event-loop callers."""
+        admitted = self._blocking_slots.acquire(
+            timeout=self._blocking_admission_timeout
+        )
+        if not admitted:
+            raise RuntimeError("Vector Lake MCP blocking executor is saturated; retry later")
+        return self._submit_admitted_blocking_call(call)
+
+    async def _acquire_blocking_slot(self) -> None:
+        deadline = time.monotonic() + self._blocking_admission_timeout
+        while True:
+            self._assert_accepting_calls()
+            if self._blocking_slots.acquire(blocking=False):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Vector Lake MCP blocking executor is saturated; retry later"
+                )
+            await asyncio.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
 
     async def _run_blocking_call(self, call):
-        future = self._submit_blocking_call(call)
+        await self._acquire_blocking_slot()
+        future = self._submit_admitted_blocking_call(call)
         try:
             return await asyncio.wrap_future(future)
         except asyncio.CancelledError:
@@ -334,40 +401,71 @@ class ReloadAwareFastMCP(FastMCP):
             raise
 
     def blocking_executor_status(self) -> dict:
+        executor_status = self._blocking_executor.status_snapshot()
         with self._executor_shutdown_lock:
-            return {
-                "workers": self._blocking_worker_count,
-                "queue_capacity": self._blocking_queue_capacity,
-                "inflight": self._blocking_inflight,
-                "queued_items": self._blocking_executor.queued_work_items(),
-                "admission_timeout_seconds": self._blocking_admission_timeout,
-                "workers_daemon": all(
-                    worker.daemon for worker in self._blocking_executor._threads
-                ),
-                "running_workers": sum(
-                    worker.is_alive() for worker in self._blocking_executor._threads
-                ),
-                "shutdown_started": self._executor_shutdown_started,
-            }
+            shutdown_started = self._executor_shutdown_started
+            inflight = self._blocking_inflight
+            timed_out = self._executor_shutdown_timed_out
+        return {
+            "workers": self._blocking_worker_count,
+            "queue_capacity": self._blocking_queue_capacity,
+            "inflight": inflight,
+            "queued_items": executor_status["queued_items"],
+            "admission_timeout_seconds": self._blocking_admission_timeout,
+            "shutdown_timeout_seconds": self._blocking_shutdown_timeout,
+            "workers_daemon": executor_status["workers_daemon"],
+            "running_workers": executor_status["running_workers"],
+            "shutdown_started": shutdown_started,
+            "shutdown_completed": shutdown_started
+            and executor_status["shutdown_completed"],
+            "shutdown_timed_out": timed_out,
+        }
 
-    def shutdown_blocking_executor(self, *, wait: bool = True) -> None:
+    def shutdown_blocking_executor(
+        self,
+        *,
+        wait: bool = True,
+        timeout: float | None = None,
+    ) -> None:
         """Idempotently stop this server's bounded blocking-tool executor."""
+        if timeout is None:
+            timeout = self._blocking_shutdown_timeout
+        else:
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("timeout must be a finite non-negative number") from exc
+            if not math.isfinite(timeout) or timeout < 0:
+                raise ValueError("timeout must be a finite non-negative number")
         with self._executor_shutdown_lock:
             first_shutdown = not self._executor_shutdown_started
             self._executor_shutdown_started = True
             if self._executor_finalizer.alive:
                 self._executor_finalizer.detach()
         if first_shutdown or wait:
-            self._blocking_executor.shutdown(wait=wait, cancel_futures=True)
+            completed = self._blocking_executor.shutdown(
+                wait=wait,
+                cancel_futures=True,
+                timeout=timeout if wait else None,
+            )
+            if wait and not completed:
+                with self._executor_shutdown_lock:
+                    self._executor_shutdown_timed_out = True
+                logging.getLogger(__name__).warning(
+                    "Vector Lake MCP blocking executor did not drain within %.3f seconds",
+                    timeout,
+                )
 
     def tool(self, *args, **kwargs):
         register = super().tool(*args, **kwargs)
 
         def decorator(fn):
             if inspect.iscoroutinefunction(fn):
+
                 @functools.wraps(fn)
                 async def managed_async_tool(*fn_args, **fn_kwargs):
                     self._assert_accepting_calls()
+                    self.runtime_guard.assert_current()
                     failed = True
                     try:
                         result = await fn(*fn_args, **fn_kwargs)
@@ -381,11 +479,14 @@ class ReloadAwareFastMCP(FastMCP):
 
             @functools.wraps(fn)
             async def threaded_tool(*fn_args, **fn_kwargs):
+                def invoke_current_tool():
+                    if fn.__name__ != "mcp_runtime_status":
+                        self.runtime_guard.assert_current()
+                    return fn(*fn_args, **fn_kwargs)
+
                 call = functools.partial(
                     self._invoke_blocking_tool,
-                    fn,
-                    *fn_args,
-                    **fn_kwargs,
+                    invoke_current_tool,
                 )
                 return await self._run_blocking_call(call)
 
@@ -398,7 +499,7 @@ class ReloadAwareFastMCP(FastMCP):
         try:
             return super().run(transport=transport, mount_path=mount_path)
         finally:
-            self.shutdown_blocking_executor(wait=False)
+            self.shutdown_blocking_executor(wait=True)
 
     async def call_tool(self, name: str, arguments: dict):
         self._assert_accepting_calls()
@@ -480,6 +581,23 @@ def evidence_foundation_backfill(dry_run: bool = True, limit: int = 500, batch_s
         dry_run=dry_run,
         limit=limit,
         batch_size=batch_size,
+    )
+
+@mcp.tool()
+def backup_retention(
+    dry_run: bool = True,
+    keep_latest: int = 5,
+    min_age_days: int = 30,
+    stage_ttl_hours: int = 24,
+    confirmation: str = "",
+) -> str:
+    """Preview or explicitly apply guarded backup retention."""
+    return tools.backup_retention_maintenance(
+        dry_run=dry_run,
+        keep_latest=keep_latest,
+        min_age_days=min_age_days,
+        stage_ttl_hours=stage_ttl_hours,
+        confirmation=confirmation,
     )
 
 @mcp.tool()
@@ -900,7 +1018,7 @@ def finalize_ingest(
     
     Args:
         files_written: Direct list of dicts with 'filename' and 'content'.
-        processed_data: Claimed job dict with filepath/hash/source_hash/ingest_contract_version/lease fields plus an integration disposition manifest.
+        processed_data: Claimed job dict with filepath/hash/source_hash/source_projection_hash/integration_candidates/ingest_contract_version/lease fields plus an integration disposition manifest.
         files_written_payload_file: Sandbox JSON file containing files_written.
         raw_files_payload_file: Sandbox JSON file containing processed_data.
     """
@@ -1007,7 +1125,11 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
     if old_text.strip() in ["", "---", "[[", "]]", "```", "#"]:
         return f"Error: '{old_text}' is a structural syntax marker. Global replacement aborted to protect graph topology."
         
-    from vector_lake.wiki_utils import get_wiki_dir, iter_markdown_files
+    from vector_lake.wiki_utils import (
+        get_wiki_dir,
+        iter_markdown_files,
+        normalize_semantic_text,
+    )
     from vector_lake.mutation_coordinator import execute_mutation_batch
     wiki_dir = get_wiki_dir()
     modified_count = 0
@@ -1017,10 +1139,18 @@ def batch_replace_links(old_text: str, new_text: str, dry_run: bool = True) -> s
     for filepath in iter_markdown_files(wiki_dir):
         filename = filepath.name
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
+            content_bytes = filepath.read_bytes()
+            content = normalize_semantic_text(content_bytes.decode("utf-8"))
             if old_text in content:
-                mutations.append({"filename": filename, "content": content.replace(old_text, new_text)})
+                mutations.append(
+                    {
+                        "filename": filename,
+                        "content": content.replace(old_text, new_text),
+                        "expected_projection_hash": hashlib.sha256(
+                            content_bytes
+                        ).hexdigest(),
+                    }
+                )
                 modified_count += 1
                 matched_files.append(filename)
         except Exception as e:

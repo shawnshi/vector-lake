@@ -46,12 +46,14 @@ def test_memory_search_index_is_explicit_across_cli_and_mcp():
     from vector_lake.cli_app import build_parser
 
     preview = build_parser().parse_args(["memory-search-index"])
-    apply = build_parser().parse_args([
-        "memory-search-index",
-        "--apply",
-        "--batch-size",
-        "32",
-    ])
+    apply = build_parser().parse_args(
+        [
+            "memory-search-index",
+            "--apply",
+            "--batch-size",
+            "32",
+        ]
+    )
 
     assert preview.apply is False
     assert preview.batch_size == 256
@@ -72,9 +74,7 @@ def test_memory_cleanup_is_preview_first_across_cli_and_mcp():
 def test_orphan_ingest_packet_cleanup_is_preview_first_across_cli_and_mcp():
     from vector_lake.cli_app import build_parser
 
-    args = build_parser().parse_args(
-        ["ingest-tasks", "--cleanup-orphans"]
-    )
+    args = build_parser().parse_args(["ingest-tasks", "--cleanup-orphans"])
     assert args.apply is False
     assert args.limit == 20
     assert args.min_age_seconds == 86400
@@ -110,6 +110,73 @@ def test_orphan_source_classification_is_preview_first_across_cli_and_mcp():
     args = build_parser().parse_args(["orphan-source-classify"])
     assert args.apply is False
     assert callable(mcp_server.orphan_source_classify)
+
+
+def test_backup_retention_is_preview_first_across_cli_and_mcp():
+    from vector_lake.cli_app import build_parser
+
+    preview = build_parser().parse_args(["backup-retention"])
+    apply = build_parser().parse_args(
+        [
+            "backup-retention",
+            "--apply",
+            "--keep-latest",
+            "3",
+            "--min-age-days",
+            "45",
+            "--stage-ttl-hours",
+            "12",
+            "--confirm-fingerprint",
+            "sha256:abc",
+        ]
+    )
+
+    assert preview.apply is False
+    assert preview.keep_latest == 5
+    assert preview.min_age_days == 30
+    assert preview.stage_ttl_hours == 24
+    assert preview.confirm_fingerprint == ""
+    assert apply.apply is True
+    assert apply.keep_latest == 3
+    assert apply.min_age_days == 45
+    assert apply.stage_ttl_hours == 12
+    assert apply.confirm_fingerprint == "sha256:abc"
+    assert callable(mcp_server.backup_retention)
+
+
+def test_backup_retention_mcp_forwards_preview_and_explicit_apply(monkeypatch):
+    calls = []
+
+    def fake_maintenance(**kwargs):
+        calls.append(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(
+        mcp_server.tools,
+        "backup_retention_maintenance",
+        fake_maintenance,
+    )
+
+    assert mcp_server.backup_retention() == "ok"
+    assert (
+        mcp_server.backup_retention(
+            dry_run=False,
+            keep_latest=2,
+            confirmation="sha256:abc",
+        )
+        == "ok"
+    )
+    assert calls[0] == {
+        "dry_run": True,
+        "keep_latest": 5,
+        "min_age_days": 30,
+        "stage_ttl_hours": 24,
+        "confirmation": "",
+    }
+    assert calls[1]["dry_run"] is False
+    assert calls[1]["keep_latest"] == 2
+    assert calls[1]["confirmation"] == "sha256:abc"
+
 
 def test_history_retention_is_preview_first_across_cli_and_mcp():
     from vector_lake.cli_app import build_parser
@@ -149,6 +216,7 @@ def test_history_retention_is_preview_first_across_cli_and_mcp():
     assert apply.keep_terminal_outbox == 30
     assert apply.keep_versions_per_family == 3
     assert callable(mcp_server.history_retention)
+
 
 def test_history_retention_mcp_forwards_preview_and_explicit_apply(monkeypatch):
     calls = []

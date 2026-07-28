@@ -26,11 +26,23 @@ def test_nested_store_calls_roll_back_with_outer_transaction(isolated_memory):
                     "status": "Active",
                 },
             )
-            governance_store.save_alias_registry({"items": {"Rollback": "entity_rollback"}})
+            governance_store.save_alias_registry(
+                {"items": {"Rollback": "entity_rollback"}}
+            )
             raise RuntimeError("inject rollback")
 
-    assert conn.execute("SELECT 1 FROM entities WHERE entity_id = 'entity_rollback'").fetchone() is None
-    assert conn.execute("SELECT 1 FROM alias_registry WHERE value = 'entity_rollback'").fetchone() is None
+    assert (
+        conn.execute(
+            "SELECT 1 FROM entities WHERE entity_id = 'entity_rollback'"
+        ).fetchone()
+        is None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM alias_registry WHERE value = 'entity_rollback'"
+        ).fetchone()
+        is None
+    )
 
 
 def test_init_db_runs_schema_work_once_per_database_path(isolated_memory, monkeypatch):
@@ -41,6 +53,109 @@ def test_init_db_runs_schema_work_once_per_database_path(isolated_memory, monkey
         lambda _key: (_ for _ in ()).throw(AssertionError("schema rerun")),
     )
     db_store.init_db()
+
+
+def test_reopening_existing_schema_v3_does_not_advance_generations(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    before = {
+        str(row["surface"]): int(row["generation"])
+        for row in db_store.get_connection().execute(
+            "SELECT surface, generation FROM runtime_generations ORDER BY surface"
+        )
+    }
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    after = {
+        str(row["surface"]): int(row["generation"])
+        for row in conn.execute(
+            "SELECT surface, generation FROM runtime_generations ORDER BY surface"
+        )
+    }
+
+    assert conn._persistent_runtime_generation_triggers is True
+    assert after == before
+
+
+def test_runtime_schema_validation_cache_skips_rescan_and_invalidates_on_ddl(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    calls = 0
+    real_check = db_store._runtime_generation_schema_issues
+
+    def counted_check(conn):
+        nonlocal calls
+        calls += 1
+        return real_check(conn)
+
+    monkeypatch.setattr(
+        db_store,
+        "_runtime_generation_schema_issues",
+        counted_check,
+    )
+    db_store.init_db()
+    db_store.init_db()
+    assert calls == 0
+
+    trigger_name = db_store._runtime_generation_trigger_name("entities", "insert")
+    with db_store.transaction() as conn:
+        conn.execute(f"DROP TRIGGER {trigger_name}")
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime generation contract is invalid",
+    ):
+        db_store.init_db()
+    assert calls == 1
+
+
+def test_failed_deferred_commit_rolls_back_generation_and_clears_dirty_set(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    before = int(
+        conn.execute(
+            "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+        ).fetchone()[0]
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with db_store.transaction():
+            conn.execute("CREATE TABLE deferred_parent (id INTEGER PRIMARY KEY)")
+            conn.execute(
+                "CREATE TABLE deferred_child ("
+                "id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, "
+                "FOREIGN KEY(parent_id) REFERENCES deferred_parent(id) "
+                "DEFERRABLE INITIALLY DEFERRED)"
+            )
+            conn.execute(
+                "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+                ("failed_commit", '{"page_key":"Concept_Failed-Commit"}'),
+            )
+            conn.execute("INSERT INTO deferred_child (id, parent_id) VALUES (1, 999)")
+
+    after = int(
+        conn.execute(
+            "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+        ).fetchone()[0]
+    )
+    assert after == before
+    assert conn.generation_dirty_snapshot() == set()
+    assert (
+        conn.execute(
+            "SELECT 1 FROM entities WHERE entity_id = 'failed_commit'"
+        ).fetchone()
+        is None
+    )
+
 
 def test_runtime_generation_tracks_same_size_entity_mutations(isolated_memory):
     db_store.init_db()
@@ -97,7 +212,7 @@ def test_runtime_generation_tracks_same_size_entity_mutations(isolated_memory):
     assert generation() == rollback_generation
 
 
-def test_bulk_write_bumps_runtime_generation_once(isolated_memory):
+def test_bulk_write_bumps_runtime_generation_for_each_changed_row(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     before = int(
@@ -120,7 +235,7 @@ def test_bulk_write_bumps_runtime_generation_once(isolated_memory):
             "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
         ).fetchone()[0]
     )
-    assert after == before + 1
+    assert after == before + 250
 
 
 def test_partial_executemany_commit_still_bumps_runtime_generation(isolated_memory):
@@ -147,9 +262,12 @@ def test_partial_executemany_commit_still_bumps_runtime_generation(isolated_memo
             "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
         ).fetchone()[0]
     )
-    assert conn.execute(
-        "SELECT COUNT(*) FROM entities WHERE entity_id = 'entity_partial'"
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE entity_id = 'entity_partial'"
+        ).fetchone()[0]
+        == 1
+    )
     assert after == before + 1
 
 
@@ -182,11 +300,14 @@ def test_runtime_generation_tracks_cte_comments_and_qualified_tables(
             "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
         ).fetchone()[0]
     )
-    assert after == before + 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM entities WHERE entity_id IN "
-        "('entity_commented', 'entity_cte')"
-    ).fetchone()[0] == 2
+    assert after == before + 2
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE entity_id IN "
+            "('entity_commented', 'entity_cte')"
+        ).fetchone()[0]
+        == 2
+    )
 
 
 def test_runtime_generation_tracks_connection_and_cursor_executescript(
@@ -247,8 +368,9 @@ def test_nested_rollback_does_not_bump_runtime_generation(isolated_memory):
     )
     assert after == before
     assert (
-        conn.execute("SELECT 1 FROM entities WHERE entity_id = 'nested_generation'")
-        .fetchone()
+        conn.execute(
+            "SELECT 1 FROM entities WHERE entity_id = 'nested_generation'"
+        ).fetchone()
         is None
     )
 
@@ -267,19 +389,215 @@ def test_runtime_generation_installs_all_write_health_surfaces(isolated_memory):
         "jobs",
     }
     generations = {
-        str(row[0])
-        for row in conn.execute("SELECT surface FROM runtime_generations")
+        str(row[0]) for row in conn.execute("SELECT surface FROM runtime_generations")
     }
     assert expected <= generations
     assert isinstance(conn, db_store._GenerationTrackingConnection)
-    trigger_names = {
-        str(row[0])
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    trigger_rows = {
+        str(row["name"]): str(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+        )
+        if "_generation_v3_" in str(row["name"])
     }
-    assert not any(
-        name.startswith("trg_") and "_generation_v1_" in name
-        for name in trigger_names
+    expected_triggers = {
+        name: sql
+        for object_type, name, sql in db_store._RUNTIME_GENERATION_SCHEMA_OBJECTS_V3
+        if object_type == "trigger"
+    }
+    assert set(trigger_rows) == set(expected_triggers)
+    assert len(trigger_rows) == len(db_store._RUNTIME_GENERATION_SURFACES) * 3
+    for name, expected_sql in expected_triggers.items():
+        assert db_store._normalized_schema_sql(trigger_rows[name]) == (
+            db_store._normalized_schema_sql(expected_sql)
+        )
+
+
+def test_external_sqlite_connection_advances_insert_update_delete_generations(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    app = db_store.get_connection()
+
+    def generation(connection):
+        return int(
+            connection.execute(
+                "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+            ).fetchone()[0]
+        )
+
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute("PRAGMA recursive_triggers=OFF")
+        before = generation(raw)
+        raw.execute(
+            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            ("external_entity", '{"page_key":"Concept_External_A"}'),
+        )
+        raw.commit()
+        after_insert = generation(app)
+
+        raw.execute(
+            "UPDATE entities SET data_json = ? WHERE entity_id = ?",
+            ('{"page_key":"Concept_External_B"}', "external_entity"),
+        )
+        raw.commit()
+        after_update = generation(app)
+
+        raw.execute(
+            "DELETE FROM entities WHERE entity_id = ?",
+            ("external_entity",),
+        )
+        raw.commit()
+        after_delete = generation(app)
+    finally:
+        raw.close()
+
+    assert after_insert == before + 1
+    assert after_update == after_insert + 1
+    assert after_delete == after_update + 1
+
+
+def test_external_sqlite_rollback_rolls_back_generation_trigger(isolated_memory):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    app = db_store.get_connection()
+    before = int(
+        app.execute(
+            "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+        ).fetchone()[0]
     )
+
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute("BEGIN IMMEDIATE")
+        raw.execute(
+            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            ("external_rollback", '{"page_key":"Concept_Rollback"}'),
+        )
+        inside = int(
+            raw.execute(
+                "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+            ).fetchone()[0]
+        )
+        raw.rollback()
+    finally:
+        raw.close()
+
+    after = int(
+        app.execute(
+            "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+        ).fetchone()[0]
+    )
+    assert inside == before + 1
+    assert after == before
+    assert (
+        app.execute(
+            "SELECT 1 FROM entities WHERE entity_id = 'external_rollback'"
+        ).fetchone()
+        is None
+    )
+
+
+def test_external_replace_advances_generation_with_recursive_triggers_off(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute("PRAGMA recursive_triggers=OFF")
+        raw.execute(
+            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            ("external_replace", '{"page_key":"Concept_Replace_A"}'),
+        )
+        raw.commit()
+        before = int(
+            raw.execute(
+                "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+            ).fetchone()[0]
+        )
+        raw.execute(
+            "INSERT OR REPLACE INTO entities (entity_id, data_json) VALUES (?, ?)",
+            ("external_replace", '{"page_key":"Concept_Replace_B"}'),
+        )
+        raw.commit()
+        after_insert_or_replace = int(
+            raw.execute(
+                "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+            ).fetchone()[0]
+        )
+        raw.execute(
+            "REPLACE INTO entities (entity_id, data_json) VALUES (?, ?)",
+            ("external_replace", '{"page_key":"Concept_Replace_C"}'),
+        )
+        raw.commit()
+        after_replace = int(
+            raw.execute(
+                "SELECT generation FROM runtime_generations WHERE surface = 'entities'"
+            ).fetchone()[0]
+        )
+    finally:
+        raw.close()
+
+    assert after_insert_or_replace == before + 1
+    assert after_replace == after_insert_or_replace + 1
+
+
+@pytest.mark.parametrize("operation", ["insert", "update", "delete", "replace"])
+def test_missing_generation_ledger_row_blocks_external_writes(
+    isolated_memory,
+    operation,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    with db_store.transaction() as conn:
+        conn.execute(
+            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            ("ledger_guard", '{"page_key":"Concept_Ledger_A"}'),
+        )
+
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute("DELETE FROM runtime_generations WHERE surface = 'entities'")
+        raw.commit()
+        statements = {
+            "insert": (
+                "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+                ("ledger_guard_insert", '{"page_key":"Concept_Ledger_Insert"}'),
+            ),
+            "update": (
+                "UPDATE entities SET data_json = ? WHERE entity_id = ?",
+                ('{"page_key":"Concept_Ledger_B"}', "ledger_guard"),
+            ),
+            "delete": (
+                "DELETE FROM entities WHERE entity_id = ?",
+                ("ledger_guard",),
+            ),
+            "replace": (
+                "INSERT OR REPLACE INTO entities (entity_id, data_json) VALUES (?, ?)",
+                ("ledger_guard", '{"page_key":"Concept_Ledger_C"}'),
+            ),
+        }
+        sql, params = statements[operation]
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="runtime generation registry is incomplete: entities",
+        ):
+            raw.execute(sql, params)
+        raw.rollback()
+        original = raw.execute(
+            "SELECT data_json FROM entities WHERE entity_id = 'ledger_guard'"
+        ).fetchone()
+        inserted = raw.execute(
+            "SELECT 1 FROM entities WHERE entity_id = 'ledger_guard_insert'"
+        ).fetchone()
+    finally:
+        raw.close()
+
+    assert original == ('{"page_key":"Concept_Ledger_A"}',)
+    assert inserted is None
 
 
 def test_targeted_alias_accessors_participate_in_transactions(isolated_memory):
@@ -323,9 +641,12 @@ def test_connection_reopens_when_database_path_changes(tmp_path, monkeypatch):
     second_connection = db_store.get_connection()
 
     assert second_connection is not first_connection
-    assert second_connection.execute(
-        "SELECT name FROM sqlite_master WHERE name = 'marker'"
-    ).fetchone() is None
+    assert (
+        second_connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'marker'"
+        ).fetchone()
+        is None
+    )
     assert second_connection.execute("SELECT vec_version()").fetchone()[0]
 
 
@@ -349,7 +670,9 @@ def test_close_all_connections_releases_worker_handles(tmp_path, monkeypatch):
         opened[0].execute("SELECT 1")
 
 
-def test_worker_connection_closes_automatically_when_thread_exits(tmp_path, monkeypatch):
+def test_worker_connection_closes_automatically_when_thread_exits(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("VECTOR_LAKE_DB_PATH", str(tmp_path / "thread-exit.db"))
     opened = []
 
@@ -445,9 +768,11 @@ def test_transaction_lock_wait_honors_max_wait(tmp_path, monkeypatch):
     assert elapsed < 0.5
     with db_store.transaction(max_wait_seconds=0.5) as connection:
         connection.execute("CREATE TABLE deadline_recovered (value TEXT)")
-    assert db_store.get_connection().execute(
-        "SELECT name FROM sqlite_master WHERE name = 'deadline_recovered'"
-    ).fetchone()
+    assert (
+        db_store.get_connection()
+        .execute("SELECT name FROM sqlite_master WHERE name = 'deadline_recovered'")
+        .fetchone()
+    )
 
 
 @pytest.mark.parametrize(
@@ -472,6 +797,27 @@ def test_transaction_default_wait_configuration_is_finite_and_bounded(
     assert db_store._configured_transaction_max_wait_seconds() == expected
 
 
+@pytest.mark.parametrize("bad_wait", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("nested", [False, True])
+def test_transaction_rejects_nonfinite_explicit_wait(
+    isolated_memory,
+    bad_wait,
+    nested,
+):
+    db_store.init_db()
+
+    if nested:
+        with db_store.transaction():
+            with pytest.raises(ValueError, match="finite"):
+                with db_store.transaction(max_wait_seconds=bad_wait):
+                    pass
+        return
+
+    with pytest.raises(ValueError, match="finite"):
+        with db_store.transaction(max_wait_seconds=bad_wait):
+            pass
+
+
 def test_transaction_lock_wait_uses_configured_default(tmp_path, monkeypatch):
     db_path = tmp_path / "configured-deadline.db"
     monkeypatch.setenv("VECTOR_LAKE_DB_PATH", str(db_path))
@@ -493,6 +839,7 @@ def test_transaction_lock_wait_uses_configured_default(tmp_path, monkeypatch):
 
     assert elapsed < 0.5
 
+
 def test_caught_nested_transaction_failure_rolls_back_to_savepoint(
     isolated_memory,
 ):
@@ -511,7 +858,9 @@ def test_caught_nested_transaction_failure_rolls_back_to_savepoint(
             pass
         conn.execute("INSERT INTO nested_values VALUES (3)")
 
-    values = [row[0] for row in conn.execute("SELECT value FROM nested_values ORDER BY value")]
+    values = [
+        row[0] for row in conn.execute("SELECT value FROM nested_values ORDER BY value")
+    ]
     assert values == [1, 3]
     assert getattr(db_store._LOCAL, "in_transaction", False) is False
     assert getattr(db_store._LOCAL, "transaction_depth", 0) == 0

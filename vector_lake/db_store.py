@@ -18,6 +18,8 @@ _INITIALIZED_DB_PATHS: set[str] = set()
 _CONNECTIONS_LOCK = threading.RLock()
 _CONNECTIONS: dict[int, sqlite3.Connection] = {}
 _IDENTITY_VALIDATION_TOKENS: dict[int, tuple] = {}
+_RUNTIME_GENERATION_SCHEMA_TOKENS: dict[int, tuple[int, int]] = {}
+_INGEST_TASK_CLEANUP_SCHEMA_TOKENS: dict[int, tuple[int, int]] = {}
 _IDENTITY_GENERATION_SURFACES = (
     "canonical_identities",
     "claim_versions",
@@ -25,9 +27,30 @@ _IDENTITY_GENERATION_SURFACES = (
     "evidence",
     "evidence_versions",
 )
+_RUNTIME_GENERATION_SURFACES = frozenset(
+    {
+        "canonical_identities",
+        "change_sets",
+        "claim_graph_edges",
+        "claim_versions",
+        "claims",
+        "entities",
+        "evidence",
+        "evidence_versions",
+        "governance_queue",
+        "operational_memory",
+        "page_graph_edges",
+        "sources",
+        "timeline_events",
+        "mutation_outbox",
+        "jobs",
+    }
+)
 _SQLITE_WRITE_WAIT_DEFAULT_SECONDS = 30.0
 _SQLITE_WRITE_WAIT_MIN_SECONDS = 0.05
 _SQLITE_WRITE_WAIT_MAX_SECONDS = 300.0
+
+
 def _normalized_schema_sql(statement: object) -> str:
     sql = re.sub(
         r"\bIF\s+NOT\s+EXISTS\s+",
@@ -42,6 +65,131 @@ def _schema_contract_checksum(statements: tuple[str, ...]) -> str:
     normalized = "\n".join(_normalized_schema_sql(item) for item in statements)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
+
+_RUNTIME_GENERATIONS_TABLE_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS runtime_generations (
+    surface TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+
+def _runtime_generation_trigger_name(surface: str, operation: str) -> str:
+    return f"trg_{surface}_generation_v3_{operation.casefold()}"
+
+
+def _runtime_generation_trigger_sql(surface: str, operation: str) -> str:
+    operation_name = operation.upper()
+    trigger_name = _runtime_generation_trigger_name(surface, operation)
+    return f"""
+    CREATE TRIGGER IF NOT EXISTS {trigger_name}
+    AFTER {operation_name} ON {surface}
+    BEGIN
+        UPDATE runtime_generations
+        SET generation = generation + 1
+        WHERE surface = '{surface}';
+        SELECT RAISE(ABORT, 'runtime generation registry is incomplete: {surface}')
+        WHERE NOT EXISTS (
+            SELECT 1 FROM runtime_generations WHERE surface = '{surface}'
+        );
+    END
+    """
+
+
+_RUNTIME_GENERATION_TRIGGER_SCHEMA_V3 = tuple(
+    _runtime_generation_trigger_sql(surface, operation)
+    for surface in sorted(_RUNTIME_GENERATION_SURFACES)
+    for operation in ("insert", "update", "delete")
+)
+_RUNTIME_GENERATION_SCHEMA_V3 = (
+    _RUNTIME_GENERATIONS_TABLE_SCHEMA_V3,
+    *_RUNTIME_GENERATION_TRIGGER_SCHEMA_V3,
+)
+_RUNTIME_GENERATION_SCHEMA_OBJECTS_V3 = (
+    ("table", "runtime_generations", _RUNTIME_GENERATIONS_TABLE_SCHEMA_V3),
+    *tuple(
+        (
+            "trigger",
+            _runtime_generation_trigger_name(surface, operation),
+            _runtime_generation_trigger_sql(surface, operation),
+        )
+        for surface in sorted(_RUNTIME_GENERATION_SURFACES)
+        for operation in ("insert", "update", "delete")
+    ),
+)
+
+
+_INGEST_TASK_CLEANUP_TABLE_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS ingest_task_cleanup (
+    cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    task_packet_path TEXT NOT NULL,
+    expected_task_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    available_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    lease_until TEXT,
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(job_id, task_packet_path)
+)
+"""
+_INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4 = """
+CREATE INDEX IF NOT EXISTS idx_ingest_task_cleanup_ready
+ON ingest_task_cleanup(status, available_at, lease_until, cleanup_id)
+"""
+_INGEST_TASK_CLEANUP_SCHEMA_V4 = (
+    _INGEST_TASK_CLEANUP_TABLE_SCHEMA_V4,
+    _INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4,
+)
+_INGEST_TASK_CLEANUP_COLUMN_CONTRACT_V4 = (
+    ("cleanup_id", "INTEGER", False, True),
+    ("job_id", "TEXT", True, False),
+    ("task_packet_path", "TEXT", True, False),
+    ("expected_task_id", "TEXT", True, False),
+    ("status", "TEXT", True, False),
+    ("attempt_count", "INTEGER", True, False),
+    ("last_error", "TEXT", False, False),
+    ("available_at", "TEXT", True, False),
+    ("created_at", "TEXT", True, False),
+    ("updated_at", "TEXT", True, False),
+    ("completed_at", "TEXT", False, False),
+    ("lease_until", "TEXT", False, False),
+    ("lease_owner", "TEXT", False, False),
+    ("lease_token", "TEXT", False, False),
+    ("lease_generation", "INTEGER", True, False),
+)
+_INGEST_TASK_CLEANUP_DEFAULTS_V4 = {
+    "status": "'pending'",
+    "attempt_count": "0",
+    "lease_generation": "0",
+}
+_INGEST_TASK_CLEANUP_CORE_COLUMNS_V4 = frozenset(
+    {"cleanup_id", "job_id", "task_packet_path"}
+)
+_INGEST_TASK_CLEANUP_ADD_COLUMNS_V4 = (
+    ("expected_task_id", "TEXT NOT NULL DEFAULT ''"),
+    ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+    ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_error", "TEXT"),
+    ("available_at", "TEXT NOT NULL DEFAULT ''"),
+    ("created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+    ("completed_at", "TEXT"),
+    ("lease_until", "TEXT"),
+    ("lease_owner", "TEXT"),
+    ("lease_token", "TEXT"),
+    ("lease_generation", "INTEGER NOT NULL DEFAULT 0"),
+)
+_INGEST_TASK_CLEANUP_IDENTITY_INDEX_SCHEMA_V4 = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_task_cleanup_identity_v4
+ON ingest_task_cleanup(job_id, task_packet_path)
+"""
 
 _CANONICAL_IDENTITIES_SCHEMA_V2 = (
     """
@@ -109,7 +257,7 @@ _CANONICAL_IDENTITIES_SCHEMA_OBJECTS_V2 = (
         _CANONICAL_IDENTITIES_SCHEMA_V2[4],
     ),
 )
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
 _SCHEMA_MIGRATIONS = {
     1: (
         "baseline_schema_v1",
@@ -118,6 +266,14 @@ _SCHEMA_MIGRATIONS = {
     2: (
         "canonical_identity_ownership_v2",
         _schema_contract_checksum(_CANONICAL_IDENTITIES_SCHEMA_V2),
+    ),
+    3: (
+        "persistent_runtime_generations_v3",
+        _schema_contract_checksum(_RUNTIME_GENERATION_SCHEMA_V3),
+    ),
+    4: (
+        "ingest_task_cleanup_contract_v4",
+        _schema_contract_checksum(_INGEST_TASK_CLEANUP_SCHEMA_V4),
     ),
 }
 
@@ -151,6 +307,204 @@ def _assert_identity_schema_contract(conn: sqlite3.Connection) -> None:
         )
 
 
+def _runtime_generation_registry_issues(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    rows = conn.execute("SELECT surface FROM runtime_generations").fetchall()
+    observed = {str(row[0]) for row in rows}
+    return [
+        f"runtime_generation_registry_missing:{surface}"
+        for surface in sorted(_RUNTIME_GENERATION_SURFACES - observed)
+    ]
+
+
+def _runtime_generation_schema_issues(conn: sqlite3.Connection) -> list[str]:
+    issues = []
+    table_available = True
+    expected_objects = {
+        name: (object_type, expected_sql)
+        for object_type, name, expected_sql in _RUNTIME_GENERATION_SCHEMA_OBJECTS_V3
+    }
+    placeholders = ", ".join("?" for _ in expected_objects)
+    observed_objects = {
+        str(row["name"]): row
+        for row in conn.execute(
+            f"SELECT name, type, sql FROM sqlite_master WHERE name IN ({placeholders})",
+            tuple(expected_objects),
+        ).fetchall()
+    }
+    expected_trigger_names = {
+        name
+        for name, (object_type, _expected_sql) in expected_objects.items()
+        if object_type == "trigger"
+    }
+    namespace_trigger_names = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name GLOB 'trg_*_generation_v*_*'"
+        ).fetchall()
+    }
+    for name in sorted(namespace_trigger_names - expected_trigger_names):
+        issues.append(f"runtime_generation_schema_unexpected:trigger:{name}")
+    for name, (object_type, expected_sql) in expected_objects.items():
+        row = observed_objects.get(name)
+        if row is None:
+            issues.append(f"runtime_generation_schema_missing:{object_type}:{name}")
+            if object_type == "table":
+                table_available = False
+            continue
+        if str(row["type"] or "") != object_type:
+            issues.append(f"runtime_generation_schema_type_mismatch:{name}")
+            if object_type == "table":
+                table_available = False
+            continue
+        if _normalized_schema_sql(row["sql"]) != _normalized_schema_sql(expected_sql):
+            issues.append(f"runtime_generation_schema_sql_mismatch:{name}")
+    if table_available:
+        issues.extend(_runtime_generation_registry_issues(conn))
+    return issues
+
+
+def _assert_runtime_generation_schema_contract(
+    conn: sqlite3.Connection,
+) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 3:
+        return
+    schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0)
+    token = (version, schema_version)
+    if _RUNTIME_GENERATION_SCHEMA_TOKENS.get(id(conn)) == token:
+        issues = _runtime_generation_registry_issues(conn)
+    else:
+        issues = _runtime_generation_schema_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v3 runtime generation contract is invalid: " + ", ".join(issues)
+        )
+    _RUNTIME_GENERATION_SCHEMA_TOKENS[id(conn)] = token
+    if isinstance(conn, _GenerationTrackingConnection):
+        conn.enable_persistent_runtime_generation_triggers()
+
+
+def _normalized_schema_default(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).split()).strip()
+    while normalized.startswith("(") and normalized.endswith(")"):
+        normalized = normalized[1:-1].strip()
+    return normalized.casefold()
+
+
+def _ingest_task_cleanup_has_identity_index(conn: sqlite3.Connection) -> bool:
+    for index in conn.execute("PRAGMA index_list('ingest_task_cleanup')").fetchall():
+        if int(index["unique"] or 0) != 1 or int(index["partial"] or 0) != 0:
+            continue
+        key_columns = conn.execute(
+            "SELECT name, desc, coll FROM pragma_index_xinfo(?) "
+            "WHERE key = 1 ORDER BY seqno",
+            (str(index["name"]),),
+        ).fetchall()
+        columns = tuple(str(row["name"]) for row in key_columns)
+        if columns != ("job_id", "task_packet_path"):
+            continue
+        if any(
+            int(row["desc"] or 0) != 0
+            or str(row["coll"] or "").casefold() != "binary"
+            for row in key_columns
+        ):
+            continue
+        return True
+    return False
+
+
+def _ingest_task_cleanup_schema_issues(conn: sqlite3.Connection) -> list[str]:
+    issues = []
+    table = conn.execute(
+        "SELECT type FROM sqlite_master WHERE name = 'ingest_task_cleanup'"
+    ).fetchone()
+    if table is None:
+        return ["ingest_task_cleanup_schema_missing:table:ingest_task_cleanup"]
+    if str(table["type"] or "") != "table":
+        return ["ingest_task_cleanup_schema_type_mismatch:ingest_task_cleanup"]
+
+    observed = {
+        str(row["name"]): row
+        for row in conn.execute("PRAGMA table_info('ingest_task_cleanup')").fetchall()
+    }
+    expected_columns = {
+        item[0] for item in _INGEST_TASK_CLEANUP_COLUMN_CONTRACT_V4
+    }
+    for name in sorted(set(observed) - expected_columns):
+        issues.append(f"ingest_task_cleanup_schema_unexpected:column:{name}")
+    for (
+        name,
+        column_type,
+        not_null,
+        primary_key,
+    ) in _INGEST_TASK_CLEANUP_COLUMN_CONTRACT_V4:
+        row = observed.get(name)
+        if row is None:
+            issues.append(f"ingest_task_cleanup_schema_missing:column:{name}")
+            continue
+        if str(row["type"] or "").strip().casefold() != column_type.casefold():
+            issues.append(f"ingest_task_cleanup_schema_type_mismatch:column:{name}")
+        if bool(row["notnull"]) != bool(not_null):
+            issues.append(
+                f"ingest_task_cleanup_schema_nullability_mismatch:column:{name}"
+            )
+        if bool(row["pk"]) != bool(primary_key):
+            issues.append(
+                f"ingest_task_cleanup_schema_primary_key_mismatch:column:{name}"
+            )
+        expected_default = _INGEST_TASK_CLEANUP_DEFAULTS_V4.get(name)
+        if expected_default is not None and _normalized_schema_default(
+            row["dflt_value"]
+        ) != _normalized_schema_default(expected_default):
+            issues.append(f"ingest_task_cleanup_schema_default_mismatch:column:{name}")
+
+    if not _ingest_task_cleanup_has_identity_index(conn):
+        issues.append(
+            "ingest_task_cleanup_schema_missing:unique:job_id_task_packet_path"
+        )
+
+    ready_index = conn.execute(
+        "SELECT type, sql FROM sqlite_master "
+        "WHERE name = 'idx_ingest_task_cleanup_ready'"
+    ).fetchone()
+    if ready_index is None:
+        issues.append(
+            "ingest_task_cleanup_schema_missing:index:idx_ingest_task_cleanup_ready"
+        )
+    elif str(ready_index["type"] or "") != "index":
+        issues.append(
+            "ingest_task_cleanup_schema_type_mismatch:idx_ingest_task_cleanup_ready"
+        )
+    elif _normalized_schema_sql(ready_index["sql"]) != _normalized_schema_sql(
+        _INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4
+    ):
+        issues.append(
+            "ingest_task_cleanup_schema_sql_mismatch:idx_ingest_task_cleanup_ready"
+        )
+    return issues
+
+
+def _assert_ingest_task_cleanup_schema_contract(conn: sqlite3.Connection) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 4:
+        return
+    schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0)
+    token = (version, schema_version)
+    if _INGEST_TASK_CLEANUP_SCHEMA_TOKENS.get(id(conn)) == token:
+        return
+    issues = _ingest_task_cleanup_schema_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v4 ingest task cleanup contract is invalid: " + ", ".join(issues)
+        )
+    _INGEST_TASK_CLEANUP_SCHEMA_TOKENS[id(conn)] = token
+
+
 def _identity_validation_token(conn: sqlite3.Connection) -> tuple:
     """Detect schema, external, and identity-relevant local writes cheaply."""
     schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0)
@@ -170,6 +524,8 @@ def _identity_validation_token(conn: sqlite3.Connection) -> tuple:
 def _validate_cached_identity_state(conn: sqlite3.Connection) -> None:
     """Revalidate ownership after relevant changes and cache only a stable scan."""
     _assert_identity_schema_contract(conn)
+    _assert_runtime_generation_schema_contract(conn)
+    _assert_ingest_task_cleanup_schema_contract(conn)
     version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
     if version < 2:
         return
@@ -188,13 +544,9 @@ def _validate_cached_identity_state(conn: sqlite3.Connection) -> None:
     )
 
 
-def inspect_schema_migration_state(
-    db_path: str | Path | None = None,
-) -> dict:
-    """Inspect the schema ledger without creating or migrating a database."""
-    path = Path(db_path) if db_path is not None else peek_db_path()
-    result = {
-        "database_path": str(path),
+def _schema_inspection_result(database_path: str | Path) -> dict:
+    return {
+        "database_path": str(database_path),
         "read_only": True,
         "supported_version": _SCHEMA_VERSION,
         "user_version": None,
@@ -204,19 +556,22 @@ def inspect_schema_migration_state(
         "status": "missing",
         "issues": [],
     }
-    if not path.exists():
-        result["issues"].append("database_missing")
-        return result
 
-    conn = None
+
+def inspect_schema_migration_connection(
+    conn: sqlite3.Connection,
+    database_path: str | Path = "<connection>",
+) -> dict:
+    """Validate schema and migration contracts on a caller-owned connection.
+
+    The validator performs no database writes and never opens or closes another
+    connection. This permits exact validation of immutable standalone backups
+    without consulting WAL sidecars or a different snapshot.
+    """
+    result = _schema_inspection_result(database_path)
+    previous_row_factory = conn.row_factory
     try:
-        conn = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro",
-            uri=True,
-            timeout=5.0,
-        )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only=ON")
         result["user_version"] = int(conn.execute("PRAGMA user_version").fetchone()[0])
         ledger_exists = bool(
             conn.execute(
@@ -247,16 +602,17 @@ def inspect_schema_migration_state(
                     _validate_canonical_identity_registry(conn)
                     _validate_canonical_identity_coverage(conn)
                 except RuntimeError as exc:
-                    result["issues"].append(
-                        f"canonical_identity_integrity:{exc}"
-                    )
+                    result["issues"].append(f"canonical_identity_integrity:{exc}")
+        if int(result["user_version"] or 0) >= 3:
+            result["issues"].extend(_runtime_generation_schema_issues(conn))
+        if int(result["user_version"] or 0) >= 4:
+            result["issues"].extend(_ingest_task_cleanup_schema_issues(conn))
     except (OSError, sqlite3.Error) as exc:
         result["status"] = "invalid"
         result["issues"].append(f"schema_inspection_failed:{exc}")
         return result
     finally:
-        if conn is not None:
-            conn.close()
+        conn.row_factory = previous_row_factory
 
     current_version = int(result["user_version"] or 0)
     if current_version > _SCHEMA_VERSION:
@@ -279,31 +635,42 @@ def inspect_schema_migration_state(
         and result["ledger_exists"]
         and not result["issues"]
     )
-    result["status"] = "ready" if result["ready"] else (
-        "uninitialized" if current_version == 0 else "invalid"
+    result["status"] = (
+        "ready"
+        if result["ready"]
+        else ("uninitialized" if current_version == 0 else "invalid")
     )
     return result
 
 
-_RUNTIME_GENERATION_SURFACES = frozenset(
-    {
-        "canonical_identities",
-        "change_sets",
-        "claim_graph_edges",
-        "claim_versions",
-        "claims",
-        "entities",
-        "evidence",
-        "evidence_versions",
-        "governance_queue",
-        "operational_memory",
-        "page_graph_edges",
-        "sources",
-        "timeline_events",
-        "mutation_outbox",
-        "jobs",
-    }
-)
+def inspect_schema_migration_state(
+    db_path: str | Path | None = None,
+) -> dict:
+    """Inspect the schema ledger without creating or migrating a database."""
+    path = Path(db_path) if db_path is not None else peek_db_path()
+    result = _schema_inspection_result(path)
+    if not path.exists():
+        result["issues"].append("database_missing")
+        return result
+
+    conn = None
+    try:
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        conn.execute("PRAGMA query_only=ON")
+        return inspect_schema_migration_connection(conn, path)
+    except (OSError, sqlite3.Error) as exc:
+        result["status"] = "invalid"
+        result["issues"].append(f"schema_inspection_failed:{exc}")
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 _SQL_IDENTIFIER = r'(?:`[^`]+`|"[^"]+"|\[[^\]]+\]|[A-Za-z_]\w*)'
 _WRITE_SURFACE_PATTERN = re.compile(
     rf"\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|"
@@ -316,7 +683,7 @@ _WRITE_SURFACE_PATTERN = re.compile(
 def _normalized_sql_identifier(value: str) -> str:
     identifier = str(value or "").strip()
     if len(identifier) >= 2 and (
-        (identifier[0], identifier[-1]) in {('"', '"'), ('`', '`'), ('[', ']')}
+        (identifier[0], identifier[-1]) in {('"', '"'), ("`", "`"), ("[", "]")}
     ):
         identifier = identifier[1:-1]
     return identifier.casefold()
@@ -349,6 +716,11 @@ class _GenerationTrackingConnection(sqlite3.Connection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._generation_dirty_surfaces: set[str] = set()
+        self._persistent_runtime_generation_triggers = False
+
+    def enable_persistent_runtime_generation_triggers(self) -> None:
+        """Use durable schema-v3 triggers while retaining dirty-read fencing."""
+        self._persistent_runtime_generation_triggers = True
 
     def _mark_runtime_surfaces(self, sql: str) -> None:
         self._generation_dirty_surfaces.update(_runtime_surfaces_written(sql))
@@ -374,13 +746,21 @@ class _GenerationTrackingConnection(sqlite3.Connection):
         try:
             result = super().executescript(sql_script)
         except BaseException:
-            if surfaces and not self.in_transaction:
+            if not self.in_transaction:
+                if self._persistent_runtime_generation_triggers:
+                    self._generation_dirty_surfaces.clear()
+                elif self._generation_dirty_surfaces:
+                    self._flush_runtime_generations()
+                    sqlite3.Connection.commit(self)
+                    self._generation_dirty_surfaces.clear()
+            raise
+        if not self.in_transaction:
+            if self._persistent_runtime_generation_triggers:
+                self._generation_dirty_surfaces.clear()
+            elif self._generation_dirty_surfaces:
                 self._flush_runtime_generations()
                 sqlite3.Connection.commit(self)
-            raise
-        if surfaces and not self.in_transaction:
-            self._flush_runtime_generations()
-            sqlite3.Connection.commit(self)
+                self._generation_dirty_surfaces.clear()
         return result
 
     def cursor(self, factory=None):
@@ -401,11 +781,16 @@ class _GenerationTrackingConnection(sqlite3.Connection):
             raise RuntimeError(
                 "runtime generation registry is incomplete for committed surfaces"
             )
-        self._generation_dirty_surfaces.clear()
 
     def commit(self):
+        if self._persistent_runtime_generation_triggers:
+            result = super().commit()
+            self._generation_dirty_surfaces.clear()
+            return result
         self._flush_runtime_generations()
-        return super().commit()
+        result = super().commit()
+        self._generation_dirty_surfaces.clear()
+        return result
 
     def rollback(self):
         try:
@@ -413,11 +798,14 @@ class _GenerationTrackingConnection(sqlite3.Connection):
         finally:
             self._generation_dirty_surfaces.clear()
 
+
 def _close_tracked_connection(conn: sqlite3.Connection) -> None:
     """Close one registered handle exactly once across thread/global cleanup."""
     with _CONNECTIONS_LOCK:
         tracked = _CONNECTIONS.pop(id(conn), None)
         _IDENTITY_VALIDATION_TOKENS.pop(id(conn), None)
+        _RUNTIME_GENERATION_SCHEMA_TOKENS.pop(id(conn), None)
+        _INGEST_TASK_CLEANUP_SCHEMA_TOKENS.pop(id(conn), None)
     if tracked is None:
         return
     try:
@@ -469,16 +857,19 @@ def _job_idempotency_key(task_type: str, payload: dict | None) -> str | None:
     canonical_name = payload.get("canonical_name")
     if not filepath or not file_hash:
         return None
-    raw = "\0".join(["ingest", str(filepath), str(file_hash), str(canonical_name or "")])
+    raw = "\0".join(
+        ["ingest", str(filepath), str(file_hash), str(canonical_name or "")]
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
 
 def get_db_path() -> Path:
     import os
+
     override = os.environ.get("VECTOR_LAKE_DB_PATH")
     if override:
         return Path(override)
     return get_meta_dir() / "vector_lake.db"
-
 
 
 def peek_db_path() -> Path:
@@ -487,15 +878,15 @@ def peek_db_path() -> Path:
     if override:
         return Path(override)
     return peek_meta_dir() / "vector_lake.db"
+
+
 def get_connection() -> sqlite3.Connection:
     db_path = get_db_path().resolve()
     db_key = str(db_path)
     conn = getattr(_LOCAL, "conn", None)
     with _CONNECTIONS_LOCK:
         tracked = conn is not None and id(conn) in _CONNECTIONS
-    if conn is not None and (
-        getattr(_LOCAL, "db_key", None) != db_key or not tracked
-    ):
+    if conn is not None and (getattr(_LOCAL, "db_key", None) != db_key or not tracked):
         if tracked:
             close_connection()
         else:
@@ -549,11 +940,7 @@ def cleanup_connection_after_tool_call(*, failed: bool = False) -> None:
     conn = getattr(_LOCAL, "conn", None)
     if conn is None:
         return
-    if (
-        failed
-        or getattr(_LOCAL, "in_transaction", False)
-        or bool(conn.in_transaction)
-    ):
+    if failed or getattr(_LOCAL, "in_transaction", False) or bool(conn.in_transaction):
         close_connection()
 
 
@@ -563,6 +950,8 @@ def close_all_connections() -> None:
         connections = list(_CONNECTIONS.values())
         _CONNECTIONS.clear()
         _IDENTITY_VALIDATION_TOKENS.clear()
+        _RUNTIME_GENERATION_SCHEMA_TOKENS.clear()
+        _INGEST_TASK_CLEANUP_SCHEMA_TOKENS.clear()
     for conn in connections:
         try:
             conn.close()
@@ -623,8 +1012,17 @@ def _configured_transaction_max_wait_seconds() -> float:
 @contextmanager
 def transaction(max_wait_seconds: float | None = None):
     """Open a write transaction with a bounded lock-acquisition deadline."""
+    explicit_wait = None
+    if max_wait_seconds is not None:
+        explicit_wait = float(max_wait_seconds)
+        if not math.isfinite(explicit_wait):
+            raise ValueError("max_wait_seconds must be finite")
+        explicit_wait = min(
+            _SQLITE_WRITE_WAIT_MAX_SECONDS,
+            max(0.0, explicit_wait),
+        )
     conn = get_connection()
-    in_tx = getattr(_LOCAL, 'in_transaction', False)
+    in_tx = getattr(_LOCAL, "in_transaction", False)
     if in_tx:
         depth = max(1, int(getattr(_LOCAL, "transaction_depth", 1)))
         savepoint = f"vector_lake_nested_{depth}"
@@ -653,8 +1051,8 @@ def transaction(max_wait_seconds: float | None = None):
 
     effective_wait = (
         _configured_transaction_max_wait_seconds()
-        if max_wait_seconds is None
-        else max(0.0, float(max_wait_seconds))
+        if explicit_wait is None
+        else explicit_wait
     )
     deadline = time.monotonic() + effective_wait
     row = conn.execute("PRAGMA busy_timeout").fetchone()
@@ -714,6 +1112,7 @@ def transaction(max_wait_seconds: float | None = None):
 _INIT_DB_DONE = False
 _INIT_LOCK = threading.Lock()
 
+
 def init_db():
     db_path = get_db_path()
     db_key = str(db_path.resolve())
@@ -736,12 +1135,113 @@ def _add_column_if_missing(
 ) -> None:
     """Apply a legacy column migration while surfacing every non-duplicate error."""
     try:
-        conn.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
-        )
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
     except sqlite3.OperationalError as exc:
         if "duplicate column name" not in str(exc).casefold():
             raise
+
+
+def _migrate_ingest_task_cleanup_schema_v4(conn: sqlite3.Connection) -> None:
+    """Add every recoverable cleanup column and index without rebuilding the table."""
+    conn.execute(_INGEST_TASK_CLEANUP_TABLE_SCHEMA_V4)
+    observed = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info('ingest_task_cleanup')").fetchall()
+    }
+    missing_core = sorted(_INGEST_TASK_CLEANUP_CORE_COLUMNS_V4 - observed)
+    if missing_core:
+        raise RuntimeError(
+            "Schema v4 cannot recover ingest_task_cleanup without core columns: "
+            + ", ".join(missing_core)
+        )
+    for column_name, column_type in _INGEST_TASK_CLEANUP_ADD_COLUMNS_V4:
+        if column_name not in observed:
+            _add_column_if_missing(
+                conn,
+                "ingest_task_cleanup",
+                column_name,
+                column_type,
+            )
+            observed.add(column_name)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE ingest_task_cleanup SET "
+        "status = COALESCE(NULLIF(TRIM(status), ''), 'pending'), "
+        "attempt_count = COALESCE(attempt_count, 0), "
+        "lease_generation = COALESCE(lease_generation, 0), "
+        "created_at = COALESCE(NULLIF(TRIM(created_at), ''), "
+        "NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(available_at), ''), ?), "
+        "updated_at = COALESCE(NULLIF(TRIM(updated_at), ''), "
+        "NULLIF(TRIM(created_at), ''), NULLIF(TRIM(available_at), ''), ?), "
+        "available_at = COALESCE(NULLIF(TRIM(available_at), ''), "
+        "NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), ''), ?)",
+        (now, now, now),
+    )
+    identity_rows = conn.execute(
+        "SELECT cleanup_id, task_packet_path FROM ingest_task_cleanup "
+        "WHERE expected_task_id IS NULL OR TRIM(expected_task_id) = ''"
+    ).fetchall()
+    identity_backfill = []
+    for row in identity_rows:
+        packet_value = str(row["task_packet_path"] or "").replace("\\", "/")
+        task_id = Path(packet_value).stem
+        if not task_id:
+            raise RuntimeError(
+                "Schema v4 cannot derive expected_task_id for cleanup row "
+                f"{row['cleanup_id']}"
+            )
+        identity_backfill.append((task_id, int(row["cleanup_id"])))
+    if identity_backfill:
+        conn.executemany(
+            "UPDATE ingest_task_cleanup SET expected_task_id = ? WHERE cleanup_id = ?",
+            identity_backfill,
+        )
+    invalid_identity = conn.execute(
+        "SELECT cleanup_id FROM ingest_task_cleanup "
+        "WHERE job_id IS NULL OR TRIM(job_id) = '' "
+        "OR task_packet_path IS NULL OR TRIM(task_packet_path) = '' "
+        "OR expected_task_id IS NULL OR TRIM(expected_task_id) = '' LIMIT 1"
+    ).fetchone()
+    if invalid_identity is not None:
+        raise RuntimeError(
+            "Schema v4 ingest_task_cleanup identity backfill is incomplete at row "
+            f"{invalid_identity['cleanup_id']}"
+        )
+
+    if not _ingest_task_cleanup_has_identity_index(conn):
+        identity_index = conn.execute(
+            "SELECT type, sql FROM sqlite_master "
+            "WHERE name = 'idx_ingest_task_cleanup_identity_v4'"
+        ).fetchone()
+        if identity_index is not None:
+            if str(identity_index["type"] or "") != "index":
+                raise RuntimeError(
+                    "Schema v4 identity index name is owned by a non-index object"
+                )
+            conn.execute("DROP INDEX idx_ingest_task_cleanup_identity_v4")
+        conn.execute(_INGEST_TASK_CLEANUP_IDENTITY_INDEX_SCHEMA_V4)
+
+    ready_index = conn.execute(
+        "SELECT type, sql FROM sqlite_master "
+        "WHERE name = 'idx_ingest_task_cleanup_ready'"
+    ).fetchone()
+    if ready_index is not None:
+        if str(ready_index["type"] or "") != "index":
+            raise RuntimeError(
+                "Schema v4 cleanup ready index name is owned by a non-index object"
+            )
+        if _normalized_schema_sql(ready_index["sql"]) != _normalized_schema_sql(
+            _INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4
+        ):
+            conn.execute("DROP INDEX idx_ingest_task_cleanup_ready")
+    conn.execute(_INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4)
+
+    issues = _ingest_task_cleanup_schema_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v4 ingest task cleanup migration failed: " + ", ".join(issues)
+        )
 
 
 def _validate_schema_migration_state(conn: sqlite3.Connection) -> int:
@@ -773,9 +1273,7 @@ def _validate_schema_migration_state(conn: sqlite3.Connection) -> int:
     for version in expected_versions:
         expected = _SCHEMA_MIGRATIONS.get(version)
         if expected is None or ledger[version] != expected:
-            raise RuntimeError(
-                f"Schema migration ledger mismatch at version {version}"
-            )
+            raise RuntimeError(f"Schema migration ledger mismatch at version {version}")
     return current_version
 
 
@@ -914,9 +1412,15 @@ def _reserve_migrated_identity(
         ),
     )
 
+
 def _backfill_canonical_identities(conn: sqlite3.Connection) -> None:
     """Reserve every legacy current/version ID before schema v2 is committed."""
-    for record_kind, current_table, version_table, id_field in _CANONICAL_IDENTITY_SPECS:
+    for (
+        record_kind,
+        current_table,
+        version_table,
+        id_field,
+    ) in _CANONICAL_IDENTITY_SPECS:
         rows = conn.execute(
             f"SELECT {id_field} AS record_id, data_json, NULL AS version_page_key "
             f"FROM {current_table} UNION ALL "
@@ -926,7 +1430,9 @@ def _backfill_canonical_identities(conn: sqlite3.Connection) -> None:
         for row in rows:
             record_id = str(row["record_id"] or "").strip()
             if not record_id:
-                raise RuntimeError(f"Cannot migrate {record_kind} identity without an ID")
+                raise RuntimeError(
+                    f"Cannot migrate {record_kind} identity without an ID"
+                )
             page_key = _identity_page_from_record(
                 row["data_json"],
                 record_kind=record_kind,
@@ -940,6 +1446,7 @@ def _backfill_canonical_identities(conn: sqlite3.Connection) -> None:
                 page_key=page_key,
             )
 
+
 def _validate_canonical_identity_registry(conn: sqlite3.Connection) -> None:
     for row in conn.execute(
         "SELECT record_kind, record_id, page_key, identity_origin, data_json "
@@ -947,9 +1454,15 @@ def _validate_canonical_identity_registry(conn: sqlite3.Connection) -> None:
     ):
         _validate_identity_registry_row(row)
 
+
 def _validate_canonical_identity_coverage(conn: sqlite3.Connection) -> None:
     """Stream canonical/history rows and require one matching durable owner."""
-    for record_kind, current_table, version_table, id_field in _CANONICAL_IDENTITY_SPECS:
+    for (
+        record_kind,
+        current_table,
+        version_table,
+        id_field,
+    ) in _CANONICAL_IDENTITY_SPECS:
         rows = conn.execute(
             f"SELECT {id_field} AS record_id, data_json, NULL AS version_page_key "
             f"FROM {current_table} UNION ALL "
@@ -984,6 +1497,7 @@ def _validate_canonical_identity_coverage(conn: sqlite3.Connection) -> None:
                     f"Schema v2 {record_kind}_id {record_id!r} is owned by "
                     f"registry page {registered_page!r}, not {page_key!r}"
                 )
+
 
 def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
     """Install the optional, lazily populated operational-memory search index.
@@ -1052,8 +1566,7 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
         (datetime.now(timezone.utc).isoformat(),),
     )
     state = conn.execute(
-        "SELECT schema_version FROM operational_memory_search_state "
-        "WHERE singleton = 1"
+        "SELECT schema_version FROM operational_memory_search_state WHERE singleton = 1"
     ).fetchone()
     if state is not None and int(state[0] or 0) != 3:
         conn.execute("DELETE FROM operational_memory_search_fts")
@@ -1119,7 +1632,7 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
 
 def _init_db_once(db_key: str):
     conn = get_connection()
-    in_tx = getattr(_LOCAL, 'in_transaction', False)
+    in_tx = getattr(_LOCAL, "in_transaction", False)
     if not in_tx:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -1127,6 +1640,8 @@ def _init_db_once(db_key: str):
     with transaction():
         current_schema_version = _validate_schema_migration_state(conn)
         _assert_identity_schema_contract(conn)
+        _assert_runtime_generation_schema_contract(conn)
+        _assert_ingest_task_cleanup_schema_contract(conn)
         if current_schema_version >= 2:
             _validate_canonical_identity_registry(conn)
             _validate_canonical_identity_coverage(conn)
@@ -1485,15 +2000,23 @@ def _init_db_once(db_key: str):
                 extracted_at TEXT
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_events(event_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_entity ON timeline_events(entity_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_events(event_date)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_entity ON timeline_events(entity_id)"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_files (
                 filepath TEXT PRIMARY KEY,
                 file_hash TEXT,
-                processed_at TEXT
+                processed_at TEXT,
+                observed_mtime_ns INTEGER,
+                observed_size INTEGER
             )
         """)
+        _add_column_if_missing(conn, "processed_files", "observed_mtime_ns", "INTEGER")
+        _add_column_if_missing(conn, "processed_files", "observed_size", "INTEGER")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS embedding_runs (
                 run_id TEXT PRIMARY KEY,
@@ -1550,7 +2073,10 @@ def _init_db_once(db_key: str):
         conn.execute(
             "UPDATE jobs SET lease_generation = 0 WHERE lease_generation IS NULL"
         )
-        conn.execute("UPDATE jobs SET available_at = created_at WHERE available_at IS NULL")
+        conn.execute("UPDATE jobs SET retries = 0 WHERE retries IS NULL")
+        conn.execute(
+            "UPDATE jobs SET available_at = created_at WHERE available_at IS NULL"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_ready "
             "ON jobs(status, available_at, lease_until, created_at)"
@@ -1559,68 +2085,92 @@ def _init_db_once(db_key: str):
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
             "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
         )
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ingest_task_cleanup (
-                cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id TEXT NOT NULL,
-                task_packet_path TEXT NOT NULL,
-                expected_task_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempt_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                available_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT,
-                lease_until TEXT,
-                lease_owner TEXT,
-                lease_token TEXT,
-                lease_generation INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(job_id, task_packet_path)
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ingest_task_cleanup_ready "
-            "ON ingest_task_cleanup(status, available_at, lease_until, cleanup_id)"
+        ingest_filepath_index_sql = (
+            "CREATE INDEX IF NOT EXISTS idx_jobs_ingest_filepath_status "
+            "ON jobs(CASE WHEN json_valid(payload) "
+            "THEN json_extract(payload, '$.filepath') END, status, retries) "
+            "WHERE task_type = 'ingest'"
         )
+        existing_ingest_filepath_index = conn.execute(
+            "SELECT type, sql FROM sqlite_master "
+            "WHERE name = 'idx_jobs_ingest_filepath_status'"
+        ).fetchone()
+        if existing_ingest_filepath_index is not None and (
+            str(existing_ingest_filepath_index["type"] or "") != "index"
+            or _normalized_schema_sql(existing_ingest_filepath_index["sql"])
+            != _normalized_schema_sql(ingest_filepath_index_sql)
+        ):
+            conn.execute("DROP INDEX idx_jobs_ingest_filepath_status")
+        conn.execute(ingest_filepath_index_sql)
+        if current_schema_version < 4:
+            _migrate_ingest_task_cleanup_schema_v4(conn)
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS runtime_generations (
-                surface TEXT PRIMARY KEY,
-                generation INTEGER NOT NULL DEFAULT 0
-            )
-        """)
+        conn.execute(_RUNTIME_GENERATIONS_TABLE_SCHEMA_V3)
         for surface in sorted(_RUNTIME_GENERATION_SURFACES):
             conn.execute(
                 "INSERT OR IGNORE INTO runtime_generations (surface, generation) "
                 "VALUES (?, 0)",
                 (surface,),
             )
-            for operation_kind in ("insert", "update", "delete"):
-                conn.execute(
-                    f"DROP TRIGGER IF EXISTS trg_{surface}_generation_v1_{operation_kind}"
+        if current_schema_version < 3:
+            for surface in sorted(_RUNTIME_GENERATION_SURFACES):
+                for operation_kind in ("insert", "update", "delete"):
+                    conn.execute(
+                        f"DROP TRIGGER IF EXISTS "
+                        f"trg_{surface}_generation_v1_{operation_kind}"
+                    )
+                    conn.execute(
+                        f"DROP TRIGGER IF EXISTS "
+                        f"{_runtime_generation_trigger_name(surface, operation_kind)}"
+                    )
+            for statement in _RUNTIME_GENERATION_TRIGGER_SCHEMA_V3:
+                conn.execute(statement)
+            issues = _runtime_generation_schema_issues(conn)
+            if issues:
+                raise RuntimeError(
+                    "Schema v3 runtime generation migration failed: "
+                    + ", ".join(issues)
                 )
 
-        
         # Expression-index failures are migration failures and must roll back.
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities (json_extract(data_json, '$.type'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_status ON entities (json_extract(data_json, '$.status'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_page_key ON entities (json_extract(data_json, '$.page_key'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_page_key ON claims (json_extract(data_json, '$.locator.page_key'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_page_key ON evidence (json_extract(data_json, '$.locator.page_key'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON operational_memory (json_extract(data_json, '$.memory_type'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_status ON operational_memory (json_extract(data_json, '$.status'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_source_claim ON operational_memory (json_extract(data_json, '$.source_claim_id'))")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_key ON operational_memory (memory_type, json_extract(data_json, '$.memory_key'))")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entities_type ON entities (json_extract(data_json, '$.type'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entities_status ON entities (json_extract(data_json, '$.status'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entities_page_key ON entities (json_extract(data_json, '$.page_key'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claims_page_key ON claims (json_extract(data_json, '$.locator.page_key'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_evidence_page_key ON evidence (json_extract(data_json, '$.locator.page_key'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_type ON operational_memory (json_extract(data_json, '$.memory_type'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_status ON operational_memory (json_extract(data_json, '$.status'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_source_claim ON operational_memory (json_extract(data_json, '$.source_claim_id'))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_key ON operational_memory (memory_type, json_extract(data_json, '$.memory_key'))"
+        )
         _record_schema_migrations(conn, current_schema_version)
+    _assert_runtime_generation_schema_contract(conn)
+    _assert_ingest_task_cleanup_schema_contract(conn)
     _INITIALIZED_DB_PATHS.add(db_key)
     _IDENTITY_VALIDATION_TOKENS[id(conn)] = _identity_validation_token(conn)
-
 
 
 def upsert_search_index(node_key: str, title: str, summary: str, text: str):
     try:
         from vector_lake.tokenizer_runtime import tokenize_for_fts
+
         title_tok = tokenize_for_fts(title)
         summary_tok = tokenize_for_fts(summary)
         text_tok = tokenize_for_fts(text)
@@ -1633,30 +2183,42 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
     with transaction():
         # FTS5 doesn't support ON CONFLICT REPLACE directly, so we delete then insert.
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO wiki_search_index (node_key, title, summary, text)
             VALUES (?, ?, ?, ?)
-        """, (node_key, title_tok, summary_tok, text_tok))
+        """,
+            (node_key, title_tok, summary_tok, text_tok),
+        )
+
 
 def upsert_embedding(entity_id: str, embedding: list[float]):
     if not embedding:
         return
     import math
-    norm = math.sqrt(sum(x*x for x in embedding))
+
+    norm = math.sqrt(sum(x * x for x in embedding))
     if norm > 0:
-        embedding = [x/norm for x in embedding]
+        embedding = [x / norm for x in embedding]
     conn = get_connection()
     import sqlite_vec
+
     query_blob = sqlite_vec.serialize_float32(embedding)
     with transaction():
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (entity_id,))
-        conn.execute("INSERT INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)", (entity_id, query_blob))
+        conn.execute(
+            "INSERT INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)",
+            (entity_id, query_blob),
+        )
 
 
 def delete_embedding(entity_id: str):
     conn = get_connection()
     with transaction():
-        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (str(entity_id),))
+        conn.execute(
+            "DELETE FROM vec_embeddings WHERE entity_id = ?", (str(entity_id),)
+        )
+
 
 def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
     conn = get_connection()
@@ -1666,8 +2228,12 @@ def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
     if not stale:
         return 0
     with transaction():
-        conn.executemany("DELETE FROM vec_embeddings WHERE entity_id = ?", [(entity_id,) for entity_id in stale])
+        conn.executemany(
+            "DELETE FROM vec_embeddings WHERE entity_id = ?",
+            [(entity_id,) for entity_id in stale],
+        )
     return len(stale)
+
 
 def count_embeddings() -> int:
     conn = get_connection()
@@ -1678,7 +2244,9 @@ def start_embedding_run(run_id: str, model: str, candidates: int):
     import os
 
     now = datetime.now(timezone.utc).isoformat()
-    stale_after = max(60, int(os.environ.get("VECTOR_LAKE_EMBEDDING_RUN_STALE_SECONDS", "3600")))
+    stale_after = max(
+        60, int(os.environ.get("VECTOR_LAKE_EMBEDDING_RUN_STALE_SECONDS", "3600"))
+    )
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after)).isoformat()
     with transaction():
         conn = get_connection()
@@ -1696,7 +2264,9 @@ def start_embedding_run(run_id: str, model: str, candidates: int):
         )
 
 
-def update_embedding_run(run_id: str, processed: int, failed_batches: int = 0, last_error: str = ""):
+def update_embedding_run(
+    run_id: str, processed: int, failed_batches: int = 0, last_error: str = ""
+):
     now = datetime.now(timezone.utc).isoformat()
     with transaction():
         get_connection().execute(
@@ -1706,7 +2276,13 @@ def update_embedding_run(run_id: str, processed: int, failed_batches: int = 0, l
         )
 
 
-def finish_embedding_run(run_id: str, status: str, processed: int, failed_batches: int = 0, last_error: str = ""):
+def finish_embedding_run(
+    run_id: str,
+    status: str,
+    processed: int,
+    failed_batches: int = 0,
+    last_error: str = "",
+):
     if status not in {"completed", "failed", "partial"}:
         raise ValueError(f"Unsupported embedding run status: {status}")
     now = datetime.now(timezone.utc).isoformat()
@@ -1714,14 +2290,24 @@ def finish_embedding_run(run_id: str, status: str, processed: int, failed_batche
         get_connection().execute(
             "UPDATE embedding_runs SET status = ?, processed = ?, failed_batches = ?, "
             "last_error = ?, updated_at = ?, completed_at = ? WHERE run_id = ?",
-            (status, int(processed), int(failed_batches), str(last_error)[:2000], now, now, run_id),
+            (
+                status,
+                int(processed),
+                int(failed_batches),
+                str(last_error)[:2000],
+                now,
+                now,
+                run_id,
+            ),
         )
+
 
 def delete_search_index(node_key: str):
     conn = get_connection()
     with transaction():
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
+
 
 def delete_node_cascade(node_key: str):
     conn = get_connection()
@@ -1796,13 +2382,17 @@ def delete_node_cascade(node_key: str):
         for row in old_claim_rows:
             record = json.loads(row["data_json"] or "{}")
             record.setdefault("claim_id", row["claim_id"])
-            record.update({"status": "Archived", "lifecycle_state": "deleted", "deleted_at": now})
+            record.update(
+                {"status": "Archived", "lifecycle_state": "deleted", "deleted_at": now}
+            )
             deleted_claims.append(record)
         deleted_evidence = []
         for row in old_evidence_rows:
             record = json.loads(row["data_json"] or "{}")
             record.setdefault("evidence_id", row["evidence_id"])
-            record.update({"status": "Archived", "lifecycle_state": "deleted", "deleted_at": now})
+            record.update(
+                {"status": "Archived", "lifecycle_state": "deleted", "deleted_at": now}
+            )
             deleted_evidence.append(record)
         _append_version_records(
             "claim_versions",
@@ -1854,7 +2444,10 @@ def delete_node_cascade(node_key: str):
             )
 
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
-        conn.execute(f"DELETE FROM vec_embeddings WHERE entity_id IN ({placeholders})", related_ids)
+        conn.execute(
+            f"DELETE FROM vec_embeddings WHERE entity_id IN ({placeholders})",
+            related_ids,
+        )
         conn.execute(
             "DELETE FROM claims WHERE "
             "json_extract(data_json, '$.locator.page_key') = ? OR "
@@ -1870,8 +2463,14 @@ def delete_node_cascade(node_key: str):
             "json_extract(data_json, '$.canonical_source_page') = ?",
             (node_key, node_key + ".md"),
         )
-        conn.execute(f"DELETE FROM alias_registry WHERE key = ? OR value IN ({placeholders})", [node_key, *related_ids])
-        conn.execute(f"DELETE FROM claim_graph_nodes WHERE node_id IN ({placeholders})", related_ids)
+        conn.execute(
+            f"DELETE FROM alias_registry WHERE key = ? OR value IN ({placeholders})",
+            [node_key, *related_ids],
+        )
+        conn.execute(
+            f"DELETE FROM claim_graph_nodes WHERE node_id IN ({placeholders})",
+            related_ids,
+        )
         conn.execute(
             f"DELETE FROM claim_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
             [*related_ids, *related_ids],
@@ -1879,7 +2478,9 @@ def delete_node_cascade(node_key: str):
         from vector_lake.tool_timeline import sync_timeline_events_for_claim_delta
 
         sync_timeline_events_for_claim_delta(old_claim_rows, [])
-        conn.execute(f"DELETE FROM entities WHERE entity_id IN ({placeholders})", related_ids)
+        conn.execute(
+            f"DELETE FROM entities WHERE entity_id IN ({placeholders})", related_ids
+        )
 
     return {"page_key": node_key, "entity_ids": sorted(entity_ids)}
 
@@ -1929,9 +2530,9 @@ def enqueue_mutation(
         if current_id is None:
             cursor = conn.execute(
                 "INSERT INTO mutation_outbox "
-            "(filename, mutation_type, payload_text, status, attempt_count, created_at, available_at, "
-            "idempotency_key, validation_mode, base_version, projection_base_hash) "
-            "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)",
+                "(filename, mutation_type, payload_text, status, attempt_count, created_at, available_at, "
+                "idempotency_key, validation_mode, base_version, projection_base_hash) "
+                "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)",
                 (
                     filename,
                     mutation_type,
@@ -1962,11 +2563,15 @@ def is_managed_projection_state(
 ) -> bool:
     """Return whether a filesystem event matches the latest durable projection intent."""
     init_db()
-    row = get_connection().execute(
-        "SELECT mutation_type, payload_text, status FROM mutation_outbox "
-        "WHERE filename = ? AND status != 'superseded' ORDER BY id DESC LIMIT 1",
-        (str(filename),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT mutation_type, payload_text, status FROM mutation_outbox "
+            "WHERE filename = ? AND status != 'superseded' ORDER BY id DESC LIMIT 1",
+            (str(filename),),
+        )
+        .fetchone()
+    )
     if row is None:
         return False
     if str(row["mutation_type"]) != str(mutation_type):
@@ -1993,7 +2598,11 @@ def claim_mutation_outbox(
 
     init_db()
     conn = get_connection()
-    owner = lease_owner or os.environ.get("VECTOR_LAKE_OUTBOX_RUN_ID") or f"{socket.gethostname()}:{os.getpid()}"
+    owner = (
+        lease_owner
+        or os.environ.get("VECTOR_LAKE_OUTBOX_RUN_ID")
+        or f"{socket.gethostname()}:{os.getpid()}"
+    )
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
     lease_until = (now_dt + timedelta(seconds=max(1, lease_seconds))).isoformat()
@@ -2063,25 +2672,33 @@ def mutation_outbox_lease_is_current(
     lease_generation: int,
 ) -> bool:
     now = datetime.now(timezone.utc).isoformat()
-    row = get_connection().execute(
-        "SELECT 1 FROM mutation_outbox WHERE id = ? AND status = 'processing' "
-        "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
-        "AND COALESCE(lease_until, '') > ?",
-        (outbox_id, lease_owner, lease_token, int(lease_generation), now),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT 1 FROM mutation_outbox WHERE id = ? AND status = 'processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (outbox_id, lease_owner, lease_token, int(lease_generation), now),
+        )
+        .fetchone()
+    )
     return row is not None
 
 
 def mutation_outbox_is_latest_intent(outbox_id: int) -> bool:
-    row = get_connection().execute(
-        "SELECT 1 FROM mutation_outbox AS current WHERE current.id = ? "
-        "AND current.status != 'superseded' AND NOT EXISTS ("
-        "  SELECT 1 FROM mutation_outbox AS newer "
-        "  WHERE newer.filename = current.filename AND newer.id > current.id "
-        "    AND newer.status != 'superseded'"
-        ")",
-        (int(outbox_id),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT 1 FROM mutation_outbox AS current WHERE current.id = ? "
+            "AND current.status != 'superseded' AND NOT EXISTS ("
+            "  SELECT 1 FROM mutation_outbox AS newer "
+            "  WHERE newer.filename = current.filename AND newer.id > current.id "
+            "    AND newer.status != 'superseded'"
+            ")",
+            (int(outbox_id),),
+        )
+        .fetchone()
+    )
     return row is not None
 
 
@@ -2090,10 +2707,14 @@ def mutation_outbox_statuses(outbox_ids: list[int]) -> dict[int, str]:
     if not ids:
         return {}
     placeholders = ",".join("?" for _ in ids)
-    rows = get_connection().execute(
-        f"SELECT id, status FROM mutation_outbox WHERE id IN ({placeholders})",
-        ids,
-    ).fetchall()
+    rows = (
+        get_connection()
+        .execute(
+            f"SELECT id, status FROM mutation_outbox WHERE id IN ({placeholders})",
+            ids,
+        )
+        .fetchall()
+    )
     return {int(row["id"]): str(row["status"]) for row in rows}
 
 
@@ -2126,13 +2747,19 @@ def record_merge_journal(
     return get_merge_journal(journal_id) or payload
 
 
-def update_merge_journal(journal_id: str, updates: dict, status: str | None = None) -> dict | None:
+def update_merge_journal(
+    journal_id: str, updates: dict, status: str | None = None
+) -> dict | None:
     """Update merge execution metadata without replacing the pre-merge snapshot."""
     with transaction():
-        row = get_connection().execute(
-            "SELECT status, data_json FROM merge_journal WHERE journal_id = ?",
-            (str(journal_id),),
-        ).fetchone()
+        row = (
+            get_connection()
+            .execute(
+                "SELECT status, data_json FROM merge_journal WHERE journal_id = ?",
+                (str(journal_id),),
+            )
+            .fetchone()
+        )
         if row is None:
             return None
         payload = json.loads(row["data_json"] or "{}")
@@ -2142,16 +2769,25 @@ def update_merge_journal(journal_id: str, updates: dict, status: str | None = No
         get_connection().execute(
             "UPDATE merge_journal SET status = ?, data_json = ?, updated_at = ? "
             "WHERE journal_id = ?",
-            (next_status, json.dumps(payload, ensure_ascii=False), now, str(journal_id)),
+            (
+                next_status,
+                json.dumps(payload, ensure_ascii=False),
+                now,
+                str(journal_id),
+            ),
         )
     return {**payload, "status": next_status}
 
 
 def get_merge_journal(journal_id: str) -> dict | None:
-    row = get_connection().execute(
-        "SELECT status, data_json, created_at, updated_at FROM merge_journal WHERE journal_id = ?",
-        (str(journal_id),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT status, data_json, created_at, updated_at FROM merge_journal WHERE journal_id = ?",
+            (str(journal_id),),
+        )
+        .fetchone()
+    )
     if row is None:
         return None
     payload = json.loads(row["data_json"] or "{}")
@@ -2208,7 +2844,11 @@ def fail_mutation_outbox(
         attempts = int(row["attempt_count"] or 0)
         terminal = attempts >= max(1, int(max_attempts))
         status = "failed" if terminal else "pending"
-        delay_seconds = 0.0 if terminal else max(0.0, float(backoff_base)) * (2 ** max(0, attempts - 1))
+        delay_seconds = (
+            0.0
+            if terminal
+            else max(0.0, float(backoff_base)) * (2 ** max(0, attempts - 1))
+        )
         available_at = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
         updated = conn.execute(
             "UPDATE mutation_outbox SET status = ?, last_error = ?, available_at = ?, "
@@ -2228,11 +2868,14 @@ def fail_mutation_outbox(
         )
         return status if updated.rowcount else "stale"
 
+
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
     import re
-    query = re.sub(r'[^\w\s\u4e00-\u9fa5]', ' ', query) if query else ""
+
+    query = re.sub(r"[^\w\s\u4e00-\u9fa5]", " ", query) if query else ""
     try:
         from vector_lake.tokenizer_runtime import tokenize_for_fts
+
         query_tok = tokenize_for_fts(query)
     except ImportError:
         query_tok = query if query else ""
@@ -2240,39 +2883,180 @@ def search_wiki(query: str, limit: int = 50) -> list[dict]:
     query_tok = query_tok.strip()
     if not query_tok:
         return []
-        
+
     query_esc = " ".join(f'"{t}"' for t in query_tok.split())
 
     conn = get_connection()
-    cur = conn.execute("""
+    cur = conn.execute(
+        """
         SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
         FROM wiki_search_index 
         WHERE wiki_search_index MATCH ? 
         ORDER BY rank LIMIT ?
-    """, (query_esc, limit))
+    """,
+        (query_esc, limit),
+    )
     return [dict(row) for row in cur.fetchall()]
+
 
 def get_processed_files() -> dict[str, str]:
     conn = get_connection()
     cur = conn.execute("SELECT filepath, file_hash FROM processed_files")
     return {row["filepath"]: row["file_hash"] for row in cur.fetchall()}
 
+
+def update_processed_file_observations(observations) -> int:
+    """Refresh changed stat hints for unchanged processed revisions in one write."""
+    rows = [
+        (
+            int(observed_mtime_ns),
+            int(observed_size),
+            str(filepath),
+            str(file_hash),
+            int(observed_mtime_ns),
+            int(observed_size),
+        )
+        for filepath, file_hash, observed_mtime_ns, observed_size in observations
+    ]
+    if not rows:
+        return 0
+    conn = get_connection()
+    with transaction():
+        before = conn.total_changes
+        conn.executemany(
+            "UPDATE processed_files "
+            "SET observed_mtime_ns = ?, observed_size = ? "
+            "WHERE filepath = ? AND file_hash = ? "
+            "AND (observed_mtime_ns IS NOT ? OR observed_size IS NOT ?)",
+            rows,
+        )
+        changed = conn.total_changes - before
+    return changed
+
+
+def update_processed_file_observation(
+    filepath: str,
+    file_hash: str,
+    observed_mtime_ns: int,
+    observed_size: int,
+) -> bool:
+    """Refresh stat metadata only when the canonical processed hash still matches."""
+    return (
+        update_processed_file_observations(
+            [(filepath, file_hash, observed_mtime_ns, observed_size)]
+        )
+        == 1
+    )
+
+
 def mark_file_processed(filepath: str, file_hash: str):
     from datetime import datetime, timezone
+
     conn = get_connection()
     now_str = datetime.now(timezone.utc).isoformat()
+    # The finalized hash belongs to the dispatched raw snapshot. Do not bind
+    # current filesystem metadata to it: the source may have changed in flight.
+    observed_mtime_ns = None
+    observed_size = None
     with transaction():
-        conn.execute("""
-            INSERT INTO processed_files (filepath, file_hash, processed_at)
-            VALUES (?, ?, ?)
+        conn.execute(
+            """
+            INSERT INTO processed_files (
+                filepath, file_hash, processed_at, observed_mtime_ns, observed_size
+            )
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(filepath) DO UPDATE SET
                 file_hash = excluded.file_hash,
-                processed_at = excluded.processed_at
-        """, (filepath, file_hash, now_str))
+                processed_at = excluded.processed_at,
+                observed_mtime_ns = excluded.observed_mtime_ns,
+                observed_size = excluded.observed_size
+        """,
+            (
+                filepath,
+                file_hash,
+                now_str,
+                observed_mtime_ns,
+                observed_size,
+            ),
+        )
 
-def enqueue_job(task_type: str, payload: dict, idempotency_key: str | None = None) -> str:
+
+def _ingest_identity_owner_is_releasable(
+    conn: sqlite3.Connection,
+    owner,
+    candidate_payload: dict,
+) -> bool:
+    """Apply one definition of terminal/recoverable ingest identity ownership."""
+    if owner is None or not isinstance(candidate_payload, dict):
+        return False
+    record = dict(owner)
+    if str(record.get("task_type") or "") != "ingest":
+        return False
+    status = str(record.get("status") or "")
+    try:
+        retries = int(record.get("retries") or 0)
+    except (TypeError, ValueError):
+        retries = 0
+    if status in {"cancelled", "superseded"} or (status == "failed" and retries >= 3):
+        return True
+    if status not in {"completed", "finalized"}:
+        return False
+    try:
+        previous_payload = json.loads(str(record.get("payload") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    same_revision = isinstance(previous_payload, dict) and all(
+        str(previous_payload.get(field) or "")
+        == str(candidate_payload.get(field) or "")
+        for field in ("filepath", "hash", "canonical_name")
+    )
+    if not same_revision:
+        return False
+    processed = conn.execute(
+        "SELECT file_hash FROM processed_files WHERE filepath = ?",
+        (str(candidate_payload.get("filepath") or ""),),
+    ).fetchone()
+    return processed is None or str(processed["file_hash"] or "") != str(
+        candidate_payload.get("hash") or ""
+    )
+
+
+def _release_releasable_ingest_identity_owner(
+    conn: sqlite3.Connection,
+    owner,
+    idempotency_key: str,
+    candidate_payload: dict,
+    now: str,
+) -> bool:
+    """CAS-release only an owner proven terminal or no longer durable."""
+    if not _ingest_identity_owner_is_releasable(conn, owner, candidate_payload):
+        return False
+    record = dict(owner)
+    cursor = conn.execute(
+        "UPDATE jobs SET idempotency_key = NULL, updated_at = ? "
+        "WHERE job_id = ? AND task_type = 'ingest' AND idempotency_key = ? "
+        "AND status IS ? AND retries IS ? AND payload IS ? AND updated_at IS ?",
+        (
+            str(now),
+            str(record.get("job_id") or ""),
+            str(idempotency_key),
+            record.get("status"),
+            record.get("retries"),
+            record.get("payload"),
+            record.get("updated_at"),
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("Ingest identity owner changed before CAS release")
+    return True
+
+
+def enqueue_job(
+    task_type: str, payload: dict, idempotency_key: str | None = None
+) -> str:
     import uuid
     from datetime import datetime, timezone
+
     init_db()
     conn = get_connection()
     job_id = uuid.uuid4().hex
@@ -2281,22 +3065,113 @@ def enqueue_job(task_type: str, payload: dict, idempotency_key: str | None = Non
     with transaction():
         if key:
             existing = conn.execute(
-                "SELECT job_id FROM jobs WHERE idempotency_key = ?",
+                "SELECT job_id, task_type, status, retries, payload, updated_at "
+                "FROM jobs WHERE idempotency_key = ?",
                 (key,),
             ).fetchone()
-            if existing:
+            if existing and not _release_releasable_ingest_identity_owner(
+                conn,
+                existing,
+                key,
+                payload,
+                now_str,
+            ):
                 return str(existing["job_id"])
-        conn.execute("""
+        if task_type == "ingest" and isinstance(payload, dict):
+            filepath = str(payload.get("filepath") or "")
+            if filepath:
+                superseded_rows = conn.execute(
+                    "SELECT job_id, task_packet_path FROM jobs "
+                    "WHERE task_type = 'ingest' "
+                    "AND CASE WHEN json_valid(payload) "
+                    "THEN json_extract(payload, '$.filepath') END = ? "
+                    "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
+                    "'subagent_processing') OR "
+                    "(status = 'failed' AND COALESCE(retries, 0) < 3))",
+                    (filepath,),
+                ).fetchall()
+                if superseded_rows:
+                    reason = (
+                        "Superseded by newer raw source version "
+                        f"before ingest completion: {job_id}"
+                    )
+                    result_json = json.dumps(
+                        {"superseded_by": job_id},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    conn.execute(
+                        "UPDATE jobs SET status = 'superseded', "
+                        "idempotency_key = NULL, error_msg = ?, result_json = ?, "
+                        "updated_at = ?, completed_at = ?, available_at = NULL, "
+                        "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+                        "WHERE task_type = 'ingest' "
+                        "AND CASE WHEN json_valid(payload) "
+                        "THEN json_extract(payload, '$.filepath') END = ? "
+                        "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
+                        "'subagent_processing') OR "
+                        "(status = 'failed' AND COALESCE(retries, 0) < 3))",
+                        (reason, result_json, now_str, now_str, filepath),
+                    )
+                    for superseded in superseded_rows:
+                        packet_path = str(superseded["task_packet_path"] or "").strip()
+                        if packet_path:
+                            enqueue_ingest_task_cleanup(
+                                str(superseded["job_id"]),
+                                packet_path,
+                            )
+        conn.execute(
+            """
             INSERT INTO jobs (job_id, task_type, payload, status, created_at, updated_at, available_at, idempotency_key)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job_id, task_type, json.dumps(payload, ensure_ascii=False), "queued", now_str, now_str, now_str, key))
+        """,
+            (
+                job_id,
+                task_type,
+                json.dumps(payload, ensure_ascii=False),
+                "queued",
+                now_str,
+                now_str,
+                now_str,
+                key,
+            ),
+        )
     return job_id
+
+
+def _current_ingest_contract_sql(payload_column: str = "payload") -> str:
+    """Return the shared SQLite predicate for a dispatchable ingest payload."""
+    if payload_column != "payload":
+        raise ValueError("Only the jobs.payload column is supported")
+    return (
+        "CASE WHEN json_valid(payload) = 0 THEN 0 "
+        "WHEN COALESCE(json_type(payload), '') <> 'object' THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.filepath'), '') <> 'text' THEN 0 "
+        "WHEN COALESCE(TRIM(json_extract(payload, '$.filepath')), '') = '' THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.hash'), '') <> 'text' THEN 0 "
+        "WHEN COALESCE(TRIM(json_extract(payload, '$.hash')), '') = '' THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.canonical_name'), '') <> 'text' THEN 0 "
+        "WHEN COALESCE(TRIM(json_extract(payload, '$.canonical_name')), '') = '' THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.instructions'), '') <> 'text' THEN 0 "
+        "WHEN COALESCE(TRIM(json_extract(payload, '$.instructions')), '') = '' THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.source_hash'), '') <> 'text' THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.source_projection_hash'), '') <> 'text' "
+        "THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.integration_candidates'), '') "
+        "<> 'array' THEN 0 "
+        "WHEN COALESCE(CAST(json_extract("
+        "payload, '$.ingest_contract_version') AS TEXT), '') <> ? THEN 0 "
+        "ELSE 1 END = 1"
+    )
 
 
 def claim_pending_jobs(
     limit: int = 10,
     lease_seconds: int = 300,
     lease_owner: str | None = None,
+    *,
+    task_type: str | None = None,
+    required_ingest_contract_version: int | None = None,
 ) -> list[dict]:
     """Fence dispatch work so an expired worker cannot publish a stale handoff."""
     import secrets
@@ -2309,6 +3184,27 @@ def claim_pending_jobs(
         or os.environ.get("VECTOR_LAKE_INGEST_WORKER_RUN_ID")
         or f"{socket.gethostname()}:{os.getpid()}"
     )
+    effective_task_type = None if task_type is None else str(task_type).strip()
+    if task_type is not None and not effective_task_type:
+        raise ValueError("task_type must be non-empty when supplied")
+    contract_version = None
+    if required_ingest_contract_version is not None:
+        contract_version = int(required_ingest_contract_version)
+        if contract_version < 1:
+            raise ValueError("required_ingest_contract_version must be positive")
+        if effective_task_type not in (None, "ingest"):
+            raise ValueError("ingest contract filtering requires task_type='ingest'")
+        effective_task_type = "ingest"
+
+    scope_sql = ""
+    scope_params: list[object] = []
+    if effective_task_type is not None:
+        scope_sql += " AND task_type = ?"
+        scope_params.append(effective_task_type)
+    if contract_version is not None:
+        scope_sql += f" AND ({_current_ingest_contract_sql()})"
+        scope_params.append(str(contract_version))
+
     with transaction():
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
@@ -2317,10 +3213,12 @@ def claim_pending_jobs(
         ).isoformat()
         rows = conn.execute(
             "SELECT job_id FROM jobs WHERE "
-            "((status IN ('queued', 'failed') AND retries < 3 AND COALESCE(available_at, created_at, '') <= ?) "
-            "OR (status = 'dispatched' AND COALESCE(lease_until, '') <= ?)) "
-            "ORDER BY created_at ASC LIMIT ?",
-            (now, now, max(1, int(limit))),
+            "((status IN ('queued', 'failed') AND COALESCE(retries, 0) < 3 "
+            "AND COALESCE(available_at, created_at, '') <= ?) "
+            "OR (status = 'dispatched' AND COALESCE(lease_until, '') <= ?))"
+            + scope_sql
+            + " ORDER BY created_at ASC LIMIT ?",
+            (now, now, *scope_params, max(1, int(limit))),
         ).fetchall()
         claimed: list[dict] = []
         for row in rows:
@@ -2331,10 +3229,21 @@ def claim_pending_jobs(
                 "lease_owner = ?, lease_token = ?, "
                 "lease_generation = COALESCE(lease_generation, 0) + 1, "
                 "updated_at = ? WHERE job_id = ? AND ("
-                "(status IN ('queued', 'failed') AND retries < 3 "
+                "(status IN ('queued', 'failed') "
+                "AND COALESCE(retries, 0) < 3 "
                 "AND COALESCE(available_at, created_at, '') <= ?) OR "
-                "(status = 'dispatched' AND COALESCE(lease_until, '') <= ?))",
-                (lease_until, owner, token, now, job_id, now, now),
+                "(status = 'dispatched' AND COALESCE(lease_until, '') <= ?))"
+                + scope_sql,
+                (
+                    lease_until,
+                    owner,
+                    token,
+                    now,
+                    job_id,
+                    now,
+                    now,
+                    *scope_params,
+                ),
             )
             if cursor.rowcount != 1:
                 continue
@@ -2349,12 +3258,17 @@ def claim_pending_jobs(
 
 def get_pending_jobs(limit: int = 10) -> list[dict]:
     conn = get_connection()
-    cur = conn.execute("""
+    cur = conn.execute(
+        """
         SELECT * FROM jobs 
-        WHERE status = 'queued' OR (status = 'failed' AND retries < 3)
+        WHERE status = 'queued'
+        OR (status = 'failed' AND COALESCE(retries, 0) < 3)
         ORDER BY created_at ASC LIMIT ?
-    """, (limit,))
+    """,
+        (limit,),
+    )
     return [dict(row) for row in cur.fetchall()]
+
 
 def get_jobs_by_status(statuses: list[str], limit: int = 20) -> list[dict]:
     if not statuses:
@@ -2367,6 +3281,7 @@ def get_jobs_by_status(statuses: list[str], limit: int = 20) -> list[dict]:
         [*statuses, max(1, int(limit))],
     ).fetchall()
     return [dict(row) for row in rows]
+
 
 def _dispatch_lease_credentials(
     lease_owner: str | None,
@@ -2502,7 +3417,14 @@ def mark_job_awaiting_subagent(
         if cursor.rowcount != 1:
             return False
         if current_packet_path and current_packet_path != next_packet_path:
-            enqueue_ingest_task_cleanup(str(job_id), current_packet_path)
+            from vector_lake.native_llm import resolve_subagent_task_path
+
+            try:
+                controlled_packet = resolve_subagent_task_path(current_packet_path)
+            except ValueError:
+                controlled_packet = None
+            if controlled_packet is not None:
+                enqueue_ingest_task_cleanup(str(job_id), str(controlled_packet))
         return True
 
 
@@ -2692,6 +3614,8 @@ def claim_subagent_jobs(
     limit: int = 10,
     lease_seconds: int = 3600,
     lease_owner: str | None = None,
+    *,
+    required_ingest_contract_version: int | None = None,
 ) -> list[dict]:
     """Lease ingest tasks to one host subagent consumer at a time."""
     import os
@@ -2708,13 +3632,22 @@ def claim_subagent_jobs(
         or os.environ.get("VECTOR_LAKE_SUBAGENT_RUN_ID")
         or f"{socket.gethostname()}:{os.getpid()}"
     )
+    scope_sql = ""
+    scope_params: list[object] = []
+    if required_ingest_contract_version is not None:
+        contract_version = int(required_ingest_contract_version)
+        if contract_version < 1:
+            raise ValueError("required_ingest_contract_version must be positive")
+        scope_sql = f" AND ({_current_ingest_contract_sql()})"
+        scope_params.append(str(contract_version))
     with transaction():
         rows = conn.execute(
             "SELECT job_id FROM jobs WHERE task_type = 'ingest' AND "
             "(status = 'awaiting_subagent' OR "
-            "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?)) "
-            "ORDER BY created_at ASC LIMIT ?",
-            (now, max(1, int(limit))),
+            "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?))"
+            + scope_sql
+            + " ORDER BY created_at ASC LIMIT ?",
+            (now, *scope_params, max(1, int(limit))),
         ).fetchall()
         job_ids = [str(row["job_id"]) for row in rows]
         if not job_ids:
@@ -2727,30 +3660,183 @@ def claim_subagent_jobs(
                 "lease_owner = ?, lease_token = ?, "
                 "lease_generation = COALESCE(lease_generation, 0) + 1, updated_at = ? "
                 "WHERE job_id = ? AND (status = 'awaiting_subagent' OR "
-                "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?))",
-                (lease_until, owner, lease_token, now, job_id, now),
+                "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?))"
+                + scope_sql,
+                (
+                    lease_until,
+                    owner,
+                    lease_token,
+                    now,
+                    job_id,
+                    now,
+                    *scope_params,
+                ),
             )
             if cursor.rowcount != 1:
                 continue
-            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
             if row is not None:
                 claimed.append(dict(row))
         return claimed
 
 
+def replace_ingest_subagent_task_packet(
+    job_id: str,
+    task_packet_path: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+) -> bool:
+    """Replace a bad packet pointer only while its subagent lease is current."""
+    lease = _dispatch_lease_credentials(
+        lease_owner,
+        lease_token,
+        lease_generation,
+    )
+    if lease is None:
+        raise ValueError("subagent lease credentials are required")
+    owner, token, generation = lease
+    next_packet_path = str(Path(task_packet_path).resolve())
+    conn = get_connection()
+    with transaction():
+        now = datetime.now(timezone.utc).isoformat()
+        row = conn.execute(
+            "SELECT task_packet_path FROM jobs WHERE job_id = ? "
+            "AND task_type = 'ingest' AND status = 'subagent_processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (str(job_id), owner, token, generation, now),
+        ).fetchone()
+        if row is None:
+            return False
+        current_packet_path = str(row["task_packet_path"] or "")
+        cursor = conn.execute(
+            "UPDATE jobs SET task_packet_path = ?, error_msg = ?, updated_at = ? "
+            "WHERE job_id = ? AND task_type = 'ingest' "
+            "AND status = 'subagent_processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ? AND task_packet_path IS ?",
+            (
+                next_packet_path,
+                f"Subagent task packet repaired: {next_packet_path}",
+                now,
+                str(job_id),
+                owner,
+                token,
+                generation,
+                now,
+                row["task_packet_path"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            return False
+        if current_packet_path and current_packet_path != next_packet_path:
+            from vector_lake.native_llm import resolve_subagent_task_path
+
+            try:
+                controlled_packet = resolve_subagent_task_path(current_packet_path)
+            except ValueError:
+                controlled_packet = None
+            if controlled_packet is not None:
+                enqueue_ingest_task_cleanup(str(job_id), str(controlled_packet))
+        return True
+
+
+def fail_ingest_subagent_task_claim(
+    job_id: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+    error_msg: str,
+) -> bool:
+    """Release an unrepaired bad-packet claim under its exact current lease."""
+    lease = _dispatch_lease_credentials(
+        lease_owner,
+        lease_token,
+        lease_generation,
+    )
+    if lease is None:
+        raise ValueError("subagent lease credentials are required")
+    owner, token, generation = lease
+    conn = get_connection()
+    with transaction():
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        row = conn.execute(
+            "SELECT retries FROM jobs WHERE job_id = ? "
+            "AND task_type = 'ingest' AND status = 'subagent_processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (str(job_id), owner, token, generation, now),
+        ).fetchone()
+        if row is None:
+            return False
+        next_retry = int(row["retries"] or 0) + 1
+        terminal = next_retry >= 3
+        available_at = (
+            now_dt + timedelta(seconds=5 * (2 ** max(0, next_retry - 1)))
+        ).isoformat()
+        result_json = (
+            json.dumps(
+                {
+                    "maintenance": "ingest_task_packet_repair",
+                    "state": "blocked",
+                    "reason": str(error_msg)[:4000],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if terminal
+            else None
+        )
+        cursor = conn.execute(
+            "UPDATE jobs SET status = 'failed', retries = ?, error_msg = ?, "
+            "updated_at = ?, available_at = ?, completed_at = ?, result_json = ?, "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+            "idempotency_key = CASE WHEN ? THEN NULL ELSE idempotency_key END "
+            "WHERE job_id = ? AND task_type = 'ingest' "
+            "AND status = 'subagent_processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (
+                next_retry,
+                str(error_msg)[:4000],
+                now,
+                available_at,
+                now if terminal else None,
+                result_json,
+                int(terminal),
+                str(job_id),
+                owner,
+                token,
+                generation,
+                now,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
 def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     """Bind finalization to the exact leased job payload."""
     init_db()
-    row = get_connection().execute(
-        "SELECT * FROM jobs WHERE job_id = ?",
-        (str(job_id),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (str(job_id),),
+        )
+        .fetchone()
+    )
     if row is None:
         raise ValueError(f"Unknown ingest job: {job_id}")
     if row["task_type"] != "ingest":
         raise ValueError(f"Job {job_id} is not an ingest job")
     if row["status"] != "subagent_processing":
-        raise ValueError(f"Job {job_id} cannot be finalized from status {row['status']}")
+        raise ValueError(
+            f"Job {job_id} cannot be finalized from status {row['status']}"
+        )
     lease_token = str(processed_data.get("lease_token") or "")
     expected_token = str(row["lease_token"] or "")
     if not lease_token or lease_token != expected_token:
@@ -2764,8 +3850,12 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Job {job_id} requires a valid lease_generation") from exc
     if lease_generation != int(row["lease_generation"] or 0):
-        raise ValueError(f"Job {job_id} lease_generation does not match the current lease")
-    lease_until = datetime.fromisoformat(str(row["lease_until"] or "").replace("Z", "+00:00"))
+        raise ValueError(
+            f"Job {job_id} lease_generation does not match the current lease"
+        )
+    lease_until = datetime.fromisoformat(
+        str(row["lease_until"] or "").replace("Z", "+00:00")
+    )
     if lease_until.tzinfo is None:
         lease_until = lease_until.replace(tzinfo=timezone.utc)
     if lease_until <= datetime.now(timezone.utc):
@@ -2780,17 +3870,50 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     expected_name = str(payload.get("canonical_name") or "")
     supplied_name = str(processed_data.get("canonical_name") or "")
     if expected_name and supplied_name != expected_name:
-        raise ValueError(f"Job {job_id} canonical_name does not match its queued payload")
+        raise ValueError(
+            f"Job {job_id} canonical_name does not match its queued payload"
+        )
     expected_source_hash = str(payload.get("source_hash") or "")
     supplied_source_hash = str(processed_data.get("source_hash") or "")
     if supplied_source_hash != expected_source_hash:
         raise ValueError(f"Job {job_id} source_hash does not match its queued payload")
+    queued_projection_hash = payload.get("source_projection_hash")
+    try:
+        projection_binding_required = (
+            int(payload.get("ingest_contract_version") or 0) >= 3
+        )
+    except (TypeError, ValueError):
+        projection_binding_required = False
+    if queued_projection_hash is None and (
+        expected_source_hash or projection_binding_required
+    ):
+        raise ValueError(
+            f"Job {job_id} is missing a source_projection_hash baseline; requeue it"
+        )
+    expected_projection_hash = str(queued_projection_hash or "")
+    supplied_projection_hash = str(processed_data.get("source_projection_hash") or "")
+    if supplied_projection_hash != expected_projection_hash:
+        raise ValueError(
+            f"Job {job_id} source_projection_hash does not match its queued payload"
+        )
     expected_contract_version = payload.get("ingest_contract_version")
+    try:
+        candidate_binding_required = int(expected_contract_version or 0) >= 4
+    except (TypeError, ValueError):
+        candidate_binding_required = False
+    if candidate_binding_required and not isinstance(
+        payload.get("integration_candidates"), list
+    ):
+        raise ValueError(
+            f"Job {job_id} is missing its integration_candidates dispatch manifest"
+        )
     if expected_contract_version is not None and (
         str(processed_data.get("ingest_contract_version") or "")
         != str(expected_contract_version)
     ):
-        raise ValueError(f"Job {job_id} ingest_contract_version does not match its queued payload")
+        raise ValueError(
+            f"Job {job_id} ingest_contract_version does not match its queued payload"
+        )
     result = dict(row)
     result["parsed_payload"] = payload
     return result
@@ -2826,11 +3949,14 @@ def finalize_ingest_job(
     if cursor.rowcount != 1:
         raise ValueError(f"Ingest job {job_id} is no longer finalizable")
 
+
 def expire_stale_subagent_jobs(max_age_seconds: int = 86400) -> int:
     """Expire stale handoffs while durably retaining cleanup for their packets."""
     init_db()
     conn = get_connection()
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(1, int(max_age_seconds)))).isoformat()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=max(1, int(max_age_seconds)))
+    ).isoformat()
     now_str = datetime.now(timezone.utc).isoformat()
     with transaction():
         rows = conn.execute(
@@ -2843,13 +3969,15 @@ def expire_stale_subagent_jobs(max_age_seconds: int = 86400) -> int:
             if packet_path:
                 enqueue_ingest_task_cleanup(str(row["job_id"]), packet_path)
         cursor = conn.execute(
-            "UPDATE jobs SET status = 'failed', retries = retries + 1, "
+            "UPDATE jobs SET status = 'failed', "
+            "retries = COALESCE(retries, 0) + 1, "
             "error_msg = 'Subagent task packet expired before finalization', updated_at = ?, "
             "available_at = ?, lease_until = NULL, lease_owner = NULL, lease_token = NULL "
             "WHERE status = 'awaiting_subagent' AND updated_at < ?",
             (now_str, now_str, cutoff),
         )
         return int(cursor.rowcount or 0)
+
 
 def update_job_status(
     job_id: str,
@@ -2903,12 +4031,12 @@ def update_job_status(
         if status == "failed":
             next_retry = int(row["retries"] or 0) + 1
             available_at = (
-                now_dt
-                + timedelta(seconds=5 * (2 ** max(0, next_retry - 1)))
+                now_dt + timedelta(seconds=5 * (2 ** max(0, next_retry - 1)))
             ).isoformat()
             cursor = conn.execute(
                 "UPDATE jobs SET status = ?, error_msg = ?, updated_at = ?, "
-                "retries = retries + 1, available_at = ?, lease_until = NULL, "
+                "retries = COALESCE(retries, 0) + 1, available_at = ?, "
+                "lease_until = NULL, "
                 "lease_owner = NULL, lease_token = NULL "
                 f"WHERE {update_predicate}",
                 (
@@ -2938,7 +4066,7 @@ def update_job_status(
 
 
 def backup_database(destination_path: str | Path | None = None):
-    """Create a transactionally consistent SQLite backup of the active database."""
+    """Create a transactionally consistent, standalone SQLite backup."""
     import time
 
     if not get_db_path().exists():
@@ -2953,9 +4081,28 @@ def backup_database(destination_path: str | Path | None = None):
     destination = sqlite3.connect(str(backup_path))
     try:
         get_connection().backup(destination)
+        journal_mode = str(
+            destination.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        ).casefold()
+        if journal_mode != "delete":
+            raise RuntimeError(
+                "SQLite backup journal mode conversion failed: "
+                f"expected delete, observed {journal_mode or '<empty>'}"
+            )
         integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise RuntimeError(f"SQLite backup integrity check failed: {integrity}")
     finally:
         destination.close()
+
+    sidecars = [
+        Path(f"{backup_path}{suffix}")
+        for suffix in ("-wal", "-shm")
+        if Path(f"{backup_path}{suffix}").exists()
+    ]
+    if sidecars:
+        raise RuntimeError(
+            "SQLite backup is not standalone; sidecar files remain: "
+            + ", ".join(str(path) for path in sidecars)
+        )
     return str(backup_path)

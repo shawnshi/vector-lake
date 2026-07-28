@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import logging
 import os
 import sqlite3
 import subprocess
@@ -14,7 +15,12 @@ import anyio
 import pytest
 
 from vector_lake import governance_store, mcp_server, mutation_coordinator
-from vector_lake.tool_search import SearchIndexError, format_operational_memory_results, search_vector_lake
+from vector_lake.tool_search import (
+    SearchIndexError,
+    format_operational_memory_results,
+    search_vector_lake,
+)
+from vector_lake.tool_ingest import get_ingest_target_directories
 from vector_lake.index_snapshot import clear_index_snapshot_cache_for_tests
 from vector_lake.watchdog_app import _watch_directories
 from vector_lake.wiki_utils import (
@@ -62,6 +68,7 @@ def test_signal_and_watch_paths_follow_active_memory_root(isolated_memory):
         "wiki": get_wiki_dir(),
         "raw": get_raw_dir(),
         "diary": get_raw_dir() / "privacy" / "Diary",
+        "raw_targets": get_ingest_target_directories(collapse_nested=True),
     }
 
     mutation_coordinator._signal_outbox_consumer()
@@ -102,9 +109,7 @@ def test_explicit_meta_dir_override_is_stable_and_cache_keyed(tmp_path, monkeypa
     assert second_meta.is_dir()
 
 
-def test_explicit_meta_dir_override_fails_closed_when_unwritable(
-    tmp_path, monkeypatch
-):
+def test_explicit_meta_dir_override_fails_closed_when_unwritable(tmp_path, monkeypatch):
     from vector_lake import wiki_utils
 
     wiki_utils._META_DIR_CACHE = None
@@ -121,9 +126,7 @@ def test_explicit_meta_dir_override_fails_closed_when_unwritable(
         get_meta_dir()
 
 
-def test_meta_dir_reuses_existing_fallback_before_empty_primary(
-    tmp_path, monkeypatch
-):
+def test_meta_dir_reuses_existing_fallback_before_empty_primary(tmp_path, monkeypatch):
     from vector_lake import wiki_utils
 
     wiki_utils._META_DIR_CACHE = None
@@ -135,9 +138,7 @@ def test_meta_dir_reuses_existing_fallback_before_empty_primary(
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(memory_root))
     monkeypatch.delenv("VECTOR_LAKE_META_DIR", raising=False)
     monkeypatch.setattr(wiki_utils, "get_extension_root", lambda: tmp_path)
-    monkeypatch.setattr(
-        wiki_utils, "_uses_legacy_default_memory_root", lambda: True
-    )
+    monkeypatch.setattr(wiki_utils, "_uses_legacy_default_memory_root", lambda: True)
     verified = []
 
     def verify(candidate):
@@ -166,9 +167,7 @@ def test_primary_meta_override_refuses_to_strand_existing_fallback(
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(memory_root))
     monkeypatch.setenv("VECTOR_LAKE_META_DIR", str(primary))
     monkeypatch.setattr(wiki_utils, "get_extension_root", lambda: tmp_path)
-    monkeypatch.setattr(
-        wiki_utils, "_uses_legacy_default_memory_root", lambda: True
-    )
+    monkeypatch.setattr(wiki_utils, "_uses_legacy_default_memory_root", lambda: True)
 
     with pytest.raises(RuntimeError, match="Refusing to create a second"):
         get_meta_dir()
@@ -217,9 +216,7 @@ def test_existing_meta_fallback_requires_explicit_opt_in(tmp_path, monkeypatch):
     monkeypatch.delenv("VECTOR_LAKE_META_DIR", raising=False)
     monkeypatch.setenv("VECTOR_LAKE_ALLOW_META_FALLBACK", "1")
     monkeypatch.setattr(wiki_utils, "get_extension_root", lambda: tmp_path)
-    monkeypatch.setattr(
-        wiki_utils, "_uses_legacy_default_memory_root", lambda: True
-    )
+    monkeypatch.setattr(wiki_utils, "_uses_legacy_default_memory_root", lambda: True)
 
     def verify(candidate):
         if candidate == primary:
@@ -310,6 +307,36 @@ def test_reload_aware_dispatch_rejects_stale_source_tree(tmp_path):
         anyio.run(server.call_tool, "any_tool", {})
 
 
+def test_mcp_runtime_status_remains_callable_after_source_revision_drift(tmp_path):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_text("VALUE = 1\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=60,
+    )
+    server = mcp_server.ReloadAwareFastMCP(
+        "stale-runtime-status-test",
+        runtime_guard=guard,
+    )
+
+    @server.tool()
+    def mcp_runtime_status() -> str:
+        return mcp_server.json.dumps(guard.status(force=True))
+
+    source_path.write_text("VALUE = 2\n", encoding="utf-8")
+    try:
+        result = anyio.run(server.call_tool, "mcp_runtime_status", {})
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    unstructured = result[0] if isinstance(result, tuple) else result
+    status = mcp_server.json.loads(unstructured[0].text)
+    assert status["stale"] is True
+    assert status["restart_required"] is True
+
+
 def test_mcp_sync_tools_run_off_the_event_loop(tmp_path):
     package_root = tmp_path / "vector_lake"
     package_root.mkdir()
@@ -351,6 +378,103 @@ def test_mcp_sync_tools_run_off_the_event_loop(tmp_path):
         server._blocking_executor.shutdown(wait=True, cancel_futures=True)
 
     assert results
+
+
+def test_queued_sync_tool_rechecks_source_revision_at_execution(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "1")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=60,
+    )
+    server = mcp_server.ReloadAwareFastMCP(
+        "queued-stale-test",
+        runtime_guard=guard,
+    )
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    tool_ran = threading.Event()
+    blocker = server._submit_blocking_call(
+        lambda: blocker_started.set() or release_blocker.wait(timeout=2)
+    )
+    assert blocker_started.wait(timeout=2)
+
+    @server.tool()
+    def queued_probe() -> str:
+        tool_ran.set()
+        return "must-not-run"
+
+    registered = server._tool_manager.get_tool("queued_probe")
+
+    async def scenario():
+        assert registered is not None
+        task = asyncio.create_task(registered.fn())
+        with anyio.fail_after(2):
+            while server._blocking_executor.queued_work_items() < 1:
+                await anyio.sleep(0.005)
+        source_path.write_text("VALUE = 2\n", encoding="utf-8")
+        release_blocker.set()
+        with pytest.raises(RuntimeError, match="restart"):
+            await task
+
+    try:
+        anyio.run(scenario)
+        blocker.result(timeout=2)
+    finally:
+        release_blocker.set()
+        server.shutdown_blocking_executor(wait=True)
+
+    assert tool_ran.is_set() is False
+
+
+def test_mcp_async_admission_wait_keeps_event_loop_responsive(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "0")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS", "0.5")
+    guard = mcp_server.MCPRuntimeGuard(
+        tmp_path,
+        check_interval_seconds=60,
+    )
+    server = mcp_server.ReloadAwareFastMCP(
+        "async-admission-test",
+        runtime_guard=guard,
+    )
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    blocker = server._submit_blocking_call(
+        lambda: blocker_started.set() or release_blocker.wait(timeout=2)
+    )
+    assert blocker_started.wait(timeout=2)
+
+    async def scenario():
+        started_at = time.monotonic()
+        waiter = asyncio.create_task(server._run_blocking_call(lambda: None))
+        await asyncio.sleep(0.02)
+        heartbeat_at = time.monotonic() - started_at
+        with pytest.raises(RuntimeError, match="saturated"):
+            await waiter
+        rejected_at = time.monotonic() - started_at
+        return heartbeat_at, rejected_at
+
+    try:
+        heartbeat_at, rejected_at = anyio.run(scenario)
+    finally:
+        release_blocker.set()
+        blocker.result(timeout=2)
+        server.shutdown_blocking_executor(wait=True)
+
+    assert heartbeat_at < 0.2
+    assert rejected_at >= 0.4
 
 
 def test_mcp_worker_reuses_clean_connection_and_closes_open_transaction(
@@ -606,11 +730,232 @@ def test_mcp_executor_shutdown_is_idempotent_and_stops_workers(tmp_path):
         server._blocking_executor.submit_tracked(lambda: None, lambda: None)
 
 
+def test_mcp_normal_transport_exit_waits_for_running_blocking_call(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_SHUTDOWN_TIMEOUT_SECONDS", "2")
+    transport_ended = threading.Event()
+
+    def end_transport(self, transport="stdio", mount_path=None):
+        transport_ended.set()
+        return "transport-ended"
+
+    monkeypatch.setattr(mcp_server.FastMCP, "run", end_transport)
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "graceful-exit-test",
+        runtime_guard=guard,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    future = server._submit_blocking_call(
+        lambda: started.set() or release.wait(timeout=2)
+    )
+    assert started.wait(timeout=2)
+    result = []
+    runner = threading.Thread(target=lambda: result.append(server.run()))
+    runner.start()
+
+    assert transport_ended.wait(timeout=2)
+    assert runner.is_alive()
+    release.set()
+    runner.join(timeout=2)
+
+    assert not runner.is_alive()
+    assert result == ["transport-ended"]
+    assert future.result(timeout=2) is True
+    status = server.blocking_executor_status()
+    assert status["shutdown_started"] is True
+    assert status["shutdown_completed"] is True
+    assert status["shutdown_timed_out"] is False
+    assert status["shutdown_timeout_seconds"] == 2.0
+
+
+def test_mcp_transport_exit_timeout_never_blocks_indefinitely(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_SHUTDOWN_TIMEOUT_SECONDS", "0.1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "1")
+    monkeypatch.setattr(
+        mcp_server.FastMCP,
+        "run",
+        lambda self, transport="stdio", mount_path=None: "transport-ended",
+    )
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "bounded-exit-test",
+        runtime_guard=guard,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    future = server._submit_blocking_call(
+        lambda: started.set() or release.wait(timeout=2)
+    )
+    assert started.wait(timeout=2)
+    queued = server._submit_blocking_call(lambda: "must-not-run")
+
+    started_at = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        assert server.run() == "transport-ended"
+    elapsed = time.monotonic() - started_at
+
+    try:
+        assert elapsed < 1
+        status = server.blocking_executor_status()
+        assert status["shutdown_started"] is True
+        assert status["shutdown_completed"] is False
+        assert status["shutdown_timed_out"] is True
+        assert status["queued_items"] == 0
+        assert queued.cancelled() is True
+        assert "did not drain" in caplog.text
+    finally:
+        release.set()
+        assert future.result(timeout=2) is True
+        deadline = time.monotonic() + 2
+        final_status = server.blocking_executor_status()
+        while not final_status["shutdown_completed"] and time.monotonic() < deadline:
+            time.sleep(0.005)
+            final_status = server.blocking_executor_status()
+        assert final_status["shutdown_completed"] is True
+        assert final_status["shutdown_timed_out"] is True
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+
+def test_daemon_executor_cancel_callback_runs_outside_state_lock():
+    executor = mcp_server._DaemonThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="lock-order-test",
+    )
+    started = threading.Event()
+    release = threading.Event()
+    callback_finished = threading.Event()
+    snapshots = []
+    running = executor.submit_tracked(
+        lambda: started.set() or release.wait(timeout=2),
+        lambda: None,
+    )
+    assert started.wait(timeout=2)
+    queued = executor.submit_tracked(
+        lambda: "must-not-run",
+        lambda: (
+            snapshots.append(executor.status_snapshot()),
+            callback_finished.set(),
+        ),
+    )
+
+    shutdown_thread = threading.Thread(
+        target=lambda: executor.shutdown(wait=False, cancel_futures=True)
+    )
+    shutdown_thread.start()
+    try:
+        assert callback_finished.wait(timeout=2)
+        shutdown_thread.join(timeout=2)
+        assert not shutdown_thread.is_alive()
+        assert queued.cancelled() is True
+        assert snapshots[0]["queued_items"] == 0
+    finally:
+        release.set()
+        shutdown_thread.join(timeout=2)
+        assert running.result(timeout=2) is True
+        executor.shutdown(wait=True, timeout=2)
+
+
+def test_mcp_status_snapshots_executor_before_server_lock(tmp_path, monkeypatch):
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "status-lock-order-test",
+        runtime_guard=guard,
+    )
+    original_snapshot = server._blocking_executor.status_snapshot
+    server_lock_was_free = []
+
+    def inspected_snapshot():
+        acquired = server._executor_shutdown_lock.acquire(blocking=False)
+        server_lock_was_free.append(acquired)
+        if acquired:
+            server._executor_shutdown_lock.release()
+        return original_snapshot()
+
+    monkeypatch.setattr(
+        server._blocking_executor,
+        "status_snapshot",
+        inspected_snapshot,
+    )
+    try:
+        status = server.blocking_executor_status()
+        assert status["queued_items"] == 0
+        assert server_lock_was_free == [True]
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+
+@pytest.mark.parametrize("invalid_timeout", [-1, float("nan"), "invalid"])
+def test_mcp_invalid_manual_shutdown_timeout_does_not_poison_server(
+    tmp_path,
+    invalid_timeout,
+):
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "invalid-shutdown-timeout-test",
+        runtime_guard=guard,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="finite non-negative"):
+            server.shutdown_blocking_executor(
+                wait=True,
+                timeout=invalid_timeout,
+            )
+        status = server.blocking_executor_status()
+        assert status["shutdown_started"] is False
+        assert (
+            server._submit_blocking_call(lambda: "still-running").result(timeout=2)
+            == "still-running"
+        )
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("configured_timeout", "expected_timeout"),
+    (("-10", 0.1), ("999", 30.0)),
+)
+def test_mcp_shutdown_timeout_configuration_is_bounded(
+    tmp_path,
+    monkeypatch,
+    configured_timeout,
+    expected_timeout,
+):
+    monkeypatch.setenv(
+        "VECTOR_LAKE_MCP_SHUTDOWN_TIMEOUT_SECONDS",
+        configured_timeout,
+    )
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "shutdown-timeout-bound-test",
+        runtime_guard=guard,
+    )
+
+    try:
+        status = server.blocking_executor_status()
+        assert status["shutdown_timeout_seconds"] == expected_timeout
+        assert status["shutdown_completed"] is False
+        assert status["shutdown_timed_out"] is False
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+
 def test_mcp_running_worker_does_not_delay_process_exit(tmp_path):
     child_memory = tmp_path / "child-memory"
     child_meta = tmp_path / "child-meta"
+    child_ready = tmp_path / "child-worker-ready"
     script = "\n".join(
         (
+            "import os",
             "import threading",
             "from pathlib import Path",
             "from vector_lake.mcp_server import MCPRuntimeGuard, ReloadAwareFastMCP",
@@ -623,25 +968,54 @@ def test_mcp_running_worker_does_not_delay_process_exit(tmp_path):
             "    lambda: started.set() or threading.Event().wait(timeout=60)",
             ")",
             "assert started.wait(timeout=2)",
+            "Path(os.environ['VECTOR_LAKE_EXIT_READY_FILE']).write_text(",
+            "    'ready',",
+            "    encoding='utf-8',",
+            ")",
         )
     )
     env = os.environ.copy()
     env["VECTOR_LAKE_MEMORY_DIR"] = str(child_memory)
     env["VECTOR_LAKE_META_DIR"] = str(child_meta)
     env["VECTOR_LAKE_DB_PATH"] = str(child_meta / "vector_lake.db")
+    env["VECTOR_LAKE_EXIT_READY_FILE"] = str(child_ready)
     env.pop("GEMINI_API_KEY", None)
 
-    result = subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, "-c", script],
         cwd=Path(__file__).resolve().parents[1],
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=10,
-        check=False,
     )
+    try:
+        startup_deadline = time.monotonic() + 20
+        while not child_ready.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate(timeout=1)
+                pytest.fail(
+                    "MCP exit probe stopped before its worker started: "
+                    f"returncode={process.returncode}, stdout={stdout!r}, "
+                    f"stderr={stderr!r}"
+                )
+            if time.monotonic() >= startup_deadline:
+                pytest.fail("MCP exit probe did not start its worker within 20 seconds")
+            time.sleep(0.02)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                "An active daemon MCP worker delayed process exit beyond 5 seconds"
+            )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
 
-    assert result.returncode == 0, result.stderr
+    assert process.returncode == 0, (
+        f"returncode={process.returncode}, stdout={stdout!r}, stderr={stderr!r}"
+    )
 
 
 def test_mcp_blocking_executor_rejects_unbounded_queue(tmp_path, monkeypatch):
@@ -779,6 +1153,7 @@ def test_mcp_runtime_status_exposes_blocking_executor_capacity():
     assert status["blocking_executor"]["workers_daemon"] is True
     assert status["blocking_executor"]["running_workers"] >= 0
 
+
 def test_mcp_worker_closes_connection_after_tool_failure(tmp_path, monkeypatch):
     from vector_lake import db_store
 
@@ -820,16 +1195,30 @@ def test_dirty_graph_is_excluded_from_search_expansion(isolated_memory, monkeypa
     (wiki_dir / "Concept_Expanded.md").write_text("# Expanded", encoding="utf-8")
     index_path = wiki_dir / "index.json"
     index_path.write_text(
-        json.dumps({
-            "nodes": {
-                "Concept_Seed": {"title": "Seed", "type": "concept", "status": "Active"},
-                "Concept_Expanded": {"title": "Expanded", "type": "concept", "status": "Active"},
-            },
-            "weighted_edges": [
-                {"source": "Concept_Seed", "target": "Concept_Expanded", "weight": 5.0}
-            ],
-            "graph_state": {"dirty": True},
-        }),
+        json.dumps(
+            {
+                "nodes": {
+                    "Concept_Seed": {
+                        "title": "Seed",
+                        "type": "concept",
+                        "status": "Active",
+                    },
+                    "Concept_Expanded": {
+                        "title": "Expanded",
+                        "type": "concept",
+                        "status": "Active",
+                    },
+                },
+                "weighted_edges": [
+                    {
+                        "source": "Concept_Seed",
+                        "target": "Concept_Expanded",
+                        "weight": 5.0,
+                    }
+                ],
+                "graph_state": {"dirty": True},
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -857,17 +1246,19 @@ def test_assemble_context_reuses_search_index_snapshot(isolated_memory, monkeypa
     (wiki_dir / "Concept_Seed.md").write_text("# Seed", encoding="utf-8")
     index_path = wiki_dir / "index.json"
     index_path.write_text(
-        json.dumps({
-            "nodes": {
-                "Concept_Seed": {
-                    "title": "Seed",
-                    "type": "concept",
-                    "status": "Active",
-                }
-            },
-            "weighted_edges": [],
-            "graph_state": {"dirty": False},
-        }),
+        json.dumps(
+            {
+                "nodes": {
+                    "Concept_Seed": {
+                        "title": "Seed",
+                        "type": "concept",
+                        "status": "Active",
+                    }
+                },
+                "weighted_edges": [],
+                "graph_state": {"dirty": False},
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -924,9 +1315,7 @@ def test_search_and_runtime_health_share_index_snapshot(isolated_memory):
     assert health_snapshot is search_snapshot
 
     index_path.write_text(
-        json.dumps(
-            {"nodes": {"Concept_One": {"title": "One changed and longer"}}}
-        ),
+        json.dumps({"nodes": {"Concept_One": {"title": "One changed and longer"}}}),
         encoding="utf-8",
     )
     refreshed_snapshot = tool_search._load_search_index(index_path)

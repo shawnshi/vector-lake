@@ -168,16 +168,62 @@ def _exists(
     )
 
 
+def _drop_runtime_generation_triggers(conn: sqlite3.Connection) -> None:
+    for object_type, name, _sql in db_store._RUNTIME_GENERATION_SCHEMA_OBJECTS_V3:
+        if object_type == "trigger":
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+
+def _downgrade_runtime_generation_to_v2(path) -> None:
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        _drop_runtime_generation_triggers(conn)
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 3")
+        conn.execute("PRAGMA user_version = 2")
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+
+def _downgrade_cleanup_contract(path, version: int) -> None:
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DROP TABLE ingest_task_cleanup")
+        conn.execute(
+            "CREATE TABLE ingest_task_cleanup ("
+            "cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "job_id TEXT NOT NULL, "
+            "task_packet_path TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO ingest_task_cleanup (job_id, task_packet_path) "
+            "VALUES ('job-legacy-cleanup', 'C:/scratch/task-legacy-cleanup.json')"
+        )
+        if version == 2:
+            _drop_runtime_generation_triggers(conn)
+            conn.execute("DROP TABLE runtime_generations")
+        conn.execute("DELETE FROM schema_migrations WHERE version > ?", (version,))
+        conn.execute(f"PRAGMA user_version = {version}")
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+
 def _downgrade_identity_registry_to_v1(path) -> None:
     conn = db_store.get_connection()
     with db_store.transaction():
-        conn.execute("DROP TRIGGER IF EXISTS trg_canonical_identities_append_only_update")
-        conn.execute("DROP TRIGGER IF EXISTS trg_canonical_identities_append_only_delete")
+        _drop_runtime_generation_triggers(conn)
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_canonical_identities_append_only_update"
+        )
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_canonical_identities_append_only_delete"
+        )
         conn.execute("DROP TABLE canonical_identities")
-        conn.execute("DELETE FROM schema_migrations WHERE version = 2")
+        conn.execute("DROP TABLE runtime_generations")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 2")
         conn.execute("PRAGMA user_version = 1")
     db_store.close_all_connections()
     db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
 
 def test_schema_v2_checksum_is_derived_from_normalized_ddl_contract():
     contract = db_store._CANONICAL_IDENTITIES_SCHEMA_V2
@@ -192,6 +238,35 @@ def test_schema_v2_checksum_is_derived_from_normalized_ddl_contract():
         *contract[1:],
     )
     assert db_store._schema_contract_checksum(changed_contract) != checksum
+
+
+def test_schema_v3_checksum_is_derived_from_runtime_generation_contract():
+    contract = db_store._RUNTIME_GENERATION_SCHEMA_V3
+    checksum = db_store._SCHEMA_MIGRATIONS[3][1]
+
+    assert checksum == db_store._schema_contract_checksum(contract)
+    assert checksum == db_store._schema_contract_checksum(
+        tuple(f"  {statement}\n" for statement in contract)
+    )
+    changed_contract = (
+        contract[0],
+        contract[1].replace("generation = generation + 1", "generation = 0"),
+        *contract[2:],
+    )
+    assert db_store._schema_contract_checksum(changed_contract) != checksum
+
+
+def test_schema_v4_checksum_is_derived_from_cleanup_contract():
+    contract = db_store._INGEST_TASK_CLEANUP_SCHEMA_V4
+    checksum = db_store._SCHEMA_MIGRATIONS[4][1]
+
+    assert checksum == db_store._schema_contract_checksum(contract)
+    changed_contract = (
+        contract[0].replace("lease_token TEXT", "lease_token BLOB"),
+        contract[1],
+    )
+    assert db_store._schema_contract_checksum(changed_contract) != checksum
+
 
 @pytest.mark.parametrize(
     ("damage", "issue"),
@@ -228,9 +303,7 @@ def test_schema_inspection_and_init_reject_identity_contract_damage(
         elif damage == "missing_index":
             conn.execute("DROP INDEX idx_canonical_identities_page")
         elif damage == "wrong_trigger":
-            conn.execute(
-                "DROP TRIGGER trg_canonical_identities_append_only_delete"
-            )
+            conn.execute("DROP TRIGGER trg_canonical_identities_append_only_delete")
             conn.execute(
                 "CREATE TRIGGER trg_canonical_identities_append_only_delete "
                 "BEFORE INSERT ON canonical_identities BEGIN SELECT 1; END"
@@ -259,6 +332,7 @@ def test_schema_inspection_and_init_reject_identity_contract_damage(
     after = db_store.inspect_schema_migration_state(path)
     assert issue in after["issues"]
 
+
 def test_schema_ledger_is_durable_and_read_only_inspection_is_current(isolated_memory):
     db_store.init_db()
     path = db_store.get_db_path()
@@ -267,16 +341,370 @@ def test_schema_ledger_is_durable_and_read_only_inspection_is_current(isolated_m
 
     assert state["ready"] is True
     assert state["status"] == "ready"
-    assert state["user_version"] == db_store._SCHEMA_VERSION == 2
-    assert [item["version"] for item in state["ledger"]] == [1, 2]
+    assert state["user_version"] == db_store._SCHEMA_VERSION == 4
+    expected_versions = list(range(1, db_store._SCHEMA_VERSION + 1))
+    assert [item["version"] for item in state["ledger"]] == expected_versions
     assert [item["name"] for item in state["ledger"]] == [
-        db_store._SCHEMA_MIGRATIONS[version][0] for version in (1, 2)
+        db_store._SCHEMA_MIGRATIONS[version][0] for version in expected_versions
     ]
     assert [item["checksum"] for item in state["ledger"]] == [
-        db_store._SCHEMA_MIGRATIONS[version][1] for version in (1, 2)
+        db_store._SCHEMA_MIGRATIONS[version][1] for version in expected_versions
     ]
     assert all(item["applied_at"] for item in state["ledger"])
 
+
+@pytest.mark.parametrize(
+    ("damage", "issue"),
+    [
+        (
+            "missing_trigger",
+            "runtime_generation_schema_missing:trigger:"
+            "trg_entities_generation_v3_insert",
+        ),
+        (
+            "wrong_trigger",
+            "runtime_generation_schema_sql_mismatch:trg_entities_generation_v3_insert",
+        ),
+        (
+            "missing_registry",
+            "runtime_generation_registry_missing:entities",
+        ),
+        (
+            "unexpected_trigger",
+            "runtime_generation_schema_unexpected:trigger:"
+            "trg_entities_generation_v1_shadow",
+        ),
+    ],
+)
+def test_schema_inspection_and_init_reject_runtime_generation_damage(
+    isolated_memory,
+    damage,
+    issue,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    trigger_name = db_store._runtime_generation_trigger_name("entities", "insert")
+    with db_store.transaction() as conn:
+        if damage in {"missing_trigger", "wrong_trigger"}:
+            conn.execute(f"DROP TRIGGER {trigger_name}")
+        if damage == "wrong_trigger":
+            conn.execute(
+                f"CREATE TRIGGER {trigger_name} AFTER INSERT ON entities "
+                "BEGIN SELECT 1; END"
+            )
+        elif damage == "missing_registry":
+            conn.execute("DELETE FROM runtime_generations WHERE surface = 'entities'")
+        elif damage == "unexpected_trigger":
+            conn.execute(
+                "CREATE TRIGGER trg_entities_generation_v1_shadow "
+                "AFTER INSERT ON entities BEGIN SELECT 1; END"
+            )
+
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is False
+    assert state["status"] == "invalid"
+    assert issue in state["issues"]
+    with pytest.raises(
+        RuntimeError,
+        match="runtime generation contract is invalid",
+    ):
+        db_store.init_db()
+
+
+def test_existing_schema_v2_migrates_runtime_generation_triggers_atomically(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_runtime_generation_to_v2(path)
+
+    before = db_store.inspect_schema_migration_state(path)
+    assert before["user_version"] == 2
+    assert before["status"] == "invalid"
+
+    db_store.init_db()
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is True
+    assert state["user_version"] == 4
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4]
+
+
+def test_schema_v3_trigger_migration_failure_rolls_back_ledger_and_ddl(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_runtime_generation_to_v2(path)
+    original = db_store._RUNTIME_GENERATION_TRIGGER_SCHEMA_V3
+    monkeypatch.setattr(
+        db_store,
+        "_RUNTIME_GENERATION_TRIGGER_SCHEMA_V3",
+        (original[0], "CREATE TRIGGER invalid runtime generation syntax"),
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        db_store.init_db()
+    db_store.close_all_connections()
+
+    raw = sqlite3.connect(path)
+    try:
+        user_version = raw.execute("PRAGMA user_version").fetchone()[0]
+        ledger = raw.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        trigger_count = raw.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE '%_generation_v3_%'"
+        ).fetchone()[0]
+    finally:
+        raw.close()
+
+    assert user_version == 2
+    assert ledger == [(1,), (2,)]
+    assert trigger_count == 0
+
+
+@pytest.mark.parametrize("legacy_version", [2, 3])
+def test_incomplete_cleanup_table_migrates_to_schema_v4(
+    isolated_memory,
+    legacy_version,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_cleanup_contract(path, legacy_version)
+
+    before = db_store.inspect_schema_migration_state(path)
+    assert before["user_version"] == legacy_version
+    assert [item["version"] for item in before["ledger"]] == list(
+        range(1, legacy_version + 1)
+    )
+    assert before["ready"] is False
+
+    db_store.init_db()
+    state = db_store.inspect_schema_migration_state(path)
+    row = db_store.get_connection().execute(
+        "SELECT * FROM ingest_task_cleanup WHERE job_id = 'job-legacy-cleanup'"
+    ).fetchone()
+
+    assert state["ready"] is True
+    assert state["user_version"] == 4
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4]
+    assert db_store._ingest_task_cleanup_schema_issues(
+        db_store.get_connection()
+    ) == []
+    assert row["expected_task_id"] == "task-legacy-cleanup"
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 0
+    assert row["lease_generation"] == 0
+    assert row["available_at"]
+    assert row["created_at"]
+    assert row["updated_at"]
+
+
+def test_schema_v4_cleanup_contract_has_all_columns_defaults_and_indexes(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    columns = {
+        str(row["name"]): row
+        for row in conn.execute("PRAGMA table_info('ingest_task_cleanup')").fetchall()
+    }
+
+    assert tuple(columns) == tuple(
+        item[0] for item in db_store._INGEST_TASK_CLEANUP_COLUMN_CONTRACT_V4
+    )
+    for name, column_type, not_null, primary_key in (
+        db_store._INGEST_TASK_CLEANUP_COLUMN_CONTRACT_V4
+    ):
+        row = columns[name]
+        assert str(row["type"]).casefold() == column_type.casefold()
+        assert bool(row["notnull"]) is not_null
+        assert bool(row["pk"]) is primary_key
+    for name, expected in db_store._INGEST_TASK_CLEANUP_DEFAULTS_V4.items():
+        assert db_store._normalized_schema_default(
+            columns[name]["dflt_value"]
+        ) == db_store._normalized_schema_default(expected)
+    assert db_store._ingest_task_cleanup_has_identity_index(conn)
+    ready_index = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'index' AND name = 'idx_ingest_task_cleanup_ready'"
+    ).fetchone()
+    assert ready_index is not None
+    assert db_store._normalized_schema_sql(
+        ready_index["sql"]
+    ) == db_store._normalized_schema_sql(
+        db_store._INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4
+    )
+
+
+@pytest.mark.parametrize(
+    ("damage", "issue"),
+    [
+        (
+            "wrong_default",
+            "ingest_task_cleanup_schema_default_mismatch:column:status",
+        ),
+        (
+            "missing_unique",
+            "ingest_task_cleanup_schema_missing:unique:job_id_task_packet_path",
+        ),
+        (
+            "partial_unique",
+            "ingest_task_cleanup_schema_missing:unique:job_id_task_packet_path",
+        ),
+        (
+            "unexpected_column",
+            "ingest_task_cleanup_schema_unexpected:column:shadow_state",
+        ),
+        (
+            "missing_ready_index",
+            "ingest_task_cleanup_schema_missing:index:idx_ingest_task_cleanup_ready",
+        ),
+    ],
+)
+def test_schema_inspection_and_init_reject_malformed_v4_cleanup_contract(
+    isolated_memory,
+    damage,
+    issue,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    with db_store.transaction() as conn:
+        if damage == "missing_ready_index":
+            conn.execute("DROP INDEX idx_ingest_task_cleanup_ready")
+        else:
+            conn.execute("DROP TABLE ingest_task_cleanup")
+            table_sql = db_store._INGEST_TASK_CLEANUP_TABLE_SCHEMA_V4
+            if damage == "wrong_default":
+                table_sql = table_sql.replace(
+                    "status TEXT NOT NULL DEFAULT 'pending'",
+                    "status TEXT NOT NULL DEFAULT 'queued'",
+                )
+            elif damage in {"missing_unique", "partial_unique"}:
+                table_sql = table_sql.replace(
+                    ",\n    UNIQUE(job_id, task_packet_path)",
+                    "",
+                )
+            elif damage == "unexpected_column":
+                table_sql = table_sql.replace(
+                    "lease_generation INTEGER NOT NULL DEFAULT 0,",
+                    "shadow_state TEXT,\n"
+                    "    lease_generation INTEGER NOT NULL DEFAULT 0,",
+                )
+            conn.execute(table_sql)
+            conn.execute(db_store._INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4)
+            if damage == "partial_unique":
+                conn.execute(
+                    "CREATE UNIQUE INDEX idx_ingest_task_cleanup_identity_v4 "
+                    "ON ingest_task_cleanup(job_id, task_packet_path) "
+                    "WHERE status = 'pending'"
+                )
+
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is False
+    assert state["status"] == "invalid"
+    assert issue in state["issues"]
+    with pytest.raises(
+        RuntimeError,
+        match="ingest task cleanup contract is invalid",
+    ):
+        db_store.init_db()
+
+
+def test_schema_v4_migration_failure_rolls_back_columns_indexes_and_ledger(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_cleanup_contract(path, 3)
+    monkeypatch.setattr(
+        db_store,
+        "_INGEST_TASK_CLEANUP_READY_INDEX_SCHEMA_V4",
+        "CREATE INDEX invalid cleanup index syntax",
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        db_store.init_db()
+    db_store.close_all_connections()
+
+    raw = sqlite3.connect(path)
+    try:
+        user_version = raw.execute("PRAGMA user_version").fetchone()[0]
+        ledger = raw.execute(
+            "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        columns = [
+            str(row[1])
+            for row in raw.execute("PRAGMA table_info('ingest_task_cleanup')").fetchall()
+        ]
+        indexes = raw.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'index' AND tbl_name = 'ingest_task_cleanup'"
+        ).fetchall()
+    finally:
+        raw.close()
+
+    assert user_version == 3
+    assert ledger == [
+        (version, *db_store._SCHEMA_MIGRATIONS[version])
+        for version in (1, 2, 3)
+    ]
+    assert columns == ["cleanup_id", "job_id", "task_packet_path"]
+    assert indexes == []
+
+
+def test_first_cleanup_enqueue_claim_and_complete_succeeds(isolated_memory):
+    db_store.init_db()
+    packet_path = isolated_memory / "scratch" / "task-first-cleanup.json"
+    with db_store.transaction() as conn:
+        _insert_job(
+            conn,
+            "job-first-cleanup",
+            "completed",
+            at=OLD,
+            task_packet_path=str(packet_path),
+        )
+        cleanup_id = db_store.enqueue_ingest_task_cleanup(
+            "job-first-cleanup",
+            str(packet_path),
+        )
+
+    claimed = db_store.claim_ingest_task_cleanup(
+        limit=1,
+        lease_seconds=60,
+        lease_owner="schema-v4-test",
+    )
+
+    assert len(claimed) == 1
+    assert claimed[0]["cleanup_id"] == cleanup_id
+    assert claimed[0]["expected_task_id"] == "task-first-cleanup"
+    assert claimed[0]["lease_generation"] == 1
+    assert db_store.complete_ingest_task_cleanup(
+        cleanup_id,
+        claimed[0]["lease_owner"],
+        claimed[0]["lease_token"],
+        claimed[0]["lease_generation"],
+    )
+    conn = db_store.get_connection()
+    cleanup = conn.execute(
+        "SELECT status, completed_at, lease_owner, lease_token "
+        "FROM ingest_task_cleanup WHERE cleanup_id = ?",
+        (cleanup_id,),
+    ).fetchone()
+    job = conn.execute(
+        "SELECT task_packet_path FROM jobs WHERE job_id = 'job-first-cleanup'"
+    ).fetchone()
+    assert cleanup["status"] == "completed"
+    assert cleanup["completed_at"]
+    assert cleanup["lease_owner"] is None
+    assert cleanup["lease_token"] is None
+    assert job["task_packet_path"] is None
 
 def test_schema_v2_backfills_current_and_version_identity_owners(isolated_memory):
     db_store.init_db()
@@ -300,10 +728,14 @@ def test_schema_v2_backfills_current_and_version_identity_owners(isolated_memory
     _downgrade_identity_registry_to_v1(path)
 
     db_store.init_db()
-    rows = db_store.get_connection().execute(
-        "SELECT record_kind, record_id, page_key, identity_origin "
-        "FROM canonical_identities ORDER BY record_kind, record_id"
-    ).fetchall()
+    rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT record_kind, record_id, page_key, identity_origin "
+            "FROM canonical_identities ORDER BY record_kind, record_id"
+        )
+        .fetchall()
+    )
 
     assert [tuple(row) for row in rows] == [
         ("claim", "claim-migrated", "PageMigrated", "schema_v2_backfill"),
@@ -337,12 +769,17 @@ def test_schema_v2_backfills_current_only_or_version_only_identity(
     _downgrade_identity_registry_to_v1(path)
 
     db_store.init_db()
-    owner = db_store.get_connection().execute(
-        "SELECT page_key, identity_origin FROM canonical_identities "
-        "WHERE record_kind = 'claim' AND record_id = 'claim-one-surface'"
-    ).fetchone()
+    owner = (
+        db_store.get_connection()
+        .execute(
+            "SELECT page_key, identity_origin FROM canonical_identities "
+            "WHERE record_kind = 'claim' AND record_id = 'claim-one-surface'"
+        )
+        .fetchone()
+    )
 
     assert tuple(owner) == ("PageOneSurface", "schema_v2_backfill")
+
 
 @pytest.mark.parametrize(
     ("damage", "message"),
@@ -368,18 +805,14 @@ def test_existing_schema_v2_rejects_missing_or_inconsistent_identity_coverage(
             page_key="PageOriginal",
         )
         if damage == "missing":
-            conn.execute(
-                "DROP TRIGGER trg_canonical_identities_append_only_delete"
-            )
+            conn.execute("DROP TRIGGER trg_canonical_identities_append_only_delete")
             conn.execute(
                 "DELETE FROM canonical_identities WHERE record_kind = 'claim' "
                 "AND record_id = 'claim-v2-damaged'"
             )
             conn.execute(db_store._CANONICAL_IDENTITIES_SCHEMA_V2[4])
         else:
-            conn.execute(
-                "DROP TRIGGER trg_canonical_identities_append_only_update"
-            )
+            conn.execute("DROP TRIGGER trg_canonical_identities_append_only_update")
             identity = {
                 "record_kind": "claim",
                 "record_id": "claim-v2-damaged",
@@ -398,8 +831,7 @@ def test_existing_schema_v2_rejects_missing_or_inconsistent_identity_coverage(
     state = db_store.inspect_schema_migration_state(path)
     assert state["ready"] is False
     assert any(
-        issue.startswith("canonical_identity_integrity:")
-        for issue in state["issues"]
+        issue.startswith("canonical_identity_integrity:") for issue in state["issues"]
     )
 
     with pytest.raises(RuntimeError, match=message):
@@ -429,10 +861,16 @@ def test_existing_schema_v2_allows_registry_only_historical_identity(
 
     db_store.init_db()
 
-    assert db_store.get_connection().execute(
-        "SELECT page_key FROM canonical_identities WHERE record_kind = 'claim' "
-        "AND record_id = 'claim-registry-only'"
-    ).fetchone()["page_key"] == "PageDeleted"
+    assert (
+        db_store.get_connection()
+        .execute(
+            "SELECT page_key FROM canonical_identities WHERE record_kind = 'claim' "
+            "AND record_id = 'claim-registry-only'"
+        )
+        .fetchone()["page_key"]
+        == "PageDeleted"
+    )
+
 
 @pytest.mark.parametrize(
     ("damage", "message"),
@@ -486,15 +924,19 @@ def test_schema_v2_backfill_fails_closed_and_rolls_back(
     raw = sqlite3.connect(path)
     try:
         assert raw.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert raw.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'canonical_identities'"
-        ).fetchone() is None
+        assert (
+            raw.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'canonical_identities'"
+            ).fetchone()
+            is None
+        )
         assert raw.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall() == [(1,)]
     finally:
         raw.close()
+
 
 def test_read_only_schema_inspection_and_retention_preview_do_not_create_database(
     isolated_memory,

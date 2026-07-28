@@ -22,11 +22,14 @@ def test_find_md_file_uses_safe_page_key_when_title_contains_a_separator(tmp_pat
     expected = tmp_path / "Source_Safe-Key.MD"
     expected.write_text("# Safe\n", encoding="utf-8")
 
-    assert governance_service._find_md_file(
-        tmp_path.resolve(),
-        "Source_Safe-Key",
-        "Unsafe / Display Title",
-    ) == expected.resolve()
+    assert (
+        governance_service._find_md_file(
+            tmp_path.resolve(),
+            "Source_Safe-Key",
+            "Unsafe / Display Title",
+        )
+        == expected.resolve()
+    )
 
 
 def _mock_row_level_queue(monkeypatch, queue):
@@ -40,7 +43,10 @@ def _mock_row_level_queue(monkeypatch, queue):
         item = get_item(item_id)
         if item is None:
             return None
-        if expected_statuses is not None and item.get("status") not in expected_statuses:
+        if (
+            expected_statuses is not None
+            and item.get("status") not in expected_statuses
+        ):
             return None
         item.update(updates)
         return item
@@ -96,7 +102,9 @@ evidence_tier: primary
 """
 
 
-def test_preflight_runs_semantic_merge_and_schema_validation(tmp_path: Path, monkeypatch):
+def test_preflight_runs_semantic_merge_and_schema_validation(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(tmp_path))
     wiki_dir = tmp_path / "wiki"
     wiki_dir.mkdir()
@@ -151,7 +159,9 @@ def test_source_preflight_blocks_different_raw_identities(tmp_path: Path, monkey
     checked = preflight_suggestion(_suggestion(), wiki_dir)
 
     assert checked["preflight_state"] == "blocked"
-    assert "exactly one approved canonical raw identity" in checked["preflight_errors"][0]
+    assert (
+        "exactly one approved canonical raw identity" in checked["preflight_errors"][0]
+    )
 
 
 def test_source_preflight_approval_cannot_mask_disjoint_raw_identities(
@@ -211,7 +221,9 @@ def test_source_preflight_blocks_an_extra_raw_identity(tmp_path: Path, monkeypat
     assert "one canonical raw identity" in checked["preflight_errors"][0]
 
 
-def test_source_preflight_blocks_direct_backlinks_to_duplicate(tmp_path: Path, monkeypatch):
+def test_source_preflight_blocks_direct_backlinks_to_duplicate(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(tmp_path))
     wiki_dir = tmp_path / "wiki"
     wiki_dir.mkdir()
@@ -386,7 +398,10 @@ def test_source_merge_converges_provenance_projection_journal_and_replay(
         )
         conn.execute(
             "UPDATE source_artifacts SET data_json = ? WHERE artifact_id = ?",
-            (json.dumps(artifact_before, ensure_ascii=False), artifact_row["artifact_id"]),
+            (
+                json.dumps(artifact_before, ensure_ascii=False),
+                artifact_row["artifact_id"],
+            ),
         )
         conn.execute(
             "INSERT INTO sources (source_id, data_json, updated_at) VALUES (?, ?, ?)",
@@ -500,18 +515,20 @@ def test_source_merge_converges_provenance_projection_journal_and_replay(
     assert frontmatter["sources"] == ["raw/alpha.md"]
     assert "Source_Alpha-ab12cd34" in frontmatter["aliases"]
     assert "Raw Preview MUST NOT SURVIVE" not in body
-    source_rows = db_store.get_connection().execute(
-        "SELECT source_id, data_json FROM sources "
-        "WHERE json_extract(data_json, '$.raw_ref') = 'raw/alpha.md'"
-    ).fetchall()
+    source_rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT source_id, data_json FROM sources "
+            "WHERE json_extract(data_json, '$.raw_ref') = 'raw/alpha.md'"
+        )
+        .fetchall()
+    )
     assert source_rows
     assert {
-        json.loads(row["data_json"])["canonical_source_page"]
-        for row in source_rows
+        json.loads(row["data_json"])["canonical_source_page"] for row in source_rows
     } == {"Source_Alpha.md"}
     preserved_by_id = {
-        row["source_id"]: json.loads(row["data_json"])
-        for row in source_rows
+        row["source_id"]: json.loads(row["data_json"]) for row in source_rows
     }
     preserved_source = preserved_by_id[source_row["source_id"]]
     assert preserved_source["legacy_content_hash"] == "legacy-reviewed-hash"
@@ -530,10 +547,12 @@ def test_source_merge_converges_provenance_projection_journal_and_replay(
         "reviewer": "legacy-reviewer"
     }
     preserved_artifact = json.loads(
-        db_store.get_connection().execute(
+        db_store.get_connection()
+        .execute(
             "SELECT data_json FROM source_artifacts WHERE artifact_id = ?",
             (artifact_row["artifact_id"],),
-        ).fetchone()["data_json"]
+        )
+        .fetchone()["data_json"]
     )
     assert preserved_artifact["retention_policy"] == "retain-7-years"
     assert preserved_artifact["legal_hold"] is True
@@ -572,9 +591,7 @@ def test_source_metadata_restore_cas_preserves_concurrent_human_update(
         "legacy_content_hash": "legacy-reviewed-hash",
     }
     observed = {
-        key: value
-        for key, value in expected.items()
-        if key != "legacy_content_hash"
+        key: value for key, value in expected.items() if key != "legacy_content_hash"
     }
     observed["ingested_at"] = "2026-07-23T00:00:00+00:00"
     observed_json = json.dumps(observed, ensure_ascii=False)
@@ -635,7 +652,9 @@ def test_source_metadata_restore_cas_preserves_concurrent_human_update(
     )
     assert current == human_update
     assert db_store.get_merge_journal(journal_id)["status"] == "projection_pending"
-    assert governance_store.get_governance_item(item_id)["status"] == "projection_pending"
+    assert (
+        governance_store.get_governance_item(item_id)["status"] == "projection_pending"
+    )
 
 
 def test_source_merge_rejects_raw_drift_between_preflight_and_commit(
@@ -723,12 +742,20 @@ def test_source_merge_rejects_raw_drift_between_preflight_and_commit(
             resolution="merge",
         )
 
-    assert governance_store.get_governance_item("gov_source_raw_drift")["status"] == "pending"
+    assert (
+        governance_store.get_governance_item("gov_source_raw_drift")["status"]
+        == "pending"
+    )
     assert (isolated_memory / "wiki" / "Source_Drift.md").is_file()
     assert (isolated_memory / "wiki" / "Source_Drift-ab12cd34.md").is_file()
-    assert db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM merge_journal WHERE item_id = 'gov_source_raw_drift'"
-    ).fetchone()[0] == 0
+    assert (
+        db_store.get_connection()
+        .execute(
+            "SELECT COUNT(*) FROM merge_journal WHERE item_id = 'gov_source_raw_drift'"
+        )
+        .fetchone()[0]
+        == 0
+    )
 
 
 def test_candidate_report_preserves_snapshot_versions_and_pool_size(monkeypatch):
@@ -990,8 +1017,7 @@ def test_resolution_passes_candidate_versions_to_atomic_mutation(
     monkeypatch.setattr(
         governance_service,
         "execute_mutation_batch",
-        lambda mutations, validation_mode, origin, return_details, transaction_callback,
-        precondition_callback: (
+        lambda mutations, validation_mode, origin, return_details, transaction_callback, precondition_callback: (
             captured.update(
                 mutations=mutations,
                 validation_mode=validation_mode,
@@ -1028,11 +1054,13 @@ def test_resolution_passes_candidate_versions_to_atomic_mutation(
             "filename": "Source_Alpha.md",
             "content": "merged",
             "expected_version": "version-a",
+            "expected_projection_hash": hashlib.sha256(b"target").hexdigest(),
         },
         {
             "filename": "Source_Alpha-Alt.md",
             "is_delete": True,
             "expected_version": "version-b",
+            "expected_projection_hash": hashlib.sha256(b"source").hexdigest(),
         },
     ]
 

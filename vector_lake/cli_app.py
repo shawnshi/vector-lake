@@ -14,7 +14,9 @@ from vector_lake import tools
 
 def _configure_stdout():
     if sys.stdout.encoding != "utf-8":
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace"
+        )
 
 
 def _load_env():
@@ -63,76 +65,224 @@ Usage Examples:
 """,
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True, help="Available wiki operations")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, help="Available wiki operations"
+    )
 
-    subparsers.add_parser("sync", help="[INGEST] Generates MCP ingestion instructions for Native Subagents.")
-    ingest_tasks_parser = subparsers.add_parser("ingest-tasks", help="[INGEST] List or expire subagent ingest tasks.")
-    ingest_tasks_parser.add_argument("--limit", type=_nonnegative_int, default=20, help="Maximum number of jobs to list.")
-    ingest_tasks_parser.add_argument("--awaiting-only", action="store_true", help="Hide queued jobs and show only awaiting-subagent jobs.")
-    ingest_tasks_parser.add_argument("--expire-stale", action="store_true", help="Expire stale awaiting-subagent jobs instead of listing.")
-    ingest_tasks_parser.add_argument("--claim", action="store_true", help="Lease awaiting task packets to this host runtime.")
-    ingest_tasks_parser.add_argument("--repair-debt", action="store_true", help="Classify and recover abandoned ingest jobs.")
-    ingest_tasks_parser.add_argument("--cleanup-orphans", action="store_true", help="Preview old unreferenced ingest task packets.")
-    ingest_tasks_parser.add_argument("--apply", action="store_true", help="Apply the selected repair or cleanup operation.")
-    ingest_tasks_parser.add_argument("--max-age-seconds", type=int, default=86400, help="Age threshold for --expire-stale.")
-    ingest_tasks_parser.add_argument("--min-age-seconds", type=_nonnegative_int, default=86400, help="Minimum age for --cleanup-orphans.")
-    ingest_tasks_parser.add_argument("--lease-seconds", type=int, default=3600, help="Lease duration for --claim.")
+    subparsers.add_parser(
+        "sync",
+        help="[INGEST] Generates MCP ingestion instructions for Native Subagents.",
+    )
+    ingest_tasks_parser = subparsers.add_parser(
+        "ingest-tasks", help="[INGEST] List or expire subagent ingest tasks."
+    )
+    ingest_tasks_parser.add_argument(
+        "--limit",
+        type=_nonnegative_int,
+        default=20,
+        help="Maximum number of jobs to list.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--awaiting-only",
+        action="store_true",
+        help="Hide queued jobs and show only awaiting-subagent jobs.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--expire-stale",
+        action="store_true",
+        help="Expire stale awaiting-subagent jobs instead of listing.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--claim",
+        action="store_true",
+        help="Lease awaiting task packets to this host runtime.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--repair-debt",
+        action="store_true",
+        help="Classify and recover abandoned ingest jobs.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--cleanup-orphans",
+        action="store_true",
+        help="Preview old unreferenced ingest task packets.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the selected repair or cleanup operation.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--max-age-seconds",
+        type=int,
+        default=86400,
+        help="Age threshold for --expire-stale.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--min-age-seconds",
+        type=_nonnegative_int,
+        default=86400,
+        help="Minimum age for --cleanup-orphans.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--lease-seconds", type=int, default=3600, help="Lease duration for --claim."
+    )
 
-    lint_parser = subparsers.add_parser("lint", help="[LINT] Run self-healing audit on the Wiki nodes.")
-    lint_parser.add_argument("--auto-fix", action="store_true", help="Automatically fix issues such as decaying notes.")
+    lint_parser = subparsers.add_parser(
+        "lint", help="[LINT] Run self-healing audit on the Wiki nodes."
+    )
+    lint_parser.add_argument(
+        "--auto-fix",
+        action="store_true",
+        help="Automatically fix issues such as decaying notes.",
+    )
 
-    search_parser = subparsers.add_parser("search", help="[SEARCH] CJK-aware search with graph expansion.")
+    search_parser = subparsers.add_parser(
+        "search", help="[SEARCH] CJK-aware search with graph expansion."
+    )
     search_parser.add_argument("query", help="Semantic query string.")
-    search_parser.add_argument("--top_k", type=int, default=5, help="Number of results (default: 5).")
-    search_parser.add_argument("--domain", type=str, default=None, help="Filter by domain namespace.")
-    search_parser.add_argument("--cluster", type=str, default=None, help="Filter by topic cluster.")
-    search_parser.add_argument("--include-history", action="store_true", help="Bypass temporal invalidation to search deprecated facts.")
-    search_parser.add_argument("--mode", choices=["page", "memory", "claim"], default="page", help="Search page index, operational memory, or fact claims.")
+    search_parser.add_argument(
+        "--top_k", type=int, default=5, help="Number of results (default: 5)."
+    )
+    search_parser.add_argument(
+        "--domain", type=str, default=None, help="Filter by domain namespace."
+    )
+    search_parser.add_argument(
+        "--cluster", type=str, default=None, help="Filter by topic cluster."
+    )
+    search_parser.add_argument(
+        "--include-history",
+        action="store_true",
+        help="Bypass temporal invalidation to search deprecated facts.",
+    )
+    search_parser.add_argument(
+        "--mode",
+        choices=["page", "memory", "claim"],
+        default="page",
+        help="Search page index, operational memory, or fact claims.",
+    )
 
-    query_parser = subparsers.add_parser("query", help="[QUERY] Deep reasoning with budget-controlled context.")
+    query_parser = subparsers.add_parser(
+        "query", help="[QUERY] Deep reasoning with budget-controlled context."
+    )
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
-    query_parser.add_argument("--dry-run", action="store_true", help="Output Markdown to stdout only without persisting to disk.")
+    query_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Output Markdown to stdout only without persisting to disk.",
+    )
 
-    subparsers.add_parser("graph", help="[GRAPH] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.")
-    timeline_rebuild_parser = subparsers.add_parser("timeline-rebuild", help="[TIMELINE] Rebuild timeline_events from timeline-event claims.")
-    timeline_rebuild_parser.add_argument("--apply", action="store_true", help="Persist the rebuilt projection. Defaults to dry-run.")
-    timeline_rebuild_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of claims to project.")
+    subparsers.add_parser(
+        "graph",
+        help="[GRAPH] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.",
+    )
+    timeline_rebuild_parser = subparsers.add_parser(
+        "timeline-rebuild",
+        help="[TIMELINE] Rebuild timeline_events from timeline-event claims.",
+    )
+    timeline_rebuild_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Persist the rebuilt projection. Defaults to dry-run.",
+    )
+    timeline_rebuild_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional maximum number of claims to project.",
+    )
 
-    projection_report_parser = subparsers.add_parser("projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift.")
-    projection_report_parser.add_argument("--limit", type=int, default=20, help="Sample size per drift bucket.")
+    projection_report_parser = subparsers.add_parser(
+        "projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift."
+    )
+    projection_report_parser.add_argument(
+        "--limit", type=int, default=20, help="Sample size per drift bucket."
+    )
 
-    canonical_backfill_parser = subparsers.add_parser("canonical-backfill", help="[MAINTENANCE] Backfill missing canonical rows from Wiki pages.")
-    canonical_backfill_parser.add_argument("--apply", action="store_true", help="Persist the backfill. Defaults to dry-run.")
-    canonical_backfill_parser.add_argument("--limit", type=int, default=50, help="Maximum number of missing pages to process.")
+    canonical_backfill_parser = subparsers.add_parser(
+        "canonical-backfill",
+        help="[MAINTENANCE] Backfill missing canonical rows from Wiki pages.",
+    )
+    canonical_backfill_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Persist the backfill. Defaults to dry-run.",
+    )
+    canonical_backfill_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of missing pages to process.",
+    )
 
     foundation_backfill_parser = subparsers.add_parser(
         "evidence-foundation-backfill",
         help="[MAINTENANCE] Backfill missing evidence-foundation metadata without replacing canonical content.",
     )
     foundation_backfill_parser.add_argument(
-        "--apply", action="store_true", help="Persist the backfill. Defaults to dry-run."
+        "--apply",
+        action="store_true",
+        help="Persist the backfill. Defaults to dry-run.",
     )
     foundation_backfill_parser.add_argument(
-        "--limit", type=int, default=500, help="Maximum page revisions per run; zero means all."
+        "--limit",
+        type=int,
+        default=500,
+        help="Maximum page revisions per run; zero means all.",
     )
     foundation_backfill_parser.add_argument(
         "--batch-size", type=int, default=100, help="Atomic page count per transaction."
     )
     foundation_backfill_parser.add_argument(
-        "--backup-reference", default="", help="Existing verified SQLite backup to reuse."
+        "--backup-reference",
+        default="",
+        help="Existing verified SQLite backup to reuse.",
     )
 
-    index_rebuild_parser = subparsers.add_parser("projection-rebuild-index", help="[MAINTENANCE] Rebuild index projection from canonical SQLite.")
-    index_rebuild_parser.add_argument("--apply", action="store_true", help="Persist rebuilt index projection. Defaults to dry-run.")
+    index_rebuild_parser = subparsers.add_parser(
+        "projection-rebuild-index",
+        help="[MAINTENANCE] Rebuild index projection from canonical SQLite.",
+    )
+    index_rebuild_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Persist rebuilt index projection. Defaults to dry-run.",
+    )
 
-    embedding_backfill_parser = subparsers.add_parser("embedding-backfill", help="[MAINTENANCE] Backfill missing vector embeddings under rate limits.")
-    embedding_backfill_parser.add_argument("--apply", action="store_true", help="Persist embeddings. Defaults to dry-run.")
-    embedding_backfill_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of nodes to embed.")
-    embedding_backfill_parser.add_argument("--include-existing", action="store_true", help="Re-embed nodes that already have vectors.")
+    embedding_backfill_parser = subparsers.add_parser(
+        "embedding-backfill",
+        help="[MAINTENANCE] Backfill missing vector embeddings under rate limits.",
+    )
+    embedding_backfill_parser.add_argument(
+        "--apply", action="store_true", help="Persist embeddings. Defaults to dry-run."
+    )
+    embedding_backfill_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional maximum number of nodes to embed.",
+    )
+    embedding_backfill_parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Re-embed nodes that already have vectors.",
+    )
 
-    wiki_restore_parser = subparsers.add_parser("wiki-restore", help="[MAINTENANCE] Restore missing Wiki pages from canonical metadata.")
-    wiki_restore_parser.add_argument("--apply", action="store_true", help="Persist restored Markdown pages. Defaults to dry-run.")
-    wiki_restore_parser.add_argument("--limit", type=int, default=10, help="Maximum number of canonical-only pages to restore.")
+    wiki_restore_parser = subparsers.add_parser(
+        "wiki-restore",
+        help="[MAINTENANCE] Restore missing Wiki pages from canonical metadata.",
+    )
+    wiki_restore_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Persist restored Markdown pages. Defaults to dry-run.",
+    )
+    wiki_restore_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of canonical-only pages to restore.",
+    )
 
     memory_index_parser = subparsers.add_parser(
         "memory-search-index",
@@ -155,10 +305,15 @@ Usage Examples:
         help="[MAINTENANCE] Preview or archive generated template artifacts in operational memory.",
     )
     memory_cleanup_parser.add_argument(
-        "--apply", action="store_true", help="Archive detected artifacts. Defaults to dry-run."
+        "--apply",
+        action="store_true",
+        help="Archive detected artifacts. Defaults to dry-run.",
     )
     memory_cleanup_parser.add_argument(
-        "--limit", type=int, default=0, help="Maximum rows to archive; zero means all candidates."
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum rows to archive; zero means all candidates.",
     )
     history_retention_parser = subparsers.add_parser(
         "history-retention",
@@ -170,7 +325,10 @@ Usage Examples:
         help="Delete the selected history batch. Defaults to read-only preview.",
     )
     history_retention_parser.add_argument(
-        "--ttl-days", type=_positive_int, default=30, help="Minimum history age in days."
+        "--ttl-days",
+        type=_positive_int,
+        default=30,
+        help="Minimum history age in days.",
     )
     history_retention_parser.add_argument(
         "--batch-size",
@@ -202,28 +360,88 @@ Usage Examples:
         default=2,
         help="Always retain the newest versions in each claim/evidence family.",
     )
+    backup_retention_parser = subparsers.add_parser(
+        "backup-retention",
+        help="[MAINTENANCE] Preview or explicitly apply backup retention.",
+    )
+    backup_retention_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete only candidates matching --confirm-fingerprint. Defaults to preview.",
+    )
+    backup_retention_parser.add_argument(
+        "--keep-latest",
+        type=_positive_int,
+        default=5,
+        help="Retain this many newest backups, plus the newest restorable backup.",
+    )
+    backup_retention_parser.add_argument(
+        "--min-age-days",
+        type=_positive_int,
+        default=30,
+        help="Minimum complete-backup age in days.",
+    )
+    backup_retention_parser.add_argument(
+        "--stage-ttl-hours",
+        type=_positive_int,
+        default=24,
+        help="Minimum private staging age in hours.",
+    )
+    backup_retention_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact fingerprint from a current preview; required with --apply.",
+    )
     topology_cleanup_parser = subparsers.add_parser(
         "topology-queue-cleanup",
         help="[MAINTENANCE] Preview or retire legacy indexer-generated community naming items.",
     )
     topology_cleanup_parser.add_argument(
-        "--apply", action="store_true", help="Retire matching legacy items. Defaults to dry-run."
+        "--apply",
+        action="store_true",
+        help="Retire matching legacy items. Defaults to dry-run.",
     )
     orphan_source_parser = subparsers.add_parser(
         "orphan-source-classify",
         help="[MAINTENANCE] Classify unreferenced canonical sources and register non-destructive debt.",
     )
     orphan_source_parser.add_argument(
-        "--apply", action="store_true", help="Register classified debt. Defaults to dry-run."
+        "--apply",
+        action="store_true",
+        help="Register classified debt. Defaults to dry-run.",
     )
 
-    review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.")
-    review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve", "ground"], help="Action: 'list' (default), 'resolve', or 'ground'.")
-    review_parser.add_argument("index", nargs="?", default="-1", help="Index or item_id of review item to resolve (for 'resolve' action).")
-    review_parser.add_argument("--resolution", type=str, default="skip", help="Resolution type: 'skip', 'create', 'merge', 'acknowledge' (default: skip).")
+    review_parser = subparsers.add_parser(
+        "review",
+        help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.",
+    )
+    review_parser.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=["list", "resolve", "ground"],
+        help="Action: 'list' (default), 'resolve', or 'ground'.",
+    )
+    review_parser.add_argument(
+        "index",
+        nargs="?",
+        default="-1",
+        help="Index or item_id of review item to resolve (for 'resolve' action).",
+    )
+    review_parser.add_argument(
+        "--resolution",
+        type=str,
+        default="skip",
+        help="Resolution type: 'skip', 'create', 'merge', 'acknowledge' (default: skip).",
+    )
 
-    subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.")
-    subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")
+    subparsers.add_parser(
+        "audit-graph",
+        help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.",
+    )
+    subparsers.add_parser(
+        "doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout."
+    )
     readiness_parser = subparsers.add_parser(
         "readiness",
         help="[READINESS] Report semantic readiness separately from runtime health.",
@@ -234,14 +452,26 @@ Usage Examples:
         help="Evaluate only a verified CriticalDecisionRegistry scope.",
     )
 
-    research_parser = subparsers.add_parser("research", help="[RESEARCH] Autonomously scan graph gaps and governance queue to formulate web research directives.")
-    research_parser.add_argument("--dry-run", action="store_true", help="Preview the research queries without the SYSTEM DIRECTIVE execution hook.")
+    research_parser = subparsers.add_parser(
+        "research",
+        help="[RESEARCH] Autonomously scan graph gaps and governance queue to formulate web research directives.",
+    )
+    research_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the research queries without the SYSTEM DIRECTIVE execution hook.",
+    )
 
+    debt_parser = subparsers.add_parser(
+        "debt", help="[DEBT] Show governance debt metrics."
+    )
+    debt_parser.add_argument(
+        "--top", type=int, default=20, help="Top debt window size."
+    )
 
-    debt_parser = subparsers.add_parser("debt", help="[DEBT] Show governance debt metrics.")
-    debt_parser.add_argument("--top", type=int, default=20, help="Top debt window size.")
-
-    trace_parser = subparsers.add_parser("trace", help="[TRACE] Show provenance trace for a query or identifier.")
+    trace_parser = subparsers.add_parser(
+        "trace", help="[TRACE] Show provenance trace for a query or identifier."
+    )
     trace_parser.add_argument("query_or_id", help="Query text or object identifier.")
 
     evidence_parser = subparsers.add_parser(
@@ -271,26 +501,65 @@ Usage Examples:
         help="Required bounded export purpose when --include-text is used.",
     )
 
-    merge_parser = subparsers.add_parser("merge-suggestions", help="[MERGE] Detect and enqueue candidate entity merges.")
-    merge_parser.add_argument("--limit", type=int, default=20, help="Maximum number of merge candidates to surface.")
-    merge_parser.add_argument("--preview", action="store_true", help="Do not enqueue governance items; only preview candidates.")
+    merge_parser = subparsers.add_parser(
+        "merge-suggestions", help="[MERGE] Detect and enqueue candidate entity merges."
+    )
+    merge_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of merge candidates to surface.",
+    )
+    merge_parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Do not enqueue governance items; only preview candidates.",
+    )
 
-    delete_parser = subparsers.add_parser("delete", help="[DELETE] Cascade-delete a raw source and all related wiki pages.")
-    delete_parser.add_argument("raw_path", help="Path to the raw source file to remove.")
+    delete_parser = subparsers.add_parser(
+        "delete",
+        help="[DELETE] Cascade-delete a raw source and all related wiki pages.",
+    )
+    delete_parser.add_argument(
+        "raw_path", help="Path to the raw source file to remove."
+    )
     delete_mode = delete_parser.add_mutually_exclusive_group()
-    delete_mode.add_argument("--apply", action="store_true", help="Execute the deletion. Defaults to dry-run.")
-    delete_mode.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
+    delete_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the deletion. Defaults to dry-run.",
+    )
+    delete_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be deleted without making changes.",
+    )
 
-    gc_parser = subparsers.add_parser("gc", help="[GC] Automatically prune isolated/orphan entities.")
-    gc_parser.add_argument("--days", type=_positive_int, default=30, help="Prune entities older than this many days (default: 30; minimum: 1).")
+    gc_parser = subparsers.add_parser(
+        "gc", help="[GC] Automatically prune isolated/orphan entities."
+    )
+    gc_parser.add_argument(
+        "--days",
+        type=_positive_int,
+        default=30,
+        help="Prune entities older than this many days (default: 30; minimum: 1).",
+    )
     gc_parser.add_argument(
         "--confirm-orphans",
         default=None,
         help="Delete only the orphan candidate set matching this dry-run fingerprint. Requires --apply.",
     )
     gc_mode = gc_parser.add_mutually_exclusive_group()
-    gc_mode.add_argument("--apply", action="store_true", help="Execute garbage collection. Defaults to dry-run.")
-    gc_mode.add_argument("--dry-run", action="store_true", help="Preview what would be deleted without making changes.")
+    gc_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute garbage collection. Defaults to dry-run.",
+    )
+    gc_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be deleted without making changes.",
+    )
     return parser
 
 
@@ -305,117 +574,175 @@ def main() -> int:
             print(tools.sync_vector_lake())
         elif args.command == "ingest-tasks":
             if getattr(args, "repair_debt", False):
-                print(tools.reconcile_ingest_job_debt(
-                    dry_run=not getattr(args, "apply", False),
-                    limit=getattr(args, "limit", 20),
-                ))
+                print(
+                    tools.reconcile_ingest_job_debt(
+                        dry_run=not getattr(args, "apply", False),
+                        limit=getattr(args, "limit", 20),
+                    )
+                )
             elif getattr(args, "cleanup_orphans", False):
-                print(tools.reconcile_orphan_ingest_task_packets(
-                    dry_run=not getattr(args, "apply", False),
-                    min_age_seconds=getattr(args, "min_age_seconds", 86400),
-                    limit=getattr(args, "limit", 20),
-                ))
+                print(
+                    tools.reconcile_orphan_ingest_task_packets(
+                        dry_run=not getattr(args, "apply", False),
+                        min_age_seconds=getattr(args, "min_age_seconds", 86400),
+                        limit=getattr(args, "limit", 20),
+                    )
+                )
             elif getattr(args, "expire_stale", False):
-                print(tools.expire_ingest_tasks(getattr(args, "max_age_seconds", 86400)))
+                print(
+                    tools.expire_ingest_tasks(getattr(args, "max_age_seconds", 86400))
+                )
             elif getattr(args, "claim", False):
-                print(tools.claim_ingest_tasks(
-                    limit=getattr(args, "limit", 20),
-                    lease_seconds=getattr(args, "lease_seconds", 3600),
-                ))
+                print(
+                    tools.claim_ingest_tasks(
+                        limit=getattr(args, "limit", 20),
+                        lease_seconds=getattr(args, "lease_seconds", 3600),
+                    )
+                )
             else:
-                print(tools.list_ingest_tasks(
-                    limit=getattr(args, "limit", 20),
-                    include_queued=not getattr(args, "awaiting_only", False),
-                ))
+                print(
+                    tools.list_ingest_tasks(
+                        limit=getattr(args, "limit", 20),
+                        include_queued=not getattr(args, "awaiting_only", False),
+                    )
+                )
         elif args.command == "search":
-            print(tools.search_vector_lake(
-                args.query,
-                args.top_k,
-                domain=getattr(args, "domain", None),
-                cluster=getattr(args, "cluster", None),
-                include_history=getattr(args, "include_history", False),
-                mode=getattr(args, "mode", "page"),
-            ))
+            print(
+                tools.search_vector_lake(
+                    args.query,
+                    args.top_k,
+                    domain=getattr(args, "domain", None),
+                    cluster=getattr(args, "cluster", None),
+                    include_history=getattr(args, "include_history", False),
+                    mode=getattr(args, "mode", "page"),
+                )
+            )
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, "auto_fix", False)))
         elif args.command == "query":
-            print(tools.prepare_query_context(args.query_str, getattr(args, "dry_run", False)))
+            print(
+                tools.prepare_query_context(
+                    args.query_str, getattr(args, "dry_run", False)
+                )
+            )
         elif args.command == "graph":
             print(tools.visualize_vector_lake())
         elif args.command == "timeline-rebuild":
-            print(tools.rebuild_timeline_events_from_claims(
-                dry_run=not getattr(args, "apply", False),
-                limit=getattr(args, "limit", None),
-            ))
+            print(
+                tools.rebuild_timeline_events_from_claims(
+                    dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", None),
+                )
+            )
         elif args.command == "projection-report":
             print(tools.projection_diff_report(limit=getattr(args, "limit", 20)))
         elif args.command == "canonical-backfill":
-            print(tools.canonical_backfill_missing_wiki(
-                dry_run=not getattr(args, "apply", False),
-                limit=getattr(args, "limit", 50),
-            ))
+            print(
+                tools.canonical_backfill_missing_wiki(
+                    dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", 50),
+                )
+            )
         elif args.command == "evidence-foundation-backfill":
-            print(tools.evidence_foundation_backfill(
-                dry_run=not getattr(args, "apply", False),
-                limit=getattr(args, "limit", 500),
-                batch_size=getattr(args, "batch_size", 100),
-                backup_reference=getattr(args, "backup_reference", ""),
-            ))
+            print(
+                tools.evidence_foundation_backfill(
+                    dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", 500),
+                    batch_size=getattr(args, "batch_size", 100),
+                    backup_reference=getattr(args, "backup_reference", ""),
+                )
+            )
         elif args.command == "projection-rebuild-index":
-            print(tools.rebuild_index_projection(dry_run=not getattr(args, "apply", False)))
-        elif args.command == "embedding-backfill":
-            print(tools.embedding_backfill_projection(
-                dry_run=not getattr(args, "apply", False),
-                limit=getattr(args, "limit", None),
-                include_existing=getattr(args, "include_existing", False),
-            ))
-        elif args.command == "wiki-restore":
-            print(tools.restore_missing_wiki_from_canonical(
-                dry_run=not getattr(args, "apply", False),
-                limit=getattr(args, "limit", 10),
-            ))
-        elif args.command == "memory-search-index":
-            print(tools.operational_memory_search_index_maintenance(
-                dry_run=not getattr(args, "apply", False),
-                batch_size=getattr(args, "batch_size", 256),
-            ))
-        elif args.command == "memory-cleanup":
-            print(tools.cleanup_operational_memory(
-                dry_run=not getattr(args, "apply", False),
-                limit=getattr(args, "limit", 0),
-            ))
-        elif args.command == "history-retention":
-            print(tools.history_retention_maintenance(
-                dry_run=not getattr(args, "apply", False),
-                ttl_days=getattr(args, "ttl_days", 30),
-                batch_size=getattr(args, "batch_size", 500),
-                keep_change_sets=getattr(args, "keep_change_sets", 1000),
-                keep_terminal_jobs=getattr(args, "keep_terminal_jobs", 1000),
-                keep_terminal_outbox=getattr(args, "keep_terminal_outbox", 1000),
-                keep_versions_per_family=getattr(
-                    args, "keep_versions_per_family", 2
-                ),
-            ))
-        elif args.command == "topology-queue-cleanup":
-            print(tools.retire_legacy_topology_queue(
-                dry_run=not getattr(args, "apply", False)
-            ))
-        elif args.command == "orphan-source-classify":
-            print(json.dumps(
-                tools.classify_orphan_source_debt(
+            print(
+                tools.rebuild_index_projection(
                     dry_run=not getattr(args, "apply", False)
-                ),
-                ensure_ascii=False,
-                indent=2,
-            ))
+                )
+            )
+        elif args.command == "embedding-backfill":
+            print(
+                tools.embedding_backfill_projection(
+                    dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", None),
+                    include_existing=getattr(args, "include_existing", False),
+                )
+            )
+        elif args.command == "wiki-restore":
+            print(
+                tools.restore_missing_wiki_from_canonical(
+                    dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", 10),
+                )
+            )
+        elif args.command == "memory-search-index":
+            print(
+                tools.operational_memory_search_index_maintenance(
+                    dry_run=not getattr(args, "apply", False),
+                    batch_size=getattr(args, "batch_size", 256),
+                )
+            )
+        elif args.command == "memory-cleanup":
+            print(
+                tools.cleanup_operational_memory(
+                    dry_run=not getattr(args, "apply", False),
+                    limit=getattr(args, "limit", 0),
+                )
+            )
+        elif args.command == "history-retention":
+            print(
+                tools.history_retention_maintenance(
+                    dry_run=not getattr(args, "apply", False),
+                    ttl_days=getattr(args, "ttl_days", 30),
+                    batch_size=getattr(args, "batch_size", 500),
+                    keep_change_sets=getattr(args, "keep_change_sets", 1000),
+                    keep_terminal_jobs=getattr(args, "keep_terminal_jobs", 1000),
+                    keep_terminal_outbox=getattr(args, "keep_terminal_outbox", 1000),
+                    keep_versions_per_family=getattr(
+                        args, "keep_versions_per_family", 2
+                    ),
+                )
+            )
+        elif args.command == "backup-retention":
+            print(
+                tools.backup_retention_maintenance(
+                    dry_run=not getattr(args, "apply", False),
+                    keep_latest=getattr(args, "keep_latest", 5),
+                    min_age_days=getattr(args, "min_age_days", 30),
+                    stage_ttl_hours=getattr(args, "stage_ttl_hours", 24),
+                    confirmation=getattr(args, "confirm_fingerprint", ""),
+                )
+            )
+        elif args.command == "topology-queue-cleanup":
+            print(
+                tools.retire_legacy_topology_queue(
+                    dry_run=not getattr(args, "apply", False)
+                )
+            )
+        elif args.command == "orphan-source-classify":
+            print(
+                json.dumps(
+                    tools.classify_orphan_source_debt(
+                        dry_run=not getattr(args, "apply", False)
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         elif args.command == "review":
-            print(tools.review_vector_lake(action=args.action, index=args.index, resolution=getattr(args, "resolution", "skip")))
+            print(
+                tools.review_vector_lake(
+                    action=args.action,
+                    index=args.index,
+                    resolution=getattr(args, "resolution", "skip"),
+                )
+            )
         elif args.command == "audit-graph":
             print(tools.audit_graph())
         elif args.command == "doctor":
             print(tools.doctor_vector_lake())
         elif args.command == "readiness":
-            print(tools.semantic_readiness_vector_lake(getattr(args, "decision_id", None)))
+            print(
+                tools.semantic_readiness_vector_lake(getattr(args, "decision_id", None))
+            )
         elif args.command == "research":
             print(tools.research_vector_lake(getattr(args, "dry_run", False)))
         elif args.command == "debt":
@@ -423,17 +750,28 @@ def main() -> int:
         elif args.command == "trace":
             print(tools.trace_vector_lake(args.query_or_id))
         elif args.command == "evidence-packet":
-            print(tools.export_evidence_packet(
-                args.claim_id,
-                include_evidence_text=getattr(args, "include_text", False),
-                max_evidence_text_chars=getattr(args, "max_text_chars", 2000),
-                actor_id=getattr(args, "actor_id", ""),
-                purpose=getattr(args, "purpose", ""),
-            ))
+            print(
+                tools.export_evidence_packet(
+                    args.claim_id,
+                    include_evidence_text=getattr(args, "include_text", False),
+                    max_evidence_text_chars=getattr(args, "max_text_chars", 2000),
+                    actor_id=getattr(args, "actor_id", ""),
+                    purpose=getattr(args, "purpose", ""),
+                )
+            )
         elif args.command == "merge-suggestions":
-            print(tools.merge_suggestions_vector_lake(limit=getattr(args, "limit", 20), enqueue=not getattr(args, "preview", False)))
+            print(
+                tools.merge_suggestions_vector_lake(
+                    limit=getattr(args, "limit", 20),
+                    enqueue=not getattr(args, "preview", False),
+                )
+            )
         elif args.command == "delete":
-            print(tools.delete_source(args.raw_path, dry_run=not getattr(args, "apply", False)))
+            print(
+                tools.delete_source(
+                    args.raw_path, dry_run=not getattr(args, "apply", False)
+                )
+            )
         elif args.command == "gc":
             gc_kwargs = {
                 "days": getattr(args, "days", 30),

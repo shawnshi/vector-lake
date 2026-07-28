@@ -2,8 +2,12 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import shutil
 import sqlite3
+import stat as stat_module
 import time
+import uuid
 from datetime import datetime, timezone
 
 from vector_lake.wiki_utils import get_wiki_dir
@@ -56,18 +60,56 @@ def _safe_change_set_retention_plan(
     )
 
 
+def _apply_runtime_history_retention(
+    conn: sqlite3.Connection,
+    *,
+    days: int,
+    now: float,
+) -> dict:
+    """Apply the bounded GC retention plan in the caller's transaction."""
+    from vector_lake import governance_store
+
+    normalized_days = validate_gc_days(days)
+    cutoff_epoch = float(now) - (normalized_days * 86400)
+    cutoff = datetime.fromtimestamp(
+        cutoff_epoch,
+        tz=timezone.utc,
+    ).isoformat()
+    plan = _safe_change_set_retention_plan(conn, cutoff=cutoff)
+    change_set_ids = list((plan.get("selected_ids") or {}).get("change_sets") or [])
+    idempotency_count = _count_change_set_idempotency(
+        conn,
+        change_set_ids,
+    )
+    deleted_counts = governance_store.apply_history_retention_plan(
+        conn,
+        plan,
+    )
+    return {
+        "dry_run": False,
+        "days": normalized_days,
+        "cutoff": cutoff,
+        "candidate_count": len(change_set_ids),
+        "candidate_idempotency_keys": idempotency_count,
+        "pruned_change_sets": int(deleted_counts["change_sets"]),
+        "pruned_idempotency_keys": idempotency_count,
+        "safe_plan": True,
+        "deleted_counts": deleted_counts,
+    }
+
+
 def prune_runtime_history(
     days: int = 30,
     dry_run: bool = True,
     now: float | None = None,
 ) -> dict:
     """Prune only reference-safe terminal change-set history in one bounded batch."""
-    from vector_lake import db_store, governance_store
+    from vector_lake import db_store
 
     normalized_days = validate_gc_days(days)
-    cutoff_epoch = (
-        time.time() if now is None else float(now)
-    ) - (normalized_days * 86400)
+    cutoff_epoch = (time.time() if now is None else float(now)) - (
+        normalized_days * 86400
+    )
     cutoff = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat()
     result = {
         "dry_run": bool(dry_run),
@@ -85,9 +127,7 @@ def prune_runtime_history(
         schema_state = db_store.inspect_schema_migration_state(path)
         result["schema_state"] = schema_state
         if not schema_state["ready"]:
-            result["preview_error"] = (
-                f"schema_not_ready:{schema_state['status']}"
-            )
+            result["preview_error"] = f"schema_not_ready:{schema_state['status']}"
             return result
         conn = None
         try:
@@ -103,8 +143,8 @@ def prune_runtime_history(
                 (plan.get("selected_ids") or {}).get("change_sets") or []
             )
             result["candidate_count"] = len(change_set_ids)
-            result["candidate_idempotency_keys"] = (
-                _count_change_set_idempotency(conn, change_set_ids)
+            result["candidate_idempotency_keys"] = _count_change_set_idempotency(
+                conn, change_set_ids
             )
             result["selected_counts"] = plan.get("selected_counts") or {}
             return result
@@ -117,34 +157,18 @@ def prune_runtime_history(
 
     db_store.init_db()
     with db_store.transaction():
-        conn = db_store.get_connection()
-        plan = _safe_change_set_retention_plan(conn, cutoff=cutoff)
-        change_set_ids = list(
-            (plan.get("selected_ids") or {}).get("change_sets") or []
+        return _apply_runtime_history_retention(
+            db_store.get_connection(),
+            days=normalized_days,
+            now=time.time() if now is None else float(now),
         )
-        idempotency_count = _count_change_set_idempotency(
-            conn,
-            change_set_ids,
-        )
-        deleted_counts = governance_store.apply_history_retention_plan(
-            conn,
-            plan,
-        )
-    result["candidate_count"] = len(change_set_ids)
-    result["candidate_idempotency_keys"] = idempotency_count
-    result["pruned_change_sets"] = int(deleted_counts["change_sets"])
-    result["pruned_idempotency_keys"] = idempotency_count
-    result["deleted_counts"] = deleted_counts
-    return result
 
 
 def _gc_snapshot_from_connection(
     conn: sqlite3.Connection,
 ) -> tuple[dict, list]:
     items = {}
-    for row in conn.execute(
-        "SELECT entity_id, data_json FROM entities"
-    ).fetchall():
+    for row in conn.execute("SELECT entity_id, data_json FROM entities").fetchall():
         items[str(row["entity_id"])] = json.loads(row["data_json"])
     edges = conn.execute(
         "SELECT source_id, target_id FROM claim_graph_edges "
@@ -184,12 +208,300 @@ def _read_gc_snapshot() -> tuple[dict | None, list | None, dict]:
             conn.close()
 
 
+def _plain_path_stat(path, *, directory: bool):
+    details = path.lstat()
+    file_attributes = getattr(details, "st_file_attributes", 0)
+    reparse_attribute = getattr(
+        stat_module,
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        0,
+    )
+    if stat_module.S_ISLNK(details.st_mode) or (
+        reparse_attribute and file_attributes & reparse_attribute
+    ):
+        raise RuntimeError(f"GC path is a symbolic link or reparse point: {path}")
+    expected = (
+        stat_module.S_ISDIR(details.st_mode)
+        if directory
+        else stat_module.S_ISREG(details.st_mode)
+    )
+    if not expected:
+        kind = "directory" if directory else "regular file"
+        raise RuntimeError(f"GC path is not a plain {kind}: {path}")
+    return details
+
+
+def _stable_stat_identity(details) -> tuple[int, int, int, int, int]:
+    return (
+        int(details.st_dev),
+        int(details.st_ino),
+        int(details.st_mode),
+        int(details.st_size),
+        int(details.st_mtime_ns),
+    )
+
+
+def _flush_plain_file(path) -> None:
+    before = _plain_path_stat(path, directory=False)
+    with path.open("r+b") as handle:
+        opened = os.fstat(handle.fileno())
+        if _stable_stat_identity(opened) != _stable_stat_identity(before):
+            raise RuntimeError(f"GC file changed before flush: {path}")
+        handle.flush()
+        os.fsync(handle.fileno())
+        after = os.fstat(handle.fileno())
+    current = _plain_path_stat(path, directory=False)
+    if _stable_stat_identity(after) != _stable_stat_identity(
+        opened
+    ) or _stable_stat_identity(current) != _stable_stat_identity(after):
+        raise RuntimeError(f"GC file changed while flushing: {path}")
+
+
+def _read_stable_utf8_file(path, *, max_bytes: int) -> str:
+    before = _plain_path_stat(path, directory=False)
+    if int(before.st_size) > max_bytes:
+        raise RuntimeError(f"GC file is unexpectedly large: {path}")
+    with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if _stable_stat_identity(opened) != _stable_stat_identity(before):
+            raise RuntimeError(f"GC file changed before reading: {path}")
+        raw = handle.read(max_bytes + 1)
+        after = os.fstat(handle.fileno())
+    current = _plain_path_stat(path, directory=False)
+    if len(raw) > max_bytes:
+        raise RuntimeError(f"GC file is unexpectedly large: {path}")
+    if _stable_stat_identity(after) != _stable_stat_identity(
+        opened
+    ) or _stable_stat_identity(current) != _stable_stat_identity(after):
+        raise RuntimeError(f"GC file changed while reading: {path}")
+    return raw.decode("utf-8")
+
+
 def _hash_file(path) -> str:
+    before = _plain_path_stat(path, directory=False)
     digest = hashlib.sha256()
     with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if _stable_stat_identity(opened) != _stable_stat_identity(before):
+            raise RuntimeError(f"GC file changed before hashing: {path}")
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+        after = os.fstat(handle.fileno())
+    current = _plain_path_stat(path, directory=False)
+    if _stable_stat_identity(after) != _stable_stat_identity(
+        opened
+    ) or _stable_stat_identity(current) != _stable_stat_identity(after):
+        raise RuntimeError(f"GC file changed while hashing: {path}")
     return digest.hexdigest()
+
+
+def _remove_plain_gc_tree(path) -> None:
+    _plain_path_stat(path, directory=True)
+    with os.scandir(path) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        child = path / name
+        details = child.lstat()
+        file_attributes = getattr(details, "st_file_attributes", 0)
+        reparse_attribute = getattr(
+            stat_module,
+            "FILE_ATTRIBUTE_REPARSE_POINT",
+            0,
+        )
+        if stat_module.S_ISLNK(details.st_mode) or (
+            reparse_attribute and file_attributes & reparse_attribute
+        ):
+            raise RuntimeError(
+                f"Refusing to clean GC staging link or reparse point: {child}"
+            )
+        if stat_module.S_ISDIR(details.st_mode):
+            _remove_plain_gc_tree(child)
+        elif stat_module.S_ISREG(details.st_mode):
+            child.unlink()
+        else:
+            raise RuntimeError(f"Refusing to clean special GC staging entry: {child}")
+    path.rmdir()
+
+
+def _gc_backup_file_records(candidates: list[dict]) -> list[dict]:
+    records = [
+        {
+            "filename": candidate["filename"],
+            "entity_id": candidate["entity_id"],
+            "page_key": candidate["page_key"],
+            "size": int(candidate["size"]),
+            "content_sha256": candidate["content_sha256"],
+        }
+        for candidate in candidates
+    ]
+    records.sort(
+        key=lambda item: (
+            item["filename"].casefold(),
+            item["filename"],
+            item["entity_id"],
+        )
+    )
+    return records
+
+
+def _verify_gc_backup(
+    backup_dir,
+    *,
+    days: int,
+    fingerprint: str,
+    candidates: list[dict],
+) -> dict:
+    _plain_path_stat(backup_dir, directory=True)
+    manifest_path = backup_dir / "manifest.json"
+    manifest = json.loads(_read_stable_utf8_file(manifest_path, max_bytes=1024 * 1024))
+    expected_files = _gc_backup_file_records(candidates)
+    if (
+        manifest.get("manifest_version") != 1
+        or manifest.get("kind") != "vector-lake-orphan-gc"
+        or manifest.get("days") != days
+        or manifest.get("fingerprint") != fingerprint
+        or manifest.get("files") != expected_files
+    ):
+        raise RuntimeError(f"GC backup manifest mismatch: {backup_dir}")
+
+    expected_names = {"manifest.json"}
+    expected_names.update(record["filename"] for record in expected_files)
+    actual_names = {entry.name for entry in backup_dir.iterdir()}
+    if actual_names != expected_names:
+        raise RuntimeError(f"GC backup file set mismatch: {backup_dir}")
+
+    for record in expected_files:
+        backup_path = backup_dir / record["filename"]
+        backup_stat = _plain_path_stat(backup_path, directory=False)
+        if backup_stat.st_size != record["size"]:
+            raise RuntimeError(f"GC backup size mismatch: {backup_path}")
+        actual_hash = _hash_file(backup_path)
+        if not hmac.compare_digest(
+            actual_hash,
+            record["content_sha256"],
+        ):
+            raise RuntimeError(f"GC backup hash mismatch: {backup_path}")
+    _plain_path_stat(backup_dir, directory=True)
+    return manifest
+
+
+def _publish_gc_backup(
+    *,
+    days: int,
+    fingerprint: str,
+    candidates: list[dict],
+    now: float,
+):
+    backup_root = get_wiki_dir().parent / "backup" / "gc"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    _plain_path_stat(backup_root, directory=True)
+    backup_name = fingerprint.removeprefix(_ORPHAN_FINGERPRINT_PREFIX)[:16]
+    backup_dir = backup_root / backup_name
+    try:
+        _plain_path_stat(backup_dir, directory=True)
+    except FileNotFoundError:
+        pass
+    else:
+        _verify_gc_backup(
+            backup_dir,
+            days=days,
+            fingerprint=fingerprint,
+            candidates=candidates,
+        )
+        return backup_dir
+
+    staging_dir = backup_root / f".{backup_name}.{uuid.uuid4().hex}.tmp"
+    staging_dir.mkdir(mode=0o700)
+    _plain_path_stat(staging_dir, directory=True)
+    try:
+        for candidate in candidates:
+            source_path = candidate["path"]
+            source_stat = _plain_path_stat(source_path, directory=False)
+            if int(source_stat.st_size) != int(candidate["size"]) or int(
+                source_stat.st_mtime_ns
+            ) != int(candidate["mtime_ns"]):
+                raise RuntimeError(f"GC source candidate changed: {source_path}")
+            backup_path = staging_dir / candidate["filename"]
+            try:
+                backup_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError(
+                    f"GC staging destination already exists: {backup_path}"
+                )
+            shutil.copyfile(source_path, backup_path)
+            _flush_plain_file(backup_path)
+            shutil.copystat(source_path, backup_path)
+            backup_stat = _plain_path_stat(backup_path, directory=False)
+            if backup_stat.st_size != candidate["size"]:
+                raise RuntimeError(f"GC backup size mismatch: {backup_path}")
+            actual_hash = _hash_file(backup_path)
+            if not hmac.compare_digest(
+                actual_hash,
+                candidate["content_sha256"],
+            ):
+                raise RuntimeError(f"GC backup hash mismatch: {backup_path}")
+
+        manifest = {
+            "manifest_version": 1,
+            "kind": "vector-lake-orphan-gc",
+            "created_at": datetime.fromtimestamp(
+                float(now),
+                tz=timezone.utc,
+            ).isoformat(),
+            "days": days,
+            "fingerprint": fingerprint,
+            "files": _gc_backup_file_records(candidates),
+        }
+        manifest_path = staging_dir / "manifest.json"
+        with manifest_path.open("x", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        _verify_gc_backup(
+            staging_dir,
+            days=days,
+            fingerprint=fingerprint,
+            candidates=candidates,
+        )
+        try:
+            staging_dir.replace(backup_dir)
+        except OSError:
+            _plain_path_stat(backup_dir, directory=True)
+            _verify_gc_backup(
+                backup_dir,
+                days=days,
+                fingerprint=fingerprint,
+                candidates=candidates,
+            )
+        else:
+            _verify_gc_backup(
+                backup_dir,
+                days=days,
+                fingerprint=fingerprint,
+                candidates=candidates,
+            )
+        return backup_dir
+    finally:
+        try:
+            _remove_plain_gc_tree(staging_dir)
+        except FileNotFoundError:
+            pass
+        except (OSError, RuntimeError) as cleanup_exc:
+            log.warning(
+                "GC staging cleanup was deferred for %s: %s",
+                staging_dir,
+                cleanup_exc,
+            )
 
 
 def _orphan_candidates(
@@ -213,12 +525,37 @@ def _orphan_candidates(
 
     wiki_dir = get_wiki_dir()
     markdown_paths: dict[str, list] = {}
+    unsafe_markdown_paths: dict[str, list] = {}
     try:
         entries = list(wiki_dir.iterdir())
     except OSError as exc:
         return [], [f"Cannot enumerate Wiki directory: {exc}"]
     for entry in entries:
-        if entry.is_file() and entry.suffix.casefold() == ".md":
+        if entry.suffix.casefold() != ".md":
+            continue
+        try:
+            entry_stat = entry.lstat()
+        except OSError:
+            unsafe_markdown_paths.setdefault(
+                entry.stem.casefold(),
+                [],
+            ).append(entry)
+            continue
+        file_attributes = getattr(entry_stat, "st_file_attributes", 0)
+        reparse_attribute = getattr(
+            stat_module,
+            "FILE_ATTRIBUTE_REPARSE_POINT",
+            0,
+        )
+        if entry.is_symlink() or (
+            reparse_attribute and file_attributes & reparse_attribute
+        ):
+            unsafe_markdown_paths.setdefault(
+                entry.stem.casefold(),
+                [],
+            ).append(entry)
+            continue
+        if stat_module.S_ISREG(entry_stat.st_mode):
             markdown_paths.setdefault(entry.stem.casefold(), []).append(entry)
 
     cutoff = now - (days * 86400)
@@ -235,11 +572,17 @@ def _orphan_candidates(
         degree = degrees[page_key]
         if degree > 1:
             continue
-        matches = markdown_paths.get(page_key.casefold(), [])
-        if len(matches) > 1:
+        identity = page_key.casefold()
+        unsafe_matches = unsafe_markdown_paths.get(identity, [])
+        if unsafe_matches:
             errors.append(
-                f"{page_key}: multiple case-insensitive Markdown matches"
+                f"{page_key}: Wiki Markdown match is a symbolic link, "
+                "reparse point, or otherwise cannot be inspected safely"
             )
+            continue
+        matches = markdown_paths.get(identity, [])
+        if len(matches) > 1:
+            errors.append(f"{page_key}: multiple case-insensitive Markdown matches")
             continue
         if not matches:
             continue
@@ -249,7 +592,7 @@ def _orphan_candidates(
             if stat.st_mtime >= cutoff:
                 continue
             content_sha256 = _hash_file(path)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             errors.append(f"{path.name}: cannot inspect candidate: {exc}")
             continue
         candidates.append(
@@ -346,9 +689,7 @@ def gc_vector_lake(
             ]
             _append_orphan_candidates(lines, candidates)
         else:
-            lines = [
-                f"[DRY-RUN] No orphan entities older than {days} days found."
-            ]
+            lines = [f"[DRY-RUN] No orphan entities older than {days} days found."]
         if inspection_errors:
             lines.append(
                 f"  [BLOCKED] {len(inspection_errors)} candidate inspection "
@@ -370,9 +711,7 @@ def gc_vector_lake(
         return "\n".join(lines)
 
     supplied_confirmation = (
-        None
-        if orphan_confirmation is None
-        else str(orphan_confirmation).strip()
+        None if orphan_confirmation is None else str(orphan_confirmation).strip()
     )
     if supplied_confirmation is not None and not hmac.compare_digest(
         supplied_confirmation,
@@ -389,8 +728,8 @@ def gc_vector_lake(
             "made. Resolve: " + "; ".join(inspection_errors[:20])
         )
 
-    retention = prune_runtime_history(days=days, dry_run=False, now=now)
     if supplied_confirmation is None:
+        retention = prune_runtime_history(days=days, dry_run=False, now=now)
         lines = [
             "GC safe phase complete. Orphan deletion was not confirmed; "
             f"retained {len(candidates)} candidate page(s).",
@@ -414,25 +753,23 @@ def gc_vector_lake(
         return "\n".join(lines)
 
     if not candidates:
+        retention = prune_runtime_history(days=days, dry_run=False, now=now)
         return (
             f"GC complete. No orphan entities older than {days} days found. "
             f"Pruned {retention['pruned_change_sets']} change set(s) and "
             f"{retention['pruned_idempotency_keys']} idempotency key(s)."
         )
 
-    import shutil
-
-    backup_dir = (
-        get_wiki_dir().parent
-        / "backup"
-        / "gc"
-        / fingerprint.removeprefix(_ORPHAN_FINGERPRINT_PREFIX)[:16]
-    )
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir = None
+    retention = None
+    details = None
     try:
-        for candidate in candidates:
-            path = candidate["path"]
-            shutil.copy2(path, backup_dir / path.name)
+        backup_dir = _publish_gc_backup(
+            days=days,
+            fingerprint=fingerprint,
+            candidates=candidates,
+            now=now,
+        )
 
         def assert_candidates_unchanged() -> None:
             from vector_lake import db_store
@@ -463,6 +800,18 @@ def gc_vector_lake(
                     "Canonical orphan candidate set changed after confirmation"
                 )
 
+        def apply_history_retention_in_transaction(
+            _outbox_ids: list[int],
+        ) -> None:
+            nonlocal retention
+            from vector_lake import db_store
+
+            retention = _apply_runtime_history_retention(
+                db_store.get_connection(),
+                days=days,
+                now=now,
+            )
+
         from vector_lake.mutation_coordinator import execute_mutation_batch
 
         details = execute_mutation_batch(
@@ -475,30 +824,55 @@ def gc_vector_lake(
                 for candidate in candidates
             ],
             precondition_callback=assert_candidates_unchanged,
+            transaction_callback=apply_history_retention_in_transaction,
             return_details=True,
         )
+        if details.get("committed") is not True:
+            raise RuntimeError(
+                "Mutation coordinator did not confirm the transaction commit"
+            )
+        if retention is None:
+            raise RuntimeError("History retention callback did not run")
     except Exception as exc:
         log.error("Confirmed orphan GC failed: %s", exc)
+        backup_note = (
+            f" Verified backup retained at {backup_dir}."
+            if backup_dir is not None
+            else ""
+        )
+        if isinstance(details, dict) and details.get("committed") is True:
+            return (
+                "GC canonical/history transaction committed, but "
+                "post-commit reporting raised a warning: "
+                f"{type(exc).__name__}: {exc}.{backup_note}"
+            )
         return (
-            "GC safe phase complete, but confirmed orphan deletion was "
-            f"blocked: {exc}. Pruned {retention['pruned_change_sets']} change "
-            f"set(s) and {retention['pruned_idempotency_keys']} idempotency "
-            "key(s)."
+            "Confirmed orphan GC was blocked: "
+            f"{exc}. No canonical or history deletion committed."
+            f"{backup_note}"
         )
 
     deferred = list(details.get("deferred") or [])
-    deleted = len(candidates) - len(deferred)
+    post_commit_warnings = list(details.get("post_commit_warnings") or [])
     deferred_note = (
-        f" {len(deferred)} projection deletion(s) were deferred: "
+        f" {len(deferred)} Markdown projection deletion(s) were deferred: "
         + ", ".join(deferred)
         + "."
         if deferred
         else ""
     )
+    warning_note = (
+        f" {len(post_commit_warnings)} post-commit warning(s): "
+        + " | ".join(post_commit_warnings)
+        + "."
+        if post_commit_warnings
+        else ""
+    )
 
     return (
-        f"GC complete. Deleted {deleted} orphan pages (backed up to "
-        f"{backup_dir}).{deferred_note} Pruned "
+        "GC complete. Canonical/history transaction committed. "
+        f"Deleted {len(candidates)} orphan pages from canonical state "
+        f"(backed up to {backup_dir}).{deferred_note}{warning_note} Pruned "
         f"{retention['pruned_change_sets']} change "
         f"set(s) and {retention['pruned_idempotency_keys']} idempotency key(s)."
     )

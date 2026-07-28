@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -11,18 +12,23 @@ from vector_lake.wiki_utils import (
     get_wiki_dir,
     iter_markdown_files,
     normalize_entity_name,
-    read_markdown_file,
+    normalize_semantic_text,
+    split_frontmatter,
 )
 
 
-def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True) -> str:
+def rename_vector_lake_entity(
+    old_name: str, new_name: str, dry_run: bool = True
+) -> str:
     """Atomically rename an entity and update every exact internal link."""
     wiki_dir = Path(get_wiki_dir()).resolve(strict=True)
     old_name = old_name if old_name.casefold().endswith(".md") else f"{old_name}.md"
     new_name = new_name if new_name.casefold().endswith(".md") else f"{new_name}.md"
     old_path = (wiki_dir / old_name).resolve()
     if not old_path.is_relative_to(wiki_dir):
-        return f"[Security Error] Old entity '{old_name}' is outside the wiki directory."
+        return (
+            f"[Security Error] Old entity '{old_name}' is outside the wiki directory."
+        )
     matches = [
         path.resolve()
         for path in iter_markdown_files(wiki_dir)
@@ -43,24 +49,37 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
     if new_path.exists():
         return f"Error: Target entity '{normalized_new_name}' already exists. Use merge instead."
 
-    frontmatter, body, _ = read_markdown_file(old_path)
+    old_bytes = old_path.read_bytes()
+    old_projection_hash = hashlib.sha256(old_bytes).hexdigest()
+    old_content = normalize_semantic_text(old_bytes.decode("utf-8"))
+    frontmatter, body = split_frontmatter(old_content)
     preserved_entity_id = str(frontmatter.get("entity_id") or "").strip()
     if not preserved_entity_id and get_db_path().exists():
         try:
-            row = get_connection().execute(
-                "SELECT entity_id FROM entities "
-                "WHERE json_extract(data_json, '$.page_key') = ? LIMIT 1",
-                (old_name[:-3],),
-            ).fetchone()
+            row = (
+                get_connection()
+                .execute(
+                    "SELECT entity_id FROM entities "
+                    "WHERE json_extract(data_json, '$.page_key') = ? LIMIT 1",
+                    (old_name[:-3],),
+                )
+                .fetchone()
+            )
             if row is not None:
                 preserved_entity_id = str(row["entity_id"])
         except Exception:
             preserved_entity_id = ""
     # The fallback is the legacy identity of the old page, never the new name.
     # Persisting it in frontmatter prevents subsequent renames from changing it.
-    frontmatter["entity_id"] = preserved_entity_id or _stable_id("entity", old_name[:-3])
+    frontmatter["entity_id"] = preserved_entity_id or _stable_id(
+        "entity", old_name[:-3]
+    )
     old_core = old_name.split("_", 1)[-1][:-3] if "_" in old_name else old_name[:-3]
-    new_core = normalized_new_name.split("_", 1)[-1][:-3] if "_" in normalized_new_name else normalized_new_name[:-3]
+    new_core = (
+        normalized_new_name.split("_", 1)[-1][:-3]
+        if "_" in normalized_new_name
+        else normalized_new_name[:-3]
+    )
     if frontmatter.get("title") == old_core:
         frontmatter["title"] = new_core
     aliases = list(frontmatter.get("aliases") or [])
@@ -78,26 +97,46 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
         return with_alias.sub(r"[[" + new_key + r"|\1]]", content)
 
     body = replace_links(body)
-    new_content = f"---\n{yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)}---\n{body}"
+    new_content = (
+        f"---\n{yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)}---\n{body}"
+    )
     mutations = [
-        {"filename": old_name, "is_delete": True},
-        {"filename": normalized_new_name, "content": new_content},
+        {
+            "filename": old_name,
+            "is_delete": True,
+            "expected_projection_hash": old_projection_hash,
+        },
+        {
+            "filename": normalized_new_name,
+            "content": new_content,
+            "expected_projection_hash": "",
+        },
     ]
     updated_files = 0
     for root, _, files in os.walk(wiki_dir):
         for filename in files:
-            if (
-                not filename.casefold().endswith(".md")
-                or filename.casefold() in {"index.md", "log.md", "overview.md"}
-            ):
+            if not filename.casefold().endswith(".md") or filename.casefold() in {
+                "index.md",
+                "log.md",
+                "overview.md",
+            }:
                 continue
             path = Path(root) / filename
             if path in {old_path, new_path}:
                 continue
-            content = path.read_text(encoding="utf-8")
+            content_bytes = path.read_bytes()
+            content = normalize_semantic_text(content_bytes.decode("utf-8"))
             replaced = replace_links(content)
             if replaced != content:
-                mutations.append({"filename": filename, "content": replaced})
+                mutations.append(
+                    {
+                        "filename": filename,
+                        "content": replaced,
+                        "expected_projection_hash": hashlib.sha256(
+                            content_bytes
+                        ).hexdigest(),
+                    }
+                )
                 updated_files += 1
 
     if dry_run:

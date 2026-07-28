@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import queue
@@ -20,12 +21,18 @@ try:
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
 except ImportError:
-    print("Error: `watchdog` library is not installed. Please run `pip install watchdog`.", flush=True)
+    print(
+        "Error: `watchdog` library is not installed. Please run `pip install watchdog`.",
+        flush=True,
+    )
     import sys
+
     sys.exit(1)
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("watchdog_sync")
 
 DEBOUNCE_SECONDS = 3.0
@@ -58,7 +65,6 @@ def _positive_env_int(name: str, default: int) -> int:
         return default
 
 
-
 _BACKGROUND_THREADS_LOCK = threading.Lock()
 _BACKGROUND_THREADS: dict[str, threading.Thread] = {}
 
@@ -87,10 +93,7 @@ def _shutdown_timeout_seconds() -> float:
 def background_thread_health() -> dict[str, bool]:
     """Return the liveness of the most recently registered watchdog workers."""
     with _BACKGROUND_THREADS_LOCK:
-        return {
-            name: thread.is_alive()
-            for name, thread in _BACKGROUND_THREADS.items()
-        }
+        return {name: thread.is_alive() for name, thread in _BACKGROUND_THREADS.items()}
 
 
 def _register_background_threads(threads: dict[str, threading.Thread]) -> None:
@@ -108,6 +111,8 @@ def _join_threads_bounded(
         remaining = max(0.0, deadline - time.monotonic())
         thread.join(timeout=remaining)
     return sorted(name for name, thread in threads.items() if thread.is_alive())
+
+
 def _wiki_reconcile_marker_path() -> Path:
     from vector_lake.wiki_utils import get_meta_dir
 
@@ -255,13 +260,10 @@ class WikiIndexEventBuffer:
         total_drift: int,
     ) -> bool:
         """Install a bounded in-process plan only for the scanned generation."""
-        bounded = tuple(
-            str(item) for item in islice(candidates, 50_000)
-        )
+        bounded = tuple(str(item) for item in islice(candidates, 50_000))
         with self._lock:
-            if (
-                not self._full_reconcile_required
-                or self._reconcile_generation != int(expected_generation)
+            if not self._full_reconcile_required or self._reconcile_generation != int(
+                expected_generation
             ):
                 return False
             self._reconcile_plan_generation = int(expected_generation)
@@ -280,17 +282,16 @@ class WikiIndexEventBuffer:
     ) -> list[str] | None:
         """Peek the next plan batch; None means the generation needs a scan."""
         with self._lock:
-            if (
-                self._reconcile_plan_generation != int(expected_generation)
-                or self._reconcile_generation != int(expected_generation)
-            ):
+            if self._reconcile_plan_generation != int(
+                expected_generation
+            ) or self._reconcile_generation != int(expected_generation):
                 return None
             end = min(
                 len(self._reconcile_plan_candidates),
                 self._reconcile_plan_cursor + max(1, int(batch_size)),
             )
             return list(
-                self._reconcile_plan_candidates[self._reconcile_plan_cursor:end]
+                self._reconcile_plan_candidates[self._reconcile_plan_cursor : end]
             )
 
     def acknowledge_reconcile_plan_batch(
@@ -301,13 +302,15 @@ class WikiIndexEventBuffer:
         """Advance only when the completed batch is exactly the current head."""
         completed = tuple(str(item) for item in filenames)
         with self._lock:
-            if (
-                self._reconcile_plan_generation != int(expected_generation)
-                or self._reconcile_generation != int(expected_generation)
-            ):
+            if self._reconcile_plan_generation != int(
+                expected_generation
+            ) or self._reconcile_generation != int(expected_generation):
                 return False
             end = self._reconcile_plan_cursor + len(completed)
-            if self._reconcile_plan_candidates[self._reconcile_plan_cursor:end] != completed:
+            if (
+                self._reconcile_plan_candidates[self._reconcile_plan_cursor : end]
+                != completed
+            ):
                 return False
             self._reconcile_plan_cursor = end
             return True
@@ -318,10 +321,9 @@ class WikiIndexEventBuffer:
     ) -> tuple[int, int] | None:
         """Return queued and unplanned drift counts for the current generation."""
         with self._lock:
-            if (
-                self._reconcile_plan_generation != int(expected_generation)
-                or self._reconcile_generation != int(expected_generation)
-            ):
+            if self._reconcile_plan_generation != int(
+                expected_generation
+            ) or self._reconcile_generation != int(expected_generation):
                 return None
             queued = len(self._reconcile_plan_candidates) - self._reconcile_plan_cursor
             return queued, self._reconcile_plan_unplanned
@@ -343,9 +345,7 @@ class WikiIndexEventBuffer:
                     and not self._full_reconcile_marker_exists_locked()
                     and not self._persist_full_reconcile_locked()
                 ):
-                    raise RuntimeError(
-                        "Wiki reconciliation marker remains non-durable"
-                    )
+                    raise RuntimeError("Wiki reconciliation marker remains non-durable")
                 return False
             if key in self._pending_paths:
                 return False
@@ -432,9 +432,8 @@ class WikiIndexEventBuffer:
     def clear_full_reconcile(self, expected_generation: int) -> bool:
         """CAS-acknowledge reconciliation without losing concurrent events."""
         with self._lock:
-            if (
-                not self._full_reconcile_required
-                or self._reconcile_generation != int(expected_generation)
+            if not self._full_reconcile_required or self._reconcile_generation != int(
+                expected_generation
             ):
                 return False
             if not self._remove_full_reconcile_marker_locked():
@@ -449,15 +448,41 @@ class WikiIndexEventBuffer:
 index_queue = WikiIndexEventBuffer(persist_reconcile_marker=True)
 
 
-def _watch_directories() -> dict[str, Path]:
+def _raw_watch_configuration() -> tuple[list[Path], str]:
+    """Return one validated ingest config snapshot for watch reconciliation."""
+    from vector_lake.tool_ingest import (
+        _load_ingest_config,
+        get_ingest_target_directories,
+    )
+
+    config_snapshot = _load_ingest_config()
+    targets = get_ingest_target_directories(
+        config_snapshot,
+        collapse_nested=True,
+    )
+    token = json.dumps(config_snapshot, ensure_ascii=False, sort_keys=True)
+    return targets, token
+
+
+def _watch_directories(
+    raw_targets: list[Path] | None = None,
+) -> dict[str, Path | list[Path]]:
+    from vector_lake.tool_ingest import get_ingest_target_directories
     from vector_lake.wiki_utils import get_raw_dir, get_wiki_dir
 
     raw_dir = get_raw_dir()
     return {
         "wiki": get_wiki_dir(),
         "raw": raw_dir,
+        "raw_targets": (
+            get_ingest_target_directories(collapse_nested=True)
+            if raw_targets is None
+            else raw_targets
+        ),
         "diary": raw_dir / "privacy" / "Diary",
     }
+
+
 global_task_lock = threading.Lock()
 
 
@@ -477,7 +502,9 @@ class WikiIndexHandler(FileSystemEventHandler):
 
             if os.path.exists(filepath):
                 payload_text = Path(filepath).read_text(encoding="utf-8")
-                if db_store.is_managed_projection_state(filename, "update", payload_text):
+                if db_store.is_managed_projection_state(
+                    filename, "update", payload_text
+                ):
                     return
             elif db_store.is_managed_projection_state(filename, "delete"):
                 return
@@ -487,9 +514,16 @@ class WikiIndexHandler(FileSystemEventHandler):
         now = time.time()
         with self.lock:
             if len(self.last_triggered) > 1000:
-                self.last_triggered = {k: v for k, v in self.last_triggered.items() if (now - v) <= DEBOUNCE_SECONDS * 2}
-            
-            if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
+                self.last_triggered = {
+                    k: v
+                    for k, v in self.last_triggered.items()
+                    if (now - v) <= DEBOUNCE_SECONDS * 2
+                }
+
+            if (
+                filepath in self.last_triggered
+                and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS
+            ):
                 return
             self.last_triggered[filepath] = now
 
@@ -652,8 +686,7 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
             monitor.join(timeout=max(0.0, deadline - time.monotonic()))
         monitor_alive = bool(monitor is not None and monitor.is_alive())
         process_alive = bool(
-            process is not None
-            and getattr(process, "poll", lambda: None)() is None
+            process is not None and getattr(process, "poll", lambda: None)() is None
         )
         if monitor_alive or process_alive:
             log.warning(
@@ -669,6 +702,7 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
     def on_modified(self, event):
         self.handle_event(event)
 
+
 class RawWatchdogHandler(FileSystemEventHandler):
     def __init__(
         self,
@@ -676,7 +710,6 @@ class RawWatchdogHandler(FileSystemEventHandler):
         stop_event: threading.Event | None = None,
     ):
         self.stop_event = stop_event or threading.Event()
-        self.last_triggered = {}
         self.lock = threading.RLock()
         self.sync_thread: threading.Thread | None = None
         self.sync_future = None
@@ -689,15 +722,27 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
     @staticmethod
     def _full_scan_complete(result) -> bool:
-        return "No new files to ingest." in str(result or "")
+        from vector_lake.tool_ingest import FULL_SCAN_COMPLETE_TOKEN
+
+        lines = str(result or "").splitlines()
+        return bool(lines) and lines[0].strip() == FULL_SCAN_COMPLETE_TOKEN
+
+    def request_full_scan(self) -> None:
+        """Schedule a bounded startup/recovery scan through the single-flight queue."""
+        with self.lock:
+            self._queue_batch_locked([], True)
+            self._submit_pending_locked()
 
     def _run_ingest(self, paths, overflow):
         from vector_lake.tool_ingest import prepare_ingest_batch
 
-        return prepare_ingest_batch(
-            batch_size=50 if overflow else max(1, len(paths)),
-            candidate_paths=None if overflow else paths,
-        )
+        options = {
+            "batch_size": 50 if overflow else max(1, len(paths)),
+            "candidate_paths": None if overflow else paths,
+        }
+        if overflow:
+            options["_enqueue_all"] = True
+        return prepare_ingest_batch(**options)
 
     def _queue_batch_locked(self, paths, overflow) -> None:
         max_pending = _positive_env_int("VECTOR_LAKE_RAW_EVENT_BUFFER", 500)
@@ -714,7 +759,11 @@ class RawWatchdogHandler(FileSystemEventHandler):
             self._submit_pending_locked()
 
     def _schedule_retry_locked(self) -> None:
-        if self.shutting_down or self.stop_event.is_set() or self.retry_timer is not None:
+        if (
+            self.shutting_down
+            or self.stop_event.is_set()
+            or self.retry_timer is not None
+        ):
             return
         delay = min(
             60.0,
@@ -736,7 +785,11 @@ class RawWatchdogHandler(FileSystemEventHandler):
             future.set_result(result)
 
     def _submit_pending_locked(self):
-        if self.shutting_down or self.stop_event.is_set() or self.retry_timer is not None:
+        if (
+            self.shutting_down
+            or self.stop_event.is_set()
+            or self.retry_timer is not None
+        ):
             return
         if self.sync_future is not None and not self.sync_future.done():
             return
@@ -773,6 +826,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
                 )
             )
         )
+
     def _ingest_done(self, future, paths, overflow):
         result = None
         try:
@@ -830,7 +884,10 @@ class RawWatchdogHandler(FileSystemEventHandler):
             except BaseException:
                 future_done = True
 
-        if worker_thread is not None and worker_thread is not threading.current_thread():
+        if (
+            worker_thread is not None
+            and worker_thread is not threading.current_thread()
+        ):
             worker_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         worker_done = worker_thread is None or not worker_thread.is_alive()
         if not future_done or not worker_done:
@@ -847,6 +904,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
         drain_error: list[BaseException] = []
         if paths or overflow:
+
             def drain_pending() -> None:
                 try:
                     result = self._run_ingest(paths, overflow)
@@ -871,31 +929,25 @@ class RawWatchdogHandler(FileSystemEventHandler):
             log.error("Raw ingest shutdown drain failed: %s", drain_error[0])
             return False
         return True
+
     def handle_event(self, event):
         if event.is_directory:
             return
-        filepath = getattr(event, "dest_path", None) or event.src_path
+        from vector_lake.tool_ingest import is_private_diary_path
 
-        # Prevent Double-Trigger: Exclude privacy/Diary (handled by DiaryWatchdogHandler)
-        if "privacy" in filepath and "Diary" in filepath:
+        filepath = getattr(event, "dest_path", None) or event.src_path
+        if is_private_diary_path(filepath):
             return
 
         filename = os.path.basename(filepath)
         if filename.startswith(".") or filename.endswith(".tmp"):
             return
 
-        now = time.time()
         with self.lock:
             if self.shutting_down or self.stop_event.is_set():
                 return
-            if len(self.last_triggered) > 2000:
-                self.last_triggered.clear()
-            if (
-                filepath in self.last_triggered
-                and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS
-            ):
-                return
-            self.last_triggered[filepath] = now
+            # pending_paths is the trailing-edge debounce. An event received
+            # during an in-flight preparation is retained for the next pass.
             self._queue_batch_locked([str(Path(filepath).resolve())], False)
             self._submit_pending_locked()
 
@@ -912,6 +964,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         self.handle_event(event)
+
 
 def process_mutation_outbox_batch(
     limit: int = 50,
@@ -955,7 +1008,9 @@ def process_mutation_outbox_batch(
             )
             if not already_materialized:
                 with db_store.transaction():
-                    if not db_store.mutation_outbox_lease_is_current(outbox_id, *lease_args):
+                    if not db_store.mutation_outbox_lease_is_current(
+                        outbox_id, *lease_args
+                    ):
                         continue
                     materialize_markdown_projection(
                         filename,
@@ -976,7 +1031,9 @@ def process_mutation_outbox_batch(
             )
             if status != "stale":
                 stats["failed" if status == "failed" else "retrying"] += 1
-            log.error(f"Outbox item {outbox_id} failed for {filename}; status={status}: {exc}")
+            log.error(
+                f"Outbox item {outbox_id} failed for {filename}; status={status}: {exc}"
+            )
     if ready_for_index:
         current_rows = [
             (row, filename)
@@ -1009,7 +1066,9 @@ def process_mutation_outbox_batch(
                 )
                 if status != "stale":
                     stats["failed" if status == "failed" else "retrying"] += 1
-                log.error(f"Outbox index batch failed for {filename}; status={status}: {exc}")
+                log.error(
+                    f"Outbox index batch failed for {filename}; status={status}: {exc}"
+                )
         else:
             for row, _ in current_rows:
                 if db_store.complete_mutation_outbox(
@@ -1025,17 +1084,30 @@ def process_mutation_outbox_batch(
 def process_legacy_projection_batch(filenames) -> dict:
     """Promote bounded manual Markdown edits into canonical state and durable outbox rows."""
     from vector_lake.mutation_coordinator import execute_mutation_batch
-    from vector_lake.wiki_utils import get_wiki_dir
+    from vector_lake.wiki_utils import get_wiki_dir, normalize_semantic_text
 
     stats = {"completed": 0, "failed": 0}
     wiki_dir = get_wiki_dir()
     for filename in dict.fromkeys(str(item) for item in filenames):
         target = wiki_dir / filename
         try:
-            mutation = {"filename": filename, "is_delete": not target.exists()}
-            if target.exists():
-                mutation["content"] = target.read_text(encoding="utf-8")
-            execute_mutation_batch([mutation], validation_mode="schema", origin="watchdog")
+            target_exists = target.exists()
+            mutation = {
+                "filename": filename,
+                "is_delete": not target_exists,
+                "expected_projection_hash": "",
+            }
+            if target_exists:
+                content_bytes = target.read_bytes()
+                mutation["content"] = normalize_semantic_text(
+                    content_bytes.decode("utf-8")
+                )
+                mutation["expected_projection_hash"] = hashlib.sha256(
+                    content_bytes
+                ).hexdigest()
+            execute_mutation_batch(
+                [mutation], validation_mode="schema", origin="watchdog"
+            )
             stats["completed"] += 1
         except Exception as exc:
             stats["failed"] += 1
@@ -1187,9 +1259,7 @@ def reconcile_wiki_overflow_once(
     if selected:
         legacy_stats = process_legacy_projection_batch(selected)
         if legacy_stats["failed"]:
-            remaining_state = event_buffer.reconcile_plan_remaining(
-                expected_generation
-            )
+            remaining_state = event_buffer.reconcile_plan_remaining(expected_generation)
             remaining = sum(remaining_state) if remaining_state is not None else 0
             return {
                 "generation": expected_generation,
@@ -1296,6 +1366,7 @@ def reconcile_wiki_overflow_once(
         "generation_changed": not installed,
         "cleared": False,
     }
+
 
 def index_worker_loop(stop_event: threading.Event | None = None):
     """Drain projection work until the watchdog requests a coordinated stop."""
@@ -1482,7 +1553,7 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                 str(exc),
                 component="outbox",
             )
-            if stop_event.wait(min(backoff_base ** consecutive_failures, 60)):
+            if stop_event.wait(min(backoff_base**consecutive_failures, 60)):
                 break
         finally:
             from vector_lake.db_store import close_connection
@@ -1533,43 +1604,66 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
 
             # Expire abandoned subagent work once per hour instead of waiting
             # for a manual CLI invocation or one of the twice-daily lint runs.
-            current_date_hour = f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
+            current_date_hour = (
+                f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
+            )
             if now.tm_min == 0 and current_date_hour != last_expiry_date_hour:
                 from vector_lake.db_store import close_connection
 
                 try:
                     expired = expire_stale_ingest_jobs_for_watchdog()
-                    log.info("Hourly ingest expiry completed: %s stale job(s).", expired)
+                    log.info(
+                        "Hourly ingest expiry completed: %s stale job(s).", expired
+                    )
                     last_expiry_date_hour = current_date_hour
                 finally:
                     close_connection()
-            
+
             # Run at 10:00 and 23:00
             if now.tm_hour in (10, 23) and now.tm_min == 0:
                 if current_date_hour != last_run_date_hour:
-                    write_status("processing", 0, index_queue.qsize(), "Running Scheduled Auto-Lint", "", component="scheduler")
+                    write_status(
+                        "processing",
+                        0,
+                        index_queue.qsize(),
+                        "Running Scheduled Auto-Lint",
+                        "",
+                        component="scheduler",
+                    )
                     log.info("Triggering Scheduled Autonomous Auto-Lint...")
 
                     from vector_lake.tool_lint import lint_vector_lake
                     from vector_lake import indexer
                     from vector_lake.db_store import close_connection, get_connection
+
                     try:
                         with global_task_lock:
                             if indexer.refresh_graph_topology_if_dirty():
-                                log.info("Graph topology refreshed during scheduled lint.")
+                                log.info(
+                                    "Graph topology refreshed during scheduled lint."
+                                )
                             lint_vector_lake(auto_fix=False)
 
                             # Truncate WAL to prevent unbounded growth
                             conn = get_connection()
                             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                            log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
+                            log.info(
+                                "SQLite WAL checkpoint (TRUNCATE) completed successfully."
+                            )
                     finally:
                         close_connection()
-                    
+
                     log.info("Scheduled Autonomous Auto-Lint completed.")
                     last_run_date_hour = current_date_hour
-                    write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "", component="scheduler")
-            
+                    write_status(
+                        "idle",
+                        0,
+                        index_queue.qsize(),
+                        "Scheduled Lint finished",
+                        "",
+                        component="scheduler",
+                    )
+
             # Calculate wait time till next minute to avoid tight spinning, or just sleep for 30 seconds
             # If we just ran at hour 10 or 23, sleep 60 seconds to push past min 0
             if now.tm_hour in (10, 23) and now.tm_min == 0:
@@ -1587,10 +1681,17 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
             )
             if stop_event.wait(wait_seconds):
                 break
-                
+
         except Exception as exc:
             log.error(f"Scheduled lint worker error: {exc}")
-            write_status("error", 0, index_queue.qsize(), "Scheduled lint exception", str(exc), component="scheduler")
+            write_status(
+                "error",
+                0,
+                index_queue.qsize(),
+                "Scheduled lint exception",
+                str(exc),
+                component="scheduler",
+            )
             if stop_event.wait(60):
                 break
 
@@ -1639,7 +1740,23 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
     raw_handler = None
     diary_handler = None
     failure_reason = ""
-    watch_dirs = _watch_directories()
+    initial_raw_targets, raw_config_token = _raw_watch_configuration()
+    watch_dirs = _watch_directories(initial_raw_targets)
+    raw_watch_handles: dict[str, object | None] = {}
+    raw_watch_refresh_seconds = _bounded_env_float(
+        "VECTOR_LAKE_RAW_WATCH_REFRESH_SECONDS",
+        5.0,
+        minimum=0.05,
+        maximum=300.0,
+    )
+    raw_watch_retry_max_seconds = _bounded_env_float(
+        "VECTOR_LAKE_RAW_WATCH_RETRY_MAX_SECONDS",
+        300.0,
+        minimum=raw_watch_refresh_seconds,
+        maximum=3600.0,
+    )
+    raw_watch_retry_state: dict[str, tuple[int, float]] = {}
+    raw_watch_cleanup_retry_state: dict[str, tuple[int, float]] = {}
 
     try:
         for name, thread in worker_threads.items():
@@ -1662,17 +1779,45 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
             observer.schedule(diary_handler, diary_dir, recursive=False)
             log.info("Diary monitor active on directory: %s", diary_dir)
 
-        raw_dir = str(watch_dirs["raw"])
-        if os.path.exists(raw_dir):
+        raw_dirs = [
+            str(path)
+            for path in watch_dirs.get("raw_targets", [watch_dirs["raw"]])
+            if os.path.exists(path)
+        ]
+        if raw_dirs:
             raw_handler = RawWatchdogHandler(stop_event=stop_event)
-            observer.schedule(raw_handler, raw_dir, recursive=True)
-            log.info("Raw source monitor active on directory: %s", raw_dir)
+            for raw_dir in raw_dirs:
+                target_key = os.path.normcase(str(Path(raw_dir).resolve()))
+                try:
+                    watch_handle = observer.schedule(
+                        raw_handler,
+                        raw_dir,
+                        recursive=True,
+                    )
+                except Exception as exc:
+                    raw_watch_retry_state[target_key] = (
+                        1,
+                        time.monotonic() + raw_watch_refresh_seconds,
+                    )
+                    log.warning(
+                        "Raw source monitor startup deferred for %s; retry in %.2fs: %s",
+                        raw_dir,
+                        raw_watch_refresh_seconds,
+                        exc,
+                    )
+                    continue
+                raw_watch_retry_state.pop(target_key, None)
+                raw_watch_handles[target_key] = watch_handle
+                log.info(
+                    "Raw source monitor active on directory: %s",
+                    raw_dir,
+                )
 
         observer.start()
         observer_started = True
-        log.info(
-            "Vector Lake Watchdog Agent is running in Background Index/Lint mode."
-        )
+        if raw_handler is not None:
+            raw_handler.request_full_scan()
+        log.info("Vector Lake Watchdog Agent is running in Background Index/Lint mode.")
         write_status(
             "idle",
             0,
@@ -1694,9 +1839,12 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
             maximum=10.0,
         )
         last_heartbeat = 0.0
+        last_raw_watch_refresh = time.monotonic()
         while not stop_event.wait(monitor_seconds):
             dead_workers = sorted(
-                name for name, thread in started_workers.items() if not thread.is_alive()
+                name
+                for name, thread in started_workers.items()
+                if not thread.is_alive()
             )
             if dead_workers:
                 failure_reason = "background worker stopped unexpectedly: " + ",".join(
@@ -1730,7 +1878,201 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
                 stop_event.set()
                 break
 
+            observed_emitters = getattr(observer, "emitters", None)
+            if observed_emitters is not None:
+                raw_handles = [
+                    handle
+                    for handle in raw_watch_handles.values()
+                    if handle is not None
+                ]
+                dead_non_raw_emitters = []
+                for emitter in list(observed_emitters):
+                    emitter_is_alive = getattr(emitter, "is_alive", None)
+                    if not callable(emitter_is_alive):
+                        continue
+                    try:
+                        is_alive = emitter_is_alive()
+                    except Exception:
+                        is_alive = False
+                    if is_alive:
+                        continue
+                    emitter_watch = getattr(emitter, "watch", None)
+                    if any(emitter_watch == raw_handle for raw_handle in raw_handles):
+                        continue
+                    dead_non_raw_emitters.append(emitter)
+                if dead_non_raw_emitters:
+                    failure_reason = "filesystem observer emitter stopped unexpectedly"
+                    write_status(
+                        "halted",
+                        0,
+                        index_queue.qsize(),
+                        "Filesystem observer emitter died",
+                        failure_reason,
+                        component="watchdog",
+                    )
+                    log.error(failure_reason)
+                    stop_event.set()
+                    break
             now = time.monotonic()
+            if now - last_raw_watch_refresh >= raw_watch_refresh_seconds:
+                last_raw_watch_refresh = now
+                try:
+                    current_targets, current_config_token = _raw_watch_configuration()
+                    desired_targets = {}
+                    for current_target in current_targets:
+                        if current_target.is_dir():
+                            resolved_target = current_target.resolve()
+                            target_key = os.path.normcase(str(resolved_target))
+                            desired_targets[target_key] = resolved_target
+                    for target_key in tuple(raw_watch_retry_state):
+                        if target_key not in desired_targets:
+                            raw_watch_retry_state.pop(target_key, None)
+
+                    dead_target_keys = set()
+                    observed_emitters = getattr(observer, "emitters", None)
+                    if observed_emitters is not None:
+                        emitters_by_watch = {
+                            emitter.watch: emitter
+                            for emitter in list(observed_emitters)
+                        }
+                        for target_key, watch_handle in list(raw_watch_handles.items()):
+                            if watch_handle is None:
+                                continue
+                            emitter = emitters_by_watch.get(watch_handle)
+                            emitter_alive = (
+                                emitter is not None
+                                and callable(getattr(emitter, "is_alive", None))
+                                and emitter.is_alive()
+                            )
+                            if emitter_alive:
+                                continue
+                            dead_target_keys.add(target_key)
+
+                    stale_target_keys = {
+                        target_key
+                        for target_key in raw_watch_handles
+                        if target_key not in desired_targets
+                    }
+                    cleanup_target_keys = dead_target_keys | stale_target_keys
+                    for target_key in tuple(raw_watch_cleanup_retry_state):
+                        if target_key not in cleanup_target_keys:
+                            raw_watch_cleanup_retry_state.pop(target_key, None)
+
+                    removed_targets = []
+                    cleaned_dead_targets = []
+                    failed_cleanup_targets = []
+                    for target_key in sorted(cleanup_target_keys):
+                        cleanup_attempt, cleanup_at = raw_watch_cleanup_retry_state.get(
+                            target_key, (0, 0.0)
+                        )
+                        if now < cleanup_at:
+                            continue
+                        watch_handle = raw_watch_handles.get(target_key)
+                        unschedule = getattr(observer, "unschedule", None)
+                        try:
+                            if watch_handle is None or not callable(unschedule):
+                                raise RuntimeError(
+                                    "filesystem observer did not return a "
+                                    "removable raw watch handle"
+                                )
+                            unschedule(watch_handle)
+                        except Exception as exc:
+                            cleanup_attempt += 1
+                            cleanup_delay = min(
+                                raw_watch_retry_max_seconds,
+                                raw_watch_refresh_seconds
+                                * (2 ** min(max(0, cleanup_attempt - 1), 10)),
+                            )
+                            raw_watch_cleanup_retry_state[target_key] = (
+                                cleanup_attempt,
+                                now + cleanup_delay,
+                            )
+                            failed_cleanup_targets.append(target_key)
+                            log.warning(
+                                "Raw monitor cleanup deferred for %s; retry in %.2fs: %s",
+                                target_key,
+                                cleanup_delay,
+                                exc,
+                            )
+                            continue
+                        raw_watch_cleanup_retry_state.pop(target_key, None)
+                        raw_watch_handles.pop(target_key, None)
+                        if target_key in stale_target_keys:
+                            removed_targets.append(target_key)
+                            log.info(
+                                "Raw source monitor removed for directory: %s",
+                                target_key,
+                            )
+                        else:
+                            cleaned_dead_targets.append(target_key)
+                            log.error(
+                                "Raw source monitor died; resubscribing: %s",
+                                target_key,
+                            )
+
+                    added_targets = []
+                    failed_add_targets = []
+                    for target_key, resolved_target in desired_targets.items():
+                        if target_key in raw_watch_handles:
+                            raw_watch_retry_state.pop(target_key, None)
+                            continue
+                        retry_attempt, retry_at = raw_watch_retry_state.get(
+                            target_key, (0, 0.0)
+                        )
+                        if now < retry_at:
+                            continue
+                        if raw_handler is None:
+                            raw_handler = RawWatchdogHandler(stop_event=stop_event)
+                        try:
+                            watch_handle = observer.schedule(
+                                raw_handler,
+                                str(resolved_target),
+                                recursive=True,
+                            )
+                        except Exception as exc:
+                            retry_attempt += 1
+                            retry_delay = min(
+                                raw_watch_retry_max_seconds,
+                                raw_watch_refresh_seconds
+                                * (2 ** min(max(0, retry_attempt - 1), 10)),
+                            )
+                            raw_watch_retry_state[target_key] = (
+                                retry_attempt,
+                                now + retry_delay,
+                            )
+                            failed_add_targets.append(target_key)
+                            log.warning(
+                                "Raw source monitor addition deferred for %s; retry in %.2fs: %s",
+                                target_key,
+                                retry_delay,
+                                exc,
+                            )
+                            continue
+                        raw_watch_retry_state.pop(target_key, None)
+                        raw_watch_handles[target_key] = watch_handle
+                        added_targets.append(str(resolved_target))
+                        log.info(
+                            "Raw source monitor added for directory: %s",
+                            resolved_target,
+                        )
+
+                    config_changed = current_config_token != raw_config_token
+                    if raw_handler is not None and (
+                        config_changed
+                        or added_targets
+                        or cleaned_dead_targets
+                        or failed_cleanup_targets
+                        or failed_add_targets
+                        or removed_targets
+                    ):
+                        raw_handler.request_full_scan()
+                    raw_config_token = current_config_token
+                except Exception as exc:
+                    log.warning(
+                        "Raw watch configuration refresh failed; keeping "
+                        "prior subscriptions: %s",
+                        exc,
+                    )
             if now - last_heartbeat >= heartbeat_seconds:
                 write_status(
                     "idle",
@@ -1748,11 +2090,10 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
         deadline = time.monotonic() + _shutdown_timeout_seconds()
         shutdown_failures: list[str] = []
 
-        if observer_started:
-            try:
-                observer.stop()
-            except Exception as exc:
-                shutdown_failures.append(f"observer_stop:{exc}")
+        try:
+            observer.stop()
+        except Exception as exc:
+            shutdown_failures.append(f"observer_stop:{exc}")
 
         if raw_handler is not None:
             remaining = max(0.0, deadline - time.monotonic())
@@ -1805,6 +2146,7 @@ def start_watchdog(stop_event: threading.Event | None = None):
         return _start_watchdog_locked(stop_event=stop_event)
     finally:
         instance_lock.release()
+
 
 if __name__ == "__main__":
     start_watchdog()

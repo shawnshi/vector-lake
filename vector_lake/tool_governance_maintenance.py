@@ -19,7 +19,10 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from vector_lake import db_store, governance_store
-from vector_lake.governance_metrics import claim_governance_version, infer_claim_validity
+from vector_lake.governance_metrics import (
+    claim_governance_version,
+    infer_claim_validity,
+)
 from vector_lake.merge_analysis import normalize_name
 from vector_lake.mutation_coordinator import execute_mutation_batch
 from vector_lake.tool_lint import _register_link_target, _resolve_link_target
@@ -32,6 +35,7 @@ from vector_lake.wiki_utils import (
     iter_wiki_link_matches,
     markdown_fenced_code_spans,
     read_markdown_file,
+    normalize_semantic_text,
     normalize_raw_ref,
 )
 
@@ -63,8 +67,10 @@ def operational_memory_search_index_maintenance(
         "before": before,
     }
     if not dry_run:
-        result["maintenance"] = governance_store.maintain_operational_memory_search_index(
-            batch_size=batch_size,
+        result["maintenance"] = (
+            governance_store.maintain_operational_memory_search_index(
+                batch_size=batch_size,
+            )
         )
         result["after"] = governance_store.operational_memory_search_index_status()
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -173,8 +179,7 @@ def _public_history_retention_result(
             {key: value for key, value in plan.items() if key != "selected_ids"}
         )
         result["selected_samples"] = {
-            table_name: list(values)[:20]
-            for table_name, values in selected.items()
+            table_name: list(values)[:20] for table_name, values in selected.items()
         }
     if deleted_counts is not None:
         result["deleted_counts"] = deleted_counts
@@ -254,6 +259,7 @@ def history_retention_maintenance(
         plan=plan,
         deleted_counts=deleted_counts,
     )
+
 
 def retire_legacy_topology_queue(dry_run: bool = True) -> dict:
     """Retire old indexer-generated naming work without touching human decisions."""
@@ -397,7 +403,9 @@ def _fuzzy_existing_target(
         ]
         if not compatible:
             continue
-        score = max(SequenceMatcher(None, target_norm, label).ratio() for label in compatible)
+        score = max(
+            SequenceMatcher(None, target_norm, label).ratio() for label in compatible
+        )
         if score >= threshold:
             scores.append((score, node_key))
     scores.sort(key=lambda item: (-item[0], item[1]))
@@ -508,7 +516,11 @@ def _commit_page_mutations(
         outbox = process_mutation_outbox_batch(limit=max(1, len(batch)))
         completed += int(outbox.get("completed", 0))
         failed += int(outbox.get("failed", 0))
-    return {"committed": committed, "outbox_completed": completed, "outbox_failed": failed}
+    return {
+        "committed": committed,
+        "outbox_completed": completed,
+        "outbox_failed": failed,
+    }
 
 
 def repair_broken_link_governance(
@@ -540,26 +552,37 @@ def repair_broken_link_governance(
         return match.group(0)
 
     for path in _wiki_files():
-        _, _, content = read_markdown_file(path)
+        content_bytes = path.read_bytes()
+        content = normalize_semantic_text(content_bytes.decode("utf-8"))
         pieces = []
         cursor = 0
         for match in iter_wiki_link_matches(content):
-            pieces.append(content[cursor:match.start()])
+            pieces.append(content[cursor : match.start()])
             pieces.append(replace(match))
             cursor = match.end()
         pieces.append(content[cursor:])
         updated = "".join(pieces)
         if updated == content:
             continue
-        mutations.append({"filename": path.name, "content": updated})
+        mutations.append(
+            {
+                "filename": path.name,
+                "content": updated,
+                "expected_projection_hash": hashlib.sha256(content_bytes).hexdigest(),
+            }
+        )
         changed_paths.append(path)
 
     backup_root = _backup_pages(changed_paths, backup_dir)
-    result = _commit_page_mutations(mutations, "broken-link-governance") if mutations else {
-        "committed": 0,
-        "outbox_completed": 0,
-        "outbox_failed": 0,
-    }
+    result = (
+        _commit_page_mutations(mutations, "broken-link-governance")
+        if mutations
+        else {
+            "committed": 0,
+            "outbox_completed": 0,
+            "outbox_failed": 0,
+        }
+    )
     created = 0
     now = _utc_now()
     due_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
@@ -597,17 +620,23 @@ def repair_broken_link_governance(
 def register_missing_link_debt(dry_run: bool = True) -> dict:
     """Bind acknowledged missing-target debt to a current owner and review date."""
     db_store.init_db()
-    rows = db_store.get_connection().execute(
-        "SELECT data_json FROM governance_queue "
-        "WHERE json_extract(data_json, '$.type') = 'missing-link-target' "
-        "AND json_extract(data_json, '$.status') = 'acknowledged'"
-    ).fetchall()
+    rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT data_json FROM governance_queue "
+            "WHERE json_extract(data_json, '$.type') = 'missing-link-target' "
+            "AND json_extract(data_json, '$.status') = 'acknowledged'"
+        )
+        .fetchall()
+    )
     now_dt = datetime.now(timezone.utc)
     pending = []
     for row in rows:
         item = json.loads(row["data_json"])
         try:
-            due_at = datetime.fromisoformat(str(item.get("due_at") or "").replace("Z", "+00:00"))
+            due_at = datetime.fromisoformat(
+                str(item.get("due_at") or "").replace("Z", "+00:00")
+            )
             if due_at.tzinfo is None:
                 due_at = due_at.replace(tzinfo=timezone.utc)
         except ValueError:
@@ -659,7 +688,8 @@ def _unreviewed_orphans() -> list[Path]:
         for path, frontmatter in parsed.items()
         if not path.name.startswith("Source_")
         and inbound[path.stem] == 0
-        and str(frontmatter.get("topology_status", "")).strip().lower() != _TOPOLOGY_STATUS
+        and str(frontmatter.get("topology_status", "")).strip().lower()
+        != _TOPOLOGY_STATUS
     ]
 
 
@@ -670,7 +700,11 @@ def review_orphan_entry_points(
     """Acknowledge topology debt without claiming that every orphan is intentional."""
     paths = _unreviewed_orphans()
     if dry_run:
-        return {"dry_run": True, "orphan_pages": len(paths), "sample": [p.name for p in paths[:20]]}
+        return {
+            "dry_run": True,
+            "orphan_pages": len(paths),
+            "sample": [p.name for p in paths[:20]],
+        }
     if not backup_dir:
         raise ValueError("Live orphan review requires an explicit backup_dir.")
     backup_root = _backup_pages(paths, backup_dir)
@@ -678,10 +712,13 @@ def review_orphan_entry_points(
     due_at = (date.today() + timedelta(days=30)).isoformat()
     mutations = []
     for path in paths:
-        content = path.read_text(encoding="utf-8")
+        content_bytes = path.read_bytes()
+        content = normalize_semantic_text(content_bytes.decode("utf-8"))
         closing = re.search(r"\r?\n---(?:\r?\n|$)", content[4:])
         if not content.startswith("---") or closing is None:
-            raise ValueError(f"Cannot annotate orphan without valid frontmatter: {path.name}")
+            raise ValueError(
+                f"Cannot annotate orphan without valid frontmatter: {path.name}"
+            )
         header_end = 4 + closing.start()
         header = content[:header_end]
         suffix = content[header_end:].lstrip("\r\n")
@@ -698,12 +735,22 @@ def review_orphan_entry_points(
             f"topology_review_due: '{due_at}'\n"
         )
         updated = header.rstrip("\r\n") + "\n" + addition + suffix
-        mutations.append({"filename": path.name, "content": updated})
-    result = _commit_page_mutations(mutations, "orphan-entry-point-review") if mutations else {
-        "committed": 0,
-        "outbox_completed": 0,
-        "outbox_failed": 0,
-    }
+        mutations.append(
+            {
+                "filename": path.name,
+                "content": updated,
+                "expected_projection_hash": hashlib.sha256(content_bytes).hexdigest(),
+            }
+        )
+    result = (
+        _commit_page_mutations(mutations, "orphan-entry-point-review")
+        if mutations
+        else {
+            "committed": 0,
+            "outbox_completed": 0,
+            "outbox_failed": 0,
+        }
+    )
     return {
         "dry_run": False,
         "acknowledged_pages": len(paths),
@@ -735,7 +782,9 @@ def register_unsupported_claim_debt(dry_run: bool = True) -> dict:
     for claim in rows:
         item = existing.get(str(claim.get("claim_id") or "")) or {}
         try:
-            due_at = datetime.fromisoformat(str(item.get("due_at") or "").replace("Z", "+00:00"))
+            due_at = datetime.fromisoformat(
+                str(item.get("due_at") or "").replace("Z", "+00:00")
+            )
             if due_at.tzinfo is None:
                 due_at = due_at.replace(tzinfo=timezone.utc)
         except ValueError:
@@ -792,7 +841,9 @@ def register_unsupported_claim_debt(dry_run: bool = True) -> dict:
 
 
 def _source_version(source: dict) -> str:
-    payload = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        source, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -802,7 +853,11 @@ def _source_raw_exists(raw_ref: str) -> bool:
         return False
     memory_dir = get_memory_dir().resolve()
     raw_path = Path(normalized)
-    candidate = raw_path.resolve() if raw_path.is_absolute() else (memory_dir / raw_path).resolve()
+    candidate = (
+        raw_path.resolve()
+        if raw_path.is_absolute()
+        else (memory_dir / raw_path).resolve()
+    )
     return candidate.is_relative_to(memory_dir) and candidate.is_file()
 
 
@@ -811,10 +866,7 @@ def _source_projection_exists(source: dict) -> bool:
     if not page:
         return False
     page_key = _strip_markdown_suffix(page)
-    return any(
-        path.stem == page_key
-        for path in iter_markdown_files(get_wiki_dir())
-    )
+    return any(path.stem == page_key for path in iter_markdown_files(get_wiki_dir()))
 
 
 def classify_orphan_source_debt(dry_run: bool = True) -> dict:
@@ -873,7 +925,9 @@ def classify_orphan_source_debt(dry_run: bool = True) -> dict:
         for source in bucket_sources:
             item = existing.get(str(source.get("source_id") or "")) or {}
             try:
-                due_at = datetime.fromisoformat(str(item.get("due_at") or "").replace("Z", "+00:00"))
+                due_at = datetime.fromisoformat(
+                    str(item.get("due_at") or "").replace("Z", "+00:00")
+                )
                 if due_at.tzinfo is None:
                     due_at = due_at.replace(tzinfo=timezone.utc)
             except ValueError:
@@ -883,8 +937,13 @@ def classify_orphan_source_debt(dry_run: bool = True) -> dict:
                 and due_at is not None
                 and due_at >= now_dt
                 and item.get("classification") == source["_orphan_bucket"]
-                and item.get("source_version") == _source_version(
-                    {key: value for key, value in source.items() if key != "_orphan_bucket"}
+                and item.get("source_version")
+                == _source_version(
+                    {
+                        key: value
+                        for key, value in source.items()
+                        if key != "_orphan_bucket"
+                    }
                 )
             ):
                 pending.append(source)
@@ -925,13 +984,16 @@ def classify_orphan_source_debt(dry_run: bool = True) -> dict:
                     "source_version": _source_version(source),
                     "classification": bucket,
                     "raw_ref": str(source.get("raw_ref") or ""),
-                    "canonical_source_page": str(source.get("canonical_source_page") or ""),
+                    "canonical_source_page": str(
+                        source.get("canonical_source_page") or ""
+                    ),
                     "resolution": resolutions[bucket],
                     "owner": "vector-lake-governance",
                     "due_at": due_at,
                     "source": "orphan-source-governance",
                     "affected_pages": [str(source.get("canonical_source_page"))]
-                    if source.get("canonical_source_page") else [],
+                    if source.get("canonical_source_page")
+                    else [],
                     "search_queries": [str(source.get("title") or source_id)],
                     "acknowledged_at": now_dt.isoformat(),
                 },
@@ -951,7 +1013,9 @@ def restore_fenced_code_from_backup(
     """Undo only fenced-block changes exactly explained by one repair report."""
     source_root = Path(source_backup_dir).expanduser().resolve()
     if not source_root.is_dir():
-        raise FileNotFoundError(f"Source backup directory does not exist: {source_root}")
+        raise FileNotFoundError(
+            f"Source backup directory does not exist: {source_root}"
+        )
     report_path = Path(repair_report_path).expanduser().resolve()
     if not report_path.is_file():
         raise FileNotFoundError(f"Repair report does not exist: {report_path}")
@@ -966,7 +1030,9 @@ def restore_fenced_code_from_backup(
         target = _strip_markdown_suffix(match.group(1).strip())
         label = match.group(2)
         if target in mapping:
-            return f"[[{mapping[target]}|{label}]]" if label else f"[[{mapping[target]}]]"
+            return (
+                f"[[{mapping[target]}|{label}]]" if label else f"[[{mapping[target]}]]"
+            )
         if target in missing:
             return str(label or target).strip().strip("[]")
         return match.group(0)
@@ -974,12 +1040,15 @@ def restore_fenced_code_from_backup(
     mutations = []
     changed_paths = []
     restored_blocks = 0
-    for original_path in sorted(iter_markdown_files(source_root), key=lambda path: path.name):
+    for original_path in sorted(
+        iter_markdown_files(source_root), key=lambda path: path.name
+    ):
         live_path = get_wiki_dir() / original_path.name
         if not live_path.exists():
             continue
         original = original_path.read_text(encoding="utf-8")
-        live = live_path.read_text(encoding="utf-8")
+        live_bytes = live_path.read_bytes()
+        live = normalize_semantic_text(live_bytes.decode("utf-8"))
         original_spans = markdown_fenced_code_spans(original)
         live_spans = markdown_fenced_code_spans(live)
         if len(original_spans) != len(live_spans):
@@ -1004,7 +1073,13 @@ def restore_fenced_code_from_backup(
         updated = live
         for (start, end), original_block in reversed(replacements):
             updated = updated[:start] + original_block + updated[end:]
-        mutations.append({"filename": live_path.name, "content": updated})
+        mutations.append(
+            {
+                "filename": live_path.name,
+                "content": updated,
+                "expected_projection_hash": hashlib.sha256(live_bytes).hexdigest(),
+            }
+        )
         changed_paths.append(live_path)
         restored_blocks += len(replacements)
     if dry_run:
@@ -1014,13 +1089,19 @@ def restore_fenced_code_from_backup(
             "restored_blocks": restored_blocks,
         }
     if not backup_dir:
-        raise ValueError("Live fenced-code restoration requires an explicit backup_dir.")
+        raise ValueError(
+            "Live fenced-code restoration requires an explicit backup_dir."
+        )
     backup_root = _backup_pages(changed_paths, backup_dir)
-    result = _commit_page_mutations(mutations, "fenced-code-provenance-restore") if mutations else {
-        "committed": 0,
-        "outbox_completed": 0,
-        "outbox_failed": 0,
-    }
+    result = (
+        _commit_page_mutations(mutations, "fenced-code-provenance-restore")
+        if mutations
+        else {
+            "committed": 0,
+            "outbox_completed": 0,
+            "outbox_failed": 0,
+        }
+    )
     return {
         "dry_run": False,
         "changed_pages": len(changed_paths),
@@ -1037,15 +1118,23 @@ def reconcile_missing_link_items_from_backup(
     """Remove code-only missing-link debt and retain original body-link counts."""
     source_root = Path(source_backup_dir).expanduser().resolve()
     if not source_root.is_dir():
-        raise FileNotFoundError(f"Source backup directory does not exist: {source_root}")
+        raise FileNotFoundError(
+            f"Source backup directory does not exist: {source_root}"
+        )
     db_store.init_db()
-    rows = db_store.get_connection().execute(
-        "SELECT item_id, data_json FROM governance_queue "
-        "WHERE json_extract(data_json, '$.type') = 'missing-link-target' "
-        "AND json_extract(data_json, '$.source') = 'broken-link-governance'"
-    ).fetchall()
+    rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT item_id, data_json FROM governance_queue "
+            "WHERE json_extract(data_json, '$.type') = 'missing-link-target' "
+            "AND json_extract(data_json, '$.source') = 'broken-link-governance'"
+        )
+        .fetchall()
+    )
     items = [(str(row["item_id"]), json.loads(row["data_json"])) for row in rows]
-    target_items = {str(item.get("target_label") or ""): (item_id, item) for item_id, item in items}
+    target_items = {
+        str(item.get("target_label") or ""): (item_id, item) for item_id, item in items
+    }
     occurrences: dict[str, dict] = defaultdict(lambda: {"count": 0, "files": set()})
     for path in sorted(iter_markdown_files(source_root), key=lambda path: path.name):
         content = path.read_text(encoding="utf-8")
@@ -1055,7 +1144,11 @@ def reconcile_missing_link_items_from_backup(
                 continue
             occurrences[target]["count"] += 1
             occurrences[target]["files"].add(path.name)
-    remove_ids = [item_id for target, (item_id, _) in target_items.items() if target not in occurrences]
+    remove_ids = [
+        item_id
+        for target, (item_id, _) in target_items.items()
+        if target not in occurrences
+    ]
     update_rows = {
         target: {
             "occurrences": data["count"],

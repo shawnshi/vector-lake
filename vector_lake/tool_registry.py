@@ -22,6 +22,7 @@ _GROUPS: dict[str, tuple[str, ...]] = {
         "export_evidence_packet",
     ),
     "vector_lake.tool_gc": ("gc_vector_lake",),
+    "vector_lake.tool_backup_retention": ("backup_retention_maintenance",),
     "vector_lake.tool_graph": ("audit_graph", "visualize_vector_lake"),
     "vector_lake.tool_lint": ("lint_vector_lake",),
     "vector_lake.tool_merge": ("merge_suggestions_vector_lake",),

@@ -32,12 +32,18 @@ def test_canonical_entity_version_ignores_transport_only_raw_text_differences():
         [("entity_transport", lf_record)]
     )
 
-    assert governance_store._canonical_entity_records_version(
-        [("entity_transport", crlf_record)]
-    ) == lf_version
-    assert governance_store._canonical_entity_records_version(
-        [("entity_transport", changed_record)]
-    ) != lf_version
+    assert (
+        governance_store._canonical_entity_records_version(
+            [("entity_transport", crlf_record)]
+        )
+        == lf_version
+    )
+    assert (
+        governance_store._canonical_entity_records_version(
+            [("entity_transport", changed_record)]
+        )
+        != lf_version
+    )
 
 
 def _write_purpose_contract(memory_dir):
@@ -98,12 +104,15 @@ def test_write_health_gate_reuses_recent_unchanged_deep_check(monkeypatch):
     monkeypatch.setattr(
         runtime_health,
         "assess_runtime_health",
-        lambda **kwargs: calls.append(kwargs) or {
-            "ok": True,
-            "issues": [],
-            "warnings": [],
-            "detail": {},
-        },
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "ok": True,
+                "issues": [],
+                "warnings": [],
+                "detail": {},
+            }
+        ),
     )
     runtime_health._clear_health_caches_for_tests()
 
@@ -133,12 +142,15 @@ def test_write_health_gate_is_strict_by_default_and_on_invalid_ttl(
     monkeypatch.setattr(
         runtime_health,
         "assess_runtime_health",
-        lambda **kwargs: calls.append(kwargs) or {
-            "ok": True,
-            "issues": [],
-            "warnings": [],
-            "detail": {},
-        },
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "ok": True,
+                "issues": [],
+                "warnings": [],
+                "detail": {},
+            }
+        ),
     )
     runtime_health._clear_health_caches_for_tests()
 
@@ -165,12 +177,15 @@ def test_write_health_gate_invalidates_when_projection_identity_changes(monkeypa
     monkeypatch.setattr(
         runtime_health,
         "assess_runtime_health",
-        lambda **kwargs: calls.append(kwargs) or {
-            "ok": True,
-            "issues": [],
-            "warnings": [],
-            "detail": {},
-        },
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "ok": True,
+                "issues": [],
+                "warnings": [],
+                "detail": {},
+            }
+        ),
     )
     runtime_health._clear_health_caches_for_tests()
 
@@ -178,6 +193,7 @@ def test_write_health_gate_invalidates_when_projection_identity_changes(monkeypa
     runtime_health.enforce_runtime_write_health()
 
     assert len(calls) == 2
+
 
 def test_write_health_gate_deep_check_is_single_flight(monkeypatch):
     from vector_lake import runtime_health
@@ -238,12 +254,15 @@ def test_write_health_gate_fails_closed_when_snapshot_keeps_changing(monkeypatch
     monkeypatch.setattr(
         runtime_health,
         "assess_runtime_health",
-        lambda **kwargs: calls.append(kwargs) or {
-            "ok": True,
-            "issues": [],
-            "warnings": [],
-            "detail": {},
-        },
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "ok": True,
+                "issues": [],
+                "warnings": [],
+                "detail": {},
+            }
+        ),
     )
     runtime_health._clear_health_caches_for_tests()
 
@@ -253,7 +272,9 @@ def test_write_health_gate_fails_closed_when_snapshot_keeps_changing(monkeypatch
     assert len(calls) == 2
 
 
-def test_write_gate_migrates_existing_database_before_retry(isolated_memory, monkeypatch):
+def test_write_gate_migrates_existing_database_before_retry(
+    isolated_memory, monkeypatch
+):
     from vector_lake import runtime_health
 
     old_db = isolated_memory / "wiki" / ".meta" / "legacy-runtime.db"
@@ -285,7 +306,9 @@ def test_write_gate_migrates_existing_database_before_retry(isolated_memory, mon
 
     surfaces = {
         str(row[0])
-        for row in db_store.get_connection().execute("SELECT surface FROM runtime_generations")
+        for row in db_store.get_connection().execute(
+            "SELECT surface FROM runtime_generations"
+        )
     }
     assert {
         "entities",
@@ -313,7 +336,10 @@ def test_write_health_token_changes_when_watchdog_becomes_stale(isolated_memory)
 
     assert stale_token != fresh_token
 
-def test_write_health_token_tracks_blocking_policy_changes(isolated_memory, monkeypatch):
+
+def test_write_health_token_tracks_blocking_policy_changes(
+    isolated_memory, monkeypatch
+):
     from vector_lake import runtime_health
 
     db_store.init_db()
@@ -331,9 +357,8 @@ def test_write_health_token_tracks_blocking_policy_changes(isolated_memory, monk
 
     assert len({initial, backlog_blocking, timeline_blocking, ready_age_policy}) == 4
 
-def test_write_health_token_does_not_enumerate_wiki_files(
-    isolated_memory, monkeypatch
-):
+
+def test_write_health_token_does_not_enumerate_wiki_files(isolated_memory, monkeypatch):
     from vector_lake import runtime_health
 
     db_store.init_db()
@@ -371,7 +396,7 @@ def test_write_health_tracks_pending_wiki_reconcile_marker(isolated_memory):
     assert runtime_health._write_health_surface_token() != pending
 
 
-def test_external_commit_invalidates_token_and_canonical_cache(isolated_memory):
+def test_external_commit_advances_generation_and_invalidates_caches(isolated_memory):
     from vector_lake import runtime_health
 
     db_store.init_db()
@@ -401,7 +426,10 @@ def test_external_commit_invalidates_token_and_canonical_cache(isolated_memory):
     try:
         external.execute(
             "UPDATE entities SET data_json = ? WHERE entity_id = ?",
-            ('{"entity_id":"entity_external","page_key":"Concept_BB"}', "entity_external"),
+            (
+                '{"entity_id":"entity_external","page_key":"Concept_BB"}',
+                "entity_external",
+            ),
         )
         external.commit()
     finally:
@@ -415,7 +443,7 @@ def test_external_commit_invalidates_token_and_canonical_cache(isolated_memory):
     after_token = runtime_health._write_health_surface_token()
     after_snapshot = runtime_health._canonical_snapshot(conn, db_path)
 
-    assert after_generation == before_generation
+    assert after_generation == before_generation + 1
     assert after_token != before_token
     assert "Concept_AA" in before_snapshot
     assert "Concept_BB" in after_snapshot
@@ -424,7 +452,9 @@ def test_external_commit_invalidates_token_and_canonical_cache(isolated_memory):
 
 def test_write_health_gate_blocks_projection_drift_after_index_exists(isolated_memory):
     _write_purpose_contract(isolated_memory)
-    execute_mutation_plan("Source_Healthy.MD", content=_source_content("source_healthy", "Healthy Source"))
+    execute_mutation_plan(
+        "Source_Healthy.MD", content=_source_content("source_healthy", "Healthy Source")
+    )
     indexer.generate_index()
     assert assess_runtime_health()["ok"] is True
 
@@ -452,7 +482,10 @@ Orphan.
     assert health["ok"] is False
     assert any("projection_drift" in issue for issue in health["issues"])
     with pytest.raises(RuntimeError, match="write gate blocked"):
-        execute_mutation_plan("Source_Blocked.md", content=_source_content("source_blocked", "Blocked Source"))
+        execute_mutation_plan(
+            "Source_Blocked.md",
+            content=_source_content("source_blocked", "Blocked Source"),
+        )
 
 
 def test_default_write_gate_detects_external_in_place_wiki_edit(
@@ -491,14 +524,23 @@ def test_default_write_gate_detects_external_in_place_wiki_edit(
 
 def test_schema_mode_bypasses_write_gate_for_bounded_repairs(isolated_memory):
     _write_purpose_contract(isolated_memory)
-    execute_mutation_plan("Source_Healthy.md", content=_source_content("source_healthy", "Healthy Source"))
+    execute_mutation_plan(
+        "Source_Healthy.md", content=_source_content("source_healthy", "Healthy Source")
+    )
     indexer.generate_index()
-    (isolated_memory / "wiki" / "Concept_Orphan.md").write_text("orphan", encoding="utf-8")
+    (isolated_memory / "wiki" / "Concept_Orphan.md").write_text(
+        "orphan", encoding="utf-8"
+    )
 
     from vector_lake.mutation_coordinator import execute_mutation_batch
 
     ok, message = execute_mutation_batch(
-        [{"filename": "Source_Repair.md", "content": _source_content("source_repair", "Repair Source")}],
+        [
+            {
+                "filename": "Source_Repair.md",
+                "content": _source_content("source_repair", "Repair Source"),
+            }
+        ],
         validation_mode="schema",
     )
     assert ok is True
@@ -507,7 +549,9 @@ def test_schema_mode_bypasses_write_gate_for_bounded_repairs(isolated_memory):
 
 def test_watchdog_error_component_is_not_cleared_by_heartbeat(isolated_memory):
     db_store.init_db()
-    write_status("error", 0, 0, "Outbox failed", "database is locked", component="outbox")
+    write_status(
+        "error", 0, 0, "Outbox failed", "database is locked", component="outbox"
+    )
     write_status("idle", 0, 0, "Watchdog heartbeat", "", component="watchdog")
 
     status = json.loads(get_status_file().read_text(encoding="utf-8"))
@@ -542,7 +586,9 @@ def test_watchdog_rejects_second_instance_for_same_memory_root(isolated_memory):
         lock.release()
 
 
-def test_raw_watchdog_uses_single_flight_path_scoped_ingest(isolated_memory, monkeypatch):
+def test_raw_watchdog_uses_single_flight_path_scoped_ingest(
+    isolated_memory, monkeypatch
+):
     from vector_lake import tool_ingest
     from vector_lake.watchdog_app import RawWatchdogHandler
 
@@ -590,7 +636,9 @@ def test_raw_watchdog_uses_single_flight_path_scoped_ingest(isolated_memory, mon
     ]
 
 
-def test_raw_watchdog_moved_event_ingests_destination_path(isolated_memory, monkeypatch):
+def test_raw_watchdog_moved_event_ingests_destination_path(
+    isolated_memory, monkeypatch
+):
     from vector_lake import tool_ingest
     from vector_lake.watchdog_app import RawWatchdogHandler
 
@@ -667,7 +715,9 @@ def test_raw_watchdog_shutdown_drains_buffer_without_resubmitting_to_closed_exec
     ]
 
 
-def test_deep_health_detects_equal_count_timeline_id_drift_without_blocking(isolated_memory):
+def test_deep_health_detects_equal_count_timeline_id_drift_without_blocking(
+    isolated_memory,
+):
     db_store.init_db()
     conn = db_store.get_connection()
     claim = {
@@ -726,7 +776,10 @@ def test_deep_health_and_doctor_reject_equal_key_wiki_content_drift(isolated_mem
     execute_mutation_plan("Source_Content-Health.md", content=content)
     assert process_mutation_outbox_batch()["completed"] == 1
     target = isolated_memory / "wiki" / "Source_Content-Health.md"
-    target.write_text(content.replace("Primary source content.", "Drifted wiki content."), encoding="utf-8")
+    target.write_text(
+        content.replace("Primary source content.", "Drifted wiki content."),
+        encoding="utf-8",
+    )
 
     shallow = assess_runtime_health()
     deep = assess_runtime_health(deep_projection_checks=True)
@@ -756,7 +809,10 @@ def test_full_write_gate_rejects_equal_key_wiki_content_drift(isolated_memory):
     execute_mutation_plan("Source_Gate-Content.md", content=content)
     assert process_mutation_outbox_batch()["completed"] == 1
     target = isolated_memory / "wiki" / "Source_Gate-Content.md"
-    target.write_text(content.replace("Primary source content.", "Drifted wiki content."), encoding="utf-8")
+    target.write_text(
+        content.replace("Primary source content.", "Drifted wiki content."),
+        encoding="utf-8",
+    )
 
     with pytest.raises(RuntimeError, match="write gate blocked"):
         execute_mutation_plan(
@@ -801,7 +857,9 @@ def test_deep_health_rejects_index_title_drift_with_equal_body(isolated_memory):
     assert health["detail"]["projection_content_drift"]["index_canonical"] == 1
 
 
-def test_timeline_parity_can_be_promoted_to_blocking_after_rebuild(isolated_memory, monkeypatch):
+def test_timeline_parity_can_be_promoted_to_blocking_after_rebuild(
+    isolated_memory, monkeypatch
+):
     db_store.init_db()
     conn = db_store.get_connection()
     claim = {
@@ -812,7 +870,13 @@ def test_timeline_parity_can_be_promoted_to_blocking_after_rebuild(isolated_memo
     with db_store.transaction():
         conn.execute(
             "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "active", json.dumps(claim), "2026-07-14T00:00:00+00:00"),
+            (
+                claim["claim_id"],
+                claim["claim_text"],
+                "active",
+                json.dumps(claim),
+                "2026-07-14T00:00:00+00:00",
+            ),
         )
     monkeypatch.setenv("VECTOR_LAKE_TIMELINE_PARITY_BLOCKING", "1")
 
@@ -822,7 +886,9 @@ def test_timeline_parity_can_be_promoted_to_blocking_after_rebuild(isolated_memo
     assert any("timeline_projection_drift" in issue for issue in health["issues"])
 
 
-def test_subagent_backlog_is_visible_without_blocking_by_default(isolated_memory, monkeypatch):
+def test_subagent_backlog_is_visible_without_blocking_by_default(
+    isolated_memory, monkeypatch
+):
     db_store.init_db()
     conn = db_store.get_connection()
     with db_store.transaction():
@@ -830,7 +896,12 @@ def test_subagent_backlog_is_visible_without_blocking_by_default(isolated_memory
             conn.execute(
                 "INSERT INTO jobs (job_id, task_type, payload, status, created_at, updated_at, available_at) "
                 "VALUES (?, 'ingest', '{}', 'awaiting_subagent', ?, ?, ?)",
-                (f"job-{index}", "2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00"),
+                (
+                    f"job-{index}",
+                    "2000-01-01T00:00:00+00:00",
+                    "2000-01-01T00:00:00+00:00",
+                    "2000-01-01T00:00:00+00:00",
+                ),
             )
     monkeypatch.setenv("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_JOBS", "1")
     monkeypatch.setenv("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_AGE_SECONDS", "60")
@@ -889,8 +960,7 @@ def test_recently_expired_ingest_lease_uses_lease_age_not_job_age(
     assert health["detail"]["ready_ingest_jobs"] == 1
     assert health["detail"]["oldest_ready_ingest_age_seconds"] < 10
     assert not any(
-        issue.startswith("ingest_dispatch_stalled:")
-        for issue in health["issues"]
+        issue.startswith("ingest_dispatch_stalled:") for issue in health["issues"]
     )
 
 
@@ -940,7 +1010,9 @@ def test_deep_health_reuses_unchanged_wiki_parse_and_invalidates_on_write(
         calls.append(filename)
         return original(filename, page_content)
 
-    monkeypatch.setattr(governance_store, "canonical_page_version_from_content", observed)
+    monkeypatch.setattr(
+        governance_store, "canonical_page_version_from_content", observed
+    )
 
     assert assess_runtime_health(deep_projection_checks=True)["ok"] is True
     first_count = len(calls)
@@ -990,7 +1062,9 @@ def test_pending_outbox_does_not_hide_conflicting_manual_wiki_edit(isolated_memo
     assert health["detail"]["projection_content_drift"]["managed_reconciliation"] == 0
 
 
-def test_semantic_readiness_can_be_ready_when_runtime_has_no_semantic_debt(isolated_memory):
+def test_semantic_readiness_can_be_ready_when_runtime_has_no_semantic_debt(
+    isolated_memory,
+):
     db_store.init_db()
 
     readiness = assess_semantic_readiness(
@@ -1034,7 +1108,9 @@ def test_semantic_readiness_can_be_ready_when_runtime_has_no_semantic_debt(isola
     }
 
 
-def test_global_semantic_readiness_surfaces_evidence_foundation_coverage(isolated_memory):
+def test_global_semantic_readiness_surfaces_evidence_foundation_coverage(
+    isolated_memory,
+):
     db_store.init_db()
     claim = {
         "claim_id": "claim_legacy_gap",
@@ -1046,7 +1122,13 @@ def test_global_semantic_readiness_surfaces_evidence_foundation_coverage(isolate
         db_store.get_connection().execute(
             "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (claim["claim_id"], claim["claim_text"], "Active", json.dumps(claim), "2026-07-21"),
+            (
+                claim["claim_id"],
+                claim["claim_text"],
+                "Active",
+                json.dumps(claim),
+                "2026-07-21",
+            ),
         )
 
     readiness = assess_semantic_readiness(
@@ -1106,11 +1188,15 @@ def test_semantic_readiness_reports_topology_claim_governance_and_ingest_debt(
 
     assert readiness["ready"] is False
     assert readiness["status"] == "not_ready"
-    assert any(issue.startswith("graph_topology_dirty:") for issue in readiness["issues"])
+    assert any(
+        issue.startswith("graph_topology_dirty:") for issue in readiness["issues"]
+    )
     assert "critical_governance_pending:1" in readiness["issues"]
     assert "governance_backlog:1>0" in readiness["issues"]
     assert "unmanaged_unsupported_runtime_claims:1>0" in readiness["issues"]
-    assert any(issue.startswith("semantic_ingest_backlog:") for issue in readiness["issues"])
+    assert any(
+        issue.startswith("semantic_ingest_backlog:") for issue in readiness["issues"]
+    )
 
 
 def test_semantic_readiness_treats_acknowledged_unsupported_claim_as_managed_debt(
@@ -1244,21 +1330,26 @@ def test_decision_scoped_readiness_uses_verified_registry_and_ignores_unmapped_d
         method_version="review-v1",
         reason="Verified for the scoped decision.",
     )
-    sync_critical_decision_registry({
-        "contract_version": "1.0",
-        "decisions": [{
-            "decision_id": "CD-READY-001",
-            "title": "Ready decision",
-            "owner": "owner:test",
-            "status": "active",
-            "risk_weight": 80,
-            "evidence_requirements": ["verified claim"],
-            "claim_refs": [claim["claim_id"]],
-            "verification": "cbss-registry-signature:test",
-        }],
-    }, verification_validator=lambda decision: decision["verification"].startswith(
-        "cbss-registry-signature:"
-    ))
+    sync_critical_decision_registry(
+        {
+            "contract_version": "1.0",
+            "decisions": [
+                {
+                    "decision_id": "CD-READY-001",
+                    "title": "Ready decision",
+                    "owner": "owner:test",
+                    "status": "active",
+                    "risk_weight": 80,
+                    "evidence_requirements": ["verified claim"],
+                    "claim_refs": [claim["claim_id"]],
+                    "verification": "cbss-registry-signature:test",
+                }
+            ],
+        },
+        verification_validator=lambda decision: decision["verification"].startswith(
+            "cbss-registry-signature:"
+        ),
+    )
 
     readiness = assess_semantic_readiness(
         index_data={"graph_state": {"dirty": False}},
@@ -1275,7 +1366,9 @@ def test_decision_scoped_readiness_uses_verified_registry_and_ignores_unmapped_d
     )
 
 
-def test_decision_scoped_readiness_rejects_unverified_registry_reference(isolated_memory):
+def test_decision_scoped_readiness_rejects_unverified_registry_reference(
+    isolated_memory,
+):
     db_store.init_db()
 
     readiness = assess_semantic_readiness(

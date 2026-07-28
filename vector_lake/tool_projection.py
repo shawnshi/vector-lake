@@ -7,10 +7,12 @@ canonical history.
 
 from __future__ import annotations
 import hashlib
+import os
 import sqlite3
 
 import json
 import logging
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -26,6 +28,7 @@ from vector_lake.db_store import (
     get_connection,
     get_db_path,
     init_db,
+    inspect_schema_migration_connection,
     inspect_schema_migration_state,
     peek_db_path,
     transaction,
@@ -48,12 +51,20 @@ from vector_lake.wiki_utils import (
     get_meta_dir,
     get_wiki_dir,
     iter_markdown_files,
+    normalize_semantic_text,
     read_markdown_file,
     split_frontmatter,
 )
 
 
-EXCLUDED_WIKI_FILES = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
+EXCLUDED_WIKI_FILES = {
+    "index.md",
+    "log.md",
+    "overview.md",
+    "orphan_pages.md",
+    "wiki_link_stats.md",
+    "synthesis_log.md",
+}
 log = logging.getLogger("vector-lake-projection")
 
 
@@ -70,6 +81,38 @@ def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
+def _validate_backup_label(label: str) -> str:
+    if (
+        not isinstance(label, str)
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}",
+            label,
+        )
+        is None
+    ):
+        raise ValueError("backup label must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+    return label
+
+
+def _stream_sha256_and_sync(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    """Hash one staged artifact with bounded memory, then flush it to storage."""
+    digest = hashlib.sha256()
+    with open(path, "r+b") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return digest.hexdigest()
+
+
+def _write_manifest_and_sync(path: Path, manifest: dict) -> None:
+    """Persist the completion marker only after all artifacts are durable."""
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _read_backup_runtime_generations(
     database_path: Path,
 ) -> tuple[dict[str, int] | None, str | None]:
@@ -77,16 +120,18 @@ def _read_backup_runtime_generations(
     connection = None
     try:
         connection = sqlite3.connect(
-            f"{database_path.resolve().as_uri()}?mode=ro",
+            f"{database_path.resolve().as_uri()}?mode=ro&immutable=1",
             uri=True,
             timeout=5.0,
         )
-        table_exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'runtime_generations'"
-        ).fetchone()
-        if not table_exists:
-            return None, "backup-database-has-no-runtime-generation-registry"
+        connection.execute("PRAGMA query_only = ON")
+        schema_state = inspect_schema_migration_connection(
+            connection,
+            database_path,
+        )
+        if not schema_state["ready"]:
+            detail = "|".join(schema_state["issues"]) or str(schema_state["status"])
+            return None, f"backup-schema-invalid:{detail}"
         rows = connection.execute(
             "SELECT surface, generation FROM runtime_generations ORDER BY surface"
         ).fetchall()
@@ -179,8 +224,7 @@ def _canonical_keys(*, allow_initialize: bool = False) -> set[str]:
         schema_state = inspect_schema_migration_state(path)
         if not schema_state["ready"]:
             raise RuntimeError(
-                "database schema is not ready: "
-                + "; ".join(schema_state["issues"])
+                "database schema is not ready: " + "; ".join(schema_state["issues"])
             )
         if allow_initialize:
             init_db()
@@ -203,8 +247,7 @@ def _canonical_keys(*, allow_initialize: bool = False) -> set[str]:
                 "FROM entities WHERE json_extract(data_json, '$.page_key') "
                 "IS NOT NULL"
             )
-            if row["page_key"]
-            and not str(row["page_key"]).startswith("System_")
+            if row["page_key"] and not str(row["page_key"]).startswith("System_")
         }
     finally:
         if close_after:
@@ -274,6 +317,7 @@ def _copy_projection_pair_to_backup(
                 claim_graph_data,
             )
 
+            del index_data, claim_graph_data
             for path in (index_path, claim_graph_path):
                 target = backup_dir / path.name
                 shutil.copy2(path, target)
@@ -311,6 +355,7 @@ def _copy_projection_pair_to_backup(
 
 def create_maintenance_backup(label: str = "maintenance") -> str:
     """Publish a complete SQLite/projection backup from a private staging directory."""
+    label = _validate_backup_label(label)
     backup_root = get_meta_dir() / "backups"
     backup_root.mkdir(parents=True, exist_ok=True)
     backup_name = f"{label}_{_utc_stamp()}"
@@ -322,7 +367,7 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
     database_generation_error = "backup-database-absent"
     try:
         if get_db_path().exists():
-            target = stage_dir / get_db_path().name
+            target = stage_dir / "vector_lake.db"
             backup_database(target)
             copied.append(target.name)
             database_generations, database_generation_error = (
@@ -340,8 +385,7 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
             projection_canonical_generation,
         )
         artifact_sha256 = {
-            name: hashlib.sha256((stage_dir / name).read_bytes()).hexdigest()
-            for name in sorted(copied)
+            name: _stream_sha256_and_sync(stage_dir / name) for name in sorted(copied)
         }
         manifest = {
             "manifest_version": 3,
@@ -359,10 +403,7 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
             ),
             "complete": True,
         }
-        (stage_dir / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _write_manifest_and_sync(stage_dir / "manifest.json", manifest)
         stage_dir.replace(backup_dir)
     except Exception:
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -451,7 +492,14 @@ def canonical_backfill_missing_wiki(dry_run: bool = True, limit: int = 50) -> st
     wiki_paths = _wiki_path_map()
     for page_key in page_keys:
         path = wiki_paths[page_key]
-        mutations.append({"filename": path.name, "content": path.read_text(encoding="utf-8")})
+        content_bytes = path.read_bytes()
+        mutations.append(
+            {
+                "filename": path.name,
+                "content": normalize_semantic_text(content_bytes.decode("utf-8")),
+                "expected_projection_hash": hashlib.sha256(content_bytes).hexdigest(),
+            }
+        )
     _, detail = execute_mutation_batch(mutations, validation_mode="schema")
     return (
         f"Backfilled {len(mutations)} wiki page(s) into canonical store. "
@@ -472,15 +520,18 @@ def _canonical_content_drift_candidates(limit: int = 0) -> dict:
         if page_key.startswith("System_") or page_key not in canonical_versions:
             continue
         try:
-            content = path.read_text(encoding="utf-8")
-            observed_version = governance_store.canonical_page_version_from_content(path.name, content)
+            content_bytes = path.read_bytes()
+            content = normalize_semantic_text(content_bytes.decode("utf-8"))
+            observed_version = governance_store.canonical_page_version_from_content(
+                path.name, content
+            )
         except Exception as exc:
             invalid.append(f"{path.name}: parse error: {exc}")
             continue
         if observed_version == canonical_versions[page_key]:
             continue
         total_drift += 1
-        total_bytes += len(content.encode("utf-8"))
+        total_bytes += len(content_bytes)
         try:
             frontmatter, body = split_frontmatter(content)
             validate_schema(frontmatter, body, path.name)
@@ -493,6 +544,9 @@ def _canonical_content_drift_candidates(limit: int = 0) -> dict:
                     "filename": path.name,
                     "content": content,
                     "expected_version": canonical_versions[page_key],
+                    "expected_projection_hash": hashlib.sha256(
+                        content_bytes
+                    ).hexdigest(),
                 }
             )
     return {
@@ -513,7 +567,9 @@ def reconcile_canonical_content_from_wiki(
     preview = _canonical_content_drift_candidates(limit=limit)
     candidates = preview["candidates"]
     lines = [
-        "[DRY RUN] Canonical content reconciliation" if dry_run else "Canonical content reconciliation",
+        "[DRY RUN] Canonical content reconciliation"
+        if dry_run
+        else "Canonical content reconciliation",
         f"drift_pages: {preview['total_drift']}",
         f"selected_pages: {len(candidates)}",
         f"selected_limit: {max(0, int(limit))}",
@@ -521,7 +577,9 @@ def reconcile_canonical_content_from_wiki(
         f"invalid_pages: {len(preview['invalid'])}",
     ]
     if candidates:
-        lines.append("sample: " + ", ".join(item["filename"] for item in candidates[:10]))
+        lines.append(
+            "sample: " + ", ".join(item["filename"] for item in candidates[:10])
+        )
     if preview["invalid"]:
         lines.append("invalid sample: " + ", ".join(preview["invalid"][:10]))
     if dry_run:
@@ -537,7 +595,9 @@ def reconcile_canonical_content_from_wiki(
     if backup_reference:
         backup_path = Path(backup_reference).expanduser().resolve()
         if not backup_path.is_file():
-            raise FileNotFoundError(f"Verified backup reference does not exist: {backup_path}")
+            raise FileNotFoundError(
+                f"Verified backup reference does not exist: {backup_path}"
+            )
         backup_label = str(backup_path)
     else:
         backup_label = create_maintenance_backup("canonical_content_reconcile")
@@ -547,14 +607,18 @@ def reconcile_canonical_content_from_wiki(
     chunk_size = max(1, int(batch_size))
     committed = 0
     for offset in range(0, len(candidates), chunk_size):
-        batch = candidates[offset:offset + chunk_size]
+        batch = candidates[offset : offset + chunk_size]
         execute_mutation_batch(
             batch,
             validation_mode="schema",
             origin="canonical-content-reconcile",
         )
         committed += len(batch)
-        log.info("Canonical content reconciliation committed %s/%s pages", committed, len(candidates))
+        log.info(
+            "Canonical content reconciliation committed %s/%s pages",
+            committed,
+            len(candidates),
+        )
 
     from vector_lake.watchdog_app import process_mutation_outbox_batch
 
@@ -651,16 +715,18 @@ def _legacy_foundation_payload(
     proposed_claims = []
     for claim in claims:
         locator = dict(claim.get("locator") or {})
-        proposed_claims.append({
-            "claim_id": claim["claim_id"],
-            "claim_family_id": version_family_id("claimfamily", page_key, locator),
-            "confidence_kind": "legacy_prior",
-            "calibrated_probability": None,
-            "assessment_status": "unreviewed",
-            "extractor_name": "vector_lake.foundation_backfill",
-            "extractor_version": "1.0",
-            "extraction_run_id": extraction_run["run_id"],
-        })
+        proposed_claims.append(
+            {
+                "claim_id": claim["claim_id"],
+                "claim_family_id": version_family_id("claimfamily", page_key, locator),
+                "confidence_kind": "legacy_prior",
+                "calibrated_probability": None,
+                "assessment_status": "unreviewed",
+                "extractor_name": "vector_lake.foundation_backfill",
+                "extractor_version": "1.0",
+                "extraction_run_id": extraction_run["run_id"],
+            }
+        )
 
     proposed_evidence = []
     for record in evidence:
@@ -674,7 +740,11 @@ def _legacy_foundation_payload(
             "evidence_family_id": version_family_id(
                 "evidencefamily",
                 page_key,
-                {**locator, "source_id": source_id, "kind": record.get("evidence_type")},
+                {
+                    **locator,
+                    "source_id": source_id,
+                    "kind": record.get("evidence_type"),
+                },
             ),
             "projection_locator": locator,
             "extraction_run_id": extraction_run["run_id"],
@@ -683,18 +753,22 @@ def _legacy_foundation_payload(
             proposed["artifact_id"] = artifact["artifact_id"]
             proposed["source_locator"] = source_locator_for(frontmatter, raw_ref)
             proposed.update(
-                evidence_independence(raw_ref, path.name, artifact["generation_parent_refs"])
+                evidence_independence(
+                    raw_ref, path.name, artifact["generation_parent_refs"]
+                )
             )
         else:
-            proposed.update({
-                "source_locator": {
-                    "kind": "unresolved",
-                    "source_id": source_id,
-                    "reason": "canonical-source-or-raw-reference-missing",
-                },
-                "independence_status": "unknown_missing_source",
-                "lineage_safe": False,
-            })
+            proposed.update(
+                {
+                    "source_locator": {
+                        "kind": "unresolved",
+                        "source_id": source_id,
+                        "reason": "canonical-source-or-raw-reference-missing",
+                    },
+                    "independence_status": "unknown_missing_source",
+                    "lineage_safe": False,
+                }
+            )
         proposed_evidence.append(proposed)
 
     proposed_sources = []
@@ -702,21 +776,23 @@ def _legacy_foundation_payload(
         artifact = artifact_by_source.get(str(source["source_id"]))
         if artifact is None:
             continue
-        proposed_sources.append({
-            "source_id": source["source_id"],
-            "artifact_id": artifact["artifact_id"],
-            "content_hash": artifact.get("content_hash"),
-            "hash_algorithm": artifact.get("hash_algorithm"),
-            "byte_size": artifact.get("byte_size"),
-            "mime_type": artifact.get("mime_type"),
-            "storage_uri": artifact.get("storage_uri"),
-            "integrity_status": artifact.get("integrity_status"),
-            "classification": artifact.get("classification"),
-            "retention_policy": artifact.get("retention_policy"),
-            "legal_hold": artifact.get("legal_hold"),
-            "lineage_id": artifact.get("lineage_id"),
-            "generation_parent_refs": artifact.get("generation_parent_refs"),
-        })
+        proposed_sources.append(
+            {
+                "source_id": source["source_id"],
+                "artifact_id": artifact["artifact_id"],
+                "content_hash": artifact.get("content_hash"),
+                "hash_algorithm": artifact.get("hash_algorithm"),
+                "byte_size": artifact.get("byte_size"),
+                "mime_type": artifact.get("mime_type"),
+                "storage_uri": artifact.get("storage_uri"),
+                "integrity_status": artifact.get("integrity_status"),
+                "classification": artifact.get("classification"),
+                "retention_policy": artifact.get("retention_policy"),
+                "legal_hold": artifact.get("legal_hold"),
+                "lineage_id": artifact.get("lineage_id"),
+                "generation_parent_refs": artifact.get("generation_parent_refs"),
+            }
+        )
     return {
         "page_key": page_key,
         "entities": entities,
@@ -728,7 +804,9 @@ def _legacy_foundation_payload(
     }
 
 
-def _payload_needs_foundation_backfill(extracted: dict, existing_run_ids: set[str], snapshot: dict) -> bool:
+def _payload_needs_foundation_backfill(
+    extracted: dict, existing_run_ids: set[str], snapshot: dict
+) -> bool:
     run_id = str(extracted["extraction_runs"][0]["run_id"])
     if run_id not in existing_run_ids:
         return True
@@ -756,7 +834,11 @@ def _payload_needs_foundation_backfill(extracted: dict, existing_run_ids: set[st
             if table_name == "sources":
                 proposed_hash = str(proposed.get("content_hash") or "")
                 current_hash = str(current.get("content_hash") or "")
-                if proposed.get("integrity_status") == "verified" and len(proposed_hash) == 64 and len(current_hash) != 64:
+                if (
+                    proposed.get("integrity_status") == "verified"
+                    and len(proposed_hash) == 64
+                    and len(current_hash) != 64
+                ):
                     return True
     return False
 
@@ -766,8 +848,7 @@ def _evidence_foundation_backfill_candidates(limit: int = 500) -> dict:
     init_db()
     conn = get_connection()
     existing_run_ids = {
-        str(row["run_id"])
-        for row in conn.execute("SELECT run_id FROM extraction_runs")
+        str(row["run_id"]) for row in conn.execute("SELECT run_id FROM extraction_runs")
     }
     snapshot = _canonical_foundation_snapshot()
     canonical_keys = set(snapshot["entities_by_page"])
@@ -793,7 +874,9 @@ def _evidence_foundation_backfill_candidates(limit: int = 500) -> dict:
         except Exception as exc:
             invalid.append(f"{path.name}: {exc}")
             continue
-        if not _payload_needs_foundation_backfill(extracted, existing_run_ids, snapshot):
+        if not _payload_needs_foundation_backfill(
+            extracted, existing_run_ids, snapshot
+        ):
             current_pages += 1
             continue
         pending_pages += 1
@@ -818,7 +901,9 @@ def evidence_foundation_backfill(
     preview = _evidence_foundation_backfill_candidates(limit=limit)
     selected = preview["selected"]
     lines = [
-        "[DRY RUN] Evidence-foundation backfill" if dry_run else "Evidence-foundation backfill",
+        "[DRY RUN] Evidence-foundation backfill"
+        if dry_run
+        else "Evidence-foundation backfill",
         f"canonical_pages: {preview['canonical_pages']}",
         f"current_pages: {preview['current_pages']}",
         f"pending_pages: {preview['pending_pages']}",
@@ -843,7 +928,9 @@ def evidence_foundation_backfill(
     if backup_reference:
         backup_path = Path(backup_reference).expanduser().resolve()
         if not backup_path.is_file():
-            raise FileNotFoundError(f"Verified backup reference does not exist: {backup_path}")
+            raise FileNotFoundError(
+                f"Verified backup reference does not exist: {backup_path}"
+            )
         backup_label = str(backup_path)
     else:
         backup_label = create_maintenance_backup("evidence_foundation_backfill")
@@ -857,7 +944,7 @@ def evidence_foundation_backfill(
     }
     chunk_size = max(1, int(batch_size))
     for offset in range(0, len(selected), chunk_size):
-        batch = selected[offset:offset + chunk_size]
+        batch = selected[offset : offset + chunk_size]
         with transaction():
             results = [
                 governance_store.backfill_evidence_foundation_records(extracted)
@@ -865,9 +952,18 @@ def evidence_foundation_backfill(
             ]
         totals["pages"] += len(results)
         for result in results:
-            for key in ("updated_claims", "updated_evidence", "updated_sources", "source_artifacts"):
+            for key in (
+                "updated_claims",
+                "updated_evidence",
+                "updated_sources",
+                "source_artifacts",
+            ):
                 totals[key] += int(result[key])
-        log.info("Evidence-foundation backfill committed %s/%s pages", totals["pages"], len(selected))
+        log.info(
+            "Evidence-foundation backfill committed %s/%s pages",
+            totals["pages"],
+            len(selected),
+        )
 
     remaining = max(0, int(preview["pending_pages"]) - totals["pages"])
     return (
@@ -899,7 +995,9 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
     )
 
 
-def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None, include_existing: bool = False) -> str:
+def embedding_backfill_projection(
+    dry_run: bool = True, limit: int | None = None, include_existing: bool = False
+) -> str:
     """Backfill missing vec_embeddings rows under rate limits without rebuilding index.json."""
     from vector_lake.embedding_scheduler import embedding_backfill
 
@@ -916,7 +1014,9 @@ def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None
     before = result.get("coverage_before") or {}
     after = result.get("coverage_after") or before
     lines = [
-        "[DRY RUN] Embedding backfill plan" if dry_run else "Embedding backfill complete",
+        "[DRY RUN] Embedding backfill plan"
+        if dry_run
+        else "Embedding backfill complete",
         f"model: {result.get('model')}",
         f"limits: rpm={result.get('rpm')} tpm={result.get('tpm')} utilization={result.get('utilization')}",
         f"effective_limits: rpm={result.get('effective_rpm')} tpm={result.get('effective_tpm')}",
@@ -928,7 +1028,9 @@ def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None
     if not dry_run:
         lines.append(f"embedded_this_run: {result.get('embedded')}")
         lines.append(f"failed_batches: {result.get('failed_batches')}")
-        lines.append(f"coverage_after: nodes={after.get('nodes')} embedded={after.get('embedded')} missing={after.get('missing')} stale={after.get('stale')}")
+        lines.append(
+            f"coverage_after: nodes={after.get('nodes')} embedded={after.get('embedded')} missing={after.get('missing')} stale={after.get('stale')}"
+        )
     if result.get("skipped"):
         lines.append(f"skipped: {result['skipped']}")
     if result.get("last_error"):
@@ -961,7 +1063,9 @@ def _frontmatter_from_entity(entity: dict) -> dict:
         str(entity.get("page_key") or entity.get("source_page") or "")
     )
     inferred_type = page_key.split("_", 1)[0].lower() if "_" in page_key else "concept"
-    entity_type = str(entity.get("type") or entity.get("entity_type") or inferred_type or "concept").lower()
+    entity_type = str(
+        entity.get("type") or entity.get("entity_type") or inferred_type or "concept"
+    ).lower()
     categories = entity.get("categories") or [entity_type.capitalize()]
     if isinstance(categories, str):
         categories = [categories]
@@ -984,7 +1088,11 @@ def _body_from_entity(entity: dict, frontmatter: dict) -> str:
     raw_text = str(entity.get("raw_text") or "")
     normalized_raw_text = raw_text.strip()
     entity_type = str(frontmatter.get("type") or "concept").lower()
-    title = str(frontmatter.get("title") or entity.get("canonical_name") or entity.get("page_key"))
+    title = str(
+        frontmatter.get("title")
+        or entity.get("canonical_name")
+        or entity.get("page_key")
+    )
     restored_note = (
         f"{title}：canonical 记录存在，但 Markdown 投影缺失。本页由维护流程从 canonical 元数据恢复，"
         "需要后续补充原始证据与完整编译事实。"
@@ -998,7 +1106,11 @@ def _body_from_entity(entity: dict, frontmatter: dict) -> str:
             "## 支撑拓扑 (Supporting Topology)\n\n"
             "- [mentions:: [[Concept_Agent_Code_Cleanliness]]]\n"
         )
-    if normalized_raw_text and "## 1. 编译事实" in raw_text and "## 2. 证据时间线" in raw_text:
+    if (
+        normalized_raw_text
+        and "## 1. 编译事实" in raw_text
+        and "## 2. 证据时间线" in raw_text
+    ):
         return raw_text
     slot = (VALID_H3_SLOTS.get(entity_type) or VALID_H3_SLOTS["concept"])[0]
     restored_at = datetime.now(timezone.utc).date().isoformat()
@@ -1040,8 +1152,12 @@ def restore_missing_wiki_from_canonical(dry_run: bool = True, limit: int = 10) -
         frontmatter = _frontmatter_from_entity(entity)
         body = _body_from_entity(entity, frontmatter)
         content = f"---\n{dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)}---\n{body}"
-        canonical_version = governance_store.canonical_page_versions({page_key}).get(page_key)
-        restored_version = governance_store.canonical_page_version_from_content(path.name, content)
+        canonical_version = governance_store.canonical_page_versions({page_key}).get(
+            page_key
+        )
+        restored_version = governance_store.canonical_page_version_from_content(
+            path.name, content
+        )
         if not canonical_version or restored_version != canonical_version:
             unsafe_versions.append(page_key)
             continue

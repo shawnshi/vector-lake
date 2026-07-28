@@ -1,26 +1,31 @@
+import hashlib
 import json
 import os
 import re
 import time
 from unittest.mock import patch
 
-from vector_lake import db_store, governance_store
+import pytest
+
+from vector_lake import db_store, governance_store, tool_gc
 from vector_lake.tool_gc import gc_vector_lake
 
 
 def _seed_vendor(memory_dir, edge_count: int):
     db_store.init_db()
-    governance_store.save_entities({
-        "items": {
-            "entity-internal-id": {
-                "entity_id": "entity-internal-id",
-                "canonical_name": "Acme",
-                "page_key": "Vendor_Acme",
-                "type": "vendor",
-                "status": "Active",
+    governance_store.save_entities(
+        {
+            "items": {
+                "entity-internal-id": {
+                    "entity_id": "entity-internal-id",
+                    "canonical_name": "Acme",
+                    "page_key": "Vendor_Acme",
+                    "type": "vendor",
+                    "status": "Active",
+                }
             }
         }
-    })
+    )
     page = memory_dir / "wiki" / "Vendor_Acme.md"
     page.write_text("legacy vendor", encoding="utf-8")
     old = time.time() - 90 * 86400
@@ -35,6 +40,25 @@ def _seed_vendor(memory_dir, edge_count: int):
             )
 
 
+def _seed_old_history(change_set_id: str = "changeset_old"):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    old = "2000-01-01T00:00:00+00:00"
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO change_sets "
+            "(change_set_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (change_set_id, '{"status":"applied"}', old),
+        )
+        conn.execute(
+            "INSERT INTO change_set_idempotency "
+            "(idempotency_key, change_set_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (f"idem-{change_set_id}", change_set_id, old),
+        )
+    return conn
+
+
 def test_gc_uses_page_key_for_file_and_graph_degree(isolated_memory):
     _seed_vendor(isolated_memory, edge_count=1)
 
@@ -42,6 +66,24 @@ def test_gc_uses_page_key_for_file_and_graph_degree(isolated_memory):
 
     assert "Vendor_Acme.md" in result
     assert "entity-internal-id" in result
+
+
+def test_gc_hash_race_is_reported_as_blocking_inspection_error(
+    isolated_memory,
+    monkeypatch,
+):
+    _seed_vendor(isolated_memory, edge_count=1)
+
+    def unstable_hash(_path):
+        raise RuntimeError("injected file change while hashing")
+
+    monkeypatch.setattr(tool_gc, "_hash_file", unstable_hash)
+
+    result = gc_vector_lake(days=30, dry_run=True)
+
+    assert "[BLOCKED]" in result
+    assert "cannot inspect candidate" in result
+    assert "injected file change while hashing" in result
 
 
 def test_gc_does_not_delete_high_degree_page_key(isolated_memory):
@@ -70,7 +112,9 @@ def test_gc_prunes_history_even_when_no_orphan_pages(isolated_memory):
 
     assert "Pruned 1 change set(s) and 1 idempotency key(s)" in result
     assert conn.execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM change_set_idempotency").fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM change_set_idempotency").fetchone()[0] == 0
+    )
 
 
 def test_gc_dry_run_missing_database_is_zero_write(isolated_memory):
@@ -126,9 +170,7 @@ def test_gc_apply_prunes_only_unreferenced_terminal_change_sets(
 
     remaining = {
         row[0]
-        for row in conn.execute(
-            "SELECT change_set_id FROM change_sets"
-        ).fetchall()
+        for row in conn.execute("SELECT change_set_id FROM change_sets").fetchall()
     }
     idempotency = {
         row[0]
@@ -168,9 +210,7 @@ def test_gc_plain_apply_retains_orphans_and_only_runs_safe_phase(
     _seed_vendor(isolated_memory, edge_count=1)
     page = isolated_memory / "wiki" / "Vendor_Acme.md"
 
-    with patch(
-        "vector_lake.mutation_coordinator.execute_mutation_batch"
-    ) as execute:
+    with patch("vector_lake.mutation_coordinator.execute_mutation_batch") as execute:
         result = gc_vector_lake(days=30, dry_run=False)
 
     assert "Orphan deletion was not confirmed" in result
@@ -186,9 +226,20 @@ def test_gc_matching_fingerprint_explicitly_enables_orphan_deletion(
     preview = gc_vector_lake(days=30, dry_run=True)
     fingerprint = _orphan_fingerprint(preview)
 
+    def execute_callbacks(_mutations, **kwargs):
+        kwargs["precondition_callback"]()
+        with db_store.transaction():
+            kwargs["transaction_callback"]([])
+        return {
+            "ok": True,
+            "committed": True,
+            "deferred": [],
+            "post_commit_warnings": [],
+        }
+
     with patch(
         "vector_lake.mutation_coordinator.execute_mutation_batch",
-        return_value={"ok": True, "deferred": []},
+        side_effect=execute_callbacks,
     ) as execute:
         result = gc_vector_lake(
             days=30,
@@ -202,7 +253,483 @@ def test_gc_matching_fingerprint_explicitly_enables_orphan_deletion(
     assert mutations[0]["is_delete"] is True
     assert len(mutations[0]["expected_projection_hash"]) == 64
     assert execute.call_args.kwargs["return_details"] is True
-    execute.call_args.kwargs["precondition_callback"]()
+    assert callable(execute.call_args.kwargs["precondition_callback"])
+    assert callable(execute.call_args.kwargs["transaction_callback"])
+
+
+def test_gc_symlink_candidate_is_blocked_before_retention_or_backup(
+    isolated_memory,
+):
+    _seed_vendor(isolated_memory, edge_count=1)
+    conn = _seed_old_history("symlink-candidate-history")
+    page = isolated_memory / "wiki" / "Vendor_Acme.md"
+    external_target = isolated_memory / "raw" / "external-vendor.md"
+    external_target.write_text("external vendor", encoding="utf-8")
+    page.unlink()
+    try:
+        page.symlink_to(external_target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"File symlink creation is unavailable: {exc}")
+
+    preview = gc_vector_lake(days=30, dry_run=True)
+    fingerprint = _orphan_fingerprint(preview)
+    result = gc_vector_lake(
+        days=30,
+        dry_run=False,
+        orphan_confirmation=fingerprint,
+    )
+
+    assert "[BLOCKED]" in preview
+    assert "symbolic link" in preview
+    assert "[BLOCKED]" in result
+    assert "No changes made" in result
+    assert page.is_symlink()
+    assert external_target.read_text(encoding="utf-8") == "external vendor"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_sets WHERE change_set_id = ?",
+            ("symlink-candidate-history",),
+        ).fetchone()[0]
+        == 1
+    )
+    assert not (isolated_memory / "backup" / "gc").exists()
+
+
+def _publish_test_orphan_backup():
+    entities, edges, schema_state = tool_gc._read_gc_snapshot()
+    assert schema_state["ready"] is True
+    assert entities is not None and edges is not None
+    now = time.time()
+    candidates, errors = tool_gc._orphan_candidates(
+        entities=entities,
+        edges=edges,
+        days=30,
+        now=now,
+    )
+    assert errors == []
+    assert len(candidates) == 1
+    fingerprint = tool_gc._orphan_candidate_fingerprint(30, candidates)
+    backup_dir = tool_gc._publish_gc_backup(
+        days=30,
+        fingerprint=fingerprint,
+        candidates=candidates,
+        now=now,
+    )
+    return fingerprint, backup_dir
+
+
+def test_gc_plain_path_stat_rejects_windows_reparse_attribute(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "reparse-candidate"
+    target.mkdir()
+    actual = target.lstat()
+    path_type = type(target)
+    real_lstat = path_type.lstat
+
+    class ReparseStat:
+        st_file_attributes = 0x400
+
+        def __getattr__(self, name):
+            return getattr(actual, name)
+
+    def fake_lstat(self):
+        if self == target:
+            return ReparseStat()
+        return real_lstat(self)
+
+    monkeypatch.setattr(tool_gc.stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    monkeypatch.setattr(path_type, "lstat", fake_lstat)
+
+    with pytest.raises(RuntimeError, match="reparse point"):
+        tool_gc._plain_path_stat(target, directory=True)
+
+
+def test_gc_existing_backup_directory_symlink_blocks_canonical_delete(
+    isolated_memory,
+):
+    _seed_vendor(isolated_memory, edge_count=1)
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+    backup_root = isolated_memory / "backup" / "gc"
+    backup_root.mkdir(parents=True)
+    external = isolated_memory / "external-backup-dir"
+    external.mkdir()
+    backup_dir = backup_root / fingerprint.removeprefix("sha256:")[:16]
+    try:
+        backup_dir.symlink_to(external, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Directory symlink creation is unavailable: {exc}")
+
+    result = gc_vector_lake(
+        days=30,
+        dry_run=False,
+        orphan_confirmation=fingerprint,
+    )
+
+    assert "symbolic link or reparse point" in result
+    assert "No canonical or history deletion committed" in result
+    assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+    assert external.is_dir()
+    assert (
+        db_store.get_connection()
+        .execute("SELECT COUNT(*) FROM entities WHERE entity_id = 'entity-internal-id'")
+        .fetchone()[0]
+        == 1
+    )
+
+
+@pytest.mark.parametrize("entry_name", ["manifest.json", "Vendor_Acme.md"])
+def test_gc_existing_backup_leaf_symlink_blocks_canonical_delete(
+    isolated_memory,
+    entry_name,
+):
+    _seed_vendor(isolated_memory, edge_count=1)
+    fingerprint, backup_dir = _publish_test_orphan_backup()
+    target = backup_dir / entry_name
+    external = isolated_memory / f"external-{entry_name}"
+    external.write_bytes(target.read_bytes())
+    target.unlink()
+    try:
+        target.symlink_to(external)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"File symlink creation is unavailable: {exc}")
+
+    result = gc_vector_lake(
+        days=30,
+        dry_run=False,
+        orphan_confirmation=fingerprint,
+    )
+
+    assert "symbolic link or reparse point" in result
+    assert "No canonical or history deletion committed" in result
+    assert external.exists()
+    assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+    assert (
+        db_store.get_connection()
+        .execute("SELECT COUNT(*) FROM entities WHERE entity_id = 'entity-internal-id'")
+        .fetchone()[0]
+        == 1
+    )
+
+
+def test_gc_staging_cleanup_failure_preserves_primary_error(
+    isolated_memory,
+    caplog,
+):
+    _seed_vendor(isolated_memory, edge_count=1)
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+
+    with (
+        patch(
+            "vector_lake.tool_gc.shutil.copyfile",
+            side_effect=OSError("primary copy failure"),
+        ),
+        patch(
+            "vector_lake.tool_gc._remove_plain_gc_tree",
+            side_effect=RuntimeError("cleanup failure"),
+        ),
+        caplog.at_level("WARNING"),
+    ):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "primary copy failure" in result
+    assert "cleanup failure" in caplog.text
+    assert "No canonical or history deletion committed" in result
+    assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+
+
+def test_gc_backup_fsync_failure_blocks_canonical_delete(isolated_memory):
+    _seed_vendor(isolated_memory, edge_count=1)
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+
+    with patch.object(
+        tool_gc.os,
+        "fsync",
+        side_effect=OSError("injected fsync failure"),
+    ):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "injected fsync failure" in result
+    assert "No canonical or history deletion committed" in result
+    assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+    backup_root = isolated_memory / "backup" / "gc"
+    assert not backup_root.exists() or list(backup_root.iterdir()) == []
+
+
+def test_gc_backup_copy_failure_leaves_no_formal_backup_or_db_mutation(
+    isolated_memory,
+):
+    _seed_vendor(isolated_memory, edge_count=1)
+    conn = _seed_old_history("copy-failure-history")
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+
+    with patch(
+        "vector_lake.tool_gc.shutil.copyfile",
+        side_effect=OSError("injected copy failure"),
+    ):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "injected copy failure" in result
+    assert "No canonical or history deletion committed" in result
+    assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM entities "
+            "WHERE json_extract(data_json, '$.page_key') = ?",
+            ("Vendor_Acme",),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_sets WHERE change_set_id = ?",
+            ("copy-failure-history",),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_set_idempotency WHERE change_set_id = ?",
+            ("copy-failure-history",),
+        ).fetchone()[0]
+        == 1
+    )
+    backup_root = isolated_memory / "backup" / "gc"
+    assert not backup_root.exists() or list(backup_root.iterdir()) == []
+
+
+def test_gc_canonical_delete_failure_rolls_back_and_preserves_history(
+    isolated_memory,
+):
+    from vector_lake import runtime_health
+
+    _seed_vendor(isolated_memory, edge_count=1)
+    conn = _seed_old_history("canonical-failure-history")
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+    real_delete = db_store.delete_node_cascade
+
+    def delete_then_fail(node_key):
+        real_delete(node_key)
+        raise RuntimeError("injected canonical delete failure")
+
+    with (
+        patch.object(runtime_health, "enforce_runtime_write_health"),
+        patch.object(
+            db_store,
+            "delete_node_cascade",
+            side_effect=delete_then_fail,
+        ),
+    ):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "injected canonical delete failure" in result
+    assert "No canonical or history deletion committed" in result
+    assert "transaction committed" not in result
+    assert "Verified backup retained" in result
+    assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM entities "
+            "WHERE json_extract(data_json, '$.page_key') = ?",
+            ("Vendor_Acme",),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_sets WHERE change_set_id = ?",
+            ("canonical-failure-history",),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_set_idempotency WHERE change_set_id = ?",
+            ("canonical-failure-history",),
+        ).fetchone()[0]
+        == 1
+    )
+    assert conn.execute("SELECT COUNT(*) FROM mutation_outbox").fetchone()[0] == 0
+    backup_root = isolated_memory / "backup" / "gc"
+    backups = [
+        entry
+        for entry in backup_root.iterdir()
+        if entry.is_dir() and not entry.name.startswith(".")
+    ]
+    assert len(backups) == 1
+    assert not any(entry.name.startswith(".") for entry in backup_root.iterdir())
+    manifest = json.loads((backups[0] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["fingerprint"] == fingerprint
+    assert manifest["files"][0]["filename"] == "Vendor_Acme.md"
+
+
+def test_gc_notification_failure_reports_committed_canonical_and_outbox(
+    isolated_memory,
+):
+    from vector_lake import mutation_coordinator, runtime_health
+
+    _seed_vendor(isolated_memory, edge_count=1)
+    conn = _seed_old_history("notification-failure-history")
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+
+    with (
+        patch.object(runtime_health, "enforce_runtime_write_health"),
+        patch.object(
+            mutation_coordinator,
+            "_signal_outbox_consumer",
+            side_effect=RuntimeError("injected notification failure"),
+        ),
+    ):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "Canonical/history transaction committed" in result
+    assert "post-commit warning(s)" in result
+    assert "injected notification failure" in result
+    assert "No canonical or history deletion committed" not in result
+    assert (
+        conn.execute(
+            "SELECT 1 FROM entities WHERE json_extract(data_json, '$.page_key') = ?",
+            ("Vendor_Acme",),
+        ).fetchone()
+        is None
+    )
+    outbox = conn.execute(
+        "SELECT mutation_type, status FROM mutation_outbox WHERE filename = ?",
+        ("Vendor_Acme.md",),
+    ).fetchone()
+    assert outbox is not None
+    assert tuple(outbox) == ("delete", "pending")
+    assert (
+        conn.execute(
+            "SELECT 1 FROM change_sets WHERE change_set_id = ?",
+            ("notification-failure-history",),
+        ).fetchone()
+        is None
+    )
+
+
+def test_gc_projection_failure_counts_canonical_delete_as_committed(
+    isolated_memory,
+):
+    from vector_lake import mutation_coordinator, runtime_health
+
+    _seed_vendor(isolated_memory, edge_count=1)
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+
+    with (
+        patch.object(runtime_health, "enforce_runtime_write_health"),
+        patch.object(
+            mutation_coordinator,
+            "materialize_markdown_projection",
+            side_effect=RuntimeError("injected projection failure"),
+        ),
+    ):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "Canonical/history transaction committed" in result
+    assert "Deleted 1 orphan pages from canonical state" in result
+    assert "1 Markdown projection deletion(s) were deferred" in result
+    assert "post-commit warning(s)" in result
+    assert "injected projection failure" in result
+    assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+    conn = db_store.get_connection()
+    assert (
+        conn.execute(
+            "SELECT 1 FROM entities WHERE json_extract(data_json, '$.page_key') = ?",
+            ("Vendor_Acme",),
+        ).fetchone()
+        is None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM mutation_outbox WHERE filename = ?",
+            ("Vendor_Acme.md",),
+        ).fetchone()
+        is not None
+    )
+
+
+def test_gc_confirmed_success_commits_canonical_and_history_together(
+    isolated_memory,
+):
+    from vector_lake import runtime_health
+
+    _seed_vendor(isolated_memory, edge_count=1)
+    conn = _seed_old_history("successful-gc-history")
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+
+    with patch.object(runtime_health, "enforce_runtime_write_health"):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "Canonical/history transaction committed" in result
+    assert "Deleted 1 orphan pages from canonical state" in result
+    assert "Pruned 1 change set(s) and 1 idempotency key(s)" in result
+    assert not (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM entities "
+            "WHERE json_extract(data_json, '$.page_key') = ?",
+            ("Vendor_Acme",),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_sets WHERE change_set_id = ?",
+            ("successful-gc-history",),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_set_idempotency WHERE change_set_id = ?",
+            ("successful-gc-history",),
+        ).fetchone()[0]
+        == 0
+    )
+    backup_root = isolated_memory / "backup" / "gc"
+    backups = [
+        entry
+        for entry in backup_root.iterdir()
+        if entry.is_dir() and not entry.name.startswith(".")
+    ]
+    assert len(backups) == 1
+    manifest = json.loads((backups[0] / "manifest.json").read_text(encoding="utf-8"))
+    record = manifest["files"][0]
+    backup_file = backups[0] / record["filename"]
+    assert record["size"] == backup_file.stat().st_size
+    assert (
+        record["content_sha256"] == hashlib.sha256(backup_file.read_bytes()).hexdigest()
+    )
 
 
 def test_gc_stale_fingerprint_blocks_orphan_and_history_mutation(
@@ -231,10 +758,13 @@ def test_gc_stale_fingerprint_blocks_orphan_and_history_mutation(
 
     assert "[BLOCKED]" in result
     assert "No changes made" in result
-    assert conn.execute(
-        "SELECT COUNT(*) FROM change_sets WHERE change_set_id = ?",
-        ("stale-token-history",),
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM change_sets WHERE change_set_id = ?",
+            ("stale-token-history",),
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_gc_rechecks_canonical_edges_inside_mutation_precondition(
@@ -278,14 +808,19 @@ def test_gc_rechecks_canonical_edges_inside_mutation_precondition(
             orphan_confirmation=fingerprint,
         )
 
-    assert "confirmed orphan deletion was blocked" in result
+    assert "Confirmed orphan GC was blocked" in result
     assert "candidate set changed after confirmation" in result
     assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
-    assert db_store.get_connection().execute(
-        "SELECT 1 FROM entities "
-        "WHERE json_extract(data_json, '$.page_key') = ?",
-        ("Vendor_Acme",),
-    ).fetchone() is not None
-    assert db_store.get_connection().execute(
-        "SELECT 1 FROM mutation_outbox"
-    ).fetchone() is None
+    assert (
+        db_store.get_connection()
+        .execute(
+            "SELECT 1 FROM entities WHERE json_extract(data_json, '$.page_key') = ?",
+            ("Vendor_Acme",),
+        )
+        .fetchone()
+        is not None
+    )
+    assert (
+        db_store.get_connection().execute("SELECT 1 FROM mutation_outbox").fetchone()
+        is None
+    )

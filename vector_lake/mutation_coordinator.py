@@ -30,6 +30,26 @@ def _filename_identity(filename: str) -> str:
     return unicodedata.normalize("NFKC", filename).casefold()
 
 
+def _mutation_idempotency_key(mutation: dict, validation_mode: str) -> str:
+    projection_base_hash = mutation["projection_base_hash"]
+    token = (
+        f"{mutation['mutation_type']}\x00{mutation['filename']}\x00"
+        f"{mutation['content'] or ''}"
+        + (
+            f"\x00expected_version={mutation['expected_version']}"
+            if mutation["has_expected_version"]
+            else ""
+        )
+        + (f"\x00validation={validation_mode}" if validation_mode != "full" else "")
+        + (
+            f"\x00projection_base_hash={projection_base_hash}"
+            if projection_base_hash is not None
+            else ""
+        )
+    )
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def resolve_wiki_mutation_path(
     filename: str,
     allow_existing_legacy_name: bool = False,
@@ -43,9 +63,15 @@ def resolve_wiki_mutation_path(
         for candidate in (filename, security_name)
         for marker in ("\x00", "/", "\\")
     ):
-        raise ValueError("Mutation filename must be a basename without path separators.")
+        raise ValueError(
+            "Mutation filename must be a basename without path separators."
+        )
     candidate_name = Path(filename)
-    if candidate_name.is_absolute() or candidate_name.name != filename or filename in {".", ".."}:
+    if (
+        candidate_name.is_absolute()
+        or candidate_name.name != filename
+        or filename in {".", ".."}
+    ):
         raise ValueError("Mutation filename must be a relative wiki basename.")
     wiki_root = get_wiki_dir().resolve()
     candidate = (wiki_root / filename).resolve()
@@ -76,7 +102,9 @@ def materialize_markdown_projection(
         raise ValueError(f"Unsupported mutation_type: {mutation_type}")
     if payload_text is None:
         if not filepath.exists():
-            raise ValueError(f"Outbox update for {filename} has no payload and no existing Markdown projection.")
+            raise ValueError(
+                f"Outbox update for {filename} has no payload and no existing Markdown projection."
+            )
         payload_text = filepath.read_text(encoding="utf-8")
     if filepath.exists() and projection_base_hash is not None:
         current_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
@@ -92,14 +120,19 @@ def materialize_markdown_projection(
     return filepath
 
 
-def _signal_outbox_consumer():
+def _signal_outbox_consumer() -> str | None:
     """Best-effort wake-up hint; correctness never depends on this file."""
     try:
         signal_path = get_outbox_signal_path()
         signal_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(signal_path, "1")
-    except OSError as exc:
-        log.warning(f"Could not write outbox wake-up hint: {exc}")
+    except Exception as exc:
+        warning = (
+            f"Outbox wake-up hint failed after commit: {type(exc).__name__}: {exc}"
+        )
+        log.warning(warning)
+        return warning
+    return None
 
 
 def _prepare_mutations(
@@ -152,20 +185,19 @@ def _prepare_mutations(
         if projection_base_hash not in {None, ""} and (
             not isinstance(projection_base_hash, str)
             or len(projection_base_hash) != 64
-            or any(character not in "0123456789abcdef" for character in projection_base_hash.casefold())
+            or any(
+                character not in "0123456789abcdef"
+                for character in projection_base_hash.casefold()
+            )
         ):
-            raise ValueError("expected_projection_hash must be empty or a 64-character SHA-256 hex digest.")
+            raise ValueError(
+                "expected_projection_hash must be empty or a 64-character SHA-256 hex digest."
+            )
         filepath = resolve_wiki_mutation_path(
             filename,
             allow_existing_legacy_name=validation_mode == "schema",
         )
-        if projection_base_hash is None:
-            projection_base_hash = (
-                hashlib.sha256(filepath.read_bytes()).hexdigest()
-                if filepath.exists()
-                else ""
-            )
-        else:
+        if projection_base_hash is not None:
             projection_base_hash = projection_base_hash.casefold()
 
         seen_filenames[filename_identity] = filename
@@ -192,22 +224,7 @@ def _prepare_mutations(
                 "has_expected_version": has_expected_version,
                 "expected_version": expected_version,
                 "projection_base_hash": projection_base_hash,
-                "idempotency_key": hashlib.sha256(
-                    (
-                        f"{mutation_type}\x00{filename}\x00{content or ''}"
-                        + (
-                            f"\x00expected_version={expected_version}"
-                            if has_expected_version
-                            else ""
-                        )
-                        + (f"\x00validation={validation_mode}" if validation_mode != "full" else "")
-                        + (
-                            f"\x00projection_base_hash={projection_base_hash}"
-                            if projection_base_hash is not None
-                            else ""
-                        )
-                    ).encode("utf-8")
-                ).hexdigest(),
+                "idempotency_key": None,
             }
         )
     if not prepared:
@@ -224,7 +241,13 @@ def execute_mutation_batch(
     transaction_callback: Callable[[list[int]], None] | None = None,
     precondition_callback: Callable[[], None] | None = None,
 ):
-    """Commit canonical mutations atomically; schema mode is for bounded legacy maintenance."""
+    """Commit canonical mutations atomically.
+
+    With ``return_details=True``, ``committed`` becomes true only after the
+    database transaction exits successfully. Ordinary post-commit failures are
+    returned in ``post_commit_warnings`` and never redefine durable commit state.
+    Schema mode is for bounded legacy maintenance.
+    """
     from vector_lake.runtime_health import enforce_runtime_write_health
 
     enforce_runtime_write_health(validation_mode=validation_mode)
@@ -248,16 +271,14 @@ def execute_mutation_batch(
         prepared_change_sets.append(change_set)
 
     with db_store.transaction():
-        page_keys = {
-            _markdown_page_key(mutation["filename"])
-            for mutation in prepared
-        }
+        page_keys = {_markdown_page_key(mutation["filename"]) for mutation in prepared}
         base_versions = governance_store.canonical_page_versions(page_keys)
-        versioned = [mutation for mutation in prepared if mutation["has_expected_version"]]
+        versioned = [
+            mutation for mutation in prepared if mutation["has_expected_version"]
+        ]
         if versioned:
             page_keys = {
-                _markdown_page_key(mutation["filename"])
-                for mutation in versioned
+                _markdown_page_key(mutation["filename"]) for mutation in versioned
             }
             current_versions = governance_store.canonical_page_versions(page_keys)
             for mutation in versioned:
@@ -274,6 +295,26 @@ def execute_mutation_batch(
                     )
         if precondition_callback is not None:
             precondition_callback()
+        for mutation in prepared:
+            filepath = mutation["filepath"]
+            current_projection_hash = (
+                hashlib.sha256(filepath.read_bytes()).hexdigest()
+                if filepath.exists()
+                else ""
+            )
+            if mutation["projection_base_hash"] is None:
+                mutation["projection_base_hash"] = current_projection_hash
+            elif mutation["projection_base_hash"] != current_projection_hash:
+                raise RuntimeError(
+                    "Projection changed before canonical mutation commit for "
+                    f"{mutation['filename']}: expected "
+                    f"{mutation['projection_base_hash'] or '<absent>'}, current "
+                    f"{current_projection_hash or '<absent>'}"
+                )
+            mutation["idempotency_key"] = _mutation_idempotency_key(
+                mutation,
+                validation_mode,
+            )
         for mutation in prepared:
             filename = mutation["filename"]
             content = mutation["content"]
@@ -309,6 +350,7 @@ def execute_mutation_batch(
             transaction_callback(list(outbox_ids))
 
     deferred = []
+    post_commit_warnings = []
     for mutation, outbox_id in zip(prepared, outbox_ids):
         try:
             with db_store.transaction():
@@ -324,6 +366,10 @@ def execute_mutation_batch(
                 )
         except Exception as exc:
             deferred.append(mutation["filename"])
+            post_commit_warnings.append(
+                "Markdown projection failed after commit for "
+                f"{mutation['filename']}: {type(exc).__name__}: {exc}"
+            )
             log.error(
                 "Canonical mutation %s committed but projection failed for %s: %s",
                 outbox_id,
@@ -331,24 +377,46 @@ def execute_mutation_batch(
                 exc,
             )
 
-    _signal_outbox_consumer()
+    try:
+        signal_warning = _signal_outbox_consumer()
+    except Exception as exc:
+        # Keep the commit boundary truthful even when a monkeypatched or
+        # replacement notifier violates the best-effort helper contract.
+        signal_warning = (
+            f"Outbox wake-up hint failed after commit: {type(exc).__name__}: {exc}"
+        )
+        log.warning(signal_warning)
+    if signal_warning:
+        post_commit_warnings.append(signal_warning)
     projection_note = (
         f"projections deferred for {', '.join(deferred)}"
         if deferred
         else "all Markdown projections materialized"
     )
-    message = f"Canonical mutation batch committed; outbox ids {outbox_ids}; {projection_note}."
+    warning_note = (
+        f"; {len(post_commit_warnings)} post-commit warning(s) recorded"
+        if post_commit_warnings
+        else ""
+    )
+    message = (
+        f"Canonical mutation batch committed; outbox ids {outbox_ids}; "
+        f"{projection_note}{warning_note}."
+    )
     if return_details:
         return {
             "ok": True,
+            "committed": True,
             "message": message,
             "outbox_ids": outbox_ids,
             "deferred": deferred,
+            "post_commit_warnings": post_commit_warnings,
         }
     return True, message
 
 
-def execute_mutation_plan(filename: str, content: str | None = None, is_delete: bool = False):
+def execute_mutation_plan(
+    filename: str, content: str | None = None, is_delete: bool = False
+):
     """Commit one canonical mutation and durable intent before updating projections."""
     return execute_mutation_batch(
         [{"filename": filename, "content": content, "is_delete": is_delete}]

@@ -20,6 +20,22 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("vector-lake-native-llm")
+SUBAGENT_TASK_PACKET_FIELDS = frozenset(
+    {
+        "task_id",
+        "task_type",
+        "created_at",
+        "runtime",
+        "cost_boundary",
+        "expected_output",
+        "metadata",
+        "prompt",
+    }
+)
+SUBAGENT_TASK_RUNTIME = "current-environment-subagent"
+SUBAGENT_TASK_COST_BOUNDARY = (
+    "no non-embedding model API calls from Vector Lake runtime"
+)
 _DEFAULT_RUN_ID = f"runtime-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
@@ -36,7 +52,10 @@ class SubagentTaskRequired(NativeLLMUnavailable):
 
 
 def native_llm_ready() -> tuple[bool, str]:
-    return False, "text generation is delegated to current-environment subagent task packets"
+    return (
+        False,
+        "text generation is delegated to current-environment subagent task packets",
+    )
 
 
 def get_subagent_scratch_dir() -> Path:
@@ -44,7 +63,9 @@ def get_subagent_scratch_dir() -> Path:
     from vector_lake import get_extension_root
 
     run_id = os.environ.get("VECTOR_LAKE_SUBAGENT_RUN_ID", _DEFAULT_RUN_ID)
-    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "subagent-runtime"
+    safe_run_id = (
+        re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "subagent-runtime"
+    )
     root = get_extension_root() / "brain" / safe_run_id / "scratch"
     root.mkdir(parents=True, exist_ok=True)
     return root
@@ -68,16 +89,39 @@ def create_subagent_task(
         "task_id": task_id,
         "task_type": task_type,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "runtime": "current-environment-subagent",
-        "cost_boundary": "no non-embedding model API calls from Vector Lake runtime",
+        "runtime": SUBAGENT_TASK_RUNTIME,
+        "cost_boundary": SUBAGENT_TASK_COST_BOUNDARY,
         "expected_output": expected_output,
         "metadata": metadata or {},
         "prompt": prompt,
     }
     tmp_path = task_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     os.replace(tmp_path, task_path)
     return task_path
+
+
+def resolve_subagent_task_path(task_path: str | Path) -> Path:
+    """Resolve only JSON packets inside brain/<run>/scratch/subagent_tasks."""
+    from vector_lake import get_extension_root
+
+    candidate = Path(task_path).resolve()
+    brain_root = (get_extension_root() / "brain").resolve()
+    try:
+        relative = candidate.relative_to(brain_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Task packet is outside the isolated brain tree: {candidate}"
+        ) from exc
+    if (
+        candidate.suffix.lower() != ".json"
+        or len(relative.parts) != 4
+        or relative.parts[1:3] != ("scratch", "subagent_tasks")
+    ):
+        raise ValueError(f"Task packet is outside the isolated brain tree: {candidate}")
+    return candidate
 
 
 def remove_subagent_task(
@@ -88,22 +132,7 @@ def remove_subagent_task(
     expected_task_id: str | None = None,
 ) -> bool:
     """Delete one verified packet from an exact per-run subagent task directory."""
-    from vector_lake import get_extension_root
-
-    candidate = Path(task_path).resolve()
-    brain_root = (get_extension_root() / "brain").resolve()
-    try:
-        relative = candidate.relative_to(brain_root)
-    except ValueError as exc:
-        raise ValueError(
-            f"Refusing to remove task packet outside isolated brain tree: {candidate}"
-        ) from exc
-    if (
-        candidate.suffix.lower() != ".json"
-        or len(relative.parts) != 4
-        or relative.parts[1:3] != ("scratch", "subagent_tasks")
-    ):
-        raise ValueError(f"Refusing to remove task packet outside isolated brain tree: {candidate}")
+    candidate = resolve_subagent_task_path(task_path)
     if expected_task_id and candidate.stem != str(expected_task_id):
         raise ValueError(
             f"Task packet filename does not match expected task id: {candidate}"
@@ -118,20 +147,24 @@ def remove_subagent_task(
         raise ValueError(f"Task packet payload is not an object: {candidate}")
     packet_task_id = str(payload.get("task_id") or "")
     if not packet_task_id or packet_task_id != candidate.stem:
-        raise ValueError(f"Task packet identity does not match its filename: {candidate}")
+        raise ValueError(
+            f"Task packet identity does not match its filename: {candidate}"
+        )
     if expected_task_id and packet_task_id != str(expected_task_id):
         raise ValueError(f"Task packet id does not match cleanup intent: {candidate}")
-    if expected_task_type and str(payload.get("task_type") or "") != str(expected_task_type):
+    if expected_task_type and str(payload.get("task_type") or "") != str(
+        expected_task_type
+    ):
         raise ValueError(f"Task packet type does not match cleanup intent: {candidate}")
     if expected_job_id:
         metadata = payload.get("metadata")
         packet_job_id = (
-            str(metadata.get("job_id") or "")
-            if isinstance(metadata, dict)
-            else ""
+            str(metadata.get("job_id") or "") if isinstance(metadata, dict) else ""
         )
         if packet_job_id != str(expected_job_id):
-            raise ValueError(f"Task packet job id does not match cleanup intent: {candidate}")
+            raise ValueError(
+                f"Task packet job id does not match cleanup intent: {candidate}"
+            )
     candidate.unlink()
     return True
 
@@ -143,7 +176,9 @@ def generate_text(prompt: str, model: str | None = None) -> str:
         "plain text",
         {"model_ignored": model, "legacy_entrypoint": "generate_text"},
     )
-    raise SubagentTaskRequired(task_path, "text generation requires host subagent execution")
+    raise SubagentTaskRequired(
+        task_path, "text generation requires host subagent execution"
+    )
 
 
 async def async_generate_text(prompt: str, model: str | None = None) -> str:
@@ -173,7 +208,9 @@ def generate_json_array(prompt: str, model: str | None = None) -> list[Any]:
         "JSON array",
         {"model_ignored": model, "legacy_entrypoint": "generate_json_array"},
     )
-    raise SubagentTaskRequired(task_path, "JSON array generation requires host subagent execution")
+    raise SubagentTaskRequired(
+        task_path, "JSON array generation requires host subagent execution"
+    )
 
 
 def generate_json_object(prompt: str, model: str | None = None) -> dict[str, Any]:
@@ -183,4 +220,6 @@ def generate_json_object(prompt: str, model: str | None = None) -> dict[str, Any
         "JSON object",
         {"model_ignored": model, "legacy_entrypoint": "generate_json_object"},
     )
-    raise SubagentTaskRequired(task_path, "JSON object generation requires host subagent execution")
+    raise SubagentTaskRequired(
+        task_path, "JSON object generation requires host subagent execution"
+    )

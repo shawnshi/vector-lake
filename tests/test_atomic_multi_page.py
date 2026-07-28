@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -33,6 +34,15 @@ def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
         "Concept_Ref.MD",
     ]
     assert captured[0][0]["is_delete"] is True
+    assert (
+        captured[0][0]["expected_projection_hash"]
+        == hashlib.sha256((wiki_dir / "Concept_Old.MD").read_bytes()).hexdigest()
+    )
+    assert captured[0][1]["expected_projection_hash"] == ""
+    assert (
+        captured[0][2]["expected_projection_hash"]
+        == hashlib.sha256((wiki_dir / "Concept_Ref.MD").read_bytes()).hexdigest()
+    )
     assert "[[Concept_New|Old]]" in captured[0][2]["content"]
     renamed_frontmatter, _ = split_frontmatter(captured[0][1]["content"])
     assert renamed_frontmatter["entity_id"] == _stable_id("entity", "Concept_Old")
@@ -48,7 +58,9 @@ def test_batch_replace_links_commits_once(isolated_memory, monkeypatch):
         captured.append(mutations)
         return True, "ok"
 
-    monkeypatch.setattr("vector_lake.mutation_coordinator.execute_mutation_batch", fake_batch)
+    monkeypatch.setattr(
+        "vector_lake.mutation_coordinator.execute_mutation_batch", fake_batch
+    )
     result = mcp_server.batch_replace_links("[[Old]]", "[[New]]", dry_run=False)
 
     assert "in 2 files" in result
@@ -56,11 +68,21 @@ def test_batch_replace_links_commits_once(isolated_memory, monkeypatch):
     assert len(captured[0]) == 2
     assert all("[[New]]" in item["content"] for item in captured[0])
 
+    assert {
+        item["filename"]: item["expected_projection_hash"] for item in captured[0]
+    } == {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in wiki_dir.iterdir()
+        if path.is_file() and path.suffix.casefold() == ".md"
+    }
+
 
 def test_schema_tag_collision_is_not_swallowed(tmp_path):
     index_path = tmp_path / "index.json"
     index_path.write_text(
-        json.dumps({"nodes": {"Concept_Existing": {"title": "Existing", "aliases": []}}}),
+        json.dumps(
+            {"nodes": {"Concept_Existing": {"title": "Existing", "aliases": []}}}
+        ),
         encoding="utf-8",
     )
     frontmatter = {
@@ -77,4 +99,6 @@ def test_schema_tag_collision_is_not_swallowed(tmp_path):
     }
 
     with pytest.raises(SchemaViolationException, match="Tag Collision"):
-        validate_schema(frontmatter, "source body", "Source_Test.md", index_path=index_path)
+        validate_schema(
+            frontmatter, "source body", "Source_Test.md", index_path=index_path
+        )

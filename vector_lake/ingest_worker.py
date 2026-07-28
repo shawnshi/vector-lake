@@ -14,15 +14,21 @@ from vector_lake.db_store import (
 from vector_lake.native_llm import create_subagent_task
 from vector_lake.watchdog_status import write_status
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("ingest-worker")
 
 
 def _ingest_finalization_proven(filepath: str, file_hash: str) -> bool:
-    row = get_connection().execute(
-        "SELECT file_hash FROM processed_files WHERE filepath = ?",
-        (filepath,),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT file_hash FROM processed_files WHERE filepath = ?",
+            (filepath,),
+        )
+        .fetchone()
+    )
     return bool(row and row["file_hash"] == file_hash)
 
 
@@ -36,10 +42,9 @@ def _subagent_ingest_prompt(instructions: str) -> str:
         + "- filename: target wiki filename\n"
         + "- content: complete Markdown content, including YAML frontmatter\n"
         + "Add processed_data.integration with disposition integrated, standalone, or rejected.\n"
-        + "Preserve the task packet source_hash. Integrated relations must use candidate canonical target_hash values; standalone and rejected require an auditable reason.\n"
+        + "Preserve the task packet source_hash and source_projection_hash. Integrated relations must use candidate canonical target_hash and target_projection_hash values; standalone and rejected require an auditable reason.\n"
         + "After producing both payloads, call the Vector Lake finalize_ingest tool or CLI-compatible finalize path with the processed_data object from this task packet.\n"
     )
-
 
 
 def _persist_dispatch_packet_cleanup(job_id: str, task_path) -> bool:
@@ -52,15 +57,22 @@ def _persist_dispatch_packet_cleanup(job_id: str, task_path) -> bool:
         log.error("Could not persist stale packet cleanup for %s: %s", job_id, exc)
         return False
 
+
 def process_jobs():
     from vector_lake.tool_ingest import (
+        INGEST_CONTRACT_VERSION,
         process_ingest_task_cleanup,
         requeue_legacy_ingest_jobs,
     )
 
     process_ingest_task_cleanup(limit=20)
     requeue_legacy_ingest_jobs()
-    jobs = claim_pending_jobs(limit=1, lease_seconds=3600)
+    jobs = claim_pending_jobs(
+        limit=1,
+        lease_seconds=3600,
+        task_type="ingest",
+        required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )
     if not jobs:
         return
 
@@ -100,9 +112,13 @@ def process_jobs():
                     "hash": file_hash,
                     "canonical_name": canonical_name,
                     "source_hash": str(payload.get("source_hash") or ""),
-                    "ingest_contract_version": payload.get(
-                        "ingest_contract_version"
+                    "source_projection_hash": str(
+                        payload.get("source_projection_hash") or ""
                     ),
+                    "integration_candidates": list(
+                        payload.get("integration_candidates") or []
+                    ),
+                    "ingest_contract_version": payload.get("ingest_contract_version"),
                     "job_id": job_id,
                 }
                 task_path = create_subagent_task(
@@ -129,7 +145,9 @@ def process_jobs():
                         job_id,
                     )
                     continue
-                log.info("Created subagent ingest task for job %s: %s", job_id, task_path)
+                log.info(
+                    "Created subagent ingest task for job %s: %s", job_id, task_path
+                )
             else:
                 if not update_job_status(
                     job_id,
@@ -155,10 +173,14 @@ def process_jobs():
                     lease_generation=lease_generation,
                 )
             except Exception as status_exc:
-                log.error("Could not persist failure for job %s: %s", job_id, status_exc)
+                log.error(
+                    "Could not persist failure for job %s: %s", job_id, status_exc
+                )
             else:
                 if not updated:
                     log.warning("Ignored stale failure update for job %s", job_id)
+
+
 def start_worker(stop_event: threading.Event | None = None):
     """Run the ingest dispatcher until the shared watchdog stop event is set."""
     stop_event = stop_event or threading.Event()
@@ -207,6 +229,7 @@ def start_worker(stop_event: threading.Event | None = None):
             "",
             component="ingest",
         )
+
 
 if __name__ == "__main__":
     start_worker()

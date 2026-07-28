@@ -61,10 +61,13 @@ def test_wiki_index_event_buffer_is_bounded_generation_tracked_and_cas_cleared()
         now=100,
     )
     assert first_generation == 1
-    assert events.claim_full_reconcile_marker(
-        retry_interval_seconds=30,
-        now=101,
-    ) is None
+    assert (
+        events.claim_full_reconcile_marker(
+            retry_interval_seconds=30,
+            now=101,
+        )
+        is None
+    )
 
     # Coalesced events stay bounded but advance the generation, so an old scan
     # cannot acknowledge changes that arrived while it was running.
@@ -248,6 +251,7 @@ def test_successful_partial_overflow_batch_is_immediately_claimable(monkeypatch)
             },
         ]
     )
+
     def scan(limit):
         scan_calls.append(limit)
         return next(scans)
@@ -268,10 +272,13 @@ def test_successful_partial_overflow_batch_is_immediately_claimable(monkeypatch)
     assert result["generation_changed"] is False
     assert result["cleared"] is False
     assert len(scan_calls) == 1
-    assert events.claim_full_reconcile_marker(
-        retry_interval_seconds=30,
-        now=101,
-    ) == generation
+    assert (
+        events.claim_full_reconcile_marker(
+            retry_interval_seconds=30,
+            now=101,
+        )
+        == generation
+    )
 
 
 def test_quiet_reconcile_plan_scans_only_initial_and_final(monkeypatch):
@@ -308,8 +315,7 @@ def test_quiet_reconcile_plan_scans_only_initial_and_final(monkeypatch):
     )
 
     results = [
-        reconcile_wiki_overflow_once(events, generation, batch_size=2)
-        for _ in range(3)
+        reconcile_wiki_overflow_once(events, generation, batch_size=2) for _ in range(3)
     ]
 
     assert batches == [
@@ -372,6 +378,7 @@ def test_3045_item_quiet_backlog_uses_two_scans(monkeypatch):
     assert len(batches) == 122
     assert max(map(len, batches)) == 25
     assert sum(map(len, batches)) == 3_045
+
 
 def test_reconcile_plan_keeps_failed_batch_for_retry(monkeypatch):
     events = WikiIndexEventBuffer(max_pending=1)
@@ -471,6 +478,7 @@ def test_reconcile_plan_install_race_fails_closed(monkeypatch):
     assert result["cleared"] is False
     assert processed == []
 
+
 def test_reconcile_plan_is_invalidated_by_concurrent_generation(monkeypatch):
     events = WikiIndexEventBuffer(max_pending=1)
     events.require_full_reconcile()
@@ -556,6 +564,7 @@ def test_restored_marker_rebuilds_plan_instead_of_reusing_process_state(
 
     assert len(scans) == 2
 
+
 def test_overflow_reconcile_failures_and_scan_errors_keep_backoff(monkeypatch):
     failed_events = WikiIndexEventBuffer(max_pending=1)
     failed_events.put("Concept_Queued.md")
@@ -582,14 +591,20 @@ def test_overflow_reconcile_failures_and_scan_errors_keep_backoff(monkeypatch):
     failed = reconcile_wiki_overflow_once(failed_events, failed_generation)
 
     assert failed["failed"] == 1
-    assert failed_events.claim_full_reconcile_marker(
-        retry_interval_seconds=30,
-        now=101,
-    ) is None
-    assert failed_events.claim_full_reconcile_marker(
-        retry_interval_seconds=30,
-        now=130,
-    ) == failed_generation
+    assert (
+        failed_events.claim_full_reconcile_marker(
+            retry_interval_seconds=30,
+            now=101,
+        )
+        is None
+    )
+    assert (
+        failed_events.claim_full_reconcile_marker(
+            retry_interval_seconds=30,
+            now=130,
+        )
+        == failed_generation
+    )
 
     error_events = WikiIndexEventBuffer(max_pending=1)
     error_events.put("Concept_Queued.md")
@@ -612,15 +627,16 @@ def test_overflow_reconcile_failures_and_scan_errors_keep_backoff(monkeypatch):
     scan_error = reconcile_wiki_overflow_once(error_events, error_generation)
 
     assert scan_error["scan_errors"]
-    assert error_events.claim_full_reconcile_marker(
-        retry_interval_seconds=30,
-        now=201,
-    ) is None
+    assert (
+        error_events.claim_full_reconcile_marker(
+            retry_interval_seconds=30,
+            now=201,
+        )
+        is None
+    )
 
 
-def test_reconcile_marker_persist_failure_is_visible_and_retried(
-    tmp_path, monkeypatch
-):
+def test_reconcile_marker_persist_failure_is_visible_and_retried(tmp_path, monkeypatch):
     from vector_lake import watchdog_app
 
     monkeypatch.setattr(
@@ -654,9 +670,7 @@ def test_reconcile_marker_disk_full_during_fsync_fails_closed_and_cleans_temp(
     monkeypatch.setattr(
         watchdog_app.os,
         "fsync",
-        lambda _fd: (_ for _ in ()).throw(
-            OSError(errno.ENOSPC, "injected disk full")
-        ),
+        lambda _fd: (_ for _ in ()).throw(OSError(errno.ENOSPC, "injected disk full")),
     )
     events = WikiIndexEventBuffer(persist_reconcile_marker=True)
 
@@ -842,9 +856,7 @@ def test_raw_watchdog_requeues_failed_batch_with_backoff(
     monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
     handler = RawWatchdogHandler(retry_base_seconds=0.01)
     try:
-        handler.handle_event(
-            SimpleNamespace(is_directory=False, src_path=str(source))
-        )
+        handler.handle_event(SimpleNamespace(is_directory=False, src_path=str(source)))
         assert completed.wait(timeout=2)
     finally:
         handler.shutdown()
@@ -853,7 +865,7 @@ def test_raw_watchdog_requeues_failed_batch_with_backoff(
     assert calls == [expected, expected]
 
 
-def test_raw_watchdog_overflow_rescans_until_no_pending_files(
+def test_raw_watchdog_overflow_runs_one_complete_inventory(
     isolated_memory,
     monkeypatch,
 ):
@@ -871,21 +883,20 @@ def test_raw_watchdog_overflow_rescans_until_no_pending_files(
     release_first = threading.Event()
     scan_complete = threading.Event()
     calls = []
-    full_scan_count = 0
 
-    def prepare(*, batch_size, candidate_paths):
-        nonlocal full_scan_count
-        calls.append((batch_size, candidate_paths))
+    def prepare(*, batch_size, candidate_paths, _enqueue_all=False):
+        calls.append((batch_size, candidate_paths, _enqueue_all))
         if len(calls) == 1:
             first_started.set()
             assert release_first.wait(timeout=2)
             return "ok"
         assert candidate_paths is None
-        full_scan_count += 1
-        if full_scan_count == 1:
-            return "Successfully enqueued 50 files for ingestion."
+        assert _enqueue_all is True
         scan_complete.set()
-        return "No new files to ingest. System is fully synced."
+        return (
+            f"{tool_ingest.FULL_SCAN_COMPLETE_TOKEN}\n"
+            "Successfully enqueued recovery inventory."
+        )
 
     monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
     monkeypatch.setenv("VECTOR_LAKE_RAW_EVENT_BUFFER", "1")
@@ -907,8 +918,10 @@ def test_raw_watchdog_overflow_rescans_until_no_pending_files(
         release_first.set()
         handler.shutdown()
 
-    assert calls[0] == (1, [str(paths[0].resolve())])
-    assert calls[1:] == [(50, None), (50, None)]
+    assert calls == [
+        (1, [str(paths[0].resolve())], False),
+        (50, None, True),
+    ]
 
 
 def test_diary_watchdog_runs_one_trailing_sync_for_coalesced_events(monkeypatch):
@@ -939,12 +952,8 @@ def test_diary_watchdog_runs_one_trailing_sync_for_coalesced_events(monkeypatch)
     monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     handler = DiaryWatchdogHandler()
-    handler.handle_event(
-        SimpleNamespace(is_directory=False, src_path="Diary_Alpha.md")
-    )
-    handler.handle_event(
-        SimpleNamespace(is_directory=False, src_path="Diary_Beta.md")
-    )
+    handler.handle_event(SimpleNamespace(is_directory=False, src_path="Diary_Alpha.md"))
+    handler.handle_event(SimpleNamespace(is_directory=False, src_path="Diary_Beta.md"))
 
     assert len(launches) == 1
     assert handler.sync_dirty is True

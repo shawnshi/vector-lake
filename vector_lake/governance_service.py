@@ -15,6 +15,7 @@ from vector_lake.wiki_utils import (
     get_wiki_dir,
     iter_markdown_files,
     iter_wiki_link_matches,
+    normalize_semantic_text,
     semantic_text_hash,
 )
 
@@ -37,10 +38,7 @@ def _find_md_file(wiki_dir: Path, page_key: str, name: str) -> Path | None:
     )
     safe_name = (
         name
-        if isinstance(name, str)
-        and name
-        and "/" not in name
-        and "\\" not in name
+        if isinstance(name, str) and name and "/" not in name and "\\" not in name
         else ""
     )
     candidate_names = [
@@ -76,15 +74,18 @@ def _validate_alias_redirect(source_id: str, target_id: str) -> None:
 
 
 def _source_rows_snapshot(page_names: set[str], raw_identity: str) -> list[dict]:
-    rows = db_store.get_connection().execute(
-        "SELECT source_id, data_json, updated_at FROM sources ORDER BY source_id"
-    ).fetchall()
+    rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT source_id, data_json, updated_at FROM sources ORDER BY source_id"
+        )
+        .fetchall()
+    )
     snapshots = []
     for row in rows:
         data = json.loads(row["data_json"] or "{}")
-        if (
-            str(data.get("canonical_source_page") or "") in page_names
-            or (raw_identity and str(data.get("raw_ref") or "") == raw_identity)
+        if str(data.get("canonical_source_page") or "") in page_names or (
+            raw_identity and str(data.get("raw_ref") or "") == raw_identity
         ):
             snapshots.append(
                 {
@@ -107,12 +108,16 @@ def _source_artifacts_snapshot(source_rows: list[dict]) -> list[dict]:
     if not source_ids:
         return []
     placeholders = ",".join("?" for _ in source_ids)
-    rows = db_store.get_connection().execute(
-        "SELECT artifact_id, source_id, sha256, byte_size, mime_type, storage_uri, "
-        "integrity_status, data_json, recorded_at FROM source_artifacts "
-        f"WHERE source_id IN ({placeholders}) ORDER BY artifact_id",
-        source_ids,
-    ).fetchall()
+    rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT artifact_id, source_id, sha256, byte_size, mime_type, storage_uri, "
+            "integrity_status, data_json, recorded_at FROM source_artifacts "
+            f"WHERE source_id IN ({placeholders}) ORDER BY artifact_id",
+            source_ids,
+        )
+        .fetchall()
+    )
     return [
         {
             "artifact_id": row["artifact_id"],
@@ -194,15 +199,21 @@ def _merge_durable_source_record(current: dict, prior: dict, context: str) -> di
             if field == "content_hash" and not prior_verified:
                 merged.setdefault("legacy_content_hash", copy.deepcopy(prior_value))
                 continue
-            raise RuntimeError(f"Conflicting verified {field} while preserving {context}.")
+            raise RuntimeError(
+                f"Conflicting verified {field} while preserving {context}."
+            )
         if field == "artifact_id" and current_value not in {None, "", prior_value}:
             if prior_verified or current_verified:
-                raise RuntimeError(f"Conflicting verified artifact_id while preserving {context}.")
+                raise RuntimeError(
+                    f"Conflicting verified artifact_id while preserving {context}."
+                )
             merged.setdefault("legacy_artifact_id", copy.deepcopy(prior_value))
             continue
         if field == "integrity_status":
             if prior_verified and not current_verified:
-                raise RuntimeError(f"Verified integrity would be downgraded while preserving {context}.")
+                raise RuntimeError(
+                    f"Verified integrity would be downgraded while preserving {context}."
+                )
             if current_verified:
                 continue
         merged[field] = copy.deepcopy(prior_value)
@@ -264,7 +275,9 @@ def _preserve_source_metadata(
             (artifact_id,),
         ).fetchone()
         if current_artifact is None:
-            raise RuntimeError(f"Source artifact disappeared while merging {artifact_id}.")
+            raise RuntimeError(
+                f"Source artifact disappeared while merging {artifact_id}."
+            )
         current_data = json.loads(current_artifact["data_json"] or "{}")
         merged_data = _merge_durable_source_record(
             current_data,
@@ -279,7 +292,8 @@ def _preserve_source_metadata(
                 merged_data.get("byte_size"),
                 merged_data.get("mime_type"),
                 merged_data.get("storage_uri"),
-                merged_data.get("integrity_status") or current_artifact["integrity_status"],
+                merged_data.get("integrity_status")
+                or current_artifact["integrity_status"],
                 json.dumps(merged_data, ensure_ascii=False, sort_keys=True),
                 artifact_id,
             ),
@@ -319,12 +333,10 @@ def _current_raw_artifact_hash(raw_identity: str) -> str:
 def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
     wiki_dir = get_wiki_dir()
     target_name = str(
-        journal.get("target_filename")
-        or f"{candidate['left_page_key']}.md"
+        journal.get("target_filename") or f"{candidate['left_page_key']}.md"
     )
     source_name = str(
-        journal.get("source_filename")
-        or f"{candidate['right_page_key']}.md"
+        journal.get("source_filename") or f"{candidate['right_page_key']}.md"
     )
     target_path = wiki_dir / target_name
     source_path = wiki_dir / source_name
@@ -337,7 +349,10 @@ def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
         errors.append(f"survivor projection hash mismatch: {target_name}")
     if source_path.exists():
         errors.append(f"duplicate projection still exists: {source_name}")
-    if governance_store.get_alias(candidate["right_entity_id"]) != candidate["left_entity_id"]:
+    if (
+        governance_store.get_alias(candidate["right_entity_id"])
+        != candidate["left_entity_id"]
+    ):
         errors.append("merge alias redirect is missing")
     backlinks = _direct_backlinks(
         candidate["right_page_key"],
@@ -354,18 +369,30 @@ def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
             errors.append(str(exc))
         else:
             if current_artifact_hash != candidate.get("source_artifact_hash"):
-                errors.append(f"Source raw artifact changed after merge: {raw_identity}")
-        rows = db_store.get_connection().execute(
-            "SELECT data_json FROM sources WHERE json_extract(data_json, '$.raw_ref') = ?",
-            (raw_identity,),
-        ).fetchall()
+                errors.append(
+                    f"Source raw artifact changed after merge: {raw_identity}"
+                )
+        rows = (
+            db_store.get_connection()
+            .execute(
+                "SELECT data_json FROM sources WHERE json_extract(data_json, '$.raw_ref') = ?",
+                (raw_identity,),
+            )
+            .fetchall()
+        )
         if not rows:
             errors.append(f"canonical source row is missing: {raw_identity}")
         else:
             wrong_pages = {
-                str(json.loads(row["data_json"] or "{}").get("canonical_source_page") or "")
+                str(
+                    json.loads(row["data_json"] or "{}").get("canonical_source_page")
+                    or ""
+                )
                 for row in rows
-                if str(json.loads(row["data_json"] or "{}").get("canonical_source_page") or "")
+                if str(
+                    json.loads(row["data_json"] or "{}").get("canonical_source_page")
+                    or ""
+                )
                 != target_name
             }
             if wrong_pages:
@@ -374,21 +401,29 @@ def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
                     + ", ".join(sorted(wrong_pages))
                 )
     for expected in journal.get("preserved_source_rows") or []:
-        row = db_store.get_connection().execute(
-            "SELECT data_json FROM sources WHERE source_id = ?",
-            (str(expected.get("source_id") or ""),),
-        ).fetchone()
+        row = (
+            db_store.get_connection()
+            .execute(
+                "SELECT data_json FROM sources WHERE source_id = ?",
+                (str(expected.get("source_id") or ""),),
+            )
+            .fetchone()
+        )
         if row is None or json.loads(row["data_json"] or "{}") != expected.get("data"):
             errors.append(
                 "preserved Source metadata does not match journal: "
                 + str(expected.get("source_id") or "")
             )
     for expected in journal.get("preserved_source_artifacts") or []:
-        row = db_store.get_connection().execute(
-            "SELECT source_id, sha256, byte_size, mime_type, storage_uri, "
-            "integrity_status, data_json FROM source_artifacts WHERE artifact_id = ?",
-            (str(expected.get("artifact_id") or ""),),
-        ).fetchone()
+        row = (
+            db_store.get_connection()
+            .execute(
+                "SELECT source_id, sha256, byte_size, mime_type, storage_uri, "
+                "integrity_status, data_json FROM source_artifacts WHERE artifact_id = ?",
+                (str(expected.get("artifact_id") or ""),),
+            )
+            .fetchone()
+        )
         observed = (
             {
                 "source_id": row["source_id"],
@@ -438,7 +473,10 @@ def _reconcile_projection_pending(item: dict) -> dict:
     journal = db_store.get_merge_journal(journal_id) if journal_id else None
     if not journal:
         raise RuntimeError("Projection-pending merge is missing its recovery journal.")
-    outbox_ids = [int(value) for value in item.get("merge_outbox_ids") or journal.get("outbox_ids") or []]
+    outbox_ids = [
+        int(value)
+        for value in item.get("merge_outbox_ids") or journal.get("outbox_ids") or []
+    ]
     if not outbox_ids:
         raise RuntimeError("Projection-pending merge is missing outbox identities.")
 
@@ -451,21 +489,26 @@ def _reconcile_projection_pending(item: dict) -> dict:
         outbox_ids=outbox_ids,
     )
     statuses = db_store.mutation_outbox_statuses(outbox_ids)
-    if set(statuses) != set(outbox_ids) or any(status != "completed" for status in statuses.values()):
+    if set(statuses) != set(outbox_ids) or any(
+        status != "completed" for status in statuses.values()
+    ):
         db_store.update_merge_journal(
             journal_id,
             {"outbox_statuses": statuses, "last_checked_at": _utc_now()},
             status="projection_pending",
         )
-        return governance_store.update_governance_item(
-            item["item_id"],
-            {
-                "status": "projection_pending",
-                "merge_outbox_statuses": statuses,
-                "last_projection_check": _utc_now(),
-            },
-            expected_statuses={"pending", "projection_pending"},
-        ) or item
+        return (
+            governance_store.update_governance_item(
+                item["item_id"],
+                {
+                    "status": "projection_pending",
+                    "merge_outbox_statuses": statuses,
+                    "last_projection_check": _utc_now(),
+                },
+                expected_statuses={"pending", "projection_pending"},
+            )
+            or item
+        )
 
     errors = _post_merge_errors(candidate, journal)
     if errors:
@@ -474,33 +517,39 @@ def _reconcile_projection_pending(item: dict) -> dict:
             {"outbox_statuses": statuses, "postcondition_errors": errors},
             status="verification_failed",
         )
-        return governance_store.update_governance_item(
-            item["item_id"],
-            {
-                "status": "projection_pending",
-                "merge_outbox_statuses": statuses,
-                "postcondition_errors": errors,
-                "last_projection_check": _utc_now(),
-            },
-            expected_statuses={"pending", "projection_pending"},
-        ) or item
+        return (
+            governance_store.update_governance_item(
+                item["item_id"],
+                {
+                    "status": "projection_pending",
+                    "merge_outbox_statuses": statuses,
+                    "postcondition_errors": errors,
+                    "last_projection_check": _utc_now(),
+                },
+                expected_statuses={"pending", "projection_pending"},
+            )
+            or item
+        )
 
     db_store.update_merge_journal(
         journal_id,
         {"outbox_statuses": statuses, "completed_at": _utc_now()},
         status="completed",
     )
-    return governance_store.update_governance_item(
-        item["item_id"],
-        {
-            "status": "resolved",
-            "resolution": "merge",
-            "merge_outbox_statuses": statuses,
-            "postcondition_errors": [],
-            "resolved_at": _utc_now(),
-        },
-        expected_statuses={"pending", "projection_pending"},
-    ) or item
+    return (
+        governance_store.update_governance_item(
+            item["item_id"],
+            {
+                "status": "resolved",
+                "resolution": "merge",
+                "merge_outbox_statuses": statuses,
+                "postcondition_errors": [],
+                "resolved_at": _utc_now(),
+            },
+            expected_statuses={"pending", "projection_pending"},
+        )
+        or item
+    )
 
 
 def resolve_governance_item(
@@ -533,7 +582,9 @@ def resolve_governance_item(
 
     candidate = item.get("merge_candidate")
     if not isinstance(candidate, dict) or not candidate:
-        raise RuntimeError("Missing merge candidate must be regenerated before resolution.")
+        raise RuntimeError(
+            "Missing merge candidate must be regenerated before resolution."
+        )
     required_contract_fields = (
         "left_entity_id",
         "right_entity_id",
@@ -574,8 +625,12 @@ def resolve_governance_item(
     if change_manifest and change_manifest.get("allow_cycles") is True:
         raise RuntimeError("Alias-cycle validation cannot be disabled.")
 
-    left_path = _find_md_file(wiki_dir, candidate["left_page_key"], candidate["left_name"])
-    right_path = _find_md_file(wiki_dir, candidate["right_page_key"], candidate["right_name"])
+    left_path = _find_md_file(
+        wiki_dir, candidate["left_page_key"], candidate["left_name"]
+    )
+    right_path = _find_md_file(
+        wiki_dir, candidate["right_page_key"], candidate["right_name"]
+    )
     if not left_path or not right_path or left_path == right_path:
         raise RuntimeError("Semantic merge requires two distinct existing wiki pages.")
 
@@ -585,16 +640,23 @@ def resolve_governance_item(
         hashlib.sha256(left_bytes).hexdigest() != candidate["left_projection_hash"]
         or hashlib.sha256(right_bytes).hexdigest() != candidate["right_projection_hash"]
     ):
-        raise RuntimeError("Markdown projection changed after merge preflight; regenerate the candidate.")
+        raise RuntimeError(
+            "Markdown projection changed after merge preflight; regenerate the candidate."
+        )
+    left_content = normalize_semantic_text(left_bytes.decode("utf-8"))
+    right_content = normalize_semantic_text(right_bytes.decode("utf-8"))
     merged_content = merge_markdown_content(
-        left_bytes.decode("utf-8"),
-        right_bytes.decode("utf-8"),
+        left_content,
+        right_content,
         source_key=candidate["right_page_key"],
     )
     merged_projection_hash = semantic_text_hash(merged_content)
-    journal_id = "merge_" + hashlib.sha256(
-        f"{item_id}\0{candidate['pair_key']}".encode("utf-8")
-    ).hexdigest()[:24]
+    journal_id = (
+        "merge_"
+        + hashlib.sha256(
+            f"{item_id}\0{candidate['pair_key']}".encode("utf-8")
+        ).hexdigest()[:24]
+    )
     source_rows = _source_rows_snapshot(
         {left_path.name, right_path.name},
         str(candidate.get("source_identity") or ""),
@@ -603,8 +665,8 @@ def resolve_governance_item(
     journal_snapshot = {
         "target_filename": left_path.name,
         "source_filename": right_path.name,
-        "target_content": left_bytes.decode("utf-8"),
-        "source_content": right_bytes.decode("utf-8"),
+        "target_content": left_content,
+        "source_content": right_content,
         "target_version": candidate["left_version"],
         "source_version": candidate["right_version"],
         "target_projection_hash": candidate["left_projection_hash"],
@@ -700,11 +762,13 @@ def resolve_governance_item(
                 "filename": left_path.name,
                 "content": merged_content,
                 "expected_version": candidate["left_version"],
+                "expected_projection_hash": candidate["left_projection_hash"],
             },
             {
                 "filename": right_path.name,
                 "is_delete": True,
                 "expected_version": candidate["right_version"],
+                "expected_projection_hash": candidate["right_projection_hash"],
             },
         ],
         validation_mode="schema",
@@ -724,5 +788,7 @@ def resolve_governance_item(
         item_id
     )
     if not pending_item or pending_item.get("status") != "projection_pending":
-        raise RuntimeError("Committed merge is missing its projection-pending control state.")
+        raise RuntimeError(
+            "Committed merge is missing its projection-pending control state."
+        )
     return _reconcile_projection_pending(pending_item)

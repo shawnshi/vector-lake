@@ -1,5 +1,11 @@
 # Unreleased
 
+- Upgraded the SQLite migration contract to `PRAGMA user_version = 4`, adding a durable ingest task-packet cleanup ledger with schema and backup inspection coverage.
+- Hardened ingest contract v4 across `sync -> worker -> claim -> finalize`: legacy jobs are migrated or retired, candidate manifests are bound outside prompt text, task packets are path/shape/content checked and lease-repaired, and finalization revalidates raw, canonical, projection, disposition, and fencing state.
+- Added bounded MCP blocking execution with configurable workers, queue capacity, admission timeout, shutdown drain, runtime status, and fail-closed source-revision detection.
+- Added preview-first, fingerprint-confirmed backup retention with verified restore-point protection; orphan-page GC now requires an exact current candidate fingerprint before deletion.
+- Hardened raw candidate scoping, case-insensitive component exclusions, `privacy/Diary` traversal blocking, watcher subscription refresh, per-root retry backoff, and bounded ingest-debt progress.
+- Aligned README operator guidance with the current type/Synthesis schema, `/sync` surface, ingest v4 handoff, real environment keys, maintenance confirmation rules, module map, validation command, and Doctor/readiness output semantics.
 - Added read-only-preview ingest-job debt reconciliation with backups, lease-fenced CAS updates, replayable verified task-packet cleanup, missing-raw retirement, processed-job closure, current-hash requeue, and duplicate-current-identity supersession.
 - Replaced placeholder graph analysis with bounded topology computation, deterministic communities, a global degree cap, and dirty-graph retrieval isolation.
 - Added cascade tombstones for operational memory, Claim/Evidence versions, and entity identities when canonical pages are deleted.
