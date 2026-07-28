@@ -1315,11 +1315,17 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
         lambda *_args: "isolated test ingest instructions",
     )
     real_hash = tool_ingest.calculate_hash
+    real_walk = tool_ingest.os.walk
     hashed = []
+    walked_roots = []
 
     def recording_hash(filepath):
         hashed.append(str(Path(filepath).resolve()))
         return real_hash(filepath)
+
+    def recording_walk(root, *args, **kwargs):
+        walked_roots.append(str(Path(root).resolve()))
+        return real_walk(root, *args, **kwargs)
 
     real_prepare = tool_ingest.prepare_ingest_batch
     calls = []
@@ -1329,6 +1335,7 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
         return real_prepare(*args, **kwargs)
 
     monkeypatch.setattr(tool_ingest, "calculate_hash", recording_hash)
+    monkeypatch.setattr(tool_ingest.os, "walk", recording_walk)
     monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", recording_prepare)
     handler = RawWatchdogHandler()
     idle = False
@@ -1355,6 +1362,7 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
     assert calls[0][1]["_enqueue_all"] is True
     assert len(hashed) == 120
     assert len(set(hashed)) == 120
+    assert walked_roots == [str(raw_dir.resolve())]
     assert (
         db_store.get_connection()
         .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")

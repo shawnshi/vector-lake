@@ -417,12 +417,15 @@ def test_integration_accepts_exact_dispatched_candidate_tokens(monkeypatch):
         }
     ]
 
-    mutations, disposition = tool_ingest._apply_integration_disposition(
-        files,
-        _integrated_processed_data(candidate, candidate),
+    mutations, disposition, integration_targets = (
+        tool_ingest._apply_integration_disposition(
+            files,
+            _integrated_processed_data(candidate, candidate),
+        )
     )
 
     assert disposition == "integrated"
+    assert integration_targets == {"Concept_Allowed.md"}
     assert [item["filename"] for item in mutations] == [
         "Source_Candidate-Test.md",
         "Concept_Allowed.md",

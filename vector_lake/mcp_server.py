@@ -751,7 +751,7 @@ def _read_payload(payload_file: str) -> str:
         return ""
     import os
     from pathlib import Path
-    from vector_lake import get_extension_root
+    from vector_lake.native_llm import peek_subagent_brain_root
 
     abs_path = Path(payload_file).resolve()
     configured_root = os.environ.get("VECTOR_LAKE_PAYLOAD_ROOT")
@@ -760,7 +760,7 @@ def _read_payload(payload_file: str) -> str:
     else:
         allowed = False
         brain_roots = [
-            (get_extension_root() / "brain").resolve(),
+            peek_subagent_brain_root().resolve(),
             Path(os.path.expanduser("~/.codex/brain")).resolve(),
         ]
         for root in brain_roots:

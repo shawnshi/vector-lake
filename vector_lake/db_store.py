@@ -506,9 +506,8 @@ def _assert_ingest_task_cleanup_schema_contract(conn: sqlite3.Connection) -> Non
 
 
 def _identity_validation_token(conn: sqlite3.Connection) -> tuple:
-    """Detect schema, external, and identity-relevant local writes cheaply."""
+    """Detect schema and identity-relevant writes without unrelated invalidation."""
     schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0)
-    data_version = int(conn.execute("PRAGMA data_version").fetchone()[0] or 0)
     placeholders = ", ".join("?" for _ in _IDENTITY_GENERATION_SURFACES)
     rows = conn.execute(
         "SELECT surface, generation FROM runtime_generations "
@@ -518,7 +517,7 @@ def _identity_validation_token(conn: sqlite3.Connection) -> tuple:
     generations = tuple((str(row[0]), int(row[1])) for row in rows)
     if len(generations) != len(_IDENTITY_GENERATION_SURFACES):
         raise RuntimeError("Identity runtime generation registry is incomplete")
-    return schema_version, data_version, generations
+    return schema_version, generations
 
 
 def _validate_cached_identity_state(conn: sqlite3.Connection) -> None:
@@ -3765,7 +3764,7 @@ def fail_ingest_subagent_task_claim(
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
         row = conn.execute(
-            "SELECT retries FROM jobs WHERE job_id = ? "
+            "SELECT retries, task_packet_path FROM jobs WHERE job_id = ? "
             "AND task_type = 'ingest' AND status = 'subagent_processing' "
             "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
             "AND COALESCE(lease_until, '') > ?",
@@ -3795,6 +3794,7 @@ def fail_ingest_subagent_task_claim(
             "UPDATE jobs SET status = 'failed', retries = ?, error_msg = ?, "
             "updated_at = ?, available_at = ?, completed_at = ?, result_json = ?, "
             "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+            "task_packet_path = CASE WHEN ? THEN NULL ELSE task_packet_path END, "
             "idempotency_key = CASE WHEN ? THEN NULL ELSE idempotency_key END "
             "WHERE job_id = ? AND task_type = 'ingest' "
             "AND status = 'subagent_processing' AND lease_owner = ? "
@@ -3808,6 +3808,7 @@ def fail_ingest_subagent_task_claim(
                 now if terminal else None,
                 result_json,
                 int(terminal),
+                int(terminal),
                 str(job_id),
                 owner,
                 token,
@@ -3815,8 +3816,86 @@ def fail_ingest_subagent_task_claim(
                 now,
             ),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return False
+        packet_path = str(row["task_packet_path"] or "")
+        if terminal and packet_path:
+            enqueue_ingest_task_cleanup(str(job_id), packet_path)
+        return True
 
+
+def requeue_ingest_subagent_baseline_conflict(
+    job_id: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+    error_msg: str,
+    *,
+    current_ingest_contract_version: int,
+) -> bool:
+    """Invalidate a stale dispatch and route it through contract rebuild."""
+    lease = _dispatch_lease_credentials(
+        lease_owner,
+        lease_token,
+        lease_generation,
+    )
+    if lease is None:
+        raise ValueError("subagent lease credentials are required")
+    contract_version = int(current_ingest_contract_version)
+    if contract_version < 2:
+        raise ValueError("current_ingest_contract_version must be at least 2")
+    owner, token, generation = lease
+    conn = get_connection()
+    with transaction():
+        now = datetime.now(timezone.utc).isoformat()
+        row = conn.execute(
+            "SELECT payload, task_packet_path FROM jobs WHERE job_id = ? "
+            "AND task_type = 'ingest' AND status = 'subagent_processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (str(job_id), owner, token, generation, now),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            payload = json.loads(str(row["payload"] or "{}"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Ingest job {job_id} has an invalid payload during requeue"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Ingest job {job_id} payload must be an object during requeue"
+            )
+        payload["ingest_contract_version"] = contract_version - 1
+        stale_payload = row["payload"]
+        refreshed_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        cursor = conn.execute(
+            "UPDATE jobs SET payload = ?, status = 'queued', error_msg = ?, "
+            "result_json = NULL, completed_at = NULL, available_at = ?, "
+            "updated_at = ?, lease_until = NULL, lease_owner = NULL, "
+            "lease_token = NULL WHERE job_id = ? AND task_type = 'ingest' "
+            "AND status = 'subagent_processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ? AND payload IS ?",
+            (
+                refreshed_payload,
+                str(error_msg)[:4000],
+                now,
+                now,
+                str(job_id),
+                owner,
+                token,
+                generation,
+                now,
+                stale_payload,
+            ),
+        )
+        return cursor.rowcount == 1
 
 def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     """Bind finalization to the exact leased job payload."""

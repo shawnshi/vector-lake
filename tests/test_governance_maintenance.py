@@ -5,6 +5,19 @@ from vector_lake.governance_metrics import claim_governance_version, compute_deb
 from vector_lake import tool_governance_maintenance as maintenance
 
 
+def test_p2_debt_types_have_explicit_default_priority():
+    for item_type in (
+        "merge",
+        "duplicate",
+        "missing-page",
+        "missing-link-target",
+        "orphan-source",
+    ):
+        assert governance_store._GOVERNANCE_DEFAULT_PRIORITY[item_type] == "P2"
+        item = governance_store.normalize_governance_item({"type": item_type})
+        assert item["priority"] == "P2"
+
+
 def _page(title: str, body: str = "") -> str:
     return f"""---
 id: {title.lower().replace(' ', '-')}
@@ -406,3 +419,234 @@ def test_orphan_source_classification_is_non_destructive_and_resumable(isolated_
     second = maintenance.classify_orphan_source_debt(dry_run=True)
     assert second["already_managed"] == 4
     assert second["to_register"] == 0
+
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "DELETE FROM sources WHERE source_id = ?",
+            ("source_raw_only",),
+        )
+
+    stale_preview = maintenance.classify_orphan_source_debt(dry_run=True)
+    assert stale_preview["stale_governance_items"] == 1
+    assert stale_preview["stale_governance_item_ids"]
+
+    stale_apply = maintenance.classify_orphan_source_debt(dry_run=False)
+    assert stale_apply["stale_resolved"] == 1
+    stale_item = next(
+        item
+        for item in governance_store.load_governance_queue()["items"]
+        if item.get("source_id") == "source_raw_only"
+    )
+    assert stale_item["status"] == "resolved"
+    assert stale_item["resolution"] == "source-record-removed"
+
+def test_orphan_source_reconciliation_closes_newly_referenced_source(
+    isolated_memory,
+):
+    db_store.init_db()
+    source = {
+        "source_id": "source_later_referenced",
+        "raw_ref": "raw/later-referenced.md",
+        "canonical_source_page": "Source_Later-Referenced.md",
+    }
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Source_Later-Referenced.md"],
+            "proposed_entities": [],
+            "proposed_claims": [],
+            "proposed_evidence": [],
+            "proposed_source_updates": [source],
+            "proposed_edges": [],
+        }
+    )
+    assert maintenance.classify_orphan_source_debt(dry_run=False)["registered"] == 1
+
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Later-Referenced.md"],
+            "proposed_entities": [],
+            "proposed_claims": [],
+            "proposed_evidence": [
+                {
+                    "evidence_id": "evidence_later_referenced",
+                    "source_id": "source_later_referenced",
+                    "locator": {"page_key": "Concept_Later-Referenced"},
+                }
+            ],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
+
+    preview = maintenance.classify_orphan_source_debt(dry_run=True)
+    assert preview["stale_governance_items"] == 1
+    assert preview["stale_managed_governance_items"] == 1
+    assert preview["stale_protected_governance_items"] == 0
+
+    applied = maintenance.classify_orphan_source_debt(dry_run=False)
+    assert applied["stale_resolved"] == 1
+    item = governance_store.load_governance_queue()["items"][0]
+    assert item["status"] == "resolved"
+    assert item["resolution"] == "source-now-referenced"
+
+
+def test_orphan_source_reconciliation_protects_foreign_and_concurrent_state(
+    isolated_memory,
+):
+    db_store.init_db()
+    source_id = "source_protected_registration"
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Source_Protected.md"],
+            "proposed_entities": [],
+            "proposed_claims": [],
+            "proposed_evidence": [],
+            "proposed_source_updates": [
+                {
+                    "source_id": source_id,
+                    "raw_ref": "raw/protected.md",
+                    "canonical_source_page": "Source_Protected.md",
+                },
+                {
+                    "source_id": "source_concurrent_restore",
+                    "raw_ref": "raw/concurrent.md",
+                    "canonical_source_page": "Source_Concurrent.md",
+                },
+            ],
+            "proposed_edges": [],
+        }
+    )
+    protected_item_id = maintenance._stable_item_id("orphan_source", source_id)
+    protected_source = json.loads(
+        db_store.get_connection()
+        .execute(
+            "SELECT data_json FROM sources WHERE source_id = ?",
+            (source_id,),
+        )
+        .fetchone()["data_json"]
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": protected_item_id,
+            "type": "orphan-source",
+            "status": "acknowledged",
+            "source_id": source_id,
+            "source_version": maintenance._source_version(protected_source),
+            "classification": "unresolved_missing_raw_and_page",
+            "owner": "human-reviewer",
+            "source": "manual-review",
+            "due_at": "2099-01-01T00:00:00+00:00",
+        }
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": "gov_manual_missing",
+            "type": "orphan-source",
+            "status": "acknowledged",
+            "source_id": "source_manual_missing",
+            "owner": "human-reviewer",
+            "source": "manual-review",
+            "due_at": "2099-01-01T00:00:00+00:00",
+        }
+    )
+    mismatched = {
+        "item_id": "gov_embedded_mismatch",
+        "type": "orphan-source",
+        "status": "acknowledged",
+        "source_id": "source_mismatched_missing",
+        "owner": "vector-lake-governance",
+        "source": "orphan-source-governance",
+        "critical_decision_refs": [],
+    }
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO governance_queue (item_id, data_json, updated_at) "
+            "VALUES (?, ?, ?)",
+            (
+                "gov_row_mismatch",
+                json.dumps(mismatched),
+                "2026-07-28T00:00:00+00:00",
+            ),
+        )
+
+    preview = maintenance.classify_orphan_source_debt(dry_run=True)
+    assert preview["to_register"] == 2
+    assert preview["stale_governance_items"] == 2
+    assert preview["stale_managed_governance_items"] == 0
+    assert preview["stale_protected_governance_items"] == 2
+
+    applied = maintenance.classify_orphan_source_debt(dry_run=False)
+    assert applied["registration_protected_skipped"] == 1
+    assert applied["registered"] == 1
+    assert applied["stale_resolved"] == 0
+    assert governance_store.get_governance_item(protected_item_id)["owner"] == (
+        "human-reviewer"
+    )
+    assert governance_store.get_governance_item("gov_manual_missing")["status"] == (
+        "acknowledged"
+    )
+    assert governance_store.get_governance_item("gov_row_mismatch")["status"] == (
+        "acknowledged"
+    )
+
+    concurrent_source_id = "source_concurrent_restore"
+    concurrent_item_id = maintenance._stable_item_id(
+        "orphan_source",
+        concurrent_source_id,
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": concurrent_item_id,
+            "type": "orphan-source",
+            "status": "acknowledged",
+            "source_id": concurrent_source_id,
+            "owner": "vector-lake-governance",
+            "source": "orphan-source-governance",
+            "critical_decision_refs": [],
+        }
+    )
+    assert (
+        maintenance._resolve_stale_managed_orphan_source_item(
+            concurrent_item_id,
+            concurrent_source_id,
+            "2026-07-28T00:00:00+00:00",
+        )
+        == "concurrent_skip"
+    )
+    assert governance_store.get_governance_item(concurrent_item_id)["status"] == (
+        "acknowledged"
+    )
+
+    governance_store.update_governance_item(
+        concurrent_item_id,
+        {"status": "resolved"},
+        expected_statuses={"acknowledged"},
+    )
+    concurrent_source = json.loads(
+        db_store.get_connection()
+        .execute(
+            "SELECT data_json FROM sources WHERE source_id = ?",
+            (concurrent_source_id,),
+        )
+        .fetchone()["data_json"]
+    )
+    replacement_item = {
+        "item_id": concurrent_item_id,
+        "type": "orphan-source",
+        "status": "acknowledged",
+        "source_id": concurrent_source_id,
+        "source_version": maintenance._source_version(concurrent_source),
+        "owner": "vector-lake-governance",
+        "source": "orphan-source-governance",
+        "critical_decision_refs": [],
+    }
+    assert (
+        maintenance._upsert_managed_orphan_source_item(
+            replacement_item,
+            replacement_item["source_version"],
+        )
+        == "protected_skip"
+    )
+    assert governance_store.get_governance_item(concurrent_item_id)["status"] == (
+        "resolved"
+    )

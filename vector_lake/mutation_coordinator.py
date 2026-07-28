@@ -138,10 +138,27 @@ def _signal_outbox_consumer() -> str | None:
 def _prepare_mutations(
     mutations: Iterable[dict],
     validation_mode: str = "full",
+    schema_maintenance_filenames: Iterable[str] | None = None,
 ) -> list[dict]:
     if validation_mode not in {"full", "schema"}:
         raise ValueError(f"Unsupported validation_mode: {validation_mode}")
+    maintenance_names = list(schema_maintenance_filenames or ())
+    if validation_mode != "full" and maintenance_names:
+        raise ValueError(
+            "Per-file schema maintenance exceptions require full batch validation."
+        )
+    if len(maintenance_names) != len(set(maintenance_names)):
+        raise ValueError("Schema maintenance filenames must be unique.")
+    maintenance_set = set(maintenance_names)
+    if any(
+        not isinstance(filename, str)
+        or not filename
+        or Path(filename).name != filename
+        for filename in maintenance_set
+    ):
+        raise ValueError("Schema maintenance filenames must be wiki basenames.")
     prepared = []
+    prepared_maintenance_names = set()
     seen_filenames: dict[str, str] = {}
     existing_filenames: dict[str, set[str]] = {}
     wiki_dir = get_wiki_dir()
@@ -193,12 +210,31 @@ def _prepare_mutations(
             raise ValueError(
                 "expected_projection_hash must be empty or a 64-character SHA-256 hex digest."
             )
+        item_validation_mode = (
+            "schema"
+            if validation_mode == "schema" or filename in maintenance_set
+            else "full"
+        )
         filepath = resolve_wiki_mutation_path(
             filename,
-            allow_existing_legacy_name=validation_mode == "schema",
+            allow_existing_legacy_name=item_validation_mode == "schema",
         )
         if projection_base_hash is not None:
             projection_base_hash = projection_base_hash.casefold()
+        if filename in maintenance_set:
+            if (
+                is_delete
+                or filename.casefold().startswith("source_")
+                or not has_expected_version
+                or not expected_version
+                or not projection_base_hash
+                or not filepath.is_file()
+            ):
+                raise ValueError(
+                    "Schema maintenance exceptions require an existing non-Source "
+                    "update with non-empty canonical and projection baselines."
+                )
+            prepared_maintenance_names.add(filename)
 
         seen_filenames[filename_identity] = filename
 
@@ -207,7 +243,7 @@ def _prepare_mutations(
             if content is None:
                 raise ValueError("Update mutations require full Markdown content.")
             frontmatter, _ = split_frontmatter(content)
-            if validation_mode == "full":
+            if item_validation_mode == "full":
                 verify_asset(content, filename, frontmatter, get_index_path())
             else:
                 # Schema mode is a bounded legacy-maintenance path. Dynamic
@@ -225,10 +261,17 @@ def _prepare_mutations(
                 "expected_version": expected_version,
                 "projection_base_hash": projection_base_hash,
                 "idempotency_key": None,
+                "validation_mode": item_validation_mode,
             }
         )
     if not prepared:
         raise ValueError("A mutation batch must contain at least one mutation.")
+    missing_maintenance_names = maintenance_set - prepared_maintenance_names
+    if missing_maintenance_names:
+        raise ValueError(
+            "Schema maintenance filenames are absent from the mutation batch: "
+            + ", ".join(sorted(missing_maintenance_names))
+        )
     return prepared
 
 
@@ -240,6 +283,7 @@ def execute_mutation_batch(
     return_details: bool = False,
     transaction_callback: Callable[[list[int]], None] | None = None,
     precondition_callback: Callable[[], None] | None = None,
+    schema_maintenance_filenames: Iterable[str] | None = None,
 ):
     """Commit canonical mutations atomically.
 
@@ -251,7 +295,11 @@ def execute_mutation_batch(
     from vector_lake.runtime_health import enforce_runtime_write_health
 
     enforce_runtime_write_health(validation_mode=validation_mode)
-    prepared = _prepare_mutations(mutations, validation_mode=validation_mode)
+    prepared = _prepare_mutations(
+        mutations,
+        validation_mode=validation_mode,
+        schema_maintenance_filenames=schema_maintenance_filenames,
+    )
     db_store.init_db()
     outbox_ids = []
     from vector_lake import governance_store
@@ -313,7 +361,7 @@ def execute_mutation_batch(
                 )
             mutation["idempotency_key"] = _mutation_idempotency_key(
                 mutation,
-                validation_mode,
+                mutation["validation_mode"],
             )
         for mutation in prepared:
             filename = mutation["filename"]
@@ -336,7 +384,7 @@ def execute_mutation_batch(
                     mutation["mutation_type"],
                     payload_text=content,
                     idempotency_key=mutation["idempotency_key"],
-                    validation_mode=validation_mode,
+                    validation_mode=mutation["validation_mode"],
                     base_version=base_versions.get(
                         _markdown_page_key(filename),
                         "",
@@ -361,7 +409,7 @@ def execute_mutation_batch(
                     mutation["filename"],
                     mutation["mutation_type"],
                     mutation["content"],
-                    validation_mode=validation_mode,
+                    validation_mode=mutation["validation_mode"],
                     projection_base_hash=mutation["projection_base_hash"],
                 )
         except Exception as exc:

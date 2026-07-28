@@ -454,7 +454,7 @@ def assess_runtime_health(
     if outbox_counts.get("failed", 0):
         issues.append(f"mutation_outbox_failed:{outbox_counts.get('failed', 0)}")
     oldest_pending = conn.execute(
-        "SELECT MIN(COALESCE(available_at, created_at)) FROM mutation_outbox "
+        "SELECT COALESCE(MIN(COALESCE(available_at, created_at)), '') FROM mutation_outbox "
         "WHERE status IN ('pending', 'processing')"
     ).fetchone()[0]
     oldest_pending_dt = _parse_dt(oldest_pending)
@@ -474,8 +474,8 @@ def assess_runtime_health(
     now_text = datetime.now(timezone.utc).isoformat()
     ready_ingest_row = conn.execute(
         "SELECT COUNT(*) AS count, "
-        "MIN(CASE WHEN status = 'dispatched' THEN lease_until "
-        "ELSE COALESCE(available_at, created_at) END) AS oldest "
+        "COALESCE(MIN(CASE WHEN status = 'dispatched' THEN lease_until "
+        "ELSE COALESCE(available_at, created_at) END), '') AS oldest "
         "FROM jobs WHERE task_type = 'ingest' AND ("
         "(status IN ('queued', 'failed') AND retries < 3 "
         "AND COALESCE(available_at, created_at, '') <= ?) OR "
@@ -504,7 +504,8 @@ def assess_runtime_health(
                 f"oldest={ready_ingest_age}s"
             )
     awaiting_row = conn.execute(
-        "SELECT COUNT(*) AS count, MIN(updated_at) AS oldest FROM jobs WHERE status = 'awaiting_subagent'"
+        "SELECT COUNT(*) AS count, COALESCE(MIN(updated_at), '') AS oldest "
+        "FROM jobs WHERE status = 'awaiting_subagent'"
     ).fetchone()
     awaiting_count = int(awaiting_row["count"] or 0)
     detail["awaiting_subagent_jobs"] = awaiting_count
@@ -1236,7 +1237,7 @@ def assess_semantic_readiness(
             warnings.append(f"{metric}_low:{coverage:.4f}<{threshold:.4f}")
 
     awaiting_row = conn.execute(
-        "SELECT COUNT(*) AS count, MIN(updated_at) AS oldest "
+        "SELECT COUNT(*) AS count, COALESCE(MIN(updated_at), '') AS oldest "
         "FROM jobs WHERE status = 'awaiting_subagent'"
     ).fetchone()
     awaiting_count = int(awaiting_row["count"] or 0)

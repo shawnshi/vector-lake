@@ -4,6 +4,11 @@ from datetime import datetime, timezone
 from vector_lake import db_store, tool_ingest
 
 
+class _RecordingRows(list):
+    def fetchall(self):
+        return list(self)
+
+
 class _RecordingConnection:
     def __init__(self):
         self.calls = []
@@ -14,10 +19,10 @@ class _RecordingConnection:
 
     def execute(self, sql, parameters=()):
         self.calls.append((" ".join(sql.split()), tuple(parameters)))
-        return []
+        return _RecordingRows()
 
 
-def test_candidate_lookup_queries_chunk_sql_parameters_at_400():
+def test_candidate_lookup_chunks_paths_but_scans_source_json_once():
     connection = _RecordingConnection()
     paths = [f"C:/raw/candidate-{index:04d}.md" for index in range(805)]
     identities = [f"raw/candidate-{index:04d}.md" for index in range(805)]
@@ -46,14 +51,22 @@ def test_candidate_lookup_queries_chunk_sql_parameters_at_400():
     } == {
         "processed": [400, 400, 5],
         "legacy": [400, 400, 5],
-        "sources": [400, 400, 5],
+        "sources": [0],
     }
     assert all(
         len(parameters) <= 400 for chunks in groups.values() for parameters in chunks
     )
     assert connection.functions[0][0:2] == (
-        "vector_lake_normalize_source_identity",
+        "vector_lake_source_identity_is_candidate",
         1,
+    )
+    is_candidate = connection.functions[0][2]
+    assert is_candidate("MEMORY/raw/candidate-0001.md") == 1
+    assert is_candidate("MEMORY/raw/unrelated.md") == 0
+    assert connection.functions[1][0:3] == (
+        "vector_lake_source_identity_is_candidate",
+        1,
+        None,
     )
 
 
@@ -161,7 +174,10 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
     ]
     assert legacy_reads
     assert all("$.filepath') END IN (" in statement for statement in legacy_reads)
-    assert any("JOIN json_each" in statement for statement in normalized_sql)
+    assert (
+        sum("JOIN json_each" in statement for statement in normalized_sql)
+        == 1
+    )
     assert not any(
         statement.startswith("SELECT data_json FROM entities WHERE")
         and "status != 'Merged'" in statement

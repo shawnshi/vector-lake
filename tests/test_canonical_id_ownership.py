@@ -798,6 +798,80 @@ def test_cached_identity_validation_ignores_unrelated_local_writes(
     assert calls == 1
 
 
+def test_cached_identity_validation_ignores_unrelated_cross_connection_writes(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    calls = 0
+    real_validate = db_store._validate_canonical_identity_coverage
+
+    def counted_validate(conn):
+        nonlocal calls
+        calls += 1
+        return real_validate(conn)
+
+    monkeypatch.setattr(
+        db_store,
+        "_validate_canonical_identity_coverage",
+        counted_validate,
+    )
+    external = sqlite3.connect(db_store.get_db_path())
+    try:
+        external.execute(
+            "INSERT INTO jobs (job_id, status) VALUES ('job_external', 'queued')"
+        )
+        external.commit()
+    finally:
+        external.close()
+
+    db_store.init_db()
+    assert calls == 0
+
+
+def test_cached_identity_validation_detects_relevant_cross_connection_writes(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    calls = 0
+    real_validate = db_store._validate_canonical_identity_coverage
+
+    def counted_validate(conn):
+        nonlocal calls
+        calls += 1
+        return real_validate(conn)
+
+    monkeypatch.setattr(
+        db_store,
+        "_validate_canonical_identity_coverage",
+        counted_validate,
+    )
+    errors = []
+
+    def write_relevant_identity():
+        try:
+            governance_store.apply_change_set(
+                _change_set(
+                    "Concept_External-Relevant",
+                    entity_id="entity_external_relevant",
+                    claim_id="claim_external_relevant",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            db_store.close_connection()
+
+    writer = threading.Thread(target=write_relevant_identity)
+    writer.start()
+    writer.join(timeout=10)
+
+    assert writer.is_alive() is False
+    assert errors == []
+    db_store.init_db()
+    assert calls == 1
+
 def test_cached_identity_validation_caches_only_stable_snapshot(
     isolated_memory,
     monkeypatch,

@@ -39,6 +39,55 @@ SUBAGENT_TASK_COST_BOUNDARY = (
 _DEFAULT_RUN_ID = f"runtime-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
+def _safe_run_id() -> str:
+    run_id = os.environ.get("VECTOR_LAKE_SUBAGENT_RUN_ID", _DEFAULT_RUN_ID)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "subagent-runtime"
+
+
+def _stable_runtime_root(env_name: str, default_name: str) -> Path:
+    configured = os.environ.get(env_name)
+    if configured:
+        candidate = Path(configured).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError(f"{env_name} must be an absolute path")
+    else:
+        from vector_lake.db_store import peek_db_path
+
+        candidate = peek_db_path().resolve().parent / default_name
+    root = candidate.resolve()
+
+    from vector_lake import get_extension_root
+
+    extension_root = get_extension_root().resolve()
+    if root == extension_root or root.is_relative_to(extension_root):
+        raise ValueError(
+            f"{env_name or default_name} must be outside the versioned extension root: {root}"
+        )
+    return root
+
+
+def peek_subagent_brain_root() -> Path:
+    """Return the version-independent ephemeral runtime root without creating it."""
+    return _stable_runtime_root("VECTOR_LAKE_SUBAGENT_BRAIN_ROOT", "brain")
+
+
+def get_subagent_brain_root() -> Path:
+    root = peek_subagent_brain_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def peek_subagent_task_root() -> Path:
+    """Return the version-independent durable task root without creating it."""
+    return _stable_runtime_root("VECTOR_LAKE_SUBAGENT_TASK_ROOT", "subagent_tasks")
+
+
+def get_subagent_task_root() -> Path:
+    root = peek_subagent_task_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 class NativeLLMUnavailable(RuntimeError):
     """Raised when in-process text generation is intentionally unavailable."""
 
@@ -59,22 +108,21 @@ def native_llm_ready() -> tuple[bool, str]:
 
 
 def get_subagent_scratch_dir() -> Path:
-    """Return the isolated scratch directory for the active host-agent run."""
-    from vector_lake import get_extension_root
+    """Return isolated ephemeral scratch outside the versioned extension tree."""
+    root = get_subagent_brain_root() / _safe_run_id() / "scratch"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
-    run_id = os.environ.get("VECTOR_LAKE_SUBAGENT_RUN_ID", _DEFAULT_RUN_ID)
-    safe_run_id = (
-        re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "subagent-runtime"
-    )
-    root = get_extension_root() / "brain" / safe_run_id / "scratch"
+
+def get_subagent_task_dir() -> Path:
+    """Return the durable per-run task directory beside the active database."""
+    root = get_subagent_task_root() / _safe_run_id()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def _task_root() -> Path:
-    root = get_subagent_scratch_dir() / "subagent_tasks"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return get_subagent_task_dir()
 
 
 def create_subagent_task(
@@ -104,23 +152,19 @@ def create_subagent_task(
 
 
 def resolve_subagent_task_path(task_path: str | Path) -> Path:
-    """Resolve only JSON packets inside brain/<run>/scratch/subagent_tasks."""
-    from vector_lake import get_extension_root
-
+    """Resolve only JSON packets inside the version-independent durable root."""
     candidate = Path(task_path).resolve()
-    brain_root = (get_extension_root() / "brain").resolve()
+    task_root = peek_subagent_task_root().resolve()
     try:
-        relative = candidate.relative_to(brain_root)
+        relative = candidate.relative_to(task_root)
     except ValueError as exc:
         raise ValueError(
-            f"Task packet is outside the isolated brain tree: {candidate}"
+            f"Task packet is outside the durable subagent task root: {candidate}"
         ) from exc
-    if (
-        candidate.suffix.lower() != ".json"
-        or len(relative.parts) != 4
-        or relative.parts[1:3] != ("scratch", "subagent_tasks")
-    ):
-        raise ValueError(f"Task packet is outside the isolated brain tree: {candidate}")
+    if candidate.suffix.lower() != ".json" or len(relative.parts) != 2:
+        raise ValueError(
+            f"Task packet is outside the durable subagent task root: {candidate}"
+        )
     return candidate
 
 

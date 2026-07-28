@@ -1,5 +1,13 @@
 # Unreleased
 
+- Made orphan-source debt explicitly P2 and added transactionally revalidated cleanup for removed or newly referenced sources, while protecting foreign, critical, and terminal governance records.
+- Upgraded ingest handoff to v5: generated `Source_*` names now satisfy the strict filename contract, legacy active jobs rebuild their canonical identity and task packet, and stale raw/Source/target baselines automatically invalidate the old lease and re-enter the rebuild path.
+- Added narrowly scoped mixed validation for ingest integration: new Source pages remain full-validated while updates to structurally valid legacy targets may use schema validation until purpose metadata is upgraded.
+
+# Vector Lake 11.14.0
+
+- Moved durable subagent task packets and ephemeral query scratch out of versioned plugin directories, and removed unrelated cross-connection writes from the canonical identity validation cache key.
+- Reconciled terminal ingest debt against the effective normalized raw revision, blocked ambiguous owner sets, and revalidated owner uniqueness inside the apply transaction.
 - Upgraded the SQLite migration contract to `PRAGMA user_version = 4`, adding a durable ingest task-packet cleanup ledger with schema and backup inspection coverage.
 - Hardened ingest contract v4 across `sync -> worker -> claim -> finalize`: legacy jobs are migrated or retired, candidate manifests are bound outside prompt text, task packets are path/shape/content checked and lease-repaired, and finalization revalidates raw, canonical, projection, disposition, and fencing state.
 - Added bounded MCP blocking execution with configurable workers, queue capacity, admission timeout, shutdown drain, runtime status, and fail-closed source-revision detection.

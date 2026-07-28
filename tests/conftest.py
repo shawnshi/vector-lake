@@ -16,6 +16,8 @@ def isolate_test_runtime(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(memory_dir))
     monkeypatch.delenv("VECTOR_LAKE_META_DIR", raising=False)
     monkeypatch.delenv("VECTOR_LAKE_DB_PATH", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_BRAIN_ROOT", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_TASK_ROOT", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     yield memory_dir
     db_store.close_all_connections()

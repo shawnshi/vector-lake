@@ -3,6 +3,7 @@ import json
 from contextlib import closing
 import os
 import sqlite3
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -323,6 +324,40 @@ def _create_verified_backup(
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is True
     return path
+
+
+def test_restorable_verification_releases_each_projection_root_before_next_decode(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    indexer.generate_index()
+    path = Path(create_maintenance_backup("projection_root_lifetime"))
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    real_loads = json.loads
+    root_refs = []
+
+    class TrackingProjectionRoot(dict):
+        pass
+
+    def tracking_loads(payload):
+        decoded = real_loads(payload)
+        if root_refs:
+            assert root_refs[-1]() is None
+        root = TrackingProjectionRoot(decoded)
+        root_refs.append(weakref.ref(root))
+        return root
+
+    class TrackingJson:
+        loads = staticmethod(tracking_loads)
+        JSONDecodeError = json.JSONDecodeError
+
+    monkeypatch.setattr(tool_backup_retention, "json", TrackingJson)
+
+    tool_backup_retention._verify_restorable_backup_snapshot(path, manifest)
+
+    assert len(root_refs) == 2
+    assert all(reference() is None for reference in root_refs)
 
 
 def test_backup_retention_falls_back_to_older_verified_guard_after_hash_failure(

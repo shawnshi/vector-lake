@@ -9,6 +9,7 @@ from vector_lake.tool_ingest import (
     INGEST_CONTRACT_VERSION,
     calculate_hash,
     claim_ingest_tasks,
+    process_ingest_task_cleanup,
     reconcile_ingest_job_debt,
 )
 from tests.test_mutation_coordinator import _write_purpose_contract
@@ -329,7 +330,16 @@ def test_unrepairable_task_packet_claim_terminalizes_at_retry_limit(
         )
         .fetchone()["idempotency_key"]
     )
-    db_store.mark_job_awaiting_subagent(job_id, "")
+    from vector_lake.native_llm import create_subagent_task
+
+    packet_path = create_subagent_task(
+        "ingest",
+        "terminal missing packet",
+        "JSON array",
+        {"job_id": job_id},
+    ).resolve()
+    db_store.mark_job_awaiting_subagent(job_id, str(packet_path))
+    packet_path.unlink()
     with db_store.transaction() as connection:
         connection.execute(
             "UPDATE jobs SET retries = 2 WHERE job_id = ?",
@@ -350,7 +360,8 @@ def test_unrepairable_task_packet_claim_terminalizes_at_retry_limit(
         db_store.get_connection()
         .execute(
             "SELECT status, retries, idempotency_key, completed_at, "
-            "lease_until, lease_owner, lease_token FROM jobs WHERE job_id = ?",
+            "lease_until, lease_owner, lease_token, task_packet_path "
+            "FROM jobs WHERE job_id = ?",
             (job_id,),
         )
         .fetchone()
@@ -363,6 +374,41 @@ def test_unrepairable_task_packet_claim_terminalizes_at_retry_limit(
     assert row["lease_until"] is None
     assert row["lease_owner"] is None
     assert row["lease_token"] is None
+    assert row["task_packet_path"] is None
+    cleanup = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, task_packet_path FROM ingest_task_cleanup "
+            "WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    assert dict(cleanup) == {
+        "status": "pending",
+        "task_packet_path": str(packet_path),
+    }
+
+    replay = process_ingest_task_cleanup(limit=1)
+    final = (
+        db_store.get_connection()
+        .execute(
+            "SELECT task_packet_path FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    cleanup_status = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status FROM ingest_task_cleanup WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    assert replay["completed"] == 1
+    assert final["task_packet_path"] is None
+    assert cleanup_status["status"] == "completed"
 
     replacement = db_store.enqueue_job("ingest", payload)
     replacement_row = (
@@ -376,6 +422,159 @@ def test_unrepairable_task_packet_claim_terminalizes_at_retry_limit(
     assert replacement != job_id
     assert replacement_row["status"] == "queued"
     assert replacement_row["idempotency_key"] == original_key
+
+
+@pytest.mark.parametrize("packet_kind", ["corrupt", "wrong_job", "outside_root"])
+def test_terminal_packet_repair_detaches_unverified_pointer_and_retains_cleanup(
+    isolated_memory,
+    monkeypatch,
+    packet_kind,
+):
+    payload = _v4_payload(
+        f"raw/terminal-{packet_kind}.md",
+        f"terminal-{packet_kind}-hash",
+        f"Source_Terminal-{packet_kind}.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    from vector_lake.native_llm import create_subagent_task
+
+    packet_path = create_subagent_task(
+        "ingest",
+        f"terminal {packet_kind} packet",
+        "JSON array",
+        {"job_id": job_id},
+    ).resolve()
+    if packet_kind == "corrupt":
+        packet_path.write_text("{", encoding="utf-8")
+    elif packet_kind == "wrong_job":
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+        packet["metadata"]["job_id"] = "different-job"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    else:
+        outside_dir = isolated_memory / "outside-terminal-task-root"
+        outside_dir.mkdir()
+        outside_path = outside_dir / packet_path.name
+        shutil.move(packet_path, outside_path)
+        packet_path = outside_path.resolve()
+    db_store.mark_job_awaiting_subagent(job_id, str(packet_path))
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET retries = 2 WHERE job_id = ?",
+            (job_id,),
+        )
+
+    def fail_packet_rebuild(*_args, **_kwargs):
+        raise OSError("injected packet rebuild failure")
+
+    monkeypatch.setattr(
+        "vector_lake.native_llm.create_subagent_task",
+        fail_packet_rebuild,
+    )
+
+    assert json.loads(claim_ingest_tasks(limit=1, lease_seconds=3600)) == []
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, task_packet_path FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    cleanup = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, task_packet_path FROM ingest_task_cleanup "
+            "WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    assert dict(row) == {
+        "status": "failed",
+        "retries": 3,
+        "task_packet_path": None,
+    }
+    assert dict(cleanup) == {
+        "status": "pending",
+        "task_packet_path": str(packet_path),
+    }
+
+    replay = process_ingest_task_cleanup(limit=1)
+    cleanup = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, attempt_count, last_error "
+            "FROM ingest_task_cleanup WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    assert replay["completed"] == 0
+    assert replay["failed"] == 1
+    assert cleanup["status"] == "failed"
+    assert cleanup["attempt_count"] == 1
+    assert cleanup["last_error"]
+    assert packet_path.is_file()
+    packet_path.unlink()
+
+
+def test_retryable_packet_repair_failure_keeps_pointer_without_cleanup(
+    isolated_memory,
+    monkeypatch,
+):
+    payload = _v4_payload(
+        "raw/retryable-packet.md",
+        "retryable-packet-hash",
+        "Source_Retryable-Packet.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    from vector_lake.native_llm import create_subagent_task
+
+    packet_path = create_subagent_task(
+        "ingest",
+        "retryable missing packet",
+        "JSON array",
+        {"job_id": job_id},
+    ).resolve()
+    db_store.mark_job_awaiting_subagent(job_id, str(packet_path))
+    packet_path.unlink()
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET retries = 1 WHERE job_id = ?",
+            (job_id,),
+        )
+
+    def fail_packet_rebuild(*_args, **_kwargs):
+        raise OSError("injected packet rebuild failure")
+
+    monkeypatch.setattr(
+        "vector_lake.native_llm.create_subagent_task",
+        fail_packet_rebuild,
+    )
+
+    assert json.loads(claim_ingest_tasks(limit=1, lease_seconds=3600)) == []
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, task_packet_path FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    cleanup_count = (
+        db_store.get_connection()
+        .execute(
+            "SELECT COUNT(*) FROM ingest_task_cleanup WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()[0]
+    )
+    assert dict(row) == {
+        "status": "failed",
+        "retries": 2,
+        "task_packet_path": str(packet_path),
+    }
+    assert cleanup_count == 0
 
 
 def test_historical_terminal_failed_identity_is_not_an_inventory_gate(
@@ -540,7 +739,7 @@ def test_claim_rebuilds_packet_when_path_or_durable_binding_is_tampered(
     tamper,
 ):
     from vector_lake.ingest_worker import _subagent_ingest_prompt
-    from vector_lake.native_llm import create_subagent_task, get_subagent_scratch_dir
+    from vector_lake.native_llm import create_subagent_task, get_subagent_task_dir
 
     payload = _v4_payload(
         f"raw/tampered-{tamper}.md",
@@ -595,7 +794,7 @@ def test_claim_rebuilds_packet_when_path_or_durable_binding_is_tampered(
     assert [item["job_id"] for item in claimed] == [job_id]
     repaired = claimed[0]
     repaired_path = Path(repaired["task_packet_path"]).resolve()
-    task_root = (get_subagent_scratch_dir() / "subagent_tasks").resolve()
+    task_root = get_subagent_task_dir().resolve()
     assert repaired_path.is_relative_to(task_root)
     assert repaired_path != bad_path.resolve()
     repaired_packet = repaired["task_packet"]

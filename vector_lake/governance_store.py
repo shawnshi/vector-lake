@@ -509,6 +509,7 @@ _GOVERNANCE_DEFAULT_PRIORITY = {
     "duplicate": "P2",
     "missing-page": "P2",
     "missing-link-target": "P2",
+    "orphan-source": "P2",
     "suggestion": "P3",
     "community_naming": "P3",
 }

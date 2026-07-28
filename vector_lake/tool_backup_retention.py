@@ -305,6 +305,25 @@ def _verify_complete_backup_artifacts(path: Path, manifest: dict[str, Any]) -> N
             raise RuntimeError(f"backup_artifact_hash_mismatch:{path / name}")
 
 
+def _read_projection_contract_stub(
+    path: Path,
+    *,
+    manifest_key: str,
+) -> dict[str, Any] | None:
+    """Decode a projection fully while retaining only its pair contract."""
+    projection_data = json.loads(
+        _read_plain_file_bytes(
+            path,
+            max_bytes=_MAX_PROJECTION_VALIDATION_BYTES,
+        )
+    )
+    if not isinstance(projection_data, dict):
+        return None
+    if manifest_key not in projection_data:
+        return {}
+    return {manifest_key: projection_data[manifest_key]}
+
+
 def _verify_restorable_backup_snapshot(
     path: Path,
     manifest: dict[str, Any],
@@ -368,30 +387,27 @@ def _verify_restorable_backup_snapshot(
         raise RuntimeError(f"backup_database_generation_mismatch:{path}")
 
     try:
-        index_data = json.loads(
-            _read_plain_file_bytes(
-                path / "index.json", max_bytes=_MAX_PROJECTION_VALIDATION_BYTES
-            )
+        index_contract = _read_projection_contract_stub(
+            path / "index.json",
+            manifest_key=indexer.PROJECTION_MANIFEST_KEY,
         )
-        claim_graph_data = json.loads(
-            _read_plain_file_bytes(
-                path / "claim_graph.json",
-                max_bytes=_MAX_PROJECTION_VALIDATION_BYTES,
-            )
+        claim_graph_contract = _read_projection_contract_stub(
+            path / "claim_graph.json",
+            manifest_key=indexer.PROJECTION_MANIFEST_KEY,
         )
     except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"backup_projection_read_failed:{path}:{exc}") from exc
-    if not isinstance(index_data, dict) or not isinstance(claim_graph_data, dict):
+    if index_contract is None or claim_graph_contract is None:
         raise RuntimeError(f"backup_projection_payload_invalid:{path}")
 
     try:
         projection_generation = indexer.validate_projection_pair(
-            index_data,
-            claim_graph_data,
+            index_contract,
+            claim_graph_contract,
         )
         projection_binding = indexer.projection_canonical_generation(
-            index_data,
-            claim_graph_data,
+            index_contract,
+            claim_graph_contract,
         )
     except Exception as exc:
         raise RuntimeError(f"backup_projection_contract_invalid:{path}:{exc}") from exc

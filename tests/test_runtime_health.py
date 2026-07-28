@@ -938,6 +938,48 @@ def test_ready_ingest_queue_age_detects_stalled_dispatch_worker(
     )
 
 
+def test_empty_health_timestamp_aggregates_use_outer_coalesce(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+    db_path = db_store.get_db_path().resolve()
+    traced_sql = []
+
+    def open_traced_read_only():
+        connection = sqlite3.connect(
+            f"{db_path.as_uri()}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.set_trace_callback(traced_sql.append)
+        return connection, db_path
+
+    monkeypatch.setattr(
+        runtime_health,
+        "_open_runtime_database_read_only",
+        open_traced_read_only,
+    )
+
+    health = assess_runtime_health()
+    readiness = assess_semantic_readiness(index_data={})
+
+    min_queries = [
+        " ".join(statement.casefold().split())
+        for statement in traced_sql
+        if "min(" in statement.casefold()
+    ]
+    assert len(min_queries) == 4
+    assert all("coalesce(min(" in statement for statement in min_queries)
+    assert health["detail"]["ready_ingest_jobs"] == 0
+    assert health["detail"]["awaiting_subagent_jobs"] == 0
+    assert "oldest_ready_ingest_age_seconds" not in health["detail"]
+    assert readiness["detail"]["awaiting_subagent_jobs"] == 0
+    assert "oldest_awaiting_subagent_age_seconds" not in readiness["detail"]
+
+
 def test_recently_expired_ingest_lease_uses_lease_age_not_job_age(
     isolated_memory,
     monkeypatch,

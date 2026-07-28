@@ -415,9 +415,11 @@ def reconcile_orphan_ingest_task_packets(
     candidates: list[dict] = []
     scanned = 0
     now = datetime.now(timezone.utc)
-    task_root = get_extension_root() / "brain"
+    from vector_lake.native_llm import peek_subagent_task_root
+
+    task_root = peek_subagent_task_root()
     for packet_path in sorted(
-        task_root.glob("*/scratch/subagent_tasks/*.json"),
+        task_root.glob("*/*.json"),
         key=lambda path: str(path).casefold(),
     ):
         if not packet_path.is_file():
@@ -660,6 +662,7 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
     action = str(item.get("action") or "")
     if action not in {
         "blocked_projection_drift",
+        "blocked_revision_identity_conflict",
         "blocked_unreadable_raw",
         "cancel_missing_raw",
         "complete_already_processed",
@@ -722,25 +725,123 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
     return ""
 
 
-def _ingest_debt_owner_is_effective(conn, item: dict) -> bool:
+
+def _ingest_debt_effective_revision_owners(
+    conn,
+    *,
+    candidate_job_id: str,
+    raw_path: Path,
+    current_hash: str,
+    candidate_payload: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Find current ingest owners for one normalized raw-file revision."""
     from vector_lake import db_store
 
-    owner_job_id = str(item.get("owner_job_id") or "")
-    target_key = str(item.get("target_key") or "")
-    candidate_payload = item.get("payload")
-    if not owner_job_id or not target_key or not isinstance(candidate_payload, dict):
-        return False
-    owner = conn.execute(
+    rows = conn.execute(
         "SELECT job_id, task_type, status, retries, payload, updated_at, "
-        "idempotency_key FROM jobs WHERE job_id = ? AND idempotency_key = ?",
-        (owner_job_id, target_key),
-    ).fetchone()
-    return owner is not None and not db_store._ingest_identity_owner_is_releasable(
-        conn,
-        owner,
-        candidate_payload,
-    )
+        "idempotency_key FROM jobs WHERE task_type = 'ingest' AND job_id <> ? "
+        "AND idempotency_key IS NOT NULL AND json_valid(payload) = 1 "
+        "AND json_extract(payload, '$.hash') = ?",
+        (str(candidate_job_id), str(current_hash)),
+    ).fetchall()
+    raw_identity = os.path.normcase(str(raw_path.resolve()))
+    owners: list[dict] = []
+    conflicts: list[dict] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            owner_payload = json.loads(str(record.get("payload") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(owner_payload, dict):
+            continue
+        owner_raw_value = str(owner_payload.get("filepath") or "").strip()
+        if not owner_raw_value:
+            continue
+        owner_raw_path = Path(owner_raw_value)
+        if not owner_raw_path.is_absolute():
+            owner_raw_path = get_raw_dir().parent / owner_raw_path
+        try:
+            owner_identity = os.path.normcase(str(owner_raw_path.resolve()))
+        except (OSError, RuntimeError):
+            continue
+        if owner_identity != raw_identity:
+            continue
 
+        canonical_name = str(owner_payload.get("canonical_name") or "").strip()
+        rebound_payload = dict(candidate_payload)
+        rebound_payload.update(
+            {
+                "filepath": owner_raw_value,
+                "hash": str(owner_payload.get("hash") or ""),
+                "canonical_name": canonical_name,
+            }
+        )
+        target_key = db_store._job_idempotency_key("ingest", rebound_payload)
+        stored_key = str(record.get("idempotency_key") or "")
+        if db_store._ingest_identity_owner_is_releasable(
+            conn,
+            record,
+            rebound_payload,
+        ):
+            continue
+        if not canonical_name or not target_key or target_key != stored_key:
+            if not canonical_name:
+                conflict_reason = "missing_canonical_name"
+            elif not target_key:
+                conflict_reason = "missing_computed_idempotency_key"
+            else:
+                conflict_reason = "idempotency_key_mismatch"
+            conflicts.append(
+                {
+                    "job_id": str(record.get("job_id") or ""),
+                    "stored_key": stored_key,
+                    "computed_key": str(target_key or ""),
+                    "canonical_name": canonical_name,
+                    "reason": conflict_reason,
+                }
+            )
+            continue
+        owners.append(
+            {
+                "job_id": str(record.get("job_id") or ""),
+                "target_key": stored_key,
+                "payload": rebound_payload,
+            }
+        )
+    return owners, conflicts
+
+def _ingest_debt_revision_owner_signature(
+    owners: list[dict],
+    conflicts: list[dict],
+):
+    """Freeze the complete effective-owner and invalid-owner evidence set."""
+    owner_signature = tuple(
+        sorted(
+            {
+                (
+                    str(owner.get("job_id") or ""),
+                    str(owner.get("target_key") or ""),
+                )
+                for owner in owners
+            }
+        )
+    )
+    conflict_signature = tuple(
+        sorted(
+            {
+                (
+                    str(conflict.get("job_id") or ""),
+                    str(conflict.get("stored_key") or ""),
+                    str(conflict.get("computed_key") or ""),
+                    str(conflict.get("canonical_name") or ""),
+                    str(conflict.get("reason") or ""),
+                )
+                for conflict in conflicts
+            }
+        )
+    )
+    return owner_signature, conflict_signature
 
 def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
     """Classify and safely recover abandoned ingest jobs without discarding valid work."""
@@ -932,8 +1033,66 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             )
             continue
 
+        if record.get("status") == "failed":
+            revision_owners, revision_conflicts = (
+                _ingest_debt_effective_revision_owners(
+                    conn,
+                    candidate_job_id=str(record["job_id"]),
+                    raw_path=raw_path,
+                    current_hash=current_hash,
+                    candidate_payload=payload,
+                )
+            )
+            if revision_conflicts or len(revision_owners) > 1:
+                conflict_ids = sorted(
+                    {
+                        *(conflict["job_id"] for conflict in revision_conflicts),
+                        *(owner["job_id"] for owner in revision_owners),
+                    }
+                )
+                plans.append(
+                    {
+                        "job_id": record["job_id"],
+                        "action": "blocked_revision_identity_conflict",
+                        "reason": (
+                            "multiple or invalid effective ingest owners for current "
+                            f"raw revision: {', '.join(conflict_ids)}"
+                        ),
+                        "packet_path": packet_path,
+                        "payload": payload,
+                        "raw_path": str(raw_path),
+                        "expected_raw_hash": current_hash,
+                        "owner_set_signature": _ingest_debt_revision_owner_signature(
+                            revision_owners,
+                            revision_conflicts,
+                        ),
+                        "expected_state": expected_state,
+                    }
+                )
+                continue
+            if revision_owners:
+                owner = revision_owners[0]
+                plans.append(
+                    {
+                        "job_id": record["job_id"],
+                        "action": "supersede_duplicate",
+                        "reason": (
+                            "current raw revision is already owned by "
+                            f"{owner['job_id']}"
+                        ),
+                        "packet_path": packet_path,
+                        "payload": owner["payload"],
+                        "raw_path": str(raw_path),
+                        "expected_raw_hash": current_hash,
+                        "target_key": owner["target_key"],
+                        "owner_job_id": owner["job_id"],
+                        "expected_state": expected_state,
+                    }
+                )
+                continue
+
         canonical_name = str(payload.get("canonical_name") or "").strip()
-        if not canonical_name:
+        if record.get("status") == "failed" or not canonical_name:
             if reconcile_target_dirs is None:
                 reconcile_target_dirs = get_ingest_target_directories()
             if reconcile_source_identity_index is None:
@@ -1132,6 +1291,7 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
     mutating_actions = {
         "blocked_invalid_payload",
         "blocked_projection_drift",
+        "blocked_revision_identity_conflict",
         "blocked_unreadable_raw",
         "cancel_missing_raw",
         "complete_already_processed",
@@ -1197,23 +1357,92 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
                     }
                 )
                 continue
-            if action == "supersede_duplicate" and not _ingest_debt_owner_is_effective(
-                conn,
-                item,
-            ):
-                result["concurrent_skips"].append(
-                    {
-                        "job_id": job_id,
-                        "reason": (
-                            "duplicate owner no longer holds an effective ingest identity"
-                        ),
-                    }
+            owner_sensitive_actions = {
+                "blocked_revision_identity_conflict",
+                "requeue_current",
+                "supersede_duplicate",
+            }
+            if action in owner_sensitive_actions:
+                candidate_payload = item.get("payload")
+                raw_value = str(item.get("raw_path") or "").strip()
+                current_hash = str(item.get("expected_raw_hash") or "").strip()
+                try:
+                    apply_raw_path = Path(raw_value).resolve()
+                except (OSError, RuntimeError):
+                    apply_raw_path = None
+                if (
+                    not isinstance(candidate_payload, dict)
+                    or apply_raw_path is None
+                    or not current_hash
+                ):
+                    result["concurrent_skips"].append(
+                        {
+                            "job_id": job_id,
+                            "reason": (
+                                "owner-set precondition is missing from the maintenance plan"
+                            ),
+                        }
+                    )
+                    continue
+                revision_owners, revision_conflicts = (
+                    _ingest_debt_effective_revision_owners(
+                        conn,
+                        candidate_job_id=str(job_id),
+                        raw_path=apply_raw_path,
+                        current_hash=current_hash,
+                        candidate_payload=candidate_payload,
+                    )
                 )
-                continue
+                if action == "requeue_current" and (
+                    revision_conflicts or revision_owners
+                ):
+                    result["concurrent_skips"].append(
+                        {
+                            "job_id": job_id,
+                            "reason": "effective owner set changed before debt requeue",
+                        }
+                    )
+                    continue
+                if action == "blocked_revision_identity_conflict":
+                    current_signature = _ingest_debt_revision_owner_signature(
+                        revision_owners,
+                        revision_conflicts,
+                    )
+                    if item.get("owner_set_signature") != current_signature:
+                        result["concurrent_skips"].append(
+                            {
+                                "job_id": job_id,
+                                "reason": (
+                                    "revision identity conflict changed before debt mutation"
+                                ),
+                            }
+                        )
+                        continue
+                if action == "supersede_duplicate":
+                    owner_job_id = str(item.get("owner_job_id") or "")
+                    target_key = str(item.get("target_key") or "")
+                    owner_is_unique = (
+                        not revision_conflicts
+                        and len(revision_owners) == 1
+                        and revision_owners[0]["job_id"] == owner_job_id
+                        and revision_owners[0]["target_key"] == target_key
+                    )
+                    if not owner_is_unique:
+                        result["concurrent_skips"].append(
+                            {
+                                "job_id": job_id,
+                                "reason": (
+                                    "duplicate owner no longer holds the unique "
+                                    "effective ingest identity"
+                                ),
+                            }
+                        )
+                        continue
             cursor = None
             if action in {
                 "blocked_invalid_payload",
                 "blocked_projection_drift",
+                "blocked_revision_identity_conflict",
                 "blocked_unreadable_raw",
             }:
                 cursor = conn.execute(
@@ -1547,13 +1776,22 @@ def canonical_source_name(
         parts = (root_label, *relative.parts)
     safe_parts = []
     for part in parts:
-        safe = re.sub(r"[^0-9A-Za-z_\-\u3400-\u9fff]+", "-", str(part)).strip("-_")
+        safe = re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fa5]+",
+            "-",
+            str(part),
+        ).strip("-")
         safe_parts.append(safe or "source")
     identity_hash = hashlib.sha256(
         os.path.normcase(source_identity).encode("utf-8")
     ).hexdigest()[:8]
-    safe_parts[-1] = f"{safe_parts[-1]}-{identity_hash}"
-    return f"Source_{'__'.join(safe_parts)}.md"
+    identity_suffix = f"-{identity_hash}"
+    core = "-".join(safe_parts)
+    max_core_length = 120 - len("Source_") - len(".md") - len(identity_suffix)
+    core = core[:max_core_length].rstrip("-") or "source"
+    canonical_name = f"Source_{core}{identity_suffix}.md"
+    validate_wiki_filename(canonical_name)
+    return canonical_name
 
 
 def calculate_hash(filepath: str) -> str:
@@ -1607,7 +1845,13 @@ def _read_purpose() -> str:
 
 
 INTEGRATION_DISPOSITIONS = {"integrated", "standalone", "rejected"}
-INGEST_CONTRACT_VERSION = 4
+INGEST_CONTRACT_VERSION = 5
+
+
+class IngestBaselineConflict(ValueError):
+    """A source or integration baseline changed after durable dispatch."""
+
+
 INTEGRATION_PREDICATES = {
     "validates",
     "falsifies",
@@ -1997,7 +2241,7 @@ def _read_canonical_target_content(
             expected_projection_hash is not None
             and current_projection_hash != expected_projection_hash.casefold()
         ):
-            raise ValueError(
+            raise IngestBaselineConflict(
                 f"integration target_projection_hash is stale for {filename}"
             )
         candidates.append(
@@ -2008,7 +2252,9 @@ def _read_canonical_target_content(
             )
         )
     elif expected_projection_hash:
-        raise ValueError(f"integration target projection is missing for {filename}")
+        raise IngestBaselineConflict(
+            f"integration target projection is missing for {filename}"
+        )
     init_db()
     rows = get_connection().execute(
         "SELECT payload_text, validation_mode FROM mutation_outbox "
@@ -2055,7 +2301,7 @@ def _read_canonical_target_content(
                     else "full",
                 )
             return content
-    raise ValueError(
+    raise IngestBaselineConflict(
         f"No canonical-aligned Markdown snapshot is available for {filename}; "
         "replay or repair its latest mutation outbox projection before integrating"
     )
@@ -2104,9 +2350,47 @@ def _upsert_section_relation(
     return _updated_now(merged)
 
 
+def _verify_ingest_source_baseline(processed_data: dict) -> None:
+    """Fail closed when the canonical Source changed after dispatch."""
+    canonical_name = str(processed_data.get("canonical_name") or "").strip()
+    validate_wiki_filename(canonical_name)
+    canonical_key = _strip_markdown_suffix(canonical_name)
+    expected_version = str(processed_data.get("source_hash") or "")
+    actual_version = str(
+        governance_store.canonical_page_versions({canonical_key}).get(
+            canonical_key,
+            "",
+        )
+        or ""
+    )
+    if actual_version != expected_version:
+        raise IngestBaselineConflict(
+            f"Source canonical baseline changed for {canonical_name}: "
+            f"expected {expected_version or '<absent>'}, "
+            f"current {actual_version or '<absent>'}"
+        )
+    try:
+        actual_projection_hash = _projection_hash_for_canonical_version(
+            canonical_name,
+            actual_version,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise IngestBaselineConflict(
+            f"Source projection baseline changed for {canonical_name}: {exc}"
+        ) from exc
+    expected_projection_hash = str(
+        processed_data.get("source_projection_hash") or ""
+    ).casefold()
+    if actual_projection_hash.casefold() != expected_projection_hash:
+        raise IngestBaselineConflict(
+            f"Source projection baseline changed for {canonical_name}: "
+            f"expected {expected_projection_hash or '<absent>'}, "
+            f"current {actual_projection_hash or '<absent>'}"
+        )
+
 def _apply_integration_disposition(
     files_written: list, processed_data: dict
-) -> tuple[list, str]:
+) -> tuple[list, str, set[str]]:
     """Validate semantic completion and materialize bounded source/target updates."""
     integration = processed_data.get("integration")
     if not isinstance(integration, dict):
@@ -2130,7 +2414,7 @@ def _apply_integration_disposition(
             raise ValueError("rejected ingest disposition must not include wiki files")
         if len(reason) < 12:
             raise ValueError("rejected ingest disposition requires an auditable reason")
-        return [], disposition
+        return [], disposition, set()
 
     canonical_name = str(processed_data.get("canonical_name") or "").strip()
     source_items = [
@@ -2161,7 +2445,7 @@ def _apply_integration_disposition(
             raise ValueError(
                 "standalone ingest disposition requires an auditable reason"
             )
-        return files, disposition
+        return files, disposition, set()
     if not isinstance(relations, list) or not relations:
         raise ValueError("integrated ingest disposition requires at least one relation")
 
@@ -2220,7 +2504,7 @@ def _apply_integration_disposition(
                 f"integration target_hash does not match the dispatched candidate for {target}"
             )
         if not expected_hash or expected_hash != actual_hash:
-            raise ValueError(
+            raise IngestBaselineConflict(
                 f"integration target_hash is stale or missing for {target}"
             )
         target_projection_hash = str(
@@ -2310,7 +2594,70 @@ def _apply_integration_disposition(
         )
 
     source_item["content"] = _updated_now(source_content)
-    return files + target_mutations, disposition
+    return files + target_mutations, disposition, seen_targets
+
+
+def _validate_final_ingest_files(
+    files: list[dict],
+    integration_target_names: set[str],
+    contract: dict,
+) -> tuple[list[dict], set[str]]:
+    """Fully validate submitted files and narrowly tolerate legacy targets."""
+    from vector_lake.defense_hook import DefenseHookException, verify_asset
+    from vector_lake.schema_validator import validate_schema
+    from vector_lake.wiki_utils import split_frontmatter
+
+    if not files:
+        return validate_ingest_payload([], contract), set()
+    permitted_tiers = (
+        set(contract["evidence_tiers"]) if integration_target_names else set()
+    )
+    node_records = []
+    schema_maintenance_names = set()
+    file_names = {
+        os.path.basename(str(item.get("filename") or "")) for item in files
+    }
+    if not integration_target_names <= file_names:
+        raise ValueError("Integration target mutations are incomplete.")
+    for item in files:
+        filename = os.path.basename(str(item.get("filename") or ""))
+        content = str(item.get("content") or "")
+        frontmatter, _body = split_frontmatter(content)
+        if filename not in integration_target_names:
+            verify_asset(content, filename, frontmatter, get_index_path())
+            node_records.extend(validate_ingest_payload([item], contract))
+            continue
+        try:
+            verify_asset(content, filename, frontmatter, get_index_path())
+            continue
+        except DefenseHookException:
+            # Match mutation_coordinator's fenced schema-maintenance path:
+            # preserve historical dynamic tag debt while validating structure.
+            validate_schema(frontmatter, content, filename)
+            strategic_scope = str(
+                frontmatter.get("strategic_scope") or ""
+            ).strip().lower()
+            evidence_tier = str(
+                frontmatter.get("evidence_tier") or ""
+            ).strip()
+            has_legacy_purpose_metadata = (
+                strategic_scope not in {"core", "edge"}
+                or evidence_tier not in permitted_tiers
+            )
+            if not has_legacy_purpose_metadata:
+                raise
+            aliases = frontmatter.get("aliases")
+            if aliases is not None and not isinstance(aliases, list):
+                raise PurposeContractError(
+                    f"{filename}: aliases must be a list."
+                )
+            categories = frontmatter.get("categories")
+            if not isinstance(categories, list) or len(categories) != 1:
+                raise PurposeContractError(
+                    f"{filename}: categories must be a list with exactly one domain."
+                )
+            schema_maintenance_names.add(filename)
+    return node_records, schema_maintenance_names
 
 
 def _prepare_ingest_instruction_context() -> _IngestInstructionContext:
@@ -2466,7 +2813,9 @@ def requeue_legacy_ingest_jobs() -> int:
 
         try:
             canonical_name = str(payload.get("canonical_name") or "").strip()
-            if not canonical_name:
+            try:
+                validate_wiki_filename(canonical_name)
+            except ValueError:
                 if target_dirs is None:
                     target_dirs = get_ingest_target_directories()
                 if source_identity_index is None:
@@ -2476,6 +2825,7 @@ def requeue_legacy_ingest_jobs() -> int:
                     source_identity_index=source_identity_index,
                     target_dirs=target_dirs,
                 )
+                validate_wiki_filename(canonical_name)
             canonical_key = _strip_markdown_suffix(canonical_name)
             source_hash = governance_store.canonical_page_versions({canonical_key}).get(
                 canonical_key,
@@ -2803,16 +3153,25 @@ def _candidate_legacy_ingest_identities(conn, filepaths) -> set[tuple[str, str, 
 
 
 def _candidate_source_entities(conn, source_identities) -> list[dict]:
-    """Read Source entities that reference one of the candidate raw identities."""
+    """Read candidate-linked Source entities with one JSON table scan."""
+    candidates = frozenset(
+        normalized
+        for value in source_identities
+        if (normalized := normalize_source_identity(value))
+    )
+    if not candidates:
+        return []
+
+    def is_candidate(value) -> int:
+        return int(normalize_source_identity(value) in candidates)
+
     conn.create_function(
-        "vector_lake_normalize_source_identity",
+        "vector_lake_source_identity_is_candidate",
         1,
-        normalize_source_identity,
+        is_candidate,
         deterministic=True,
     )
-    items = {}
-    for chunk in _sql_parameter_chunks(source_identities):
-        placeholders = ", ".join("?" for _ in chunk)
+    try:
         rows = conn.execute(
             "SELECT DISTINCT entities.entity_id, entities.data_json "
             "FROM entities JOIN json_each("
@@ -2820,18 +3179,25 @@ def _candidate_source_entities(conn, source_identities) -> list[dict]:
             "THEN entities.data_json ELSE '{}' END, '$.sources'"
             ") AS source_identity "
             "WHERE entities.type = 'source' AND entities.status != 'Merged' "
-            "AND vector_lake_normalize_source_identity(source_identity.value) "
-            f"IN ({placeholders}) ORDER BY entities.entity_id",
-            tuple(chunk),
+            "AND vector_lake_source_identity_is_candidate(source_identity.value) = 1 "
+            "ORDER BY entities.entity_id"
+        ).fetchall()
+    finally:
+        conn.create_function(
+            "vector_lake_source_identity_is_candidate",
+            1,
+            None,
+            deterministic=True,
         )
-        for row in rows:
-            try:
-                item = json.loads(str(row["data_json"] or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if isinstance(item, dict):
-                entity_id = str(item.get("entity_id") or row["entity_id"])
-                items[entity_id] = item
+    items = {}
+    for row in rows:
+        try:
+            item = json.loads(str(row["data_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            entity_id = str(item.get("entity_id") or row["entity_id"])
+            items[entity_id] = item
     return [items[entity_id] for entity_id in sorted(items)]
 
 
@@ -3008,11 +3374,15 @@ def prepare_ingest_batch(
             if allowed_path(Path(candidate))
         }
     else:
+        scan_target_dirs = get_ingest_target_directories(
+            config,
+            collapse_nested=True,
+        )
 
         def record_walk_error(exc):
             inventory_errors.append(f"inventory_walk_error:{type(exc).__name__}:{exc}")
 
-        for target_dir in target_dirs:
+        for target_dir in scan_target_dirs:
             if is_private_diary_path(target_dir):
                 continue
             if any(path_is_excluded(target_dir, root) for root in target_dirs):
@@ -3275,20 +3645,30 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                 return
             current_hash = _stable_current_raw_hash(queued_filepath)
             if current_hash.casefold() != queued_hash.casefold():
-                raise ValueError(
+                raise IngestBaselineConflict(
                     "Raw source changed after ingest dispatch; "
                     f"queued_hash={queued_hash} current_hash={current_hash}"
                 )
 
         verify_raw_revision()
+        _verify_ingest_source_baseline(processed_data)
         lease_owner = str(processed_data.get("lease_owner") or "")
         lease_token = str(processed_data.get("lease_token") or "")
         lease_generation = int(processed_data.get("lease_generation"))
-        files, integration_disposition = _apply_integration_disposition(
-            files, processed_data
-        )
+        (
+            files,
+            integration_disposition,
+            integration_target_names,
+        ) = _apply_integration_disposition(files, processed_data)
         contract = load_purpose_contract()
-        node_records = validate_ingest_payload(files, contract)
+        (
+            node_records,
+            schema_maintenance_filenames,
+        ) = _validate_final_ingest_files(
+            files,
+            integration_target_names,
+            contract,
+        )
 
         wiki_dir = get_wiki_dir()
 
@@ -3345,6 +3725,8 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             execute_mutation_batch(
                 mutations,
                 canonical_callback=mark_ingest_processed,
+                origin="ingest_integration",
+                schema_maintenance_filenames=schema_maintenance_filenames,
             )
         else:
             from vector_lake.db_store import transaction
@@ -3422,6 +3804,33 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         return (
             f"Successfully finalized ingestion for {filepath}. "
             f"Integration disposition: {integration_disposition}.{suffix}"
+        )
+    except IngestBaselineConflict as exc:
+        try:
+            from vector_lake import db_store
+
+            requeued = db_store.requeue_ingest_subagent_baseline_conflict(
+                str(processed_data.get("job_id") or ""),
+                str(processed_data.get("lease_owner") or ""),
+                str(processed_data.get("lease_token") or ""),
+                int(processed_data.get("lease_generation")),
+                f"Ingest baseline changed after dispatch: {exc}",
+                current_ingest_contract_version=INGEST_CONTRACT_VERSION,
+            )
+        except Exception as requeue_error:
+            return (
+                f"Error finalizing ingestion: {exc}; "
+                f"automatic baseline requeue failed: {requeue_error}\n"
+                f"{traceback.format_exc()}"
+            )
+        if requeued:
+            return (
+                "Ingest baseline changed; job requeued for a fresh dispatch: "
+                f"{exc}"
+            )
+        return (
+            "Error finalizing ingestion: baseline changed, but the lease was "
+            f"no longer current: {exc}"
         )
     except Exception as e:
         return f"Error finalizing ingestion: {e}\n{traceback.format_exc()}"

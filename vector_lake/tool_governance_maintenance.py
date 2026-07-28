@@ -869,6 +869,124 @@ def _source_projection_exists(source: dict) -> bool:
     return any(path.stem == page_key for path in iter_markdown_files(get_wiki_dir()))
 
 
+def _source_is_referenced(conn: sqlite3.Connection, source_id: str) -> bool:
+    if conn.execute(
+        "SELECT 1 FROM evidence "
+        "WHERE json_extract(data_json, '$.source_id') = ? LIMIT 1",
+        (source_id,),
+    ).fetchone():
+        return True
+    return (
+        conn.execute(
+            "SELECT 1 FROM claims AS claim "
+            "JOIN json_each(claim.data_json, '$.source_ids') AS source "
+            "WHERE CAST(source.value AS TEXT) = ? LIMIT 1",
+            (source_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _is_managed_orphan_source_item(row_item_id: str, item: dict) -> bool:
+    source_id = str(item.get("source_id") or "")
+    expected_item_id = _stable_item_id("orphan_source", source_id)
+    return bool(
+        source_id
+        and row_item_id == expected_item_id
+        and str(item.get("item_id") or "") == expected_item_id
+        and item.get("type") == "orphan-source"
+        and item.get("source") == "orphan-source-governance"
+        and item.get("owner") == "vector-lake-governance"
+        and not item.get("critical_decision_refs")
+        and not item.get("verified_critical_decision_refs")
+    )
+
+
+def _upsert_managed_orphan_source_item(item: dict, source_version: str) -> str:
+    source_id = str(item.get("source_id") or "")
+    item_id = str(item.get("item_id") or "")
+    with db_store.transaction():
+        conn = db_store.get_connection()
+        source_row = conn.execute(
+            "SELECT data_json FROM sources WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        if source_row is None:
+            return "concurrent_skip"
+        current_source = json.loads(source_row["data_json"])
+        if (
+            _source_version(current_source) != source_version
+            or _source_is_referenced(conn, source_id)
+        ):
+            return "concurrent_skip"
+        existing_row = conn.execute(
+            "SELECT data_json FROM governance_queue WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing_item = json.loads(existing_row["data_json"])
+            if (
+                existing_item.get("status") != "acknowledged"
+                or not _is_managed_orphan_source_item(item_id, existing_item)
+            ):
+                return "protected_skip"
+        governance_store.upsert_governance_item(item, insert_only=False)
+    return "registered"
+
+
+def _resolve_stale_managed_orphan_source_item(
+    row_item_id: str,
+    source_id: str,
+    resolved_at: str,
+) -> str:
+    with db_store.transaction():
+        conn = db_store.get_connection()
+        row = conn.execute(
+            "SELECT data_json FROM governance_queue WHERE item_id = ?",
+            (row_item_id,),
+        ).fetchone()
+        if row is None:
+            return "concurrent_skip"
+        item = json.loads(row["data_json"])
+        if (
+            item.get("status") != "acknowledged"
+            or str(item.get("source_id") or "") != source_id
+            or not _is_managed_orphan_source_item(row_item_id, item)
+        ):
+            return "protected_skip"
+        source_exists = (
+            conn.execute(
+                "SELECT 1 FROM sources WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+            is not None
+        )
+        referenced = _source_is_referenced(conn, source_id)
+        if source_exists and not referenced:
+            return "concurrent_skip"
+        if not source_exists and referenced:
+            return "protected_skip"
+        resolution = (
+            "source-now-referenced" if source_exists else "source-record-removed"
+        )
+        item.update(
+            {
+                "status": "resolved",
+                "resolution": resolution,
+                "resolved_at": resolved_at,
+            }
+        )
+        conn.execute(
+            "UPDATE governance_queue SET data_json = ?, updated_at = ? "
+            "WHERE item_id = ?",
+            (
+                json.dumps(item, ensure_ascii=False),
+                resolved_at,
+                row_item_id,
+            ),
+        )
+    return "resolved"
+
 def classify_orphan_source_debt(dry_run: bool = True) -> dict:
     """Classify unreferenced sources and register explicit, non-destructive debt."""
     db_store.init_db()
@@ -885,26 +1003,33 @@ def classify_orphan_source_debt(dry_run: bool = True) -> dict:
         for source_id in [json.loads(row["data_json"]).get("source_id")]
         if str(source_id or "")
     )
-    existing = {
-        str(item.get("source_id") or ""): item
-        for row in conn.execute(
-            "SELECT data_json FROM governance_queue "
-            "WHERE json_extract(data_json, '$.type') = 'orphan-source' "
-            "AND json_extract(data_json, '$.status') = 'acknowledged'"
-        )
-        for item in [json.loads(row["data_json"])]
-        if item.get("source_id")
-    }
+    existing_rows: list[tuple[str, dict]] = []
+    existing_by_source: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for row in conn.execute(
+        "SELECT item_id, data_json FROM governance_queue "
+        "WHERE json_extract(data_json, '$.type') = 'orphan-source' "
+        "AND json_extract(data_json, '$.status') = 'acknowledged'"
+    ):
+        item = json.loads(row["data_json"])
+        source_id = str(item.get("source_id") or "")
+        if not source_id:
+            continue
+        row_item_id = str(row["item_id"])
+        existing_rows.append((row_item_id, item))
+        existing_by_source[source_id].append((row_item_id, item))
+
     buckets: dict[str, list[dict]] = {
         "unreferenced_but_recoverable": [],
         "raw_only": [],
         "projection_only_missing_raw": [],
         "unresolved_missing_raw_and_page": [],
     }
+    current_orphan_source_ids: set[str] = set()
     for row in conn.execute("SELECT source_id, data_json FROM sources"):
         source_id = str(row["source_id"])
         if source_id in referenced:
             continue
+        current_orphan_source_ids.add(source_id)
         source = json.loads(row["data_json"])
         raw_exists = _source_raw_exists(str(source.get("raw_ref") or ""))
         projection_exists = _source_projection_exists(source)
@@ -919,33 +1044,51 @@ def classify_orphan_source_debt(dry_run: bool = True) -> dict:
         source["_orphan_bucket"] = bucket
         buckets[bucket].append(source)
 
+    stale_existing = [
+        (row_item_id, item)
+        for row_item_id, item in existing_rows
+        if str(item.get("source_id") or "") not in current_orphan_source_ids
+    ]
+    stale_managed = [
+        (row_item_id, item)
+        for row_item_id, item in stale_existing
+        if _is_managed_orphan_source_item(row_item_id, item)
+    ]
     now_dt = datetime.now(timezone.utc)
     pending: list[dict] = []
     for bucket_sources in buckets.values():
         for source in bucket_sources:
-            item = existing.get(str(source.get("source_id") or "")) or {}
-            try:
-                due_at = datetime.fromisoformat(
-                    str(item.get("due_at") or "").replace("Z", "+00:00")
-                )
-                if due_at.tzinfo is None:
-                    due_at = due_at.replace(tzinfo=timezone.utc)
-            except ValueError:
-                due_at = None
-            if not (
-                str(item.get("owner") or "").strip()
-                and due_at is not None
-                and due_at >= now_dt
-                and item.get("classification") == source["_orphan_bucket"]
-                and item.get("source_version")
-                == _source_version(
-                    {
-                        key: value
-                        for key, value in source.items()
-                        if key != "_orphan_bucket"
-                    }
-                )
+            source_version = _source_version(
+                {
+                    key: value
+                    for key, value in source.items()
+                    if key != "_orphan_bucket"
+                }
+            )
+            managed = False
+            for row_item_id, item in existing_by_source.get(
+                str(source.get("source_id") or ""),
+                [],
             ):
+                try:
+                    due_at = datetime.fromisoformat(
+                        str(item.get("due_at") or "").replace("Z", "+00:00")
+                    )
+                    if due_at.tzinfo is None:
+                        due_at = due_at.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    due_at = None
+                if (
+                    item.get("status") == "acknowledged"
+                    and _is_managed_orphan_source_item(row_item_id, item)
+                    and due_at is not None
+                    and due_at >= now_dt
+                    and item.get("classification") == source["_orphan_bucket"]
+                    and item.get("source_version") == source_version
+                ):
+                    managed = True
+                    break
+            if not managed:
                 pending.append(source)
 
     result = {
@@ -953,6 +1096,13 @@ def classify_orphan_source_debt(dry_run: bool = True) -> dict:
         "orphan_sources": sum(len(items) for items in buckets.values()),
         "already_managed": sum(len(items) for items in buckets.values()) - len(pending),
         "to_register": len(pending),
+        "stale_governance_items": len(stale_existing),
+        "stale_managed_governance_items": len(stale_managed),
+        "stale_protected_governance_items": len(stale_existing)
+        - len(stale_managed),
+        "stale_governance_item_ids": [
+            row_item_id for row_item_id, _item in stale_existing[:10]
+        ],
         "buckets": {key: len(items) for key, items in buckets.items()},
         "samples": {
             key: [str(item.get("source_id") or "") for item in items[:10]]
@@ -969,40 +1119,69 @@ def classify_orphan_source_debt(dry_run: bool = True) -> dict:
         "projection_only_missing_raw": "raw-source-recovery-required",
         "unresolved_missing_raw_and_page": "source-provenance-research-required",
     }
-    registered = 0
+    registration_results = Counter()
     for source in pending:
         source_id = str(source.get("source_id") or "")
-        bucket = str(source.pop("_orphan_bucket"))
-        registered += int(
-            governance_store.upsert_governance_item(
-                {
-                    "item_id": _stable_item_id("orphan_source", source_id),
-                    "type": "orphan-source",
-                    "status": "acknowledged",
-                    "title": f"Orphan source: {source_id}",
-                    "source_id": source_id,
-                    "source_version": _source_version(source),
-                    "classification": bucket,
-                    "raw_ref": str(source.get("raw_ref") or ""),
-                    "canonical_source_page": str(
-                        source.get("canonical_source_page") or ""
-                    ),
-                    "resolution": resolutions[bucket],
-                    "owner": "vector-lake-governance",
-                    "due_at": due_at,
-                    "source": "orphan-source-governance",
-                    "affected_pages": [str(source.get("canonical_source_page"))]
-                    if source.get("canonical_source_page")
-                    else [],
-                    "search_queries": [str(source.get("title") or source_id)],
-                    "acknowledged_at": now_dt.isoformat(),
-                },
-                insert_only=False,
+        bucket = str(source["_orphan_bucket"])
+        canonical_source = {
+            key: value
+            for key, value in source.items()
+            if key != "_orphan_bucket"
+        }
+        item = {
+            "item_id": _stable_item_id("orphan_source", source_id),
+            "type": "orphan-source",
+            "status": "acknowledged",
+            "title": f"Orphan source: {source_id}",
+            "source_id": source_id,
+            "source_version": _source_version(canonical_source),
+            "classification": bucket,
+            "raw_ref": str(source.get("raw_ref") or ""),
+            "canonical_source_page": str(
+                source.get("canonical_source_page") or ""
+            ),
+            "resolution": resolutions[bucket],
+            "owner": "vector-lake-governance",
+            "due_at": due_at,
+            "source": "orphan-source-governance",
+            "affected_pages": [str(source.get("canonical_source_page"))]
+            if source.get("canonical_source_page")
+            else [],
+            "search_queries": [str(source.get("title") or source_id)],
+            "acknowledged_at": now_dt.isoformat(),
+        }
+        registration_results[
+            _upsert_managed_orphan_source_item(
+                item,
+                str(item["source_version"]),
             )
-        )
-    result.update({"registered": registered, "due_at": due_at})
-    return result
+        ] += 1
 
+    stale_results = Counter()
+    for row_item_id, item in stale_managed:
+        stale_results[
+            _resolve_stale_managed_orphan_source_item(
+                row_item_id,
+                str(item.get("source_id") or ""),
+                now_dt.isoformat(),
+            )
+        ] += 1
+    result.update(
+        {
+            "registered": registration_results["registered"],
+            "registration_protected_skipped": registration_results[
+                "protected_skip"
+            ],
+            "registration_concurrent_skipped": registration_results[
+                "concurrent_skip"
+            ],
+            "stale_resolved": stale_results["resolved"],
+            "stale_protected_skipped": stale_results["protected_skip"],
+            "stale_concurrent_skipped": stale_results["concurrent_skip"],
+            "due_at": due_at,
+        }
+    )
+    return result
 
 def restore_fenced_code_from_backup(
     source_backup_dir: str,

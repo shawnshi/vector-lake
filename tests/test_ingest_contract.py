@@ -102,8 +102,8 @@ def test_candidate_ingest_is_path_scoped_and_nested_names_do_not_collide(
 
     names = [item[1]["canonical_name"] for item in enqueued]
     assert len(set(names)) == 2
-    assert re.fullmatch(r"Source_team-a__report-[0-9a-f]{8}\.md", names[0])
-    assert re.fullmatch(r"Source_team-b__report-[0-9a-f]{8}\.md", names[1])
+    assert re.fullmatch(r"Source_team-a-report-[0-9a-f]{8}\.md", names[0])
+    assert re.fullmatch(r"Source_team-b-report-[0-9a-f]{8}\.md", names[1])
     assert {item[1]["filepath"] for item in enqueued} == {str(left), str(right)}
     assert all(item[1]["filepath"] != str(unrelated) for item in enqueued)
 
@@ -153,7 +153,29 @@ def test_new_source_names_survive_sanitization_and_extension_collisions(
     assert first == second
     assert len(set(first)) == len(paths)
     assert all(re.search(r"-[0-9a-f]{8}\.md$", name) for name in first)
+    assert all("__" not in name for name in first)
+    for name in first:
+        tool_ingest.validate_wiki_filename(name)
 
+
+def test_new_source_names_are_bounded_and_strictly_valid(
+    isolated_memory,
+):
+    raw_dir = isolated_memory / "raw"
+    raw_path = (
+        raw_dir
+        / ("nested_folder_" * 8)
+        / ("very_long_source_name_" * 8 + "\u3400.txt")
+    )
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_text("bounded", encoding="utf-8")
+
+    name = canonical_source_name(str(raw_path))
+
+    assert len(name) <= 120
+    assert "__" not in name
+    assert "\u3400" not in name
+    tool_ingest.validate_wiki_filename(name)
 
 def test_external_roots_with_same_basename_get_distinct_canonical_names(
     isolated_memory,
@@ -1780,6 +1802,44 @@ def test_ingest_worker_rebuilds_legacy_awaiting_packet_before_dispatch(isolated_
     Path(row["task_packet_path"]).unlink(missing_ok=True)
 
 
+def test_v4_invalid_nested_source_name_migrates_to_v5(
+    isolated_memory,
+):
+    _write_purpose_contract(isolated_memory)
+    raw_path = isolated_memory / "raw" / "nested_folder" / "name.md"
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_text("nested source", encoding="utf-8")
+    (isolated_memory / "wiki" / "index.json").write_text(
+        json.dumps({"nodes": {}}),
+        encoding="utf-8",
+    )
+    payload = {
+        "filepath": str(raw_path),
+        "hash": calculate_hash(str(raw_path)),
+        "canonical_name": "Source_nested-folder__name-12345678.md",
+        "source_hash": "",
+        "source_projection_hash": "",
+        "integration_candidates": [],
+        "ingest_contract_version": 4,
+        "instructions": "legacy nested source",
+    }
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+
+    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+
+    row = db_store.get_connection().execute(
+        "SELECT status, payload FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    refreshed = json.loads(row["payload"])
+    assert migrated == 1
+    assert row["status"] == "queued"
+    assert refreshed["ingest_contract_version"] == INGEST_CONTRACT_VERSION
+    assert refreshed["canonical_name"] != payload["canonical_name"]
+    assert "__" not in refreshed["canonical_name"]
+    tool_ingest.validate_wiki_filename(refreshed["canonical_name"])
+
 def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
     isolated_memory,
     monkeypatch,
@@ -2589,7 +2649,7 @@ def test_finalize_ingest_rechecks_raw_revision_inside_canonical_commit(
         },
     )
 
-    assert result.startswith("Error finalizing ingestion")
+    assert result.startswith("Ingest baseline changed; job requeued")
     assert "Raw source changed after ingest dispatch" in result
     assert not (isolated_memory / "wiki" / payload["canonical_name"]).exists()
     connection = db_store.get_connection()
@@ -2598,7 +2658,7 @@ def test_finalize_ingest_rechecks_raw_revision_inside_canonical_commit(
             "SELECT status FROM jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()["status"]
-        == "subagent_processing"
+        == "queued"
     )
     assert (
         connection.execute(
@@ -2656,7 +2716,7 @@ def test_finalize_rejected_ingest_rechecks_raw_revision_inside_transaction(
         },
     )
 
-    assert result.startswith("Error finalizing ingestion")
+    assert result.startswith("Ingest baseline changed; job requeued")
     assert "Raw source changed after ingest dispatch" in result
     connection = db_store.get_connection()
     assert (
@@ -2664,7 +2724,7 @@ def test_finalize_rejected_ingest_rechecks_raw_revision_inside_transaction(
             "SELECT status FROM jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()["status"]
-        == "subagent_processing"
+        == "queued"
     )
     assert (
         connection.execute(
@@ -2709,8 +2769,8 @@ def test_standalone_ingest_cannot_overwrite_existing_source_without_queued_versi
         },
     )
 
-    assert result.startswith("Error finalizing ingestion")
-    assert "Canonical version conflict" in result
+    assert result.startswith("Ingest baseline changed; job requeued")
+    assert "Source canonical baseline changed" in result
     assert (
         _ingest_finalization_proven("raw/standalone-rewrite.md", "standalone-rewrite")
         is False
@@ -2719,7 +2779,7 @@ def test_standalone_ingest_cannot_overwrite_existing_source_without_queued_versi
         db_store.get_connection()
         .execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,))
         .fetchone()["status"]
-        == "subagent_processing"
+        == "queued"
     )
     assert "Unauthorized rewrite." not in (
         isolated_memory / "wiki" / "Source_Standalone.md"
@@ -3314,6 +3374,130 @@ def test_finalize_ingest_rejects_stale_target_hash(isolated_memory):
     assert _ingest_finalization_proven("raw/stale-target.md", "stale-target") is False
 
 
+def test_baseline_requeue_requires_exact_current_lease(isolated_memory):
+    payload = _v4_ingest_payload(
+        "raw/baseline-lease.md",
+        "baseline-lease",
+        "Source_Baseline-Lease.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+
+    stale = db_store.requeue_ingest_subagent_baseline_conflict(
+        job_id,
+        claim["lease_owner"],
+        claim["lease_token"] + "-stale",
+        claim["lease_generation"],
+        "stale caller",
+        current_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )
+
+    row = db_store.get_connection().execute(
+        "SELECT status, payload FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert stale is False
+    assert row["status"] == "subagent_processing"
+    assert json.loads(row["payload"])["ingest_contract_version"] == (
+        INGEST_CONTRACT_VERSION
+    )
+
+    current = db_store.requeue_ingest_subagent_baseline_conflict(
+        job_id,
+        claim["lease_owner"],
+        claim["lease_token"],
+        claim["lease_generation"],
+        "current caller",
+        current_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )
+    replay = db_store.requeue_ingest_subagent_baseline_conflict(
+        job_id,
+        claim["lease_owner"],
+        claim["lease_token"],
+        claim["lease_generation"],
+        "replayed caller",
+        current_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )
+
+    row = db_store.get_connection().execute(
+        "SELECT status, payload, lease_owner, lease_token FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert current is True
+    assert replay is False
+    assert row["status"] == "queued"
+    assert json.loads(row["payload"])["ingest_contract_version"] == 4
+    assert row["lease_owner"] is None
+    assert row["lease_token"] is None
+
+def test_finalize_ingest_requeues_changed_target_baseline(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    target_path = isolated_memory / "wiki" / "Concept_Target.md"
+    execute_mutation_plan("Concept_Target.md", content=_concept_content())
+    target_version = governance_store.canonical_page_versions({"Concept_Target"})[
+        "Concept_Target"
+    ]
+    target_projection_hash = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    payload = _v4_ingest_payload(
+        "raw/changed-target.md",
+        "changed-target",
+        "Source_Changed-Target.md",
+        integration_candidates=[
+            _integration_candidate(
+                "Concept_Target.md",
+                target_version,
+                target_projection_hash,
+            )
+        ],
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+    execute_mutation_plan(
+        "Concept_Target.md",
+        content=_concept_content().replace("Target Concept", "Updated Target Concept"),
+    )
+
+    result = mcp_server.tools.finalize_ingest(
+        [{"filename": payload["canonical_name"], "content": _source_content()}],
+        _claimed_processed_data(
+            payload,
+            job_id,
+            claim,
+            integration={
+                "disposition": "integrated",
+                "relations": [
+                    {
+                        "target": "Concept_Target.md",
+                        "target_hash": target_version,
+                        "target_projection_hash": target_projection_hash,
+                        "predicate": "validates",
+                        "evidence": "The source directly supports the target mechanism.",
+                        "confidence": 0.9,
+                        "event_date": "2026-07-15",
+                        "event_tag": "Validation",
+                    }
+                ],
+            },
+        ),
+    )
+
+    assert result.startswith("Ingest baseline changed; job requeued")
+    assert "target_hash is stale or missing" in result
+    row = db_store.get_connection().execute(
+        "SELECT status, payload, lease_owner, lease_token, lease_until "
+        "FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "queued"
+    assert json.loads(row["payload"])["ingest_contract_version"] == 4
+    assert row["lease_owner"] is None
+    assert row["lease_token"] is None
+    assert row["lease_until"] is None
+    assert not (isolated_memory / "wiki" / payload["canonical_name"]).exists()
+    assert _ingest_finalization_proven(payload["filepath"], payload["hash"]) is False
+
 def test_init_db_migrates_legacy_jobs_without_changing_payload(isolated_memory):
     path = db_store.get_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3513,6 +3697,540 @@ def test_reconcile_ingest_job_debt_deduplicates_current_raw_identity(
     superseded = next(row for row in rows if row["status"] == "superseded")
     assert superseded["idempotency_key"] is None
 
+
+def test_reconcile_failed_legacy_name_uses_current_revision_owner(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_path = isolated_memory / "raw" / "renamed-owner.md"
+    raw_path.write_text("current revision", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    failed_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        "Source_Legacy-Name.md",
+        instructions="legacy",
+    )
+    failed_job = db_store.enqueue_job("ingest", failed_payload)
+    db_store.mark_job_awaiting_subagent(failed_job, "")
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+
+    owner_payload = {
+        **failed_payload,
+        "canonical_name": "Source_Current-Owner-12345678.md",
+        "instructions": "current",
+    }
+    owner_job = db_store.enqueue_job("ingest", owner_payload)
+    db_store.mark_job_awaiting_subagent(owner_job, "")
+    owner_key = db_store._job_idempotency_key("ingest", owner_payload)
+    monkeypatch.setattr(
+        tool_ingest,
+        "canonical_source_name",
+        lambda *_args, **_kwargs: "Source_Resolver-Drift-87654321.md",
+    )
+
+    preview = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+
+    assert preview["counts"] == {
+        "leave_awaiting": 1,
+        "supersede_duplicate": 1,
+    }
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    rows = {
+        row["job_id"]: dict(row)
+        for row in db_store.get_connection().execute(
+            "SELECT job_id, status, retries, idempotency_key, payload, result_json "
+            "FROM jobs WHERE job_id IN (?, ?)",
+            (failed_job, owner_job),
+        )
+    }
+
+    assert result["terminal_failed_after"] == 0
+    assert result["applied_counts"] == {"supersede_duplicate": 1}
+    assert result["concurrent_skips"] == []
+    assert rows[failed_job]["status"] == "superseded"
+    assert rows[failed_job]["retries"] == 0
+    assert rows[failed_job]["idempotency_key"] is None
+    assert json.loads(rows[failed_job]["result_json"])["owner_job_id"] == owner_job
+    assert rows[owner_job]["status"] == "awaiting_subagent"
+    assert rows[owner_job]["idempotency_key"] == owner_key
+    assert json.loads(rows[owner_job]["payload"]) == owner_payload
+
+def test_reconcile_failed_revision_blocks_multiple_effective_owners(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "conflicting-owners.md"
+    raw_path.write_text("current revision", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    base_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        "Source_Legacy-Conflict.md",
+    )
+    failed_job = db_store.enqueue_job("ingest", base_payload)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+
+    owner_payloads = [
+        {**base_payload, "canonical_name": "Source_Current-Owner-A.md"},
+        {**base_payload, "canonical_name": "Source_Current-Owner-B.md"},
+    ]
+    owner_jobs = []
+    for owner_payload in owner_payloads:
+        owner_job = db_store.enqueue_job("ingest", owner_payload)
+        db_store.mark_job_awaiting_subagent(owner_job, "")
+        owner_jobs.append(owner_job)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'awaiting_subagent', retries = 0, "
+            "idempotency_key = ?, error_msg = '', result_json = NULL, "
+            "completed_at = NULL WHERE job_id = ?",
+            (
+                db_store._job_idempotency_key("ingest", owner_payloads[0]),
+                owner_jobs[0],
+            ),
+        )
+
+    preview = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+
+    assert preview["counts"] == {
+        "blocked_revision_identity_conflict": 1,
+        "leave_awaiting": 2,
+    }
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    rows = {
+        row["job_id"]: dict(row)
+        for row in db_store.get_connection().execute(
+            "SELECT job_id, status, retries, idempotency_key, result_json FROM jobs "
+            "WHERE job_id IN (?, ?, ?)",
+            (failed_job, *owner_jobs),
+        )
+    }
+
+    assert result["applied_counts"] == {
+        "blocked_revision_identity_conflict": 1,
+    }
+    assert result["concurrent_skips"] == []
+    assert rows[failed_job]["status"] == "failed"
+    assert rows[failed_job]["retries"] == 3
+    assert rows[failed_job]["idempotency_key"] is None
+    blocked = json.loads(rows[failed_job]["result_json"])
+    assert blocked["state"] == "blocked"
+    assert blocked["action"] == "blocked_revision_identity_conflict"
+    assert all(rows[job_id]["status"] == "awaiting_subagent" for job_id in owner_jobs)
+
+def test_reconcile_failed_revision_rechecks_owner_uniqueness_at_apply(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_projection
+
+    raw_path = isolated_memory / "raw" / "owner-race.md"
+    raw_path.write_text("current revision", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    failed_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        "Source_Legacy-Race.md",
+    )
+    failed_job = db_store.enqueue_job("ingest", failed_payload)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+
+    first_payload = {
+        **failed_payload,
+        "canonical_name": "Source_Current-Race-A.md",
+    }
+    first_owner = db_store.enqueue_job("ingest", first_payload)
+    db_store.mark_job_awaiting_subagent(first_owner, "")
+    added_owners = []
+
+    def inject_second_owner(_label):
+        second_payload = {
+            **failed_payload,
+            "canonical_name": "Source_Current-Race-B.md",
+        }
+        second_owner = db_store.enqueue_job("ingest", second_payload)
+        db_store.mark_job_awaiting_subagent(second_owner, "")
+        with db_store.transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'awaiting_subagent', retries = 0, "
+                "idempotency_key = ?, error_msg = '', result_json = NULL, "
+                "completed_at = NULL WHERE job_id = ?",
+                (
+                    db_store._job_idempotency_key("ingest", first_payload),
+                    first_owner,
+                ),
+            )
+        added_owners.append(second_owner)
+        return str(isolated_memory / "backup-owner-race")
+
+    monkeypatch.setattr(
+        tool_projection,
+        "create_maintenance_backup",
+        inject_second_owner,
+    )
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    failed = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, idempotency_key FROM jobs WHERE job_id = ?",
+            (failed_job,),
+        )
+        .fetchone()
+    )
+
+    assert len(added_owners) == 1
+    assert result["applied_counts"] == {}
+    assert result["concurrent_skips"] == [
+        {
+            "job_id": failed_job,
+            "reason": "duplicate owner no longer holds the unique effective ingest identity",
+        }
+    ]
+    assert failed["status"] == "failed"
+    assert failed["retries"] == 3
+    assert failed["idempotency_key"] is not None
+
+def test_reconcile_requeue_rechecks_revision_owner_set_at_apply(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_projection
+
+    raw_path = isolated_memory / "raw" / "requeue-owner-race.md"
+    raw_path.write_text("current revision", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    failed_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        "Source_Legacy-Requeue-Race.md",
+    )
+    failed_job = db_store.enqueue_job("ingest", failed_payload)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+    planned_canonical = "Source_Planned-Requeue-Race.md"
+    monkeypatch.setattr(
+        tool_ingest,
+        "canonical_source_name",
+        lambda *_args, **_kwargs: planned_canonical,
+    )
+    monkeypatch.setattr(
+        governance_store,
+        "canonical_page_versions",
+        lambda _keys: {},
+    )
+    monkeypatch.setattr(
+        tool_ingest,
+        "_projection_hash_for_canonical_version",
+        lambda *_args: "",
+    )
+    monkeypatch.setattr(
+        tool_ingest,
+        "_build_ingest_instructions",
+        lambda *_args: "rebuilt instructions",
+    )
+    raced_owners = []
+
+    def inject_owner(_label):
+        owner_payload = _v4_ingest_payload(
+            str(raw_path),
+            current_hash,
+            "Source_Raced-Requeue-Owner.md",
+        )
+        owner_job = db_store.enqueue_job("ingest", owner_payload)
+        db_store.mark_job_awaiting_subagent(owner_job, "")
+        raced_owners.append(owner_job)
+        return str(isolated_memory / "backup-requeue-owner-race")
+
+    monkeypatch.setattr(tool_projection, "create_maintenance_backup", inject_owner)
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    failed = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, idempotency_key FROM jobs WHERE job_id = ?",
+            (failed_job,),
+        )
+        .fetchone()
+    )
+
+    assert len(raced_owners) == 1
+    assert result["applied_counts"] == {}
+    assert result["concurrent_skips"] == [
+        {
+            "job_id": failed_job,
+            "reason": "effective owner set changed before debt requeue",
+        }
+    ]
+    assert failed["status"] == "failed"
+    assert failed["retries"] == 3
+    assert failed["idempotency_key"] == db_store._job_idempotency_key(
+        "ingest",
+        failed_payload,
+    )
+
+
+def test_reconcile_conflict_rechecks_ambiguity_at_apply(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_projection
+
+    raw_path = isolated_memory / "raw" / "resolved-owner-conflict.md"
+    raw_path.write_text("current revision", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    failed_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        "Source_Legacy-Resolved-Conflict.md",
+    )
+    failed_job = db_store.enqueue_job("ingest", failed_payload)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+
+    owner_payloads = [
+        {**failed_payload, "canonical_name": "Source_Conflict-Owner-A.md"},
+        {**failed_payload, "canonical_name": "Source_Conflict-Owner-B.md"},
+    ]
+    first_owner = db_store.enqueue_job("ingest", owner_payloads[0])
+    db_store.mark_job_awaiting_subagent(first_owner, "")
+    second_owner = db_store.enqueue_job("ingest", owner_payloads[1])
+    db_store.mark_job_awaiting_subagent(second_owner, "")
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'awaiting_subagent', retries = 0, "
+            "idempotency_key = ?, error_msg = '', result_json = NULL, "
+            "completed_at = NULL WHERE job_id = ?",
+            (
+                db_store._job_idempotency_key("ingest", owner_payloads[0]),
+                first_owner,
+            ),
+        )
+
+    def resolve_conflict(_label):
+        with db_store.transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'cancelled', idempotency_key = NULL "
+                "WHERE job_id = ?",
+                (second_owner,),
+            )
+        return str(isolated_memory / "backup-resolved-owner-conflict")
+
+    monkeypatch.setattr(
+        tool_projection,
+        "create_maintenance_backup",
+        resolve_conflict,
+    )
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    failed = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, idempotency_key, result_json FROM jobs "
+            "WHERE job_id = ?",
+            (failed_job,),
+        )
+        .fetchone()
+    )
+
+    assert result["applied_counts"] == {}
+    assert result["concurrent_skips"] == [
+        {
+            "job_id": failed_job,
+            "reason": "revision identity conflict changed before debt mutation",
+        }
+    ]
+    assert failed["status"] == "failed"
+    assert failed["retries"] == 3
+    assert failed["idempotency_key"] is not None
+    assert failed["result_json"] is None
+
+def test_reconcile_conflict_rechecks_exact_owner_signature_at_apply(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_projection
+
+    raw_path = isolated_memory / "raw" / "changed-owner-conflict.md"
+    raw_path.write_text("current revision", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    failed_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        "Source_Legacy-Changed-Conflict.md",
+    )
+    failed_job = db_store.enqueue_job("ingest", failed_payload)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+
+    owner_payloads = [
+        {**failed_payload, "canonical_name": "Source_Changed-Owner-A.md"},
+        {**failed_payload, "canonical_name": "Source_Changed-Owner-B.md"},
+    ]
+    first_owner = db_store.enqueue_job("ingest", owner_payloads[0])
+    db_store.mark_job_awaiting_subagent(first_owner, "")
+    second_owner = db_store.enqueue_job("ingest", owner_payloads[1])
+    db_store.mark_job_awaiting_subagent(second_owner, "")
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'awaiting_subagent', retries = 0, "
+            "idempotency_key = ?, error_msg = '', result_json = NULL, "
+            "completed_at = NULL WHERE job_id = ?",
+            (
+                db_store._job_idempotency_key("ingest", owner_payloads[0]),
+                first_owner,
+            ),
+        )
+    replacement_owners = []
+
+    def change_conflict_membership(_label):
+        with db_store.transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'cancelled', idempotency_key = NULL "
+                "WHERE job_id = ?",
+                (first_owner,),
+            )
+        replacement_payload = {
+            **failed_payload,
+            "canonical_name": "Source_Changed-Owner-C.md",
+        }
+        replacement_owner = db_store.enqueue_job("ingest", replacement_payload)
+        db_store.mark_job_awaiting_subagent(replacement_owner, "")
+        with db_store.transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'awaiting_subagent', retries = 0, "
+                "idempotency_key = ?, error_msg = '', result_json = NULL, "
+                "completed_at = NULL WHERE job_id = ?",
+                (
+                    db_store._job_idempotency_key("ingest", owner_payloads[1]),
+                    second_owner,
+                ),
+            )
+        replacement_owners.append(replacement_owner)
+        return str(isolated_memory / "backup-changed-owner-conflict")
+
+    monkeypatch.setattr(
+        tool_projection,
+        "create_maintenance_backup",
+        change_conflict_membership,
+    )
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    failed = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, idempotency_key, result_json FROM jobs "
+            "WHERE job_id = ?",
+            (failed_job,),
+        )
+        .fetchone()
+    )
+
+    assert len(replacement_owners) == 1
+    assert result["applied_counts"] == {}
+    assert result["concurrent_skips"] == [
+        {
+            "job_id": failed_job,
+            "reason": "revision identity conflict changed before debt mutation",
+        }
+    ]
+    assert failed["status"] == "failed"
+    assert failed["retries"] == 3
+    assert failed["idempotency_key"] is not None
+    assert failed["result_json"] is None
+
+def test_reconcile_conflict_signature_tracks_invalid_owner_key_changes(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_projection
+
+    raw_path = isolated_memory / "raw" / "invalid-owner-key-race.md"
+    raw_path.write_text("current revision", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    failed_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        "Source_Legacy-Invalid-Owner-Key.md",
+    )
+    failed_job = db_store.enqueue_job("ingest", failed_payload)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+
+    owner_payload = {
+        **failed_payload,
+        "canonical_name": "Source_Invalid-Owner-Key.md",
+    }
+    owner_job = db_store.enqueue_job("ingest", owner_payload)
+    db_store.mark_job_awaiting_subagent(owner_job, "")
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET idempotency_key = ? WHERE job_id = ?",
+            ("invalid-owner-key-a", owner_job),
+        )
+
+    def change_invalid_owner_key(_label):
+        with db_store.transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET idempotency_key = ? WHERE job_id = ?",
+                ("invalid-owner-key-b", owner_job),
+            )
+        return str(isolated_memory / "backup-invalid-owner-key-race")
+
+    monkeypatch.setattr(
+        tool_projection,
+        "create_maintenance_backup",
+        change_invalid_owner_key,
+    )
+
+    result = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+    failed = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, idempotency_key, result_json FROM jobs "
+            "WHERE job_id = ?",
+            (failed_job,),
+        )
+        .fetchone()
+    )
+
+    assert result["applied_counts"] == {}
+    assert result["concurrent_skips"] == [
+        {
+            "job_id": failed_job,
+            "reason": "revision identity conflict changed before debt mutation",
+        }
+    ]
+    assert failed["status"] == "failed"
+    assert failed["retries"] == 3
+    assert failed["idempotency_key"] is not None
+    assert failed["result_json"] is None
 
 def test_reconcile_preview_does_not_create_missing_database(isolated_memory):
     db_path = db_store.get_db_path()
