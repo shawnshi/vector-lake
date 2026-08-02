@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -244,7 +244,10 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
     governance_store.initialize_meta_store()
     conn = governance_store.get_connection()
     now = _utc_now()
-    validity_state_counts = {}
+    # ⚡ Bolt Optimization: Replace dict with defaultdict to eliminate O(N) missing key lookup overhead
+    # during validity state counting loop. Expected impact: Slight reduction in metric generation time
+    # for large databases by bypassing `dict.get(key, 0)` method call overhead.
+    validity_state_counts = defaultdict(int)
     unsupported_claim_count = 0
     managed_unsupported_claim_count = 0
     conflicted_claim_count = 0
@@ -271,12 +274,17 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         claim_version = claim_governance_version(raw_claim)
         claim_count += 1
         source_ids_with_claims.update(str(item) for item in raw_claim.get("source_ids", []))
-        claim = annotate_claim_validity(raw_claim, now=now)
-        state = claim.get("validity_state", "active")
-        validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
+
+        # ⚡ Bolt Optimization: Avoid unnecessary dictionary allocation from annotate_claim_validity.
+        # Call infer_claim_validity directly and read fields from raw_claim where possible.
+        # This speeds up the O(N) loop significantly by avoiding copying the entire claim dictionary.
+        validity = infer_claim_validity(raw_claim, now=now)
+        state = validity.get("validity_state", "active")
+        validity_state_counts[state] += 1
+
         if state == "unsupported":
             unsupported_claim_count += 1
-            managed_item = managed_claim_items.get(str(claim.get("claim_id") or ""))
+            managed_item = managed_claim_items.get(str(raw_claim.get("claim_id") or ""))
             due_at = _parse_dt((managed_item or {}).get("due_at"))
             if (
                 managed_item
@@ -296,7 +304,7 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
             review_due_claim_count += 1
         if state == "provisional":
             provisional_claim_count += 1
-        if float(claim.get("confidence", 0)) < 0.5 and len(claim.get("subject_entity_ids", [])) > 0:
+        if float(raw_claim.get("confidence", 0)) < 0.5 and len(raw_claim.get("subject_entity_ids", [])) > 0:
             high_centrality_low_confidence += 1
 
     # Evidence is a first-class source reference. Counting only claim.source_ids
@@ -387,6 +395,6 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         "superseded_memory_count": memory_validity_counts.get("superseded", 0),
         "conflicted_memory_count": memory_validity_counts.get("conflicted", 0),
         "memory_type_counts": memory_type_counts,
-        "validity_state_counts": validity_state_counts,
+        "validity_state_counts": dict(validity_state_counts),
     }
 
