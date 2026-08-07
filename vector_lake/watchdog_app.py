@@ -90,6 +90,16 @@ def _shutdown_timeout_seconds() -> float:
     )
 
 
+def _outbox_batch_yield_seconds() -> float:
+    """Return the interruptible pause after a successful durable outbox batch."""
+    return _bounded_env_float(
+        "VECTOR_LAKE_OUTBOX_BATCH_YIELD_SECONDS",
+        0.05,
+        minimum=0.001,
+        maximum=1.0,
+    )
+
+
 def background_thread_health() -> dict[str, bool]:
     """Return the liveness of the most recently registered watchdog workers."""
     with _BACKGROUND_THREADS_LOCK:
@@ -742,6 +752,16 @@ class RawWatchdogHandler(FileSystemEventHandler):
         }
         if overflow:
             options["_enqueue_all"] = True
+            from vector_lake.heavy_task_gate import heavy_task
+
+            with heavy_task(
+                "ingest_scan",
+                "watchdog-raw-full-scan",
+                origin="watchdog",
+                wait_timeout_seconds=0,
+                warn_after_seconds=1800,
+            ):
+                return prepare_ingest_batch(**options)
         return prepare_ingest_batch(**options)
 
     def _queue_batch_locked(self, paths, overflow) -> None:
@@ -834,14 +854,24 @@ class RawWatchdogHandler(FileSystemEventHandler):
             error = None
         except BaseException as exc:
             error = exc
-            log.error("Raw ingest preparation failed: %s", error)
+            from vector_lake.heavy_task_gate import HeavyTaskBusy
+
+            if isinstance(error, HeavyTaskBusy):
+                log.info(
+                    "Raw full scan deferred because the heavy-task gate is occupied."
+                )
+            else:
+                log.error("Raw ingest preparation failed: %s", error)
         with self.lock:
             if self.sync_future is future:
                 self.sync_future = None
                 self.sync_thread = None
             if error is not None:
                 self._queue_batch_locked(paths, overflow)
-                self.retry_attempt += 1
+                from vector_lake.heavy_task_gate import HeavyTaskBusy
+
+                if not isinstance(error, HeavyTaskBusy):
+                    self.retry_attempt += 1
             else:
                 self.retry_attempt = 0
                 if overflow and not self._full_scan_complete(result):
@@ -1049,9 +1079,15 @@ def process_mutation_outbox_batch(
         try:
             if filenames:
                 if indexer.index_projection_matches_canonical(filenames):
-                    indexer.refresh_claim_graph_projection()
+                    if not indexer.projection_pair_matches_current_generation():
+                        indexer.refresh_claim_graph_projection()
                 else:
                     indexer.update_index_items(filenames)
+                if not indexer.projection_pair_matches_current_generation():
+                    raise RuntimeError(
+                        "Projection pair is not committed against the current "
+                        "canonical generation after outbox indexing."
+                    )
         except Exception as exc:
             for row, filename in current_rows:
                 outbox_id = int(row["id"])
@@ -1393,6 +1429,12 @@ def index_worker_loop(stop_event: threading.Event | None = None):
     )
 
     while not stop_event.is_set():
+        gate_lease = None
+        gate_entered = False
+        gate_failure = None
+        no_completed_work = False
+        successful_outbox_batch = False
+        retry_wait_seconds = 0.0
         try:
             if consecutive_failures >= max_failures:
                 write_status(
@@ -1403,15 +1445,66 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                     "Max consecutive failures reached",
                     component="outbox",
                 )
-                log.error("Outbox Consumer Halted. Entering 60s cooldown before retry.")
+                log.error(
+                    "Outbox Consumer Halted. Entering 60s cooldown before retry."
+                )
                 if stop_event.wait(60):
                     break
                 consecutive_failures = 0
                 continue
 
+            from vector_lake import db_store
             from vector_lake.wiki_utils import get_outbox_signal_path
 
             flag_path = get_outbox_signal_path()
+            try:
+                claimable_outbox = db_store.mutation_outbox_has_claimable()
+            except Exception:
+                claimable_outbox = True
+            work_pending = bool(
+                flag_path.exists()
+                or claimable_outbox
+                or not index_queue.empty()
+                or index_queue.full_reconcile_required
+            )
+            if not work_pending:
+                write_status(
+                    "idle",
+                    0,
+                    index_queue.qsize(),
+                    "Outbox idle",
+                    "",
+                    component="outbox",
+                )
+                if stop_event.wait(1):
+                    break
+                continue
+
+            from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
+
+            gate_lease = heavy_task(
+                "projection",
+                "watchdog-outbox-cycle",
+                origin="watchdog",
+                wait_timeout_seconds=0,
+                warn_after_seconds=900,
+            )
+            try:
+                gate_lease.__enter__()
+                gate_entered = True
+            except HeavyTaskBusy:
+                write_status(
+                    "idle",
+                    0,
+                    index_queue.qsize(),
+                    "Outbox deferred by heavy-task gate",
+                    "Another memory-intensive operation is active",
+                    component="outbox",
+                )
+                if stop_event.wait(1):
+                    break
+                continue
+
             if flag_path.exists():
                 try:
                     flag_path.unlink()
@@ -1420,6 +1513,7 @@ def index_worker_loop(stop_event: threading.Event | None = None):
 
             with global_task_lock:
                 stats = process_mutation_outbox_batch(limit=50)
+            successful_outbox_batch = bool(stats["completed"])
 
             if consecutive_failures:
                 write_status(
@@ -1440,9 +1534,8 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                     "",
                     component="outbox",
                 )
-                log.info(f"Outbox batch completed: {stats}")
+                log.info("Outbox batch completed: %s", stats)
 
-            # Manual filesystem edits remain bounded and drain before overflow scans.
             pending_legacy = set()
             while len(pending_legacy) < 25:
                 try:
@@ -1510,21 +1603,28 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                             else (
                                 f"remaining={reconcile_stats['remaining']}; "
                                 f"failed={reconcile_stats['failed']}; "
-                                f"scan_errors={len(reconcile_stats['scan_errors'])}; "
-                                f"generation_changed={reconcile_stats['generation_changed']}"
+                                "scan_errors="
+                                f"{len(reconcile_stats['scan_errors'])}; "
+                                "generation_changed="
+                                f"{reconcile_stats['generation_changed']}"
                             )
                         ),
                         component="outbox",
                     )
                     log.info("Wiki overflow reconciliation: %s", reconcile_stats)
 
-            if not pending_legacy and reconcile_stats is None and not stats["claimed"]:
+            no_completed_work = (
+                not pending_legacy
+                and reconcile_stats is None
+                and not stats["claimed"]
+            )
+            if no_completed_work:
                 if index_queue.full_reconcile_required:
                     write_status(
-                        "error",
+                        "idle",
                         0,
                         index_queue.qsize(),
-                        "Full Wiki reconciliation pending",
+                        "Full Wiki reconciliation deferred",
                         f"retry interval={reconcile_retry_seconds}s",
                         component="outbox",
                     )
@@ -1537,14 +1637,16 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                         "",
                         component="outbox",
                     )
-                if stop_event.wait(1):
-                    break
 
             consecutive_failures = 0
 
+        except (KeyboardInterrupt, SystemExit) as exc:
+            gate_failure = exc
+            raise
         except Exception as exc:
+            gate_failure = exc
             consecutive_failures += 1
-            log.error(f"Outbox worker error: {exc}")
+            log.error("Outbox worker error: %s", exc)
             write_status(
                 "error",
                 0,
@@ -1553,12 +1655,34 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                 str(exc),
                 component="outbox",
             )
-            if stop_event.wait(min(backoff_base**consecutive_failures, 60)):
-                break
+            retry_wait_seconds = min(
+                backoff_base**consecutive_failures,
+                60,
+            )
         finally:
             from vector_lake.db_store import close_connection
 
-            close_connection()
+            try:
+                close_connection()
+            finally:
+                if gate_entered and gate_lease is not None:
+                    gate_lease.__exit__(
+                        type(gate_failure) if gate_failure is not None else None,
+                        gate_failure,
+                        (
+                            gate_failure.__traceback__
+                            if gate_failure is not None
+                            else None
+                        ),
+                    )
+
+        wait_seconds = (
+            retry_wait_seconds
+            or (_outbox_batch_yield_seconds() if successful_outbox_batch else 0.0)
+            or (1.0 if no_completed_work else 0.0)
+        )
+        if wait_seconds and stop_event.wait(wait_seconds):
+            break
 
     write_status(
         "stopped",
@@ -1587,6 +1711,8 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
     log.info("Scheduled Lint Worker Thread started.")
     last_run_date_hour = ""
     last_expiry_date_hour = ""
+    pending_due = ""
+    next_due = ""
 
     write_status(
         "idle",
@@ -1607,6 +1733,24 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
             current_date_hour = (
                 f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
             )
+            observed_due = (
+                current_date_hour
+                if now.tm_hour in (10, 23) and now.tm_min == 0
+                else ""
+            )
+            if (
+                observed_due
+                and observed_due != last_run_date_hour
+                and observed_due != pending_due
+                and observed_due != next_due
+            ):
+                if pending_due:
+                    # Coalesce multiple missed windows to the newest follow-up.
+                    # The oldest pending window is always attempted first.
+                    next_due = observed_due
+                else:
+                    pending_due = observed_due
+
             if now.tm_min == 0 and current_date_hour != last_expiry_date_hour:
                 from vector_lake.db_store import close_connection
 
@@ -1619,9 +1763,11 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                 finally:
                     close_connection()
 
-            # Run at 10:00 and 23:00
-            if now.tm_hour in (10, 23) and now.tm_min == 0:
-                if current_date_hour != last_run_date_hour:
+            # Run at 10:00 and 23:00. Once observed, a due slot remains pending
+            # across minute boundaries until the heavy-task gate admits it.
+            if pending_due and pending_due != last_run_date_hour:
+                due_to_run = pending_due
+                if due_to_run:
                     write_status(
                         "processing",
                         0,
@@ -1635,38 +1781,69 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                     from vector_lake.tool_lint import lint_vector_lake
                     from vector_lake import indexer
                     from vector_lake.db_store import close_connection, get_connection
+                    from vector_lake.heavy_task_gate import (
+                        HeavyTaskBusy,
+                        heavy_task,
+                    )
 
+                    scheduled_completed = False
                     try:
-                        with global_task_lock:
-                            if indexer.refresh_graph_topology_if_dirty():
-                                log.info(
-                                    "Graph topology refreshed during scheduled lint."
-                                )
-                            lint_vector_lake(auto_fix=False)
+                        with heavy_task(
+                            "scan",
+                            "watchdog-scheduled-lint",
+                            origin="watchdog",
+                            wait_timeout_seconds=0,
+                            warn_after_seconds=1800,
+                        ):
+                            with global_task_lock:
+                                if indexer.refresh_graph_topology_if_dirty():
+                                    log.info(
+                                        "Graph topology refreshed during scheduled lint."
+                                    )
+                                lint_vector_lake(auto_fix=False)
 
-                            # Truncate WAL to prevent unbounded growth
-                            conn = get_connection()
-                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                            log.info(
-                                "SQLite WAL checkpoint (TRUNCATE) completed successfully."
-                            )
+                                conn = get_connection()
+                                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                                log.info(
+                                    "SQLite WAL checkpoint (TRUNCATE) completed "
+                                    "successfully."
+                                )
+                        scheduled_completed = True
+                    except HeavyTaskBusy:
+                        log.info(
+                            "Scheduled lint deferred because the heavy-task gate "
+                            "is occupied."
+                        )
+                        write_status(
+                            "idle",
+                            0,
+                            index_queue.qsize(),
+                            "Scheduled Lint deferred",
+                            "Another memory-intensive operation is active",
+                            component="scheduler",
+                        )
                     finally:
                         close_connection()
 
-                    log.info("Scheduled Autonomous Auto-Lint completed.")
-                    last_run_date_hour = current_date_hour
-                    write_status(
-                        "idle",
-                        0,
-                        index_queue.qsize(),
-                        "Scheduled Lint finished",
-                        "",
-                        component="scheduler",
-                    )
+                    if scheduled_completed:
+                        log.info("Scheduled Autonomous Auto-Lint completed.")
+                        last_run_date_hour = due_to_run
+                        pending_due = next_due
+                        next_due = ""
+                        write_status(
+                            "idle",
+                            0,
+                            index_queue.qsize(),
+                            "Scheduled Lint finished",
+                            "",
+                            component="scheduler",
+                        )
 
-            # Calculate wait time till next minute to avoid tight spinning, or just sleep for 30 seconds
-            # If we just ran at hour 10 or 23, sleep 60 seconds to push past min 0
-            if now.tm_hour in (10, 23) and now.tm_min == 0:
+            # Pending maintenance retries every 30 seconds even after the
+            # original minute-zero window has passed.
+            if pending_due:
+                wait_seconds = 30
+            elif observed_due:
                 wait_seconds = 60
             else:
                 wait_seconds = 30

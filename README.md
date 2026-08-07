@@ -22,7 +22,7 @@ graph LR
     MUTATION --> META["vector_lake.db<br>SQLite Canonical Store"]
     META --> OUTBOX["Fenced Outbox<br>latest intent per page"]
     OUTBOX --> WIKI
-    OUTBOX --> INDEX["index.json + FTS<br>search projection"]
+    OUTBOX --> INDEX["index.json + claim_graph.json + sidecar<br>FTS search projection"]
     META --> CLAIM["SQLite claim_graph_edges<br>governed topology"]
     META --> MEMORY["SQLite operational_memory<br>agent runtime memory"]
     MEMORY --> PACKET["Memory Packet<br>selective context injection"]
@@ -41,11 +41,38 @@ graph LR
 |---|---|
 | Plugin package | `11.14.0+codex.20260728154444` |
 | Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
-| SQLite migration schema | `PRAGMA user_version = 4` |
+| SQLite migration schema | `PRAGMA user_version = 6` |
 | Canonical governance schema | `8.0` |
 | Index projection | `PROJECTION_CONTRACT_VERSION = 1` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 50 MCP tools / 30 CLI commands / 19 Codex skills / 19 Gemini command prompts |
+| Public surfaces | 51 MCP tools / 32 CLI commands / 19 Codex skills / 19 Gemini command prompts |
+
+通用 `init_db()` 遇到既有 v1–v5 数据库会拒绝自动升级。CLI-only
+`schema-migrate` 只接受契约完整的 v4 或 v5 数据库，按 v4→v5→v6 或 v5→v6
+单向迁移；v1–v3 明确不受该入口支持，必须先通过经单独验证的离线恢复或旧版迁移
+流程升级到 v4。执行前必须停止 MCP/watchdog 及其他写入者；apply 持有 schema
+maintenance lock，重新核验 preview fingerprint；preview 如报告未 checkpoint 的 WAL，
+必须先用同一 fingerprint 执行显式 `--checkpoint-wal`，然后重新 preview。apply 在任何
+DDL 前生成经 `quick_check` 验证、强制转换为 DELETE journal 的独立 SQLite 备份及
+SHA-256，并先发布已 fsync 的 pending receipt/backup manifest。数据库提交后再发布
+completed receipt；若迁移或 completed 发布失败，备份与 pending manifest 保留供恢复。
+迁移只删除
+`timeline_events` 上两条已经有等价替代项的重复索引，并明确保留仍被外部运行时
+使用的 `wiki_embeddings`、`embedding_jobs` 与 `embedding_rate_events`。索引和
+migration ledger 在同一 EXCLUSIVE 事务回滚，但备份、迁移收据及 journal
+mode/sidecar 不属于该原子边界；旧进程不得与迁移 CLI 并行运行。删除索引只减少
+后续维护开销，不会自动缩小数据库文件。
+
+Schema v6 继续采用受控单向迁移，并新增 change-set 内容寻址 payload、生命周期业务时间、
+retention 收据与固定 `plan_as_of`。新 change-set 单条 payload 最大 4 MiB、单批累计最大
+32 MiB、最多 200 项且全批最多覆盖 200 个不重叠页面；终态历史只保留有界 manifest
+和摘要，不保留可回放 payload。旧快照压缩规划每次最多扫描 5,000 行，默认最多处理
+100 行/64 MiB，硬上限 500 行/128 MiB。retention 每批全局最多删除 500 行、默认
+128 MiB；版本历史采用最多 5,000 行的主键游标窗口和族内顺序索引，不再对全表做
+窗口排名。活动 change-set、job 与 outbox 的保护扫描同时受行数和 UTF-8 字节上限约束，
+超过上限即停止版本删除。计划绑定参数、业务截止时间、运行代次、行级 guard 与持久
+收据；下一批版本游标只能取自成功 apply 后的收据。任何物理
+`VACUUM` 都必须在实际删除后重新测量 freelist，再于无写入者的独占维护窗口单独决策。
 
 ## CBSS Integration Boundary
 
@@ -157,7 +184,7 @@ Vector Lake 使用 SQLite canonical 与可重建投影分离的架构。
 
 - **SQLite (Canonical Store)**：`vector_lake.db` 保存 entities、claims、evidence、sources、graph edges、governance state、jobs、outbox 与 operational memory。
 - **Markdown (Human-Audit Projection)**：`wiki/*.md` 是可审计发布面；`raw/` 保存由扫描器识别和按 revision 跟踪的输入材料。
-- **Derived Projections**：`index.json`、FTS、`claim_graph.json`、Timeline 和 operational-memory packets 可从 canonical 状态与受治理信源重建。
+- **Derived Projections**：`index.json`、FTS、`claim_graph.json`、`projection_pair_manifest.json`、Timeline 和 operational-memory packets 可从 canonical 状态与受治理信源重建。小型 sidecar 是 index/claim-graph 对的最后提交标记，绑定共同 generation、文件大小和 SHA-256；缺失、损坏或摘要不一致时读取链路失败关闭并要求重新同步。
 - **Commit Boundary**：canonical change set 与 outbox intent 在 SQLite 内原子提交；文件投影使用备份、原子替换和 fenced worker 恢复，但不宣称文件系统与 SQLite 之间存在分布式事务。
 
 ```text
@@ -189,7 +216,7 @@ MEMORY/
 > - `/lint`：执行节点健康度自愈审查（支持传入 `auto_fix=True` 自动修复残缺元数据与图谱断层）
 > - `/research`：自主扫描并下发网络检索指令
 > - `/graph`：直接生成并刷新 3D 可视化拓扑面板
-> - `/doctor`：运行环境与依赖健康体检
+> - `/doctor`：运行环境与依赖发现性体检；重型依赖的实际导入由对应运行路径和测试验证
 > - `/daemon_watchdog`：启动长期运行的增量监听与 ingest dispatcher
 > - `/gc`：垃圾回收与孤儿节点自动清理
 > - `/delete`：级联删除信源与切断图谱边
@@ -301,6 +328,17 @@ GC 的孤儿页删除要求显式 `--apply`，并且 `--confirm-orphans` 必须�
 投影与 canonical 维护：
 
 ```powershell
+# 1. 先停止 MCP、watchdog 和其他 SQLite 写入者。
+python cli.py schema-migrate
+# 2. 仅当 preview 报告 database_has_uncheckpointed_wal 时执行；之后必须重新 preview。
+python cli.py schema-migrate --checkpoint-wal --confirm-fingerprint "sha256:<preview-fingerprint>" --confirm-no-writers
+python cli.py schema-migrate
+# 3. 使用重新 preview 返回的 fingerprint 执行迁移。
+python cli.py schema-migrate --apply --confirm-fingerprint "sha256:<preview-fingerprint>" --confirm-no-writers
+# 4. pending/completed 收据都要求重建投影；数据库迁移不会自动执行此步骤。
+python cli.py projection-rebuild-index --apply
+python cli.py doctor
+
 python cli.py projection-report --limit 20
 python cli.py canonical-backfill --limit 100
 python cli.py canonical-backfill --apply --limit 100
@@ -318,8 +356,13 @@ python cli.py memory-search-index
 python cli.py memory-search-index --apply --batch-size 256
 python cli.py memory-cleanup
 python cli.py memory-cleanup --apply
-python cli.py history-retention
-python cli.py history-retention --apply --ttl-days 30 --batch-size 500
+python cli.py history-retention --ttl-days 30 --batch-size 500
+python cli.py history-retention --apply --ttl-days 30 --batch-size 500 --plan-as-of "<preview-plan-as-of>" --confirm-fingerprint "sha256:<preview-fingerprint>"
+python cli.py history-retention --ttl-days 30 --claim-version-cursor "<receipt-claim-cursor>" --evidence-version-cursor "<receipt-evidence-cursor>" --version-cursor-receipt "sha256:<prior-receipt-fingerprint>"
+python cli.py change-set-compaction --max-rows 100 --max-input-bytes 67108864
+python cli.py change-set-compaction --apply --max-rows 100 --max-input-bytes 67108864 --confirm-fingerprint "sha256:<preview-fingerprint>"
+python cli.py change-set-compaction --max-rows 100 --max-input-bytes 67108864 --cursor "<prior-successful-safe-next-cursor>"
+python cli.py change-set-compaction --apply --max-rows 100 --max-input-bytes 67108864 --cursor "<same-input-cursor>" --confirm-fingerprint "sha256:<matching-preview-fingerprint>"
 python cli.py topology-queue-cleanup
 python cli.py topology-queue-cleanup --apply
 python cli.py orphan-source-classify
@@ -328,9 +371,9 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hours 24 --apply --confirm-fingerprint "sha256:<preview-fingerprint>"
 ```
 
-除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 才写入或删除。`canonical-backfill` 从 Wiki Markdown 回填缺失 canonical；`evidence-foundation-backfill` 只合并缺失的证据基础元数据；`projection-rebuild-index` 从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐向量；`wiki-restore` 只做 projection-only 恢复；`memory-search-index` 每次推进一个有界索引批次；`history-retention` 只删除超龄且不再被引用的有界历史批次；`memory-cleanup`、`topology-queue-cleanup` 和 `orphan-source-classify` 均先返回候选或债务分类。
+除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` 的 preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥，二者都必须提交匹配的完整 fingerprint 与 `--confirm-no-writers`。checkpoint 只在 maintenance/heavy lock 内执行 `wal_checkpoint(TRUNCATE)`，不生成备份、不执行 DDL，并返回新的只读 preview/fingerprint。apply 在 DDL 前持久化备份和 pending manifest，成功收据返回备份路径/摘要及 `projection_rebuild_required=true`。普通 v6 输入是幂等 no-op；若 v6 preview 发现并校验到同数据库的 pending manifest，仍返回 `projection_rebuild_required=true`，apply 可补发 completed receipt，且不会新建备份。`canonical-backfill` 从 Wiki Markdown 回填缺失 canonical；`evidence-foundation-backfill` 只合并缺失的证据基础元数据；`projection-rebuild-index` 从 canonical 重建 `index.json`、FTS、`claim_graph.json` 和 sidecar，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐向量；`wiki-restore` 只做 projection-only 恢复；`memory-search-index` 每次推进一个有界索引批次；`history-retention` 只删除超龄且不再被引用的有界历史批次，apply 必须提交同一次预览返回的 `plan_as_of` 与完整 fingerprint；`change-set-compaction` 将旧 change-set 完整快照转换为受限 manifest 与内容寻址引用，apply 必须提交同一次预览的完整 fingerprint，后续批次只能使用上一次成功 apply 的 `result.safe_next_cursor` 作为 `--cursor`；`memory-cleanup`、`topology-queue-cleanup` 和 `orphan-source-classify` 均先返回候选或债务分类。
 
-`backup-retention` 预览返回 fingerprint；apply 必须复用相同的 `keep-latest`、`min-age-days`、`stage-ttl-hours` 参数并提交该 fingerprint。默认保留最新 5 份完整备份、30 天内的完整备份和最新一份经实际校验可恢复的 canonical/projection 快照；过期但校验通过的删除 tombstone 也可作为恢复保护点，私有 staging 与失败删除 tombstone 至少保留 24 小时。预检和执行前重扫会核验 artifact SHA-256、SQLite 结构与完整性、投影/数据库代次。
+`backup-retention` 预览返回 fingerprint；apply 必须复用相同的 `keep-latest`、`min-age-days`、`stage-ttl-hours` 参数并提交该 fingerprint。默认保留最新 5 份完整备份、30 天内的完整备份和最新一份经实际校验可恢复的 canonical/projection 快照；过期但校验通过的删除 tombstone 也可作为恢复保护点，私有 staging 与失败删除 tombstone 至少保留 24 小时。预检和执行前重扫会核验 artifact SHA-256、SQLite 结构与完整性、投影/数据库代次；新备份还会复制并验证 sidecar，旧版无 sidecar 的 v3 备份继续按内嵌 pair contract 兼容校验。
 
 ## Config
 
@@ -357,11 +400,14 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 - `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
 - `VECTOR_LAKE_QUERY_EMBEDDING_TIMEOUT_MS` / `VECTOR_LAKE_QUERY_EMBEDDING_MAX_WAIT_MS` / `VECTOR_LAKE_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS`：查询向量默认 `2000 ms` 请求超时、`250 ms` 配额等待、失败后 `30 s` 冷却。
 - `VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS`：源码 revision 检查周期，默认 `5` 秒；设为 `0` 时每次检查。
-- `VECTOR_LAKE_MCP_BLOCKING_WORKERS`：同步 MCP 工具 worker 数，默认 `4`，限制为 `1` 至 `8`。
+- `VECTOR_LAKE_MCP_BLOCKING_WORKERS`：同步 MCP 工具 worker 数，默认 `1`，限制为 `1` 至 `8`；需要更高吞吐时可显式上调，并同步评估重型查询的并发内存。
 - `VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY`：等待队列容量，默认等于 worker 数，限制为 `0` 至 `64`。
 - `VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS`：饱和 admission 等待，默认 `0.05` 秒，限制为 `0` 至 `5` 秒；超时返回“retry later”。
 - `VECTOR_LAKE_MCP_SHUTDOWN_TIMEOUT_SECONDS`：transport 结束后的排空等待，默认 `5` 秒，限制为 `0.1` 至 `30` 秒；超时取消未开始项，已运行 daemon worker 可能在后台完成。
-- `mcp_runtime_status` 返回源码 revision 以及 worker、队列、inflight 和 shutdown 状态；它是源码漂移后仍允许调用的诊断工具。
+- `VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS`：MCP 重任务等待共享跨进程门的时间，默认 `0.5` 秒，限制为 `0` 至 `5` 秒；超时返回结构化 `heavy_task_busy`。
+- `VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS`：CLI 重任务等待同一门的时间，默认 `30` 秒，限制为 `0` 至 `300` 秒；超时退出码为 `75`。
+- `VECTOR_LAKE_TOPOLOGY_WORKER_TIMEOUT_SECONDS`：Louvain 拓扑隔离进程超时，默认 `60` 秒，限制为 `5` 至 `300` 秒；失败时回退到确定性的 connected-components。
+- MCP、CLI 与 watchdog 以 canonical meta 根下的 `.heavy-task.lock` 共享单容量重任务门；同线程可重入，跨线程/进程互斥，soft deadline 只告警而不抢锁。`mcp_runtime_status` 返回源码 revision、worker/队列/inflight/shutdown 以及 heavy-task owner 状态；它是源码漂移后仍允许调用的诊断工具。
 - 所有进程通过 SQLite 滚动窗口共享 embedding RPM/TPM 预算；索引重建和增量索引不调用 embedding API。
 - Ingest 完成必须提交领取阶段返回的 `job_id`、`lease_owner`、`lease_token` 和 `lease_generation`；过期 worker 的结果会被事务内 CAS 拒绝。
 - Mutation outbox 同样使用 owner/token/generation fencing；较旧 intent 会被标记为 `superseded`，worker 写投影前再次校验租约。
@@ -394,6 +440,8 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |
 | `vector_lake/tool_review.py` | legacy/governance review surface |
 | `vector_lake/tool_doctor.py` | 只读基础设施体检与语义就绪度摘要 |
+| `vector_lake/tool_legacy_graph_audit.py` | 以 caller-owned 只读连接对账旧 Wiki 图与 canonical/page/claim 关系；只输出删除阻断证据，不提供删除入口 |
+| `vector_lake/tool_storage_baseline.py` | 以 caller-owned 只读事务建立 FTS5/vec0 重建基线；重建就绪必须同时核验 sidecar/index/claim-graph 原始字节、嵌入 manifest、expected corpus，并在扫描前后复核 live canonical generation |
 | `vector_lake/tool_governance_maintenance.py` | evidence foundation、history retention、memory index 与债务维护 |
 | `vector_lake/tool_backup_retention.py` | 指纹确认、恢复点保护与两阶段备份保留 |
 | `vector_lake/runtime_health.py` | 基础设施健康和语义就绪度的独立只读评估器 |
@@ -402,7 +450,7 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 | `vector_lake/claim_assessment.py` | 追加式 ClaimAssessment；不产生 AcceptedFact |
 | `vector_lake/decision_registry.py` | 同步外部已验证 CriticalDecisionRegistry 并支持决策范围就绪度 |
 | `vector_lake/quality_registry.py` | 登记不可变 schema/dialect 版本与 golden dataset 评估结果 |
-| `vector_lake/mcp_server.py` | 50-tool MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
+| `vector_lake/mcp_server.py` | 51-tool MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
 | `vector_lake/watchdog_app.py` | 增量监听后台服务，队列调度，定时自愈审计 (Scheduled Auto-Lint) |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |

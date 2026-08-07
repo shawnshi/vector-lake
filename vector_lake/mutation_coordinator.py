@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import unicodedata
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -293,17 +292,23 @@ def execute_mutation_batch(
     Schema mode is for bounded legacy maintenance.
     """
     from vector_lake.runtime_health import enforce_runtime_write_health
+    from vector_lake import governance_store
 
     enforce_runtime_write_health(validation_mode=validation_mode)
+    mutation_list = list(mutations)
+    if len(mutation_list) > governance_store._CHANGE_SET_MAX_BATCH_ITEMS:
+        raise governance_store.ChangeSetBatchTooLarge(
+            "Mutation batch item count exceeds hard limit: "
+            f"{len(mutation_list)} > "
+            f"{governance_store._CHANGE_SET_MAX_BATCH_ITEMS}"
+        )
     prepared = _prepare_mutations(
-        mutations,
+        mutation_list,
         validation_mode=validation_mode,
         schema_maintenance_filenames=schema_maintenance_filenames,
     )
     db_store.init_db()
     outbox_ids = []
-    from vector_lake import governance_store
-
     prepared_change_sets = []
     for mutation in prepared:
         if mutation["mutation_type"] != "update":
@@ -317,6 +322,7 @@ def execute_mutation_batch(
             summary=f"Canonical mutation for {filename}",
         )
         prepared_change_sets.append(change_set)
+    governance_store._validate_change_set_batch_limits(prepared_change_sets)
 
     with db_store.transaction():
         page_keys = {_markdown_page_key(mutation["filename"]) for mutation in prepared}
@@ -369,11 +375,7 @@ def execute_mutation_batch(
             if mutation["mutation_type"] == "delete":
                 node_key = _markdown_page_key(filename)
                 db_store.delete_node_cascade(node_key)
-        governance_store.apply_change_sets_batch(prepared_change_sets)
-        published_at = datetime.now(timezone.utc).isoformat()
-        for change_set in prepared_change_sets:
-            change_set["published_at"] = published_at
-        governance_store.record_prepared_change_sets(prepared_change_sets)
+        governance_store.apply_and_record_change_sets_batch(prepared_change_sets)
 
         for mutation in prepared:
             filename = mutation["filename"]

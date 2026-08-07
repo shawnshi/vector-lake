@@ -82,6 +82,43 @@ def test_reopening_existing_schema_v3_does_not_advance_generations(
     assert after == before
 
 
+def test_existing_database_identity_validation_runs_outside_write_transaction(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+    observed = []
+    real_registry = db_store._validate_canonical_identity_registry
+    real_coverage = db_store._validate_canonical_identity_coverage
+
+    def checked_registry(conn):
+        observed.append(("registry", conn.in_transaction))
+        return real_registry(conn)
+
+    def checked_coverage(conn):
+        observed.append(("coverage", conn.in_transaction))
+        return real_coverage(conn)
+
+    monkeypatch.setattr(
+        db_store,
+        "_validate_canonical_identity_registry",
+        checked_registry,
+    )
+    monkeypatch.setattr(
+        db_store,
+        "_validate_canonical_identity_coverage",
+        checked_coverage,
+    )
+
+    db_store.init_db()
+
+    assert observed == [("registry", False), ("coverage", False)]
+    assert str(path.resolve()) in db_store._INITIALIZED_DB_PATHS
+
+
 def test_runtime_schema_validation_cache_skips_rescan_and_invalidates_on_ddl(
     isolated_memory,
     monkeypatch,
@@ -633,6 +670,9 @@ def test_connection_reopens_when_database_path_changes(tmp_path, monkeypatch):
     second = tmp_path / "second.db"
     monkeypatch.setenv("VECTOR_LAKE_DB_PATH", str(first))
     first_connection = db_store.get_connection()
+    with pytest.raises(sqlite3.OperationalError, match="vec_version"):
+        first_connection.execute("SELECT vec_version()").fetchone()
+    assert db_store.get_vector_connection() is first_connection
     assert first_connection.execute("SELECT vec_version()").fetchone()[0]
     first_connection.execute("CREATE TABLE marker (value TEXT)")
     first_connection.commit()
@@ -647,6 +687,9 @@ def test_connection_reopens_when_database_path_changes(tmp_path, monkeypatch):
         ).fetchone()
         is None
     )
+    with pytest.raises(sqlite3.OperationalError, match="vec_version"):
+        second_connection.execute("SELECT vec_version()").fetchone()
+    assert db_store.get_vector_connection() is second_connection
     assert second_connection.execute("SELECT vec_version()").fetchone()[0]
 
 
@@ -745,6 +788,139 @@ def test_importing_db_store_does_not_eagerly_import_sqlite_vec():
     )
 
     assert probe.stdout.strip() == ""
+
+
+def test_existing_database_connection_loads_sqlite_vec_only_on_demand(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    db_store.close_all_connections()
+    calls = []
+    monkeypatch.setattr(
+        db_store,
+        "_load_sqlite_vec_extension",
+        lambda connection: calls.append(id(connection)),
+    )
+
+    ordinary = db_store.get_connection()
+
+    assert calls == []
+    vector = db_store.get_vector_connection()
+    assert vector is ordinary
+    assert calls == [id(ordinary)]
+
+
+def test_existing_database_init_does_not_require_vector_extension(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    path_key = str(db_store.get_db_path().resolve())
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(path_key)
+    monkeypatch.setattr(
+        db_store,
+        "_load_sqlite_vec_extension",
+        lambda _connection: (_ for _ in ()).throw(
+            AssertionError("existing vec0 schema must remain lazy")
+        ),
+    )
+
+    db_store.init_db()
+
+
+def test_vector_extension_load_is_serialized_per_tracked_connection(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    db_store.close_all_connections()
+    connection = db_store.get_connection()
+    real_path = db_store._sqlite_vec_loadable_path
+    calls = []
+    errors = []
+    ready = threading.Barrier(3)
+
+    def counted_path():
+        calls.append(id(connection))
+        return real_path()
+
+    def load_from_worker():
+        ready.wait()
+        try:
+            db_store._load_sqlite_vec_extension(connection)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(db_store, "_sqlite_vec_loadable_path", counted_path)
+    workers = [threading.Thread(target=load_from_worker) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    ready.wait()
+    for worker in workers:
+        worker.join()
+
+    assert errors == []
+    assert calls == [id(connection)]
+    assert connection.execute("SELECT vec_version()").fetchone()[0]
+
+
+def test_external_vector_connection_does_not_pollute_tracked_cache(monkeypatch):
+    connection = sqlite3.connect(":memory:")
+    real_path = db_store._sqlite_vec_loadable_path
+    calls = []
+
+    def counted_path():
+        calls.append(id(connection))
+        return real_path()
+
+    monkeypatch.setattr(db_store, "_sqlite_vec_loadable_path", counted_path)
+    try:
+        db_store._load_sqlite_vec_extension(connection)
+        db_store._load_sqlite_vec_extension(connection)
+        assert calls == [id(connection)]
+        assert id(connection) not in db_store._VECTOR_EXTENSION_CONNECTION_IDS
+        assert connection.execute("SELECT vec_version()").fetchone()[0]
+    finally:
+        connection.close()
+
+
+def test_loading_vector_extension_does_not_import_python_wrapper():
+    repository_root = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sqlite3,sys; "
+                "from vector_lake import db_store; "
+                "connection=sqlite3.connect(':memory:'); "
+                "db_store._load_sqlite_vec_extension(connection); "
+                "print(connection.execute('SELECT vec_version()').fetchone()[0]); "
+                "print(','.join(name for name in ('sqlite_vec', 'numpy') "
+                "if name in sys.modules)); "
+                "connection.close()"
+            ),
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    lines = probe.stdout.splitlines()
+    assert lines[0].startswith("v")
+    assert lines[1] == ""
+
+
+def test_external_vector_probe_preserves_unrelated_operational_errors():
+    class LockedConnection:
+        def execute(self, _statement):
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        db_store._load_sqlite_vec_extension(LockedConnection())
 
 
 def test_transaction_lock_wait_honors_max_wait(tmp_path, monkeypatch):

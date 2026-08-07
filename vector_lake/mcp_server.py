@@ -19,6 +19,44 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 
+_DEFAULT_BLOCKING_WORKERS = 1
+
+_MCP_HEAVY_TASKS = {
+    "backup_retention": ("maintenance", 900.0),
+    "batch_replace_links": ("maintenance", 900.0),
+    "bulk_reconciliation": ("maintenance", 1800.0),
+    "canonical_backfill": ("maintenance", 900.0),
+    "canonical_reconcile_content": ("maintenance", 1800.0),
+    "compact_change_set_history": ("maintenance", 1800.0),
+    "delete_source": ("maintenance", 900.0),
+    "doctor_vector_lake": ("scan", 900.0),
+    "embedding_backfill": ("embedding", 3600.0),
+    "evidence_foundation_backfill": ("maintenance", 1800.0),
+    "finalize_ingest": ("projection", 900.0),
+    "gc_vector_lake": ("maintenance", 1800.0),
+    "get_governance_debt": ("scan", 900.0),
+    "history_retention": ("maintenance", 1800.0),
+    "lint_vector_lake": ("scan", 1800.0),
+    "merge_suggestions_vector_lake": ("scan", 1800.0),
+    "operational_memory_cleanup": ("maintenance", 900.0),
+    "operational_memory_search_index": ("maintenance", 1800.0),
+    "orphan_source_classify": ("scan", 900.0),
+    "prepare_ingest_batch": ("ingest_scan", 1800.0),
+    "projection_rebuild_index": ("projection", 1800.0),
+    "projection_report": ("scan", 900.0),
+    "reconcile_ingest_tasks": ("maintenance", 1800.0),
+    "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
+    "rebuild_timeline_events": ("projection", 900.0),
+    "rename_entity": ("maintenance", 900.0),
+    "sync_vector_lake": ("ingest_scan", 1800.0),
+    "topology_queue_cleanup": ("maintenance", 900.0),
+    "trigger_audit_graph": ("scan", 1800.0),
+    "trigger_autonomous_research": ("ingest_scan", 1800.0),
+    "visualize_vector_lake": ("scan", 900.0),
+    "wiki_restore": ("maintenance", 900.0),
+}
+
+
 
 class _DaemonThreadPoolExecutor:
     """Small public-API executor whose running calls cannot hold process exit."""
@@ -273,9 +311,14 @@ class ReloadAwareFastMCP(FastMCP):
             Path(__file__).resolve().parent
         )
         try:
-            worker_count = int(os.environ.get("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "4"))
+            worker_count = int(
+                os.environ.get(
+                    "VECTOR_LAKE_MCP_BLOCKING_WORKERS",
+                    str(_DEFAULT_BLOCKING_WORKERS),
+                )
+            )
         except (TypeError, ValueError):
-            worker_count = 4
+            worker_count = _DEFAULT_BLOCKING_WORKERS
         worker_count = max(1, min(8, worker_count))
         try:
             queue_capacity = int(
@@ -302,10 +345,19 @@ class ReloadAwareFastMCP(FastMCP):
             shutdown_timeout = 5.0
         if not math.isfinite(shutdown_timeout):
             shutdown_timeout = 5.0
+        try:
+            heavy_task_wait = float(
+                os.environ.get("VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS", "0.5")
+            )
+        except (TypeError, ValueError):
+            heavy_task_wait = 0.5
+        if not math.isfinite(heavy_task_wait):
+            heavy_task_wait = 0.5
         self._blocking_worker_count = worker_count
         self._blocking_queue_capacity = queue_capacity
         self._blocking_admission_timeout = max(0.0, min(5.0, admission_timeout))
         self._blocking_shutdown_timeout = max(0.1, min(30.0, shutdown_timeout))
+        self._heavy_task_wait = max(0.0, min(5.0, heavy_task_wait))
         self._blocking_slots = threading.BoundedSemaphore(worker_count + queue_capacity)
         self._blocking_inflight = 0
         self._blocking_executor = _DaemonThreadPoolExecutor(
@@ -482,7 +534,20 @@ class ReloadAwareFastMCP(FastMCP):
                 def invoke_current_tool():
                     if fn.__name__ != "mcp_runtime_status":
                         self.runtime_guard.assert_current()
-                    return fn(*fn_args, **fn_kwargs)
+                    policy = _MCP_HEAVY_TASKS.get(fn.__name__)
+                    if policy is None:
+                        return fn(*fn_args, **fn_kwargs)
+                    from vector_lake.heavy_task_gate import heavy_task
+
+                    task_class, warn_after_seconds = policy
+                    with heavy_task(
+                        task_class,
+                        fn.__name__,
+                        origin="mcp",
+                        wait_timeout_seconds=self._heavy_task_wait,
+                        warn_after_seconds=warn_after_seconds,
+                    ):
+                        return fn(*fn_args, **fn_kwargs)
 
                 call = functools.partial(
                     self._invoke_blocking_tool,
@@ -522,6 +587,9 @@ def mcp_runtime_status() -> str:
     """Report whether this MCP process still matches the on-disk source tree."""
     status = mcp.runtime_guard.status(force=True)
     status["blocking_executor"] = mcp.blocking_executor_status()
+    from vector_lake.heavy_task_gate import heavy_task_gate_status
+
+    status["heavy_task_gate"] = heavy_task_gate_status()
     return json.dumps(
         status,
         ensure_ascii=False,
@@ -643,20 +711,50 @@ def history_retention(
     dry_run: bool = True,
     ttl_days: int = 30,
     batch_size: int = 500,
+    max_delete_bytes: int = 128 * 1024 * 1024,
     keep_change_sets: int = 1000,
     keep_terminal_jobs: int = 1000,
     keep_terminal_outbox: int = 1000,
     keep_versions_per_family: int = 2,
+    claim_version_cursor: str = "",
+    evidence_version_cursor: str = "",
+    version_cursor_receipt: str = "",
+    plan_as_of: str = "",
+    confirmation: str = "",
 ) -> str:
     """Preview or explicitly apply one bounded, reference-safe history batch."""
     return tools.history_retention_maintenance(
         dry_run=dry_run,
         ttl_days=ttl_days,
         batch_size=batch_size,
+        max_delete_bytes=max_delete_bytes,
         keep_change_sets=keep_change_sets,
         keep_terminal_jobs=keep_terminal_jobs,
         keep_terminal_outbox=keep_terminal_outbox,
         keep_versions_per_family=keep_versions_per_family,
+        claim_version_cursor=claim_version_cursor,
+        evidence_version_cursor=evidence_version_cursor,
+        version_cursor_receipt=version_cursor_receipt,
+        plan_as_of=plan_as_of,
+        confirmation=confirmation,
+    )
+
+
+@mcp.tool()
+def compact_change_set_history(
+    dry_run: bool = True,
+    max_rows: int = 100,
+    max_input_bytes: int = 64 * 1024 * 1024,
+    confirmation: str = "",
+    cursor: str = "",
+) -> str:
+    """Preview/apply one batch; resume with a successful result.safe_next_cursor."""
+    return tools.compact_change_set_history(
+        dry_run=dry_run,
+        max_rows=max_rows,
+        max_input_bytes=max_input_bytes,
+        confirmation=confirmation,
+        cursor=cursor,
     )
 
 @mcp.tool()

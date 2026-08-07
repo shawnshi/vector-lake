@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import math
 import os
 import sys
 
@@ -10,6 +11,68 @@ except ImportError:
     dotenv = None
 
 from vector_lake import tools
+
+
+_CLI_HEAVY_TASKS = {
+    "audit-graph": ("scan", 1800.0),
+    "backup-retention": ("maintenance", 900.0),
+    "canonical-backfill": ("maintenance", 900.0),
+    "change-set-compaction": ("maintenance", 1800.0),
+    "debt": ("scan", 900.0),
+    "delete": ("maintenance", 900.0),
+    "doctor": ("scan", 900.0),
+    "embedding-backfill": ("embedding", 3600.0),
+    "evidence-foundation-backfill": ("maintenance", 1800.0),
+    "gc": ("maintenance", 1800.0),
+    "graph": ("scan", 900.0),
+    "history-retention": ("maintenance", 1800.0),
+    "lint": ("scan", 1800.0),
+    "memory-cleanup": ("maintenance", 900.0),
+    "memory-search-index": ("maintenance", 1800.0),
+    "merge-suggestions": ("scan", 1800.0),
+    "orphan-source-classify": ("scan", 900.0),
+    "projection-rebuild-index": ("projection", 1800.0),
+    "projection-report": ("scan", 900.0),
+    "research": ("ingest_scan", 1800.0),
+    "schema-migrate": ("maintenance", 1800.0),
+    "sync": ("ingest_scan", 1800.0),
+    "timeline-rebuild": ("projection", 900.0),
+    "topology-queue-cleanup": ("maintenance", 900.0),
+    "wiki-restore": ("maintenance", 900.0),
+}
+
+
+def _cli_heavy_task_policy(args) -> tuple[str, float] | None:
+    if args.command == "ingest-tasks":
+        if any(
+            bool(getattr(args, field, False))
+            for field in (
+                "repair_debt",
+                "cleanup_orphans",
+                "expire_stale",
+            )
+        ):
+            return "maintenance", 900.0
+        return None
+    if args.command == "schema-migrate":
+        if not (
+            getattr(args, "apply", False)
+            or getattr(args, "checkpoint_wal", False)
+        ):
+            return None
+    return _CLI_HEAVY_TASKS.get(args.command)
+
+
+def _cli_heavy_task_wait_seconds() -> float:
+    try:
+        value = float(
+            os.environ.get("VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS", "30")
+        )
+    except (TypeError, ValueError):
+        value = 30.0
+    if not math.isfinite(value):
+        value = 30.0
+    return max(0.0, min(300.0, value))
 
 
 def _configure_stdout():
@@ -334,7 +397,13 @@ Usage Examples:
         "--batch-size",
         type=_positive_int,
         default=500,
-        help="Maximum rows selected per history table (max: 10000).",
+        help="Maximum rows selected globally (max: 500).",
+    )
+    history_retention_parser.add_argument(
+        "--max-delete-bytes",
+        type=_positive_int,
+        default=128 * 1024 * 1024,
+        help="Maximum logical bytes selected globally.",
     )
     history_retention_parser.add_argument(
         "--keep-change-sets",
@@ -359,6 +428,50 @@ Usage Examples:
         type=_positive_int,
         default=2,
         help="Always retain the newest versions in each claim/evidence family.",
+    )
+    history_retention_parser.add_argument(
+        "--claim-version-cursor",
+        default="",
+        help="Receipt-issued claim-version keyset cursor for the next batch.",
+    )
+    history_retention_parser.add_argument(
+        "--evidence-version-cursor",
+        default="",
+        help="Receipt-issued evidence-version keyset cursor for the next batch.",
+    )
+    history_retention_parser.add_argument(
+        "--version-cursor-receipt",
+        default="",
+        help="Fingerprint of the successful receipt that issued both cursors.",
+    )
+    history_retention_parser.add_argument(
+        "--plan-as-of",
+        default="",
+        help="Fixed timezone-aware preview instant required for apply.",
+    )
+    history_retention_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact sha256 fingerprint returned by the matching preview.",
+    )
+    change_set_compaction_parser = subparsers.add_parser(
+        "change-set-compaction",
+        help="[MAINTENANCE] Preview or apply bounded legacy change-set compaction.",
+    )
+    change_set_compaction_parser.add_argument("--apply", action="store_true")
+    change_set_compaction_parser.add_argument(
+        "--max-rows", type=_positive_int, default=100
+    )
+    change_set_compaction_parser.add_argument(
+        "--max-input-bytes", type=_positive_int, default=64 * 1024 * 1024
+    )
+    change_set_compaction_parser.add_argument(
+        "--cursor",
+        default="",
+        help="safe_next_cursor returned by the prior successful apply.",
+    )
+    change_set_compaction_parser.add_argument(
+        "--confirm-fingerprint", default=""
     )
     backup_retention_parser = subparsers.add_parser(
         "backup-retention",
@@ -391,6 +504,31 @@ Usage Examples:
         "--confirm-fingerprint",
         default="",
         help="Exact fingerprint from a current preview; required with --apply.",
+    )
+    schema_migrate_parser = subparsers.add_parser(
+        "schema-migrate",
+        help="[MAINTENANCE] Preview or apply the controlled SQLite v4/v5 to v6 migration.",
+    )
+    schema_migrate_action = schema_migrate_parser.add_mutually_exclusive_group()
+    schema_migrate_action.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the exact previewed plan. Defaults to a physically read-only preview.",
+    )
+    schema_migrate_action.add_argument(
+        "--checkpoint-wal",
+        action="store_true",
+        help="Checkpoint and truncate the exact previewed WAL without running migration DDL.",
+    )
+    schema_migrate_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact sha256 fingerprint returned by the matching preview.",
+    )
+    schema_migrate_parser.add_argument(
+        "--confirm-no-writers",
+        action="store_true",
+        help="Assert that MCP, watchdog, and every other database writer are stopped.",
     )
     topology_cleanup_parser = subparsers.add_parser(
         "topology-queue-cleanup",
@@ -569,7 +707,24 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    lease = None
+    lease_entered = False
+    lease_failure = None
     try:
+        policy = _cli_heavy_task_policy(args)
+        if policy is not None:
+            from vector_lake.heavy_task_gate import heavy_task
+
+            task_class, warn_after_seconds = policy
+            lease = heavy_task(
+                task_class,
+                args.command,
+                origin="cli",
+                wait_timeout_seconds=_cli_heavy_task_wait_seconds(),
+                warn_after_seconds=warn_after_seconds,
+            )
+            lease.__enter__()
+            lease_entered = True
         if args.command == "sync":
             print(tools.sync_vector_lake())
         elif args.command == "ingest-tasks":
@@ -693,12 +848,38 @@ def main() -> int:
                     dry_run=not getattr(args, "apply", False),
                     ttl_days=getattr(args, "ttl_days", 30),
                     batch_size=getattr(args, "batch_size", 500),
+                    max_delete_bytes=getattr(
+                        args, "max_delete_bytes", 128 * 1024 * 1024
+                    ),
                     keep_change_sets=getattr(args, "keep_change_sets", 1000),
                     keep_terminal_jobs=getattr(args, "keep_terminal_jobs", 1000),
                     keep_terminal_outbox=getattr(args, "keep_terminal_outbox", 1000),
                     keep_versions_per_family=getattr(
                         args, "keep_versions_per_family", 2
                     ),
+                    claim_version_cursor=getattr(
+                        args, "claim_version_cursor", ""
+                    ),
+                    evidence_version_cursor=getattr(
+                        args, "evidence_version_cursor", ""
+                    ),
+                    version_cursor_receipt=getattr(
+                        args, "version_cursor_receipt", ""
+                    ),
+                    plan_as_of=getattr(args, "plan_as_of", ""),
+                    confirmation=getattr(args, "confirm_fingerprint", ""),
+                )
+            )
+        elif args.command == "change-set-compaction":
+            print(
+                tools.compact_change_set_history(
+                    dry_run=not getattr(args, "apply", False),
+                    max_rows=getattr(args, "max_rows", 100),
+                    max_input_bytes=getattr(
+                        args, "max_input_bytes", 64 * 1024 * 1024
+                    ),
+                    cursor=getattr(args, "cursor", ""),
+                    confirmation=getattr(args, "confirm_fingerprint", ""),
                 )
             )
         elif args.command == "backup-retention":
@@ -709,6 +890,24 @@ def main() -> int:
                     min_age_days=getattr(args, "min_age_days", 30),
                     stage_ttl_hours=getattr(args, "stage_ttl_hours", 24),
                     confirmation=getattr(args, "confirm_fingerprint", ""),
+                )
+            )
+        elif args.command == "schema-migrate":
+            from vector_lake import db_store
+
+            print(
+                json.dumps(
+                    db_store.schema_migration_maintenance(
+                        apply=getattr(args, "apply", False),
+                        checkpoint_wal=getattr(args, "checkpoint_wal", False),
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
+                        confirm_no_writers=getattr(
+                            args, "confirm_no_writers", False
+                        ),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
                 )
             )
         elif args.command == "topology-queue-cleanup":
@@ -782,6 +981,26 @@ def main() -> int:
                 gc_kwargs["orphan_confirmation"] = orphan_confirmation
             print(tools.gc_vector_lake(**gc_kwargs))
     except Exception as exc:
+        lease_failure = exc
+        from vector_lake.heavy_task_gate import HeavyTaskBusy
+
+        if isinstance(exc, HeavyTaskBusy):
+            print(
+                json.dumps(exc.to_dict(), ensure_ascii=False, sort_keys=True),
+                file=sys.stderr,
+            )
+            return 75
         print(f"Error executing command '{args.command}': {exc}", file=sys.stderr)
         return 1
+    finally:
+        if lease_entered and lease is not None:
+            lease.__exit__(
+                type(lease_failure) if lease_failure is not None else None,
+                lease_failure,
+                (
+                    lease_failure.__traceback__
+                    if lease_failure is not None
+                    else None
+                ),
+            )
     return 0

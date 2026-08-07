@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import pytest
+from filelock import FileLock, Timeout
 
 from vector_lake import db_store, governance_store
 from vector_lake.tool_governance_maintenance import history_retention_maintenance
@@ -207,6 +208,58 @@ def _downgrade_cleanup_contract(path, version: int) -> None:
     db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
 
 
+def _create_v5_duplicate_indexes(
+    conn: sqlite3.Connection,
+    *,
+    wrong_index: str | None = None,
+) -> None:
+    date_column = "sentiment" if wrong_index == "idx_date" else "event_date"
+    entity_column = "sentiment" if wrong_index == "idx_entity" else "entity_id"
+    conn.execute(f"CREATE INDEX idx_date ON timeline_events({date_column})")
+    conn.execute(f"CREATE INDEX idx_entity ON timeline_events({entity_column})")
+
+
+def _create_deferred_external_consumer_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE wiki_embeddings ("
+        "node_key TEXT PRIMARY KEY, embedding_json TEXT, updated_at TEXT, "
+        "content_hash TEXT, model TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE embedding_jobs ("
+        "node_key TEXT, job_id TEXT, content_hash TEXT, model TEXT, "
+        "text_version TEXT, estimated_tokens INTEGER, state TEXT, "
+        "attempts INTEGER, force_single INTEGER, next_attempt_at REAL, "
+        "lease_owner TEXT, lease_until REAL, last_http_status INTEGER, "
+        "last_error_class TEXT, last_error TEXT, created_at REAL, updated_at REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE embedding_rate_events ("
+        "request_id TEXT, reserved_at REAL, token_count INTEGER, "
+        "item_count INTEGER, outcome TEXT, http_status INTEGER, completed_at REAL)"
+    )
+    conn.execute("INSERT INTO wiki_embeddings (node_key) VALUES ('legacy-embedding')")
+    conn.execute("INSERT INTO embedding_jobs (node_key) VALUES ('legacy-job')")
+    conn.execute(
+        "INSERT INTO embedding_rate_events (request_id) VALUES ('legacy-request')"
+    )
+
+
+def _downgrade_duplicate_indexes_to_v4(
+    path,
+    *,
+    wrong_index: str | None = None,
+) -> None:
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        _create_v5_duplicate_indexes(conn, wrong_index=wrong_index)
+        _create_deferred_external_consumer_tables(conn)
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 5")
+        conn.execute("PRAGMA user_version = 4")
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+
 def _downgrade_identity_registry_to_v1(path) -> None:
     conn = db_store.get_connection()
     with db_store.transaction():
@@ -223,6 +276,44 @@ def _downgrade_identity_registry_to_v1(path) -> None:
         conn.execute("PRAGMA user_version = 1")
     db_store.close_all_connections()
     db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+
+def _run_controlled_existing_schema_migration(path) -> None:
+    maintenance_lock = FileLock(
+        str(path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME),
+        timeout=0,
+    )
+    connection = db_store.get_connection()
+    with maintenance_lock:
+        with db_store._controlled_schema_v5_transaction(
+            connection,
+            maintenance_lock,
+        ):
+            current_version = db_store._validate_schema_migration_state(connection)
+            if current_version < 2:
+                db_store._migrate_canonical_identity_schema_v2(connection)
+            if current_version < 3:
+                db_store._migrate_runtime_generation_schema_v3(connection)
+            if current_version < 4:
+                db_store._migrate_ingest_task_cleanup_schema_v4(connection)
+            if current_version < 4:
+                applied_at = datetime.now(timezone.utc).isoformat()
+                for version in range(current_version + 1, 5):
+                    name, checksum = db_store._SCHEMA_MIGRATIONS[version]
+                    connection.execute(
+                        "INSERT INTO schema_migrations "
+                        "(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+                        (version, name, checksum, applied_at),
+                    )
+                connection.execute("PRAGMA user_version = 4")
+            db_store._apply_controlled_schema_v5_migration(
+                connection,
+                maintenance_lock=maintenance_lock,
+            )
+            db_store._apply_controlled_schema_v6_migration(
+                connection,
+                maintenance_lock=maintenance_lock,
+            )
 
 
 def test_schema_v2_checksum_is_derived_from_normalized_ddl_contract():
@@ -265,6 +356,32 @@ def test_schema_v4_checksum_is_derived_from_cleanup_contract():
         contract[0].replace("lease_token TEXT", "lease_token BLOB"),
         contract[1],
     )
+    assert db_store._schema_contract_checksum(changed_contract) != checksum
+
+
+def test_schema_v5_checksum_is_derived_from_duplicate_index_absence_contract():
+    contract = db_store._DUPLICATE_INDEX_CLEANUP_SCHEMA_V5
+    checksum = db_store._SCHEMA_MIGRATIONS[5][1]
+
+    assert checksum == db_store._schema_contract_checksum(contract)
+    changed_contract = (
+        contract[0].replace("ABSENT INDEX", "PRESENT INDEX"),
+        *contract[1:],
+    )
+    assert db_store._schema_contract_checksum(changed_contract) != checksum
+
+
+def test_schema_v6_checksum_covers_terminal_status_immutability():
+    contract = db_store._CHANGE_SET_HISTORY_SCHEMA_V6
+    checksum = db_store._SCHEMA_MIGRATIONS[6][1]
+
+    assert checksum == db_store._schema_contract_checksum(contract)
+    weakened_trigger = contract[5].replace(
+        "WHEN OLD.status IN (",
+        "WHEN OLD.terminal_at IS NOT NULL AND OLD.status IN (",
+    )
+    assert weakened_trigger != contract[5]
+    changed_contract = (*contract[:5], weakened_trigger, *contract[6:])
     assert db_store._schema_contract_checksum(changed_contract) != checksum
 
 
@@ -341,7 +458,7 @@ def test_schema_ledger_is_durable_and_read_only_inspection_is_current(isolated_m
 
     assert state["ready"] is True
     assert state["status"] == "ready"
-    assert state["user_version"] == db_store._SCHEMA_VERSION == 4
+    assert state["user_version"] == db_store._SCHEMA_VERSION == 6
     expected_versions = list(range(1, db_store._SCHEMA_VERSION + 1))
     assert [item["version"] for item in state["ledger"]] == expected_versions
     assert [item["name"] for item in state["ledger"]] == [
@@ -423,12 +540,12 @@ def test_existing_schema_v2_migrates_runtime_generation_triggers_atomically(
     assert before["user_version"] == 2
     assert before["status"] == "invalid"
 
-    db_store.init_db()
+    _run_controlled_existing_schema_migration(path)
     state = db_store.inspect_schema_migration_state(path)
 
     assert state["ready"] is True
-    assert state["user_version"] == 4
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4]
+    assert state["user_version"] == 6
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6]
 
 
 def test_schema_v3_trigger_migration_failure_rolls_back_ledger_and_ddl(
@@ -446,7 +563,7 @@ def test_schema_v3_trigger_migration_failure_rolls_back_ledger_and_ddl(
     )
 
     with pytest.raises(sqlite3.OperationalError):
-        db_store.init_db()
+        _run_controlled_existing_schema_migration(path)
     db_store.close_all_connections()
 
     raw = sqlite3.connect(path)
@@ -483,15 +600,15 @@ def test_incomplete_cleanup_table_migrates_to_schema_v4(
     )
     assert before["ready"] is False
 
-    db_store.init_db()
+    _run_controlled_existing_schema_migration(path)
     state = db_store.inspect_schema_migration_state(path)
     row = db_store.get_connection().execute(
         "SELECT * FROM ingest_task_cleanup WHERE job_id = 'job-legacy-cleanup'"
     ).fetchone()
 
     assert state["ready"] is True
-    assert state["user_version"] == 4
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4]
+    assert state["user_version"] == 6
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6]
     assert db_store._ingest_task_cleanup_schema_issues(
         db_store.get_connection()
     ) == []
@@ -630,7 +747,7 @@ def test_schema_v4_migration_failure_rolls_back_columns_indexes_and_ledger(
     )
 
     with pytest.raises(sqlite3.OperationalError):
-        db_store.init_db()
+        _run_controlled_existing_schema_migration(path)
     db_store.close_all_connections()
 
     raw = sqlite3.connect(path)
@@ -657,6 +774,451 @@ def test_schema_v4_migration_failure_rolls_back_columns_indexes_and_ledger(
     ]
     assert columns == ["cleanup_id", "job_id", "task_packet_path"]
     assert indexes == []
+
+
+def _v5_duplicate_index_names(conn: sqlite3.Connection) -> set[str]:
+    names = set()
+    for index_name in db_store._DUPLICATE_INDEXES_V5:
+        names.update(
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name = ? COLLATE NOCASE",
+                (index_name,),
+            ).fetchall()
+        )
+    return names
+
+
+def _deferred_external_consumer_table_names(conn: sqlite3.Connection) -> set[str]:
+    table_names = db_store._DEFERRED_EXTERNAL_CONSUMER_TABLES_V5
+    placeholders = ", ".join("?" for _ in table_names)
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            f"AND name IN ({placeholders})",
+            tuple(sorted(table_names)),
+        ).fetchall()
+    }
+
+
+def test_existing_schema_v4_removes_duplicate_indexes_but_preserves_deferred_tables(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Database schema upgrade required: 4->6",
+    ):
+        db_store.init_db()
+    blocked = db_store.get_connection()
+    assert int(blocked.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(blocked) == set(db_store._DUPLICATE_INDEXES_V5)
+    held_lock = FileLock(
+        str(path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME),
+        timeout=0,
+    )
+    with held_lock:
+        with pytest.raises(
+            RuntimeError,
+            match="Database schema upgrade required: 4->6",
+        ):
+            db_store._init_db_once(str(path.resolve()))
+
+    _run_controlled_existing_schema_migration(path)
+    conn = db_store.get_connection()
+    state = db_store.inspect_schema_migration_connection(conn, path)
+
+    assert state["ready"] is True
+    assert state["user_version"] == 6
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6]
+    assert _v5_duplicate_index_names(conn) == set()
+    assert _deferred_external_consumer_table_names(conn) == set(
+        db_store._DEFERRED_EXTERNAL_CONSUMER_TABLES_V5
+    )
+    assert (
+        conn.execute("SELECT node_key FROM wiki_embeddings").fetchone()[0]
+        == "legacy-embedding"
+    )
+    assert (
+        conn.execute("SELECT node_key FROM embedding_jobs").fetchone()[0]
+        == "legacy-job"
+    )
+    assert (
+        conn.execute("SELECT request_id FROM embedding_rate_events").fetchone()[0]
+        == "legacy-request"
+    )
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    date_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT event_date FROM timeline_events "
+            "ORDER BY event_date DESC LIMIT 10"
+        ).fetchall()
+    )
+    entity_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT event_date FROM timeline_events "
+            "WHERE entity_id = 'Entity_Test'"
+        ).fetchall()
+    )
+    assert "idx_timeline_date" in date_plan
+    assert "idx_timeline_entity" in entity_plan
+
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+    db_store.init_db()
+    conn = db_store.get_connection()
+    assert _v5_duplicate_index_names(conn) == set()
+    assert _deferred_external_consumer_table_names(conn) == set(
+        db_store._DEFERRED_EXTERNAL_CONSUMER_TABLES_V5
+    )
+
+
+def test_cached_init_refuses_a_database_downgraded_to_v4(isolated_memory):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    connection = db_store.get_connection()
+    with db_store.transaction():
+        _create_v5_duplicate_indexes(connection)
+        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+        connection.execute("PRAGMA user_version = 4")
+
+    assert str(path.resolve()) in db_store._INITIALIZED_DB_PATHS
+    with pytest.raises(
+        RuntimeError,
+        match="Database schema upgrade required: 4->6",
+    ):
+        db_store.init_db()
+
+    assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(connection) == set(
+        db_store._DUPLICATE_INDEXES_V5
+    )
+
+
+def test_cached_init_holds_schema_migration_guard_through_validation(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    lock_path = path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME
+    original = db_store._validate_cached_identity_state
+    observations = []
+
+    def validate_while_guarded(connection):
+        with pytest.raises(Timeout):
+            with FileLock(str(lock_path), timeout=0):
+                pass
+        observations.append("guarded")
+        return original(connection)
+
+    monkeypatch.setattr(
+        db_store,
+        "_validate_cached_identity_state",
+        validate_while_guarded,
+    )
+
+    db_store.init_db()
+
+    assert observations == ["guarded"]
+
+
+def test_controlled_schema_v5_entry_requires_caller_owned_transaction(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+    conn = db_store.get_connection()
+    maintenance_lock = FileLock(
+        str(path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME),
+        timeout=0,
+    )
+
+    with maintenance_lock:
+        with pytest.raises(RuntimeError, match="requires an active caller transaction"):
+            db_store._apply_controlled_schema_v5_migration(
+                conn,
+                maintenance_lock=maintenance_lock,
+            )
+
+        with db_store._controlled_schema_v5_transaction(conn, maintenance_lock):
+            outsider = sqlite3.connect(path, timeout=0)
+            try:
+                outsider.execute("PRAGMA busy_timeout=0")
+                with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                    outsider.execute("CREATE TABLE writer_must_be_blocked (id INTEGER)")
+            finally:
+                outsider.close()
+            db_store._apply_controlled_schema_v5_migration(
+                conn,
+                maintenance_lock=maintenance_lock,
+            )
+
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 5
+    assert _v5_duplicate_index_names(conn) == set()
+
+
+def test_controlled_schema_v5_entry_rejects_a_forged_lock(isolated_memory):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+    conn = db_store.get_connection()
+
+    class ForgedLock:
+        is_locked = True
+        lock_file = str(path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME)
+
+    with db_store.transaction():
+        with pytest.raises(RuntimeError, match="migration lock is not held"):
+            db_store._apply_controlled_schema_v5_migration(
+                conn,
+                maintenance_lock=ForgedLock(),
+            )
+
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(conn) == set(
+        db_store._DUPLICATE_INDEXES_V5
+    )
+
+
+def test_controlled_schema_v5_entry_rejects_a_generic_transaction(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+    conn = db_store.get_connection()
+    maintenance_lock = FileLock(
+        str(path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME),
+        timeout=0,
+    )
+
+    with maintenance_lock:
+        with db_store.transaction():
+            with pytest.raises(RuntimeError, match="lock-bound transaction"):
+                db_store._apply_controlled_schema_v5_migration(
+                    conn,
+                    maintenance_lock=maintenance_lock,
+                )
+
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(conn) == set(
+        db_store._DUPLICATE_INDEXES_V5
+    )
+
+
+def test_controlled_schema_v5_transaction_rolls_back_if_lock_released_before_commit(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+    conn = db_store.get_connection()
+    maintenance_lock = FileLock(
+        str(path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME),
+        timeout=0,
+    )
+    maintenance_lock.acquire()
+
+    with pytest.raises(RuntimeError, match="migration lock is not held"):
+        with db_store._controlled_schema_v5_transaction(conn, maintenance_lock):
+            db_store._apply_controlled_schema_v5_migration(
+                conn,
+                maintenance_lock=maintenance_lock,
+            )
+            maintenance_lock.release()
+
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(conn) == set(
+        db_store._DUPLICATE_INDEXES_V5
+    )
+
+
+@pytest.mark.parametrize("wrong_index", ["idx_date", "idx_entity"])
+def test_schema_v5_migration_refuses_unexpected_duplicate_index_shape_atomically(
+    isolated_memory,
+    wrong_index,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path, wrong_index=wrong_index)
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"duplicate_index_migration_shape_mismatch:index:{wrong_index}",
+    ):
+        _run_controlled_existing_schema_migration(path)
+
+    conn = db_store.get_connection()
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(conn) == set(db_store._DUPLICATE_INDEXES_V5)
+    assert _deferred_external_consumer_table_names(conn) == set(
+        db_store._DEFERRED_EXTERNAL_CONSUMER_TABLES_V5
+    )
+
+
+def test_schema_v5_preflight_rejects_case_variant_with_wrong_shape_atomically(
+    isolated_memory,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute('DROP INDEX "idx_date"')
+        conn.execute('CREATE INDEX "IDX_DATE" ON timeline_events(sentiment)')
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(
+        RuntimeError,
+        match="duplicate_index_migration_shape_mismatch:index:idx_date",
+    ):
+        _run_controlled_existing_schema_migration(path)
+
+    conn = db_store.get_connection()
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(conn) == {"IDX_DATE", "idx_entity"}
+
+
+def test_schema_v5_post_drop_failure_rolls_back_indexes_ledger_and_external_rows(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+    original = db_store._duplicate_index_cleanup_v5_issues
+
+    def fail_after_drop(conn):
+        if not _v5_duplicate_index_names(conn):
+            return ["injected_post_drop_failure"]
+        return original(conn)
+
+    monkeypatch.setattr(db_store, "_duplicate_index_cleanup_v5_issues", fail_after_drop)
+
+    with pytest.raises(RuntimeError, match="injected_post_drop_failure"):
+        _run_controlled_existing_schema_migration(path)
+
+    conn = db_store.get_connection()
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(conn) == set(db_store._DUPLICATE_INDEXES_V5)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = 5"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT node_key FROM wiki_embeddings"
+    ).fetchone()[0] == "legacy-embedding"
+    assert conn.execute("SELECT node_key FROM embedding_jobs").fetchone()[0] == "legacy-job"
+    assert conn.execute(
+        "SELECT request_id FROM embedding_rate_events"
+    ).fetchone()[0] == "legacy-request"
+
+
+@pytest.mark.parametrize(
+    ("replacement_index", "wrong_column"),
+    [
+        ("idx_timeline_date", "sentiment"),
+        ("idx_timeline_entity", "action"),
+    ],
+)
+def test_schema_v5_migration_refuses_invalid_replacement_index_atomically(
+    isolated_memory,
+    replacement_index,
+    wrong_column,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    _downgrade_duplicate_indexes_to_v4(path)
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(f'DROP INDEX "{replacement_index}"')
+        conn.execute(
+            f'CREATE INDEX "{replacement_index}" '
+            f'ON timeline_events("{wrong_column}")'
+        )
+    db_store.close_all_connections()
+    db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "duplicate_index_migration_replacement_invalid:index:"
+            + replacement_index
+        ),
+    ):
+        _run_controlled_existing_schema_migration(path)
+
+    conn = db_store.get_connection()
+    assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+    assert _v5_duplicate_index_names(conn) == set(db_store._DUPLICATE_INDEXES_V5)
+
+
+def test_schema_v5_allows_deferred_external_consumer_tables(isolated_memory):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    with db_store.transaction() as conn:
+        _create_deferred_external_consumer_tables(conn)
+
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is True
+    assert state["issues"] == []
+    db_store.init_db()
+    assert _deferred_external_consumer_table_names(db_store.get_connection()) == set(
+        db_store._DEFERRED_EXTERNAL_CONSUMER_TABLES_V5
+    )
+
+
+@pytest.mark.parametrize(
+    ("object_name", "create_sql", "issue"),
+    [
+        (
+            "idx_date",
+            "CREATE INDEX idx_date ON timeline_events(event_date)",
+            "duplicate_index_schema_unexpected:index:idx_date",
+        ),
+        (
+            "idx_entity",
+            "CREATE INDEX idx_entity ON timeline_events(entity_id)",
+            "duplicate_index_schema_unexpected:index:idx_entity",
+        ),
+        (
+            "IDX_DATE",
+            "CREATE INDEX IDX_DATE ON timeline_events(event_date)",
+            "duplicate_index_schema_unexpected:index:IDX_DATE",
+        ),
+    ],
+)
+def test_schema_inspection_and_init_reject_reintroduced_v5_duplicate_index(
+    isolated_memory,
+    object_name,
+    create_sql,
+    issue,
+):
+    db_store.init_db()
+    path = db_store.get_db_path()
+    with db_store.transaction() as conn:
+        conn.execute(create_sql)
+
+    state = db_store.inspect_schema_migration_state(path)
+
+    assert state["ready"] is False
+    assert issue in state["issues"]
+    with pytest.raises(
+        RuntimeError,
+        match=rf"duplicate index cleanup contract is invalid.*{object_name}",
+    ):
+        db_store.init_db()
 
 
 def test_first_cleanup_enqueue_claim_and_complete_succeeds(isolated_memory):
@@ -727,7 +1289,7 @@ def test_schema_v2_backfills_current_and_version_identity_owners(isolated_memory
         )
     _downgrade_identity_registry_to_v1(path)
 
-    db_store.init_db()
+    _run_controlled_existing_schema_migration(path)
     rows = (
         db_store.get_connection()
         .execute(
@@ -768,7 +1330,7 @@ def test_schema_v2_backfills_current_only_or_version_only_identity(
             conn.execute("DELETE FROM claims WHERE claim_id = 'claim-one-surface'")
     _downgrade_identity_registry_to_v1(path)
 
-    db_store.init_db()
+    _run_controlled_existing_schema_migration(path)
     owner = (
         db_store.get_connection()
         .execute(
@@ -918,7 +1480,7 @@ def test_schema_v2_backfill_fails_closed_and_rolls_back(
     _downgrade_identity_registry_to_v1(path)
 
     with pytest.raises(RuntimeError, match=message):
-        db_store.init_db()
+        _run_controlled_existing_schema_migration(path)
     db_store.close_all_connections()
 
     raw = sqlite3.connect(path)
@@ -952,6 +1514,23 @@ def test_read_only_schema_inspection_and_retention_preview_do_not_create_databas
     assert preview["dry_run"] is True
     assert preview["applied"] is False
     assert preview["preview_error"] == "schema_not_ready:missing"
+    assert not path.exists()
+
+
+def test_init_refuses_active_schema_migration_window_without_creating_database(
+    isolated_memory,
+):
+    path = db_store.peek_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.parent / db_store._SCHEMA_MIGRATION_LOCK_FILENAME
+
+    with FileLock(str(lock_path), timeout=0):
+        with pytest.raises(
+            RuntimeError,
+            match="schema migration maintenance window is active",
+        ):
+            db_store.init_db()
+
     assert not path.exists()
 
 
@@ -1039,10 +1618,24 @@ def test_history_retention_preview_and_apply_are_bounded_and_reference_safe(
         for change_set_id, body in change_sets.items():
             body = {"change_set_id": change_set_id, **body}
             at = recent if change_set_id == "cs-terminal-keep" else OLD
+            raw_body = json.dumps(body)
             conn.execute(
                 "INSERT INTO change_sets (change_set_id, data_json, updated_at) "
                 "VALUES (?, ?, ?)",
-                (change_set_id, json.dumps(body), at),
+                (change_set_id, raw_body, at),
+            )
+            status = body["status"]
+            conn.execute(
+                "INSERT INTO change_set_lifecycle_v6 "
+                "(change_set_id, status, created_at, terminal_at, time_source, "
+                "payload_guard_sha256) VALUES (?, ?, ?, ?, 'test_seed', ?)",
+                (
+                    change_set_id,
+                    status,
+                    at,
+                    at if status == "published" else None,
+                    hashlib.sha256(raw_body.encode("utf-8")).hexdigest(),
+                ),
             )
             conn.execute(
                 "INSERT INTO change_set_idempotency "
@@ -1199,10 +1792,39 @@ def test_history_retention_preview_and_apply_are_bounded_and_reference_safe(
         for table in counts_before
     }
 
-    applied = json.loads(history_retention_maintenance(dry_run=False, **options))
+    applied = json.loads(
+        history_retention_maintenance(
+            dry_run=False,
+            plan_as_of=preview["plan_as_of"],
+            confirmation=preview["fingerprint"],
+            **options,
+        )
+    )
+
+    replayed = json.loads(
+        history_retention_maintenance(
+            dry_run=False,
+            plan_as_of=preview["plan_as_of"],
+            confirmation=preview["fingerprint"],
+            **options,
+        )
+    )
+    with pytest.raises(RuntimeError, match="receipt options do not match"):
+        history_retention_maintenance(
+            dry_run=False,
+            plan_as_of=preview["plan_as_of"],
+            confirmation=preview["fingerprint"],
+            **{**options, "batch_size": options["batch_size"] - 1},
+        )
 
     assert applied["applied"] is True
-    assert applied["deleted_counts"] == preview["selected_counts"]
+    assert replayed["replayed_receipt"] is True
+    assert {
+        key: value
+        for key, value in applied["deleted_counts"].items()
+        if key != "change_set_payloads"
+    } == preview["selected_counts"]
+    assert applied["deleted_counts"]["change_set_payloads"] == 0
     assert not _exists(conn, "change_sets", "change_set_id", "cs-terminal-old")
     assert _exists(conn, "change_sets", "change_set_id", "cs-terminal-keep")
     assert _exists(conn, "change_sets", "change_set_id", "cs-referenced-old")

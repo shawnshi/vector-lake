@@ -1,3 +1,5 @@
+import pytest
+
 from vector_lake import db_store, governance_store
 from vector_lake.governance_metrics import (
     claim_governance_version,
@@ -73,6 +75,90 @@ def test_debt_metrics_stream_rows_without_full_store_loads(isolated_memory, monk
     assert metrics["managed_unsupported_claim_count"] == 0
     assert metrics["unmanaged_unsupported_claim_count"] == 1
     assert metrics["validity_state_counts"]["unsupported"] == 1
+
+
+def test_debt_metrics_read_only_bypasses_schema_initializer(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    db_store.close_all_connections()
+    monkeypatch.setattr(
+        governance_store,
+        "initialize_meta_store",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("read-only metrics initialized the database")
+        ),
+    )
+
+    metrics = compute_debt_metrics(skip_heavy=True, read_only=True)
+
+    assert metrics["unsupported_claim_count"] == 0
+
+
+def test_debt_metrics_read_only_returns_zero_shape_without_creating_database(
+    isolated_memory,
+    monkeypatch,
+):
+    database_path = db_store.peek_db_path()
+    assert not database_path.exists()
+    monkeypatch.setattr(
+        governance_store,
+        "initialize_meta_store",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("read-only metrics initialized the database")
+        ),
+    )
+
+    metrics = compute_debt_metrics(skip_heavy=True, read_only=True)
+
+    assert metrics["unsupported_claim_count"] == 0
+    assert metrics["pending_change_set_count"] == 0
+    assert metrics["memory_type_counts"] == {}
+    assert metrics["validity_state_counts"] == {}
+    assert not database_path.exists()
+
+
+def test_debt_metrics_read_only_rejects_mutation_capable_heavy_paths(
+    isolated_memory,
+):
+    db_store.init_db()
+
+    with pytest.raises(ValueError, match="require skip_heavy=True"):
+        compute_debt_metrics(read_only=True)
+
+
+def test_debt_metrics_do_not_transfer_full_claim_or_evidence_payloads(
+    isolated_memory,
+):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_scalar_metrics",
+        "claim_text": "Scalar governance metric",
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+        "subject_entity_ids": [],
+    }
+    _publish_claim(claim, "Concept_Scalar-Metrics")
+    conn = db_store.get_connection()
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        compute_debt_metrics(skip_heavy=True)
+    finally:
+        conn.set_trace_callback(None)
+
+    normalized = [" ".join(statement.casefold().split()) for statement in statements]
+    assert not any(
+        statement.startswith("select data_json from claims")
+        for statement in normalized
+    )
+    assert not any(
+        statement.startswith("select data_json from evidence")
+        for statement in normalized
+    )
 
 
 def test_acknowledged_evidence_gap_is_managed_debt(isolated_memory):

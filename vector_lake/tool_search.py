@@ -16,10 +16,9 @@ from xml.sax.saxutils import escape, quoteattr
 from vector_lake import governance_store
 from vector_lake.index_snapshot import (
     CompactGraphAdjacency,
-    get_cached_index_snapshot,
     get_compact_graph_adjacency,
-    load_index_snapshot,
 )
+from vector_lake.indexer import read_committed_index_snapshot
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 
@@ -177,10 +176,12 @@ _VECTOR_CACHE = {
 
 def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> dict[str, float]:
     try:
-        from vector_lake.db_store import get_connection
-        import sqlite_vec
-        conn = get_connection()
-        query_blob = sqlite_vec.serialize_float32(query_vector)
+        from vector_lake.db_store import (
+            get_vector_connection,
+            serialize_float32_vector,
+        )
+        conn = get_vector_connection()
+        query_blob = serialize_float32_vector(query_vector)
         # Using match because it's fast. It returns L2 distance.
         # Cosine similarity for normalized vectors: 1 - L2^2 / 2
         # But sqlite-vec also has vec_distance_cosine which returns cosine distance.
@@ -512,11 +513,11 @@ def _safe_eval(expr: str, context: dict) -> bool:
         return False
 
 def _load_search_index(index_path: str | os.PathLike) -> dict:
-    """Load the shared snapshot with bounded retries around atomic replacement."""
+    """Load only a current, sidecar-committed shared projection snapshot."""
     last_error = None
     for attempt in range(3):
         try:
-            return load_index_snapshot(index_path)
+            return read_committed_index_snapshot(index_path)
         except Exception as exc:
             last_error = exc
             if attempt < 2:
@@ -753,6 +754,26 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         except SearchBackendError as exc:
             backend_issues.append(exc.backend)
 
+    # FTS/vec rows are committed before their matching projection files are
+    # published.  Revalidate after those SQLite reads so results from a newer
+    # database generation are never blended with the older index snapshot.
+    try:
+        current_index_data = _load_search_index(index_path)
+    except Exception as exc:
+        raise SearchIndexError(
+            "The knowledge base projection changed during search; retry after sync."
+        ) from exc
+    if current_index_data.get("projection_manifest") != index_data.get(
+        "projection_manifest"
+    ):
+        index_data = current_index_data
+        hybrid_scores = _lexical_fallback_scores(
+            index_data,
+            [query, *tokens],
+            limit=top_k * 5,
+        )
+        backend_issues.append("projection_generation_changed")
+
     for key, score in hybrid_scores.items():
         if key in index_data.get('nodes', {}):
             node = {'_key': key, **index_data['nodes'][key]}
@@ -901,6 +922,18 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     # Wiki dynamically eats the remaining budget
     wiki_budget = max_chars - actual_memory_used - index_budget
 
+    index_path = str(get_index_path())
+    index_existed_before_search = os.path.exists(index_path)
+    search_index_data = None
+    if index_existed_before_search:
+        try:
+            search_index_data = _load_search_index(index_path)
+        except Exception as exc:
+            raise SearchIndexError(
+                "The knowledge base projection could not be verified before "
+                "context assembly."
+            ) from exc
+
     search_results = search_vector_lake(query, top_k=15, as_xml=False)
     wiki_context = ""
     page_count = 0
@@ -912,13 +945,29 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
         page_count += 1
 
     index_summary = ""
-    index_path = str(get_index_path())
-    if os.path.exists(index_path):
-        index_data = get_cached_index_snapshot(index_path) or {}
+    if index_existed_before_search:
+        try:
+            index_data = _load_search_index(index_path)
+        except Exception as exc:
+            raise SearchIndexError(
+                "The knowledge base projection changed during context assembly; "
+                "retry after sync."
+            ) from exc
+        if index_data.get("projection_manifest") != search_index_data.get(
+            "projection_manifest"
+        ):
+            raise SearchIndexError(
+                "The knowledge base projection generation changed during context "
+                "assembly; retry."
+            )
         lines = []
         for key, node in islice(index_data.get("nodes", {}).items(), 50):
             lines.append(f"[{node.get('type', '?')}] {node.get('title', key)}")
         index_summary = "\n".join(lines)[:index_budget]
+    elif os.path.exists(index_path):
+        raise SearchIndexError(
+            "The knowledge base projection appeared during context assembly; retry."
+        )
 
     purpose = ""
     try:
@@ -939,4 +988,3 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
         "budget_used": len(memory_packet["packet"]) + len(wiki_context) + len(index_summary) + len(purpose),
         "budget_max": max_chars,
     }
-

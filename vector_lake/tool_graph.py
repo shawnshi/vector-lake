@@ -1,18 +1,32 @@
 import json
 import logging
 import os
+import sqlite3
 import webbrowser
 
 from filelock import FileLock, Timeout
 
 from vector_lake import get_extension_root
+from vector_lake import db_store
 from vector_lake import governance_store
 from vector_lake.indexer import (
     PROJECTION_MANIFEST_KEY,
     ProjectionPairContractError,
+    _cached_projection_sha256,
+    _projection_file_identity,
+    _validate_canonical_generation_binding,
+    _validate_projection_sidecar,
+    canonical_runtime_generation_snapshot,
+    read_committed_index_snapshot,
     validate_projection_pair,
 )
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_legacy_claim_graph_path, get_memory_dir
+from vector_lake.wiki_utils import (
+    get_claim_graph_path,
+    get_index_path,
+    get_legacy_claim_graph_path,
+    get_memory_dir,
+    get_projection_manifest_path,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -122,13 +136,39 @@ def _build_graph_payload(index_data: dict, claim_graph_data: dict | None = None)
     page_graph = _build_page_graph(index_data)
     claim_graph = _build_claim_graph(claim_graph_data or {})
     return {
-        "nodes": page_graph["nodes"],
-        "edges": page_graph["edges"],
-        "community_labels": page_graph["community_labels"],
         "pageGraph": page_graph,
         "claimGraph": claim_graph,
         "governanceMetrics": index_data.get("governance_metrics", {}),
     }
+
+
+def _read_current_canonical_generation() -> dict[str, int]:
+    """Read live runtime generations through a query-only SQLite snapshot."""
+    db_path = db_store.peek_db_path().resolve()
+    if not db_path.is_file():
+        raise ProjectionPairContractError(
+            f"Canonical database is missing: {db_path}"
+        )
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"{db_path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        return canonical_runtime_generation_snapshot(connection)
+    except (OSError, sqlite3.Error) as exc:
+        raise ProjectionPairContractError(
+            f"Cannot verify current canonical runtime generation: {exc}"
+        ) from exc
+    finally:
+        if connection is not None:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
 
 
 
@@ -162,6 +202,46 @@ def _read_projection_pair(
         if "canonical_generation" not in manifest:
             raise ProjectionPairContractError(
                 "Legacy projection manifest has no canonical_generation; run a full rebuild."
+            )
+        sidecar_path = get_projection_manifest_path()
+        if not sidecar_path.exists():
+            raise ProjectionPairContractError(
+                "Projection sidecar is missing; run sync to rebuild the pair."
+            )
+        with open(sidecar_path, "r", encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+        sidecar_manifest, sidecar_artifacts = _validate_projection_sidecar(sidecar)
+        del sidecar
+        if sidecar_manifest != manifest:
+            raise ProjectionPairContractError(
+                "Projection sidecar manifest does not match the projection pair."
+            )
+        binding = _validate_canonical_generation_binding(manifest)
+        if binding.get("status") != "verified":
+            raise ProjectionPairContractError(
+                "Projection canonical-generation binding is unverifiable; "
+                "run a full sync before reading the graph."
+            )
+        for path in (index_path, claim_graph_path):
+            metadata = sidecar_artifacts[os.path.basename(path)]
+            if os.path.getsize(path) != metadata["bytes"]:
+                raise ProjectionPairContractError(
+                    f"Projection sidecar size does not match {os.path.basename(path)}."
+                )
+            digest, identity = _cached_projection_sha256(path)
+            if digest != metadata["sha256"]:
+                raise ProjectionPairContractError(
+                    f"Projection sidecar digest does not match {os.path.basename(path)}."
+                )
+            if _projection_file_identity(path) != identity:
+                raise ProjectionPairContractError(
+                    f"Projection changed while reading {os.path.basename(path)}."
+                )
+        current_generation = _read_current_canonical_generation()
+        if binding["runtime_generations"] != current_generation:
+            raise ProjectionPairContractError(
+                "Projection canonical-generation binding is stale; "
+                "run sync to rebuild the graph projections."
             )
         return index_data, claim_graph_data
 
@@ -234,8 +314,12 @@ def audit_graph() -> str:
     if not os.path.exists(index_path):
         return "Error: Lake is drying. index.json not found. Please ingest sources first."
 
-    with open(index_path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
+    try:
+        data = read_committed_index_snapshot(index_path)
+    except Timeout:
+        return "Error: System is busy publishing graph projections. Please try again later."
+    except ProjectionPairContractError as exc:
+        return f"Error: committed graph projection is not ready; {exc}"
 
     insights = data.get("graph_insights", [])
     if not insights:
@@ -272,4 +356,3 @@ def audit_graph() -> str:
         else:
             return f"Audit complete. No new actionable insights found ({len(items)} existing insights already in queue)."
     return "Audit complete. No actionable insights found."
-

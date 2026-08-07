@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import threading
 
 import pytest
 
@@ -11,6 +12,7 @@ from vector_lake import (
     indexer,
     mutation_coordinator,
     wiki_utils,
+    watchdog_app,
 )
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.watchdog_app import (
@@ -39,6 +41,67 @@ def test_worker_recovers_projection_without_signal(isolated_memory):
     assert "Source_Test" in index_data["nodes"]
 
 
+def test_watchdog_busy_gate_preserves_signal_and_does_not_claim(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake.heavy_task_gate import heavy_task
+
+    db_store.init_db()
+    while not index_queue.empty():
+        index_queue.get_nowait()
+        index_queue.task_done()
+    signal_path = wiki_utils.get_outbox_signal_path()
+    signal_path.write_text("1", encoding="utf-8")
+    holder_acquired = threading.Event()
+    holder_release = threading.Event()
+    deferred = threading.Event()
+    stop_event = threading.Event()
+    claimed = []
+
+    def hold_gate():
+        with heavy_task(
+            "maintenance",
+            "external-holder",
+            origin="pytest",
+            wait_timeout_seconds=0,
+        ):
+            holder_acquired.set()
+            holder_release.wait(timeout=3)
+
+    def capture_status(_state, _processed, _queue, message, _error, **_kwargs):
+        if "deferred by heavy-task gate" in message:
+            deferred.set()
+
+    monkeypatch.setattr(watchdog_app, "write_status", capture_status)
+    monkeypatch.setattr(
+        watchdog_app,
+        "process_mutation_outbox_batch",
+        lambda **_kwargs: claimed.append("claimed"),
+    )
+    holder = threading.Thread(target=hold_gate, name="watchdog-gate-holder")
+    worker = threading.Thread(
+        target=watchdog_app.index_worker_loop,
+        args=(stop_event,),
+        name="watchdog-gate-contender",
+    )
+    holder.start()
+    assert holder_acquired.wait(timeout=2)
+    worker.start()
+    try:
+        assert deferred.wait(timeout=2)
+        assert signal_path.read_text(encoding="utf-8") == "1"
+        assert claimed == []
+    finally:
+        stop_event.set()
+        holder_release.set()
+        worker.join(timeout=3)
+        holder.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert not holder.is_alive()
+
+
 def test_worker_continues_after_one_row_fails(isolated_memory):
     db_store.init_db()
     first_id = db_store.enqueue_mutation("Concept_Missing.md", "update", payload_text=None)
@@ -61,6 +124,11 @@ def test_worker_batches_index_update_once_for_all_ready_rows(isolated_memory, mo
     db_store.enqueue_mutation("Concept_Second.md", "delete")
     calls = []
     monkeypatch.setattr(indexer, "update_index_items", lambda filenames: calls.append(list(filenames)))
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: True,
+    )
 
     stats = process_mutation_outbox_batch(limit=10)
 
@@ -87,6 +155,12 @@ def test_worker_completes_when_selected_index_projection_is_already_current(isol
     db_store.init_db()
     db_store.enqueue_mutation("Concept_Already-Deleted.md", "delete")
     monkeypatch.setattr(indexer, "index_projection_matches_canonical", lambda filenames: True)
+    pair_checks = iter((False, True))
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: next(pair_checks),
+    )
     monkeypatch.setattr(
         indexer,
         "update_index_items",
@@ -105,6 +179,42 @@ def test_worker_completes_when_selected_index_projection_is_already_current(isol
     assert refreshed == ["claim_graph"]
 
 
+def test_worker_skips_projection_writers_when_pair_is_already_current(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    db_store.enqueue_mutation("Concept_Already-Deleted.md", "delete")
+    monkeypatch.setattr(
+        indexer,
+        "index_projection_matches_canonical",
+        lambda filenames: True,
+    )
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        indexer,
+        "update_index_items",
+        lambda filenames: (_ for _ in ()).throw(
+            AssertionError("current projection pair must be reused")
+        ),
+    )
+    monkeypatch.setattr(
+        indexer,
+        "refresh_claim_graph_projection",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("current claim graph must be reused")
+        ),
+    )
+
+    stats = process_mutation_outbox_batch(limit=10)
+
+    assert stats == {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0}
+
+
 def test_worker_skips_duplicate_markdown_projection(isolated_memory, monkeypatch):
     _write_purpose_contract(isolated_memory)
     execute_mutation_plan("Source_Test.md", content=_source_content())
@@ -114,10 +224,69 @@ def test_worker_skips_duplicate_markdown_projection(isolated_memory, monkeypatch
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("projection should be reused")),
     )
     monkeypatch.setattr(indexer, "update_index_items", lambda filenames: None)
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: True,
+    )
 
     stats = process_mutation_outbox_batch(limit=10)
 
     assert stats["completed"] == 1
+
+
+def test_worker_rebuilds_damaged_stale_pair_before_marking_completed(
+    isolated_memory,
+):
+    _write_purpose_contract(isolated_memory)
+    db_store.init_db()
+    indexer.generate_index()
+    execute_mutation_plan("Source_Test.md", content=_source_content())
+    wiki_utils.get_projection_manifest_path().write_bytes(b"{")
+
+    stats = process_mutation_outbox_batch(limit=10)
+
+    assert stats == {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0}
+    row = db_store.get_connection().execute(
+        "SELECT status FROM mutation_outbox"
+    ).fetchone()
+    assert row["status"] == "completed"
+    committed = indexer.read_committed_index_snapshot()
+    assert "Source_Test" in committed["nodes"]
+    assert indexer.projection_pair_matches_current_generation() is True
+
+
+def test_worker_does_not_complete_when_writer_returns_without_committed_pair(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    outbox_id = db_store.enqueue_mutation("Concept_Not-Ready.md", "delete")
+    monkeypatch.setattr(
+        indexer,
+        "index_projection_matches_canonical",
+        lambda _filenames: False,
+    )
+    monkeypatch.setattr(indexer, "update_index_items", lambda _filenames: None)
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: False,
+    )
+
+    stats = process_mutation_outbox_batch(
+        limit=10,
+        max_attempts=3,
+        backoff_base=0,
+    )
+
+    assert stats == {"claimed": 1, "completed": 0, "retrying": 1, "failed": 0}
+    row = db_store.get_connection().execute(
+        "SELECT status, last_error FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+    assert row["status"] == "pending"
+    assert "not committed" in row["last_error"]
 
 
 def test_worker_projection_cas_does_not_overwrite_manual_edit(

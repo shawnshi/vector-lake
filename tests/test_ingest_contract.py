@@ -15,6 +15,7 @@ import pytest
 from vector_lake import (
     db_store,
     governance_store,
+    indexer,
     mcp_server,
     mutation_coordinator,
     tool_ingest,
@@ -35,6 +36,15 @@ from vector_lake.tool_ingest import (
     reconcile_orphan_ingest_task_packets,
 )
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
+
+
+def _use_explicit_bare_index_test_seam(monkeypatch):
+    """Keep ranking-only fixtures independent from the committed-pair contract."""
+    monkeypatch.setattr(
+        indexer,
+        "read_committed_index_snapshot",
+        lambda path, **_kwargs: json.loads(Path(path).read_text(encoding="utf-8")),
+    )
 
 
 def _v4_ingest_payload(
@@ -1760,10 +1770,7 @@ def test_ingest_worker_rebuilds_legacy_awaiting_packet_before_dispatch(isolated_
     db_store.init_db()
     raw_path = isolated_memory / "raw" / "legacy-awaiting.md"
     raw_path.write_text("Legacy source content.", encoding="utf-8")
-    (isolated_memory / "wiki" / "index.json").write_text(
-        json.dumps({"nodes": {}}),
-        encoding="utf-8",
-    )
+    indexer.generate_index()
     payload = {
         "filepath": str(raw_path),
         "hash": "legacy-awaiting-hash",
@@ -1809,10 +1816,8 @@ def test_v4_invalid_nested_source_name_migrates_to_v5(
     raw_path = isolated_memory / "raw" / "nested_folder" / "name.md"
     raw_path.parent.mkdir(parents=True)
     raw_path.write_text("nested source", encoding="utf-8")
-    (isolated_memory / "wiki" / "index.json").write_text(
-        json.dumps({"nodes": {}}),
-        encoding="utf-8",
-    )
+    db_store.init_db()
+    indexer.generate_index()
     payload = {
         "filepath": str(raw_path),
         "hash": calculate_hash(str(raw_path)),
@@ -2402,7 +2407,11 @@ def test_final_cas_rolls_back_processed_marker_if_lease_changes_after_validation
     assert row["lease_generation"] == stale["lease_generation"] + 1
 
 
-def test_relevant_index_context_searches_beyond_first_hundred_nodes(isolated_memory):
+def test_relevant_index_context_searches_beyond_first_hundred_nodes(
+    isolated_memory,
+    monkeypatch,
+):
+    _use_explicit_bare_index_test_seam(monkeypatch)
     _write_purpose_contract(isolated_memory)
     raw_path = isolated_memory / "raw" / "candidate.md"
     raw_path.write_text("国家级主数据治理要求进入持续运营阶段。", encoding="utf-8")
@@ -2441,7 +2450,9 @@ def test_relevant_index_context_searches_beyond_first_hundred_nodes(isolated_mem
 
 def test_relevant_index_context_includes_canonical_synthesis_candidates(
     isolated_memory,
+    monkeypatch,
 ):
+    _use_explicit_bare_index_test_seam(monkeypatch)
     _write_purpose_contract(isolated_memory)
     raw_path = isolated_memory / "raw" / "synthesis-candidate.md"
     raw_path.write_text(
@@ -2488,7 +2499,9 @@ def test_relevant_index_context_rejects_an_unreadable_index(isolated_memory):
 
 def test_relevant_index_context_excludes_sources_and_ascii_substring_false_positives(
     isolated_memory,
+    monkeypatch,
 ):
+    _use_explicit_bare_index_test_seam(monkeypatch)
     _write_purpose_contract(isolated_memory)
     raw_path = isolated_memory / "raw" / "candidate.md"
     raw_path.write_text(

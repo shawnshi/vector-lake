@@ -130,7 +130,7 @@ def existing_embedding_ids(
             db_store._load_sqlite_vec_extension(conn)
             conn.execute("PRAGMA query_only=ON")
         else:
-            conn = db_store.get_connection()
+            conn = db_store.get_vector_connection()
         return {
             row["entity_id"]
             for row in conn.execute("SELECT entity_id FROM vec_embeddings")

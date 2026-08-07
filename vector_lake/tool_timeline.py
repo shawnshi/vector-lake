@@ -59,10 +59,14 @@ def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> d
     }
 
 
-def _entity_title_map(entity_ids: set[str]) -> dict[str, str]:
+def _entity_title_map(
+    entity_ids: set[str],
+    *,
+    connection=None,
+) -> dict[str, str]:
     if not entity_ids:
         return {}
-    conn = get_connection()
+    conn = connection or get_connection()
     placeholders = ",".join("?" for _ in entity_ids)
     rows = conn.execute(
         f"SELECT entity_id, canonical_name FROM entities WHERE entity_id IN ({placeholders})",
@@ -186,9 +190,9 @@ def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: 
     return {"deleted": len(old_event_ids), "upserted": len(new_events)}
 
 
-def timeline_projection_parity() -> dict:
+def timeline_projection_parity(*, connection=None) -> dict:
     """Compare canonical timeline events with the SQL projection."""
-    conn = get_connection()
+    conn = connection or get_connection()
     claim_rows = conn.execute(
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
         "WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
@@ -201,7 +205,7 @@ def timeline_projection_parity() -> dict:
         if isinstance(subjects, str):
             subjects = [subjects]
         entity_ids.update(str(item) for item in subjects)
-    entity_titles = _entity_title_map(entity_ids)
+    entity_titles = _entity_title_map(entity_ids, connection=conn)
 
     expected_events = [
         _event_from_claim_row(row, entity_titles=entity_titles)

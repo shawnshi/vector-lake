@@ -13,6 +13,29 @@ from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.watchdog_status import get_status_file, write_status
 
 
+def test_runtime_health_uses_immutable_read_only_uri_when_wal_is_empty(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+    db_store.close_all_connections()
+    observed = []
+    real_connect = sqlite3.connect
+
+    def capture_connect(database, *args, **kwargs):
+        observed.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_health.sqlite3, "connect", capture_connect)
+    connection, _db_path = runtime_health._open_runtime_database_read_only()
+    connection.close()
+
+    assert observed
+    assert "mode=ro&immutable=1" in observed[0]
+
+
 def test_canonical_entity_version_ignores_transport_only_raw_text_differences():
     lf_record = {
         "entity_id": "entity_transport",
@@ -1425,13 +1448,10 @@ def test_decision_scoped_readiness_rejects_unverified_registry_reference(
 def test_doctor_labels_infrastructure_and_semantic_status_separately(
     isolated_memory, monkeypatch
 ):
-    from vector_lake import tool_doctor
+    from vector_lake import indexer, tool_doctor
 
-    (isolated_memory / "wiki" / "index.json").write_text(
-        json.dumps({"nodes": {}, "graph_state": {"dirty": False}}),
-        encoding="utf-8",
-    )
     db_store.init_db()
+    indexer.generate_index()
 
     monkeypatch.setattr(
         tool_doctor,

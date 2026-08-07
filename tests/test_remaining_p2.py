@@ -91,6 +91,111 @@ def test_subagent_claim_gate_rejects_legacy_awaiting_packet(isolated_memory):
     )
 
 
+def test_job_queues_break_created_at_ties_with_stable_job_id(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    created_at = "2026-01-01T00:00:00+00:00"
+    with db_store.transaction():
+        for job_id in ("dispatch-z", "dispatch-a"):
+            conn.execute(
+                "INSERT INTO jobs "
+                "(job_id, task_type, payload, status, retries, created_at, updated_at) "
+                "VALUES (?, 'ingest', '{}', 'queued', 0, ?, ?)",
+                (job_id, created_at, created_at),
+            )
+        for job_id in ("subagent-z", "subagent-a"):
+            conn.execute(
+                "INSERT INTO jobs "
+                "(job_id, task_type, payload, status, retries, created_at, updated_at) "
+                "VALUES (?, 'ingest', '{}', 'awaiting_subagent', 0, ?, ?)",
+                (job_id, created_at, created_at),
+            )
+
+    assert [row["job_id"] for row in db_store.get_pending_jobs(limit=2)] == [
+        "dispatch-a",
+        "dispatch-z",
+    ]
+    assert [
+        row["job_id"]
+        for row in db_store.get_jobs_by_status(["queued"], limit=2)
+    ] == ["dispatch-a", "dispatch-z"]
+    assert [
+        row["job_id"]
+        for row in db_store.claim_pending_jobs(
+            limit=2,
+            lease_seconds=60,
+            lease_owner="stable-dispatch-order",
+        )
+    ] == ["dispatch-a", "dispatch-z"]
+    assert [
+        row["job_id"]
+        for row in db_store.claim_subagent_jobs(
+            limit=2,
+            lease_seconds=60,
+            lease_owner="stable-subagent-order",
+        )
+    ] == ["subagent-a", "subagent-z"]
+
+
+def test_cleanup_queue_order_does_not_depend_on_jobs_row_order(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    created_at = "2000-01-01T00:00:00+00:00"
+    shared_path = "raw/stable-cleanup-order.md"
+    with db_store.transaction():
+        for job_id in ("superseded-z", "superseded-a"):
+            payload = {"filepath": shared_path, "hash": job_id}
+            conn.execute(
+                "INSERT INTO jobs "
+                "(job_id, task_type, payload, status, retries, created_at, updated_at, "
+                "task_packet_path) VALUES (?, 'ingest', ?, 'queued', 0, ?, ?, ?)",
+                (
+                    job_id,
+                    json.dumps(payload),
+                    created_at,
+                    created_at,
+                    str(isolated_memory / f"{job_id}.json"),
+                ),
+            )
+
+    db_store.enqueue_job(
+        "ingest",
+        {"filepath": shared_path, "hash": "new-source-version"},
+    )
+    superseded_cleanup = conn.execute(
+        "SELECT job_id FROM ingest_task_cleanup ORDER BY cleanup_id ASC"
+    ).fetchall()
+    assert [row["job_id"] for row in superseded_cleanup] == [
+        "superseded-a",
+        "superseded-z",
+    ]
+
+    with db_store.transaction():
+        conn.execute("DELETE FROM ingest_task_cleanup")
+        for job_id in ("expired-z", "expired-a"):
+            conn.execute(
+                "INSERT INTO jobs "
+                "(job_id, task_type, payload, status, retries, created_at, updated_at, "
+                "task_packet_path) VALUES (?, 'ingest', '{}', 'awaiting_subagent', "
+                "0, ?, ?, ?)",
+                (
+                    job_id,
+                    created_at,
+                    created_at,
+                    str(isolated_memory / f"{job_id}.json"),
+                ),
+            )
+
+    assert db_store.expire_stale_subagent_jobs(max_age_seconds=1) == 2
+    expired_cleanup = conn.execute(
+        "SELECT job_id FROM ingest_task_cleanup ORDER BY cleanup_id ASC"
+    ).fetchall()
+    assert [row["job_id"] for row in expired_cleanup] == [
+        "expired-a",
+        "expired-z",
+    ]
+
+
 def test_legacy_migration_covers_every_claimable_status_and_refreshes_raw_hash(
     isolated_memory,
     monkeypatch,
@@ -432,3 +537,27 @@ def test_integration_accepts_exact_dispatched_candidate_tokens(monkeypatch):
     ]
     assert mutations[1]["expected_version"] == "v1"
     assert mutations[1]["expected_projection_hash"] == "a" * 64
+
+
+def test_governance_queue_load_uses_item_id_as_stable_tie_break(
+    isolated_memory,
+):
+    governance_store.initialize_meta_store()
+    connection = db_store.get_connection()
+    timestamp = "2026-08-03T00:00:00+00:00"
+    with db_store.transaction():
+        connection.executemany(
+            "INSERT INTO governance_queue (item_id, data_json, updated_at) "
+            "VALUES (?, ?, ?)",
+            [
+                ("item-b", json.dumps({"item_id": "item-b"}), timestamp),
+                ("item-a", json.dumps({"item_id": "item-a"}), timestamp),
+            ],
+        )
+
+    before = governance_store.load_governance_queue()["items"]
+    connection.execute("VACUUM main")
+    after = governance_store.load_governance_queue()["items"]
+
+    assert [item["item_id"] for item in before] == ["item-a", "item-b"]
+    assert [item["item_id"] for item in after] == ["item-a", "item-b"]

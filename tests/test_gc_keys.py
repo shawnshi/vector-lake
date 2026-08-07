@@ -11,6 +11,34 @@ from vector_lake import db_store, governance_store, tool_gc
 from vector_lake.tool_gc import gc_vector_lake
 
 
+def _insert_change_set_history(
+    conn,
+    change_set_id: str,
+    *,
+    status: str = "applied",
+    timestamp: str = "2000-01-01T00:00:00+00:00",
+):
+    data_json = json.dumps({"status": status}, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO change_sets "
+        "(change_set_id, data_json, updated_at) VALUES (?, ?, ?)",
+        (change_set_id, data_json, timestamp),
+    )
+    conn.execute(
+        "INSERT INTO change_set_lifecycle_v6 "
+        "(change_set_id, status, created_at, terminal_at, time_source, "
+        "payload_guard_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            change_set_id,
+            status,
+            timestamp,
+            None if status == "pending" else timestamp,
+            "test_seed",
+            hashlib.sha256(data_json.encode("utf-8")).hexdigest(),
+        ),
+    )
+
+
 def _seed_vendor(memory_dir, edge_count: int):
     db_store.init_db()
     governance_store.save_entities(
@@ -45,11 +73,7 @@ def _seed_old_history(change_set_id: str = "changeset_old"):
     conn = db_store.get_connection()
     old = "2000-01-01T00:00:00+00:00"
     with db_store.transaction():
-        conn.execute(
-            "INSERT INTO change_sets "
-            "(change_set_id, data_json, updated_at) VALUES (?, ?, ?)",
-            (change_set_id, '{"status":"applied"}', old),
-        )
+        _insert_change_set_history(conn, change_set_id, timestamp=old)
         conn.execute(
             "INSERT INTO change_set_idempotency "
             "(idempotency_key, change_set_id, created_at) "
@@ -94,14 +118,11 @@ def test_gc_does_not_delete_high_degree_page_key(isolated_memory):
     assert "No orphan entities" in result
 
 
-def test_gc_prunes_history_even_when_no_orphan_pages(isolated_memory):
+def test_gc_defers_history_when_no_orphan_pages(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     with db_store.transaction():
-        conn.execute(
-            "INSERT INTO change_sets (change_set_id, data_json, updated_at) VALUES (?, ?, ?)",
-            ("changeset_old", '{"status":"applied"}', "2000-01-01T00:00:00+00:00"),
-        )
+        _insert_change_set_history(conn, "changeset_old")
         conn.execute(
             "INSERT INTO change_set_idempotency (idempotency_key, change_set_id, created_at) "
             "VALUES (?, ?, ?)",
@@ -110,10 +131,11 @@ def test_gc_prunes_history_even_when_no_orphan_pages(isolated_memory):
 
     result = gc_vector_lake(days=30, dry_run=False)
 
-    assert "Pruned 1 change set(s) and 1 idempotency key(s)" in result
-    assert conn.execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == 0
+    assert "History retention deferred to the dedicated confirmed workflow" in result
+    assert "1 change set(s), 1 idempotency key(s)" in result
+    assert conn.execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == 1
     assert (
-        conn.execute("SELECT COUNT(*) FROM change_set_idempotency").fetchone()[0] == 0
+        conn.execute("SELECT COUNT(*) FROM change_set_idempotency").fetchone()[0] == 1
     )
 
 
@@ -127,7 +149,7 @@ def test_gc_dry_run_missing_database_is_zero_write(isolated_memory):
     assert not meta_dir.exists()
 
 
-def test_gc_apply_prunes_only_unreferenced_terminal_change_sets(
+def test_gc_apply_reports_only_unreferenced_terminal_change_sets(
     isolated_memory,
 ):
     db_store.init_db()
@@ -140,10 +162,11 @@ def test_gc_apply_prunes_only_unreferenced_terminal_change_sets(
     }
     with db_store.transaction():
         for change_set_id, body in change_sets.items():
-            conn.execute(
-                "INSERT INTO change_sets (change_set_id, data_json, updated_at) "
-                "VALUES (?, ?, ?)",
-                (change_set_id, json.dumps(body), old),
+            _insert_change_set_history(
+                conn,
+                change_set_id,
+                status=str(body["status"]),
+                timestamp=old,
             )
             conn.execute(
                 "INSERT INTO change_set_idempotency "
@@ -178,8 +201,9 @@ def test_gc_apply_prunes_only_unreferenced_terminal_change_sets(
             "SELECT change_set_id FROM change_set_idempotency"
         ).fetchall()
     }
-    assert "Pruned 1 change set(s) and 1 idempotency key(s)" in result
-    assert remaining == {"terminal-referenced", "pending-protected"}
+    assert "History retention deferred to the dedicated confirmed workflow" in result
+    assert "1 change set(s), 1 idempotency key(s)" in result
+    assert remaining == set(change_sets)
     assert idempotency == remaining
 
 
@@ -368,7 +392,7 @@ def test_gc_existing_backup_directory_symlink_blocks_canonical_delete(
     )
 
     assert "symbolic link or reparse point" in result
-    assert "No canonical or history deletion committed" in result
+    assert "No canonical deletion committed" in result
     assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
     assert external.is_dir()
     assert (
@@ -402,7 +426,7 @@ def test_gc_existing_backup_leaf_symlink_blocks_canonical_delete(
     )
 
     assert "symbolic link or reparse point" in result
-    assert "No canonical or history deletion committed" in result
+    assert "No canonical deletion committed" in result
     assert external.exists()
     assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
     assert (
@@ -439,7 +463,7 @@ def test_gc_staging_cleanup_failure_preserves_primary_error(
 
     assert "primary copy failure" in result
     assert "cleanup failure" in caplog.text
-    assert "No canonical or history deletion committed" in result
+    assert "No canonical deletion committed" in result
     assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
 
 
@@ -459,7 +483,7 @@ def test_gc_backup_fsync_failure_blocks_canonical_delete(isolated_memory):
         )
 
     assert "injected fsync failure" in result
-    assert "No canonical or history deletion committed" in result
+    assert "No canonical deletion committed" in result
     assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
     backup_root = isolated_memory / "backup" / "gc"
     assert not backup_root.exists() or list(backup_root.iterdir()) == []
@@ -483,7 +507,7 @@ def test_gc_backup_copy_failure_leaves_no_formal_backup_or_db_mutation(
         )
 
     assert "injected copy failure" in result
-    assert "No canonical or history deletion committed" in result
+    assert "No canonical deletion committed" in result
     assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
     assert (
         conn.execute(
@@ -540,7 +564,7 @@ def test_gc_canonical_delete_failure_rolls_back_and_preserves_history(
         )
 
     assert "injected canonical delete failure" in result
-    assert "No canonical or history deletion committed" in result
+    assert "No canonical deletion committed" in result
     assert "transaction committed" not in result
     assert "Verified backup retained" in result
     assert (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
@@ -603,10 +627,10 @@ def test_gc_notification_failure_reports_committed_canonical_and_outbox(
             orphan_confirmation=fingerprint,
         )
 
-    assert "Canonical/history transaction committed" in result
+    assert "Canonical transaction committed" in result
     assert "post-commit warning(s)" in result
     assert "injected notification failure" in result
-    assert "No canonical or history deletion committed" not in result
+    assert "No canonical deletion committed" not in result
     assert (
         conn.execute(
             "SELECT 1 FROM entities WHERE json_extract(data_json, '$.page_key') = ?",
@@ -625,7 +649,7 @@ def test_gc_notification_failure_reports_committed_canonical_and_outbox(
             "SELECT 1 FROM change_sets WHERE change_set_id = ?",
             ("notification-failure-history",),
         ).fetchone()
-        is None
+        is not None
     )
 
 
@@ -651,7 +675,7 @@ def test_gc_projection_failure_counts_canonical_delete_as_committed(
             orphan_confirmation=fingerprint,
         )
 
-    assert "Canonical/history transaction committed" in result
+    assert "Canonical transaction committed" in result
     assert "Deleted 1 orphan pages from canonical state" in result
     assert "1 Markdown projection deletion(s) were deferred" in result
     assert "post-commit warning(s)" in result
@@ -674,7 +698,7 @@ def test_gc_projection_failure_counts_canonical_delete_as_committed(
     )
 
 
-def test_gc_confirmed_success_commits_canonical_and_history_together(
+def test_gc_confirmed_success_commits_canonical_and_defers_history(
     isolated_memory,
 ):
     from vector_lake import runtime_health
@@ -690,9 +714,10 @@ def test_gc_confirmed_success_commits_canonical_and_history_together(
             orphan_confirmation=fingerprint,
         )
 
-    assert "Canonical/history transaction committed" in result
+    assert "Canonical transaction committed" in result
     assert "Deleted 1 orphan pages from canonical state" in result
-    assert "Pruned 1 change set(s) and 1 idempotency key(s)" in result
+    assert "History retention deferred to the dedicated confirmed workflow" in result
+    assert "1 change set(s), 1 idempotency key(s)" in result
     assert not (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
     assert (
         conn.execute(
@@ -707,14 +732,14 @@ def test_gc_confirmed_success_commits_canonical_and_history_together(
             "SELECT COUNT(*) FROM change_sets WHERE change_set_id = ?",
             ("successful-gc-history",),
         ).fetchone()[0]
-        == 0
+        == 1
     )
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM change_set_idempotency WHERE change_set_id = ?",
             ("successful-gc-history",),
         ).fetchone()[0]
-        == 0
+        == 1
     )
     backup_root = isolated_memory / "backup" / "gc"
     backups = [
@@ -744,10 +769,10 @@ def test_gc_stale_fingerprint_blocks_orphan_and_history_mutation(
     os.utime(page, (old, old))
     conn = db_store.get_connection()
     with db_store.transaction():
-        conn.execute(
-            "INSERT INTO change_sets (change_set_id, data_json, updated_at) "
-            "VALUES (?, ?, ?)",
-            ("stale-token-history", '{"status":"applied"}', "2000-01-01"),
+        _insert_change_set_history(
+            conn,
+            "stale-token-history",
+            timestamp="2000-01-01T00:00:00+00:00",
         )
 
     result = gc_vector_lake(

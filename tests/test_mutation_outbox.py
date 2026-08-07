@@ -84,9 +84,16 @@ def test_outbox_retries_then_dead_letters(isolated_memory):
     )
     assert retry_status == "pending"
     first = db_store.get_connection().execute(
-        "SELECT status, attempt_count, last_error FROM mutation_outbox WHERE id = ?", (outbox_id,)
+        "SELECT status, attempt_count, last_error, completed_at "
+        "FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
     ).fetchone()
-    assert dict(first) == {"status": "pending", "attempt_count": 1, "last_error": "first failure"}
+    assert dict(first) == {
+        "status": "pending",
+        "attempt_count": 1,
+        "last_error": "first failure",
+        "completed_at": None,
+    }
 
     rows = db_store.claim_mutation_outbox(limit=1, lease_owner="worker-a")
     assert len(rows) == 1
@@ -100,6 +107,15 @@ def test_outbox_retries_then_dead_letters(isolated_memory):
         backoff_base=0,
     )
     assert terminal_status == "failed"
+    terminal = db_store.get_connection().execute(
+        "SELECT status, attempt_count, last_error, completed_at "
+        "FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_count"] == 2
+    assert terminal["last_error"] == "second failure"
+    assert terminal["completed_at"]
 
 
 def test_stale_processing_lease_is_reclaimed(isolated_memory):

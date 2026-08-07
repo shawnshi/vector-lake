@@ -7,7 +7,6 @@ import string
 from collections import defaultdict
 
 from vector_lake import governance_metrics
-from vector_lake import governance_store
 from vector_lake.merge_analysis import (
     filename_candidate_pairs,
     normalize_name,
@@ -27,6 +26,47 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vector-lake-tool-lint")
 
 _TEMPORAL_LINK = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class _BoundedIssueCollector:
+    """Keep an exact count while retaining only report-sized samples."""
+
+    def __init__(self, sample_limit: int = 10):
+        self._sample_limit = max(0, int(sample_limit))
+        self._samples: list[str] = []
+        self._count = 0
+
+    def append(self, item: str) -> None:
+        self._count += 1
+        if len(self._samples) < self._sample_limit:
+            self._samples.append(item)
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __getitem__(self, index):
+        return self._samples[index]
+
+    @property
+    def retained_sample_count(self) -> int:
+        return len(self._samples)
+
+
+def _lint_record(
+    frontmatter: dict,
+    body: str,
+    links: set[str],
+    path: str,
+    *,
+    retain_body: bool,
+) -> dict:
+    return {
+        "fm": frontmatter,
+        "body": body if retain_body else None,
+        "body_length": len(body.strip()),
+        "links": links,
+        "path": path,
+    }
 
 
 def _frontmatter_integrity_error(content: str, frontmatter: dict) -> str | None:
@@ -113,7 +153,15 @@ def lint_vector_lake(auto_fix: bool = False):
         and name.casefold() not in skip_files
         and os.path.isfile(os.path.join(wiki_dir, name))
     )
-    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "reviewed_orphan", "similarity", "decay", "semantic_gc", "governance", "managed_governance", "alignment"]}
+    issues = {
+        key: _BoundedIssueCollector()
+        for key in [
+            "frontmatter", "schema", "naming", "type_status", "category",
+            "duplicate_id", "alias_conflict", "broken_links", "orphan",
+            "reviewed_orphan", "similarity", "decay", "semantic_gc",
+            "governance", "managed_governance", "alignment",
+        ]
+    }
     fixes_applied = 0
 
     parsed = {}
@@ -151,7 +199,19 @@ def lint_vector_lake(auto_fix: bool = False):
         }
         links.discard("")
 
-        parsed[filename] = {"fm": frontmatter, "body": body, "links": links, "path": filepath}
+        if not auto_fix:
+            try:
+                validate_schema(frontmatter, body, filename)
+            except SchemaViolationException as exc:
+                issues["schema"].append(f"{filename}: {str(exc)}")
+
+        parsed[filename] = _lint_record(
+            frontmatter,
+            body,
+            links,
+            filepath,
+            retain_body=auto_fix,
+        )
 
         node_id = frontmatter.get("id", "")
         if node_id:
@@ -360,10 +420,11 @@ def lint_vector_lake(auto_fix: bool = False):
             _write_fixed_frontmatter(data["path"], frontmatter, data["body"])
             fixes_applied += 1
 
-        try:
-            validate_schema(frontmatter, data["body"], filename)
-        except SchemaViolationException as e:
-            issues["schema"].append(f"{filename}: {str(e)}")
+        if auto_fix:
+            try:
+                validate_schema(frontmatter, data["body"], filename)
+            except SchemaViolationException as e:
+                issues["schema"].append(f"{filename}: {str(e)}")
 
     # 6. Filename similarity candidates. Actual merge decisions use governance analysis.
     similarity_pairs = set()
@@ -484,7 +545,7 @@ def lint_vector_lake(auto_fix: bool = False):
                 
         is_contested = node_status in ["superseded", "deprecated"]
         has_low_inbound = inbound_count.get(node_key, 0) <= 1
-        is_empty = len(data["body"].strip()) < 50 and not filename.startswith("Source_")
+        is_empty = data["body_length"] < 50 and not filename.startswith("Source_")
         
         if (is_contested and age_days > 30 and has_low_inbound) or (is_empty and age_days > 30 and has_low_inbound):
             issues["semantic_gc"].append(f"{filename}: GC triggered (Status: {node_status}, Age: {age_days}d, Inbound: {inbound_count.get(node_key, 0)})")
@@ -501,8 +562,10 @@ def lint_vector_lake(auto_fix: bool = False):
                 except Exception as e:
                     log.error(f"Failed to archive {filename}: {e}")
 
-    governance_store.initialize_meta_store()
-    metrics = governance_metrics.compute_debt_metrics()
+    metrics = governance_metrics.compute_debt_metrics(
+        skip_heavy=True,
+        read_only=not auto_fix,
+    )
     if metrics["unmanaged_unsupported_claim_count"] > 0:
         issues["governance"].append(
             f"Unmanaged unsupported claims: {metrics['unmanaged_unsupported_claim_count']}"

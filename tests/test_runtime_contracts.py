@@ -32,6 +32,32 @@ from vector_lake.wiki_utils import (
 )
 
 
+@pytest.mark.parametrize("configured_workers", [None, "invalid"])
+def test_mcp_blocking_executor_uses_memory_safe_default(
+    tmp_path,
+    monkeypatch,
+    configured_workers,
+):
+    if configured_workers is None:
+        monkeypatch.delenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", raising=False)
+    else:
+        monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", configured_workers)
+    monkeypatch.delenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", raising=False)
+    server = mcp_server.ReloadAwareFastMCP(
+        "memory-safe-default-test",
+        runtime_guard=mcp_server.MCPRuntimeGuard(
+            tmp_path,
+            check_interval_seconds=60,
+        ),
+    )
+    try:
+        status = server.blocking_executor_status()
+        assert status["workers"] == 1
+        assert status["queue_capacity"] == 1
+    finally:
+        server.shutdown_blocking_executor(wait=True)
+
+
 def test_operational_memory_xml_is_a_well_formed_document(isolated_memory, monkeypatch):
     monkeypatch.setattr(
         governance_store,
@@ -378,6 +404,78 @@ def test_mcp_sync_tools_run_off_the_event_loop(tmp_path):
         server._blocking_executor.shutdown(wait=True, cancel_futures=True)
 
     assert results
+
+
+def test_mcp_heavy_tool_busy_releases_executor_capacity(
+    isolated_memory,
+    tmp_path,
+    monkeypatch,
+):
+    from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
+
+    monkeypatch.setenv("VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS", "0.05")
+    monkeypatch.setitem(
+        mcp_server._MCP_HEAVY_TASKS,
+        "heavy_gate_probe",
+        ("scan", 60.0),
+    )
+    guard = mcp_server.MCPRuntimeGuard(
+        tmp_path,
+        check_interval_seconds=60,
+    )
+    server = mcp_server.ReloadAwareFastMCP(
+        "heavy-gate-test",
+        runtime_guard=guard,
+    )
+    tool_ran = threading.Event()
+
+    @server.tool()
+    def heavy_gate_probe() -> str:
+        tool_ran.set()
+        return "ok"
+
+    registered = server._tool_manager.get_tool("heavy_gate_probe")
+    assert registered is not None
+    try:
+        with heavy_task(
+            "maintenance",
+            "external-holder",
+            origin="pytest",
+            wait_timeout_seconds=0,
+        ):
+            with pytest.raises(HeavyTaskBusy):
+                anyio.run(registered.fn)
+        assert server.blocking_executor_status()["inflight"] == 0
+        assert tool_ran.is_set() is False
+
+        result = anyio.run(registered.fn)
+        assert result == "ok"
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+
+def test_all_known_mcp_rescan_entrypoints_are_heavy_task_gated():
+    expected = {
+        "doctor_vector_lake": ("scan", 900.0),
+        "get_governance_debt": ("scan", 900.0),
+        "lint_vector_lake": ("scan", 1800.0),
+        "merge_suggestions_vector_lake": ("scan", 1800.0),
+        "orphan_source_classify": ("scan", 900.0),
+        "prepare_ingest_batch": ("ingest_scan", 1800.0),
+        "projection_report": ("scan", 900.0),
+        "reconcile_ingest_tasks": ("maintenance", 1800.0),
+        "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
+        "sync_vector_lake": ("ingest_scan", 1800.0),
+        "trigger_audit_graph": ("scan", 1800.0),
+        "trigger_autonomous_research": ("ingest_scan", 1800.0),
+        "visualize_vector_lake": ("scan", 900.0),
+    }
+
+    assert {name: mcp_server._MCP_HEAVY_TASKS[name] for name in expected} == expected
+    for name in expected:
+        registered = mcp_server.mcp._tool_manager.get_tool(name)
+        assert registered is not None
+        assert registered.is_async is True
 
 
 def test_queued_sync_tool_rechecks_source_revision_at_execution(
@@ -990,7 +1088,11 @@ def test_mcp_running_worker_does_not_delay_process_exit(tmp_path):
         text=True,
     )
     try:
-        startup_deadline = time.monotonic() + 20
+        # Windows process/import startup can be delayed by antivirus and memory
+        # pressure in the full suite. The contract under test starts only after
+        # the ready marker; its five-second process-exit bound remains strict.
+        startup_timeout_seconds = 45
+        startup_deadline = time.monotonic() + startup_timeout_seconds
         while not child_ready.exists():
             if process.poll() is not None:
                 stdout, stderr = process.communicate(timeout=1)
@@ -1000,7 +1102,10 @@ def test_mcp_running_worker_does_not_delay_process_exit(tmp_path):
                     f"stderr={stderr!r}"
                 )
             if time.monotonic() >= startup_deadline:
-                pytest.fail("MCP exit probe did not start its worker within 20 seconds")
+                pytest.fail(
+                    "MCP exit probe did not start its worker within "
+                    f"{startup_timeout_seconds} seconds"
+                )
             time.sleep(0.02)
         try:
             stdout, stderr = process.communicate(timeout=5)
@@ -1152,6 +1257,7 @@ def test_mcp_runtime_status_exposes_blocking_executor_capacity():
     assert status["blocking_executor"]["queued_items"] >= 0
     assert status["blocking_executor"]["workers_daemon"] is True
     assert status["blocking_executor"]["running_workers"] >= 0
+    assert status["heavy_task_gate"]["physical_state"] in {"free", "locked"}
 
 
 def test_mcp_worker_closes_connection_after_tool_failure(tmp_path, monkeypatch):
@@ -1185,9 +1291,69 @@ def test_corrupt_search_index_raises_typed_runtime_error(isolated_memory):
         search_vector_lake("test")
 
 
+def test_projection_consumers_fail_closed_on_uncommitted_index(isolated_memory):
+    import json
+
+    from vector_lake import (
+        db_store,
+        indexer,
+        runtime_health,
+        tool_doctor,
+        tool_graph,
+        tool_ingest,
+        tool_piea,
+        tool_projection,
+        tool_research,
+    )
+
+    db_store.init_db()
+    index_path = get_wiki_dir() / "index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "nodes": {},
+                "graph_insights": [
+                    {"type": "isolated_node", "node": "Concept_Uncommitted"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert tool_research.research_vector_lake().startswith(
+        "Error: committed projection is not ready"
+    )
+    assert tool_graph.audit_graph().startswith(
+        "Error: committed graph projection is not ready"
+    )
+    duplicate = json.loads(
+        tool_piea.check_duplicate_entity("Uncommitted", "concept")
+    )
+    assert duplicate["status"] == "not_ready"
+    assert duplicate["is_duplicate"] is None
+    assert duplicate["error"] == "projection_not_committed"
+    with pytest.raises(indexer.ProjectionPairContractError):
+        tool_projection.embedding_backfill_projection(dry_run=True)
+    with pytest.raises(indexer.ProjectionPairContractError):
+        tool_ingest._prepare_relevant_index_context()
+
+    health = runtime_health.assess_runtime_health()
+    assert health["ok"] is False
+    assert health["detail"]["projection_pair"] == "invalid"
+    assert any(
+        issue.startswith("projection_pair_invalid:")
+        for issue in health["issues"]
+    )
+    doctor = tool_doctor.doctor_vector_lake()
+    projection_line = next(
+        line for line in doctor.splitlines() if "Projection Pair:" in line
+    )
+    assert projection_line.startswith("[FAIL]")
+
+
 def test_dirty_graph_is_excluded_from_search_expansion(isolated_memory, monkeypatch):
     import json
-    from vector_lake import tool_search
+    from vector_lake import index_snapshot, tool_search
 
     wiki_dir = get_wiki_dir()
     wiki_dir.mkdir(parents=True, exist_ok=True)
@@ -1228,6 +1394,11 @@ def test_dirty_graph_is_excluded_from_search_expansion(isolated_memory, monkeypa
     )
     monkeypatch.setattr(tool_search, "_get_query_embedding", lambda *_: None)
     monkeypatch.setattr(tool_search, "_expand_query_locally", lambda *_: ["seed"])
+    monkeypatch.setattr(
+        tool_search,
+        "read_committed_index_snapshot",
+        index_snapshot.load_index_snapshot,
+    )
     clear_index_snapshot_cache_for_tests()
 
     dirty_result = tool_search.search_vector_lake("seed", top_k=2)
@@ -1278,6 +1449,11 @@ def test_assemble_context_reuses_search_index_snapshot(isolated_memory, monkeypa
     )
     monkeypatch.setattr(tool_search, "_get_query_embedding", lambda *_: None)
     monkeypatch.setattr(tool_search, "_expand_query_locally", lambda *_: ["seed"])
+    monkeypatch.setattr(
+        tool_search,
+        "read_committed_index_snapshot",
+        index_snapshot.load_index_snapshot,
+    )
     clear_index_snapshot_cache_for_tests()
 
     real_decode = index_snapshot._decode_index_snapshot
@@ -1296,16 +1472,11 @@ def test_assemble_context_reuses_search_index_snapshot(isolated_memory, monkeypa
 
 
 def test_search_and_runtime_health_share_index_snapshot(isolated_memory):
-    import json
-
-    from vector_lake import runtime_health, tool_search
+    from vector_lake import db_store, indexer, runtime_health, tool_search
 
     index_path = get_wiki_dir() / "index.json"
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(
-        json.dumps({"nodes": {"Concept_One": {"title": "One"}}}),
-        encoding="utf-8",
-    )
+    db_store.init_db()
+    indexer.generate_index()
     clear_index_snapshot_cache_for_tests()
 
     search_snapshot = tool_search._load_search_index(index_path)
@@ -1314,11 +1485,60 @@ def test_search_and_runtime_health_share_index_snapshot(isolated_memory):
     assert error is None
     assert health_snapshot is search_snapshot
 
-    index_path.write_text(
-        json.dumps({"nodes": {"Concept_One": {"title": "One changed and longer"}}}),
-        encoding="utf-8",
-    )
+    indexer.generate_index()
     refreshed_snapshot = tool_search._load_search_index(index_path)
 
     assert refreshed_snapshot is not search_snapshot
-    assert refreshed_snapshot["nodes"]["Concept_One"]["title"].endswith("longer")
+    assert (
+        refreshed_snapshot["projection_manifest"]["generation"]
+        != search_snapshot["projection_manifest"]["generation"]
+    )
+
+
+def test_search_discards_backend_scores_when_projection_generation_changes(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_search
+
+    index_path = get_wiki_dir() / "index.json"
+    index_path.write_text("{}", encoding="utf-8")
+    (get_wiki_dir() / "Concept_New.md").write_text("# New", encoding="utf-8")
+    old_snapshot = {
+        "projection_manifest": {"generation": "old"},
+        "nodes": {
+            "Concept_Old": {
+                "title": "Old",
+                "type": "concept",
+                "status": "Active",
+            }
+        },
+        "weighted_edges": [],
+    }
+    new_snapshot = {
+        "projection_manifest": {"generation": "new"},
+        "nodes": {
+            "Concept_New": {
+                "title": "New seed",
+                "summary": "seed",
+                "type": "concept",
+                "status": "Active",
+            }
+        },
+        "weighted_edges": [],
+    }
+    snapshots = iter((old_snapshot, new_snapshot))
+    monkeypatch.setattr(tool_search, "_load_search_index", lambda *_: next(snapshots))
+    monkeypatch.setattr(
+        tool_search,
+        "_get_fts_search_results",
+        lambda *_args, **_kwargs: [{"node_key": "Concept_Old", "rank": -100.0}],
+    )
+    monkeypatch.setattr(tool_search, "_get_query_embedding", lambda *_: None)
+    monkeypatch.setattr(tool_search, "_expand_query_locally", lambda *_: ["seed"])
+
+    result = tool_search.search_vector_lake("seed", top_k=2)
+
+    assert "New seed" in result
+    assert "**Old**" not in result
+    assert "projection_generation_changed" in result

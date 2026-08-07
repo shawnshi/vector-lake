@@ -59,6 +59,7 @@ _GROUPS: dict[str, tuple[str, ...]] = {
     "vector_lake.tool_governance_maintenance": (
         "classify_orphan_source_debt",
         "cleanup_operational_memory",
+        "compact_change_set_history",
         "history_retention_maintenance",
         "operational_memory_search_index_maintenance",
         "retire_legacy_topology_queue",

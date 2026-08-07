@@ -356,7 +356,7 @@ def test_restorable_verification_releases_each_projection_root_before_next_decod
 
     tool_backup_retention._verify_restorable_backup_snapshot(path, manifest)
 
-    assert len(root_refs) == 2
+    assert len(root_refs) == 3
     assert all(reference() is None for reference in root_refs)
 
 

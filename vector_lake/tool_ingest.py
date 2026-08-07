@@ -2047,7 +2047,9 @@ def _prepare_relevant_index_context() -> _PreparedIndexContext:
     index_path = get_index_path()
     if not index_path.exists():
         return _PreparedIndexContext(candidates=())
-    index_data = json.loads(index_path.read_text(encoding="utf-8"))
+    from vector_lake.indexer import read_committed_index_snapshot
+
+    index_data = read_committed_index_snapshot(index_path)
     nodes = index_data.get("nodes", {})
     if not isinstance(nodes, dict) or not nodes:
         return _PreparedIndexContext(candidates=())

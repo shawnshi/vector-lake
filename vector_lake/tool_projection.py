@@ -49,6 +49,7 @@ from vector_lake.wiki_utils import (
     get_index_path,
     get_legacy_claim_graph_path,
     get_meta_dir,
+    get_projection_manifest_path,
     get_wiki_dir,
     iter_markdown_files,
     normalize_semantic_text,
@@ -283,6 +284,7 @@ def _copy_projection_pair_to_backup(
     """Validate and copy one projection generation under the publish lock."""
     index_path = get_index_path()
     claim_graph_path = get_claim_graph_path()
+    sidecar_path = get_projection_manifest_path()
     legacy_claim_graph_path = get_legacy_claim_graph_path()
     copied: list[str] = []
     try:
@@ -316,12 +318,70 @@ def _copy_projection_pair_to_backup(
                 index_data,
                 claim_graph_data,
             )
-
-            del index_data, claim_graph_data
+            generated_backup_sidecar = not sidecar_path.exists()
+            if generated_backup_sidecar:
+                if canonical_generation.get("status") != "verified":
+                    raise indexer.ProjectionPairContractError(
+                        "Projection sidecar is missing and the canonical binding "
+                        "is unverifiable; run sync before backup."
+                    )
+                current_generation = (
+                    indexer.canonical_runtime_generation_snapshot()
+                )
+                if (
+                    canonical_generation.get("runtime_generations")
+                    != current_generation
+                ):
+                    raise indexer.ProjectionPairContractError(
+                        "Projection sidecar is missing and the projection binding "
+                        "is stale; run sync before backup."
+                    )
+                sidecar_data = indexer._projection_sidecar_payload(
+                    manifest,
+                    index_stage=str(index_path),
+                    claim_graph_stage=str(claim_graph_path),
+                    index_data=index_data,
+                    claim_graph_data=claim_graph_data,
+                )
+                del index_data, claim_graph_data
+            else:
+                # The source projections dominate peak RSS.  Their validated
+                # manifest/binding values are self-contained, so release both
+                # payloads before loading the (small) sidecar document.
+                del index_data, claim_graph_data
+                with open(sidecar_path, "r", encoding="utf-8") as handle:
+                    sidecar_data = json.load(handle)
+            sidecar_manifest, sidecar_artifacts = (
+                indexer._validate_projection_sidecar(sidecar_data)
+            )
+            if sidecar_manifest != manifest:
+                raise indexer.ProjectionPairContractError(
+                    "Projection sidecar manifest does not match the projection pair."
+                )
+            for path in (index_path, claim_graph_path):
+                digest, _identity = indexer._stable_file_sha256(str(path))
+                metadata = sidecar_artifacts[path.name]
+                if (
+                    digest != metadata["sha256"]
+                    or path.stat().st_size != metadata["bytes"]
+                ):
+                    raise indexer.ProjectionPairContractError(
+                        f"Projection sidecar digest does not match {path.name}."
+                    )
             for path in (index_path, claim_graph_path):
                 target = backup_dir / path.name
                 shutil.copy2(path, target)
                 copied.append(target.name)
+            backup_sidecar_path = backup_dir / sidecar_path.name
+            if generated_backup_sidecar:
+                backup_sidecar_path.write_text(
+                    json.dumps(sidecar_data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            else:
+                shutil.copy2(sidecar_path, backup_sidecar_path)
+            copied.append(backup_sidecar_path.name)
+            del sidecar_data
 
             with open(backup_dir / index_path.name, "r", encoding="utf-8") as handle:
                 copied_index = json.load(handle)
@@ -339,13 +399,34 @@ def _copy_projection_pair_to_backup(
                 copied_index,
                 copied_claim_graph,
             )
+            del copied_index, copied_claim_graph
+            copied_sidecar = json.loads(
+                (backup_dir / sidecar_path.name).read_text(encoding="utf-8")
+            )
+            copied_manifest, copied_artifacts = indexer._validate_projection_sidecar(
+                copied_sidecar
+            )
             if (
                 copied_generation != generation
                 or copied_canonical_generation != canonical_generation
+                or copied_manifest != manifest
             ):
                 raise indexer.ProjectionPairContractError(
                     "Copied projection generation changed during backup."
                 )
+            for path in (
+                backup_dir / index_path.name,
+                backup_dir / claim_graph_path.name,
+            ):
+                digest, _identity = indexer._stable_file_sha256(str(path))
+                metadata = copied_artifacts[path.name]
+                if (
+                    digest != metadata["sha256"]
+                    or path.stat().st_size != metadata["bytes"]
+                ):
+                    raise indexer.ProjectionPairContractError(
+                        f"Copied projection digest changed for {path.name}."
+                    )
             return copied, generation, copied_canonical_generation
     except Timeout as exc:
         raise TimeoutError(
@@ -1004,7 +1085,7 @@ def embedding_backfill_projection(
     index_path = get_index_path()
     if not index_path.exists():
         return "index.json not found; run projection-rebuild-index first."
-    index_data = load_index_snapshot(index_path)
+    index_data = indexer.read_committed_index_snapshot(index_path)
     result = embedding_backfill(
         index_data,
         dry_run=dry_run,

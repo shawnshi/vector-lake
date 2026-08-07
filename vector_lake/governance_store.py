@@ -1,13 +1,16 @@
 import copy
 import heapq
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
 import sqlite3
+import unicodedata
 import uuid
+import zlib
 from datetime import datetime, timezone
 
 from filelock import FileLock
@@ -67,6 +70,54 @@ class OperationalMemoryNotReady(RuntimeError):
 
 class CanonicalIdOwnershipError(ValueError):
     """Reject reuse or relocation of a globally unique canonical identifier."""
+
+
+class ChangeSetIdempotencyConflict(RuntimeError):
+    """Reject an ambiguous legacy idempotency key without choosing an owner."""
+
+
+class ChangeSetPayloadTooLarge(ValueError):
+    """Reject one change set whose canonical delta exceeds its hard ceiling."""
+
+
+class ChangeSetBatchTooLarge(ValueError):
+    """Reject an atomic change-set batch that exceeds count or byte ceilings."""
+
+
+class ChangeSetPayloadCorrupt(RuntimeError):
+    """Reject a missing, malformed, or digest-mismatched content-addressed delta."""
+
+
+_CHANGE_SET_PAYLOAD_SECTIONS = (
+    "proposed_entities",
+    "proposed_claims",
+    "proposed_evidence",
+    "proposed_source_updates",
+    "proposed_source_artifacts",
+    "proposed_extraction_runs",
+    "proposed_edges",
+)
+_CHANGE_SET_TERMINAL_STATUSES = frozenset(
+    {"applied", "cancelled", "failed", "published", "rejected", "superseded"}
+)
+_CHANGE_SET_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+_CHANGE_SET_MAX_STORED_BYTES = _CHANGE_SET_MAX_PAYLOAD_BYTES + 64 * 1024
+_CHANGE_SET_BATCH_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
+_CHANGE_SET_MAX_BATCH_ITEMS = 200
+_CHANGE_SET_MAX_PAGES = 200
+_CHANGE_SET_MAX_AFFECTED_IDS = 20_000
+_CHANGE_SET_BATCH_MAX_AFFECTED_IDS = 50_000
+_CHANGE_SET_MAX_MANIFEST_BYTES = 64 * 1024
+_CHANGE_SET_ID_PREVIEW_LIMIT = 32
+_CHANGE_SET_PAGE_PREVIEW_LIMIT = _CHANGE_SET_MAX_PAGES
+_CHANGE_SET_MANIFEST_VERSION = 2
+_CHANGE_SET_DELTA_KIND = "page_replace_v1"
+_CHANGE_SET_PAYLOAD_CODEC = "zlib-json-v1"
+_CHANGE_SET_DETACHED_LEGACY_CODEC = "detached-legacy-json-sha256-v1"
+_CHANGE_SET_LOAD_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+_CHANGE_SET_COMPACTION_MAX_SCAN_ROWS = 5000
+_CHANGE_SET_COMPACTION_MAX_INPUT_BYTES = 128 * 1024 * 1024
+_CHANGE_SET_COMPACTION_MAX_CURSOR_BYTES = 1024
 
 
 _PURPOSE_VECTORS_CACHE = None
@@ -159,10 +210,15 @@ def _load_db_map(table_name: str, pk_col: str):
 
 def _load_db_queue(table_name: str, pk_col: str):
     _validate_table_name(table_name)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", pk_col) is None:
+        raise ValueError(f"Security error: Invalid primary key column '{pk_col}'")
     initialize_meta_store()
     conn = get_connection()
     store = _default_queue_store()
-    rows = conn.execute(f"SELECT data_json FROM {table_name} ORDER BY updated_at ASC").fetchall()
+    rows = conn.execute(
+        f"SELECT data_json FROM {table_name} "
+        f"ORDER BY updated_at ASC, {pk_col} ASC"
+    ).fetchall()
     for row in rows:
         store["items"].append(json.loads(row["data_json"]))
     return store
@@ -286,6 +342,152 @@ def load_sources():
     return _load_db_map("sources", "source_id")
 
 
+def canonical_store_counts() -> dict[str, int]:
+    """Return canonical row counts without materializing domain objects."""
+    initialize_meta_store()
+    row = get_connection().execute(
+        "SELECT "
+        "(SELECT COUNT(*) FROM entities) AS entities, "
+        "(SELECT COUNT(*) FROM claims) AS claims, "
+        "(SELECT COUNT(*) FROM sources) AS sources"
+    ).fetchone()
+    return {
+        "entities": int(row["entities"]),
+        "claims": int(row["claims"]),
+        "sources": int(row["sources"]),
+    }
+
+
+def _needs_unicode_trace_fallback(tokens: list[str]) -> bool:
+    return any(
+        ord(character) > 127
+        and character.isalpha()
+        and character.lower() != character.upper()
+        for token in tokens
+        for character in str(token)
+    )
+
+
+def _select_trace_claims_streaming(
+    tokens: list[str],
+    relevant_pages: set[str],
+    top_k: int,
+) -> list[dict]:
+    """Preserve Python Unicode matching while retaining only a top-K heap."""
+    normalized_tokens = [str(token).lower() for token in tokens]
+    normalized_pages = {str(page) for page in relevant_pages}
+    retained: list[tuple[int, str, str]] = []
+    rows = get_connection().execute(
+        "SELECT claim_id AS source_key, claim_text, "
+        "COALESCE(json_extract(data_json, '$.source_page'), '') AS source_page, "
+        "data_json FROM claims"
+    )
+    for row in rows:
+        source_page = str(row["source_page"] or "")
+        haystack = f"{row['claim_text'] or ''} {source_page}".lower()
+        score = (5 if source_page in normalized_pages else 0) + sum(
+            1 for token in normalized_tokens if token in haystack
+        )
+        if score <= 0:
+            continue
+        source_key = str(row["source_key"])
+        candidate = (score, source_key, str(row["data_json"]))
+        if len(retained) < top_k:
+            retained.append(candidate)
+            continue
+        worst_index = max(
+            range(len(retained)),
+            key=lambda index: (-retained[index][0], retained[index][1]),
+        )
+        worst = retained[worst_index]
+        if score > worst[0] or (score == worst[0] and source_key < worst[1]):
+            retained[worst_index] = candidate
+    retained.sort(key=lambda item: (-item[0], item[1]))
+    return [json.loads(data_json) for _, _, data_json in retained]
+
+
+def select_trace_claims(
+    tokens: list[str],
+    relevant_pages: set[str],
+    top_k: int,
+) -> list[dict]:
+    """Select only the highest-scoring trace claims with bounded result memory."""
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative")
+    if top_k == 0 or (not tokens and not relevant_pages):
+        return []
+    initialize_meta_store()
+    if _needs_unicode_trace_fallback(tokens):
+        return _select_trace_claims_streaming(tokens, relevant_pages, top_k)
+    rows = get_connection().execute(
+        "WITH query_terms(term) AS ("
+        "SELECT CAST(value AS TEXT) FROM json_each(?)"
+        "), relevant_pages(page_key) AS ("
+        "SELECT CAST(value AS TEXT) FROM json_each(?)"
+        "), scored AS ("
+        "SELECT claims.claim_id AS source_key, claims.data_json AS data_json, "
+        "(CASE WHEN EXISTS ("
+        "SELECT 1 FROM relevant_pages WHERE page_key = "
+        "COALESCE(json_extract(claims.data_json, '$.source_page'), '')"
+        ") THEN 5 ELSE 0 END) + ("
+        "SELECT COUNT(*) FROM query_terms WHERE instr("
+        "lower(COALESCE(claims.claim_text, '') || ' ' || "
+        "COALESCE(json_extract(claims.data_json, '$.source_page'), '')), "
+        "term) > 0"
+        ") AS trace_score FROM claims"
+        ") SELECT data_json FROM scored WHERE trace_score > 0 "
+        "ORDER BY trace_score DESC, source_key ASC LIMIT ?",
+        (
+            json.dumps([str(token).lower() for token in tokens], ensure_ascii=False),
+            json.dumps(sorted(str(page) for page in relevant_pages), ensure_ascii=False),
+            int(top_k),
+        ),
+    ).fetchall()
+    return [json.loads(row["data_json"]) for row in rows]
+
+
+def load_trace_labels(
+    entity_ids: set[str],
+    source_ids: set[str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Load labels only for entities and sources referenced by selected claims."""
+    initialize_meta_store()
+    conn = get_connection()
+    entity_names: dict[str, str] = {}
+    source_pages: dict[str, str] = {}
+
+    ordered_entities = sorted(str(value) for value in entity_ids if value)
+    for offset in range(0, len(ordered_entities), 500):
+        batch = ordered_entities[offset:offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            "SELECT entity_id, canonical_name, data_json FROM entities "
+            f"WHERE entity_id IN ({placeholders})",
+            tuple(batch),
+        ).fetchall()
+        for row in rows:
+            record = json.loads(row["data_json"])
+            entity_names[str(row["entity_id"])] = str(
+                record.get("canonical_name") or row["canonical_name"] or ""
+            )
+
+    ordered_sources = sorted(str(value) for value in source_ids if value)
+    for offset in range(0, len(ordered_sources), 500):
+        batch = ordered_sources[offset:offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            "SELECT source_id, data_json FROM sources "
+            f"WHERE source_id IN ({placeholders})",
+            tuple(batch),
+        ).fetchall()
+        for row in rows:
+            record = json.loads(row["data_json"])
+            source_pages[str(row["source_id"])] = str(
+                record.get("canonical_source_page") or ""
+            )
+    return entity_names, source_pages
+
+
 def load_alias_registry():
     initialize_meta_store()
     conn = get_connection()
@@ -344,8 +546,88 @@ def query_memory_objects(filters: dict = None) -> dict:
     return store
 
 
-def load_change_sets():
-    return _load_db_queue("change_sets", "change_set_id")
+def load_change_sets(limit: int = 1000):
+    """Load bounded manifests only; payload blobs are never hydrated here."""
+    initialize_meta_store()
+    normalized_limit = int(limit)
+    if normalized_limit < 1 or normalized_limit > 5000:
+        raise ValueError("change-set manifest limit must be between 1 and 5000")
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT change_sets.change_set_id, lifecycle.status, lifecycle.created_at, "
+        "lifecycle.terminal_at, length(CAST(change_sets.data_json AS BLOB)) "
+        "AS data_bytes, CASE WHEN json_valid(change_sets.data_json) "
+        "THEN json_extract(change_sets.data_json, '$.manifest_version') END "
+        "AS manifest_version FROM change_sets "
+        "JOIN change_set_lifecycle_v6 AS lifecycle "
+        "ON lifecycle.change_set_id = change_sets.change_set_id "
+        "ORDER BY COALESCE(lifecycle.terminal_at, lifecycle.created_at) DESC, "
+        "change_sets.change_set_id DESC LIMIT ?",
+        (normalized_limit,),
+    ).fetchall()
+    items = []
+    loaded_bytes = 0
+    truncated_by_bytes = False
+    for row in rows:
+        data_bytes = int(row["data_bytes"] or 0)
+        if int(row["manifest_version"] or 0) != _CHANGE_SET_MANIFEST_VERSION:
+            items.append(
+                {
+                    "change_set_id": str(row["change_set_id"]),
+                    "manifest_version": 0,
+                    "status": str(row["status"]),
+                    "created_at": row["created_at"],
+                    "terminal_at": row["terminal_at"],
+                    "legacy_inline": True,
+                    "compaction_required": True,
+                    "payload": {
+                        "available": False,
+                        "codec": "legacy-inline-json-v1",
+                        "raw_bytes": data_bytes,
+                    },
+                }
+            )
+            continue
+        if data_bytes < 0 or data_bytes > _CHANGE_SET_MAX_MANIFEST_BYTES:
+            raise ChangeSetPayloadCorrupt(
+                "Stored change-set manifest exceeds hard limit: "
+                f"{row['change_set_id']} ({data_bytes} bytes)"
+            )
+        if loaded_bytes + data_bytes > _CHANGE_SET_LOAD_MAX_TOTAL_BYTES:
+            truncated_by_bytes = True
+            break
+        manifest_row = conn.execute(
+            "SELECT data_json FROM change_sets WHERE change_set_id = ? "
+            "AND length(CAST(data_json AS BLOB)) = ? "
+            "AND length(CAST(data_json AS BLOB)) <= ?",
+            (
+                row["change_set_id"],
+                data_bytes,
+                _CHANGE_SET_MAX_MANIFEST_BYTES,
+            ),
+        ).fetchone()
+        if manifest_row is None:
+            raise ChangeSetPayloadCorrupt(
+                f"Change-set manifest changed during bounded load: {row['change_set_id']}"
+            )
+        manifest = _history_json_object(manifest_row["data_json"] or "")
+        _validate_loaded_change_set_manifest(
+            manifest,
+            change_set_id=str(row["change_set_id"]),
+            lifecycle_status=str(row["status"]),
+            lifecycle_terminal_at=row["terminal_at"],
+        )
+        items.append(manifest)
+        loaded_bytes += data_bytes
+    store = _default_queue_store()
+    store["items"] = items
+    store["bounded"] = True
+    store["limit"] = normalized_limit
+    store["loaded_manifest_bytes"] = loaded_bytes
+    store["max_manifest_bytes"] = _CHANGE_SET_MAX_MANIFEST_BYTES
+    store["max_total_manifest_bytes"] = _CHANGE_SET_LOAD_MAX_TOTAL_BYTES
+    store["truncated_by_bytes"] = truncated_by_bytes
+    return store
 
 
 def load_governance_queue():
@@ -418,8 +700,11 @@ def save_memory_objects(data):
     ])
 
 
-def save_change_sets(data):
-    _save_db_queue("change_sets", "change_set_id", data)
+def save_change_sets(_data):
+    raise RuntimeError(
+        "Full-history change-set replacement is disabled; use "
+        "record_prepared_change_sets or confirmed history maintenance"
+    )
 
 def save_governance_queue(data):
     """Compatibility writer that upserts the supplied rows without deleting peers."""
@@ -1940,7 +2225,7 @@ def _upsert_memory_search_documents(
 def _advance_operational_memory_search_index(
     conn: sqlite3.Connection,
     batch_size: int | None = None,
-) -> tuple[int, int]:
+) -> tuple[str, str]:
     """Apply a bounded pending/backfill slice and return its durable cursor."""
     if batch_size is None:
         batch_size = _operational_memory_search_batch_size()
@@ -1953,14 +2238,14 @@ def _advance_operational_memory_search_index(
         ).fetchone()
         if state is None:
             raise sqlite3.OperationalError("operational-memory search state is missing")
-        cursor = int(state[0])
-        target = int(state[1])
+        cursor = str(state[0] or "")
+        target = str(state[1] or "")
 
         pending_rows = conn.execute(
             "SELECT p.memory_id, p.operation, om.data_json, om.updated_at "
             "FROM operational_memory_search_pending AS p "
             "LEFT JOIN operational_memory AS om ON om.memory_id = p.memory_id "
-            "ORDER BY p.rowid LIMIT ?",
+            "ORDER BY COALESCE(p.queued_at, ''), p.memory_id LIMIT ?",
             (batch_size,),
         ).fetchall()
         _delete_memory_search_documents(
@@ -1989,16 +2274,16 @@ def _advance_operational_memory_search_index(
         backfill_rows = []
         if remaining and cursor < target:
             backfill_rows = conn.execute(
-                "SELECT rowid, memory_id, data_json, updated_at "
-                "FROM operational_memory WHERE rowid > ? AND rowid <= ? "
-                "ORDER BY rowid LIMIT ?",
+                "SELECT memory_id, data_json, updated_at "
+                "FROM operational_memory WHERE memory_id > ? AND memory_id <= ? "
+                "ORDER BY memory_id LIMIT ?",
                 (cursor, target, remaining),
             ).fetchall()
             _upsert_memory_search_documents(
                 conn,
-                [(str(row[1]), row[2], row[3]) for row in backfill_rows],
+                [(str(row[0]), row[1], row[2]) for row in backfill_rows],
             )
-            cursor = int(backfill_rows[-1][0]) if backfill_rows else target
+            cursor = str(backfill_rows[-1][0]) if backfill_rows else target
 
         conn.execute(
             "UPDATE operational_memory_search_state SET "
@@ -2049,8 +2334,8 @@ def operational_memory_search_index_status() -> dict:
         "SELECT backfill_cursor, backfill_target, schema_version "
         "FROM operational_memory_search_state WHERE singleton = 1"
     ).fetchone()
-    cursor = int(state[0]) if state is not None else 0
-    target = int(state[1]) if state is not None else 0
+    cursor = str(state[0] or "") if state is not None else ""
+    target = str(state[1] or "") if state is not None else ""
     pending = int(conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_pending"
     ).fetchone()[0])
@@ -2142,8 +2427,8 @@ def _indexed_operational_memory_rows(
         ).fetchone()
         if state is None:
             return None
-        cursor = int(state[0])
-        target = int(state[1])
+        cursor = str(state[0] or "")
+        target = str(state[1] or "")
         type_sql = ""
         type_params: list[object] = []
         if allowed_types:
@@ -2160,7 +2445,7 @@ def _indexed_operational_memory_rows(
         short_terms = [term for term in terms if len(term) <= 2]
         if long_terms:
             candidate_queries.append(
-                "SELECT om.rowid AS source_rowid, om.data_json AS data_json "
+                "SELECT om.memory_id AS source_key, om.data_json AS data_json "
                 "FROM operational_memory_search_fts "
                 "JOIN operational_memory_search_docs AS docs "
                 "ON docs.doc_id = operational_memory_search_fts.rowid "
@@ -2171,15 +2456,15 @@ def _indexed_operational_memory_rows(
         if short_terms:
             short_filter, short_params = _memory_sql_term_filter(short_terms)
             candidate_queries.append(
-                "SELECT om.rowid AS source_rowid, om.data_json AS data_json "
+                "SELECT om.memory_id AS source_key, om.data_json AS data_json "
                 "FROM operational_memory AS om WHERE " + short_filter + type_sql
             )
             candidate_params.extend((*short_params, *type_params))
 
         residual_filter, residual_params = _memory_sql_term_filter(terms)
         candidate_queries.append(
-            "SELECT om.rowid AS source_rowid, om.data_json AS data_json "
-            "FROM operational_memory AS om WHERE ((om.rowid > ? AND om.rowid <= ?) "
+            "SELECT om.memory_id AS source_key, om.data_json AS data_json "
+            "FROM operational_memory AS om WHERE ((om.memory_id > ? AND om.memory_id <= ?) "
             "OR EXISTS (SELECT 1 FROM operational_memory_search_pending AS pending "
             "WHERE pending.memory_id = om.memory_id "
             "AND pending.operation = 'upsert')) AND "
@@ -2194,7 +2479,7 @@ def _indexed_operational_memory_rows(
         ))
         return conn.execute(
             "SELECT data_json FROM (" + " UNION ".join(candidate_queries) + ") "
-            "ORDER BY source_rowid",
+            "ORDER BY source_key",
             tuple(candidate_params),
         )
     except sqlite3.Error as exc:
@@ -2282,7 +2567,10 @@ def _operational_memory_candidate_sql(
         params.extend(sorted(allowed_types))
 
     where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
-    sql = f"SELECT data_json FROM operational_memory {where_sql}"
+    sql = (
+        f"SELECT data_json FROM operational_memory {where_sql} "
+        "ORDER BY memory_id ASC"
+    )
     return sql, params
 
 
@@ -2316,7 +2604,9 @@ def _legacy_operational_memory_views(
             heapq.heapreplace(heap, entry)
 
     sequence = 0
-    for row in conn.execute("SELECT data_json FROM operational_memory"):
+    for row in conn.execute(
+        "SELECT data_json FROM operational_memory ORDER BY memory_id ASC"
+    ):
         memory = _decode_operational_memory_json(row["data_json"])
         memory_type = str(memory.get("memory_type", "fact")).lower()
         if allowed_types and memory_type not in allowed_types:
@@ -2572,7 +2862,11 @@ def remediate_operational_memory_pollution(
     return result
 
 
-def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
+def build_claim_graph_projection(
+    limit_nodes: int | None = None,
+    *,
+    connection=None,
+) -> dict:
     max_degree = 12
     entity_window = 6
     source_window = 4
@@ -2580,7 +2874,8 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
         limit_nodes = 2500  # Hard cap to prevent 3D-force-graph from freezing the browser
     from vector_lake import governance_metrics
 
-    claim_rows = get_connection().execute(
+    conn = connection or get_connection()
+    claim_rows = conn.execute(
         "SELECT data_json FROM claims ORDER BY "
         "COALESCE(json_extract(data_json, '$.updated_at'), "
         "json_extract(data_json, '$.created_at'), "
@@ -2611,7 +2906,7 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
             if not batch:
                 continue
             placeholders = ",".join("?" for _ in batch)
-            rows = get_connection().execute(
+            rows = conn.execute(
                 f"SELECT {id_column}, data_json FROM {table_name} "
                 f"WHERE {id_column} IN ({placeholders})",
                 tuple(batch),
@@ -2796,6 +3091,955 @@ def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
     return result
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    try:
+        text = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload is not canonical JSON: {exc}"
+        ) from exc
+    return text.encode("utf-8")
+
+
+def _canonical_change_set_payload(change_set: dict) -> tuple[dict, bytes]:
+    affected_pages = change_set.get("affected_pages") or []
+    if not isinstance(affected_pages, list) or any(
+        not isinstance(page, str) or not page for page in affected_pages
+    ):
+        raise ChangeSetPayloadCorrupt(
+            "Change-set affected_pages must be a list of non-empty strings"
+        )
+    payload: dict[str, object] = {
+        "delta_kind": _CHANGE_SET_DELTA_KIND,
+        "affected_pages": list(affected_pages),
+    }
+    for section in _CHANGE_SET_PAYLOAD_SECTIONS:
+        records = change_set.get(section) or []
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) for record in records
+        ):
+            raise ChangeSetPayloadCorrupt(
+                f"Change-set {section} must be a list of objects"
+            )
+        payload[section] = records
+    return payload, _canonical_json_bytes(payload)
+
+
+def _change_set_payload_digest(payload_bytes: bytes) -> str:
+    return hashlib.sha256(payload_bytes).hexdigest()
+
+
+def _normalized_change_set_status(value: object) -> str:
+    status = str(value or "pending").strip().casefold()
+    allowed = {"pending", *_CHANGE_SET_TERMINAL_STATUSES}
+    if status not in allowed:
+        raise ChangeSetPayloadCorrupt(
+            f"Unsupported change-set status: {status or '<missing>'}"
+        )
+    return status
+
+
+def _strict_utc_instant(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _terminal_time_for_change_set(
+    change_set: dict,
+    status: str,
+    *,
+    default_terminal_at: str | None = None,
+) -> tuple[str | None, str]:
+    created_at = _strict_utc_instant(change_set.get("created_at"))
+    if status not in _CHANGE_SET_TERMINAL_STATUSES:
+        return None, "active"
+    field_name = {
+        "applied": "applied_at",
+        "cancelled": "cancelled_at",
+        "failed": "failed_at",
+        "published": "published_at",
+        "rejected": "rejected_at",
+        "superseded": "superseded_at",
+    }[status]
+    terminal_at = _strict_utc_instant(change_set.get(field_name))
+    if terminal_at is not None:
+        return terminal_at, field_name
+    terminal_at = _strict_utc_instant(change_set.get("terminal_at"))
+    if terminal_at is not None:
+        return terminal_at, "terminal_at"
+    if change_set.get("requires_human_review") is False and created_at is not None:
+        return created_at, "created_terminal"
+    fallback = _strict_utc_instant(default_terminal_at)
+    if fallback is not None:
+        return fallback, "persisted_terminal"
+    return None, "unknown"
+
+
+def _change_set_manifest(
+    change_set: dict,
+    payload_bytes: bytes,
+    *,
+    payload_available: bool,
+    terminal_at: str | None = None,
+) -> dict:
+    payload, canonical_payload = _canonical_change_set_payload(change_set)
+    if canonical_payload != payload_bytes:
+        raise ChangeSetPayloadCorrupt(
+            "Change-set payload changed while its manifest was being built"
+        )
+    status = _normalized_change_set_status(change_set.get("status"))
+    affected_id_values = change_set.get("affected_ids") or []
+    if not isinstance(affected_id_values, list):
+        raise ChangeSetPayloadCorrupt("Legacy affected_ids must be a list")
+    affected_ids = sorted({str(value) for value in affected_id_values if value})
+    stored_bytes = len(zlib.compress(payload_bytes)) if payload_available else 0
+    record_counts = {
+        section: len(payload[section]) for section in _CHANGE_SET_PAYLOAD_SECTIONS
+    }
+    manifest_keys = (
+        "change_set_id",
+        "idempotency_key",
+        "origin",
+        "created_at",
+        "summary",
+        "risk_level",
+        "requires_human_review",
+        "write_contract",
+        "published_at",
+        "applied_at",
+        "cancelled_at",
+        "failed_at",
+        "rejected_at",
+        "superseded_at",
+        "operational_memory_count",
+    )
+    manifest = {
+        key: copy.deepcopy(change_set[key])
+        for key in manifest_keys
+        if key in change_set
+    }
+    affected_pages = list(payload["affected_pages"])
+    manifest.update(
+        {
+            "manifest_version": _CHANGE_SET_MANIFEST_VERSION,
+            "delta_kind": _CHANGE_SET_DELTA_KIND,
+            "status": status,
+            "terminal_at": terminal_at,
+            "affected_pages": affected_pages[:_CHANGE_SET_PAGE_PREVIEW_LIMIT],
+            "affected_page_count": len(affected_pages),
+            "affected_pages_sha256": hashlib.sha256(
+                _canonical_json_bytes(affected_pages)
+            ).hexdigest(),
+            "affected_ids": affected_ids[:_CHANGE_SET_ID_PREVIEW_LIMIT],
+            "affected_id_count": len(affected_ids),
+            "affected_ids_sha256": hashlib.sha256(
+                "\n".join(affected_ids).encode("utf-8")
+            ).hexdigest(),
+            "payload": {
+                "sha256": _change_set_payload_digest(payload_bytes),
+                "codec": _CHANGE_SET_PAYLOAD_CODEC,
+                "raw_bytes": len(payload_bytes),
+                "stored_bytes": stored_bytes,
+                "record_counts": record_counts,
+                "available": bool(payload_available),
+            },
+        }
+    )
+    manifest_bytes = _canonical_json_bytes(manifest)
+    if len(manifest_bytes) > _CHANGE_SET_MAX_MANIFEST_BYTES:
+        raise ChangeSetPayloadTooLarge(
+            "Change-set manifest exceeds hard limit: "
+            f"{len(manifest_bytes)} > {_CHANGE_SET_MAX_MANIFEST_BYTES} bytes"
+        )
+    return manifest
+
+
+def _legacy_terminal_change_set_manifest(
+    change_set: dict,
+    *,
+    raw_sha256: str,
+    raw_bytes: int,
+    terminal_at: str | None,
+) -> dict:
+    """Detach an already-applied legacy snapshot without rebuilding its payload."""
+    status = _normalized_change_set_status(change_set.get("status"))
+    if status not in _CHANGE_SET_TERMINAL_STATUSES:
+        raise ChangeSetPayloadCorrupt("Legacy detached manifests require terminal status")
+    if not re.fullmatch(r"[0-9a-f]{64}", raw_sha256):
+        raise ChangeSetPayloadCorrupt("Legacy detached manifest digest is invalid")
+    if raw_bytes < 0 or raw_bytes > _CHANGE_SET_COMPACTION_MAX_INPUT_BYTES:
+        raise ChangeSetPayloadTooLarge("Legacy detached snapshot exceeds hard limit")
+    affected_pages = change_set.get("affected_pages") or []
+    if not isinstance(affected_pages, list) or any(
+        not isinstance(page, str) or not page for page in affected_pages
+    ):
+        raise ChangeSetPayloadCorrupt("Legacy affected_pages are malformed")
+    affected_id_values = change_set.get("affected_ids") or []
+    if not isinstance(affected_id_values, list) or any(
+        not isinstance(value, str) or not value for value in affected_id_values
+    ):
+        raise ChangeSetPayloadCorrupt(
+            "Change-set affected_ids must be a list of non-empty strings"
+        )
+    affected_ids = sorted(set(affected_id_values))
+    affected_ids_digest = hashlib.sha256()
+    for index, affected_id in enumerate(affected_ids):
+        if index:
+            affected_ids_digest.update(b"\n")
+        affected_ids_digest.update(affected_id.encode("utf-8"))
+    record_counts = {}
+    for section in _CHANGE_SET_PAYLOAD_SECTIONS:
+        records = change_set.get(section) or []
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) for record in records
+        ):
+            raise ChangeSetPayloadCorrupt(
+                f"Legacy change-set {section} must be a list"
+            )
+        record_counts[section] = len(records)
+    manifest_keys = (
+        "change_set_id",
+        "idempotency_key",
+        "origin",
+        "created_at",
+        "summary",
+        "risk_level",
+        "requires_human_review",
+        "write_contract",
+        "published_at",
+        "applied_at",
+        "cancelled_at",
+        "failed_at",
+        "rejected_at",
+        "superseded_at",
+        "operational_memory_count",
+    )
+    manifest = {
+        key: copy.deepcopy(change_set[key])
+        for key in manifest_keys
+        if key in change_set
+    }
+    manifest.update(
+        {
+            "manifest_version": _CHANGE_SET_MANIFEST_VERSION,
+            "delta_kind": _CHANGE_SET_DELTA_KIND,
+            "status": status,
+            "terminal_at": terminal_at,
+            "affected_pages": affected_pages[:_CHANGE_SET_PAGE_PREVIEW_LIMIT],
+            "affected_page_count": len(affected_pages),
+            "affected_pages_sha256": hashlib.sha256(
+                _canonical_json_bytes(affected_pages)
+            ).hexdigest(),
+            "affected_ids": affected_ids[:_CHANGE_SET_ID_PREVIEW_LIMIT],
+            "affected_id_count": len(affected_ids),
+            "affected_ids_sha256": affected_ids_digest.hexdigest(),
+            "payload": {
+                "sha256": raw_sha256,
+                "codec": _CHANGE_SET_DETACHED_LEGACY_CODEC,
+                "raw_bytes": int(raw_bytes),
+                "stored_bytes": 0,
+                "record_counts": record_counts,
+                "available": False,
+            },
+        }
+    )
+    manifest_bytes = _canonical_json_bytes(manifest)
+    if len(manifest_bytes) > _CHANGE_SET_MAX_MANIFEST_BYTES:
+        raise ChangeSetPayloadTooLarge(
+            "Legacy detached change-set manifest exceeds hard limit: "
+            f"{len(manifest_bytes)} > {_CHANGE_SET_MAX_MANIFEST_BYTES} bytes"
+        )
+    return manifest
+
+
+def _validate_change_set_batch_limits(
+    change_sets: list[dict],
+) -> list[tuple[dict, bytes]]:
+    if len(change_sets) > _CHANGE_SET_MAX_BATCH_ITEMS:
+        raise ChangeSetBatchTooLarge(
+            "Change-set batch item count exceeds hard limit: "
+            f"{len(change_sets)} > {_CHANGE_SET_MAX_BATCH_ITEMS}"
+    )
+    prepared: list[tuple[dict, bytes]] = []
+    aggregate = 0
+    aggregate_affected_ids = 0
+    batch_pages: dict[str, str] = {}
+    for index, change_set in enumerate(change_sets):
+        if not isinstance(change_set, dict):
+            raise ChangeSetPayloadCorrupt("Every change set must be an object")
+        pages = change_set.get("affected_pages") or []
+        if len(pages) > _CHANGE_SET_MAX_PAGES:
+            raise ChangeSetPayloadTooLarge(
+                "Change-set page count exceeds hard limit: "
+                f"{len(pages)} > {_CHANGE_SET_MAX_PAGES}"
+            )
+        local_pages: set[str] = set()
+        for page in pages:
+            normalized_page = unicodedata.normalize(
+                "NFKC",
+                os.path.basename(str(page)).strip(),
+            ).casefold()
+            if not normalized_page:
+                raise ChangeSetPayloadCorrupt(
+                    "Change-set affected_pages contains an empty normalized page"
+                )
+            if normalized_page in local_pages:
+                raise ChangeSetBatchTooLarge(
+                    f"Change-set contains a duplicate affected page: {page}"
+                )
+            local_pages.add(normalized_page)
+            prior = batch_pages.get(normalized_page)
+            if prior is not None:
+                raise ChangeSetBatchTooLarge(
+                    "Atomic change-set batch contains overlapping pages: "
+                    f"{prior!r} and {page!r}"
+                )
+            batch_pages[normalized_page] = str(page)
+        if len(batch_pages) > _CHANGE_SET_MAX_PAGES:
+            raise ChangeSetBatchTooLarge(
+                "Change-set batch page count exceeds hard limit: "
+                f"{len(batch_pages)} > {_CHANGE_SET_MAX_PAGES} "
+                f"after item {index + 1}"
+            )
+        affected_ids = change_set.get("affected_ids") or []
+        if not isinstance(affected_ids, list) or any(
+            not isinstance(value, str) or not value for value in affected_ids
+        ):
+            raise ChangeSetPayloadCorrupt(
+                "Change-set affected_ids must be a list of non-empty strings"
+            )
+        if len(affected_ids) > _CHANGE_SET_MAX_AFFECTED_IDS:
+            raise ChangeSetPayloadTooLarge(
+                "Change-set affected_ids exceeds hard limit: "
+                f"{len(affected_ids)} > {_CHANGE_SET_MAX_AFFECTED_IDS}"
+            )
+        aggregate_affected_ids += len(affected_ids)
+        if aggregate_affected_ids > _CHANGE_SET_BATCH_MAX_AFFECTED_IDS:
+            raise ChangeSetBatchTooLarge(
+                "Change-set batch affected_ids exceeds hard limit: "
+                f"{aggregate_affected_ids} > {_CHANGE_SET_BATCH_MAX_AFFECTED_IDS}"
+            )
+        _payload, payload_bytes = _canonical_change_set_payload(change_set)
+        observed = len(payload_bytes)
+        if observed > _CHANGE_SET_MAX_PAYLOAD_BYTES:
+            raise ChangeSetPayloadTooLarge(
+                "Change-set payload exceeds hard limit: "
+                f"{observed} > {_CHANGE_SET_MAX_PAYLOAD_BYTES} bytes"
+            )
+        aggregate += observed
+        if aggregate > _CHANGE_SET_BATCH_MAX_PAYLOAD_BYTES:
+            raise ChangeSetBatchTooLarge(
+                "Change-set batch payload exceeds hard limit: "
+                f"{aggregate} > {_CHANGE_SET_BATCH_MAX_PAYLOAD_BYTES} bytes"
+            )
+        status = _normalized_change_set_status(change_set.get("status"))
+        terminal_at, _source = _terminal_time_for_change_set(change_set, status)
+        _change_set_manifest(
+            change_set,
+            payload_bytes,
+            payload_available=status not in _CHANGE_SET_TERMINAL_STATUSES,
+            terminal_at=terminal_at,
+        )
+        prepared.append((change_set, payload_bytes))
+    return prepared
+
+
+def _validate_loaded_change_set_manifest(
+    manifest: dict,
+    *,
+    change_set_id: str,
+    lifecycle_status: str,
+    lifecycle_terminal_at: object,
+) -> None:
+    """Fail closed on malformed bounded manifests without hydrating payloads."""
+    if not isinstance(manifest, dict) or not manifest:
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set manifest is malformed: {change_set_id}"
+        )
+    if (
+        manifest.get("manifest_version") != _CHANGE_SET_MANIFEST_VERSION
+        or str(manifest.get("change_set_id") or "") != change_set_id
+        or manifest.get("delta_kind") != _CHANGE_SET_DELTA_KIND
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set manifest identity is invalid: {change_set_id}"
+        )
+    status = _normalized_change_set_status(manifest.get("status"))
+    if status != _normalized_change_set_status(lifecycle_status):
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set manifest lifecycle drifted: {change_set_id}"
+        )
+    pages = manifest.get("affected_pages")
+    page_count = manifest.get("affected_page_count")
+    page_digest = str(manifest.get("affected_pages_sha256") or "")
+    if (
+        not isinstance(pages, list)
+        or any(not isinstance(page, str) or not page for page in pages)
+        or len(pages) > _CHANGE_SET_PAGE_PREVIEW_LIMIT
+        or not isinstance(page_count, int)
+        or page_count < len(pages)
+        or not re.fullmatch(r"[0-9a-f]{64}", page_digest)
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set page summary is invalid: {change_set_id}"
+        )
+    if page_count == len(pages) and not hmac.compare_digest(
+        page_digest,
+        hashlib.sha256(_canonical_json_bytes(pages)).hexdigest(),
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set page digest is invalid: {change_set_id}"
+        )
+    descriptor = manifest.get("payload")
+    if not isinstance(descriptor, dict):
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set payload descriptor is missing: {change_set_id}"
+        )
+    try:
+        raw_bytes = int(descriptor.get("raw_bytes"))
+        stored_bytes = int(descriptor.get("stored_bytes"))
+    except (TypeError, ValueError) as exc:
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set payload sizes are invalid: {change_set_id}"
+        ) from exc
+    available = descriptor.get("available")
+    record_counts = descriptor.get("record_counts")
+    codec = descriptor.get("codec")
+    max_descriptor_raw_bytes = (
+        _CHANGE_SET_COMPACTION_MAX_INPUT_BYTES
+        if available is False and codec == _CHANGE_SET_DETACHED_LEGACY_CODEC
+        else _CHANGE_SET_MAX_PAYLOAD_BYTES
+    )
+    if (
+        codec not in {
+            _CHANGE_SET_PAYLOAD_CODEC,
+            _CHANGE_SET_DETACHED_LEGACY_CODEC,
+        }
+        or (available is True and codec != _CHANGE_SET_PAYLOAD_CODEC)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(descriptor.get("sha256") or ""))
+        or raw_bytes < 0
+        or raw_bytes > max_descriptor_raw_bytes
+        or stored_bytes < 0
+        or stored_bytes > _CHANGE_SET_MAX_STORED_BYTES
+        or (available is True and stored_bytes == 0)
+        or (codec == _CHANGE_SET_DETACHED_LEGACY_CODEC and stored_bytes != 0)
+        or not isinstance(record_counts, dict)
+        or set(record_counts) != set(_CHANGE_SET_PAYLOAD_SECTIONS)
+        or any(
+            not isinstance(value, int) or value < 0
+            for value in record_counts.values()
+        )
+        or not isinstance(available, bool)
+        or (status == "pending") is not available
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Stored change-set payload descriptor is invalid: {change_set_id}"
+        )
+    terminal_at = manifest.get("terminal_at")
+    if status in _CHANGE_SET_TERMINAL_STATUSES:
+        if terminal_at != lifecycle_terminal_at:
+            raise ChangeSetPayloadCorrupt(
+                f"Stored change-set terminal time drifted: {change_set_id}"
+            )
+    elif terminal_at is not None or lifecycle_terminal_at is not None:
+        raise ChangeSetPayloadCorrupt(
+            f"Pending change-set has a terminal time: {change_set_id}"
+        )
+
+
+def _store_change_set_payload(
+    conn: sqlite3.Connection,
+    payload_bytes: bytes,
+    *,
+    created_at: str | None = None,
+) -> str:
+    if len(payload_bytes) > _CHANGE_SET_MAX_PAYLOAD_BYTES:
+        raise ChangeSetPayloadTooLarge(
+            "Change-set payload exceeds hard limit: "
+            f"{len(payload_bytes)} > {_CHANGE_SET_MAX_PAYLOAD_BYTES} bytes"
+        )
+    payload_sha256 = _change_set_payload_digest(payload_bytes)
+    compressed = zlib.compress(payload_bytes)
+    if len(compressed) > _CHANGE_SET_MAX_STORED_BYTES:
+        raise ChangeSetPayloadTooLarge(
+            "Compressed change-set payload exceeds hard input limit: "
+            f"{len(compressed)} > {_CHANGE_SET_MAX_STORED_BYTES} bytes"
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO change_set_payloads "
+        "(payload_sha256, codec, payload_blob, raw_bytes, stored_bytes, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            payload_sha256,
+            _CHANGE_SET_PAYLOAD_CODEC,
+            compressed,
+            len(payload_bytes),
+            len(compressed),
+            created_at or _utc_now(),
+        ),
+    )
+    row = conn.execute(
+        "SELECT codec, payload_blob, raw_bytes, stored_bytes "
+        "FROM change_set_payloads WHERE payload_sha256 = ?",
+        (payload_sha256,),
+    ).fetchone()
+    if row is None or (
+        str(row["codec"]) != _CHANGE_SET_PAYLOAD_CODEC
+        or bytes(row["payload_blob"]) != compressed
+        or int(row["raw_bytes"]) != len(payload_bytes)
+        or int(row["stored_bytes"]) != len(compressed)
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Content-addressed payload collision or corruption: {payload_sha256}"
+        )
+    return payload_sha256
+
+
+def _bounded_decompress_change_set_payload(
+    compressed: bytes,
+    expected_raw_bytes: int,
+) -> bytes:
+    if expected_raw_bytes < 0 or expected_raw_bytes > _CHANGE_SET_MAX_PAYLOAD_BYTES:
+        raise ChangeSetPayloadCorrupt(
+            f"Invalid change-set raw byte declaration: {expected_raw_bytes}"
+        )
+    decompressor = zlib.decompressobj()
+    try:
+        payload = decompressor.decompress(compressed, expected_raw_bytes + 1)
+    except zlib.error as exc:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload decompression failed: {exc}"
+        ) from exc
+    if (
+        len(payload) != expected_raw_bytes
+        or not decompressor.eof
+        or decompressor.unconsumed_tail
+        or decompressor.unused_data
+    ):
+        raise ChangeSetPayloadCorrupt(
+            "Change-set payload decompressed size or stream boundary is invalid"
+        )
+    return payload
+
+
+def _load_change_set_payload(
+    conn: sqlite3.Connection,
+    manifest: dict,
+) -> dict:
+    descriptor = manifest.get("payload")
+    if not isinstance(descriptor, dict) or descriptor.get("available") is not True:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload is unavailable: {manifest.get('change_set_id')}"
+        )
+    payload_sha256 = str(descriptor.get("sha256") or "")
+    reference = conn.execute(
+        "SELECT payload_sha256 FROM change_set_payload_refs WHERE change_set_id = ?",
+        (manifest.get("change_set_id"),),
+    ).fetchone()
+    if reference is None or str(reference["payload_sha256"]) != payload_sha256:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload reference is missing or mismatched: "
+            f"{manifest.get('change_set_id')}"
+        )
+    row = conn.execute(
+        "SELECT codec, raw_bytes, stored_bytes, length(payload_blob) AS blob_bytes "
+        "FROM change_set_payloads WHERE payload_sha256 = ?",
+        (payload_sha256,),
+    ).fetchone()
+    if row is None:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload blob is missing: {payload_sha256}"
+        )
+    raw_bytes = int(row["raw_bytes"])
+    stored_bytes = int(row["stored_bytes"])
+    blob_bytes = int(row["blob_bytes"])
+    if (
+        str(row["codec"]) != _CHANGE_SET_PAYLOAD_CODEC
+        or str(descriptor.get("codec")) != _CHANGE_SET_PAYLOAD_CODEC
+        or raw_bytes < 0
+        or raw_bytes > _CHANGE_SET_MAX_PAYLOAD_BYTES
+        or raw_bytes != int(descriptor.get("raw_bytes") or -1)
+        or stored_bytes < 0
+        or stored_bytes > _CHANGE_SET_MAX_STORED_BYTES
+        or blob_bytes != stored_bytes
+        or stored_bytes != int(descriptor.get("stored_bytes") or -1)
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload metadata is inconsistent: {payload_sha256}"
+        )
+    blob_row = conn.execute(
+        "SELECT payload_blob FROM change_set_payloads "
+        "WHERE payload_sha256 = ? AND raw_bytes = ? AND stored_bytes = ? "
+        "AND length(payload_blob) = stored_bytes",
+        (payload_sha256, raw_bytes, stored_bytes),
+    ).fetchone()
+    if blob_row is None:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload changed during bounded load: {payload_sha256}"
+        )
+    compressed = bytes(blob_row["payload_blob"])
+    if len(compressed) != stored_bytes:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload physical length drifted: {payload_sha256}"
+        )
+    payload_bytes = _bounded_decompress_change_set_payload(compressed, raw_bytes)
+    if not hmac.compare_digest(
+        _change_set_payload_digest(payload_bytes),
+        payload_sha256,
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload digest mismatch: {payload_sha256}"
+        )
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload JSON is invalid: {payload_sha256}"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("delta_kind") != _CHANGE_SET_DELTA_KIND:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set payload delta contract is invalid: {payload_sha256}"
+        )
+    for section in _CHANGE_SET_PAYLOAD_SECTIONS:
+        records = payload.get(section)
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) for record in records
+        ):
+            raise ChangeSetPayloadCorrupt(
+                f"Change-set payload section is invalid: {section}"
+            )
+    affected_pages = payload.get("affected_pages")
+    if (
+        not isinstance(affected_pages, list)
+        or manifest.get("affected_pages")
+        != affected_pages[:_CHANGE_SET_PAGE_PREVIEW_LIMIT]
+        or manifest.get("affected_page_count") != len(affected_pages)
+        or not hmac.compare_digest(
+            str(manifest.get("affected_pages_sha256") or ""),
+            hashlib.sha256(_canonical_json_bytes(affected_pages)).hexdigest(),
+        )
+    ):
+        raise ChangeSetPayloadCorrupt(
+            "Change-set payload affected_pages do not match the manifest summary"
+        )
+    return payload
+
+
+def _hydrate_change_set(
+    manifest: dict,
+    *,
+    connection: sqlite3.Connection | None = None,
+    require_payload: bool = True,
+) -> dict:
+    version = manifest.get("manifest_version")
+    if version in {None, 1}:
+        return copy.deepcopy(manifest)
+    if version != _CHANGE_SET_MANIFEST_VERSION:
+        raise ChangeSetPayloadCorrupt(
+            f"Unsupported change-set manifest version: {version}"
+        )
+    descriptor = manifest.get("payload")
+    available = isinstance(descriptor, dict) and descriptor.get("available") is True
+    if not available:
+        if require_payload:
+            raise ChangeSetPayloadCorrupt(
+                f"Terminal change-set payload is detached: "
+                f"{manifest.get('change_set_id')}"
+            )
+        return copy.deepcopy(manifest)
+    payload = _load_change_set_payload(connection or get_connection(), manifest)
+    hydrated = copy.deepcopy(manifest)
+    for section in _CHANGE_SET_PAYLOAD_SECTIONS:
+        hydrated[section] = payload[section]
+    hydrated["affected_pages"] = payload["affected_pages"]
+    return hydrated
+
+
+def _delete_unreferenced_change_set_payloads(
+    conn: sqlite3.Connection,
+    payload_hashes: set[str] | None = None,
+) -> tuple[int, int]:
+    deleted_rows = 0
+    deleted_bytes = 0
+    if payload_hashes is None:
+        rows = conn.execute(
+            "SELECT payload_sha256, stored_bytes FROM change_set_payloads AS payload "
+            "WHERE NOT EXISTS (SELECT 1 FROM change_set_payload_refs AS ref "
+            "WHERE ref.payload_sha256 = payload.payload_sha256)"
+        ).fetchall()
+    else:
+        rows = []
+        for payload_hash in sorted(payload_hashes):
+            row = conn.execute(
+                "SELECT payload_sha256, stored_bytes FROM change_set_payloads "
+                "WHERE payload_sha256 = ? AND NOT EXISTS ("
+                "SELECT 1 FROM change_set_payload_refs "
+                "WHERE payload_sha256 = change_set_payloads.payload_sha256)",
+                (payload_hash,),
+            ).fetchone()
+            if row is not None:
+                rows.append(row)
+    for row in rows:
+        cursor = conn.execute(
+            "DELETE FROM change_set_payloads WHERE payload_sha256 = ? "
+            "AND NOT EXISTS (SELECT 1 FROM change_set_payload_refs "
+            "WHERE payload_sha256 = change_set_payloads.payload_sha256)",
+            (row["payload_sha256"],),
+        )
+        if cursor.rowcount:
+            deleted_rows += 1
+            deleted_bytes += int(row["stored_bytes"] or 0)
+    return deleted_rows, deleted_bytes
+
+
+def _persist_prepared_change_set(
+    conn: sqlite3.Connection,
+    change_set: dict,
+    now: str,
+    *,
+    payload_bytes: bytes | None = None,
+) -> bool:
+    if payload_bytes is None:
+        _payload, payload_bytes = _canonical_change_set_payload(change_set)
+    payload_sha256 = _change_set_payload_digest(payload_bytes)
+    change_set_id = str(change_set.get("change_set_id") or "")
+    idempotency_key = str(change_set.get("idempotency_key") or change_set_id)
+    if not change_set_id or not idempotency_key:
+        raise ChangeSetPayloadCorrupt(
+            "Change sets require non-empty change_set_id and idempotency_key"
+        )
+    status = _normalized_change_set_status(change_set.get("status"))
+    if status != "pending":
+        raise ChangeSetPayloadCorrupt(
+            "Prepared change-set persistence accepts pending deltas only; "
+            "terminal state requires the apply-and-terminalize transaction"
+        )
+    existing = conn.execute(
+        "SELECT change_sets.change_set_id, change_sets.data_json, lifecycle.status "
+        "FROM change_set_idempotency JOIN change_sets "
+        "ON change_sets.change_set_id = change_set_idempotency.change_set_id "
+        "JOIN change_set_lifecycle_v6 AS lifecycle "
+        "ON lifecycle.change_set_id = change_sets.change_set_id "
+        "WHERE change_set_idempotency.idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone()
+    if existing is not None:
+        try:
+            existing_manifest = json.loads(existing["data_json"])
+        except (TypeError, ValueError) as exc:
+            raise ChangeSetIdempotencyConflict(
+                f"Existing idempotency owner is malformed: {idempotency_key}"
+            ) from exc
+        existing_descriptor = existing_manifest.get("payload") or {}
+        existing_payload_sha256 = str(existing_descriptor.get("sha256") or "")
+        if not existing_payload_sha256 and existing_manifest.get("manifest_version") in {
+            None,
+            1,
+        }:
+            _existing_payload, existing_bytes = _canonical_change_set_payload(
+                existing_manifest
+            )
+            existing_payload_sha256 = _change_set_payload_digest(existing_bytes)
+        if existing_payload_sha256 != payload_sha256:
+            raise ChangeSetIdempotencyConflict(
+                "Idempotency key is already owned by a different payload: "
+                f"{idempotency_key}"
+            )
+        existing_status = _normalized_change_set_status(existing["status"])
+        manifest_status = _normalized_change_set_status(
+            existing_manifest.get("status")
+        )
+        if manifest_status != existing_status:
+            raise ChangeSetPayloadCorrupt(
+                f"Existing idempotency lifecycle drifted: {idempotency_key}"
+            )
+        available = (existing_manifest.get("payload") or {}).get("available")
+        if (existing_status == "pending") is not (available is True):
+            raise ChangeSetPayloadCorrupt(
+                f"Existing idempotency payload availability drifted: {idempotency_key}"
+            )
+        return False
+
+    terminal_at = None
+    time_source = "active"
+    manifest = _change_set_manifest(
+        change_set,
+        payload_bytes,
+        payload_available=True,
+        terminal_at=terminal_at,
+    )
+    manifest_json = _canonical_json_bytes(manifest).decode("utf-8")
+    reserved = conn.execute(
+        "INSERT OR IGNORE INTO change_set_idempotency "
+        "(idempotency_key, change_set_id, created_at) VALUES (?, ?, ?)",
+        (idempotency_key, change_set_id, now),
+    )
+    if not reserved.rowcount:
+        raise ChangeSetIdempotencyConflict(
+            f"Idempotency key reservation raced with another owner: {idempotency_key}"
+        )
+    conn.execute(
+        "INSERT INTO change_sets (change_set_id, data_json, updated_at) "
+        "VALUES (?, ?, ?)",
+        (change_set_id, manifest_json, now),
+    )
+    stored_hash = _store_change_set_payload(conn, payload_bytes, created_at=now)
+    conn.execute(
+        "INSERT INTO change_set_payload_refs "
+        "(change_set_id, payload_sha256, created_at) VALUES (?, ?, ?)",
+        (change_set_id, stored_hash, now),
+    )
+    conn.execute(
+        "INSERT INTO change_set_lifecycle_v6 "
+        "(change_set_id, status, created_at, terminal_at, time_source, "
+        "payload_guard_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            change_set_id,
+            status,
+            _strict_utc_instant(change_set.get("created_at")),
+            terminal_at,
+            time_source,
+            hashlib.sha256(manifest_json.encode("utf-8")).hexdigest(),
+        ),
+    )
+    return True
+
+
+def _terminalize_change_set(
+    conn: sqlite3.Connection,
+    change_set: dict,
+    terminal_at: str,
+) -> dict:
+    change_set_id = str(change_set.get("change_set_id") or "")
+    terminal_at = _strict_utc_instant(terminal_at) or ""
+    if not change_set_id or not terminal_at:
+        raise ChangeSetPayloadCorrupt(
+            "Terminal change-set transition requires an id and UTC instant"
+        )
+    row = conn.execute(
+        "SELECT change_sets.data_json, lifecycle.status, "
+        "lifecycle.payload_guard_sha256, ref.payload_sha256 "
+        "FROM change_sets JOIN change_set_lifecycle_v6 AS lifecycle "
+        "ON lifecycle.change_set_id = change_sets.change_set_id "
+        "LEFT JOIN change_set_payload_refs AS ref "
+        "ON ref.change_set_id = change_sets.change_set_id "
+        "WHERE change_sets.change_set_id = ?",
+        (change_set_id,),
+    ).fetchone()
+    if row is None or str(row["status"]) != "pending":
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set is not a current pending candidate: {change_set_id}"
+        )
+    raw_manifest = str(row["data_json"])
+    if not hmac.compare_digest(
+        hashlib.sha256(raw_manifest.encode("utf-8")).hexdigest(),
+        str(row["payload_guard_sha256"]),
+    ):
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set manifest guard drifted: {change_set_id}"
+        )
+    _payload, payload_bytes = _canonical_change_set_payload(change_set)
+    terminal = copy.deepcopy(change_set)
+    terminal["status"] = "published"
+    terminal["published_at"] = terminal_at
+    terminal["terminal_at"] = terminal_at
+    manifest = _change_set_manifest(
+        terminal,
+        payload_bytes,
+        payload_available=False,
+        terminal_at=terminal_at,
+    )
+    manifest_json = _canonical_json_bytes(manifest).decode("utf-8")
+    cursor = conn.execute(
+        "UPDATE change_sets SET data_json = ?, updated_at = ? "
+        "WHERE change_set_id = ? AND data_json IS ?",
+        (manifest_json, terminal_at, change_set_id, raw_manifest),
+    )
+    if cursor.rowcount != 1:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set manifest changed before terminal transition: {change_set_id}"
+        )
+    lifecycle_cursor = conn.execute(
+        "UPDATE change_set_lifecycle_v6 SET status = 'published', terminal_at = ?, "
+        "time_source = 'published_at', payload_guard_sha256 = ? "
+        "WHERE change_set_id = ? AND status = 'pending' AND terminal_at IS NULL",
+        (
+            terminal_at,
+            hashlib.sha256(manifest_json.encode("utf-8")).hexdigest(),
+            change_set_id,
+        ),
+    )
+    if lifecycle_cursor.rowcount != 1:
+        raise ChangeSetPayloadCorrupt(
+            f"Change-set lifecycle changed before terminal transition: {change_set_id}"
+        )
+    payload_hash = str(row["payload_sha256"] or "")
+    conn.execute(
+        "DELETE FROM change_set_payload_refs WHERE change_set_id = ?",
+        (change_set_id,),
+    )
+    if payload_hash:
+        _delete_unreferenced_change_set_payloads(conn, {payload_hash})
+    return manifest
+
+
+def _load_change_set_by_idempotency_key(idempotency_key: str) -> dict | None:
+    """Load one change set through the dedicated key index with legacy fallback."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT change_sets.data_json FROM change_set_idempotency "
+        "JOIN change_sets ON change_sets.change_set_id = "
+        "change_set_idempotency.change_set_id "
+        "WHERE change_set_idempotency.idempotency_key = ? LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    if row is None:
+        # Historical stores can predate change_set_idempotency. Keep them
+        # readable until a separately approved maintenance window backfills
+        # and validates every legacy key.
+        legacy_rows = conn.execute(
+            "SELECT change_set_id, data_json FROM change_sets "
+            "WHERE json_valid(data_json) = 1 "
+            "AND json_extract(data_json, '$.idempotency_key') = ? "
+            "ORDER BY change_set_id LIMIT 2",
+            (idempotency_key,),
+        ).fetchall()
+        if len(legacy_rows) > 1:
+            owners = ", ".join(str(item["change_set_id"]) for item in legacy_rows)
+            raise ChangeSetIdempotencyConflict(
+                "Legacy change-set idempotency key has multiple unmapped owners: "
+                f"{idempotency_key} ({owners})."
+            )
+        row = legacy_rows[0] if legacy_rows else None
+    if row is None:
+        return None
+    loaded = json.loads(row["data_json"])
+    if loaded.get("manifest_version") == _CHANGE_SET_MANIFEST_VERSION:
+        descriptor = loaded.get("payload") or {}
+        return _hydrate_change_set(
+            loaded,
+            connection=conn,
+            require_payload=descriptor.get("available") is True,
+        )
+    return loaded
+
+
 def create_change_set(
     page_paths: list[str],
     origin: str,
@@ -2804,6 +4048,11 @@ def create_change_set(
     force: bool = False,
     dry_run: bool = False,
 ) -> dict:
+    if len(page_paths) > _CHANGE_SET_MAX_PAGES:
+        raise ChangeSetPayloadTooLarge(
+            "Change-set page count exceeds hard limit: "
+            f"{len(page_paths)} > {_CHANGE_SET_MAX_PAGES}"
+        )
     initialize_meta_store()
     proposed_entities = []
     proposed_claims = []
@@ -2838,11 +4087,13 @@ def create_change_set(
         "|".join([origin, *sorted(page_summaries), *sorted(page_fingerprints)]),
     )
     if not force:
-        from vector_lake.db_store import get_connection
-        conn = get_connection()
-        row = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.idempotency_key') = ?", (idempotency_key,)).fetchone()
-        if row:
-            duplicate = json.loads(row[0])
+        duplicate = _load_change_set_by_idempotency_key(idempotency_key)
+        if duplicate:
+            if (
+                auto_approve
+                and _normalized_change_set_status(duplicate.get("status")) == "pending"
+            ):
+                duplicate = apply_and_record_change_sets_batch([duplicate])[0]
             duplicate["deduplicated"] = True
             return duplicate
 
@@ -2851,7 +4102,7 @@ def create_change_set(
         "idempotency_key": idempotency_key,
         "origin": origin,
         "created_at": _utc_now(),
-        "status": "published" if auto_approve else "pending",
+        "status": "pending",
         "summary": summary or f"Sync pages: {', '.join(page_summaries[:5])}",
         "risk_level": "medium" if len(page_paths) > 3 else "low",
         "requires_human_review": not auto_approve,
@@ -2877,8 +4128,7 @@ def create_change_set(
 
     with transaction():
         if auto_approve:
-            apply_change_set(change_set)
-            change_set["published_at"] = _utc_now()
+            return apply_and_record_change_sets_batch([change_set])[0]
         else:
             item = {
                 "item_id": f"gov_{uuid.uuid4().hex[:12]}",
@@ -2894,8 +4144,7 @@ def create_change_set(
                 "affected_pages": [os.path.basename(path) for path in page_paths],
             }
             insert_governance_item_if_absent(item, ("change_set_id",))
-
-        record_prepared_change_sets([change_set])
+            record_prepared_change_sets([change_set])
     return change_set
 
 
@@ -2924,7 +4173,7 @@ def prepare_change_set_from_content(
         "idempotency_key": idempotency_key,
         "origin": origin,
         "created_at": _utc_now(),
-        "status": "published" if auto_approve else "pending",
+        "status": "pending",
         "summary": summary or f"Sync page: {page_key}",
         "risk_level": "low",
         "requires_human_review": not auto_approve,
@@ -2953,28 +4202,115 @@ def prepare_change_set_from_content(
 
 
 def record_prepared_change_sets(change_sets: list[dict]) -> int:
-    """Persist prepared change sets once without scanning the JSON history."""
+    """Persist pending change sets once without scanning the JSON history."""
     if not change_sets:
         return 0
+    prepared = _validate_change_set_batch_limits(change_sets)
     conn = get_connection()
     now = _utc_now()
     added = 0
     with transaction():
-        for change_set in change_sets:
-            idempotency_key = str(change_set.get("idempotency_key") or change_set["change_set_id"])
-            reserved = conn.execute(
-                "INSERT OR IGNORE INTO change_set_idempotency "
-                "(idempotency_key, change_set_id, created_at) VALUES (?, ?, ?)",
-                (idempotency_key, change_set["change_set_id"], now),
+        for change_set, payload_bytes in prepared:
+            added += int(
+                _persist_prepared_change_set(
+                    conn,
+                    change_set,
+                    now,
+                    payload_bytes=payload_bytes,
+                )
             )
-            if not reserved.rowcount:
-                continue
-            conn.execute(
-                "INSERT INTO change_sets (change_set_id, data_json, updated_at) VALUES (?, ?, ?)",
-                (change_set["change_set_id"], json.dumps(change_set, ensure_ascii=False), now),
-            )
-            added += 1
     return added
+
+
+def apply_and_record_change_sets_batch(change_sets: list[dict]) -> list[dict]:
+    """Persist pending deltas, apply them, and detach payloads in one transaction."""
+    if not change_sets:
+        return []
+    prepared = _validate_change_set_batch_limits(change_sets)
+    if any(
+        _normalized_change_set_status(change_set.get("status")) != "pending"
+        for change_set, _payload_bytes in prepared
+    ):
+        raise ChangeSetPayloadCorrupt(
+            "Apply-and-record accepts pending change sets only"
+        )
+    conn = get_connection()
+    outcomes: dict[str, dict] = {}
+    with transaction():
+        now = _utc_now()
+        active: list[dict] = []
+        for change_set, payload_bytes in prepared:
+            _persist_prepared_change_set(
+                conn,
+                change_set,
+                now,
+                payload_bytes=payload_bytes,
+            )
+            idempotency_key = str(
+                change_set.get("idempotency_key")
+                or change_set.get("change_set_id")
+                or ""
+            )
+            row = conn.execute(
+                "SELECT change_sets.data_json, lifecycle.status "
+                "FROM change_set_idempotency JOIN change_sets "
+                "ON change_sets.change_set_id = change_set_idempotency.change_set_id "
+                "JOIN change_set_lifecycle_v6 AS lifecycle "
+                "ON lifecycle.change_set_id = change_sets.change_set_id "
+                "WHERE change_set_idempotency.idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                raise ChangeSetPayloadCorrupt(
+                    f"Prepared change set disappeared: {idempotency_key}"
+                )
+            manifest = _history_json_object(row["data_json"])
+            if not manifest:
+                raise ChangeSetPayloadCorrupt(
+                    f"Prepared change-set manifest is malformed: {idempotency_key}"
+                )
+            status = _normalized_change_set_status(row["status"])
+            if status == "pending":
+                active.append(
+                    _hydrate_change_set(
+                        manifest,
+                        connection=conn,
+                        require_payload=True,
+                    )
+                )
+            else:
+                outcomes[idempotency_key] = manifest
+
+        if active:
+            _apply_change_sets_batch_unchecked(active)
+            published_at = _utc_now()
+            for change_set in active:
+                terminal = _terminalize_change_set(
+                    conn,
+                    change_set,
+                    published_at,
+                )
+                idempotency_key = str(
+                    change_set.get("idempotency_key")
+                    or change_set.get("change_set_id")
+                    or ""
+                )
+                outcomes[idempotency_key] = terminal
+
+    ordered = []
+    for change_set in change_sets:
+        idempotency_key = str(
+            change_set.get("idempotency_key")
+            or change_set.get("change_set_id")
+            or ""
+        )
+        outcome = outcomes.get(idempotency_key)
+        if outcome is None:
+            raise ChangeSetPayloadCorrupt(
+                f"Apply-and-record outcome is missing: {idempotency_key}"
+            )
+        ordered.append(outcome)
+    return ordered
 
 
 def create_change_set_from_content(
@@ -2992,20 +4328,20 @@ def create_change_set_from_content(
         summary=summary,
         auto_approve=auto_approve,
     )
-    existing = get_connection().execute(
-        "SELECT data_json FROM change_sets "
-        "WHERE json_extract(data_json, '$.idempotency_key') = ? LIMIT 1",
-        (change_set["idempotency_key"],),
-    ).fetchone()
+    existing = _load_change_set_by_idempotency_key(change_set["idempotency_key"])
     if existing:
-        duplicate = json.loads(existing["data_json"])
+        duplicate = existing
+        if (
+            auto_approve
+            and _normalized_change_set_status(duplicate.get("status")) == "pending"
+        ):
+            duplicate = apply_and_record_change_sets_batch([duplicate])[0]
         duplicate["deduplicated"] = True
         return duplicate
 
     with transaction():
         if auto_approve:
-            apply_change_sets_batch([change_set])
-            change_set["published_at"] = _utc_now()
+            return apply_and_record_change_sets_batch([change_set])[0]
         else:
             item = {
                 "item_id": f"gov_{uuid.uuid4().hex[:12]}",
@@ -3021,8 +4357,7 @@ def create_change_set_from_content(
                 "affected_pages": [filename],
             }
             insert_governance_item_if_absent(item, ("change_set_id",))
-
-        record_prepared_change_sets([change_set])
+            record_prepared_change_sets([change_set])
     return change_set
 
 
@@ -3380,6 +4715,16 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     """Apply a page-scoped canonical delta inside an existing transaction."""
     if not change_sets:
         return []
+    change_sets = [
+        _hydrate_change_set(item, connection=get_connection(), require_payload=True)
+        for item in change_sets
+    ]
+    if any(
+        _normalized_change_set_status(item.get("status")) != "pending"
+        for item in change_sets
+    ):
+        raise ChangeSetPayloadCorrupt("Canonical apply accepts pending deltas only")
+    _validate_change_set_batch_limits(change_sets)
     affected_pages = {
         page
         for change_set in change_sets
@@ -3513,9 +4858,37 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
 
 
 def apply_change_sets_batch(change_sets: list[dict]) -> list[dict]:
-    """Atomically apply page-scoped canonical and derived projection deltas."""
-    with transaction():
-        return _apply_change_sets_batch_unchecked(change_sets)
+    """Persist, apply, and terminalize direct canonical deltas atomically."""
+    prepared = []
+    for item in change_sets:
+        if not isinstance(item, dict):
+            raise ChangeSetPayloadCorrupt("Every change set must be an object")
+        change_set = copy.deepcopy(item)
+        status = _normalized_change_set_status(change_set.get("status"))
+        if status != "pending":
+            raise ChangeSetPayloadCorrupt(
+                "Direct canonical apply accepts pending change sets only"
+            )
+        change_set["status"] = "pending"
+        change_set.setdefault("origin", "direct_apply")
+        change_set.setdefault("created_at", _utc_now())
+        change_set.setdefault("summary", "Direct canonical delta")
+        change_set.setdefault("requires_human_review", False)
+        _payload, payload_bytes = _canonical_change_set_payload(change_set)
+        payload_sha256 = _change_set_payload_digest(payload_bytes)
+        if not str(change_set.get("change_set_id") or "").strip():
+            change_set["change_set_id"] = (
+                f"changeset_direct_{payload_sha256[:16]}"
+            )
+        if not str(change_set.get("idempotency_key") or "").strip():
+            change_set["idempotency_key"] = (
+                f"changeset_direct_idem_{payload_sha256}"
+            )
+        prepared.append(change_set)
+    outcomes = apply_and_record_change_sets_batch(prepared)
+    for original, outcome in zip(change_sets, outcomes):
+        original.update(copy.deepcopy(outcome))
+    return change_sets
 
 
 def apply_change_set(change_set: dict) -> dict:
@@ -3523,28 +4896,54 @@ def apply_change_set(change_set: dict) -> dict:
     return change_set
 
 
+def _validated_change_set_limit(limit: int | None, *, default: int = 100) -> int:
+    normalized = default if limit is None else int(limit)
+    if normalized < 1 or normalized > _CHANGE_SET_MAX_BATCH_ITEMS:
+        raise ValueError(
+            "change-set limit must be between 1 and "
+            f"{_CHANGE_SET_MAX_BATCH_ITEMS}"
+        )
+    return normalized
+
+
 def publish_change_sets(limit: int | None = None) -> dict:
     from vector_lake.db_store import get_connection, transaction
     conn = get_connection()
-    rows = conn.execute("SELECT change_set_id, data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
-    
+    normalized_limit = _validated_change_set_limit(limit)
+    rows = conn.execute(
+        "SELECT change_sets.change_set_id FROM change_sets "
+        "JOIN change_set_lifecycle_v6 AS lifecycle "
+        "ON lifecycle.change_set_id = change_sets.change_set_id "
+        "WHERE lifecycle.status = 'pending' "
+        "ORDER BY lifecycle.created_at, change_sets.change_set_id LIMIT ?",
+        (normalized_limit,),
+    ).fetchall()
+
     published = 0
     published_ids = []
-    
+
     for row in rows:
-        change_set = json.loads(row[1])
-        apply_change_set(change_set)
-        change_set["status"] = "published"
-        change_set["published_at"] = _utc_now()
-        
         with transaction():
-            conn.execute("UPDATE change_sets SET data_json = ?, updated_at = ? WHERE change_set_id = ?", 
-                         (json.dumps(change_set, ensure_ascii=False), _utc_now(), change_set["change_set_id"]))
-            
+            current = conn.execute(
+                "SELECT data_json FROM change_sets WHERE change_set_id = ?",
+                (row["change_set_id"],),
+            ).fetchone()
+            if current is None:
+                raise ChangeSetPayloadCorrupt(
+                    f"Pending change set disappeared: {row['change_set_id']}"
+                )
+            manifest = json.loads(current["data_json"])
+            change_set = _hydrate_change_set(
+                manifest,
+                connection=conn,
+                require_payload=True,
+            )
+            _apply_change_sets_batch_unchecked([change_set])
+            published_at = _utc_now()
+            _terminalize_change_set(conn, change_set, published_at)
+
         published += 1
-        published_ids.append(change_set["change_set_id"])
-        if limit is not None and published >= limit:
-            break
+        published_ids.append(str(row["change_set_id"]))
 
     for change_set_id in published_ids:
         update_governance_items_by_field(
@@ -3554,11 +4953,22 @@ def publish_change_sets(limit: int | None = None) -> dict:
         )
     return {"published": published, "change_set_ids": published_ids}
 
-def pending_change_sets() -> list:
+def pending_change_sets(limit: int = 100) -> list:
     from vector_lake.db_store import get_connection
     conn = get_connection()
-    rows = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
-    return [json.loads(r[0]) for r in rows]
+    normalized_limit = _validated_change_set_limit(limit)
+    rows = conn.execute(
+        "SELECT change_sets.data_json FROM change_sets "
+        "JOIN change_set_lifecycle_v6 AS lifecycle "
+        "ON lifecycle.change_set_id = change_sets.change_set_id "
+        "WHERE lifecycle.status = 'pending' "
+        "ORDER BY lifecycle.created_at, change_sets.change_set_id LIMIT ?",
+        (normalized_limit,),
+    ).fetchall()
+    return [
+        _hydrate_change_set(json.loads(row["data_json"]), connection=conn)
+        for row in rows
+    ]
 
 
 def pending_governance_items() -> list:
@@ -3618,14 +5028,65 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
         }
 
     initialize_meta_store()
-    change_set = create_change_set(page_paths, origin="migrate-v8", summary="V8 migration", auto_approve=True, force=True)
-    migrated_page_keys = {item.get("page_key") for item in change_set.get("proposed_entities", []) if item.get("page_key")}
+    preflight: list[tuple[str, int]] = []
+    migrated_page_keys: set[str] = set()
+    for page_path in page_paths:
+        _frontmatter, _body, content = read_markdown_file(page_path)
+        prepared = prepare_change_set_from_content(
+            os.path.basename(page_path),
+            content,
+            origin="migrate-v8-preflight",
+            auto_approve=True,
+        )
+        _payload, payload_bytes = _canonical_change_set_payload(prepared)
+        if len(payload_bytes) > _CHANGE_SET_MAX_PAYLOAD_BYTES:
+            raise ChangeSetPayloadTooLarge(
+                "Migration page exceeds the change-set payload hard limit: "
+                f"{os.path.basename(page_path)} ({len(payload_bytes)} > "
+                f"{_CHANGE_SET_MAX_PAYLOAD_BYTES} bytes)"
+            )
+        preflight.append((page_path, len(payload_bytes)))
+        migrated_page_keys.update(
+            _normalized_owner_page(page)
+            for page in prepared.get("affected_pages", [])
+            if page
+        )
+
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    current_bytes = 0
+    conservative_bytes = int(_CHANGE_SET_MAX_PAYLOAD_BYTES * 0.85)
+    for page_path, payload_bytes in preflight:
+        if current_batch and (
+            len(current_batch) >= 20
+            or current_bytes + payload_bytes > conservative_bytes
+        ):
+            batches.append(current_batch)
+            current_batch = []
+            current_bytes = 0
+        current_batch.append(page_path)
+        current_bytes += payload_bytes
+    if current_batch:
+        batches.append(current_batch)
+
+    change_set_ids = []
+    for index, batch in enumerate(batches, start=1):
+        change_set = create_change_set(
+            batch,
+            origin="migrate-v8",
+            summary=f"V8 migration batch {index}/{len(batches)}",
+            auto_approve=True,
+            force=True,
+        )
+        change_set_ids.append(change_set["change_set_id"])
     canonical_page_keys = {item.get("page_key") for item in load_entities()["items"].values() if item.get("page_key")}
     stale_entities = canonical_page_keys - migrated_page_keys
 
     return {
         "dry_run": False,
-        "change_set_id": change_set["change_set_id"],
+        "change_set_id": change_set_ids[0] if change_set_ids else None,
+        "change_set_ids": change_set_ids,
+        "change_set_batches": len(change_set_ids),
         "pages_scanned": len(page_paths),
         "entities": len(load_entities()["items"]),
         "claims": len(load_claims()["items"]),
@@ -3637,17 +5098,15 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
 
 def ensure_canonical_store_populated() -> dict:
     initialize_meta_store()
-    entities = load_entities()["items"]
-    claims = load_claims()["items"]
-    sources = load_sources()["items"]
+    counts = canonical_store_counts()
     wiki_pages = _count_wiki_pages()
 
-    if claims or entities or sources or wiki_pages == 0:
+    if any(counts.values()) or wiki_pages == 0:
         return {
             "bootstrapped": False,
-            "entities": len(entities),
-            "claims": len(claims),
-            "sources": len(sources),
+            "entities": counts["entities"],
+            "claims": counts["claims"],
+            "sources": counts["sources"],
             "pages_scanned": wiki_pages,
         }
 
@@ -3741,6 +5200,18 @@ _HISTORY_RETENTION_TABLES = (
     "claim_versions",
     "evidence_versions",
 )
+_HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS = 1000
+_HISTORY_ACTIVE_CHANGE_SET_MAX_BYTES = 64 * 1024 * 1024
+_HISTORY_ACTIVE_OUTBOX_MAX_ROWS = 1000
+_HISTORY_ACTIVE_OUTBOX_MAX_BYTES = 16 * 1024 * 1024
+_HISTORY_ACTIVE_JOB_MAX_ROWS = 1000
+_HISTORY_ACTIVE_JOB_MAX_BYTES = 64 * 1024 * 1024
+_HISTORY_VERSION_MIN_SCAN_ROWS = 1000
+_HISTORY_VERSION_MAX_SCAN_ROWS = 5000
+_HISTORY_VERSION_MAX_CURSOR_BYTES = 1024
+_HISTORY_VERSION_MAX_KEEP_PER_FAMILY = 1000
+_HISTORY_CANONICAL_GUARD_MAX_BYTES = 4 * 1024 * 1024
+_HISTORY_RETENTION_MAX_DELETE_BYTES = 128 * 1024 * 1024
 
 
 def _history_page_key(value: object) -> str:
@@ -3756,6 +5227,45 @@ def _history_json_object(value: object) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _sqlite_text_blob_sha256(
+    conn: sqlite3.Connection,
+    *,
+    table_name: str,
+    column_name: str,
+    rowid: int,
+    expected_bytes: int,
+) -> str:
+    """Hash one SQLite TEXT/BLOB value without materializing it in Python."""
+    if (table_name, column_name) not in {("change_sets", "data_json")}:
+        raise ValueError("Unsupported SQLite streaming hash target")
+    if expected_bytes < 0:
+        raise ValueError("expected_bytes must be zero or positive")
+    digest = hashlib.sha256()
+    observed = 0
+    try:
+        with conn.blobopen(
+            table_name,
+            column_name,
+            int(rowid),
+            readonly=True,
+        ) as blob:
+            if len(blob) != expected_bytes:
+                raise RuntimeError("SQLite value length drifted before streaming hash")
+            while observed < expected_bytes:
+                chunk = blob.read(min(1024 * 1024, expected_bytes - observed))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                observed += len(chunk)
+    except sqlite3.Error as exc:
+        raise RuntimeError("SQLite streaming hash failed") from exc
+    if observed != expected_bytes:
+        raise RuntimeError(
+            f"SQLite streaming hash read {observed} of {expected_bytes} bytes"
+        )
+    return digest.hexdigest()
+
+
 def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]:
     """Collect identifiers that unfinished work may still need."""
     protected = {
@@ -3765,19 +5275,110 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
         "evidence_family_ids": set(),
         "page_keys": set(),
         "block_version_retention": set(),
+        "guard_parts": set(),
     }
-    terminal_change = ",".join("?" for _ in _HISTORY_TERMINAL_CHANGE_SET_STATUSES)
-    rows = conn.execute(
-        "SELECT data_json FROM change_sets WHERE "
-        "CASE WHEN json_valid(data_json) THEN "
-        "LOWER(COALESCE(json_extract(data_json, '$.status'), '')) ELSE '' END "
-        f"NOT IN ({terminal_change})",
-        _HISTORY_TERMINAL_CHANGE_SET_STATUSES,
+    active_rows = conn.execute(
+        "SELECT change_sets.change_set_id, lifecycle.status, "
+        "lifecycle.terminal_at, lifecycle.payload_guard_sha256, "
+        "length(CAST(change_sets.data_json AS BLOB)) AS manifest_bytes, "
+        "CASE WHEN json_valid(change_sets.data_json) "
+        "THEN json_extract(change_sets.data_json, '$.manifest_version') END "
+        "AS manifest_version, CASE WHEN json_valid(change_sets.data_json) "
+        "THEN json_extract(change_sets.data_json, '$.payload.raw_bytes') END "
+        "AS payload_raw_bytes "
+        "FROM change_sets JOIN change_set_lifecycle_v6 AS lifecycle "
+        "ON lifecycle.change_set_id = change_sets.change_set_id "
+        "WHERE lifecycle.status NOT IN "
+        "('applied','cancelled','failed','published','rejected','superseded') "
+        "ORDER BY change_sets.change_set_id LIMIT ?",
+        (_HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS + 1,),
     ).fetchall()
-    for row in rows:
-        change_set = _history_json_object(row["data_json"])
+    if len(active_rows) > _HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS:
+        protected["block_version_retention"].add("active_change_set_row_limit")
+        protected["guard_parts"].add(
+            "active_change_set_row_limit:"
+            + str(_HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS)
+        )
+        active_rows = active_rows[:_HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS]
+    active_bytes = 0
+    for row in active_rows:
+        change_set_id = str(row["change_set_id"])
+        manifest_bytes = int(row["manifest_bytes"] or 0)
+        manifest_version = int(row["manifest_version"] or 0)
+        try:
+            payload_raw_bytes = int(row["payload_raw_bytes"])
+        except (TypeError, ValueError):
+            payload_raw_bytes = 0 if manifest_version == 0 else -1
+        estimated_bytes = (
+            manifest_bytes + payload_raw_bytes
+            if manifest_version == _CHANGE_SET_MANIFEST_VERSION
+            else manifest_bytes * 2
+        )
+        active_bytes += max(0, estimated_bytes)
+        protected["guard_parts"].add(
+            f"change_set:{change_set_id}:{row['payload_guard_sha256']}:"
+            f"{manifest_version}:{manifest_bytes}:{payload_raw_bytes}"
+        )
+        if manifest_version not in {0, 1, _CHANGE_SET_MANIFEST_VERSION}:
+            protected["block_version_retention"].add(
+                "unbounded_active_change_set"
+            )
+            continue
+        max_inline_bytes = (
+            _CHANGE_SET_MAX_MANIFEST_BYTES
+            if manifest_version == _CHANGE_SET_MANIFEST_VERSION
+            else _CHANGE_SET_MAX_PAYLOAD_BYTES
+        )
+        if (
+            manifest_bytes < 0
+            or manifest_bytes > max_inline_bytes
+            or payload_raw_bytes < 0
+            or payload_raw_bytes > _CHANGE_SET_MAX_PAYLOAD_BYTES
+        ):
+            protected["block_version_retention"].add("unbounded_active_change_set")
+            continue
+        if active_bytes > _HISTORY_ACTIVE_CHANGE_SET_MAX_BYTES:
+            protected["block_version_retention"].add(
+                "active_change_set_byte_limit"
+            )
+            continue
+        manifest_row = conn.execute(
+            "SELECT data_json FROM change_sets WHERE change_set_id = ? "
+            "AND length(CAST(data_json AS BLOB)) = ? "
+            "AND length(CAST(data_json AS BLOB)) <= ?",
+            (
+                change_set_id,
+                manifest_bytes,
+                max_inline_bytes,
+            ),
+        ).fetchone()
+        change_set = _history_json_object(
+            manifest_row["data_json"] if manifest_row is not None else ""
+        )
         if not change_set:
             protected["block_version_retention"].add("malformed_change_set")
+            continue
+        try:
+            if manifest_version == _CHANGE_SET_MANIFEST_VERSION:
+                _validate_loaded_change_set_manifest(
+                    change_set,
+                    change_set_id=change_set_id,
+                    lifecycle_status=str(row["status"]),
+                    lifecycle_terminal_at=row["terminal_at"],
+                )
+            else:
+                _validate_change_set_batch_limits([change_set])
+            if not hmac.compare_digest(
+                hashlib.sha256(
+                    str(manifest_row["data_json"]).encode("utf-8")
+                ).hexdigest(),
+                str(row["payload_guard_sha256"] or ""),
+            ):
+                raise ChangeSetPayloadCorrupt("active manifest guard drifted")
+            if manifest_version == _CHANGE_SET_MANIFEST_VERSION:
+                change_set = _hydrate_change_set(change_set, connection=conn)
+        except ChangeSetPayloadCorrupt:
+            protected["block_version_retention"].add("corrupt_active_change_set")
             continue
         for page in change_set.get("affected_pages") or []:
             if page_key := _history_page_key(page):
@@ -3806,32 +5407,130 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
                     protected["page_keys"].add(page_key)
 
     terminal_outbox = ",".join("?" for _ in _HISTORY_TERMINAL_OUTBOX_STATUSES)
-    for row in conn.execute(
-        "SELECT filename FROM mutation_outbox "
-        f"WHERE COALESCE(status, '') NOT IN ({terminal_outbox})",
-        _HISTORY_TERMINAL_OUTBOX_STATUSES,
-    ).fetchall():
+    outbox_guard_expr = (
+        "length(CAST(id AS TEXT)) + "
+        "length(CAST(COALESCE(filename, '') AS BLOB)) + "
+        "length(CAST(COALESCE(status, '') AS BLOB)) + "
+        "length(CAST(COALESCE(lease_until, '') AS BLOB))"
+    )
+    active_outbox_rows = conn.execute(
+        f"SELECT id, {outbox_guard_expr} AS guard_bytes "
+        "FROM mutation_outbox "
+        f"WHERE COALESCE(status, '') NOT IN ({terminal_outbox}) "
+        "ORDER BY id LIMIT ?",
+        (*_HISTORY_TERMINAL_OUTBOX_STATUSES, _HISTORY_ACTIVE_OUTBOX_MAX_ROWS + 1),
+    ).fetchall()
+    if len(active_outbox_rows) > _HISTORY_ACTIVE_OUTBOX_MAX_ROWS:
+        protected["block_version_retention"].add("active_outbox_row_limit")
+        protected["guard_parts"].add(
+            f"active_outbox_row_limit:{_HISTORY_ACTIVE_OUTBOX_MAX_ROWS}"
+        )
+        active_outbox_rows = active_outbox_rows[:_HISTORY_ACTIVE_OUTBOX_MAX_ROWS]
+    active_outbox_bytes = 0
+    for metadata in active_outbox_rows:
+        guard_bytes = int(metadata["guard_bytes"] or 0)
+        if (
+            guard_bytes < 0
+            or active_outbox_bytes + guard_bytes
+            > _HISTORY_ACTIVE_OUTBOX_MAX_BYTES
+        ):
+            protected["block_version_retention"].add("active_outbox_byte_limit")
+            protected["guard_parts"].add(
+                f"active_outbox_byte_limit:{_HISTORY_ACTIVE_OUTBOX_MAX_BYTES}"
+            )
+            break
+        row = conn.execute(
+            "SELECT id, filename, status, lease_until FROM mutation_outbox "
+            f"WHERE id = ? AND ({outbox_guard_expr}) = ? "
+            f"AND ({outbox_guard_expr}) <= ?",
+            (metadata["id"], guard_bytes, _HISTORY_ACTIVE_OUTBOX_MAX_BYTES),
+        ).fetchone()
+        if row is None:
+            protected["block_version_retention"].add("active_outbox_guard_drift")
+            protected["guard_parts"].add(
+                f"active_outbox_guard_drift:{metadata['id']}"
+            )
+            break
+        active_outbox_bytes += guard_bytes
         if page_key := _history_page_key(row["filename"]):
             protected["page_keys"].add(page_key)
         else:
             protected["block_version_retention"].add(
                 "missing_active_outbox_filename"
             )
+        protected["guard_parts"].add(
+            "outbox:"
+            + ":".join(
+                str(row[field] or "")
+                for field in ("id", "filename", "status", "lease_until")
+            )
+        )
 
     terminal_jobs = ",".join("?" for _ in _HISTORY_TERMINAL_JOB_STATUSES)
+    job_guard_expr = (
+        "length(CAST(COALESCE(job_id, '') AS BLOB)) + "
+        "length(CAST(COALESCE(payload, '') AS BLOB)) + "
+        "length(CAST(COALESCE(status, '') AS BLOB)) + "
+        "length(CAST(COALESCE(lease_until, '') AS BLOB))"
+    )
     rows = conn.execute(
-        "SELECT payload FROM jobs WHERE status IS NULL OR "
+        f"SELECT job_id, {job_guard_expr} AS guard_bytes "
+        "FROM jobs WHERE status IS NULL OR "
         "(status = 'failed' AND COALESCE(retries, 0) < 3) OR "
-        f"(status != 'failed' AND status NOT IN ({terminal_jobs}))",
-        _HISTORY_TERMINAL_JOB_STATUSES,
+        f"(status != 'failed' AND status NOT IN ({terminal_jobs})) "
+        "ORDER BY job_id LIMIT ?",
+        (*_HISTORY_TERMINAL_JOB_STATUSES, _HISTORY_ACTIVE_JOB_MAX_ROWS + 1),
     ).fetchall()
-    for row in rows:
+    if len(rows) > _HISTORY_ACTIVE_JOB_MAX_ROWS:
+        protected["block_version_retention"].add("active_job_row_limit")
+        protected["guard_parts"].add(
+            f"active_job_row_limit:{_HISTORY_ACTIVE_JOB_MAX_ROWS}"
+        )
+        rows = rows[:_HISTORY_ACTIVE_JOB_MAX_ROWS]
+    active_job_bytes = 0
+    for metadata in rows:
+        guard_bytes = int(metadata["guard_bytes"] or 0)
+        if (
+            guard_bytes < 0
+            or active_job_bytes + guard_bytes > _HISTORY_ACTIVE_JOB_MAX_BYTES
+        ):
+            protected["block_version_retention"].add("active_job_byte_limit")
+            protected["guard_parts"].add(
+                f"active_job_byte_limit:{_HISTORY_ACTIVE_JOB_MAX_BYTES}"
+            )
+            break
+        row = conn.execute(
+            "SELECT job_id, payload, status, lease_until FROM jobs "
+            f"WHERE job_id = ? AND ({job_guard_expr}) = ? "
+            f"AND ({job_guard_expr}) <= ?",
+            (
+                metadata["job_id"],
+                guard_bytes,
+                _HISTORY_ACTIVE_JOB_MAX_BYTES,
+            ),
+        ).fetchone()
+        if row is None:
+            protected["block_version_retention"].add("active_job_guard_drift")
+            protected["guard_parts"].add(
+                f"active_job_guard_drift:job_id:{metadata['job_id']}"
+            )
+            break
+        active_job_bytes += guard_bytes
         payload = _history_json_object(row["payload"])
         if not payload:
             protected["block_version_retention"].add(
                 "malformed_active_job_payload"
             )
             continue
+        protected["guard_parts"].add(
+            "job:"
+            + ":".join(
+                str(row[field] or "")
+                for field in ("job_id", "status", "lease_until")
+            )
+            + ":"
+            + hashlib.sha256(str(row["payload"]).encode("utf-8")).hexdigest()
+        )
         for field in ("canonical_name", "page_key"):
             if page_key := _history_page_key(payload.get(field)):
                 protected["page_keys"].add(page_key)
@@ -3844,14 +5543,13 @@ def _select_change_set_retention_candidates(
     batch_size: int,
     keep_latest: int,
 ) -> list[str]:
-    terminal = ",".join("?" for _ in _HISTORY_TERMINAL_CHANGE_SET_STATUSES)
     queue_terminal = ",".join("?" for _ in _HISTORY_TERMINAL_QUEUE_STATUSES)
     rows = conn.execute(
         "WITH terminal AS ("
-        " SELECT change_set_id, COALESCE(updated_at, '') AS retained_at"
-        " FROM change_sets WHERE json_valid(data_json) "
-        " AND LOWER(COALESCE(json_extract(data_json, '$.status'), '')) "
-        f" IN ({terminal})"
+        " SELECT lifecycle.change_set_id, lifecycle.terminal_at AS retained_at"
+        " FROM change_set_lifecycle_v6 AS lifecycle "
+        " WHERE lifecycle.status IN "
+        " ('applied','cancelled','failed','published','rejected','superseded')"
         "), ranked AS ("
         " SELECT change_set_id, retained_at,"
         " ROW_NUMBER() OVER (ORDER BY retained_at DESC, change_set_id DESC) AS retain_rank"
@@ -3871,7 +5569,6 @@ def _select_change_set_retention_candidates(
         f" NOT IN ({queue_terminal})"
         ") ORDER BY candidate.retained_at ASC, candidate.change_set_id ASC LIMIT ?",
         (
-            *_HISTORY_TERMINAL_CHANGE_SET_STATUSES,
             cutoff,
             keep_latest,
             *_HISTORY_TERMINAL_QUEUE_STATUSES,
@@ -3888,8 +5585,7 @@ def _select_job_retention_candidates(
 ) -> list[str]:
     rows = conn.execute(
         "WITH terminal AS ("
-        " SELECT job_id, task_packet_path,"
-        " COALESCE(completed_at, updated_at, created_at, '') AS retained_at"
+        " SELECT job_id, task_packet_path, completed_at AS retained_at"
         " FROM jobs WHERE "
         " status IN ('finalized', 'completed', 'cancelled', 'superseded') "
         " OR (status = 'failed' AND COALESCE(retries, 0) >= 3)"
@@ -3919,7 +5615,7 @@ def _select_outbox_retention_candidates(
     terminal = ",".join("?" for _ in _HISTORY_TERMINAL_OUTBOX_STATUSES)
     rows = conn.execute(
         "WITH terminal AS ("
-        " SELECT id, COALESCE(completed_at, available_at, created_at, '') AS retained_at"
+        " SELECT id, completed_at AS retained_at"
         " FROM mutation_outbox "
         f" WHERE status IN ({terminal})"
         "), ranked AS ("
@@ -3957,7 +5653,8 @@ def _select_version_retention_candidates(
     batch_size: int,
     keep_per_family: int,
     protected: dict[str, set[str]],
-) -> tuple[list[str], dict[str, int]]:
+    cursor: str = "",
+) -> tuple[list[str], dict[str, object], list[tuple[str, str | None]]]:
     allowed = {
         (
             "claim_versions",
@@ -3965,6 +5662,7 @@ def _select_version_retention_candidates(
             "claim_id",
             "claim_family_id",
             "claims",
+            "idx_claim_versions_retention_v6",
         ),
         (
             "evidence_versions",
@@ -3972,94 +5670,524 @@ def _select_version_retention_candidates(
             "evidence_id",
             "evidence_family_id",
             "evidence",
+            "idx_evidence_versions_retention_v6",
         ),
     }
+    retention_index = (
+        "idx_claim_versions_retention_v6"
+        if table_name == "claim_versions"
+        else "idx_evidence_versions_retention_v6"
+    )
     identity = (
         table_name,
         version_id_field,
         id_field,
         family_field,
         canonical_table,
+        retention_index,
     )
     if identity not in allowed:
         raise ValueError(f"Unsupported history table: {table_name}")
-    if protected["block_version_retention"]:
-        return [], {
-            "active_work": 0,
-            "current_canonical": 0,
-            "malformed_canonical": 0,
-            "scanned": 0,
-            "blocked_by_unknown_active_work": len(
-                protected["block_version_retention"]
-            ),
-        }
-    rows = conn.execute(
-        f"WITH ranked AS ("
-        f" SELECT {version_id_field}, {id_field}, {family_field}, page_key, "
-        f" record_hash, recorded_at, version_no, "
-        f" ROW_NUMBER() OVER (PARTITION BY {family_field} "
-        f" ORDER BY version_no DESC, recorded_at DESC, {version_id_field} DESC) AS family_rank "
-        f" FROM {table_name}"
-        f") SELECT candidate.*, canonical.data_json AS current_data_json "
-        f"FROM ranked AS candidate LEFT JOIN {canonical_table} AS canonical "
-        f"ON canonical.{id_field} = candidate.{id_field} "
-        f"WHERE julianday(candidate.recorded_at) IS NOT NULL "
-        f"AND julianday(candidate.recorded_at) < julianday(?) "
-        f"AND candidate.family_rank > ? "
-        f"ORDER BY candidate.recorded_at ASC, candidate.{version_id_field} ASC",
-        (cutoff, keep_per_family),
+    normalized_cursor = str(cursor or "")
+    if (
+        "\x00" in normalized_cursor
+        or len(normalized_cursor.encode("utf-8"))
+        > _HISTORY_VERSION_MAX_CURSOR_BYTES
+    ):
+        raise ValueError(f"{table_name} retention cursor is malformed")
+    scan_limit = min(
+        _HISTORY_VERSION_MAX_SCAN_ROWS,
+        max(_HISTORY_VERSION_MIN_SCAN_ROWS, batch_size * 8),
     )
+    skipped: dict[str, object] = {
+        "active_work": 0,
+        "current_canonical": 0,
+        "malformed_canonical": 0,
+        "oversize_canonical": 0,
+        "invalid_business_time": 0,
+        "not_expired": 0,
+        "newest_family_versions": 0,
+        "scanned": 0,
+        "scanned_rows": 0,
+        "scan_limit": scan_limit,
+        "scan_truncated": False,
+        "input_cursor": normalized_cursor,
+        "last_scanned_cursor": normalized_cursor,
+        "blocked_by_unknown_active_work": 0,
+    }
+    if protected["block_version_retention"]:
+        skipped["blocked_by_unknown_active_work"] = len(
+            protected["block_version_retention"]
+        )
+        return [], skipped, []
+    # SQLite orders storage classes as NULL/numeric < TEXT < BLOB.  Checking
+    # both indexed key boundaries therefore detects every non-TEXT storage
+    # class without rescanning the whole history table on every batch.
+    for direction in ("ASC", "DESC"):
+        boundary_row = conn.execute(
+            f"SELECT {version_id_field} AS version_id, "
+            f"typeof({version_id_field}) AS storage_class FROM {table_name} "
+            f"ORDER BY {version_id_field} {direction} LIMIT 1"
+        ).fetchone()
+        if boundary_row is not None and (
+            str(boundary_row["storage_class"]) != "text"
+            or not isinstance(boundary_row["version_id"], str)
+            or not boundary_row["version_id"]
+        ):
+            raise RuntimeError(
+                f"{table_name} contains an unresumable version identifier"
+            )
+    raw_rows = conn.execute(
+        f"SELECT {version_id_field}, {id_field}, {family_field}, page_key, "
+        f"record_hash, recorded_at, version_no FROM {table_name} "
+        f"WHERE {version_id_field} > ? "
+        f"ORDER BY {version_id_field} LIMIT ?",
+        (normalized_cursor, scan_limit + 1),
+    ).fetchall()
+    more_after_scan_window = len(raw_rows) > scan_limit
+    rows = raw_rows[:scan_limit]
     protected_ids = protected[f"{id_field}s"]
     protected_families = protected[f"{family_field}s"]
     protected_pages = protected["page_keys"]
     selected: list[str] = []
-    skipped = {
-        "active_work": 0,
-        "current_canonical": 0,
-        "malformed_canonical": 0,
-        "scanned": 0,
-        "blocked_by_unknown_active_work": 0,
-    }
+    trace: list[tuple[str, str | None]] = []
+    cutoff_dt = datetime.fromisoformat(cutoff)
     for row in rows:
-        skipped["scanned"] += 1
+        raw_version_id = row[version_id_field]
+        if (
+            not isinstance(raw_version_id, str)
+            or not raw_version_id
+        ):
+            raise RuntimeError(
+                f"{table_name} contains an unresumable version identifier"
+            )
+        version_id = raw_version_id
+        if (
+            "\x00" in version_id
+            or len(version_id.encode("utf-8"))
+            > _HISTORY_VERSION_MAX_CURSOR_BYTES
+        ):
+            raise RuntimeError(
+                f"{table_name} contains an unresumable version identifier"
+            )
+        skipped["scanned"] = int(skipped["scanned"]) + 1
+        skipped["scanned_rows"] = int(skipped["scanned_rows"]) + 1
+        skipped["last_scanned_cursor"] = version_id
+        recorded_at = _strict_utc_instant(row["recorded_at"])
+        if recorded_at is None:
+            skipped["invalid_business_time"] = (
+                int(skipped["invalid_business_time"]) + 1
+            )
+            trace.append((version_id, None))
+            continue
+        if datetime.fromisoformat(recorded_at) >= cutoff_dt:
+            skipped["not_expired"] = int(skipped["not_expired"]) + 1
+            trace.append((version_id, None))
+            continue
         page_key = _history_page_key(row["page_key"])
         if (
             str(row[id_field]) in protected_ids
             or str(row[family_field]) in protected_families
             or (page_key and page_key in protected_pages)
         ):
-            skipped["active_work"] += 1
+            skipped["active_work"] = int(skipped["active_work"]) + 1
+            trace.append((version_id, None))
             continue
-        current_data = row["current_data_json"]
-        if current_data is not None:
+        newest_rows = conn.execute(
+            f"SELECT {version_id_field} FROM {table_name} "
+            f"INDEXED BY {retention_index} WHERE {family_field} = ? "
+            f"ORDER BY version_no DESC, recorded_at DESC, "
+            f"{version_id_field} DESC LIMIT ?",
+            (row[family_field], keep_per_family),
+        ).fetchall()
+        if version_id in {
+            str(newest[version_id_field]) for newest in newest_rows
+        }:
+            skipped["newest_family_versions"] = (
+                int(skipped["newest_family_versions"]) + 1
+            )
+            trace.append((version_id, None))
+            continue
+        canonical_metadata = conn.execute(
+            f"SELECT length(CAST(data_json AS BLOB)) AS data_bytes "
+            f"FROM {canonical_table} WHERE {id_field} = ?",
+            (row[id_field],),
+        ).fetchone()
+        if canonical_metadata is not None:
+            canonical_bytes = int(canonical_metadata["data_bytes"] or 0)
+            if (
+                canonical_bytes < 0
+                or canonical_bytes > _HISTORY_CANONICAL_GUARD_MAX_BYTES
+            ):
+                skipped["oversize_canonical"] = (
+                    int(skipped["oversize_canonical"]) + 1
+                )
+                trace.append((version_id, None))
+                continue
+            canonical_row = conn.execute(
+                f"SELECT data_json FROM {canonical_table} "
+                f"WHERE {id_field} = ? "
+                "AND length(CAST(data_json AS BLOB)) = ? "
+                "AND length(CAST(data_json AS BLOB)) <= ?",
+                (
+                    row[id_field],
+                    canonical_bytes,
+                    _HISTORY_CANONICAL_GUARD_MAX_BYTES,
+                ),
+            ).fetchone()
+            if canonical_row is None:
+                skipped["malformed_canonical"] = (
+                    int(skipped["malformed_canonical"]) + 1
+                )
+                trace.append((version_id, None))
+                continue
+            current_data = canonical_row["data_json"]
             current_record = _history_json_object(current_data)
             if not current_record:
-                skipped["malformed_canonical"] += 1
+                skipped["malformed_canonical"] = (
+                    int(skipped["malformed_canonical"]) + 1
+                )
+                trace.append((version_id, None))
                 continue
             current_hash = hashlib.sha256(
                 _canonical_record_json(current_record).encode("utf-8")
             ).hexdigest()
             if current_hash == str(row["record_hash"] or ""):
-                skipped["current_canonical"] += 1
+                skipped["current_canonical"] = (
+                    int(skipped["current_canonical"]) + 1
+                )
+                trace.append((version_id, None))
                 continue
-        selected.append(str(row[version_id_field]))
+        selected.append(version_id)
+        trace.append((version_id, version_id))
         if len(selected) >= batch_size:
             break
-    return selected, skipped
+    skipped["scan_truncated"] = bool(
+        more_after_scan_window or int(skipped["scanned_rows"]) < len(rows)
+    )
+    return selected, skipped, trace
+
+
+_HISTORY_GENERATION_SURFACES = (
+    "change_sets",
+    "governance_queue",
+    "jobs",
+    "mutation_outbox",
+    "claim_versions",
+    "evidence_versions",
+    "claims",
+    "evidence",
+)
+
+
+def _history_runtime_generations(conn: sqlite3.Connection) -> dict[str, int]:
+    placeholders = ",".join("?" for _ in _HISTORY_GENERATION_SURFACES)
+    rows = conn.execute(
+        "SELECT surface, generation FROM runtime_generations "
+        f"WHERE surface IN ({placeholders}) ORDER BY surface",
+        _HISTORY_GENERATION_SURFACES,
+    ).fetchall()
+    generations = {str(row["surface"]): int(row["generation"]) for row in rows}
+    missing = sorted(set(_HISTORY_GENERATION_SURFACES) - set(generations))
+    if missing:
+        raise RuntimeError(
+            "History retention generation registry is incomplete: "
+            + ", ".join(missing)
+        )
+    return generations
+
+
+def _history_protection_digest(protected: dict[str, set[str]]) -> str:
+    canonical = {
+        name: sorted(str(value) for value in values)
+        for name, values in sorted(protected.items())
+    }
+    return hashlib.sha256(_canonical_json_bytes(canonical)).hexdigest()
+
+
+def _history_candidate_metadata(
+    conn: sqlite3.Connection,
+    table_name: str,
+    key: object,
+) -> dict | None:
+    if table_name == "change_sets":
+        row = conn.execute(
+            "SELECT lifecycle.terminal_at AS business_at, "
+            "length(CAST(change_sets.data_json AS BLOB)) + COALESCE(("
+            "SELECT payload.stored_bytes FROM change_set_payload_refs AS ref "
+            "JOIN change_set_payloads AS payload "
+            "ON payload.payload_sha256 = ref.payload_sha256 "
+            "WHERE ref.change_set_id = change_sets.change_set_id), 0) "
+            "AS logical_bytes "
+            "FROM change_sets JOIN change_set_lifecycle_v6 AS lifecycle "
+            "ON lifecycle.change_set_id = change_sets.change_set_id "
+            "WHERE change_sets.change_set_id = ?",
+            (key,),
+        ).fetchone()
+    elif table_name == "jobs":
+        row = conn.execute(
+            "SELECT completed_at AS business_at, "
+            "length(CAST(COALESCE(payload,'') AS BLOB)) + "
+            "length(CAST(COALESCE(result_json,'') AS BLOB)) + "
+            "length(CAST(COALESCE(error_msg,'') AS BLOB)) + 256 AS logical_bytes "
+            "FROM jobs WHERE job_id = ?",
+            (key,),
+        ).fetchone()
+    elif table_name == "mutation_outbox":
+        row = conn.execute(
+            "SELECT completed_at AS business_at, "
+            "length(CAST(COALESCE(payload_text,'') AS BLOB)) + 256 AS logical_bytes "
+            "FROM mutation_outbox WHERE id = ?",
+            (key,),
+        ).fetchone()
+    elif table_name == "claim_versions":
+        row = conn.execute(
+            "SELECT recorded_at AS business_at, "
+            "length(CAST(COALESCE(data_json,'') AS BLOB)) + 256 AS logical_bytes "
+            "FROM claim_versions WHERE claim_version_id = ?",
+            (key,),
+        ).fetchone()
+    elif table_name == "evidence_versions":
+        row = conn.execute(
+            "SELECT recorded_at AS business_at, "
+            "length(CAST(COALESCE(data_json,'') AS BLOB)) + 256 AS logical_bytes "
+            "FROM evidence_versions WHERE evidence_version_id = ?",
+            (key,),
+        ).fetchone()
+    else:
+        raise ValueError(f"Unsupported history candidate table: {table_name}")
+    if row is None:
+        return None
+    return {
+        "table": table_name,
+        "key": key,
+        "business_at": row["business_at"],
+        "logical_bytes": int(row["logical_bytes"] or 0),
+    }
+
+
+def _history_guarded_row(
+    conn: sqlite3.Connection,
+    table_name: str,
+    key: object,
+) -> dict | None:
+    if table_name == "change_sets":
+        row = conn.execute(
+            "SELECT change_sets.rowid AS storage_rowid, change_sets.change_set_id, "
+            "length(CAST(change_sets.data_json AS BLOB)) AS data_bytes, "
+            "change_sets.updated_at, lifecycle.status, lifecycle.created_at, "
+            "lifecycle.terminal_at, lifecycle.time_source, "
+            "lifecycle.payload_guard_sha256 "
+            "FROM change_sets JOIN change_set_lifecycle_v6 AS lifecycle "
+            "ON lifecycle.change_set_id = change_sets.change_set_id "
+            "WHERE change_sets.change_set_id = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        guarded = dict(row)
+        storage_rowid = int(guarded.pop("storage_rowid"))
+        observed_guard = _sqlite_text_blob_sha256(
+            conn,
+            table_name="change_sets",
+            column_name="data_json",
+            rowid=storage_rowid,
+            expected_bytes=int(row["data_bytes"] or 0),
+        )
+        if not hmac.compare_digest(
+            observed_guard,
+            str(row["payload_guard_sha256"] or ""),
+        ):
+            raise RuntimeError(
+                f"Change-set lifecycle guard drifted: {row['change_set_id']}"
+            )
+        guarded["observed_data_sha256"] = observed_guard
+        return guarded
+    elif table_name == "jobs":
+        row = conn.execute(
+            "SELECT job_id, task_type, payload, status, retries, error_msg, "
+            "created_at, updated_at, available_at, lease_until, lease_owner, "
+            "lease_token, lease_generation, idempotency_key, task_packet_path, "
+            "completed_at, result_json FROM jobs WHERE job_id = ?",
+            (key,),
+        ).fetchone()
+    elif table_name == "mutation_outbox":
+        row = conn.execute(
+            "SELECT id, filename, mutation_type, payload_text, status, created_at, "
+            "attempt_count, last_error, available_at, started_at, completed_at, "
+            "superseded_by, lease_until, lease_owner, lease_token, lease_generation, "
+            "idempotency_key, validation_mode, base_version, projection_base_hash "
+            "FROM mutation_outbox WHERE id = ?",
+            (key,),
+        ).fetchone()
+    elif table_name == "claim_versions":
+        row = conn.execute(
+            "SELECT claim_version_id, claim_id, claim_family_id, page_key, "
+            "data_json, record_hash, recorded_at, version_no "
+            "FROM claim_versions WHERE claim_version_id = ?",
+            (key,),
+        ).fetchone()
+    elif table_name == "evidence_versions":
+        row = conn.execute(
+            "SELECT evidence_version_id, evidence_id, evidence_family_id, page_key, "
+            "data_json, record_hash, recorded_at, version_no "
+            "FROM evidence_versions WHERE evidence_version_id = ?",
+            (key,),
+        ).fetchone()
+    else:
+        raise ValueError(f"Unsupported history candidate table: {table_name}")
+    return dict(row) if row is not None else None
+
+
+def _history_row_guard(row: dict) -> str:
+    return hashlib.sha256(_canonical_json_bytes(row)).hexdigest()
+
+
+def _history_plan_fingerprint(plan: dict) -> str:
+    unsigned = {key: value for key, value in plan.items() if key != "fingerprint"}
+    return "sha256:" + hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+
+
+def _safe_version_resume_cursor(
+    *,
+    input_cursor: str,
+    stats: dict[str, object],
+    trace: list[tuple[str, str | None]],
+    finally_selected: set[str],
+) -> str:
+    """Advance only across a continuous prefix safe after this exact apply."""
+    if int(stats.get("blocked_by_unknown_active_work") or 0):
+        return input_cursor
+    safe_cursor = input_cursor
+    for scanned_cursor, eligible_id in trace:
+        if eligible_id is not None and eligible_id not in finally_selected:
+            break
+        safe_cursor = scanned_cursor
+    # Keep the last scanned key at end-of-range.  An empty cursor means
+    # "start from the beginning", so clearing it here would wrap the next
+    # batch back to the first row instead of producing stable exhaustion.
+    return safe_cursor
+
+
+def _version_cursor_policy(
+    *,
+    plan_as_of: str,
+    cutoff: str,
+    batch_size: int,
+    max_delete_bytes: int,
+    keep_change_sets: int,
+    keep_terminal_jobs: int,
+    keep_terminal_outbox: int,
+    keep_versions_per_family: int,
+    scan_version_history: bool,
+) -> dict[str, object]:
+    return {
+        "cursor_semantics": "last-safe-key-v2",
+        "version_id_invariant": (
+            "storage-class-text-nonempty-no-nul-max1024-utf8-v2"
+        ),
+        "plan_as_of": plan_as_of,
+        "cutoff": cutoff,
+        "max_delete_rows": int(batch_size),
+        "max_delete_bytes": int(max_delete_bytes),
+        "keep_change_sets": int(keep_change_sets),
+        "keep_terminal_jobs": int(keep_terminal_jobs),
+        "keep_terminal_outbox": int(keep_terminal_outbox),
+        "keep_versions_per_family": int(keep_versions_per_family),
+        "scan_version_history": bool(scan_version_history),
+    }
+
+
+def _version_cursor_policy_sha256(policy: dict[str, object]) -> str:
+    return hashlib.sha256(_canonical_json_bytes(policy)).hexdigest()
+
+
+def _validate_version_cursor_receipt(
+    conn: sqlite3.Connection,
+    *,
+    claim_version_cursor: str,
+    evidence_version_cursor: str,
+    version_cursor_receipt: str,
+    cursor_policy: dict[str, object],
+) -> None:
+    cursors = {
+        "claim_versions": str(claim_version_cursor or ""),
+        "evidence_versions": str(evidence_version_cursor or ""),
+    }
+    receipt_fingerprint = str(version_cursor_receipt or "")
+    if not receipt_fingerprint:
+        if any(cursors.values()):
+            raise ValueError(
+                "Version retention cursors require the successful prior receipt fingerprint"
+            )
+        return
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_fingerprint):
+        raise ValueError("Version retention cursor receipt fingerprint is malformed")
+    row = conn.execute(
+        "SELECT receipt_json FROM history_retention_runs_v6 WHERE fingerprint = ?",
+        (receipt_fingerprint,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Version retention cursor receipt does not exist")
+    receipt = _history_json_object(row["receipt_json"])
+    if not receipt or not hmac.compare_digest(
+        str(receipt.get("fingerprint") or ""), receipt_fingerprint
+    ):
+        raise RuntimeError("Version retention cursor receipt is malformed")
+    receipt_cursors = receipt.get("version_resume_cursors")
+    if not isinstance(receipt_cursors, dict) or {
+        table_name: str(receipt_cursors.get(table_name) or "")
+        for table_name in cursors
+    } != cursors:
+        raise RuntimeError("Version retention cursors do not match the prior receipt")
+    receipt_policy = receipt.get("version_cursor_policy")
+    receipt_policy_sha256 = str(
+        receipt.get("version_cursor_policy_sha256") or ""
+    )
+    if (
+        not isinstance(receipt_policy, dict)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt_policy_sha256)
+        or not hmac.compare_digest(
+            _version_cursor_policy_sha256(receipt_policy),
+            receipt_policy_sha256,
+        )
+        or receipt_policy != cursor_policy
+    ):
+        raise RuntimeError(
+            "Version retention cursor policy does not match the prior receipt; "
+            "restart the campaign from empty cursors"
+        )
+    receipt_generations = receipt.get("runtime_generations_after")
+    if not isinstance(receipt_generations, dict) or receipt_generations != (
+        _history_runtime_generations(conn)
+    ):
+        raise RuntimeError(
+            "Version retention runtime generations drifted after the prior receipt; "
+            "restart the campaign from empty cursors"
+        )
+
 
 def plan_history_retention(
     conn: sqlite3.Connection,
     *,
     cutoff: str,
     batch_size: int = 500,
+    max_delete_bytes: int = 128 * 1024 * 1024,
     keep_change_sets: int = 1000,
     keep_terminal_jobs: int = 1000,
     keep_terminal_outbox: int = 1000,
     keep_versions_per_family: int = 2,
+    claim_version_cursor: str = "",
+    evidence_version_cursor: str = "",
+    version_cursor_receipt: str = "",
+    scan_version_history: bool = True,
+    plan_as_of: str | None = None,
 ) -> dict:
     """Select bounded history rows without mutating the supplied database."""
-    if batch_size < 1 or batch_size > 10_000:
-        raise ValueError("batch_size must be between 1 and 10000")
+    if batch_size < 1 or batch_size > 500:
+        raise ValueError("batch_size must be between 1 and 500")
+    if max_delete_bytes < 1 or max_delete_bytes > _HISTORY_RETENTION_MAX_DELETE_BYTES:
+        raise ValueError("max_delete_bytes must be between 1 byte and 128 MiB")
     for name, value in (
         ("keep_change_sets", keep_change_sets),
         ("keep_terminal_jobs", keep_terminal_jobs),
@@ -4067,72 +6195,233 @@ def plan_history_retention(
     ):
         if int(value) < 0:
             raise ValueError(f"{name} must be zero or positive")
-    if keep_versions_per_family < 1:
-        raise ValueError("keep_versions_per_family must be positive")
+    if (
+        keep_versions_per_family < 1
+        or keep_versions_per_family > _HISTORY_VERSION_MAX_KEEP_PER_FAMILY
+    ):
+        raise ValueError(
+            "keep_versions_per_family must be between 1 and "
+            f"{_HISTORY_VERSION_MAX_KEEP_PER_FAMILY}"
+        )
+    normalized_as_of = _strict_utc_instant(plan_as_of or _utc_now())
+    normalized_cutoff = _strict_utc_instant(cutoff)
+    if normalized_as_of is None or normalized_cutoff is None:
+        raise ValueError("plan_as_of and cutoff must be timezone-aware ISO-8601")
+    cursor_policy = _version_cursor_policy(
+        plan_as_of=normalized_as_of,
+        cutoff=normalized_cutoff,
+        batch_size=batch_size,
+        max_delete_bytes=max_delete_bytes,
+        keep_change_sets=keep_change_sets,
+        keep_terminal_jobs=keep_terminal_jobs,
+        keep_terminal_outbox=keep_terminal_outbox,
+        keep_versions_per_family=keep_versions_per_family,
+        scan_version_history=scan_version_history,
+    )
+
+    if not scan_version_history and (
+        claim_version_cursor or evidence_version_cursor or version_cursor_receipt
+    ):
+        raise ValueError("Disabled version retention cannot accept version cursors")
+    if scan_version_history:
+        _validate_version_cursor_receipt(
+            conn,
+            claim_version_cursor=claim_version_cursor,
+            evidence_version_cursor=evidence_version_cursor,
+            version_cursor_receipt=version_cursor_receipt,
+            cursor_policy=cursor_policy,
+        )
 
     protected = _history_active_protections(conn)
-    selected: dict[str, list] = {
+    proposed_ids: dict[str, list] = {
         "change_sets": _select_change_set_retention_candidates(
             conn,
-            cutoff,
+            normalized_cutoff,
             batch_size,
             int(keep_change_sets),
         ),
         "jobs": _select_job_retention_candidates(
             conn,
-            cutoff,
+            normalized_cutoff,
             batch_size,
             int(keep_terminal_jobs),
         ),
         "mutation_outbox": _select_outbox_retention_candidates(
             conn,
-            cutoff,
+            normalized_cutoff,
             batch_size,
             int(keep_terminal_outbox),
         ),
     }
-    claim_versions, claim_skipped = _select_version_retention_candidates(
-        conn,
-        table_name="claim_versions",
-        version_id_field="claim_version_id",
-        id_field="claim_id",
-        family_field="claim_family_id",
-        canonical_table="claims",
-        cutoff=cutoff,
-        batch_size=batch_size,
-        keep_per_family=int(keep_versions_per_family),
-        protected=protected,
+    if scan_version_history:
+        claim_versions, claim_skipped, claim_trace = (
+            _select_version_retention_candidates(
+                conn,
+                table_name="claim_versions",
+                version_id_field="claim_version_id",
+                id_field="claim_id",
+                family_field="claim_family_id",
+                canonical_table="claims",
+                cutoff=normalized_cutoff,
+                batch_size=batch_size,
+                keep_per_family=int(keep_versions_per_family),
+                protected=protected,
+                cursor=claim_version_cursor,
+            )
+        )
+        evidence_versions, evidence_skipped, evidence_trace = (
+            _select_version_retention_candidates(
+                conn,
+                table_name="evidence_versions",
+                version_id_field="evidence_version_id",
+                id_field="evidence_id",
+                family_field="evidence_family_id",
+                canonical_table="evidence",
+                cutoff=normalized_cutoff,
+                batch_size=batch_size,
+                keep_per_family=int(keep_versions_per_family),
+                protected=protected,
+                cursor=evidence_version_cursor,
+            )
+        )
+    else:
+        disabled_stats: dict[str, object] = {
+            "disabled_by_scope": 1,
+            "scanned": 0,
+            "scanned_rows": 0,
+            "scan_limit": 0,
+            "scan_truncated": False,
+            "input_cursor": "",
+            "last_scanned_cursor": "",
+            "blocked_by_unknown_active_work": 0,
+        }
+        claim_versions, claim_skipped, claim_trace = [], dict(disabled_stats), []
+        evidence_versions, evidence_skipped, evidence_trace = (
+            [],
+            dict(disabled_stats),
+            [],
+        )
+    proposed_ids["claim_versions"] = claim_versions
+    proposed_ids["evidence_versions"] = evidence_versions
+    metadata: list[dict] = []
+    missing_rows = 0
+    invalid_business_time: dict[str, int] = {
+        table_name: 0 for table_name in _HISTORY_RETENTION_TABLES
+    }
+    for table_name in _HISTORY_RETENTION_TABLES:
+        for key in proposed_ids.get(table_name, []):
+            candidate = _history_candidate_metadata(conn, table_name, key)
+            if candidate is None:
+                missing_rows += 1
+                continue
+            normalized_business_at = _strict_utc_instant(candidate["business_at"])
+            if normalized_business_at is None:
+                invalid_business_time[table_name] += 1
+                continue
+            candidate["business_at"] = normalized_business_at
+            metadata.append(candidate)
+    metadata.sort(
+        key=lambda item: (
+            item["business_at"],
+            item["table"],
+            str(item["key"]),
+        )
     )
-    evidence_versions, evidence_skipped = _select_version_retention_candidates(
-        conn,
-        table_name="evidence_versions",
-        version_id_field="evidence_version_id",
-        id_field="evidence_id",
-        family_field="evidence_family_id",
-        canonical_table="evidence",
-        cutoff=cutoff,
-        batch_size=batch_size,
-        keep_per_family=int(keep_versions_per_family),
-        protected=protected,
-    )
-    selected["claim_versions"] = claim_versions
-    selected["evidence_versions"] = evidence_versions
+    candidates: list[dict] = []
+    selected_bytes = 0
+    oversize_candidates: list[dict] = []
+    for candidate in metadata:
+        logical_bytes = max(0, int(candidate["logical_bytes"]))
+        if logical_bytes > max_delete_bytes:
+            oversize_candidates.append(
+                {
+                    "table": candidate["table"],
+                    "key": candidate["key"],
+                    "logical_bytes": logical_bytes,
+                }
+            )
+            continue
+        if len(candidates) >= batch_size:
+            break
+        if selected_bytes + logical_bytes > max_delete_bytes:
+            continue
+        guarded_row = _history_guarded_row(
+            conn,
+            candidate["table"],
+            candidate["key"],
+        )
+        if guarded_row is None:
+            missing_rows += 1
+            continue
+        candidate["row_guard_sha256"] = _history_row_guard(guarded_row)
+        candidates.append(candidate)
+        selected_bytes += logical_bytes
+    selected = {table_name: [] for table_name in _HISTORY_RETENTION_TABLES}
+    for candidate in candidates:
+        selected[candidate["table"]].append(candidate["key"])
+    version_scan = {}
+    for table_name, input_cursor, eligible_ids, stats, trace in (
+        (
+            "claim_versions",
+            str(claim_version_cursor or ""),
+            claim_versions,
+            claim_skipped,
+            claim_trace,
+        ),
+        (
+            "evidence_versions",
+            str(evidence_version_cursor or ""),
+            evidence_versions,
+            evidence_skipped,
+            evidence_trace,
+        ),
+    ):
+        finally_selected = {
+            str(value) for value in selected.get(table_name, [])
+        }
+        scan_stats = dict(stats)
+        scan_stats["eligible_rows"] = len(eligible_ids)
+        scan_stats["scheduled_rows"] = len(finally_selected)
+        scan_stats["safe_next_cursor"] = _safe_version_resume_cursor(
+            input_cursor=input_cursor,
+            stats=stats,
+            trace=trace,
+            finally_selected=finally_selected,
+        )
+        version_scan[table_name] = scan_stats
     table_counts = {
         table_name: int(
             conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
         )
         for table_name in _HISTORY_RETENTION_TABLES
     }
-    return {
-        "cutoff": cutoff,
+    plan = {
+        "contract": "history-retention-plan-v2",
+        "schema_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+        "schema_cookie": int(conn.execute("PRAGMA schema_version").fetchone()[0]),
+        "plan_as_of": normalized_as_of,
+        "cutoff": normalized_cutoff,
+        "version_cursor_policy_sha256": _version_cursor_policy_sha256(
+            cursor_policy
+        ),
         "rules": {
-            "batch_size_per_table": batch_size,
+            "max_delete_rows": batch_size,
+            "max_delete_bytes": int(max_delete_bytes),
             "keep_change_sets": int(keep_change_sets),
             "keep_terminal_jobs": int(keep_terminal_jobs),
             "keep_terminal_outbox": int(keep_terminal_outbox),
             "keep_versions_per_family": int(keep_versions_per_family),
+            "claim_version_cursor": str(claim_version_cursor or ""),
+            "evidence_version_cursor": str(evidence_version_cursor or ""),
+            "version_cursor_receipt": str(version_cursor_receipt or ""),
+            "scan_version_history": bool(scan_version_history),
         },
         "table_counts_before": table_counts,
+        "runtime_generations": _history_runtime_generations(conn),
+        "active_protection_sha256": _history_protection_digest(protected),
+        "candidates": candidates,
+        "selected_count_total": len(candidates),
+        "selected_bytes_total": selected_bytes,
         "selected_ids": selected,
         "selected_counts": {
             table_name: len(selected.get(table_name, []))
@@ -4141,11 +6430,20 @@ def plan_history_retention(
         "active_protection_counts": {
             name: len(values) for name, values in protected.items()
         },
+        "candidate_skip_counts": {
+            "missing_rows": missing_rows,
+            "invalid_business_time": invalid_business_time,
+            "oversize_candidates": len(oversize_candidates),
+        },
+        "oversize_candidate_samples": oversize_candidates[:20],
         "version_skip_counts": {
             "claim_versions": claim_skipped,
             "evidence_versions": evidence_skipped,
         },
+        "version_scan": version_scan,
     }
+    plan["fingerprint"] = _history_plan_fingerprint(plan)
+    return plan
 
 
 def _delete_history_ids(
@@ -4182,54 +6480,826 @@ def _delete_history_ids(
 def apply_history_retention_plan(
     conn: sqlite3.Connection,
     plan: dict,
+    *,
+    confirmation: str = "",
+    plan_as_of: str = "",
 ) -> dict[str, int]:
-    """Delete a plan computed under the caller's current write transaction."""
+    """Apply one exact, fingerprint-confirmed history batch and durable receipt."""
     if not conn.in_transaction:
         raise RuntimeError("History retention apply requires an active transaction")
-    selected = plan.get("selected_ids") or {}
-    unknown = set(selected) - set(_HISTORY_RETENTION_TABLES)
-    if unknown:
-        raise ValueError(f"Unsupported history plan tables: {sorted(unknown)}")
+    if plan.get("contract") != "history-retention-plan-v2":
+        raise ValueError("Unsupported history retention plan contract")
+    fingerprint = str(plan.get("fingerprint") or "")
+    if not fingerprint or not hmac.compare_digest(
+        fingerprint,
+        _history_plan_fingerprint(plan),
+    ):
+        raise RuntimeError("History retention plan fingerprint is invalid")
+    if not confirmation or not hmac.compare_digest(str(confirmation), fingerprint):
+        raise RuntimeError("History retention requires the exact preview fingerprint")
+    normalized_as_of = _strict_utc_instant(plan_as_of)
+    if normalized_as_of is None or not hmac.compare_digest(
+        normalized_as_of,
+        str(plan.get("plan_as_of") or ""),
+    ):
+        raise RuntimeError("History retention plan_as_of does not match the preview")
 
-    change_set_ids = list(selected.get("change_sets") or [])
-    job_ids = list(selected.get("jobs") or [])
-    _delete_history_ids(
+    rules = plan.get("rules")
+    candidates = plan.get("candidates")
+    if not isinstance(rules, dict) or not isinstance(candidates, list):
+        raise ValueError("History retention plan rules or candidates are missing")
+    try:
+        max_delete_rows = int(rules.get("max_delete_rows"))
+        max_delete_bytes = int(rules.get("max_delete_bytes"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("History retention plan bounds are malformed") from exc
+    if max_delete_rows < 1 or max_delete_rows > 500:
+        raise ValueError("History retention row bound is outside the hard limit")
+    if (
+        max_delete_bytes < 1
+        or max_delete_bytes > _HISTORY_RETENTION_MAX_DELETE_BYTES
+    ):
+        raise ValueError("History retention byte bound is outside the hard limit")
+    if not isinstance(rules.get("scan_version_history"), bool):
+        raise ValueError("History retention version-scan policy is malformed")
+    try:
+        cursor_policy = _version_cursor_policy(
+            plan_as_of=str(plan["plan_as_of"]),
+            cutoff=str(plan["cutoff"]),
+            batch_size=max_delete_rows,
+            max_delete_bytes=max_delete_bytes,
+            keep_change_sets=int(rules["keep_change_sets"]),
+            keep_terminal_jobs=int(rules["keep_terminal_jobs"]),
+            keep_terminal_outbox=int(rules["keep_terminal_outbox"]),
+            keep_versions_per_family=int(rules["keep_versions_per_family"]),
+            scan_version_history=rules["scan_version_history"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("History retention cursor policy is malformed") from exc
+    if not hmac.compare_digest(
+        str(plan.get("version_cursor_policy_sha256") or ""),
+        _version_cursor_policy_sha256(cursor_policy),
+    ):
+        raise RuntimeError("History retention cursor policy drifted after preview")
+    if len(candidates) > max_delete_rows:
+        raise ValueError("History retention candidates exceed the row bound")
+    candidate_bytes = 0
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("History retention candidate is malformed")
+        try:
+            logical_bytes = int(candidate.get("logical_bytes"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("History retention candidate size is malformed") from exc
+        if logical_bytes < 0 or logical_bytes > max_delete_bytes:
+            raise ValueError("History retention candidate exceeds the byte bound")
+        candidate_bytes += logical_bytes
+    if candidate_bytes > max_delete_bytes:
+        raise ValueError("History retention candidates exceed the batch byte bound")
+    if (
+        int(plan.get("selected_count_total") or 0) != len(candidates)
+        or int(plan.get("selected_bytes_total") or 0) != candidate_bytes
+    ):
+        raise ValueError("History retention plan totals are inconsistent")
+
+    prior = conn.execute(
+        "SELECT plan_sha256, receipt_json FROM history_retention_runs_v6 "
+        "WHERE fingerprint = ?",
+        (fingerprint,),
+    ).fetchone()
+    if prior is not None:
+        if not hmac.compare_digest(str(prior["plan_sha256"]), fingerprint[7:]):
+            raise RuntimeError("History retention receipt plan digest is invalid")
+        receipt = _history_json_object(prior["receipt_json"])
+        deleted = receipt.get("deleted_counts")
+        if not isinstance(deleted, dict):
+            raise RuntimeError("History retention receipt is malformed")
+        return {str(key): int(value) for key, value in deleted.items()}
+
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) != int(
+        plan.get("schema_version") or -1
+    ):
+        raise RuntimeError("History retention schema version drifted after preview")
+    if int(conn.execute("PRAGMA schema_version").fetchone()[0]) != int(
+        plan.get("schema_cookie") or -1
+    ):
+        raise RuntimeError("History retention schema cookie drifted after preview")
+    if _history_runtime_generations(conn) != plan.get("runtime_generations"):
+        raise RuntimeError("History retention runtime generations drifted after preview")
+    protected = _history_active_protections(conn)
+    if not hmac.compare_digest(
+        _history_protection_digest(protected),
+        str(plan.get("active_protection_sha256") or ""),
+    ):
+        raise RuntimeError("History retention active references drifted after preview")
+
+    deleted_counts = {table_name: 0 for table_name in _HISTORY_RETENTION_TABLES}
+    payload_hashes: set[str] = set()
+    guarded_rows: list[tuple[dict, dict]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("History retention candidate is malformed")
+        table_name = str(candidate.get("table") or "")
+        if table_name not in _HISTORY_RETENTION_TABLES:
+            raise ValueError(f"Unsupported history plan table: {table_name}")
+        guarded_row = _history_guarded_row(conn, table_name, candidate.get("key"))
+        if guarded_row is None or not hmac.compare_digest(
+            _history_row_guard(guarded_row),
+            str(candidate.get("row_guard_sha256") or ""),
+        ):
+            raise RuntimeError(
+                "History retention row changed after preview: "
+                f"{table_name}:{candidate.get('key')}"
+            )
+        guarded_rows.append((candidate, guarded_row))
+
+    for candidate, row in guarded_rows:
+        table_name = str(candidate["table"])
+        key = candidate["key"]
+        if table_name == "change_sets":
+            ref = conn.execute(
+                "SELECT payload_sha256 FROM change_set_payload_refs "
+                "WHERE change_set_id = ?",
+                (key,),
+            ).fetchone()
+            if ref is not None:
+                payload_hashes.add(str(ref["payload_sha256"]))
+            conn.execute(
+                "DELETE FROM change_set_idempotency WHERE change_set_id = ?",
+                (key,),
+            )
+            cursor = conn.execute(
+                "DELETE FROM change_sets WHERE change_set_id = ? "
+                "AND updated_at IS ? "
+                "AND length(CAST(data_json AS BLOB)) = ? "
+                "AND EXISTS (SELECT 1 FROM change_set_lifecycle_v6 AS lifecycle "
+                "WHERE lifecycle.change_set_id = change_sets.change_set_id "
+                "AND lifecycle.status IS ? AND lifecycle.terminal_at IS ? "
+                "AND lifecycle.payload_guard_sha256 IS ?)",
+                (
+                    key,
+                    row["updated_at"],
+                    row["data_bytes"],
+                    row["status"],
+                    row["terminal_at"],
+                    row["payload_guard_sha256"],
+                ),
+            )
+        elif table_name == "jobs":
+            conn.execute(
+                "DELETE FROM ingest_task_cleanup WHERE job_id = ? "
+                "AND status = 'completed'",
+                (key,),
+            )
+            cursor = conn.execute(
+                "DELETE FROM jobs WHERE job_id = ? AND status IS ? "
+                "AND completed_at IS ? AND payload IS ? AND updated_at IS ?",
+                (
+                    key,
+                    row["status"],
+                    row["completed_at"],
+                    row["payload"],
+                    row["updated_at"],
+                ),
+            )
+        elif table_name == "mutation_outbox":
+            cursor = conn.execute(
+                "DELETE FROM mutation_outbox WHERE id = ? AND status IS ? "
+                "AND completed_at IS ? AND payload_text IS ? AND filename IS ? "
+                "AND superseded_by IS ?",
+                (
+                    key,
+                    row["status"],
+                    row["completed_at"],
+                    row["payload_text"],
+                    row["filename"],
+                    row["superseded_by"],
+                ),
+            )
+        elif table_name == "claim_versions":
+            cursor = conn.execute(
+                "DELETE FROM claim_versions WHERE claim_version_id = ? "
+                "AND record_hash IS ? AND recorded_at IS ? AND data_json IS ?",
+                (key, row["record_hash"], row["recorded_at"], row["data_json"]),
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM evidence_versions WHERE evidence_version_id = ? "
+                "AND record_hash IS ? AND recorded_at IS ? AND data_json IS ?",
+                (key, row["record_hash"], row["recorded_at"], row["data_json"]),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"History retention CAS delete failed: {table_name}:{key}"
+            )
+        deleted_counts[table_name] += 1
+
+    payload_rows, payload_bytes = _delete_unreferenced_change_set_payloads(
         conn,
-        "change_set_idempotency",
-        "change_set_id",
-        change_set_ids,
+        payload_hashes,
     )
-    _delete_history_ids(
-        conn,
-        "ingest_task_cleanup",
-        "job_id",
-        job_ids,
-        extra_predicate="AND status = 'completed'",
+    deleted_counts["change_set_payloads"] = payload_rows
+    receipt = {
+        "contract": "history-retention-receipt-v2",
+        "fingerprint": fingerprint,
+        "plan_as_of": plan["plan_as_of"],
+        "cutoff": plan["cutoff"],
+        "deleted_counts": deleted_counts,
+        "deleted_payload_bytes": payload_bytes,
+        "selected_bytes_total": int(plan.get("selected_bytes_total") or 0),
+        "version_resume_cursors": {
+            table_name: str(
+                ((plan.get("version_scan") or {}).get(table_name) or {}).get(
+                    "safe_next_cursor"
+                )
+                or ""
+            )
+            for table_name in ("claim_versions", "evidence_versions")
+        },
+        "version_cursor_policy": cursor_policy,
+        "version_cursor_policy_sha256": _version_cursor_policy_sha256(
+            cursor_policy
+        ),
+        "runtime_generations_after": _history_runtime_generations(conn),
+        "applied_at": _utc_now(),
+    }
+    conn.execute(
+        "INSERT INTO history_retention_runs_v6 "
+        "(fingerprint, plan_version, schema_version, plan_as_of, options_json, "
+        "plan_sha256, receipt_json, applied_at) VALUES (?, 2, ?, ?, ?, ?, ?, ?)",
+        (
+            fingerprint,
+            int(plan["schema_version"]),
+            plan["plan_as_of"],
+            _canonical_json_bytes(plan["rules"]).decode("utf-8"),
+            fingerprint[7:],
+            _canonical_json_bytes(receipt).decode("utf-8"),
+            receipt["applied_at"],
+        ),
     )
+    return deleted_counts
+
+
+def _prepare_legacy_change_set_compaction(
+    change_set: dict,
+    *,
+    lifecycle_status: str,
+    raw_sha256: str,
+    raw_bytes: int,
+    terminal_at: str | None,
+) -> tuple[dict, str, bytes]:
+    """Build one bounded legacy rewrite and classify its storage strategy."""
+    prepared_change_set = copy.deepcopy(change_set)
+    status = _normalized_change_set_status(lifecycle_status)
+    prepared_change_set["status"] = status
+    if status in _CHANGE_SET_TERMINAL_STATUSES:
+        return (
+            _legacy_terminal_change_set_manifest(
+                prepared_change_set,
+                raw_sha256=raw_sha256,
+                raw_bytes=raw_bytes,
+                terminal_at=terminal_at,
+            ),
+            "terminal_detached_summary",
+            b"",
+        )
+    prepared = _validate_change_set_batch_limits([prepared_change_set])
+    payload_bytes = prepared[0][1]
+    return (
+        _change_set_manifest(
+            prepared_change_set,
+            payload_bytes,
+            payload_available=True,
+            terminal_at=None,
+        ),
+        "pending_content_addressed_delta",
+        payload_bytes,
+    )
+
+
+def _change_set_compaction_cursor_policy() -> dict[str, str]:
     return {
-        "change_sets": _delete_history_ids(
-            conn,
-            "change_sets",
-            "change_set_id",
-            change_set_ids,
+        "cursor_semantics": "last-classified-key-v2",
+        "change_set_id_invariant": (
+            "storage-class-text-nonempty-no-nul-max1024-utf8-v2"
         ),
-        "jobs": _delete_history_ids(conn, "jobs", "job_id", job_ids),
-        "mutation_outbox": _delete_history_ids(
-            conn,
-            "mutation_outbox",
-            "id",
-            list(selected.get("mutation_outbox") or []),
+    }
+
+
+def _change_set_compaction_cursor_policy_sha256(
+    policy: dict[str, str],
+) -> str:
+    return hashlib.sha256(_canonical_json_bytes(policy)).hexdigest()
+
+
+def _assert_change_set_compaction_id_domain(conn: sqlite3.Connection) -> None:
+    """Fail before keyset planning when either joined ID domain is unsafe."""
+    for table_name in ("change_sets", "change_set_lifecycle_v6"):
+        # SQLite orders NULL/numeric < TEXT < BLOB.  Both primary-key
+        # boundaries therefore detect every non-TEXT storage class without a
+        # full-table validation scan on every compaction batch.
+        for direction in ("ASC", "DESC"):
+            row = conn.execute(
+                f"SELECT change_set_id, typeof(change_set_id) AS storage_class "
+                f"FROM {table_name} ORDER BY change_set_id {direction} LIMIT 1"
+            ).fetchone()
+            if row is not None and (
+                str(row["storage_class"]) != "text"
+                or not isinstance(row["change_set_id"], str)
+                or not row["change_set_id"]
+            ):
+                raise RuntimeError(
+                    f"{table_name} contains an unresumable change-set identifier"
+                )
+
+
+def plan_change_set_history_compaction(
+    conn: sqlite3.Connection,
+    *,
+    max_rows: int = 100,
+    max_input_bytes: int = 64 * 1024 * 1024,
+    cursor: str = "",
+) -> dict:
+    """Plan one metadata-first keyset window of legacy snapshot rewrites."""
+    if max_rows < 1 or max_rows > 500:
+        raise ValueError("max_rows must be between 1 and 500")
+    if max_input_bytes < 1 or max_input_bytes > _CHANGE_SET_COMPACTION_MAX_INPUT_BYTES:
+        raise ValueError("max_input_bytes must be between 1 byte and 128 MiB")
+    normalized_cursor = str(cursor or "")
+    if (
+        "\x00" in normalized_cursor
+        or len(normalized_cursor.encode("utf-8"))
+        > _CHANGE_SET_COMPACTION_MAX_CURSOR_BYTES
+    ):
+        raise ValueError("change-set compaction cursor is malformed")
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) < 6:
+        raise RuntimeError("Change-set history compaction requires schema v6")
+    _assert_change_set_compaction_id_domain(conn)
+    cursor_policy = _change_set_compaction_cursor_policy()
+    cursor_policy_sha256 = _change_set_compaction_cursor_policy_sha256(
+        cursor_policy
+    )
+    scan_rows = conn.execute(
+        "SELECT change_sets.rowid AS storage_rowid, change_sets.change_set_id, "
+        "change_sets.updated_at, "
+        "length(CAST(change_sets.data_json AS BLOB)) AS input_bytes, lifecycle.status, "
+        "lifecycle.terminal_at, lifecycle.payload_guard_sha256 "
+        "FROM change_sets JOIN change_set_lifecycle_v6 AS lifecycle "
+        "ON lifecycle.change_set_id = change_sets.change_set_id "
+        "WHERE change_sets.change_set_id > ? "
+        "ORDER BY change_sets.change_set_id LIMIT ?",
+        (
+            normalized_cursor,
+            _CHANGE_SET_COMPACTION_MAX_SCAN_ROWS + 1,
         ),
-        "claim_versions": _delete_history_ids(
+    ).fetchall()
+    more_after_scan_window = len(scan_rows) > _CHANGE_SET_COMPACTION_MAX_SCAN_ROWS
+    rows = scan_rows[:_CHANGE_SET_COMPACTION_MAX_SCAN_ROWS]
+    candidates: list[dict] = []
+    selected_bytes = 0
+    oversize: list[dict] = []
+    oversize_count = 0
+    uncompactable: list[dict] = []
+    uncompactable_count = 0
+    skipped_by_batch_bytes = 0
+    scanned_rows = 0
+    preflight_input_bytes = 0
+    preflight_byte_limit_reached = False
+    current_manifest_count = 0
+    safe_next_cursor = normalized_cursor
+    for row in rows:
+        if len(candidates) >= max_rows:
+            break
+        raw_change_set_id = row["change_set_id"]
+        if not isinstance(raw_change_set_id, str) or not raw_change_set_id:
+            raise RuntimeError(
+                "change_sets contains an unresumable change-set identifier"
+            )
+        change_set_id = raw_change_set_id
+        if (
+            "\x00" in change_set_id
+            or len(change_set_id.encode("utf-8"))
+            > _CHANGE_SET_COMPACTION_MAX_CURSOR_BYTES
+        ):
+            raise RuntimeError(
+                "change_sets contains an unresumable change-set identifier"
+            )
+        input_bytes = int(row["input_bytes"] or 0)
+        if input_bytes > max_input_bytes:
+            scanned_rows += 1
+            safe_next_cursor = change_set_id
+            oversize_count += 1
+            if len(oversize) < 20:
+                oversize.append(
+                    {
+                        "change_set_id": change_set_id,
+                        "input_bytes": input_bytes,
+                    }
+                )
+            continue
+        if preflight_input_bytes + input_bytes > max_input_bytes:
+            preflight_byte_limit_reached = True
+            skipped_by_batch_bytes += 1
+            break
+        remaining_input_bytes = max_input_bytes - preflight_input_bytes
+        raw_guard = _sqlite_text_blob_sha256(
             conn,
-            "claim_versions",
-            "claim_version_id",
-            list(selected.get("claim_versions") or []),
-        ),
-        "evidence_versions": _delete_history_ids(
+            table_name="change_sets",
+            column_name="data_json",
+            rowid=int(row["storage_rowid"]),
+            expected_bytes=input_bytes,
+        )
+        if not hmac.compare_digest(
+            raw_guard,
+            str(row["payload_guard_sha256"]),
+        ):
+            raise ChangeSetPayloadCorrupt(
+                "Legacy change-set lifecycle guard drifted before compaction: "
+                f"{row['change_set_id']}"
+            )
+        raw = conn.execute(
+            "SELECT data_json FROM change_sets WHERE rowid = ? "
+            "AND change_set_id = ? "
+            "AND length(CAST(data_json AS BLOB)) = ? "
+            "AND length(CAST(data_json AS BLOB)) <= ?",
+            (
+                row["storage_rowid"],
+                change_set_id,
+                input_bytes,
+                remaining_input_bytes,
+            ),
+        ).fetchone()
+        if raw is None:
+            raise RuntimeError(
+                "Legacy change-set changed before bounded compaction preflight: "
+                f"{change_set_id}"
+            )
+        raw_text = str(raw["data_json"])
+        if len(raw_text.encode("utf-8")) != input_bytes:
+            raise RuntimeError(
+                "Legacy change-set byte length drifted during compaction preflight: "
+                f"{change_set_id}"
+            )
+        preflight_input_bytes += input_bytes
+        scanned_rows += 1
+        safe_next_cursor = change_set_id
+        change_set = _history_json_object(raw_text)
+        if change_set and change_set.get("manifest_version") not in {None, 1}:
+            current_manifest_count += 1
+            continue
+        try:
+            if not change_set:
+                raise ChangeSetPayloadCorrupt(
+                    "legacy snapshot is malformed or no longer uses a legacy manifest"
+                )
+            _manifest, compaction_kind, _payload_bytes = (
+                _prepare_legacy_change_set_compaction(
+                    change_set,
+                    lifecycle_status=str(row["status"]),
+                    raw_sha256=raw_guard,
+                    raw_bytes=input_bytes,
+                    terminal_at=row["terminal_at"],
+                )
+            )
+        except (
+            ChangeSetBatchTooLarge,
+            ChangeSetPayloadCorrupt,
+            ChangeSetPayloadTooLarge,
+            TypeError,
+            ValueError,
+        ) as exc:
+            uncompactable_count += 1
+            if len(uncompactable) < 20:
+                uncompactable.append(
+                    {
+                        "change_set_id": change_set_id,
+                        "input_bytes": input_bytes,
+                        "reason": type(exc).__name__,
+                        "detail": str(exc)[:240],
+                    }
+                )
+            continue
+        candidates.append(
+            {
+                "change_set_id": change_set_id,
+                "updated_at": row["updated_at"],
+                "status": str(row["status"]),
+                "terminal_at": row["terminal_at"],
+                "input_bytes": input_bytes,
+                "row_guard_sha256": raw_guard,
+                "compaction_kind": compaction_kind,
+            }
+        )
+        selected_bytes += input_bytes
+    classified_rows = scanned_rows
+    scan_truncated = (
+        classified_rows < len(rows)
+        or more_after_scan_window
+        or preflight_byte_limit_reached
+    )
+    compaction_exhausted = bool(
+        not scan_truncated
+        and not candidates
+        and not oversize_count
+        and not uncompactable_count
+    )
+    remaining_legacy_lower_bound = (
+        len(candidates)
+        + oversize_count
+        + uncompactable_count
+        + int(scan_truncated)
+    )
+    plan = {
+        "contract": "change-set-history-compaction-plan-v1",
+        "schema_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+        "schema_cookie": int(conn.execute("PRAGMA schema_version").fetchone()[0]),
+        "runtime_generations": _history_runtime_generations(conn),
+        "max_rows": int(max_rows),
+        "max_input_bytes": int(max_input_bytes),
+        "cursor_policy": cursor_policy,
+        "cursor_policy_sha256": cursor_policy_sha256,
+        "input_cursor": normalized_cursor,
+        "safe_next_cursor": safe_next_cursor,
+        "selected_rows": len(candidates),
+        "selected_input_bytes": selected_bytes,
+        "remaining_legacy_before": remaining_legacy_lower_bound,
+        "remaining_legacy_exact": not scan_truncated and not oversize_count,
+        "malformed_rows": None,
+        "malformed_rows_exact": False,
+        "scan_limit": _CHANGE_SET_COMPACTION_MAX_SCAN_ROWS,
+        "scanned_rows": scanned_rows,
+        "scan_truncated": scan_truncated,
+        "scan_reached_end": not scan_truncated,
+        "compaction_exhausted": compaction_exhausted,
+        "preflight_input_bytes": preflight_input_bytes,
+        "preflight_byte_limit_reached": preflight_byte_limit_reached,
+        "oversize_count": oversize_count,
+        "oversize_samples": oversize,
+        "uncompactable_count": uncompactable_count,
+        "uncompactable_samples": uncompactable,
+        "current_manifest_count": current_manifest_count,
+        "skipped_by_batch_bytes": skipped_by_batch_bytes,
+        "candidates": candidates,
+    }
+    plan["fingerprint"] = _history_plan_fingerprint(plan)
+    return plan
+
+
+def apply_change_set_history_compaction_plan(
+    conn: sqlite3.Connection,
+    plan: dict,
+    *,
+    confirmation: str,
+) -> dict:
+    """Rewrite only exact legacy rows selected by a confirmed compaction plan."""
+    if not conn.in_transaction:
+        raise RuntimeError("Change-set compaction requires an active transaction")
+    if plan.get("contract") != "change-set-history-compaction-plan-v1":
+        raise ValueError("Unsupported change-set compaction plan")
+    fingerprint = str(plan.get("fingerprint") or "")
+    if not confirmation or not hmac.compare_digest(confirmation, fingerprint):
+        raise RuntimeError("Change-set compaction requires the exact preview fingerprint")
+    if not hmac.compare_digest(fingerprint, _history_plan_fingerprint(plan)):
+        raise RuntimeError("Change-set compaction plan fingerprint is invalid")
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) != int(
+        plan.get("schema_version") or -1
+    ) or int(conn.execute("PRAGMA schema_version").fetchone()[0]) != int(
+        plan.get("schema_cookie") or -1
+    ):
+        raise RuntimeError("Change-set compaction schema drifted after preview")
+    if _history_runtime_generations(conn) != plan.get("runtime_generations"):
+        raise RuntimeError("Change-set compaction generations drifted after preview")
+    _assert_change_set_compaction_id_domain(conn)
+    expected_cursor_policy = _change_set_compaction_cursor_policy()
+    expected_cursor_policy_sha256 = _change_set_compaction_cursor_policy_sha256(
+        expected_cursor_policy
+    )
+    if (
+        plan.get("cursor_policy") != expected_cursor_policy
+        or not hmac.compare_digest(
+            str(plan.get("cursor_policy_sha256") or ""),
+            expected_cursor_policy_sha256,
+        )
+    ):
+        raise ValueError("Change-set compaction cursor policy is invalid")
+
+    try:
+        max_rows = int(plan.get("max_rows"))
+        max_input_bytes = int(plan.get("max_input_bytes"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Change-set compaction bounds are malformed") from exc
+    if max_rows < 1 or max_rows > 500:
+        raise ValueError("Change-set compaction max_rows is outside the hard limit")
+    if (
+        max_input_bytes < 1
+        or max_input_bytes > _CHANGE_SET_COMPACTION_MAX_INPUT_BYTES
+    ):
+        raise ValueError("Change-set compaction byte bound is outside the hard limit")
+    input_cursor = str(plan.get("input_cursor") or "")
+    safe_next_cursor = str(plan.get("safe_next_cursor") or "")
+    for cursor_name, cursor_value in (
+        ("input", input_cursor),
+        ("safe next", safe_next_cursor),
+    ):
+        if (
+            "\x00" in cursor_value
+            or len(cursor_value.encode("utf-8"))
+            > _CHANGE_SET_COMPACTION_MAX_CURSOR_BYTES
+        ):
+            raise ValueError(
+                f"Change-set compaction {cursor_name} cursor is malformed"
+            )
+    if safe_next_cursor < input_cursor:
+        raise ValueError("Change-set compaction cursor moves backwards")
+    candidates = plan.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) > max_rows:
+        raise ValueError("Change-set compaction candidates exceed the row bound")
+    expected_input_bytes = 0
+    candidate_ids = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("Change-set compaction candidate is malformed")
+        candidate_id = str(candidate.get("change_set_id") or "")
+        if (
+            not candidate_id
+            or candidate_id <= input_cursor
+            or candidate_id > safe_next_cursor
+        ):
+            raise ValueError("Change-set compaction candidate is outside its cursor window")
+        candidate_ids.append(candidate_id)
+        try:
+            candidate_bytes = int(candidate.get("input_bytes"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Change-set compaction candidate size is malformed") from exc
+        if candidate_bytes < 0 or candidate_bytes > max_input_bytes:
+            raise ValueError("Change-set compaction candidate exceeds the byte bound")
+        expected_input_bytes += candidate_bytes
+    if expected_input_bytes > max_input_bytes:
+        raise ValueError("Change-set compaction batch exceeds the byte bound")
+    if candidate_ids != sorted(set(candidate_ids)):
+        raise ValueError("Change-set compaction candidates are not a unique keyset")
+    if int(plan.get("selected_rows") or 0) != len(candidates) or int(
+        plan.get("selected_input_bytes") or 0
+    ) != expected_input_bytes:
+        raise ValueError("Change-set compaction plan totals are inconsistent")
+    if int(plan.get("preflight_input_bytes") or 0) > max_input_bytes:
+        raise ValueError("Change-set compaction preflight exceeds the byte bound")
+    if bool(plan.get("compaction_exhausted")) and (
+        bool(plan.get("scan_truncated"))
+        or candidates
+        or int(plan.get("oversize_count") or 0)
+        or int(plan.get("uncompactable_count") or 0)
+    ):
+        raise ValueError("Change-set compaction exhaustion marker is inconsistent")
+
+    compacted = 0
+    input_bytes_total = 0
+    output_bytes_total = 0
+    pending_payload_bytes = 0
+    for candidate in candidates:
+        change_set_id = str(candidate.get("change_set_id") or "")
+        row = conn.execute(
+            "SELECT change_sets.rowid AS storage_rowid, change_sets.updated_at, "
+            "length(CAST(change_sets.data_json AS BLOB)) AS input_bytes, "
+            "lifecycle.status, "
+            "lifecycle.terminal_at, lifecycle.payload_guard_sha256 "
+            "FROM change_sets JOIN change_set_lifecycle_v6 AS lifecycle "
+            "ON lifecycle.change_set_id = change_sets.change_set_id "
+            "WHERE change_sets.change_set_id = ?",
+            (change_set_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"Change-set compaction row disappeared: {change_set_id}"
+            )
+        input_bytes = int(row["input_bytes"] or 0)
+        if (
+            input_bytes != int(candidate.get("input_bytes") or -1)
+            or str(row["status"]) != str(candidate.get("status") or "")
+            or row["terminal_at"] != candidate.get("terminal_at")
+            or row["updated_at"] != candidate.get("updated_at")
+        ):
+            raise RuntimeError(
+                f"Change-set compaction metadata drifted after preview: {change_set_id}"
+            )
+        raw_guard = _sqlite_text_blob_sha256(
             conn,
-            "evidence_versions",
-            "evidence_version_id",
-            list(selected.get("evidence_versions") or []),
-        ),
+            table_name="change_sets",
+            column_name="data_json",
+            rowid=int(row["storage_rowid"]),
+            expected_bytes=input_bytes,
+        )
+        if (
+            not hmac.compare_digest(
+                raw_guard,
+                str(candidate.get("row_guard_sha256") or ""),
+            )
+            or not hmac.compare_digest(
+                raw_guard,
+                str(row["payload_guard_sha256"] or ""),
+            )
+        ):
+            raise RuntimeError(
+                f"Change-set compaction row drifted after preview: {change_set_id}"
+            )
+        raw = conn.execute(
+            "SELECT data_json FROM change_sets WHERE rowid = ? "
+            "AND change_set_id = ? "
+            "AND length(CAST(data_json AS BLOB)) = ? "
+            "AND length(CAST(data_json AS BLOB)) <= ?",
+            (
+                row["storage_rowid"],
+                change_set_id,
+                input_bytes,
+                max_input_bytes,
+            ),
+        ).fetchone()
+        if raw is None:
+            raise RuntimeError(
+                f"Change-set compaction input changed before bounded load: {change_set_id}"
+            )
+        raw_text = str(raw["data_json"])
+        if len(raw_text.encode("utf-8")) != input_bytes:
+            raise RuntimeError(
+                f"Change-set compaction byte length drifted: {change_set_id}"
+            )
+        change_set = _history_json_object(raw_text)
+        if not change_set or change_set.get("manifest_version") not in {None, 1}:
+            raise ChangeSetPayloadCorrupt(
+                f"Change-set compaction input is no longer legacy: {change_set_id}"
+            )
+        manifest, compaction_kind, payload_bytes = (
+            _prepare_legacy_change_set_compaction(
+                change_set,
+                lifecycle_status=str(row["status"]),
+                raw_sha256=raw_guard,
+                raw_bytes=input_bytes,
+                terminal_at=row["terminal_at"],
+            )
+        )
+        if compaction_kind != str(candidate.get("compaction_kind") or ""):
+            raise RuntimeError(
+                "Change-set compaction strategy drifted after preview: "
+                f"{change_set_id}"
+            )
+        payload_available = bool(payload_bytes)
+        manifest_json = _canonical_json_bytes(manifest).decode("utf-8")
+        cursor = conn.execute(
+            "UPDATE change_sets SET data_json = ?, updated_at = ? "
+            "WHERE change_set_id = ? AND updated_at IS ? "
+            "AND length(CAST(data_json AS BLOB)) = ? "
+            "AND EXISTS (SELECT 1 FROM change_set_lifecycle_v6 AS lifecycle "
+            "WHERE lifecycle.change_set_id = change_sets.change_set_id "
+            "AND lifecycle.payload_guard_sha256 IS ?)",
+            (
+                manifest_json,
+                _utc_now(),
+                change_set_id,
+                row["updated_at"],
+                input_bytes,
+                raw_guard,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Change-set compaction CAS update failed: {change_set_id}"
+            )
+        if payload_available:
+            payload_sha256 = _store_change_set_payload(conn, payload_bytes)
+            conn.execute(
+                "INSERT INTO change_set_payload_refs "
+                "(change_set_id, payload_sha256, created_at) VALUES (?, ?, ?)",
+                (change_set_id, payload_sha256, _utc_now()),
+            )
+            pending_payload_bytes += len(payload_bytes)
+        lifecycle_cursor = conn.execute(
+            "UPDATE change_set_lifecycle_v6 SET payload_guard_sha256 = ? "
+            "WHERE change_set_id = ? AND payload_guard_sha256 IS ?",
+            (
+                hashlib.sha256(manifest_json.encode("utf-8")).hexdigest(),
+                change_set_id,
+                raw_guard,
+            ),
+        )
+        if lifecycle_cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Change-set compaction lifecycle CAS failed: {change_set_id}"
+            )
+        compacted += 1
+        input_bytes_total += input_bytes
+        output_bytes_total += len(manifest_json.encode("utf-8"))
+    return {
+        "fingerprint": fingerprint,
+        "input_cursor": input_cursor,
+        "safe_next_cursor": safe_next_cursor,
+        "scan_truncated": bool(plan.get("scan_truncated")),
+        "scan_reached_end": bool(plan.get("scan_reached_end")),
+        "compaction_exhausted": bool(plan.get("compaction_exhausted")),
+        "oversize_count": int(plan.get("oversize_count") or 0),
+        "uncompactable_count": int(plan.get("uncompactable_count") or 0),
+        "compacted_rows": compacted,
+        "input_bytes": input_bytes_total,
+        "manifest_bytes": output_bytes_total,
+        "logical_bytes_removed": max(0, input_bytes_total - output_bytes_total),
+        "pending_payload_raw_bytes": pending_payload_bytes,
     }

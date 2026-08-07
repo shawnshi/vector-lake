@@ -9,6 +9,7 @@ unsupported, but become distinguishable from unreviewed debt after registration.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import shutil
@@ -17,6 +18,8 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from vector_lake import db_store, governance_store
 from vector_lake.governance_metrics import (
@@ -97,6 +100,11 @@ _HISTORY_RETENTION_REQUIRED_TABLES = frozenset(
         "evidence_versions",
         "claims",
         "evidence",
+        "runtime_generations",
+        "change_set_payloads",
+        "change_set_payload_refs",
+        "change_set_lifecycle_v6",
+        "history_retention_runs_v6",
     }
 )
 
@@ -105,23 +113,37 @@ def _validate_history_retention_options(
     *,
     ttl_days: int,
     batch_size: int,
+    max_delete_bytes: int,
     keep_change_sets: int,
     keep_terminal_jobs: int,
     keep_terminal_outbox: int,
     keep_versions_per_family: int,
-) -> dict[str, int]:
+    claim_version_cursor: str,
+    evidence_version_cursor: str,
+    version_cursor_receipt: str,
+) -> dict[str, int | str]:
     options = {
         "ttl_days": int(ttl_days),
         "batch_size": int(batch_size),
+        "max_delete_bytes": int(max_delete_bytes),
         "keep_change_sets": int(keep_change_sets),
         "keep_terminal_jobs": int(keep_terminal_jobs),
         "keep_terminal_outbox": int(keep_terminal_outbox),
         "keep_versions_per_family": int(keep_versions_per_family),
+        "claim_version_cursor": str(claim_version_cursor or ""),
+        "evidence_version_cursor": str(evidence_version_cursor or ""),
+        "version_cursor_receipt": str(version_cursor_receipt or ""),
     }
     if options["ttl_days"] < 1:
         raise ValueError("ttl_days must be positive")
-    if not 1 <= options["batch_size"] <= 10_000:
-        raise ValueError("batch_size must be between 1 and 10000")
+    if not 1 <= options["batch_size"] <= 500:
+        raise ValueError("batch_size must be between 1 and 500")
+    if not (
+        1
+        <= options["max_delete_bytes"]
+        <= governance_store._HISTORY_RETENTION_MAX_DELETE_BYTES
+    ):
+        raise ValueError("max_delete_bytes must be between 1 byte and 128 MiB")
     for name in (
         "keep_change_sets",
         "keep_terminal_jobs",
@@ -129,8 +151,15 @@ def _validate_history_retention_options(
     ):
         if options[name] < 0:
             raise ValueError(f"{name} must be zero or positive")
-    if options["keep_versions_per_family"] < 1:
-        raise ValueError("keep_versions_per_family must be positive")
+    if not (
+        1
+        <= options["keep_versions_per_family"]
+        <= governance_store._HISTORY_VERSION_MAX_KEEP_PER_FAMILY
+    ):
+        raise ValueError(
+            "keep_versions_per_family must be between 1 and "
+            f"{governance_store._HISTORY_VERSION_MAX_KEEP_PER_FAMILY}"
+        )
     return options
 
 
@@ -138,7 +167,8 @@ def _history_retention_plan(
     conn: sqlite3.Connection,
     *,
     cutoff: str,
-    options: dict[str, int],
+    plan_as_of: str,
+    options: dict[str, int | str],
 ) -> dict:
     tables = {
         str(row["name"])
@@ -153,10 +183,15 @@ def _history_retention_plan(
         conn,
         cutoff=cutoff,
         batch_size=options["batch_size"],
+        max_delete_bytes=options["max_delete_bytes"],
         keep_change_sets=options["keep_change_sets"],
         keep_terminal_jobs=options["keep_terminal_jobs"],
         keep_terminal_outbox=options["keep_terminal_outbox"],
         keep_versions_per_family=options["keep_versions_per_family"],
+        claim_version_cursor=options["claim_version_cursor"],
+        evidence_version_cursor=options["evidence_version_cursor"],
+        version_cursor_receipt=options["version_cursor_receipt"],
+        plan_as_of=plan_as_of,
     )
 
 
@@ -176,7 +211,11 @@ def _public_history_retention_result(
     if plan is not None:
         selected = plan.get("selected_ids") or {}
         result.update(
-            {key: value for key, value in plan.items() if key != "selected_ids"}
+            {
+                key: value
+                for key, value in plan.items()
+                if key not in {"selected_ids", "candidates"}
+            }
         )
         result["selected_samples"] = {
             table_name: list(values)[:20] for table_name, values in selected.items()
@@ -192,24 +231,43 @@ def history_retention_maintenance(
     dry_run: bool = True,
     ttl_days: int = 30,
     batch_size: int = 500,
+    max_delete_bytes: int = 128 * 1024 * 1024,
     keep_change_sets: int = 1000,
     keep_terminal_jobs: int = 1000,
     keep_terminal_outbox: int = 1000,
     keep_versions_per_family: int = 2,
+    claim_version_cursor: str = "",
+    evidence_version_cursor: str = "",
+    version_cursor_receipt: str = "",
+    plan_as_of: str = "",
+    confirmation: str = "",
 ) -> str:
-    """Preview or explicitly apply one bounded, reference-safe retention batch."""
+    """Preview or apply one exact, globally bounded retention batch."""
     options = _validate_history_retention_options(
         ttl_days=ttl_days,
         batch_size=batch_size,
+        max_delete_bytes=max_delete_bytes,
         keep_change_sets=keep_change_sets,
         keep_terminal_jobs=keep_terminal_jobs,
         keep_terminal_outbox=keep_terminal_outbox,
         keep_versions_per_family=keep_versions_per_family,
+        claim_version_cursor=claim_version_cursor,
+        evidence_version_cursor=evidence_version_cursor,
+        version_cursor_receipt=version_cursor_receipt,
     )
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=options["ttl_days"])
-    ).isoformat()
+    normalized_as_of = governance_store._strict_utc_instant(
+        plan_as_of or _utc_now()
+    )
+    if normalized_as_of is None:
+        raise ValueError("plan_as_of must be a timezone-aware ISO-8601 instant")
+    as_of_dt = datetime.fromisoformat(normalized_as_of)
+    cutoff = (as_of_dt - timedelta(days=options["ttl_days"])).isoformat()
     path = db_store.peek_db_path() if dry_run else db_store.get_db_path()
+
+    if not dry_run and (not plan_as_of or not confirmation):
+        raise RuntimeError(
+            "History retention apply requires plan_as_of and the exact preview fingerprint"
+        )
 
     if dry_run:
         schema_state = db_store.inspect_schema_migration_state(path)
@@ -228,8 +286,13 @@ def history_retention_maintenance(
             )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only=ON")
-            plan = _history_retention_plan(conn, cutoff=cutoff, options=options)
-        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            plan = _history_retention_plan(
+                conn,
+                cutoff=cutoff,
+                plan_as_of=normalized_as_of,
+                options=options,
+            )
+        except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
             return _public_history_retention_result(
                 dry_run=True,
                 schema_state=schema_state,
@@ -244,20 +307,227 @@ def history_retention_maintenance(
             plan=plan,
         )
 
-    db_store.init_db()
-    schema_state = db_store.inspect_schema_migration_state(path)
-    if not schema_state["ready"]:
-        raise RuntimeError(f"schema_not_ready:{schema_state['status']}")
-    with db_store.transaction():
-        conn = db_store.get_connection()
-        plan = _history_retention_plan(conn, cutoff=cutoff, options=options)
-        deleted_counts = governance_store.apply_history_retention_plan(conn, plan)
+    lock_path = path.parent / ".history-retention.lock"
+    try:
+        maintenance_lock = FileLock(str(lock_path), timeout=5)
+        maintenance_lock.acquire()
+    except FileLockTimeout as exc:
+        raise RuntimeError("History retention maintenance window is busy") from exc
+    try:
+        db_store.init_db()
+        schema_state = db_store.inspect_schema_migration_state(path)
+        if not schema_state["ready"]:
+            raise RuntimeError(f"schema_not_ready:{schema_state['status']}")
+        with db_store.transaction():
+            conn = db_store.get_connection()
+            prior = conn.execute(
+                "SELECT plan_as_of, options_json, plan_sha256, receipt_json "
+                "FROM history_retention_runs_v6 "
+                "WHERE fingerprint = ?",
+                (confirmation,),
+            ).fetchone()
+            if prior is not None:
+                try:
+                    receipt = json.loads(prior["receipt_json"])
+                    stored_rules = json.loads(prior["options_json"])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "History retention receipt metadata is malformed"
+                    ) from exc
+                expected_rules = {
+                    "max_delete_rows": options["batch_size"],
+                    "max_delete_bytes": options["max_delete_bytes"],
+                    "keep_change_sets": options["keep_change_sets"],
+                    "keep_terminal_jobs": options["keep_terminal_jobs"],
+                    "keep_terminal_outbox": options["keep_terminal_outbox"],
+                    "keep_versions_per_family": options[
+                        "keep_versions_per_family"
+                    ],
+                    "claim_version_cursor": options["claim_version_cursor"],
+                    "evidence_version_cursor": options[
+                        "evidence_version_cursor"
+                    ],
+                    "version_cursor_receipt": options[
+                        "version_cursor_receipt"
+                    ],
+                    "scan_version_history": True,
+                }
+                if stored_rules != expected_rules:
+                    raise RuntimeError(
+                        "History retention receipt options do not match the request"
+                    )
+                if (
+                    prior["plan_as_of"] != normalized_as_of
+                    or receipt.get("plan_as_of") != normalized_as_of
+                ):
+                    raise RuntimeError(
+                        "History retention receipt plan_as_of does not match"
+                    )
+                if governance_store._strict_utc_instant(receipt.get("cutoff")) != cutoff:
+                    raise RuntimeError(
+                        "History retention receipt cutoff does not match the request"
+                    )
+                if (
+                    receipt.get("fingerprint") != confirmation
+                    or not confirmation.startswith("sha256:")
+                    or not hmac.compare_digest(
+                        str(prior["plan_sha256"] or ""),
+                        confirmation[7:],
+                    )
+                ):
+                    raise RuntimeError(
+                        "History retention receipt fingerprint is invalid"
+                    )
+                deleted_counts = {
+                    str(key): int(value)
+                    for key, value in (receipt.get("deleted_counts") or {}).items()
+                }
+                plan = {
+                    "contract": "history-retention-plan-v2",
+                    "plan_as_of": normalized_as_of,
+                    "cutoff": receipt.get("cutoff"),
+                    "rules": expected_rules,
+                    "fingerprint": confirmation,
+                    "selected_ids": {},
+                    "selected_counts": {},
+                    "selected_count_total": 0,
+                    "selected_bytes_total": int(
+                        receipt.get("selected_bytes_total") or 0
+                    ),
+                    "version_resume_cursors": receipt.get(
+                        "version_resume_cursors"
+                    )
+                    or {},
+                    "replayed_receipt": True,
+                }
+            else:
+                plan = _history_retention_plan(
+                    conn,
+                    cutoff=cutoff,
+                    plan_as_of=normalized_as_of,
+                    options=options,
+                )
+                if plan["fingerprint"] != confirmation:
+                    raise RuntimeError(
+                        "History retention candidate set changed after preview"
+                    )
+                deleted_counts = governance_store.apply_history_retention_plan(
+                    conn,
+                    plan,
+                    confirmation=confirmation,
+                    plan_as_of=normalized_as_of,
+                )
+    finally:
+        maintenance_lock.release()
     schema_state = db_store.inspect_schema_migration_state(path)
     return _public_history_retention_result(
         dry_run=False,
         schema_state=schema_state,
         plan=plan,
         deleted_counts=deleted_counts,
+    )
+
+
+def compact_change_set_history(
+    dry_run: bool = True,
+    max_rows: int = 100,
+    max_input_bytes: int = 64 * 1024 * 1024,
+    confirmation: str = "",
+    cursor: str = "",
+) -> str:
+    """Preview or CAS-rewrite one bounded legacy change-set keyset window."""
+    path = db_store.peek_db_path() if dry_run else db_store.get_db_path()
+    schema_state = db_store.inspect_schema_migration_state(path)
+    if not schema_state["ready"]:
+        return json.dumps(
+            {
+                "dry_run": bool(dry_run),
+                "applied": False,
+                "schema_state": schema_state,
+                "preview_error": f"schema_not_ready:{schema_state['status']}",
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    if not dry_run and not confirmation:
+        raise RuntimeError(
+            "Change-set history compaction requires the exact preview fingerprint"
+        )
+
+    lock_path = path.parent / ".change-set-compaction.lock"
+    maintenance_lock = None
+    conn = None
+    try:
+        if dry_run:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            plan = governance_store.plan_change_set_history_compaction(
+                conn,
+                max_rows=max_rows,
+                max_input_bytes=max_input_bytes,
+                cursor=cursor,
+            )
+            applied = None
+        else:
+            try:
+                maintenance_lock = FileLock(str(lock_path), timeout=5)
+                maintenance_lock.acquire()
+            except FileLockTimeout as exc:
+                raise RuntimeError(
+                    "Change-set compaction maintenance window is busy"
+                ) from exc
+            db_store.init_db()
+            with db_store.transaction():
+                conn = db_store.get_connection()
+                plan = governance_store.plan_change_set_history_compaction(
+                    conn,
+                    max_rows=max_rows,
+                    max_input_bytes=max_input_bytes,
+                    cursor=cursor,
+                )
+                if not hmac.compare_digest(plan["fingerprint"], confirmation):
+                    raise RuntimeError(
+                        "Change-set compaction candidate set changed after preview"
+                    )
+                applied = governance_store.apply_change_set_history_compaction_plan(
+                    conn,
+                    plan,
+                    confirmation=confirmation,
+                )
+    finally:
+        if dry_run and conn is not None:
+            conn.close()
+        if maintenance_lock is not None:
+            maintenance_lock.release()
+
+    public_plan = {
+        key: value for key, value in plan.items() if key != "candidates"
+    }
+    public_plan["selected_samples"] = [
+        {
+            "change_set_id": candidate["change_set_id"],
+            "input_bytes": candidate["input_bytes"],
+            "status": candidate["status"],
+        }
+        for candidate in (plan.get("candidates") or [])[:20]
+    ]
+    return json.dumps(
+        {
+            "dry_run": bool(dry_run),
+            "applied": not dry_run,
+            "schema_state": schema_state,
+            **public_plan,
+            **({"result": applied} if applied is not None else {}),
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
     )
 
 
@@ -503,12 +773,15 @@ def _backup_pages(paths: list[Path], backup_dir: str | Path) -> Path:
 def _commit_page_mutations(
     mutations: list[dict],
     origin: str,
-    batch_size: int = 200,
+    batch_size: int = 100,
 ) -> dict:
     committed = 0
     completed = 0
     failed = 0
-    size = max(1, min(250, int(batch_size)))
+    size = max(
+        1,
+        min(governance_store._CHANGE_SET_MAX_BATCH_ITEMS, int(batch_size)),
+    )
     for offset in range(0, len(mutations), size):
         batch = mutations[offset : offset + size]
         execute_mutation_batch(batch, validation_mode="schema", origin=origin)

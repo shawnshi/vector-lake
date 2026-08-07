@@ -4,16 +4,28 @@ import logging
 import math
 import os
 import re
+import subprocess
+import sys
+import threading
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
+from pathlib import Path
 
 from filelock import FileLock, Timeout
 
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake import db_store
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file, VALID_PREFIXES
+from vector_lake.wiki_utils import (
+    VALID_PREFIXES,
+    get_claim_graph_path,
+    get_index_path,
+    get_projection_manifest_path,
+    get_wiki_dir,
+    read_markdown_file,
+)
 
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
@@ -54,27 +66,78 @@ INDEX_PARITY_FIELDS = (
 PROJECTION_MANIFEST_KEY = "projection_manifest"
 PROJECTION_CONTRACT = "index-claim-graph-pair"
 PROJECTION_CONTRACT_VERSION = 1
+PROJECTION_SIDECAR_CONTRACT = "index-claim-graph-sidecar"
+PROJECTION_SIDECAR_VERSION = 1
+PROJECTION_SIDECAR_STAGE_SUFFIX = ".pair-manifest"
+_PROJECTION_DIGEST_CACHE_MAX = 16
+_PROJECTION_DIGEST_CACHE_LOCK = threading.Lock()
+_PROJECTION_DIGEST_CACHE: dict[tuple[str, tuple[int, ...]], str] = {}
 
 CANONICAL_PROJECTION_SURFACES = (
-    "change_sets",
-    "claim_graph_edges",
-    "claims",
     "entities",
-    "evidence",
-    "governance_queue",
-    "operational_memory",
-    "page_graph_edges",
+    "claims",
     "sources",
+    "page_graph_edges",
+    "claim_graph_edges",
 )
-CANONICAL_GENERATION_ALGORITHM = "runtime-generations-sha256-v1"
+CANONICAL_GENERATION_ALGORITHM = "runtime-generations-sha256-v2"
 
-def _load_louvain_runtime():
+def _topology_worker_timeout_seconds() -> float:
     try:
-        import networkx as nx
-        from community import community_louvain
-    except ImportError:
-        return None, None
-    return nx, community_louvain
+        value = float(
+            os.environ.get("VECTOR_LAKE_TOPOLOGY_WORKER_TIMEOUT_SECONDS", "60")
+        )
+    except (TypeError, ValueError):
+        value = 60.0
+    if not math.isfinite(value):
+        value = 60.0
+    return max(5.0, min(300.0, value))
+
+
+def _louvain_partition_in_subprocess(
+    node_keys: list[str],
+    weighted_edges: list[dict],
+) -> dict[str, str]:
+    """Compute Louvain out of process so NumPy memory dies with the worker."""
+    payload = json.dumps(
+        {
+            "nodes": node_keys,
+            "edges": [
+                [
+                    edge["source"],
+                    edge["target"],
+                    float(edge.get("weight", 1.0) or 1.0),
+                ]
+                for edge in weighted_edges
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    worker_path = Path(__file__).with_name("topology_worker.py").resolve()
+    completed = subprocess.run(
+        [sys.executable, "-I", str(worker_path)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=_topology_worker_timeout_seconds(),
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        detail = str(completed.stderr or "").strip()[-1000:]
+        raise RuntimeError(
+            f"topology worker exited with {completed.returncode}: {detail}"
+        )
+    if len(completed.stdout) > max(1_000_000, len(node_keys) * 256):
+        raise RuntimeError("topology worker output exceeds the bounded result size")
+    result = json.loads(completed.stdout)
+    partition = result.get("partition") if isinstance(result, dict) else None
+    if not isinstance(partition, dict) or set(partition) != set(node_keys):
+        raise RuntimeError("topology worker returned an incomplete partition")
+    return {node_key: str(partition[node_key]) for node_key in node_keys}
 
 
 
@@ -153,11 +216,21 @@ def index_projection_matches_canonical(
     }
     if not page_keys or not get_index_path().exists():
         return False
-    lock_path = str(get_index_path()) + ".lock"
     try:
-        with FileLock(lock_path, timeout=15):
-            index_data = _load_index_unlocked(str(get_index_path()))
-    except (Timeout, OSError, json.JSONDecodeError):
+        index_data = read_committed_index_snapshot(
+            get_index_path(),
+            lock_timeout=15,
+            _require_current_generation=False,
+            _require_verified_binding=False,
+        )
+    except (
+        Timeout,
+        OSError,
+        json.JSONDecodeError,
+        ProjectionPairContractError,
+        ProjectionSnapshotChanged,
+        ValueError,
+    ):
         return False
     nodes = index_data.get("nodes") or {}
     expected: dict[str, set[str]] = {page_key: set() for page_key in page_keys}
@@ -305,6 +378,34 @@ def _build_bm25_index(index_data: dict, embeddings_map: dict):
             db_store.upsert_embedding(node_key, embeddings_map[node_key])
 
 
+def _search_projection_row(
+    node_key: str,
+    node: dict,
+) -> tuple[str, str, str, str]:
+    aliases = node.get("aliases") or []
+    aliases_text = " ".join(aliases) if isinstance(aliases, list) else ""
+    text = f"{aliases_text} {node.get('raw_text', '')}"
+    return (
+        str(node_key),
+        _tokenize_for_fts(node.get("title", "")),
+        _tokenize_for_fts(node.get("summary", "")),
+        _tokenize_for_fts(text),
+    )
+
+
+def _search_projection_upserts(index_data: dict) -> list[tuple[str, str, str, str]]:
+    """Pre-tokenize the FTS payload without holding a SQLite write transaction."""
+    rows = []
+    nodes = index_data.get("nodes") or {}
+    total = len(nodes)
+    log.info("Preparing BM25 projection rows for %s nodes...", total)
+    for offset, (node_key, node) in enumerate(nodes.items()):
+        if offset % 1000 == 0:
+            log.info("Tokenized %s/%s nodes...", offset, total)
+        rows.append(_search_projection_row(node_key, node))
+    return rows
+
+
 
 
 def _strip_legacy_embedded_payloads(index_data: dict) -> list[str]:
@@ -362,6 +463,8 @@ def _write_json_payload(output_path: str, data: dict):
 def _write_json_stage(stage_path: str, data: dict):
     with open(stage_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _deduplicate_weighted_edges(edges: list[dict]) -> list[dict]:
@@ -440,9 +543,11 @@ class ProjectionCanonicalGenerationChanged(RuntimeError):
     """Raised when canonical rows change while a projection is materialized."""
 
 
-def canonical_runtime_generation_snapshot() -> dict[str, int]:
+def canonical_runtime_generation_snapshot(
+    connection=None,
+) -> dict[str, int]:
     """Read the tracked canonical generations used by the projection pair."""
-    connection = db_store.get_connection()
+    connection = connection or db_store.get_connection()
     dirty_reader = getattr(connection, "generation_dirty_snapshot", None)
     if callable(dirty_reader):
         dirty_surfaces = set(dirty_reader())
@@ -467,6 +572,19 @@ def canonical_runtime_generation_snapshot() -> dict[str, int]:
         surface: snapshot[surface]
         for surface in CANONICAL_PROJECTION_SURFACES
     }
+
+
+def _assert_canonical_generation(
+    expected: dict[str, int],
+    *,
+    context: str,
+) -> None:
+    observed = canonical_runtime_generation_snapshot()
+    if observed != expected:
+        raise ProjectionCanonicalGenerationChanged(
+            "Canonical runtime generation changed "
+            f"{context}; discard the staged projection and retry."
+        )
 
 
 def _canonical_generation_token(snapshot: dict[str, int]) -> str:
@@ -630,6 +748,323 @@ def projection_canonical_generation(
     )
 
 
+def _stable_file_sha256(path: str) -> tuple[str, tuple[int, ...]]:
+    """Hash one file only when its physical identity remains unchanged."""
+    last_error = None
+    for _attempt in range(2):
+        before = _projection_file_identity(path)
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        after = _projection_file_identity(path)
+        if before == after:
+            return digest.hexdigest(), after
+        last_error = ProjectionSnapshotChanged(
+            f"Projection changed while hashing {path}"
+        )
+    raise last_error or ProjectionSnapshotChanged(
+        f"Projection could not be hashed stably: {path}"
+    )
+
+
+def _cached_projection_sha256(path: str) -> tuple[str, tuple[int, ...]]:
+    resolved = os.path.normcase(str(Path(path).resolve()))
+    identity = _projection_file_identity(path)
+    cache_key = (resolved, identity)
+    with _PROJECTION_DIGEST_CACHE_LOCK:
+        cached = _PROJECTION_DIGEST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached, identity
+
+    digest, stable_identity = _stable_file_sha256(path)
+    cache_key = (resolved, stable_identity)
+    with _PROJECTION_DIGEST_CACHE_LOCK:
+        _PROJECTION_DIGEST_CACHE[cache_key] = digest
+        while len(_PROJECTION_DIGEST_CACHE) > _PROJECTION_DIGEST_CACHE_MAX:
+            _PROJECTION_DIGEST_CACHE.pop(next(iter(_PROJECTION_DIGEST_CACHE)))
+    return digest, stable_identity
+
+
+def _projection_sidecar_payload(
+    manifest: dict,
+    *,
+    index_stage: str,
+    claim_graph_stage: str,
+    index_data: dict,
+    claim_graph_data: dict,
+) -> dict:
+    index_digest, _index_identity = _stable_file_sha256(index_stage)
+    graph_digest, _graph_identity = _stable_file_sha256(claim_graph_stage)
+    return {
+        "contract": PROJECTION_SIDECAR_CONTRACT,
+        "version": PROJECTION_SIDECAR_VERSION,
+        "projection_manifest": dict(manifest),
+        "artifacts": {
+            get_index_path().name: {
+                "sha256": index_digest,
+                "bytes": os.path.getsize(index_stage),
+                "node_count": len(index_data.get("nodes") or {}),
+                "edge_count": len(index_data.get("weighted_edges") or []),
+            },
+            get_claim_graph_path().name: {
+                "sha256": graph_digest,
+                "bytes": os.path.getsize(claim_graph_stage),
+                "node_count": len(claim_graph_data.get("nodes") or []),
+                "edge_count": len(claim_graph_data.get("edges") or []),
+            },
+        },
+    }
+
+
+def _validate_projection_sidecar(sidecar: dict) -> tuple[dict, dict]:
+    if not isinstance(sidecar, dict):
+        raise ProjectionPairContractError("Projection sidecar is not an object.")
+    if (
+        sidecar.get("contract") != PROJECTION_SIDECAR_CONTRACT
+        or sidecar.get("version") != PROJECTION_SIDECAR_VERSION
+    ):
+        raise ProjectionPairContractError("Unsupported projection sidecar contract.")
+    manifest = sidecar.get("projection_manifest")
+    if not isinstance(manifest, dict):
+        raise ProjectionPairContractError("Projection sidecar manifest is missing.")
+    if (
+        manifest.get("contract") != PROJECTION_CONTRACT
+        or manifest.get("version") != PROJECTION_CONTRACT_VERSION
+        or not isinstance(manifest.get("generation"), str)
+        or not manifest.get("generation")
+        or not isinstance(manifest.get("published_at"), str)
+        or not manifest.get("published_at")
+    ):
+        raise ProjectionPairContractError("Projection sidecar manifest is invalid.")
+    _validate_canonical_generation_binding(manifest)
+
+    artifacts = sidecar.get("artifacts")
+    expected_names = {get_index_path().name, get_claim_graph_path().name}
+    if not isinstance(artifacts, dict) or set(artifacts) != expected_names:
+        raise ProjectionPairContractError(
+            "Projection sidecar artifacts must use the fixed projection filenames."
+        )
+    for filename in sorted(expected_names):
+        metadata = artifacts.get(filename)
+        if not isinstance(metadata, dict):
+            raise ProjectionPairContractError(
+                f"Projection sidecar metadata is invalid for {filename}."
+            )
+        digest = metadata.get("sha256")
+        size = metadata.get("bytes")
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            raise ProjectionPairContractError(
+                f"Projection sidecar digest metadata is invalid for {filename}."
+            )
+    return manifest, artifacts
+
+
+def read_committed_index_snapshot(
+    index_path: str | Path | None = None,
+    *,
+    lock_timeout: float = 5.0,
+    connection=None,
+    _acquire_lock: bool = True,
+    _require_current_generation: bool = True,
+    _require_verified_binding: bool = True,
+    _mutable: bool = False,
+) -> dict:
+    """Return index.json only when the complete projection commit is current.
+
+    ``projection_pair_manifest.json`` is the commit marker.  A caller never
+    receives an index snapshot unless both artifacts still match that marker,
+    the parsed index embeds the same manifest, and the marker is bound to the
+    current canonical runtime generation.  Low-level diagnostic readers may
+    continue to use :func:`vector_lake.index_snapshot.load_index_snapshot` when
+    they explicitly need to inspect broken state.
+    """
+    resolved_index = Path(index_path or get_index_path())
+    claim_graph_path = resolved_index.with_name(get_claim_graph_path().name)
+    sidecar_path = resolved_index.with_name(get_projection_manifest_path().name)
+    expected_names = {get_index_path().name, get_claim_graph_path().name}
+    if resolved_index.name != get_index_path().name:
+        raise ProjectionPairContractError(
+            "Committed projection reads require the fixed index filename; run sync."
+        )
+
+    def read_under_contract() -> dict:
+        missing = [
+            path.name
+            for path in (resolved_index, claim_graph_path, sidecar_path)
+            if not path.is_file()
+        ]
+        if missing:
+            raise ProjectionPairContractError(
+                "Committed projection is incomplete (missing "
+                + ", ".join(missing)
+                + "); run sync to rebuild it."
+            )
+
+        sidecar_identity = _projection_file_identity(str(sidecar_path))
+        with open(sidecar_path, "r", encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+        if _projection_file_identity(str(sidecar_path)) != sidecar_identity:
+            raise ProjectionPairContractError(
+                "Projection commit marker changed while it was read; retry sync."
+            )
+        manifest, artifacts = _validate_projection_sidecar(sidecar)
+        binding = _validate_canonical_generation_binding(manifest)
+        if _require_verified_binding and binding.get("status") != "verified":
+            raise ProjectionPairContractError(
+                "Projection canonical-generation binding is unverifiable; "
+                "run a full sync."
+            )
+        if set(artifacts) != expected_names:
+            raise ProjectionPairContractError(
+                "Projection commit marker does not cover the fixed artifact pair; "
+                "run sync."
+            )
+
+        artifact_identities: dict[str, tuple[int, ...]] = {}
+        for path in (resolved_index, claim_graph_path):
+            metadata = artifacts[path.name]
+            if path.stat().st_size != metadata["bytes"]:
+                raise ProjectionPairContractError(
+                    f"Projection commit size does not match {path.name}; run sync."
+                )
+            digest, identity = _cached_projection_sha256(str(path))
+            if digest != metadata["sha256"]:
+                raise ProjectionPairContractError(
+                    f"Projection commit digest does not match {path.name}; run sync."
+                )
+            if _projection_file_identity(str(path)) != identity:
+                raise ProjectionPairContractError(
+                    f"Projection artifact changed while reading {path.name}; retry."
+                )
+            artifact_identities[path.name] = identity
+
+        # Import lazily so index_snapshot remains a low-level, cycle-free
+        # diagnostic/cache module.
+        if _mutable:
+            index_data = _load_index_unlocked(str(resolved_index))
+            if index_data is None:
+                raise ProjectionPairContractError(
+                    "index.json disappeared while its committed snapshot was "
+                    "decoded; retry."
+                )
+        else:
+            from vector_lake.index_snapshot import load_index_snapshot
+
+            index_data = load_index_snapshot(resolved_index)
+        if (
+            _projection_file_identity(str(resolved_index))
+            != artifact_identities[resolved_index.name]
+        ):
+            raise ProjectionPairContractError(
+                "index.json changed while its committed snapshot was decoded; retry."
+            )
+        if index_data.get(PROJECTION_MANIFEST_KEY) != manifest:
+            raise ProjectionPairContractError(
+                "index.json manifest does not match the projection commit marker; "
+                "run sync."
+            )
+
+        if _require_current_generation:
+            if binding.get("status") != "verified":
+                raise ProjectionPairContractError(
+                    "Projection canonical-generation binding is unverifiable; "
+                    "run a full sync."
+                )
+            current_generation = canonical_runtime_generation_snapshot(connection)
+            if binding["runtime_generations"] != current_generation:
+                raise ProjectionPairContractError(
+                    "Projection canonical-generation binding is stale; run sync."
+                )
+        for path in (resolved_index, claim_graph_path):
+            if (
+                _projection_file_identity(str(path))
+                != artifact_identities[path.name]
+            ):
+                raise ProjectionPairContractError(
+                    f"Projection artifact changed while validating {path.name}; retry."
+                )
+        if _projection_file_identity(str(sidecar_path)) != sidecar_identity:
+            raise ProjectionPairContractError(
+                "Projection commit marker changed while validating the snapshot; retry."
+            )
+        return index_data
+
+    try:
+        if _acquire_lock:
+            with FileLock(str(resolved_index) + ".lock", timeout=lock_timeout):
+                return read_under_contract()
+        # Runtime diagnostics use the same digest/identity checks without
+        # creating a transient lockfile that would invalidate their own stable
+        # directory token. Publishers remain detectable because the sidecar is
+        # replaced last and every artifact identity is checked before return.
+        return read_under_contract()
+    except Timeout:
+        raise
+    except ProjectionPairContractError:
+        raise
+    except (OSError, json.JSONDecodeError, ValueError, ProjectionSnapshotChanged) as exc:
+        raise ProjectionPairContractError(
+            f"Committed projection could not be verified ({exc}); run sync."
+        ) from exc
+    except Exception as exc:
+        raise ProjectionPairContractError(
+            f"Committed projection validation failed ({exc}); run sync."
+        ) from exc
+
+
+def projection_pair_matches_current_generation() -> bool:
+    """Prove current binding from the small commit marker and artifact digests."""
+    index_path = get_index_path()
+    claim_graph_path = get_claim_graph_path()
+    sidecar_path = get_projection_manifest_path()
+    if (
+        not index_path.exists()
+        or not claim_graph_path.exists()
+        or not sidecar_path.exists()
+    ):
+        return False
+    try:
+        with FileLock(str(index_path) + ".lock", timeout=0):
+            with open(sidecar_path, "r", encoding="utf-8") as handle:
+                sidecar = json.load(handle)
+            manifest, artifacts = _validate_projection_sidecar(sidecar)
+            binding = _validate_canonical_generation_binding(manifest)
+            if binding.get("status") != "verified":
+                return False
+
+            for path in (index_path, claim_graph_path):
+                metadata = artifacts[path.name]
+                if path.stat().st_size != metadata["bytes"]:
+                    return False
+                digest, stable_identity = _cached_projection_sha256(str(path))
+                if digest != metadata["sha256"]:
+                    return False
+                if _projection_file_identity(str(path)) != stable_identity:
+                    return False
+
+            return binding.get("runtime_generations") == (
+                canonical_runtime_generation_snapshot()
+            )
+    except (
+        Timeout,
+        OSError,
+        json.JSONDecodeError,
+        ProjectionPairContractError,
+        ProjectionSnapshotChanged,
+    ):
+        return False
+
+
 def _canonical_generation_for_existing_index(
     index_data: dict,
     before: dict[str, int],
@@ -655,12 +1090,53 @@ def _canonical_generation_for_existing_index(
     )
 
 
+def _read_verified_projection_for_writer_unlocked(
+    output_path: str,
+    expected_generation: dict[str, int],
+    *,
+    connection=None,
+) -> tuple[dict, dict]:
+    """Load a reusable projection pair while the caller owns the publish lock.
+
+    Incremental publishers must never turn an incomplete, tampered, or stale
+    projection into a new commit.  The sidecar/digest checks prove the complete
+    pair, while the explicit expected-generation comparison closes the window
+    between the caller's canonical snapshot and the committed read.
+    """
+    index_data = read_committed_index_snapshot(
+        output_path,
+        connection=connection,
+        _acquire_lock=False,
+        _require_current_generation=False,
+        _mutable=True,
+    )
+    manifest = index_data.get(PROJECTION_MANIFEST_KEY)
+    if not isinstance(manifest, dict):
+        raise ProjectionPairContractError(
+            "Existing projection manifest is missing; run a full sync."
+        )
+    binding = _validate_canonical_generation_binding(manifest)
+    if (
+        binding.get("status") != "verified"
+        or binding.get("runtime_generations") != expected_generation
+    ):
+        raise ProjectionPairContractError(
+            "Existing projection binding does not match the writer's canonical "
+            "snapshot; run a full sync."
+        )
+    return index_data, binding
+
+
 def _cleanup_projection_stages(*stage_paths: str):
     for stage_path in stage_paths:
-        try:
-            os.remove(stage_path)
-        except FileNotFoundError:
-            pass
+        for candidate in (
+            stage_path,
+            stage_path + PROJECTION_SIDECAR_STAGE_SUFFIX,
+        ):
+            try:
+                os.remove(candidate)
+            except FileNotFoundError:
+                pass
 
 
 def _stage_projection_pair(
@@ -682,6 +1158,17 @@ def _stage_projection_pair(
     try:
         _write_json_stage(tmp_claim, claim_graph_data)
         _write_json_stage(tmp_output, index_data)
+        sidecar = _projection_sidecar_payload(
+            manifest,
+            index_stage=tmp_output,
+            claim_graph_stage=tmp_claim,
+            index_data=index_data,
+            claim_graph_data=claim_graph_data,
+        )
+        _write_json_stage(
+            tmp_output + PROJECTION_SIDECAR_STAGE_SUFFIX,
+            sidecar,
+        )
     except Exception:
         _cleanup_projection_stages(tmp_claim, tmp_output)
         raise
@@ -704,9 +1191,11 @@ def _publish_staged_projection_pair(
     tmp_output: str,
     tmp_claim: str,
 ):
-    """Publish graph first and index last as the pair's commit marker."""
+    """Publish graph, index, then the sidecar as the pair's commit marker."""
     claim_graph_path = str(get_claim_graph_path())
-    for staged_path in (tmp_claim, tmp_output):
+    sidecar_stage = tmp_output + PROJECTION_SIDECAR_STAGE_SUFFIX
+    sidecar_path = str(get_projection_manifest_path())
+    for staged_path in (tmp_claim, tmp_output, sidecar_stage):
         if not os.path.exists(staged_path):
             raise FileNotFoundError(
                 f"Missing staged projection file before publish: {staged_path}"
@@ -714,15 +1203,32 @@ def _publish_staged_projection_pair(
     try:
         _replace_projection_stage(tmp_claim, claim_graph_path)
         _replace_projection_stage(tmp_output, output_path)
+        _replace_projection_stage(sidecar_stage, sidecar_path)
     finally:
         _cleanup_projection_stages(tmp_claim, tmp_output)
+
+
+def _publish_staged_projection_pair_guarded(
+    output_path: str,
+    tmp_output: str,
+    tmp_claim: str,
+    expected_generation: dict[str, int],
+):
+    """Publish while a short SQLite writer guard prevents canonical drift."""
+    with db_store.transaction():
+        _assert_canonical_generation(
+            expected_generation,
+            context="immediately before publishing the staged projection pair",
+        )
+        _publish_staged_projection_pair(output_path, tmp_output, tmp_claim)
 
 
 def _publish_projection_pair(
     output_path: str,
     index_data: dict,
     claim_graph_data: dict,
-    canonical_generation: dict | None = None,
+    canonical_generation: dict,
+    expected_generation: dict[str, int],
 ) -> dict:
     tmp_output, tmp_claim, manifest = _stage_projection_pair(
         output_path,
@@ -730,7 +1236,16 @@ def _publish_projection_pair(
         claim_graph_data,
         canonical_generation,
     )
-    _publish_staged_projection_pair(output_path, tmp_output, tmp_claim)
+    try:
+        _publish_staged_projection_pair_guarded(
+            output_path,
+            tmp_output,
+            tmp_claim,
+            expected_generation,
+        )
+    except Exception:
+        _cleanup_projection_stages(tmp_claim, tmp_output)
+        raise
     return manifest
 
 
@@ -1245,18 +1760,19 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
             "UNION SELECT source_id, target_id, weight FROM page_graph_edges"
         )
         db_edges = cursor.fetchall()
-        for row in db_edges:
-            src = row["source_id"]
-            tgt = row["target_id"]
-            if src in nodes_dict and tgt in nodes_dict:
-                edges.append({
-                    "source": src,
-                    "target": tgt,
-                    "weight": float(row["weight"]) if row["weight"] else 1.0,
-                })
-    except Exception as e:
-        import logging
-        logging.getLogger("vector-lake-indexer").debug(f"Could not load graph edges from SQLite: {e}")
+    except Exception as exc:
+        raise RuntimeError(
+            "Canonical graph-edge query failed; projection publication aborted."
+        ) from exc
+    for row in db_edges:
+        src = row["source_id"]
+        tgt = row["target_id"]
+        if src in nodes_dict and tgt in nodes_dict:
+            edges.append({
+                "source": src,
+                "target": tgt,
+                "weight": float(row["weight"]) if row["weight"] else 1.0,
+            })
 
     return _prune_weighted_edges(edges, set(node_keys))
 
@@ -1330,28 +1846,17 @@ def _apply_graph_topology(index_data: dict):
     components.sort(key=lambda members: (-len(members), members[0] if members else ""))
 
     raw_partition: dict[str, object] = {}
-    nx, community_louvain = (
-        _load_louvain_runtime() if index_data["weighted_edges"] else (None, None)
-    )
-    if nx is not None and community_louvain is not None:
-        graph = nx.Graph()
-        graph.add_nodes_from(node_keys)
-        graph.add_weighted_edges_from(
-            (
-                edge["source"],
-                edge["target"],
-                float(edge.get("weight", 1.0) or 1.0),
-            )
-            for edge in index_data["weighted_edges"]
-        )
+    if index_data["weighted_edges"]:
         try:
-            raw_partition = community_louvain.best_partition(
-                graph,
-                weight="weight",
-                random_state=0,
+            raw_partition = _louvain_partition_in_subprocess(
+                node_keys,
+                index_data["weighted_edges"],
             )
         except Exception as exc:
-            log.warning("Louvain topology analysis failed; using connected components: %s", exc)
+            log.warning(
+                "Isolated Louvain analysis failed; using connected components: %s",
+                exc,
+            )
 
     if not raw_partition:
         raw_partition = {
@@ -1414,7 +1919,11 @@ def _apply_graph_topology(index_data: dict):
     )
 
 
-def _generate_index_unlocked(skip_embeddings: bool = True):
+def _generate_index_unlocked(
+    skip_embeddings: bool = True,
+    *,
+    invalidate_embedding_ids: Iterable[str] = (),
+):
     index_data = _empty_index_data()
     from vector_lake.db_store import get_connection
     conn = get_connection()
@@ -1427,9 +1936,11 @@ def _generate_index_unlocked(skip_embeddings: bool = True):
         try:
             entity_data = json.loads(row["data_json"])
             node_key, node_data = _entity_to_index_node(entity_data, row["entity_id"])
-        except Exception as e:
-            log.warning(f"Failed to project canonical entity {row['entity_id']}: {e}")
-            continue
+        except Exception as exc:
+            raise RuntimeError(
+                "Canonical entity projection failed for "
+                f"{row['entity_id']}; projection publication aborted."
+            ) from exc
         if node_key.startswith("System_") or node_data.get("type") == "system":
             continue
 
@@ -1445,7 +1956,6 @@ def _generate_index_unlocked(skip_embeddings: bool = True):
             for category in node_data["categories"]:
                 index_data["categories"].add(category)
 
-    from vector_lake.db_store import transaction
     index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
     _initialize_graph_topology_pending(
         index_data,
@@ -1463,21 +1973,45 @@ def _generate_index_unlocked(skip_embeddings: bool = True):
         raise ProjectionCanonicalGenerationChanged(
             "Canonical runtime generation changed while rebuilding projections; retry."
         )
+    # Embeddings are a separate resumable projection. Index rebuilds never call an external API.
+    search_upserts = _search_projection_upserts(index_data)
+    vector_conn = db_store.get_vector_connection()
+    existing_embedding_ids = {
+        str(row["entity_id"])
+        for row in vector_conn.execute(
+            "SELECT entity_id FROM vec_embeddings"
+        ).fetchall()
+    }
+    stale_embedding_ids = existing_embedding_ids - set(index_data["nodes"])
+    stale_embedding_ids.update(
+        str(entity_id)
+        for entity_id in invalidate_embedding_ids
+        if str(entity_id)
+    )
     tmp_output, tmp_claim, _ = _stage_projection_pair(
         output_path,
         index_data,
         claim_graph_data,
         _verified_canonical_generation(canonical_before),
     )
-
-    # Embeddings are a separate resumable projection. Index rebuilds never call an external API.
-    embeddings_map = {}
     try:
-        with transaction():
-            conn.execute("DELETE FROM wiki_search_index")
-            db_store.delete_stale_embeddings(set(index_data["nodes"]))
-            _build_bm25_index(index_data, embeddings_map)
-        _publish_staged_projection_pair(output_path, tmp_output, tmp_claim)
+        with db_store.transaction():
+            _assert_canonical_generation(
+                canonical_before,
+                context="after acquiring the SQLite write lock",
+            )
+            db_store.apply_search_projection_mutations(
+                vector_conn,
+                upserts=search_upserts,
+                embedding_deletes=stale_embedding_ids,
+                reset_search=True,
+            )
+        _publish_staged_projection_pair_guarded(
+            output_path,
+            tmp_output,
+            tmp_claim,
+            canonical_before,
+        )
     except Exception:
         _cleanup_projection_stages(tmp_claim, tmp_output)
         raise
@@ -1490,12 +2024,19 @@ def _generate_index_unlocked(skip_embeddings: bool = True):
     return output_path
 
 
-def generate_index(skip_embeddings: bool = True):
+def generate_index(
+    skip_embeddings: bool = True,
+    *,
+    invalidate_embedding_ids: Iterable[str] = (),
+):
     """Build and publish every index projection under the shared publish lock."""
     output_path = str(get_index_path())
     try:
         with FileLock(output_path + ".lock", timeout=15):
-            return _generate_index_unlocked(skip_embeddings=skip_embeddings)
+            return _generate_index_unlocked(
+                skip_embeddings=skip_embeddings,
+                invalidate_embedding_ids=invalidate_embedding_ids,
+            )
     except Timeout as exc:
         raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
 
@@ -1511,9 +2052,15 @@ class ProjectionSnapshotChanged(RuntimeError):
     """Raised when a projection changes repeatedly during a read snapshot."""
 
 
-def _projection_file_identity(path: str) -> tuple[int, int, int]:
+def _projection_file_identity(path: str) -> tuple[int, ...]:
     stat = os.stat(path)
-    return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
 
 
 def _read_claim_graph_snapshot(path: str) -> dict:
@@ -1544,9 +2091,15 @@ def _read_claim_graph_snapshot(path: str) -> dict:
     raise last_error
 
 
-def claim_graph_projection_parity() -> dict[str, int]:
+def claim_graph_projection_parity(*, connection=None) -> dict[str, int]:
     """Compare exact claim-graph node and edge payloads with canonical SQLite."""
-    expected = governance_store.build_claim_graph_projection()
+    expected = (
+        governance_store.build_claim_graph_projection()
+        if connection is None
+        else governance_store.build_claim_graph_projection(
+            connection=connection,
+        )
+    )
     observed = _read_claim_graph_snapshot(str(get_claim_graph_path()))
 
     expected_nodes = _claim_graph_signatures(expected.get("nodes") or [])
@@ -1571,22 +2124,36 @@ def refresh_claim_graph_projection() -> str:
     claim_graph_path = str(get_claim_graph_path())
     try:
         with FileLock(output_path + ".lock", timeout=15):
-            index_data = _load_index_unlocked(output_path)
-            if index_data is None:
+            canonical_before = canonical_runtime_generation_snapshot()
+            try:
+                index_data, canonical_binding = (
+                    _read_verified_projection_for_writer_unlocked(
+                        output_path,
+                        canonical_before,
+                        connection=db_store.get_connection(),
+                    )
+                )
+            except ProjectionPairContractError as exc:
+                log.warning(
+                    "Claim-graph refresh cannot reuse the existing projection "
+                    "pair (%s); using a full rebuild.",
+                    exc,
+                )
                 _generate_index_unlocked()
             else:
-                canonical_before = canonical_runtime_generation_snapshot()
                 claim_graph_data = governance_store.build_claim_graph_projection()
                 canonical_after = canonical_runtime_generation_snapshot()
+                if canonical_before != canonical_after:
+                    raise ProjectionCanonicalGenerationChanged(
+                        "Canonical runtime generation changed during claim-graph "
+                        "projection refresh; retry."
+                    )
                 _publish_projection_pair(
                     output_path,
                     index_data,
                     claim_graph_data,
-                    _canonical_generation_for_existing_index(
-                        index_data,
-                        canonical_before,
-                        canonical_after,
-                    ),
+                    canonical_binding,
+                    canonical_before,
                 )
     except Timeout as exc:
         raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
@@ -1597,7 +2164,6 @@ def update_index_items(filenames: list[str]):
     if not filenames:
         return
 
-    # Filter valid files
     excluded = {
         "index.md",
         "log.md",
@@ -1606,16 +2172,13 @@ def update_index_items(filenames: list[str]):
         "wiki_link_stats.md",
         "synthesis_log.md",
     }
-    valid_filenames = []
-    for filename in filenames:
-        if (
-            not filename.casefold().endswith(".md")
-            or filename.casefold() in excluded
-            or filename.casefold().startswith("system_")
-        ):
-            continue
-        valid_filenames.append(filename)
-        
+    valid_filenames = [
+        filename
+        for filename in filenames
+        if filename.casefold().endswith(".md")
+        and filename.casefold() not in excluded
+        and not filename.casefold().startswith("system_")
+    ]
     if not valid_filenames:
         return
 
@@ -1629,12 +2192,15 @@ def update_index_items(filenames: list[str]):
             len(valid_filenames),
             incremental_limit,
         )
-        return generate_index()
+        return generate_index(
+            invalidate_embedding_ids={
+                filename[:-3] for filename in valid_filenames
+            }
+        )
 
-    # Pre-parse canonical nodes. Embedding refresh is handled by the explicit backfill scheduler.
+    canonical_before = canonical_runtime_generation_snapshot()
     pre_parsed_data = {}
     canonical_load_errors = {}
-
     conn = db_store.get_connection()
     for filename in valid_filenames:
         node_key = filename[:-3]
@@ -1645,227 +2211,299 @@ def update_index_items(filenames: list[str]):
                 (node_key,),
             ).fetchone()
             if row:
-                projected_key, node_data = _entity_to_index_node(json.loads(row["data_json"]), row["entity_id"])
+                projected_key, node_data = _entity_to_index_node(
+                    json.loads(row["data_json"]),
+                    row["entity_id"],
+                )
                 if projected_key != node_key:
-                    raise ValueError(f"Canonical page_key mismatch: expected {node_key}, got {projected_key}")
+                    raise ValueError(
+                        "Canonical page_key mismatch: "
+                        f"expected {node_key}, got {projected_key}"
+                    )
             else:
                 node_data = None
         except Exception as exc:
-            log.error(f"Failed to load canonical entity for {filename}: {exc}")
+            log.error("Failed to load canonical entity for %s: %s", filename, exc)
             canonical_load_errors[filename] = str(exc)
             continue
         if node_data:
             pre_parsed_data[node_key] = node_data
 
     if canonical_load_errors:
-        detail = "; ".join(f"{name}: {error}" for name, error in sorted(canonical_load_errors.items()))
-        raise RuntimeError(f"Canonical index batch aborted; source rows could not be loaded: {detail}")
+        detail = "; ".join(
+            f"{name}: {error}"
+            for name, error in sorted(canonical_load_errors.items())
+        )
+        raise RuntimeError(
+            "Canonical index batch aborted; source rows could not be loaded: "
+            f"{detail}"
+        )
 
     output_path = str(get_index_path())
     if not os.path.exists(output_path):
-        return generate_index()
+        return generate_index(
+            invalidate_embedding_ids={
+                filename[:-3] for filename in valid_filenames
+            }
+        )
 
     lock_path = output_path + ".lock"
     needs_full_rebuild = False
     try:
         with FileLock(lock_path, timeout=15):
-            from vector_lake.db_store import transaction
-            with transaction():
-                try:
-                    index_data = _load_index_unlocked(output_path)
-                except json.JSONDecodeError:
+            try:
+                index_data, canonical_binding = (
+                    _read_verified_projection_for_writer_unlocked(
+                        output_path,
+                        canonical_before,
+                        connection=conn,
+                    )
+                )
+            except ProjectionPairContractError as exc:
+                log.warning(
+                    "Incremental index update cannot reuse the existing "
+                    "projection pair (%s); using a full rebuild.",
+                    exc,
+                )
+                index_data = None
+                needs_full_rebuild = True
+
+            if index_data is None:
+                needs_full_rebuild = True
+            else:
+                search_deletes = set(_strip_system_nodes(index_data))
+                embedding_deletes = set(search_deletes)
+                removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
+                if removed_legacy_keys:
+                    log.info(
+                        "Detected legacy embedded governance payloads in index.json "
+                        "(%s). Triggering full rebuild.",
+                        ", ".join(removed_legacy_keys),
+                    )
                     needs_full_rebuild = True
                     index_data = None
-    
-                if index_data is None:
-                    needs_full_rebuild = True
-                else:
-                    removed_system_keys = _strip_system_nodes(index_data)
-                    for system_key in removed_system_keys:
-                        db_store.delete_search_index(system_key)
-                    removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
-                    if removed_legacy_keys:
-                        log.info(
-                            "Detected legacy embedded governance payloads in index.json "
-                            f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+
+            if index_data is not None:
+                index_data.setdefault("nodes", {})
+                index_data.setdefault("aliases", {})
+                index_data.setdefault("error_log", [])
+                touched_node_keys = {filename[:-3] for filename in valid_filenames}
+                active_node_keys = set()
+                search_upserts = {}
+
+                for filename in valid_filenames:
+                    node_key = filename[:-3]
+                    index_data["aliases"] = {
+                        key: value
+                        for key, value in (index_data.get("aliases") or {}).items()
+                        if value != node_key
+                    }
+                    index_data["error_log"] = [
+                        item
+                        for item in index_data["error_log"]
+                        if item.get("file") != filename
+                    ]
+
+                    if not filename.startswith(VALID_PREFIXES):
+                        index_data["error_log"].append(
+                            {
+                                "file": filename,
+                                "error": (
+                                    "Schema violation: Missing valid entity prefix."
+                                ),
+                            }
                         )
-                        needs_full_rebuild = True
-                        index_data = None
-    
-                if index_data is not None:
-                    if isinstance(index_data.get("categories"), list):
-                        index_data["categories"] = set(index_data["categories"])
-    
-                    all_nodes_triples = {}
-                    for k, v in (index_data.get("nodes") or {}).items():
-                        td = {}
-                        for t in (v.get("triples") or []):
-                            if t.get("target"):
-                                td[t["target"]] = t.get("predicate", "mentions")
-                        all_nodes_triples[k] = td
-                    source_preview = dict(index_data.get("nodes") or {})
-                    source_preview.update(pre_parsed_data)
-                    allowed_graph_sources = set(_graph_source_index(source_preview))
-    
-                    for filename in valid_filenames:
-                        node_key = filename[:-3]
-    
-                        if (
-                            not filename.startswith(VALID_PREFIXES)
-                            and filename.casefold() not in {"index.md", "log.md"}
+                        log.warning(
+                            "Schema violation in %s during partial update.",
+                            filename,
+                        )
+                        index_data["nodes"].pop(node_key, None)
+                        search_deletes.add(node_key)
+                        embedding_deletes.add(node_key)
+                        continue
+
+                    node_data = pre_parsed_data.get(node_key)
+                    if node_data is None:
+                        index_data["nodes"].pop(node_key, None)
+                        search_deletes.add(node_key)
+                        embedding_deletes.add(node_key)
+                        continue
+
+                    index_data["nodes"][node_key] = node_data
+                    active_node_keys.add(node_key)
+                    search_upserts[node_key] = _search_projection_row(
+                        node_key,
+                        node_data,
+                    )
+                    embedding_deletes.add(node_key)
+                    if node_data.get("id"):
+                        index_data["aliases"][node_data["id"]] = node_key
+                    if node_data.get("title"):
+                        index_data["aliases"][node_data["title"]] = node_key
+                    index_data["aliases"][node_key] = node_key
+                    for alias in node_data.get("aliases") or []:
+                        index_data["aliases"][alias] = node_key
+
+                index_data["weighted_edges"] = [
+                    edge
+                    for edge in (index_data.get("weighted_edges") or [])
+                    if edge.get("source") not in touched_node_keys
+                    and edge.get("target") not in touched_node_keys
+                ]
+
+                all_nodes = index_data["nodes"]
+                all_nodes_triples = {}
+                for node_key, node in all_nodes.items():
+                    all_nodes_triples[node_key] = {
+                        triple["target"]: triple.get("predicate", "mentions")
+                        for triple in (node.get("triples") or [])
+                        if triple.get("target")
+                    }
+                allowed_graph_sources = set(_graph_source_index(all_nodes))
+
+                for node_key in sorted(active_node_keys):
+                    try:
+                        manual_rows = conn.execute(
+                            "SELECT source_id, target_id, weight "
+                            "FROM claim_graph_edges "
+                            "WHERE source_id = ? OR target_id = ? "
+                            "UNION SELECT source_id, target_id, weight "
+                            "FROM page_graph_edges "
+                            "WHERE source_id = ? OR target_id = ?",
+                            (node_key, node_key, node_key, node_key),
+                        ).fetchall()
+                        for row in manual_rows:
+                            index_data["weighted_edges"].append(
+                                {
+                                    "source": row["source_id"],
+                                    "target": row["target_id"],
+                                    "weight": (
+                                        float(row["weight"])
+                                        if row["weight"]
+                                        else 1.0
+                                    ),
+                                }
+                            )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Canonical graph-edge query failed for incremental "
+                            f"node {node_key}; projection publication aborted."
+                        ) from exc
+
+                    node_data = all_nodes[node_key]
+                    node_data["_key"] = node_key
+                    node_links = set(node_data.get("links") or [])
+                    node_sources = {
+                        source
+                        for source in (node_data.get("sources") or [])
+                        if str(source) in allowed_graph_sources
+                    }
+                    triples_a = all_nodes_triples.get(node_key) or {}
+                    for other_key, other_node in all_nodes.items():
+                        if other_key == node_key:
+                            continue
+                        other_links = set(other_node.get("links") or [])
+                        other_sources = {
+                            source
+                            for source in (other_node.get("sources") or [])
+                            if str(source) in allowed_graph_sources
+                        }
+                        if not (
+                            other_key in node_links
+                            or node_key in other_links
+                            or not node_sources.isdisjoint(other_sources)
+                            or not node_links.isdisjoint(other_links)
                         ):
-                            index_data.setdefault("error_log", [])
-                            index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
-                            index_data["error_log"].append({"file": filename, "error": "Schema violation: Missing valid entity prefix."})
-                            log.warning(f"Schema violation in {filename} during partial update.")
-                            old_node = (index_data.get("nodes") or {}).pop(node_key, None)
-                            if old_node:
-                                db_store.delete_search_index(node_key)
-                            index_data["weighted_edges"] = [
-                                edge for edge in (index_data.get("weighted_edges") or [])
-                                if edge["source"] != node_key and edge["target"] != node_key
-                            ]
-                        else:
-                            index_data["aliases"] = {key: value for key, value in (index_data.get("aliases") or {}).items() if value != node_key}
-                            index_data.setdefault("error_log", [])
-                            index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
-    
-                            node_data = pre_parsed_data.get(node_key)
-                            if node_data is None:
-                                old_node = (index_data.get("nodes") or {}).pop(node_key, None)
-                                if old_node:
-                                    db_store.delete_search_index(node_key)
-                                index_data["weighted_edges"] = [
-                                    edge for edge in (index_data.get("weighted_edges") or [])
-                                    if edge["source"] != node_key and edge["target"] != node_key
-                                ]
-                            else:
-                                if node_data is not None:
-                                    index_data["nodes"][node_key] = node_data
-                                    aliases_str = " ".join((node_data.get("aliases") or [])) if isinstance(node_data.get("aliases"), list) else ""
-                                    text = f"{aliases_str} {node_data.get('raw_text', '')}"
-                                    t_title = _tokenize_for_fts(node_data.get('title', ''))
-                                    t_summary = _tokenize_for_fts(node_data.get('summary', ''))
-                                    t_text = _tokenize_for_fts(text)
-                                    db_store.upsert_search_index(node_key, t_title, t_summary, t_text)
-                                    # The old vector is now stale; explicit backfill will replace it.
-                                    db_store.delete_embedding(node_key)
-                                    
-                                    if node_data["id"]:
-                                        index_data["aliases"][node_data["id"]] = node_key
-                                    if node_data.get("title"):
-                                        index_data["aliases"][node_data["title"]] = node_key
-                                    index_data["aliases"][node_key] = node_key
-                                    for alias in node_data["aliases"]:
-                                        index_data["aliases"][alias] = node_key
-    
-                                    if isinstance(node_data["categories"], list):
-                                        categories = set((index_data.get("categories") or []))
-                                        for category in node_data["categories"]:
-                                            categories.add(category)
-                                        index_data["categories"] = categories
-    
-                                    index_data["weighted_edges"] = [
-                                        edge for edge in (index_data.get("weighted_edges") or [])
-                                        if edge["source"] != node_key and edge["target"] != node_key
-                                    ]
-                                    # Preserve manual edges from SQLite
-                                    try:
-                                        conn = db_store.get_connection()
-                                        cursor = conn.cursor()
-                                        cursor.execute(
-                                            "SELECT source_id, target_id, weight FROM claim_graph_edges WHERE source_id = ? OR target_id = ? "
-                                            "UNION SELECT source_id, target_id, weight FROM page_graph_edges WHERE source_id = ? OR target_id = ?",
-                                            (node_key, node_key, node_key, node_key),
-                                        )
-                                        for row in cursor.fetchall():
-                                            index_data["weighted_edges"].append({
-                                                "source": row["source_id"],
-                                                "target": row["target_id"],
-                                                "weight": float(row["weight"]) if row["weight"] else 1.0,
-                                            })
-                                    except Exception:
-                                        pass
-                                    node_data["_key"] = node_key
-                                    all_nodes = index_data["nodes"]
-    
-                                    td = {}
-                                    for t in (node_data.get("triples") or []):
-                                        if t.get("target"):
-                                            td[t["target"]] = t.get("predicate", "mentions")
-                                    all_nodes_triples[node_key] = td
-                                    triples_a = td
-                                    
-                                    node_links = set((node_data.get("links") or []))
-                                    node_sources = {
-                                        source
-                                        for source in (node_data.get("sources") or [])
-                                        if str(source) in allowed_graph_sources
-                                    }
-                                    for other_key, other_node in all_nodes.items():
-                                        if other_key == node_key:
-                                            continue
-                                            
-                                        other_links = set((other_node.get("links") or []))
-                                        other_sources = {
-                                            source
-                                            for source in (other_node.get("sources") or [])
-                                            if str(source) in allowed_graph_sources
-                                        }
-                                        triples_b = all_nodes_triples.get(other_key)
-                                        
-                                        has_direct = other_key in node_links or node_key in other_links
-                                        # Optimization: Replace bool(set1 & set2) with not isdisjoint() to prevent allocating a new set just to check for overlap
-                                        has_source_overlap = not node_sources.isdisjoint(other_sources)
-                                        has_common_neighbor = not node_links.isdisjoint(other_links)
-                                        
-                                        if not (has_direct or has_source_overlap or has_common_neighbor):
-                                            continue
-    
-                                        other_node["_key"] = other_key
-                                        relevance = calculate_relevance(
-                                            node_data, other_node, all_nodes,
-                                            links_a=node_links, links_b=other_links,
-                                            sources_a=node_sources, sources_b=other_sources,
-                                            triples_a=triples_a, triples_b=triples_b
-                                        )
-                                        if relevance >= 1.5:
-                                            index_data["weighted_edges"].append({
-                                                "source": min(node_key, other_key),
-                                                "target": max(node_key, other_key),
-                                                "weight": relevance,
-                                            })
-                                        other_node.pop("_key", None)
-                                    node_data.pop("_key", None)
-    
-                    _initialize_graph_topology_pending(
-                        index_data,
-                        f"Partial batch update for {len(valid_filenames)} items",
+                            continue
+                        other_node["_key"] = other_key
+                        relevance = calculate_relevance(
+                            node_data,
+                            other_node,
+                            all_nodes,
+                            links_a=node_links,
+                            links_b=other_links,
+                            sources_a=node_sources,
+                            sources_b=other_sources,
+                            triples_a=triples_a,
+                            triples_b=all_nodes_triples.get(other_key),
+                        )
+                        if relevance >= 1.5:
+                            index_data["weighted_edges"].append(
+                                {
+                                    "source": min(node_key, other_key),
+                                    "target": max(node_key, other_key),
+                                    "weight": relevance,
+                                }
+                            )
+                        other_node.pop("_key", None)
+                    node_data.pop("_key", None)
+
+                _initialize_graph_topology_pending(
+                    index_data,
+                    f"Partial batch update for {len(valid_filenames)} items",
+                )
+                index_data["categories"] = sorted(
+                    {
+                        category
+                        for node in all_nodes.values()
+                        for category in (node.get("categories") or [])
+                    }
+                )
+                index_data["governance_metrics"] = (
+                    index_data.get("governance_metrics") or {}
+                )
+                index_data["schema_version"] = "8.0"
+
+                claim_graph_data = governance_store.build_claim_graph_projection()
+                canonical_after = canonical_runtime_generation_snapshot()
+                if canonical_before != canonical_after:
+                    raise ProjectionCanonicalGenerationChanged(
+                        "Canonical runtime generation changed during incremental "
+                        "projection computation; retry."
                     )
-                    index_data["categories"] = list((index_data.get("categories") or []))
-                    # Do not recompute heavy debt metrics on partial update
-                    index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
-                    index_data["schema_version"] = "8.0"
-                    # Incremental coverage is verified only when the existing full
-                    # projection was already bound to the same canonical generation.
-                    canonical_before = canonical_runtime_generation_snapshot()
-                    claim_graph_data = governance_store.build_claim_graph_projection()
-                    canonical_after = canonical_runtime_generation_snapshot()
-                    _publish_projection_pair(
-                        output_path,
-                        index_data,
-                        claim_graph_data,
-                        _canonical_generation_for_existing_index(
-                            index_data,
+                vector_conn = db_store.get_vector_connection()
+                tmp_output, tmp_claim, _ = _stage_projection_pair(
+                    output_path,
+                    index_data,
+                    claim_graph_data,
+                    canonical_binding,
+                )
+                try:
+                    with db_store.transaction():
+                        _assert_canonical_generation(
                             canonical_before,
-                            canonical_after,
-                        ),
+                            context="after acquiring the SQLite write lock",
+                        )
+                        db_store.apply_search_projection_mutations(
+                            vector_conn,
+                            upserts=[
+                                search_upserts[key]
+                                for key in sorted(search_upserts)
+                            ],
+                            search_deletes=search_deletes,
+                            embedding_deletes=embedding_deletes,
+                        )
+                    _publish_staged_projection_pair_guarded(
+                        output_path,
+                        tmp_output,
+                        tmp_claim,
+                        canonical_before,
                     )
-    except Timeout:
-        raise TimeoutError(f"Timeout while acquiring lock for {output_path}")
+                except Exception:
+                    _cleanup_projection_stages(tmp_claim, tmp_output)
+                    raise
+    except Timeout as exc:
+        raise TimeoutError(
+            f"Timeout while acquiring lock for {output_path}"
+        ) from exc
 
     if needs_full_rebuild:
-        return generate_index()
+        return generate_index(
+            invalidate_embedding_ids={
+                filename[:-3] for filename in valid_filenames
+            }
+        )
+
 
 def update_index_item(filename: str):
     """Legacy single file entrypoint."""
@@ -1879,54 +2517,107 @@ def refresh_graph_topology_if_dirty() -> bool:
         return True
 
     lock_path = output_path + ".lock"
+    needs_full_rebuild = False
+    refreshed = False
     try:
         with FileLock(lock_path, timeout=15):
-            from vector_lake.db_store import transaction
-            with transaction():
-                try:
-                    index_data = _load_index_unlocked(output_path)
-                except json.JSONDecodeError:
-                    index_data = None
-    
-                if index_data is None:
-                    _generate_index_unlocked()
-                    return True
+            canonical_before = canonical_runtime_generation_snapshot()
+            try:
+                index_data, canonical_binding = (
+                    _read_verified_projection_for_writer_unlocked(
+                        output_path,
+                        canonical_before,
+                        connection=db_store.get_connection(),
+                    )
+                )
+            except ProjectionPairContractError as exc:
+                log.warning(
+                    "Topology refresh cannot reuse the existing projection "
+                    "pair (%s); using a full rebuild.",
+                    exc,
+                )
+                index_data = None
+                needs_full_rebuild = True
 
-                removed_system_keys = _strip_system_nodes(index_data)
-                for system_key in removed_system_keys:
-                    db_store.delete_search_index(system_key)
-
+            if index_data is None:
+                needs_full_rebuild = True
+            else:
+                removed_system_keys = set(_strip_system_nodes(index_data))
                 removed_legacy_keys = _strip_legacy_embedded_payloads(index_data)
                 if removed_legacy_keys:
                     log.info(
-                        "Detected legacy embedded governance payloads during graph refresh "
-                        f"({', '.join(removed_legacy_keys)}). Triggering full rebuild."
+                        "Detected legacy embedded governance payloads during "
+                        "graph refresh (%s). Triggering full rebuild.",
+                        ", ".join(removed_legacy_keys),
                     )
-                    _generate_index_unlocked()
-                    return True
-    
-                if is_graph_dirty(index_data):
-                    index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
-                    _apply_graph_topology(index_data)
-                    canonical_before = canonical_runtime_generation_snapshot()
-                    claim_graph_data = governance_store.build_claim_graph_projection()
-                    canonical_after = canonical_runtime_generation_snapshot()
-                    _publish_projection_pair(
-                        output_path,
-                        index_data,
-                        claim_graph_data,
-                        _canonical_generation_for_existing_index(
+                    needs_full_rebuild = True
+                else:
+                    if removed_system_keys and not is_graph_dirty(index_data):
+                        _mark_graph_dirty(
                             index_data,
-                            canonical_before,
-                            canonical_after,
-                        ),
-                    )
-                    log.info("Graph topology partially refreshed and saved.")
-                    return True
-            return False
+                            "Legacy system nodes removed during topology refresh",
+                        )
+                    if is_graph_dirty(index_data):
+                        index_data["weighted_edges"] = _calculate_weighted_edges(
+                            index_data
+                        )
+                        _apply_graph_topology(index_data)
+                        claim_graph_data = (
+                            governance_store.build_claim_graph_projection()
+                        )
+                        canonical_after = canonical_runtime_generation_snapshot()
+                        if canonical_before != canonical_after:
+                            raise ProjectionCanonicalGenerationChanged(
+                                "Canonical runtime generation changed during "
+                                "topology projection computation; retry."
+                            )
+                        mutation_conn = (
+                            db_store.get_vector_connection()
+                            if removed_system_keys
+                            else db_store.get_connection()
+                        )
+                        tmp_output, tmp_claim, _ = _stage_projection_pair(
+                            output_path,
+                            index_data,
+                            claim_graph_data,
+                            canonical_binding,
+                        )
+                        try:
+                            with db_store.transaction():
+                                _assert_canonical_generation(
+                                    canonical_before,
+                                    context=(
+                                        "after acquiring the SQLite write lock"
+                                    ),
+                                )
+                                if removed_system_keys:
+                                    db_store.apply_search_projection_mutations(
+                                        mutation_conn,
+                                        search_deletes=removed_system_keys,
+                                        embedding_deletes=removed_system_keys,
+                                    )
+                            _publish_staged_projection_pair_guarded(
+                                output_path,
+                                tmp_output,
+                                tmp_claim,
+                                canonical_before,
+                            )
+                        except Exception:
+                            _cleanup_projection_stages(tmp_claim, tmp_output)
+                            raise
+                        log.info(
+                            "Graph topology refreshed outside the SQLite write "
+                            "transaction and published."
+                        )
+                        refreshed = True
     except Timeout:
-        log.error(f"Timeout while acquiring lock for {output_path}")
+        log.error("Timeout while acquiring lock for %s", output_path)
         return False
+
+    if needs_full_rebuild:
+        generate_index()
+        return True
+    return refreshed
 
 
 if __name__ == "__main__":

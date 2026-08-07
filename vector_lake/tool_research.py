@@ -1,9 +1,8 @@
-import json
 import os
 import logging
-from filelock import FileLock
 
 from vector_lake import governance_store
+from vector_lake.indexer import read_committed_index_snapshot
 from vector_lake.wiki_utils import get_index_path
 from vector_lake.purpose_contract import PurposeContractError, render_strategy_directive
 
@@ -11,17 +10,14 @@ log = logging.getLogger("vector-lake-tool-research")
 
 def research_vector_lake(dry_run: bool = False):
     index_path = str(get_index_path())
-    lock_path = index_path + ".lock"
     insights = []
     
     if os.path.exists(index_path):
         try:
-            with FileLock(lock_path, timeout=5):
-                with open(index_path, "r", encoding="utf-8") as handle:
-                    index_data = json.load(handle)
-                insights = index_data.get("graph_insights", [])
+            index_data = read_committed_index_snapshot(index_path)
+            insights = index_data.get("graph_insights", [])
         except Exception as e:
-            return f"Error reading index.json: {e}"
+            return f"Error: committed projection is not ready; run sync. Detail: {e}"
 
     pending_items = governance_store.pending_governance_items()
     review_queries = []

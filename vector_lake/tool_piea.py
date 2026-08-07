@@ -6,6 +6,7 @@ import re
 from collections import Counter
 from filelock import FileLock
 from vector_lake import get_extension_root
+from vector_lake.indexer import read_committed_index_snapshot
 from vector_lake.wiki_utils import get_index_path, normalize_memory_key
 
 log = logging.getLogger("vector-lake-piea")
@@ -80,14 +81,23 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
 
     index_path = get_index_path()
     if not index_path.exists():
-        return json.dumps({"is_duplicate": False, "reason": "No index exists yet."})
+        return json.dumps({
+            "status": "not_ready",
+            "is_duplicate": None,
+            "error": "projection_not_committed",
+            "reason": "No committed index exists; run sync before deduplication.",
+        })
 
     try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
+        index_data = read_committed_index_snapshot(index_path)
     except Exception as e:
         log.warning(f"Could not load index for PIEA check: {e}")
-        return json.dumps({"is_duplicate": False, "reason": "Could not read index."})
+        return json.dumps({
+            "status": "not_ready",
+            "is_duplicate": None,
+            "error": "projection_not_committed",
+            "reason": "Committed projection could not be verified; run sync.",
+        })
 
     CONFIG_PATH = get_extension_root() / "config.json"
     threshold = 0.92

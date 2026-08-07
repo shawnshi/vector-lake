@@ -48,15 +48,15 @@ def _safe_change_set_retention_plan(
 ) -> dict:
     from vector_lake import governance_store
 
-    keep_all_other_history = 2_147_483_647
     return governance_store.plan_history_retention(
         conn,
         cutoff=cutoff,
         batch_size=500,
         keep_change_sets=0,
-        keep_terminal_jobs=keep_all_other_history,
-        keep_terminal_outbox=keep_all_other_history,
-        keep_versions_per_family=keep_all_other_history,
+        keep_terminal_jobs=2_147_483_647,
+        keep_terminal_outbox=2_147_483_647,
+        keep_versions_per_family=1,
+        scan_version_history=False,
     )
 
 
@@ -66,8 +66,7 @@ def _apply_runtime_history_retention(
     days: int,
     now: float,
 ) -> dict:
-    """Apply the bounded GC retention plan in the caller's transaction."""
-    from vector_lake import governance_store
+    """Report GC-adjacent history candidates without bypassing confirmation."""
 
     normalized_days = validate_gc_days(days)
     cutoff_epoch = float(now) - (normalized_days * 86400)
@@ -81,20 +80,18 @@ def _apply_runtime_history_retention(
         conn,
         change_set_ids,
     )
-    deleted_counts = governance_store.apply_history_retention_plan(
-        conn,
-        plan,
-    )
     return {
         "dry_run": False,
         "days": normalized_days,
         "cutoff": cutoff,
         "candidate_count": len(change_set_ids),
         "candidate_idempotency_keys": idempotency_count,
-        "pruned_change_sets": int(deleted_counts["change_sets"]),
-        "pruned_idempotency_keys": idempotency_count,
+        "pruned_change_sets": 0,
+        "pruned_idempotency_keys": 0,
         "safe_plan": True,
-        "deleted_counts": deleted_counts,
+        "history_retention_deferred": True,
+        "history_retention_fingerprint": plan.get("fingerprint"),
+        "deferred_reason": "dedicated_confirmed_history_retention_required",
     }
 
 
@@ -103,7 +100,7 @@ def prune_runtime_history(
     dry_run: bool = True,
     now: float | None = None,
 ) -> dict:
-    """Prune only reference-safe terminal change-set history in one bounded batch."""
+    """Report reference-safe history candidates; deletion needs confirmed retention."""
     from vector_lake import db_store
 
     normalized_days = validate_gc_days(days)
@@ -747,8 +744,9 @@ def gc_vector_lake(
                 "error(s); no orphan pages were deleted."
             )
         lines.append(
-            f"Pruned {retention['pruned_change_sets']} change set(s) and "
-            f"{retention['pruned_idempotency_keys']} idempotency key(s)."
+            "History retention deferred to the dedicated confirmed workflow: "
+            f"{retention['candidate_count']} change set(s), "
+            f"{retention['candidate_idempotency_keys']} idempotency key(s)."
         )
         return "\n".join(lines)
 
@@ -756,8 +754,9 @@ def gc_vector_lake(
         retention = prune_runtime_history(days=days, dry_run=False, now=now)
         return (
             f"GC complete. No orphan entities older than {days} days found. "
-            f"Pruned {retention['pruned_change_sets']} change set(s) and "
-            f"{retention['pruned_idempotency_keys']} idempotency key(s)."
+            "History retention deferred to the dedicated confirmed workflow: "
+            f"{retention['candidate_count']} change set(s), "
+            f"{retention['candidate_idempotency_keys']} idempotency key(s)."
         )
 
     backup_dir = None
@@ -800,7 +799,7 @@ def gc_vector_lake(
                     "Canonical orphan candidate set changed after confirmation"
                 )
 
-        def apply_history_retention_in_transaction(
+        def report_history_retention_in_transaction(
             _outbox_ids: list[int],
         ) -> None:
             nonlocal retention
@@ -824,7 +823,7 @@ def gc_vector_lake(
                 for candidate in candidates
             ],
             precondition_callback=assert_candidates_unchanged,
-            transaction_callback=apply_history_retention_in_transaction,
+            transaction_callback=report_history_retention_in_transaction,
             return_details=True,
         )
         if details.get("committed") is not True:
@@ -842,13 +841,13 @@ def gc_vector_lake(
         )
         if isinstance(details, dict) and details.get("committed") is True:
             return (
-                "GC canonical/history transaction committed, but "
+                "GC canonical transaction committed, but "
                 "post-commit reporting raised a warning: "
                 f"{type(exc).__name__}: {exc}.{backup_note}"
             )
         return (
             "Confirmed orphan GC was blocked: "
-            f"{exc}. No canonical or history deletion committed."
+            f"{exc}. No canonical deletion committed."
             f"{backup_note}"
         )
 
@@ -870,9 +869,10 @@ def gc_vector_lake(
     )
 
     return (
-        "GC complete. Canonical/history transaction committed. "
+        "GC complete. Canonical transaction committed. "
         f"Deleted {len(candidates)} orphan pages from canonical state "
-        f"(backed up to {backup_dir}).{deferred_note}{warning_note} Pruned "
-        f"{retention['pruned_change_sets']} change "
-        f"set(s) and {retention['pruned_idempotency_keys']} idempotency key(s)."
+        f"(backed up to {backup_dir}).{deferred_note}{warning_note} History "
+        "retention deferred to the dedicated confirmed workflow: "
+        f"{retention['candidate_count']} change set(s), "
+        f"{retention['candidate_idempotency_keys']} idempotency key(s)."
     )

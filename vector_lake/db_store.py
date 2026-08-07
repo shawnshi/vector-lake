@@ -1,15 +1,21 @@
 import atexit
 import hashlib
+import hmac
+import importlib.util
 import json
 import math
 import os
 import re
 import sqlite3
+import struct
 import threading
 from contextlib import contextmanager
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from filelock import BaseFileLock, FileLock, Timeout as FileLockTimeout
+
 from vector_lake.wiki_utils import get_meta_dir, normalize_semantic_text, peek_meta_dir
 
 _LOCAL = threading.local()
@@ -17,7 +23,9 @@ _INIT_LOCK = threading.Lock()
 _INITIALIZED_DB_PATHS: set[str] = set()
 _CONNECTIONS_LOCK = threading.RLock()
 _CONNECTIONS: dict[int, sqlite3.Connection] = {}
-_IDENTITY_VALIDATION_TOKENS: dict[int, tuple] = {}
+_VECTOR_EXTENSION_CONNECTION_IDS: set[int] = set()
+_IDENTITY_VALIDATION_LOCK = threading.Lock()
+_IDENTITY_VALIDATION_TOKENS: dict[str, tuple] = {}
 _RUNTIME_GENERATION_SCHEMA_TOKENS: dict[int, tuple[int, int]] = {}
 _INGEST_TASK_CLEANUP_SCHEMA_TOKENS: dict[int, tuple[int, int]] = {}
 _IDENTITY_GENERATION_SURFACES = (
@@ -49,6 +57,12 @@ _RUNTIME_GENERATION_SURFACES = frozenset(
 _SQLITE_WRITE_WAIT_DEFAULT_SECONDS = 30.0
 _SQLITE_WRITE_WAIT_MIN_SECONDS = 0.05
 _SQLITE_WRITE_WAIT_MAX_SECONDS = 300.0
+_SCHEMA_MIGRATION_LOCK_FILENAME = ".schema-migration-v5.lock"
+_SCHEMA_MIGRATION_RUNTIME_LOCK_TIMEOUT_SECONDS = 5.0
+_CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN = object()
+_SCHEMA_MIGRATION_PLAN_CONTRACT = "vector-lake-schema-migration-plan/v1"
+_SCHEMA_MIGRATION_RECEIPT_CONTRACT = "vector-lake-schema-migration-receipt/v1"
+_SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS = frozenset({4, 5, 6})
 
 
 def _normalized_schema_sql(statement: object) -> str:
@@ -257,7 +271,188 @@ _CANONICAL_IDENTITIES_SCHEMA_OBJECTS_V2 = (
         _CANONICAL_IDENTITIES_SCHEMA_V2[4],
     ),
 )
-_SCHEMA_VERSION = 4
+_DUPLICATE_INDEXES_V5 = {
+    "idx_date": ("timeline_events", ("event_date",)),
+    "idx_entity": ("timeline_events", ("entity_id",)),
+}
+_RETAINED_TIMELINE_INDEXES_V5 = {
+    "idx_timeline_date": ("timeline_events", ("event_date",)),
+    "idx_timeline_entity": ("timeline_events", ("entity_id",)),
+}
+# These legacy-looking tables are intentionally outside v5 cleanup because a
+# supported external checkout can share this database via VECTOR_LAKE_MEMORY_DIR.
+_DEFERRED_EXTERNAL_CONSUMER_TABLES_V5 = frozenset(
+    {"wiki_embeddings", "embedding_jobs", "embedding_rate_events"}
+)
+_DUPLICATE_INDEX_CLEANUP_SCHEMA_V5 = (
+    "ABSENT INDEX idx_date ON timeline_events(event_date)",
+    "ABSENT INDEX idx_entity ON timeline_events(entity_id)",
+    "INDEX idx_timeline_date ON timeline_events(event_date)",
+    "INDEX idx_timeline_entity ON timeline_events(entity_id)",
+)
+_CHANGE_SET_PAYLOAD_MAX_RAW_BYTES_V6 = 4 * 1024 * 1024
+_CHANGE_SET_PAYLOAD_MAX_STORED_BYTES_V6 = (
+    _CHANGE_SET_PAYLOAD_MAX_RAW_BYTES_V6 + 64 * 1024
+)
+_CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V6 = f"""
+CREATE TABLE IF NOT EXISTS change_set_payloads (
+    payload_sha256 TEXT PRIMARY KEY,
+    codec TEXT NOT NULL CHECK (codec = 'zlib-json-v1'),
+    payload_blob BLOB NOT NULL,
+    raw_bytes INTEGER NOT NULL
+        CHECK (raw_bytes >= 0 AND raw_bytes <= {_CHANGE_SET_PAYLOAD_MAX_RAW_BYTES_V6}),
+    stored_bytes INTEGER NOT NULL
+        CHECK (stored_bytes >= 0 AND stored_bytes <= {_CHANGE_SET_PAYLOAD_MAX_STORED_BYTES_V6}),
+    created_at TEXT NOT NULL,
+    CHECK (length(payload_sha256) = 64),
+    CHECK (length(payload_blob) = stored_bytes)
+)
+"""
+_CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS change_set_payload_refs (
+    change_set_id TEXT PRIMARY KEY
+        REFERENCES change_sets(change_set_id) ON DELETE CASCADE,
+    payload_sha256 TEXT NOT NULL
+        REFERENCES change_set_payloads(payload_sha256) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL
+)
+"""
+_CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V6 = """
+CREATE INDEX IF NOT EXISTS idx_change_set_payload_refs_payload_v6
+ON change_set_payload_refs(payload_sha256, change_set_id)
+"""
+_CHANGE_SET_LIFECYCLE_TABLE_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS change_set_lifecycle_v6 (
+    change_set_id TEXT PRIMARY KEY
+        REFERENCES change_sets(change_set_id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    created_at TEXT,
+    terminal_at TEXT,
+    time_source TEXT NOT NULL,
+    payload_guard_sha256 TEXT NOT NULL,
+    CHECK (status IN (
+        'pending', 'applied', 'cancelled', 'failed', 'published', 'rejected',
+        'superseded'
+    )),
+    CHECK (terminal_at IS NULL OR status IN (
+        'applied', 'cancelled', 'failed', 'published', 'rejected', 'superseded'
+    )),
+    CHECK (length(payload_guard_sha256) = 64)
+)
+"""
+_CHANGE_SET_LIFECYCLE_INDEX_SCHEMA_V6 = """
+CREATE INDEX IF NOT EXISTS idx_change_set_lifecycle_retention_v6
+ON change_set_lifecycle_v6(status, terminal_at, change_set_id)
+"""
+_CHANGE_SET_LIFECYCLE_TRIGGER_SCHEMA_V6 = """
+CREATE TRIGGER IF NOT EXISTS trg_change_set_terminal_v6_immutable
+BEFORE UPDATE OF status, terminal_at ON change_set_lifecycle_v6
+WHEN OLD.status IN (
+    'applied', 'cancelled', 'failed', 'published', 'rejected', 'superseded'
+)
+ AND (NEW.terminal_at IS NOT OLD.terminal_at OR NEW.status IS NOT OLD.status)
+BEGIN
+    SELECT RAISE(ABORT, 'change-set terminal lifecycle is immutable');
+END
+"""
+_HISTORY_RETENTION_RUNS_TABLE_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS history_retention_runs_v6 (
+    fingerprint TEXT PRIMARY KEY,
+    plan_version INTEGER NOT NULL CHECK (plan_version = 2),
+    schema_version INTEGER NOT NULL CHECK (schema_version >= 6),
+    plan_as_of TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    plan_sha256 TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    CHECK (length(fingerprint) = 71 AND substr(fingerprint, 1, 7) = 'sha256:'),
+    CHECK (length(plan_sha256) = 64)
+)
+"""
+_JOBS_RETENTION_INDEX_SCHEMA_V6 = """
+CREATE INDEX IF NOT EXISTS idx_jobs_retention_v6
+ON jobs(status, completed_at, job_id)
+"""
+_MUTATION_OUTBOX_RETENTION_INDEX_SCHEMA_V6 = """
+CREATE INDEX IF NOT EXISTS idx_mutation_outbox_retention_v6
+ON mutation_outbox(status, completed_at, id)
+"""
+_CLAIM_VERSIONS_RETENTION_INDEX_SCHEMA_V6 = """
+CREATE INDEX IF NOT EXISTS idx_claim_versions_retention_v6
+ON claim_versions(
+    claim_family_id, version_no DESC, recorded_at DESC, claim_version_id DESC
+)
+"""
+_EVIDENCE_VERSIONS_RETENTION_INDEX_SCHEMA_V6 = """
+CREATE INDEX IF NOT EXISTS idx_evidence_versions_retention_v6
+ON evidence_versions(
+    evidence_family_id, version_no DESC, recorded_at DESC, evidence_version_id DESC
+)
+"""
+_CHANGE_SET_HISTORY_SCHEMA_V6 = (
+    _CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V6,
+    _CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V6,
+    _CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V6,
+    _CHANGE_SET_LIFECYCLE_TABLE_SCHEMA_V6,
+    _CHANGE_SET_LIFECYCLE_INDEX_SCHEMA_V6,
+    _CHANGE_SET_LIFECYCLE_TRIGGER_SCHEMA_V6,
+    _HISTORY_RETENTION_RUNS_TABLE_SCHEMA_V6,
+    _JOBS_RETENTION_INDEX_SCHEMA_V6,
+    _MUTATION_OUTBOX_RETENTION_INDEX_SCHEMA_V6,
+    _CLAIM_VERSIONS_RETENTION_INDEX_SCHEMA_V6,
+    _EVIDENCE_VERSIONS_RETENTION_INDEX_SCHEMA_V6,
+)
+_CHANGE_SET_HISTORY_SCHEMA_OBJECTS_V6 = (
+    ("table", "change_set_payloads", _CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V6),
+    (
+        "table",
+        "change_set_payload_refs",
+        _CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V6,
+    ),
+    (
+        "index",
+        "idx_change_set_payload_refs_payload_v6",
+        _CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V6,
+    ),
+    (
+        "table",
+        "change_set_lifecycle_v6",
+        _CHANGE_SET_LIFECYCLE_TABLE_SCHEMA_V6,
+    ),
+    (
+        "index",
+        "idx_change_set_lifecycle_retention_v6",
+        _CHANGE_SET_LIFECYCLE_INDEX_SCHEMA_V6,
+    ),
+    (
+        "trigger",
+        "trg_change_set_terminal_v6_immutable",
+        _CHANGE_SET_LIFECYCLE_TRIGGER_SCHEMA_V6,
+    ),
+    (
+        "table",
+        "history_retention_runs_v6",
+        _HISTORY_RETENTION_RUNS_TABLE_SCHEMA_V6,
+    ),
+    ("index", "idx_jobs_retention_v6", _JOBS_RETENTION_INDEX_SCHEMA_V6),
+    (
+        "index",
+        "idx_mutation_outbox_retention_v6",
+        _MUTATION_OUTBOX_RETENTION_INDEX_SCHEMA_V6,
+    ),
+    (
+        "index",
+        "idx_claim_versions_retention_v6",
+        _CLAIM_VERSIONS_RETENTION_INDEX_SCHEMA_V6,
+    ),
+    (
+        "index",
+        "idx_evidence_versions_retention_v6",
+        _EVIDENCE_VERSIONS_RETENTION_INDEX_SCHEMA_V6,
+    ),
+)
+
+_SCHEMA_VERSION = 6
 _SCHEMA_MIGRATIONS = {
     1: (
         "baseline_schema_v1",
@@ -274,6 +469,14 @@ _SCHEMA_MIGRATIONS = {
     4: (
         "ingest_task_cleanup_contract_v4",
         _schema_contract_checksum(_INGEST_TASK_CLEANUP_SCHEMA_V4),
+    ),
+    5: (
+        "duplicate_index_cleanup_v5",
+        _schema_contract_checksum(_DUPLICATE_INDEX_CLEANUP_SCHEMA_V5),
+    ),
+    6: (
+        "change_set_delta_history_v6",
+        _schema_contract_checksum(_CHANGE_SET_HISTORY_SCHEMA_V6),
     ),
 }
 
@@ -505,6 +708,153 @@ def _assert_ingest_task_cleanup_schema_contract(conn: sqlite3.Connection) -> Non
     _INGEST_TASK_CLEANUP_SCHEMA_TOKENS[id(conn)] = token
 
 
+def _index_has_expected_shape(
+    conn: sqlite3.Connection,
+    index_name: str,
+    expected_table: str,
+    expected_columns: tuple[str, ...],
+) -> bool:
+    rows = conn.execute(
+        "SELECT type, name, tbl_name FROM main.sqlite_master "
+        "WHERE name = ? COLLATE NOCASE ORDER BY type, name COLLATE BINARY",
+        (index_name,),
+    ).fetchall()
+    row = rows[0] if len(rows) == 1 else None
+    if (
+        row is None
+        or str(row["type"] or "") != "index"
+        or str(row["tbl_name"] or "").casefold() != expected_table.casefold()
+    ):
+        return False
+    actual_index_name = str(row["name"])
+    metadata = next(
+        (
+            item
+            for item in conn.execute(
+                "SELECT name, \"unique\", partial FROM pragma_index_list(?)",
+                (expected_table,),
+            ).fetchall()
+            if str(item["name"] or "").casefold()
+            == actual_index_name.casefold()
+        ),
+        None,
+    )
+    key_columns = tuple(
+        (
+            str(item["name"] or "").casefold(),
+            int(item["desc"] or 0),
+            str(item["coll"] or "").casefold(),
+        )
+        for item in conn.execute(
+            "SELECT name, desc, coll FROM pragma_index_xinfo(?) "
+            "WHERE key = 1 ORDER BY seqno",
+            (actual_index_name,),
+        ).fetchall()
+    )
+    return bool(
+        metadata is not None
+        and int(metadata["unique"] or 0) == 0
+        and int(metadata["partial"] or 0) == 0
+        and key_columns
+        == tuple((column.casefold(), 0, "binary") for column in expected_columns)
+    )
+
+
+def _duplicate_index_cleanup_v5_issues(conn: sqlite3.Connection) -> list[str]:
+    rows = []
+    for index_name in sorted(_DUPLICATE_INDEXES_V5):
+        rows.extend(
+            conn.execute(
+                "SELECT type, name FROM main.sqlite_master "
+                "WHERE name = ? COLLATE NOCASE ORDER BY type, name COLLATE BINARY",
+                (index_name,),
+            ).fetchall()
+        )
+    issues = [
+        f"duplicate_index_schema_unexpected:{str(row['type'] or 'object')}:"
+        f"{str(row['name'])}"
+        for row in rows
+    ]
+    for index_name, (expected_table, expected_columns) in (
+        _RETAINED_TIMELINE_INDEXES_V5.items()
+    ):
+        if not _index_has_expected_shape(
+            conn,
+            index_name,
+            expected_table,
+            expected_columns,
+        ):
+            issues.append(f"duplicate_index_schema_invalid:index:{index_name}")
+    return issues
+
+
+def _assert_duplicate_index_cleanup_v5_contract(conn: sqlite3.Connection) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 5:
+        return
+    issues = _duplicate_index_cleanup_v5_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v5 duplicate index cleanup contract is invalid: "
+            + ", ".join(issues)
+        )
+
+
+def _change_set_history_schema_v6_issues(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    issues: list[str] = []
+    for object_type, name, expected_sql in _CHANGE_SET_HISTORY_SCHEMA_OBJECTS_V6:
+        row = conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            issues.append(f"change_set_history_schema_missing:{object_type}:{name}")
+            continue
+        if str(row["type"] or "") != object_type:
+            issues.append(f"change_set_history_schema_type_mismatch:{name}")
+            continue
+        if _normalized_schema_sql(row["sql"]) != _normalized_schema_sql(expected_sql):
+            issues.append(f"change_set_history_schema_sql_mismatch:{name}")
+
+    lifecycle_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'change_set_lifecycle_v6'"
+    ).fetchone()
+    change_sets_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'change_sets'"
+    ).fetchone()
+    if lifecycle_table is not None and change_sets_table is not None:
+        missing = conn.execute(
+            "SELECT change_set_id FROM change_sets AS change_set "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM change_set_lifecycle_v6 AS lifecycle "
+            "WHERE lifecycle.change_set_id = change_set.change_set_id"
+            ") LIMIT 1"
+        ).fetchone()
+        if missing is not None:
+            issues.append(
+                "change_set_history_lifecycle_missing:"
+                f"{str(missing['change_set_id'])}"
+            )
+    return issues
+
+
+def _assert_change_set_history_schema_v6_contract(
+    conn: sqlite3.Connection,
+) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 6:
+        return
+    issues = _change_set_history_schema_v6_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v6 change-set history contract is invalid: "
+            + ", ".join(issues)
+        )
+
+
 def _identity_validation_token(conn: sqlite3.Connection) -> tuple:
     """Detect schema and identity-relevant writes without unrelated invalidation."""
     schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0)
@@ -521,23 +871,37 @@ def _identity_validation_token(conn: sqlite3.Connection) -> tuple:
 
 
 def _validate_cached_identity_state(conn: sqlite3.Connection) -> None:
-    """Revalidate ownership after relevant changes and cache only a stable scan."""
+    """Revalidate ownership once per database generation and stable process view."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version != _SCHEMA_VERSION:
+        if version < _SCHEMA_VERSION:
+            raise RuntimeError(
+                "Database schema upgrade required: "
+                f"{version}->{_SCHEMA_VERSION}; generic init_db cannot run an "
+                "existing-database migration. Use the controlled backup, "
+                "fingerprint, exclusive-window, and receipt workflow."
+            )
+        raise RuntimeError(
+            f"Database schema version {version} is newer than supported version "
+            f"{_SCHEMA_VERSION}"
+        )
     _assert_identity_schema_contract(conn)
     _assert_runtime_generation_schema_contract(conn)
     _assert_ingest_task_cleanup_schema_contract(conn)
-    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
-    if version < 2:
-        return
-    for _attempt in range(2):
-        before = _identity_validation_token(conn)
-        if _IDENTITY_VALIDATION_TOKENS.get(id(conn)) == before:
-            return
-        _validate_canonical_identity_registry(conn)
-        _validate_canonical_identity_coverage(conn)
-        after = _identity_validation_token(conn)
-        if before == after:
-            _IDENTITY_VALIDATION_TOKENS[id(conn)] = after
-            return
+    _assert_duplicate_index_cleanup_v5_contract(conn)
+    _assert_change_set_history_schema_v6_contract(conn)
+    db_key = str(get_db_path().resolve())
+    with _IDENTITY_VALIDATION_LOCK:
+        for _attempt in range(2):
+            before = _identity_validation_token(conn)
+            if _IDENTITY_VALIDATION_TOKENS.get(db_key) == before:
+                return
+            _validate_canonical_identity_registry(conn)
+            _validate_canonical_identity_coverage(conn)
+            after = _identity_validation_token(conn)
+            if before == after:
+                _IDENTITY_VALIDATION_TOKENS[db_key] = after
+                return
     raise RuntimeError(
         "Canonical identity state changed during validation; retry after writers finish"
     )
@@ -606,6 +970,10 @@ def inspect_schema_migration_connection(
             result["issues"].extend(_runtime_generation_schema_issues(conn))
         if int(result["user_version"] or 0) >= 4:
             result["issues"].extend(_ingest_task_cleanup_schema_issues(conn))
+        if int(result["user_version"] or 0) >= 5:
+            result["issues"].extend(_duplicate_index_cleanup_v5_issues(conn))
+        if int(result["user_version"] or 0) >= 6:
+            result["issues"].extend(_change_set_history_schema_v6_issues(conn))
     except (OSError, sqlite3.Error) as exc:
         result["status"] = "invalid"
         result["issues"].append(f"schema_inspection_failed:{exc}")
@@ -652,10 +1020,25 @@ def inspect_schema_migration_state(
         result["issues"].append("database_missing")
         return result
 
+    resolved = path.resolve()
+    wal_path = Path(str(resolved) + "-wal")
+    try:
+        wal_size = wal_path.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    if wal_size == 0:
+        try:
+            with checkpointed_read_only_snapshot(resolved) as conn:
+                return inspect_schema_migration_connection(conn, path)
+        except (OSError, sqlite3.Error, ReadOnlySnapshotUnavailable) as exc:
+            result["status"] = "invalid"
+            result["issues"].append(f"schema_inspection_failed:{exc}")
+            return result
+
     conn = None
     try:
         conn = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro",
+            f"{resolved.as_uri()}?mode=ro",
             uri=True,
             timeout=5.0,
         )
@@ -802,7 +1185,7 @@ def _close_tracked_connection(conn: sqlite3.Connection) -> None:
     """Close one registered handle exactly once across thread/global cleanup."""
     with _CONNECTIONS_LOCK:
         tracked = _CONNECTIONS.pop(id(conn), None)
-        _IDENTITY_VALIDATION_TOKENS.pop(id(conn), None)
+        _VECTOR_EXTENSION_CONNECTION_IDS.discard(id(conn))
         _RUNTIME_GENERATION_SCHEMA_TOKENS.pop(id(conn), None)
         _INGEST_TASK_CLEANUP_SCHEMA_TOKENS.pop(id(conn), None)
     if tracked is None:
@@ -838,14 +1221,39 @@ class _ThreadConnectionOwner:
 
 
 def _load_sqlite_vec_extension(conn: sqlite3.Connection) -> None:
-    """Import sqlite-vec lazily, while loading it into every new connection."""
-    import sqlite_vec
+    """Load sqlite-vec once on a connection that explicitly needs vectors."""
+    with _CONNECTIONS_LOCK:
+        tracked = _CONNECTIONS.get(id(conn)) is conn
+        if tracked and id(conn) in _VECTOR_EXTENSION_CONNECTION_IDS:
+            return
+        if not tracked:
+            try:
+                conn.execute("SELECT vec_version()").fetchone()
+                return
+            except sqlite3.OperationalError as exc:
+                if "no such function: vec_version" not in str(exc).lower():
+                    raise
+        conn.enable_load_extension(True)
+        try:
+            conn.load_extension(_sqlite_vec_loadable_path())
+        finally:
+            conn.enable_load_extension(False)
+        if tracked:
+            if _CONNECTIONS.get(id(conn)) is conn:
+                _VECTOR_EXTENSION_CONNECTION_IDS.add(id(conn))
 
-    conn.enable_load_extension(True)
-    try:
-        sqlite_vec.load(conn)
-    finally:
-        conn.enable_load_extension(False)
+
+def _sqlite_vec_loadable_path() -> str:
+    """Locate sqlite-vec's native extension without executing its Python module."""
+    spec = importlib.util.find_spec("sqlite_vec")
+    if spec is None or not spec.origin:
+        raise ImportError("sqlite-vec is not installed")
+    return str(Path(spec.origin).resolve().parent / "vec0")
+
+
+def serialize_float32_vector(vector) -> bytes:
+    """Serialize floats for sqlite-vec without importing its NumPy-aware wrapper."""
+    return struct.pack(f"{len(vector)}f", *vector)
 
 
 def _job_idempotency_key(task_type: str, payload: dict | None) -> str | None:
@@ -879,6 +1287,76 @@ def peek_db_path() -> Path:
     return peek_meta_dir() / "vector_lake.db"
 
 
+class ReadOnlySnapshotUnavailable(RuntimeError):
+    """A byte-stable immutable SQLite snapshot cannot be opened safely."""
+
+
+def _read_only_snapshot_identity(path: Path) -> tuple:
+    identities = []
+    for candidate in (path, path.with_name(path.name + "-wal")):
+        try:
+            stat = candidate.stat()
+            identities.append(
+                (
+                    str(candidate.resolve()),
+                    int(stat.st_dev),
+                    int(stat.st_ino),
+                    int(stat.st_size),
+                    int(stat.st_mtime_ns),
+                    int(stat.st_ctime_ns),
+                )
+            )
+        except FileNotFoundError:
+            identities.append((str(candidate.resolve()), "missing"))
+    return tuple(identities)
+
+
+@contextmanager
+def checkpointed_read_only_snapshot(
+    db_path: str | Path | None = None,
+    *,
+    timeout: float = 5.0,
+):
+    """Yield an immutable read handle only when no WAL frames are pending.
+
+    The physical DB/WAL identity is checked again after the query so a
+    concurrent writer fails the diagnostic instead of returning a mixed view.
+    """
+    path = (Path(db_path) if db_path is not None else peek_db_path()).resolve()
+    if not path.is_file():
+        raise ReadOnlySnapshotUnavailable(f"database_missing:{path}")
+    before = _read_only_snapshot_identity(path)
+    wal_identity = before[1]
+    if wal_identity[-1] != "missing" and int(wal_identity[3]) > 0:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_has_uncheckpointed_wal:{path.with_name(path.name + '-wal')}"
+        )
+
+    connection = None
+    failure = None
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=timeout,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        yield connection
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+        if failure is None:
+            after = _read_only_snapshot_identity(path)
+            if after != before:
+                raise ReadOnlySnapshotUnavailable(
+                    "database_changed_during_read_only_snapshot"
+                )
+
+
 def get_connection() -> sqlite3.Connection:
     db_path = get_db_path().resolve()
     db_key = str(db_path)
@@ -905,16 +1383,18 @@ def get_connection() -> sqlite3.Connection:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA recursive_triggers=ON")
-        try:
-            _load_sqlite_vec_extension(conn)
-        except BaseException:
-            conn.close()
-            raise
         with _CONNECTIONS_LOCK:
             _CONNECTIONS[id(conn)] = conn
         _LOCAL.conn = conn
         _LOCAL.db_key = db_key
         _LOCAL.connection_owner = _ThreadConnectionOwner(conn)
+    return conn
+
+
+def get_vector_connection() -> sqlite3.Connection:
+    """Return the thread connection after explicitly enabling vector access."""
+    conn = get_connection()
+    _load_sqlite_vec_extension(conn)
     return conn
 
 
@@ -948,9 +1428,11 @@ def close_all_connections() -> None:
     with _CONNECTIONS_LOCK:
         connections = list(_CONNECTIONS.values())
         _CONNECTIONS.clear()
-        _IDENTITY_VALIDATION_TOKENS.clear()
+        _VECTOR_EXTENSION_CONNECTION_IDS.clear()
         _RUNTIME_GENERATION_SCHEMA_TOKENS.clear()
         _INGEST_TASK_CLEANUP_SCHEMA_TOKENS.clear()
+    with _IDENTITY_VALIDATION_LOCK:
+        _IDENTITY_VALIDATION_TOKENS.clear()
     for conn in connections:
         try:
             conn.close()
@@ -1114,16 +1596,27 @@ _INIT_LOCK = threading.Lock()
 
 def init_db():
     db_path = get_db_path()
-    db_key = str(db_path.resolve())
-    if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
-        _validate_cached_identity_state(get_connection())
-        return
+    lock_path = db_path.parent / _SCHEMA_MIGRATION_LOCK_FILENAME
     with _INIT_LOCK:
-        if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
-            _validate_cached_identity_state(get_connection())
-            return
-        _INITIALIZED_DB_PATHS.discard(db_key)
-        _init_db_once(db_key)
+        try:
+            migration_guard = FileLock(
+                str(lock_path),
+                timeout=_SCHEMA_MIGRATION_RUNTIME_LOCK_TIMEOUT_SECONDS,
+            )
+            migration_guard.acquire()
+        except FileLockTimeout as exc:
+            raise RuntimeError(
+                "Database schema migration maintenance window is active"
+            ) from exc
+        try:
+            db_key = str(db_path.resolve())
+            if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
+                _validate_cached_identity_state(get_connection())
+                return
+            _INITIALIZED_DB_PATHS.discard(db_key)
+            _init_db_once(db_key)
+        finally:
+            migration_guard.release()
 
 
 def _add_column_if_missing(
@@ -1241,6 +1734,1219 @@ def _migrate_ingest_task_cleanup_schema_v4(conn: sqlite3.Connection) -> None:
         raise RuntimeError(
             "Schema v4 ingest task cleanup migration failed: " + ", ".join(issues)
         )
+
+
+def _migrate_canonical_identity_schema_v2(conn: sqlite3.Connection) -> None:
+    for statement in _CANONICAL_IDENTITIES_SCHEMA_V2:
+        conn.execute(statement)
+    _backfill_canonical_identities(conn)
+    _validate_canonical_identity_registry(conn)
+    _validate_canonical_identity_coverage(conn)
+
+
+def _migrate_runtime_generation_schema_v3(conn: sqlite3.Connection) -> None:
+    conn.execute(_RUNTIME_GENERATIONS_TABLE_SCHEMA_V3)
+    for surface in sorted(_RUNTIME_GENERATION_SURFACES):
+        conn.execute(
+            "INSERT OR IGNORE INTO runtime_generations (surface, generation) "
+            "VALUES (?, 0)",
+            (surface,),
+        )
+        for operation_kind in ("insert", "update", "delete"):
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS "
+                f"trg_{surface}_generation_v1_{operation_kind}"
+            )
+            conn.execute(
+                f"DROP TRIGGER IF EXISTS "
+                f"{_runtime_generation_trigger_name(surface, operation_kind)}"
+            )
+    for statement in _RUNTIME_GENERATION_TRIGGER_SCHEMA_V3:
+        conn.execute(statement)
+    issues = _runtime_generation_schema_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v3 runtime generation migration failed: " + ", ".join(issues)
+        )
+
+
+def _duplicate_index_cleanup_v5_preflight_issues(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    """Validate both duplicate indexes before executing the first DROP."""
+    issues: list[str] = []
+
+    for index_name, (expected_table, expected_columns) in (
+        _DUPLICATE_INDEXES_V5.items()
+    ):
+        rows = conn.execute(
+            "SELECT type, name, tbl_name FROM main.sqlite_master "
+            "WHERE name = ? COLLATE NOCASE ORDER BY type, name COLLATE BINARY",
+            (index_name,),
+        ).fetchall()
+        if not rows:
+            continue
+        row = rows[0] if len(rows) == 1 else None
+        if (
+            row is None
+            or str(row["type"] or "") != "index"
+            or str(row["tbl_name"] or "").casefold()
+            != expected_table.casefold()
+        ):
+            issues.append(
+                f"duplicate_index_migration_shape_mismatch:index:{index_name}"
+            )
+            continue
+        if not _index_has_expected_shape(
+            conn,
+            str(row["name"]),
+            expected_table,
+            expected_columns,
+        ):
+            issues.append(
+                f"duplicate_index_migration_shape_mismatch:index:{index_name}"
+            )
+
+    for index_name, (expected_table, expected_columns) in (
+        _RETAINED_TIMELINE_INDEXES_V5.items()
+    ):
+        if not _index_has_expected_shape(
+            conn,
+            index_name,
+            expected_table,
+            expected_columns,
+        ):
+            issues.append(
+                f"duplicate_index_migration_replacement_invalid:index:{index_name}"
+            )
+
+    return list(dict.fromkeys(issues))
+
+
+def _migrate_duplicate_index_cleanup_v5(conn: sqlite3.Connection) -> None:
+    """Drop only the two recognized duplicate timeline indexes."""
+    issues = _duplicate_index_cleanup_v5_preflight_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v5 duplicate index cleanup preflight failed: "
+            + ", ".join(issues)
+        )
+    for index_name in _DUPLICATE_INDEXES_V5:
+        row = conn.execute(
+            "SELECT name FROM main.sqlite_master "
+            "WHERE type = 'index' AND name = ? COLLATE NOCASE",
+            (index_name,),
+        ).fetchone()
+        if row is not None:
+            actual_name = str(row["name"])
+            quoted_name = '"' + actual_name.replace('"', '""') + '"'
+            conn.execute(f"DROP INDEX {quoted_name}")
+    issues = _duplicate_index_cleanup_v5_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v5 duplicate index cleanup migration failed: "
+            + ", ".join(issues)
+        )
+
+
+_CHANGE_SET_TERMINAL_TIME_FIELDS_V6 = {
+    "applied": "applied_at",
+    "cancelled": "cancelled_at",
+    "failed": "failed_at",
+    "published": "published_at",
+    "rejected": "rejected_at",
+    "superseded": "superseded_at",
+}
+_CHANGE_SET_STATUSES_V6 = frozenset(
+    {"pending", *_CHANGE_SET_TERMINAL_TIME_FIELDS_V6}
+)
+
+
+def _normalize_change_set_lifecycle_instant_v6(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _change_set_lifecycle_from_legacy_v6(
+    change_set_id: str,
+    raw_data_json: object,
+) -> tuple[str, str | None, str | None, str, str]:
+    raw_text = str(raw_data_json or "")
+    try:
+        payload = json.loads(raw_text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Schema v6 cannot parse change-set payload {change_set_id!r}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Schema v6 change-set payload is not an object: {change_set_id!r}"
+        )
+    payload_guard = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+    return _change_set_lifecycle_from_values_v6(
+        change_set_id,
+        status_value=payload.get("status"),
+        created_at_value=payload.get("created_at"),
+        terminal_values={
+            field_name: payload.get(field_name)
+            for field_name in _CHANGE_SET_TERMINAL_TIME_FIELDS_V6.values()
+        },
+        requires_human_review_is_false=(
+            payload.get("requires_human_review") is False
+        ),
+        payload_guard=payload_guard,
+    )
+
+
+def _change_set_lifecycle_from_values_v6(
+    change_set_id: str,
+    *,
+    status_value: object,
+    created_at_value: object,
+    terminal_values: dict[str, object],
+    requires_human_review_is_false: bool,
+    payload_guard: str,
+) -> tuple[str, str | None, str | None, str, str]:
+    status = str(status_value or "").strip().casefold()
+    if status not in _CHANGE_SET_STATUSES_V6:
+        raise RuntimeError(
+            f"Schema v6 change-set status is unsupported for {change_set_id!r}: "
+            f"{status or '<missing>'}"
+        )
+    created_at = _normalize_change_set_lifecycle_instant_v6(
+        created_at_value
+    )
+    terminal_at = None
+    time_source = "active_v6_backfill"
+    if status in _CHANGE_SET_TERMINAL_TIME_FIELDS_V6:
+        field_name = _CHANGE_SET_TERMINAL_TIME_FIELDS_V6[status]
+        terminal_at = _normalize_change_set_lifecycle_instant_v6(
+            terminal_values.get(field_name)
+        )
+        if terminal_at is not None:
+            time_source = field_name
+        elif requires_human_review_is_false and created_at is not None:
+            terminal_at = created_at
+            time_source = "created_terminal_v6_backfill"
+        else:
+            time_source = "unknown_v6_backfill"
+    return status, created_at, terminal_at, time_source, payload_guard
+
+
+def _change_set_payload_guard_v6(
+    conn: sqlite3.Connection,
+    rowid: int,
+    *,
+    chunk_bytes: int = 1024 * 1024,
+) -> str:
+    """Hash the exact stored UTF-8 JSON bytes without materializing the payload."""
+    digest = hashlib.sha256()
+    with conn.blobopen(
+        "change_sets",
+        "data_json",
+        int(rowid),
+        readonly=True,
+    ) as payload_blob:
+        while chunk := payload_blob.read(chunk_bytes):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _migrate_change_set_history_schema_v6(conn: sqlite3.Connection) -> None:
+    """Install compact change-set payload storage without rewriting legacy JSON."""
+    for statement in _CHANGE_SET_HISTORY_SCHEMA_V6:
+        conn.execute(statement)
+    encoding = str(conn.execute("PRAGMA encoding").fetchone()[0] or "").casefold()
+    if encoding.replace("-", "") != "utf8":
+        raise RuntimeError(
+            "Schema v6 streaming payload guards require a UTF-8 SQLite database"
+        )
+    invalid = conn.execute(
+        "SELECT change_set_id FROM change_sets WHERE NOT json_valid(data_json) "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM change_set_lifecycle_v6 AS lifecycle "
+        "WHERE lifecycle.change_set_id = change_sets.change_set_id"
+        ") ORDER BY change_set_id LIMIT 1"
+    ).fetchone()
+    if invalid is not None:
+        raise RuntimeError(
+            "Schema v6 cannot parse change-set payload "
+            f"{str(invalid['change_set_id'])!r}"
+        )
+    rows = conn.execute(
+        "SELECT change_sets.rowid AS payload_rowid, change_sets.change_set_id, "
+        "json_type(change_sets.data_json, '$') AS root_type, "
+        "json_extract(change_sets.data_json, '$.status') AS status_value, "
+        "json_extract(change_sets.data_json, '$.created_at') AS created_at_value, "
+        "json_type(change_sets.data_json, '$.requires_human_review') AS review_type, "
+        "json_extract(change_sets.data_json, '$.applied_at') AS applied_at, "
+        "json_extract(change_sets.data_json, '$.cancelled_at') AS cancelled_at, "
+        "json_extract(change_sets.data_json, '$.failed_at') AS failed_at, "
+        "json_extract(change_sets.data_json, '$.published_at') AS published_at, "
+        "json_extract(change_sets.data_json, '$.rejected_at') AS rejected_at, "
+        "json_extract(change_sets.data_json, '$.superseded_at') AS superseded_at "
+        "FROM change_sets "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM change_set_lifecycle_v6 AS lifecycle "
+        "WHERE lifecycle.change_set_id = change_sets.change_set_id"
+        ") ORDER BY change_sets.change_set_id"
+    ).fetchall()
+    for row in rows:
+        change_set_id = str(row["change_set_id"])
+        if str(row["root_type"] or "") != "object":
+            raise RuntimeError(
+                "Schema v6 change-set payload is not an object: "
+                f"{change_set_id!r}"
+            )
+        lifecycle = _change_set_lifecycle_from_values_v6(
+            change_set_id,
+            status_value=row["status_value"],
+            created_at_value=row["created_at_value"],
+            terminal_values={
+                field_name: row[field_name]
+                for field_name in _CHANGE_SET_TERMINAL_TIME_FIELDS_V6.values()
+            },
+            requires_human_review_is_false=(row["review_type"] == "false"),
+            payload_guard=_change_set_payload_guard_v6(
+                conn,
+                int(row["payload_rowid"]),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO change_set_lifecycle_v6 "
+            "(change_set_id, status, created_at, terminal_at, time_source, "
+            "payload_guard_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+            (change_set_id, *lifecycle),
+        )
+    issues = _change_set_history_schema_v6_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v6 change-set history migration failed: " + ", ".join(issues)
+        )
+
+
+def _assert_held_schema_migration_lock(
+    conn: sqlite3.Connection,
+    maintenance_lock: BaseFileLock,
+) -> None:
+    if not isinstance(maintenance_lock, BaseFileLock) or not maintenance_lock.is_locked:
+        raise RuntimeError("Controlled schema v5 migration lock is not held")
+    database_rows = conn.execute("PRAGMA database_list").fetchall()
+    main_database = next(
+        (str(row[2]) for row in database_rows if str(row[1]) == "main"),
+        "",
+    )
+    if not main_database:
+        raise RuntimeError("Controlled schema v5 migration requires a file database")
+    expected_lock = (
+        Path(main_database).resolve().parent / _SCHEMA_MIGRATION_LOCK_FILENAME
+    ).resolve()
+    observed_lock = Path(str(maintenance_lock.lock_file)).resolve()
+    if os.path.normcase(str(observed_lock)) != os.path.normcase(str(expected_lock)):
+        raise RuntimeError(
+            "Controlled schema v5 migration lock does not match the database"
+        )
+
+
+@contextmanager
+def _controlled_schema_v5_transaction(
+    conn: sqlite3.Connection,
+    maintenance_lock: BaseFileLock,
+):
+    """Bind the exclusive v5 transaction and commit to one held OS file lock."""
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Controlled schema v5 transaction requires an idle connection"
+        )
+    _assert_held_schema_migration_lock(conn, maintenance_lock)
+    conn.execute("BEGIN EXCLUSIVE")
+    if getattr(_LOCAL, "controlled_schema_v5_context", None) is not None:
+        conn.execute("ROLLBACK")
+        raise RuntimeError("Controlled schema v5 transaction cannot be nested")
+    context_authority = (
+        _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN,
+        id(conn),
+        id(maintenance_lock),
+    )
+    _LOCAL.controlled_schema_v5_context = context_authority
+    try:
+        _assert_held_schema_migration_lock(conn, maintenance_lock)
+        yield conn
+        _assert_held_schema_migration_lock(conn, maintenance_lock)
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        if getattr(_LOCAL, "controlled_schema_v5_context", None) == context_authority:
+            delattr(_LOCAL, "controlled_schema_v5_context")
+
+
+def _apply_controlled_schema_v5_migration(
+    conn: sqlite3.Connection,
+    *,
+    maintenance_lock: BaseFileLock,
+) -> None:
+    """Apply v4->v5 inside the lock-bound controlled transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError(
+            "Controlled schema v5 migration requires an active caller transaction"
+        )
+    _assert_held_schema_migration_lock(conn, maintenance_lock)
+    expected_authority = (
+        _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN,
+        id(conn),
+        id(maintenance_lock),
+    )
+    if getattr(_LOCAL, "controlled_schema_v5_context", None) != expected_authority:
+        raise RuntimeError(
+            "Controlled schema v5 migration requires the lock-bound transaction"
+        )
+    current_version = _validate_schema_migration_state(conn)
+    if current_version != 4:
+        raise RuntimeError(
+            f"Controlled schema v5 migration requires schema v4, found "
+            f"v{current_version}"
+        )
+    _migrate_duplicate_index_cleanup_v5(conn)
+    applied_at = datetime.now(timezone.utc).isoformat()
+    name, checksum = _SCHEMA_MIGRATIONS[5]
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
+        "VALUES (5, ?, ?, ?)",
+        (name, checksum, applied_at),
+    )
+    conn.execute("PRAGMA user_version = 5")
+    if _validate_schema_migration_state(conn) != 5:
+        raise RuntimeError("Controlled schema v5 migration ledger validation failed")
+    _assert_duplicate_index_cleanup_v5_contract(conn)
+
+
+def _apply_controlled_schema_v6_migration(
+    conn: sqlite3.Connection,
+    *,
+    maintenance_lock: BaseFileLock,
+) -> None:
+    """Apply v5->v6 inside the existing lock-bound exclusive transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError(
+            "Controlled schema v6 migration requires an active caller transaction"
+        )
+    _assert_held_schema_migration_lock(conn, maintenance_lock)
+    expected_authority = (
+        _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN,
+        id(conn),
+        id(maintenance_lock),
+    )
+    if getattr(_LOCAL, "controlled_schema_v5_context", None) != expected_authority:
+        raise RuntimeError(
+            "Controlled schema v6 migration requires the lock-bound transaction"
+        )
+    current_version = _validate_schema_migration_state(conn)
+    if current_version != 5:
+        raise RuntimeError(
+            f"Controlled schema v6 migration requires schema v5, found "
+            f"v{current_version}"
+        )
+    _migrate_change_set_history_schema_v6(conn)
+    _record_schema_migrations(conn, current_version)
+    if _validate_schema_migration_state(conn) != 6:
+        raise RuntimeError("Controlled schema v6 migration ledger validation failed")
+    _assert_change_set_history_schema_v6_contract(conn)
+
+
+def _schema_migration_file_identity(path: Path) -> dict:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {"path": str(path), "exists": False}
+    return {
+        "path": str(path),
+        "exists": True,
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "ctime_ns": int(stat.st_ctime_ns),
+    }
+
+
+def _schema_migration_physical_identity(path: Path) -> list[dict]:
+    return [
+        _schema_migration_file_identity(candidate)
+        for candidate in (
+            path,
+            path.with_name(path.name + "-wal"),
+            path.with_name(path.name + "-shm"),
+        )
+    ]
+
+
+def _schema_migration_fingerprint(payload: dict) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _schema_migration_steps(version: int) -> list[str]:
+    if version == 4:
+        return ["schema_v4_to_v5", "schema_v5_to_v6"]
+    if version == 5:
+        return ["schema_v5_to_v6"]
+    return []
+
+
+def _schema_migration_plan_core(plan: dict) -> dict:
+    return {
+        key: plan[key]
+        for key in (
+            "contract",
+            "database_path",
+            "target_schema_version",
+            "pre_schema_version",
+            "steps",
+            "source_identity",
+            "pre_state",
+            "issues",
+            "can_apply",
+            "no_op",
+            "pending_receipt",
+            "projection_rebuild_required",
+        )
+    }
+
+
+def _schema_migration_receipt_paths(database_path: Path) -> tuple[Path, Path]:
+    normalized = os.path.normcase(str(database_path.resolve()))
+    database_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    receipt_dir = database_path.parent / "schema-migration-receipts"
+    basename = f"{database_path.name}.{database_digest}.to-v{_SCHEMA_VERSION}"
+    return receipt_dir / f"{basename}.json", receipt_dir / f"{basename}.pending.json"
+
+
+def _schema_migration_same_database(left: object, right: Path) -> bool:
+    try:
+        observed = Path(str(left)).resolve()
+    except (OSError, ValueError):
+        return False
+    return os.path.normcase(str(observed)) == os.path.normcase(str(right.resolve()))
+
+
+def _schema_migration_validate_receipt(
+    database_path: Path,
+    receipt_path: Path,
+    *,
+    expected_status: str,
+) -> dict:
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("pending_receipt_unreadable") from exc
+    if not isinstance(receipt, dict):
+        raise RuntimeError("pending_receipt_malformed")
+    if (
+        receipt.get("contract") != _SCHEMA_MIGRATION_RECEIPT_CONTRACT
+        or receipt.get("status") != expected_status
+        or int(receipt.get("target_schema_version") or -1) != _SCHEMA_VERSION
+        or not _schema_migration_same_database(
+            receipt.get("database_path"), database_path
+        )
+        or receipt.get("projection_rebuild_required") is not True
+    ):
+        raise RuntimeError("pending_receipt_contract_mismatch")
+
+    fingerprint = str(receipt.get("receipt_fingerprint") or "")
+    fingerprint_payload = dict(receipt)
+    fingerprint_payload.pop("receipt_fingerprint", None)
+    if not hmac.compare_digest(
+        fingerprint,
+        _schema_migration_fingerprint(fingerprint_payload),
+    ):
+        raise RuntimeError("pending_receipt_fingerprint_mismatch")
+
+    plan = receipt.get("plan")
+    plan_fingerprint = str(receipt.get("plan_fingerprint") or "")
+    if (
+        not isinstance(plan, dict)
+        or not hmac.compare_digest(
+            plan_fingerprint,
+            _schema_migration_fingerprint(plan),
+        )
+        or not _schema_migration_same_database(
+            plan.get("database_path"), database_path
+        )
+    ):
+        raise RuntimeError("pending_receipt_plan_mismatch")
+    source_binding = receipt.get("source_binding")
+    expected_binding = {
+        "database_path": plan.get("database_path"),
+        "source_identity": plan.get("source_identity"),
+        "pre_state": plan.get("pre_state"),
+    }
+    if source_binding != expected_binding or receipt.get("steps") != plan.get("steps"):
+        raise RuntimeError("pending_receipt_source_binding_mismatch")
+
+    backup = receipt.get("backup")
+    if not isinstance(backup, dict):
+        raise RuntimeError("pending_receipt_backup_missing")
+    backup_path = Path(str(backup.get("path") or "")).resolve()
+    expected_backup_dir = (database_path.parent / "schema-migration-backups").resolve()
+    if backup_path.parent != expected_backup_dir or not backup_path.is_file():
+        raise RuntimeError("pending_receipt_backup_missing")
+    expected_sha256 = str(backup.get("sha256") or "")
+    if not hmac.compare_digest(
+        expected_sha256,
+        _schema_migration_sha256(backup_path),
+    ):
+        raise RuntimeError("pending_receipt_backup_hash_mismatch")
+    if any(Path(str(backup_path) + suffix).exists() for suffix in ("-wal", "-shm")):
+        raise RuntimeError("pending_receipt_backup_not_standalone")
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"{backup_path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5.0,
+        )
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        if quick_check is None or str(quick_check[0]).casefold() != "ok":
+            raise RuntimeError("pending_receipt_backup_quick_check_failed")
+        backup_state = inspect_schema_migration_connection(connection, backup_path)
+        if _schema_migration_state_binding(backup_state) != (
+            _schema_migration_state_binding(plan.get("pre_state") or {})
+        ):
+            raise RuntimeError("pending_receipt_backup_state_mismatch")
+    except sqlite3.Error as exc:
+        raise RuntimeError("pending_receipt_backup_unreadable") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    if expected_status == "completed":
+        post = receipt.get("post")
+        if (
+            not isinstance(post, dict)
+            or post.get("ready") is not True
+            or int(post.get("user_version") or -1) != _SCHEMA_VERSION
+        ):
+            raise RuntimeError("completed_receipt_post_state_mismatch")
+    return receipt
+
+
+def _schema_migration_pending_receipt(database_path: Path) -> tuple[dict | None, list[str]]:
+    completed_path, pending_path = _schema_migration_receipt_paths(database_path)
+    if completed_path.is_file():
+        try:
+            _schema_migration_validate_receipt(
+                database_path,
+                completed_path,
+                expected_status="completed",
+            )
+        except RuntimeError as exc:
+            return None, [f"schema_migration_{exc}"]
+        return None, []
+    if not pending_path.is_file():
+        return None, []
+    try:
+        receipt = _schema_migration_validate_receipt(
+            database_path,
+            pending_path,
+            expected_status="pending",
+        )
+    except RuntimeError as exc:
+        return None, [f"schema_migration_{exc}"]
+    return {"path": str(pending_path), "receipt": receipt}, []
+
+
+def preview_schema_migration(
+    db_path: str | Path | None = None,
+) -> dict:
+    """Build a byte-bound migration plan without creating SQLite state."""
+    path = (Path(db_path) if db_path is not None else peek_db_path()).resolve()
+    before = _schema_migration_physical_identity(path)
+    issues: list[str] = []
+    state = _schema_inspection_result(path)
+
+    if not path.is_file():
+        issues.append("database_missing")
+    else:
+        wal_identity = before[1]
+        if bool(wal_identity.get("exists")) and int(wal_identity.get("size", 0)) > 0:
+            issues.append("database_has_uncheckpointed_wal")
+        else:
+            connection = None
+            try:
+                connection = sqlite3.connect(
+                    f"{path.as_uri()}?mode=ro&immutable=1",
+                    uri=True,
+                    timeout=5.0,
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                state = inspect_schema_migration_connection(connection, path)
+                quick_check = connection.execute("PRAGMA quick_check").fetchone()
+                if quick_check is None or str(quick_check[0]).casefold() != "ok":
+                    issues.append(
+                        "database_quick_check_failed:"
+                        + (str(quick_check[0]) if quick_check is not None else "missing")
+                    )
+            except (OSError, sqlite3.Error) as exc:
+                issues.append(f"schema_preview_failed:{exc}")
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    after = _schema_migration_physical_identity(path)
+    if after != before:
+        raise RuntimeError("Database changed during schema migration preview")
+
+    version_value = state.get("user_version")
+    version = int(version_value) if version_value is not None else None
+    if version is not None:
+        if 1 <= version <= 3:
+            issues.append(f"unsupported_source_schema_v{version}:minimum_supported_v4")
+        elif version == 0:
+            issues.append("uninitialized_database")
+        elif version > _SCHEMA_VERSION:
+            issues.append("database_schema_newer_than_runtime")
+        elif version not in _SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS:
+            issues.append(f"unsupported_source_schema_v{version}")
+    issues.extend(str(item) for item in state.get("issues", []))
+    pending_receipt = None
+    if version == _SCHEMA_VERSION:
+        pending_receipt, pending_issues = _schema_migration_pending_receipt(path)
+        issues.extend(pending_issues)
+    issues = list(dict.fromkeys(issues))
+    no_op = version == _SCHEMA_VERSION and bool(state.get("ready")) and not issues
+    can_apply = (
+        version in _SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS
+        and not issues
+        and (version != _SCHEMA_VERSION or bool(state.get("ready")))
+    )
+    core = {
+        "contract": _SCHEMA_MIGRATION_PLAN_CONTRACT,
+        "database_path": str(path),
+        "target_schema_version": _SCHEMA_VERSION,
+        "pre_schema_version": version,
+        "steps": _schema_migration_steps(version) if version is not None else [],
+        "source_identity": before,
+        "pre_state": state,
+        "issues": issues,
+        "can_apply": bool(can_apply),
+        "no_op": bool(no_op),
+        "pending_receipt": pending_receipt,
+        "projection_rebuild_required": bool(
+            can_apply and (not no_op or pending_receipt is not None)
+        ),
+    }
+    return {
+        **core,
+        "dry_run": True,
+        "applied": False,
+        "confirm_no_writers_required": True,
+        "fingerprint": _schema_migration_fingerprint(core),
+    }
+
+
+def _schema_migration_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _schema_migration_fsync_path(path: Path) -> None:
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _schema_migration_fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        if os.name != "nt":
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def _schema_migration_atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _schema_migration_fsync_path(path)
+        _schema_migration_fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _schema_migration_promote_backup(staging_path: Path, final_path: Path) -> None:
+    os.replace(staging_path, final_path)
+    _schema_migration_fsync_path(final_path)
+    _schema_migration_fsync_directory(final_path.parent)
+
+
+def _schema_migration_backup(
+    connection: sqlite3.Connection,
+    *,
+    database_path: Path,
+    plan: dict,
+) -> tuple[Path, str, Path]:
+    backup_dir = database_path.parent / "schema-migration-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    fingerprint_suffix = str(plan["fingerprint"]).split(":", 1)[-1][:16]
+    final_path = backup_dir / (
+        f"{database_path.stem}.pre-v{plan['pre_schema_version']}-to-v"
+        f"{_SCHEMA_VERSION}.{stamp}.{fingerprint_suffix}.db"
+    )
+    staging_path = final_path.with_name(
+        f".{final_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        destination = sqlite3.connect(str(staging_path), isolation_level=None)
+        try:
+            destination.execute("PRAGMA journal_mode=DELETE")
+            destination.execute("PRAGMA synchronous=FULL")
+
+            def fail_on_lock(status: int, _remaining: int, _total: int) -> None:
+                if status in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    raise RuntimeError(
+                        "Pre-migration backup encountered an active SQLite writer"
+                    )
+
+            connection.backup(
+                destination,
+                pages=1024,
+                progress=fail_on_lock,
+                sleep=0.01,
+            )
+            journal_mode_row = destination.execute(
+                "PRAGMA journal_mode=DELETE"
+            ).fetchone()
+            journal_mode = (
+                str(journal_mode_row[0]).casefold() if journal_mode_row else ""
+            )
+            if journal_mode != "delete":
+                raise RuntimeError(
+                    "Pre-migration backup journal mode conversion failed: "
+                    f"expected delete, observed {journal_mode or '<empty>'}"
+                )
+            quick_check = destination.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or str(quick_check[0]).casefold() != "ok":
+                raise RuntimeError(
+                    "Pre-migration backup quick_check failed: "
+                    + (
+                        str(quick_check[0])
+                        if quick_check is not None
+                        else "missing"
+                    )
+                )
+            backup_state = inspect_schema_migration_connection(
+                destination,
+                staging_path,
+            )
+            if (
+                backup_state.get("user_version") != plan.get("pre_schema_version")
+                or backup_state.get("ledger")
+                != plan.get("pre_state", {}).get("ledger")
+                or backup_state.get("issues")
+                != plan.get("pre_state", {}).get("issues")
+            ):
+                raise RuntimeError(
+                    "Pre-migration backup does not match the previewed schema"
+                )
+        finally:
+            destination.close()
+        sidecars = [
+            Path(str(staging_path) + suffix)
+            for suffix in ("-wal", "-shm")
+            if Path(str(staging_path) + suffix).exists()
+        ]
+        if sidecars:
+            raise RuntimeError(
+                "Pre-migration backup is not standalone: "
+                + ", ".join(str(item) for item in sidecars)
+            )
+        return staging_path, _schema_migration_sha256(staging_path), final_path
+    except BaseException:
+        staging_path.unlink(missing_ok=True)
+        Path(str(staging_path) + "-wal").unlink(missing_ok=True)
+        Path(str(staging_path) + "-shm").unlink(missing_ok=True)
+        raise
+
+
+def _schema_migration_state_binding(state: dict) -> dict:
+    return {
+        "user_version": state.get("user_version"),
+        "ledger": state.get("ledger"),
+        "issues": state.get("issues"),
+    }
+
+
+def _schema_migration_wal_is_quiescent(identity: dict) -> bool:
+    return not bool(identity.get("exists")) or int(identity.get("size") or 0) == 0
+
+
+def _schema_migration_assert_prebackup_source(plan: dict, database_path: Path) -> None:
+    planned = plan.get("source_identity") or []
+    current = _schema_migration_physical_identity(database_path)
+    if (
+        len(planned) != 3
+        or planned[0] != current[0]
+        or not _schema_migration_wal_is_quiescent(planned[1])
+        or not _schema_migration_wal_is_quiescent(current[1])
+    ):
+        raise RuntimeError(
+            "Database changed after the locked schema migration preview"
+        )
+
+
+def _schema_migration_assert_checkpoint_source(
+    plan: dict,
+    database_path: Path,
+) -> None:
+    planned = plan.get("source_identity") or []
+    current = _schema_migration_physical_identity(database_path)
+    if len(planned) != 3 or planned[:2] != current[:2]:
+        raise RuntimeError(
+            "Database changed after the locked schema migration preview"
+        )
+
+
+def _schema_migration_pending_payload(
+    *,
+    plan: dict,
+    backup_path: Path,
+    backup_sha256: str,
+) -> dict:
+    plan_core = _schema_migration_plan_core(plan)
+    created_at = datetime.now(timezone.utc).isoformat()
+    receipt = {
+        "contract": _SCHEMA_MIGRATION_RECEIPT_CONTRACT,
+        "status": "pending",
+        "database_path": plan["database_path"],
+        "target_schema_version": _SCHEMA_VERSION,
+        "created_at": created_at,
+        "plan_fingerprint": plan["fingerprint"],
+        "plan": plan_core,
+        "steps": plan["steps"],
+        "source_binding": {
+            "database_path": plan["database_path"],
+            "source_identity": plan["source_identity"],
+            "pre_state": plan["pre_state"],
+        },
+        "pre": plan["pre_state"],
+        "backup": {
+            "path": str(backup_path),
+            "sha256": backup_sha256,
+            "quick_check": "ok",
+            "standalone": True,
+        },
+        "projection_rebuild_required": True,
+    }
+    receipt["receipt_fingerprint"] = _schema_migration_fingerprint(receipt)
+    return receipt
+
+
+def _schema_migration_completed_payload(pending: dict, post_state: dict) -> dict:
+    receipt = dict(pending)
+    receipt.pop("receipt_fingerprint", None)
+    receipt.update(
+        {
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "post": post_state,
+        }
+    )
+    receipt["receipt_fingerprint"] = _schema_migration_fingerprint(receipt)
+    return receipt
+
+
+def schema_migration_maintenance(
+    *,
+    apply: bool = False,
+    checkpoint_wal: bool = False,
+    confirmation: str = "",
+    confirm_no_writers: bool = False,
+    db_path: str | Path | None = None,
+) -> dict:
+    """Preview or execute the CLI-only controlled v4/v5 to v6 migration."""
+    initial_plan = preview_schema_migration(db_path)
+    if apply and checkpoint_wal:
+        raise RuntimeError(
+            "Schema migration --apply and --checkpoint-wal are mutually exclusive"
+        )
+    if not apply and not checkpoint_wal:
+        return initial_plan
+    if not confirm_no_writers:
+        raise RuntimeError(
+            "Schema migration maintenance requires --confirm-no-writers"
+        )
+    if not hmac.compare_digest(
+        str(confirmation),
+        str(initial_plan["fingerprint"]),
+    ):
+        raise RuntimeError(
+            "Schema migration fingerprint mismatch; run a new read-only preview"
+        )
+    if apply and not initial_plan["can_apply"]:
+        raise RuntimeError(
+            "Schema migration cannot apply: "
+            + ", ".join(initial_plan["issues"] or ["unsupported_source_state"])
+        )
+    if checkpoint_wal and not Path(initial_plan["database_path"]).is_file():
+        raise RuntimeError("Schema migration WAL checkpoint requires an existing database")
+
+    path = Path(initial_plan["database_path"])
+    maintenance_lock = FileLock(
+        str(path.parent / _SCHEMA_MIGRATION_LOCK_FILENAME),
+        timeout=0,
+    )
+    try:
+        maintenance_lock.acquire()
+    except FileLockTimeout as exc:
+        raise RuntimeError("Schema migration maintenance lock is busy") from exc
+
+    source = None
+    staging_path = None
+    backup_path = None
+    backup_sha256 = None
+    pending_receipt = None
+    pending_receipt_path = None
+    try:
+        plan = preview_schema_migration(path)
+        if not hmac.compare_digest(str(confirmation), str(plan["fingerprint"])):
+            raise RuntimeError(
+                "Schema migration fingerprint mismatch; run a new read-only preview"
+            )
+        if checkpoint_wal:
+            with _CONNECTIONS_LOCK:
+                if _CONNECTIONS:
+                    raise RuntimeError(
+                        "Schema migration WAL checkpoint requires all in-process "
+                        "database connections to be closed"
+                    )
+            source = sqlite3.connect(
+                f"{path.as_uri()}?mode=rw",
+                uri=True,
+                timeout=0,
+                isolation_level=None,
+            )
+            source.execute("PRAGMA busy_timeout=0")
+            source.execute("PRAGMA data_version").fetchone()
+            _schema_migration_assert_checkpoint_source(plan, path)
+            checkpoint_row = source.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if checkpoint_row is None or int(checkpoint_row[0] or 0) != 0:
+                busy = int(checkpoint_row[0] or 0) if checkpoint_row else -1
+                raise RuntimeError(
+                    "Schema migration WAL checkpoint was blocked by an active writer: "
+                    f"busy={busy}"
+                )
+            checkpoint_result = {
+                "busy": int(checkpoint_row[0] or 0),
+                "log_frames": int(checkpoint_row[1] or 0),
+                "checkpointed_frames": int(checkpoint_row[2] or 0),
+            }
+            source.close()
+            source = None
+            refreshed = preview_schema_migration(path)
+            return {
+                **refreshed,
+                "checkpoint_wal_applied": True,
+                "checkpoint_result": checkpoint_result,
+            }
+
+        if not plan["can_apply"]:
+            raise RuntimeError(
+                "Schema migration cannot apply: "
+                + ", ".join(plan["issues"] or ["unsupported_source_state"])
+            )
+        if plan["no_op"]:
+            pending_info = plan.get("pending_receipt")
+            if isinstance(pending_info, dict):
+                pending_receipt = pending_info.get("receipt")
+                if not isinstance(pending_receipt, dict):
+                    raise RuntimeError("Schema migration pending receipt is malformed")
+                completed_path, pending_path = _schema_migration_receipt_paths(path)
+                if Path(str(pending_info.get("path") or "")).resolve() != (
+                    pending_path.resolve()
+                ):
+                    raise RuntimeError("Schema migration pending receipt path mismatch")
+                completed = _schema_migration_completed_payload(
+                    pending_receipt,
+                    plan["pre_state"],
+                )
+                try:
+                    _schema_migration_atomic_json(completed_path, completed)
+                except (OSError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Schema migration is v6, but completed receipt publication failed"
+                    ) from exc
+                return {
+                    "contract": _SCHEMA_MIGRATION_RECEIPT_CONTRACT,
+                    "dry_run": False,
+                    "applied": False,
+                    "no_op": True,
+                    "plan_fingerprint": plan["fingerprint"],
+                    "migration_plan_fingerprint": completed["plan_fingerprint"],
+                    "backup": completed["backup"],
+                    "pre": completed["pre"],
+                    "post": completed["post"],
+                    "projection_rebuild_required": True,
+                    "receipt_path": str(completed_path),
+                    "pending_receipt_path": str(pending_path),
+                    "receipt_fingerprint": completed["receipt_fingerprint"],
+                }
+            return {
+                **plan,
+                "dry_run": False,
+                "post_state": plan["pre_state"],
+                "receipt_path": None,
+                "backup": None,
+            }
+
+        with _CONNECTIONS_LOCK:
+            if _CONNECTIONS:
+                raise RuntimeError(
+                    "Schema migration requires all in-process database connections "
+                    "to be closed"
+                )
+        source = sqlite3.connect(
+            f"{path.as_uri()}?mode=rw",
+            uri=True,
+            timeout=0,
+            isolation_level=None,
+        )
+        source.row_factory = sqlite3.Row
+        source.execute("PRAGMA busy_timeout=0")
+        source.execute("PRAGMA foreign_keys=ON")
+        source.execute("PRAGMA recursive_triggers=ON")
+        data_version_before = int(source.execute("PRAGMA data_version").fetchone()[0])
+        _schema_migration_assert_prebackup_source(plan, path)
+        staging_path, backup_sha256, backup_path = _schema_migration_backup(
+            source,
+            database_path=path,
+            plan=plan,
+        )
+
+        with _controlled_schema_v5_transaction(source, maintenance_lock):
+            data_version_after = int(source.execute("PRAGMA data_version").fetchone()[0])
+            if data_version_after != data_version_before:
+                raise RuntimeError(
+                    "Database changed while the pre-migration backup was created"
+                )
+            locked_state = inspect_schema_migration_connection(source, path)
+            if _schema_migration_state_binding(locked_state) != (
+                _schema_migration_state_binding(plan["pre_state"])
+            ):
+                raise RuntimeError(
+                    "Database schema changed before the exclusive migration transaction"
+                )
+            _schema_migration_promote_backup(staging_path, backup_path)
+            staging_path = None
+            _, pending_receipt_path = _schema_migration_receipt_paths(path)
+            pending_receipt = _schema_migration_pending_payload(
+                plan=plan,
+                backup_path=backup_path,
+                backup_sha256=str(backup_sha256),
+            )
+            try:
+                _schema_migration_atomic_json(
+                    pending_receipt_path,
+                    pending_receipt,
+                )
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    "Schema migration pending receipt publication failed before DDL"
+                ) from exc
+            current_version = int(plan["pre_schema_version"])
+            if current_version == 4:
+                _apply_controlled_schema_v5_migration(
+                    source,
+                    maintenance_lock=maintenance_lock,
+                )
+                current_version = 5
+            if current_version == 5:
+                _apply_controlled_schema_v6_migration(
+                    source,
+                    maintenance_lock=maintenance_lock,
+                )
+
+        source.execute("PRAGMA query_only=ON")
+        post_state = inspect_schema_migration_connection(source, path)
+        if not post_state.get("ready") or post_state.get("user_version") != _SCHEMA_VERSION:
+            raise RuntimeError(
+                "Schema migration committed but read-only v6 verification failed: "
+                + ", ".join(post_state.get("issues") or ["schema_not_ready"])
+            )
+        if pending_receipt is None or pending_receipt_path is None:
+            raise RuntimeError("Schema migration pending receipt was not published")
+        receipt = _schema_migration_completed_payload(pending_receipt, post_state)
+        receipt_path, expected_pending_path = _schema_migration_receipt_paths(path)
+        if pending_receipt_path.resolve() != expected_pending_path.resolve():
+            raise RuntimeError("Schema migration pending receipt path drifted")
+        try:
+            _schema_migration_atomic_json(receipt_path, receipt)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Schema migration committed and verified, but receipt publication failed"
+            ) from exc
+        _INITIALIZED_DB_PATHS.discard(str(path.resolve()))
+        return {
+            "contract": _SCHEMA_MIGRATION_RECEIPT_CONTRACT,
+            "dry_run": False,
+            "applied": True,
+            "no_op": False,
+            "plan_fingerprint": plan["fingerprint"],
+            "backup": receipt["backup"],
+            "pre": receipt["pre"],
+            "post": receipt["post"],
+            "projection_rebuild_required": True,
+            "receipt_path": str(receipt_path),
+            "pending_receipt_path": str(pending_receipt_path),
+            "receipt_fingerprint": receipt["receipt_fingerprint"],
+        }
+    finally:
+        if source is not None:
+            source.close()
+        if staging_path is not None:
+            staging_path.unlink(missing_ok=True)
+            Path(str(staging_path) + "-wal").unlink(missing_ok=True)
+            Path(str(staging_path) + "-shm").unlink(missing_ok=True)
+        maintenance_lock.release()
 
 
 def _validate_schema_migration_state(conn: sqlite3.Connection) -> int:
@@ -1454,19 +3160,71 @@ def _validate_canonical_identity_registry(conn: sqlite3.Connection) -> None:
         _validate_identity_registry_row(row)
 
 
+def _normalized_identity_page_sql(expression: str) -> str:
+    """Return the SQLite equivalent of simple identity-page normalization."""
+    trimmed = f"trim(CAST({expression} AS TEXT))"
+    return (
+        f"CASE WHEN lower(substr({trimmed}, -3)) = '.md' "
+        f"THEN substr({trimmed}, 1, length({trimmed}) - 3) "
+        f"ELSE {trimmed} END"
+    )
+
+
 def _validate_canonical_identity_coverage(conn: sqlite3.Connection) -> None:
-    """Stream canonical/history rows and require one matching durable owner."""
+    """Use SQLite to select anomalies, then diagnose only those rows in Python."""
     for (
         record_kind,
         current_table,
         version_table,
         id_field,
     ) in _CANONICAL_IDENTITY_SPECS:
+        payload_page = _normalized_identity_page_sql("parsed.payload_page")
+        owner_page = _normalized_identity_page_sql("parsed.owner_page_key")
+        version_page = _normalized_identity_page_sql("parsed.version_page_key")
+        embedded_id_path = f"$.{record_kind}_id"
         rows = conn.execute(
-            f"SELECT {id_field} AS record_id, data_json, NULL AS version_page_key "
-            f"FROM {current_table} UNION ALL "
-            f"SELECT {id_field} AS record_id, data_json, page_key AS version_page_key "
-            f"FROM {version_table}"
+            "WITH records AS ("
+            f"SELECT {id_field} AS record_id, data_json, "
+            f"NULL AS version_page_key FROM {current_table} UNION ALL "
+            f"SELECT {id_field} AS record_id, data_json, "
+            f"page_key AS version_page_key FROM {version_table}"
+            "), parsed AS ("
+            "SELECT records.*, owner.record_id AS owner_record_id, "
+            "owner.page_key AS owner_page_key, "
+            "CASE WHEN json_valid(records.data_json) = 1 "
+            "THEN json_type(records.data_json) END AS payload_type, "
+            "CASE WHEN json_valid(records.data_json) = 1 "
+            "THEN json_type(records.data_json, '$.locator') END AS locator_type, "
+            "CASE WHEN json_valid(records.data_json) = 1 "
+            "THEN json_type(records.data_json, '$.locator.page_key') "
+            "END AS page_type, "
+            "CASE WHEN json_valid(records.data_json) = 1 "
+            "THEN json_extract(records.data_json, '$.locator.page_key') "
+            "END AS payload_page, "
+            "CASE WHEN json_valid(records.data_json) = 1 "
+            f"THEN json_type(records.data_json, '{embedded_id_path}') "
+            "END AS embedded_type, "
+            "CASE WHEN json_valid(records.data_json) = 1 "
+            f"THEN json_extract(records.data_json, '{embedded_id_path}') "
+            "END AS embedded_id "
+            "FROM records LEFT JOIN canonical_identities AS owner "
+            "ON owner.record_kind = ? AND owner.record_id = records.record_id"
+            ") SELECT record_id, data_json, version_page_key, "
+            "owner_record_id, owner_page_key FROM parsed WHERE NOT ("
+            "trim(CAST(record_id AS TEXT)) <> '' "
+            "AND payload_type = 'object' AND locator_type = 'object' "
+            "AND page_type = 'text' "
+            f"AND {payload_page} <> '' "
+            "AND (embedded_type IS NULL OR embedded_type = 'null' OR ("
+            "embedded_type = 'text' AND ("
+            "trim(CAST(embedded_id AS TEXT)) = '' OR "
+            "trim(CAST(embedded_id AS TEXT)) = trim(CAST(record_id AS TEXT))"
+            "))) AND owner_record_id IS NOT NULL "
+            f"AND {owner_page} = {payload_page} "
+            "AND (version_page_key IS NULL "
+            f"OR {version_page} = {payload_page})"
+            ")",
+            (record_kind,),
         )
         for row in rows:
             record_id = str(row["record_id"] or "").strip()
@@ -1480,17 +3238,12 @@ def _validate_canonical_identity_coverage(conn: sqlite3.Connection) -> None:
                 record_id=record_id,
                 version_page_key=row["version_page_key"],
             )
-            identity = conn.execute(
-                "SELECT record_kind, record_id, page_key, identity_origin, data_json "
-                "FROM canonical_identities WHERE record_kind = ? AND record_id = ?",
-                (record_kind, record_id),
-            ).fetchone()
-            if identity is None:
+            if row["owner_record_id"] is None:
                 raise RuntimeError(
                     f"Schema v2 {record_kind}_id {record_id!r} "
                     "is missing an identity registry owner"
                 )
-            registered_page = _validate_identity_registry_row(identity)
+            registered_page = _normalized_identity_page(row["owner_page_key"])
             if registered_page != page_key:
                 raise RuntimeError(
                     f"Schema v2 {record_kind}_id {record_id!r} is owned by "
@@ -1543,37 +3296,51 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
             queued_at TEXT
         )
     """)
-    conn.execute("""
+    search_state_sql = """
         CREATE TABLE IF NOT EXISTS operational_memory_search_state (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            backfill_cursor INTEGER NOT NULL DEFAULT 0,
-            backfill_target INTEGER NOT NULL DEFAULT 0,
-            schema_version INTEGER NOT NULL DEFAULT 3,
+            backfill_cursor TEXT NOT NULL DEFAULT '',
+            backfill_target TEXT NOT NULL DEFAULT '',
+            schema_version INTEGER NOT NULL DEFAULT 4,
             updated_at TEXT
         )
-    """)
-    _add_column_if_missing(
-        conn,
-        "operational_memory_search_state",
-        "schema_version",
-        "INTEGER",
-    )
+    """
+    conn.execute(search_state_sql)
+    state_columns = {
+        str(row[1]): str(row[2] or "").strip().upper()
+        for row in conn.execute(
+            "PRAGMA table_info(operational_memory_search_state)"
+        )
+    }
+    if state_columns != {
+        "singleton": "INTEGER",
+        "backfill_cursor": "TEXT",
+        "backfill_target": "TEXT",
+        "schema_version": "INTEGER",
+        "updated_at": "TEXT",
+    }:
+        conn.execute("DELETE FROM operational_memory_search_fts")
+        conn.execute("DELETE FROM operational_memory_search_docs")
+        conn.execute("DELETE FROM operational_memory_search_pending")
+        conn.execute("DROP TABLE operational_memory_search_state")
+        conn.execute(search_state_sql)
     conn.execute(
         "INSERT OR IGNORE INTO operational_memory_search_state "
         "(singleton, backfill_cursor, backfill_target, schema_version, updated_at) "
-        "SELECT 1, 0, COALESCE(MAX(rowid), 0), 3, ? FROM operational_memory",
+        "SELECT 1, '', COALESCE(MAX(memory_id), ''), 4, ? FROM operational_memory",
         (datetime.now(timezone.utc).isoformat(),),
     )
     state = conn.execute(
         "SELECT schema_version FROM operational_memory_search_state WHERE singleton = 1"
     ).fetchone()
-    if state is not None and int(state[0] or 0) != 3:
+    if state is not None and int(state[0] or 0) != 4:
         conn.execute("DELETE FROM operational_memory_search_fts")
         conn.execute("DELETE FROM operational_memory_search_docs")
+        conn.execute("DELETE FROM operational_memory_search_pending")
         conn.execute(
-            "UPDATE operational_memory_search_state SET backfill_cursor = 0, "
-            "backfill_target = (SELECT COALESCE(MAX(rowid), 0) "
-            "FROM operational_memory), schema_version = 3, updated_at = ? "
+            "UPDATE operational_memory_search_state SET backfill_cursor = '', "
+            "backfill_target = (SELECT COALESCE(MAX(memory_id), '') "
+            "FROM operational_memory), schema_version = 4, updated_at = ? "
             "WHERE singleton = 1",
             (datetime.now(timezone.utc).isoformat(),),
         )
@@ -1637,13 +3404,30 @@ def _init_db_once(db_key: str):
         conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     with transaction():
+        observed_schema_version = int(
+            conn.execute("PRAGMA user_version").fetchone()[0] or 0
+        )
+        if observed_schema_version > _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {observed_schema_version} is newer than "
+                f"supported version {_SCHEMA_VERSION}"
+            )
+        if observed_schema_version < _SCHEMA_VERSION:
+            requires_controlled_upgrade = 0 < observed_schema_version < _SCHEMA_VERSION
+            if requires_controlled_upgrade:
+                raise RuntimeError(
+                    "Database schema upgrade required: "
+                    f"{observed_schema_version}->{_SCHEMA_VERSION}; generic "
+                    "init_db cannot run an existing-database migration. Use the "
+                    "controlled backup, fingerprint, exclusive-window, and receipt "
+                    "workflow."
+                )
         current_schema_version = _validate_schema_migration_state(conn)
         _assert_identity_schema_contract(conn)
         _assert_runtime_generation_schema_contract(conn)
         _assert_ingest_task_cleanup_schema_contract(conn)
-        if current_schema_version >= 2:
-            _validate_canonical_identity_registry(conn)
-            _validate_canonical_identity_coverage(conn)
+        _assert_duplicate_index_cleanup_v5_contract(conn)
+        _assert_change_set_history_schema_v6_contract(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (
                 entity_id TEXT PRIMARY KEY,
@@ -1652,12 +3436,18 @@ def _init_db_once(db_key: str):
                 updated_at TEXT
             )
         """)
-        conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
-                entity_id TEXT PRIMARY KEY,
-                embedding float[3072]
-            )
-        """)
+        vector_table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'vec_embeddings'"
+        ).fetchone()
+        if vector_table_exists is None:
+            _load_sqlite_vec_extension(conn)
+            conn.execute("""
+                CREATE VIRTUAL TABLE vec_embeddings USING vec0(
+                    entity_id TEXT PRIMARY KEY,
+                    embedding float[3072]
+                )
+            """)
         for col, col_type in [
             ("type", "TEXT"),
             ("status", "TEXT"),
@@ -1755,11 +3545,7 @@ def _init_db_once(db_key: str):
             "ON evidence_versions(evidence_family_id, version_no)"
         )
         if current_schema_version < 2:
-            for statement in _CANONICAL_IDENTITIES_SCHEMA_V2:
-                conn.execute(statement)
-            _backfill_canonical_identities(conn)
-            _validate_canonical_identity_registry(conn)
-            _validate_canonical_identity_coverage(conn)
+            _migrate_canonical_identity_schema_v2(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entity_identities (
                 entity_id TEXT PRIMARY KEY,
@@ -2112,24 +3898,7 @@ def _init_db_once(db_key: str):
                 (surface,),
             )
         if current_schema_version < 3:
-            for surface in sorted(_RUNTIME_GENERATION_SURFACES):
-                for operation_kind in ("insert", "update", "delete"):
-                    conn.execute(
-                        f"DROP TRIGGER IF EXISTS "
-                        f"trg_{surface}_generation_v1_{operation_kind}"
-                    )
-                    conn.execute(
-                        f"DROP TRIGGER IF EXISTS "
-                        f"{_runtime_generation_trigger_name(surface, operation_kind)}"
-                    )
-            for statement in _RUNTIME_GENERATION_TRIGGER_SCHEMA_V3:
-                conn.execute(statement)
-            issues = _runtime_generation_schema_issues(conn)
-            if issues:
-                raise RuntimeError(
-                    "Schema v3 runtime generation migration failed: "
-                    + ", ".join(issues)
-                )
+            _migrate_runtime_generation_schema_v3(conn)
 
         # Expression-index failures are migration failures and must roll back.
         conn.execute(
@@ -2159,11 +3928,22 @@ def _init_db_once(db_key: str):
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_key ON operational_memory (memory_type, json_extract(data_json, '$.memory_key'))"
         )
+        if current_schema_version < 5:
+            _migrate_duplicate_index_cleanup_v5(conn)
+        if current_schema_version < 6:
+            _migrate_change_set_history_schema_v6(conn)
         _record_schema_migrations(conn, current_schema_version)
-    _assert_runtime_generation_schema_contract(conn)
-    _assert_ingest_task_cleanup_schema_contract(conn)
+    if current_schema_version < 2:
+        _assert_identity_schema_contract(conn)
+        _assert_runtime_generation_schema_contract(conn)
+        _assert_ingest_task_cleanup_schema_contract(conn)
+        _assert_duplicate_index_cleanup_v5_contract(conn)
+        _assert_change_set_history_schema_v6_contract(conn)
+        with _IDENTITY_VALIDATION_LOCK:
+            _IDENTITY_VALIDATION_TOKENS[db_key] = _identity_validation_token(conn)
+    else:
+        _validate_cached_identity_state(conn)
     _INITIALIZED_DB_PATHS.add(db_key)
-    _IDENTITY_VALIDATION_TOKENS[id(conn)] = _identity_validation_token(conn)
 
 
 def upsert_search_index(node_key: str, title: str, summary: str, text: str):
@@ -2191,6 +3971,56 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
         )
 
 
+def apply_search_projection_mutations(
+    conn: sqlite3.Connection,
+    *,
+    upserts: list[tuple[str, str, str, str]] | tuple[tuple[str, str, str, str], ...] = (),
+    search_deletes: set[str] | list[str] | tuple[str, ...] = (),
+    embedding_deletes: set[str] | list[str] | tuple[str, ...] = (),
+    reset_search: bool = False,
+) -> None:
+    """Apply precomputed search mutations inside one caller-owned transaction."""
+    if not getattr(_LOCAL, "in_transaction", False) or not conn.in_transaction:
+        raise RuntimeError(
+            "Search projection mutations require an active caller-owned transaction"
+        )
+
+    normalized_upserts = [
+        (str(node_key), str(title), str(summary), str(text))
+        for node_key, title, summary, text in upserts
+    ]
+    delete_keys = {
+        str(node_key)
+        for node_key in search_deletes
+        if str(node_key)
+    }
+    delete_keys.update(row[0] for row in normalized_upserts)
+    stale_embedding_keys = {
+        str(node_key)
+        for node_key in embedding_deletes
+        if str(node_key)
+    }
+
+    if reset_search:
+        conn.execute("DELETE FROM wiki_search_index")
+    elif delete_keys:
+        conn.executemany(
+            "DELETE FROM wiki_search_index WHERE node_key = ?",
+            [(node_key,) for node_key in sorted(delete_keys)],
+        )
+    if normalized_upserts:
+        conn.executemany(
+            "INSERT INTO wiki_search_index (node_key, title, summary, text) "
+            "VALUES (?, ?, ?, ?)",
+            normalized_upserts,
+        )
+    if stale_embedding_keys:
+        conn.executemany(
+            "DELETE FROM vec_embeddings WHERE entity_id = ?",
+            [(node_key,) for node_key in sorted(stale_embedding_keys)],
+        )
+
+
 def upsert_embedding(entity_id: str, embedding: list[float]):
     if not embedding:
         return
@@ -2199,10 +4029,8 @@ def upsert_embedding(entity_id: str, embedding: list[float]):
     norm = math.sqrt(sum(x * x for x in embedding))
     if norm > 0:
         embedding = [x / norm for x in embedding]
-    conn = get_connection()
-    import sqlite_vec
-
-    query_blob = sqlite_vec.serialize_float32(embedding)
+    conn = get_vector_connection()
+    query_blob = serialize_float32_vector(embedding)
     with transaction():
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (entity_id,))
         conn.execute(
@@ -2212,7 +4040,7 @@ def upsert_embedding(entity_id: str, embedding: list[float]):
 
 
 def delete_embedding(entity_id: str):
-    conn = get_connection()
+    conn = get_vector_connection()
     with transaction():
         conn.execute(
             "DELETE FROM vec_embeddings WHERE entity_id = ?", (str(entity_id),)
@@ -2220,7 +4048,7 @@ def delete_embedding(entity_id: str):
 
 
 def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
-    conn = get_connection()
+    conn = get_vector_connection()
     valid = {str(item) for item in valid_entity_ids if item}
     rows = conn.execute("SELECT entity_id FROM vec_embeddings").fetchall()
     stale = [row["entity_id"] for row in rows if row["entity_id"] not in valid]
@@ -2235,7 +4063,7 @@ def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
 
 
 def count_embeddings() -> int:
-    conn = get_connection()
+    conn = get_vector_connection()
     return int(conn.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0])
 
 
@@ -2302,14 +4130,14 @@ def finish_embedding_run(
 
 
 def delete_search_index(node_key: str):
-    conn = get_connection()
+    conn = get_vector_connection()
     with transaction():
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
 
 
 def delete_node_cascade(node_key: str):
-    conn = get_connection()
+    conn = get_vector_connection()
     with transaction():
         rows = conn.execute(
             "SELECT entity_id, canonical_name, data_json FROM entities "
@@ -2664,6 +4492,19 @@ def claim_mutation_outbox(
         return [dict(row) for row in claimed]
 
 
+def mutation_outbox_has_claimable() -> bool:
+    """Return whether one outbox row is ready without claiming or mutating it."""
+    now = datetime.now(timezone.utc).isoformat()
+    row = get_connection().execute(
+        "SELECT 1 FROM mutation_outbox WHERE "
+        "((status = 'pending' AND COALESCE(available_at, created_at, '') <= ?) "
+        "OR (status = 'processing' AND COALESCE(lease_until, '') <= ?)) "
+        "LIMIT 1",
+        (now, now),
+    ).fetchone()
+    return row is not None
+
+
 def mutation_outbox_lease_is_current(
     outbox_id: int,
     lease_owner: str,
@@ -2851,13 +4692,15 @@ def fail_mutation_outbox(
         available_at = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
         updated = conn.execute(
             "UPDATE mutation_outbox SET status = ?, last_error = ?, available_at = ?, "
-            "lease_until = NULL, lease_owner = NULL, lease_token = NULL WHERE id = ? "
+            "completed_at = ?, lease_until = NULL, lease_owner = NULL, "
+            "lease_token = NULL WHERE id = ? "
             "AND status = 'processing' AND lease_owner = ? AND lease_token = ? "
             "AND lease_generation = ? AND COALESCE(lease_until, '') > ?",
             (
                 status,
                 str(error)[:4000],
                 available_at,
+                now if terminal else None,
                 outbox_id,
                 lease_owner,
                 lease_token,
@@ -3084,9 +4927,10 @@ def enqueue_job(
                     "WHERE task_type = 'ingest' "
                     "AND CASE WHEN json_valid(payload) "
                     "THEN json_extract(payload, '$.filepath') END = ? "
-                    "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
-                    "'subagent_processing') OR "
-                    "(status = 'failed' AND COALESCE(retries, 0) < 3))",
+                     "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
+                     "'subagent_processing') OR "
+                     "(status = 'failed' AND COALESCE(retries, 0) < 3)) "
+                     "ORDER BY job_id ASC",
                     (filepath,),
                 ).fetchall()
                 if superseded_rows:
@@ -3216,7 +5060,7 @@ def claim_pending_jobs(
             "AND COALESCE(available_at, created_at, '') <= ?) "
             "OR (status = 'dispatched' AND COALESCE(lease_until, '') <= ?))"
             + scope_sql
-            + " ORDER BY created_at ASC LIMIT ?",
+            + " ORDER BY created_at ASC, job_id ASC LIMIT ?",
             (now, now, *scope_params, max(1, int(limit))),
         ).fetchall()
         claimed: list[dict] = []
@@ -3262,7 +5106,7 @@ def get_pending_jobs(limit: int = 10) -> list[dict]:
         SELECT * FROM jobs 
         WHERE status = 'queued'
         OR (status = 'failed' AND COALESCE(retries, 0) < 3)
-        ORDER BY created_at ASC LIMIT ?
+        ORDER BY created_at ASC, job_id ASC LIMIT ?
     """,
         (limit,),
     )
@@ -3276,7 +5120,8 @@ def get_jobs_by_status(statuses: list[str], limit: int = 20) -> list[dict]:
     conn = get_connection()
     placeholders = ",".join("?" for _ in statuses)
     rows = conn.execute(
-        f"SELECT * FROM jobs WHERE status IN ({placeholders}) ORDER BY created_at ASC LIMIT ?",
+        f"SELECT * FROM jobs WHERE status IN ({placeholders}) "
+        "ORDER BY created_at ASC, job_id ASC LIMIT ?",
         [*statuses, max(1, int(limit))],
     ).fetchall()
     return [dict(row) for row in rows]
@@ -3645,7 +5490,7 @@ def claim_subagent_jobs(
             "(status = 'awaiting_subagent' OR "
             "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?))"
             + scope_sql
-            + " ORDER BY created_at ASC LIMIT ?",
+            + " ORDER BY created_at ASC, job_id ASC LIMIT ?",
             (now, *scope_params, max(1, int(limit))),
         ).fetchall()
         job_ids = [str(row["job_id"]) for row in rows]
@@ -4040,7 +5885,8 @@ def expire_stale_subagent_jobs(max_age_seconds: int = 86400) -> int:
     with transaction():
         rows = conn.execute(
             "SELECT job_id, task_packet_path FROM jobs "
-            "WHERE status = 'awaiting_subagent' AND updated_at < ?",
+            "WHERE status = 'awaiting_subagent' AND updated_at < ? "
+            "ORDER BY job_id ASC",
             (cutoff,),
         ).fetchall()
         for row in rows:

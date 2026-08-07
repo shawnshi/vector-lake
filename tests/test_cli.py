@@ -1,7 +1,47 @@
 import unittest
+import threading
 from unittest.mock import patch
 
 from vector_lake import cli_app
+
+
+def test_cli_heavy_task_busy_returns_temporary_failure(
+    isolated_memory,
+    monkeypatch,
+    capsys,
+):
+    from vector_lake.heavy_task_gate import heavy_task
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_gate():
+        with heavy_task(
+            "maintenance",
+            "external-holder",
+            origin="pytest",
+            wait_timeout_seconds=0,
+        ):
+            acquired.set()
+            release.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_gate, name="cli-gate-holder")
+    holder.start()
+    assert acquired.wait(timeout=2)
+    monkeypatch.setenv("VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS", "0.05")
+    try:
+        with (
+            patch("sys.argv", ["cli.py", "doctor"]),
+            patch.object(cli_app.tools, "doctor_vector_lake") as doctor,
+        ):
+            assert cli_app.main() == 75
+        doctor.assert_not_called()
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert '"error": "heavy_task_busy"' in capsys.readouterr().err
 
 class TestCLI(unittest.TestCase):
     @patch('vector_lake.tools.doctor_vector_lake')

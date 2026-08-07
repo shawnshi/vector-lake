@@ -133,7 +133,7 @@ def test_assemble_context_reads_at_most_fifty_summary_nodes(
     monkeypatch.setattr(tool_search, "get_index_path", lambda: index_path)
     monkeypatch.setattr(
         tool_search,
-        "get_cached_index_snapshot",
+        "_load_search_index",
         lambda _path: {"nodes": nodes},
     )
     monkeypatch.setattr(tool_search, "search_vector_lake", lambda *_args, **_kwargs: "")
@@ -153,6 +153,82 @@ def test_assemble_context_reads_at_most_fifty_summary_nodes(
     assert nodes.yielded == 50
     assert context["index_summary"].count("\n") == 49
     assert "[concept] Concept 49" in context["index_summary"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    (
+        "missing_sidecar",
+        "tampered_digest",
+        "projection_generation",
+        "blocking_generation",
+    ),
+)
+def test_assemble_context_fails_closed_when_projection_changes_after_search(
+    isolated_memory,
+    monkeypatch,
+    damage,
+):
+    import json
+
+    from vector_lake import db_store, governance_store, indexer
+    from vector_lake.wiki_utils import (
+        get_index_path,
+        get_projection_manifest_path,
+    )
+
+    db_store.init_db()
+    governance_store.upsert_entity(
+        "entity_context_seed",
+        {
+            "entity_id": "entity_context_seed",
+            "canonical_name": "Context Seed",
+            "entity_type": "concept",
+            "page_key": "Concept_Context-Seed",
+        },
+    )
+    indexer.generate_index()
+    monkeypatch.setattr(
+        tool_search,
+        "build_memory_packet",
+        lambda *_args, **_kwargs: {
+            "packet": "",
+            "memory_count": 0,
+            "warning_count": 0,
+            "omitted_count": 0,
+        },
+    )
+
+    def damage_after_search(*_args, **_kwargs):
+        if damage == "missing_sidecar":
+            get_projection_manifest_path().unlink()
+        elif damage == "tampered_digest":
+            index_path = get_index_path()
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            payload["schema_version"] = "tampered"
+            index_path.write_text(json.dumps(payload), encoding="utf-8")
+        elif damage == "projection_generation":
+            indexer.generate_index()
+        else:
+            governance_store.upsert_entity(
+                "entity_context_generation_drift",
+                {
+                    "entity_id": "entity_context_generation_drift",
+                    "canonical_name": "Context Generation Drift",
+                    "entity_type": "concept",
+                    "page_key": "Concept_Context-Generation-Drift",
+                },
+            )
+        return ""
+
+    monkeypatch.setattr(
+        tool_search,
+        "search_vector_lake",
+        damage_after_search,
+    )
+
+    with pytest.raises(tool_search.SearchIndexError, match="changed during context"):
+        tool_search.assemble_context("seed", max_chars=12_000)
 
 
 def test_graph_expansion_applies_same_eligibility_gate(

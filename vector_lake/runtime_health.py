@@ -121,9 +121,19 @@ def _open_runtime_database_read_only():
     db_path = peek_db_path().resolve()
     if not db_path.is_file():
         raise RuntimeDatabaseBlocked(f"database_missing:{db_path}")
+    wal_path = Path(str(db_path) + "-wal")
+    try:
+        wal_size = wal_path.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    uri = f"{db_path.as_uri()}?mode=ro"
+    if wal_size == 0:
+        # A checkpointed database can be inspected without asking SQLite to
+        # create WAL/SHM sidecars in a protected canonical directory.
+        uri += "&immutable=1"
     try:
         conn = sqlite3.connect(
-            f"{db_path.as_uri()}?mode=ro",
+            uri,
             uri=True,
             timeout=5.0,
         )
@@ -131,6 +141,7 @@ def _open_runtime_database_read_only():
         raise RuntimeDatabaseBlocked(f"database_read_only_open_failed:{exc}") from exc
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA query_only=ON")
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
@@ -635,7 +646,32 @@ def assess_runtime_health(
     index_available = index_path.exists()
     index_data: dict[str, Any] = {"nodes": {}}
     if index_path.exists():
-        index_data, index_error = _index_snapshot(index_path)
+        from vector_lake.indexer import (
+            ProjectionPairContractError,
+            read_committed_index_snapshot,
+        )
+
+        try:
+            index_data = read_committed_index_snapshot(
+                index_path,
+                lock_timeout=1.0,
+                connection=conn,
+                _acquire_lock=False,
+            )
+            index_error = None
+            detail["projection_pair"] = "committed_current"
+        except Exception as exc:
+            detail["projection_pair"] = "invalid"
+            detail["projection_pair_error"] = str(exc)
+            issue_kind = (
+                "contract"
+                if isinstance(exc, ProjectionPairContractError)
+                else "unavailable"
+            )
+            issues.append(f"projection_pair_invalid:{issue_kind}:{exc}")
+            # Diagnostics still inspect the raw artifact so drift detail remains
+            # useful; operational consumers never use this low-level fallback.
+            index_data, index_error = _index_snapshot(index_path)
         if index_error is None:
             index_keys = {
                 key for key in index_data.get("nodes", {})
@@ -646,6 +682,7 @@ def assess_runtime_health(
             issues.append(f"index_unreadable:{index_error}")
     else:
         index_keys = set()
+        detail["projection_pair"] = "missing"
         warnings.append("index_missing")
 
     drift = {
@@ -795,7 +832,7 @@ def assess_runtime_health(
             warnings.append(f"projection_reconciliation_pending:{len(managed_reconciliation_drift)}")
 
         try:
-            claim_graph_drift = claim_graph_projection_parity()
+            claim_graph_drift = claim_graph_projection_parity(connection=conn)
             detail["claim_graph_projection_drift"] = claim_graph_drift
             if any(
                 claim_graph_drift[key]
@@ -821,7 +858,7 @@ def assess_runtime_health(
     if deep_projection_checks or strict_timeline_parity:
         from vector_lake.tool_timeline import timeline_projection_parity
 
-        timeline_drift = timeline_projection_parity()
+        timeline_drift = timeline_projection_parity(connection=conn)
         detail["timeline_projection_drift"] = timeline_drift
         if timeline_drift["missing"] or timeline_drift["extra"]:
             message = (

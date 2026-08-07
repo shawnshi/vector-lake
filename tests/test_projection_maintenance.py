@@ -413,7 +413,11 @@ def test_maintenance_backup_copies_one_projection_generation(isolated_memory):
     )
     assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is True
     assert manifest["complete"] is True
-    assert {"index.json", "claim_graph.json"} <= set(manifest["copied"])
+    assert {
+        "index.json",
+        "claim_graph.json",
+        "projection_pair_manifest.json",
+    } <= set(manifest["copied"])
     assert set(manifest["artifact_sha256"]) == set(manifest["copied"])
     for name, expected_hash in manifest["artifact_sha256"].items():
         assert hashlib.sha256((backup_dir / name).read_bytes()).hexdigest() == (
@@ -452,7 +456,11 @@ def test_projection_backup_releases_source_payloads_before_copy_validation(
         tool_projection._copy_projection_pair_to_backup(backup_dir)
     )
 
-    assert set(copied) == {"index.json", "claim_graph.json"}
+    assert set(copied) == {
+        "index.json",
+        "claim_graph.json",
+        "projection_pair_manifest.json",
+    }
     assert generation
     assert canonical_binding["status"] == "verified"
     assert peak_live_roots <= 2
@@ -701,7 +709,7 @@ def test_custom_database_path_backup_uses_stable_name_and_is_retention_eligible(
     assert retention["ignored"] == []
 
 
-def test_maintenance_backup_detects_stale_governance_metrics(
+def test_maintenance_backup_ignores_soft_governance_generation_drift(
     isolated_memory,
 ):
     db_store.init_db()
@@ -718,15 +726,15 @@ def test_maintenance_backup_detects_stale_governance_metrics(
     manifest = json.loads((backup_dir / "manifest.json").read_text(encoding="utf-8"))
     consistency = manifest["canonical_projection_consistency"]
 
-    assert consistency["status"] == "unverifiable"
-    assert consistency["reason"] == (
-        "backup-and-projection-runtime-generations-do-not-match"
+    assert consistency["status"] == "verified"
+    assert consistency["reason"] == "runtime-generations-match"
+    assert consistency["covered_surfaces"] == list(
+        indexer.CANONICAL_PROJECTION_SURFACES
     )
-    assert (
-        consistency["database_runtime_generations"]["governance_queue"]
-        > (consistency["projection_runtime_generations"]["governance_queue"])
-    )
-    assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is False
+    assert "governance_queue" not in consistency[
+        "projection_runtime_generations"
+    ]
+    assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is True
 
 
 def test_maintenance_backup_compares_projection_to_copied_database_snapshot(
@@ -866,6 +874,70 @@ def test_maintenance_backup_rejects_half_published_pair_without_partial_backup(
     ):
         create_maintenance_backup("half_published")
 
+    assert _backup_entries() == []
+
+
+def test_maintenance_backup_synthesizes_missing_sidecar_only_inside_backup(
+    isolated_memory,
+):
+    from vector_lake.wiki_utils import get_projection_manifest_path
+
+    db_store.init_db()
+    indexer.generate_index()
+    sidecar_path = get_projection_manifest_path()
+    sidecar_path.unlink()
+
+    backup = Path(create_maintenance_backup("missing_sidecar"))
+
+    assert sidecar_path.exists() is False
+    copied_sidecar = json.loads(
+        (backup / sidecar_path.name).read_text(encoding="utf-8")
+    )
+    indexer._validate_projection_sidecar(copied_sidecar)
+
+
+def test_maintenance_backup_rejects_hard_stale_pair_when_sidecar_is_missing(
+    isolated_memory,
+):
+    from vector_lake import governance_store
+    from vector_lake.wiki_utils import get_projection_manifest_path
+
+    db_store.init_db()
+    indexer.generate_index()
+    get_projection_manifest_path().unlink()
+    governance_store.upsert_entity(
+        "entity_backup_stale_pair",
+        {
+            "entity_id": "entity_backup_stale_pair",
+            "canonical_name": "Backup Stale Pair",
+            "entity_type": "concept",
+            "page_key": "Concept_Backup-Stale-Pair",
+        },
+    )
+
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="binding is stale",
+    ):
+        create_maintenance_backup("missing_stale_sidecar")
+    assert _backup_entries() == []
+
+
+def test_maintenance_backup_rejects_tampered_sidecar(
+    isolated_memory,
+):
+    from vector_lake.wiki_utils import get_index_path
+
+    db_store.init_db()
+    indexer.generate_index()
+    index_payload = json.loads(get_index_path().read_text(encoding="utf-8"))
+    index_payload["nodes"]["Concept_Tampered"] = {"title": "Tampered"}
+    get_index_path().write_text(json.dumps(index_payload), encoding="utf-8")
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="sidecar digest does not match index.json",
+    ):
+        create_maintenance_backup("tampered_sidecar")
     assert _backup_entries() == []
 
 

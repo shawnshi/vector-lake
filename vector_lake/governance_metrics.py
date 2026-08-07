@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 
-from vector_lake import governance_store
+from vector_lake import db_store, governance_store
 from vector_lake.merge_analysis import (
     analyze_entities,
     build_wiki_backlink_index,
@@ -51,16 +51,24 @@ def claim_governance_version(claim: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def infer_claim_validity(claim: dict, now=None) -> dict:
+def _infer_claim_validity_components(
+    *,
+    valid_to_value,
+    review_after_value,
+    freshness_tier_value,
+    confidence_value,
+    status_value,
+    evidence_count: int,
+    source_count: int,
+    contradiction_count: int,
+    now,
+) -> dict:
     now = now or _utc_now()
-    valid_to = _parse_dt(claim.get("valid_to"))
-    review_after = _parse_dt(claim.get("review_after"))
-    freshness_tier = str(claim.get("freshness_tier", "unknown")).lower()
-    confidence = float(claim.get("confidence", 0) or 0)
-    status = str(claim.get("status", "Active")).lower()
-    evidence_count = len(claim.get("evidence_ids", []))
-    source_count = len(claim.get("source_ids", []))
-    contradictions = len(claim.get("contradicts", []))
+    valid_to = _parse_dt(valid_to_value)
+    review_after = _parse_dt(review_after_value)
+    freshness_tier = str(freshness_tier_value or "unknown").lower()
+    confidence = float(confidence_value or 0)
+    status = str(status_value or "Active").lower()
     reasons = []
 
     if status in {"deprecated", "archived", "inactive"}:
@@ -69,7 +77,7 @@ def infer_claim_validity(claim: dict, now=None) -> dict:
     if valid_to and valid_to < now:
         reasons.append("valid_to")
         return {"validity_state": "expired", "reasons": reasons}
-    if contradictions:
+    if contradiction_count:
         reasons.append("conflicts")
         return {"validity_state": "conflicted", "reasons": reasons}
     if evidence_count == 0:
@@ -91,6 +99,20 @@ def infer_claim_validity(claim: dict, now=None) -> dict:
         reasons.append("confidence")
         return {"validity_state": "provisional", "reasons": reasons}
     return {"validity_state": "active", "reasons": reasons}
+
+
+def infer_claim_validity(claim: dict, now=None) -> dict:
+    return _infer_claim_validity_components(
+        valid_to_value=claim.get("valid_to"),
+        review_after_value=claim.get("review_after"),
+        freshness_tier_value=claim.get("freshness_tier", "unknown"),
+        confidence_value=claim.get("confidence", 0),
+        status_value=claim.get("status", "Active"),
+        evidence_count=len(claim.get("evidence_ids", [])),
+        source_count=len(claim.get("source_ids", [])),
+        contradiction_count=len(claim.get("contradicts", [])),
+        now=now,
+    )
 
 
 def annotate_claim_validity(claim: dict, now=None) -> dict:
@@ -239,10 +261,67 @@ def find_merge_candidates(
     )["suggestions"]
 
 
-def compute_debt_metrics(skip_heavy: bool = False) -> dict:
-    """Compute governance counts without materializing the whole canonical graph."""
-    governance_store.initialize_meta_store()
-    conn = governance_store.get_connection()
+def compute_debt_metrics(
+    skip_heavy: bool = False,
+    *,
+    read_only: bool = False,
+) -> dict:
+    """Compute governance counts without materializing the canonical graph.
+
+    Read-only audits bypass schema initialization and use a URI read-only
+    handle. Mutation-capable callers retain the existing initialization path.
+    """
+    if read_only and not skip_heavy:
+        raise ValueError("read_only debt metrics require skip_heavy=True")
+    if not read_only:
+        governance_store.initialize_meta_store()
+        return _compute_debt_metrics_with_connection(
+            governance_store.get_connection(),
+            skip_heavy=skip_heavy,
+        )
+
+    path = db_store.peek_db_path().resolve()
+    if not path.is_file():
+        return _empty_debt_metrics()
+    with db_store.checkpointed_read_only_snapshot(path) as conn:
+        return _compute_debt_metrics_with_connection(
+            conn,
+            skip_heavy=skip_heavy,
+        )
+
+
+def _empty_debt_metrics() -> dict:
+    """Return the stable zero shape for a genuinely absent read-only store."""
+    return {
+        "stale_claim_count": 0,
+        "expired_claim_count": 0,
+        "review_due_claim_count": 0,
+        "unsupported_claim_count": 0,
+        "managed_unsupported_claim_count": 0,
+        "unmanaged_unsupported_claim_count": 0,
+        "conflicted_claim_count": 0,
+        "provisional_claim_count": 0,
+        "pending_change_set_count": 0,
+        "merge_candidate_count": 0,
+        "orphan_source_count": 0,
+        "high_centrality_low_confidence_count": 0,
+        "pending_governance_item_count": 0,
+        "acknowledged_missing_link_target_count": 0,
+        "managed_missing_link_target_count": 0,
+        "unmanaged_missing_link_target_count": 0,
+        "operational_memory_count": 0,
+        "superseded_memory_count": 0,
+        "conflicted_memory_count": 0,
+        "memory_type_counts": {},
+        "validity_state_counts": {},
+    }
+
+
+def _compute_debt_metrics_with_connection(
+    conn,
+    *,
+    skip_heavy: bool,
+) -> dict:
     now = _utc_now()
     validity_state_counts = {}
     unsupported_claim_count = 0
@@ -253,7 +332,7 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
     review_due_claim_count = 0
     provisional_claim_count = 0
     high_centrality_low_confidence = 0
-    source_ids_with_claims = set()
+    unsupported_claim_ids = set()
     claim_count = 0
 
     managed_claim_items = {}
@@ -266,26 +345,41 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         item = json.loads(row["data_json"])
         managed_claim_items[str(item.get("claim_id") or "")] = item
 
-    for row in conn.execute("SELECT data_json FROM claims"):
-        raw_claim = json.loads(row["data_json"])
-        claim_version = claim_governance_version(raw_claim)
+    for row in conn.execute(
+        "SELECT claim_id, "
+        "COALESCE(json_extract(data_json, '$.status'), status, 'Active') AS status, "
+        "json_extract(data_json, '$.valid_to') AS valid_to, "
+        "json_extract(data_json, '$.review_after') AS review_after, "
+        "COALESCE(json_extract(data_json, '$.freshness_tier'), 'unknown') "
+        "AS freshness_tier, "
+        "COALESCE(CAST(json_extract(data_json, '$.confidence') AS REAL), 0) "
+        "AS confidence, "
+        "COALESCE(json_array_length(data_json, '$.evidence_ids'), 0) "
+        "AS evidence_count, "
+        "COALESCE(json_array_length(data_json, '$.source_ids'), 0) "
+        "AS source_count, "
+        "COALESCE(json_array_length(data_json, '$.contradicts'), 0) "
+        "AS contradiction_count, "
+        "COALESCE(json_array_length(data_json, '$.subject_entity_ids'), 0) "
+        "AS subject_count FROM claims"
+    ):
         claim_count += 1
-        source_ids_with_claims.update(str(item) for item in raw_claim.get("source_ids", []))
-        claim = annotate_claim_validity(raw_claim, now=now)
-        state = claim.get("validity_state", "active")
+        validity = _infer_claim_validity_components(
+            valid_to_value=row["valid_to"],
+            review_after_value=row["review_after"],
+            freshness_tier_value=row["freshness_tier"],
+            confidence_value=row["confidence"],
+            status_value=row["status"],
+            evidence_count=int(row["evidence_count"] or 0),
+            source_count=int(row["source_count"] or 0),
+            contradiction_count=int(row["contradiction_count"] or 0),
+            now=now,
+        )
+        state = validity["validity_state"]
         validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
         if state == "unsupported":
             unsupported_claim_count += 1
-            managed_item = managed_claim_items.get(str(claim.get("claim_id") or ""))
-            due_at = _parse_dt((managed_item or {}).get("due_at"))
-            if (
-                managed_item
-                and str(managed_item.get("owner") or "").strip()
-                and due_at is not None
-                and due_at >= now
-                and str(managed_item.get("claim_version") or "") == claim_version
-            ):
-                managed_unsupported_claim_count += 1
+            unsupported_claim_ids.add(str(row["claim_id"] or ""))
         if state == "conflicted":
             conflicted_claim_count += 1
         if state in {"review-due", "needs-review", "expiring-soon"}:
@@ -296,22 +390,44 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
             review_due_claim_count += 1
         if state == "provisional":
             provisional_claim_count += 1
-        if float(claim.get("confidence", 0)) < 0.5 and len(claim.get("subject_entity_ids", [])) > 0:
+        if float(row["confidence"] or 0) < 0.5 and int(row["subject_count"] or 0) > 0:
             high_centrality_low_confidence += 1
 
-    # Evidence is a first-class source reference. Counting only claim.source_ids
-    # falsely labels sources as orphaned when the claim reaches them through an
-    # Evidence record.
-    for row in conn.execute("SELECT data_json FROM evidence"):
-        evidence = json.loads(row["data_json"])
-        source_id = str(evidence.get("source_id") or "").strip()
-        if source_id:
-            source_ids_with_claims.add(source_id)
+    managed_ids = sorted(set(managed_claim_items).intersection(unsupported_claim_ids))
+    for offset in range(0, len(managed_ids), 500):
+        batch = managed_ids[offset:offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            "SELECT claim_id, data_json FROM claims "
+            f"WHERE claim_id IN ({placeholders})",
+            tuple(batch),
+        ):
+            managed_item = managed_claim_items[str(row["claim_id"])]
+            due_at = _parse_dt(managed_item.get("due_at"))
+            if (
+                str(managed_item.get("owner") or "").strip()
+                and due_at is not None
+                and due_at >= now
+                and str(managed_item.get("claim_version") or "")
+                == claim_governance_version(json.loads(row["data_json"]))
+            ):
+                managed_unsupported_claim_count += 1
 
-    orphan_source_count = sum(
-        1
-        for row in conn.execute("SELECT source_id FROM sources")
-        if str(row["source_id"]) not in source_ids_with_claims
+    # Evidence is a first-class source reference. Build the distinct reference
+    # set inside SQLite so Python never retains all source IDs.
+    orphan_source_count = int(
+        conn.execute(
+            "WITH referenced_sources(source_id) AS ("
+            "SELECT DISTINCT CAST(value AS TEXT) FROM claims, "
+            "json_each(claims.data_json, '$.source_ids') "
+            "WHERE trim(CAST(value AS TEXT)) <> '' UNION "
+            "SELECT DISTINCT CAST(json_extract(data_json, '$.source_id') AS TEXT) "
+            "FROM evidence WHERE trim(COALESCE(CAST("
+            "json_extract(data_json, '$.source_id') AS TEXT), '')) <> ''"
+            ") SELECT COUNT(*) FROM sources LEFT JOIN referenced_sources "
+            "ON referenced_sources.source_id = sources.source_id "
+            "WHERE referenced_sources.source_id IS NULL"
+        ).fetchone()[0]
     )
     pending_governance_item_count = int(
         conn.execute(

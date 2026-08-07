@@ -178,7 +178,7 @@
         const COMMUNITY_COLORS = ['#e6194b', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#d946ef', '#06b6d4', '#f43f5e', '#14b8a6', '#84cc16'];
 
         const graphs = {
-            page: rawData.pageGraph || { nodes: rawData.nodes || [], edges: rawData.edges || [], community_labels: rawData.community_labels || {} },
+            page: rawData.pageGraph || { nodes: [], edges: [], community_labels: {} },
             claim: rawData.claimGraph || { nodes: [], edges: [], community_labels: {} }
         };
         let activeGraphKey = 'page';

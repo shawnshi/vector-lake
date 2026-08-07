@@ -505,6 +505,11 @@ def get_claim_graph_path() -> Path:
     return get_wiki_dir() / "claim_graph.json"
 
 
+def get_projection_manifest_path() -> Path:
+    """Return the fixed commit-marker path for the projection pair."""
+    return get_wiki_dir() / "projection_pair_manifest.json"
+
+
 def get_legacy_claim_graph_path() -> Path:
     return get_wiki_dir() / "claim_topology.json"
 

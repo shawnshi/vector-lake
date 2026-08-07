@@ -15,11 +15,23 @@ from vector_lake.wiki_utils import (
     iter_markdown_files,
     peek_meta_dir,
 )
-from vector_lake.db_store import inspect_schema_migration_state, peek_db_path
+from vector_lake.db_store import (
+    checkpointed_read_only_snapshot,
+    inspect_schema_migration_state,
+    peek_db_path,
+)
 from vector_lake import get_extension_root
 from vector_lake.native_llm import native_llm_ready
-from vector_lake.runtime_health import assess_runtime_health, assess_semantic_readiness
-from vector_lake.tokenizer_runtime import load_tokenizer
+from vector_lake.runtime_health import (
+    _open_runtime_database_read_only,
+    assess_runtime_health,
+    assess_semantic_readiness,
+)
+
+
+def _dependency_available(module_name: str) -> bool:
+    """Check installation without executing dependency import side effects."""
+    return importlib.util.find_spec(module_name) is not None
 
 def _check_ast(module_path: Path) -> tuple[bool, str]:
     if not module_path.exists():
@@ -35,50 +47,84 @@ def _check_ast(module_path: Path) -> tuple[bool, str]:
 
 
 
+def _read_database_state_from_connection(conn: sqlite3.Connection) -> dict:
+    """Read Doctor counters from a caller-owned query-only connection."""
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    canonical_keys = {
+        row["page_key"]
+        for row in conn.execute(
+            "SELECT json_extract(data_json, '$.page_key') AS page_key "
+            "FROM entities WHERE json_extract(data_json, '$.page_key') "
+            "IS NOT NULL"
+        )
+        if not str(row["page_key"]).startswith("System_")
+    }
+    outbox_counts = {
+        row["status"]: row["count"]
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS count FROM mutation_outbox "
+            "GROUP BY status"
+        )
+    }
+    terminal_jobs = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
+    ).fetchone()[0]
+    queued_jobs = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'queued'"
+    ).fetchone()[0]
+    awaiting_jobs = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'"
+    ).fetchone()[0]
+    return {
+        "canonical_keys": canonical_keys,
+        "outbox_counts": outbox_counts,
+        "terminal_jobs": terminal_jobs,
+        "queued_jobs": queued_jobs,
+        "awaiting_jobs": awaiting_jobs,
+    }
+
+
 def _read_database_state(db_path: Path) -> dict:
     """Read Doctor counters without creating, migrating, or retaining a connection."""
+    resolved = db_path.resolve()
+    wal_path = Path(str(resolved) + "-wal")
+    try:
+        wal_size = wal_path.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    if wal_size == 0:
+        with checkpointed_read_only_snapshot(resolved) as conn:
+            return _read_database_state_from_connection(conn)
+
     conn = sqlite3.connect(
-        f"{db_path.resolve().as_uri()}?mode=ro",
+        f"{resolved.as_uri()}?mode=ro",
         uri=True,
         timeout=5.0,
     )
-    conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA query_only=ON")
-        canonical_keys = {
-            row["page_key"]
-            for row in conn.execute(
-                "SELECT json_extract(data_json, '$.page_key') AS page_key "
-                "FROM entities WHERE json_extract(data_json, '$.page_key') "
-                "IS NOT NULL"
-            )
-            if not str(row["page_key"]).startswith("System_")
-        }
-        outbox_counts = {
-            row["status"]: row["count"]
-            for row in conn.execute(
-                "SELECT status, COUNT(*) AS count FROM mutation_outbox "
-                "GROUP BY status"
-            )
-        }
-        terminal_jobs = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
-        ).fetchone()[0]
-        queued_jobs = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'queued'"
-        ).fetchone()[0]
-        awaiting_jobs = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'"
-        ).fetchone()[0]
-        return {
-            "canonical_keys": canonical_keys,
-            "outbox_counts": outbox_counts,
-            "terminal_jobs": terminal_jobs,
-            "queued_jobs": queued_jobs,
-            "awaiting_jobs": awaiting_jobs,
-        }
+        return _read_database_state_from_connection(conn)
     finally:
         conn.close()
+
+
+def _schema_readiness_reasons(schema_state: dict) -> list[str]:
+    """Explain a non-ready schema even when a valid older ledger is migratable."""
+    reasons = [str(item) for item in (schema_state.get("issues") or []) if item]
+    user_version = schema_state.get("user_version")
+    supported_version = schema_state.get("supported_version")
+    if user_version is not None and supported_version is not None:
+        current = int(user_version)
+        supported = int(supported_version)
+        if current < supported:
+            reasons.append(f"database_schema_upgrade_required:{current}->{supported}")
+        elif current > supported:
+            reasons.append(f"database_schema_newer_than_runtime:{current}>{supported}")
+    if not schema_state.get("ready") and not reasons:
+        reasons.append(f"database_schema_not_ready:{schema_state.get('status', 'unknown')}")
+    return list(dict.fromkeys(reasons))
+
+
 def doctor_vector_lake() -> str:
     checks = []
     semantic_readiness = {
@@ -120,14 +166,11 @@ def doctor_vector_lake() -> str:
     }
     for module_name, package_name in dependencies.items():
         try:
-            if module_name == "rjieba":
-                load_tokenizer()
-            elif module_name == "google.genai":
-                if importlib.util.find_spec(module_name) is None:
-                    raise ImportError(module_name)
-            else:
-                importlib.import_module(module_name)
-            checks.append((package_name, True, "installed"))
+            if not _dependency_available(module_name):
+                raise ImportError(module_name)
+            checks.append(
+                (package_name, True, "discoverable; runtime import deferred")
+            )
         except ImportError:
             checks.append((package_name, False, "missing"))
             
@@ -138,6 +181,7 @@ def doctor_vector_lake() -> str:
     meta_path = peek_meta_dir()
     db_path = peek_db_path()
     schema_state = inspect_schema_migration_state(db_path)
+    schema_reasons = _schema_readiness_reasons(schema_state)
     for label, path in [("MEMORY", get_memory_dir()), ("Raw", get_raw_dir()), ("Wiki", get_wiki_dir())]:
         checks.append((label, path.exists(), str(path)))
 
@@ -150,13 +194,46 @@ def doctor_vector_lake() -> str:
         f"supported={schema_state['supported_version']}; "
         f"ledger_entries={len(schema_state['ledger'])}"
     )
-    if schema_state["issues"]:
-        migration_detail += "; " + "; ".join(schema_state["issues"])
+    if schema_reasons:
+        migration_detail += "; " + "; ".join(schema_reasons)
     checks.append((
         "Schema Migrations",
         bool(schema_state["ready"]),
         migration_detail,
     ))
+
+    committed_index_data = None
+    projection_connection = None
+    if index_exists and schema_state["ready"]:
+        try:
+            from vector_lake.indexer import read_committed_index_snapshot
+
+            projection_connection, _projection_db_path = (
+                _open_runtime_database_read_only()
+            )
+            committed_index_data = read_committed_index_snapshot(
+                get_index_path(),
+                lock_timeout=1.0,
+                connection=projection_connection,
+                _acquire_lock=False,
+            )
+            projection_manifest = committed_index_data.get(
+                "projection_manifest"
+            ) or {}
+            checks.append((
+                "Projection Pair",
+                True,
+                "committed generation="
+                + str(projection_manifest.get("generation") or "unknown"),
+            ))
+        except Exception as exc:
+            checks.append(("Projection Pair", False, f"not committed/current: {exc}"))
+        finally:
+            if projection_connection is not None:
+                projection_connection.close()
+    else:
+        reason = "index missing" if not index_exists else "database schema not ready"
+        checks.append(("Projection Pair", False, reason))
 
     # 4. AST Compilation Checks
     ext_root = get_extension_root()
@@ -259,16 +336,17 @@ def doctor_vector_lake() -> str:
             if path.name.casefold() not in excluded
             and not path.name.casefold().startswith("system_")
         }
-        with open(get_index_path(), "r", encoding="utf-8") as f:
-            index_data = json.load(f)
-            index_keys = {
-                key for key in index_data.get("nodes", {})
-                if not str(key).startswith("System_")
-            }
+        if committed_index_data is None:
+            raise RuntimeError("projection pair is not committed and current")
+        index_data = committed_index_data
+        index_keys = {
+            key for key in index_data.get("nodes", {})
+            if not str(key).startswith("System_")
+        }
         if not schema_state["ready"]:
             raise RuntimeError(
                 "database schema is not ready: "
-                + "; ".join(schema_state["issues"])
+                + "; ".join(schema_reasons)
             )
         db_state = _read_database_state(db_path)
         canonical_keys = db_state["canonical_keys"]

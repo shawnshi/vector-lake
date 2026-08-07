@@ -157,6 +157,37 @@ def test_atomic_write_rejects_unterminated_frontmatter_without_replacing_target(
     assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
 
 
+def test_oversized_mutation_batch_fails_before_canonical_or_outbox_write(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    db_store.init_db()
+    monkeypatch.setattr(governance_store, "_CHANGE_SET_MAX_BATCH_ITEMS", 1)
+
+    with pytest.raises(governance_store.ChangeSetBatchTooLarge):
+        execute_mutation_batch(
+            [
+                {
+                    "filename": "Source_A.md",
+                    "content": _named_source_content("source_a", "Source A"),
+                },
+                {
+                    "filename": "Source_B.md",
+                    "content": _named_source_content("source_b", "Source B"),
+                },
+            ],
+            validation_mode="schema",
+        )
+
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM mutation_outbox").fetchone()[0] == 0
+    assert not (isolated_memory / "wiki" / "Source_A.md").exists()
+    assert not (isolated_memory / "wiki" / "Source_B.md").exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows path casing contract")
 @pytest.mark.parametrize("validation_mode", ["full", "schema"])
 def test_atomic_write_validates_case_alias_of_canonical_wiki_root(
@@ -592,7 +623,7 @@ def test_record_prepared_change_sets_does_not_load_full_history(isolated_memory,
     change_set = {
         "change_set_id": "changeset_delta",
         "idempotency_key": "delta-key",
-        "status": "published",
+        "status": "pending",
     }
     monkeypatch.setattr(governance_store, "load_change_sets", lambda: (_ for _ in ()).throw(AssertionError("full history load")))
 

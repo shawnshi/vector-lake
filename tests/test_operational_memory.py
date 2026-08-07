@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from vector_lake import db_store, governance_store, wiki_utils
 from vector_lake.tool_search import build_memory_packet, search_vector_lake
 
@@ -594,8 +596,8 @@ def _reset_search_index_as_legacy(conn):
         conn.execute("DELETE FROM operational_memory_search_pending")
         conn.execute(
             "UPDATE operational_memory_search_state SET "
-            "backfill_cursor = 0, "
-            "backfill_target = (SELECT COALESCE(MAX(rowid), 0) "
+            "backfill_cursor = '', "
+            "backfill_target = (SELECT COALESCE(MAX(memory_id), '') "
             "FROM operational_memory) WHERE singleton = 1"
         )
 
@@ -638,16 +640,17 @@ def test_lazy_fts_backfill_preserves_exact_results(isolated_memory, monkeypatch)
         "SELECT backfill_cursor, backfill_target "
         "FROM operational_memory_search_state"
     ).fetchone()
-    assert state[0] == 0 < state[1]
+    assert state[0] == "" < state[1]
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0] == 0
 
     progress = governance_store.maintain_operational_memory_search_index(2)
-    assert progress["backfill_cursor"] == 2
+    assert progress["backfill_cursor"] == "memory_1"
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0] == 2
+    conn.execute("VACUUM")
     for _ in range(3):
         governance_store.maintain_operational_memory_search_index(2)
     state = conn.execute(
@@ -678,6 +681,55 @@ def test_lazy_fts_backfill_preserves_exact_results(isolated_memory, monkeypatch)
     ):
         cjk = governance_store.search_operational_memory("甲", top_k=10)
     assert [item["memory_id"] for item in cjk] == ["memory_3"]
+
+
+def test_equal_rank_results_use_stable_memory_id_after_physical_reorder(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "0")
+    records = [
+        {
+            "memory_id": memory_id,
+            "memory_type": "fact",
+            "memory_key": "equal rank",
+            "text": "stable tie",
+            "source_page": "Concept_Stable-Tie.md",
+            "validity_state": "active",
+            "memory_score": 0.8,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        for memory_id in ("memory-z", "memory-a")
+    ]
+    conn = _seed_isolated_search_memories(records)
+
+    def result_ids():
+        return [
+            item["memory_id"]
+            for item in governance_store.search_operational_memory(
+                "stable tie",
+                top_k=2,
+            )
+        ]
+
+    assert result_ids() == ["memory-a", "memory-z"]
+    stored = conn.execute(
+        "SELECT memory_id, memory_type, data_json, updated_at "
+        "FROM operational_memory WHERE memory_id = 'memory-a'"
+    ).fetchone()
+    with db_store.transaction():
+        conn.execute("DELETE FROM operational_memory WHERE memory_id = 'memory-a'")
+        conn.execute(
+            "INSERT INTO operational_memory "
+            "(memory_id, memory_type, data_json, updated_at) VALUES (?, ?, ?, ?)",
+            tuple(stored),
+        )
+    conn.execute("VACUUM")
+
+    assert result_ids() == ["memory-a", "memory-z"]
+    legacy, _ = governance_store._legacy_operational_memory_views(
+        "stable tie", 2, 0, None, False
+    )
+    assert [item["memory_id"] for item in legacy] == ["memory-a", "memory-z"]
 
 
 def test_pending_rows_keep_update_and_delete_results_exact(
@@ -902,7 +954,7 @@ def test_search_index_schema_upgrade_resets_only_derived_state(
         "SELECT backfill_cursor, backfill_target, schema_version "
         "FROM operational_memory_search_state"
     ).fetchone()
-    assert tuple(state) == (0, 1, 3)
+    assert tuple(state) == ("", "memory_upgrade", 4)
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0] == 0
@@ -911,6 +963,66 @@ def test_search_index_schema_upgrade_resets_only_derived_state(
         item["memory_id"]
         for item in governance_store.search_operational_memory("upgrade", top_k=10)
     ] == ["memory_upgrade"]
+
+
+@pytest.mark.parametrize("legacy_schema_version", [3, 4])
+def test_search_index_v4_rebuilds_legacy_integer_cursor_affinity(
+    isolated_memory, monkeypatch, legacy_schema_version
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    records = [
+        {
+            "memory_id": memory_id,
+            "memory_type": "fact",
+            "memory_key": memory_id,
+            "text": "stable keyset",
+            "source_page": "Concept_Keyset.md",
+            "validity_state": "active",
+            "memory_score": 0.8,
+        }
+        for memory_id in ("001", "010")
+    ]
+    conn = _seed_isolated_search_memories(records)
+    with db_store.transaction():
+        conn.execute("DROP TABLE operational_memory_search_state")
+        conn.execute(
+            "CREATE TABLE operational_memory_search_state ("
+            "singleton INTEGER PRIMARY KEY, "
+            "backfill_cursor INTEGER NOT NULL DEFAULT 0, "
+            "backfill_target INTEGER NOT NULL DEFAULT 0, "
+            "schema_version INTEGER NOT NULL DEFAULT 4, updated_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO operational_memory_search_state "
+            "VALUES (1, 0, 10, ?, NULL)",
+            (legacy_schema_version,),
+        )
+        assert db_store._init_operational_memory_search_schema(conn) is True
+
+    column_types = {
+        row[1]: row[2]
+        for row in conn.execute(
+            "PRAGMA table_info(operational_memory_search_state)"
+        )
+    }
+    state = conn.execute(
+        "SELECT backfill_cursor, backfill_target, schema_version "
+        "FROM operational_memory_search_state"
+    ).fetchone()
+
+    assert column_types["backfill_cursor"] == "TEXT"
+    assert column_types["backfill_target"] == "TEXT"
+    assert tuple(state) == ("", "010", 4)
+    progress = governance_store.maintain_operational_memory_search_index(1)
+    assert progress["ready"] is False
+    assert progress["backfill_cursor"] == "001"
+    conn.execute("VACUUM")
+    progress = governance_store.maintain_operational_memory_search_index(1)
+    assert progress["ready"] is True
+    assert progress["backfill_cursor"] == "010"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_docs"
+    ).fetchone()[0] == 2
 
 
 def test_empty_search_index_is_ready_without_backfill(
@@ -925,7 +1037,7 @@ def test_empty_search_index_is_ready_without_backfill(
         "SELECT backfill_cursor, backfill_target, schema_version "
         "FROM operational_memory_search_state"
     ).fetchone()
-    assert tuple(state) == (0, 0, 3)
+    assert tuple(state) == ("", "", 4)
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0] == 0

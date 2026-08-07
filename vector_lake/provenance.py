@@ -9,39 +9,47 @@ def _tokenize(query: str) -> list[str]:
 
 
 def build_trace_for_query(query: str, top_k: int = 5) -> dict:
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative")
+    if top_k == 0:
+        return {"query": query, "items": []}
     tokens = _tokenize(query)
-    
-    # 1. Use FTS5 to find relevant source pages instead of O(N) full claim scan
+
     from vector_lake.db_store import search_wiki
     search_results = search_wiki(query, limit=10)
     relevant_pages = {res["node_key"] for res in search_results}
-    
-    claims = governance_store.load_claims()["items"].values()
-    entities = governance_store.load_entities()["items"]
-    sources = governance_store.load_sources()["items"]
-
-    matches = []
-    for claim in claims:
-        # Boost score if the claim comes from a top FTS match
-        source_page = claim.get('source_page', '')
-        base_score = 5 if source_page in relevant_pages else 0
-        
-        haystack = f"{claim.get('claim_text', '')} {source_page}".lower()
-        match_score = sum(1 for token in tokens if token in haystack)
-        score = base_score + match_score
-        
-        if score > 0:
-            matches.append((score, claim))
-    matches.sort(key=lambda item: item[0], reverse=True)
+    claims = governance_store.select_trace_claims(tokens, relevant_pages, top_k)
+    entity_ids = {
+        str(entity_id)
+        for claim in claims
+        for entity_id in claim.get("subject_entity_ids", [])
+    }
+    source_ids = {
+        str(source_id)
+        for claim in claims
+        for source_id in claim.get("source_ids", [])
+    }
+    entity_names, source_pages = governance_store.load_trace_labels(
+        entity_ids,
+        source_ids,
+    )
 
     trace_items = []
-    for _, claim in matches[:top_k]:
+    for claim in claims:
         annotated = governance_metrics.annotate_claim_validity(claim)
         trace_items.append({
             "claim_id": annotated["claim_id"],
             "claim_text": annotated.get("claim_text", ""),
-            "subject_entities": [entities[entity_id]["canonical_name"] for entity_id in annotated.get("subject_entity_ids", []) if entity_id in entities],
-            "source_pages": [sources[source_id]["canonical_source_page"] for source_id in annotated.get("source_ids", []) if source_id in sources],
+            "subject_entities": [
+                entity_names[entity_id]
+                for entity_id in annotated.get("subject_entity_ids", [])
+                if entity_id in entity_names
+            ],
+            "source_pages": [
+                source_pages[source_id]
+                for source_id in annotated.get("source_ids", [])
+                if source_id in source_pages
+            ],
             "confidence": annotated.get("confidence"),
             "valid_to": annotated.get("valid_to"),
             "review_after": annotated.get("review_after"),

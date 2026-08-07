@@ -872,13 +872,140 @@ def test_cached_identity_validation_detects_relevant_cross_connection_writes(
     db_store.init_db()
     assert calls == 1
 
+
+def test_cached_identity_validation_is_shared_across_worker_connections(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    governance_store.apply_change_set(
+        _change_set(
+            "Concept_Shared-Validation",
+            entity_id="entity_shared_validation",
+            claim_id="claim_shared_validation",
+        )
+    )
+    calls = 0
+    calls_lock = threading.Lock()
+    start = threading.Barrier(2)
+    real_validate = db_store._validate_canonical_identity_coverage
+
+    def counted_validate(conn):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        return real_validate(conn)
+
+    monkeypatch.setattr(
+        db_store,
+        "_validate_canonical_identity_coverage",
+        counted_validate,
+    )
+
+    def validate_from_worker():
+        start.wait(timeout=5)
+        try:
+            db_store.init_db()
+        finally:
+            db_store.close_connection()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(validate_from_worker) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert calls == 1
+
+
+def test_identity_coverage_uses_one_joined_query_per_record_kind(
+    isolated_memory,
+):
+    db_store.init_db()
+    governance_store.apply_change_set(
+        _change_set(
+            "Concept_Joined-Coverage",
+            entity_id="entity_joined_coverage",
+            claim_id="claim_joined_coverage",
+            evidence_id="evidence_joined_coverage",
+        )
+    )
+    conn = db_store.get_connection()
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        db_store._validate_canonical_identity_coverage(conn)
+    finally:
+        conn.set_trace_callback(None)
+
+    identity_selects = [
+        " ".join(statement.casefold().split())
+        for statement in statements
+        if "canonical_identities" in statement.casefold()
+        and statement.lstrip().casefold().startswith(("select", "with"))
+    ]
+    assert len(identity_selects) == len(db_store._CANONICAL_IDENTITY_SPECS)
+    assert all(
+        "left join canonical_identities" in statement
+        for statement in identity_selects
+    )
+
+
+def test_identity_coverage_decodes_only_anomalous_payloads(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    governance_store.apply_change_set(
+        _change_set(
+            "Concept_SQL-Coverage",
+            entity_id="entity_sql_coverage",
+            claim_id="claim_sql_coverage",
+            evidence_id="evidence_sql_coverage",
+        )
+    )
+
+    monkeypatch.setattr(
+        db_store.json,
+        "loads",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("valid identity rows must be filtered inside SQLite")
+        ),
+    )
+
+    db_store._validate_canonical_identity_coverage(db_store.get_connection())
+
+
+def test_identity_coverage_reports_non_object_payload_after_sql_filter(
+    isolated_memory,
+):
+    db_store.init_db()
+    governance_store.apply_change_set(
+        _change_set(
+            "Concept_Invalid-Coverage",
+            entity_id="entity_invalid_coverage",
+            claim_id="claim_invalid_coverage",
+            evidence_id="evidence_invalid_coverage",
+        )
+    )
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE claims SET data_json = '[]' "
+            "WHERE claim_id = 'claim_invalid_coverage'"
+        )
+
+    with pytest.raises(RuntimeError, match="identity JSON is not an object"):
+        db_store._validate_canonical_identity_coverage(conn)
+
+
 def test_cached_identity_validation_caches_only_stable_snapshot(
     isolated_memory,
     monkeypatch,
 ):
     db_store.init_db()
     conn = db_store.get_connection()
-    db_store._IDENTITY_VALIDATION_TOKENS.pop(id(conn), None)
+    db_key = str(db_store.get_db_path().resolve())
+    db_store._IDENTITY_VALIDATION_TOKENS.pop(db_key, None)
     token_before = (1, 1, (("claims", 1),))
     token_after = (1, 2, (("claims", 2),))
     tokens = iter((token_before, token_after, token_after, token_after))
@@ -908,7 +1035,7 @@ def test_cached_identity_validation_caches_only_stable_snapshot(
     db_store._validate_cached_identity_state(conn)
 
     assert coverage_calls == 2
-    assert db_store._IDENTITY_VALIDATION_TOKENS[id(conn)] == token_after
+    assert db_store._IDENTITY_VALIDATION_TOKENS[db_key] == token_after
 
 
 def test_concurrent_cross_page_claim_reuse_has_one_winner(isolated_memory):

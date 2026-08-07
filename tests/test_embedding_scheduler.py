@@ -120,6 +120,16 @@ def test_embedding_backfill_dry_run_reads_existing_database_without_writes(
     assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
 
 
+def test_existing_embedding_inventory_reloads_vector_extension_after_close(
+    isolated_memory,
+):
+    db_store.init_db()
+    db_store.upsert_embedding("Concept_A", [1.0] * 3072)
+    db_store.close_all_connections()
+
+    assert embedding_scheduler.existing_embedding_ids() == {"Concept_A"}
+
+
 def test_embedding_backfill_fails_closed_when_inventory_is_unavailable(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "must-not-be-used")
 
@@ -313,8 +323,13 @@ def test_rate_limiter_uses_shared_sqlite_window(isolated_memory, monkeypatch):
 def test_incremental_index_invalidates_stale_vector_without_api(isolated_memory, monkeypatch):
     _purpose(isolated_memory)
     execute_mutation_plan("Source_Changed.md", content=_source_content("source_changed", "Old Title"))
+    execute_mutation_plan(
+        "Source_Untouched.md",
+        content=_source_content("source_untouched", "Untouched Title"),
+    )
     indexer.generate_index()
     db_store.upsert_embedding("Source_Changed", [1.0] * 3072)
+    db_store.upsert_embedding("Source_Untouched", [1.0] * 3072)
     monkeypatch.setenv("GEMINI_API_KEY", "must-not-be-used")
     monkeypatch.setattr(
         embedding_scheduler,
@@ -328,6 +343,43 @@ def test_incremental_index_invalidates_stale_vector_without_api(isolated_memory,
     assert db_store.get_connection().execute(
         "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = 'Source_Changed'"
     ).fetchone()[0] == 0
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = 'Source_Untouched'"
+    ).fetchone()[0] == 1
+
+
+def test_missing_index_fallback_invalidates_touched_vector_without_api(
+    isolated_memory,
+    monkeypatch,
+):
+    _purpose(isolated_memory)
+    execute_mutation_plan(
+        "Source_Changed.md",
+        content=_source_content("source_changed", "Changed Title"),
+    )
+    execute_mutation_plan(
+        "Source_Untouched.md",
+        content=_source_content("source_untouched", "Untouched Title"),
+    )
+    db_store.upsert_embedding("Source_Changed", [1.0] * 3072)
+    db_store.upsert_embedding("Source_Untouched", [1.0] * 3072)
+    monkeypatch.setenv("GEMINI_API_KEY", "must-not-be-used")
+    monkeypatch.setattr(
+        embedding_scheduler,
+        "_create_client",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("missing-index fallback called embedding API")
+        ),
+    )
+
+    indexer.update_index_items(["Source_Changed.md"])
+
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = 'Source_Changed'"
+    ).fetchone()[0] == 0
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = 'Source_Untouched'"
+    ).fetchone()[0] == 1
 
 
 def test_interactive_embed_closes_client_and_disables_retries(monkeypatch):
@@ -554,7 +606,11 @@ def test_embedding_projection_reuses_shared_index_snapshot(
             },
         }
 
-    monkeypatch.setattr(tool_projection, "load_index_snapshot", fake_load)
+    monkeypatch.setattr(
+        tool_projection.indexer,
+        "read_committed_index_snapshot",
+        fake_load,
+    )
     monkeypatch.setattr(embedding_scheduler, "embedding_backfill", fake_backfill)
 
     output = tool_projection.embedding_backfill_projection(dry_run=True, limit=7)

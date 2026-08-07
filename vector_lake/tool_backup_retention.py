@@ -22,7 +22,12 @@ _DEFAULT_MIN_AGE_DAYS = 30
 _DEFAULT_STAGE_TTL_HOURS = 24
 _MAX_PROJECTION_VALIDATION_BYTES = 256 * 1024 * 1024
 _MAINTENANCE_ARTIFACT_NAMES = frozenset(
-    {"vector_lake.db", "index.json", "claim_graph.json"}
+    {
+        "vector_lake.db",
+        "index.json",
+        "claim_graph.json",
+        "projection_pair_manifest.json",
+    }
 )
 _MAINTENANCE_MANIFEST_KEYS = frozenset(
     {
@@ -236,6 +241,7 @@ def _read_complete_manifest(path: Path) -> tuple[dict[str, Any], str] | None:
     copied_names = set(copied)
     projection_names = {"index.json", "claim_graph.json"}
     projection_present = projection_names.issubset(copied_names)
+    sidecar_present = "projection_pair_manifest.json" in copied_names
     database_generations = manifest["database_runtime_generations"]
     database_error = manifest["database_runtime_generation_error"]
     projection_generation = manifest["projection_generation"]
@@ -269,6 +275,7 @@ def _read_complete_manifest(path: Path) -> tuple[dict[str, Any], str] | None:
         or "vector_lake.db" not in copied_names
         or not copied_names.issubset(_MAINTENANCE_ARTIFACT_NAMES)
         or bool(copied_names & projection_names) != projection_present
+        or (sidecar_present and not projection_present)
         or not database_identity_valid
         or not projection_identity_valid
         or not _valid_consistency(
@@ -337,8 +344,18 @@ def _verify_restorable_backup_snapshot(
         or manifest.get("database_runtime_generation_error") is not None
         or manifest.get("canonical_projection_consistency", {}).get("status")
         != "verified"
-        or set(manifest.get("copied", ()))
-        != {"vector_lake.db", "index.json", "claim_graph.json"}
+        or frozenset(manifest.get("copied", ()))
+        not in {
+            frozenset({"vector_lake.db", "index.json", "claim_graph.json"}),
+            frozenset(
+                {
+                    "vector_lake.db",
+                    "index.json",
+                    "claim_graph.json",
+                    "projection_pair_manifest.json",
+                }
+            ),
+        }
     ):
         raise RuntimeError(f"backup_restorable_claim_is_incomplete:{path}")
 
@@ -400,6 +417,21 @@ def _verify_restorable_backup_snapshot(
     if index_contract is None or claim_graph_contract is None:
         raise RuntimeError(f"backup_projection_payload_invalid:{path}")
 
+    sidecar_name = "projection_pair_manifest.json"
+    sidecar = None
+    if sidecar_name in manifest["copied"]:
+        try:
+            sidecar = json.loads(
+                _read_plain_file_bytes(
+                    path / sidecar_name,
+                    max_bytes=1024 * 1024,
+                )
+            )
+        except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"backup_projection_sidecar_read_failed:{path}:{exc}"
+            ) from exc
+
     try:
         projection_generation = indexer.validate_projection_pair(
             index_contract,
@@ -417,6 +449,27 @@ def _verify_restorable_backup_snapshot(
         raise RuntimeError(f"backup_projection_binding_mismatch:{path}")
     if projection_binding.get("status") != "verified":
         raise RuntimeError(f"backup_projection_binding_unverified:{path}")
+    if sidecar is not None:
+        try:
+            sidecar_manifest, sidecar_artifacts = (
+                indexer._validate_projection_sidecar(sidecar)
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"backup_projection_sidecar_invalid:{path}:{exc}"
+            ) from exc
+        if sidecar_manifest != index_contract[indexer.PROJECTION_MANIFEST_KEY]:
+            raise RuntimeError(f"backup_projection_sidecar_manifest_mismatch:{path}")
+        for artifact_name in ("index.json", "claim_graph.json"):
+            metadata = sidecar_artifacts[artifact_name]
+            if (
+                metadata["sha256"] != manifest["artifact_sha256"][artifact_name]
+                or metadata["bytes"] != (path / artifact_name).stat().st_size
+            ):
+                raise RuntimeError(
+                    f"backup_projection_sidecar_artifact_mismatch:"
+                    f"{path / artifact_name}"
+                )
 
     covered_surfaces = list(indexer.CANONICAL_PROJECTION_SURFACES)
     database_projection_generations = {

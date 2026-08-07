@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import queue
 import threading
 import time
 from types import SimpleNamespace
@@ -20,6 +21,31 @@ from vector_lake.watchdog_app import (
     process_legacy_projection_queue_batch,
     reconcile_wiki_overflow_once,
 )
+
+
+class _EmptyWatchdogIndexQueue:
+    full_reconcile_required = False
+    max_pending = 1
+
+    @staticmethod
+    def qsize():
+        return 0
+
+    @staticmethod
+    def empty():
+        return True
+
+    @staticmethod
+    def get_nowait():
+        raise queue.Empty
+
+    @staticmethod
+    def task_done():
+        return None
+
+    @staticmethod
+    def claim_full_reconcile_marker(**_kwargs):
+        return None
 
 
 def test_stale_ingest_jobs_can_be_expired_by_background_maintenance(
@@ -863,6 +889,236 @@ def test_raw_watchdog_requeues_failed_batch_with_backoff(
 
     expected = (1, [str(source.resolve())])
     assert calls == [expected, expected]
+
+
+def test_raw_watchdog_gate_busy_defers_full_scan_without_failure_count(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_ingest
+    from vector_lake.heavy_task_gate import heavy_task
+
+    holder_acquired = threading.Event()
+    holder_release = threading.Event()
+    completed = threading.Event()
+    calls = []
+
+    def hold_gate():
+        with heavy_task(
+            "maintenance",
+            "external-holder",
+            origin="pytest",
+            wait_timeout_seconds=0,
+        ):
+            holder_acquired.set()
+            holder_release.wait(timeout=3)
+
+    def prepare(*, batch_size, candidate_paths, _enqueue_all=False):
+        calls.append((batch_size, candidate_paths, _enqueue_all))
+        completed.set()
+        return f"{tool_ingest.FULL_SCAN_COMPLETE_TOKEN}\ncomplete"
+
+    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
+    holder = threading.Thread(target=hold_gate, name="raw-gate-holder")
+    holder.start()
+    assert holder_acquired.wait(timeout=2)
+    handler = RawWatchdogHandler(retry_base_seconds=0.05)
+    try:
+        handler.request_full_scan()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with handler.lock:
+                deferred = (
+                    handler.pending_overflow
+                    and handler.retry_attempt == 0
+                    and handler.retry_timer is not None
+                )
+            if deferred:
+                break
+            time.sleep(0.01)
+        assert deferred is True
+        assert calls == []
+
+        holder_release.set()
+        assert completed.wait(timeout=2)
+    finally:
+        holder_release.set()
+        handler.shutdown()
+        holder.join(timeout=3)
+
+    assert not holder.is_alive()
+    assert calls == [(50, None, True)]
+
+
+def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(
+    monkeypatch,
+):
+    from vector_lake import db_store, heavy_task_gate, indexer, tool_lint, watchdog_app
+
+    moments = iter(
+        [
+            time.struct_time((2026, 7, 30, 10, 0, 0, 3, 211, -1)),
+            time.struct_time((2026, 7, 30, 10, 1, 0, 3, 211, -1)),
+        ]
+    )
+    gate_attempts = []
+    lint_calls = []
+    checkpoint_calls = []
+    messages = []
+
+    class SuccessfulLease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_heavy_task(task_class, operation, **_kwargs):
+        gate_attempts.append((task_class, operation))
+        if len(gate_attempts) == 1:
+            raise heavy_task_gate.HeavyTaskBusy(
+                task_class=task_class,
+                operation=operation,
+                origin="watchdog",
+                wait_timeout_seconds=0,
+                gate_status={"current": {"operation": "external-holder"}},
+            )
+        return SuccessfulLease()
+
+    class FakeConnection:
+        @staticmethod
+        def execute(sql):
+            checkpoint_calls.append(sql)
+
+    class StopAfterRetry:
+        def __init__(self):
+            self.waits = []
+
+        @staticmethod
+        def is_set():
+            return False
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            return len(self.waits) == 2
+
+    stop_event = StopAfterRetry()
+    monkeypatch.setattr(watchdog_app.time, "localtime", lambda: next(moments))
+    monkeypatch.setattr(
+        watchdog_app,
+        "expire_stale_ingest_jobs_for_watchdog",
+        lambda: 0,
+    )
+    monkeypatch.setattr(heavy_task_gate, "heavy_task", fake_heavy_task)
+    monkeypatch.setattr(
+        indexer,
+        "refresh_graph_topology_if_dirty",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        tool_lint,
+        "lint_vector_lake",
+        lambda *, auto_fix: lint_calls.append(auto_fix),
+    )
+    monkeypatch.setattr(db_store, "get_connection", lambda: FakeConnection())
+    monkeypatch.setattr(db_store, "close_connection", lambda: None)
+    monkeypatch.setattr(
+        watchdog_app,
+        "write_status",
+        lambda _state, _processed, _queue, message, _error, **_kwargs: (
+            messages.append(message)
+        ),
+    )
+
+    watchdog_app.scheduled_lint_loop(stop_event)
+
+    assert gate_attempts == [
+        ("scan", "watchdog-scheduled-lint"),
+        ("scan", "watchdog-scheduled-lint"),
+    ]
+    assert lint_calls == [False]
+    assert checkpoint_calls == ["PRAGMA wal_checkpoint(TRUNCATE)"]
+    assert stop_event.waits == [30, 30]
+    assert "Scheduled Lint deferred" in messages
+    assert "Scheduled Lint finished" in messages
+
+
+def test_outbox_worker_yields_after_successful_batch(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import watchdog_app
+
+    waits = []
+
+    class StopOnYield:
+        @staticmethod
+        def is_set():
+            return False
+
+        @staticmethod
+        def wait(seconds):
+            waits.append(seconds)
+            return True
+
+    monkeypatch.setenv("VECTOR_LAKE_OUTBOX_BATCH_YIELD_SECONDS", "0.025")
+    monkeypatch.setattr(watchdog_app, "index_queue", _EmptyWatchdogIndexQueue())
+    monkeypatch.setattr(db_store, "mutation_outbox_has_claimable", lambda: True)
+    monkeypatch.setattr(db_store, "close_connection", lambda: None)
+    monkeypatch.setattr(
+        watchdog_app,
+        "process_mutation_outbox_batch",
+        lambda **_kwargs: {
+            "claimed": 50,
+            "completed": 50,
+            "retrying": 0,
+            "failed": 0,
+        },
+    )
+    monkeypatch.setattr(watchdog_app, "write_status", lambda *_args, **_kwargs: None)
+
+    watchdog_app.index_worker_loop(StopOnYield())
+
+    assert waits == [0.025]
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_outbox_worker_records_base_interrupt_as_failed_gate_task(
+    isolated_memory,
+    monkeypatch,
+    interrupt_type,
+):
+    from vector_lake import watchdog_app
+    from vector_lake.heavy_task_gate import heavy_task_gate_status
+
+    class MustNotWait:
+        @staticmethod
+        def is_set():
+            return False
+
+        @staticmethod
+        def wait(_seconds):
+            raise AssertionError("an interrupt must propagate without retrying")
+
+    def interrupt(**_kwargs):
+        raise interrupt_type("requested stop")
+
+    monkeypatch.setattr(watchdog_app, "index_queue", _EmptyWatchdogIndexQueue())
+    monkeypatch.setattr(db_store, "mutation_outbox_has_claimable", lambda: True)
+    monkeypatch.setattr(db_store, "close_connection", lambda: None)
+    monkeypatch.setattr(watchdog_app, "process_mutation_outbox_batch", interrupt)
+    monkeypatch.setattr(watchdog_app, "write_status", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(interrupt_type, match="requested stop"):
+        watchdog_app.index_worker_loop(MustNotWait())
+
+    status = heavy_task_gate_status()
+    assert status["physical_state"] == "free"
+    assert status["last"]["operation"] == "watchdog-outbox-cycle"
+    assert status["last"]["outcome"] == "failed"
+    assert status["last"]["error"] == (
+        f"{interrupt_type.__name__}: requested stop"
+    )
 
 
 def test_raw_watchdog_overflow_runs_one_complete_inventory(
