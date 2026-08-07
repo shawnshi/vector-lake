@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -323,7 +323,7 @@ def _compute_debt_metrics_with_connection(
     skip_heavy: bool,
 ) -> dict:
     now = _utc_now()
-    validity_state_counts = {}
+    validity_state_counts = defaultdict(int)
     unsupported_claim_count = 0
     managed_unsupported_claim_count = 0
     conflicted_claim_count = 0
@@ -376,7 +376,8 @@ def _compute_debt_metrics_with_connection(
             now=now,
         )
         state = validity["validity_state"]
-        validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
+        # ⚡ Bolt: Using defaultdict avoids dict.get() overhead in this O(N) loop
+        validity_state_counts[state] += 1
         if state == "unsupported":
             unsupported_claim_count += 1
             unsupported_claim_ids.add(str(row["claim_id"] or ""))
@@ -503,6 +504,6 @@ def _compute_debt_metrics_with_connection(
         "superseded_memory_count": memory_validity_counts.get("superseded", 0),
         "conflicted_memory_count": memory_validity_counts.get("conflicted", 0),
         "memory_type_counts": memory_type_counts,
-        "validity_state_counts": validity_state_counts,
+        "validity_state_counts": dict(validity_state_counts),
     }
 
