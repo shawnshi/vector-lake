@@ -1076,6 +1076,11 @@ def process_mutation_outbox_batch(
             )
         ]
         filenames = list(dict.fromkeys(filename for _, filename in current_rows))
+        system_filenames = [
+            filename
+            for filename in filenames
+            if indexer.is_system_page_filename(filename)
+        ]
         try:
             if filenames:
                 if indexer.index_projection_matches_canonical(filenames):
@@ -1083,6 +1088,13 @@ def process_mutation_outbox_batch(
                         indexer.refresh_claim_graph_projection()
                 else:
                     indexer.update_index_items(filenames)
+                    if system_filenames and not indexer.index_projection_matches_canonical(
+                        system_filenames
+                    ):
+                        raise RuntimeError(
+                            "Selected index projection does not match canonical state "
+                            "after outbox indexing."
+                        )
                 if not indexer.projection_pair_matches_current_generation():
                     raise RuntimeError(
                         "Projection pair is not committed against the current "

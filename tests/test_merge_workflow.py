@@ -102,6 +102,23 @@ evidence_tier: primary
 """
 
 
+def _system_content(entity_id: str, title: str, body: str) -> str:
+    return f"""---
+id: {entity_id}
+title: {title}
+type: system
+domain: General
+status: Active
+epistemic-status: seed
+categories: [Uncategorized]
+updated: 2026-08-09T00:00:00Z
+sources: []
+strategic_scope: core
+---
+{body}
+"""
+
+
 def test_preflight_runs_semantic_merge_and_schema_validation(
     tmp_path: Path, monkeypatch
 ):
@@ -162,6 +179,53 @@ def test_source_preflight_blocks_different_raw_identities(tmp_path: Path, monkey
     assert (
         "exactly one approved canonical raw identity" in checked["preflight_errors"][0]
     )
+
+
+def test_source_metadata_conflict_policy_is_explicit_in_merge_preflight(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(tmp_path))
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "alpha.md").write_text("alpha", encoding="utf-8")
+    target = _source_content(
+        "source_alpha",
+        "Alpha",
+        "Primary.",
+        "[raw/alpha.md]",
+    ).replace(
+        "domain: General\n",
+        "domain: Healthcare\ntopic_cluster: Hospital_IT\ntags: [target-one, target-two]\n",
+    )
+    source = _source_content(
+        "source_alpha_alt",
+        "Alpha Alt",
+        "Other.",
+        "[raw/alpha.md]",
+    ).replace(
+        "domain: General\n",
+        (
+            "domain: Artificial_Intelligence\n"
+            "topic_cluster: Agentic_AI\n"
+            "tags: [source-one, source-two, source-three]\n"
+        ),
+    )
+    (wiki_dir / "Source_Alpha.md").write_text(target, encoding="utf-8")
+    (wiki_dir / "Source_Alpha-Alt.md").write_text(source, encoding="utf-8")
+
+    blocked = preflight_suggestion(_suggestion(), wiki_dir)
+    checked = preflight_suggestion(
+        _suggestion(source_metadata_conflict_policy="preserve_target"),
+        wiki_dir,
+    )
+
+    assert blocked["preflight_state"] == "blocked"
+    assert "Conflicting Source scalar field" in blocked["preflight_errors"][0]
+    assert checked["preflight_state"] == "passed", checked["preflight_errors"]
+    assert checked["source_metadata_conflict_policy"] == "preserve_target"
 
 
 def test_source_preflight_approval_cannot_mask_disjoint_raw_identities(
@@ -576,6 +640,178 @@ def test_source_merge_converges_provenance_projection_journal_and_replay(
     )
     assert replayed["status"] == "resolved"
     assert target_path.read_bytes() == before_replay
+
+
+def test_approved_system_merge_resolves_with_intentional_index_exclusion(
+    isolated_memory,
+):
+    from vector_lake import indexer
+    from vector_lake.wiki_utils import get_index_path
+
+    _write_purpose_contract(isolated_memory)
+    db_store.init_db()
+    indexer.generate_index()
+    target_key = "System_Time-Series-Foundation-Models"
+    source_key = "System_Time_Series_Foundation_Models"
+    target_path = isolated_memory / "wiki" / f"{target_key}.md"
+    source_path = isolated_memory / "wiki" / f"{source_key}.md"
+    execute_mutation_plan(
+        target_path.name,
+        content=_system_content(
+            "system_time_series_target",
+            "Time-Series Foundation Models",
+            "Curated system projection.",
+        ),
+    )
+    assert process_mutation_outbox_batch(limit=10)["completed"] == 1
+    execute_mutation_plan(
+        source_path.name,
+        content=_system_content(
+            "system_time_series_source",
+            "Time Series Foundation Models",
+            "Historical system projection.",
+        ),
+    )
+    assert process_mutation_outbox_batch(limit=10)["completed"] == 1
+
+    entities = governance_store.query_entities({"type": "system"})["items"].values()
+    by_page = {item["page_key"]: item for item in entities}
+    versions = governance_store.canonical_page_versions({target_key, source_key})
+    left_id = by_page[target_key]["entity_id"]
+    right_id = by_page[source_key]["entity_id"]
+    candidate = preflight_suggestion(
+        {
+            "pair_key": "::".join(sorted((left_id, right_id))),
+            "evidence_score": 100,
+            "score": 100,
+            "decision": "merge",
+            "left_entity_id": left_id,
+            "right_entity_id": right_id,
+            "left_name": by_page[target_key]["title"],
+            "right_name": by_page[source_key]["title"],
+            "left_page_key": target_key,
+            "right_page_key": source_key,
+            "left_version": versions[target_key],
+            "right_version": versions[source_key],
+            "component_id": "approved_system_merge_test",
+            "component_size": 2,
+            "preflight_state": "not_run",
+            "preflight_errors": [],
+        },
+        isolated_memory / "wiki",
+    )
+    assert candidate["preflight_state"] == "passed", candidate["preflight_errors"]
+    item_id = "gov_system_time_series_models"
+    governance_store.upsert_governance_item(
+        {
+            "item_id": item_id,
+            "type": "merge",
+            "status": "pending",
+            "merge_candidate": candidate,
+        }
+    )
+
+    resolved = governance_service.resolve_governance_item(item_id, resolution="merge")
+
+    assert resolved["status"] == "resolved"
+    assert resolved["resolution"] == "merge"
+    assert resolved["postcondition_errors"] == []
+    assert target_path.is_file()
+    assert not source_path.exists()
+    assert governance_store.get_entity(left_id)["page_key"] == target_key
+    assert governance_store.get_entity(right_id) is None
+    assert governance_store.get_alias(right_id) == left_id
+    frontmatter, _body = split_frontmatter(target_path.read_text(encoding="utf-8"))
+    assert source_key in frontmatter["aliases"]
+    assert all(
+        status == "completed"
+        for status in db_store.mutation_outbox_statuses(
+            resolved["merge_outbox_ids"]
+        ).values()
+    )
+    assert db_store.get_merge_journal(resolved["merge_journal_id"])["status"] == (
+        "completed"
+    )
+    index_data = json.loads(get_index_path().read_text(encoding="utf-8"))
+    selected = {target_key, source_key}
+    assert selected.isdisjoint(index_data["nodes"])
+    assert all(
+        key not in selected and value not in selected
+        for key, value in index_data["aliases"].items()
+    )
+    assert all(
+        edge.get(endpoint) not in selected
+        for edge in index_data["weighted_edges"]
+        for endpoint in ("source", "target")
+    )
+    connection = db_store.get_connection()
+    assert connection.execute(
+        "SELECT COUNT(*) FROM wiki_search_index WHERE node_key IN (?, ?)",
+        (target_key, source_key),
+    ).fetchone()[0] == 0
+    vector_connection = db_store.get_vector_connection()
+    assert vector_connection.execute(
+        "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id IN (?, ?)",
+        (target_key, source_key),
+    ).fetchone()[0] == 0
+    claim_parity = indexer.claim_graph_projection_parity()
+    assert claim_parity["canonical_nodes"] == claim_parity["projection_nodes"]
+    assert claim_parity["canonical_edges"] == claim_parity["projection_edges"]
+    assert claim_parity["missing_nodes"] == 0
+    assert claim_parity["extra_nodes"] == 0
+    assert claim_parity["missing_edges"] == 0
+    assert claim_parity["extra_edges"] == 0
+    assert indexer.projection_pair_matches_current_generation() is True
+
+    before_replay = target_path.read_bytes()
+    replayed = governance_service.resolve_governance_item(item_id, resolution="merge")
+    assert replayed["status"] == "resolved"
+    assert target_path.read_bytes() == before_replay
+
+
+def test_system_outbox_fails_closed_when_excluded_search_projection_is_stale(
+    isolated_memory,
+):
+    from vector_lake import indexer
+
+    _write_purpose_contract(isolated_memory)
+    db_store.init_db()
+    indexer.generate_index()
+    filename = "System_Contaminated.md"
+    content = _system_content(
+        "system_contaminated",
+        "Contaminated System",
+        "System projection exclusion test.",
+    )
+    execute_mutation_plan(filename, content=content)
+    assert process_mutation_outbox_batch(limit=10)["completed"] == 1
+    assert indexer.projection_pair_matches_current_generation() is True
+
+    db_store.upsert_search_index(
+        "System_Contaminated",
+        "contaminated",
+        "contaminated",
+        "contaminated",
+    )
+    assert indexer.index_projection_matches_canonical([filename]) is False
+    outbox_id = db_store.enqueue_mutation(
+        filename,
+        "update",
+        content,
+        idempotency_key="system-contaminated-recheck",
+        validation_mode="schema",
+    )
+
+    result = process_mutation_outbox_batch(
+        limit=1,
+        max_attempts=1,
+        backoff_base=0,
+        outbox_ids=[outbox_id],
+    )
+
+    assert result["completed"] == 0
+    assert result["failed"] == 1
+    assert db_store.mutation_outbox_statuses([outbox_id]) == {outbox_id: "failed"}
 
 
 def test_source_metadata_restore_cas_preserves_concurrent_human_update(
@@ -1012,7 +1248,7 @@ def test_resolution_passes_candidate_versions_to_atomic_mutation(
     monkeypatch.setattr(
         governance_service,
         "merge_markdown_content",
-        lambda left, right, source_key: "merged",
+        lambda left, right, source_key, source_metadata_conflict_policy=None: "merged",
     )
     monkeypatch.setattr(
         governance_service,

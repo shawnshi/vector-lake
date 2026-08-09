@@ -49,7 +49,7 @@ type: source
 domain: General
 status: Active
 epistemic-status: seed
-categories: [Source]
+categories: [Uncategorized]
 updated: 2026-07-13T00:00:00+00:00
 sources: [raw/test.pdf]
 strategic_scope: core
@@ -67,7 +67,7 @@ type: source
 domain: General
 status: Active
 epistemic-status: seed
-categories: [Source]
+categories: [Uncategorized]
 updated: 2026-07-13T00:00:00+00:00
 sources: [raw/test.pdf]
 strategic_scope: core
@@ -664,8 +664,8 @@ def test_schema_maintenance_preserves_legacy_tag_entity_collision(isolated_memor
         encoding="utf-8",
     )
     legacy_content = _named_source_content("source_tag_collision", "Tag Collision").replace(
-        "categories: [Source]\n",
-        "categories: [Source]\ntags: [Agentic AI]\n",
+        "categories: [Uncategorized]\n",
+        "categories: [Uncategorized]\ntags: [Agentic AI]\n",
     )
 
     ok, message = execute_mutation_batch(

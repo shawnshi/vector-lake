@@ -1,3 +1,5 @@
+import pytest
+
 from vector_lake.semantic_merge import merge_markdown_content
 from vector_lake.wiki_utils import split_frontmatter
 
@@ -114,3 +116,85 @@ def test_semantic_merge_unions_source_metadata_and_omits_backlog_raw_preview():
     assert "Source_2605-14892v2-0dadf455" in frontmatter["aliases"]
     assert "Raw Preview MUST NOT SURVIVE" not in body
     assert body.strip() == "Curated analysis."
+
+
+def test_semantic_merge_rejects_source_scalar_conflict_without_policy():
+    left = _content(
+        "source_left",
+        "Left",
+        "Left body.",
+        extra_frontmatter="domain: Healthcare\n",
+    )
+    right = _content(
+        "source_right",
+        "Right",
+        "Right body.",
+        extra_frontmatter="domain: Artificial_Intelligence\n",
+    )
+
+    with pytest.raises(ValueError, match="Conflicting Source scalar field domain"):
+        merge_markdown_content(left, right)
+
+
+def test_source_metadata_conflict_policy_preserves_target_scalars_and_tags():
+    left = _content(
+        "source_left",
+        "Left",
+        "Left body.",
+        extra_frontmatter=(
+            "domain: Healthcare\n"
+            "topic_cluster: Hospital_IT\n"
+            "tags: [target-one, target-two]\n"
+        ),
+    )
+    right = _content(
+        "source_right",
+        "Right",
+        "Right body.",
+        extra_frontmatter=(
+            "domain: Artificial_Intelligence\n"
+            "topic_cluster: Agentic_AI\n"
+            "tags: [source-one, source-two, source-three]\n"
+        ),
+    )
+
+    merged = merge_markdown_content(
+        left,
+        right,
+        source_metadata_conflict_policy="preserve_target",
+    )
+    frontmatter, _body = split_frontmatter(merged)
+
+    assert frontmatter["domain"] == "Healthcare"
+    assert frontmatter["topic_cluster"] == "Hospital_IT"
+    assert frontmatter["tags"] == ["target-one", "target-two"]
+
+
+def test_source_metadata_conflict_policy_rejects_unknown_value():
+    left = _content("source_left", "Left", "Left body.")
+    right = _content("source_right", "Right", "Right body.")
+
+    with pytest.raises(ValueError, match="Unsupported source_metadata_conflict_policy"):
+        merge_markdown_content(
+            left,
+            right,
+            source_metadata_conflict_policy="truncate",
+        )
+
+
+def test_source_metadata_conflict_policy_rejects_non_source_merge():
+    left = _content("concept_left", "Left", "Left body.").replace(
+        "type: source",
+        "type: concept",
+    )
+    right = _content("concept_right", "Right", "Right body.").replace(
+        "type: source",
+        "type: concept",
+    )
+
+    with pytest.raises(ValueError, match="only valid for Source-to-Source"):
+        merge_markdown_content(
+            left,
+            right,
+            source_metadata_conflict_policy="preserve_target",
+        )

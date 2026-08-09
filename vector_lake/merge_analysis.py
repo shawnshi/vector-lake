@@ -798,6 +798,9 @@ def preflight_suggestion(
             target_bytes.decode("utf-8"),
             source_bytes.decode("utf-8"),
             source_key=source_key,
+            source_metadata_conflict_policy=checked.get(
+                "source_metadata_conflict_policy"
+            ),
         )
         frontmatter, body = split_frontmatter(merged_content)
         validate_schema(frontmatter, body, target_path.name)

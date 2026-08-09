@@ -28,7 +28,7 @@ def _drop_v6_contract(conn) -> None:
     conn.execute("DROP TABLE change_set_payload_refs")
     conn.execute("DROP TABLE change_set_payloads")
     conn.execute("DROP TABLE change_set_lifecycle_v6")
-    conn.execute("DELETE FROM schema_migrations WHERE version = 6")
+    conn.execute("DELETE FROM schema_migrations WHERE version >= 6")
     conn.execute("PRAGMA user_version = 5")
 
 
@@ -41,6 +41,10 @@ def _controlled_v6_migrate(path) -> None:
     with lock:
         with db_store._controlled_schema_v5_transaction(conn, lock):
             db_store._apply_controlled_schema_v6_migration(
+                conn,
+                maintenance_lock=lock,
+            )
+            db_store._apply_controlled_schema_v7_migration(
                 conn,
                 maintenance_lock=lock,
             )

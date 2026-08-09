@@ -343,6 +343,132 @@ def test_index_projection_allows_only_explicit_merge_alias_redirect(
     ) is True
 
 
+def test_index_projection_proves_system_pages_are_intentionally_absent(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import db_store, indexer
+    from vector_lake.wiki_utils import get_index_path
+
+    db_store.init_db()
+    get_index_path().write_text("{}", encoding="utf-8")
+    snapshot = {"nodes": {}, "aliases": {}, "weighted_edges": []}
+    monkeypatch.setattr(
+        indexer,
+        "read_committed_index_snapshot",
+        lambda *_args, **_kwargs: snapshot,
+    )
+
+    selected = ["System_Target.md", "System_Source.md"]
+    assert index_projection_matches_canonical(
+        selected,
+        allowed_alias_redirects={"System_Source": "System_Target"},
+    ) is True
+    assert index_projection_matches_canonical(["system_source.MD"]) is True
+
+    snapshot["nodes"]["Ｓｙｓｔｅｍ＿Ｓｏｕｒｃｅ"] = {}
+    assert index_projection_matches_canonical(selected) is False
+    snapshot["nodes"].clear()
+    snapshot["nodes"]["System_Source"] = {}
+    assert index_projection_matches_canonical(
+        ["Ｓｙｓｔｅｍ＿Ｓｏｕｒｃｅ.md"]
+    ) is False
+    snapshot["nodes"].clear()
+    snapshot["aliases"]["System_Source"] = "Concept_Other"
+    assert index_projection_matches_canonical(selected) is False
+    snapshot["aliases"].clear()
+    snapshot["aliases"]["Concept_Other"] = "System_Source"
+    assert index_projection_matches_canonical(selected) is False
+    snapshot["aliases"].clear()
+    snapshot["weighted_edges"].append(
+        {"source": "System_Source", "target": "Concept_Other"}
+    )
+    assert index_projection_matches_canonical(selected) is False
+    snapshot["weighted_edges"] = [
+        {"source": "Concept_Other", "target": "System_Source"}
+    ]
+    assert index_projection_matches_canonical(selected) is False
+    snapshot["weighted_edges"].clear()
+
+    db_store.upsert_search_index("System_Source", "system", "system", "system")
+    assert index_projection_matches_canonical(selected) is False
+    with db_store.transaction() as connection:
+        connection.execute(
+            "DELETE FROM wiki_search_index WHERE node_key = 'System_Source'"
+        )
+    db_store.upsert_embedding("System_Source", [1.0] * 3072)
+    assert index_projection_matches_canonical(selected) is False
+    db_store.delete_embedding("System_Source")
+    assert index_projection_matches_canonical(selected) is True
+
+    get_index_path().unlink()
+    assert index_projection_matches_canonical(selected) is False
+
+
+def test_index_projection_requires_both_mixed_partitions_to_match(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import db_store, governance_store, indexer
+    from vector_lake.wiki_utils import get_index_path
+
+    db_store.init_db()
+    entity = {
+        "entity_id": "entity_mixed_projection",
+        "page_key": "Concept_Mixed-Projection",
+        "canonical_name": "Mixed Projection",
+        "type": "concept",
+        "raw_text": "Current canonical body.",
+        "updated": "2026-08-09T00:00:00+00:00",
+    }
+    governance_store.upsert_entity(entity["entity_id"], entity)
+    indexer.generate_index()
+    selected = ["Concept_Mixed-Projection.md", "System_Source.md"]
+
+    assert index_projection_matches_canonical(selected) is True
+    snapshot = json.loads(get_index_path().read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        indexer,
+        "read_committed_index_snapshot",
+        lambda *_args, **_kwargs: snapshot,
+    )
+    snapshot["nodes"]["System_Source"] = {}
+    assert index_projection_matches_canonical(
+        selected,
+        allowed_alias_redirects={"System_Source": "Concept_Mixed-Projection"},
+    ) is False
+    snapshot["nodes"].pop("System_Source")
+    assert index_projection_matches_canonical(selected) is True
+
+    changed = dict(entity)
+    changed["raw_text"] = "Canonical drift after projection."
+    governance_store.upsert_entity(entity["entity_id"], changed)
+    assert index_projection_matches_canonical(selected) is False
+
+
+def test_automatic_merge_discovery_keeps_system_entities_excluded():
+    from vector_lake.merge_analysis import analyze_entities
+
+    entities = [
+        {
+            "entity_id": "system_candidate_a",
+            "page_key": "System_Time-Series-Foundation-Models",
+            "canonical_name": "Time Series Foundation Models",
+            "type": "system",
+            "status": "Active",
+        },
+        {
+            "entity_id": "system_candidate_b",
+            "page_key": "System_Time_Series_Foundation_Models",
+            "canonical_name": "Time-Series Foundation Models",
+            "type": "system",
+            "status": "Active",
+        },
+    ]
+
+    assert analyze_entities(entities, limit=None, versions={}) == []
+
+
 def test_projection_pair_generation_ignores_soft_drift_and_blocks_entity_drift(
     isolated_memory,
 ):

@@ -74,7 +74,7 @@ type: {page_type}
 domain: General
 status: Active
 epistemic-status: seed
-categories: [Concept]
+categories: [Uncategorized]
 updated: 2026-07-13T00:00:00+00:00
 sources: []
 strategic_scope: core

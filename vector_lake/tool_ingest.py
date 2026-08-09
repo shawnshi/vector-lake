@@ -5,10 +5,12 @@ import logging
 import re
 import sqlite3
 import traceback
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Callable
 
 from vector_lake import get_extension_root
 from vector_lake.db_store import mark_file_processed, update_processed_file_observations
@@ -20,7 +22,9 @@ from vector_lake.wiki_utils import (
     get_wiki_dir,
     get_index_path,
     iter_markdown_files,
+    iter_wiki_link_matches,
     normalize_semantic_text,
+    split_frontmatter,
     validate_wiki_filename,
 )
 from vector_lake.purpose_contract import (
@@ -2599,6 +2603,153 @@ def _apply_integration_disposition(
     return files + target_mutations, disposition, seen_targets
 
 
+_TEMPORAL_WIKI_LINK = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class SourceLinkClosureError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _PreparedSourceLinkClosure:
+    proposed_page_keys: frozenset[str]
+    proposed_labels: tuple[tuple[str, str], ...]
+    source_links: tuple[tuple[str, str], ...]
+
+
+def _strict_link_identity(value: object) -> str:
+    """Normalize identity syntax only; preserve prefix, punctuation and spacing."""
+    cleaned = _strip_markdown_suffix(str(value or "").strip())
+    return unicodedata.normalize("NFKC", cleaned).casefold()
+
+
+def _prepare_source_link_closure(files: list[dict]) -> _PreparedSourceLinkClosure:
+    proposed_page_keys = set()
+    proposed_labels = []
+    source_links = []
+    for item in files:
+        filename = os.path.basename(str(item.get("filename") or ""))
+        content = str(item.get("content") or "")
+        frontmatter, _ = split_frontmatter(content)
+        page_key = _strip_markdown_suffix(filename)
+        if page_key:
+            proposed_page_keys.add(_strict_link_identity(page_key))
+            proposed_labels.append((page_key, page_key))
+            title = str(frontmatter.get("title") or "").strip()
+            if title:
+                proposed_labels.append((title, page_key))
+            aliases = frontmatter.get("aliases") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            if isinstance(aliases, list):
+                proposed_labels.extend(
+                    (str(alias).strip(), page_key)
+                    for alias in aliases
+                    if str(alias).strip()
+                )
+        if str(frontmatter.get("type") or "").casefold() != "source":
+            continue
+        for match in iter_wiki_link_matches(content):
+            target = _strip_markdown_suffix(match.group(1).strip())
+            if target and not _TEMPORAL_WIKI_LINK.fullmatch(target):
+                source_links.append((filename, target))
+    return _PreparedSourceLinkClosure(
+        proposed_page_keys=frozenset(proposed_page_keys),
+        proposed_labels=tuple(proposed_labels),
+        source_links=tuple(source_links),
+    )
+
+
+def _decode_link_aliases(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed]
+    if isinstance(parsed, str):
+        return [parsed]
+    return []
+
+
+def _canonical_source_link_label_rows() -> list[tuple[str, str, object]]:
+    """Read the narrow canonical label projection on the caller's transaction."""
+    from vector_lake import db_store
+
+    return [
+        (str(row[0] or ""), str(row[1] or ""), row[2])
+        for row in db_store.get_connection()
+        .execute(
+            "SELECT "
+            "json_extract(data_json, '$.page_key'), "
+            "json_extract(data_json, '$.title'), "
+            "json_extract(data_json, '$.aliases') "
+            "FROM entities"
+        )
+        .fetchall()
+    ]
+
+
+def _assert_source_link_closure(
+    prepared: _PreparedSourceLinkClosure,
+    canonical_rows: list[tuple[str, str, object]],
+) -> None:
+    labels: dict[str, set[str]] = {}
+
+    def register(label: object, page_key: str) -> None:
+        identity = _strict_link_identity(label)
+        if identity:
+            labels.setdefault(identity, set()).add(page_key)
+
+    for page_key, title, raw_aliases in canonical_rows:
+        if not page_key or _strict_link_identity(page_key) in prepared.proposed_page_keys:
+            continue
+        register(page_key, page_key)
+        register(title, page_key)
+        for alias in _decode_link_aliases(raw_aliases):
+            register(alias, page_key)
+    for label, page_key in prepared.proposed_labels:
+        register(label, page_key)
+
+    failures = []
+    for filename, target in prepared.source_links:
+        matches = sorted(labels.get(_strict_link_identity(target), set()))
+        if len(matches) == 1:
+            continue
+        status = "missing" if not matches else f"ambiguous: {', '.join(matches)}"
+        failures.append((filename, target, status))
+    if not failures:
+        return
+    unique_failures = sorted(set(failures))
+    samples = "; ".join(
+        f"{filename} -> [[{target}]] ({status})"
+        for filename, target, status in unique_failures[:20]
+    )
+    raise SourceLinkClosureError(
+        "Source Wiki link closure failed: "
+        f"{len(unique_failures)} unresolved/ambiguous target(s); {samples}"
+    )
+
+
+def _prepare_source_link_precondition(
+    files: list[dict],
+) -> Callable[[], None]:
+    """Prepare immutable batch labels; query canonical state inside the write lock."""
+    prepared = _prepare_source_link_closure(files)
+
+    def verify() -> None:
+        _assert_source_link_closure(
+            prepared,
+            _canonical_source_link_label_rows(),
+        )
+
+    return verify
+
+
 def _validate_final_ingest_files(
     files: list[dict],
     integration_target_names: set[str],
@@ -3671,6 +3822,7 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             integration_target_names,
             contract,
         )
+        verify_source_link_closure = _prepare_source_link_precondition(files)
 
         wiki_dir = get_wiki_dir()
 
@@ -3727,6 +3879,7 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             execute_mutation_batch(
                 mutations,
                 canonical_callback=mark_ingest_processed,
+                precondition_callback=verify_source_link_closure,
                 origin="ingest_integration",
                 schema_maintenance_filenames=schema_maintenance_filenames,
             )

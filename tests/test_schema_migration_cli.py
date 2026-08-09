@@ -30,6 +30,31 @@ def _downgrade_ledger(path: Path, version: int, *, duplicate_indexes=False) -> N
     db_store.close_all_connections()
     connection = sqlite3.connect(path)
     try:
+        if version < 7:
+            payloads = connection.execute(
+                "SELECT payload_sha256, codec, payload_blob, raw_bytes, "
+                "stored_bytes, created_at FROM change_set_payloads"
+            ).fetchall()
+            refs = connection.execute(
+                "SELECT change_set_id, payload_sha256, created_at "
+                "FROM change_set_payload_refs"
+            ).fetchall()
+            connection.execute("DROP TABLE change_set_payload_refs")
+            connection.execute("DROP TABLE change_set_payloads")
+            connection.execute(db_store._CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V6)
+            connection.execute(db_store._CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V6)
+            connection.execute(db_store._CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V6)
+            connection.executemany(
+                "INSERT INTO change_set_payloads "
+                "(payload_sha256, codec, payload_blob, raw_bytes, stored_bytes, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                payloads,
+            )
+            connection.executemany(
+                "INSERT INTO change_set_payload_refs "
+                "(change_set_id, payload_sha256, created_at) VALUES (?, ?, ?)",
+                refs,
+            )
         if duplicate_indexes:
             connection.execute("CREATE INDEX idx_date ON timeline_events(event_date)")
             connection.execute("CREATE INDEX idx_entity ON timeline_events(entity_id)")
@@ -102,7 +127,7 @@ def test_schema_migration_existing_preview_preserves_all_physical_identity(
 
     assert preview["can_apply"] is True
     assert preview["pre_schema_version"] == 5
-    assert preview["steps"] == ["schema_v5_to_v6"]
+    assert preview["steps"] == ["schema_v5_to_v6", "schema_v6_to_v7"]
     assert _physical_tree_identity(isolated_memory) == before
 
 
@@ -128,8 +153,9 @@ def test_schema_migration_explicitly_rejects_v1_to_v3(version, isolated_memory):
 @pytest.mark.parametrize(
     ("version", "expected_steps"),
     [
-        (4, ["schema_v4_to_v5", "schema_v5_to_v6"]),
-        (5, ["schema_v5_to_v6"]),
+        (4, ["schema_v4_to_v5", "schema_v5_to_v6", "schema_v6_to_v7"]),
+        (5, ["schema_v5_to_v6", "schema_v6_to_v7"]),
+        (6, ["schema_v6_to_v7"]),
     ],
 )
 def test_schema_migration_applies_with_verified_backup_and_receipt(
@@ -152,7 +178,7 @@ def test_schema_migration_applies_with_verified_backup_and_receipt(
     assert result["plan_fingerprint"] == preview["fingerprint"]
     assert result["pre"]["user_version"] == version
     assert result["post"]["ready"] is True
-    assert result["post"]["user_version"] == 6
+    assert result["post"]["user_version"] == 7
     backup_path = Path(result["backup"]["path"])
     assert backup_path.is_file()
     assert result["backup"]["sha256"] == _sha256(backup_path)
@@ -183,8 +209,8 @@ def test_schema_migration_applies_with_verified_backup_and_receipt(
     assert db_store.inspect_schema_migration_state(path)["ready"] is True
 
 
-def test_schema_migration_v6_apply_is_idempotent_no_op(isolated_memory):
-    path = _ready_database(6)
+def test_schema_migration_v7_apply_is_idempotent_no_op(isolated_memory):
+    path = _ready_database(7)
     preview = db_store.preview_schema_migration(path)
 
     result = db_store.schema_migration_maintenance(
@@ -312,25 +338,25 @@ def test_schema_migration_rejects_commit_after_locked_preview_before_backup(
     assert not (path.parent / "schema-migration-receipts").exists()
 
 
-def test_schema_migration_v4_to_v6_rolls_back_as_one_transaction(
+def test_schema_migration_v4_to_v7_rolls_back_as_one_transaction(
     isolated_memory,
     monkeypatch,
 ):
     path = _ready_database(4, duplicate_indexes=True)
     preview = db_store.preview_schema_migration(path)
-    real_v6 = db_store._apply_controlled_schema_v6_migration
+    real_v7 = db_store._apply_controlled_schema_v7_migration
 
-    def fail_after_v6(connection, *, maintenance_lock):
-        real_v6(connection, maintenance_lock=maintenance_lock)
-        raise RuntimeError("injected v6 failure")
+    def fail_after_v7(connection, *, maintenance_lock):
+        real_v7(connection, maintenance_lock=maintenance_lock)
+        raise RuntimeError("injected v7 failure")
 
     monkeypatch.setattr(
         db_store,
-        "_apply_controlled_schema_v6_migration",
-        fail_after_v6,
+        "_apply_controlled_schema_v7_migration",
+        fail_after_v7,
     )
 
-    with pytest.raises(RuntimeError, match="injected v6 failure"):
+    with pytest.raises(RuntimeError, match="injected v7 failure"):
         db_store.schema_migration_maintenance(
             apply=True,
             confirmation=preview["fingerprint"],
@@ -387,7 +413,7 @@ def test_schema_migration_pending_receipt_recovers_after_completion_publish_fail
             db_path=path,
         )
 
-    assert db_store.inspect_schema_migration_state(path)["user_version"] == 6
+    assert db_store.inspect_schema_migration_state(path)["user_version"] == 7
     completed_path, pending_path = db_store._schema_migration_receipt_paths(path)
     assert not completed_path.exists()
     assert json.loads(pending_path.read_text(encoding="utf-8"))["status"] == "pending"

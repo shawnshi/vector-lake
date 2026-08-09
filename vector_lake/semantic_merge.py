@@ -89,7 +89,32 @@ def _is_backlog_placeholder(frontmatter: dict, body: str) -> bool:
     )
 
 
-def _validate_scalar_contract(left: dict, right: dict, right_is_backlog: bool) -> None:
+def _validate_source_metadata_conflict_policy(
+    left: dict,
+    right: dict,
+    policy: str | None,
+) -> None:
+    if policy is None:
+        return
+    if policy != "preserve_target":
+        raise ValueError(
+            "Unsupported source_metadata_conflict_policy; expected 'preserve_target'."
+        )
+    if any(
+        str(frontmatter.get("type") or "").strip().casefold() != "source"
+        for frontmatter in (left, right)
+    ):
+        raise ValueError(
+            "source_metadata_conflict_policy is only valid for Source-to-Source merges."
+        )
+
+
+def _validate_scalar_contract(
+    left: dict,
+    right: dict,
+    right_is_backlog: bool,
+    conflict_policy: str | None,
+) -> None:
     if right_is_backlog:
         return
     neutral = {"", "general", "unknown", "unspecified", "edge", "derived"}
@@ -103,13 +128,17 @@ def _validate_scalar_contract(left: dict, right: dict, right_is_backlog: bool) -
             and right_value.casefold() not in neutral
             and left_value.casefold() != right_value.casefold()
         ):
-            raise ValueError(f"Conflicting Source scalar field {field}: {left_value} != {right_value}.")
+            if conflict_policy != "preserve_target":
+                raise ValueError(
+                    f"Conflicting Source scalar field {field}: {left_value} != {right_value}."
+                )
 
 
 def merge_markdown_content(
     left_content: str,
     right_content: str,
     source_key: str | None = None,
+    source_metadata_conflict_policy: str | None = None,
 ) -> str:
     """Return a merged left page without mutating either source file."""
     left_frontmatter, left_body = split_frontmatter(left_content)
@@ -119,8 +148,18 @@ def merge_markdown_content(
     if not right_frontmatter:
         raise ValueError("The merge source has no valid YAML frontmatter.")
 
+    _validate_source_metadata_conflict_policy(
+        left_frontmatter,
+        right_frontmatter,
+        source_metadata_conflict_policy,
+    )
     right_is_backlog = _is_backlog_placeholder(right_frontmatter, right_body)
-    _validate_scalar_contract(left_frontmatter, right_frontmatter, right_is_backlog)
+    _validate_scalar_contract(
+        left_frontmatter,
+        right_frontmatter,
+        right_is_backlog,
+        source_metadata_conflict_policy,
+    )
 
     left_aliases = _as_list(left_frontmatter.get("aliases"))
     right_aliases = _as_list(right_frontmatter.get("aliases"))
@@ -144,6 +183,12 @@ def merge_markdown_content(
 
     for field in ("tags", "tension_edges"):
         merged = _union_list(left_frontmatter.get(field), right_frontmatter.get(field))
+        if (
+            field == "tags"
+            and source_metadata_conflict_policy == "preserve_target"
+            and len(merged) > 3
+        ):
+            merged = _as_list(left_frontmatter.get(field))
         if merged or field in left_frontmatter or field in right_frontmatter:
             left_frontmatter[field] = merged
 

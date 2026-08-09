@@ -41,15 +41,16 @@ graph LR
 |---|---|
 | Plugin package | `11.14.0+codex.20260728154444` |
 | Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
-| SQLite migration schema | `PRAGMA user_version = 6` |
+| SQLite migration schema | `PRAGMA user_version = 7` |
 | Canonical governance schema | `8.0` |
 | Index projection | `PROJECTION_CONTRACT_VERSION = 1` |
 | EvidencePacket | `1.1` |
 | Public surfaces | 51 MCP tools / 32 CLI commands / 19 Codex skills / 19 Gemini command prompts |
 
-通用 `init_db()` 遇到既有 v1–v5 数据库会拒绝自动升级。CLI-only
-`schema-migrate` 只接受契约完整的 v4 或 v5 数据库，按 v4→v5→v6 或 v5→v6
-单向迁移；v1–v3 明确不受该入口支持，必须先通过经单独验证的离线恢复或旧版迁移
+通用 `init_db()` 遇到既有 v1–v6 数据库会拒绝自动升级。CLI-only
+`schema-migrate` 接受契约完整的 v4、v5、v6 或 v7 数据库，按 v4→v5→v6→v7、
+v5→v6→v7 或 v6→v7 单向迁移；契约完整的 v7 输入返回幂等 no-op。
+v1–v3 明确不受该入口支持，必须先通过经单独验证的离线恢复或旧版迁移
 流程升级到 v4。执行前必须停止 MCP/watchdog 及其他写入者；apply 持有 schema
 maintenance lock，重新核验 preview fingerprint；preview 如报告未 checkpoint 的 WAL，
 必须先用同一 fingerprint 执行显式 `--checkpoint-wal`，然后重新 preview。apply 在任何
@@ -63,9 +64,9 @@ migration ledger 在同一 EXCLUSIVE 事务回滚，但备份、迁移收据及 
 mode/sidecar 不属于该原子边界；旧进程不得与迁移 CLI 并行运行。删除索引只减少
 后续维护开销，不会自动缩小数据库文件。
 
-Schema v6 继续采用受控单向迁移，并新增 change-set 内容寻址 payload、生命周期业务时间、
-retention 收据与固定 `plan_as_of`。新 change-set 单条 payload 最大 4 MiB、单批累计最大
-32 MiB、最多 200 项且全批最多覆盖 200 个不重叠页面；终态历史只保留有界 manifest
+Schema v6 的历史 DDL 与迁移 checksum 保持不变；Schema v7 通过受控单向迁移将
+change-set payload 原始上限提高到 8 MiB，同时保持压缩存储上限 4 MiB + 64 KiB。
+单批累计仍为 32 MiB、最多 200 项且全批最多覆盖 200 个不重叠页面；终态历史只保留有界 manifest
 和摘要，不保留可回放 payload。旧快照压缩规划每次最多扫描 5,000 行，默认最多处理
 100 行/64 MiB，硬上限 500 行/128 MiB。retention 每批全局最多删除 500 行、默认
 128 MiB；版本历史采用最多 5,000 行的主键游标窗口和族内顺序索引，不再对全表做
@@ -371,7 +372,7 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hours 24 --apply --confirm-fingerprint "sha256:<preview-fingerprint>"
 ```
 
-除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` 的 preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥，二者都必须提交匹配的完整 fingerprint 与 `--confirm-no-writers`。checkpoint 只在 maintenance/heavy lock 内执行 `wal_checkpoint(TRUNCATE)`，不生成备份、不执行 DDL，并返回新的只读 preview/fingerprint。apply 在 DDL 前持久化备份和 pending manifest，成功收据返回备份路径/摘要及 `projection_rebuild_required=true`。普通 v6 输入是幂等 no-op；若 v6 preview 发现并校验到同数据库的 pending manifest，仍返回 `projection_rebuild_required=true`，apply 可补发 completed receipt，且不会新建备份。`canonical-backfill` 从 Wiki Markdown 回填缺失 canonical；`evidence-foundation-backfill` 只合并缺失的证据基础元数据；`projection-rebuild-index` 从 canonical 重建 `index.json`、FTS、`claim_graph.json` 和 sidecar，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐向量；`wiki-restore` 只做 projection-only 恢复；`memory-search-index` 每次推进一个有界索引批次；`history-retention` 只删除超龄且不再被引用的有界历史批次，apply 必须提交同一次预览返回的 `plan_as_of` 与完整 fingerprint；`change-set-compaction` 将旧 change-set 完整快照转换为受限 manifest 与内容寻址引用，apply 必须提交同一次预览的完整 fingerprint，后续批次只能使用上一次成功 apply 的 `result.safe_next_cursor` 作为 `--cursor`；`memory-cleanup`、`topology-queue-cleanup` 和 `orphan-source-classify` 均先返回候选或债务分类。
+除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` 的 preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥，二者都必须提交匹配的完整 fingerprint 与 `--confirm-no-writers`。checkpoint 只在 maintenance/heavy lock 内执行 `wal_checkpoint(TRUNCATE)`，不生成备份、不执行 DDL，并返回新的只读 preview/fingerprint。apply 在 DDL 前持久化备份和 pending manifest，成功收据返回备份路径/摘要及 `projection_rebuild_required=true`。普通 v7 输入是幂等 no-op；若 v7 preview 发现并校验到同数据库的 pending manifest，仍返回 `projection_rebuild_required=true`，apply 可补发 completed receipt，且不会新建备份。`canonical-backfill` 从 Wiki Markdown 回填缺失 canonical；`evidence-foundation-backfill` 只合并缺失的证据基础元数据；`projection-rebuild-index` 从 canonical 重建 `index.json`、FTS、`claim_graph.json` 和 sidecar，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐向量；`wiki-restore` 只做 projection-only 恢复；`memory-search-index` 每次推进一个有界索引批次；`history-retention` 只删除超龄且不再被引用的有界历史批次，apply 必须提交同一次预览返回的 `plan_as_of` 与完整 fingerprint；`change-set-compaction` 将旧 change-set 完整快照转换为受限 manifest 与内容寻址引用，apply 必须提交同一次预览的完整 fingerprint，后续批次只能使用上一次成功 apply 的 `result.safe_next_cursor` 作为 `--cursor`；`memory-cleanup`、`topology-queue-cleanup` 和 `orphan-source-classify` 均先返回候选或债务分类。
 
 `backup-retention` 预览返回 fingerprint；apply 必须复用相同的 `keep-latest`、`min-age-days`、`stage-ttl-hours` 参数并提交该 fingerprint。默认保留最新 5 份完整备份、30 天内的完整备份和最新一份经实际校验可恢复的 canonical/projection 快照；过期但校验通过的删除 tombstone 也可作为恢复保护点，私有 staging 与失败删除 tombstone 至少保留 24 小时。预检和执行前重扫会核验 artifact SHA-256、SQLite 结构与完整性、投影/数据库代次；新备份还会复制并验证 sidecar，旧版无 sidecar 的 v3 备份继续按内嵌 pair contract 兼容校验。
 

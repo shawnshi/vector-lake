@@ -15,7 +15,7 @@ def _frontmatter(source_ref: str | None = None) -> dict:
         "domain": "General",
         "status": "Active",
         "epistemic-status": "seed",
-        "categories": ["Testing"],
+        "categories": ["Uncategorized"],
         "created": "2026-07-21T00:00:00+00:00",
         "updated": "2026-07-21T00:00:00+00:00",
         "sources": [source_ref] if source_ref else [],
@@ -32,7 +32,7 @@ def _content(body: str, source_ref: str | None = None) -> str:
         "domain: General\n"
         "status: Active\n"
         "epistemic-status: seed\n"
-        "categories: [Testing]\n"
+        "categories: [Uncategorized]\n"
         "created: 2026-07-21T00:00:00+00:00\n"
         "updated: 2026-07-21T00:00:00+00:00\n"
         f"{source_yaml}"

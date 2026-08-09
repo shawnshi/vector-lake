@@ -62,7 +62,7 @@ _SCHEMA_MIGRATION_RUNTIME_LOCK_TIMEOUT_SECONDS = 5.0
 _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN = object()
 _SCHEMA_MIGRATION_PLAN_CONTRACT = "vector-lake-schema-migration-plan/v1"
 _SCHEMA_MIGRATION_RECEIPT_CONTRACT = "vector-lake-schema-migration-receipt/v1"
-_SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS = frozenset({4, 5, 6})
+_SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS = frozenset({4, 5, 6, 7})
 
 
 def _normalized_schema_sql(statement: object) -> str:
@@ -321,6 +321,56 @@ _CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V6 = """
 CREATE INDEX IF NOT EXISTS idx_change_set_payload_refs_payload_v6
 ON change_set_payload_refs(payload_sha256, change_set_id)
 """
+_CHANGE_SET_PAYLOAD_MAX_RAW_BYTES_V7 = 8 * 1024 * 1024
+_CHANGE_SET_PAYLOAD_MAX_STORED_BYTES_V7 = 4 * 1024 * 1024 + 64 * 1024
+# SQLite preserves the quoted final table names produced by the v7 rebuild
+# renames. These contracts therefore match sqlite_master exactly while keeping
+# the v6 contract and checksum immutable.
+_CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V7 = f"""
+CREATE TABLE "change_set_payloads" (
+    payload_sha256 TEXT PRIMARY KEY,
+    codec TEXT NOT NULL CHECK (codec = 'zlib-json-v1'),
+    payload_blob BLOB NOT NULL,
+    raw_bytes INTEGER NOT NULL
+        CHECK (raw_bytes >= 0 AND raw_bytes <= {_CHANGE_SET_PAYLOAD_MAX_RAW_BYTES_V7}),
+    stored_bytes INTEGER NOT NULL
+        CHECK (stored_bytes >= 0 AND stored_bytes <= {_CHANGE_SET_PAYLOAD_MAX_STORED_BYTES_V7}),
+    created_at TEXT NOT NULL,
+    CHECK (length(payload_sha256) = 64),
+    CHECK (length(payload_blob) = stored_bytes)
+)
+"""
+_CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V7 = """
+CREATE TABLE "change_set_payload_refs" (
+    change_set_id TEXT PRIMARY KEY
+        REFERENCES change_sets(change_set_id) ON DELETE CASCADE,
+    payload_sha256 TEXT NOT NULL
+        REFERENCES "change_set_payloads"(payload_sha256) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL
+)
+"""
+_CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V7 = """
+CREATE INDEX IF NOT EXISTS idx_change_set_payload_refs_payload_v6
+ON change_set_payload_refs(payload_sha256, change_set_id)
+"""
+_CHANGE_SET_PAYLOAD_SCHEMA_V7 = (
+    _CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V7,
+    _CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V7,
+    _CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V7,
+)
+_CHANGE_SET_PAYLOAD_SCHEMA_OBJECTS_V7 = (
+    ("table", "change_set_payloads", _CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V7),
+    (
+        "table",
+        "change_set_payload_refs",
+        _CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V7,
+    ),
+    (
+        "index",
+        "idx_change_set_payload_refs_payload_v6",
+        _CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V7,
+    ),
+)
 _CHANGE_SET_LIFECYCLE_TABLE_SCHEMA_V6 = """
 CREATE TABLE IF NOT EXISTS change_set_lifecycle_v6 (
     change_set_id TEXT PRIMARY KEY
@@ -452,7 +502,7 @@ _CHANGE_SET_HISTORY_SCHEMA_OBJECTS_V6 = (
     ),
 )
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _SCHEMA_MIGRATIONS = {
     1: (
         "baseline_schema_v1",
@@ -477,6 +527,10 @@ _SCHEMA_MIGRATIONS = {
     6: (
         "change_set_delta_history_v6",
         _schema_contract_checksum(_CHANGE_SET_HISTORY_SCHEMA_V6),
+    ),
+    7: (
+        "change_set_payload_limits_v7",
+        _schema_contract_checksum(_CHANGE_SET_PAYLOAD_SCHEMA_V7),
     ),
 }
 
@@ -802,9 +856,19 @@ def _assert_duplicate_index_cleanup_v5_contract(conn: sqlite3.Connection) -> Non
 
 def _change_set_history_schema_v6_issues(
     conn: sqlite3.Connection,
+    *,
+    include_payload_schema: bool | None = None,
 ) -> list[str]:
     issues: list[str] = []
-    for object_type, name, expected_sql in _CHANGE_SET_HISTORY_SCHEMA_OBJECTS_V6:
+    if include_payload_schema is None:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        include_payload_schema = version < 7
+    expected_objects = (
+        _CHANGE_SET_HISTORY_SCHEMA_OBJECTS_V6
+        if include_payload_schema
+        else _CHANGE_SET_HISTORY_SCHEMA_OBJECTS_V6[3:]
+    )
+    for object_type, name, expected_sql in expected_objects:
         row = conn.execute(
             "SELECT type, sql FROM sqlite_master WHERE name = ?",
             (name,),
@@ -841,6 +905,26 @@ def _change_set_history_schema_v6_issues(
     return issues
 
 
+def _change_set_payload_schema_v7_issues(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    issues: list[str] = []
+    for object_type, name, expected_sql in _CHANGE_SET_PAYLOAD_SCHEMA_OBJECTS_V7:
+        row = conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            issues.append(f"change_set_payload_schema_missing:{object_type}:{name}")
+            continue
+        if str(row["type"] or "") != object_type:
+            issues.append(f"change_set_payload_schema_type_mismatch:{name}")
+            continue
+        if _normalized_schema_sql(row["sql"]) != _normalized_schema_sql(expected_sql):
+            issues.append(f"change_set_payload_schema_sql_mismatch:{name}")
+    return issues
+
+
 def _assert_change_set_history_schema_v6_contract(
     conn: sqlite3.Connection,
 ) -> None:
@@ -851,6 +935,20 @@ def _assert_change_set_history_schema_v6_contract(
     if issues:
         raise RuntimeError(
             "Schema v6 change-set history contract is invalid: "
+            + ", ".join(issues)
+        )
+
+
+def _assert_change_set_payload_schema_v7_contract(
+    conn: sqlite3.Connection,
+) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 7:
+        return
+    issues = _change_set_payload_schema_v7_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v7 change-set payload contract is invalid: "
             + ", ".join(issues)
         )
 
@@ -890,6 +988,7 @@ def _validate_cached_identity_state(conn: sqlite3.Connection) -> None:
     _assert_ingest_task_cleanup_schema_contract(conn)
     _assert_duplicate_index_cleanup_v5_contract(conn)
     _assert_change_set_history_schema_v6_contract(conn)
+    _assert_change_set_payload_schema_v7_contract(conn)
     db_key = str(get_db_path().resolve())
     with _IDENTITY_VALIDATION_LOCK:
         for _attempt in range(2):
@@ -974,6 +1073,8 @@ def inspect_schema_migration_connection(
             result["issues"].extend(_duplicate_index_cleanup_v5_issues(conn))
         if int(result["user_version"] or 0) >= 6:
             result["issues"].extend(_change_set_history_schema_v6_issues(conn))
+        if int(result["user_version"] or 0) >= 7:
+            result["issues"].extend(_change_set_payload_schema_v7_issues(conn))
     except (OSError, sqlite3.Error) as exc:
         result["status"] = "invalid"
         result["issues"].append(f"schema_inspection_failed:{exc}")
@@ -1383,6 +1484,10 @@ def get_connection() -> sqlite3.Connection:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA recursive_triggers=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        if int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+            conn.close()
+            raise RuntimeError("SQLite foreign-key enforcement could not be enabled")
         with _CONNECTIONS_LOCK:
             _CONNECTIONS[id(conn)] = conn
         _LOCAL.conn = conn
@@ -2035,6 +2140,247 @@ def _migrate_change_set_history_schema_v6(conn: sqlite3.Connection) -> None:
         )
 
 
+def _change_set_payload_v7_scalar_state(
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> tuple[int, int]:
+    if table_name not in {"change_set_payloads", "change_set_payloads_v7_new"}:
+        raise ValueError("Unsupported payload table for schema v7 verification")
+    row = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(stored_bytes), 0) FROM {table_name}"
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
+def _change_set_payload_v7_copy_mismatch(
+    conn: sqlite3.Connection,
+) -> str | None:
+    payload_mismatch = conn.execute(
+        "SELECT 1 FROM change_set_payloads AS old "
+        "LEFT JOIN change_set_payloads_v7_new AS new "
+        "ON new.payload_sha256 = old.payload_sha256 "
+        "WHERE new.payload_sha256 IS NULL "
+        "OR new.codec IS NOT old.codec "
+        "OR new.payload_blob IS NOT old.payload_blob "
+        "OR new.raw_bytes IS NOT old.raw_bytes "
+        "OR new.stored_bytes IS NOT old.stored_bytes "
+        "OR new.created_at IS NOT old.created_at LIMIT 1"
+    ).fetchone()
+    if payload_mismatch is not None:
+        return "change_set_payloads"
+    ref_mismatch = conn.execute(
+        "SELECT 1 FROM change_set_payload_refs AS old "
+        "LEFT JOIN change_set_payload_refs_v7_new AS new "
+        "ON new.change_set_id = old.change_set_id "
+        "WHERE new.change_set_id IS NULL "
+        "OR new.payload_sha256 IS NOT old.payload_sha256 "
+        "OR new.created_at IS NOT old.created_at LIMIT 1"
+    ).fetchone()
+    if ref_mismatch is not None:
+        return "change_set_payload_refs"
+    return None
+
+
+def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
+    """Rebuild payload storage with an independent 8 MiB raw-byte ceiling."""
+    v6_issues = _change_set_history_schema_v6_issues(
+        conn,
+        include_payload_schema=True,
+    )
+    if v6_issues:
+        raise RuntimeError(
+            "Schema v7 requires the exact schema v6 contract: "
+            + ", ".join(v6_issues)
+        )
+    quick_check = conn.execute("PRAGMA quick_check").fetchone()
+    if quick_check is None or str(quick_check[0]).casefold() != "ok":
+        raise RuntimeError("Schema v7 source quick_check failed")
+    if int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise RuntimeError("Schema v7 migration requires foreign_keys=ON")
+    if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise RuntimeError("Schema v7 source foreign_key_check failed")
+
+    temporary_names = (
+        "change_set_payloads_v7_new",
+        "change_set_payload_refs_v7_new",
+    )
+    placeholders = ", ".join("?" for _ in temporary_names)
+    collision = conn.execute(
+        f"SELECT name FROM sqlite_master WHERE name IN ({placeholders}) LIMIT 1",
+        temporary_names,
+    ).fetchone()
+    if collision is not None:
+        raise RuntimeError(f"Schema v7 temporary object already exists: {collision[0]}")
+
+    invalid_payload = conn.execute(
+        "SELECT payload_sha256 FROM change_set_payloads WHERE "
+        "typeof(payload_sha256) != 'text' OR length(payload_sha256) != 64 OR "
+        "payload_sha256 GLOB '*[^0-9a-f]*' OR codec != 'zlib-json-v1' OR "
+        "typeof(payload_blob) != 'blob' OR typeof(raw_bytes) != 'integer' OR "
+        "raw_bytes < 0 OR raw_bytes > ? OR "
+        "typeof(stored_bytes) != 'integer' OR stored_bytes < 0 OR "
+        "stored_bytes > ? OR length(payload_blob) != stored_bytes LIMIT 1",
+        (
+            _CHANGE_SET_PAYLOAD_MAX_RAW_BYTES_V6,
+            _CHANGE_SET_PAYLOAD_MAX_STORED_BYTES_V6,
+        ),
+    ).fetchone()
+    if invalid_payload is not None:
+        raise RuntimeError(
+            "Schema v7 source payload metadata is invalid: "
+            f"{str(invalid_payload[0])}"
+        )
+    orphan_ref = conn.execute(
+        "SELECT ref.change_set_id FROM change_set_payload_refs AS ref "
+        "LEFT JOIN change_sets AS change_set "
+        "ON change_set.change_set_id = ref.change_set_id "
+        "LEFT JOIN change_set_payloads AS payload "
+        "ON payload.payload_sha256 = ref.payload_sha256 "
+        "WHERE change_set.change_set_id IS NULL OR payload.payload_sha256 IS NULL "
+        "LIMIT 1"
+    ).fetchone()
+    if orphan_ref is not None:
+        raise RuntimeError(f"Schema v7 source payload reference is orphaned: {orphan_ref[0]}")
+
+    payload_columns = (
+        "payload_sha256, codec, payload_blob, raw_bytes, stored_bytes, created_at"
+    )
+    ref_columns = "change_set_id, payload_sha256, created_at"
+    expected_payload_state = _change_set_payload_v7_scalar_state(
+        conn,
+        "change_set_payloads",
+    )
+    expected_ref_count = int(
+        conn.execute("SELECT COUNT(*) FROM change_set_payload_refs").fetchone()[0]
+    )
+
+    conn.execute(
+        f"""
+        CREATE TABLE change_set_payloads_v7_new (
+            payload_sha256 TEXT PRIMARY KEY,
+            codec TEXT NOT NULL CHECK (codec = 'zlib-json-v1'),
+            payload_blob BLOB NOT NULL,
+            raw_bytes INTEGER NOT NULL
+                CHECK (raw_bytes >= 0 AND raw_bytes <= {_CHANGE_SET_PAYLOAD_MAX_RAW_BYTES_V7}),
+            stored_bytes INTEGER NOT NULL
+                CHECK (stored_bytes >= 0 AND stored_bytes <= {_CHANGE_SET_PAYLOAD_MAX_STORED_BYTES_V7}),
+            created_at TEXT NOT NULL,
+            CHECK (length(payload_sha256) = 64),
+            CHECK (length(payload_blob) = stored_bytes)
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO change_set_payloads_v7_new "
+        f"({payload_columns}) SELECT {payload_columns} FROM change_set_payloads"
+    )
+    if int(conn.execute("SELECT changes()").fetchone()[0]) != expected_payload_state[0]:
+        raise RuntimeError("Schema v7 copied payload row count differs")
+    conn.execute(
+        """
+        CREATE TABLE change_set_payload_refs_v7_new (
+            change_set_id TEXT PRIMARY KEY
+                REFERENCES change_sets(change_set_id) ON DELETE CASCADE,
+            payload_sha256 TEXT NOT NULL
+                REFERENCES change_set_payloads_v7_new(payload_sha256)
+                ON DELETE RESTRICT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO change_set_payload_refs_v7_new "
+        f"({ref_columns}) SELECT {ref_columns} FROM change_set_payload_refs"
+    )
+    if int(conn.execute("SELECT changes()").fetchone()[0]) != expected_ref_count:
+        raise RuntimeError("Schema v7 copied payload-reference row count differs")
+    if _change_set_payload_v7_scalar_state(
+        conn,
+        "change_set_payloads_v7_new",
+    ) != expected_payload_state:
+        raise RuntimeError("Schema v7 copied payload scalar state differs")
+    new_ref_count = int(
+        conn.execute("SELECT COUNT(*) FROM change_set_payload_refs_v7_new").fetchone()[0]
+    )
+    if new_ref_count != expected_ref_count:
+        raise RuntimeError("Schema v7 copied payload-reference scalar state differs")
+    mismatch = _change_set_payload_v7_copy_mismatch(conn)
+    if mismatch is not None:
+        raise RuntimeError(f"Schema v7 copied rows differ: {mismatch}")
+
+    conn.execute("DROP TABLE change_set_payload_refs")
+    conn.execute("DROP TABLE change_set_payloads")
+    conn.execute(
+        "ALTER TABLE change_set_payloads_v7_new RENAME TO change_set_payloads"
+    )
+    conn.execute(
+        "ALTER TABLE change_set_payload_refs_v7_new RENAME TO change_set_payload_refs"
+    )
+    conn.execute(_CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V7)
+
+    if _change_set_payload_v7_scalar_state(
+        conn,
+        "change_set_payloads",
+    ) != expected_payload_state:
+        raise RuntimeError("Schema v7 final payload scalar state differs from the source")
+    final_ref_count = int(
+        conn.execute("SELECT COUNT(*) FROM change_set_payload_refs").fetchone()[0]
+    )
+    if final_ref_count != expected_ref_count:
+        raise RuntimeError("Schema v7 final payload-reference count differs from the source")
+
+    observed_fks = {
+        (
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[5]),
+            str(row[6]),
+            str(row[7]),
+        )
+        for row in conn.execute("PRAGMA foreign_key_list(change_set_payload_refs)")
+    }
+    expected_fks = {
+        (
+            "change_sets",
+            "change_set_id",
+            "change_set_id",
+            "NO ACTION",
+            "CASCADE",
+            "NONE",
+        ),
+        (
+            "change_set_payloads",
+            "payload_sha256",
+            "payload_sha256",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        ),
+    }
+    if observed_fks != expected_fks:
+        raise RuntimeError("Schema v7 final payload foreign keys differ")
+    if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise RuntimeError("Schema v7 final foreign_key_check failed")
+    if conn.execute(
+        f"SELECT name FROM sqlite_master WHERE name IN ({placeholders}) LIMIT 1",
+        temporary_names,
+    ).fetchone() is not None:
+        raise RuntimeError("Schema v7 temporary objects remain after rebuild")
+
+    issues = _change_set_payload_schema_v7_issues(conn)
+    issues.extend(
+        _change_set_history_schema_v6_issues(
+            conn,
+            include_payload_schema=False,
+        )
+    )
+    if issues:
+        raise RuntimeError(
+            "Schema v7 change-set payload migration failed: " + ", ".join(issues)
+        )
+
+
 def _assert_held_schema_migration_lock(
     conn: sqlite3.Connection,
     maintenance_lock: BaseFileLock,
@@ -2160,10 +2506,54 @@ def _apply_controlled_schema_v6_migration(
             f"v{current_version}"
         )
     _migrate_change_set_history_schema_v6(conn)
-    _record_schema_migrations(conn, current_version)
+    applied_at = datetime.now(timezone.utc).isoformat()
+    name, checksum = _SCHEMA_MIGRATIONS[6]
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
+        "VALUES (6, ?, ?, ?)",
+        (name, checksum, applied_at),
+    )
+    conn.execute("PRAGMA user_version = 6")
     if _validate_schema_migration_state(conn) != 6:
         raise RuntimeError("Controlled schema v6 migration ledger validation failed")
     _assert_change_set_history_schema_v6_contract(conn)
+
+
+def _apply_controlled_schema_v7_migration(
+    conn: sqlite3.Connection,
+    *,
+    maintenance_lock: BaseFileLock,
+) -> None:
+    """Apply v6->v7 inside the existing lock-bound exclusive transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError(
+            "Controlled schema v7 migration requires an active caller transaction"
+        )
+    _assert_held_schema_migration_lock(conn, maintenance_lock)
+    expected_authority = (
+        _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN,
+        id(conn),
+        id(maintenance_lock),
+    )
+    if getattr(_LOCAL, "controlled_schema_v5_context", None) != expected_authority:
+        raise RuntimeError(
+            "Controlled schema v7 migration requires the lock-bound transaction"
+        )
+    current_version = _validate_schema_migration_state(conn)
+    if current_version != 6:
+        raise RuntimeError(
+            f"Controlled schema v7 migration requires schema v6, found "
+            f"v{current_version}"
+        )
+    _assert_change_set_history_schema_v6_contract(conn)
+    _migrate_change_set_payload_schema_v7(conn)
+    _record_schema_migrations(conn, current_version)
+    if _validate_schema_migration_state(conn) != 7:
+        raise RuntimeError("Controlled schema v7 migration ledger validation failed")
+    _assert_change_set_history_schema_v6_contract(conn)
+    _assert_change_set_payload_schema_v7_contract(conn)
+    if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise RuntimeError("Controlled schema v7 migration foreign_key_check failed")
 
 
 def _schema_migration_file_identity(path: Path) -> dict:
@@ -2205,9 +2595,11 @@ def _schema_migration_fingerprint(payload: dict) -> str:
 
 def _schema_migration_steps(version: int) -> list[str]:
     if version == 4:
-        return ["schema_v4_to_v5", "schema_v5_to_v6"]
+        return ["schema_v4_to_v5", "schema_v5_to_v6", "schema_v6_to_v7"]
     if version == 5:
-        return ["schema_v5_to_v6"]
+        return ["schema_v5_to_v6", "schema_v6_to_v7"]
+    if version == 6:
+        return ["schema_v6_to_v7"]
     return []
 
 
@@ -2701,7 +3093,7 @@ def schema_migration_maintenance(
     confirm_no_writers: bool = False,
     db_path: str | Path | None = None,
 ) -> dict:
-    """Preview or execute the CLI-only controlled v4/v5 to v6 migration."""
+    """Preview or execute the CLI-only controlled v4/v5/v6 to v7 migration."""
     initial_plan = preview_schema_migration(db_path)
     if apply and checkpoint_wal:
         raise RuntimeError(
@@ -2813,7 +3205,8 @@ def schema_migration_maintenance(
                     _schema_migration_atomic_json(completed_path, completed)
                 except (OSError, ValueError) as exc:
                     raise RuntimeError(
-                        "Schema migration is v6, but completed receipt publication failed"
+                        "Schema migration is at the current target, but completed "
+                        "receipt publication failed"
                     ) from exc
                 return {
                     "contract": _SCHEMA_MIGRATION_RECEIPT_CONTRACT,
@@ -2904,12 +3297,18 @@ def schema_migration_maintenance(
                     source,
                     maintenance_lock=maintenance_lock,
                 )
+                current_version = 6
+            if current_version == 6:
+                _apply_controlled_schema_v7_migration(
+                    source,
+                    maintenance_lock=maintenance_lock,
+                )
 
         source.execute("PRAGMA query_only=ON")
         post_state = inspect_schema_migration_connection(source, path)
         if not post_state.get("ready") or post_state.get("user_version") != _SCHEMA_VERSION:
             raise RuntimeError(
-                "Schema migration committed but read-only v6 verification failed: "
+                "Schema migration committed but read-only target verification failed: "
                 + ", ".join(post_state.get("issues") or ["schema_not_ready"])
             )
         if pending_receipt is None or pending_receipt_path is None:
@@ -3428,6 +3827,7 @@ def _init_db_once(db_key: str):
         _assert_ingest_task_cleanup_schema_contract(conn)
         _assert_duplicate_index_cleanup_v5_contract(conn)
         _assert_change_set_history_schema_v6_contract(conn)
+        _assert_change_set_payload_schema_v7_contract(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (
                 entity_id TEXT PRIMARY KEY,
@@ -3932,6 +4332,8 @@ def _init_db_once(db_key: str):
             _migrate_duplicate_index_cleanup_v5(conn)
         if current_schema_version < 6:
             _migrate_change_set_history_schema_v6(conn)
+        if current_schema_version < 7:
+            _migrate_change_set_payload_schema_v7(conn)
         _record_schema_migrations(conn, current_schema_version)
     if current_schema_version < 2:
         _assert_identity_schema_contract(conn)
@@ -3939,6 +4341,7 @@ def _init_db_once(db_key: str):
         _assert_ingest_task_cleanup_schema_contract(conn)
         _assert_duplicate_index_cleanup_v5_contract(conn)
         _assert_change_set_history_schema_v6_contract(conn)
+        _assert_change_set_payload_schema_v7_contract(conn)
         with _IDENTITY_VALIDATION_LOCK:
             _IDENTITY_VALIDATION_TOKENS[db_key] = _identity_validation_token(conn)
     else:

@@ -649,6 +649,9 @@ def resolve_governance_item(
         left_content,
         right_content,
         source_key=candidate["right_page_key"],
+        source_metadata_conflict_policy=candidate.get(
+            "source_metadata_conflict_policy"
+        ),
     )
     merged_projection_hash = semantic_text_hash(merged_content)
     journal_id = (

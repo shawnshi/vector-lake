@@ -92,7 +92,7 @@ def test_schema_tag_collision_is_not_swallowed(tmp_path):
         "domain": "General",
         "status": "Active",
         "epistemic-status": "seed",
-        "categories": ["Source"],
+        "categories": ["Uncategorized"],
         "updated": "2026-07-14T00:00:00+00:00",
         "sources": [],
         "tags": ["Existing"],

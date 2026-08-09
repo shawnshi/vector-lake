@@ -104,7 +104,7 @@ type: source
 domain: General
 status: Active
 epistemic-status: seed
-categories: [Source]
+categories: [Uncategorized]
 updated: 2026-07-13T00:00:00+00:00
 sources: [raw/test.pdf]
 strategic_scope: core

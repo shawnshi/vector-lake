@@ -77,22 +77,37 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     if doc_type not in VALID_TYPES:
         raise SchemaViolationException(f"Schema Violation: Invalid type '{doc_type}'. Must be one of {VALID_TYPES}.")
 
-    # 1.3 Epistemic Status
+    # 1.3 Controlled category vocabulary
+    categories = frontmatter.get("categories")
+    if not isinstance(categories, list) or not categories:
+        raise SchemaViolationException(
+            "Schema Violation: categories must be a non-empty list."
+        )
+    invalid_categories = sorted(
+        {str(category) for category in categories if category not in VALID_CATEGORIES}
+    )
+    if invalid_categories:
+        raise SchemaViolationException(
+            "Schema Violation: Invalid category "
+            f"'{invalid_categories[0]}'. Must be one of {sorted(VALID_CATEGORIES)}."
+        )
+
+    # 1.4 Epistemic Status
     epistemic_status = str(frontmatter.get("epistemic-status", "")).lower()
     if epistemic_status and epistemic_status not in VALID_EPISTEMIC_STATUS:
         raise SchemaViolationException(f"Schema Violation: epistemic-status '{epistemic_status}' is invalid. Allowed: {VALID_EPISTEMIC_STATUS}.")
 
-    # 1.4 Status
+    # 1.5 Status
     status = str(frontmatter.get("status", "")).title()
     if status and status not in VALID_STATUS:
         raise SchemaViolationException(f"Schema Violation: status '{status}' is invalid. Allowed: {VALID_STATUS}.")
 
-    # 1.5 Tags Constraints
+    # 1.6 Tags Constraints
     tags = frontmatter.get("tags", [])
     if isinstance(tags, list) and len(tags) > 3:
         raise SchemaViolationException(f"Taxonomy Violation: Maximum 3 tags allowed, but found {len(tags)}.")
         
-    # 1.6 Dates
+    # 1.7 Dates
     try:
         if "created" in frontmatter:
             datetime.fromisoformat(str(frontmatter["created"]).replace("Z", "+00:00"))
@@ -100,7 +115,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     except ValueError:
         raise SchemaViolationException("Schema Violation: 'created' and 'updated' must be valid ISO8601 timestamps.")
         
-    # 1.7 Tension Edges & STQM
+    # 1.8 Tension Edges & STQM
     tension_edges = frontmatter.get("tension_edges", [])
     if tension_edges:
         if not isinstance(tension_edges, list):
@@ -118,7 +133,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
             if not 0.0 <= intensity <= 1.0:
                 raise SchemaViolationException(f"Schema Violation: tension_edges intensity {intensity} out of bounds [0.0, 1.0].")
 
-    # 1.8 YAML Tyranny
+    # 1.9 YAML Tyranny
     for forbidden_key in ["parents", "children", "competes_with"]:
         if forbidden_key in frontmatter:
             raise SchemaViolationException(f"SSOT Violation: Topological edge '{forbidden_key}' must not exist in YAML. Use Markdown semantic links instead.")

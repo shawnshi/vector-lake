@@ -175,9 +175,37 @@ def _drop_runtime_generation_triggers(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
 
 
+def _downgrade_payload_contract_to_v6(conn: sqlite3.Connection) -> None:
+    payloads = conn.execute(
+        "SELECT payload_sha256, codec, payload_blob, raw_bytes, stored_bytes, "
+        "created_at FROM change_set_payloads"
+    ).fetchall()
+    refs = conn.execute(
+        "SELECT change_set_id, payload_sha256, created_at "
+        "FROM change_set_payload_refs"
+    ).fetchall()
+    conn.execute("DROP TABLE change_set_payload_refs")
+    conn.execute("DROP TABLE change_set_payloads")
+    conn.execute(db_store._CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V6)
+    conn.execute(db_store._CHANGE_SET_PAYLOAD_REFS_TABLE_SCHEMA_V6)
+    conn.execute(db_store._CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V6)
+    conn.executemany(
+        "INSERT INTO change_set_payloads "
+        "(payload_sha256, codec, payload_blob, raw_bytes, stored_bytes, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        payloads,
+    )
+    conn.executemany(
+        "INSERT INTO change_set_payload_refs "
+        "(change_set_id, payload_sha256, created_at) VALUES (?, ?, ?)",
+        refs,
+    )
+
+
 def _downgrade_runtime_generation_to_v2(path) -> None:
     conn = db_store.get_connection()
     with db_store.transaction():
+        _downgrade_payload_contract_to_v6(conn)
         _drop_runtime_generation_triggers(conn)
         conn.execute("DELETE FROM schema_migrations WHERE version >= 3")
         conn.execute("PRAGMA user_version = 2")
@@ -188,6 +216,7 @@ def _downgrade_runtime_generation_to_v2(path) -> None:
 def _downgrade_cleanup_contract(path, version: int) -> None:
     conn = db_store.get_connection()
     with db_store.transaction():
+        _downgrade_payload_contract_to_v6(conn)
         conn.execute("DROP TABLE ingest_task_cleanup")
         conn.execute(
             "CREATE TABLE ingest_task_cleanup ("
@@ -252,6 +281,7 @@ def _downgrade_duplicate_indexes_to_v4(
 ) -> None:
     conn = db_store.get_connection()
     with db_store.transaction():
+        _downgrade_payload_contract_to_v6(conn)
         _create_v5_duplicate_indexes(conn, wrong_index=wrong_index)
         _create_deferred_external_consumer_tables(conn)
         conn.execute("DELETE FROM schema_migrations WHERE version >= 5")
@@ -263,6 +293,7 @@ def _downgrade_duplicate_indexes_to_v4(
 def _downgrade_identity_registry_to_v1(path) -> None:
     conn = db_store.get_connection()
     with db_store.transaction():
+        _downgrade_payload_contract_to_v6(conn)
         _drop_runtime_generation_triggers(conn)
         conn.execute(
             "DROP TRIGGER IF EXISTS trg_canonical_identities_append_only_update"
@@ -311,6 +342,10 @@ def _run_controlled_existing_schema_migration(path) -> None:
                 maintenance_lock=maintenance_lock,
             )
             db_store._apply_controlled_schema_v6_migration(
+                connection,
+                maintenance_lock=maintenance_lock,
+            )
+            db_store._apply_controlled_schema_v7_migration(
                 connection,
                 maintenance_lock=maintenance_lock,
             )
@@ -458,7 +493,7 @@ def test_schema_ledger_is_durable_and_read_only_inspection_is_current(isolated_m
 
     assert state["ready"] is True
     assert state["status"] == "ready"
-    assert state["user_version"] == db_store._SCHEMA_VERSION == 6
+    assert state["user_version"] == db_store._SCHEMA_VERSION == 7
     expected_versions = list(range(1, db_store._SCHEMA_VERSION + 1))
     assert [item["version"] for item in state["ledger"]] == expected_versions
     assert [item["name"] for item in state["ledger"]] == [
@@ -544,8 +579,8 @@ def test_existing_schema_v2_migrates_runtime_generation_triggers_atomically(
     state = db_store.inspect_schema_migration_state(path)
 
     assert state["ready"] is True
-    assert state["user_version"] == 6
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6]
+    assert state["user_version"] == 7
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6, 7]
 
 
 def test_schema_v3_trigger_migration_failure_rolls_back_ledger_and_ddl(
@@ -607,8 +642,8 @@ def test_incomplete_cleanup_table_migrates_to_schema_v4(
     ).fetchone()
 
     assert state["ready"] is True
-    assert state["user_version"] == 6
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6]
+    assert state["user_version"] == 7
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6, 7]
     assert db_store._ingest_task_cleanup_schema_issues(
         db_store.get_connection()
     ) == []
@@ -812,7 +847,7 @@ def test_existing_schema_v4_removes_duplicate_indexes_but_preserves_deferred_tab
 
     with pytest.raises(
         RuntimeError,
-        match="Database schema upgrade required: 4->6",
+        match="Database schema upgrade required: 4->7",
     ):
         db_store.init_db()
     blocked = db_store.get_connection()
@@ -825,7 +860,7 @@ def test_existing_schema_v4_removes_duplicate_indexes_but_preserves_deferred_tab
     with held_lock:
         with pytest.raises(
             RuntimeError,
-            match="Database schema upgrade required: 4->6",
+            match="Database schema upgrade required: 4->7",
         ):
             db_store._init_db_once(str(path.resolve()))
 
@@ -834,8 +869,8 @@ def test_existing_schema_v4_removes_duplicate_indexes_but_preserves_deferred_tab
     state = db_store.inspect_schema_migration_connection(conn, path)
 
     assert state["ready"] is True
-    assert state["user_version"] == 6
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6]
+    assert state["user_version"] == 7
+    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6, 7]
     assert _v5_duplicate_index_names(conn) == set()
     assert _deferred_external_consumer_table_names(conn) == set(
         db_store._DEFERRED_EXTERNAL_CONSUMER_TABLES_V5
@@ -886,14 +921,15 @@ def test_cached_init_refuses_a_database_downgraded_to_v4(isolated_memory):
     path = db_store.get_db_path()
     connection = db_store.get_connection()
     with db_store.transaction():
+        _downgrade_payload_contract_to_v6(connection)
         _create_v5_duplicate_indexes(connection)
-        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+        connection.execute("DELETE FROM schema_migrations WHERE version > 4")
         connection.execute("PRAGMA user_version = 4")
 
     assert str(path.resolve()) in db_store._INITIALIZED_DB_PATHS
     with pytest.raises(
         RuntimeError,
-        match="Database schema upgrade required: 4->6",
+        match="Database schema upgrade required: 4->7",
     ):
         db_store.init_db()
 

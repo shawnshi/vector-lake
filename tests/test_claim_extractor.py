@@ -29,7 +29,7 @@ class TestClaimExtractor(unittest.TestCase):
             "domain": "General",
             "status": "Active",
             "epistemic-status": "seed",
-            "categories": ["Testing"],
+            "categories": ["Uncategorized"],
             "updated": "2026-07-13T00:00:00+00:00",
             "aliases": ["Test Alias"],
             "sources": ["MEMORY/wiki/raw/Test.pdf"]
@@ -50,7 +50,7 @@ This is a paragraph claim.
         self.assertEqual(result["entities"][0]["canonical_name"], "Test Concept")
         self.assertEqual(result["entities"][0]["title"], "Test Concept")
         self.assertEqual(result["entities"][0]["type"], "concept")
-        self.assertEqual(result["entities"][0]["categories"], ["Testing"])
+        self.assertEqual(result["entities"][0]["categories"], ["Uncategorized"])
         self.assertEqual(result["entities"][0]["sources"], ["wiki/raw/Test.pdf"])
         self.assertIn("This is a paragraph claim.", result["entities"][0]["raw_text"])
 
@@ -72,7 +72,7 @@ This is a paragraph claim.
             "domain": "Medical_IT",
             "status": "Active",
             "epistemic-status": "seed",
-            "categories": [],
+            "categories": ["Uncategorized"],
             "updated": "2024-01-01",
             "sources": []
         }
@@ -99,7 +99,7 @@ This page mentions OtherPage and defines [is-a:: [[Category]]].
             "domain": "General",
             "status": "Active",
             "epistemic-status": "seed",
-            "categories": [],
+            "categories": ["Uncategorized"],
             "created": "2026-07-21T00:00:00+00:00",
             "updated": "2026-07-21T00:00:00+00:00",
             "sources": [],
@@ -134,7 +134,7 @@ This is a claim with [is-a:: [[Category]]].
             "domain": "General",
             "status": "Active",
             "epistemic-status": "seed",
-            "categories": ["Source"],
+            "categories": ["Uncategorized"],
             "updated": "2026-07-13T00:00:00+00:00",
             "sources": ["raw/primary.pdf"],
         }
@@ -151,7 +151,7 @@ This is a claim with [is-a:: [[Category]]].
             "domain": "General",
             "status": "Active",
             "epistemic-status": "seed",
-            "categories": [],
+            "categories": ["Uncategorized"],
             "updated": "2026-07-18T00:00:00+00:00",
             "sources": [],
         }
@@ -178,7 +178,7 @@ This is a real claim.[^1]
             "domain": "General",
             "status": "Active",
             "epistemic-status": "seed",
-            "categories": [],
+            "categories": ["Uncategorized"],
             "updated": "2026-07-21T00:00:00+00:00",
             "sources": [],
         }

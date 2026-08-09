@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -202,19 +203,37 @@ def _index_node_signature(node: dict) -> str:
     return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _normalize_projection_identity(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).casefold()
+
+
+def is_system_page_filename(filename: str) -> bool:
+    page_key = filename[:-3] if filename.casefold().endswith(".md") else filename
+    return _normalize_projection_identity(page_key).startswith("system_")
+
+
 def index_projection_matches_canonical(
     filenames: list[str],
     allowed_alias_redirects: dict[str, str] | None = None,
 ) -> bool:
     """Prove that selected canonical pages are already reflected in index.json."""
     allowed_alias_redirects = allowed_alias_redirects or {}
-    page_keys = {
+    selected_page_keys = {
         filename[:-3]
         for filename in filenames
         if filename.casefold().endswith(".md")
-        and not filename.casefold().startswith("system_")
     }
-    if not page_keys or not get_index_path().exists():
+    system_identities = {
+        _normalize_projection_identity(page_key)
+        for page_key in selected_page_keys
+        if is_system_page_filename(page_key)
+    }
+    page_keys = {
+        page_key
+        for page_key in selected_page_keys
+        if _normalize_projection_identity(page_key) not in system_identities
+    }
+    if not selected_page_keys or not get_index_path().exists():
         return False
     try:
         index_data = read_committed_index_snapshot(
@@ -269,6 +288,40 @@ def index_projection_matches_canonical(
                 return False
             if any(edge.get("source") == page_key or edge.get("target") == page_key for edge in edges):
                 return False
+    if any(
+        _normalize_projection_identity(page_key) in system_identities
+        for page_key in nodes
+    ):
+        return False
+    if any(
+        _normalize_projection_identity(value) in system_identities
+        for key, target in aliases.items()
+        for value in (key, target)
+    ):
+        return False
+    if any(
+        _normalize_projection_identity(edge.get(endpoint)) in system_identities
+        for edge in edges
+        for endpoint in ("source", "target")
+    ):
+        return False
+    if system_identities:
+        search_keys = conn.execute(
+            "SELECT node_key FROM wiki_search_index"
+        ).fetchall()
+        if any(
+            _normalize_projection_identity(row["node_key"]) in system_identities
+            for row in search_keys
+        ):
+            return False
+        vector_keys = db_store.get_vector_connection().execute(
+            "SELECT entity_id FROM vec_embeddings"
+        ).fetchall()
+        if any(
+            _normalize_projection_identity(row["entity_id"]) in system_identities
+            for row in vector_keys
+        ):
+            return False
     return True
 
 PRED_WEIGHT_TAXONOMY = frozenset({"属于", "parent", "is-a", "belongs_to", "instance_of", "has_part", "核心构件"})

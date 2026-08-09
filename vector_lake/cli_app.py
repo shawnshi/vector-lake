@@ -507,7 +507,10 @@ Usage Examples:
     )
     schema_migrate_parser = subparsers.add_parser(
         "schema-migrate",
-        help="[MAINTENANCE] Preview or apply the controlled SQLite v4/v5 to v6 migration.",
+        help=(
+            "[MAINTENANCE] Preview or apply the controlled SQLite "
+            "v4/v5/v6 to v7 migration."
+        ),
     )
     schema_migrate_action = schema_migrate_parser.add_mutually_exclusive_group()
     schema_migrate_action.add_argument(
