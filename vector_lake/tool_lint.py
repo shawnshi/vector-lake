@@ -4,13 +4,13 @@ import os
 import random
 import re
 import string
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from vector_lake import governance_metrics
 from vector_lake.merge_analysis import (
-    filename_candidate_pairs,
+    FilenameCandidateStats,
+    iter_filename_candidates,
     normalize_name,
-    source_identity_candidate_pairs,
 )
 from vector_lake.wiki_utils import (
     SYSTEM_WHITELIST,
@@ -35,9 +35,12 @@ class _BoundedIssueCollector:
         self._sample_limit = max(0, int(sample_limit))
         self._samples: list[str] = []
         self._count = 0
+        self._category_counts: Counter[str] = Counter()
 
-    def append(self, item: str) -> None:
+    def append(self, item: str, *, category: str | None = None) -> None:
         self._count += 1
+        if category:
+            self._category_counts[category] += 1
         if len(self._samples) < self._sample_limit:
             self._samples.append(item)
 
@@ -50,6 +53,10 @@ class _BoundedIssueCollector:
     @property
     def retained_sample_count(self) -> int:
         return len(self._samples)
+
+    @property
+    def category_counts(self) -> dict[str, int]:
+        return dict(self._category_counts)
 
 
 def _lint_record(
@@ -427,23 +434,34 @@ def lint_vector_lake(auto_fix: bool = False):
                 issues["schema"].append(f"{filename}: {str(e)}")
 
     # 6. Filename similarity candidates. Actual merge decisions use governance analysis.
-    similarity_pairs = set()
-    for key_a, key_b, ratio in filename_candidate_pairs(all_keys):
-        similarity_pairs.add(tuple(sorted((key_a, key_b))))
-        issues["similarity"].append(
-            f"Candidate: {key_a}.md <-> {key_b}.md ({ratio:.0%})"
-        )
+    page_types = {
+        filename[:-3]: str(data["fm"].get("type") or "")
+        for filename, data in parsed.items()
+    }
     page_sources = {
         filename[:-3]: data["fm"].get("sources") or []
         for filename, data in parsed.items()
         if str(data["fm"].get("type") or "").casefold() == "source"
     }
-    for key_a, key_b, raw_identity in source_identity_candidate_pairs(page_sources):
-        pair_key = tuple(sorted((key_a, key_b)))
-        if pair_key in similarity_pairs:
+    similarity_stats = FilenameCandidateStats()
+    for event in iter_filename_candidates(
+        all_keys,
+        page_types=page_types,
+        page_sources=page_sources,
+        stats=similarity_stats,
+    ):
+        if not event.eligible:
             continue
+        if event.category == "raw_source":
+            evidence = f"same raw source: {event.detail}"
+        elif event.category == "ambiguous_revision":
+            evidence = "date-shaped revision requires review"
+        else:
+            evidence = f"{event.ratio:.0%}"
         issues["similarity"].append(
-            f"Candidate: {key_a}.md <-> {key_b}.md (same raw source: {raw_identity})"
+            f"Candidate: {event.left}.md <-> {event.right}.md "
+            f"({evidence}) [{event.category}]",
+            category=event.category,
         )
 
     # Remaining checks (Orphans, Decay, Governance, Alignment)
@@ -634,5 +652,23 @@ def lint_vector_lake(auto_fix: bool = False):
             lines.append(f"    {item}")
         if len(items) > 10:
             lines.append(f"    ... and {len(items) - 10} more")
+        if key == "similarity":
+            category_counts = items.category_counts
+            lines.append(
+                "    Breakdown: "
+                f"exact={category_counts.get('exact', 0)} | "
+                f"hash_revision={category_counts.get('hash_revision', 0)} | "
+                "ambiguous_revision="
+                f"{category_counts.get('ambiguous_revision', 0)} | "
+                f"fuzzy={category_counts.get('fuzzy', 0)} | "
+                f"raw_source={category_counts.get('raw_source', 0)}"
+            )
+            lines.append(
+                "    Suppressed: "
+                f"temporal_series={similarity_stats.temporal_series} | "
+                "numeric_identity_conflict="
+                f"{similarity_stats.numeric_identity_conflict} | "
+                f"system_pages={similarity_stats.excluded_system_pages}"
+            )
         lines.append("")
     return "\n".join(lines)

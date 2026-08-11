@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import inspect
 import logging
 import os
 import sqlite3
@@ -30,6 +31,23 @@ from vector_lake.wiki_utils import (
     get_raw_dir,
     get_wiki_dir,
 )
+
+
+def test_merge_public_defaults_remain_explicit_and_unchanged():
+    from vector_lake import cli_app, tool_merge
+
+    cli_args = cli_app.build_parser().parse_args(["merge-suggestions"])
+    mcp_enqueue = inspect.signature(
+        mcp_server.merge_suggestions_vector_lake
+    ).parameters["enqueue"]
+    tool_enqueue = inspect.signature(
+        tool_merge.merge_suggestions_vector_lake
+    ).parameters["enqueue"]
+
+    assert cli_args.limit == 20
+    assert cli_args.preview is False
+    assert mcp_enqueue.default is False
+    assert tool_enqueue.default is True
 
 
 @pytest.mark.parametrize("configured_workers", [None, "invalid"])

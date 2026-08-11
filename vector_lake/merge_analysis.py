@@ -6,16 +6,23 @@ import hashlib
 import re
 import unicodedata
 from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date
 from difflib import SequenceMatcher
 from itertools import combinations
 from pathlib import Path
+from typing import Iterable, Iterator, Mapping, TypeVar
 
 
 _TYPE_PREFIX = re.compile(
-    r"^(?:concept|vendor|institution|product|person|event|policy|standard|source|synthesis|system)[_-]+",
+    r"^(concept|vendor|institution|product|person|event|policy|standard|source|synthesis|system)[_-]+",
     re.IGNORECASE,
 )
-_REVISION_HASH_SUFFIX = re.compile(r"-(?:[0-9a-f]{8})$", re.IGNORECASE)
+_REVISION_HASH_SUFFIX = re.compile(r"-([0-9a-f]{8})$", re.IGNORECASE)
+_COMPACT_DATE_TOKEN = re.compile(r"(?<!\d)((?:19|20)\d{6})(?!\d)")
+_SEPARATED_DATE_TOKEN = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[-_.](\d{2})[-_.](\d{2})(?!\d)"
+)
 _ARXIV_ID = re.compile(r"^\d{4}\.\d{4,5}v\d+$", re.IGNORECASE)
 _GENERIC_SOURCE_MARKERS = {
     "sourceautofixed",
@@ -25,11 +32,42 @@ _GENERIC_SOURCE_MARKERS = {
     "sourcetemplate",
 }
 _DECISION_ORDER = {"merge": 0, "alias": 1, "review": 2, "keep_separate": 3}
+_BUCKET_CLIQUE_LIMIT = 8
 WikiBacklinkIndex = dict[str, tuple[tuple[str, str, str], ...]]
+BucketValue = TypeVar("BucketValue", str, int)
+
+
+@dataclass(frozen=True)
+class FilenameCandidateEvent:
+    """One classified filename-candidate edge or one suppressed edge."""
+
+    left: str
+    right: str
+    ratio: float
+    category: str
+    eligible: bool
+    detail: str = ""
+
+
+@dataclass
+class FilenameCandidateStats:
+    """Exact counters for the streaming filename-candidate scan."""
+
+    exact: int = 0
+    hash_revision: int = 0
+    ambiguous_revision: int = 0
+    fuzzy: int = 0
+    raw_source: int = 0
+    temporal_series: int = 0
+    numeric_identity_conflict: int = 0
+    excluded_system_pages: int = 0
+
+    def record(self, event: FilenameCandidateEvent) -> None:
+        setattr(self, event.category, getattr(self, event.category) + 1)
 
 
 def strip_entity_prefix(value: str) -> str:
-    text = str(value or "").strip()
+    text = unicodedata.normalize("NFKC", str(value or "").strip())
     if text.casefold().endswith(".md"):
         text = text[:-3]
     return _TYPE_PREFIX.sub("", text, count=1)
@@ -57,6 +95,178 @@ def normalize_source_identity(value: str) -> str:
     if text.startswith("MEMORY/"):
         text = text[len("MEMORY/") :]
     return text
+
+
+def _page_key_type(value: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "").strip())
+    if text.casefold().endswith(".md"):
+        text = text[:-3]
+    match = _TYPE_PREFIX.match(text)
+    return match.group(1).casefold() if match else ""
+
+
+def _effective_page_type(page_key: str, declared_type: str = "") -> str:
+    prefix_type = _page_key_type(page_key)
+    declared = str(declared_type or "").casefold()
+    if "system" in {prefix_type, declared}:
+        return "system"
+    if declared and prefix_type and declared != prefix_type:
+        return "type_conflict"
+    return declared or prefix_type
+
+
+def _valid_compact_date(value: str) -> bool:
+    if not re.fullmatch(r"(?:19|20)\d{6}", value):
+        return False
+    try:
+        date(int(value[:4]), int(value[4:6]), int(value[6:8]))
+    except ValueError:
+        return False
+    return True
+
+
+def _calendar_date_tokens(value: str) -> frozenset[str]:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    tokens = {
+        match.group(1)
+        for match in _COMPACT_DATE_TOKEN.finditer(text)
+        if _valid_compact_date(match.group(1))
+    }
+    for match in _SEPARATED_DATE_TOKEN.finditer(text):
+        compact = "".join(match.groups())
+        if _valid_compact_date(compact):
+            tokens.add(compact)
+    return frozenset(tokens)
+
+
+def _revision_hash_suffix(value: str) -> str:
+    text = str(value or "").strip()
+    if text.casefold().endswith(".md"):
+        text = text[:-3]
+    match = _REVISION_HASH_SUFFIX.search(text)
+    if not match:
+        return ""
+    suffix = match.group(1)
+    return "" if _valid_compact_date(suffix) else suffix.casefold()
+
+
+def _ambiguous_revision_suffix(value: str) -> str:
+    text = str(value or "").strip()
+    if text.casefold().endswith(".md"):
+        text = text[:-3]
+    match = _REVISION_HASH_SUFFIX.search(text)
+    if not match:
+        return ""
+    suffix = match.group(1)
+    return suffix if _valid_compact_date(suffix) else ""
+
+
+def _source_revision_base(page_key: str, entity_type: str = "source") -> str:
+    if str(entity_type or "").casefold() != "source":
+        return ""
+    value = str(page_key or "").strip()
+    if value.casefold().endswith(".md"):
+        value = value[:-3]
+    if _page_key_type(value) != "source" or not _revision_hash_suffix(value):
+        return ""
+    match = _REVISION_HASH_SUFFIX.search(value)
+    return value[: match.start()] if match else ""
+
+
+def _source_ambiguous_revision_base(
+    page_key: str,
+    entity_type: str = "source",
+) -> str:
+    if str(entity_type or "").casefold() != "source":
+        return ""
+    value = str(page_key or "").strip()
+    if value.casefold().endswith(".md"):
+        value = value[:-3]
+    if _page_key_type(value) != "source" or not _ambiguous_revision_suffix(value):
+        return ""
+    match = _REVISION_HASH_SUFFIX.search(value)
+    return value[: match.start()] if match else ""
+
+
+def _source_revision_family_match(
+    left_key: str,
+    right_key: str,
+    entity_type: str = "source",
+) -> bool:
+    left_base = _source_revision_base(left_key, entity_type)
+    right_base = _source_revision_base(right_key, entity_type)
+    if not left_base and not right_base:
+        return False
+    left_family = left_base or str(left_key)
+    right_family = right_base or str(right_key)
+    return normalize_page_key_identity(left_family) == normalize_page_key_identity(
+        right_family
+    )
+
+
+def _unverified_non_source_hash_conflict(
+    left_key: str,
+    right_key: str,
+    left_type: str,
+    right_type: str,
+) -> bool:
+    if left_type != right_type or left_type in {"source", "system"}:
+        return False
+
+    def revision_like_base(page_key: str) -> str:
+        value = str(page_key or "").strip()
+        if value.casefold().endswith(".md"):
+            value = value[:-3]
+        suffix = _revision_hash_suffix(value)
+        if not suffix:
+            return ""
+        return normalize_page_key_identity(value[: -(len(suffix) + 1)])
+
+    left_base = revision_like_base(left_key)
+    right_base = revision_like_base(right_key)
+    left_identity = normalize_page_key_identity(left_key)
+    right_identity = normalize_page_key_identity(right_key)
+    return bool(
+        (left_base and left_base == right_identity)
+        or (right_base and right_base == left_identity)
+        or (left_base and right_base and left_base == right_base)
+    )
+
+
+def _temporal_series_conflict(left_name: str, right_name: str) -> bool:
+    left_dates = _calendar_date_tokens(left_name)
+    right_dates = _calendar_date_tokens(right_name)
+    return bool(left_dates and right_dates and left_dates != right_dates)
+
+
+def _page_key_canonical_rank(page_key: str) -> tuple:
+    entity_type = _page_key_type(page_key)
+    is_revision = int(bool(_source_revision_base(page_key, entity_type)))
+    normalized = normalize_name(page_key)
+    return (
+        is_revision,
+        len(normalized),
+        normalize_page_key_identity(page_key),
+    )
+
+
+def _bounded_bucket_pairs(
+    values: Iterable[BucketValue],
+    *,
+    preferred_anchor: BucketValue | None = None,
+    clique_limit: int = _BUCKET_CLIQUE_LIMIT,
+) -> Iterator[tuple[BucketValue, BucketValue]]:
+    """Return a clique for small buckets and a deterministic star for large ones."""
+    ordered = sorted(set(values))
+    if len(ordered) < 2:
+        return
+    if len(ordered) <= max(2, int(clique_limit)):
+        yield from combinations(ordered, 2)
+        return
+    anchor = preferred_anchor if preferred_anchor in ordered else ordered[0]
+    for value in ordered:
+        if value != anchor:
+            yield tuple(sorted((anchor, value)))
 
 
 def build_wiki_backlink_index(wiki_dir: Path) -> WikiBacklinkIndex:
@@ -101,7 +311,12 @@ def source_identity_candidate_pairs(
 
     pairs = []
     for identity, page_keys in buckets.items():
-        for left, right in combinations(sorted(set(page_keys)), 2):
+        unique_keys = sorted(set(page_keys))
+        anchor = min(unique_keys, key=_page_key_canonical_rank)
+        for left, right in _bounded_bucket_pairs(
+            unique_keys,
+            preferred_anchor=anchor,
+        ):
             pairs.append((left, right, identity))
     return sorted(pairs)
 
@@ -154,13 +369,6 @@ def _body_fingerprint(body: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _revision_base(page_key: str) -> str:
-    value = str(page_key or "")
-    if value.casefold().endswith(".md"):
-        value = value[:-3]
-    return _REVISION_HASH_SUFFIX.sub("", value)
-
-
 def _record(entity: dict) -> dict:
     canonical_name = str(
         entity.get("canonical_name")
@@ -171,6 +379,8 @@ def _record(entity: dict) -> dict:
     )
     aliases = _string_list(entity.get("aliases"))
     page_key = str(entity.get("page_key") or "")
+    declared_type = str(entity.get("type") or entity.get("entity_type") or "")
+    effective_type = _effective_page_type(page_key, declared_type)
     variants = [canonical_name, strip_entity_prefix(page_key), *aliases]
     norms = frozenset(filter(None, (normalize_name(value) for value in variants)))
     alias_norms = frozenset(filter(None, (normalize_name(value) for value in aliases)))
@@ -180,6 +390,7 @@ def _record(entity: dict) -> dict:
         "entity_id": str(entity.get("entity_id") or page_key or canonical_name),
         "name": canonical_name,
         "page_key": page_key,
+        "effective_type": effective_type,
         "primary_norm": normalize_name(canonical_name),
         "norms": norms,
         "alias_norms": alias_norms,
@@ -196,7 +407,6 @@ def _record(entity: dict) -> dict:
         ),
         "body": body,
         "body_fingerprint": _body_fingerprint(body),
-        "revision_base": _revision_base(page_key),
     }
 
 
@@ -209,19 +419,70 @@ def _name_similarity(left: dict, right: dict) -> float:
 
 
 def _numeric_identity_conflict(left: dict, right: dict) -> bool:
-    left_norm = left["primary_norm"]
-    right_norm = right["primary_norm"]
-    left_numbers = tuple(re.findall(r"\d+", left_norm))
-    right_numbers = tuple(re.findall(r"\d+", right_norm))
+    return _numeric_identity_conflict_values(
+        left["name"],
+        right["name"],
+    ) or _numeric_identity_conflict_values(
+        left["page_key"],
+        right["page_key"],
+    )
+
+
+def _temporal_identity_conflict(left: dict, right: dict) -> bool:
+    return _temporal_series_conflict(
+        left["name"],
+        right["name"],
+    ) or _temporal_series_conflict(
+        left["page_key"],
+        right["page_key"],
+    )
+
+
+def _numeric_identity_tokens(value: str) -> tuple[str, ...]:
+    """Keep numeric group boundaries while normalizing valid calendar dates."""
+    text = unicodedata.normalize("NFKC", strip_entity_prefix(value)).casefold()
+    date_spans: list[tuple[int, int, str]] = []
+    for match in _SEPARATED_DATE_TOKEN.finditer(text):
+        compact = "".join(match.groups())
+        if _valid_compact_date(compact):
+            date_spans.append((match.start(), match.end(), compact))
+    for match in _COMPACT_DATE_TOKEN.finditer(text):
+        compact = match.group(1)
+        if _valid_compact_date(compact):
+            date_spans.append((match.start(), match.end(), compact))
+
+    tokens: list[str] = []
+    cursor = 0
+    for start, end, compact in sorted(date_spans):
+        if start < cursor:
+            continue
+        tokens.extend(
+            f"num:{number}"
+            for number in re.findall(r"\d+", text[cursor:start])
+        )
+        tokens.append(f"date:{compact}")
+        cursor = end
+    tokens.extend(
+        f"num:{number}"
+        for number in re.findall(r"\d+", text[cursor:])
+    )
+    return tuple(tokens)
+
+
+def _numeric_identity_conflict_values(left_name: str, right_name: str) -> bool:
+    left_norm = normalize_name(left_name)
+    right_norm = normalize_name(right_name)
+    left_numbers = _numeric_identity_tokens(left_name)
+    right_numbers = _numeric_identity_tokens(right_name)
     if left_numbers == right_numbers:
         return False
     left_surface = unicodedata.normalize(
         "NFKC",
-        strip_entity_prefix(left["name"]),
+        strip_entity_prefix(left_name),
     ).casefold()
     right_surface = unicodedata.normalize(
         "NFKC",
-        strip_entity_prefix(right["name"]),
+        strip_entity_prefix(right_name),
     ).casefold()
     if _ARXIV_ID.fullmatch(left_surface) and _ARXIV_ID.fullmatch(right_surface):
         return True
@@ -244,6 +505,11 @@ def _numeric_identity_conflict(left: dict, right: dict) -> bool:
     )
 
 
+def _numeric_identity_signature(value: str) -> tuple[str, ...]:
+    """Preserve version/date identity while ignoring punctuation variants."""
+    return _numeric_identity_tokens(value)
+
+
 def _plural_equivalent(left_norm: str, right_norm: str) -> bool:
     if not left_norm or not right_norm:
         return False
@@ -256,7 +522,7 @@ def _plural_equivalent(left_norm: str, right_norm: str) -> bool:
 
 def _canonical_rank(record: dict) -> tuple:
     entity = record["entity"]
-    entity_type = str(entity.get("type") or entity.get("entity_type") or "").casefold()
+    entity_type = record["effective_type"]
     categories = {str(item).casefold() for item in _string_list(entity.get("categories"))}
     is_backlog_source = entity_type == "source" and (
         str(entity.get("topic_cluster") or "").casefold() == "raw_ingest_backlog"
@@ -265,7 +531,7 @@ def _canonical_rank(record: dict) -> tuple:
     )
     stable_source_identity = int(
         entity_type != "source"
-        or not _REVISION_HASH_SUFFIX.search(str(record["page_key"] or ""))
+        or not _source_revision_base(str(record["page_key"] or ""), entity_type)
     )
     curated_source = int(entity_type != "source" or not is_backlog_source)
     status = str(entity.get("status", "")).casefold()
@@ -285,6 +551,15 @@ def _canonical_rank(record: dict) -> tuple:
         inbound_score,
         len(body),
     )
+
+
+def _canonical_record_index(records: list[dict], indices: Iterable[int]) -> int:
+    """Select the same stable target that component materialization will keep."""
+    ordered = sorted(
+        set(indices),
+        key=lambda index: records[index]["entity_id"],
+    )
+    return max(ordered, key=lambda index: _canonical_rank(records[index]))
 
 
 def _evaluate_pair(left: dict, right: dict) -> dict:
@@ -310,22 +585,72 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
         left["body_fingerprint"]
         and left["body_fingerprint"] == right["body_fingerprint"]
     )
+    left_type = left["effective_type"]
+    right_type = right["effective_type"]
+    left_revision_base = _source_revision_base(left["page_key"], left_type)
+    right_revision_base = _source_revision_base(right["page_key"], right_type)
     revision_suffix_match = bool(
-        left["page_key"]
+        left_type == right_type == "source"
+        and left["page_key"]
         and right["page_key"]
         and left["page_key"] != right["page_key"]
-        and left["revision_base"] == right["revision_base"]
         and (
-            _REVISION_HASH_SUFFIX.search(left["page_key"])
-            or _REVISION_HASH_SUFFIX.search(right["page_key"])
+            (
+                left_revision_base
+                and normalize_page_key_identity(left_revision_base)
+                == normalize_page_key_identity(right["page_key"])
+            )
+            or (
+                right_revision_base
+                and normalize_page_key_identity(right_revision_base)
+                == normalize_page_key_identity(left["page_key"])
+            )
+            or (
+                left_revision_base
+                and right_revision_base
+                and normalize_page_key_identity(left_revision_base)
+                == normalize_page_key_identity(right_revision_base)
+            )
         )
     )
+    left_ambiguous_base = _source_ambiguous_revision_base(
+        left["page_key"],
+        left_type,
+    )
+    right_ambiguous_base = _source_ambiguous_revision_base(
+        right["page_key"],
+        right_type,
+    )
+    ambiguous_revision_match = bool(
+        left_type == right_type == "source"
+        and left["page_key"]
+        and right["page_key"]
+        and left["page_key"] != right["page_key"]
+        and (
+            (
+                left_ambiguous_base
+                and normalize_page_key_identity(left_ambiguous_base)
+                == normalize_page_key_identity(right["page_key"])
+            )
+            or (
+                right_ambiguous_base
+                and normalize_page_key_identity(right_ambiguous_base)
+                == normalize_page_key_identity(left["page_key"])
+            )
+        )
+    )
+    temporal_conflict = _temporal_identity_conflict(left, right)
     numeric_conflict = _numeric_identity_conflict(left, right)
     plural_equivalent = _plural_equivalent(left["primary_norm"], right["primary_norm"])
-    left_type = str(left["entity"].get("type") or left["entity"].get("entity_type") or "").casefold()
-    right_type = str(right["entity"].get("type") or right["entity"].get("entity_type") or "").casefold()
+    surface_type_conflict = "type_conflict" in {left_type, right_type}
     type_conflict = bool(left_type and right_type and left_type != right_type)
     both_sources = left_type == right_type == "source"
+    non_source_hash_conflict = _unverified_non_source_hash_conflict(
+        left["page_key"],
+        right["page_key"],
+        left_type,
+        right_type,
+    )
 
     reasons = []
     evidence_score = round(similarity * 45)
@@ -353,6 +678,8 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
     if revision_suffix_match:
         reasons.append("revision-suffix-match")
         evidence_score += 20
+    if ambiguous_revision_match:
+        reasons.append("ambiguous-date-shaped-revision")
     if body_similarity >= 0.55:
         reasons.append(f"body-similarity:{body_similarity:.0%}")
         evidence_score += round(body_similarity * 10)
@@ -376,8 +703,12 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
         reasons.append("domain-cluster-match")
         evidence_score += 5
 
-    if type_conflict:
+    if type_conflict or surface_type_conflict:
         reasons.append("entity-type-conflict")
+    if temporal_conflict:
+        reasons.append("temporal-series-conflict")
+    if non_source_hash_conflict:
+        reasons.append("unverified-non-source-hash-suffix")
 
     source_identity_evidence = bool(
         raw_identity_overlap
@@ -386,7 +717,10 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
         or body_similarity >= 0.90
     )
 
-    if type_conflict and "source" in {left_type, right_type}:
+    if surface_type_conflict:
+        decision = "keep_separate"
+        evidence_score = min(evidence_score, 25)
+    elif type_conflict and "source" in {left_type, right_type}:
         decision = "keep_separate"
         evidence_score = min(evidence_score, 25)
     elif both_sources and not raw_identity_overlap:
@@ -400,6 +734,12 @@ def _evaluate_pair(left: dict, right: dict) -> dict:
         decision = "merge"
     elif revision_suffix_match and left_type == right_type:
         decision = "merge"
+    elif non_source_hash_conflict:
+        decision = "keep_separate"
+        evidence_score = min(evidence_score, 35)
+    elif temporal_conflict:
+        decision = "keep_separate"
+        evidence_score = min(evidence_score, 35)
     elif numeric_conflict:
         reasons.append("numeric-identity-conflict")
         decision = "keep_separate"
@@ -465,42 +805,102 @@ class _UnionFind:
             self.parent[right_root] = left_root
 
 
-def _candidate_index_pairs(records: list[dict], fuzzy_threshold: float = 0.82, window: int = 16) -> set[tuple[int, int]]:
+def _candidate_index_pairs(
+    records: list[dict],
+    fuzzy_threshold: float = 0.82,
+    window: int = 16,
+) -> set[tuple[int, int]]:
     pairs: set[tuple[int, int]] = set()
-    norm_buckets: dict[str, list[int]] = defaultdict(list)
+    norm_buckets: dict[tuple[str, str, tuple[str, ...]], list[int]] = defaultdict(
+        list
+    )
+    norm_type_representatives: dict[str, dict[str, list[int]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for index, record in enumerate(records):
+        entity_type = record["effective_type"]
+        identity_signature = _numeric_identity_signature(record["page_key"])
         for norm in record["norms"]:
             if norm:
-                norm_buckets[norm].append(index)
+                norm_buckets[(entity_type, norm, identity_signature)].append(index)
+                norm_type_representatives[norm][entity_type].append(index)
     for indices in norm_buckets.values():
-        pairs.update(combinations(sorted(set(indices)), 2))
+        unique = sorted(set(indices))
+        anchor = _canonical_record_index(records, unique)
+        pairs.update(
+            _bounded_bucket_pairs(unique, preferred_anchor=anchor)
+        )
+    for type_buckets in norm_type_representatives.values():
+        if len(type_buckets) < 2:
+            continue
+        representatives = [
+            _canonical_record_index(records, indices)
+            for indices in type_buckets.values()
+        ]
+        pairs.update(_bounded_bucket_pairs(representatives))
 
     revision_buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    ambiguous_revision_buckets: dict[tuple[str, str], list[int]] = defaultdict(
+        list
+    )
     source_identity_buckets: dict[str, list[int]] = defaultdict(list)
     page_key_indices: dict[tuple[str, str], list[int]] = defaultdict(list)
     for index, record in enumerate(records):
-        entity_type = str(record["entity"].get("type") or record["entity"].get("entity_type") or "").casefold()
-        page_key_indices[(entity_type, str(record["page_key"] or ""))].append(index)
+        entity_type = record["effective_type"]
+        page_key_indices[
+            (entity_type, normalize_page_key_identity(record["page_key"]))
+        ].append(index)
     for index, record in enumerate(records):
-        entity_type = str(record["entity"].get("type") or record["entity"].get("entity_type") or "").casefold()
+        entity_type = record["effective_type"]
         page_key = str(record["page_key"] or "")
-        revision_base = _revision_base(page_key)
-        if entity_type == "source" and revision_base and revision_base != page_key:
-            revision_buckets[(entity_type, revision_base)].append(index)
-            revision_buckets[(entity_type, revision_base)].extend(
-                page_key_indices.get((entity_type, revision_base), [])
-            )
+        revision_base = _source_revision_base(page_key, entity_type)
+        ambiguous_base = _source_ambiguous_revision_base(page_key, entity_type)
+        if revision_base:
+            revision_buckets[
+                (entity_type, normalize_page_key_identity(revision_base))
+            ].append(index)
+        elif ambiguous_base:
+            ambiguous_revision_buckets[
+                (entity_type, normalize_page_key_identity(ambiguous_base))
+            ].append(index)
         if entity_type == "source":
             for identity in record["source_identities"]:
                 source_identity_buckets[identity].append(index)
-    for indices in [*revision_buckets.values(), *source_identity_buckets.values()]:
-        pairs.update(combinations(sorted(set(indices)), 2))
+    for (entity_type, base_identity), revision_indices in revision_buckets.items():
+        canonical_indices = page_key_indices.get((entity_type, base_identity), [])
+        if not canonical_indices:
+            unique = sorted(set(revision_indices))
+            anchor = _canonical_record_index(records, unique)
+            pairs.update(
+                _bounded_bucket_pairs(unique, preferred_anchor=anchor)
+            )
+            continue
+        anchor = _canonical_record_index(records, canonical_indices)
+        for revision_index in sorted(set(revision_indices)):
+            if revision_index != anchor:
+                pairs.add(tuple(sorted((anchor, revision_index))))
+    for (entity_type, base_identity), revision_indices in (
+        ambiguous_revision_buckets.items()
+    ):
+        canonical_indices = page_key_indices.get((entity_type, base_identity), [])
+        if not canonical_indices:
+            continue
+        anchor = _canonical_record_index(records, canonical_indices)
+        for revision_index in sorted(set(revision_indices)):
+            if revision_index != anchor:
+                pairs.add(tuple(sorted((anchor, revision_index))))
+    for indices in source_identity_buckets.values():
+        unique = sorted(set(indices))
+        anchor = _canonical_record_index(records, unique)
+        pairs.update(
+            _bounded_bucket_pairs(unique, preferred_anchor=anchor)
+        )
 
     type_buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
     for index, record in enumerate(records):
-        entity_type = str(record["entity"].get("type") or record["entity"].get("entity_type") or "")
+        entity_type = record["effective_type"]
         type_buckets[
-            (entity_type.casefold(), record["primary_norm"][:2])
+            (entity_type, record["primary_norm"][:2])
         ].append(index)
     for indices in type_buckets.values():
         ordered = sorted(indices, key=lambda index: (records[index]["primary_norm"], records[index]["entity_id"]))
@@ -515,9 +915,20 @@ def _candidate_index_pairs(records: list[dict], fuzzy_threshold: float = 0.82, w
                 longer = max(len(left_norm), len(right_norm))
                 if abs(len(left_norm) - len(right_norm)) > max(3, int(longer * 0.25)):
                     continue
+                pair = tuple(sorted((left_index, right_index)))
+                if pair in pairs:
+                    continue
+                if _temporal_identity_conflict(
+                    records[left_index],
+                    records[right_index],
+                ) or _numeric_identity_conflict(
+                    records[left_index],
+                    records[right_index],
+                ):
+                    continue
                 similarity = SequenceMatcher(None, left_norm, right_norm).ratio()
                 if similarity >= fuzzy_threshold:
-                    pairs.add(tuple(sorted((left_index, right_index))))
+                    pairs.add(pair)
     return pairs
 
 
@@ -531,7 +942,13 @@ def analyze_entities(
     for entity in entities:
         if str(entity.get("status", "")).casefold() == "merged":
             continue
-        if str(entity.get("type") or entity.get("entity_type") or "").casefold() == "system":
+        declared_type = str(
+            entity.get("type") or entity.get("entity_type") or ""
+        )
+        if _effective_page_type(
+            str(entity.get("page_key") or ""),
+            declared_type,
+        ) == "system":
             continue
         record = _record(entity)
         if record["primary_norm"]:
@@ -555,6 +972,7 @@ def analyze_entities(
 
     merge_results = []
     merged_component_by_id = {}
+    component_target_by_id = {}
     evaluated_by_pair = {candidate["pair_key"]: candidate for candidate in evaluated}
     for member_ids in components.values():
         if len(member_ids) < 2:
@@ -564,6 +982,7 @@ def analyze_entities(
         target_id = max(ordered_members, key=lambda entity_id: _canonical_rank(record_by_id[entity_id]))
         for entity_id in ordered_members:
             merged_component_by_id[entity_id] = component_id
+            component_target_by_id[entity_id] = target_id
         for source_id in ordered_members:
             if source_id == target_id:
                 continue
@@ -589,16 +1008,57 @@ def analyze_entities(
                 candidate["reasons"] = [*candidate["reasons"], "large-component-review"]
             merge_results.append(candidate)
 
-    other_results = []
+    other_results_by_pair = {}
     for candidate in evaluated:
         left_component = merged_component_by_id.get(candidate["left_entity_id"])
         right_component = merged_component_by_id.get(candidate["right_entity_id"])
         if left_component and left_component == right_component:
             continue
-        candidate = dict(candidate)
+        original_decision = candidate["decision"]
+        left_id = component_target_by_id.get(
+            candidate["left_entity_id"],
+            candidate["left_entity_id"],
+        )
+        right_id = component_target_by_id.get(
+            candidate["right_entity_id"],
+            candidate["right_entity_id"],
+        )
+        if left_id == right_id:
+            continue
+        remapped = (
+            left_id != candidate["left_entity_id"]
+            or right_id != candidate["right_entity_id"]
+        )
+        if remapped:
+            ordered_ids = sorted((left_id, right_id))
+            candidate = _evaluate_pair(
+                record_by_id[ordered_ids[0]],
+                record_by_id[ordered_ids[1]],
+            )
+            if _DECISION_ORDER[candidate["decision"]] < _DECISION_ORDER[
+                original_decision
+            ]:
+                candidate["decision"] = original_decision
+            if "component-endpoint-remap" not in candidate["reasons"]:
+                candidate["reasons"] = [
+                    *candidate["reasons"],
+                    "component-endpoint-remap",
+                ]
+        else:
+            candidate = dict(candidate)
         candidate["component_id"] = ""
         candidate["component_size"] = 1
-        other_results.append(candidate)
+        existing = other_results_by_pair.get(candidate["pair_key"])
+        if existing is None or (
+            _DECISION_ORDER[candidate["decision"]],
+            candidate["evidence_score"],
+        ) > (
+            _DECISION_ORDER[existing["decision"]],
+            existing["evidence_score"],
+        ):
+            other_results_by_pair[candidate["pair_key"]] = candidate
+
+    other_results = list(other_results_by_pair.values())
 
     versions = versions or {}
     results = merge_results + other_results
@@ -616,51 +1076,222 @@ def analyze_entities(
     return results if limit is None else results[: max(0, limit)]
 
 
+def iter_filename_candidates(
+    page_keys: Iterable[str],
+    *,
+    page_types: Mapping[str, str] | None = None,
+    page_sources: Mapping[str, object] | None = None,
+    threshold: float = 0.91,
+    window: int = 32,
+    stats: FilenameCandidateStats | None = None,
+) -> Iterator[FilenameCandidateEvent]:
+    """Stream typed candidate edges and suppressed numeric/temporal edges."""
+    stats = stats if stats is not None else FilenameCandidateStats()
+    declared_types = page_types or {}
+    source_values = page_sources or {}
+    records: list[tuple[str, str, str]] = []
+    for page_key in sorted(set(map(str, page_keys))):
+        entity_type = _effective_page_type(
+            page_key,
+            declared_types.get(page_key, ""),
+        )
+        if entity_type == "system":
+            stats.excluded_system_pages += 1
+            continue
+        normalized = normalize_name(page_key)
+        if normalized:
+            records.append((page_key, entity_type, normalized))
+
+    key_buckets: dict[str, list[str]] = defaultdict(list)
+    for page_key, _entity_type, _normalized in records:
+        key_buckets[normalize_page_key_identity(page_key)].append(page_key)
+    key_lookup = {
+        identity: min(keys, key=_page_key_canonical_rank)
+        for identity, keys in key_buckets.items()
+    }
+    page_raw_ids: dict[str, frozenset[str]] = {}
+    raw_buckets: dict[str, list[str]] = defaultdict(list)
+    for page_key, entity_type, _normalized in records:
+        identities = frozenset(
+            identity
+            for value in _string_list(source_values.get(page_key))
+            for identity in [normalize_source_identity(value)]
+            if entity_type == "source" and identity.startswith("raw/")
+        )
+        page_raw_ids[page_key] = identities
+        for identity in identities:
+            raw_buckets[identity].append(page_key)
+
+    def shared_raw(left: str, right: str) -> bool:
+        return bool(page_raw_ids.get(left, frozenset()) & page_raw_ids.get(right, frozenset()))
+
+    raw_emitted: set[tuple[str, str]] = set()
+    for identity in sorted(raw_buckets):
+        keys = sorted(set(raw_buckets[identity]))
+        anchor = min(keys, key=_page_key_canonical_rank)
+        for left, right in _bounded_bucket_pairs(keys, preferred_anchor=anchor):
+            pair = tuple(sorted((left, right)))
+            if pair in raw_emitted:
+                continue
+            raw_emitted.add(pair)
+            event = FilenameCandidateEvent(
+                pair[0],
+                pair[1],
+                1.0,
+                "raw_source",
+                True,
+                identity,
+            )
+            stats.record(event)
+            yield event
+
+    exact_buckets: dict[tuple[str, str, tuple[str, ...]], list[str]] = defaultdict(
+        list
+    )
+    for page_key, entity_type, normalized in records:
+        exact_buckets[
+            (entity_type, normalized, _numeric_identity_signature(page_key))
+        ].append(page_key)
+    for bucket_key in sorted(exact_buckets):
+        keys = sorted(set(exact_buckets[bucket_key]))
+        anchor = min(keys, key=_page_key_canonical_rank)
+        for left, right in _bounded_bucket_pairs(keys, preferred_anchor=anchor):
+            if shared_raw(left, right):
+                continue
+            event = FilenameCandidateEvent(
+                left,
+                right,
+                1.0,
+                "exact",
+                True,
+            )
+            stats.record(event)
+            yield event
+
+    for category, base_function in (
+        ("hash_revision", _source_revision_base),
+        ("ambiguous_revision", _source_ambiguous_revision_base),
+    ):
+        revision_buckets: dict[str, list[str]] = defaultdict(list)
+        for page_key, entity_type, _normalized in records:
+            base = base_function(page_key, entity_type)
+            if base:
+                revision_buckets[normalize_page_key_identity(base)].append(page_key)
+        for base_identity in sorted(revision_buckets):
+            revisions = sorted(set(revision_buckets[base_identity]))
+            canonical = key_lookup.get(base_identity)
+            if canonical:
+                candidate_pairs = (
+                    tuple(sorted((canonical, revision)))
+                    for revision in revisions
+                )
+            elif category == "hash_revision":
+                anchor = min(revisions, key=_page_key_canonical_rank)
+                candidate_pairs = _bounded_bucket_pairs(
+                    revisions,
+                    preferred_anchor=anchor,
+                )
+            else:
+                continue
+            for left, right in candidate_pairs:
+                if shared_raw(left, right):
+                    continue
+                event = FilenameCandidateEvent(
+                    left,
+                    right,
+                    1.0,
+                    category,
+                    True,
+                    base_identity,
+                )
+                stats.record(event)
+                yield event
+
+    prefix_buckets: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
+    for page_key, entity_type, normalized in records:
+        prefix_buckets[(entity_type, normalized[:2])].append(
+            (normalized, page_key)
+        )
+    for bucket_key in sorted(prefix_buckets):
+        ordered = sorted(prefix_buckets[bucket_key])
+        for index, (left_norm, left_key) in enumerate(ordered):
+            for right_norm, right_key in ordered[index + 1 : index + 1 + window]:
+                if (
+                    left_norm == right_norm
+                    and _numeric_identity_signature(left_key)
+                    == _numeric_identity_signature(right_key)
+                ):
+                    continue
+                entity_type = bucket_key[0]
+                if _source_revision_family_match(
+                    left_key,
+                    right_key,
+                    entity_type,
+                ):
+                    continue
+                left_ambiguous = _source_ambiguous_revision_base(
+                    left_key,
+                    entity_type,
+                )
+                right_ambiguous = _source_ambiguous_revision_base(
+                    right_key,
+                    entity_type,
+                )
+                if (
+                    left_ambiguous
+                    and normalize_page_key_identity(left_ambiguous)
+                    == normalize_page_key_identity(right_key)
+                ) or (
+                    right_ambiguous
+                    and normalize_page_key_identity(right_ambiguous)
+                    == normalize_page_key_identity(left_key)
+                ):
+                    continue
+                longer = max(len(left_norm), len(right_norm))
+                if abs(len(left_norm) - len(right_norm)) > max(
+                    3,
+                    int(longer * 0.25),
+                ):
+                    continue
+                ratio = SequenceMatcher(None, left_norm, right_norm).ratio()
+                if ratio < threshold or shared_raw(left_key, right_key):
+                    continue
+                if _temporal_series_conflict(left_key, right_key):
+                    category = "temporal_series"
+                    eligible = False
+                elif _numeric_identity_conflict_values(left_key, right_key):
+                    category = "numeric_identity_conflict"
+                    eligible = False
+                else:
+                    category = "fuzzy"
+                    eligible = True
+                left, right = sorted((left_key, right_key))
+                event = FilenameCandidateEvent(
+                    left,
+                    right,
+                    ratio,
+                    category,
+                    eligible,
+                )
+                stats.record(event)
+                yield event
+
+
 def filename_candidate_pairs(
     page_keys: list[str] | set[str],
     threshold: float = 0.91,
     window: int = 32,
 ) -> list[tuple[str, str, float]]:
-    """Recall similar filename pairs by normalized buckets and normalized neighborhoods."""
-    records = []
-    for page_key in sorted(set(page_keys)):
-        normalized = normalize_name(page_key)
-        if normalized:
-            prefix = page_key.split("_", 1)[0].casefold() if "_" in page_key else ""
-            records.append((page_key, prefix, normalized))
-
-    pairs: dict[tuple[str, str], float] = {}
-    exact_buckets: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for page_key, prefix, normalized in records:
-        exact_buckets[(prefix, normalized)].append(page_key)
-    for keys in exact_buckets.values():
-        for left, right in combinations(keys, 2):
-            pairs[tuple(sorted((left, right)))] = 1.0
-
-    revision_buckets: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for page_key, prefix, _normalized in records:
-        revision_buckets[(prefix, _revision_base(page_key))].append(page_key)
-    for keys in revision_buckets.values():
-        if len(keys) < 2 or not any(_REVISION_HASH_SUFFIX.search(key) for key in keys):
-            continue
-        for left, right in combinations(sorted(set(keys)), 2):
-            pairs[tuple(sorted((left, right)))] = 1.0
-
-    prefix_buckets: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
-    for page_key, prefix, normalized in records:
-        prefix_buckets[(prefix, normalized[:2])].append((normalized, page_key))
-    for values in prefix_buckets.values():
-        ordered = sorted(values)
-        for index, (left_norm, left_key) in enumerate(ordered):
-            for right_norm, right_key in ordered[index + 1 : index + 1 + window]:
-                longer = max(len(left_norm), len(right_norm))
-                if abs(len(left_norm) - len(right_norm)) > max(3, int(longer * 0.25)):
-                    continue
-                ratio = SequenceMatcher(None, left_norm, right_norm).ratio()
-                if ratio >= threshold:
-                    pair = tuple(sorted((left_key, right_key)))
-                    pairs[pair] = max(ratio, pairs.get(pair, 0.0))
-    return [(left, right, ratio) for (left, right), ratio in sorted(pairs.items())]
+    """Return stable actionable filename pairs for compatibility callers."""
+    return [
+        (event.left, event.right, event.ratio)
+        for event in iter_filename_candidates(
+            page_keys,
+            threshold=threshold,
+            window=window,
+        )
+        if event.eligible
+    ]
 
 
 def preflight_suggestion(

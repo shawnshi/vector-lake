@@ -59,11 +59,77 @@ def test_lint_issue_collector_retains_ten_samples_and_exact_count():
     collector = _BoundedIssueCollector(sample_limit=10)
 
     for index in range(100_000):
-        collector.append(f"issue-{index}")
+        collector.append(f"issue-{index}", category=f"kind-{index % 4}")
 
     assert len(collector) == 100_000
     assert collector[:10] == [f"issue-{index}" for index in range(10)]
     assert collector.retained_sample_count == 10
+    assert collector.category_counts == {
+        "kind-0": 25_000,
+        "kind-1": 25_000,
+        "kind-2": 25_000,
+        "kind-3": 25_000,
+    }
+    snapshot = collector.category_counts
+    snapshot["kind-0"] = 0
+    assert collector.category_counts["kind-0"] == 25_000
+
+
+def test_lint_similarity_report_has_bounded_breakdown_and_suppression(
+    isolated_memory,
+):
+    wiki_dir = isolated_memory / "wiki"
+    page_specs = [
+        ("System_Community-L1-aaaaaaaa", "system", []),
+        ("System_Community-L1-bbbbbbbb", "system", []),
+        ("Source_Intelligence-20260301-Briefing", "source", ["raw/news/day-1.md"]),
+        ("Source_Intelligence-20260302-Briefing", "source", ["raw/news/day-2.md"]),
+        ("Concept_A_B", "concept", []),
+        ("Concept_AB", "concept", []),
+        ("Source_Report", "source", ["raw/reports/base.md"]),
+        ("Source_Report-ab12cd34", "source", ["raw/reports/hash.md"]),
+        ("Source_Raw-Left", "source", ["raw/shared.md"]),
+        ("Source_Unrelated-Right", "source", ["raw/shared.md"]),
+        ("Concept_Human-in-the-Loop", "concept", []),
+        ("Concept_Human-on-the-Loop", "concept", []),
+    ]
+    for index, (page_key, entity_type, sources) in enumerate(page_specs):
+        source_lines = "\n".join(f"- '{source}'" for source in sources) or "[]"
+        (wiki_dir / f"{page_key}.md").write_text(
+            f"""---
+title: '{page_key}'
+type: {entity_type}
+domain: General
+status: Active
+epistemic-status: seed
+categories:
+- Uncategorized
+sources: {source_lines if source_lines == '[]' else ''}
+{'' if source_lines == '[]' else source_lines}
+id: 20260811_similarity_{index:02d}
+updated: '2026-08-11'
+strategic_scope: core
+---
+# {page_key}
+
+Candidate inventory fixture.
+""",
+            encoding="utf-8",
+        )
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "9. Filename Similarity: [INFO: 4]" in report
+    assert (
+        "Breakdown: exact=1 | hash_revision=1 | ambiguous_revision=0 | "
+        "fuzzy=1 | raw_source=1"
+        in report
+    )
+    assert (
+        "Suppressed: temporal_series=1 | numeric_identity_conflict=0 | "
+        "system_pages=2"
+        in report
+    )
 
 
 def test_read_only_lint_record_does_not_retain_body():
