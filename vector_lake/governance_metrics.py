@@ -283,7 +283,7 @@ def compute_debt_metrics(
     path = db_store.peek_db_path().resolve()
     if not path.is_file():
         return _empty_debt_metrics()
-    with db_store.checkpointed_read_only_snapshot(path) as conn:
+    with db_store.read_only_transaction_snapshot(path) as conn:
         return _compute_debt_metrics_with_connection(
             conn,
             skip_heavy=skip_heavy,

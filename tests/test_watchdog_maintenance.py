@@ -963,7 +963,7 @@ def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(
     )
     gate_attempts = []
     lint_calls = []
-    checkpoint_calls = []
+    close_calls = []
     messages = []
 
     class SuccessfulLease:
@@ -984,11 +984,6 @@ def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(
                 gate_status={"current": {"operation": "external-holder"}},
             )
         return SuccessfulLease()
-
-    class FakeConnection:
-        @staticmethod
-        def execute(sql):
-            checkpoint_calls.append(sql)
 
     class StopAfterRetry:
         def __init__(self):
@@ -1020,8 +1015,18 @@ def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(
         "lint_vector_lake",
         lambda *, auto_fix: lint_calls.append(auto_fix),
     )
-    monkeypatch.setattr(db_store, "get_connection", lambda: FakeConnection())
-    monkeypatch.setattr(db_store, "close_connection", lambda: None)
+    monkeypatch.setattr(
+        db_store,
+        "get_connection",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("scheduled lint must not checkpoint")
+        ),
+    )
+    monkeypatch.setattr(
+        db_store,
+        "close_connection",
+        lambda: close_calls.append(True),
+    )
     monkeypatch.setattr(
         watchdog_app,
         "write_status",
@@ -1037,7 +1042,7 @@ def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(
         ("scan", "watchdog-scheduled-lint"),
     ]
     assert lint_calls == [False]
-    assert checkpoint_calls == ["PRAGMA wal_checkpoint(TRUNCATE)"]
+    assert close_calls == [True, True, True]
     assert stop_event.waits == [30, 30]
     assert "Scheduled Lint deferred" in messages
     assert "Scheduled Lint finished" in messages

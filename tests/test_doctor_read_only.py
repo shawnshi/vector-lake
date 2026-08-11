@@ -1,4 +1,7 @@
 import json
+import hashlib
+import shutil
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -54,6 +57,293 @@ def test_checkpointed_read_only_snapshot_rejects_pending_wal_without_touching(
             pass
 
     assert wal_path.read_bytes() == before
+
+
+def test_read_only_transaction_snapshot_is_consistent_across_concurrent_commit(
+    isolated_memory,
+):
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    db_store.close_all_connections()
+    writer = sqlite3.connect(str(db_path))
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE snapshot_probe (value INTEGER NOT NULL)")
+        writer.execute("INSERT INTO snapshot_probe (value) VALUES (1)")
+        writer.commit()
+
+        with db_store.read_only_transaction_snapshot(db_path) as snapshot:
+            before = snapshot.execute(
+                "SELECT COUNT(*) FROM snapshot_probe"
+            ).fetchone()[0]
+            writer.execute("INSERT INTO snapshot_probe (value) VALUES (2)")
+            writer.commit()
+            after = snapshot.execute(
+                "SELECT COUNT(*) FROM snapshot_probe"
+            ).fetchone()[0]
+
+        assert before == 1
+        assert after == 1
+        assert writer.execute("SELECT COUNT(*) FROM snapshot_probe").fetchone()[0] == 2
+    finally:
+        writer.close()
+
+
+def test_read_only_transaction_snapshot_rejects_commit_between_validation_and_begin(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    db_store.close_all_connections()
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE snapshot_race_probe (value INTEGER NOT NULL)")
+    writer.execute("INSERT INTO snapshot_race_probe (value) VALUES (1)")
+    writer.commit()
+    real_validate = db_store._validate_nonempty_wal_sidecars
+
+    def commit_after_validation(path):
+        token = real_validate(path)
+        writer.execute("INSERT INTO snapshot_race_probe (value) VALUES (2)")
+        writer.commit()
+        return token
+
+    monkeypatch.setattr(
+        db_store,
+        "_validate_nonempty_wal_sidecars",
+        commit_after_validation,
+    )
+    try:
+        with pytest.raises(
+            db_store.ReadOnlySnapshotUnavailable,
+            match="wal_changed_before_snapshot_begin",
+        ):
+            with db_store.read_only_transaction_snapshot(db_path):
+                pass
+    finally:
+        writer.close()
+
+
+def test_read_only_transaction_snapshot_revalidates_frames_after_begin(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    writer = db_store.get_connection()
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    with db_store.transaction():
+        writer.execute("CREATE TABLE wal_frame_race_probe (value TEXT NOT NULL)")
+        writer.execute(
+            "INSERT INTO wal_frame_race_probe (value) VALUES (?)",
+            ("committed-frame-marker",),
+        )
+
+    source_wal = Path(str(db_path) + "-wal")
+    source_shm = Path(str(db_path) + "-shm")
+    clone_dir = isolated_memory / "scratch" / "wal-frame-validation-race"
+    clone_dir.mkdir(parents=True)
+    clone_db = clone_dir / "vector_lake.db"
+    clone_wal = Path(str(clone_db) + "-wal")
+    clone_shm = Path(str(clone_db) + "-shm")
+    shutil.copyfile(db_path, clone_db)
+    shutil.copyfile(source_wal, clone_wal)
+    shutil.copyfile(source_shm, clone_shm)
+    real_validate = db_store._validate_nonempty_wal_sidecars
+    validation_calls = 0
+
+    def corrupt_after_first_validation(path):
+        nonlocal validation_calls
+        token = real_validate(path)
+        validation_calls += 1
+        if validation_calls == 1:
+            wal_bytes = bytearray(clone_wal.read_bytes())
+            wal_bytes[32 + 24 + 100] ^= 1
+            clone_wal.write_bytes(wal_bytes)
+        return token
+
+    monkeypatch.setattr(
+        db_store,
+        "_validate_nonempty_wal_sidecars",
+        corrupt_after_first_validation,
+    )
+
+    with pytest.raises(
+        db_store.ReadOnlySnapshotUnavailable,
+        match="wal_changed_before_snapshot_begin",
+    ):
+        with db_store.read_only_transaction_snapshot(clone_db):
+            pass
+
+    assert validation_calls == 1
+
+
+def test_read_only_transaction_snapshot_rejects_invalid_wal_without_touching(
+    isolated_memory,
+):
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    db_store.close_all_connections()
+    wal_path = Path(str(db_path) + "-wal")
+    wal_path.write_bytes(b"not-a-sqlite-wal")
+    before = wal_path.read_bytes()
+
+    with pytest.raises(
+        db_store.ReadOnlySnapshotUnavailable,
+        match="invalid_wal_header",
+    ):
+        with db_store.read_only_transaction_snapshot(db_path):
+            pass
+
+    assert wal_path.read_bytes() == before
+
+
+def test_read_only_transaction_snapshot_rejects_corrupt_wal_index_before_open(
+    isolated_memory,
+):
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    writer = db_store.get_connection()
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    with db_store.transaction():
+        writer.execute("CREATE TABLE wal_index_probe (value INTEGER NOT NULL)")
+        writer.execute("INSERT INTO wal_index_probe (value) VALUES (1)")
+
+    source_wal = Path(str(db_path) + "-wal")
+    source_shm = Path(str(db_path) + "-shm")
+    clone_dir = isolated_memory / "scratch" / "corrupt-wal-index"
+    clone_dir.mkdir(parents=True)
+    clone_db = clone_dir / "vector_lake.db"
+    clone_wal = Path(str(clone_db) + "-wal")
+    clone_shm = Path(str(clone_db) + "-shm")
+    shutil.copyfile(db_path, clone_db)
+    shutil.copyfile(source_wal, clone_wal)
+    shutil.copyfile(source_shm, clone_shm)
+    clone_shm.write_bytes(b"\xA5" * clone_shm.stat().st_size)
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    before = {
+        path: (path.stat().st_size, digest(path))
+        for path in (clone_db, clone_wal, clone_shm)
+    }
+    with pytest.raises(
+        db_store.ReadOnlySnapshotUnavailable,
+        match="invalid_wal_index",
+    ):
+        with db_store.read_only_transaction_snapshot(clone_db):
+            pass
+    after = {
+        path: (path.stat().st_size, digest(path))
+        for path in (clone_db, clone_wal, clone_shm)
+    }
+
+    assert after == before
+
+
+def test_read_only_transaction_snapshot_rejects_matching_bad_wal_index_checksum(
+    isolated_memory,
+):
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    writer = db_store.get_connection()
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    with db_store.transaction():
+        writer.execute("CREATE TABLE wal_checksum_probe (value INTEGER NOT NULL)")
+        writer.execute("INSERT INTO wal_checksum_probe (value) VALUES (9)")
+
+    source_wal = Path(str(db_path) + "-wal")
+    source_shm = Path(str(db_path) + "-shm")
+    clone_dir = isolated_memory / "scratch" / "bad-wal-index-checksum"
+    clone_dir.mkdir(parents=True)
+    clone_db = clone_dir / "vector_lake.db"
+    clone_wal = Path(str(clone_db) + "-wal")
+    clone_shm = Path(str(clone_db) + "-shm")
+    shutil.copyfile(db_path, clone_db)
+    shutil.copyfile(source_wal, clone_wal)
+    shutil.copyfile(source_shm, clone_shm)
+    shm_bytes = bytearray(clone_shm.read_bytes())
+    shm_bytes[8] ^= 1
+    shm_bytes[56] ^= 1
+    clone_shm.write_bytes(shm_bytes)
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    before = {
+        path: (path.stat().st_size, digest(path))
+        for path in (clone_db, clone_wal, clone_shm)
+    }
+    with pytest.raises(
+        db_store.ReadOnlySnapshotUnavailable,
+        match="invalid_wal_index_checksum",
+    ):
+        with db_store.read_only_transaction_snapshot(clone_db):
+            pass
+    after = {
+        path: (path.stat().st_size, digest(path))
+        for path in (clone_db, clone_wal, clone_shm)
+    }
+
+    assert after == before
+
+
+def test_read_only_transaction_snapshot_rejects_corrupt_committed_wal_frame(
+    isolated_memory,
+):
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    writer = db_store.get_connection()
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    with db_store.transaction():
+        writer.execute("CREATE TABLE wal_frame_probe (value TEXT NOT NULL)")
+        writer.execute(
+            "INSERT INTO wal_frame_probe (value) VALUES (?)",
+            ("committed-frame-marker",),
+        )
+
+    source_wal = Path(str(db_path) + "-wal")
+    source_shm = Path(str(db_path) + "-shm")
+    clone_dir = isolated_memory / "scratch" / "bad-committed-wal-frame"
+    clone_dir.mkdir(parents=True)
+    clone_db = clone_dir / "vector_lake.db"
+    clone_wal = Path(str(clone_db) + "-wal")
+    clone_shm = Path(str(clone_db) + "-shm")
+    shutil.copyfile(db_path, clone_db)
+    shutil.copyfile(source_wal, clone_wal)
+    shutil.copyfile(source_shm, clone_shm)
+    wal_bytes = bytearray(clone_wal.read_bytes())
+    wal_page_size = int.from_bytes(wal_bytes[8:12], "big")
+    if wal_page_size == 1:
+        wal_page_size = 65_536
+    first_frame_payload_offset = 32 + 24
+    assert len(wal_bytes) >= first_frame_payload_offset + wal_page_size
+    wal_bytes[first_frame_payload_offset + 100] ^= 1
+    clone_wal.write_bytes(wal_bytes)
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    before = {
+        path: (path.stat().st_size, digest(path))
+        for path in (clone_db, clone_wal, clone_shm)
+    }
+    with pytest.raises(
+        db_store.ReadOnlySnapshotUnavailable,
+        match="invalid_wal_frame_checksum",
+    ):
+        with db_store.read_only_transaction_snapshot(clone_db):
+            pass
+    after = {
+        path: (path.stat().st_size, digest(path))
+        for path in (clone_db, clone_wal, clone_shm)
+    }
+
+    assert after == before
 
 
 def test_doctor_uses_immutable_snapshot_for_closed_database(

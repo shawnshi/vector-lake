@@ -1,3 +1,6 @@
+import hashlib
+from pathlib import Path
+
 import pytest
 
 from vector_lake import db_store, governance_store
@@ -94,6 +97,44 @@ def test_debt_metrics_read_only_bypasses_schema_initializer(
     metrics = compute_debt_metrics(skip_heavy=True, read_only=True)
 
     assert metrics["unsupported_claim_count"] == 0
+
+
+def test_debt_metrics_read_only_reads_committed_wal_without_mutating_files(
+    isolated_memory,
+):
+    db_store.init_db()
+    writer = db_store.get_connection()
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    claim = {
+        "claim_id": "claim_wal_read_only",
+        "claim_text": "Read-only metrics include committed WAL state",
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+        "subject_entity_ids": [],
+    }
+    _publish_claim(claim, "Concept_WAL-Read-Only")
+    db_path = db_store.get_db_path()
+    wal_path = Path(str(db_path) + "-wal")
+    assert wal_path.stat().st_size > 0
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    before = {
+        db_path: (db_path.stat().st_size, digest(db_path)),
+        wal_path: (wal_path.stat().st_size, digest(wal_path)),
+    }
+
+    metrics = compute_debt_metrics(skip_heavy=True, read_only=True)
+
+    after = {
+        db_path: (db_path.stat().st_size, digest(db_path)),
+        wal_path: (wal_path.stat().st_size, digest(wal_path)),
+    }
+    assert metrics["unsupported_claim_count"] == 1
+    assert after == before
 
 
 def test_debt_metrics_read_only_returns_zero_shape_without_creating_database(

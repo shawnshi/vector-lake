@@ -4975,6 +4975,23 @@ def pending_governance_items() -> list:
     return [item for item in load_governance_queue()["items"] if item.get("status") == "pending"]
 
 
+def reviewable_governance_items() -> list:
+    """Return items that the public review surface can act on.
+
+    Research keeps using ``pending_governance_items`` so a committed merge that
+    only needs projection reconciliation is not rediscovered as new research.
+    """
+    return [
+        item
+        for item in load_governance_queue()["items"]
+        if item.get("status") == "pending"
+        or (
+            item.get("type") == "merge"
+            and item.get("status") == "projection_pending"
+        )
+    ]
+
+
 def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bool = True, summary: str | None = None) -> dict | None:
     existing_paths = []
     deleted_paths = []

@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -10,12 +11,36 @@ from vector_lake import (
     governance_service,
     governance_store,
     mutation_coordinator,
+    watchdog_app,
 )
 from vector_lake.merge_analysis import preflight_suggestion
 from vector_lake.mutation_coordinator import execute_mutation_plan
-from vector_lake.wiki_utils import split_frontmatter
+from vector_lake.wiki_utils import semantic_text_hash, split_frontmatter
 from vector_lake.watchdog_app import process_mutation_outbox_batch
 from tests.test_mutation_coordinator import _write_purpose_contract
+
+
+def _projection_journal_snapshot(
+    outbox_ids,
+    *,
+    target_filename,
+    source_filename,
+    merged_content,
+    target_projection_hash="",
+    source_projection_hash="",
+    target_version="",
+    source_version="",
+):
+    return {
+        "outbox_ids": list(outbox_ids),
+        "target_filename": target_filename,
+        "source_filename": source_filename,
+        "target_version": target_version,
+        "source_version": source_version,
+        "target_projection_hash": target_projection_hash,
+        "source_projection_hash": source_projection_hash,
+        "merged_projection_hash": semantic_text_hash(merged_content),
+    }
 
 
 def test_find_md_file_uses_safe_page_key_when_title_contains_a_separator(tmp_path):
@@ -393,6 +418,116 @@ def test_source_metadata_merge_rejects_conflicting_verified_hashes():
             },
             "test source",
         )
+
+
+def test_preserved_source_data_allows_only_lowercase_md_title_normalization():
+    expected = {
+        "source_id": "source_alpha",
+        "raw_ref": "raw/alpha.md",
+        "title": "Alpha.md",
+        "retention_policy": "retain-7-years",
+        "reviewed_provenance": {"reviewer": "human-review-board"},
+    }
+    observed = copy.deepcopy(expected)
+    observed["title"] = "Alpha"
+
+    assert governance_service._preserved_source_data_matches(expected, observed)
+
+
+def test_preserved_source_data_allows_hash_verified_survivor_title():
+    expected = {
+        "source_id": "source_alpha",
+        "raw_ref": "raw/alpha.md",
+        "title": "“Future Ready”",
+        "retention_policy": "retain-7-years",
+    }
+    observed = copy.deepcopy(expected)
+    observed["title"] = "《Future Ready》"
+
+    assert governance_service._preserved_source_data_matches(
+        expected,
+        observed,
+        canonical_source_title="《Future Ready》",
+    )
+    assert not governance_service._preserved_source_data_matches(
+        expected,
+        observed,
+        canonical_source_title="《Different Title》",
+    )
+
+
+def test_verified_survivor_source_title_requires_matching_hash_and_source_type():
+    content = _source_content(
+        "source_alpha",
+        "《Future Ready》",
+        "Evidence.",
+        "[raw/alpha.md]",
+    )
+    content_hash = semantic_text_hash(content)
+
+    assert (
+        governance_service._verified_survivor_source_title(content, content_hash)
+        == "《Future Ready》"
+    )
+    assert governance_service._verified_survivor_source_title(content, "0" * 64) is None
+    assert (
+        governance_service._verified_survivor_source_title(
+            content.replace("type: source", "type: concept"),
+            semantic_text_hash(content.replace("type: source", "type: concept")),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected_title", "observed_title"),
+    [
+        ("Alpha.MD", "Alpha"),
+        ("Alpha.md ", "Alpha"),
+        ("Alpha.md.md", "Alpha"),
+        ("Alpha", "Alpha.md"),
+        ("Alpha.md", "Beta"),
+    ],
+)
+def test_preserved_source_data_rejects_other_title_changes(
+    expected_title,
+    observed_title,
+):
+    expected = {"source_id": "source_alpha", "title": expected_title}
+    observed = {"source_id": "source_alpha", "title": observed_title}
+
+    assert not governance_service._preserved_source_data_matches(expected, observed)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("raw_ref", "raw/beta.md"),
+        ("content_hash", "b" * 64),
+        ("retention_policy", "delete-after-30-days"),
+        ("legal_hold", False),
+        ("reviewed_provenance", {"reviewer": "different-reviewer"}),
+    ],
+)
+def test_preserved_source_data_keeps_non_title_fields_strict(field, changed_value):
+    expected = {
+        "source_id": "source_alpha",
+        "raw_ref": "raw/alpha.md",
+        "title": "Alpha.md",
+        "content_hash": "a" * 64,
+        "retention_policy": "retain-7-years",
+        "legal_hold": True,
+        "reviewed_provenance": {"reviewer": "human-review-board"},
+    }
+    observed = copy.deepcopy(expected)
+    observed["title"] = "Alpha"
+    observed[field] = changed_value
+
+    assert not governance_service._preserved_source_data_matches(
+        expected,
+        observed,
+        canonical_source_title="Alpha",
+    )
 
 
 def test_source_merge_converges_provenance_projection_journal_and_replay(
@@ -891,6 +1026,246 @@ def test_source_metadata_restore_cas_preserves_concurrent_human_update(
     assert (
         governance_store.get_governance_item(item_id)["status"] == "projection_pending"
     )
+
+
+def test_projection_pending_reconcile_normalizes_post_commit_worker_error(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    journal_id = "journal_projection_worker_error"
+    item_id = "gov_projection_worker_error"
+    merged_content = "---\ntype: concept\ntitle: Target\n---\n\nMerged.\n"
+    target_outbox_id = db_store.enqueue_mutation(
+        "Concept_Target.md",
+        "update",
+        payload_text=merged_content,
+        validation_mode="schema",
+        base_version="target-v1",
+        projection_base_hash="a" * 64,
+    )
+    source_outbox_id = db_store.enqueue_mutation(
+        "Concept_Source.md",
+        "delete",
+        validation_mode="schema",
+        base_version="source-v1",
+        projection_base_hash="b" * 64,
+    )
+    outbox_ids = [target_outbox_id, source_outbox_id]
+    db_store.record_merge_journal(
+        journal_id,
+        item_id,
+        _projection_journal_snapshot(
+            outbox_ids,
+            target_filename="Concept_Target.md",
+            source_filename="Concept_Source.md",
+            merged_content=merged_content,
+            target_projection_hash="a" * 64,
+            source_projection_hash="b" * 64,
+            target_version="target-v1",
+            source_version="source-v1",
+        ),
+        status="projection_pending",
+    )
+    assert governance_store.upsert_governance_item(
+        {
+            "item_id": item_id,
+            "type": "merge",
+            "title": "Projection worker error",
+            "status": "projection_pending",
+            "merge_candidate": {},
+            "merge_journal_id": journal_id,
+            "merge_outbox_ids": outbox_ids,
+        }
+    )
+    item = governance_store.get_governance_item(item_id)
+    assert item is not None
+
+    def fail_after_commit(**_kwargs):
+        raise RuntimeError("Database schema migration maintenance window is active")
+
+    monkeypatch.setattr(
+        watchdog_app,
+        "process_mutation_outbox_batch",
+        fail_after_commit,
+    )
+
+    result = governance_service._reconcile_projection_pending(item)
+
+    assert result["status"] == "projection_pending"
+    assert result["recovery_required"] is True
+    assert result["last_projection_error"] == (
+        "RuntimeError: Database schema migration maintenance window is active"
+    )
+    durable = governance_store.get_governance_item(item_id)
+    assert durable["status"] == "projection_pending"
+    assert durable.get("resolved_at") is None
+    assert db_store.get_merge_journal(journal_id)["status"] == "projection_pending"
+
+
+def test_post_commit_journal_annotation_failure_remains_projection_pending(
+    monkeypatch,
+):
+    pending_item = {
+        "item_id": "gov_post_commit_annotation",
+        "type": "merge",
+        "status": "projection_pending",
+    }
+
+    def fail_update(*_args, **_kwargs):
+        raise RuntimeError("maintenance window")
+
+    monkeypatch.setattr(db_store, "update_merge_journal", fail_update)
+
+    result = governance_service._record_merge_post_commit_state(
+        "journal_post_commit_annotation",
+        pending_item,
+        ["Concept_Target.md"],
+    )
+
+    assert result["status"] == "projection_pending"
+    assert result["recovery_required"] is True
+    assert result["last_projection_error"] == (
+        "Post-commit merge journal update failed: RuntimeError: maintenance window"
+    )
+
+
+def test_projection_pending_reconcile_keeps_missing_control_state_fail_closed(
+    isolated_memory,
+):
+    db_store.init_db()
+
+    with pytest.raises(RuntimeError, match="missing its recovery journal"):
+        governance_service._reconcile_projection_pending(
+            {
+                "item_id": "gov_missing_journal",
+                "type": "merge",
+                "status": "projection_pending",
+                "merge_candidate": {},
+                "merge_journal_id": "missing",
+                "merge_outbox_ids": [101],
+            }
+        )
+
+
+def test_projection_pending_rejects_item_journal_outbox_drift_without_requeue(
+    isolated_memory,
+):
+    db_store.init_db()
+    merged_content = "---\ntype: concept\ntitle: Target\n---\n\nMerged.\n"
+    target_id = db_store.enqueue_mutation(
+        "Concept_Target.md",
+        "update",
+        payload_text=merged_content,
+        validation_mode="schema",
+    )
+    source_id = db_store.enqueue_mutation(
+        "Concept_Source.md",
+        "delete",
+        validation_mode="schema",
+    )
+    unrelated_id = db_store.enqueue_mutation(
+        "Concept_Unrelated.md",
+        "delete",
+        validation_mode="schema",
+    )
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'failed', attempt_count = 3 "
+            "WHERE id = ?",
+            (unrelated_id,),
+        )
+    journal_id = "journal_outbox_id_drift"
+    item_id = "gov_outbox_id_drift"
+    db_store.record_merge_journal(
+        journal_id,
+        item_id,
+        _projection_journal_snapshot(
+            [target_id, source_id],
+            target_filename="Concept_Target.md",
+            source_filename="Concept_Source.md",
+            merged_content=merged_content,
+        ),
+        status="projection_pending",
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": item_id,
+            "type": "merge",
+            "status": "projection_pending",
+            "merge_candidate": {},
+            "merge_journal_id": journal_id,
+            "merge_outbox_ids": [target_id, unrelated_id],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="outbox IDs differ"):
+        governance_service.resolve_governance_item(item_id, resolution="merge")
+
+    unrelated = conn.execute(
+        "SELECT status, attempt_count FROM mutation_outbox WHERE id = ?",
+        (unrelated_id,),
+    ).fetchone()
+    assert tuple(unrelated) == ("failed", 3)
+    assert db_store.mutation_outbox_statuses([source_id]) == {source_id: "pending"}
+
+
+def test_projection_pending_rejects_outbox_intent_drift_without_requeue(
+    isolated_memory,
+):
+    db_store.init_db()
+    merged_content = "---\ntype: concept\ntitle: Target\n---\n\nMerged.\n"
+    target_id = db_store.enqueue_mutation(
+        "Concept_Wrong-Target.md",
+        "update",
+        payload_text=merged_content,
+        validation_mode="schema",
+    )
+    source_id = db_store.enqueue_mutation(
+        "Concept_Source.md",
+        "delete",
+        validation_mode="schema",
+    )
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'failed', attempt_count = 3 "
+            "WHERE id = ?",
+            (target_id,),
+        )
+    journal_id = "journal_outbox_intent_drift"
+    item_id = "gov_outbox_intent_drift"
+    db_store.record_merge_journal(
+        journal_id,
+        item_id,
+        _projection_journal_snapshot(
+            [target_id, source_id],
+            target_filename="Concept_Target.md",
+            source_filename="Concept_Source.md",
+            merged_content=merged_content,
+        ),
+        status="projection_pending",
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": item_id,
+            "type": "merge",
+            "status": "projection_pending",
+            "merge_candidate": {},
+            "merge_journal_id": journal_id,
+            "merge_outbox_ids": [target_id, source_id],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="outbox filenames"):
+        governance_service.resolve_governance_item(item_id, resolution="merge")
+
+    failed = conn.execute(
+        "SELECT status, attempt_count FROM mutation_outbox WHERE id = ?",
+        (target_id,),
+    ).fetchone()
+    assert tuple(failed) == ("failed", 3)
 
 
 def test_source_merge_rejects_raw_drift_between_preflight_and_commit(

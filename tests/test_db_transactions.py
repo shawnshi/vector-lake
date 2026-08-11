@@ -755,6 +755,20 @@ def test_connection_scope_reuses_then_closes_connection(tmp_path, monkeypatch):
         connection.execute("SELECT 1")
 
 
+def test_rw_connection_applies_configurable_wal_retention(
+    isolated_memory,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_WAL_AUTOCHECKPOINT_PAGES", "37")
+    monkeypatch.setenv("VECTOR_LAKE_WAL_JOURNAL_SIZE_LIMIT_BYTES", "1048576")
+
+    db_store.init_db()
+    connection = db_store.get_connection()
+
+    assert connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 37
+    assert connection.execute("PRAGMA journal_size_limit").fetchone()[0] == 1048576
+
+
 def test_connection_scope_inside_transaction_defers_close(tmp_path, monkeypatch):
     monkeypatch.setenv("VECTOR_LAKE_DB_PATH", str(tmp_path / "transaction-scope.db"))
 

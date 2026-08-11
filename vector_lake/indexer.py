@@ -2053,12 +2053,20 @@ def _generate_index_unlocked(
                 canonical_before,
                 context="after acquiring the SQLite write lock",
             )
-            db_store.apply_search_projection_mutations(
+            search_stats = db_store.apply_search_projection_mutations(
                 vector_conn,
                 upserts=search_upserts,
                 embedding_deletes=stale_embedding_ids,
                 reset_search=True,
             )
+        log.info(
+            "FTS projection delta committed: upserts=%s deletes=%s "
+            "payload_bytes=%s embedding_deletes=%s",
+            search_stats["search_upserts"],
+            search_stats["search_deletes"],
+            search_stats["search_payload_bytes"],
+            search_stats["embedding_deletes"],
+        )
         _publish_staged_projection_pair_guarded(
             output_path,
             tmp_output,

@@ -1792,7 +1792,7 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
 
                     from vector_lake.tool_lint import lint_vector_lake
                     from vector_lake import indexer
-                    from vector_lake.db_store import close_connection, get_connection
+                    from vector_lake.db_store import close_connection
                     from vector_lake.heavy_task_gate import (
                         HeavyTaskBusy,
                         heavy_task,
@@ -1813,13 +1813,6 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                                         "Graph topology refreshed during scheduled lint."
                                     )
                                 lint_vector_lake(auto_fix=False)
-
-                                conn = get_connection()
-                                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                                log.info(
-                                    "SQLite WAL checkpoint (TRUNCATE) completed "
-                                    "successfully."
-                                )
                         scheduled_completed = True
                     except HeavyTaskBusy:
                         log.info(

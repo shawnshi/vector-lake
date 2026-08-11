@@ -17,6 +17,7 @@ from vector_lake.wiki_utils import (
     iter_wiki_link_matches,
     normalize_semantic_text,
     semantic_text_hash,
+    split_frontmatter,
 )
 
 
@@ -330,6 +331,62 @@ def _current_raw_artifact_hash(raw_identity: str) -> str:
     return hashlib.sha256(raw_path.read_bytes()).hexdigest()
 
 
+def _verified_survivor_source_title(
+    content: str,
+    expected_projection_hash: str,
+) -> str | None:
+    """Return the Source title only from the hash-verified content buffer."""
+    if semantic_text_hash(content) != expected_projection_hash:
+        return None
+    try:
+        frontmatter, _body = split_frontmatter(content)
+    except Exception:
+        return None
+    if not isinstance(frontmatter, dict) or frontmatter.get("type") != "source":
+        return None
+    title = frontmatter.get("title")
+    return title if isinstance(title, str) and title else None
+
+
+def _preserved_source_data_matches(
+    expected: dict,
+    observed: dict,
+    *,
+    canonical_source_title: str | None = None,
+) -> bool:
+    """Allow only hash-bound extractor normalization of the derived title.
+
+    A raw-derived Source row can initially use the raw basename as its title,
+    including ``.md``.  Re-projecting the canonical Source page refreshes that
+    derived field from hash-verified frontmatter.  Every other field remains
+    part of the exact preservation contract.
+    """
+    if observed == expected:
+        return True
+    if not isinstance(expected, dict) or not isinstance(observed, dict):
+        return False
+    expected_title = expected.get("title")
+    observed_title = observed.get("title")
+    if (
+        isinstance(expected_title, str)
+        and isinstance(observed_title, str)
+        and expected_title.endswith(".md")
+        and expected_title[:-3] == observed_title
+    ):
+        title_matches = True
+    else:
+        title_matches = (
+            isinstance(observed_title, str)
+            and isinstance(canonical_source_title, str)
+            and observed_title == canonical_source_title
+        )
+    if not title_matches:
+        return False
+    expected_rest = {key: value for key, value in expected.items() if key != "title"}
+    observed_rest = {key: value for key, value in observed.items() if key != "title"}
+    return observed_rest == expected_rest
+
+
 def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
     wiki_dir = get_wiki_dir()
     target_name = str(
@@ -341,12 +398,17 @@ def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
     target_path = wiki_dir / target_name
     source_path = wiki_dir / source_name
     errors = []
+    canonical_source_title = None
     if not target_path.is_file():
         errors.append(f"missing survivor projection: {target_name}")
-    elif semantic_text_hash(target_path.read_text(encoding="utf-8")) != journal.get(
-        "merged_projection_hash"
-    ):
-        errors.append(f"survivor projection hash mismatch: {target_name}")
+    else:
+        target_content = target_path.read_text(encoding="utf-8")
+        canonical_source_title = _verified_survivor_source_title(
+            target_content,
+            str(journal.get("merged_projection_hash") or ""),
+        )
+        if semantic_text_hash(target_content) != journal.get("merged_projection_hash"):
+            errors.append(f"survivor projection hash mismatch: {target_name}")
     if source_path.exists():
         errors.append(f"duplicate projection still exists: {source_name}")
     if (
@@ -409,7 +471,12 @@ def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
             )
             .fetchone()
         )
-        if row is None or json.loads(row["data_json"] or "{}") != expected.get("data"):
+        observed = json.loads(row["data_json"] or "{}") if row is not None else None
+        if row is None or not _preserved_source_data_matches(
+            expected.get("data"),
+            observed,
+            canonical_source_title=canonical_source_title,
+        ):
             errors.append(
                 "preserved Source metadata does not match journal: "
                 + str(expected.get("source_id") or "")
@@ -467,89 +534,284 @@ def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:
     return errors
 
 
-def _reconcile_projection_pending(item: dict) -> dict:
+def _strict_outbox_id_list(value, *, owner: str) -> list[int]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(
+            f"Merge projection control-state mismatch: {owner} outbox IDs are missing."
+        )
+    ids = []
+    for outbox_id in value:
+        if (
+            isinstance(outbox_id, bool)
+            or not isinstance(outbox_id, int)
+            or outbox_id <= 0
+        ):
+            raise RuntimeError(
+                f"Merge projection control-state mismatch: {owner} contains an invalid outbox ID."
+            )
+        ids.append(outbox_id)
+    if len(ids) != len(set(ids)):
+        raise RuntimeError(
+            f"Merge projection control-state mismatch: {owner} contains duplicate outbox IDs."
+        )
+    return ids
+
+
+def _validate_merge_outbox_control_state(item: dict, journal: dict) -> list[int]:
+    """Bind a recoverable merge to its exact two durable projection intents."""
+    item_ids = _strict_outbox_id_list(
+        item.get("merge_outbox_ids"),
+        owner="governance item",
+    )
+    journal_ids = _strict_outbox_id_list(
+        journal.get("outbox_ids"),
+        owner="merge journal",
+    )
+    if set(item_ids) != set(journal_ids):
+        raise RuntimeError(
+            "Merge projection control-state mismatch: governance item and journal "
+            "outbox IDs differ."
+        )
+
+    required = {
+        "target_filename",
+        "source_filename",
+        "target_version",
+        "source_version",
+        "target_projection_hash",
+        "source_projection_hash",
+        "merged_projection_hash",
+    }
+    missing = sorted(key for key in required if key not in journal)
+    if missing:
+        raise RuntimeError(
+            "Merge projection control-state mismatch: journal intent metadata is "
+            f"missing {', '.join(missing)}."
+        )
+    target_filename = str(journal["target_filename"])
+    source_filename = str(journal["source_filename"])
+    if not target_filename or not source_filename or target_filename == source_filename:
+        raise RuntimeError(
+            "Merge projection control-state mismatch: journal filenames are invalid."
+        )
+    expected_by_filename = {
+        target_filename: {
+            "mutation_type": "update",
+            "validation_mode": "schema",
+            "base_version": str(journal["target_version"]),
+            "projection_base_hash": str(journal["target_projection_hash"]),
+            "payload_hash": str(journal["merged_projection_hash"]),
+        },
+        source_filename: {
+            "mutation_type": "delete",
+            "validation_mode": "schema",
+            "base_version": str(journal["source_version"]),
+            "projection_base_hash": str(journal["source_projection_hash"]),
+            "payload_hash": None,
+        },
+    }
+    if len(journal_ids) != len(expected_by_filename):
+        raise RuntimeError(
+            "Merge projection control-state mismatch: journal must own exactly one "
+            "target update and one source delete intent."
+        )
+
+    observed = db_store.mutation_outbox_intents(journal_ids)
+    if set(observed) != set(journal_ids):
+        raise RuntimeError(
+            "Merge projection control-state mismatch: a journal outbox row is missing."
+        )
+    observed_filenames = set()
+    for outbox_id in journal_ids:
+        row = observed[outbox_id]
+        filename = str(row.get("filename") or "")
+        expected = expected_by_filename.get(filename)
+        if expected is None or filename in observed_filenames:
+            raise RuntimeError(
+                "Merge projection control-state mismatch: outbox filenames do not "
+                "match the journal target/source pair."
+            )
+        observed_filenames.add(filename)
+        actual_payload_hash = (
+            semantic_text_hash(str(row["payload_text"]))
+            if row.get("payload_text") is not None
+            else None
+        )
+        actual = {
+            "mutation_type": str(row.get("mutation_type") or ""),
+            "validation_mode": str(row.get("validation_mode") or ""),
+            "base_version": str(row.get("base_version") or ""),
+            "projection_base_hash": str(row.get("projection_base_hash") or ""),
+            "payload_hash": actual_payload_hash,
+        }
+        if actual != expected:
+            raise RuntimeError(
+                "Merge projection control-state mismatch: outbox intent does not "
+                f"match journal metadata for {filename}."
+            )
+    if observed_filenames != set(expected_by_filename):
+        raise RuntimeError(
+            "Merge projection control-state mismatch: outbox intent set is incomplete."
+        )
+    return journal_ids
+
+
+def _reconcile_projection_pending(
+    item: dict,
+    *,
+    allow_failed_retry: bool = False,
+) -> dict:
     candidate = item["merge_candidate"]
     journal_id = str(item.get("merge_journal_id") or "")
     journal = db_store.get_merge_journal(journal_id) if journal_id else None
     if not journal:
         raise RuntimeError("Projection-pending merge is missing its recovery journal.")
-    outbox_ids = [
-        int(value)
-        for value in item.get("merge_outbox_ids") or journal.get("outbox_ids") or []
-    ]
-    if not outbox_ids:
-        raise RuntimeError("Projection-pending merge is missing outbox identities.")
+    outbox_ids = _validate_merge_outbox_control_state(item, journal)
 
     from vector_lake.watchdog_app import process_mutation_outbox_batch
 
-    process_mutation_outbox_batch(
-        limit=max(1, len(outbox_ids)),
-        max_attempts=3,
-        backoff_base=0,
-        outbox_ids=outbox_ids,
-    )
-    statuses = db_store.mutation_outbox_statuses(outbox_ids)
-    if set(statuses) != set(outbox_ids) or any(
-        status != "completed" for status in statuses.values()
-    ):
+    try:
+        recovery = None
+        initial_statuses = db_store.mutation_outbox_statuses(outbox_ids)
+        if allow_failed_retry and any(
+            status == "failed" for status in initial_statuses.values()
+        ):
+            recovery = db_store.recover_failed_mutation_outbox(outbox_ids)
+        process_mutation_outbox_batch(
+            limit=max(1, len(outbox_ids)),
+            max_attempts=3,
+            backoff_base=0,
+            outbox_ids=outbox_ids,
+        )
+        statuses = db_store.mutation_outbox_statuses(outbox_ids)
+        terminal_projection_statuses = {"completed", "superseded"}
+        if set(statuses) != set(outbox_ids) or any(
+            status not in terminal_projection_statuses
+            for status in statuses.values()
+        ):
+            pending_updates = {
+                "status": "projection_pending",
+                "merge_outbox_statuses": statuses,
+                "last_projection_check": _utc_now(),
+            }
+            if recovery is not None:
+                pending_updates["failed_outbox_recovery"] = recovery
+            db_store.update_merge_journal(
+                journal_id,
+                {
+                    "outbox_statuses": statuses,
+                    "last_checked_at": _utc_now(),
+                    **(
+                        {"failed_outbox_recovery": recovery}
+                        if recovery is not None
+                        else {}
+                    ),
+                },
+                status="projection_pending",
+            )
+            return (
+                governance_store.update_governance_item(
+                    item["item_id"],
+                    pending_updates,
+                    expected_statuses={"pending", "projection_pending"},
+                )
+                or item
+            )
+
+        errors = _post_merge_errors(candidate, journal)
+        if errors:
+            db_store.update_merge_journal(
+                journal_id,
+                {
+                    "outbox_statuses": statuses,
+                    "postcondition_errors": errors,
+                    **(
+                        {"failed_outbox_recovery": recovery}
+                        if recovery is not None
+                        else {}
+                    ),
+                },
+                status="verification_failed",
+            )
+            verification_updates = {
+                "status": "projection_pending",
+                "merge_outbox_statuses": statuses,
+                "postcondition_errors": errors,
+                "last_projection_check": _utc_now(),
+            }
+            if recovery is not None:
+                verification_updates["failed_outbox_recovery"] = recovery
+            return (
+                governance_store.update_governance_item(
+                    item["item_id"],
+                    verification_updates,
+                    expected_statuses={"pending", "projection_pending"},
+                )
+                or item
+            )
+
         db_store.update_merge_journal(
             journal_id,
-            {"outbox_statuses": statuses, "last_checked_at": _utc_now()},
+            {
+                "outbox_statuses": statuses,
+                "completed_at": _utc_now(),
+                **(
+                    {"failed_outbox_recovery": recovery}
+                    if recovery is not None
+                    else {}
+                ),
+            },
+            status="completed",
+        )
+        resolved_updates = {
+            "status": "resolved",
+            "resolution": "merge",
+            "merge_outbox_statuses": statuses,
+            "postcondition_errors": [],
+            "resolved_at": _utc_now(),
+        }
+        if recovery is not None:
+            resolved_updates["failed_outbox_recovery"] = recovery
+        return (
+            governance_store.update_governance_item(
+                item["item_id"],
+                resolved_updates,
+                expected_statuses={"pending", "projection_pending"},
+            )
+            or item
+        )
+    except Exception as exc:
+        return {
+            **item,
+            "status": "projection_pending",
+            "recovery_required": True,
+            "last_projection_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _record_merge_post_commit_state(
+    journal_id: str,
+    pending_item: dict,
+    deferred: list[str],
+) -> dict | None:
+    """Record best-effort post-commit detail without redefining the commit."""
+    try:
+        db_store.update_merge_journal(
+            journal_id,
+            {"deferred": list(deferred)},
             status="projection_pending",
         )
-        return (
-            governance_store.update_governance_item(
-                item["item_id"],
-                {
-                    "status": "projection_pending",
-                    "merge_outbox_statuses": statuses,
-                    "last_projection_check": _utc_now(),
-                },
-                expected_statuses={"pending", "projection_pending"},
-            )
-            or item
-        )
-
-    errors = _post_merge_errors(candidate, journal)
-    if errors:
-        db_store.update_merge_journal(
-            journal_id,
-            {"outbox_statuses": statuses, "postcondition_errors": errors},
-            status="verification_failed",
-        )
-        return (
-            governance_store.update_governance_item(
-                item["item_id"],
-                {
-                    "status": "projection_pending",
-                    "merge_outbox_statuses": statuses,
-                    "postcondition_errors": errors,
-                    "last_projection_check": _utc_now(),
-                },
-                expected_statuses={"pending", "projection_pending"},
-            )
-            or item
-        )
-
-    db_store.update_merge_journal(
-        journal_id,
-        {"outbox_statuses": statuses, "completed_at": _utc_now()},
-        status="completed",
-    )
-    return (
-        governance_store.update_governance_item(
-            item["item_id"],
-            {
-                "status": "resolved",
-                "resolution": "merge",
-                "merge_outbox_statuses": statuses,
-                "postcondition_errors": [],
-                "resolved_at": _utc_now(),
-            },
-            expected_statuses={"pending", "projection_pending"},
-        )
-        or item
-    )
+    except Exception as exc:
+        return {
+            **pending_item,
+            "status": "projection_pending",
+            "recovery_required": True,
+            "last_projection_error": (
+                "Post-commit merge journal update failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+    return None
 
 
 def resolve_governance_item(
@@ -576,7 +838,7 @@ def resolve_governance_item(
     if status == "resolved":
         return item
     if status == "projection_pending":
-        return _reconcile_projection_pending(item)
+        return _reconcile_projection_pending(item, allow_failed_retry=True)
     if status != "pending":
         return None
 
@@ -780,13 +1042,6 @@ def resolve_governance_item(
         transaction_callback=commit_merge_control_state,
         precondition_callback=verify_source_metadata_snapshot,
     )
-    db_store.update_merge_journal(
-        journal_id,
-        {
-            "deferred": outcome["deferred"],
-        },
-        status="projection_pending",
-    )
     pending_item = pending_holder.get("item") or governance_store.get_governance_item(
         item_id
     )
@@ -794,4 +1049,11 @@ def resolve_governance_item(
         raise RuntimeError(
             "Committed merge is missing its projection-pending control state."
         )
+    post_commit_pending = _record_merge_post_commit_state(
+        journal_id,
+        pending_item,
+        outcome["deferred"],
+    )
+    if post_commit_pending is not None:
+        return post_commit_pending
     return _reconcile_projection_pending(pending_item)

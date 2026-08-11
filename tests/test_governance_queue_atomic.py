@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from vector_lake import governance_service, governance_store
+from vector_lake import governance_service, governance_store, tool_review
 from vector_lake.tool_review import _combined_pending_items, _format_combined_report
 
 
@@ -111,6 +111,117 @@ def test_governance_priority_uses_explicit_critical_decision_refs(isolated_memor
     report = _format_combined_report(items)
     assert "Priority: P0" in report
     assert "Critical decisions: CD-PAY-001" in report
+
+
+def test_review_surface_includes_only_actionable_projection_pending_merges(
+    isolated_memory,
+):
+    pending = governance_store.enqueue_governance_item(
+        "suggestion", "Pending", "Research me", "test", [], []
+    )
+    merge = governance_store.enqueue_governance_item(
+        "merge", "Recover merge", "Finish projection", "test", [], []
+    )
+    non_merge = governance_store.enqueue_governance_item(
+        "suggestion", "Not recoverable", "Do not list", "test", [], []
+    )
+    resolved = governance_store.enqueue_governance_item(
+        "suggestion", "Resolved", "Do not list", "test", [], []
+    )
+    governance_store.update_governance_item(
+        merge["item_id"],
+        {"status": "projection_pending"},
+        expected_statuses={"pending"},
+    )
+    governance_store.update_governance_item(
+        non_merge["item_id"],
+        {"status": "projection_pending"},
+        expected_statuses={"pending"},
+    )
+    governance_store.update_governance_item(
+        resolved["item_id"],
+        {"status": "resolved"},
+        expected_statuses={"pending"},
+    )
+
+    assert [item["item_id"] for item in governance_store.pending_governance_items()] == [
+        pending["item_id"]
+    ]
+    reviewable = governance_store.reviewable_governance_items()
+    assert {item["item_id"] for item in reviewable} == {
+        pending["item_id"],
+        merge["item_id"],
+    }
+    combined = _combined_pending_items()
+    assert {item["item_id"] for item in combined} == {
+        pending["item_id"],
+        merge["item_id"],
+    }
+    report = _format_combined_report(combined)
+    assert f"ID: {merge['item_id']}" in report
+    assert "Status: projection_pending" in report
+
+
+def test_review_stable_item_id_reaches_projection_pending_recovery(
+    isolated_memory,
+    monkeypatch,
+):
+    merge = governance_store.enqueue_governance_item(
+        "merge", "Recover merge", "Finish projection", "test", [], []
+    )
+    governance_store.update_governance_item(
+        merge["item_id"],
+        {"status": "projection_pending"},
+        expected_statuses={"pending"},
+    )
+    observed = []
+
+    def resolve(item_id, resolution, change_manifest=None):
+        observed.append((item_id, resolution, change_manifest))
+        return {
+            **governance_store.get_governance_item(item_id),
+            "status": "projection_pending",
+        }
+
+    monkeypatch.setattr(governance_service, "resolve_governance_item", resolve)
+
+    result = tool_review._resolve_combined_item(
+        merge["item_id"],
+        "merge",
+        change_manifest={"approved": True},
+    )
+
+    assert result["status"] == "projection_pending"
+    assert observed == [
+        (merge["item_id"], "merge", {"approved": True})
+    ]
+
+
+def test_review_reports_projection_pending_without_false_resolved_wording(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        tool_review,
+        "_resolve_combined_item",
+        lambda *_args, **_kwargs: {
+            "item_id": "gov_projection_pending",
+            "title": "Recover merge",
+            "status": "projection_pending",
+            "recovery_required": True,
+            "last_projection_error": "RuntimeError: maintenance window",
+        },
+    )
+
+    report = tool_review.review_vector_lake(
+        action="resolve",
+        index="gov_projection_pending",
+        resolution="merge",
+    )
+
+    assert "Resolved item" not in report
+    assert "Merge committed" in report
+    assert "projection recovery pending" in report
+    assert "RuntimeError: maintenance window" in report
 
 
 def test_unverified_decision_reference_does_not_auto_escalate_to_p0(isolated_memory):

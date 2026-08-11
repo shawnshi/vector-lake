@@ -309,6 +309,146 @@ def test_full_index_rebuild_does_not_load_duplicate_canonical_snapshots(isolated
     assert index_projection_matches_canonical(["Concept_Streaming-Index.md"]) is False
 
 
+def test_noop_full_rebuild_performs_zero_fts_dml(isolated_memory):
+    from vector_lake import db_store, governance_store, indexer
+
+    db_store.init_db()
+    for suffix in ("Alpha", "Beta"):
+        governance_store.upsert_entity(
+            f"entity_fts_{suffix.casefold()}",
+            {
+                "entity_id": f"entity_fts_{suffix.casefold()}",
+                "page_key": f"Concept_FTS-{suffix}",
+                "canonical_name": f"FTS {suffix}",
+                "type": "concept",
+                "raw_text": f"Stable body {suffix}.",
+            },
+        )
+
+    indexer.generate_index()
+    conn = db_store.get_connection()
+    before_rows = conn.execute(
+        "SELECT rowid, node_key, title, summary, text "
+        "FROM wiki_search_index ORDER BY node_key"
+    ).fetchall()
+    before_changes = conn.total_changes
+
+    indexer.generate_index()
+
+    after_rows = conn.execute(
+        "SELECT rowid, node_key, title, summary, text "
+        "FROM wiki_search_index ORDER BY node_key"
+    ).fetchall()
+    assert [tuple(row) for row in after_rows] == [tuple(row) for row in before_rows]
+    assert conn.total_changes == before_changes
+
+
+def test_full_rebuild_repairs_only_changed_stale_and_duplicate_fts_keys(
+    isolated_memory,
+):
+    from vector_lake import db_store, governance_store, indexer
+
+    db_store.init_db()
+    entities = {
+        "alpha": {
+            "entity_id": "entity_delta_alpha",
+            "page_key": "Concept_Delta-Alpha",
+            "canonical_name": "Delta Alpha",
+            "type": "concept",
+            "raw_text": "Alpha body.",
+        },
+        "beta": {
+            "entity_id": "entity_delta_beta",
+            "page_key": "Concept_Delta-Beta",
+            "canonical_name": "Delta Beta",
+            "type": "concept",
+            "raw_text": "Beta body.",
+        },
+    }
+    for entity in entities.values():
+        governance_store.upsert_entity(entity["entity_id"], entity)
+    indexer.generate_index()
+    conn = db_store.get_connection()
+    alpha_rowid = conn.execute(
+        "SELECT rowid FROM wiki_search_index WHERE node_key = ?",
+        (entities["alpha"]["page_key"],),
+    ).fetchone()[0]
+    beta_rowid = conn.execute(
+        "SELECT rowid FROM wiki_search_index WHERE node_key = ?",
+        (entities["beta"]["page_key"],),
+    ).fetchone()[0]
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO wiki_search_index (node_key, title, summary, text) "
+            "VALUES (?, ?, ?, ?)",
+            (entities["beta"]["page_key"], "duplicate", "", "duplicate"),
+        )
+        conn.execute(
+            "INSERT INTO wiki_search_index (node_key, title, summary, text) "
+            "VALUES ('Concept_Stale', 'stale', '', 'stale')"
+        )
+
+    changed = dict(entities["alpha"])
+    changed["raw_text"] = "Alpha body changed."
+    governance_store.upsert_entity(changed["entity_id"], changed)
+    indexer.generate_index()
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM wiki_search_index WHERE node_key = 'Concept_Stale'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM wiki_search_index WHERE node_key = ?",
+        (entities["beta"]["page_key"],),
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT rowid FROM wiki_search_index WHERE node_key = ?",
+        (entities["alpha"]["page_key"],),
+    ).fetchone()[0] != alpha_rowid
+    assert conn.execute(
+        "SELECT rowid FROM wiki_search_index WHERE node_key = ?",
+        (entities["beta"]["page_key"],),
+    ).fetchone()[0] != beta_rowid
+
+
+def test_search_projection_replacement_rejects_duplicate_desired_key_before_dml(
+    isolated_memory,
+):
+    from vector_lake import db_store
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        db_store.apply_search_projection_mutations(
+            conn,
+            upserts=[("Concept_Stable", "Stable", "", "stable")],
+        )
+    before = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT rowid, node_key, title, summary, text FROM wiki_search_index"
+        ).fetchall()
+    ]
+
+    with pytest.raises(ValueError, match="duplicate search projection key"):
+        with db_store.transaction():
+            db_store.apply_search_projection_mutations(
+                conn,
+                upserts=[
+                    ("Concept_Duplicate", "One", "", "one"),
+                    ("Concept_Duplicate", "Two", "", "two"),
+                ],
+                reset_search=True,
+            )
+
+    after = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT rowid, node_key, title, summary, text FROM wiki_search_index"
+        ).fetchall()
+    ]
+    assert after == before
+
+
 def test_index_projection_allows_only_explicit_merge_alias_redirect(
     isolated_memory,
     monkeypatch,

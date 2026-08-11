@@ -25,6 +25,29 @@ from vector_lake.watchdog_app import (
 from tests.test_mutation_coordinator import _named_source_content, _source_content, _write_purpose_contract
 
 
+def _projection_journal_snapshot(
+    outbox_ids,
+    *,
+    target_filename,
+    source_filename,
+    merged_content,
+    target_projection_hash="",
+    source_projection_hash="",
+    target_version="",
+    source_version="",
+):
+    return {
+        "outbox_ids": list(outbox_ids),
+        "target_filename": target_filename,
+        "source_filename": source_filename,
+        "target_version": target_version,
+        "source_version": source_version,
+        "target_projection_hash": target_projection_hash,
+        "source_projection_hash": source_projection_hash,
+        "merged_projection_hash": wiki_utils.semantic_text_hash(merged_content),
+    }
+
+
 def test_worker_recovers_projection_without_signal(isolated_memory):
     _write_purpose_contract(isolated_memory)
     execute_mutation_plan("Source_Test.md", content=_source_content())
@@ -352,12 +375,26 @@ def test_worker_projection_cas_rolls_back_edit_injected_after_hash(
         validation_mode="schema",
         projection_base_hash=base_hash,
     )
+    source_outbox_id = db_store.enqueue_mutation(
+        "Source_CAS-Race-Duplicate.md",
+        "delete",
+        validation_mode="schema",
+        base_version="",
+        projection_base_hash="",
+    )
+    outbox_ids = [outbox_id, source_outbox_id]
     journal_id = "journal_projection_cas_after_hash"
     item_id = "gov_projection_cas_after_hash"
     db_store.record_merge_journal(
         journal_id,
         item_id,
-        {"outbox_ids": [outbox_id]},
+        _projection_journal_snapshot(
+            outbox_ids,
+            target_filename=target.name,
+            source_filename="Source_CAS-Race-Duplicate.md",
+            merged_content=replacement,
+            target_projection_hash=base_hash,
+        ),
         status="projection_pending",
     )
     governance_store.upsert_governance_item(
@@ -367,7 +404,7 @@ def test_worker_projection_cas_rolls_back_edit_injected_after_hash(
             "status": "projection_pending",
             "merge_candidate": {},
             "merge_journal_id": journal_id,
-            "merge_outbox_ids": [outbox_id],
+            "merge_outbox_ids": outbox_ids,
         }
     )
 
@@ -405,7 +442,266 @@ def test_worker_projection_cas_rolls_back_edit_injected_after_hash(
 
     pending = governance_service.resolve_governance_item(item_id, resolution="merge")
     assert pending["status"] == "projection_pending"
-    assert pending["merge_outbox_statuses"] == {outbox_id: "failed"}
+    assert pending["merge_outbox_statuses"] == {
+        outbox_id: "pending",
+        source_outbox_id: "completed",
+    }
+    assert pending["failed_outbox_recovery"]["requeued"] == [outbox_id]
+
+
+def test_explicit_failed_outbox_recovery_requeues_latest_intent(
+    isolated_memory,
+):
+    db_store.init_db()
+    outbox_id = db_store.enqueue_mutation(
+        "Concept_Recover-Latest.md",
+        "delete",
+        idempotency_key="recover-latest",
+    )
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'failed', attempt_count = 3, "
+            "last_error = 'transient failure', completed_at = created_at "
+            "WHERE id = ?",
+            (outbox_id,),
+        )
+
+    recovery = db_store.recover_failed_mutation_outbox([outbox_id])
+    row = conn.execute(
+        "SELECT status, attempt_count, last_error, completed_at, lease_owner "
+        "FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+
+    assert recovery == {"requeued": [outbox_id], "superseded": {}, "skipped": {}}
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 0
+    assert row["last_error"] == "transient failure"
+    assert row["completed_at"] is None
+    assert row["lease_owner"] is None
+    claimed = db_store.claim_mutation_outbox(outbox_ids=[outbox_id])
+    assert [item["id"] for item in claimed] == [outbox_id]
+    assert claimed[0]["attempt_count"] == 1
+
+
+def test_failed_outbox_recovery_fences_older_intent_behind_newer_work(
+    isolated_memory,
+):
+    db_store.init_db()
+    old_id = db_store.enqueue_mutation(
+        "Concept_Recover-Ordering.md",
+        "update",
+        payload_text="old",
+        idempotency_key="recover-ordering-old",
+        validation_mode="schema",
+    )
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'failed', attempt_count = 3 "
+            "WHERE id = ?",
+            (old_id,),
+        )
+    newer_id = db_store.enqueue_mutation(
+        "Concept_Recover-Ordering.md",
+        "update",
+        payload_text="new",
+        idempotency_key="recover-ordering-new",
+        validation_mode="schema",
+    )
+
+    recovery = db_store.recover_failed_mutation_outbox([old_id])
+    old = conn.execute(
+        "SELECT status, superseded_by FROM mutation_outbox WHERE id = ?",
+        (old_id,),
+    ).fetchone()
+
+    assert recovery == {
+        "requeued": [],
+        "superseded": {old_id: newer_id},
+        "skipped": {},
+    }
+    assert old["status"] == "superseded"
+    assert old["superseded_by"] == newer_id
+
+
+def test_failed_outbox_recovery_does_not_overtake_newer_failed_intent(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    old_id = db_store.enqueue_mutation(
+        "Concept_Recover-Failed-Ordering.md",
+        "update",
+        payload_text="old",
+        idempotency_key="recover-failed-old",
+        validation_mode="schema",
+    )
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'failed', attempt_count = 3 "
+            "WHERE id = ?",
+            (old_id,),
+        )
+    newer_id = db_store.enqueue_mutation(
+        "Concept_Recover-Failed-Ordering.md",
+        "update",
+        payload_text="new",
+        idempotency_key="recover-failed-new",
+        validation_mode="schema",
+    )
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'failed', attempt_count = 3 "
+            "WHERE id = ?",
+            (newer_id,),
+        )
+
+    recovery = db_store.recover_failed_mutation_outbox([old_id])
+
+    assert recovery == {
+        "requeued": [],
+        "superseded": {},
+        "skipped": {old_id: f"newer_failed_intent:{newer_id}"},
+    }
+    assert db_store.mutation_outbox_statuses([old_id, newer_id]) == {
+        old_id: "failed",
+        newer_id: "failed",
+    }
+
+
+def test_restricted_outbox_claim_does_not_supersede_unrelated_rows(
+    isolated_memory,
+):
+    db_store.init_db()
+    unrelated_old_id = db_store.enqueue_mutation(
+        "Concept_Unrelated-Ordering.md",
+        "update",
+        payload_text="old",
+        idempotency_key="unrelated-ordering-old",
+        validation_mode="schema",
+    )
+    unrelated_new_id = db_store.enqueue_mutation(
+        "Concept_Unrelated-Ordering.md",
+        "update",
+        payload_text="new",
+        idempotency_key="unrelated-ordering-new",
+        validation_mode="schema",
+    )
+    requested_id = db_store.enqueue_mutation(
+        "Concept_Requested.md",
+        "delete",
+        idempotency_key="requested-only",
+        validation_mode="schema",
+    )
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'pending', superseded_by = NULL, "
+            "completed_at = NULL WHERE id = ?",
+            (unrelated_old_id,),
+        )
+
+    claimed = db_store.claim_mutation_outbox(outbox_ids=[requested_id])
+
+    assert [row["id"] for row in claimed] == [requested_id]
+    assert db_store.mutation_outbox_statuses(
+        [unrelated_old_id, unrelated_new_id]
+    ) == {
+        unrelated_old_id: "pending",
+        unrelated_new_id: "pending",
+    }
+
+
+def test_projection_pending_review_recovers_terminal_failed_outbox(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    merged_content = "---\ntype: concept\ntitle: Recover\n---\n\nRecovered.\n"
+    target_outbox_id = db_store.enqueue_mutation(
+        "Concept_Recover-Target.md",
+        "update",
+        payload_text=merged_content,
+        validation_mode="schema",
+    )
+    source_outbox_id = db_store.enqueue_mutation(
+        "Concept_Recover-Projection.md",
+        "delete",
+        idempotency_key="recover-projection",
+        validation_mode="schema",
+    )
+    outbox_ids = [target_outbox_id, source_outbox_id]
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'completed', "
+            "completed_at = created_at WHERE id = ?",
+            (target_outbox_id,),
+        )
+        conn.execute(
+            "UPDATE mutation_outbox SET status = 'failed', attempt_count = 3, "
+            "last_error = 'transient projection failure', completed_at = created_at "
+            "WHERE id = ?",
+            (source_outbox_id,),
+        )
+    journal_id = "journal_recover_projection"
+    item_id = "gov_recover_projection"
+    db_store.record_merge_journal(
+        journal_id,
+        item_id,
+        _projection_journal_snapshot(
+            outbox_ids,
+            target_filename="Concept_Recover-Target.md",
+            source_filename="Concept_Recover-Projection.md",
+            merged_content=merged_content,
+        ),
+        status="projection_pending",
+    )
+    governance_store.upsert_governance_item(
+        {
+            "item_id": item_id,
+            "type": "merge",
+            "title": "Recover projection",
+            "status": "projection_pending",
+            "merge_candidate": {},
+            "merge_journal_id": journal_id,
+            "merge_outbox_ids": outbox_ids,
+        }
+    )
+    monkeypatch.setattr(
+        indexer,
+        "index_projection_matches_canonical",
+        lambda _filenames: True,
+    )
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        governance_service,
+        "_post_merge_errors",
+        lambda _candidate, _journal: [],
+    )
+
+    resolved = governance_service.resolve_governance_item(
+        item_id,
+        resolution="merge",
+    )
+
+    assert resolved["status"] == "resolved"
+    assert resolved["merge_outbox_statuses"] == {
+        target_outbox_id: "completed",
+        source_outbox_id: "completed",
+    }
+    assert resolved["failed_outbox_recovery"]["requeued"] == [source_outbox_id]
+    assert db_store.mutation_outbox_statuses(outbox_ids) == {
+        target_outbox_id: "completed",
+        source_outbox_id: "completed",
+    }
+    assert db_store.get_merge_journal(journal_id)["status"] == "completed"
 
 
 def test_worker_does_not_materialize_or_index_after_lease_is_superseded(

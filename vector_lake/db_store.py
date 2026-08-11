@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import struct
+import sys
 import threading
 from contextlib import contextmanager
 import time
@@ -57,6 +58,10 @@ _RUNTIME_GENERATION_SURFACES = frozenset(
 _SQLITE_WRITE_WAIT_DEFAULT_SECONDS = 30.0
 _SQLITE_WRITE_WAIT_MIN_SECONDS = 0.05
 _SQLITE_WRITE_WAIT_MAX_SECONDS = 300.0
+_WAL_AUTOCHECKPOINT_DEFAULT_PAGES = 1_000
+_WAL_AUTOCHECKPOINT_MAX_PAGES = 1_000_000
+_WAL_JOURNAL_SIZE_LIMIT_DEFAULT_BYTES = 64 * 1024 * 1024
+_WAL_JOURNAL_SIZE_LIMIT_MAX_BYTES = 16 * 1024 * 1024 * 1024
 _SCHEMA_MIGRATION_LOCK_FILENAME = ".schema-migration-v5.lock"
 _SCHEMA_MIGRATION_RUNTIME_LOCK_TIMEOUT_SECONDS = 5.0
 _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN = object()
@@ -1392,6 +1397,22 @@ class ReadOnlySnapshotUnavailable(RuntimeError):
     """A byte-stable immutable SQLite snapshot cannot be opened safely."""
 
 
+def _wal_checksum(
+    data: bytes,
+    byteorder: str,
+    seed: tuple[int, int] = (0, 0),
+) -> tuple[int, int]:
+    if len(data) % 8:
+        raise ValueError("WAL checksum input must contain complete word pairs")
+    first, second = seed
+    for offset in range(0, len(data), 8):
+        left = int.from_bytes(data[offset : offset + 4], byteorder)
+        right = int.from_bytes(data[offset + 4 : offset + 8], byteorder)
+        first = (first + left + second) & 0xFFFFFFFF
+        second = (second + right + first) & 0xFFFFFFFF
+    return first, second
+
+
 def _read_only_snapshot_identity(path: Path) -> tuple:
     identities = []
     for candidate in (path, path.with_name(path.name + "-wal")):
@@ -1410,6 +1431,139 @@ def _read_only_snapshot_identity(path: Path) -> tuple:
         except FileNotFoundError:
             identities.append((str(candidate.resolve()), "missing"))
     return tuple(identities)
+
+
+def _validate_nonempty_wal_sidecars(path: Path) -> tuple[bytes, bytes]:
+    wal_path = path.with_name(path.name + "-wal")
+    shm_path = path.with_name(path.name + "-shm")
+    try:
+        with wal_path.open("rb") as handle:
+            header = handle.read(32)
+        wal_size = wal_path.stat().st_size
+    except OSError as exc:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:{exc}"
+        ) from exc
+    magic = int.from_bytes(header[:4], "big") if len(header) >= 4 else 0
+    if len(header) != 32 or magic not in {
+        0x377F0682,
+        0x377F0683,
+    }:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:invalid_wal_header:{wal_path}"
+        )
+    checksum_order = "little" if magic == 0x377F0682 else "big"
+    observed_wal_checksum = (
+        int.from_bytes(header[24:28], "big"),
+        int.from_bytes(header[28:32], "big"),
+    )
+    if _wal_checksum(header[:24], checksum_order) != observed_wal_checksum:
+        raise ReadOnlySnapshotUnavailable(
+            "database_read_only_snapshot_unavailable:"
+            f"invalid_wal_header_checksum:{wal_path}"
+        )
+    wal_page_size = int.from_bytes(header[8:12], "big")
+    if wal_page_size == 1:
+        wal_page_size = 65_536
+    frame_size = 24 + wal_page_size
+    if (
+        wal_page_size < 512
+        or wal_page_size > 65_536
+        or wal_page_size & (wal_page_size - 1)
+        or wal_size < 32
+        or (wal_size - 32) % frame_size
+    ):
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:invalid_wal_layout:{wal_path}"
+        )
+    if not shm_path.is_file():
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:missing_wal_index:{shm_path}"
+        )
+    try:
+        with shm_path.open("rb") as handle:
+            shm_headers = handle.read(96)
+    except OSError as exc:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:{exc}"
+        ) from exc
+    if len(shm_headers) != 96 or shm_headers[:48] != shm_headers[48:96]:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:invalid_wal_index:{shm_path}"
+        )
+    for wal_index_header in (shm_headers[:48], shm_headers[48:96]):
+        observed_checksum = (
+            int.from_bytes(wal_index_header[40:44], sys.byteorder),
+            int.from_bytes(wal_index_header[44:48], sys.byteorder),
+        )
+        if _wal_checksum(wal_index_header[:40], sys.byteorder) != observed_checksum:
+            raise ReadOnlySnapshotUnavailable(
+                "database_read_only_snapshot_unavailable:"
+                f"invalid_wal_index_checksum:{shm_path}"
+            )
+    try:
+        wal_index = struct.unpack("=IIIBBHIIIIIIII", shm_headers[:48])
+    except struct.error as exc:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:invalid_wal_index:{shm_path}"
+        ) from exc
+    shm_page_size = 65_536 if wal_index[5] == 1 else int(wal_index[5])
+    physical_frames = (wal_size - 32) // frame_size
+    if (
+        int(wal_index[0]) <= 0
+        or int(wal_index[3]) != 1
+        or shm_page_size != wal_page_size
+        or int(wal_index[6]) > physical_frames
+        or shm_headers[32:40] != header[16:24]
+    ):
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:invalid_wal_index:{shm_path}"
+        )
+    committed_frames = int(wal_index[6])
+    rolling_checksum = observed_wal_checksum
+    try:
+        with wal_path.open("rb") as handle:
+            handle.seek(32)
+            for frame_number in range(1, committed_frames + 1):
+                frame = handle.read(frame_size)
+                if len(frame) != frame_size or int.from_bytes(frame[:4], "big") == 0:
+                    raise ReadOnlySnapshotUnavailable(
+                        "database_read_only_snapshot_unavailable:"
+                        f"invalid_wal_frame:{wal_path}:{frame_number}"
+                    )
+                if frame[8:16] != header[16:24]:
+                    raise ReadOnlySnapshotUnavailable(
+                        "database_read_only_snapshot_unavailable:"
+                        f"invalid_wal_frame_salt:{wal_path}:{frame_number}"
+                    )
+                observed_frame_checksum = (
+                    int.from_bytes(frame[16:20], "big"),
+                    int.from_bytes(frame[20:24], "big"),
+                )
+                rolling_checksum = _wal_checksum(
+                    frame[:8] + frame[24:],
+                    checksum_order,
+                    rolling_checksum,
+                )
+                if rolling_checksum != observed_frame_checksum:
+                    raise ReadOnlySnapshotUnavailable(
+                        "database_read_only_snapshot_unavailable:"
+                        f"invalid_wal_frame_checksum:{wal_path}:{frame_number}"
+                    )
+    except ReadOnlySnapshotUnavailable:
+        raise
+    except OSError as exc:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:{exc}"
+        ) from exc
+    if committed_frames:
+        indexed_frame_checksum = (int(wal_index[8]), int(wal_index[9]))
+        if rolling_checksum != indexed_frame_checksum:
+            raise ReadOnlySnapshotUnavailable(
+                "database_read_only_snapshot_unavailable:"
+                f"invalid_wal_index_frame_checksum:{shm_path}"
+            )
+    return header, shm_headers
 
 
 @contextmanager
@@ -1458,6 +1612,131 @@ def checkpointed_read_only_snapshot(
                 )
 
 
+@contextmanager
+def read_only_transaction_snapshot(
+    db_path: str | Path | None = None,
+    *,
+    timeout: float = 5.0,
+):
+    """Yield one query-only SQLite snapshot, including committed WAL state.
+
+    Closed databases retain the immutable byte-stable fast path. A live WAL
+    database participates in SQLite's normal read-lock protocol and pins one
+    logical generation before the caller executes any query. This helper never
+    checkpoints, initializes, or migrates the source database.
+    """
+    path = (Path(db_path) if db_path is not None else peek_db_path()).resolve()
+    if not path.is_file():
+        raise ReadOnlySnapshotUnavailable(f"database_missing:{path}")
+    wal_path = path.with_name(path.name + "-wal")
+    try:
+        wal_size = wal_path.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    if wal_size == 0:
+        with checkpointed_read_only_snapshot(path, timeout=timeout) as connection:
+            yield connection
+        return
+
+    validated_wal_header, validated_shm_headers = _validate_nonempty_wal_sidecars(
+        path
+    )
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=timeout,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        connection.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+        try:
+            current_wal_header, current_shm_headers = (
+                _validate_nonempty_wal_sidecars(path)
+            )
+        except ReadOnlySnapshotUnavailable as exc:
+            raise ReadOnlySnapshotUnavailable(
+                "database_read_only_snapshot_unavailable:"
+                f"wal_changed_before_snapshot_begin:{exc}"
+            ) from exc
+        if (
+            current_wal_header != validated_wal_header
+            or current_shm_headers != validated_shm_headers
+        ):
+            raise ReadOnlySnapshotUnavailable(
+                "database_read_only_snapshot_unavailable:"
+                "wal_changed_before_snapshot_begin"
+            )
+        yield connection
+    except ReadOnlySnapshotUnavailable:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise ReadOnlySnapshotUnavailable(
+            f"database_read_only_snapshot_unavailable:{exc}"
+        ) from exc
+    finally:
+        if connection is not None:
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+            finally:
+                connection.close()
+
+
+def _configured_nonnegative_int(
+    env_name: str,
+    default: int,
+    maximum: int,
+) -> int:
+    raw = os.environ.get(env_name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(0, value))
+
+
+def configured_wal_autocheckpoint_pages() -> int:
+    return _configured_nonnegative_int(
+        "VECTOR_LAKE_WAL_AUTOCHECKPOINT_PAGES",
+        _WAL_AUTOCHECKPOINT_DEFAULT_PAGES,
+        _WAL_AUTOCHECKPOINT_MAX_PAGES,
+    )
+
+
+def configured_wal_journal_size_limit_bytes() -> int:
+    return _configured_nonnegative_int(
+        "VECTOR_LAKE_WAL_JOURNAL_SIZE_LIMIT_BYTES",
+        _WAL_JOURNAL_SIZE_LIMIT_DEFAULT_BYTES,
+        _WAL_JOURNAL_SIZE_LIMIT_MAX_BYTES,
+    )
+
+
+def _configure_wal_retention(connection: sqlite3.Connection) -> None:
+    autocheckpoint_pages = configured_wal_autocheckpoint_pages()
+    journal_limit_bytes = configured_wal_journal_size_limit_bytes()
+    observed_autocheckpoint = connection.execute(
+        f"PRAGMA wal_autocheckpoint={autocheckpoint_pages}"
+    ).fetchone()
+    observed_journal_limit = connection.execute(
+        f"PRAGMA journal_size_limit={journal_limit_bytes}"
+    ).fetchone()
+    if (
+        observed_autocheckpoint is None
+        or int(observed_autocheckpoint[0]) != autocheckpoint_pages
+    ):
+        connection.close()
+        raise RuntimeError("SQLite WAL autocheckpoint configuration was not applied")
+    if (
+        observed_journal_limit is None
+        or int(observed_journal_limit[0]) != journal_limit_bytes
+    ):
+        connection.close()
+        raise RuntimeError("SQLite WAL journal size limit was not applied")
+
+
 def get_connection() -> sqlite3.Connection:
     db_path = get_db_path().resolve()
     db_key = str(db_path)
@@ -1485,6 +1764,7 @@ def get_connection() -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA recursive_triggers=ON")
         conn.execute("PRAGMA foreign_keys=ON")
+        _configure_wal_retention(conn)
         if int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
             conn.close()
             raise RuntimeError("SQLite foreign-key enforcement could not be enabled")
@@ -4381,7 +4661,7 @@ def apply_search_projection_mutations(
     search_deletes: set[str] | list[str] | tuple[str, ...] = (),
     embedding_deletes: set[str] | list[str] | tuple[str, ...] = (),
     reset_search: bool = False,
-) -> None:
+) -> dict:
     """Apply precomputed search mutations inside one caller-owned transaction."""
     if not getattr(_LOCAL, "in_transaction", False) or not conn.in_transaction:
         raise RuntimeError(
@@ -4392,12 +4672,16 @@ def apply_search_projection_mutations(
         (str(node_key), str(title), str(summary), str(text))
         for node_key, title, summary, text in upserts
     ]
+    desired_by_key = {}
+    for row in normalized_upserts:
+        if row[0] in desired_by_key:
+            raise ValueError(f"duplicate search projection key: {row[0]}")
+        desired_by_key[row[0]] = row
     delete_keys = {
         str(node_key)
         for node_key in search_deletes
         if str(node_key)
     }
-    delete_keys.update(row[0] for row in normalized_upserts)
     stale_embedding_keys = {
         str(node_key)
         for node_key in embedding_deletes
@@ -4405,8 +4689,36 @@ def apply_search_projection_mutations(
     }
 
     if reset_search:
-        conn.execute("DELETE FROM wiki_search_index")
-    elif delete_keys:
+        seen_existing_keys = set()
+        dirty_existing_keys = set()
+        stale_keys = set()
+        for current in conn.execute(
+            "SELECT node_key, title, summary, text FROM wiki_search_index"
+        ):
+            current_row = tuple(str(value) for value in current)
+            node_key = current_row[0]
+            if node_key in seen_existing_keys:
+                dirty_existing_keys.add(node_key)
+            seen_existing_keys.add(node_key)
+            desired = desired_by_key.get(node_key)
+            if desired is None:
+                stale_keys.add(node_key)
+            elif current_row != desired:
+                dirty_existing_keys.add(node_key)
+        desired_keys = set(desired_by_key)
+        explicit_delete_keys = set(delete_keys)
+        delete_keys.update(stale_keys)
+        delete_keys.update(dirty_existing_keys)
+        insert_keys = desired_keys - seen_existing_keys
+        insert_keys.update(dirty_existing_keys & desired_keys)
+        insert_keys.update(explicit_delete_keys & desired_keys)
+        normalized_upserts = [
+            row for row in normalized_upserts if row[0] in insert_keys
+        ]
+    else:
+        delete_keys.update(row[0] for row in normalized_upserts)
+
+    if delete_keys:
         conn.executemany(
             "DELETE FROM wiki_search_index WHERE node_key = ?",
             [(node_key,) for node_key in sorted(delete_keys)],
@@ -4422,6 +4734,16 @@ def apply_search_projection_mutations(
             "DELETE FROM vec_embeddings WHERE entity_id = ?",
             [(node_key,) for node_key in sorted(stale_embedding_keys)],
         )
+    return {
+        "search_upserts": len(normalized_upserts),
+        "search_deletes": len(delete_keys),
+        "search_payload_bytes": sum(
+            len(value.encode("utf-8"))
+            for row in normalized_upserts
+            for value in row
+        ),
+        "embedding_deletes": len(stale_embedding_keys),
+    }
 
 
 def upsert_embedding(entity_id: str, embedding: list[float]):
@@ -4836,8 +5158,9 @@ def claim_mutation_outbox(
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
     lease_until = (now_dt + timedelta(seconds=max(1, lease_seconds))).isoformat()
+    requested_ids = sorted({int(value) for value in (outbox_ids or [])})
     with transaction():
-        conn.execute(
+        supersede_query = (
             "UPDATE mutation_outbox SET status = 'superseded', "
             "superseded_by = ("
             "  SELECT MAX(newer.id) FROM mutation_outbox AS newer "
@@ -4851,10 +5174,14 @@ def claim_mutation_outbox(
             "  WHERE newer.filename = mutation_outbox.filename "
             "    AND newer.status IN ('pending', 'processing') "
             "    AND newer.id > mutation_outbox.id"
-            ")",
-            (now,),
+            ")"
         )
-        requested_ids = sorted({int(value) for value in (outbox_ids or [])})
+        supersede_params: list = [now]
+        if requested_ids:
+            placeholders = ",".join("?" for _ in requested_ids)
+            supersede_query += f" AND id IN ({placeholders})"
+            supersede_params.extend(requested_ids)
+        conn.execute(supersede_query, tuple(supersede_params))
         query = (
             "SELECT id FROM mutation_outbox WHERE ((status = 'pending' "
             "AND COALESCE(available_at, created_at, '') <= ?) OR "
@@ -4959,6 +5286,95 @@ def mutation_outbox_statuses(outbox_ids: list[int]) -> dict[int, str]:
         .fetchall()
     )
     return {int(row["id"]): str(row["status"]) for row in rows}
+
+
+def mutation_outbox_intents(outbox_ids: list[int]) -> dict[int, dict]:
+    """Return immutable intent fields for an explicitly named outbox set."""
+    ids = sorted({int(value) for value in outbox_ids})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT id, filename, mutation_type, payload_text, validation_mode, "
+            "base_version, projection_base_hash FROM mutation_outbox "
+            f"WHERE id IN ({placeholders}) ORDER BY id",
+            ids,
+        )
+        .fetchall()
+    )
+    return {int(row["id"]): dict(row) for row in rows}
+
+
+def recover_failed_mutation_outbox(outbox_ids: list[int]) -> dict:
+    """Explicitly recover selected failed intents without overtaking newer work.
+
+    A failed latest intent is requeued with a fresh attempt budget. If a newer
+    active or completed intent exists for the same file, the older failed row is
+    fenced as superseded instead. A newer failed intent remains an explicit
+    manual blocker; replaying older payload behind it would violate ordering.
+    """
+    ids = sorted({int(value) for value in outbox_ids})
+    result = {"requeued": [], "superseded": {}, "skipped": {}}
+    if not ids:
+        return result
+    init_db()
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    placeholders = ",".join("?" for _ in ids)
+    with transaction():
+        rows = conn.execute(
+            f"SELECT id, filename, status FROM mutation_outbox "
+            f"WHERE id IN ({placeholders}) ORDER BY id",
+            ids,
+        ).fetchall()
+        observed_ids = {int(row["id"]) for row in rows}
+        for missing_id in set(ids) - observed_ids:
+            result["skipped"][missing_id] = "missing"
+        for row in rows:
+            outbox_id = int(row["id"])
+            if str(row["status"]) != "failed":
+                result["skipped"][outbox_id] = f"status:{row['status']}"
+                continue
+            newer = conn.execute(
+                "SELECT id, status FROM mutation_outbox "
+                "WHERE filename = ? AND id > ? AND status != 'superseded' "
+                "ORDER BY id DESC LIMIT 1",
+                (str(row["filename"]), outbox_id),
+            ).fetchone()
+            if newer is not None:
+                newer_id = int(newer["id"])
+                newer_status = str(newer["status"])
+                if newer_status == "failed":
+                    result["skipped"][outbox_id] = (
+                        f"newer_failed_intent:{newer_id}"
+                    )
+                    continue
+                updated = conn.execute(
+                    "UPDATE mutation_outbox SET status = 'superseded', "
+                    "superseded_by = ?, completed_at = COALESCE(completed_at, ?), "
+                    "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+                    "WHERE id = ? AND status = 'failed'",
+                    (newer_id, now, outbox_id),
+                )
+                if updated.rowcount:
+                    result["superseded"][outbox_id] = newer_id
+                else:
+                    result["skipped"][outbox_id] = "state_changed"
+                continue
+            updated = conn.execute(
+                "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
+                "available_at = ?, started_at = NULL, completed_at = NULL, "
+                "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+                "superseded_by = NULL WHERE id = ? AND status = 'failed'",
+                (now, outbox_id),
+            )
+            if updated.rowcount:
+                result["requeued"].append(outbox_id)
+            else:
+                result["skipped"][outbox_id] = "state_changed"
+    return result
 
 
 def record_merge_journal(

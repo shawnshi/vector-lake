@@ -15,12 +15,8 @@ from vector_lake.wiki_utils import (
     iter_markdown_files,
     peek_meta_dir,
 )
-from vector_lake.db_store import (
-    checkpointed_read_only_snapshot,
-    inspect_schema_migration_state,
-    peek_db_path,
-)
-from vector_lake import get_extension_root
+from vector_lake.db_store import inspect_schema_migration_state, peek_db_path
+from vector_lake import db_store, get_extension_root
 from vector_lake.native_llm import native_llm_ready
 from vector_lake.runtime_health import (
     _open_runtime_database_read_only,
@@ -87,25 +83,8 @@ def _read_database_state_from_connection(conn: sqlite3.Connection) -> dict:
 
 def _read_database_state(db_path: Path) -> dict:
     """Read Doctor counters without creating, migrating, or retaining a connection."""
-    resolved = db_path.resolve()
-    wal_path = Path(str(resolved) + "-wal")
-    try:
-        wal_size = wal_path.stat().st_size
-    except FileNotFoundError:
-        wal_size = 0
-    if wal_size == 0:
-        with checkpointed_read_only_snapshot(resolved) as conn:
-            return _read_database_state_from_connection(conn)
-
-    conn = sqlite3.connect(
-        f"{resolved.as_uri()}?mode=ro",
-        uri=True,
-        timeout=5.0,
-    )
-    try:
+    with db_store.read_only_transaction_snapshot(db_path.resolve()) as conn:
         return _read_database_state_from_connection(conn)
-    finally:
-        conn.close()
 
 
 def _schema_readiness_reasons(schema_state: dict) -> list[str]:
