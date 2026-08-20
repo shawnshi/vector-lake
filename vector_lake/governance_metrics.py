@@ -2,6 +2,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import sqlite3
 
 from vector_lake import db_store, governance_store
 from vector_lake.merge_analysis import (
@@ -11,6 +12,20 @@ from vector_lake.merge_analysis import (
     preflight_suggestion,
 )
 from vector_lake.wiki_utils import get_wiki_dir
+
+
+_DEBT_REQUIRED_TABLES = frozenset(
+    {
+        "change_sets",
+        "claims",
+        "evidence",
+        "governance_queue",
+        "operational_memory",
+        "sources",
+    }
+)
+_MERGE_REQUIRED_TABLES = frozenset({"entities"})
+_MERGE_DECISION_ORDER = ("merge", "alias", "review", "keep_separate")
 
 
 def _utc_now():
@@ -123,14 +138,85 @@ def annotate_claim_validity(claim: dict, now=None) -> dict:
     return annotated
 
 
+def _missing_tables(conn, required_tables: frozenset[str]) -> list[str]:
+    if not required_tables:
+        return []
+    placeholders = ",".join("?" for _ in required_tables)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_schema "
+        f"WHERE type = 'table' AND name IN ({placeholders})",
+        tuple(sorted(required_tables)),
+    ).fetchall()
+    present = {str(row["name"]) for row in rows}
+    return sorted(required_tables - present)
+
+
+def _empty_merge_candidate_report(
+    unavailable_reason: str,
+    *,
+    missing_tables: list[str] | None = None,
+) -> dict:
+    return {
+        "available": False,
+        "unavailable_reason": unavailable_reason,
+        "missing_tables": list(missing_tables or []),
+        "candidate_pool_size": 0,
+        "actionable_pool_size": 0,
+        "decision_counts": {
+            candidate_decision: 0
+            for candidate_decision in _MERGE_DECISION_ORDER
+        },
+        "selected_decision_counts": {},
+        "returned_count": 0,
+        "suggestions": [],
+    }
+
+
 def find_merge_candidate_report(
     limit: int | None = 20,
     run_preflight: bool = True,
     decision: str | None = None,
+    *,
+    connection=None,
+    read_only: bool = False,
 ) -> dict:
+    if decision is not None and decision not in _MERGE_DECISION_ORDER:
+        raise ValueError(f"Unsupported merge decision filter: {decision}")
+    if read_only and connection is None:
+        path = db_store.peek_db_path().resolve()
+        if not path.is_file():
+            return _empty_merge_candidate_report("database_missing")
+        try:
+            with db_store.read_only_transaction_snapshot(path) as read_connection:
+                return find_merge_candidate_report(
+                    limit=limit,
+                    run_preflight=run_preflight,
+                    decision=decision,
+                    connection=read_connection,
+                )
+        except db_store.ReadOnlySnapshotUnavailable:
+            return _empty_merge_candidate_report("snapshot_unavailable")
+
+    if connection is not None:
+        try:
+            missing = _missing_tables(connection, _MERGE_REQUIRED_TABLES)
+        except sqlite3.DatabaseError:
+            return _empty_merge_candidate_report("database_unavailable")
+        if missing:
+            return _empty_merge_candidate_report(
+                "missing_tables",
+                missing_tables=missing,
+            )
+
+    connection_kwargs = (
+        {"connection": connection}
+        if connection is not None
+        else {}
+    )
     entities = list(
         governance_store.query_entities(
-            {"status!=": "Merged", "type!=": "system"}
+            {"status!=": "Merged", "type!=": "system"},
+            **connection_kwargs,
         )["items"].values()
     )
     page_keys = {
@@ -138,15 +224,15 @@ def find_merge_candidate_report(
         for entity in entities
         if entity.get("page_key")
     }
-    snapshot_versions = governance_store.canonical_page_versions(page_keys)
+    snapshot_versions = governance_store.canonical_page_versions(
+        page_keys,
+        **connection_kwargs,
+    )
     candidate_pool = analyze_entities(
         entities,
         limit=None,
         versions=snapshot_versions,
     )
-    decision_order = ("merge", "alias", "review", "keep_separate")
-    if decision is not None and decision not in decision_order:
-        raise ValueError(f"Unsupported merge decision filter: {decision}")
     decision_counts = Counter(
         candidate["decision"]
         for candidate in candidate_pool
@@ -172,14 +258,14 @@ def find_merge_candidate_report(
                 for candidate in candidate_pool
                 if candidate["decision"] == candidate_decision
             ]
-            for candidate_decision in decision_order
+            for candidate_decision in _MERGE_DECISION_ORDER
         }
         max_bucket_size = max(
             (len(bucket) for bucket in buckets.values()),
             default=0,
         )
         for offset in range(max_bucket_size):
-            for candidate_decision in decision_order:
+            for candidate_decision in _MERGE_DECISION_ORDER:
                 if len(suggestions) >= max(0, limit):
                     break
                 bucket = buckets[candidate_decision]
@@ -208,7 +294,10 @@ def find_merge_candidate_report(
             )
             if page_key
         }
-        current_versions = governance_store.canonical_page_versions(checked_page_keys)
+        current_versions = governance_store.canonical_page_versions(
+            checked_page_keys,
+            **connection_kwargs,
+        )
         for suggestion in suggestions:
             if suggestion.get("decision") != "merge":
                 suggestion["snapshot_state"] = "not_applicable"
@@ -232,6 +321,9 @@ def find_merge_candidate_report(
                 suggestion["snapshot_state"] = "stable"
 
     return {
+        "available": True,
+        "unavailable_reason": None,
+        "missing_tables": [],
         "candidate_pool_size": len(candidate_pool),
         "actionable_pool_size": sum(
             decision_counts[candidate_decision]
@@ -239,7 +331,7 @@ def find_merge_candidate_report(
         ),
         "decision_counts": {
             candidate_decision: decision_counts[candidate_decision]
-            for candidate_decision in decision_order
+            for candidate_decision in _MERGE_DECISION_ORDER
         },
         "selected_decision_counts": dict(
             Counter(candidate["decision"] for candidate in suggestions)
@@ -253,11 +345,15 @@ def find_merge_candidates(
     limit: int | None = 20,
     run_preflight: bool = True,
     decision: str | None = None,
+    *,
+    connection=None,
 ) -> list[dict]:
     return find_merge_candidate_report(
         limit=limit,
         run_preflight=run_preflight,
         decision=decision,
+        connection=connection,
+        read_only=connection is None,
     )["suggestions"]
 
 
@@ -265,6 +361,7 @@ def compute_debt_metrics(
     skip_heavy: bool = False,
     *,
     read_only: bool = False,
+    connection=None,
 ) -> dict:
     """Compute governance counts without materializing the canonical graph.
 
@@ -273,6 +370,10 @@ def compute_debt_metrics(
     """
     if read_only and not skip_heavy:
         raise ValueError("read_only debt metrics require skip_heavy=True")
+    if connection is not None:
+        if not read_only:
+            raise ValueError("A supplied debt connection requires read_only=True")
+        return _read_only_debt_metrics(connection, skip_heavy=skip_heavy)
     if not read_only:
         governance_store.initialize_meta_store()
         return _compute_debt_metrics_with_connection(
@@ -282,17 +383,24 @@ def compute_debt_metrics(
 
     path = db_store.peek_db_path().resolve()
     if not path.is_file():
-        return _empty_debt_metrics()
-    with db_store.read_only_transaction_snapshot(path) as conn:
-        return _compute_debt_metrics_with_connection(
-            conn,
-            skip_heavy=skip_heavy,
-        )
+        return _empty_debt_metrics("database_missing")
+    try:
+        with db_store.read_only_transaction_snapshot(path) as conn:
+            return _read_only_debt_metrics(conn, skip_heavy=skip_heavy)
+    except db_store.ReadOnlySnapshotUnavailable:
+        return _empty_debt_metrics("snapshot_unavailable")
 
 
-def _empty_debt_metrics() -> dict:
-    """Return the stable zero shape for a genuinely absent read-only store."""
+def _empty_debt_metrics(
+    unavailable_reason: str,
+    *,
+    missing_tables: list[str] | None = None,
+) -> dict:
+    """Return the stable zero shape for an unavailable read-only store."""
     return {
+        "available": False,
+        "unavailable_reason": unavailable_reason,
+        "missing_tables": list(missing_tables or []),
         "stale_claim_count": 0,
         "expired_claim_count": 0,
         "review_due_claim_count": 0,
@@ -314,6 +422,99 @@ def _empty_debt_metrics() -> dict:
         "conflicted_memory_count": 0,
         "memory_type_counts": {},
         "validity_state_counts": {},
+    }
+
+
+def _read_only_debt_metrics(conn, *, skip_heavy: bool) -> dict:
+    try:
+        missing = _missing_tables(conn, _DEBT_REQUIRED_TABLES)
+    except sqlite3.DatabaseError:
+        return _empty_debt_metrics("database_unavailable")
+    if missing:
+        return _empty_debt_metrics(
+            "missing_tables",
+            missing_tables=missing,
+        )
+    try:
+        return _compute_debt_metrics_with_connection(
+            conn,
+            skip_heavy=skip_heavy,
+        )
+    except sqlite3.DatabaseError:
+        return _empty_debt_metrics("database_unavailable")
+
+
+def read_only_governance_debt_snapshot(limit: int = 20) -> dict:
+    """Read metrics and merge candidates from one non-mutating SQLite snapshot."""
+    path = db_store.peek_db_path().resolve()
+    if not path.is_file():
+        metrics = compute_debt_metrics(skip_heavy=True, read_only=True)
+        merge_candidates = find_merge_candidates(
+            limit=limit,
+            run_preflight=False,
+        )
+        unavailable_reason = metrics.get("unavailable_reason")
+        merge_report = (
+            _empty_merge_candidate_report(str(unavailable_reason))
+            if unavailable_reason
+            else {
+                "available": True,
+                "unavailable_reason": None,
+                "missing_tables": [],
+                "returned_count": len(merge_candidates),
+                "suggestions": merge_candidates,
+            }
+        )
+    else:
+        try:
+            with db_store.read_only_transaction_snapshot(path) as conn:
+                metrics = compute_debt_metrics(
+                    skip_heavy=True,
+                    read_only=True,
+                    connection=conn,
+                )
+                missing_merge_tables = _missing_tables(
+                    conn,
+                    _MERGE_REQUIRED_TABLES,
+                )
+                merge_candidates = find_merge_candidates(
+                    limit=limit,
+                    run_preflight=False,
+                    connection=conn,
+                )
+                merge_report = (
+                    _empty_merge_candidate_report(
+                        "missing_tables",
+                        missing_tables=missing_merge_tables,
+                    )
+                    if missing_merge_tables
+                    else {
+                        "available": True,
+                        "unavailable_reason": None,
+                        "missing_tables": [],
+                        "returned_count": len(merge_candidates),
+                        "suggestions": merge_candidates,
+                    }
+                )
+        except db_store.ReadOnlySnapshotUnavailable:
+            metrics = _empty_debt_metrics("snapshot_unavailable")
+            merge_report = _empty_merge_candidate_report("snapshot_unavailable")
+        except sqlite3.DatabaseError:
+            metrics = _empty_debt_metrics("database_unavailable")
+            merge_report = _empty_merge_candidate_report("database_unavailable")
+
+    metrics_available = bool(metrics.get("available", True))
+    available = bool(metrics_available and merge_report["available"])
+    reasons = [
+        str(result["unavailable_reason"])
+        for result in (metrics, merge_report)
+        if result.get("available", True) is False
+    ]
+    return {
+        "available": available,
+        "unavailable_reason": None if available else ",".join(dict.fromkeys(reasons)),
+        "metrics": metrics,
+        "merge_candidate_report": merge_report,
     }
 
 
@@ -477,6 +678,9 @@ def _compute_debt_metrics_with_connection(
     merge_candidates = [] if skip_heavy else find_merge_candidates(limit=20, run_preflight=False)
 
     return {
+        "available": True,
+        "unavailable_reason": None,
+        "missing_tables": [],
         "stale_claim_count": stale_claim_count,
         "expired_claim_count": expired_claim_count,
         "review_due_claim_count": review_due_claim_count,

@@ -305,9 +305,15 @@ def load_entities():
     return _load_db_map("entities", "entity_id")
 
 
-def query_entities(filters: dict = None) -> dict:
-    initialize_meta_store()
-    conn = get_connection()
+def query_entities(
+    filters: dict = None,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> dict:
+    """Query entities, reusing a caller-owned read-only snapshot when supplied."""
+    if connection is None:
+        initialize_meta_store()
+        connection = get_connection()
     store = _default_map_store("entity_id")
     query = "SELECT data_json FROM entities"
     params = []
@@ -322,7 +328,7 @@ def query_entities(filters: dict = None) -> dict:
                 clauses.append(f"{k} = ?")
             params.append(v)
         query += " WHERE " + " AND ".join(clauses)
-    rows = conn.execute(query, tuple(params)).fetchall()
+    rows = connection.execute(query, tuple(params)).fetchall()
     for row in rows:
         data = json.loads(row["data_json"])
         store["items"][data["entity_id"]] = data
@@ -947,12 +953,17 @@ def canonical_page_version_from_content(filename: str, content: str) -> str:
     return _canonical_entity_records_version(records)
 
 
-def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]:
+def canonical_page_versions(
+    page_keys: set[str] | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> dict[str, str]:
     """Return deterministic version tokens for the current canonical page state."""
-    init_db()
+    if connection is None:
+        init_db()
+        connection = get_connection()
     requested = set(page_keys) if page_keys is not None else None
     records_by_page: dict[str, list[tuple[str, dict]]] = {}
-    conn = get_connection()
     if requested:
         rows = []
         ordered = sorted(requested)
@@ -960,7 +971,7 @@ def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]
             batch = ordered[offset : offset + 500]
             placeholders = ",".join("?" for _ in batch)
             rows.extend(
-                conn.execute(
+                connection.execute(
                     "SELECT entity_id, data_json FROM entities "
                     f"WHERE json_extract(data_json, '$.page_key') IN ({placeholders}) "
                     "ORDER BY entity_id",
@@ -968,7 +979,7 @@ def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]
                 ).fetchall()
             )
     else:
-        rows = conn.execute(
+        rows = connection.execute(
             "SELECT entity_id, data_json FROM entities ORDER BY entity_id"
         ).fetchall()
     for row in rows:
@@ -1703,10 +1714,33 @@ def _normalize_memory_key(value: str) -> str:
     return normalized[:96] or "general"
 
 
+def _unicode_search_runs(value: str) -> list[str]:
+    """Return case-folded Unicode letter/number runs without script truncation."""
+    runs: list[str] = []
+    current: list[str] = []
+    for char in str(value or "").casefold():
+        category = unicodedata.category(char)
+        if category.startswith(("L", "N")) or (current and category.startswith("M")):
+            current.append(char)
+        elif current:
+            runs.append("".join(current))
+            current = []
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
+def _is_cjk_ideograph(char: str) -> bool:
+    name = unicodedata.name(char, "")
+    return name.startswith("CJK UNIFIED IDEOGRAPH-") or name.startswith(
+        "CJK COMPATIBILITY IDEOGRAPH-"
+    )
+
+
 def _query_terms(query: str) -> list[str]:
-    text = str(query or "").lower()
-    terms = {token for token in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", text) if token}
-    cjk_chars = [char for char in text if "\u4e00" <= char <= "\u9fff"]
+    runs = _unicode_search_runs(query)
+    terms = set(runs)
+    cjk_chars = [char for run in runs for char in run if _is_cjk_ideograph(char)]
     for index in range(len(cjk_chars) - 1):
         terms.add(cjk_chars[index] + cjk_chars[index + 1])
     terms.update(cjk_chars)
@@ -2099,8 +2133,10 @@ _MEMORY_MATCHER_PATTERN_CHAR_LIMIT = 8_192
 _MEMORY_CANDIDATE_TERM_LIMIT = 12
 _MEMORY_SEARCH_INDEX_DEFAULT_BATCH = 256
 _MEMORY_SEARCH_INDEX_MAX_BATCH = 10_000
+_MEMORY_SEARCH_INDEX_SCHEMA_VERSION = 5
 _MEMORY_SEARCH_INDEX_TABLES = frozenset({
     "operational_memory_search_fts",
+    "operational_memory_search_short_fts",
     "operational_memory_search_docs",
     "operational_memory_search_pending",
     "operational_memory_search_state",
@@ -2150,6 +2186,16 @@ def _memory_search_document_ids(
     return documents
 
 
+def _memory_short_token_projection(*values: str) -> str:
+    """Project exact one/two-character substrings into stable FTS tokens."""
+    tokens: set[str] = set()
+    for value in values:
+        for run in _unicode_search_runs(value):
+            tokens.update(run)
+            tokens.update(run[index : index + 2] for index in range(len(run) - 1))
+    return " ".join(sorted(tokens))
+
+
 def _delete_memory_search_documents(
     conn: sqlite3.Connection,
     memory_ids: list[str],
@@ -2162,6 +2208,10 @@ def _delete_memory_search_documents(
     doc_ids = [(doc_id,) for doc_id in documents.values()]
     conn.executemany(
         "DELETE FROM operational_memory_search_fts WHERE rowid = ?",
+        doc_ids,
+    )
+    conn.executemany(
+        "DELETE FROM operational_memory_search_short_fts WHERE rowid = ?",
         doc_ids,
     )
     conn.executemany(
@@ -2182,10 +2232,16 @@ def _upsert_memory_search_documents(
         decoded.append((
             memory_id,
             updated_at,
-            str(memory.get("memory_key", "")).lower(),
-            str(memory.get("text", "")).lower(),
-            str(memory.get("source_page", "")).lower(),
-            str(memory.get("memory_type", "fact")).lower(),
+            key_text := str(memory.get("memory_key", "")).lower(),
+            memory_text := str(memory.get("text", "")).lower(),
+            page_text := str(memory.get("source_page", "")).lower(),
+            type_text := str(memory.get("memory_type", "fact")).lower(),
+            _memory_short_token_projection(
+                key_text,
+                memory_text,
+                page_text,
+                type_text,
+            ),
         ))
 
     memory_ids = [row[0] for row in decoded]
@@ -2202,9 +2258,14 @@ def _upsert_memory_search_documents(
         )
 
     if existing:
+        existing_doc_ids = [(doc_id,) for doc_id in existing.values()]
         conn.executemany(
             "DELETE FROM operational_memory_search_fts WHERE rowid = ?",
-            [(doc_id,) for doc_id in existing.values()],
+            existing_doc_ids,
+        )
+        conn.executemany(
+            "DELETE FROM operational_memory_search_short_fts WHERE rowid = ?",
+            existing_doc_ids,
         )
     conn.executemany(
         "UPDATE operational_memory_search_docs SET source_updated_at = ? "
@@ -2219,6 +2280,11 @@ def _upsert_memory_search_documents(
             (documents[row[0]], row[2], row[3], row[4], row[5])
             for row in decoded
         ],
+    )
+    conn.executemany(
+        "INSERT INTO operational_memory_search_short_fts (rowid, short_text) "
+        "VALUES (?, ?)",
+        [(documents[row[0]], row[6]) for row in decoded],
     )
 
 
@@ -2304,12 +2370,19 @@ def operational_memory_search_index_status() -> dict:
     """Inspect derived-index progress without creating schema or changing state."""
     configured = _operational_memory_search_index_enabled()
     if not peek_db_path().exists():
+        warnings = (
+            ["operational_memory_search_database_missing"] if configured else []
+        )
         return {
             "configured": configured,
             "available": False,
             "ready": False,
+            "status": "unavailable" if configured else "disabled",
+            "warnings": warnings,
             "canonical_documents": 0,
             "indexed_documents": 0,
+            "trigram_indexed_documents": 0,
+            "short_indexed_documents": 0,
             "pending": 0,
         }
     conn = get_connection()
@@ -2326,8 +2399,16 @@ def operational_memory_search_index_status() -> dict:
             "configured": configured,
             "available": False,
             "ready": False,
+            "status": "unavailable" if configured else "disabled",
+            "warnings": (
+                ["operational_memory_search_schema_unavailable"]
+                if configured
+                else []
+            ),
             "canonical_documents": canonical_documents,
             "indexed_documents": 0,
+            "trigram_indexed_documents": 0,
+            "short_indexed_documents": 0,
             "pending": 0,
         }
     state = conn.execute(
@@ -2342,18 +2423,55 @@ def operational_memory_search_index_status() -> dict:
     indexed_documents = int(conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0])
+    trigram_indexed_documents = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_fts"
+    ).fetchone()[0])
+    short_indexed_documents = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_short_fts"
+    ).fetchone()[0])
     canonical_documents = int(conn.execute(
         "SELECT COUNT(*) FROM operational_memory"
     ).fetchone()[0])
+    schema_version = int(state[2]) if state is not None else None
+    warnings: list[str] = []
+    if schema_version != _MEMORY_SEARCH_INDEX_SCHEMA_VERSION:
+        warnings.append(
+            "operational_memory_search_schema_version_mismatch:"
+            f"{schema_version}!={_MEMORY_SEARCH_INDEX_SCHEMA_VERSION}"
+        )
+    if cursor < target:
+        warnings.append("operational_memory_search_backfill_incomplete")
+    if pending:
+        warnings.append(f"operational_memory_search_pending:{pending}")
+    if cursor >= target and indexed_documents != canonical_documents:
+        warnings.append(
+            "operational_memory_search_document_count_mismatch:"
+            f"{indexed_documents}!={canonical_documents}"
+        )
+    if short_indexed_documents != indexed_documents:
+        warnings.append(
+            "operational_memory_search_short_index_count_mismatch:"
+            f"{short_indexed_documents}!={indexed_documents}"
+        )
+    if trigram_indexed_documents != indexed_documents:
+        warnings.append(
+            "operational_memory_search_trigram_index_count_mismatch:"
+            f"{trigram_indexed_documents}!={indexed_documents}"
+        )
+    ready = configured and not warnings
     return {
         "configured": configured,
         "available": True,
-        "ready": cursor >= target and pending == 0,
-        "schema_version": int(state[2]) if state is not None else None,
+        "ready": ready,
+        "status": "ready" if ready else ("backfilling" if configured else "disabled"),
+        "warnings": warnings,
+        "schema_version": schema_version,
         "backfill_cursor": cursor,
         "backfill_target": target,
         "canonical_documents": canonical_documents,
         "indexed_documents": indexed_documents,
+        "trigram_indexed_documents": trigram_indexed_documents,
+        "short_indexed_documents": short_indexed_documents,
         "pending": pending,
     }
 
@@ -2407,6 +2525,84 @@ def _memory_sql_term_filter(terms: list[str], alias: str = "om") -> tuple[str, l
     )
 
 
+def _indexed_operational_memory_query(
+    terms: list[str],
+    allowed_types: set[str] | None,
+    *,
+    cursor: str,
+    target: str,
+    include_pending: bool,
+) -> tuple[str, tuple[object, ...]]:
+    """Build an indexed candidate union with only bounded canonical tails."""
+    type_sql = ""
+    type_params: list[object] = []
+    if allowed_types:
+        placeholders = ", ".join("?" for _ in allowed_types)
+        type_sql = (
+            " AND lower(COALESCE(om.memory_type, 'fact')) "
+            f"IN ({placeholders})"
+        )
+        type_params = sorted(allowed_types)
+
+    candidate_queries: list[str] = []
+    candidate_params: list[object] = []
+    long_terms = [term for term in terms if len(term) >= 3]
+    short_terms = [term for term in terms if len(term) <= 2]
+    if long_terms:
+        candidate_queries.append(
+            "SELECT om.memory_id AS source_key, om.data_json AS data_json "
+            "FROM operational_memory_search_fts "
+            "JOIN operational_memory_search_docs AS docs "
+            "ON docs.doc_id = operational_memory_search_fts.rowid "
+            "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
+            "WHERE operational_memory_search_fts MATCH ?" + type_sql
+        )
+        candidate_params.extend((_memory_fts_expression(long_terms), *type_params))
+    if short_terms:
+        candidate_queries.append(
+            "SELECT om.memory_id AS source_key, om.data_json AS data_json "
+            "FROM operational_memory_search_short_fts "
+            "JOIN operational_memory_search_docs AS docs "
+            "ON docs.doc_id = operational_memory_search_short_fts.rowid "
+            "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
+            "WHERE operational_memory_search_short_fts MATCH ?" + type_sql
+        )
+        candidate_params.extend((_memory_fts_expression(short_terms), *type_params))
+
+    residual_filter, residual_params = _memory_sql_term_filter(terms)
+    if cursor < target:
+        candidate_queries.append(
+            "SELECT om.memory_id AS source_key, om.data_json AS data_json "
+            "FROM operational_memory AS om WHERE om.memory_id > ? "
+            "AND om.memory_id <= ? AND " + residual_filter + type_sql
+        )
+        candidate_params.extend((
+            cursor,
+            target,
+            *residual_params,
+            *type_params,
+        ))
+    if include_pending:
+        candidate_queries.append(
+            "SELECT om.memory_id AS source_key, om.data_json AS data_json "
+            "FROM operational_memory_search_pending AS pending "
+            "CROSS JOIN operational_memory AS om "
+            "ON om.memory_id = pending.memory_id "
+            "WHERE pending.operation = 'upsert' AND "
+            + residual_filter
+            + type_sql
+        )
+        candidate_params.extend((*residual_params, *type_params))
+
+    if not candidate_queries:
+        raise ValueError("indexed operational-memory query requires at least one term")
+    return (
+        "SELECT data_json FROM (" + " UNION ".join(candidate_queries) + ") "
+        "ORDER BY source_key",
+        tuple(candidate_params),
+    )
+
+
 def _indexed_operational_memory_rows(
     conn: sqlite3.Connection,
     terms: list[str],
@@ -2422,66 +2618,40 @@ def _indexed_operational_memory_rows(
 
     try:
         state = conn.execute(
-            "SELECT backfill_cursor, backfill_target "
+            "SELECT backfill_cursor, backfill_target, schema_version "
             "FROM operational_memory_search_state WHERE singleton = 1"
         ).fetchone()
         if state is None:
+            log.warning(
+                "Operational-memory FTS state missing; using compatibility prefilter"
+            )
             return None
         cursor = str(state[0] or "")
         target = str(state[1] or "")
-        type_sql = ""
-        type_params: list[object] = []
-        if allowed_types:
-            placeholders = ", ".join("?" for _ in allowed_types)
-            type_sql = (
-                " AND lower(COALESCE(om.memory_type, 'fact')) "
-                f"IN ({placeholders})"
+        schema_version = int(state[2] or 0)
+        if schema_version != _MEMORY_SEARCH_INDEX_SCHEMA_VERSION:
+            log.warning(
+                "Operational-memory FTS schema v%s is not ready for v%s; "
+                "using compatibility prefilter",
+                schema_version,
+                _MEMORY_SEARCH_INDEX_SCHEMA_VERSION,
             )
-            type_params = sorted(allowed_types)
-
-        candidate_queries: list[str] = []
-        candidate_params: list[object] = []
-        long_terms = [term for term in terms if len(term) >= 3]
-        short_terms = [term for term in terms if len(term) <= 2]
-        if long_terms:
-            candidate_queries.append(
-                "SELECT om.memory_id AS source_key, om.data_json AS data_json "
-                "FROM operational_memory_search_fts "
-                "JOIN operational_memory_search_docs AS docs "
-                "ON docs.doc_id = operational_memory_search_fts.rowid "
-                "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
-                "WHERE operational_memory_search_fts MATCH ?" + type_sql
+            return None
+        include_pending = conn.execute(
+            "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
+        ).fetchone() is not None
+        if cursor < target or include_pending:
+            log.warning(
+                "Operational-memory FTS is not ready; merging bounded backfill/pending rows"
             )
-            candidate_params.extend((_memory_fts_expression(long_terms), *type_params))
-        if short_terms:
-            short_filter, short_params = _memory_sql_term_filter(short_terms)
-            candidate_queries.append(
-                "SELECT om.memory_id AS source_key, om.data_json AS data_json "
-                "FROM operational_memory AS om WHERE " + short_filter + type_sql
-            )
-            candidate_params.extend((*short_params, *type_params))
-
-        residual_filter, residual_params = _memory_sql_term_filter(terms)
-        candidate_queries.append(
-            "SELECT om.memory_id AS source_key, om.data_json AS data_json "
-            "FROM operational_memory AS om WHERE ((om.memory_id > ? AND om.memory_id <= ?) "
-            "OR EXISTS (SELECT 1 FROM operational_memory_search_pending AS pending "
-            "WHERE pending.memory_id = om.memory_id "
-            "AND pending.operation = 'upsert')) AND "
-            + residual_filter
-            + type_sql
+        sql, params = _indexed_operational_memory_query(
+            terms,
+            allowed_types,
+            cursor=cursor,
+            target=target,
+            include_pending=include_pending,
         )
-        candidate_params.extend((
-            cursor,
-            target,
-            *residual_params,
-            *type_params,
-        ))
-        return conn.execute(
-            "SELECT data_json FROM (" + " UNION ".join(candidate_queries) + ") "
-            "ORDER BY source_key",
-            tuple(candidate_params),
-        )
+        return conn.execute(sql, params)
     except sqlite3.Error as exc:
         log.warning(
             "Operational-memory FTS unavailable; using compatibility prefilter: %s",
@@ -2668,7 +2838,9 @@ def search_operational_memory_views(
     }
     if available_tables != required_tables:
         raise OperationalMemoryNotReady("schema_not_ready")
-    if not conn.execute("SELECT 1 FROM operational_memory LIMIT 1").fetchone():
+    if not conn.execute(
+        "SELECT 1 FROM operational_memory WHERE memory_id >= '' LIMIT 1"
+    ).fetchone():
         if conn.execute("SELECT 1 FROM claims LIMIT 1").fetchone():
             raise OperationalMemoryNotReady("projection_empty")
         return [], []

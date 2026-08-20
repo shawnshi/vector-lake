@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 
 import pytest
 
@@ -162,8 +163,12 @@ def test_worker_batches_index_update_once_for_all_ready_rows(isolated_memory, mo
 def test_large_worker_batch_uses_extended_lease(isolated_memory, monkeypatch):
     captured = {}
 
-    def claim(*, limit, lease_seconds):
-        captured.update(limit=limit, lease_seconds=lease_seconds)
+    def claim(*, limit, lease_seconds, lease_owner):
+        captured.update(
+            limit=limit,
+            lease_seconds=lease_seconds,
+            lease_owner=lease_owner,
+        )
         return []
 
     monkeypatch.setattr(db_store, "claim_mutation_outbox", claim)
@@ -171,7 +176,171 @@ def test_large_worker_batch_uses_extended_lease(isolated_memory, monkeypatch):
     stats = process_mutation_outbox_batch(limit=10000)
 
     assert stats["claimed"] == 0
-    assert captured == {"limit": 10000, "lease_seconds": 3600}
+    assert captured["limit"] == 10000
+    assert captured["lease_seconds"] == 3600
+    assert captured["lease_owner"].startswith("watchdog:")
+
+
+def test_watchdog_private_outbox_lease_helpers_are_strictly_fenced(
+    isolated_memory,
+):
+    db_store.init_db()
+    outbox_id = db_store.enqueue_mutation("Concept_Fenced.md", "delete")
+    row = db_store.claim_mutation_outbox(
+        limit=1,
+        lease_seconds=30,
+        lease_owner="watchdog:test-run:100",
+    )[0]
+    before = db_store.get_connection().execute(
+        "SELECT lease_until, attempt_count FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+
+    assert watchdog_app._renew_mutation_outbox_lease(db_store, row, 120) is True
+    renewed = db_store.get_connection().execute(
+        "SELECT lease_until, attempt_count FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+    assert renewed["lease_until"] > before["lease_until"]
+    assert renewed["attempt_count"] == 1
+
+    for field, bad_value in (
+        ("lease_owner", "foreign-owner"),
+        ("lease_token", "foreign-token"),
+        ("lease_generation", int(row["lease_generation"]) + 1),
+    ):
+        forged = dict(row)
+        forged[field] = bad_value
+        assert watchdog_app._renew_mutation_outbox_lease(
+            db_store,
+            forged,
+            120,
+        ) is False
+        assert watchdog_app._release_mutation_outbox_lease(
+            db_store,
+            forged,
+            "forged release",
+        ) is False
+
+    assert watchdog_app._release_mutation_outbox_lease(
+        db_store,
+        row,
+        "bounded scheduler deferral",
+    ) is True
+    released = db_store.get_connection().execute(
+        "SELECT status, attempt_count, lease_owner, lease_token, last_error "
+        "FROM mutation_outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+    assert dict(released) == {
+        "status": "pending",
+        "attempt_count": 0,
+        "lease_owner": None,
+        "lease_token": None,
+        "last_error": "bounded scheduler deferral",
+    }
+
+
+def test_slow_outbox_stage_renews_lease_until_operation_returns(monkeypatch):
+    renewals = []
+    row = {
+        "id": 7,
+        "lease_owner": "owner",
+        "lease_token": "token",
+        "lease_generation": 3,
+    }
+
+    monkeypatch.setenv("VECTOR_LAKE_OUTBOX_LEASE_RENEW_INTERVAL_SECONDS", "0.05")
+    monkeypatch.setattr(
+        watchdog_app,
+        "_renew_mutation_outbox_lease",
+        lambda _store, current, _seconds: renewals.append(current["id"]) or True,
+    )
+    monkeypatch.setattr(db_store, "close_connection", lambda: None)
+
+    active = watchdog_app._run_with_outbox_lease_renewal(
+        db_store,
+        [row],
+        3,
+        lambda _rows: time.sleep(0.13),
+    )
+
+    assert active == [row]
+    assert len(renewals) >= 3
+
+
+def test_outbox_materialization_does_not_hold_sqlite_write_transaction(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    db_store.enqueue_mutation(
+        "Concept_No-IO-Lock.md",
+        "update",
+        payload_text="projection",
+        validation_mode="schema",
+    )
+    observed = []
+
+    def materialize(*_args, **_kwargs):
+        observed.append(db_store.get_connection().in_transaction)
+
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "materialize_markdown_projection",
+        materialize,
+    )
+    monkeypatch.setattr(indexer, "index_projection_matches_canonical", lambda _items: False)
+    monkeypatch.setattr(indexer, "update_index_items", lambda _items: None)
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: True,
+    )
+
+    stats = process_mutation_outbox_batch(limit=1)
+
+    assert observed == [False]
+    assert stats == {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0}
+
+
+def test_outbox_index_failure_isolates_poison_row_and_completes_peer(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    good_id = db_store.enqueue_mutation("Concept_Good.md", "delete")
+    poison_id = db_store.enqueue_mutation("Concept_Poison.md", "delete")
+    calls = []
+
+    monkeypatch.setattr(indexer, "index_projection_matches_canonical", lambda _items: False)
+
+    def index_batch(filenames):
+        calls.append(list(filenames))
+        if "Concept_Poison.md" in filenames:
+            raise ValueError("poison projection")
+
+    monkeypatch.setattr(indexer, "update_index_items", index_batch)
+    monkeypatch.setattr(
+        indexer,
+        "projection_pair_matches_current_generation",
+        lambda: True,
+    )
+
+    stats = process_mutation_outbox_batch(
+        limit=2,
+        max_attempts=3,
+        backoff_base=0,
+    )
+
+    assert calls == [
+        ["Concept_Good.md", "Concept_Poison.md"],
+        ["Concept_Good.md"],
+        ["Concept_Poison.md"],
+    ]
+    assert stats == {"claimed": 2, "completed": 1, "retrying": 1, "failed": 0}
+    statuses = db_store.mutation_outbox_statuses([good_id, poison_id])
+    assert statuses == {good_id: "completed", poison_id: "pending"}
 
 
 def test_worker_completes_when_selected_index_projection_is_already_current(isolated_memory, monkeypatch):

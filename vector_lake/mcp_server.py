@@ -9,9 +9,11 @@ import math
 import os
 from pathlib import Path
 import queue
+import stat
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 import weakref
 from datetime import datetime, timezone
@@ -33,6 +35,7 @@ _MCP_HEAVY_TASKS = {
     "embedding_backfill": ("embedding", 3600.0),
     "evidence_foundation_backfill": ("maintenance", 1800.0),
     "finalize_ingest": ("projection", 900.0),
+    "finalize_query_synthesis": ("projection", 900.0),
     "gc_vector_lake": ("maintenance", 1800.0),
     "get_governance_debt": ("scan", 900.0),
     "history_retention": ("maintenance", 1800.0),
@@ -44,17 +47,53 @@ _MCP_HEAVY_TASKS = {
     "prepare_ingest_batch": ("ingest_scan", 1800.0),
     "projection_rebuild_index": ("projection", 1800.0),
     "projection_report": ("scan", 900.0),
+    "propose_schema_mutation": ("maintenance", 900.0),
     "reconcile_ingest_tasks": ("maintenance", 1800.0),
     "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
     "rebuild_timeline_events": ("projection", 900.0),
     "rename_entity": ("maintenance", 900.0),
     "sync_vector_lake": ("ingest_scan", 1800.0),
+    "sync_critical_decision_registry": ("maintenance", 900.0),
     "topology_queue_cleanup": ("maintenance", 900.0),
     "trigger_audit_graph": ("scan", 1800.0),
     "trigger_autonomous_research": ("ingest_scan", 1800.0),
     "visualize_vector_lake": ("scan", 900.0),
     "wiki_restore": ("maintenance", 900.0),
 }
+
+_MANUAL_INGEST_ADMIN_ENV = "VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN"
+_MANUAL_QUERY_SYNTHESIS_ENV = "VECTOR_LAKE_ALLOW_MANUAL_QUERY_SYNTHESIS"
+_SYSTEM_PAGE_WRITE_ENV = "VECTOR_LAKE_ALLOW_SYSTEM_PAGE_WRITE"
+_EVIDENCE_TEXT_EXPORT_ENV = "VECTOR_LAKE_ALLOW_EVIDENCE_TEXT_EXPORT"
+
+_RUNTIME_REVISION_ROOT_FILES = (
+    ".mcp.json",
+    "config.json",
+    "gemini-extension.json",
+    "mcp_config.json",
+    "plugin.json",
+    "requirements-ci-bootstrap.lock.txt",
+    "requirements-ci.lock.txt",
+    "requirements.lock.txt",
+    "requirements.txt",
+    "SCHEMA_CATEGORIES.md",
+    "schema.md",
+    "watchdog_sync.py",
+)
+_RUNTIME_REVISION_ASSET_DIRS = (
+    ".codex-plugin",
+    "commands",
+    "contracts",
+    "skills",
+    "templates",
+)
+
+
+def _require_explicit_capability(env_name: str, action: str) -> None:
+    if os.environ.get(env_name) != "1":
+        raise PermissionError(
+            f"{action} is disabled by default; set {env_name}=1 in the trusted host"
+        )
 
 
 
@@ -232,15 +271,42 @@ def _finalize_blocking_executor(executor: _DaemonThreadPoolExecutor) -> None:
     executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _runtime_revision_paths(source_root: Path) -> list[tuple[str, Path]]:
+    """Return the bounded set of code and restart-sensitive plugin assets."""
+    source_root = Path(source_root).resolve()
+    plugin_root = source_root.parent if source_root.name == "vector_lake" else source_root
+    paths: dict[str, Path] = {}
+
+    for source_path in source_root.rglob("*.py"):
+        if source_path.is_file():
+            relative = source_path.relative_to(plugin_root).as_posix()
+            paths[relative] = source_path
+
+    if plugin_root != source_root:
+        for filename in _RUNTIME_REVISION_ROOT_FILES:
+            candidate = plugin_root / filename
+            if candidate.is_file():
+                paths[candidate.relative_to(plugin_root).as_posix()] = candidate
+        for dirname in _RUNTIME_REVISION_ASSET_DIRS:
+            asset_root = plugin_root / dirname
+            if not asset_root.is_dir():
+                continue
+            for candidate in asset_root.rglob("*"):
+                if candidate.is_file():
+                    paths[candidate.relative_to(plugin_root).as_posix()] = candidate
+
+    return sorted(paths.items())
+
+
 def _source_tree_revision(source_root: Path) -> str:
-    """Hash loaded Python sources so long-running MCPs can detect code drift."""
+    """Hash loaded code and restart-sensitive assets for drift detection."""
     digest = hashlib.sha256()
-    for source_path in sorted(source_root.rglob("*.py")):
+    for relative_path, source_path in _runtime_revision_paths(source_root):
         try:
             source_bytes = source_path.read_bytes()
         except FileNotFoundError:
             continue
-        digest.update(source_path.relative_to(source_root).as_posix().encode("utf-8"))
+        digest.update(relative_path.encode("utf-8"))
         digest.update(b"\x00")
         digest.update(source_bytes)
         digest.update(b"\x00")
@@ -288,8 +354,8 @@ class MCPRuntimeGuard:
                 "check_interval_seconds": self.check_interval_seconds,
             }
 
-    def assert_current(self) -> None:
-        status = self.status(force=True)
+    def assert_current(self, *, force: bool = True) -> None:
+        status = self.status(force=force)
         if status["stale"]:
             raise RuntimeError(
                 "Vector Lake MCP source changed after process startup; "
@@ -512,6 +578,18 @@ class ReloadAwareFastMCP(FastMCP):
         register = super().tool(*args, **kwargs)
 
         def decorator(fn):
+            if fn.__name__ == "mcp_runtime_status" and not inspect.iscoroutinefunction(fn):
+
+                @functools.wraps(fn)
+                async def direct_runtime_status(*fn_args, **fn_kwargs):
+                    # This endpoint performs only bounded source/status reads. Keep it
+                    # available when the single heavy-tool lane is occupied.
+                    self._assert_accepting_calls()
+                    return fn(*fn_args, **fn_kwargs)
+
+                register(direct_runtime_status)
+                return fn
+
             if inspect.iscoroutinefunction(fn):
 
                 @functools.wraps(fn)
@@ -569,7 +647,9 @@ class ReloadAwareFastMCP(FastMCP):
     async def call_tool(self, name: str, arguments: dict):
         self._assert_accepting_calls()
         if name != "mcp_runtime_status":
-            await self._run_blocking_call(self.runtime_guard.assert_current)
+            # Admission only needs the cached guard. The registered wrapper performs
+            # one authoritative forced check in the worker immediately before use.
+            self.runtime_guard.assert_current(force=False)
         return await super().call_tool(name, arguments)
 
 # Global lock against stdout pollution
@@ -807,6 +887,11 @@ def export_evidence_packet(
     The packet remains a claim candidate. It never promotes a Vector Lake claim
     to an AcceptedFact and defaults to hashes and locators instead of raw text.
     """
+    if include_evidence_text:
+        _require_explicit_capability(
+            _EVIDENCE_TEXT_EXPORT_ENV,
+            "evidence text export",
+        )
     return tools.export_evidence_packet(
         claim_id,
         include_evidence_text=include_evidence_text,
@@ -847,36 +932,107 @@ def sync_critical_decision_registry(
 def _read_payload(payload_file: str) -> str:
     if not payload_file:
         return ""
-    import os
-    from pathlib import Path
     from vector_lake.native_llm import peek_subagent_brain_root
 
-    abs_path = Path(payload_file).resolve()
+    requested_path = Path(payload_file).expanduser()
+    if not requested_path.is_absolute():
+        raise ValueError("[Security Error] Payload path must be absolute")
+    lexical_path = Path(os.path.abspath(str(requested_path)))
     configured_root = os.environ.get("VECTOR_LAKE_PAYLOAD_ROOT")
+    allowed_root: Path | None = None
     if configured_root:
-        allowed = abs_path.is_relative_to(Path(configured_root).expanduser().resolve())
+        candidate_root = Path(os.path.abspath(str(Path(configured_root).expanduser())))
+        allowed = lexical_path.is_relative_to(candidate_root)
+        if allowed:
+            allowed_root = candidate_root
     else:
         allowed = False
         brain_roots = [
-            peek_subagent_brain_root().resolve(),
-            Path(os.path.expanduser("~/.codex/brain")).resolve(),
+            Path(os.path.abspath(str(peek_subagent_brain_root()))),
+            Path(os.path.abspath(os.path.expanduser("~/.codex/brain"))),
         ]
         for root in brain_roots:
-            if not abs_path.is_relative_to(root):
+            if not lexical_path.is_relative_to(root):
                 continue
-            relative_parts = abs_path.relative_to(root).parts
+            relative_parts = lexical_path.relative_to(root).parts
             if len(relative_parts) >= 3 and relative_parts[1].lower() == "scratch":
                 allowed = True
+                allowed_root = root
                 break
     if not allowed:
         raise ValueError(f"[Security Error] Payload file must be within an approved agent sandbox: {payload_file}")
-    if not abs_path.exists() or not abs_path.is_file():
-        raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Please use write_to_file to create it first.")
+    assert allowed_root is not None
+    root_stat = os.lstat(allowed_root)
+    if allowed_root.is_symlink() or (
+        getattr(root_stat, "st_file_attributes", 0) & 0x400
+    ):
+        raise ValueError("[Security Error] Approved payload root is a reparse point")
+    current = allowed_root
+    for part in lexical_path.relative_to(allowed_root).parts:
+        current = current / part
+        try:
+            current_stat = os.lstat(current)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"[Sandbox Error] Payload file not found: {payload_file}"
+            ) from exc
+        if current.is_symlink() or (
+            getattr(current_stat, "st_file_attributes", 0) & 0x400
+        ):
+            raise ValueError(
+                f"[Security Error] Payload path contains a reparse point: {payload_file}"
+            )
+    abs_path = lexical_path.resolve(strict=True)
+    if not abs_path.is_relative_to(allowed_root.resolve(strict=True)):
+        raise ValueError(
+            f"[Security Error] Payload resolved outside the approved sandbox: {payload_file}"
+        )
     max_bytes = max(1, int(os.environ.get("VECTOR_LAKE_PAYLOAD_MAX_BYTES", str(5 * 1024 * 1024))))
-    if abs_path.stat().st_size > max_bytes:
-        raise ValueError(f"[Sandbox Error] Payload file exceeds {max_bytes} bytes: {payload_file}")
-    with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(abs_path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("[Security Error] Payload must be a regular file")
+        if before.st_size > max_bytes:
+            raise ValueError(
+                f"[Sandbox Error] Payload file exceeds {max_bytes} bytes: {payload_file}"
+            )
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload_bytes = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if len(payload_bytes) > max_bytes:
+            raise ValueError(
+                f"[Sandbox Error] Payload file exceeds {max_bytes} bytes: {payload_file}"
+            )
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ValueError("[Security Error] Payload changed while it was being read")
+        path_after = os.stat(abs_path, follow_symlinks=False)
+        if (after.st_dev, after.st_ino) != (path_after.st_dev, path_after.st_ino):
+            raise ValueError("[Security Error] Payload identity changed during read")
+    finally:
+        os.close(descriptor)
+    try:
+        return payload_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("[Sandbox Error] Payload must be strict UTF-8") from exc
 
 @mcp.tool()
 def update_operational_memory(memory_type: str, payload_file: str) -> str:
@@ -898,9 +1054,9 @@ def sync_vector_lake() -> str:
     try:
         return tools.sync_vector_lake()
     except Exception as e:
-        import traceback
-        logging.error(f"MCP Tool Exception (sync_vector_lake): {e}\n{traceback.format_exc()}")
-        return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
+        incident = uuid.uuid4().hex[:12]
+        logging.exception("MCP sync_vector_lake failed incident=%s", incident)
+        return f"MCP Exception: {type(e).__name__}; incident={incident}"
 
 @mcp.tool()
 def lint_vector_lake(auto_fix: bool = False) -> str:
@@ -912,28 +1068,41 @@ def lint_vector_lake(auto_fix: bool = False) -> str:
     try:
         return tools.lint_vector_lake(auto_fix=auto_fix)
     except Exception as e:
-        import traceback
-        logging.error(f"MCP Tool Exception (lint_vector_lake): {e}\n{traceback.format_exc()}")
-        return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
+        incident = uuid.uuid4().hex[:12]
+        logging.exception("MCP lint_vector_lake failed incident=%s", incident)
+        return f"MCP Exception: {type(e).__name__}; incident={incident}"
 
 @mcp.tool()
-def query_logic_lake(query_str: str) -> str:
-    """Deep reasoning with budget-controlled context.
+def query_logic_lake(query_str: str, dry_run: bool = True) -> str:
+    """Read-only reasoning context by default; job creation is operator-gated.
     
     Args:
         query_str: The topic or command for reasoning.
+        dry_run: Keep context in memory without creating a query job. Defaults to true.
     """
-    return tools.prepare_query_context(query_str)
+    if not isinstance(dry_run, bool):
+        raise ValueError("dry_run must be a boolean")
+    if not dry_run:
+        _require_explicit_capability(
+            _MANUAL_QUERY_SYNTHESIS_ENV,
+            "Manual query synthesis",
+        )
+    return tools.prepare_query_context(query_str, dry_run=dry_run)
 
 @mcp.tool()
-def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
-    """Finalize the logic lake query by indexing the new pages and syncing to the governance store.
-    
+def finalize_query_synthesis(completion_json: str, query_str: str) -> str:
+    """Atomically commit a prepared query job's bounded synthesis proposals.
+
     Args:
-        files_written_str: Comma-separated list of filenames (e.g. 'Synthesis_Topic.md') that were written by the subagent.
-        query_str: The original query string for the trace.
+        completion_json: Strict JSON completion containing job_id, nonce, and
+            inline Synthesis_ proposals with SHA-256 digests.
+        query_str: The exact original query bound to the prepared job.
     """
-    return tools.finalize_query_synthesis(files_written_str, query_str)
+    _require_explicit_capability(
+        _MANUAL_QUERY_SYNTHESIS_ENV,
+        "Manual query synthesis finalization",
+    )
+    return tools.finalize_query_synthesis(completion_json, query_str)
 
 @mcp.tool()
 def review_governance_list() -> str:
@@ -989,9 +1158,9 @@ def get_governance_debt(top: int = 20) -> str:
     return tools.debt_vector_lake(top=top)
 
 @mcp.tool()
-def trigger_audit_graph() -> str:
-    """Synthesize graph topology insights into the unified review surface."""
-    return tools.audit_graph()
+def trigger_audit_graph(dry_run: bool = True, confirmation: str = "") -> str:
+    """Preview topology insights, or apply an exact confirmed audit plan."""
+    return tools.audit_graph(dry_run=dry_run, confirmation=confirmation)
 
 @mcp.tool()
 def delete_source(raw_path: str, dry_run: bool = True) -> str:
@@ -1079,12 +1248,20 @@ def list_ingest_tasks(limit: int = 20, include_queued: bool = True) -> str:
 @mcp.tool()
 def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
     """Lease awaiting ingest task packets to the current-environment subagent host."""
-    return tools.claim_ingest_tasks(limit=limit, lease_seconds=lease_seconds)
+    _require_explicit_capability(_MANUAL_INGEST_ADMIN_ENV, "manual ingest claim")
+    bounded_limit = max(1, min(5, int(limit)))
+    bounded_lease = max(60, min(3600, int(lease_seconds)))
+    return tools.claim_ingest_tasks(
+        limit=bounded_limit,
+        lease_seconds=bounded_lease,
+    )
 
 @mcp.tool()
 def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     """Expire stale awaiting-subagent ingest jobs so they can be retried deliberately."""
-    return tools.expire_ingest_tasks(max_age_seconds=max_age_seconds)
+    _require_explicit_capability(_MANUAL_INGEST_ADMIN_ENV, "manual ingest expiry")
+    bounded_age = max(300, min(30 * 86400, int(max_age_seconds)))
+    return tools.expire_ingest_tasks(max_age_seconds=bounded_age)
 
 
 @mcp.tool()
@@ -1165,19 +1342,119 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
         filename: The filename (e.g. 'Concept_Example.md').
         payload_file: Absolute path to a temporary file containing the full markdown content including YAML frontmatter.
     """
+    def receipt(
+        *,
+        ok: bool,
+        committed: bool,
+        outbox_ids: list[int] | None = None,
+        deferred: list[str] | None = None,
+        post_commit_warnings: list[str] | None = None,
+        error_code: str | None = None,
+        message: str,
+    ) -> str:
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "ok": ok,
+                "committed": committed,
+                "outbox_ids": list(outbox_ids or []),
+                "deferred": list(deferred or []),
+                "post_commit_warnings": list(post_commit_warnings or []),
+                "error_code": error_code,
+                "message": message,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    normalized_filename = (
+        unicodedata.normalize("NFKC", filename).casefold()
+        if isinstance(filename, str)
+        else ""
+    )
+    if (
+        normalized_filename.startswith("system_")
+        and os.environ.get(_SYSTEM_PAGE_WRITE_ENV) != "1"
+    ):
+        return receipt(
+            ok=False,
+            committed=False,
+            error_code="system_page_write_forbidden",
+            message="System wiki page writes are disabled by default.",
+        )
+
     try:
         content = _read_payload(payload_file)
-    except Exception as e:
-        return str(e)
+    except Exception as exc:
+        logging.warning(
+            "write_wiki_page payload rejected: %s",
+            type(exc).__name__,
+        )
+        return receipt(
+            ok=False,
+            committed=False,
+            error_code="payload_rejected",
+            message="Wiki payload could not be accepted.",
+        )
     from vector_lake.wiki_utils import SafeWriteError
     try:
-        from vector_lake.mutation_coordinator import execute_mutation_plan
-        execute_mutation_plan(filename, content=content, is_delete=False)
-        return f"Successfully wrote {filename} and queued index update."
-    except SafeWriteError as e:
-        return f"[Write Rejected] {str(e)}"
-    except Exception as e:
-        return f"Error writing file: {str(e)}"
+        from vector_lake.mutation_coordinator import execute_mutation_batch
+
+        details = execute_mutation_batch(
+            [{"filename": filename, "content": content, "is_delete": False}],
+            origin="mcp_write_wiki_page",
+            return_details=True,
+        )
+        outbox_ids = [int(value) for value in details.get("outbox_ids", [])]
+        deferred = [str(value) for value in details.get("deferred", [])]
+        raw_warnings = list(details.get("post_commit_warnings", []))
+        public_warnings = [
+            "post_commit_follow_up_warning" for _warning in raw_warnings
+        ]
+        committed = bool(details.get("committed"))
+        ok = bool(details.get("ok")) and committed
+        error_code = None if ok else "mutation_not_committed"
+        message = (
+            "Canonical wiki mutation committed; "
+            f"outbox={len(outbox_ids)}; deferred={len(deferred)}; "
+            f"warnings={len(public_warnings)}."
+            if committed
+            else "Canonical wiki mutation was not committed."
+        )
+        return receipt(
+            ok=ok,
+            committed=committed,
+            outbox_ids=outbox_ids,
+            deferred=deferred,
+            post_commit_warnings=public_warnings,
+            error_code=error_code,
+            message=message,
+        )
+    except SafeWriteError as exc:
+        logging.warning("write_wiki_page rejected: %s", type(exc).__name__)
+        return receipt(
+            ok=False,
+            committed=False,
+            error_code="write_rejected",
+            message="Wiki mutation was rejected.",
+        )
+    except ValueError as exc:
+        logging.warning("write_wiki_page invalid request: %s", type(exc).__name__)
+        return receipt(
+            ok=False,
+            committed=False,
+            error_code="invalid_request",
+            message="Wiki mutation request is invalid.",
+        )
+    except Exception as exc:
+        logging.warning("write_wiki_page failed: %s", type(exc).__name__)
+        return receipt(
+            ok=False,
+            committed=False,
+            error_code="write_failed",
+            message="Wiki mutation failed before commit.",
+        )
 
 @mcp.tool()
 def propose_schema_mutation(new_category: str, payload_file: str, parent_category: str = "Uncategorized") -> str:
@@ -1192,6 +1469,9 @@ def propose_schema_mutation(new_category: str, payload_file: str, parent_categor
         description = _read_payload(payload_file)
     except Exception as e:
         return str(e)
+    from vector_lake.runtime_health import enforce_runtime_write_health
+
+    enforce_runtime_write_health(validation_mode="full")
     item_id = f"gov_{uuid.uuid4().hex[:12]}"
     insert_governance_item_if_absent({
             "item_id": item_id,

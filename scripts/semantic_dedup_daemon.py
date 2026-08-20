@@ -1,23 +1,19 @@
+"""Deprecated semantic-dedup operator script, disabled by default."""
+
 import os
 import json
-import hashlib
 import logging
-import math
 import uuid
-import time
-import re
 import asyncio
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
-from pathlib import Path
 import sys
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from vector_lake.wiki_utils import get_meta_dir, get_index_path
-from vector_lake import governance_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("semantic-dedup-daemon")
+
+_LEGACY_DAEMON_ENV = "VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS"
+_DISABLED_EXIT_CODE = 78
 
 EMBEDDING_MODEL = "gemini-embedding-2"
 SIMILARITY_THRESHOLD = 0.92
@@ -27,9 +23,30 @@ CONCURRENCY_LIMIT = 20
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-from vector_lake.wiki_utils import normalize_memory_key as strip_name, calculate_cosine_similarity
+
+def _legacy_daemon_enabled() -> bool:
+    return os.environ.get(_LEGACY_DAEMON_ENV) == "1"
+
+
+def _require_legacy_daemon() -> None:
+    if not _legacy_daemon_enabled():
+        raise PermissionError(
+            "Deprecated/unsupported semantic dedup daemon is disabled; set "
+            f"{_LEGACY_DAEMON_ENV}=1 only in a trusted operator process"
+        )
+
+
+def _enable_repo_imports() -> None:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
 
 def _get_cache_path():
+    _require_legacy_daemon()
+    _enable_repo_imports()
+    from vector_lake.wiki_utils import get_meta_dir
+
     return get_meta_dir() / "embeddings.pkl"
 
 def load_cache() -> dict:
@@ -50,7 +67,16 @@ def save_cache(cache: dict):
         pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-async def async_run_daemon():
+async def _unsafe_async_run_daemon():
+    _require_legacy_daemon()
+    _enable_repo_imports()
+    from vector_lake import governance_store
+    from vector_lake.wiki_utils import (
+        calculate_cosine_similarity,
+        get_index_path,
+        normalize_memory_key as strip_name,
+    )
+
     if os.environ.get("GEMINI_API_KEY"):
         log.info("Semantic dedup never calls the provider directly; use embedding-backfill for missing vectors.")
 
@@ -71,7 +97,8 @@ async def async_run_daemon():
     for key, node in entities.items():
         node['_stripped'] = strip_name(node.get('title', key))
         aliases = node.get('aliases', [])
-        if isinstance(aliases, str): aliases = [aliases]
+        if isinstance(aliases, str):
+            aliases = [aliases]
         node['_stripped_aliases'] = [strip_name(a) for a in aliases if a]
         node['backlinks'] = []
 
@@ -109,7 +136,8 @@ async def async_run_daemon():
     window_size = min(150, len(entity_keys))
     
     for i in range(len(entity_keys)):
-        if i % 10 == 0: await asyncio.sleep(0) # Yield to prevent blocking
+        if i % 10 == 0:
+            await asyncio.sleep(0)  # Yield to prevent blocking
         left_key = entity_keys[i]
         left_node = entities[left_key]
         left_strip = left_node['_stripped']
@@ -122,12 +150,19 @@ async def async_run_daemon():
             right_title = right_node.get('title', right_key)
             
             pair_key = "::".join(sorted([left_key, right_key]))
-            if pair_key in existing_pairs: continue
-            if left_key.startswith('Source_') and right_key.startswith('Source_'): continue
+            if pair_key in existing_pairs:
+                continue
+            if left_key.startswith('Source_') and right_key.startswith('Source_'):
+                continue
                 
             collision = False
-            if len(left_strip) > 2 and left_strip == right_strip: collision = True
-            elif left_strip in right_node['_stripped_aliases'] or right_strip in left_node['_stripped_aliases']: collision = True
+            if len(left_strip) > 2 and left_strip == right_strip:
+                collision = True
+            elif (
+                left_strip in right_node['_stripped_aliases']
+                or right_strip in left_node['_stripped_aliases']
+            ):
+                collision = True
                 
             b1, b2 = set(left_node.get('backlinks', [])), set(right_node.get('backlinks', []))
             jaccard = (len(b1.intersection(b2)) / len(b1.union(b2))) if b1 or b2 else 0.0
@@ -145,11 +180,13 @@ async def async_run_daemon():
             if left_key in cached_embeddings and right_key in cached_embeddings:
                 sim = calculate_cosine_similarity(cached_embeddings[left_key]["vector"], cached_embeddings[right_key]["vector"])
                 if sim >= SIMILARITY_THRESHOLD:
-                    if sim > final_score: final_score = sim
+                    if sim > final_score:
+                        final_score = sim
                     reasons.append(f"semantic-embedding-match:{round(sim, 3)}")
             
             if final_score >= ADVANCED_THRESHOLD:
-                if not reasons: reasons.append(f"lexical-similarity:{round(str_score, 3)}")
+                if not reasons:
+                    reasons.append(f"lexical-similarity:{round(str_score, 3)}")
                 reasons.append("local-review-required")
                 candidates.append({
                     "pair_key": pair_key, "score": round(final_score, 3), "left_entity_id": left_key, "left_name": left_title,
@@ -159,18 +196,23 @@ async def async_run_daemon():
 
         if cached_embeddings:
             left_data = cached_embeddings.get(left_key)
-            if not left_data or "vector" not in left_data: continue
+            if not left_data or "vector" not in left_data:
+                continue
             
             for j in range(i + 1, len(entity_keys)):
-                if j < i + window_size: continue
+                if j < i + window_size:
+                    continue
                 
                 right_key = entity_keys[j]
                 right_data = cached_embeddings.get(right_key)
-                if not right_data or "vector" not in right_data: continue
+                if not right_data or "vector" not in right_data:
+                    continue
                 
                 pair_key = "::".join(sorted([left_key, right_key]))
-                if pair_key in existing_pairs: continue
-                if left_key.startswith('Source_') and right_key.startswith('Source_'): continue
+                if pair_key in existing_pairs:
+                    continue
+                if left_key.startswith('Source_') and right_key.startswith('Source_'):
+                    continue
                     
                 sim = calculate_cosine_similarity(left_data["vector"], right_data["vector"])
                 if sim >= ADVANCED_THRESHOLD:
@@ -207,8 +249,30 @@ async def async_run_daemon():
     else:
         log.info("No new merge candidates found.")
 
-def run_daemon():
-    asyncio.run(async_run_daemon())
+def _run_legacy_daemon() -> None:
+    asyncio.run(_unsafe_async_run_daemon())
+
+
+def main() -> int:
+    if not _legacy_daemon_enabled():
+        print(
+            "DEPRECATED/UNSUPPORTED semantic dedup daemon is disabled by default; "
+            f"set {_LEGACY_DAEMON_ENV}=1 only for isolated operator recovery.",
+            file=sys.stderr,
+        )
+        return _DISABLED_EXIT_CODE
+    print(
+        "DEPRECATED/UNSUPPORTED semantic dedup daemon override enabled; never run "
+        "it alongside watchdog_sync.py or vector_lake.watchdog_app.",
+        file=sys.stderr,
+    )
+    _run_legacy_daemon()
+    return 0
+
+
+def run_daemon() -> int:
+    """Compatibility entrypoint retaining the same fail-closed operator gate."""
+    return main()
 
 if __name__ == "__main__":
-    run_daemon()
+    raise SystemExit(main())

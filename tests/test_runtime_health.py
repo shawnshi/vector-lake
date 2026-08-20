@@ -1,8 +1,10 @@
 import json
+import os
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,28 @@ from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.runtime_health import assess_runtime_health, assess_semantic_readiness
 from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.watchdog_status import get_status_file, write_status
+
+
+def test_watchdog_status_read_retries_transient_permission_error(tmp_path, monkeypatch):
+    from vector_lake import runtime_health
+
+    status_path = tmp_path / ".watchdog_status.json"
+    status_path.write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+    attempts = 0
+
+    def flaky_read_text(path, *args, **kwargs):
+        nonlocal attempts
+        if path == status_path and attempts < 2:
+            attempts += 1
+            raise PermissionError("simulated Windows sharing violation")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    monkeypatch.setattr(runtime_health.time, "sleep", lambda _seconds: None)
+
+    assert runtime_health._read_watchdog_status(status_path) == {}
+    assert attempts == 2
 
 
 def test_runtime_health_uses_immutable_read_only_uri_when_wal_is_empty(
@@ -94,6 +118,172 @@ Test purpose.
 """,
         encoding="utf-8",
     )
+
+
+def _write_auto_ingest_health_config(memory_dir, **updates):
+    payload = {
+        "schema_version": 1,
+        "enabled": True,
+        "timeout_seconds": 1200,
+    }
+    payload.update(updates)
+    meta_dir = memory_dir / "wiki" / ".meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    (meta_dir / "auto_ingest_config.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def _write_complete_watchdog_status(
+    memory_dir,
+    *,
+    auto_status="idle",
+    auto_action="Automatic ingest waiting",
+    auto_error="",
+):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    components = {
+        name: {
+            "status": "idle",
+            "current_action": "",
+            "last_error": "",
+            "heartbeat_at": now,
+            "updated_at": now,
+        }
+        for name in ("watchdog", "outbox", "scheduler", "ingest")
+    }
+    components["auto_ingest"] = {
+        "status": auto_status,
+        "current_action": auto_action,
+        "last_error": auto_error,
+        "heartbeat_at": now,
+        "updated_at": now,
+    }
+    status_path = memory_dir / "wiki" / ".meta" / ".watchdog_status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "status": auto_status if auto_status != "idle" else "idle",
+                "updated_at": now,
+                "components": components,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_auto_ingest_receipt_health_reports_invalid_stale_warning_and_retention(
+    isolated_memory,
+):
+    from vector_lake import runtime_health
+
+    meta_dir = isolated_memory / "wiki" / ".meta"
+    receipt_root = meta_dir / "auto_ingest_attempt_receipts"
+    bucket = receipt_root / datetime.now(timezone.utc).date().isoformat()
+    bucket.mkdir(parents=True)
+    now = datetime.now(timezone.utc)
+
+    (bucket / f"{'0' * 32}.json").write_text("{", encoding="utf-8")
+    (bucket / f"{'1' * 32}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "attempt_id": "1" * 32,
+                "outcome": "started",
+                "started_at": (now - timedelta(minutes=10)).isoformat(),
+                "ended_at": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bucket / f"{'2' * 32}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "attempt_id": "2" * 32,
+                "outcome": "finalized_with_warning",
+                "started_at": (now - timedelta(seconds=2)).isoformat(),
+                "ended_at": now.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    expired = receipt_root / f"{'3' * 32}.json"
+    expired.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "attempt_id": "3" * 32,
+                "outcome": "finalized",
+                "started_at": (now - timedelta(days=30)).isoformat(),
+                "ended_at": (now - timedelta(days=30)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    expired_time = (now - timedelta(days=30)).timestamp()
+    os.utime(expired, (expired_time, expired_time))
+
+    summary, warnings = runtime_health._auto_ingest_attempt_receipt_summary(
+        meta_dir,
+        stale_after_seconds=60,
+        retention_days=14,
+        scan_cap=10,
+    )
+
+    assert summary["count"] == 3
+    assert summary["invalid"] == 1
+    assert summary["stale_started"] == 1
+    assert summary["expired_ignored"] == 1
+    assert summary["outcomes"] == {
+        "finalized_with_warning": 1,
+        "started": 1,
+    }
+    assert summary["truncated"] is False
+    assert "auto_ingest_attempt_receipts_invalid:1" in warnings
+    assert "auto_ingest_attempt_receipts_stale:1" in warnings
+    assert "auto_ingest_finalized_with_warning:1" in warnings
+
+
+def test_auto_ingest_receipt_health_scan_is_strictly_capped(isolated_memory):
+    from vector_lake import runtime_health
+
+    meta_dir = isolated_memory / "wiki" / ".meta"
+    bucket = (
+        meta_dir
+        / "auto_ingest_attempt_receipts"
+        / datetime.now(timezone.utc).date().isoformat()
+    )
+    bucket.mkdir(parents=True)
+    now = datetime.now(timezone.utc).isoformat()
+    for index in range(5):
+        attempt_id = f"{index + 1:032x}"
+        (bucket / f"{attempt_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "outcome": "finalized",
+                    "started_at": now,
+                    "ended_at": now,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    summary, warnings = runtime_health._auto_ingest_attempt_receipt_summary(
+        meta_dir,
+        stale_after_seconds=60,
+        retention_days=14,
+        scan_cap=3,
+    )
+
+    assert summary["scanned_entries"] == 3
+    assert summary["count"] == 3
+    assert summary["truncated"] is True
+    assert "auto_ingest_attempt_receipts_truncated:3" in warnings
 
 
 def _source_content(entity_id: str, title: str):
@@ -935,6 +1125,208 @@ def test_subagent_backlog_is_visible_without_blocking_by_default(
     assert any("subagent_backlog" in warning for warning in health["warnings"])
 
 
+def test_auto_ingest_quarantine_is_recoverable_warning_not_write_gate_failure(
+    isolated_memory,
+):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    result = {
+        "maintenance": "auto_ingest_controller",
+        "state": "quarantined",
+        "failure_class": "output_policy",
+    }
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, result_json, "
+            "created_at, updated_at, available_at) "
+            "VALUES ('auto-quarantine', 'ingest', '{}', 'failed', 3, ?, ?, ?, ?)",
+            (json.dumps(result), now, now, now),
+        )
+
+    health = assess_runtime_health()
+
+    assert health["ok"] is True
+    assert health["detail"]["terminal_failed_jobs"] == 1
+    assert health["detail"]["blocking_terminal_failed_jobs"] == 0
+    assert health["detail"]["auto_ingest_quarantined_jobs"] == 1
+    assert health["detail"]["auto_ingest_quarantine_recovery"] == {
+        "preview": "reconcile_ingest_job_debt(dry_run=True)",
+        "apply": "reconcile_ingest_job_debt(dry_run=False)",
+    }
+    assert "auto_ingest_quarantined_jobs:1" in health["warnings"]
+    runtime_health.enforce_runtime_write_health()
+
+
+def test_non_quarantine_terminal_failure_still_blocks_runtime_health(
+    isolated_memory,
+):
+    db_store.init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, result_json, "
+            "created_at, updated_at, available_at) "
+            "VALUES ('ordinary-terminal', 'ingest', '{}', 'failed', 3, NULL, ?, ?, ?)",
+            (now, now, now),
+        )
+
+    health = assess_runtime_health()
+
+    assert health["ok"] is False
+    assert health["detail"]["blocking_terminal_failed_jobs"] == 1
+    assert "terminal_failed_jobs:1" in health["issues"]
+
+
+@pytest.mark.parametrize(
+    ("component_status", "action", "error"),
+    [
+        (
+            "idle",
+            "Automatic ingest paused by budget gate",
+            "hourly_budget_exhausted:4/4",
+        ),
+        (
+            "idle",
+            "Automatic ingest paused by budget gate",
+            "circuit_open_until:2026-08-20T12:00:00+00:00",
+        ),
+        (
+            "idle",
+            "Automatic ingest runner unavailable",
+            "codex_executable_not_found",
+        ),
+        (
+            "idle",
+            "Automatic ingest waiting",
+            "codex_executable_not_found",
+        ),
+    ],
+)
+def test_auto_ingest_budget_circuit_and_runner_pauses_do_not_block_other_writes(
+    isolated_memory,
+    component_status,
+    action,
+    error,
+):
+    _write_auto_ingest_health_config(isolated_memory)
+    db_store.init_db()
+    _write_complete_watchdog_status(
+        isolated_memory,
+        auto_status=component_status,
+        auto_action=action,
+        auto_error=error,
+    )
+
+    health = assess_runtime_health()
+
+    assert health["ok"] is True
+    assert health["detail"]["watchdog_component_effective_statuses"][
+        "auto_ingest"
+    ] == "paused"
+    assert health["detail"]["watchdog_paused_components"] == {
+        "auto_ingest": action
+    }
+    assert any(
+        warning.startswith("watchdog_component_paused:auto_ingest:")
+        for warning in health["warnings"]
+    )
+    assert not any("watchdog_unhealthy" in issue for issue in health["issues"])
+
+
+def test_auto_ingest_worker_exception_remains_blocking(isolated_memory):
+    _write_auto_ingest_health_config(isolated_memory)
+    db_store.init_db()
+    _write_complete_watchdog_status(
+        isolated_memory,
+        auto_status="error",
+        auto_action="Automatic ingest worker exception",
+        auto_error="unexpected controller failure",
+    )
+
+    health = assess_runtime_health()
+
+    assert health["ok"] is False
+    assert health["detail"]["watchdog_component_effective_statuses"][
+        "auto_ingest"
+    ] == "error"
+    assert "watchdog_unhealthy:auto_ingest" in health["issues"]
+
+
+def test_normal_auto_ingest_waiting_is_idle_not_a_pause_warning(isolated_memory):
+    _write_auto_ingest_health_config(isolated_memory)
+    db_store.init_db()
+    _write_complete_watchdog_status(
+        isolated_memory,
+        auto_status="idle",
+        auto_action="Automatic ingest waiting",
+        auto_error="",
+    )
+
+    health = assess_runtime_health()
+
+    assert health["ok"] is True
+    assert health["detail"]["watchdog_component_effective_statuses"][
+        "auto_ingest"
+    ] == "idle"
+    assert health["detail"]["watchdog_paused_components"] == {}
+    assert not any(
+        warning.startswith("watchdog_component_paused:auto_ingest:")
+        for warning in health["warnings"]
+    )
+
+
+def test_auto_ingest_backpressure_and_processing_age_warn_without_self_blocking(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_auto_ingest_health_config(isolated_memory, timeout_seconds=60)
+    db_store.init_db()
+    _write_complete_watchdog_status(
+        isolated_memory,
+        auto_status="processing",
+        auto_action="Automatic ingest processing",
+    )
+    old = "2000-01-01T00:00:00+00:00"
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, created_at, updated_at, "
+            "available_at) VALUES ('active-auto', 'ingest', '{}', "
+            "'subagent_processing', 0, ?, ?, ?)",
+            (old, old, old),
+        )
+        db_store.get_connection().execute(
+            "INSERT INTO jobs "
+            "(job_id, task_type, payload, status, retries, created_at, updated_at, "
+            "available_at) VALUES ('queued-behind-auto', 'ingest', '{}', "
+            "'queued', 0, ?, ?, ?)",
+            (old, old, old),
+        )
+    monkeypatch.setenv("VECTOR_LAKE_MAX_READY_INGEST_AGE_SECONDS", "60")
+
+    health = assess_runtime_health()
+
+    assert health["ok"] is True
+    assert health["detail"]["auto_ingest_active_jobs"] == 1
+    assert any(
+        warning.startswith("auto_ingest_backpressure:ingest_dispatch_stalled:")
+        for warning in health["warnings"]
+    )
+    assert any(
+        warning.startswith("auto_ingest_processing_stalled:")
+        for warning in health["warnings"]
+    )
+    assert not any(
+        issue.startswith("ingest_dispatch_stalled:")
+        or issue.startswith("auto_ingest_processing_stalled:")
+        for issue in health["issues"]
+    )
+
+
 def test_ready_ingest_queue_age_detects_stalled_dispatch_worker(
     isolated_memory,
     monkeypatch,
@@ -1093,6 +1485,90 @@ def test_deep_health_reuses_unchanged_wiki_parse_and_invalidates_on_write(
     health = assess_runtime_health(deep_projection_checks=True)
     assert len(calls) == first_count + 1
     assert health["detail"]["projection_content_drift"]["wiki_canonical"] == 1
+
+
+def test_wiki_version_cache_avoids_resolve_and_invalidates_file_identity(
+    tmp_path, monkeypatch
+):
+    from vector_lake import runtime_health
+
+    runtime_health._clear_health_caches_for_tests()
+    page = tmp_path / "Concept_Cache.md"
+    page.write_text("alpha", encoding="utf-8")
+    calls = []
+
+    class Store:
+        @staticmethod
+        def canonical_page_version_from_content(filename, content):
+            calls.append((filename, content))
+            return content
+
+    real_resolve = Path.resolve
+
+    def reject_page_resolve(path, *args, **kwargs):
+        if path == page or path.parent == tmp_path:
+            raise AssertionError("per-page resolve is forbidden on the health hot path")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", reject_page_resolve)
+
+    assert runtime_health._wiki_projection_version(Store, page) == ("alpha", None)
+    assert runtime_health._wiki_projection_version(Store, page) == ("alpha", None)
+    assert len(calls) == 1
+
+    before = page.stat()
+    page.write_text("bravo", encoding="utf-8")
+    os.utime(
+        page,
+        ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+    )
+    assert runtime_health._wiki_projection_version(Store, page) == ("bravo", None)
+    assert len(calls) == 2
+
+    renamed = tmp_path / "Concept_Renamed.md"
+    page.rename(renamed)
+    assert runtime_health._wiki_projection_version(Store, renamed) == ("bravo", None)
+    assert len(calls) == 3
+    runtime_health._prune_wiki_version_cache(
+        {runtime_health._wiki_cache_key(renamed)}
+    )
+    assert runtime_health._wiki_cache_key(page) not in runtime_health._WIKI_VERSION_CACHE
+
+    renamed.unlink()
+    missing_version, missing_error = runtime_health._wiki_projection_version(
+        Store, renamed
+    )
+    assert missing_version is None
+    assert missing_error
+    assert (
+        runtime_health._wiki_cache_key(renamed)
+        not in runtime_health._WIKI_VERSION_CACHE
+    )
+
+
+def test_wiki_version_cache_fails_closed_when_page_changes_during_parse(tmp_path):
+    from vector_lake import runtime_health
+
+    runtime_health._clear_health_caches_for_tests()
+    page = tmp_path / "Concept_Racing.md"
+    page.write_text("alpha", encoding="utf-8")
+    before = page.stat()
+
+    class MutatingStore:
+        @staticmethod
+        def canonical_page_version_from_content(_filename, content):
+            page.write_text("bravo", encoding="utf-8")
+            os.utime(
+                page,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
+            return content
+
+    assert runtime_health._wiki_projection_version(MutatingStore, page) == (
+        None,
+        "wiki_page_changed_during_read",
+    )
+    assert runtime_health._wiki_cache_key(page) not in runtime_health._WIKI_VERSION_CACHE
 
 
 def test_pending_outbox_does_not_hide_conflicting_manual_wiki_edit(isolated_memory):

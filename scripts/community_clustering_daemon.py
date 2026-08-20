@@ -1,30 +1,37 @@
+"""Deprecated community-clustering operator script, disabled by default."""
+
 import json
 import logging
-import math
 import os
-import re
 import uuid
 import glob
 from datetime import datetime, timezone
-import time
-from filelock import FileLock
-
-try:
-    import networkx as nx
-    from community import community_louvain
-except ImportError:
-    nx = None
-    community_louvain = None
-
-# Ensure vector_lake is in path
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from vector_lake.wiki_utils import get_index_path, get_wiki_dir, get_meta_dir
-from vector_lake.governance_store import load_governance_queue, save_governance_queue
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-clustering-daemon")
+
+_LEGACY_DAEMON_ENV = "VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS"
+_DISABLED_EXIT_CODE = 78
+
+
+def _legacy_daemon_enabled() -> bool:
+    return os.environ.get(_LEGACY_DAEMON_ENV) == "1"
+
+
+def _require_legacy_daemon() -> None:
+    if not _legacy_daemon_enabled():
+        raise PermissionError(
+            "Deprecated/unsupported community clustering daemon is disabled; set "
+            f"{_LEGACY_DAEMON_ENV}=1 only in a trusted operator process"
+        )
+
+
+def _enable_repo_imports() -> None:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -70,7 +77,24 @@ def _stabilize_community_ids(new_partition, old_partition, old_uuids):
     final_partition = {n: stable_uuids[c] for n, c in new_partition.items()}
     return final_partition, diffs, stable_uuids
 
-def run_clustering():
+def _unsafe_run_clustering():
+    _require_legacy_daemon()
+    _enable_repo_imports()
+    from filelock import FileLock
+
+    try:
+        import networkx as nx
+        from community import community_louvain
+    except ImportError:
+        nx = None
+        community_louvain = None
+
+    from vector_lake.governance_store import (
+        load_governance_queue,
+        save_governance_queue,
+    )
+    from vector_lake.wiki_utils import get_index_path, get_meta_dir, get_wiki_dir
+
     index_file = get_index_path()
     if not index_file.exists():
         log.warning("Index file not found, skipping clustering.")
@@ -112,7 +136,7 @@ def run_clustering():
                     node = index_data["nodes"][node_key]
                     node["centrality_score"] = round(pr_score, 4)
                     node["node_score"] = round(node.get("decay_weight", 1.0) * pr_score, 4)
-            except Exception as e:
+            except Exception:
                 pass
 
         try:
@@ -156,7 +180,8 @@ def run_clustering():
                     community_nodes.setdefault(c_uuid, []).append(node)
 
                 for c_uuid, nodes in community_nodes.items():
-                    if len(nodes) < 3: continue
+                    if len(nodes) < 3:
+                        continue
                     sorted_nodes = sorted(nodes, key=lambda node: G.degree(node), reverse=True)
                     titles = [index_data["nodes"].get(n, {}).get("title", n) for n in sorted_nodes[:2]]
                     label = f"{level_name} Comm: {' / '.join(titles) if titles else 'Unknown'}"
@@ -266,5 +291,31 @@ aliases:
                 
         log.info("V9 Heavy graph topology clustering complete.")
 
+
+def _run_legacy_clustering() -> None:
+    _unsafe_run_clustering()
+
+
+def main() -> int:
+    if not _legacy_daemon_enabled():
+        print(
+            "DEPRECATED/UNSUPPORTED community clustering daemon is disabled by "
+            f"default; set {_LEGACY_DAEMON_ENV}=1 only for isolated operator recovery.",
+            file=sys.stderr,
+        )
+        return _DISABLED_EXIT_CODE
+    print(
+        "DEPRECATED/UNSUPPORTED community clustering daemon override enabled; "
+        "never run it alongside watchdog_sync.py or vector_lake.watchdog_app.",
+        file=sys.stderr,
+    )
+    _run_legacy_clustering()
+    return 0
+
+
+def run_clustering() -> int:
+    """Compatibility entrypoint retaining the same fail-closed operator gate."""
+    return main()
+
 if __name__ == "__main__":
-    run_clustering()
+    raise SystemExit(main())

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -306,7 +307,7 @@ def visualize_vector_lake(output_dir: str = None):
     )
 
 
-def audit_graph() -> str:
+def audit_graph(*, dry_run: bool = True, confirmation: str = "") -> str:
     # Removed synchronous refresh_graph_topology_if_dirty()
 
 
@@ -325,15 +326,25 @@ def audit_graph() -> str:
     if not insights:
         return "No graph insights found. Please ensure 'sync' has been run recently."
 
-    import uuid
     from datetime import datetime, timezone
 
     items = []
     for insight in insights:
         search_queries = [insight.get("node", "")] if insight.get("node") else []
         affected_pages = [f"wiki/{insight.get('node', '')}.md"] if insight.get("node") else []
+        identity = json.dumps(
+            {
+                "type": insight.get("type", ""),
+                "node": insight.get("node", ""),
+                "description": insight.get("description", ""),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        item_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         items.append({
-            "item_id": f"gov_{uuid.uuid4().hex[:12]}",
+            "item_id": f"gov_topology_{item_digest[:12]}",
             "type": "suggestion",
             "title": f"Topology Insight: {insight['type'].replace('_', ' ').title()}",
             "description": insight.get("description", "A topological insight was detected."),
@@ -341,10 +352,33 @@ def audit_graph() -> str:
             "affected_pages": affected_pages,
             "source": "audit-graph",
             "status": "pending",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": "<apply-time>",
         })
 
     if items:
+        plan_fingerprint = hashlib.sha256(
+            json.dumps(
+                items,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if dry_run:
+            return (
+                f"Audit preview: {len(items)} topology insight(s); "
+                f"confirmation={plan_fingerprint}"
+            )
+        if not confirmation or confirmation.casefold() != plan_fingerprint:
+            raise ValueError(
+                "Audit apply requires the exact confirmation fingerprint from a current preview"
+            )
+        from vector_lake.runtime_health import enforce_runtime_write_health
+
+        enforce_runtime_write_health(validation_mode="full")
+        applied_at = datetime.now(timezone.utc).isoformat()
+        for item in items:
+            item["created_at"] = applied_at
         from vector_lake import governance_store
         created = sum(
             1

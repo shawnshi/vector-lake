@@ -93,10 +93,19 @@ Conflict rules:
 | `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
 | `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
 | `vector_lake/yaml_utils.py` | YAML helpers |
-| `scripts/community_clustering_daemon.py` | Optional operator-invoked Louvain analysis; not scheduled by watchdog |
+| `scripts/community_clustering_daemon.py` | Deprecated/unsupported legacy Louvain operator script; disabled by default and never scheduled by watchdog |
 | `schema.md` | Wiki and runtime memory contract |
 | `commands/` | Macro-level workflows (e.g. research/review) for Agents |
 | `contracts/cbss/` | Evidence, authority-acceptance, business-event, decision-registry, and readiness contracts |
+
+`scripts/semantic_dedup_daemon.py` and `scripts/community_clustering_daemon.py`
+are deprecated, unsupported, and fail closed before DB, index, or governance
+access. A trusted operator may opt in only with
+`VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS=1` during isolated recovery; neither
+script may run concurrently with `watchdog_sync.py` or
+`vector_lake.watchdog_app.py`. Supported paths are watchdog/indexer topology
+maintenance plus the preview-first `projection-rebuild-index`,
+`embedding-backfill`, and `topology-queue-cleanup` CLI commands.
 
 ## 4. CLI Contract & MCP Interface
 

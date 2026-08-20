@@ -198,6 +198,26 @@ def _graph_source_index(nodes_dict: dict[str, dict]) -> dict[str, list[str]]:
     }
 
 
+def _incremental_relevance_candidate_keys(
+    node_key: str,
+    node_links: set,
+    node_sources: set,
+    all_nodes: dict[str, dict],
+    nodes_by_link: dict[object, set[str]],
+    nodes_by_source: dict[object, set[str]],
+    node_order: dict[str, int],
+) -> list[str]:
+    """Return the exact relevance frontier without scanning every graph node."""
+    candidate_keys = {link for link in node_links if link in all_nodes}
+    candidate_keys.update(nodes_by_link.get(node_key, ()))
+    for source in node_sources:
+        candidate_keys.update(nodes_by_source.get(source, ()))
+    for link in node_links:
+        candidate_keys.update(nodes_by_link.get(link, ()))
+    candidate_keys.discard(node_key)
+    return sorted(candidate_keys, key=node_order.__getitem__)
+
+
 def _index_node_signature(node: dict) -> str:
     stable = {field: node.get(field) for field in INDEX_PARITY_FIELDS}
     return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -2421,6 +2441,26 @@ def update_index_items(filenames: list[str]):
                         if triple.get("target")
                     }
                 allowed_graph_sources = set(_graph_source_index(all_nodes))
+                node_order = {key: position for position, key in enumerate(all_nodes)}
+                links_by_node = {
+                    key: set(node.get("links") or [])
+                    for key, node in all_nodes.items()
+                }
+                sources_by_node = {
+                    key: {
+                        source
+                        for source in (node.get("sources") or [])
+                        if str(source) in allowed_graph_sources
+                    }
+                    for key, node in all_nodes.items()
+                }
+                nodes_by_link: dict[object, set[str]] = {}
+                nodes_by_source: dict[object, set[str]] = {}
+                for indexed_key in all_nodes:
+                    for link in links_by_node[indexed_key]:
+                        nodes_by_link.setdefault(link, set()).add(indexed_key)
+                    for source in sources_by_node[indexed_key]:
+                        nodes_by_source.setdefault(source, set()).add(indexed_key)
 
                 for node_key in sorted(active_node_keys):
                     try:
@@ -2453,29 +2493,22 @@ def update_index_items(filenames: list[str]):
 
                     node_data = all_nodes[node_key]
                     node_data["_key"] = node_key
-                    node_links = set(node_data.get("links") or [])
-                    node_sources = {
-                        source
-                        for source in (node_data.get("sources") or [])
-                        if str(source) in allowed_graph_sources
-                    }
+                    node_links = links_by_node[node_key]
+                    node_sources = sources_by_node[node_key]
                     triples_a = all_nodes_triples.get(node_key) or {}
-                    for other_key, other_node in all_nodes.items():
-                        if other_key == node_key:
-                            continue
-                        other_links = set(other_node.get("links") or [])
-                        other_sources = {
-                            source
-                            for source in (other_node.get("sources") or [])
-                            if str(source) in allowed_graph_sources
-                        }
-                        if not (
-                            other_key in node_links
-                            or node_key in other_links
-                            or not node_sources.isdisjoint(other_sources)
-                            or not node_links.isdisjoint(other_links)
-                        ):
-                            continue
+                    candidate_keys = _incremental_relevance_candidate_keys(
+                        node_key,
+                        node_links,
+                        node_sources,
+                        all_nodes,
+                        nodes_by_link,
+                        nodes_by_source,
+                        node_order,
+                    )
+                    for other_key in candidate_keys:
+                        other_node = all_nodes[other_key]
+                        other_links = links_by_node[other_key]
+                        other_sources = sources_by_node[other_key]
                         other_node["_key"] = other_key
                         relevance = calculate_relevance(
                             node_data,

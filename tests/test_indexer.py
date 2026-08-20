@@ -16,6 +16,7 @@ from vector_lake.indexer import (
     _calculate_weighted_edges,
     index_projection_matches_canonical,
     _entity_to_index_node,
+    _incremental_relevance_candidate_keys,
     _strip_legacy_embedded_payloads,
     _tokenize,
     get_pred_weight,
@@ -27,6 +28,41 @@ from vector_lake.indexer import (
 )
 
 class TestIndexer(unittest.TestCase):
+    def test_incremental_relevance_frontier_excludes_unrelated_nodes(self):
+        node_keys = ["Concept_Touched"] + [
+            f"Concept_Unrelated-{index:05d}" for index in range(10000)
+        ] + [
+            "Concept_Direct",
+            "Concept_Inbound",
+            "Concept_Shared",
+            "Concept_Source-Peer",
+        ]
+        all_nodes = {key: {} for key in node_keys}
+        node_order = {key: position for position, key in enumerate(node_keys)}
+
+        candidates = _incremental_relevance_candidate_keys(
+            "Concept_Touched",
+            {"Concept_Direct", "shared-link"},
+            {"source-a"},
+            all_nodes,
+            {
+                "Concept_Touched": {"Concept_Inbound"},
+                "shared-link": {"Concept_Touched", "Concept_Shared"},
+            },
+            {"source-a": {"Concept_Touched", "Concept_Source-Peer"}},
+            node_order,
+        )
+
+        self.assertEqual(
+            candidates,
+            [
+                "Concept_Direct",
+                "Concept_Inbound",
+                "Concept_Shared",
+                "Concept_Source-Peer",
+            ],
+        )
+
     def test_candidate_edge_frontier_is_bounded_and_deterministic(self):
         candidates = [(1.5 + index / 1000, f"Concept_Target-{index:03d}") for index in range(200)]
 

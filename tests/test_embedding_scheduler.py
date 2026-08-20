@@ -57,6 +57,14 @@ Primary source content.
 """
 
 
+def test_embedding_retry_budget_accepts_explicit_zero(monkeypatch):
+    monkeypatch.setenv("VECTOR_LAKE_EMBEDDING_MAX_RETRIES", "0")
+
+    config = embedding_scheduler.load_embedding_rate_config()
+
+    assert config.max_retries == 0
+
+
 def test_embedding_backfill_dry_run_counts_missing_vectors(isolated_memory, monkeypatch):
     monkeypatch.setenv("VECTOR_LAKE_EMBEDDING_RPM", "3000")
     monkeypatch.setenv("VECTOR_LAKE_EMBEDDING_TPM", "1000000")

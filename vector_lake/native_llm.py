@@ -1,10 +1,10 @@
 """Current-environment subagent handoff for text-generation work.
 
 Vector Lake may still use model APIs for embeddings in the indexer/search
-pipeline. Non-embedding text generation is intentionally not performed from
-library code because that silently creates external model cost. When a runtime
-path needs reasoning, it writes a bounded task packet that the host agent or a
-current-environment subagent can execute explicitly.
+pipeline. Non-embedding text generation is not performed in-process. When a
+runtime path needs reasoning, it writes a bounded task packet. A host may
+execute that packet explicitly, or an operator may opt in to the separately
+budgeted, tool-isolated automatic controller.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ SUBAGENT_TASK_PACKET_FIELDS = frozenset(
 )
 SUBAGENT_TASK_RUNTIME = "current-environment-subagent"
 SUBAGENT_TASK_COST_BOUNDARY = (
-    "no non-embedding model API calls from Vector Lake runtime"
+    "non-embedding generation requires explicit host enablement and bounded launch policy"
 )
 _DEFAULT_RUN_ID = f"runtime-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -54,14 +54,16 @@ def _stable_runtime_root(env_name: str, default_name: str) -> Path:
         from vector_lake.db_store import peek_db_path
 
         candidate = peek_db_path().resolve().parent / default_name
-    root = candidate.resolve()
+    root = Path(os.path.abspath(os.fspath(candidate)))
 
     from vector_lake import get_extension_root
 
     extension_root = get_extension_root().resolve()
-    if root == extension_root or root.is_relative_to(extension_root):
+    resolved_root = root.resolve()
+    if resolved_root == extension_root or resolved_root.is_relative_to(extension_root):
         raise ValueError(
-            f"{env_name or default_name} must be outside the versioned extension root: {root}"
+            f"{env_name or default_name} must be outside the versioned extension root: "
+            f"{resolved_root}"
         )
     return root
 
@@ -107,9 +109,14 @@ def native_llm_ready() -> tuple[bool, str]:
     )
 
 
+def peek_subagent_scratch_dir() -> Path:
+    """Return the non-canonicalized scratch path so callers can inspect reparse ancestry."""
+    return peek_subagent_brain_root() / _safe_run_id() / "scratch"
+
+
 def get_subagent_scratch_dir() -> Path:
     """Return isolated ephemeral scratch outside the versioned extension tree."""
-    root = get_subagent_brain_root() / _safe_run_id() / "scratch"
+    root = peek_subagent_scratch_dir()
     root.mkdir(parents=True, exist_ok=True)
     return root
 

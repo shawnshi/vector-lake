@@ -1,6 +1,8 @@
 import logging
 import json
 import threading
+from datetime import datetime, timezone
+from pathlib import Path
 
 from vector_lake.db_store import (
     claim_pending_jobs,
@@ -12,7 +14,9 @@ from vector_lake.db_store import (
     update_job_status,
 )
 from vector_lake.native_llm import create_subagent_task
+from vector_lake.raw_revision import current_file_proves_revisions
 from vector_lake.watchdog_status import write_status
+from vector_lake.wiki_utils import get_raw_dir
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -20,7 +24,25 @@ logging.basicConfig(
 log = logging.getLogger("ingest-worker")
 
 
+def _auto_ingest_dispatch_capacity_available() -> bool:
+    """Reserve at most one ingest handoff while the automatic consumer is enabled."""
+    from vector_lake.auto_ingest_worker import load_auto_ingest_config
+
+    if not load_auto_ingest_config().enabled:
+        return True
+    now = datetime.now(timezone.utc).isoformat()
+    active = get_connection().execute(
+        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest' AND ("
+        "status IN ('awaiting_subagent', 'subagent_processing') OR "
+        "(status = 'dispatched' AND COALESCE(lease_until, '') > ?))",
+        (now,),
+    ).fetchone()[0]
+    return int(active or 0) < 1
+
+
 def _ingest_finalization_proven(filepath: str, file_hash: str) -> bool:
+    from vector_lake.tool_ingest import get_ingest_target_directories
+
     row = (
         get_connection()
         .execute(
@@ -29,7 +51,18 @@ def _ingest_finalization_proven(filepath: str, file_hash: str) -> bool:
         )
         .fetchone()
     )
-    return bool(row and row["file_hash"] == file_hash)
+    proof_path = Path(filepath)
+    if not proof_path.is_absolute():
+        proof_path = get_raw_dir().parent / proof_path
+    return bool(
+        row
+        and current_file_proves_revisions(
+            proof_path,
+            file_hash,
+            row["file_hash"],
+            allowed_roots=get_ingest_target_directories(),
+        )
+    )
 
 
 def _subagent_ingest_prompt(instructions: str) -> str:
@@ -67,6 +100,9 @@ def process_jobs():
 
     process_ingest_task_cleanup(limit=20)
     requeue_legacy_ingest_jobs()
+    if not _auto_ingest_dispatch_capacity_available():
+        log.debug("Automatic ingest handoff is at its single-job capacity")
+        return
     jobs = claim_pending_jobs(
         limit=1,
         lease_seconds=3600,

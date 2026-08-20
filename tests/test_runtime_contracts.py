@@ -1,6 +1,8 @@
 import asyncio
 import gc
+import importlib
 import inspect
+import json
 import logging
 import os
 import sqlite3
@@ -30,6 +32,10 @@ from vector_lake.wiki_utils import (
     get_outbox_signal_path,
     get_raw_dir,
     get_wiki_dir,
+)
+from tests.test_mutation_coordinator import (
+    _source_content,
+    _write_purpose_contract,
 )
 
 
@@ -118,6 +124,211 @@ def test_signal_and_watch_paths_follow_active_memory_root(isolated_memory):
     mutation_coordinator._signal_outbox_consumer()
 
     assert get_outbox_signal_path().read_text(encoding="utf-8") == "1"
+
+
+def test_write_wiki_page_returns_committed_mutation_receipt(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    monkeypatch.setattr(mcp_server, "_read_payload", lambda _path: _source_content())
+
+    raw_receipt = mcp_server.write_wiki_page(
+        "Source_Public-Receipt.md",
+        "C:/approved/scratch/payload.md",
+    )
+    receipt = json.loads(raw_receipt)
+
+    assert set(receipt) == {
+        "schema_version",
+        "ok",
+        "committed",
+        "outbox_ids",
+        "deferred",
+        "post_commit_warnings",
+        "error_code",
+        "message",
+    }
+    assert receipt["schema_version"] == 1
+    assert receipt["ok"] is True
+    assert receipt["committed"] is True
+    assert len(receipt["outbox_ids"]) == 1
+    assert receipt["deferred"] == []
+    assert receipt["post_commit_warnings"] == []
+    assert receipt["error_code"] is None
+    row = mutation_coordinator.db_store.get_connection().execute(
+        "SELECT id, status FROM mutation_outbox WHERE filename = ?",
+        ("Source_Public-Receipt.md",),
+    ).fetchone()
+    assert dict(row) == {
+        "id": receipt["outbox_ids"][0],
+        "status": "pending",
+    }
+
+
+def test_write_wiki_page_receipt_preserves_outcome_without_leaking_paths(
+    monkeypatch,
+):
+    monkeypatch.setattr(mcp_server, "_read_payload", lambda _path: "payload")
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "execute_mutation_batch",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "committed": True,
+            "outbox_ids": [17],
+            "deferred": ["Source_Deferred.md"],
+            "post_commit_warnings": [
+                "projection failed at C:/private/operator/wiki/Source_Deferred.md"
+            ],
+        },
+    )
+
+    raw_receipt = mcp_server.write_wiki_page(
+        "Source_Deferred.md",
+        "C:/approved/scratch/payload.md",
+    )
+    receipt = json.loads(raw_receipt)
+
+    assert receipt == {
+        "schema_version": 1,
+        "ok": True,
+        "committed": True,
+        "outbox_ids": [17],
+        "deferred": ["Source_Deferred.md"],
+        "post_commit_warnings": ["post_commit_follow_up_warning"],
+        "error_code": None,
+        "message": (
+            "Canonical wiki mutation committed; outbox=1; deferred=1; warnings=1."
+        ),
+    }
+    assert "C:/private" not in raw_receipt
+
+
+@pytest.mark.parametrize(
+    ("phase", "error_code"),
+    [
+        ("payload", "payload_rejected"),
+        ("mutation", "write_failed"),
+    ],
+)
+def test_write_wiki_page_failure_receipt_is_stable_and_sanitized(
+    monkeypatch,
+    phase,
+    error_code,
+):
+    leaked = "C:/private/operator/secret.md traceback sentinel"
+    if phase == "payload":
+        monkeypatch.setattr(
+            mcp_server,
+            "_read_payload",
+            lambda _path: (_ for _ in ()).throw(ValueError(leaked)),
+        )
+    else:
+        monkeypatch.setattr(mcp_server, "_read_payload", lambda _path: "payload")
+        monkeypatch.setattr(
+            mutation_coordinator,
+            "execute_mutation_batch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(leaked)),
+        )
+
+    raw_receipt = mcp_server.write_wiki_page(
+        "Source_Failed.md",
+        "C:/approved/scratch/payload.md",
+    )
+    receipt = json.loads(raw_receipt)
+
+    assert receipt["ok"] is False
+    assert receipt["committed"] is False
+    assert receipt["outbox_ids"] == []
+    assert receipt["deferred"] == []
+    assert receipt["post_commit_warnings"] == []
+    assert receipt["error_code"] == error_code
+    assert "C:/private" not in raw_receipt
+    assert "traceback sentinel" not in raw_receipt
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "System_Community-L1-deadbeef.md",
+        "system_Community-L1-deadbeef.md",
+        "SYSTEM_Community-L1-deadbeef.md",
+        "Ｓｙｓｔｅｍ＿Community-L1-deadbeef.md",
+        "Syſtem_Community-L1-deadbeef.md",
+    ],
+)
+def test_public_write_wiki_page_rejects_system_identity_before_any_write(
+    monkeypatch,
+    filename,
+):
+    monkeypatch.delenv("VECTOR_LAKE_ALLOW_SYSTEM_PAGE_WRITE", raising=False)
+    observed = []
+
+    def forbidden(*_args, **_kwargs):
+        observed.append("called")
+        raise AssertionError("System write gate was bypassed")
+
+    monkeypatch.setattr(mcp_server, "_read_payload", forbidden)
+    monkeypatch.setattr(mutation_coordinator, "execute_mutation_batch", forbidden)
+
+    receipt = json.loads(
+        mcp_server.write_wiki_page(filename, "C:/approved/scratch/payload.md")
+    )
+
+    assert receipt == {
+        "schema_version": 1,
+        "ok": False,
+        "committed": False,
+        "outbox_ids": [],
+        "deferred": [],
+        "post_commit_warnings": [],
+        "error_code": "system_page_write_forbidden",
+        "message": "System wiki page writes are disabled by default.",
+    }
+    assert observed == []
+
+
+def test_operator_capability_allows_system_page_to_enter_existing_write_path(
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_ALLOW_SYSTEM_PAGE_WRITE", "1")
+    monkeypatch.setattr(mcp_server, "_read_payload", lambda _path: "payload")
+    captured = []
+
+    def commit(mutations, **kwargs):
+        captured.append((mutations, kwargs))
+        return {
+            "ok": True,
+            "committed": True,
+            "outbox_ids": [23],
+            "deferred": [],
+            "post_commit_warnings": [],
+        }
+
+    monkeypatch.setattr(mutation_coordinator, "execute_mutation_batch", commit)
+
+    receipt = json.loads(
+        mcp_server.write_wiki_page(
+            "System_Community-L1-deadbeef.md",
+            "C:/approved/scratch/payload.md",
+        )
+    )
+
+    assert receipt["ok"] is True
+    assert receipt["committed"] is True
+    assert captured == [
+        (
+            [
+                {
+                    "filename": "System_Community-L1-deadbeef.md",
+                    "content": "payload",
+                    "is_delete": False,
+                }
+            ],
+            {"origin": "mcp_write_wiki_page", "return_details": True},
+        )
+    ]
 
 
 def test_meta_dir_cache_is_keyed_by_active_memory_root(tmp_path, monkeypatch):
@@ -325,6 +536,64 @@ def test_mcp_runtime_guard_detects_source_revision_drift(tmp_path):
         guard.assert_current()
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "initial", "changed"),
+    [
+        ("config.json", "{}\n", '{"changed": true}\n'),
+        ("templates/query_prompt.md", "before\n", "after\n"),
+        (".codex-plugin/plugin.json", "{}\n", '{"version": "next"}\n'),
+    ],
+)
+def test_mcp_runtime_guard_detects_restart_sensitive_asset_drift(
+    tmp_path,
+    relative_path,
+    initial,
+    changed,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+    asset_path = tmp_path / relative_path
+    asset_path.parent.mkdir(parents=True, exist_ok=True)
+    asset_path.write_text(initial, encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(package_root, check_interval_seconds=60)
+
+    asset_path.write_text(changed, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="restart"):
+        guard.assert_current()
+
+
+def test_mcp_call_tool_uses_cached_admission_and_one_forced_execution_check(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(package_root, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP("revision-count-test", runtime_guard=guard)
+    original_status = guard.status
+    force_values = []
+
+    def observed_status(*, force=False):
+        force_values.append(force)
+        return original_status(force=force)
+
+    monkeypatch.setattr(guard, "status", observed_status)
+
+    @server.tool()
+    def revision_probe() -> str:
+        return "ok"
+
+    try:
+        anyio.run(server.call_tool, "revision_probe", {})
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert force_values == [False, True]
+
+
 def test_mcp_server_uses_reload_aware_dispatch():
     assert isinstance(mcp_server.mcp, mcp_server.ReloadAwareFastMCP)
     status = mcp_server.mcp_runtime_status()
@@ -379,6 +648,38 @@ def test_mcp_runtime_status_remains_callable_after_source_revision_drift(tmp_pat
     status = mcp_server.json.loads(unstructured[0].text)
     assert status["stale"] is True
     assert status["restart_required"] is True
+
+
+def test_mcp_runtime_status_bypasses_saturated_heavy_tool_lane(tmp_path, monkeypatch):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "0")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS", "0.05")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP("status-lane-test", runtime_guard=guard)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    blocker = server._submit_blocking_call(
+        lambda: blocker_started.set() or release_blocker.wait(timeout=2)
+    )
+    assert blocker_started.wait(timeout=2)
+
+    @server.tool()
+    def mcp_runtime_status() -> str:
+        return mcp_server.json.dumps(guard.status(force=True))
+
+    started_at = time.monotonic()
+    try:
+        result = anyio.run(server.call_tool, "mcp_runtime_status", {})
+        elapsed = time.monotonic() - started_at
+    finally:
+        release_blocker.set()
+        blocker.result(timeout=2)
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    unstructured = result[0] if isinstance(result, tuple) else result
+    status = mcp_server.json.loads(unstructured[0].text)
+    assert status["stale"] is False
+    assert elapsed < 0.5
 
 
 def test_mcp_sync_tools_run_off_the_event_loop(tmp_path):
@@ -475,15 +776,18 @@ def test_mcp_heavy_tool_busy_releases_executor_capacity(
 def test_all_known_mcp_rescan_entrypoints_are_heavy_task_gated():
     expected = {
         "doctor_vector_lake": ("scan", 900.0),
+        "finalize_query_synthesis": ("projection", 900.0),
         "get_governance_debt": ("scan", 900.0),
         "lint_vector_lake": ("scan", 1800.0),
         "merge_suggestions_vector_lake": ("scan", 1800.0),
         "orphan_source_classify": ("scan", 900.0),
         "prepare_ingest_batch": ("ingest_scan", 1800.0),
         "projection_report": ("scan", 900.0),
+        "propose_schema_mutation": ("maintenance", 900.0),
         "reconcile_ingest_tasks": ("maintenance", 1800.0),
         "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
         "sync_vector_lake": ("ingest_scan", 1800.0),
+        "sync_critical_decision_registry": ("maintenance", 900.0),
         "trigger_audit_graph": ("scan", 1800.0),
         "trigger_autonomous_research": ("ingest_scan", 1800.0),
         "visualize_vector_lake": ("scan", 900.0),
@@ -494,6 +798,65 @@ def test_all_known_mcp_rescan_entrypoints_are_heavy_task_gated():
         registered = mcp_server.mcp._tool_manager.get_tool(name)
         assert registered is not None
         assert registered.is_async is True
+
+
+def test_manual_ingest_admin_endpoints_are_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", raising=False)
+    with pytest.raises(PermissionError, match="disabled by default"):
+        mcp_server.claim_ingest_tasks(limit=999, lease_seconds=999999)
+    with pytest.raises(PermissionError, match="disabled by default"):
+        mcp_server.expire_ingest_tasks(max_age_seconds=1)
+
+
+def test_manual_ingest_admin_endpoints_apply_hard_bounds(monkeypatch):
+    monkeypatch.setenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", "1")
+    observed = {}
+
+    def claim(*, limit, lease_seconds):
+        observed["claim"] = (limit, lease_seconds)
+        return "[]"
+
+    def expire(*, max_age_seconds):
+        observed["expire"] = max_age_seconds
+        return "ok"
+
+    monkeypatch.setattr(mcp_server.tools, "claim_ingest_tasks", claim)
+    monkeypatch.setattr(mcp_server.tools, "expire_ingest_tasks", expire)
+    assert mcp_server.claim_ingest_tasks(limit=999, lease_seconds=999999) == "[]"
+    assert mcp_server.expire_ingest_tasks(max_age_seconds=1) == "ok"
+    assert observed == {"claim": (5, 3600), "expire": 300}
+
+
+def test_audit_graph_defaults_to_stable_read_only_preview(monkeypatch):
+    from vector_lake import tool_graph
+
+    monkeypatch.setattr(tool_graph.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(
+        tool_graph,
+        "read_committed_index_snapshot",
+        lambda path: {
+            "graph_insights": [
+                {
+                    "type": "isolated_node",
+                    "node": "Concept_Preview",
+                    "description": "preview only",
+                }
+            ]
+        },
+    )
+
+    def forbidden_write(*args, **kwargs):
+        raise AssertionError("audit preview attempted a governance write")
+
+    monkeypatch.setattr(
+        tool_graph.governance_store,
+        "insert_governance_item_if_absent",
+        forbidden_write,
+    )
+    first = tool_graph.audit_graph()
+    second = tool_graph.audit_graph()
+    assert first == second
+    assert first.startswith("Audit preview: 1 topology insight")
 
 
 def test_queued_sync_tool_rechecks_source_revision_at_execution(
@@ -1560,3 +1923,92 @@ def test_search_discards_backend_scores_when_projection_generation_changes(
     assert "New seed" in result
     assert "**Old**" not in result
     assert "projection_generation_changed" in result
+
+
+@pytest.mark.parametrize(
+    ("module_name", "dispatch_name"),
+    [
+        ("scripts.semantic_dedup_daemon", "_run_legacy_daemon"),
+        ("scripts.community_clustering_daemon", "_run_legacy_clustering"),
+    ],
+)
+def test_legacy_operator_daemons_fail_closed_before_storage_access(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    module_name,
+    dispatch_name,
+):
+    from vector_lake import db_store, wiki_utils
+
+    module = importlib.import_module(module_name)
+    monkeypatch.delenv("VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS", raising=False)
+    observed = []
+
+    def forbidden(*_args, **_kwargs):
+        observed.append("storage_or_dispatch")
+        raise AssertionError("legacy daemon reached DB/index/governance access")
+
+    for owner, attribute in (
+        (db_store, "get_connection"),
+        (wiki_utils, "get_index_path"),
+        (wiki_utils, "get_meta_dir"),
+        (wiki_utils, "get_wiki_dir"),
+        (governance_store, "load_governance_queue"),
+        (governance_store, "save_governance_queue"),
+        (mutation_coordinator, "execute_mutation_batch"),
+        (module, dispatch_name),
+    ):
+        monkeypatch.setattr(owner, attribute, forbidden)
+
+    monkeypatch.chdir(tmp_path)
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+
+    assert module.main() == 78
+
+    after = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+    stderr = capsys.readouterr().err
+    assert observed == []
+    assert after == before
+    assert "DEPRECATED/UNSUPPORTED" in stderr
+    assert "disabled by default" in stderr
+
+
+@pytest.mark.parametrize(
+    ("module_name", "dispatch_name"),
+    [
+        ("scripts.semantic_dedup_daemon", "_run_legacy_daemon"),
+        ("scripts.community_clustering_daemon", "_run_legacy_clustering"),
+    ],
+)
+def test_legacy_operator_daemon_opt_in_reaches_only_dispatch_boundary(
+    monkeypatch,
+    capsys,
+    module_name,
+    dispatch_name,
+):
+    module = importlib.import_module(module_name)
+    monkeypatch.setenv("VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS", "1")
+    observed = []
+    monkeypatch.setattr(module, dispatch_name, lambda: observed.append("dispatch"))
+
+    assert module.main() == 0
+
+    stderr = capsys.readouterr().err
+    assert observed == ["dispatch"]
+    assert "DEPRECATED/UNSUPPORTED" in stderr
+    assert "never run" in stderr
+    assert "watchdog" in stderr
+
+
+def test_active_runtime_does_not_import_legacy_operator_daemons():
+    root = Path(__file__).resolve().parents[1]
+    forbidden_names = (
+        "semantic_dedup_daemon",
+        "community_clustering_daemon",
+    )
+    active_paths = [root / "watchdog_sync.py", *sorted((root / "vector_lake").glob("*.py"))]
+
+    for path in active_paths:
+        content = path.read_text(encoding="utf-8")
+        assert all(name not in content for name in forbidden_names), path

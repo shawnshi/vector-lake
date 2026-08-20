@@ -1,6 +1,12 @@
 import sqlite3
+import threading
+import time
 
-from vector_lake import db_store
+from vector_lake import db_store, mutation_coordinator
+from tests.test_mutation_coordinator import (
+    _source_content,
+    _write_purpose_contract,
+)
 
 
 def test_outbox_claims_pending_rows_without_signal(isolated_memory):
@@ -330,3 +336,175 @@ def test_init_db_preserves_old_rows_and_supersedes_duplicate_active_intents(isol
         {"id": 1, "status": "superseded", "superseded_by": 2},
         {"id": 2, "status": "processing", "superseded_by": None},
     ]
+
+
+def test_projection_validation_and_staging_do_not_hold_sqlite_write_lock(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    materialize_entered = threading.Event()
+    release_materialize = threading.Event()
+    real_materialize = mutation_coordinator.materialize_markdown_projection
+    result = {}
+    errors = []
+
+    def blocked_materialize(*args, **kwargs):
+        materialize_entered.set()
+        assert release_materialize.wait(timeout=5)
+        return real_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "materialize_markdown_projection",
+        blocked_materialize,
+    )
+
+    def commit_mutation():
+        try:
+            result.update(
+                mutation_coordinator.execute_mutation_batch(
+                    [
+                        {
+                            "filename": "Source_No-Long-Lock.md",
+                            "content": _source_content(),
+                        }
+                    ],
+                    return_details=True,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            db_store.close_connection()
+
+    mutation_thread = threading.Thread(target=commit_mutation)
+    mutation_thread.start()
+    assert materialize_entered.wait(timeout=5)
+
+    writer = sqlite3.connect(db_store.get_db_path(), timeout=0.5)
+    started = time.monotonic()
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("CREATE TABLE barrier_writer_probe(value TEXT)")
+        writer.execute("INSERT INTO barrier_writer_probe VALUES ('committed')")
+        writer.commit()
+    finally:
+        writer.close()
+    elapsed = time.monotonic() - started
+
+    release_materialize.set()
+    mutation_thread.join(timeout=5)
+    assert not mutation_thread.is_alive()
+    assert errors == []
+    assert elapsed < 0.5
+    assert result["committed"] is True
+    assert result["deferred"] == []
+    assert (
+        isolated_memory / "wiki" / "Source_No-Long-Lock.md"
+    ).read_text(encoding="utf-8") == _source_content()
+
+
+def test_newer_intent_wins_while_older_projection_is_staging(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    original = _source_content()
+    old_content = original.replace("Primary source content.", "Old intent.")
+    new_content = original.replace("Primary source content.", "New intent.")
+    old_stage_entered = threading.Event()
+    release_old_stage = threading.Event()
+    real_materialize = mutation_coordinator.materialize_markdown_projection
+    old_result = {}
+    old_errors = []
+
+    def block_old_materialize(
+        filename,
+        mutation_type,
+        payload_text=None,
+        validation_mode="full",
+        projection_base_hash=None,
+    ):
+        if payload_text and "Old intent." in payload_text:
+            old_stage_entered.set()
+            assert release_old_stage.wait(timeout=5)
+        return real_materialize(
+            filename,
+            mutation_type,
+            payload_text,
+            validation_mode=validation_mode,
+            projection_base_hash=projection_base_hash,
+        )
+
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "materialize_markdown_projection",
+        block_old_materialize,
+    )
+
+    def commit_old_intent():
+        try:
+            old_result.update(
+                mutation_coordinator.execute_mutation_batch(
+                    [
+                        {
+                            "filename": "Source_Latest-Intent.md",
+                            "content": old_content,
+                        }
+                    ],
+                    validation_mode="schema",
+                    return_details=True,
+                )
+            )
+        except BaseException as exc:
+            old_errors.append(exc)
+        finally:
+            db_store.close_connection()
+
+    old_thread = threading.Thread(target=commit_old_intent)
+    old_thread.start()
+    assert old_stage_entered.wait(timeout=5)
+
+    new_result = mutation_coordinator.execute_mutation_batch(
+        [
+            {
+                "filename": "Source_Latest-Intent.md",
+                "content": new_content,
+            }
+        ],
+        validation_mode="schema",
+        return_details=True,
+    )
+    release_old_stage.set()
+    old_thread.join(timeout=5)
+
+    assert not old_thread.is_alive()
+    assert old_errors == []
+    assert old_result["committed"] is True
+    assert old_result["deferred"] == ["Source_Latest-Intent.md"]
+    assert old_result["post_commit_warnings"] == []
+    assert new_result["committed"] is True
+    assert new_result["deferred"] == []
+    assert (
+        isolated_memory / "wiki" / "Source_Latest-Intent.md"
+    ).read_text(encoding="utf-8") == new_content
+    rows = db_store.get_connection().execute(
+        "SELECT id, status, superseded_by FROM mutation_outbox "
+        "WHERE filename = 'Source_Latest-Intent.md' ORDER BY id"
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "id": old_result["outbox_ids"][0],
+            "status": "superseded",
+            "superseded_by": new_result["outbox_ids"][0],
+        },
+        {
+            "id": new_result["outbox_ids"][0],
+            "status": "pending",
+            "superseded_by": None,
+        },
+    ]
+    assert not tuple(
+        (isolated_memory / "wiki").glob("Source_Latest-Intent.md.*.stage")
+    )

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -8,9 +9,14 @@ from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION
 
 
 def _current_payload(filepath: str, file_hash: str, *, candidates=None) -> dict:
+    canonical_hash = (
+        file_hash
+        if str(file_hash).startswith("sha256:")
+        else "sha256:" + hashlib.sha256(str(file_hash).encode("utf-8")).hexdigest()
+    )
     return {
         "filepath": filepath,
-        "hash": file_hash,
+        "hash": canonical_hash,
         "canonical_name": f"Source_{Path(filepath).stem}.md",
         "source_hash": "",
         "source_projection_hash": "",

@@ -592,6 +592,7 @@ def _seed_isolated_search_memories(records):
 def _reset_search_index_as_legacy(conn):
     with db_store.transaction():
         conn.execute("DELETE FROM operational_memory_search_fts")
+        conn.execute("DELETE FROM operational_memory_search_short_fts")
         conn.execute("DELETE FROM operational_memory_search_docs")
         conn.execute("DELETE FROM operational_memory_search_pending")
         conn.execute(
@@ -627,6 +628,9 @@ def test_lazy_fts_backfill_preserves_exact_results(isolated_memory, monkeypatch)
     conn = _seed_isolated_search_memories(records)
     _reset_search_index_as_legacy(conn)
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_INDEX_BATCH", "2")
+    initial_status = governance_store.operational_memory_search_index_status()
+    assert initial_status["ready"] is False
+    assert "operational_memory_search_backfill_incomplete" in initial_status["warnings"]
 
     expected = governance_store._legacy_operational_memory_views(
         "needle", 10, 10, None, False
@@ -661,6 +665,10 @@ def test_lazy_fts_backfill_preserves_exact_results(isolated_memory, monkeypatch)
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0] == len(records)
+    ready_status = governance_store.operational_memory_search_index_status()
+    assert ready_status["ready"] is True
+    assert ready_status["schema_version"] == 5
+    assert ready_status["warnings"] == []
 
     with mock.patch.object(
         governance_store,
@@ -681,6 +689,97 @@ def test_lazy_fts_backfill_preserves_exact_results(isolated_memory, monkeypatch)
     ):
         cjk = governance_store.search_operational_memory("甲", top_k=10)
     assert [item["memory_id"] for item in cjk] == ["memory_3"]
+
+
+def test_ready_dual_fts_matches_legacy_cjk_and_has_no_canonical_scan(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    records = [
+        {
+            "memory_id": "memory_cjk_single",
+            "memory_type": "fact",
+            "memory_key": "甲状腺",
+            "text": "甲型临床路径",
+            "source_page": "Concept_CJK.md",
+            "validity_state": "active",
+            "memory_score": 0.7,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "memory_id": "memory_cjk_pair",
+            "memory_type": "fact",
+            "memory_key": "医疗信息化",
+            "text": "医疗信息系统互操作",
+            "source_page": "Concept_CJK.md",
+            "validity_state": "active",
+            "memory_score": 0.8,
+            "updated_at": "2026-01-02T00:00:00+00:00",
+        },
+        {
+            "memory_id": "memory_cjk_mixed",
+            "memory_type": "fact",
+            "memory_key": "医疗ai",
+            "text": "医疗AI辅助诊断",
+            "source_page": "Concept_CJK.md",
+            "validity_state": "active",
+            "memory_score": 0.9,
+            "updated_at": "2026-01-03T00:00:00+00:00",
+        },
+        {
+            "memory_id": "memory_unrelated",
+            "memory_type": "fact",
+            "memory_key": "unrelated",
+            "text": "普通运营记录",
+            "source_page": "Concept_Other.md",
+            "validity_state": "active",
+            "memory_score": 0.6,
+            "updated_at": "2026-01-04T00:00:00+00:00",
+        },
+        {
+            "memory_id": "memory_unicode_extensions",
+            "memory_type": "fact",
+            "memory_key": "𠀀型élan",
+            "text": "扩展汉字𠀀与Unicode字母é、α",
+            "source_page": "Concept_Unicode.md",
+            "validity_state": "active",
+            "memory_score": 0.75,
+            "updated_at": "2026-01-05T00:00:00+00:00",
+        },
+    ]
+    conn = _seed_isolated_search_memories(records)
+    assert governance_store.maintain_operational_memory_search_index(100)["ready"]
+    state = conn.execute(
+        "SELECT backfill_cursor, backfill_target FROM operational_memory_search_state"
+    ).fetchone()
+
+    for query in ("甲", "医疗", "AI", "医疗AI", "𠀀", "é", "α"):
+        expected = governance_store._legacy_operational_memory_views(
+            query, 10, 10, None, False
+        )
+        actual = governance_store.search_operational_memory_views(
+            query, current_top_k=10, history_top_k=10
+        )
+        assert actual == expected
+
+        sql, params = governance_store._indexed_operational_memory_query(
+            governance_store._bounded_memory_query_terms(query),
+            None,
+            cursor=str(state[0]),
+            target=str(state[1]),
+            include_pending=False,
+        )
+        assert "instr(" not in sql.casefold()
+        plan = [
+            str(row[3]).casefold()
+            for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+        ]
+        assert not any(
+            detail == "scan operational_memory"
+            or detail.startswith("scan operational_memory ")
+            for detail in plan
+        )
+        assert any("virtual table index" in detail for detail in plan)
 
 
 def test_equal_rank_results_use_stable_memory_id_after_physical_reorder(
@@ -785,6 +884,80 @@ def test_pending_rows_keep_update_and_delete_results_exact(
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0] == 0
+
+
+def test_ready_short_fts_update_removes_stale_tokens_without_canonical_scan(
+    isolated_memory,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    record = {
+        "memory_id": "memory_cjk_update",
+        "memory_type": "fact",
+        "memory_key": "cjk_update",
+        "text": "甲型临床路径",
+        "source_page": "Concept_CJK-Update.md",
+        "validity_state": "active",
+        "memory_score": 0.8,
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    conn = _seed_isolated_search_memories([record])
+    assert governance_store.maintain_operational_memory_search_index(10)["ready"]
+
+    changed = dict(record)
+    changed["text"] = "乙型临床路径"
+    changed["updated_at"] = "2026-01-02T00:00:00+00:00"
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE operational_memory SET data_json = ?, updated_at = ? "
+            "WHERE memory_id = ?",
+            (
+                governance_store.json.dumps(changed, ensure_ascii=False),
+                changed["updated_at"],
+                changed["memory_id"],
+            ),
+        )
+    assert governance_store.maintain_operational_memory_search_index(10)["ready"]
+
+    stale_rows = conn.execute(
+        "SELECT rowid FROM operational_memory_search_short_fts "
+        "WHERE operational_memory_search_short_fts MATCH ?",
+        ('"甲"',),
+    ).fetchall()
+    current_rows = conn.execute(
+        "SELECT rowid FROM operational_memory_search_short_fts "
+        "WHERE operational_memory_search_short_fts MATCH ?",
+        ('"乙"',),
+    ).fetchall()
+    assert stale_rows == []
+    assert len(current_rows) == 1
+
+    state = conn.execute(
+        "SELECT backfill_cursor, backfill_target "
+        "FROM operational_memory_search_state WHERE singleton = 1"
+    ).fetchone()
+    sql, params = governance_store._indexed_operational_memory_query(
+        ["乙"],
+        None,
+        cursor=str(state[0]),
+        target=str(state[1]),
+        include_pending=False,
+    )
+    assert "instr(" not in sql.casefold()
+    plan = [
+        str(row[3]).casefold()
+        for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+    ]
+    assert not any(
+        detail == "scan operational_memory"
+        or detail.startswith("scan operational_memory ")
+        for detail in plan
+    )
+    assert governance_store.search_operational_memory("甲", top_k=10) == []
+    assert [
+        item["memory_id"]
+        for item in governance_store.search_operational_memory("乙", top_k=10)
+    ] == ["memory_cjk_update"]
 
 
 
@@ -929,7 +1102,7 @@ def test_memory_search_index_tool_is_preview_first(
         "SELECT COUNT(*) FROM operational_memory_search_pending"
     ).fetchone()[0] == 0
 
-def test_search_index_schema_upgrade_resets_only_derived_state(
+def test_search_index_v4_to_v5_upgrade_resets_only_derived_state(
     isolated_memory, monkeypatch
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
@@ -946,7 +1119,7 @@ def test_search_index_schema_upgrade_resets_only_derived_state(
     governance_store.maintain_operational_memory_search_index(10)
     with db_store.transaction():
         conn.execute(
-            "UPDATE operational_memory_search_state SET schema_version = 2"
+            "UPDATE operational_memory_search_state SET schema_version = 4"
         )
         assert db_store._init_operational_memory_search_schema(conn) is True
 
@@ -954,9 +1127,15 @@ def test_search_index_schema_upgrade_resets_only_derived_state(
         "SELECT backfill_cursor, backfill_target, schema_version "
         "FROM operational_memory_search_state"
     ).fetchone()
-    assert tuple(state) == ("", "memory_upgrade", 4)
+    assert tuple(state) == ("", "memory_upgrade", 5)
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_fts"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_search_short_fts"
     ).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0] == 1
     assert [
@@ -966,7 +1145,7 @@ def test_search_index_schema_upgrade_resets_only_derived_state(
 
 
 @pytest.mark.parametrize("legacy_schema_version", [3, 4])
-def test_search_index_v4_rebuilds_legacy_integer_cursor_affinity(
+def test_search_index_v5_rebuilds_legacy_integer_cursor_affinity(
     isolated_memory, monkeypatch, legacy_schema_version
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
@@ -1012,7 +1191,7 @@ def test_search_index_v4_rebuilds_legacy_integer_cursor_affinity(
 
     assert column_types["backfill_cursor"] == "TEXT"
     assert column_types["backfill_target"] == "TEXT"
-    assert tuple(state) == ("", "010", 4)
+    assert tuple(state) == ("", "010", 5)
     progress = governance_store.maintain_operational_memory_search_index(1)
     assert progress["ready"] is False
     assert progress["backfill_cursor"] == "001"
@@ -1037,10 +1216,82 @@ def test_empty_search_index_is_ready_without_backfill(
         "SELECT backfill_cursor, backfill_target, schema_version "
         "FROM operational_memory_search_state"
     ).fetchone()
-    assert tuple(state) == ("", "", 4)
+    assert tuple(state) == ("", "", 5)
     assert conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_docs"
     ).fetchone()[0] == 0
+
+
+def test_operational_memory_cjk_search_scalable_benchmark(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    row_count = max(
+        1_000,
+        int(os.environ.get("VECTOR_LAKE_OPERATIONAL_MEMORY_BENCHMARK_ROWS", "2000")),
+    )
+    governance_store.initialize_meta_store()
+    conn = db_store.get_connection()
+    for offset in range(0, row_count, 5_000):
+        batch = []
+        for index in range(offset, min(row_count, offset + 5_000)):
+            memory_id = f"benchmark_{index:06d}"
+            text = (
+                "医疗AI benchmark needle"
+                if index == row_count - 1
+                else f"routine operational record {index}"
+            )
+            payload = {
+                "memory_id": memory_id,
+                "memory_type": "fact",
+                "memory_key": f"benchmark_key_{index}",
+                "text": text,
+                "source_page": "Concept_Benchmark.md",
+                "validity_state": "active",
+                "memory_score": 0.8,
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            }
+            batch.append((
+                memory_id,
+                "fact",
+                0.8,
+                "Active",
+                365.0,
+                governance_store.json.dumps(payload, ensure_ascii=False),
+                payload["updated_at"],
+            ))
+        with db_store.transaction():
+            conn.executemany(
+                "INSERT INTO operational_memory "
+                "(memory_id, memory_type, score, status, ttl, data_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                batch,
+            )
+
+    while True:
+        progress = governance_store.maintain_operational_memory_search_index(10_000)
+        if progress["ready"]:
+            break
+
+    db_store.close_all_connections()
+    started = time.perf_counter()
+    cold = governance_store.search_operational_memory("医疗AI", top_k=10)
+    cold_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    hot = governance_store.search_operational_memory("医疗AI", top_k=10)
+    hot_seconds = time.perf_counter() - started
+
+    assert [item["memory_id"] for item in cold] == [
+        f"benchmark_{row_count - 1:06d}"
+    ]
+    assert hot == cold
+    assert cold_seconds < 2.0
+    assert hot_seconds < 0.5
+    print(
+        "operational-memory benchmark "
+        f"rows={row_count} cold={cold_seconds:.6f}s hot={hot_seconds:.6f}s"
+    )
+
 
 def test_fts_can_be_disabled_without_changing_search_results(
     isolated_memory,
@@ -1076,6 +1327,41 @@ def test_fts_can_be_disabled_without_changing_search_results(
     }
     assert "operational_memory_search_fts" not in schema_names
     assert "operational_memory_search_docs" not in schema_names
+
+
+def test_configured_fts_missing_schema_warns_and_uses_compatibility_scan(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "0")
+    record = {
+        "memory_id": "memory_missing_schema",
+        "memory_type": "fact",
+        "memory_key": "missing_schema",
+        "text": "兼容检索",
+        "source_page": "Concept_Fallback.md",
+        "validity_state": "active",
+        "memory_score": 0.8,
+    }
+    _seed_isolated_search_memories([record])
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+
+    status = governance_store.operational_memory_search_index_status()
+    assert status["ready"] is False
+    assert status["warnings"] == ["operational_memory_search_schema_unavailable"]
+    assert [
+        item["memory_id"]
+        for item in governance_store.search_operational_memory("兼容", top_k=10)
+    ] == ["memory_missing_schema"]
+
+
+def test_rc_mcp_configs_enable_operational_memory_fts():
+    root = Path(__file__).resolve().parents[1]
+    for filename in (".mcp.json", "mcp_config.json"):
+        payload = governance_store.json.loads(
+            (root / filename).read_text(encoding="utf-8")
+        )
+        env = payload["mcpServers"]["vector-lake-mcp"]["env"]
+        assert env["VECTOR_LAKE_OPERATIONAL_MEMORY_FTS"] == "1"
 
 
 

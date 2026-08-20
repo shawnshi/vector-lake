@@ -1,13 +1,18 @@
 import hashlib
+import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-from vector_lake import db_store, governance_store
+from vector_lake import db_store, governance_store, tool_debt
 from vector_lake.governance_metrics import (
     claim_governance_version,
     compute_debt_metrics,
+    find_merge_candidate_report,
+    find_merge_candidates,
     infer_claim_validity,
+    read_only_governance_debt_snapshot,
 )
 
 
@@ -23,6 +28,28 @@ def _publish_claim(claim: dict, page_key: str) -> None:
             "proposed_edges": [],
         }
     )
+
+
+def _database_identity(path: Path) -> dict:
+    stat = path.stat()
+    sidecars = tuple(
+        candidate.name
+        for candidate in (
+            Path(str(path) + "-wal"),
+            Path(str(path) + "-shm"),
+        )
+        if candidate.exists()
+    )
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "sidecars": sidecars,
+    }
+
+
+def _fail_storage_initialization():
+    raise AssertionError("read-only governance debt initialized storage")
 
 
 def test_source_only_claim_is_provisional_not_unsupported():
@@ -167,6 +194,161 @@ def test_debt_metrics_read_only_rejects_mutation_capable_heavy_paths(
 
     with pytest.raises(ValueError, match="require skip_heavy=True"):
         compute_debt_metrics(read_only=True)
+
+
+def test_governance_debt_missing_database_is_structured_and_side_effect_free(
+    isolated_memory,
+    monkeypatch,
+):
+    database_path = db_store.peek_db_path()
+    forbidden_initializer = _fail_storage_initialization
+    monkeypatch.setattr(db_store, "init_db", forbidden_initializer)
+    monkeypatch.setattr(governance_store, "init_db", forbidden_initializer)
+    monkeypatch.setattr(
+        governance_store,
+        "initialize_meta_store",
+        forbidden_initializer,
+    )
+
+    snapshot = read_only_governance_debt_snapshot(limit=5)
+    report = find_merge_candidate_report(
+        limit=5,
+        run_preflight=False,
+        read_only=True,
+    )
+    candidates = find_merge_candidates(limit=5, run_preflight=False)
+    dashboard = tool_debt.debt_vector_lake(top=5)
+
+    assert snapshot["available"] is False
+    assert snapshot["unavailable_reason"] == "database_missing"
+    assert snapshot["metrics"]["unsupported_claim_count"] == 0
+    assert report["available"] is False
+    assert report["unavailable_reason"] == "database_missing"
+    assert report["returned_count"] == 0
+    assert candidates == []
+    assert "availability: unavailable" in dashboard
+    assert "unavailable_reason: database_missing" in dashboard
+    assert not database_path.exists()
+    assert not Path(str(database_path) + "-wal").exists()
+    assert not Path(str(database_path) + "-shm").exists()
+    assert not database_path.parent.exists()
+
+
+def test_governance_debt_missing_tables_is_structured_and_read_only(
+    isolated_memory,
+    monkeypatch,
+):
+    database_path = db_store.peek_db_path()
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+    before = _database_identity(database_path)
+    forbidden_initializer = _fail_storage_initialization
+    monkeypatch.setattr(db_store, "init_db", forbidden_initializer)
+    monkeypatch.setattr(governance_store, "init_db", forbidden_initializer)
+    monkeypatch.setattr(
+        governance_store,
+        "initialize_meta_store",
+        forbidden_initializer,
+    )
+
+    snapshot = read_only_governance_debt_snapshot(limit=5)
+    report = find_merge_candidate_report(
+        limit=5,
+        run_preflight=False,
+        read_only=True,
+    )
+
+    assert snapshot["available"] is False
+    assert snapshot["metrics"]["unavailable_reason"] == "missing_tables"
+    assert "claims" in snapshot["metrics"]["missing_tables"]
+    assert snapshot["merge_candidate_report"]["returned_count"] == 0
+    assert report["available"] is False
+    assert report["unavailable_reason"] == "missing_tables"
+    assert report["missing_tables"] == ["entities"]
+    assert _database_identity(database_path) == before
+
+
+def test_debt_and_merge_candidates_use_authorized_read_only_snapshots_without_drift(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    database_path = db_store.get_db_path()
+    before = _database_identity(database_path)
+    real_snapshot = db_store.read_only_transaction_snapshot
+    authorizer_actions = []
+    snapshot_calls = []
+    write_actions = {
+        getattr(sqlite3, name)
+        for name in (
+            "SQLITE_ALTER_TABLE",
+            "SQLITE_ATTACH",
+            "SQLITE_CREATE_INDEX",
+            "SQLITE_CREATE_TABLE",
+            "SQLITE_CREATE_TEMP_INDEX",
+            "SQLITE_CREATE_TEMP_TABLE",
+            "SQLITE_CREATE_TEMP_TRIGGER",
+            "SQLITE_CREATE_TEMP_VIEW",
+            "SQLITE_CREATE_TRIGGER",
+            "SQLITE_CREATE_VIEW",
+            "SQLITE_DELETE",
+            "SQLITE_DETACH",
+            "SQLITE_DROP_INDEX",
+            "SQLITE_DROP_TABLE",
+            "SQLITE_DROP_TEMP_INDEX",
+            "SQLITE_DROP_TEMP_TABLE",
+            "SQLITE_DROP_TEMP_TRIGGER",
+            "SQLITE_DROP_TEMP_VIEW",
+            "SQLITE_DROP_TRIGGER",
+            "SQLITE_DROP_VIEW",
+            "SQLITE_INSERT",
+            "SQLITE_REINDEX",
+            "SQLITE_UPDATE",
+        )
+    }
+
+    @contextmanager
+    def guarded_snapshot(*args, **kwargs):
+        snapshot_calls.append((args, kwargs))
+        with real_snapshot(*args, **kwargs) as connection:
+            def authorize(action, _arg1, _arg2, _database, _trigger):
+                authorizer_actions.append(action)
+                return (
+                    sqlite3.SQLITE_DENY
+                    if action in write_actions
+                    else sqlite3.SQLITE_OK
+                )
+
+            connection.set_authorizer(authorize)
+            try:
+                yield connection
+            finally:
+                connection.set_authorizer(None)
+
+    monkeypatch.setattr(
+        db_store,
+        "read_only_transaction_snapshot",
+        guarded_snapshot,
+    )
+    forbidden_initializer = _fail_storage_initialization
+    monkeypatch.setattr(db_store, "init_db", forbidden_initializer)
+    monkeypatch.setattr(governance_store, "init_db", forbidden_initializer)
+    monkeypatch.setattr(
+        governance_store,
+        "initialize_meta_store",
+        forbidden_initializer,
+    )
+
+    dashboard = tool_debt.debt_vector_lake(top=5)
+
+    assert "availability: available" in dashboard
+    assert len(snapshot_calls) == 1
+    assert find_merge_candidates(limit=5, run_preflight=False) == []
+    assert len(snapshot_calls) == 2
+    assert authorizer_actions
+    assert not write_actions.intersection(authorizer_actions)
+    assert _database_identity(database_path) == before
 
 
 def test_debt_metrics_do_not_transfer_full_claim_or_evidence_payloads(

@@ -39,7 +39,7 @@ graph LR
 
 | Surface | Current contract |
 |---|---|
-| Plugin package | `11.14.0+codex.20260728154444` |
+| Plugin package | `11.14.0+codex.20260820182223` |
 | Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
 | SQLite migration schema | `PRAGMA user_version = 7` |
 | Canonical governance schema | `8.0` |
@@ -399,6 +399,7 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 - `VECTOR_LAKE_EMBEDDING_MAX_BATCH_ITEMS` / `VECTOR_LAKE_EMBEDDING_MAX_BATCH_TOKENS`：单批条数与 token 上限，默认 `100` / `200000`。
 - `VECTOR_LAKE_EMBEDDING_MAX_CHARS_PER_ITEM` / `VECTOR_LAKE_EMBEDDING_MAX_RETRIES` / `VECTOR_LAKE_EMBEDDING_DIMENSION` / `VECTOR_LAKE_EMBEDDING_MAX_CONSECUTIVE_FAILURES`：默认 `15000` / `5` / `3072` / `3`。
 - `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
+- `VECTOR_LAKE_QUERY_EMBEDDING`：查询时调用 embedding provider 的显式能力门；默认关闭，只有精确设为 `1` 且存在 `GEMINI_API_KEY` 才允许外呼。
 - `VECTOR_LAKE_QUERY_EMBEDDING_TIMEOUT_MS` / `VECTOR_LAKE_QUERY_EMBEDDING_MAX_WAIT_MS` / `VECTOR_LAKE_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS`：查询向量默认 `2000 ms` 请求超时、`250 ms` 配额等待、失败后 `30 s` 冷却。
 - `VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS`：源码 revision 检查周期，默认 `5` 秒；设为 `0` 时每次检查。
 - `VECTOR_LAKE_MCP_BLOCKING_WORKERS`：同步 MCP 工具 worker 数，默认 `1`，限制为 `1` 至 `8`；需要更高吞吐时可显式上调，并同步评估重型查询的并发内存。
@@ -466,10 +467,24 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 | `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
 | `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
 | `vector_lake/yaml_utils.py` | YAML helpers |
-| `scripts/community_clustering_daemon.py` | Louvain Community Detection |
+| `scripts/community_clustering_daemon.py` | Deprecated/unsupported legacy Louvain operator script; disabled by default |
 | `schema.md` | Wiki 与运行态记忆契约 |
 | `commands/` | 19 个 Gemini CLI slash-command 兼容提示；Codex 使用同名 namespaced skills |
 | `contracts/cbss/` | Vector Lake 与 CBSS 的证据、权限确认、业务事件及就绪度契约 |
+
+### Deprecated legacy operator daemons
+
+`scripts/semantic_dedup_daemon.py` 与
+`scripts/community_clustering_daemon.py` 是不受支持的历史运维脚本，默认在任何
+DB、`index.json` 或 governance 访问前失败关闭。仅隔离恢复场景的受信 operator
+进程可显式设置 `VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS=1`；即使启用，也禁止
+与 `watchdog_sync.py` / `vector_lake.watchdog_app.py` 并行运行。
+
+日常运行使用受支持入口：由 watchdog/indexer 维护增量索引和拓扑；通过
+`python cli.py projection-rebuild-index` 预览索引重建，通过
+`python cli.py embedding-backfill --limit 200` 预览缺失向量，并通过
+`python cli.py topology-queue-cleanup` 预览历史 topology queue 债务。写入操作继续
+遵循各命令的显式 `--apply` 与无并发写入者门禁。
 
 ## Validation
 

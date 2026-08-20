@@ -22,6 +22,12 @@ from vector_lake import (
 )
 from vector_lake.ingest_worker import _ingest_finalization_proven, process_jobs
 from vector_lake.mutation_coordinator import execute_mutation_plan
+from vector_lake.raw_revision import (
+    RawRevisionFormatError,
+    RawSourceContainmentError,
+    parse_revision,
+    stable_raw_revision,
+)
 from vector_lake.tool_ingest import (
     INGEST_CONTRACT_VERSION,
     _read_canonical_target_content,
@@ -57,6 +63,16 @@ def _v4_ingest_payload(
     integration_candidates=None,
     instructions="compile this source",
 ):
+    try:
+        parse_revision(file_hash)
+    except RawRevisionFormatError:
+        raw_path = Path(filepath)
+        if not raw_path.is_absolute():
+            raw_path = tool_ingest.get_raw_dir().parent / raw_path
+        if not raw_path.exists():
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_text(f"test raw revision: {file_hash}", encoding="utf-8")
+        file_hash = calculate_hash(str(raw_path))
     return {
         "filepath": filepath,
         "hash": file_hash,
@@ -86,6 +102,194 @@ def _claimed_processed_data(payload, job_id, claim, **updates):
         "lease_token": claim["lease_token"],
         "lease_generation": claim["lease_generation"],
     }
+
+
+# Public Wang/Yu MD5 collision pair (128 bytes each).
+_MD5_COLLISION_A = bytes.fromhex(
+    "d131dd02c5e6eec4693d9a0698aff95c2fcab58712467eab4004583eb8fb7f89"
+    "55ad340609f4b30283e488832571415a085125e8f7cdc99fd91dbdf280373c5b"
+    "d8823e3156348f5bae6dacd436c919c6dd53e2b487da03fd02396306d248cda0"
+    "e99f33420f577ee8ce54b67080a80d1ec69821bcb6a8839396f9652b6ff72a70"
+)
+_MD5_COLLISION_B = bytes.fromhex(
+    "d131dd02c5e6eec4693d9a0698aff95c2fcab50712467eab4004583eb8fb7f89"
+    "55ad340609f4b30283e4888325f1415a085125e8f7cdc99fd91dbd7280373c5b"
+    "d8823e3156348f5bae6dacd436c919c6dd53e23487da03fd02396306d248cda0"
+    "e99f33420f577ee8ce54b67080280d1ec69821bcb6a8839396f965ab6ff72a70"
+)
+
+
+def _insert_legacy_processed_file(filepath: Path, legacy_md5: str) -> None:
+    db_store.init_db()
+    with db_store.transaction() as conn:
+        conn.execute(
+            "INSERT INTO processed_files (filepath, file_hash, processed_at) "
+            "VALUES (?, ?, ?)",
+            (
+                str(filepath.absolute()),
+                legacy_md5,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+
+def test_canonical_revision_separates_public_md5_collision_pair(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "md5-collision.bin"
+    raw_path.write_bytes(_MD5_COLLISION_A)
+    first = stable_raw_revision(raw_path)
+    raw_path.write_bytes(_MD5_COLLISION_B)
+    second = stable_raw_revision(raw_path)
+
+    assert first.legacy_md5 == second.legacy_md5
+    assert first.canonical_revision != second.canonical_revision
+    assert calculate_hash(str(raw_path)) == second.canonical_revision
+
+
+def test_scanner_requeues_public_md5_collision_instead_of_upgrading_marker(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "md5-collision.md"
+    raw_path.write_bytes(_MD5_COLLISION_A)
+    first = stable_raw_revision(raw_path)
+    _insert_legacy_processed_file(raw_path, first.legacy_md5)
+    raw_path.write_bytes(_MD5_COLLISION_B)
+    second = stable_raw_revision(raw_path)
+
+    payload = json.loads(
+        prepare_ingest_batch(batch_size=1, candidate_paths=[str(raw_path)])
+    )
+
+    marker = db_store.get_connection().execute(
+        "SELECT file_hash FROM processed_files WHERE filepath = ?",
+        (str(raw_path.absolute()),),
+    ).fetchone()["file_hash"]
+    assert first.legacy_md5 == second.legacy_md5
+    assert first.canonical_revision != second.canonical_revision
+    assert payload["hash"] == second.canonical_revision
+    assert marker == first.legacy_md5
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "A" * 32,
+        "a" * 64,
+        "sha256:" + "A" * 64,
+        "sha1:" + "a" * 40,
+        "",
+    ],
+)
+def test_raw_revision_parser_rejects_unknown_or_noncanonical_formats(revision):
+    with pytest.raises(RawRevisionFormatError):
+        parse_revision(revision)
+
+
+def test_scanner_requeues_matching_legacy_md5_marker_for_canonical_proof(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "legacy-marker.txt"
+    raw_path.write_text("legacy marker bytes", encoding="utf-8")
+    snapshot = stable_raw_revision(raw_path)
+    _insert_legacy_processed_file(raw_path, snapshot.legacy_md5)
+
+    payload = json.loads(
+        prepare_ingest_batch(
+            batch_size=1,
+            candidate_paths=[str(raw_path)],
+        )
+    )
+
+    row = db_store.get_connection().execute(
+        "SELECT file_hash, observed_mtime_ns, observed_size "
+        "FROM processed_files WHERE filepath = ?",
+        (str(raw_path.absolute()),),
+    ).fetchone()
+    assert dict(row) == {
+        "file_hash": snapshot.legacy_md5,
+        "observed_mtime_ns": None,
+        "observed_size": None,
+    }
+    assert payload["hash"] == snapshot.canonical_revision
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
+    ).fetchone()[0] == 1
+
+
+def test_scanner_requeues_changed_bytes_behind_legacy_marker(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "legacy-drift.txt"
+    raw_path.write_text("legacy bytes", encoding="utf-8")
+    legacy = stable_raw_revision(raw_path)
+    _insert_legacy_processed_file(raw_path, legacy.legacy_md5)
+    raw_path.write_text("changed bytes", encoding="utf-8")
+    current = stable_raw_revision(raw_path)
+
+    payload = json.loads(
+        prepare_ingest_batch(
+            batch_size=1,
+            candidate_paths=[str(raw_path)],
+        )
+    )
+
+    assert payload["hash"] == current.canonical_revision
+    assert payload["hash"] != legacy.canonical_revision
+    marker = db_store.get_connection().execute(
+        "SELECT file_hash FROM processed_files WHERE filepath = ?",
+        (str(raw_path.absolute()),),
+    ).fetchone()["file_hash"]
+    assert marker == legacy.legacy_md5
+
+
+def test_scanner_fails_closed_on_unknown_processed_revision(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "invalid-marker.txt"
+    raw_path.write_text("invalid marker bytes", encoding="utf-8")
+    _insert_legacy_processed_file(raw_path, "a" * 64)
+
+    with pytest.raises(RuntimeError, match="processed_revision_invalid"):
+        prepare_ingest_batch(
+            batch_size=1,
+            candidate_paths=[str(raw_path)],
+        )
+
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
+    ).fetchone()[0] == 0
+
+
+def test_stable_revision_rejects_reparse_escape_from_raw_root(
+    isolated_memory,
+):
+    raw_root = isolated_memory / "raw"
+    outside = isolated_memory / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    linked = raw_root / "linked-outside.txt"
+    try:
+        linked.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(RawSourceContainmentError):
+        stable_raw_revision(linked, allowed_roots=[raw_root])
+
+
+def _publish_required_watchdog_components(*, ingest_state="idle"):
+    from vector_lake.watchdog_status import write_status
+
+    for component in ("watchdog", "outbox", "scheduler", "ingest"):
+        state = ingest_state if component == "ingest" else "idle"
+        assert write_status(
+            state,
+            0,
+            0,
+            f"{component} contract-test heartbeat",
+            "",
+            component=component,
+        )
 
 
 def test_candidate_ingest_is_path_scoped_and_nested_names_do_not_collide(
@@ -796,7 +1000,10 @@ def test_full_scan_fails_closed_when_hash_is_unavailable(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_text("payload", encoding="utf-8")
     db_store.init_db()
-    db_store.mark_file_processed(str(raw_path.resolve()), "")
+    db_store.mark_file_processed(
+        str(raw_path.resolve()),
+        calculate_hash(str(raw_path)),
+    )
 
     config_root = isolated_memory / "extension-config"
     config_root.mkdir()
@@ -805,9 +1012,13 @@ def test_full_scan_fails_closed_when_hash_is_unavailable(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
-    monkeypatch.setattr(tool_ingest, "calculate_hash", lambda _path: "")
+    monkeypatch.setattr(
+        tool_ingest,
+        "stable_raw_revision",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+    )
 
-    with pytest.raises(RuntimeError, match="hash_unavailable"):
+    with pytest.raises(RuntimeError, match="source_stat_error.*OSError"):
         prepare_ingest_batch(batch_size=1, _enqueue_all=True)
 
     assert (
@@ -1050,11 +1261,17 @@ def test_finalize_ingest_accepts_payload_file_contract(tmp_path, monkeypatch):
 
 def test_ingest_finalization_requires_matching_processed_file(isolated_memory):
     db_store.init_db()
-    assert _ingest_finalization_proven("raw/test.pdf", "abc123") is False
-    db_store.mark_file_processed("raw/test.pdf", "different")
-    assert _ingest_finalization_proven("raw/test.pdf", "abc123") is False
-    db_store.mark_file_processed("raw/test.pdf", "abc123")
-    assert _ingest_finalization_proven("raw/test.pdf", "abc123") is True
+    raw_path = isolated_memory / "raw" / "test.pdf"
+    raw_path.write_bytes(b"revision proof")
+    snapshot = stable_raw_revision(raw_path)
+    assert _ingest_finalization_proven("raw/test.pdf", snapshot.legacy_md5) is False
+    db_store.mark_file_processed("raw/test.pdf", "sha256:" + "0" * 64)
+    assert _ingest_finalization_proven("raw/test.pdf", snapshot.legacy_md5) is False
+    db_store.mark_file_processed("raw/test.pdf", snapshot.canonical_revision)
+    assert _ingest_finalization_proven("raw/test.pdf", snapshot.legacy_md5) is False
+    assert (
+        _ingest_finalization_proven("raw/test.pdf", snapshot.canonical_revision) is True
+    )
 
 
 def test_job_claim_uses_a_lease(isolated_memory):
@@ -1259,7 +1476,7 @@ def test_ingest_worker_does_not_overwrite_reclaimed_dispatch_packet(
     monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-dispatch-race")
     payload = {
         "filepath": "raw/dispatch-race.md",
-        "hash": "dispatch-race-hash",
+        "hash": "sha256:" + "d" * 64,
         "canonical_name": "Source_Dispatch-Race.md",
         "source_hash": "",
         "source_projection_hash": "",
@@ -1885,7 +2102,7 @@ def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
             "ingest",
             {
                 "filepath": str(raw_path),
-                "hash": f"current-hash-{index:03d}",
+                "hash": stable_raw_revision(raw_path).canonical_revision,
                 "canonical_name": f"Source_Current-Batch-{index:03d}.md",
                 "source_hash": "current-version",
                 "source_projection_hash": "",
@@ -2076,7 +2293,7 @@ def test_subagent_task_claim_uses_lease_and_can_reclaim_expired_work(isolated_me
     db_store.init_db()
     payload = {
         "filepath": "raw/lease.md",
-        "hash": "lease-hash",
+        "hash": "sha256:" + "e" * 64,
         "canonical_name": "Source_Lease.md",
         "source_hash": "",
         "source_projection_hash": "",
@@ -2107,6 +2324,103 @@ def test_subagent_task_claim_uses_lease_and_can_reclaim_expired_work(isolated_me
     assert reclaimed[0]["lease_token"] != first[0]["lease_token"]
     assert reclaimed[0]["task_packet_path"] == first[0]["task_packet_path"]
     Path(reclaimed[0]["task_packet_path"]).unlink(missing_ok=True)
+
+
+def test_auto_claim_does_not_overlap_an_existing_live_manual_claim(isolated_memory):
+    db_store.init_db()
+    first_id = db_store.enqueue_job(
+        "ingest",
+        _v4_ingest_payload(
+            "raw/manual-live.md", "manual-live-hash", "Source_Manual-Live.md"
+        ),
+    )
+    second_id = db_store.enqueue_job(
+        "ingest",
+        _v4_ingest_payload(
+            "raw/auto-waiting.md", "auto-waiting-hash", "Source_Auto-Waiting.md"
+        ),
+    )
+    assert db_store.mark_job_awaiting_subagent(first_id, "")
+    assert db_store.mark_job_awaiting_subagent(second_id, "")
+    manual = db_store.claim_subagent_jobs(
+        limit=1,
+        lease_seconds=300,
+        lease_owner="manual-host",
+        required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )
+
+    automatic = db_store.claim_subagent_jobs(
+        limit=1,
+        lease_seconds=300,
+        lease_owner="auto-ingest:1234",
+        required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+        require_no_live_processing=True,
+    )
+
+    assert [row["job_id"] for row in manual] == [first_id]
+    assert automatic == []
+    rows = {
+        row["job_id"]: dict(row)
+        for row in db_store.get_connection()
+        .execute(
+            "SELECT job_id, status, lease_owner, lease_generation FROM jobs "
+            "WHERE job_id IN (?, ?)",
+            (first_id, second_id),
+        )
+        .fetchall()
+    }
+    assert rows[first_id]["status"] == "subagent_processing"
+    assert rows[first_id]["lease_owner"] == "manual-host"
+    assert rows[first_id]["lease_generation"] == 1
+    assert rows[second_id]["status"] == "awaiting_subagent"
+    assert rows[second_id]["lease_owner"] is None
+
+
+def test_manual_claim_does_not_overlap_an_existing_live_auto_claim(isolated_memory):
+    db_store.init_db()
+    first_id = db_store.enqueue_job(
+        "ingest",
+        _v4_ingest_payload(
+            "raw/auto-live.md", "auto-live-hash", "Source_Auto-Live.md"
+        ),
+    )
+    second_id = db_store.enqueue_job(
+        "ingest",
+        _v4_ingest_payload(
+            "raw/manual-waiting.md",
+            "manual-waiting-hash",
+            "Source_Manual-Waiting.md",
+        ),
+    )
+    assert db_store.mark_job_awaiting_subagent(first_id, "")
+    assert db_store.mark_job_awaiting_subagent(second_id, "")
+    automatic = db_store.claim_subagent_jobs(
+        limit=1,
+        lease_seconds=300,
+        lease_owner="auto-ingest:1234",
+        required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+        require_no_live_processing=True,
+    )
+
+    manual = json.loads(claim_ingest_tasks(limit=1, lease_seconds=300))
+
+    assert [row["job_id"] for row in automatic] == [first_id]
+    assert manual == []
+    rows = {
+        row["job_id"]: dict(row)
+        for row in db_store.get_connection()
+        .execute(
+            "SELECT job_id, status, lease_owner, lease_generation FROM jobs "
+            "WHERE job_id IN (?, ?)",
+            (first_id, second_id),
+        )
+        .fetchall()
+    }
+    assert rows[first_id]["status"] == "subagent_processing"
+    assert rows[first_id]["lease_owner"] == "auto-ingest:1234"
+    assert rows[first_id]["lease_generation"] == 1
+    assert rows[second_id]["status"] == "awaiting_subagent"
+    assert rows[second_id]["lease_owner"] is None
 
 
 def test_finalize_ingest_rejects_mismatched_job_payload(isolated_memory, monkeypatch):
@@ -2293,8 +2607,320 @@ def test_finalize_ingest_marks_subagent_job_finalized(isolated_memory, monkeypat
     )
     assert result.startswith("Successfully finalized ingestion")
     assert row["status"] == "finalized"
-    assert _ingest_finalization_proven("raw/finalize.md", "finalize-hash") is True
+    assert _ingest_finalization_proven(payload["filepath"], payload["hash"]) is True
     assert task_path.exists() is False
+
+
+def test_legacy_md5_job_must_be_requeued_before_finalization(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    _write_purpose_contract(isolated_memory)
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-legacy-finalize")
+    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr(
+        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+    )
+    raw_path = isolated_memory / "raw" / "legacy-finalize.md"
+    raw_path.write_text("legacy canary bytes", encoding="utf-8")
+    snapshot = stable_raw_revision(raw_path)
+    payload = _v4_ingest_payload(
+        "raw/legacy-finalize.md",
+        snapshot.legacy_md5,
+        "Source_Legacy-Finalize.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = db_store.claim_subagent_jobs(
+        limit=1,
+        lease_seconds=60,
+        required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )[0]
+
+    result = tool_ingest.finalize_ingest_strict(
+        [],
+        _claimed_processed_data(
+            payload,
+            job_id,
+            claim,
+            integration={
+                "disposition": "rejected",
+                "reason": "Source is outside the active strategic purpose contract.",
+            },
+        ),
+    )
+
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM processed_files WHERE filepath = ?",
+        (payload["filepath"],),
+    ).fetchone()[0] == 0
+    assert "job requeued for a fresh dispatch" in result
+    assert db_store.get_connection().execute(
+        "SELECT status FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()["status"] == "queued"
+    assert payload["hash"] == snapshot.legacy_md5
+
+    assert tool_ingest.requeue_legacy_ingest_jobs() == 1
+    refreshed = json.loads(
+        db_store.get_connection().execute(
+            "SELECT payload FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()["payload"]
+    )
+    assert refreshed["hash"] == snapshot.canonical_revision
+
+
+def test_finalize_ingest_rejects_nested_filepath_without_reading_it(
+    isolated_memory,
+    monkeypatch,
+):
+    sentinel = isolated_memory / "outside-finalize-sentinel.md"
+    sentinel.write_text("secret sentinel", encoding="utf-8")
+
+    def forbidden_read(*args, **kwargs):
+        raise AssertionError("caller-controlled filepath was dereferenced")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read)
+    with pytest.raises(ValueError, match="filepath is not supported"):
+        tool_ingest._normalize_inline_files_written(
+            [{"filename": "Concept_Sentinel.md", "filepath": str(sentinel)}]
+        )
+    assert sentinel.exists()
+
+
+def test_finalize_ingest_rejects_oversize_inline_content():
+    with pytest.raises(ValueError, match="per-file inline byte limit"):
+        tool_ingest._normalize_inline_files_written(
+            [
+                {
+                    "filename": "Concept_Oversize.md",
+                    "content": "x"
+                    * (tool_ingest._MAX_FINALIZE_INLINE_FILE_BYTES + 1),
+                }
+            ]
+        )
+
+
+def test_cleanup_failure_after_durable_finalize_remains_success(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-cleanup-warning")
+    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr(
+        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+    )
+    payload = _v4_ingest_payload(
+        "raw/finalize-cleanup-warning.md",
+        "finalize-cleanup-warning-hash",
+        "Source_Finalize-Cleanup-Warning.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    from vector_lake.native_llm import create_subagent_task
+
+    task_path = create_subagent_task("ingest", "test", "JSON array", {"job_id": job_id})
+    db_store.mark_job_awaiting_subagent(job_id, str(task_path))
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+
+    def fail_cleanup(*args, **kwargs):
+        raise sqlite3.OperationalError("injected cleanup claim failure")
+
+    monkeypatch.setattr(tool_ingest, "process_ingest_task_cleanup", fail_cleanup)
+    result = tool_ingest.finalize_ingest_strict(
+        [],
+        _claimed_processed_data(
+            payload,
+            job_id,
+            claim,
+            integration={
+                "disposition": "rejected",
+                "reason": "Source is outside the active strategic purpose contract.",
+            },
+        ),
+    )
+
+    row = db_store.get_connection().execute(
+        "SELECT status FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    cleanup_row = db_store.get_connection().execute(
+        "SELECT status FROM ingest_task_cleanup WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert result.startswith("Successfully finalized ingestion")
+    assert row["status"] == "finalized"
+    assert cleanup_row["status"] == "pending"
+    assert task_path.exists() is True
+    assert _ingest_finalization_proven(
+        payload["filepath"], payload["hash"]
+    ) is True
+
+
+def test_empty_rejected_finalize_obeys_real_unhealthy_full_write_gate(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    monkeypatch.delenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", raising=False)
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "0")
+    monkeypatch.setenv(
+        "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+        "watchdog,outbox,scheduler,ingest",
+    )
+    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr(
+        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+    )
+    payload = _v4_ingest_payload(
+        "raw/empty-gate-blocked.md",
+        "empty-gate-blocked-hash",
+        "Source_Empty-Gate-Blocked.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=600))[0]
+    _publish_required_watchdog_components(ingest_state="stopped")
+    connection = db_store.get_connection()
+    before = dict(
+        connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    )
+
+    processed_data = _claimed_processed_data(
+        payload,
+        job_id,
+        claim,
+        integration={
+            "disposition": "rejected",
+            "reason": "Source is outside the active strategic purpose contract.",
+        },
+    )
+    result = mcp_server.tools.finalize_ingest([], processed_data)
+    with pytest.raises(
+        tool_ingest.IngestFinalizationInfrastructureError,
+        match="Vector Lake write gate blocked this mutation",
+    ):
+        tool_ingest.finalize_ingest_strict([], processed_data)
+
+    after = dict(
+        connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    )
+    processed = connection.execute(
+        "SELECT filepath, file_hash FROM processed_files WHERE filepath = ?",
+        (payload["filepath"],),
+    ).fetchone()
+    assert result.startswith("Error finalizing ingestion")
+    assert "Vector Lake write gate blocked this mutation" in result
+    assert "watchdog_unhealthy:ingest" in result
+    assert processed is None
+    assert after == before
+    assert after["status"] == "subagent_processing"
+    assert after["lease_owner"] == claim["lease_owner"]
+    assert after["lease_token"] == claim["lease_token"]
+    assert after["lease_generation"] == claim["lease_generation"]
+
+
+def test_empty_rejected_finalize_callback_is_atomic_under_healthy_full_write_gate(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    monkeypatch.delenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", raising=False)
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "0")
+    monkeypatch.setenv(
+        "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+        "watchdog,outbox,scheduler,ingest",
+    )
+    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr(
+        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+    )
+    payload = _v4_ingest_payload(
+        "raw/empty-gate-atomic.md",
+        "empty-gate-atomic-hash",
+        "Source_Empty-Gate-Atomic.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=600))[0]
+    _publish_required_watchdog_components()
+    connection = db_store.get_connection()
+    before = dict(
+        connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    )
+    processed_data = _claimed_processed_data(
+        payload,
+        job_id,
+        claim,
+        integration={
+            "disposition": "rejected",
+            "reason": "Source is outside the active strategic purpose contract.",
+        },
+    )
+    with db_store.transaction():
+        connection.execute(
+            "CREATE TRIGGER fail_empty_finalize_atomic "
+            "BEFORE UPDATE OF status ON jobs "
+            "WHEN NEW.status = 'finalized' "
+            "BEGIN SELECT RAISE(ABORT, 'injected empty finalize failure'); END"
+        )
+
+    failed_result = mcp_server.tools.finalize_ingest([], processed_data)
+
+    after_failed_callback = dict(
+        connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    )
+    processed_after_failure = connection.execute(
+        "SELECT filepath, file_hash FROM processed_files WHERE filepath = ?",
+        (payload["filepath"],),
+    ).fetchone()
+    assert failed_result.startswith("Error finalizing ingestion")
+    assert "injected empty finalize failure" in failed_result
+    assert processed_after_failure is None
+    assert after_failed_callback == before
+
+    with db_store.transaction():
+        connection.execute("DROP TRIGGER fail_empty_finalize_atomic")
+
+    result = mcp_server.tools.finalize_ingest([], processed_data)
+
+    finalized = dict(
+        connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    )
+    processed = connection.execute(
+        "SELECT filepath, file_hash FROM processed_files WHERE filepath = ?",
+        (payload["filepath"],),
+    ).fetchone()
+    assert result.startswith("Successfully finalized ingestion")
+    assert dict(processed) == {
+        "filepath": payload["filepath"],
+        "file_hash": payload["hash"],
+    }
+    assert finalized["status"] == "finalized"
+    assert finalized["completed_at"]
+    assert finalized["lease_until"] is None
+    assert finalized["lease_owner"] is None
+    assert finalized["lease_token"] is None
+    assert json.loads(finalized["result_json"]) == {
+        "integration": processed_data["integration"]
+    }
 
 
 def test_finalize_ingest_requires_claimed_job(isolated_memory, monkeypatch):
@@ -3667,6 +4293,109 @@ def test_reconcile_ingest_job_debt_recovers_terminal_and_retires_safe_debt(
         "completed",
         "completed",
     ]
+
+
+def test_auto_quarantine_reconcile_preview_and_cas_requeue_same_revision(
+    isolated_memory,
+):
+    _write_purpose_contract(isolated_memory)
+    raw_path = isolated_memory / "raw" / "auto-quarantine.md"
+    raw_path.write_text("same revision", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_Auto-Quarantine.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    dispatched = db_store.claim_pending_jobs(
+        limit=1,
+        lease_seconds=300,
+        task_type="ingest",
+        required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )[0]
+    assert db_store.mark_job_awaiting_subagent(
+        job_id,
+        "",
+        lease_owner=dispatched["lease_owner"],
+        lease_token=dispatched["lease_token"],
+        lease_generation=dispatched["lease_generation"],
+    )
+    claim = db_store.claim_subagent_jobs(
+        limit=1,
+        lease_seconds=300,
+        required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+    )[0]
+    assert db_store.fail_auto_ingest_subagent_task_claim(
+        job_id,
+        claim["lease_owner"],
+        claim["lease_token"],
+        claim["lease_generation"],
+        "model output violated the bounded schema",
+        retryable=False,
+        failure_class="output_policy",
+    )
+    quarantined = dict(
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, result_json, idempotency_key, lease_generation "
+            "FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    assert quarantined["status"] == "failed"
+    assert quarantined["retries"] == 3
+    assert json.loads(quarantined["result_json"])["state"] == "quarantined"
+    assert db_store.enqueue_job("ingest", payload) == job_id
+
+    preview = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
+
+    assert preview["counts"] == {"requeue_current": 1}
+    assert preview["samples"] == [
+        {
+            "job_id": job_id,
+            "action": "requeue_current",
+            "reason": "terminal failure",
+        }
+    ]
+    unchanged = db_store.get_connection().execute(
+        "SELECT status, retries, result_json, lease_generation FROM jobs "
+        "WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(unchanged) == {
+        "status": "failed",
+        "retries": 3,
+        "result_json": quarantined["result_json"],
+        "lease_generation": quarantined["lease_generation"],
+    }
+
+    applied = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
+
+    assert applied["applied_counts"] == {"requeue_current": 1}
+    recovered = dict(
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, result_json, idempotency_key, payload, "
+            "lease_owner, lease_token, completed_at FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    assert recovered["status"] == "queued"
+    assert recovered["retries"] == 0
+    assert recovered["result_json"] is None
+    recovered_payload = json.loads(recovered["payload"])
+    assert recovered_payload["filepath"] == payload["filepath"]
+    assert recovered_payload["hash"] == payload["hash"]
+    assert recovered["idempotency_key"] == db_store._job_idempotency_key(
+        "ingest",
+        recovered_payload,
+    )
+    assert recovered["lease_owner"] is None
+    assert recovered["lease_token"] is None
+    assert recovered["completed_at"] is None
+    assert db_store.enqueue_job("ingest", recovered_payload) == job_id
 
 
 def test_reconcile_ingest_job_debt_deduplicates_current_raw_identity(

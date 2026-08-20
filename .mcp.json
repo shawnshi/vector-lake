@@ -7,9 +7,15 @@
         "vector_lake.mcp_server"
       ],
       "cwd": ".",
+      "env_vars": [
+        "GEMINI_API_KEY",
+        "VECTOR_LAKE_QUERY_EMBEDDING"
+      ],
       "env": {
         "PYTHONPATH": ".",
-        "VECTOR_LAKE_META_DIR": "~/.gemini/MEMORY/wiki/.meta",
+        "VECTOR_LAKE_MEMORY_DIR": "~/MEMORY",
+        "VECTOR_LAKE_META_DIR": "~/MEMORY/wiki/.meta",
+        "VECTOR_LAKE_OPERATIONAL_MEMORY_FTS": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1"
       }

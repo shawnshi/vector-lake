@@ -12,6 +12,7 @@ def _reset_query_embedding_state():
 
 def test_query_embedding_is_cached_and_bounded(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "1")
     monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING_TIMEOUT_MS", "1500")
     monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING_MAX_WAIT_MS", "200")
     calls = []
@@ -39,6 +40,7 @@ def test_query_embedding_is_cached_and_bounded(monkeypatch):
 
 def test_query_embedding_failure_opens_short_circuit(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "1")
     monkeypatch.setenv(
         "VECTOR_LAKE_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS",
         "30",
@@ -61,6 +63,7 @@ def test_query_embedding_failure_opens_short_circuit(monkeypatch):
 
 def test_query_embedding_same_key_is_single_flight(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "1")
     calls = []
     calls_lock = threading.Lock()
     barrier = threading.Barrier(3)
@@ -92,6 +95,7 @@ def test_query_embedding_same_key_is_single_flight(monkeypatch):
 
 def test_cached_query_embedding_bypasses_open_circuit(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "1")
     calls = []
 
     def fake_embed(texts, **kwargs):
@@ -111,6 +115,7 @@ def test_cached_query_embedding_bypasses_open_circuit(monkeypatch):
 
 def test_search_rejects_oversized_query_before_caches_or_embedding(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "1")
     _reset_query_embedding_state()
     tool_search._expand_query_locally.cache_clear()
     expansion_before = tool_search._expand_query_locally.cache_info()
@@ -148,6 +153,7 @@ def test_search_clamps_top_k_before_mode_dispatch(monkeypatch):
 
 def test_direct_query_embedding_rejects_oversized_text_before_api(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "1")
     calls = []
     monkeypatch.setattr(
         embedding_scheduler,
@@ -161,3 +167,19 @@ def test_direct_query_embedding_rejects_oversized_text_before_api(monkeypatch):
         )
 
     assert calls == []
+
+
+def test_query_embedding_requires_explicit_opt_in_even_with_api_key(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VECTOR_LAKE_QUERY_EMBEDDING", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        embedding_scheduler,
+        "embed_texts",
+        lambda *_args, **_kwargs: calls.append(1) or [[0.1]],
+    )
+    _reset_query_embedding_state()
+
+    assert tool_search._get_query_embedding("default local-only query") == []
+    assert calls == []
+    assert tool_search._cached_query_embedding.cache_info().misses == 0

@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -9,7 +10,89 @@ import pytest
 
 from vector_lake import db_store
 from vector_lake.runtime_health import assess_runtime_health
-from vector_lake.watchdog_status import get_status_file, write_status
+from vector_lake.watchdog_status import (
+    begin_watchdog_run,
+    current_watchdog_run_id,
+    get_status_file,
+    write_status,
+)
+
+
+def test_watchdog_run_generation_atomically_replaces_foreign_components(
+    isolated_memory,
+):
+    expected = ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")
+    run_id = begin_watchdog_run(expected)
+    status_path = get_status_file()
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+
+    assert run_id == current_watchdog_run_id() == status["run_id"]
+    assert status["schema_version"] == 3
+    assert status["process_id"] == os.getpid()
+    assert status["expected_components"] == list(expected)
+    assert set(status["components"]) == set(expected)
+    assert {
+        component["run_id"] for component in status["components"].values()
+    } == {run_id}
+    assert {
+        component["status"] for component in status["components"].values()
+    } == {"starting"}
+
+    foreign = dict(status)
+    foreign["run_id"] = "foreign-generation"
+    foreign["process_id"] = 999999
+    status_path.write_text(json.dumps(foreign), encoding="utf-8")
+    assert write_status("idle", 0, 0, component="watchdog") is False
+    assert json.loads(status_path.read_text(encoding="utf-8"))["run_id"] == (
+        "foreign-generation"
+    )
+
+    replacement = begin_watchdog_run(("watchdog", "outbox"))
+    replaced = json.loads(status_path.read_text(encoding="utf-8"))
+    assert replacement != run_id
+    assert replaced["run_id"] == replacement
+    assert set(replaced["components"]) == {"watchdog", "outbox"}
+
+    replaced["components"]["foreign"] = {
+        "run_id": "foreign-generation",
+        "process_id": 999999,
+        "status": "idle",
+    }
+    status_path.write_text(json.dumps(replaced), encoding="utf-8")
+    assert write_status("idle", 0, 0, component="watchdog") is True
+    cleaned = json.loads(status_path.read_text(encoding="utf-8"))
+    assert set(cleaned["components"]) == {"watchdog", "outbox"}
+
+
+def test_watchdog_run_refuses_a_live_foreign_generation(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import watchdog_status
+
+    status_path = get_status_file()
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "run_id": "still-draining",
+                "process_id": 424242,
+                "components": {
+                    "auto_ingest": {"status": "draining"},
+                    "watchdog": {"status": "halted"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(watchdog_status, "_process_is_alive", lambda _pid: True)
+
+    with pytest.raises(RuntimeError, match="prior status owner is still alive"):
+        begin_watchdog_run(("watchdog", "auto_ingest"))
+
+    preserved = json.loads(status_path.read_text(encoding="utf-8"))
+    assert preserved["run_id"] == "still-draining"
 
 
 def test_component_heartbeat_staleness_is_not_hidden_by_fresh_top_level(
@@ -192,6 +275,7 @@ def test_watchdog_detects_dead_worker_and_joins_remaining_workers(
         "outbox": False,
         "scheduler": False,
         "ingest": False,
+        "auto_ingest": False,
     }
 
 
@@ -1314,14 +1398,15 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
         "_build_ingest_instructions",
         lambda *_args: "isolated test ingest instructions",
     )
-    real_hash = tool_ingest.calculate_hash
+    real_revision = tool_ingest.stable_raw_revision
     real_walk = tool_ingest.os.walk
     hashed = []
     walked_roots = []
 
-    def recording_hash(filepath):
-        hashed.append(str(Path(filepath).resolve()))
-        return real_hash(filepath)
+    def recording_revision(filepath, *args, **kwargs):
+        snapshot = real_revision(filepath, *args, **kwargs)
+        hashed.append(str(snapshot.path))
+        return snapshot
 
     def recording_walk(root, *args, **kwargs):
         walked_roots.append(str(Path(root).resolve()))
@@ -1334,7 +1419,7 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
         calls.append((args, dict(kwargs)))
         return real_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(tool_ingest, "calculate_hash", recording_hash)
+    monkeypatch.setattr(tool_ingest, "stable_raw_revision", recording_revision)
     monkeypatch.setattr(tool_ingest.os, "walk", recording_walk)
     monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", recording_prepare)
     handler = RawWatchdogHandler()
@@ -1402,14 +1487,14 @@ def test_raw_full_scan_preserves_event_arriving_during_inventory(
         "_build_ingest_instructions",
         lambda *_args: "isolated test ingest instructions",
     )
-    real_hash = tool_ingest.calculate_hash
+    real_revision = tool_ingest.stable_raw_revision
     inventory_hashed = threading.Event()
     release_inventory = threading.Event()
     hashed = []
 
-    def pausing_hash(filepath):
-        result = real_hash(filepath)
-        hashed.append(str(Path(filepath).resolve()))
+    def pausing_revision(filepath, *args, **kwargs):
+        result = real_revision(filepath, *args, **kwargs)
+        hashed.append(str(result.path))
         if len(hashed) == 10:
             inventory_hashed.set()
             if not release_inventory.wait(timeout=5):
@@ -1423,7 +1508,7 @@ def test_raw_full_scan_preserves_event_arriving_during_inventory(
         calls.append((args, dict(kwargs)))
         return real_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(tool_ingest, "calculate_hash", pausing_hash)
+    monkeypatch.setattr(tool_ingest, "stable_raw_revision", pausing_revision)
     monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", recording_prepare)
     handler = RawWatchdogHandler()
     idle = False
@@ -1564,6 +1649,314 @@ def test_raw_handler_shutdown_has_a_hard_deadline():
         release.set()
         future.result(timeout=1)
         handler.shutdown(timeout_seconds=0.5)
+
+
+def test_auto_ingest_drain_holds_shutdown_until_finalizer_returns():
+    from vector_lake import watchdog_app
+
+    release = threading.Event()
+    finalizer = threading.Thread(target=release.wait, daemon=False)
+    finalizer.start()
+    result = []
+
+    def drain():
+        result.extend(
+            watchdog_app._drain_auto_ingest_worker(
+                {"auto_ingest": finalizer},
+                ["auto_ingest"],
+            )
+        )
+
+    waiter = threading.Thread(target=drain)
+    waiter.start()
+    time.sleep(0.05)
+    assert waiter.is_alive()
+    release.set()
+    waiter.join(timeout=2)
+    finalizer.join(timeout=2)
+    assert not waiter.is_alive()
+    assert result == []
+
+
+def test_auto_ingest_drain_has_a_hard_deadline():
+    from vector_lake import watchdog_app
+
+    release = threading.Event()
+    finalizer = threading.Thread(target=release.wait, daemon=False)
+    finalizer.start()
+    try:
+        before = time.monotonic()
+        remaining = watchdog_app._drain_auto_ingest_worker(
+            {"auto_ingest": finalizer},
+            ["auto_ingest"],
+            timeout_seconds=0.05,
+        )
+        elapsed = time.monotonic() - before
+
+        assert remaining == ["auto_ingest"]
+        assert elapsed < 0.5
+    finally:
+        release.set()
+        finalizer.join(timeout=2)
+
+
+def test_raw_event_logging_aggregates_bursts_in_a_small_window(
+    monkeypatch,
+    caplog,
+):
+    from vector_lake import watchdog_app
+
+    moments = iter((1.0, 1.01, 1.02, 1.2))
+    monkeypatch.setattr(
+        watchdog_app,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(moments)),
+    )
+    monkeypatch.setattr(watchdog_app, "_raw_event_log_window_seconds", lambda: 0.1)
+    monkeypatch.setattr(watchdog_app, "_RAW_EVENT_LOG_WINDOW_STARTED", 0.0)
+    monkeypatch.setattr(watchdog_app, "_RAW_EVENT_LOG_SUPPRESSED", 0)
+    monkeypatch.setattr(watchdog_app, "_RAW_EVENT_LOG_FILENAMES", set())
+
+    with caplog.at_level("INFO", logger="watchdog_sync"):
+        watchdog_app._log_raw_event("one.md")
+        watchdog_app._log_raw_event("one.md")
+        watchdog_app._log_raw_event("two.md")
+        watchdog_app._log_raw_event("three.md")
+
+    detail = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("Raw source modified:")
+    ]
+    aggregate = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("Raw source events aggregated:")
+    ]
+    assert len(detail) == 2
+    assert aggregate == [
+        "Raw source events aggregated: suppressed=2 unique_files=2 "
+        "window_seconds=0.20"
+    ]
+
+
+@pytest.mark.parametrize("drain_publish_raises", [False, True])
+def test_watchdog_drains_auto_before_stopping_required_peer_workers(
+    isolated_memory,
+    monkeypatch,
+    drain_publish_raises,
+):
+    from vector_lake import (
+        auto_ingest_worker,
+        db_store,
+        ingest_worker,
+        runtime_health,
+        watchdog_app,
+    )
+    from vector_lake.watchdog_status import write_status as publish_watchdog_status
+
+    supervisor_stop = threading.Event()
+    auto_started = threading.Event()
+    auto_stop_seen = threading.Event()
+    release_auto = threading.Event()
+    peer_events = []
+    auto_events = []
+    order = []
+    statuses = []
+    errors = []
+    missing = isolated_memory / "not-watched"
+    injected_drain_failure = False
+
+    db_store.init_db()
+    meta_dir = isolated_memory / "wiki" / ".meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    (meta_dir / "auto_ingest_config.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "enabled": True,
+                "timeout_seconds": 1200,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for component in ("watchdog", "outbox", "scheduler", "ingest"):
+        assert publish_watchdog_status(
+            "idle",
+            0,
+            0,
+            f"{component} heartbeat",
+            "",
+            component=component,
+        )
+    assert publish_watchdog_status(
+        "processing",
+        1,
+        0,
+        "Automatic ingest finalizing test job",
+        "",
+        component="auto_ingest",
+    )
+
+    class FakeObserver:
+        def __init__(self):
+            self.alive = False
+
+        def schedule(self, *_args, **_kwargs):
+            return None
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def stop(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            return None
+
+    def peer_worker(event):
+        peer_events.append(event)
+        assert event.wait(3)
+        component = {
+            "vector-lake-outbox-worker": "outbox",
+            "vector-lake-scheduled-lint-worker": "scheduler",
+            "vector-lake-ingest-worker": "ingest",
+        }[threading.current_thread().name]
+        assert publish_watchdog_status(
+            "stopped",
+            0,
+            0,
+            f"{component} stopped",
+            "",
+            component=component,
+        )
+        order.append("peer_stopped")
+
+    def auto_worker(event):
+        auto_events.append(event)
+        auto_started.set()
+        assert event.wait(3)
+        auto_stop_seen.set()
+        assert release_auto.wait(3)
+        assert publish_watchdog_status(
+            "stopped",
+            0,
+            0,
+            "Automatic ingest stopped",
+            "",
+            component="auto_ingest",
+        )
+        order.append("auto_returned")
+
+    def observed_write_status(
+        state,
+        task_queue_size,
+        index_queue_size,
+        current_action="",
+        last_error="",
+        component="watchdog",
+    ):
+        nonlocal injected_drain_failure
+        statuses.append((component, state))
+        published = publish_watchdog_status(
+            state,
+            task_queue_size,
+            index_queue_size,
+            current_action,
+            last_error,
+            component=component,
+        )
+        if (
+            drain_publish_raises
+            and state == "draining"
+            and not injected_drain_failure
+        ):
+            injected_drain_failure = True
+            raise OSError("injected drain heartbeat publish failure")
+        return published
+
+    monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
+    monkeypatch.setattr(
+        watchdog_app,
+        "_watch_directories",
+        lambda *_args: {"wiki": missing, "diary": missing, "raw": missing},
+    )
+    monkeypatch.setattr(watchdog_app, "index_worker_loop", peer_worker)
+    monkeypatch.setattr(watchdog_app, "scheduled_lint_loop", peer_worker)
+    monkeypatch.setattr(ingest_worker, "start_worker", peer_worker)
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "start_auto_ingest_worker",
+        auto_worker,
+    )
+    monkeypatch.setattr(
+        watchdog_app,
+        "write_status",
+        observed_write_status,
+    )
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_MONITOR_SECONDS", "0.05")
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS", "1")
+
+    def run_watchdog():
+        try:
+            watchdog_app._start_watchdog_locked(supervisor_stop)
+        except BaseException as exc:
+            errors.append(exc)
+
+    watchdog_thread = threading.Thread(target=run_watchdog, daemon=False)
+    watchdog_thread.start()
+    assert auto_started.wait(2)
+    deadline = time.monotonic() + 2
+    while len(peer_events) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(peer_events) == 3
+
+    supervisor_stop.set()
+    assert auto_stop_seen.wait(2)
+    assert all(not event.is_set() for event in peer_events)
+    assert "peer_stopped" not in order
+    deadline = time.monotonic() + 2
+    while ("watchdog", "draining") not in statuses and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ("watchdog", "draining") in statuses
+    drain_health = runtime_health.assess_runtime_health()
+    effective_statuses = drain_health["detail"][
+        "watchdog_component_effective_statuses"
+    ]
+    assert all(
+        effective_statuses[component] != "stopped"
+        for component in ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")
+    )
+    assert not any(
+        issue.startswith("watchdog_unhealthy:")
+        or issue.startswith("watchdog_component_stale:")
+        for issue in drain_health["issues"]
+    )
+    runtime_health.enforce_runtime_write_health()
+
+    release_auto.set()
+    watchdog_thread.join(timeout=3)
+
+    assert errors == []
+    assert not watchdog_thread.is_alive()
+    assert len(auto_events) == 1
+    assert len({id(event) for event in peer_events}) == 1
+    assert auto_events[0] is not peer_events[0]
+    assert order[0] == "auto_returned"
+    assert order.count("peer_stopped") == 3
+    final_status = json.loads(get_status_file().read_text(encoding="utf-8"))
+    assert all(
+        final_status["components"][component]["status"] == "stopped"
+        for component in ("outbox", "scheduler", "ingest", "auto_ingest")
+    )
+    expected_watchdog_status = "halted" if drain_publish_raises else "stopped"
+    assert final_status["components"]["watchdog"]["status"] == (
+        expected_watchdog_status
+    )
+    assert injected_drain_failure is drain_publish_raises
 
 
 def test_shared_stop_event_prevents_ingest_dispatch(monkeypatch):

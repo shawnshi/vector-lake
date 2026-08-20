@@ -16,8 +16,8 @@ import re
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass, replace
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, replace
 from typing import Any
 
 from filelock import FileLock, Timeout
@@ -31,10 +31,16 @@ DEFAULT_RPM = 3000
 DEFAULT_TPM = 1_000_000
 DEFAULT_DIMENSION = 3072
 
-
 def _env_int(name: str, default: int) -> int:
     try:
         return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_nonnegative_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, default)))
     except (TypeError, ValueError):
         return default
 
@@ -77,7 +83,7 @@ def load_embedding_rate_config() -> EmbeddingRateConfig:
         max_batch_items=_env_int("VECTOR_LAKE_EMBEDDING_MAX_BATCH_ITEMS", 100),
         max_batch_tokens=_env_int("VECTOR_LAKE_EMBEDDING_MAX_BATCH_TOKENS", 200_000),
         max_chars_per_item=_env_int("VECTOR_LAKE_EMBEDDING_MAX_CHARS_PER_ITEM", 15_000),
-        max_retries=_env_int("VECTOR_LAKE_EMBEDDING_MAX_RETRIES", 5),
+        max_retries=_env_nonnegative_int("VECTOR_LAKE_EMBEDDING_MAX_RETRIES", 5),
         dimension=_env_int("VECTOR_LAKE_EMBEDDING_DIMENSION", DEFAULT_DIMENSION),
         max_consecutive_failed_batches=_env_int("VECTOR_LAKE_EMBEDDING_MAX_CONSECUTIVE_FAILURES", 3),
     )

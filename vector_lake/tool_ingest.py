@@ -4,7 +4,6 @@ import hashlib
 import logging
 import re
 import sqlite3
-import traceback
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -13,7 +12,10 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from vector_lake import get_extension_root
-from vector_lake.db_store import mark_file_processed, update_processed_file_observations
+from vector_lake.db_store import (
+    mark_file_processed,
+    update_processed_file_observations,
+)
 from vector_lake import governance_store
 from vector_lake.merge_analysis import normalize_source_identity
 from vector_lake.skeleton_parser import parse_static_skeleton
@@ -34,6 +36,15 @@ from vector_lake.purpose_contract import (
     render_strategy_directive,
     validate_ingest_payload,
 )
+from vector_lake.raw_revision import (
+    RawRevisionFormatError,
+    RawSourceContainmentError,
+    RawSourceUnstableError,
+    StableRawRevision,
+    parse_revision,
+    snapshot_still_current,
+    stable_raw_revision,
+)
 
 log = logging.getLogger("vector-lake-ingest")
 FULL_SCAN_COMPLETE_TOKEN = "VECTOR_LAKE_RAW_FULL_SCAN_COMPLETE_V1"
@@ -42,6 +53,49 @@ NO_NEW_REVISIONS_MESSAGE = (
 )
 _INGEST_DEBT_APPLY_DEFAULT_LIMIT = 100
 _INGEST_DEBT_APPLY_MAX_LIMIT = 100
+_MAX_FINALIZE_INLINE_FILES = 64
+_MAX_FINALIZE_INLINE_FILE_BYTES = 2 * 1024 * 1024
+_MAX_FINALIZE_INLINE_BATCH_BYTES = 5 * 1024 * 1024
+
+
+def _normalize_inline_files_written(files_written: list) -> list[dict]:
+    """Accept only bounded inline content; never dereference caller paths."""
+    if not isinstance(files_written, list):
+        raise ValueError("files_written must be a list")
+    if len(files_written) > _MAX_FINALIZE_INLINE_FILES:
+        raise ValueError(
+            f"files_written exceeds {_MAX_FINALIZE_INLINE_FILES} inline files"
+        )
+    normalized: list[dict] = []
+    total_bytes = 0
+    for index, item in enumerate(files_written):
+        if not isinstance(item, dict):
+            raise ValueError(f"files_written[{index}] must be an object")
+        if "filepath" in item:
+            raise ValueError(
+                "files_written[].filepath is not supported; provide bounded inline content"
+            )
+        filename = str(item.get("filename") or "")
+        if not filename or filename != os.path.basename(filename):
+            raise ValueError(f"files_written[{index}].filename must be a basename")
+        content = item.get("content")
+        if not isinstance(content, str):
+            raise ValueError(
+                f"files_written[{index}] requires UTF-8 inline string content"
+            )
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > _MAX_FINALIZE_INLINE_FILE_BYTES:
+            raise ValueError(
+                f"files_written[{index}] exceeds the per-file inline byte limit"
+            )
+        total_bytes += content_bytes
+        if total_bytes > _MAX_FINALIZE_INLINE_BATCH_BYTES:
+            raise ValueError("files_written exceeds the inline batch byte limit")
+        record = dict(item)
+        record["filename"] = filename
+        record["content"] = content
+        normalized.append(record)
+    return normalized
 
 
 def _strip_markdown_suffix(value: str) -> str:
@@ -232,12 +286,19 @@ def _rebuild_claimed_ingest_task_packet(row: dict) -> tuple[dict, str]:
 def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
     """Lease valid task packets, repairing bad pointers without spending a retry."""
     from vector_lake import db_store
+    from vector_lake.auto_ingest_worker import load_auto_ingest_config
+
+    if load_auto_ingest_config().enabled:
+        raise RuntimeError(
+            "automatic ingest is enabled; task claims are controller-exclusive"
+        )
 
     requeue_legacy_ingest_jobs()
     claimed = db_store.claim_subagent_jobs(
         limit=limit,
         lease_seconds=lease_seconds,
         required_ingest_contract_version=INGEST_CONTRACT_VERSION,
+        forbid_live_owner_prefix="auto-ingest:",
     )
     tasks = []
     for row in claimed:
@@ -688,7 +749,8 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
         return f"raw source reappeared after preview: {raw_path}"
 
     try:
-        current_hash = _stable_current_raw_hash(str(raw_path))
+        current_snapshot = _stable_current_raw_revision(str(raw_path))
+        current_hash = current_snapshot.canonical_revision
     except (OSError, ValueError) as exc:
         if action == "blocked_unreadable_raw":
             return ""
@@ -724,7 +786,13 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
         f"SELECT file_hash FROM processed_files WHERE filepath IN ({placeholders})",
         tuple(lookup_paths),
     ).fetchall()
-    if not any(str(row["file_hash"] or "") == current_hash for row in rows):
+    def marker_matches_current(row) -> bool:
+        try:
+            return current_snapshot.matches(str(row["file_hash"] or ""))
+        except RawRevisionFormatError:
+            return False
+
+    if not any(marker_matches_current(row) for row in rows):
         return "processed_files no longer proves the current raw revision"
     return ""
 
@@ -741,12 +809,19 @@ def _ingest_debt_effective_revision_owners(
     """Find current ingest owners for one normalized raw-file revision."""
     from vector_lake import db_store
 
+    snapshot = _stable_current_raw_revision(str(raw_path))
+    if snapshot.canonical_revision != current_hash:
+        raise ValueError("current raw revision changed during owner lookup")
     rows = conn.execute(
         "SELECT job_id, task_type, status, retries, payload, updated_at, "
         "idempotency_key FROM jobs WHERE task_type = 'ingest' AND job_id <> ? "
         "AND idempotency_key IS NOT NULL AND json_valid(payload) = 1 "
-        "AND json_extract(payload, '$.hash') = ?",
-        (str(candidate_job_id), str(current_hash)),
+        "AND json_extract(payload, '$.hash') IN (?, ?)",
+        (
+            str(candidate_job_id),
+            snapshot.canonical_revision,
+            snapshot.legacy_md5,
+        ),
     ).fetchall()
     raw_identity = os.path.normcase(str(raw_path.resolve()))
     owners: list[dict] = []
@@ -905,7 +980,7 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
 
     plans: list[dict] = []
     requeue_groups: dict[str, list[dict]] = {}
-    reconcile_target_dirs = None
+    reconcile_target_dirs = get_ingest_target_directories() if rows else []
     reconcile_source_identity_index = None
     instruction_context = None if dry_run else _LazyIngestInstructionContext()
 
@@ -973,8 +1048,12 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             )
             continue
 
-        current_hash = calculate_hash(str(raw_path))
-        if not current_hash:
+        try:
+            current_snapshot = _stable_current_raw_revision(
+                str(raw_path),
+                allowed_roots=reconcile_target_dirs,
+            )
+        except (OSError, RawSourceUnstableError):
             plans.append(
                 {
                     "job_id": record["job_id"],
@@ -986,6 +1065,7 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
                 }
             )
             continue
+        current_hash = current_snapshot.canonical_revision
 
         processed_lookup_paths = list(dict.fromkeys([str(raw_path), raw_value]))
         placeholders = ", ".join("?" for _ in processed_lookup_paths)
@@ -999,7 +1079,13 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             for processed_row in processed_rows
         }
         processed_hash = processed.get(str(raw_path)) or processed.get(raw_value)
-        if processed_hash == current_hash:
+        try:
+            processed_matches_current = bool(
+                processed_hash and current_snapshot.matches(processed_hash)
+            )
+        except RawRevisionFormatError:
+            processed_matches_current = False
+        if processed_matches_current:
             plans.append(
                 {
                     "job_id": record["job_id"],
@@ -1097,8 +1183,6 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
 
         canonical_name = str(payload.get("canonical_name") or "").strip()
         if record.get("status") == "failed" or not canonical_name:
-            if reconcile_target_dirs is None:
-                reconcile_target_dirs = get_ingest_target_directories()
             if reconcile_source_identity_index is None:
                 if dry_run:
                     reconcile_source_identity_index = (
@@ -1799,45 +1883,37 @@ def canonical_source_name(
 
 
 def calculate_hash(filepath: str) -> str:
-    hasher = hashlib.md5()
     try:
-        with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-    except Exception as e:
-        log.error(f"Error calculating hash for {filepath}: {e}")
+        return stable_raw_revision(
+            filepath,
+            allowed_roots=get_ingest_target_directories(),
+        ).canonical_revision
+    except (OSError, RawSourceContainmentError, RawSourceUnstableError) as exc:
+        log.error("Error calculating stable hash for %s: %s", filepath, exc)
         return ""
 
 
-def _stable_current_raw_hash(filepath: str) -> str:
-    """Hash one raw file only when its filesystem identity stays stable."""
+def _stable_current_raw_revision(
+    filepath: str,
+    *,
+    allowed_roots: list[Path] | None = None,
+) -> StableRawRevision:
+    """Read one supported raw path through the shared stable revision layer."""
     path = Path(filepath)
     if not path.is_absolute():
         path = get_raw_dir().parent / path
-    path = path.resolve()
-    before = path.stat()
-    current_hash = calculate_hash(str(path))
-    after = path.stat()
-    before_identity = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
+    return stable_raw_revision(
+        path,
+        allowed_roots=(
+            allowed_roots
+            if allowed_roots is not None
+            else get_ingest_target_directories()
+        ),
     )
-    after_identity = (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
-    if not current_hash:
-        raise ValueError(f"Raw source cannot be hashed: {path}")
-    if before_identity != after_identity:
-        raise ValueError(f"Raw source changed while verifying finalization: {path}")
-    return current_hash
+
+
+def _stable_current_raw_hash(filepath: str) -> str:
+    return _stable_current_raw_revision(filepath).canonical_revision
 
 
 def _read_purpose() -> str:
@@ -1854,6 +1930,10 @@ INGEST_CONTRACT_VERSION = 5
 
 class IngestBaselineConflict(ValueError):
     """A source or integration baseline changed after durable dispatch."""
+
+
+class IngestFinalizationInfrastructureError(RuntimeError):
+    """A retryable runtime failure prevented durable ingest finalization."""
 
 
 INTEGRATION_PREDICATES = {
@@ -2407,12 +2487,7 @@ def _apply_integration_disposition(
             f"integration disposition must be one of {sorted(INTEGRATION_DISPOSITIONS)}"
         )
 
-    files = []
-    for item in files_written:
-        record = dict(item)
-        if "filepath" in record and not record.get("content"):
-            record["content"] = Path(record["filepath"]).read_text(encoding="utf-8")
-        files.append(record)
+    files = _normalize_inline_files_written(files_written)
 
     reason = str(integration.get("reason") or "").strip()
     if disposition == "rejected":
@@ -2880,7 +2955,9 @@ def requeue_legacy_ingest_jobs() -> int:
         "lease_generation, lease_until, lease_owner, lease_token, updated_at, "
         "idempotency_key, completed_at, result_json, error_msg, created_at "
         "FROM jobs WHERE task_type = 'ingest' "
-        f"AND COALESCE(({contract_sql}), 0) = 0 AND ("
+        f"AND (COALESCE(({contract_sql}), 0) = 0 OR (json_valid(payload) "
+        "AND json_type(payload, '$.hash') = 'text' "
+        "AND length(json_extract(payload, '$.hash')) = 32)) AND ("
         "status = 'awaiting_subagent' OR "
         "(status IN ('queued', 'failed') AND COALESCE(retries, 0) < 3 "
         "AND COALESCE(available_at, created_at, '') <= ?) OR "
@@ -3272,6 +3349,55 @@ def _candidate_processed_files(conn, filepaths) -> dict[str, tuple]:
     return processed
 
 
+def _processed_file_row(conn, filepath: str) -> tuple | None:
+    row = conn.execute(
+        "SELECT file_hash, observed_mtime_ns, observed_size "
+        "FROM processed_files WHERE filepath = ?",
+        (str(filepath),),
+    ).fetchone()
+    if row is None:
+        return None
+    return (
+        str(row["file_hash"] or ""),
+        row["observed_mtime_ns"],
+        row["observed_size"],
+    )
+
+
+def _processed_revision_state(
+    conn,
+    filepath: str,
+    initial_row: tuple,
+    snapshot: StableRawRevision,
+) -> tuple[str, tuple | None]:
+    """Compare one marker without silently trusting a legacy MD5 collision."""
+    row = initial_row
+    for _attempt in range(2):
+        if row is None:
+            return "drifted", None
+        stored_hash, observed_mtime_ns, observed_size = row
+        try:
+            kind, _digest = parse_revision(stored_hash)
+        except RawRevisionFormatError:
+            return "invalid", row
+        if not snapshot.matches(stored_hash):
+            if not snapshot_still_current(snapshot):
+                return "retry", row
+            return "drifted", row
+        if kind == "sha256":
+            if not snapshot_still_current(snapshot):
+                return "retry", row
+            return "matched", row
+        # An MD5 match cannot prove the current bytes are the bytes that were
+        # ingested. Keep the legacy marker and enqueue a canonical SHA-256 job.
+        # An explicit operator migration may establish a trusted baseline
+        # before scanning, but the runtime must never make that trust decision.
+        if not snapshot_still_current(snapshot):
+            return "retry", row
+        return "legacy", row
+    return "retry", row
+
+
 def _candidate_legacy_ingest_identities(conn, filepaths) -> set[tuple[str, str, str]]:
     """Read active legacy identities only for paths in a candidate event batch."""
     identities = set()
@@ -3522,7 +3648,7 @@ def prepare_ingest_batch(
     inventory_errors = []
     if candidate_paths is not None:
         files_to_process = {
-            str(Path(candidate).resolve())
+            str(Path(candidate).absolute())
             for candidate in candidate_paths
             if allowed_path(Path(candidate))
         }
@@ -3561,7 +3687,7 @@ def prepare_ingest_batch(
                 for filename in files:
                     path = root_path / filename
                     if allowed_path(path):
-                        files_to_process.add(str(path.resolve()))
+                        files_to_process.add(str(path.absolute()))
 
     # Configured roots may overlap. One recovery generation hashes each
     # physical path at most once before persisting the complete inventory.
@@ -3624,54 +3750,77 @@ def prepare_ingest_batch(
     observations_to_update = []
     for filepath in files_to_process:
         try:
-            details = os.stat(filepath)
-            if filepath in processed:
-                processed_hash, observed_mtime_ns, observed_size = processed[filepath]
-                # Recovery inventories hash every allowed file. Filesystem
-                # timestamps and sizes are scheduling hints, not content proof.
-                file_hash = calculate_hash(filepath)
-                if not file_hash:
-                    inventory_errors.append(f"hash_unavailable:{filepath}")
-                    continue
-                if file_hash == processed_hash:
-                    try:
-                        observed = os.stat(filepath)
-                    except OSError:
-                        observed = details
-                    current_mtime_ns = int(observed.st_mtime_ns)
-                    current_size = int(observed.st_size)
-                    if (
-                        observed_mtime_ns != current_mtime_ns
-                        or observed_size != current_size
-                    ):
-                        observations_to_update.append(
-                            (filepath, file_hash, current_mtime_ns, current_size)
+            processed_row = processed.get(filepath)
+            state = "retry"
+            classified_row = processed_row
+            snapshot = None
+            for _attempt in range(2):
+                snapshot = stable_raw_revision(
+                    filepath,
+                    allowed_roots=target_dirs,
+                )
+                if processed_row is None:
+                    state, classified_row = "drifted", None
+                else:
+                    state, classified_row = _processed_revision_state(
+                        conn,
+                        filepath,
+                        processed_row,
+                        snapshot,
+                    )
+                if state == "drifted" and not snapshot_still_current(snapshot):
+                    state = "retry"
+                if state != "retry":
+                    break
+                processed_row = _processed_file_row(conn, filepath)
+            if snapshot is None or state == "retry":
+                inventory_errors.append(f"hash_unstable:{filepath}")
+                continue
+            if state == "invalid":
+                invalid_hash = str((classified_row or ("",))[0])
+                inventory_errors.append(
+                    f"processed_revision_invalid:{filepath}:{invalid_hash}"
+                )
+                continue
+            if state == "cas_failed":
+                inventory_errors.append(
+                    f"processed_revision_upgrade_cas_failed:{filepath}"
+                )
+                continue
+            if state in {"matched", "migrated"}:
+                assert classified_row is not None
+                _stored_hash, observed_mtime_ns, observed_size = classified_row
+                if (
+                    observed_mtime_ns != snapshot.observed_mtime_ns
+                    or observed_size != snapshot.observed_size
+                ):
+                    observations_to_update.append(
+                        (
+                            filepath,
+                            snapshot.canonical_revision,
+                            snapshot.observed_mtime_ns,
+                            snapshot.observed_size,
                         )
-                    continue
-            else:
-                file_hash = calculate_hash(filepath)
-
-            if not file_hash:
-                inventory_errors.append(f"hash_unavailable:{filepath}")
+                    )
                 continue
 
-            if file_hash:
-                canonical_name = canonical_source_name(
-                    filepath,
-                    source_identity_index,
-                    target_dirs,
-                )
-                identity = (filepath, file_hash, canonical_name)
-                identity_key = _job_idempotency_key(
-                    "ingest",
-                    {
-                        "filepath": filepath,
-                        "hash": file_hash,
-                        "canonical_name": canonical_name,
-                    },
-                )
-                ingest_candidates.append((identity_key, identity))
-        except OSError as exc:
+            file_hash = snapshot.canonical_revision
+            canonical_name = canonical_source_name(
+                filepath,
+                source_identity_index,
+                target_dirs,
+            )
+            identity = (filepath, file_hash, canonical_name)
+            identity_key = _job_idempotency_key(
+                "ingest",
+                {
+                    "filepath": filepath,
+                    "hash": file_hash,
+                    "canonical_name": canonical_name,
+                },
+            )
+            ingest_candidates.append((identity_key, identity))
+        except (OSError, RawSourceUnstableError) as exc:
             inventory_errors.append(
                 f"source_stat_error:{filepath}:{type(exc).__name__}:{exc}"
             )
@@ -3772,8 +3921,13 @@ def prepare_ingest_batch(
     return f"Successfully enqueued {enqueued_count} files for ingestion."
 
 
-def finalize_ingest(files_written: list, processed_data: dict) -> str:
-    """Finalizes an ingest operation from a subagent using direct data."""
+def _finalize_ingest_impl(
+    files_written: list,
+    processed_data: dict,
+    *,
+    propagate_errors: bool,
+) -> str:
+    """Finalize one ingest while preserving the public string-error contract."""
     try:
         from vector_lake.wiki_utils import SafeWriteError
         from vector_lake.db_store import (
@@ -3793,15 +3947,32 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         queued_hash = str(processed_data.get("hash") or "")
         queued_filepath = str(processed_data.get("filepath") or "")
 
-        def verify_raw_revision():
-            if not re.fullmatch(r"[0-9a-fA-F]{32}", queued_hash):
-                return
-            current_hash = _stable_current_raw_hash(queued_filepath)
-            if current_hash.casefold() != queued_hash.casefold():
+        try:
+            queued_hash_kind, _queued_hash_digest = parse_revision(queued_hash)
+        except RawRevisionFormatError as exc:
+            raise IngestBaselineConflict(
+                "Queued raw revision format is unsupported"
+            ) from exc
+        if queued_hash_kind != "sha256":
+            raise IngestBaselineConflict(
+                "Legacy queued raw revision must be rebuilt with canonical SHA-256"
+            )
+
+        def verify_raw_revision() -> StableRawRevision:
+            try:
+                snapshot = _stable_current_raw_revision(queued_filepath)
+                matches = snapshot.matches(queued_hash)
+            except RawRevisionFormatError as exc:
+                raise IngestBaselineConflict(
+                    "Queued raw revision format is unsupported"
+                ) from exc
+            if not matches:
                 raise IngestBaselineConflict(
                     "Raw source changed after ingest dispatch; "
-                    f"queued_hash={queued_hash} current_hash={current_hash}"
+                    f"queued_hash={queued_hash} "
+                    f"current_hash={snapshot.canonical_revision}"
                 )
+            return snapshot
 
         verify_raw_revision()
         _verify_ingest_source_baseline(processed_data)
@@ -3830,9 +4001,6 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         mutations = []
         for item in files:
             fname = os.path.basename(item["filename"])
-            if "filepath" in item and not item.get("content"):
-                with open(item["filepath"], "r", encoding="utf-8") as f:
-                    item["content"] = f.read()
             fcontent = item["content"]
 
             if "Concept_Decision_" in fname:
@@ -3854,28 +4022,32 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             written_paths.append(str(wiki_dir / fname))
 
         filepath = processed_data["filepath"]
-        file_hash = processed_data["hash"]
-        if mutations:
-            from vector_lake.mutation_coordinator import execute_mutation_batch
+        from vector_lake.mutation_coordinator import execute_mutation_batch
 
-            def mark_ingest_processed():
-                verify_raw_revision()
-                mark_file_processed(filepath, file_hash)
-                finalize_ingest_job(
+        def mark_ingest_processed():
+            final_snapshot = verify_raw_revision()
+            mark_file_processed(
+                filepath,
+                final_snapshot.canonical_revision,
+                observed_mtime_ns=final_snapshot.observed_mtime_ns,
+                observed_size=final_snapshot.observed_size,
+            )
+            finalize_ingest_job(
+                str(job_id),
+                lease_owner,
+                lease_token,
+                lease_generation,
+                result_data={"integration": processed_data.get("integration")},
+            )
+            if job_row.get("task_packet_path"):
+                from vector_lake import db_store
+
+                db_store.enqueue_ingest_task_cleanup(
                     str(job_id),
-                    lease_owner,
-                    lease_token,
-                    lease_generation,
-                    result_data={"integration": processed_data.get("integration")},
+                    str(job_row["task_packet_path"]),
                 )
-                if job_row.get("task_packet_path"):
-                    from vector_lake import db_store
 
-                    db_store.enqueue_ingest_task_cleanup(
-                        str(job_id),
-                        str(job_row["task_packet_path"]),
-                    )
-
+        if mutations:
             execute_mutation_batch(
                 mutations,
                 canonical_callback=mark_ingest_processed,
@@ -3884,27 +4056,19 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                 schema_maintenance_filenames=schema_maintenance_filenames,
             )
         else:
-            from vector_lake.db_store import transaction
+            from vector_lake import db_store as ingest_db_store
+            from vector_lake.runtime_health import enforce_runtime_write_health
 
-            with transaction():
-                verify_raw_revision()
-                mark_file_processed(filepath, file_hash)
-                finalize_ingest_job(
-                    str(job_id),
-                    lease_owner,
-                    lease_token,
-                    lease_generation,
-                    result_data={"integration": processed_data.get("integration")},
-                )
-                if job_row.get("task_packet_path"):
-                    from vector_lake import db_store
+            enforce_runtime_write_health(validation_mode="full")
+            ingest_db_store.init_db()
+            with ingest_db_store.transaction():
+                verify_source_link_closure()
+                mark_ingest_processed()
 
-                    db_store.enqueue_ingest_task_cleanup(
-                        str(job_id),
-                        str(job_row["task_packet_path"]),
-                    )
-
-        cleanup = process_ingest_task_cleanup(limit=20)
+        try:
+            cleanup = process_ingest_task_cleanup(limit=20)
+        except Exception as cleanup_error:
+            cleanup = {"errors": [f"{type(cleanup_error).__name__}:{cleanup_error}"]}
         for error in cleanup["errors"]:
             log.warning("Ingest finalized, but task packet cleanup failed: %s", error)
 
@@ -3973,19 +4137,57 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                 current_ingest_contract_version=INGEST_CONTRACT_VERSION,
             )
         except Exception as requeue_error:
+            if propagate_errors:
+                raise IngestFinalizationInfrastructureError(
+                    "automatic baseline requeue failed: "
+                    f"{type(requeue_error).__name__}:{requeue_error}"
+                ) from requeue_error
+            log.exception("Automatic baseline requeue failed")
             return (
                 f"Error finalizing ingestion: {exc}; "
-                f"automatic baseline requeue failed: {requeue_error}\n"
-                f"{traceback.format_exc()}"
+                f"automatic baseline requeue failed: {type(requeue_error).__name__}"
             )
         if requeued:
             return (
                 "Ingest baseline changed; job requeued for a fresh dispatch: "
                 f"{exc}"
             )
+        if propagate_errors:
+            raise IngestFinalizationInfrastructureError(
+                "baseline changed, but the exact finalization lease was no longer current: "
+                f"{exc}"
+            ) from exc
         return (
             "Error finalizing ingestion: baseline changed, but the lease was "
             f"no longer current: {exc}"
         )
     except Exception as e:
-        return f"Error finalizing ingestion: {e}\n{traceback.format_exc()}"
+        if propagate_errors:
+            raise
+        log.exception("Public ingest finalization failed")
+        return f"Error finalizing ingestion: {e}"
+
+
+def finalize_ingest(files_written: list, processed_data: dict) -> str:
+    """Finalize an ingest operation using the stable MCP string-return contract."""
+    return _finalize_ingest_impl(
+        files_written,
+        processed_data,
+        propagate_errors=False,
+    )
+
+
+def finalize_ingest_strict(files_written: list, processed_data: dict) -> str:
+    """Finalize for the automatic controller with typed retryable failures."""
+    try:
+        return _finalize_ingest_impl(
+            files_written,
+            processed_data,
+            propagate_errors=True,
+        )
+    except IngestFinalizationInfrastructureError:
+        raise
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        raise IngestFinalizationInfrastructureError(
+            f"{type(exc).__name__}:{exc}"
+        ) from exc

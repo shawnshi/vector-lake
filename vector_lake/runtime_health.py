@@ -8,7 +8,7 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from vector_lake.index_snapshot import (
     clear_index_snapshot_cache_for_tests,
@@ -49,7 +49,13 @@ _WRITE_GATE_CACHE: dict[str, Any] = {
     "checked_at": 0.0,
     "health": None,
 }
-_WIKI_VERSION_CACHE: dict[str, tuple[tuple[int, int, int], str | None, str | None]] = {}
+_WIKI_VERSION_CACHE: dict[
+    str,
+    tuple[tuple[int, int, int, int, int], str | None, str | None],
+] = {}
+_AUTO_INGEST_RECEIPT_SCAN_CAP = 256
+_AUTO_INGEST_RECEIPT_MAX_SCAN_CAP = 4096
+_AUTO_INGEST_RECEIPT_RETENTION_DAYS = 14
 
 
 def _index_projection_signature(node: dict[str, Any]) -> str:
@@ -68,6 +74,27 @@ def _parse_dt(value: Any):
     except Exception:
         return None
 
+
+def _read_watchdog_status(path: Path) -> dict[str, Any]:
+    """Read the watchdog snapshot across Windows atomic-replace races."""
+    from vector_lake import watchdog_status
+
+    last_error: PermissionError | None = None
+    for attempt in range(5):
+        try:
+            with watchdog_status._status_lock:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("watchdog_status_is_not_an_object")
+            return payload
+        except PermissionError as exc:
+            last_error = exc
+            if attempt < 4:
+                time.sleep(0.02)
+    assert last_error is not None
+    raise last_error
+
+
 def _bounded_env_int(name: str, default: int, minimum: int) -> int:
     raw = os.environ.get(name, str(default))
     try:
@@ -75,6 +102,182 @@ def _bounded_env_int(name: str, default: int, minimum: int) -> int:
     except (TypeError, ValueError):
         value = default
     return max(minimum, value)
+
+
+def _auto_ingest_health_config(meta_dir: Path) -> tuple[bool, dict[str, Any], str]:
+    path = meta_dir / "auto_ingest_config.json"
+    if not path.exists():
+        return False, {}, ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, {}, f"{type(exc).__name__}:{exc}"
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return False, {}, "schema"
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return False, {}, "enabled_must_be_boolean"
+    return enabled, payload, ""
+
+
+def _auto_ingest_attempt_receipt_summary(
+    meta_dir: Path,
+    *,
+    stale_after_seconds: int,
+    retention_days: int,
+    scan_cap: int,
+) -> tuple[dict[str, Any], list[str]]:
+    """Inspect a bounded recent receipt window without enumerating all history."""
+    root = meta_dir / "auto_ingest_attempt_receipts"
+    retention_days = max(1, min(90, int(retention_days)))
+    scan_cap = max(1, min(_AUTO_INGEST_RECEIPT_MAX_SCAN_CAP, int(scan_cap)))
+    summary: dict[str, Any] = {
+        "count": 0,
+        "outcomes": {},
+        "invalid": 0,
+        "stale_started": 0,
+        "latest_ended_at": "",
+        "retention_days": retention_days,
+        "scan_cap": scan_cap,
+        "scanned_entries": 0,
+        "expired_ignored": 0,
+        "truncated": False,
+    }
+    warnings: list[str] = []
+    now = datetime.now(timezone.utc)
+    retention_cutoff = now - timedelta(days=retention_days)
+    paths: list[Path] = []
+    read_errors = 0
+
+    def scan_directory(directory: Path, *, legacy_flat: bool) -> None:
+        nonlocal read_errors
+        if summary["truncated"]:
+            return
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if summary["scanned_entries"] >= scan_cap:
+                        summary["truncated"] = True
+                        return
+                    summary["scanned_entries"] += 1
+                    try:
+                        is_receipt = (
+                            entry.is_file(follow_symlinks=False)
+                            and entry.name.lower().endswith(".json")
+                        )
+                    except OSError:
+                        read_errors += 1
+                        continue
+                    if not is_receipt:
+                        continue
+                    path = Path(entry.path)
+                    if legacy_flat:
+                        try:
+                            modified_at = datetime.fromtimestamp(
+                                entry.stat(follow_symlinks=False).st_mtime,
+                                tz=timezone.utc,
+                            )
+                        except OSError:
+                            read_errors += 1
+                            continue
+                        if modified_at < retention_cutoff:
+                            summary["expired_ignored"] += 1
+                            continue
+                    paths.append(path)
+        except FileNotFoundError:
+            return
+        except OSError:
+            read_errors += 1
+
+    # New receipts are date-partitioned, so only the explicit retention window
+    # is addressed. The legacy flat directory is sampled with the same global
+    # entry cap and filtered by mtime; neither path can grow beyond scan_cap.
+    for day_offset in range(retention_days):
+        bucket = (now - timedelta(days=day_offset)).date().isoformat()
+        scan_directory(root / bucket, legacy_flat=False)
+        if summary["truncated"]:
+            break
+    if not summary["truncated"]:
+        scan_directory(root, legacy_flat=True)
+
+    outcomes: dict[str, int] = {}
+    latest_ended: datetime | None = None
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            summary["invalid"] += 1
+            continue
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or str(payload.get("attempt_id") or "") != path.stem
+        ):
+            summary["invalid"] += 1
+            continue
+        outcome = str(payload.get("outcome") or "")
+        if not outcome:
+            summary["invalid"] += 1
+            continue
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if outcome == "started":
+            started = _parse_dt(payload.get("started_at"))
+            if started is None:
+                summary["invalid"] += 1
+            elif (now - started).total_seconds() > stale_after_seconds:
+                summary["stale_started"] += 1
+        ended = _parse_dt(payload.get("ended_at"))
+        if ended is not None and (latest_ended is None or ended > latest_ended):
+            latest_ended = ended
+
+    summary["count"] = len(paths)
+    summary["outcomes"] = dict(sorted(outcomes.items()))
+    summary["latest_ended_at"] = latest_ended.isoformat() if latest_ended else ""
+    summary["read_errors"] = read_errors
+    if read_errors:
+        warnings.append("auto_ingest_attempt_receipts_unreadable")
+    if summary["truncated"]:
+        warnings.append(f"auto_ingest_attempt_receipts_truncated:{scan_cap}")
+    if summary["invalid"]:
+        warnings.append(
+            f"auto_ingest_attempt_receipts_invalid:{summary['invalid']}"
+        )
+    if summary["stale_started"]:
+        warnings.append(
+            f"auto_ingest_attempt_receipts_stale:{summary['stale_started']}"
+        )
+    finalized_with_warning = outcomes.get("finalized_with_warning", 0)
+    if finalized_with_warning:
+        warnings.append(
+            f"auto_ingest_finalized_with_warning:{finalized_with_warning}"
+        )
+    return summary, warnings
+
+
+def _effective_watchdog_component_status(
+    component_name: str,
+    component: dict[str, Any],
+) -> tuple[str, str]:
+    """Normalize bounded auto-ingest pauses without hiding worker crashes."""
+    raw_status = str(component.get("status", "")).lower()
+    action = str(component.get("current_action") or "")
+    last_error = str(component.get("last_error") or "")
+    if component_name == "auto_ingest" and raw_status in {
+        "idle",
+        "paused",
+        "error",
+        "halted",
+    }:
+        pause_actions = {
+            "Automatic ingest budget gate closed",
+            "Automatic ingest paused by budget gate",
+            "Automatic ingest runner unavailable",
+        }
+        if action in pause_actions or (
+            action == "Automatic ingest waiting" and last_error
+        ):
+            return "paused", action
+    return raw_status, ""
 
 
 _RUNTIME_HEALTH_REQUIRED_COLUMNS = {
@@ -104,6 +307,7 @@ _RUNTIME_HEALTH_REQUIRED_COLUMNS = {
         "available_at",
         "created_at",
         "updated_at",
+        "result_json",
     },
     "runtime_generations": {"surface", "generation"},
     "operational_memory": {"memory_id", "data_json"},
@@ -227,13 +431,30 @@ def _index_snapshot(index_path: Path) -> tuple[dict[str, Any], Exception | None]
         return {"nodes": {}}, exc
 
 
+def _wiki_cache_key(path: Path) -> str:
+    """Return a stable lexical key without resolving every Wiki page on disk."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _wiki_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+        int(stat.st_size),
+    )
+
+
 def _wiki_projection_version(governance_store, path: Path) -> tuple[str | None, str | None]:
     """Return a page version using a stat-keyed, process-local parse cache."""
-    cache_key = str(path.resolve())
+    cache_key = _wiki_cache_key(path)
     try:
-        stat = path.stat()
-        identity = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        identity = _wiki_file_identity(path)
     except OSError as exc:
+        with _CACHE_LOCK:
+            _WIKI_VERSION_CACHE.pop(cache_key, None)
         return None, str(exc)
     with _CACHE_LOCK:
         cached = _WIKI_VERSION_CACHE.get(cache_key)
@@ -244,10 +465,16 @@ def _wiki_projection_version(governance_store, path: Path) -> tuple[str | None, 
             path.name,
             path.read_text(encoding="utf-8"),
         )
+        observed_identity = _wiki_file_identity(path)
         error = None
     except Exception as exc:
         version = None
         error = str(exc)
+        observed_identity = None
+    if observed_identity != identity:
+        with _CACHE_LOCK:
+            _WIKI_VERSION_CACHE.pop(cache_key, None)
+        return None, error or "wiki_page_changed_during_read"
     with _CACHE_LOCK:
         _WIKI_VERSION_CACHE[cache_key] = (identity, version, error)
     return version, error
@@ -299,7 +526,7 @@ def _write_health_surface_token() -> str:
 
     watchdog_status_path = peek_meta_dir() / ".watchdog_status.json"
     try:
-        watchdog_status = json.loads(watchdog_status_path.read_text(encoding="utf-8"))
+        watchdog_status = _read_watchdog_status(watchdog_status_path)
         components = watchdog_status.get("components")
         component_signature = ()
         if isinstance(components, dict):
@@ -314,6 +541,7 @@ def _write_health_surface_token() -> str:
                     (
                         str(name),
                         str(detail.get("status")),
+                        str(detail.get("current_action") or ""),
                         (
                             (heartbeat := _parse_dt(
                                 detail.get("heartbeat_at") or detail.get("updated_at")
@@ -456,6 +684,41 @@ def assess_runtime_health(
 
     detail["db_path"] = str(db_path)
     detail["database_access"] = "read_only"
+    meta_dir = peek_meta_dir()
+    auto_ingest_enabled, auto_ingest_config, auto_ingest_config_error = (
+        _auto_ingest_health_config(meta_dir)
+    )
+    detail["auto_ingest_enabled"] = auto_ingest_enabled
+    if auto_ingest_config_error:
+        issues.append(f"auto_ingest_config_invalid:{auto_ingest_config_error}")
+    if auto_ingest_enabled:
+        receipt_summary, receipt_warnings = _auto_ingest_attempt_receipt_summary(
+            meta_dir,
+            stale_after_seconds=max(
+                120,
+                int(auto_ingest_config.get("lease_seconds") or 1320) + 60,
+            ),
+            retention_days=max(
+                1,
+                min(
+                    90,
+                    int(
+                        auto_ingest_config.get("scratch_retention_days")
+                        or _AUTO_INGEST_RECEIPT_RETENTION_DAYS
+                    ),
+                ),
+            ),
+            scan_cap=min(
+                _AUTO_INGEST_RECEIPT_MAX_SCAN_CAP,
+                _bounded_env_int(
+                    "VECTOR_LAKE_AUTO_INGEST_RECEIPT_SCAN_CAP",
+                    _AUTO_INGEST_RECEIPT_SCAN_CAP,
+                    1,
+                ),
+            ),
+        )
+        detail["auto_ingest_attempt_receipts"] = receipt_summary
+        warnings.extend(receipt_warnings)
 
     outbox_counts = {
         row["status"]: row["count"]
@@ -476,12 +739,42 @@ def assess_runtime_health(
         if pending_age > max_pending_age:
             issues.append(f"mutation_outbox_stalled:{pending_age}s")
 
-    terminal_jobs = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
-    ).fetchone()[0]
-    detail["terminal_failed_jobs"] = int(terminal_jobs)
-    if terminal_jobs:
-        issues.append(f"terminal_failed_jobs:{terminal_jobs}")
+    from vector_lake.db_store import _ingest_result_is_auto_quarantine
+
+    terminal_rows = conn.execute(
+        "SELECT task_type, result_json FROM jobs "
+        "WHERE status = 'failed' AND retries >= 3"
+    ).fetchall()
+    terminal_jobs = len(terminal_rows)
+    auto_quarantined_jobs = sum(
+        1
+        for row in terminal_rows
+        if str(row["task_type"] or "") == "ingest"
+        and _ingest_result_is_auto_quarantine(row["result_json"])
+    )
+    blocking_terminal_jobs = terminal_jobs - auto_quarantined_jobs
+    detail["terminal_failed_jobs"] = terminal_jobs
+    detail["blocking_terminal_failed_jobs"] = blocking_terminal_jobs
+    detail["auto_ingest_quarantined_jobs"] = auto_quarantined_jobs
+    if auto_quarantined_jobs:
+        detail["auto_ingest_quarantine_recovery"] = {
+            "preview": "reconcile_ingest_job_debt(dry_run=True)",
+            "apply": "reconcile_ingest_job_debt(dry_run=False)",
+        }
+        warnings.append(f"auto_ingest_quarantined_jobs:{auto_quarantined_jobs}")
+    if blocking_terminal_jobs:
+        issues.append(f"terminal_failed_jobs:{blocking_terminal_jobs}")
+
+    auto_ingest_active_jobs = 0
+    if auto_ingest_enabled:
+        auto_ingest_active_jobs = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest' "
+                "AND status IN ('awaiting_subagent', 'subagent_processing')"
+            ).fetchone()[0]
+            or 0
+        )
+        detail["auto_ingest_active_jobs"] = auto_ingest_active_jobs
     now_text = datetime.now(timezone.utc).isoformat()
     ready_ingest_row = conn.execute(
         "SELECT COUNT(*) AS count, "
@@ -510,10 +803,14 @@ def assess_runtime_health(
             minimum=30,
         )
         if ready_ingest_age > max_ready_age:
-            issues.append(
+            message = (
                 f"ingest_dispatch_stalled:count={ready_ingest_count},"
                 f"oldest={ready_ingest_age}s"
             )
+            if auto_ingest_enabled and auto_ingest_active_jobs >= 1:
+                warnings.append("auto_ingest_backpressure:" + message)
+            else:
+                issues.append(message)
     awaiting_row = conn.execute(
         "SELECT COUNT(*) AS count, COALESCE(MIN(updated_at), '') AS oldest "
         "FROM jobs WHERE status = 'awaiting_subagent'"
@@ -522,6 +819,8 @@ def assess_runtime_health(
     detail["awaiting_subagent_jobs"] = awaiting_count
     backlog_messages = []
     max_awaiting = max(1, int(os.environ.get("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_JOBS", "500")))
+    if auto_ingest_enabled:
+        max_awaiting = min(max_awaiting, 1)
     if awaiting_count > max_awaiting:
         backlog_messages.append(f"count={awaiting_count}")
     oldest_awaiting = _parse_dt(awaiting_row["oldest"])
@@ -529,16 +828,51 @@ def assess_runtime_health(
         awaiting_age = max(0, int((datetime.now(timezone.utc) - oldest_awaiting).total_seconds()))
         detail["oldest_awaiting_subagent_age_seconds"] = awaiting_age
         max_age = max(60, int(os.environ.get("VECTOR_LAKE_MAX_AWAITING_SUBAGENT_AGE_SECONDS", "86400")))
+        if auto_ingest_enabled:
+            max_age = min(max_age, 60)
         if awaiting_age > max_age:
             backlog_messages.append(f"oldest={awaiting_age}s")
     if backlog_messages:
         message = "subagent_backlog:" + ",".join(backlog_messages)
-        if os.environ.get("VECTOR_LAKE_SUBAGENT_BACKLOG_BLOCKING") == "1":
+        if (
+            not auto_ingest_enabled
+            and os.environ.get("VECTOR_LAKE_SUBAGENT_BACKLOG_BLOCKING") == "1"
+        ):
             issues.append(message)
         else:
             warnings.append(message)
 
-    meta_dir = peek_meta_dir()
+    if auto_ingest_enabled:
+        processing_row = conn.execute(
+            "SELECT COUNT(*) AS count, COALESCE(MIN(updated_at), '') AS oldest "
+            "FROM jobs WHERE status = 'subagent_processing'"
+        ).fetchone()
+        processing_count = int(processing_row["count"] or 0)
+        detail["subagent_processing_jobs"] = processing_count
+        if processing_count > 1:
+            warnings.append(
+                f"auto_ingest_concurrency_violation:count={processing_count}"
+            )
+        oldest_processing = _parse_dt(processing_row["oldest"])
+        if oldest_processing is not None:
+            processing_age = max(
+                0,
+                int((datetime.now(timezone.utc) - oldest_processing).total_seconds()),
+            )
+            detail["oldest_subagent_processing_age_seconds"] = processing_age
+            try:
+                configured_timeout = int(
+                    auto_ingest_config.get("timeout_seconds", 1200)
+                )
+            except (TypeError, ValueError):
+                configured_timeout = 1200
+            max_processing_age = max(120, configured_timeout + 120)
+            if processing_age > max_processing_age:
+                warnings.append(
+                    "auto_ingest_processing_stalled:"
+                    f"count={processing_count},oldest={processing_age}s"
+                )
+
     reconcile_marker = meta_dir / "wiki_reconcile_required.json"
     if reconcile_marker.exists():
         try:
@@ -552,7 +886,7 @@ def assess_runtime_health(
     status_path = meta_dir / ".watchdog_status.json"
     if status_path.exists():
         try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status = _read_watchdog_status(status_path)
             now_utc = datetime.now(timezone.utc)
             updated_at = _parse_dt(status.get("updated_at"))
             age = None
@@ -566,6 +900,8 @@ def assess_runtime_health(
             components = status.get("components")
             unhealthy_states = {"error", "halted", "stopped"}
             unhealthy_components: list[str] = []
+            paused_components: dict[str, str] = {}
+            effective_component_statuses: dict[str, str] = {}
             if isinstance(components, dict) and components:
                 component_max_age = _bounded_env_int(
                     "VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS",
@@ -586,9 +922,18 @@ def assess_runtime_health(
                     )
                     component_name = str(name)
                     component_ages[component_name] = component_age
+                    effective_status, pause_reason = (
+                        _effective_watchdog_component_status(
+                            component_name,
+                            component,
+                        )
+                    )
+                    effective_component_statuses[component_name] = effective_status
+                    if pause_reason:
+                        paused_components[component_name] = pause_reason
                     if component_age is None or component_age > component_max_age:
                         stale_components.append(component_name)
-                    if str(component.get("status", "")).lower() in unhealthy_states:
+                    if effective_status in unhealthy_states:
                         unhealthy_components.append(component_name)
 
                 required_components = {
@@ -599,10 +944,20 @@ def assess_runtime_health(
                     ).split(",")
                     if item.strip()
                 }
+                if auto_ingest_enabled:
+                    required_components.add("auto_ingest")
                 missing_components = sorted(required_components - set(components))
                 detail["watchdog_component_max_age_seconds"] = component_max_age
                 detail["watchdog_component_ages_seconds"] = component_ages
+                detail["watchdog_component_effective_statuses"] = (
+                    effective_component_statuses
+                )
+                detail["watchdog_paused_components"] = paused_components
                 detail["watchdog_missing_components"] = missing_components
+                for component_name, pause_reason in sorted(paused_components.items()):
+                    warnings.append(
+                        f"watchdog_component_paused:{component_name}:{pause_reason}"
+                    )
                 for component_name in sorted(stale_components):
                     component_age = component_ages[component_name]
                     issues.append(
@@ -611,15 +966,30 @@ def assess_runtime_health(
                         f"{component_age if component_age is not None else 'unknown'}"
                     )
                 if missing_components:
-                    warnings.append(
-                        "watchdog_components_missing:" + ",".join(missing_components)
+                    missing_message = "watchdog_components_missing:" + ",".join(
+                        missing_components
                     )
+                    if auto_ingest_enabled and "auto_ingest" in missing_components:
+                        issues.append(missing_message)
+                    else:
+                        warnings.append(missing_message)
             else:
                 detail["watchdog_status_schema"] = "legacy"
                 warnings.append("watchdog_component_status_legacy")
 
+            aggregate_status = str(status.get("status", "")).lower()
+            aggregate_is_paused = bool(
+                aggregate_status in unhealthy_states
+                and not unhealthy_components
+                and paused_components
+                and any(
+                    str((components.get(name) or {}).get("status", "")).lower()
+                    == aggregate_status
+                    for name in paused_components
+                )
+            )
             if (
-                str(status.get("status", "")).lower() in unhealthy_states
+                (aggregate_status in unhealthy_states and not aggregate_is_paused)
                 or unhealthy_components
             ):
                 issues.append(
@@ -752,8 +1122,7 @@ def assess_runtime_health(
             if payload_version == canonical_versions.get(page_key):
                 managed_base_versions[page_key] = str(base_version)
         active_wiki_paths = {
-            str(wiki_paths[page_key].resolve())
-            for page_key in shared_wiki_keys
+            _wiki_cache_key(wiki_paths[page_key]) for page_key in shared_wiki_keys
         }
         _prune_wiki_version_cache(active_wiki_paths)
         managed_reconciliation_drift: set[str] = set()

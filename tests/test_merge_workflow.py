@@ -787,7 +787,9 @@ def test_approved_system_merge_resolves_with_intentional_index_exclusion(
     db_store.init_db()
     indexer.generate_index()
     target_key = "System_Time-Series-Foundation-Models"
-    source_key = "System_Time_Series_Foundation_Models"
+    # System pages no longer bypass the canonical filename grammar. Keep this
+    # merge fixture distinct while exercising a valid System_* node name.
+    source_key = "System_Time-Series-Foundation-Models-Legacy"
     target_path = isolated_memory / "wiki" / f"{target_key}.md"
     source_path = isolated_memory / "wiki" / f"{source_key}.md"
     execute_mutation_plan(

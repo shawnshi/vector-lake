@@ -4,11 +4,16 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from itertools import islice
 import json
 from vector_lake import get_extension_root
-from vector_lake.watchdog_status import write_status
+from vector_lake.watchdog_status import (
+    begin_watchdog_run,
+    current_watchdog_run_id,
+    write_status,
+)
 
 # Load config
 CONFIG_PATH = get_extension_root() / "config.json"
@@ -67,6 +72,10 @@ def _positive_env_int(name: str, default: int) -> int:
 
 _BACKGROUND_THREADS_LOCK = threading.Lock()
 _BACKGROUND_THREADS: dict[str, threading.Thread] = {}
+_RAW_EVENT_LOG_LOCK = threading.Lock()
+_RAW_EVENT_LOG_WINDOW_STARTED = 0.0
+_RAW_EVENT_LOG_SUPPRESSED = 0
+_RAW_EVENT_LOG_FILENAMES: set[str] = set()
 
 
 def _bounded_env_float(
@@ -90,6 +99,15 @@ def _shutdown_timeout_seconds() -> float:
     )
 
 
+def _auto_ingest_drain_timeout_seconds() -> float:
+    return _bounded_env_float(
+        "VECTOR_LAKE_AUTO_INGEST_DRAIN_TIMEOUT_SECONDS",
+        300.0,
+        minimum=1.0,
+        maximum=3600.0,
+    )
+
+
 def _outbox_batch_yield_seconds() -> float:
     """Return the interruptible pause after a successful durable outbox batch."""
     return _bounded_env_float(
@@ -98,6 +116,53 @@ def _outbox_batch_yield_seconds() -> float:
         minimum=0.001,
         maximum=1.0,
     )
+
+
+def _raw_event_log_window_seconds() -> float:
+    return _bounded_env_float(
+        "VECTOR_LAKE_RAW_EVENT_LOG_WINDOW_SECONDS",
+        5.0,
+        minimum=0.1,
+        maximum=60.0,
+    )
+
+
+def _log_raw_event(filename: str) -> None:
+    """Emit one detail line per small window and aggregate repeated events."""
+    global _RAW_EVENT_LOG_FILENAMES
+    global _RAW_EVENT_LOG_SUPPRESSED
+    global _RAW_EVENT_LOG_WINDOW_STARTED
+
+    now = time.monotonic()
+    with _RAW_EVENT_LOG_LOCK:
+        if not _RAW_EVENT_LOG_WINDOW_STARTED:
+            _RAW_EVENT_LOG_WINDOW_STARTED = now
+            log.info(
+                "Raw source modified: %s. Scheduled path-scoped ingest preparation.",
+                filename,
+            )
+            return
+        elapsed = now - _RAW_EVENT_LOG_WINDOW_STARTED
+        if elapsed < _raw_event_log_window_seconds():
+            _RAW_EVENT_LOG_SUPPRESSED += 1
+            if len(_RAW_EVENT_LOG_FILENAMES) < 50:
+                _RAW_EVENT_LOG_FILENAMES.add(filename)
+            return
+        if _RAW_EVENT_LOG_SUPPRESSED:
+            log.info(
+                "Raw source events aggregated: suppressed=%s unique_files=%s "
+                "window_seconds=%.2f",
+                _RAW_EVENT_LOG_SUPPRESSED,
+                len(_RAW_EVENT_LOG_FILENAMES),
+                elapsed,
+            )
+        _RAW_EVENT_LOG_WINDOW_STARTED = now
+        _RAW_EVENT_LOG_SUPPRESSED = 0
+        _RAW_EVENT_LOG_FILENAMES = set()
+        log.info(
+            "Raw source modified: %s. Scheduled path-scoped ingest preparation.",
+            filename,
+        )
 
 
 def background_thread_health() -> dict[str, bool]:
@@ -123,10 +188,71 @@ def _join_threads_bounded(
     return sorted(name for name, thread in threads.items() if thread.is_alive())
 
 
+def _drain_auto_ingest_worker(
+    threads: dict[str, threading.Thread],
+    alive_workers: list[str],
+    heartbeat: Callable[[], None] | None = None,
+    timeout_seconds: float | None = None,
+) -> list[str]:
+    """Wait for an in-flight finalizer only within a durable shutdown budget."""
+    if "auto_ingest" not in alive_workers:
+        return alive_workers
+    auto_thread = threads.get("auto_ingest")
+    timeout = (
+        _auto_ingest_drain_timeout_seconds()
+        if timeout_seconds is None
+        else max(0.0, float(timeout_seconds))
+    )
+    deadline = time.monotonic() + timeout
+    while (
+        auto_thread is not None
+        and auto_thread.is_alive()
+        and time.monotonic() < deadline
+    ):
+        if heartbeat is not None:
+            heartbeat()
+        auto_thread.join(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+    if auto_thread is not None and auto_thread.is_alive():
+        return alive_workers
+    return [name for name in alive_workers if name != "auto_ingest"]
+
+
 def _wiki_reconcile_marker_path() -> Path:
     from vector_lake.wiki_utils import get_meta_dir
 
     return get_meta_dir() / "wiki_reconcile_required.json"
+
+
+def watchdog_stop_request_path() -> Path:
+    """Return the stable control marker used for bounded external shutdown."""
+    from vector_lake.wiki_utils import get_meta_dir
+
+    return get_meta_dir() / ".watchdog.stop"
+
+
+def request_watchdog_stop() -> Path:
+    """Atomically ask the active watchdog to run its normal shutdown sequence."""
+    path = watchdog_stop_request_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(
+                {
+                    "requested_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                    ),
+                    "requester_pid": os.getpid(),
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return path
 
 
 class WikiIndexEventBuffer:
@@ -981,10 +1107,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
             self._queue_batch_locked([str(Path(filepath).resolve())], False)
             self._submit_pending_locked()
 
-        log.info(
-            "Raw source modified: %s. Scheduled path-scoped ingest preparation.",
-            filename,
-        )
+        _log_raw_event(filename)
 
     def on_created(self, event):
         self.handle_event(event)
@@ -994,6 +1117,268 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         self.handle_event(event)
+
+
+def _outbox_batch_budget_seconds() -> float:
+    return _bounded_env_float(
+        "VECTOR_LAKE_OUTBOX_BATCH_BUDGET_SECONDS",
+        60.0,
+        minimum=1.0,
+        maximum=3600.0,
+    )
+
+
+def _outbox_lease_seconds(limit: int, budget_seconds: float) -> int:
+    return max(
+        120,
+        min(3600, max(max(1, int(limit)), int(budget_seconds) + 30)),
+    )
+
+
+def _outbox_lease_renew_interval_seconds(lease_seconds: int) -> float:
+    return _bounded_env_float(
+        "VECTOR_LAKE_OUTBOX_LEASE_RENEW_INTERVAL_SECONDS",
+        max(1.0, min(30.0, float(lease_seconds) / 3.0)),
+        minimum=0.05,
+        maximum=30.0,
+    )
+
+
+def _renew_mutation_outbox_lease(db_store, row: dict, lease_seconds: int) -> bool:
+    """Renew one outbox lease under its full owner/token/generation fence."""
+    from datetime import datetime, timedelta, timezone
+
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    lease_until = (now_dt + timedelta(seconds=max(1, int(lease_seconds)))).isoformat()
+    connection = db_store.get_connection()
+    with db_store.transaction():
+        updated = connection.execute(
+            "UPDATE mutation_outbox SET lease_until = ? "
+            "WHERE id = ? AND status = 'processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (
+                lease_until,
+                int(row["id"]),
+                row["lease_owner"],
+                row["lease_token"],
+                int(row["lease_generation"]),
+                now,
+            ),
+        )
+    return bool(updated.rowcount)
+
+
+def _release_mutation_outbox_lease(db_store, row: dict, reason: str) -> bool:
+    """CAS-release scheduler-deferred work without charging a content attempt."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    connection = db_store.get_connection()
+    with db_store.transaction():
+        updated = connection.execute(
+            "UPDATE mutation_outbox SET status = 'pending', available_at = ?, "
+            "attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END, "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+            "last_error = ? WHERE id = ? AND status = 'processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (
+                now,
+                str(reason)[:4000],
+                int(row["id"]),
+                row["lease_owner"],
+                row["lease_token"],
+                int(row["lease_generation"]),
+                now,
+            ),
+        )
+    return bool(updated.rowcount)
+
+
+def _run_with_outbox_lease_renewal(
+    db_store,
+    rows: list[dict],
+    lease_seconds: int,
+    operation: Callable[[list[dict]], None],
+) -> list[dict]:
+    """Keep current leases alive while one slow projection operation runs."""
+    active = [
+        row
+        for row in rows
+        if _renew_mutation_outbox_lease(db_store, row, lease_seconds)
+    ]
+    if not active:
+        return []
+    stop_renewal = threading.Event()
+    interval = _outbox_lease_renew_interval_seconds(lease_seconds)
+
+    def renew_loop() -> None:
+        try:
+            while not stop_renewal.wait(interval):
+                for row in active:
+                    try:
+                        if not _renew_mutation_outbox_lease(
+                            db_store,
+                            row,
+                            lease_seconds,
+                        ):
+                            log.warning(
+                                "Outbox lease lost during projection work: id=%s",
+                                row["id"],
+                            )
+                    except Exception as exc:
+                        log.warning(
+                            "Outbox lease renewal failed transiently for id=%s: %s",
+                            row["id"],
+                            exc,
+                        )
+        finally:
+            db_store.close_connection()
+
+    renewal_thread = threading.Thread(
+        target=renew_loop,
+        daemon=True,
+        name="vector-lake-outbox-lease-renewer",
+    )
+    renewal_thread.start()
+    try:
+        operation(active)
+    finally:
+        stop_renewal.set()
+        renewal_thread.join(timeout=min(5.0, interval + 0.5))
+        if renewal_thread.is_alive():
+            log.error("Outbox lease-renewal thread did not stop within its bound.")
+    return active
+
+
+def _apply_outbox_index_projection(indexer, filenames: list[str]) -> None:
+    system_filenames = [
+        filename for filename in filenames if indexer.is_system_page_filename(filename)
+    ]
+    if indexer.index_projection_matches_canonical(filenames):
+        if not indexer.projection_pair_matches_current_generation():
+            indexer.refresh_claim_graph_projection()
+    else:
+        indexer.update_index_items(filenames)
+        if system_filenames and not indexer.index_projection_matches_canonical(
+            system_filenames
+        ):
+            raise RuntimeError(
+                "Selected index projection does not match canonical state after "
+                "outbox indexing."
+            )
+    if not indexer.projection_pair_matches_current_generation():
+        raise RuntimeError(
+            "Projection pair is not committed against the current canonical "
+            "generation after outbox indexing."
+        )
+
+
+def _settle_outbox_index_partition(
+    rows: list[dict],
+    *,
+    db_store,
+    indexer,
+    lease_seconds: int,
+    deadline: float,
+    stats: dict,
+    max_attempts: int,
+    backoff_base: float,
+) -> None:
+    current_rows = [
+        row
+        for row in rows
+        if db_store.mutation_outbox_lease_is_current(
+            int(row["id"]),
+            row["lease_owner"],
+            row["lease_token"],
+            int(row["lease_generation"]),
+        )
+    ]
+    if not current_rows:
+        return
+    if time.monotonic() >= deadline:
+        for row in current_rows:
+            _release_mutation_outbox_lease(
+                db_store,
+                row,
+                "Outbox batch time budget exhausted before projection indexing",
+            )
+        return
+
+    try:
+        active_rows = _run_with_outbox_lease_renewal(
+            db_store,
+            current_rows,
+            lease_seconds,
+            lambda held: _apply_outbox_index_projection(
+                indexer,
+                list(dict.fromkeys(str(row["filename"]) for row in held)),
+            ),
+        )
+    except Exception as exc:
+        if len(current_rows) > 1 and time.monotonic() < deadline:
+            midpoint = len(current_rows) // 2
+            log.warning(
+                "Outbox index batch failed; isolating poison rows across %s/%s "
+                "partitions: %s",
+                midpoint,
+                len(current_rows) - midpoint,
+                exc,
+            )
+            _settle_outbox_index_partition(
+                current_rows[:midpoint],
+                db_store=db_store,
+                indexer=indexer,
+                lease_seconds=lease_seconds,
+                deadline=deadline,
+                stats=stats,
+                max_attempts=max_attempts,
+                backoff_base=backoff_base,
+            )
+            _settle_outbox_index_partition(
+                current_rows[midpoint:],
+                db_store=db_store,
+                indexer=indexer,
+                lease_seconds=lease_seconds,
+                deadline=deadline,
+                stats=stats,
+                max_attempts=max_attempts,
+                backoff_base=backoff_base,
+            )
+            return
+        for row in current_rows:
+            outbox_id = int(row["id"])
+            status = db_store.fail_mutation_outbox(
+                outbox_id,
+                str(exc),
+                row["lease_owner"],
+                row["lease_token"],
+                int(row["lease_generation"]),
+                max_attempts=max_attempts,
+                backoff_base=backoff_base,
+            )
+            if status != "stale":
+                stats["failed" if status == "failed" else "retrying"] += 1
+            log.error(
+                "Outbox index item %s failed for %s; status=%s: %s",
+                outbox_id,
+                row["filename"],
+                status,
+                exc,
+            )
+        return
+
+    for row in active_rows:
+        if db_store.complete_mutation_outbox(
+            int(row["id"]),
+            row["lease_owner"],
+            row["lease_token"],
+            int(row["lease_generation"]),
+        ):
+            stats["completed"] += 1
 
 
 def process_mutation_outbox_batch(
@@ -1007,8 +1392,16 @@ def process_mutation_outbox_batch(
     from vector_lake.mutation_coordinator import materialize_markdown_projection
     from vector_lake.wiki_utils import get_wiki_dir, normalize_semantic_text
 
-    lease_seconds = max(120, min(3600, max(1, int(limit))))
-    claim_kwargs = {"limit": limit, "lease_seconds": lease_seconds}
+    budget_seconds = _outbox_batch_budget_seconds()
+    deadline = time.monotonic() + budget_seconds
+    lease_seconds = _outbox_lease_seconds(limit, budget_seconds)
+    claim_kwargs = {
+        "limit": limit,
+        "lease_seconds": lease_seconds,
+        "lease_owner": (
+            f"watchdog:{current_watchdog_run_id()}:{os.getpid()}"
+        ),
+    }
     if outbox_ids is not None:
         claim_kwargs["outbox_ids"] = outbox_ids
     rows = db_store.claim_mutation_outbox(**claim_kwargs)
@@ -1025,6 +1418,15 @@ def process_mutation_outbox_batch(
         try:
             if not db_store.mutation_outbox_lease_is_current(outbox_id, *lease_args):
                 continue
+            if time.monotonic() >= deadline:
+                _release_mutation_outbox_lease(
+                    db_store,
+                    row,
+                    "Outbox batch time budget exhausted before materialization",
+                )
+                continue
+            if not _renew_mutation_outbox_lease(db_store, row, lease_seconds):
+                continue
             target = get_wiki_dir() / filename
             already_materialized = (
                 not target.exists()
@@ -1037,19 +1439,18 @@ def process_mutation_outbox_batch(
                 )
             )
             if not already_materialized:
-                with db_store.transaction():
-                    if not db_store.mutation_outbox_lease_is_current(
-                        outbox_id, *lease_args
-                    ):
-                        continue
-                    materialize_markdown_projection(
-                        filename,
-                        row["mutation_type"],
-                        row.get("payload_text"),
-                        validation_mode=row.get("validation_mode") or "full",
-                        projection_base_hash=row.get("projection_base_hash"),
-                    )
-            if db_store.mutation_outbox_lease_is_current(outbox_id, *lease_args):
+                if not db_store.mutation_outbox_lease_is_current(
+                    outbox_id, *lease_args
+                ):
+                    continue
+                materialize_markdown_projection(
+                    filename,
+                    row["mutation_type"],
+                    row.get("payload_text"),
+                    validation_mode=row.get("validation_mode") or "full",
+                    projection_base_hash=row.get("projection_base_hash"),
+                )
+            if _renew_mutation_outbox_lease(db_store, row, lease_seconds):
                 ready_for_index.append((row, filename))
         except Exception as exc:
             status = db_store.fail_mutation_outbox(
@@ -1065,67 +1466,16 @@ def process_mutation_outbox_batch(
                 f"Outbox item {outbox_id} failed for {filename}; status={status}: {exc}"
             )
     if ready_for_index:
-        current_rows = [
-            (row, filename)
-            for row, filename in ready_for_index
-            if db_store.mutation_outbox_lease_is_current(
-                int(row["id"]),
-                row["lease_owner"],
-                row["lease_token"],
-                int(row["lease_generation"]),
-            )
-        ]
-        filenames = list(dict.fromkeys(filename for _, filename in current_rows))
-        system_filenames = [
-            filename
-            for filename in filenames
-            if indexer.is_system_page_filename(filename)
-        ]
-        try:
-            if filenames:
-                if indexer.index_projection_matches_canonical(filenames):
-                    if not indexer.projection_pair_matches_current_generation():
-                        indexer.refresh_claim_graph_projection()
-                else:
-                    indexer.update_index_items(filenames)
-                    if system_filenames and not indexer.index_projection_matches_canonical(
-                        system_filenames
-                    ):
-                        raise RuntimeError(
-                            "Selected index projection does not match canonical state "
-                            "after outbox indexing."
-                        )
-                if not indexer.projection_pair_matches_current_generation():
-                    raise RuntimeError(
-                        "Projection pair is not committed against the current "
-                        "canonical generation after outbox indexing."
-                    )
-        except Exception as exc:
-            for row, filename in current_rows:
-                outbox_id = int(row["id"])
-                status = db_store.fail_mutation_outbox(
-                    outbox_id,
-                    str(exc),
-                    row["lease_owner"],
-                    row["lease_token"],
-                    int(row["lease_generation"]),
-                    max_attempts=max_attempts,
-                    backoff_base=backoff_base,
-                )
-                if status != "stale":
-                    stats["failed" if status == "failed" else "retrying"] += 1
-                log.error(
-                    f"Outbox index batch failed for {filename}; status={status}: {exc}"
-                )
-        else:
-            for row, _ in current_rows:
-                if db_store.complete_mutation_outbox(
-                    int(row["id"]),
-                    row["lease_owner"],
-                    row["lease_token"],
-                    int(row["lease_generation"]),
-                ):
-                    stats["completed"] += 1
+        _settle_outbox_index_partition(
+            [row for row, _filename in ready_for_index],
+            db_store=db_store,
+            indexer=indexer,
+            lease_seconds=lease_seconds,
+            deadline=deadline,
+            stats=stats,
+            max_attempts=max_attempts,
+            backoff_base=backoff_base,
+        )
     return stats
 
 
@@ -1889,29 +2239,43 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
 
 def _start_watchdog_locked(stop_event: threading.Event | None = None):
     stop_event = stop_event or threading.Event()
+    worker_stop_event = threading.Event()
+    auto_stop_event = threading.Event()
+    stop_request_path = watchdog_stop_request_path()
+    stop_request_path.unlink(missing_ok=True)
+    begin_watchdog_run(
+        ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")
+    )
     if index_queue.restore_full_reconcile_marker():
         log.warning("Restored pending Wiki reconciliation marker after restart.")
 
+    from vector_lake.auto_ingest_worker import start_auto_ingest_worker
     from vector_lake.ingest_worker import start_worker
 
     worker_threads = {
         "outbox": threading.Thread(
             target=index_worker_loop,
-            args=(stop_event,),
+            args=(worker_stop_event,),
             daemon=True,
             name="vector-lake-outbox-worker",
         ),
         "scheduler": threading.Thread(
             target=scheduled_lint_loop,
-            args=(stop_event,),
+            args=(worker_stop_event,),
             daemon=True,
             name="vector-lake-scheduled-lint-worker",
         ),
         "ingest": threading.Thread(
             target=start_worker,
-            args=(stop_event,),
+            args=(worker_stop_event,),
             daemon=True,
             name="vector-lake-ingest-worker",
+        ),
+        "auto_ingest": threading.Thread(
+            target=start_auto_ingest_worker,
+            args=(auto_stop_event,),
+            daemon=False,
+            name="vector-lake-auto-ingest-worker",
         ),
     }
     _register_background_threads(worker_threads)
@@ -2023,6 +2387,10 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
         last_heartbeat = 0.0
         last_raw_watch_refresh = time.monotonic()
         while not stop_event.wait(monitor_seconds):
+            if stop_request_path.exists():
+                log.info("External watchdog stop request received.")
+                stop_event.set()
+                break
             dead_workers = sorted(
                 name
                 for name, thread in started_workers.items()
@@ -2269,8 +2637,55 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
         log.info("Termination signal received. Shutting down Watchdog...")
     finally:
         stop_event.set()
-        deadline = time.monotonic() + _shutdown_timeout_seconds()
+        auto_stop_event.set()
+        stop_request_path.unlink(missing_ok=True)
         shutdown_failures: list[str] = []
+
+        auto_thread = started_workers.get("auto_ingest")
+        if auto_thread is not None and auto_thread.is_alive():
+            drain_action = "Watchdog waiting for automatic ingest finalizer"
+            drain_error = (
+                "singleton and execution locks remain held until finalization returns"
+            )
+
+            def publish_drain_heartbeat() -> None:
+                try:
+                    published = write_status(
+                        "draining",
+                        0,
+                        index_queue.qsize(),
+                        drain_action,
+                        drain_error,
+                        component="watchdog",
+                    )
+                except Exception as exc:
+                    failure = (
+                        "watchdog_drain_heartbeat_exception:"
+                        f"{type(exc).__name__}:{exc}"
+                    )[:1000]
+                    log.error("Could not publish watchdog drain heartbeat: %s", exc)
+                else:
+                    failure = (
+                        "" if published else "watchdog_drain_heartbeat_publish_failed"
+                    )
+                if failure and not any(
+                    item.startswith("watchdog_drain_heartbeat_")
+                    for item in shutdown_failures
+                ):
+                    shutdown_failures.append(failure)
+
+            alive_workers = _drain_auto_ingest_worker(
+                started_workers,
+                ["auto_ingest"],
+                heartbeat=publish_drain_heartbeat,
+            )
+            if alive_workers:
+                shutdown_failures.append(
+                    "auto_ingest_drain_incomplete:" + ",".join(alive_workers)
+                )
+
+        worker_stop_event.set()
+        deadline = time.monotonic() + _shutdown_timeout_seconds()
 
         try:
             observer.stop()
@@ -2295,7 +2710,12 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
                 shutdown_failures.append("observer_join_timeout")
 
         remaining = max(0.0, deadline - time.monotonic())
-        alive_workers = _join_threads_bounded(started_workers, remaining)
+        peer_workers = {
+            name: thread
+            for name, thread in started_workers.items()
+            if name != "auto_ingest"
+        }
+        alive_workers = _join_threads_bounded(peer_workers, remaining)
         if alive_workers:
             shutdown_failures.append("worker_join_timeout:" + ",".join(alive_workers))
 

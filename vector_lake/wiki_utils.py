@@ -268,7 +268,14 @@ def iter_wiki_link_matches(content: str):
             continue
         yield match
 
-SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
+SYSTEM_WHITELIST = {
+    "index.md",
+    "log.md",
+    "overview.md",
+    "orphan_pages.md",
+    "wiki_link_stats.md",
+    "Synthesis_log.md",
+}
 VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
 
@@ -304,7 +311,10 @@ def normalize_entity_name(name: str) -> str:
     return f"{prefix}{name}"
 
 def validate_wiki_filename(filename: str):
-    if filename in SYSTEM_WHITELIST or filename.startswith("System_"):
+    # Only exact, owned metadata basenames bypass the node filename contract.
+    # System_ pages are ordinary canonical nodes and must pass every suffix,
+    # prefix, character, shape, anti-cheat, and length rule below.
+    if filename in SYSTEM_WHITELIST:
         return
     
     if not filename.casefold().endswith(".md"):
@@ -316,7 +326,7 @@ def validate_wiki_filename(filename: str):
     if INVALID_CHARS_REGEX.search(filename):
         raise ValueError(f"Invalid characters: '{filename}' contains forbidden characters (e.g., brackets, slashes, spaces).")
         
-    if not re.match(r'^(Concept|Vendor|Institution|Product|Person|Event|Policy|Standard|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*(?i:\.md)$', filename):
+    if not re.fullmatch(r'(Concept|Vendor|Institution|Product|Person|Event|Policy|Standard|Source|Synthesis|System)_[a-zA-Z0-9\u4e00-\u9fa5]+(?:-[a-zA-Z0-9\u4e00-\u9fa5]+)*(?i:\.md)', filename):
         raise ValueError(f"Strict Naming Violation: '{filename}' must match pattern [Type]_[MainName]-[SubName].md")
         
     core_name = filename.split("_", 1)[1][:-3] if "_" in filename else filename[:-3]

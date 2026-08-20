@@ -63,6 +63,7 @@ QUERY_EXPANSION_DICT = {
 
 _SEARCH_QUERY_CHAR_LIMIT = 16_384
 _SEARCH_TOP_K_LIMIT = 100
+_QUERY_EMBEDDING_OPT_IN_ENV = "VECTOR_LAKE_QUERY_EMBEDDING"
 
 _QUERY_EMBEDDING_STATE_LOCK = threading.Lock()
 _QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
@@ -78,6 +79,11 @@ def _query_embedding_int(name: str, default: int) -> int:
         return max(1, int(os.environ.get(name, default)))
     except (TypeError, ValueError):
         return default
+
+
+def _query_embedding_enabled() -> bool:
+    """Return true only for the trusted host's explicit provider opt-in."""
+    return os.environ.get(_QUERY_EMBEDDING_OPT_IN_ENV) == "1"
 
 
 @functools.lru_cache(maxsize=64)
@@ -114,7 +120,11 @@ def _get_query_embedding(query: str) -> list[float]:
         raise ValueError(
             f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters"
         )
-    if not os.environ.get("GEMINI_API_KEY") or not normalized_query:
+    if (
+        not _query_embedding_enabled()
+        or not os.environ.get("GEMINI_API_KEY")
+        or not normalized_query
+    ):
         return []
 
     timeout_ms = _query_embedding_int(
@@ -743,7 +753,11 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     # 2. Vector Search (Hybrid blending)
     query_vector = _get_query_embedding(query)
-    if not query_vector and os.environ.get("GEMINI_API_KEY"):
+    if (
+        not query_vector
+        and _query_embedding_enabled()
+        and os.environ.get("GEMINI_API_KEY")
+    ):
         backend_issues.append("query_embedding")
     if query_vector:
         try:

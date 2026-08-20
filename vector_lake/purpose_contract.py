@@ -159,11 +159,12 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
     for item in items:
         if not isinstance(item, dict) or "filename" not in item:
             raise PurposeContractError("Each ingest item requires filename.")
-        if "filepath" in item and not item.get("content"):
-            with open(item["filepath"], "r", encoding="utf-8") as f:
-                item["content"] = f.read()
-        if "content" not in item:
-            raise PurposeContractError("Each ingest item requires content or filepath.")
+        if "filepath" in item:
+            raise PurposeContractError(
+                "Ingest filepath inputs are forbidden; provide bounded inline content."
+            )
+        if not isinstance(item.get("content"), str):
+            raise PurposeContractError("Each ingest item requires inline string content.")
         filename = Path(str(item["filename"])).name
         content = str(item["content"])
         frontmatter = _parse_node_frontmatter(content, filename)

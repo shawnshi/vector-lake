@@ -1,6 +1,9 @@
 import hashlib
 import logging
+import threading
 import unicodedata
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -8,6 +11,7 @@ from vector_lake import db_store
 from vector_lake.defense_hook import verify_asset
 from vector_lake.schema_validator import validate_schema
 from vector_lake.wiki_utils import (
+    _replace_prepared_file_compare_and_swap,
     atomic_write_text,
     delete_file_compare_and_swap,
     get_index_path,
@@ -19,6 +23,17 @@ from vector_lake.wiki_utils import (
 
 
 log = logging.getLogger("vector-lake-mutation")
+
+
+@dataclass(frozen=True)
+class _StagedProjection:
+    filepath: Path
+    mutation_type: str
+    projection_base_hash: str
+    temp_path: Path | None = None
+
+
+_MATERIALIZATION_CONTEXT = threading.local()
 
 
 def _markdown_page_key(filename: str) -> str:
@@ -81,14 +96,135 @@ def resolve_wiki_mutation_path(
     return candidate
 
 
+def _prepare_staged_projection(
+    filename: str,
+    mutation_type: str,
+    payload_text: str | None,
+    validation_mode: str,
+    projection_base_hash: str | None,
+) -> _StagedProjection:
+    """Validate and write a projection candidate without holding a DB lock."""
+    filepath = resolve_wiki_mutation_path(
+        filename,
+        allow_existing_legacy_name=validation_mode == "schema",
+    )
+    if not isinstance(projection_base_hash, str):
+        raise RuntimeError("Staged projection requires a committed projection baseline.")
+    if mutation_type == "delete":
+        return _StagedProjection(
+            filepath=filepath,
+            mutation_type=mutation_type,
+            projection_base_hash=projection_base_hash,
+        )
+    if mutation_type != "update":
+        raise ValueError(f"Unsupported mutation_type: {mutation_type}")
+    if payload_text is None:
+        if not filepath.exists():
+            raise ValueError(
+                f"Outbox update for {filename} has no payload and no existing Markdown projection."
+            )
+        payload_text = filepath.read_text(encoding="utf-8")
+
+    frontmatter, _ = split_frontmatter(payload_text)
+    if validation_mode == "full":
+        verify_asset(payload_text, filename, frontmatter, get_index_path())
+    elif validation_mode == "schema":
+        validate_schema(frontmatter, payload_text, filename)
+    else:
+        raise ValueError(f"Unsupported validation_mode: {validation_mode}")
+
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = filepath.with_name(f"{filepath.name}.{uuid.uuid4().hex}.stage")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(payload_text)
+    except BaseException:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+    return _StagedProjection(
+        filepath=filepath,
+        mutation_type=mutation_type,
+        projection_base_hash=projection_base_hash,
+        temp_path=temp_path,
+    )
+
+
+def _stage_markdown_projection(
+    filename: str,
+    mutation_type: str,
+    payload_text: str | None,
+    validation_mode: str,
+    projection_base_hash: str,
+) -> _StagedProjection:
+    """Invoke the observable materializer in staging mode outside transactions."""
+    if getattr(_MATERIALIZATION_CONTEXT, "stage_only", False):
+        raise RuntimeError("Nested projection staging is not supported.")
+    _MATERIALIZATION_CONTEXT.stage_only = True
+    try:
+        staged = materialize_markdown_projection(
+            filename,
+            mutation_type,
+            payload_text,
+            validation_mode=validation_mode,
+            projection_base_hash=projection_base_hash,
+        )
+    finally:
+        _MATERIALIZATION_CONTEXT.stage_only = False
+    if not isinstance(staged, _StagedProjection):
+        raise RuntimeError("Projection materializer did not return a staged projection.")
+    return staged
+
+
+def _publish_staged_projection(staged: _StagedProjection) -> Path:
+    """Perform only the latest-intent-fenced atomic publish/confirmation step."""
+    if staged.mutation_type == "delete":
+        if staged.filepath.exists():
+            delete_file_compare_and_swap(
+                staged.filepath,
+                staged.projection_base_hash,
+            )
+        return staged.filepath
+    if staged.mutation_type != "update" or staged.temp_path is None:
+        raise RuntimeError("Invalid staged projection payload.")
+
+    current_hash = (
+        hashlib.sha256(staged.filepath.read_bytes()).hexdigest()
+        if staged.filepath.exists()
+        else ""
+    )
+    desired_hash = hashlib.sha256(staged.temp_path.read_bytes()).hexdigest()
+    if current_hash == desired_hash:
+        return staged.filepath
+    _replace_prepared_file_compare_and_swap(
+        staged.filepath,
+        staged.temp_path,
+        staged.projection_base_hash,
+    )
+    return staged.filepath
+
+
+def _discard_staged_projection(staged: _StagedProjection | None) -> None:
+    if staged is not None and staged.temp_path is not None and staged.temp_path.exists():
+        staged.temp_path.unlink()
+
+
 def materialize_markdown_projection(
     filename: str,
     mutation_type: str,
     payload_text: str | None = None,
     validation_mode: str = "full",
     projection_base_hash: str | None = None,
-) -> Path:
+) -> Path | _StagedProjection:
     """Idempotently materialize the Markdown projection for one outbox row."""
+    if getattr(_MATERIALIZATION_CONTEXT, "stage_only", False):
+        return _prepare_staged_projection(
+            filename,
+            mutation_type,
+            payload_text,
+            validation_mode,
+            projection_base_hash,
+        )
     filepath = resolve_wiki_mutation_path(
         filename,
         allow_existing_legacy_name=validation_mode == "schema",
@@ -402,19 +538,25 @@ def execute_mutation_batch(
     deferred = []
     post_commit_warnings = []
     for mutation, outbox_id in zip(prepared, outbox_ids):
+        staged = None
         try:
-            with db_store.transaction():
-                if not db_store.mutation_outbox_is_latest_intent(outbox_id):
-                    deferred.append(mutation["filename"])
-                    continue
-                materialize_markdown_projection(
-                    mutation["filename"],
-                    mutation["mutation_type"],
-                    mutation["content"],
-                    validation_mode=mutation["validation_mode"],
-                    projection_base_hash=mutation["projection_base_hash"],
-                )
+            staged = _stage_markdown_projection(
+                mutation["filename"],
+                mutation["mutation_type"],
+                mutation["content"],
+                validation_mode=mutation["validation_mode"],
+                projection_base_hash=mutation["projection_base_hash"],
+            )
+            try:
+                with db_store.transaction():
+                    if not db_store.mutation_outbox_is_latest_intent(outbox_id):
+                        deferred.append(mutation["filename"])
+                        continue
+                    _publish_staged_projection(staged)
+            finally:
+                _discard_staged_projection(staged)
         except Exception as exc:
+            _discard_staged_projection(staged)
             deferred.append(mutation["filename"])
             post_commit_warnings.append(
                 "Markdown projection failed after commit for "

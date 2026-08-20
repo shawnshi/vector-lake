@@ -17,7 +17,20 @@ from pathlib import Path
 
 from filelock import BaseFileLock, FileLock, Timeout as FileLockTimeout
 
-from vector_lake.wiki_utils import get_meta_dir, normalize_semantic_text, peek_meta_dir
+from vector_lake.raw_revision import (
+    RawRevisionFormatError,
+    RawSourceContainmentError,
+    RawSourceUnstableError,
+    is_canonical_revision,
+    parse_revision,
+    stable_raw_revision,
+)
+from vector_lake.wiki_utils import (
+    get_meta_dir,
+    get_raw_dir,
+    normalize_semantic_text,
+    peek_meta_dir,
+)
 
 _LOCAL = threading.local()
 _INIT_LOCK = threading.Lock()
@@ -3960,6 +3973,15 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
             tokenize='trigram case_sensitive 0'
         )
     """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS operational_memory_search_short_fts
+        USING fts5(
+            short_text,
+            content='',
+            contentless_delete=1,
+            tokenize='unicode61 remove_diacritics 0'
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS operational_memory_search_docs (
@@ -3980,7 +4002,7 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             backfill_cursor TEXT NOT NULL DEFAULT '',
             backfill_target TEXT NOT NULL DEFAULT '',
-            schema_version INTEGER NOT NULL DEFAULT 4,
+            schema_version INTEGER NOT NULL DEFAULT 5,
             updated_at TEXT
         )
     """
@@ -3999,6 +4021,7 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
         "updated_at": "TEXT",
     }:
         conn.execute("DELETE FROM operational_memory_search_fts")
+        conn.execute("DELETE FROM operational_memory_search_short_fts")
         conn.execute("DELETE FROM operational_memory_search_docs")
         conn.execute("DELETE FROM operational_memory_search_pending")
         conn.execute("DROP TABLE operational_memory_search_state")
@@ -4006,20 +4029,21 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
     conn.execute(
         "INSERT OR IGNORE INTO operational_memory_search_state "
         "(singleton, backfill_cursor, backfill_target, schema_version, updated_at) "
-        "SELECT 1, '', COALESCE(MAX(memory_id), ''), 4, ? FROM operational_memory",
+        "SELECT 1, '', COALESCE(MAX(memory_id), ''), 5, ? FROM operational_memory",
         (datetime.now(timezone.utc).isoformat(),),
     )
     state = conn.execute(
         "SELECT schema_version FROM operational_memory_search_state WHERE singleton = 1"
     ).fetchone()
-    if state is not None and int(state[0] or 0) != 4:
+    if state is not None and int(state[0] or 0) != 5:
         conn.execute("DELETE FROM operational_memory_search_fts")
+        conn.execute("DELETE FROM operational_memory_search_short_fts")
         conn.execute("DELETE FROM operational_memory_search_docs")
         conn.execute("DELETE FROM operational_memory_search_pending")
         conn.execute(
             "UPDATE operational_memory_search_state SET backfill_cursor = '', "
             "backfill_target = (SELECT COALESCE(MAX(memory_id), '') "
-            "FROM operational_memory), schema_version = 4, updated_at = ? "
+            "FROM operational_memory), schema_version = 5, updated_at = ? "
             "WHERE singleton = 1",
             (datetime.now(timezone.utc).isoformat(),),
         )
@@ -5610,15 +5634,55 @@ def update_processed_file_observation(
     )
 
 
-def mark_file_processed(filepath: str, file_hash: str):
+def cas_upgrade_processed_file_revision(
+    filepath: str,
+    old_hash: str,
+    expected_observed_mtime_ns: int | None,
+    expected_observed_size: int | None,
+    canonical_revision: str,
+    observed_mtime_ns: int,
+    observed_size: int,
+) -> bool:
+    """CAS-upgrade one legacy marker while preserving concurrent row changes."""
+    kind, _digest = parse_revision(old_hash)
+    if kind != "md5":
+        raise ValueError("processed_revision_upgrade_requires_legacy_md5")
+    if not is_canonical_revision(canonical_revision):
+        raise ValueError("processed_revision_upgrade_requires_canonical_sha256")
+    conn = get_connection()
+    with transaction():
+        cursor = conn.execute(
+            "UPDATE processed_files SET file_hash = ?, observed_mtime_ns = ?, "
+            "observed_size = ? WHERE filepath = ? AND file_hash = ? "
+            "AND observed_mtime_ns IS ? AND observed_size IS ?",
+            (
+                canonical_revision,
+                int(observed_mtime_ns),
+                int(observed_size),
+                str(filepath),
+                old_hash,
+                expected_observed_mtime_ns,
+                expected_observed_size,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def mark_file_processed(
+    filepath: str,
+    file_hash: str,
+    *,
+    observed_mtime_ns: int | None = None,
+    observed_size: int | None = None,
+):
     from datetime import datetime, timezone
 
+    if not is_canonical_revision(file_hash):
+        raise ValueError("processed_file_hash_requires_canonical_sha256")
+    if (observed_mtime_ns is None) != (observed_size is None):
+        raise ValueError("processed_file_observation_requires_mtime_and_size")
     conn = get_connection()
     now_str = datetime.now(timezone.utc).isoformat()
-    # The finalized hash belongs to the dispatched raw snapshot. Do not bind
-    # current filesystem metadata to it: the source may have changed in flight.
-    observed_mtime_ns = None
-    observed_size = None
     with transaction():
         conn.execute(
             """
@@ -5636,10 +5700,27 @@ def mark_file_processed(filepath: str, file_hash: str):
                 filepath,
                 file_hash,
                 now_str,
-                observed_mtime_ns,
-                observed_size,
+                (
+                    None
+                    if observed_mtime_ns is None
+                    else int(observed_mtime_ns)
+                ),
+                None if observed_size is None else int(observed_size),
             ),
         )
+
+
+def _ingest_result_is_auto_quarantine(result_json: object) -> bool:
+    """Identify controller quarantines without treating arbitrary failures as safe."""
+    try:
+        result = json.loads(str(result_json or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(result, dict)
+        and result.get("maintenance") == "auto_ingest_controller"
+        and result.get("state") == "quarantined"
+    )
 
 
 def _ingest_identity_owner_is_releasable(
@@ -5658,7 +5739,14 @@ def _ingest_identity_owner_is_releasable(
         retries = int(record.get("retries") or 0)
     except (TypeError, ValueError):
         retries = 0
-    if status in {"cancelled", "superseded"} or (status == "failed" and retries >= 3):
+    if status in {"cancelled", "superseded"}:
+        return True
+    if status == "failed" and retries >= 3:
+        if _ingest_result_is_auto_quarantine(record.get("result_json")):
+            # A quarantine deliberately retains the exact revision identity. It
+            # can be released only by the preview/CAS apply path in
+            # reconcile_ingest_job_debt, never by an opportunistic enqueue.
+            return False
         return True
     if status not in {"completed", "finalized"}:
         return False
@@ -5677,8 +5765,33 @@ def _ingest_identity_owner_is_releasable(
         "SELECT file_hash FROM processed_files WHERE filepath = ?",
         (str(candidate_payload.get("filepath") or ""),),
     ).fetchone()
-    return processed is None or str(processed["file_hash"] or "") != str(
-        candidate_payload.get("hash") or ""
+    if processed is None:
+        return True
+    job_revision = str(candidate_payload.get("hash") or "")
+    marker_revision = str(processed["file_hash"] or "")
+    try:
+        parse_revision(job_revision)
+        parse_revision(marker_revision)
+    except RawRevisionFormatError:
+        return False
+    if marker_revision == job_revision:
+        return False
+    raw_path = Path(str(candidate_payload.get("filepath") or ""))
+    if not raw_path.is_absolute():
+        raw_path = get_raw_dir().parent / raw_path
+    try:
+        from vector_lake.tool_ingest import get_ingest_target_directories
+
+        snapshot = stable_raw_revision(
+            raw_path,
+            allowed_roots=get_ingest_target_directories(),
+        )
+    except (RawSourceContainmentError, RawSourceUnstableError, RuntimeError):
+        return False
+    except OSError:
+        return True
+    return not (
+        snapshot.matches(job_revision) and snapshot.matches(marker_revision)
     )
 
 
@@ -5726,7 +5839,8 @@ def enqueue_job(
     with transaction():
         if key:
             existing = conn.execute(
-                "SELECT job_id, task_type, status, retries, payload, updated_at "
+                "SELECT job_id, task_type, status, retries, payload, updated_at, "
+                "result_json "
                 "FROM jobs WHERE idempotency_key = ?",
                 (key,),
             ).fetchone()
@@ -5812,6 +5926,14 @@ def _current_ingest_contract_sql(payload_column: str = "payload") -> str:
         "WHEN COALESCE(TRIM(json_extract(payload, '$.filepath')), '') = '' THEN 0 "
         "WHEN COALESCE(json_type(payload, '$.hash'), '') <> 'text' THEN 0 "
         "WHEN COALESCE(TRIM(json_extract(payload, '$.hash')), '') = '' THEN 0 "
+        "WHEN json_extract(payload, '$.hash') <> "
+        "TRIM(json_extract(payload, '$.hash')) THEN 0 "
+        "WHEN NOT ((length(json_extract(payload, '$.hash')) = 32 "
+        "AND json_extract(payload, '$.hash') NOT GLOB '*[^0-9a-f]*') "
+        "OR (length(json_extract(payload, '$.hash')) = 71 "
+        "AND substr(json_extract(payload, '$.hash'), 1, 7) = 'sha256:' "
+        "AND substr(json_extract(payload, '$.hash'), 8) "
+        "NOT GLOB '*[^0-9a-f]*')) THEN 0 "
         "WHEN COALESCE(json_type(payload, '$.canonical_name'), '') <> 'text' THEN 0 "
         "WHEN COALESCE(TRIM(json_extract(payload, '$.canonical_name')), '') = '' THEN 0 "
         "WHEN COALESCE(json_type(payload, '$.instructions'), '') <> 'text' THEN 0 "
@@ -6273,12 +6395,97 @@ def fail_ingest_task_cleanup(
         return cursor.rowcount == 1
 
 
+_AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX = "Recovered by ingest debt reconciliation:"
+_AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX = (
+    "Auto-ingest budget ledger prepared: "
+)
+_AUTO_INGEST_BUDGET_RESET_ACK_PREFIX = "Auto-ingest budget ledger reconciled: "
+
+
+def list_auto_ingest_budget_resets() -> list[dict]:
+    """Return new or prepared debt resets that still require JSON-ledger closure."""
+    init_db()
+    rows = get_connection().execute(
+        "SELECT job_id, payload, CASE "
+        "WHEN error_msg LIKE ? THEN 'pending' "
+        "WHEN error_msg LIKE ? THEN 'prepared' END AS reconcile_phase "
+        "FROM jobs WHERE task_type = 'ingest' "
+        "AND COALESCE(retries, 0) = 0 "
+        "AND (error_msg LIKE ? OR error_msg LIKE ?) ORDER BY job_id",
+        (
+            _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX + "%",
+            _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX + "%",
+            _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX + "%",
+            _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX + "%",
+        ),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def prepare_auto_ingest_budget_resets(job_ids: list[str]) -> int:
+    """Durably mark every selected reset before mutating the JSON budget ledger."""
+    normalized = sorted({str(job_id) for job_id in job_ids if str(job_id)})
+    if not normalized:
+        return 0
+    updated = 0
+    with transaction():
+        for job_id in normalized:
+            cursor = get_connection().execute(
+                "UPDATE jobs SET error_msg = ? || error_msg "
+                "WHERE job_id = ? AND task_type = 'ingest' "
+                "AND COALESCE(retries, 0) = 0 AND error_msg LIKE ?",
+                (
+                    _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX,
+                    job_id,
+                    _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX + "%",
+                ),
+            )
+            updated += int(cursor.rowcount or 0)
+        if updated != len(normalized):
+            raise RuntimeError(
+                "auto_ingest_budget_reset_prepare_rowcount_mismatch:"
+                f"{updated}/{len(normalized)}"
+            )
+    return updated
+
+
+def ack_auto_ingest_budget_resets(job_ids: list[str]) -> int:
+    """Acknowledge every prepared reset with an exact transactional row count."""
+    normalized = sorted({str(job_id) for job_id in job_ids if str(job_id)})
+    if not normalized:
+        return 0
+    updated = 0
+    with transaction():
+        for job_id in normalized:
+            cursor = get_connection().execute(
+                "UPDATE jobs SET error_msg = ? || substr(error_msg, ?) "
+                "WHERE job_id = ? AND task_type = 'ingest' "
+                "AND COALESCE(retries, 0) = 0 "
+                "AND error_msg LIKE ?",
+                (
+                    _AUTO_INGEST_BUDGET_RESET_ACK_PREFIX,
+                    len(_AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX) + 1,
+                    job_id,
+                    _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX + "%",
+                ),
+            )
+            updated += int(cursor.rowcount or 0)
+        if updated != len(normalized):
+            raise RuntimeError(
+                "auto_ingest_budget_reset_ack_rowcount_mismatch:"
+                f"{updated}/{len(normalized)}"
+            )
+    return updated
+
+
 def claim_subagent_jobs(
     limit: int = 10,
     lease_seconds: int = 3600,
     lease_owner: str | None = None,
     *,
     required_ingest_contract_version: int | None = None,
+    require_no_live_processing: bool = False,
+    forbid_live_owner_prefix: str | None = None,
 ) -> list[dict]:
     """Lease ingest tasks to one host subagent consumer at a time."""
     import os
@@ -6303,7 +6510,27 @@ def claim_subagent_jobs(
             raise ValueError("required_ingest_contract_version must be positive")
         scope_sql = f" AND ({_current_ingest_contract_sql()})"
         scope_params.append(str(contract_version))
+    forbidden_prefix = str(forbid_live_owner_prefix or "")
     with transaction():
+        if require_no_live_processing:
+            live_processing = conn.execute(
+                "SELECT 1 FROM jobs WHERE task_type = 'ingest' "
+                "AND status = 'subagent_processing' "
+                "AND COALESCE(lease_until, '') > ? LIMIT 1",
+                (now,),
+            ).fetchone()
+            if live_processing is not None:
+                return []
+        if forbidden_prefix:
+            live_forbidden_owner = conn.execute(
+                "SELECT 1 FROM jobs WHERE task_type = 'ingest' "
+                "AND status = 'subagent_processing' "
+                "AND COALESCE(lease_until, '') > ? "
+                "AND substr(COALESCE(lease_owner, ''), 1, length(?)) = ? LIMIT 1",
+                (now, forbidden_prefix, forbidden_prefix),
+            ).fetchone()
+            if live_forbidden_owner is not None:
+                return []
         rows = conn.execute(
             "SELECT job_id FROM jobs WHERE task_type = 'ingest' AND "
             "(status = 'awaiting_subagent' OR "
@@ -6343,6 +6570,162 @@ def claim_subagent_jobs(
             if row is not None:
                 claimed.append(dict(row))
         return claimed
+
+
+def renew_ingest_subagent_task_claim(
+    job_id: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+    lease_seconds: int = 3600,
+) -> bool:
+    """Extend only the current, unexpired subagent-processing lease."""
+    lease = _dispatch_lease_credentials(
+        lease_owner,
+        lease_token,
+        lease_generation,
+    )
+    if lease is None:
+        raise ValueError("subagent lease credentials are required")
+    owner, token, generation = lease
+    with transaction():
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        lease_until = (
+            now_dt + timedelta(seconds=max(1, int(lease_seconds)))
+        ).isoformat()
+        cursor = get_connection().execute(
+            "UPDATE jobs SET lease_until = ?, updated_at = ? "
+            "WHERE job_id = ? AND task_type = 'ingest' "
+            "AND status = 'subagent_processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (
+                lease_until,
+                now,
+                str(job_id),
+                owner,
+                token,
+                generation,
+                now,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def release_ingest_subagent_task_claim(
+    job_id: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+    reason: str,
+) -> bool:
+    """Return an exact current claim to awaiting without spending a content retry."""
+    lease = _dispatch_lease_credentials(
+        lease_owner,
+        lease_token,
+        lease_generation,
+    )
+    if lease is None:
+        raise ValueError("subagent lease credentials are required")
+    owner, token, generation = lease
+    with transaction():
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent', error_msg = ?, "
+            "updated_at = ?, available_at = ?, lease_until = NULL, "
+            "lease_owner = NULL, lease_token = NULL "
+            "WHERE job_id = ? AND task_type = 'ingest' "
+            "AND status = 'subagent_processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (
+                str(reason)[:4000],
+                now,
+                now,
+                str(job_id),
+                owner,
+                token,
+                generation,
+                now,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def fail_auto_ingest_subagent_task_claim(
+    job_id: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+    error_msg: str,
+    *,
+    retryable: bool,
+    failure_class: str,
+) -> bool:
+    """Fail or quarantine an auto-ingest result under its exact current lease."""
+    lease = _dispatch_lease_credentials(
+        lease_owner,
+        lease_token,
+        lease_generation,
+    )
+    if lease is None:
+        raise ValueError("subagent lease credentials are required")
+    owner, token, generation = lease
+    failure_kind = str(failure_class or "unknown")[:80]
+    with transaction():
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        row = get_connection().execute(
+            "SELECT retries FROM jobs WHERE job_id = ? AND task_type = 'ingest' "
+            "AND status = 'subagent_processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (str(job_id), owner, token, generation, now),
+        ).fetchone()
+        if row is None:
+            return False
+        prior_retries = int(row["retries"] or 0)
+        next_retry = prior_retries + 1 if retryable else max(3, prior_retries + 1)
+        terminal = next_retry >= 3
+        available_at = (
+            now_dt + timedelta(seconds=5 * (2 ** max(0, next_retry - 1)))
+        ).isoformat()
+        result_json = None
+        if terminal:
+            result_json = json.dumps(
+                {
+                    "maintenance": "auto_ingest_controller",
+                    "state": "quarantined",
+                    "failure_class": failure_kind,
+                    "reason": str(error_msg)[:4000],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        cursor = get_connection().execute(
+            "UPDATE jobs SET status = 'failed', retries = ?, error_msg = ?, "
+            "updated_at = ?, available_at = ?, completed_at = ?, result_json = ?, "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+            "WHERE job_id = ? AND task_type = 'ingest' "
+            "AND status = 'subagent_processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (
+                next_retry,
+                str(error_msg)[:4000],
+                now,
+                available_at,
+                now if terminal else None,
+                result_json,
+                str(job_id),
+                owner,
+                token,
+                generation,
+                now,
+            ),
+        )
+        return cursor.rowcount == 1
 
 
 def replace_ingest_subagent_task_packet(
@@ -6610,6 +6993,12 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     for key in ("filepath", "hash"):
         if str(processed_data.get(key) or "") != str(payload.get(key) or ""):
             raise ValueError(f"Job {job_id} {key} does not match its queued payload")
+    try:
+        parse_revision(payload.get("hash"))
+    except RawRevisionFormatError as exc:
+        raise ValueError(
+            f"Job {job_id} raw revision format is unsupported"
+        ) from exc
     expected_name = str(payload.get("canonical_name") or "")
     supplied_name = str(processed_data.get("canonical_name") or "")
     if expected_name and supplied_name != expected_name:

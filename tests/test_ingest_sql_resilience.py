@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from vector_lake import db_store, governance_store, tool_ingest
+from vector_lake.raw_revision import is_supported_revision
 from vector_lake.tool_ingest import (
     INGEST_CONTRACT_VERSION,
     calculate_hash,
@@ -16,6 +18,10 @@ from tests.test_mutation_coordinator import _write_purpose_contract
 
 
 def _v4_payload(filepath, file_hash, canonical_name):
+    if not is_supported_revision(file_hash):
+        file_hash = "sha256:" + hashlib.sha256(
+            str(file_hash).encode("utf-8")
+        ).hexdigest()
     return {
         "filepath": str(filepath),
         "hash": file_hash,
@@ -694,7 +700,7 @@ def _assert_claimed_control_plane_contract(task_packet, payload, job_id):
     assert task_packet["runtime"] == "current-environment-subagent"
     assert (
         task_packet["cost_boundary"]
-        == "no non-embedding model API calls from Vector Lake runtime"
+        == "non-embedding generation requires explicit host enablement and bounded launch policy"
     )
     assert (
         task_packet["expected_output"]
