@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 from unittest.mock import patch
 
@@ -118,7 +119,22 @@ def test_gc_does_not_delete_high_degree_page_key(isolated_memory):
     assert "No orphan entities" in result
 
 
-def test_gc_defers_history_when_no_orphan_pages(isolated_memory):
+def test_gc_orphan_workflow_never_calls_history_retention(isolated_memory):
+    _seed_vendor(isolated_memory, edge_count=2)
+
+    with patch.object(
+        tool_gc,
+        "prune_runtime_history",
+        side_effect=AssertionError("history retention must remain decoupled"),
+    ):
+        preview = gc_vector_lake(days=30, dry_run=True)
+        apply_without_confirmation = gc_vector_lake(days=30, dry_run=False)
+
+    assert "History retention was not scanned" in preview
+    assert "History retention was not scanned" in apply_without_confirmation
+
+
+def test_gc_does_not_scan_history_when_no_orphan_pages(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     with db_store.transaction():
@@ -131,8 +147,7 @@ def test_gc_defers_history_when_no_orphan_pages(isolated_memory):
 
     result = gc_vector_lake(days=30, dry_run=False)
 
-    assert "History retention deferred to the dedicated confirmed workflow" in result
-    assert "1 change set(s), 1 idempotency key(s)" in result
+    assert "History retention was not scanned" in result
     assert conn.execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == 1
     assert (
         conn.execute("SELECT COUNT(*) FROM change_set_idempotency").fetchone()[0] == 1
@@ -149,7 +164,7 @@ def test_gc_dry_run_missing_database_is_zero_write(isolated_memory):
     assert not meta_dir.exists()
 
 
-def test_gc_apply_reports_only_unreferenced_terminal_change_sets(
+def test_gc_apply_leaves_history_to_dedicated_workflow(
     isolated_memory,
 ):
     db_store.init_db()
@@ -201,8 +216,7 @@ def test_gc_apply_reports_only_unreferenced_terminal_change_sets(
             "SELECT change_set_id FROM change_set_idempotency"
         ).fetchall()
     }
-    assert "History retention deferred to the dedicated confirmed workflow" in result
-    assert "1 change set(s), 1 idempotency key(s)" in result
+    assert "History retention was not scanned" in result
     assert remaining == set(change_sets)
     assert idempotency == remaining
 
@@ -340,6 +354,34 @@ def _publish_test_orphan_backup():
         now=now,
     )
     return fingerprint, backup_dir
+
+
+def test_gc_snapshot_uses_compact_page_key_index_scan(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    governance_store.upsert_entity(
+        "entity_compact_snapshot",
+        {
+            "entity_id": "entity_compact_snapshot",
+            "page_key": "Vendor_Compact-Snapshot",
+            "type": "vendor",
+            "large_payload": "x" * 100_000,
+        },
+    )
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        entities, _edges = tool_gc._gc_snapshot_from_connection(conn)
+    finally:
+        conn.set_trace_callback(None)
+
+    assert entities["items"]["entity_compact_snapshot"] == {
+        "page_key": "Vendor_Compact-Snapshot",
+        "type": "vendor",
+    }
+    assert any(
+        "INDEXED BY idx_entities_page_key" in statement for statement in statements
+    )
 
 
 def test_gc_plain_path_stat_rejects_windows_reparse_attribute(
@@ -698,7 +740,7 @@ def test_gc_projection_failure_counts_canonical_delete_as_committed(
     )
 
 
-def test_gc_confirmed_success_commits_canonical_and_defers_history(
+def test_gc_confirmed_success_commits_canonical_and_receipt_without_history_scan(
     isolated_memory,
 ):
     from vector_lake import runtime_health
@@ -716,8 +758,7 @@ def test_gc_confirmed_success_commits_canonical_and_defers_history(
 
     assert "Canonical transaction committed" in result
     assert "Deleted 1 orphan pages from canonical state" in result
-    assert "History retention deferred to the dedicated confirmed workflow" in result
-    assert "1 change set(s), 1 idempotency key(s)" in result
+    assert "History retention was not scanned" in result
     assert not (isolated_memory / "wiki" / "Vendor_Acme.md").exists()
     assert (
         conn.execute(
@@ -755,6 +796,45 @@ def test_gc_confirmed_success_commits_canonical_and_defers_history(
     assert (
         record["content_sha256"] == hashlib.sha256(backup_file.read_bytes()).hexdigest()
     )
+    receipt_path = (
+        isolated_memory
+        / "wiki"
+        / ".meta"
+        / "gc-runs"
+        / f"{fingerprint.removeprefix('sha256:')}.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "committed"
+    assert receipt["fingerprint"] == fingerprint
+    assert receipt["backup_name"] == backups[0].name
+    assert len(receipt["outbox_ids"]) == 1
+
+
+def test_gc_receipt_does_not_self_block_the_runtime_health_gate(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import runtime_health
+
+    _seed_vendor(isolated_memory, edge_count=1)
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+    observed_receipt_roots = []
+    real_gate = runtime_health.enforce_runtime_write_health
+
+    def observed_gate(*args, **kwargs):
+        receipt_root = isolated_memory / "wiki" / ".meta" / "gc-runs"
+        observed_receipt_roots.append(receipt_root.exists())
+        return real_gate(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_health, "enforce_runtime_write_health", observed_gate)
+    result = gc_vector_lake(
+        days=30,
+        dry_run=False,
+        orphan_confirmation=fingerprint,
+    )
+
+    assert "Canonical transaction committed" in result
+    assert observed_receipt_roots == [False]
 
 
 def test_gc_stale_fingerprint_blocks_orphan_and_history_mutation(
@@ -789,6 +869,87 @@ def test_gc_stale_fingerprint_blocks_orphan_and_history_mutation(
             ("stale-token-history",),
         ).fetchone()[0]
         == 1
+    )
+
+
+def test_gc_confirmed_delete_accepts_existing_legacy_filename(isolated_memory):
+    from vector_lake import runtime_health
+
+    db_store.init_db()
+    page_key = "Vendor_Acme_Legacy_20260516"
+    filename = f"{page_key}.md"
+    governance_store.save_entities(
+        {
+            "items": {
+                "entity-legacy-filename": {
+                    "entity_id": "entity-legacy-filename",
+                    "canonical_name": "Acme Legacy",
+                    "page_key": page_key,
+                    "type": "vendor",
+                    "status": "Active",
+                }
+            }
+        }
+    )
+    page = isolated_memory / "wiki" / filename
+    page.write_text("legacy vendor", encoding="utf-8")
+    old = time.time() - 90 * 86400
+    os.utime(page, (old, old))
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO claim_graph_edges "
+            "(source_id, target_id, relation, weight, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (page_key, "Concept_0", "related", 1.0, "2026-01-01"),
+        )
+
+    preview = gc_vector_lake(days=30, dry_run=True)
+    fingerprint = _orphan_fingerprint(preview)
+    assert filename in preview
+
+    with patch.object(runtime_health, "enforce_runtime_write_health"):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+
+    assert "Canonical transaction committed" in result
+    assert not page.exists()
+    outbox = conn.execute(
+        "SELECT mutation_type, validation_mode FROM mutation_outbox "
+        "WHERE filename = ?",
+        (filename,),
+    ).fetchone()
+    assert tuple(outbox) == ("delete", "schema")
+
+
+def test_gc_missing_backup_is_reported_by_receipt_and_write_health(isolated_memory):
+    from vector_lake import runtime_health
+
+    _seed_vendor(isolated_memory, edge_count=1)
+    fingerprint = _orphan_fingerprint(gc_vector_lake(days=30, dry_run=True))
+    with patch.object(runtime_health, "enforce_runtime_write_health"):
+        result = gc_vector_lake(
+            days=30,
+            dry_run=False,
+            orphan_confirmation=fingerprint,
+        )
+    assert "Canonical transaction committed" in result
+
+    backup_name = fingerprint.removeprefix("sha256:")[:16]
+    shutil.rmtree(isolated_memory / "backup" / "gc" / backup_name)
+
+    verification = tool_gc.verify_gc_recovery_receipts(deep=True)
+    assert any(
+        issue.startswith("gc_receipt_invalid:")
+        for issue in verification["issues"]
+    )
+    health = runtime_health.assess_runtime_health()
+    assert health["ok"] is False
+    assert any(
+        issue.startswith("gc_receipt_invalid:") for issue in health["issues"]
     )
 
 

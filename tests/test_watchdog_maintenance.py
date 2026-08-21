@@ -1087,6 +1087,25 @@ def test_outbox_worker_yields_after_successful_batch(
     assert waits == [0.025]
 
 
+def test_topology_refresh_deadline_debounces_but_caps_staleness(monkeypatch):
+    from vector_lake import watchdog_app
+
+    monkeypatch.setenv("VECTOR_LAKE_TOPOLOGY_REFRESH_DEBOUNCE_SECONDS", "10")
+    monkeypatch.setenv("VECTOR_LAKE_TOPOLOGY_MAX_STALENESS_SECONDS", "30")
+
+    dirty_since, due = watchdog_app._topology_refresh_deadline(
+        now=100.0,
+        dirty_since=None,
+    )
+    assert (dirty_since, due) == (100.0, 110.0)
+
+    dirty_since, due = watchdog_app._topology_refresh_deadline(
+        now=125.0,
+        dirty_since=dirty_since,
+    )
+    assert (dirty_since, due) == (100.0, 130.0)
+
+
 @pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
 def test_outbox_worker_records_base_interrupt_as_failed_gate_task(
     isolated_memory,

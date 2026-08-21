@@ -26,8 +26,9 @@ triggers: 'When the user requests to start the Vector Lake daemon, watchdog, or 
 
 <execution_workflow>
   <workflow>
-    1. Pre-launch checks: Verify the command parameters and environment readiness.
+    1. Pre-launch checks: Verify the command parameters, `.mcp.json` runtime-path fields, and environment readiness. Treat `.mcp.json` as configuration data; do not assume its `env` block is inherited by an independently launched process.
     2. Launch Daemon: Resolve the installed plugin from `$env:USERPROFILE\.codex\plugins\vector-lake`, then execute its `watchdog_sync.py` with `PYTHONIOENCODING=utf-8` and `WaitMsBeforeAsync=2000`.
+    2a. Runtime authority: The entrypoint must bootstrap missing `VECTOR_LAKE_MEMORY_DIR` and `VECTOR_LAKE_META_DIR` from that plugin's `.mcp.json` before importing the Vector Lake runtime. Preserve explicit process-environment overrides only when both path variables are supplied together; reject partial overrides.
     3. Sandbox Isolation: Route any temporary monitoring logs or state checks to the `scratch/` directory.
     4. Registration: Update the operational state in the knowledge graph.
     5. Checkpoint: [Fable 5 Checkpoint] Enforce user approval if the command fails to start or exits prematurely.
@@ -54,6 +55,7 @@ triggers: 'When the user requests to start the Vector Lake daemon, watchdog, or 
   <metrics>
     - Process launch wait time is verified as 2000 ms.
     - The command string strictly matches the watchdog sync script path.
+    - The registered MEMORY/meta paths match the authoritative `.mcp.json` values or explicit process-environment overrides.
   </metrics>
 
   <validation_gate>

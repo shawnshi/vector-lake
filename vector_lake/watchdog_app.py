@@ -118,6 +118,28 @@ def _outbox_batch_yield_seconds() -> float:
     )
 
 
+def _topology_refresh_deadline(
+    *,
+    now: float,
+    dirty_since: float | None,
+) -> tuple[float, float]:
+    """Coalesce projection batches while enforcing a maximum dirty age."""
+    first_dirty = float(now if dirty_since is None else dirty_since)
+    debounce = _bounded_env_float(
+        "VECTOR_LAKE_TOPOLOGY_REFRESH_DEBOUNCE_SECONDS",
+        5.0,
+        minimum=0.1,
+        maximum=60.0,
+    )
+    max_staleness = _bounded_env_float(
+        "VECTOR_LAKE_TOPOLOGY_MAX_STALENESS_SECONDS",
+        300.0,
+        minimum=1.0,
+        maximum=3600.0,
+    )
+    return first_dirty, min(float(now) + debounce, first_dirty + max_staleness)
+
+
 def _raw_event_log_window_seconds() -> float:
     return _bounded_env_float(
         "VECTOR_LAKE_RAW_EVENT_LOG_WINDOW_SECONDS",
@@ -1780,6 +1802,8 @@ def index_worker_loop(stop_event: threading.Event | None = None):
             _positive_env_int("VECTOR_LAKE_WIKI_RECONCILE_RETRY_SECONDS", 30),
         ),
     )
+    topology_dirty_since: float | None = None
+    topology_refresh_due: float | None = None
 
     write_status(
         "idle",
@@ -1819,6 +1843,11 @@ def index_worker_loop(stop_event: threading.Event | None = None):
             from vector_lake.wiki_utils import get_outbox_signal_path
 
             flag_path = get_outbox_signal_path()
+            monotonic_now = time.monotonic()
+            topology_due = bool(
+                topology_refresh_due is not None
+                and monotonic_now >= topology_refresh_due
+            )
             try:
                 claimable_outbox = db_store.mutation_outbox_has_claimable()
             except Exception:
@@ -1828,6 +1857,7 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                 or claimable_outbox
                 or not index_queue.empty()
                 or index_queue.full_reconcile_required
+                or topology_due
             )
             if not work_pending:
                 write_status(
@@ -1915,9 +1945,15 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                     "",
                     component="outbox",
                 )
+
+            projection_completed = bool(stats["completed"])
+            if pending_legacy:
                 legacy_stats = process_legacy_projection_queue_batch(
                     index_queue,
                     pending_legacy,
+                )
+                projection_completed = projection_completed or bool(
+                    legacy_stats["completed"]
                 )
                 write_status(
                     "error" if legacy_stats["failed"] else "idle",
@@ -1974,6 +2010,38 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                         component="outbox",
                     )
                     log.info("Wiki overflow reconciliation: %s", reconcile_stats)
+
+            if reconcile_stats is not None:
+                projection_completed = projection_completed or bool(
+                    reconcile_stats.get("completed")
+                )
+            if projection_completed:
+                topology_dirty_since, topology_refresh_due = (
+                    _topology_refresh_deadline(
+                        now=time.monotonic(),
+                        dirty_since=topology_dirty_since,
+                    )
+                )
+
+            if topology_due:
+                from vector_lake import indexer
+
+                with global_task_lock:
+                    refreshed = indexer.refresh_graph_topology_if_dirty()
+                topology_dirty_since = None
+                topology_refresh_due = None
+                write_status(
+                    "idle",
+                    0,
+                    index_queue.qsize(),
+                    (
+                        "Graph topology refreshed after projection batches"
+                        if refreshed
+                        else "Graph topology already current"
+                    ),
+                    "",
+                    component="outbox",
+                )
 
             no_completed_work = (
                 not pending_legacy

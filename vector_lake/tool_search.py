@@ -71,6 +71,12 @@ _QUERY_EMBEDDING_KEY_LOCKS = tuple(threading.Lock() for _ in range(16))
 _QUERY_EMBEDDING_CACHE_KEYS: OrderedDict[
     tuple[str, str, int, int], None
 ] = OrderedDict()
+_SEARCH_PERFORMANCE_LOCK = threading.Lock()
+_SEARCH_PERFORMANCE = {
+    "completed_calls": 0,
+    "last": {},
+    "max_total_ms": 0.0,
+}
 
 
 
@@ -79,6 +85,49 @@ def _query_embedding_int(name: str, default: int) -> int:
         return max(1, int(os.environ.get(name, default)))
     except (TypeError, ValueError):
         return default
+
+
+def _search_result_char_limit() -> int:
+    try:
+        value = int(os.environ.get("VECTOR_LAKE_SEARCH_RESULT_MAX_CHARS", "24000"))
+    except (TypeError, ValueError):
+        value = 24_000
+    return max(1_000, min(256_000, value))
+
+
+def _record_search_performance(
+    timings: dict[str, float],
+    *,
+    result_chars: int,
+    backend_issues: list[str],
+) -> None:
+    normalized = {
+        key: round(max(0.0, float(value)), 3)
+        for key, value in timings.items()
+    }
+    normalized["result_chars"] = max(0, int(result_chars))
+    normalized["backend_issues"] = sorted(set(backend_issues))
+    with _SEARCH_PERFORMANCE_LOCK:
+        _SEARCH_PERFORMANCE["completed_calls"] += 1
+        _SEARCH_PERFORMANCE["last"] = normalized
+        _SEARCH_PERFORMANCE["max_total_ms"] = round(
+            max(
+                float(_SEARCH_PERFORMANCE["max_total_ms"]),
+                float(normalized.get("total_ms") or 0.0),
+            ),
+            3,
+        )
+
+
+def search_performance_status() -> dict:
+    """Return query-text-free process-local search timing telemetry."""
+    with _SEARCH_PERFORMANCE_LOCK:
+        return {
+            "completed_calls": int(_SEARCH_PERFORMANCE["completed_calls"]),
+            "last": dict(_SEARCH_PERFORMANCE["last"]),
+            "max_total_ms": float(_SEARCH_PERFORMANCE["max_total_ms"]),
+            "result_char_limit": _search_result_char_limit(),
+        }
 
 
 def _query_embedding_enabled() -> bool:
@@ -707,29 +756,46 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     if normalized_mode in {"claim", "claims"}:
         return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history, memory_types=["fact"])
 
+    search_started = time.perf_counter()
+    timings: dict[str, float] = {}
+    backend_issues: list[str] = []
+
+    def finish(value: str) -> str:
+        timings["total_ms"] = (time.perf_counter() - search_started) * 1000.0
+        _record_search_performance(
+            timings,
+            result_chars=len(value),
+            backend_issues=backend_issues,
+        )
+        return value
+
     wiki_dir = str(get_wiki_dir())
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
-        return "Lake is drying. No index.json found, please ingest sources first."
+        return finish("Lake is drying. No index.json found, please ingest sources first.")
+    phase_started = time.perf_counter()
     try:
         index_data = _load_search_index(index_path)
     except Exception as exc:
         log.error(f"Failed to read index.json: {exc}")
         raise SearchIndexError("The knowledge base index could not be read safely.") from exc
+    timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
     # ⚡ Bolt: Removed unused O(N) list comprehension of all index nodes to eliminate unnecessary memory allocation and CPU overhead in the search hot path.
     intent = _classify_intent(query)
+    phase_started = time.perf_counter()
     tokens = _expand_query_locally(query)
+    timings["tokenize_ms"] = (time.perf_counter() - phase_started) * 1000.0
     if not tokens:
-        return "No valid search tokens."
+        return finish("No valid search tokens.")
 
     scored = []
     
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
     hybrid_scores = {}
-    backend_issues: list[str] = []
-    
+
     # 1. FTS5 Search
+    phase_started = time.perf_counter()
     try:
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
@@ -750,9 +816,12 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 index_data, [query, *tokens], limit=top_k * 5
             )
         )
+    timings["fts_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
     # 2. Vector Search (Hybrid blending)
+    phase_started = time.perf_counter()
     query_vector = _get_query_embedding(query)
+    timings["embedding_ms"] = (time.perf_counter() - phase_started) * 1000.0
     if (
         not query_vector
         and _query_embedding_enabled()
@@ -760,6 +829,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     ):
         backend_issues.append("query_embedding")
     if query_vector:
+        phase_started = time.perf_counter()
         try:
             vector_results = _get_vector_search_results(query_vector, limit=top_k * 5)
             for key, sim in vector_results.items():
@@ -767,10 +837,14 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
         except SearchBackendError as exc:
             backend_issues.append(exc.backend)
+        timings["vector_ms"] = (time.perf_counter() - phase_started) * 1000.0
+    else:
+        timings["vector_ms"] = 0.0
 
     # FTS/vec rows are committed before their matching projection files are
     # published.  Revalidate after those SQLite reads so results from a newer
     # database generation are never blended with the older index snapshot.
+    phase_started = time.perf_counter()
     try:
         current_index_data = _load_search_index(index_path)
     except Exception as exc:
@@ -787,6 +861,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             limit=top_k * 5,
         )
         backend_issues.append("projection_generation_changed")
+    timings["generation_check_ms"] = (
+        time.perf_counter() - phase_started
+    ) * 1000.0
 
     for key, score in hybrid_scores.items():
         if key in index_data.get('nodes', {}):
@@ -807,6 +884,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     scored.sort(key=lambda item: item[0], reverse=True)
 
     # P2-1: Dynamic Graph Expansion via Multi-hop PPR (Personalized PageRank)
+    phase_started = time.perf_counter()
     top_keys = {node["_key"] for _, node in scored[:5]}
     graph_ready = (index_data.get("graph_state") or {}).get("dirty") is False
     if top_keys and graph_ready and index_data.get("weighted_edges"):
@@ -844,6 +922,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 # Scale PPR weight to match BM25 range approximately
                 scored.append((ppr_weight * 15.0, candidate))
                 expansion_count += 1
+    timings["graph_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
@@ -865,7 +944,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             
     # Phase 2: Local deterministic ranking. Text-model reranking is delegated
     # to the host agent when explicitly requested, not performed by runtime code.
+    phase_started = time.perf_counter()
     reranked = _rerank_candidates_locally(query, candidate_pool)
+    timings["rerank_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
     # Phase 3: Final top_k extraction
     final_scored = []
@@ -883,6 +964,8 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             break
 
     result = ""
+    result_char_limit = _search_result_char_limit()
+    phase_started = time.perf_counter()
     for index, (score, node) in enumerate(final_scored):
         filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
         snippet = ""
@@ -902,13 +985,18 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 
         if as_xml:
             source_name = f"{node['_key']}.md"
-            result += (
+            block = (
                 f"<Evidence_Node ID={quoteattr(f'Wiki_{index}')} "
                 f"Source={quoteattr(source_name)}>\n"
                 f"{escape(tension_info + snippet)}\n</Evidence_Node>\n"
             )
         else:
-            result += f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
+            block = f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
+        if len(result) + len(block) > result_char_limit:
+            backend_issues.append("result_budget")
+            break
+        result += block
+    timings["materialize_ms"] = (time.perf_counter() - phase_started) * 1000.0
     issues = sorted(set(backend_issues))
     if as_xml:
         state = "degraded" if issues else "ok"
@@ -917,12 +1005,12 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             f"Backends={quoteattr(','.join(issues))}/>\n"
         )
         body = result or "<NoEvidence/>\n"
-        return f"<EvidenceResults>\n{status}{body}</EvidenceResults>"
+        return finish(f"<EvidenceResults>\n{status}{body}</EvidenceResults>")
     if not result:
         result = "No matching evidence found.\n"
     if issues:
-        return f"[Search degraded: {', '.join(issues)}]\n{result}"
-    return result
+        return finish(f"[Search degraded: {', '.join(issues)}]\n{result}")
+    return finish(result)
 
 
 def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:

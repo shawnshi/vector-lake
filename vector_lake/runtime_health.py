@@ -684,6 +684,56 @@ def assess_runtime_health(
 
     detail["db_path"] = str(db_path)
     detail["database_access"] = "read_only"
+    storage = {
+        "database_bytes": db_path.stat().st_size if db_path.exists() else 0,
+        "wal_bytes": Path(str(db_path) + "-wal").stat().st_size
+        if Path(str(db_path) + "-wal").exists()
+        else 0,
+        "shm_bytes": Path(str(db_path) + "-shm").stat().st_size
+        if Path(str(db_path) + "-shm").exists()
+        else 0,
+    }
+    if deep_projection_checks:
+        storage["row_counts"] = {
+            table_name: int(
+                conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                or 0
+            )
+            for table_name in (
+                "claim_versions",
+                "evidence_versions",
+                "operational_memory",
+                "claims",
+                "evidence",
+                "change_sets",
+                "governance_queue",
+            )
+        }
+    detail["storage"] = storage
+    database_warning_bytes = _bounded_env_int(
+        "VECTOR_LAKE_DATABASE_WARNING_BYTES",
+        4 * 1024 * 1024 * 1024,
+        1024 * 1024,
+    )
+    if int(storage["database_bytes"]) >= database_warning_bytes:
+        warnings.append(
+            "database_size_high:"
+            f"{int(storage['database_bytes'])}>={database_warning_bytes}"
+        )
+
+    try:
+        from vector_lake.tool_gc import verify_gc_recovery_receipts
+
+        gc_receipts = verify_gc_recovery_receipts(deep=deep_projection_checks)
+        detail["gc_recovery_receipts"] = gc_receipts
+        issues.extend(str(item) for item in gc_receipts.get("issues") or [])
+        warnings.extend(str(item) for item in gc_receipts.get("warnings") or [])
+        if int(gc_receipts.get("aborted") or 0):
+            warnings.append(
+                f"gc_receipt_aborted:{int(gc_receipts.get('aborted') or 0)}"
+            )
+    except Exception as exc:
+        issues.append(f"gc_receipt_check_failed:{type(exc).__name__}:{exc}")
     meta_dir = peek_meta_dir()
     auto_ingest_enabled, auto_ingest_config, auto_ingest_config_error = (
         _auto_ingest_health_config(meta_dir)

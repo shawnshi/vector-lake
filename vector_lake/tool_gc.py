@@ -3,18 +3,23 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat as stat_module
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
-from vector_lake.wiki_utils import get_wiki_dir
+from vector_lake.wiki_utils import get_meta_dir, get_wiki_dir, peek_meta_dir
 
 log = logging.getLogger("vector-lake-gc")
 
 _ORPHAN_FINGERPRINT_PREFIX = "sha256:"
+_GC_RECEIPT_CONTRACT = "vector-lake-orphan-gc-receipt-v1"
+_GC_RECEIPT_NAME = re.compile(r"^[0-9a-f]{64}\.json$")
+_GC_BACKUP_NAME = re.compile(r"^[0-9a-f]{16}$")
 
 
 def validate_gc_days(days: int) -> int:
@@ -164,9 +169,20 @@ def prune_runtime_history(
 def _gc_snapshot_from_connection(
     conn: sqlite3.Connection,
 ) -> tuple[dict, list]:
-    items = {}
-    for row in conn.execute("SELECT entity_id, data_json FROM entities").fetchall():
-        items[str(row["entity_id"])] = json.loads(row["data_json"])
+    # Keep the GC scan off the often-large entity JSON blobs. The page-key
+    # expression index is covering for page_key/entity_id, while the scalar
+    # type column is maintained by every canonical entity upsert.
+    rows = conn.execute(
+        "SELECT entity_id, json_extract(data_json, '$.page_key') AS page_key, type "
+        "FROM entities INDEXED BY idx_entities_page_key"
+    ).fetchall()
+    items = {
+        str(row["entity_id"]): {
+            "page_key": str(row["page_key"] or row["entity_id"]),
+            "type": str(row["type"] or ""),
+        }
+        for row in rows
+    }
     edges = conn.execute(
         "SELECT source_id, target_id FROM claim_graph_edges "
         "UNION SELECT source_id, target_id FROM page_graph_edges"
@@ -501,6 +517,188 @@ def _publish_gc_backup(
             )
 
 
+def _gc_receipt_path(fingerprint: str, *, create: bool) -> tuple[Path, Path]:
+    digest = str(fingerprint).removeprefix(_ORPHAN_FINGERPRINT_PREFIX)
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("GC receipt fingerprint must be canonical SHA-256")
+    root = (get_meta_dir() if create else peek_meta_dir()) / "gc-runs"
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+        _plain_path_stat(root, directory=True)
+    return root, root / f"{digest}.json"
+
+
+def _publish_gc_receipt(payload: dict) -> Path:
+    fingerprint = str(payload.get("fingerprint") or "")
+    root, receipt_path = _gc_receipt_path(fingerprint, create=True)
+    normalized = json.loads(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    )
+    normalized["contract"] = _GC_RECEIPT_CONTRACT
+    normalized["updated_at"] = datetime.now(timezone.utc).isoformat()
+    serialized = (
+        json.dumps(
+            normalized,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    staging = root / f".{receipt_path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with staging.open("x", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _plain_path_stat(staging, directory=False)
+        os.replace(staging, receipt_path)
+        _plain_path_stat(receipt_path, directory=False)
+        observed = json.loads(_read_stable_utf8_file(receipt_path, max_bytes=2_000_000))
+        if observed != normalized:
+            raise RuntimeError(f"GC receipt verification failed: {receipt_path}")
+        return receipt_path
+    finally:
+        try:
+            staging.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _initial_gc_receipt(
+    *,
+    days: int,
+    fingerprint: str,
+    backup_dir: Path,
+    candidates: list[dict],
+    now: float,
+) -> dict:
+    manifest_path = backup_dir / "manifest.json"
+    _plain_path_stat(manifest_path, directory=False)
+    return {
+        "contract": _GC_RECEIPT_CONTRACT,
+        "status": "prepared",
+        "fingerprint": fingerprint,
+        "days": int(days),
+        "candidate_count": len(candidates),
+        "candidate_files": _gc_backup_file_records(candidates),
+        "backup_name": backup_dir.name,
+        "backup_manifest_sha256": _hash_file(manifest_path),
+        "outbox_ids": [],
+        "prepared_at": datetime.fromtimestamp(
+            float(now), tz=timezone.utc
+        ).isoformat(),
+        "committed_at": None,
+    }
+
+
+def verify_gc_recovery_receipts(*, deep: bool = False) -> dict:
+    """Validate durable GC receipts without creating runtime directories."""
+    root = peek_meta_dir() / "gc-runs"
+    summary = {
+        "receipt_root": str(root),
+        "receipts": 0,
+        "committed": 0,
+        "pending": 0,
+        "aborted": 0,
+        "issues": [],
+        "warnings": [],
+    }
+    if not root.exists():
+        return summary
+    try:
+        _plain_path_stat(root, directory=True)
+        entries = sorted(root.iterdir(), key=lambda path: path.name)
+    except (OSError, RuntimeError) as exc:
+        summary["issues"].append(f"gc_receipt_root_invalid:{type(exc).__name__}")
+        return summary
+    if len(entries) > 1_000:
+        summary["issues"].append(f"gc_receipt_scan_limit_exceeded:{len(entries)}")
+        return summary
+
+    backup_root = get_wiki_dir().parent / "backup" / "gc"
+    for receipt_path in entries:
+        if not _GC_RECEIPT_NAME.fullmatch(receipt_path.name):
+            summary["issues"].append(f"gc_receipt_name_invalid:{receipt_path.name}")
+            continue
+        digest = receipt_path.stem
+        try:
+            _plain_path_stat(receipt_path, directory=False)
+            receipt = json.loads(
+                _read_stable_utf8_file(receipt_path, max_bytes=2_000_000)
+            )
+            fingerprint = str(receipt.get("fingerprint") or "")
+            if (
+                receipt.get("contract") != _GC_RECEIPT_CONTRACT
+                or fingerprint != _ORPHAN_FINGERPRINT_PREFIX + digest
+            ):
+                raise RuntimeError("receipt contract or fingerprint mismatch")
+            status = str(receipt.get("status") or "")
+            status_bucket = None
+            if status == "committed":
+                status_bucket = "committed"
+            elif status == "aborted":
+                status_bucket = "aborted"
+            elif status in {"prepared", "commit_pending"}:
+                status_bucket = "pending"
+                summary["issues"].append(f"gc_receipt_incomplete:{digest}")
+            else:
+                raise RuntimeError("unsupported receipt status")
+
+            backup_name = str(receipt.get("backup_name") or "")
+            if not _GC_BACKUP_NAME.fullmatch(backup_name):
+                raise RuntimeError("backup name is invalid")
+            backup_dir = backup_root / backup_name
+            _plain_path_stat(backup_dir, directory=True)
+            manifest_path = backup_dir / "manifest.json"
+            _plain_path_stat(manifest_path, directory=False)
+            expected_manifest_hash = str(
+                receipt.get("backup_manifest_sha256") or ""
+            )
+            if not hmac.compare_digest(
+                _hash_file(manifest_path), expected_manifest_hash
+            ):
+                raise RuntimeError("backup manifest hash mismatch")
+            manifest = json.loads(
+                _read_stable_utf8_file(manifest_path, max_bytes=1_000_000)
+            )
+            files = manifest.get("files")
+            if (
+                manifest.get("kind") != "vector-lake-orphan-gc"
+                or manifest.get("fingerprint") != fingerprint
+                or not isinstance(files, list)
+                or int(receipt.get("candidate_count") or -1) != len(files)
+                or receipt.get("candidate_files") != files
+            ):
+                raise RuntimeError("backup manifest content mismatch")
+            if deep:
+                expected_names = {"manifest.json"}
+                for record in files:
+                    filename = str(record.get("filename") or "")
+                    if not filename or Path(filename).name != filename:
+                        raise RuntimeError("backup filename is invalid")
+                    expected_names.add(filename)
+                    backup_file = backup_dir / filename
+                    file_stat = _plain_path_stat(backup_file, directory=False)
+                    if int(file_stat.st_size) != int(record.get("size") or -1):
+                        raise RuntimeError("backup file size mismatch")
+                    if not hmac.compare_digest(
+                        _hash_file(backup_file),
+                        str(record.get("content_sha256") or ""),
+                    ):
+                        raise RuntimeError("backup file hash mismatch")
+                if {path.name for path in backup_dir.iterdir()} != expected_names:
+                    raise RuntimeError("backup file set mismatch")
+            summary["receipts"] += 1
+            summary[status_bucket] += 1
+        except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            summary["issues"].append(
+                f"gc_receipt_invalid:{digest}:{type(exc).__name__}:{exc}"
+            )
+    return summary
+
+
 def _orphan_candidates(
     *,
     entities: dict,
@@ -678,7 +876,6 @@ def gc_vector_lake(
     fingerprint = _orphan_candidate_fingerprint(days, candidates)
 
     if dry_run:
-        retention_preview = prune_runtime_history(days=days, dry_run=True, now=now)
         if candidates:
             lines = [
                 f"[DRY-RUN] Found {len(candidates)} orphan entities older "
@@ -700,8 +897,8 @@ def gc_vector_lake(
                 "this exact candidate set, use CLI --apply --confirm-orphans "
                 "<fingerprint>, or MCP orphan_confirmation equal to the "
                 "fingerprint.",
-                "Retention would prune "
-                f"{retention_preview['candidate_count']} change set(s).",
+                "History retention was not scanned; use the dedicated "
+                "history_retention workflow for a separately bounded preview.",
                 "No changes made.",
             ]
         )
@@ -726,7 +923,6 @@ def gc_vector_lake(
         )
 
     if supplied_confirmation is None:
-        retention = prune_runtime_history(days=days, dry_run=False, now=now)
         lines = [
             "GC safe phase complete. Orphan deletion was not confirmed; "
             f"retained {len(candidates)} candidate page(s).",
@@ -744,28 +940,33 @@ def gc_vector_lake(
                 "error(s); no orphan pages were deleted."
             )
         lines.append(
-            "History retention deferred to the dedicated confirmed workflow: "
-            f"{retention['candidate_count']} change set(s), "
-            f"{retention['candidate_idempotency_keys']} idempotency key(s)."
+            "History retention was not scanned; use the dedicated "
+            "history_retention workflow."
         )
         return "\n".join(lines)
 
     if not candidates:
-        retention = prune_runtime_history(days=days, dry_run=False, now=now)
         return (
             f"GC complete. No orphan entities older than {days} days found. "
-            "History retention deferred to the dedicated confirmed workflow: "
-            f"{retention['candidate_count']} change set(s), "
-            f"{retention['candidate_idempotency_keys']} idempotency key(s)."
+            "History retention was not scanned; use the dedicated "
+            "history_retention workflow."
         )
 
     backup_dir = None
-    retention = None
+    receipt = None
+    receipt_path = None
     details = None
     try:
         backup_dir = _publish_gc_backup(
             days=days,
             fingerprint=fingerprint,
+            candidates=candidates,
+            now=now,
+        )
+        receipt = _initial_gc_receipt(
+            days=days,
+            fingerprint=fingerprint,
+            backup_dir=backup_dir,
             candidates=candidates,
             now=now,
         )
@@ -799,17 +1000,14 @@ def gc_vector_lake(
                     "Canonical orphan candidate set changed after confirmation"
                 )
 
-        def report_history_retention_in_transaction(
-            _outbox_ids: list[int],
+        def publish_commit_intent(
+            outbox_ids: list[int],
         ) -> None:
-            nonlocal retention
-            from vector_lake import db_store
-
-            retention = _apply_runtime_history_retention(
-                db_store.get_connection(),
-                days=days,
-                now=now,
-            )
+            nonlocal receipt, receipt_path
+            receipt = dict(receipt or {})
+            receipt["status"] = "commit_pending"
+            receipt["outbox_ids"] = [int(value) for value in outbox_ids]
+            receipt_path = _publish_gc_receipt(receipt)
 
         from vector_lake.mutation_coordinator import execute_mutation_batch
 
@@ -823,17 +1021,31 @@ def gc_vector_lake(
                 for candidate in candidates
             ],
             precondition_callback=assert_candidates_unchanged,
-            transaction_callback=report_history_retention_in_transaction,
+            transaction_callback=publish_commit_intent,
+            validation_mode="schema",
             return_details=True,
         )
         if details.get("committed") is not True:
             raise RuntimeError(
                 "Mutation coordinator did not confirm the transaction commit"
             )
-        if retention is None:
-            raise RuntimeError("History retention callback did not run")
+        receipt = dict(receipt or {})
+        receipt["status"] = "committed"
+        receipt["committed_at"] = datetime.now(timezone.utc).isoformat()
+        receipt_path = _publish_gc_receipt(receipt)
     except Exception as exc:
         log.error("Confirmed orphan GC failed: %s", exc)
+        if receipt is not None and not (
+            isinstance(details, dict) and details.get("committed") is True
+        ):
+            try:
+                receipt = dict(receipt)
+                receipt["status"] = "aborted"
+                receipt["aborted_at"] = datetime.now(timezone.utc).isoformat()
+                receipt["error_type"] = type(exc).__name__
+                receipt_path = _publish_gc_receipt(receipt)
+            except Exception as receipt_exc:
+                log.error("Failed to seal aborted GC receipt: %s", receipt_exc)
         backup_note = (
             f" Verified backup retained at {backup_dir}."
             if backup_dir is not None
@@ -871,8 +1083,7 @@ def gc_vector_lake(
     return (
         "GC complete. Canonical transaction committed. "
         f"Deleted {len(candidates)} orphan pages from canonical state "
-        f"(backed up to {backup_dir}).{deferred_note}{warning_note} History "
-        "retention deferred to the dedicated confirmed workflow: "
-        f"{retention['candidate_count']} change set(s), "
-        f"{retention['candidate_idempotency_keys']} idempotency key(s)."
+        f"(backed up to {backup_dir}; receipt {receipt_path})."
+        f"{deferred_note}{warning_note} History retention was not scanned; "
+        "use the dedicated history_retention workflow."
     )

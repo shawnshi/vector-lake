@@ -1,5 +1,10 @@
-# Unreleased
+# Vector Lake 11.15.0
 
+- Added independently durable orphan-GC receipts that bind the approved fingerprint to the verified backup manifest and mutation outbox IDs; Doctor now detects missing or incomplete recovery evidence.
+- Removed history-retention planning from orphan GC and rewrote active governance protection as one bounded queue scan, eliminating the correlated JSON scan from the GC hot path.
+- Split synchronous MCP execution into independent fast-read and heavy-task lanes, with per-lane admission, queue-wait, and execution metrics.
+- Added debounced post-projection topology refresh with a maximum staleness bound, target-side graph indexes, database-growth telemetry, and bounded search results with phase timings.
+- Hardened the standalone watchdog entrypoint so it loads paired runtime roots from `.mcp.json` before importing Vector Lake.
 - Made orphan-source debt explicitly P2 and added transactionally revalidated cleanup for removed or newly referenced sources, while protecting foreign, critical, and terminal governance records.
 - Upgraded ingest handoff to v5: generated `Source_*` names now satisfy the strict filename contract, legacy active jobs rebuild their canonical identity and task packet, and stale raw/Source/target baselines automatically invalidate the old lease and re-enter the rebuild path.
 - Added narrowly scoped mixed validation for ingest integration: new Source pages remain full-validated while updates to structurally valid legacy targets may use schema validation until purpose metadata is upgraded.

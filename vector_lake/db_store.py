@@ -4336,6 +4336,14 @@ def _init_db_once(db_key: str):
                 updated_at TEXT
             )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_governance_queue_change_set_status "
+            "ON governance_queue("
+            "CASE WHEN json_valid(data_json) "
+            "THEN json_extract(data_json, '$.change_set_id') END, "
+            "CASE WHEN json_valid(data_json) "
+            "THEN LOWER(COALESCE(json_extract(data_json, '$.status'), '')) END)"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS merge_journal (
                 journal_id TEXT PRIMARY KEY,
@@ -4476,6 +4484,14 @@ def _init_db_once(db_key: str):
                 PRIMARY KEY (source_id, target_id, relation)
             )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_graph_edges_target "
+            "ON claim_graph_edges(target_id, source_id, relation)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_page_graph_edges_target "
+            "ON page_graph_edges(target_id, source_id, relation)"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS timeline_events (
                 id TEXT PRIMARY KEY,

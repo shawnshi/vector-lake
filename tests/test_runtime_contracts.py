@@ -82,6 +82,41 @@ def test_mcp_blocking_executor_uses_memory_safe_default(
         server.shutdown_blocking_executor(wait=True)
 
 
+def test_mcp_heavy_lane_does_not_block_fast_read_lane(tmp_path, monkeypatch):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "0")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_HEAVY_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_HEAVY_QUEUE_CAPACITY", "0")
+    server = mcp_server.ReloadAwareFastMCP(
+        "split-lane-test",
+        runtime_guard=mcp_server.MCPRuntimeGuard(
+            tmp_path,
+            check_interval_seconds=60,
+        ),
+    )
+    heavy_started = threading.Event()
+    heavy_release = threading.Event()
+    heavy = server._submit_heavy_call(
+        lambda: heavy_started.set() or heavy_release.wait(timeout=2)
+    )
+    assert heavy_started.wait(timeout=2)
+
+    try:
+        fast = server._submit_blocking_call(lambda: "fast-result")
+        assert fast.result(timeout=1) == "fast-result"
+        status = server.blocking_executor_status()
+        assert status["heavy_lane"]["inflight"] == 1
+        assert status["fast_lane"]["inflight"] == 0
+    finally:
+        heavy_release.set()
+        assert heavy.result(timeout=2) is True
+        server.shutdown_blocking_executor(wait=True)
+        shutdown_status = server.blocking_executor_status()
+        assert shutdown_status["fast_lane"]["shutdown_completed"] is True
+        assert shutdown_status["heavy_lane"]["shutdown_completed"] is True
+        assert shutdown_status["shutdown_completed"] is True
+
+
 def test_operational_memory_xml_is_a_well_formed_document(isolated_memory, monkeypatch):
     monkeypatch.setattr(
         governance_store,
@@ -1638,6 +1673,9 @@ def test_mcp_runtime_status_exposes_blocking_executor_capacity():
     assert status["blocking_executor"]["queued_items"] >= 0
     assert status["blocking_executor"]["workers_daemon"] is True
     assert status["blocking_executor"]["running_workers"] >= 0
+    assert status["blocking_executor"]["fast_lane"]["workers"] >= 1
+    assert status["blocking_executor"]["heavy_lane"]["workers"] >= 1
+    assert status["search_performance"]["result_char_limit"] >= 1_000
     assert status["heavy_task_gate"]["physical_state"] in {"free", "locked"}
 
 

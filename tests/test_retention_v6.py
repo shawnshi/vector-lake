@@ -98,6 +98,100 @@ def _retention_plan(conn, *, rows: int = 100) -> dict:
     )
 
 
+def test_change_set_retention_active_queue_scan_is_linear_bounded(
+    isolated_memory,
+):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    total = 3_000
+    terminal_rows = []
+    lifecycle_rows = []
+    queue_rows = []
+    for index in range(total):
+        change_set_id = f"changeset-perf-{index:05d}"
+        body = json.dumps(
+            {"change_set_id": change_set_id, "status": "applied"},
+            separators=(",", ":"),
+        )
+        terminal_rows.append((change_set_id, body, OLD))
+        lifecycle_rows.append(
+            (
+                change_set_id,
+                "applied",
+                OLD,
+                OLD,
+                hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            )
+        )
+        if index % 2 == 0:
+            queue_body = json.dumps(
+                {
+                    "status": "pending",
+                    "change_set_id": change_set_id,
+                },
+                separators=(",", ":"),
+            )
+            queue_rows.append((f"queue-perf-{index:05d}", queue_body, OLD))
+    with db_store.transaction():
+        conn.executemany(
+            "INSERT INTO change_sets(change_set_id, data_json, updated_at) "
+            "VALUES (?, ?, ?)",
+            terminal_rows,
+        )
+        conn.executemany(
+            "INSERT INTO change_set_lifecycle_v6 "
+            "(change_set_id, status, created_at, terminal_at, time_source, "
+            "payload_guard_sha256) VALUES (?, ?, ?, ?, 'test_seed', ?)",
+            lifecycle_rows,
+        )
+        conn.executemany(
+            "INSERT INTO governance_queue(item_id, data_json, updated_at) "
+            "VALUES (?, ?, ?)",
+            queue_rows,
+        )
+
+    progress_callbacks = 0
+
+    def bounded_progress():
+        nonlocal progress_callbacks
+        progress_callbacks += 1
+        return 1 if progress_callbacks > 5_000 else 0
+
+    conn.set_progress_handler(bounded_progress, 1_000)
+    try:
+        selected = governance_store._select_change_set_retention_candidates(
+            conn,
+            "2026-08-01T00:00:00+00:00",
+            500,
+            0,
+        )
+    finally:
+        conn.set_progress_handler(None, 0)
+
+    assert len(selected) == 500
+    assert all(int(change_set_id.rsplit("-", 1)[1]) % 2 == 1 for change_set_id in selected)
+    assert progress_callbacks < 5_000
+
+
+def test_hot_path_queue_and_graph_target_indexes_are_installed(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+
+    governance_indexes = {
+        row["name"] for row in conn.execute("PRAGMA index_list('governance_queue')")
+    }
+    claim_indexes = {
+        row["name"] for row in conn.execute("PRAGMA index_list('claim_graph_edges')")
+    }
+    page_indexes = {
+        row["name"] for row in conn.execute("PRAGMA index_list('page_graph_edges')")
+    }
+
+    assert "idx_governance_queue_change_set_status" in governance_indexes
+    assert "idx_claim_graph_edges_target" in claim_indexes
+    assert "idx_page_graph_edges_target" in page_indexes
+
+
 def _seed_claim_version_family(
     conn,
     *,

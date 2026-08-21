@@ -26,10 +26,11 @@ triggers: 'When the user requests to clean up, garbage collect, prune, or remove
 <execution_workflow>
   <workflow>
     1. Parse user constraints (e.g., `days` specifying the age threshold).
-    2. Invoke the garbage collection tool with `dry_run=True` to preview what would be deleted without making changes.
+    2. Invoke the garbage collection tool with `dry_run=True` to preview what would be deleted without making changes. Capture the complete `sha256:` orphan candidate fingerprint. History retention is a separate workflow and must not be inferred from this preview.
     3. Temporarily store large results in the `scratch/` directory for Sandbox Isolation if the list of orphaned entities is extensive.
     4. [FABLE 5 CHECKPOINT] Present the preview to the user. Stop and await human approval.
-    5. Upon receiving explicit human approval, execute the garbage collection tool with `dry_run=False` to finalize the deletion.
+    5. Upon receiving explicit human approval quoting the exact fingerprint, execute the garbage collection tool with `dry_run=False` and `orphan_confirmation` equal to that complete fingerprint.
+    6. Require the response to identify both the verified backup directory and the durable `wiki/.meta/gc-runs` receipt. Run Doctor and treat a missing, incomplete, or invalid GC receipt/backup as a blocking recovery-integrity failure.
   </workflow>
 
   <tool_dispatch>
@@ -48,14 +49,16 @@ triggers: 'When the user requests to clean up, garbage collect, prune, or remove
       [执行自我推演与 Metrics 校验区。该区域内容作为模型的推理草稿。]
       1. Has the age threshold been correctly parsed?
       2. Am I running a dry_run first?
-      3. Did the user explicitly approve the actual deletion?
-      4. Are the results properly isolated in the scratch space if necessary?
+      3. Did the user explicitly approve the exact current fingerprint?
+      4. Did the response and Doctor verify both backup and durable GC receipt?
+      5. Are the results properly isolated in the scratch space if necessary?
     </thought>
     Provide a clear, bulleted markdown summary of the isolated/orphaned entities identified or removed. 
   </output_format>
 
   <metrics>
     - 100% adherence to the dry-run first policy.
+    - 100% binding between approved fingerprint, backup manifest, receipt, and outbox IDs.
     - Safe pruning of isolated nodes without disrupting active graph topology.
   </metrics>
 

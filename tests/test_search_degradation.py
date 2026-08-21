@@ -128,3 +128,42 @@ def test_local_reranker_promotes_direct_title_match(monkeypatch):
 
     assert reranked[0][1]["_key"] == "Concept_Alpha"
     assert reranked[0][0] > reranked[1][0]
+
+
+def test_search_result_budget_and_phase_telemetry_are_enforced(
+    isolated_memory,
+    monkeypatch,
+):
+    _install_index(
+        isolated_memory,
+        monkeypatch,
+        {
+            "Concept_Alpha": {
+                "title": "Alpha",
+                "summary": "alpha",
+                "type": "concept",
+                "status": "active",
+            }
+        },
+    )
+    (isolated_memory / "wiki" / "Concept_Alpha.md").write_text(
+        "alpha " * 1_000,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VECTOR_LAKE_SEARCH_RESULT_MAX_CHARS", "1000")
+    monkeypatch.setattr(
+        tool_search,
+        "_get_fts_search_results",
+        lambda *_args, **_kwargs: [
+            {"node_key": "Concept_Alpha", "rank": -1.0}
+        ],
+    )
+
+    result = tool_search.search_vector_lake("alpha", top_k=100)
+    status = tool_search.search_performance_status()
+
+    assert result.startswith("[Search degraded: result_budget]")
+    assert len(result) < 1_200
+    assert status["last"]["result_chars"] == len(result)
+    assert status["last"]["total_ms"] >= 0
+    assert status["last"]["fts_ms"] >= 0

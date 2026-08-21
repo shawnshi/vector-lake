@@ -5732,7 +5732,23 @@ def _select_change_set_retention_candidates(
     batch_size: int,
     keep_latest: int,
 ) -> list[str]:
-    queue_terminal = ",".join("?" for _ in _HISTORY_TERMINAL_QUEUE_STATUSES)
+    queue_rows = conn.execute(
+        "SELECT COALESCE(json_valid(data_json), 0) AS is_valid, "
+        "CASE WHEN json_valid(data_json) "
+        "THEN json_extract(data_json, '$.change_set_id') END AS change_set_id, "
+        "CASE WHEN json_valid(data_json) "
+        "THEN LOWER(COALESCE(json_extract(data_json, '$.status'), '')) "
+        "END AS status FROM governance_queue"
+    ).fetchall()
+    if any(not int(row["is_valid"] or 0) for row in queue_rows):
+        return []
+    active_change_set_ids = {
+        str(row["change_set_id"])
+        for row in queue_rows
+        if isinstance(row["change_set_id"], str)
+        and str(row["status"] or "") not in _HISTORY_TERMINAL_QUEUE_STATUSES
+    }
+    scan_limit = int(batch_size) + len(active_change_set_ids)
     rows = conn.execute(
         "WITH terminal AS ("
         " SELECT lifecycle.change_set_id, lifecycle.terminal_at AS retained_at"
@@ -5747,24 +5763,18 @@ def _select_change_set_retention_candidates(
         "WHERE julianday(candidate.retained_at) IS NOT NULL "
         "AND julianday(candidate.retained_at) < julianday(?) "
         "AND candidate.retain_rank > ? "
-        "AND NOT EXISTS ("
-        " SELECT 1 FROM governance_queue "
-        " WHERE COALESCE(json_valid(data_json), 0) = 0"
-        ") AND NOT EXISTS ("
-        " SELECT 1 FROM governance_queue AS queue "
-        " WHERE json_valid(queue.data_json) "
-        " AND json_extract(queue.data_json, '$.change_set_id') = candidate.change_set_id "
-        " AND LOWER(COALESCE(json_extract(queue.data_json, '$.status'), '')) "
-        f" NOT IN ({queue_terminal})"
-        ") ORDER BY candidate.retained_at ASC, candidate.change_set_id ASC LIMIT ?",
+        "ORDER BY candidate.retained_at ASC, candidate.change_set_id ASC LIMIT ?",
         (
             cutoff,
             keep_latest,
-            *_HISTORY_TERMINAL_QUEUE_STATUSES,
-            batch_size,
+            scan_limit,
         ),
     ).fetchall()
-    return [str(row["change_set_id"]) for row in rows]
+    return [
+        str(row["change_set_id"])
+        for row in rows
+        if str(row["change_set_id"]) not in active_change_set_ids
+    ][:batch_size]
 
 def _select_job_retention_candidates(
     conn: sqlite3.Connection,

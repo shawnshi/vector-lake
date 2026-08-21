@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 
 
 _DEFAULT_BLOCKING_WORKERS = 1
+_DEFAULT_HEAVY_WORKERS = 1
 
 _MCP_HEAVY_TASKS = {
     "backup_retention": ("maintenance", 900.0),
@@ -428,13 +429,61 @@ class ReloadAwareFastMCP(FastMCP):
         self._blocking_inflight = 0
         self._blocking_executor = _DaemonThreadPoolExecutor(
             max_workers=worker_count,
-            thread_name_prefix="vector-lake-mcp",
+            thread_name_prefix="vector-lake-mcp-fast",
         )
+        try:
+            heavy_worker_count = int(
+                os.environ.get(
+                    "VECTOR_LAKE_MCP_HEAVY_WORKERS",
+                    str(_DEFAULT_HEAVY_WORKERS),
+                )
+            )
+        except (TypeError, ValueError):
+            heavy_worker_count = _DEFAULT_HEAVY_WORKERS
+        heavy_worker_count = max(1, min(2, heavy_worker_count))
+        try:
+            heavy_queue_capacity = int(
+                os.environ.get(
+                    "VECTOR_LAKE_MCP_HEAVY_QUEUE_CAPACITY",
+                    str(heavy_worker_count),
+                )
+            )
+        except (TypeError, ValueError):
+            heavy_queue_capacity = heavy_worker_count
+        heavy_queue_capacity = max(0, min(8, heavy_queue_capacity))
+        self._heavy_worker_count = heavy_worker_count
+        self._heavy_queue_capacity = heavy_queue_capacity
+        self._heavy_slots = threading.BoundedSemaphore(
+            heavy_worker_count + heavy_queue_capacity
+        )
+        self._heavy_inflight = 0
+        self._heavy_executor = _DaemonThreadPoolExecutor(
+            max_workers=heavy_worker_count,
+            thread_name_prefix="vector-lake-mcp-heavy",
+        )
+        self._lane_metrics_lock = threading.Lock()
+        self._lane_metrics = {
+            lane: {
+                "submitted": 0,
+                "started": 0,
+                "completed": 0,
+                "failed": 0,
+                "admission_rejections": 0,
+                "queue_wait_seconds_total": 0.0,
+                "queue_wait_seconds_max": 0.0,
+                "execution_seconds_total": 0.0,
+                "execution_seconds_max": 0.0,
+            }
+            for lane in ("fast", "heavy")
+        }
         self._executor_shutdown_lock = threading.Lock()
         self._executor_shutdown_started = False
         self._executor_shutdown_timed_out = False
         self._executor_finalizer = weakref.finalize(
             self, _finalize_blocking_executor, self._blocking_executor
+        )
+        self._heavy_executor_finalizer = weakref.finalize(
+            self, _finalize_blocking_executor, self._heavy_executor
         )
 
     @staticmethod
@@ -464,6 +513,50 @@ class ReloadAwareFastMCP(FastMCP):
             if self._executor_shutdown_started:
                 raise RuntimeError("Vector Lake MCP server is shutting down")
 
+    def _observed_lane_call(self, lane: str, call):
+        submitted_at = time.monotonic()
+        with self._lane_metrics_lock:
+            self._lane_metrics[lane]["submitted"] += 1
+
+        def observed():
+            started_at = time.monotonic()
+            queue_wait = max(0.0, started_at - submitted_at)
+            with self._lane_metrics_lock:
+                metrics = self._lane_metrics[lane]
+                metrics["started"] += 1
+                metrics["queue_wait_seconds_total"] += queue_wait
+                metrics["queue_wait_seconds_max"] = max(
+                    metrics["queue_wait_seconds_max"], queue_wait
+                )
+            failed = True
+            try:
+                result = call()
+                failed = False
+                return result
+            finally:
+                elapsed = max(0.0, time.monotonic() - started_at)
+                with self._lane_metrics_lock:
+                    metrics = self._lane_metrics[lane]
+                    metrics["completed"] += 1
+                    metrics["failed"] += int(failed)
+                    metrics["execution_seconds_total"] += elapsed
+                    metrics["execution_seconds_max"] = max(
+                        metrics["execution_seconds_max"], elapsed
+                    )
+
+        return observed
+
+    def _lane_metrics_snapshot(self, lane: str) -> dict:
+        with self._lane_metrics_lock:
+            return {
+                key: round(value, 6) if isinstance(value, float) else int(value)
+                for key, value in self._lane_metrics[lane].items()
+            }
+
+    def _record_admission_rejection(self, lane: str) -> None:
+        with self._lane_metrics_lock:
+            self._lane_metrics[lane]["admission_rejections"] += 1
+
     def _submit_admitted_blocking_call(self, call):
         released = False
 
@@ -482,7 +575,10 @@ class ReloadAwareFastMCP(FastMCP):
                 raise RuntimeError("Vector Lake MCP server is shutting down")
             self._blocking_inflight += 1
             try:
-                return self._blocking_executor.submit_tracked(call, release_slot)
+                return self._blocking_executor.submit_tracked(
+                    self._observed_lane_call("fast", call),
+                    release_slot,
+                )
             except BaseException:
                 self._blocking_inflight -= 1
                 self._blocking_slots.release()
@@ -494,8 +590,48 @@ class ReloadAwareFastMCP(FastMCP):
             timeout=self._blocking_admission_timeout
         )
         if not admitted:
+            self._record_admission_rejection("fast")
             raise RuntimeError("Vector Lake MCP blocking executor is saturated; retry later")
         return self._submit_admitted_blocking_call(call)
+
+    def _submit_admitted_heavy_call(self, call):
+        released = False
+
+        def release_slot():
+            nonlocal released
+            with self._executor_shutdown_lock:
+                if released:
+                    return
+                released = True
+                self._heavy_inflight -= 1
+            self._heavy_slots.release()
+
+        with self._executor_shutdown_lock:
+            if self._executor_shutdown_started:
+                self._heavy_slots.release()
+                raise RuntimeError("Vector Lake MCP server is shutting down")
+            self._heavy_inflight += 1
+            try:
+                return self._heavy_executor.submit_tracked(
+                    self._observed_lane_call("heavy", call),
+                    release_slot,
+                )
+            except BaseException:
+                self._heavy_inflight -= 1
+                self._heavy_slots.release()
+                raise
+
+    def _submit_heavy_call(self, call):
+        admitted = self._heavy_slots.acquire(
+            timeout=self._blocking_admission_timeout
+        )
+        if not admitted:
+            self._record_admission_rejection("heavy")
+            raise RuntimeError(
+                "Vector Lake MCP heavy executor is saturated; "
+                f"retry_after_seconds={self._blocking_admission_timeout:.3f}"
+            )
+        return self._submit_admitted_heavy_call(call)
 
     async def _acquire_blocking_slot(self) -> None:
         deadline = time.monotonic() + self._blocking_admission_timeout
@@ -504,8 +640,23 @@ class ReloadAwareFastMCP(FastMCP):
             if self._blocking_slots.acquire(blocking=False):
                 return
             if time.monotonic() >= deadline:
+                self._record_admission_rejection("fast")
                 raise RuntimeError(
                     "Vector Lake MCP blocking executor is saturated; retry later"
+                )
+            await asyncio.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
+
+    async def _acquire_heavy_slot(self) -> None:
+        deadline = time.monotonic() + self._blocking_admission_timeout
+        while True:
+            self._assert_accepting_calls()
+            if self._heavy_slots.acquire(blocking=False):
+                return
+            if time.monotonic() >= deadline:
+                self._record_admission_rejection("heavy")
+                raise RuntimeError(
+                    "Vector Lake MCP heavy executor is saturated; "
+                    f"retry_after_seconds={self._blocking_admission_timeout:.3f}"
                 )
             await asyncio.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
 
@@ -518,13 +669,24 @@ class ReloadAwareFastMCP(FastMCP):
             future.cancel()
             raise
 
+    async def _run_heavy_call(self, call):
+        await self._acquire_heavy_slot()
+        future = self._submit_admitted_heavy_call(call)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
     def blocking_executor_status(self) -> dict:
         executor_status = self._blocking_executor.status_snapshot()
+        heavy_executor_status = self._heavy_executor.status_snapshot()
         with self._executor_shutdown_lock:
             shutdown_started = self._executor_shutdown_started
             inflight = self._blocking_inflight
             timed_out = self._executor_shutdown_timed_out
-        return {
+            heavy_inflight = self._heavy_inflight
+        fast_lane = {
             "workers": self._blocking_worker_count,
             "queue_capacity": self._blocking_queue_capacity,
             "inflight": inflight,
@@ -537,7 +699,30 @@ class ReloadAwareFastMCP(FastMCP):
             "shutdown_completed": shutdown_started
             and executor_status["shutdown_completed"],
             "shutdown_timed_out": timed_out,
+            "metrics": self._lane_metrics_snapshot("fast"),
         }
+        heavy_lane = {
+            "workers": self._heavy_worker_count,
+            "queue_capacity": self._heavy_queue_capacity,
+            "inflight": heavy_inflight,
+            "queued_items": heavy_executor_status["queued_items"],
+            "admission_timeout_seconds": self._blocking_admission_timeout,
+            "shutdown_timeout_seconds": self._blocking_shutdown_timeout,
+            "workers_daemon": heavy_executor_status["workers_daemon"],
+            "running_workers": heavy_executor_status["running_workers"],
+            "shutdown_started": shutdown_started,
+            "shutdown_completed": shutdown_started
+            and heavy_executor_status["shutdown_completed"],
+            "shutdown_timed_out": timed_out,
+            "metrics": self._lane_metrics_snapshot("heavy"),
+        }
+        combined = dict(fast_lane)
+        combined["shutdown_completed"] = (
+            fast_lane["shutdown_completed"] and heavy_lane["shutdown_completed"]
+        )
+        combined["fast_lane"] = fast_lane
+        combined["heavy_lane"] = heavy_lane
+        return combined
 
     def shutdown_blocking_executor(
         self,
@@ -560,13 +745,26 @@ class ReloadAwareFastMCP(FastMCP):
             self._executor_shutdown_started = True
             if self._executor_finalizer.alive:
                 self._executor_finalizer.detach()
+            if self._heavy_executor_finalizer.alive:
+                self._heavy_executor_finalizer.detach()
         if first_shutdown or wait:
-            completed = self._blocking_executor.shutdown(
+            deadline = time.monotonic() + timeout if wait else None
+            fast_completed = self._blocking_executor.shutdown(
                 wait=wait,
                 cancel_futures=True,
                 timeout=timeout if wait else None,
             )
-            if wait and not completed:
+            heavy_timeout = (
+                max(0.0, deadline - time.monotonic())
+                if deadline is not None
+                else None
+            )
+            heavy_completed = self._heavy_executor.shutdown(
+                wait=wait,
+                cancel_futures=True,
+                timeout=heavy_timeout,
+            )
+            if wait and not (fast_completed and heavy_completed):
                 with self._executor_shutdown_lock:
                     self._executor_shutdown_timed_out = True
                 logging.getLogger(__name__).warning(
@@ -609,10 +807,11 @@ class ReloadAwareFastMCP(FastMCP):
 
             @functools.wraps(fn)
             async def threaded_tool(*fn_args, **fn_kwargs):
+                policy = _MCP_HEAVY_TASKS.get(fn.__name__)
+
                 def invoke_current_tool():
                     if fn.__name__ != "mcp_runtime_status":
                         self.runtime_guard.assert_current()
-                    policy = _MCP_HEAVY_TASKS.get(fn.__name__)
                     if policy is None:
                         return fn(*fn_args, **fn_kwargs)
                     from vector_lake.heavy_task_gate import heavy_task
@@ -631,6 +830,8 @@ class ReloadAwareFastMCP(FastMCP):
                     self._invoke_blocking_tool,
                     invoke_current_tool,
                 )
+                if policy is not None:
+                    return await self._run_heavy_call(call)
                 return await self._run_blocking_call(call)
 
             register(threaded_tool)
@@ -667,6 +868,9 @@ def mcp_runtime_status() -> str:
     """Report whether this MCP process still matches the on-disk source tree."""
     status = mcp.runtime_guard.status(force=True)
     status["blocking_executor"] = mcp.blocking_executor_status()
+    from vector_lake.tool_search import search_performance_status
+
+    status["search_performance"] = search_performance_status()
     from vector_lake.heavy_task_gate import heavy_task_gate_status
 
     status["heavy_task_gate"] = heavy_task_gate_status()
