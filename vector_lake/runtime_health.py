@@ -721,6 +721,39 @@ def assess_runtime_health(
             f"{int(storage['database_bytes'])}>={database_warning_bytes}"
         )
 
+    from vector_lake.storage_growth import storage_growth_status
+
+    storage_growth = storage_growth_status(meta_dir=peek_meta_dir())
+    detail["storage_growth"] = storage_growth
+    if storage_growth["status"] == "invalid":
+        warnings.append("storage_growth_history_invalid")
+    elif deep_projection_checks and storage_growth["status"] == "not_initialized":
+        warnings.append("storage_growth_baseline_missing")
+    delta = storage_growth.get("delta") or {}
+    database_growth_warning_bytes = _bounded_env_int(
+        "VECTOR_LAKE_DATABASE_DAILY_GROWTH_WARNING_BYTES",
+        256 * 1024 * 1024,
+        1024 * 1024,
+    )
+    if int(delta.get("database_bytes") or 0) >= database_growth_warning_bytes:
+        warnings.append(
+            "database_daily_growth_high:"
+            f"{int(delta['database_bytes'])}>={database_growth_warning_bytes}"
+        )
+    version_growth = sum(
+        int(value or 0) for value in (delta.get("row_counts") or {}).values()
+    )
+    version_growth_warning_rows = _bounded_env_int(
+        "VECTOR_LAKE_VERSION_DAILY_GROWTH_WARNING_ROWS",
+        50_000,
+        1_000,
+    )
+    if version_growth >= version_growth_warning_rows:
+        warnings.append(
+            "version_rows_daily_growth_high:"
+            f"{version_growth}>={version_growth_warning_rows}"
+        )
+
     try:
         from vector_lake.tool_gc import verify_gc_recovery_receipts
 

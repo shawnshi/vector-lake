@@ -15,6 +15,45 @@ from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.watchdog_status import get_status_file, write_status
 
 
+def test_runtime_health_surfaces_storage_growth_delta(isolated_memory):
+    from vector_lake.storage_growth import record_storage_growth_sample
+
+    db_store.init_db()
+    meta = isolated_memory / "wiki" / ".meta"
+    common = {
+        "wal_bytes": 0,
+        "version_payload_bytes": 0,
+        "backup_bytes": 0,
+        "backup_files": 0,
+        "backup_scan_complete": True,
+    }
+    record_storage_growth_sample(
+        meta_dir=meta,
+        sample={
+            **common,
+            "sampled_at": "2026-08-20T00:00:00Z",
+            "date_utc": "2026-08-20",
+            "database_bytes": 100,
+            "row_counts": {"claim_versions": 1, "evidence_versions": 2},
+        },
+    )
+    record_storage_growth_sample(
+        meta_dir=meta,
+        sample={
+            **common,
+            "sampled_at": "2026-08-21T00:00:00Z",
+            "date_utc": "2026-08-21",
+            "database_bytes": 150,
+            "row_counts": {"claim_versions": 4, "evidence_versions": 6},
+        },
+    )
+
+    health = assess_runtime_health()
+
+    assert health["detail"]["storage_growth"]["status"] == "ready"
+    assert health["detail"]["storage_growth"]["delta"]["database_bytes"] == 50
+
+
 def test_watchdog_status_read_retries_transient_permission_error(tmp_path, monkeypatch):
     from vector_lake import runtime_health
 

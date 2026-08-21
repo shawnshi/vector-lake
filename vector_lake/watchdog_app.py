@@ -2141,6 +2141,8 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
     log.info("Scheduled Lint Worker Thread started.")
     last_run_date_hour = ""
     last_expiry_date_hour = ""
+    last_storage_sample_date = ""
+    last_storage_attempt_date_hour = ""
     pending_due = ""
     next_due = ""
 
@@ -2157,12 +2159,32 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
         try:
             # DB connection opens only inside actual work blocks now
             now = time.localtime()
+            utc_now = time.gmtime()
 
             # Expire abandoned subagent work once per hour instead of waiting
             # for a manual CLI invocation or one of the twice-daily lint runs.
             current_date_hour = (
                 f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
             )
+            storage_date = (
+                f"{utc_now.tm_year:04d}-{utc_now.tm_mon:02d}-{utc_now.tm_mday:02d}"
+            )
+            storage_date_hour = f"{storage_date}-{utc_now.tm_hour}"
+            if (
+                storage_date != last_storage_sample_date
+                and storage_date_hour != last_storage_attempt_date_hour
+            ):
+                last_storage_attempt_date_hour = storage_date_hour
+                try:
+                    from vector_lake.storage_growth import (
+                        record_storage_growth_sample,
+                    )
+
+                    record_storage_growth_sample()
+                    last_storage_sample_date = storage_date
+                    log.info("Daily storage growth baseline recorded for %s.", storage_date)
+                except Exception as exc:
+                    log.warning("Daily storage growth baseline failed: %s", exc)
             observed_due = (
                 current_date_hour
                 if now.tm_hour in (10, 23) and now.tm_min == 0

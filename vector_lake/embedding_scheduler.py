@@ -262,8 +262,14 @@ class EmbeddingRateLimitTimeout(TimeoutError):
 class MinuteRateLimiter:
     """Cross-process rolling-window limiter backed by canonical SQLite."""
 
-    def __init__(self, config: EmbeddingRateConfig):
+    def __init__(
+        self,
+        config: EmbeddingRateConfig,
+        *,
+        initialize_schema: bool = True,
+    ):
         self.config = config
+        self.initialize_schema = bool(initialize_schema)
 
     def reserve(
         self,
@@ -292,7 +298,8 @@ class MinuteRateLimiter:
                 f"Embedding request tokens {request_tokens} exceed effective TPM {self.config.effective_tpm}"
             )
         remaining_wait()
-        db_store.init_db()
+        if self.initialize_schema:
+            db_store.init_db()
         remaining_wait()
         while True:
             now = time.time()
@@ -409,6 +416,7 @@ def embed_texts(
     max_retries: int | None = None,
     timeout_ms: int | None = None,
     max_wait_seconds: float | None = None,
+    initialize_schema: bool = True,
 ) -> list[list[float]]:
     """Shared validated embedding entrypoint for small runtime requests."""
     if not texts or not os.environ.get("GEMINI_API_KEY"):
@@ -429,7 +437,7 @@ def embed_texts(
             normalized,
             tokens,
             config,
-            MinuteRateLimiter(config),
+            MinuteRateLimiter(config, initialize_schema=initialize_schema),
             max_wait_seconds=max_wait_seconds,
         )
     finally:

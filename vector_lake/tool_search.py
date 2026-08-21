@@ -95,10 +95,19 @@ def _search_result_char_limit() -> int:
     return max(1_000, min(256_000, value))
 
 
+def _search_result_byte_limit() -> int:
+    try:
+        value = int(os.environ.get("VECTOR_LAKE_SEARCH_RESULT_MAX_BYTES", "32768"))
+    except (TypeError, ValueError):
+        value = 32_768
+    return max(4_096, min(1_048_576, value))
+
+
 def _record_search_performance(
     timings: dict[str, float],
     *,
     result_chars: int,
+    result_bytes: int,
     backend_issues: list[str],
 ) -> None:
     normalized = {
@@ -106,6 +115,7 @@ def _record_search_performance(
         for key, value in timings.items()
     }
     normalized["result_chars"] = max(0, int(result_chars))
+    normalized["result_bytes"] = max(0, int(result_bytes))
     normalized["backend_issues"] = sorted(set(backend_issues))
     with _SEARCH_PERFORMANCE_LOCK:
         _SEARCH_PERFORMANCE["completed_calls"] += 1
@@ -127,12 +137,26 @@ def search_performance_status() -> dict:
             "last": dict(_SEARCH_PERFORMANCE["last"]),
             "max_total_ms": float(_SEARCH_PERFORMANCE["max_total_ms"]),
             "result_char_limit": _search_result_char_limit(),
+            "result_byte_limit": _search_result_byte_limit(),
         }
 
 
 def _query_embedding_enabled() -> bool:
     """Return true only for the trusted host's explicit provider opt-in."""
     return os.environ.get(_QUERY_EMBEDDING_OPT_IN_ENV) == "1"
+
+
+def _should_query_embedding(*, fts_result_count: int, top_k: int) -> bool:
+    if not _query_embedding_enabled():
+        return False
+    if os.environ.get("VECTOR_LAKE_QUERY_EMBEDDING_ALWAYS") == "1":
+        return True
+    minimum = _query_embedding_int(
+        "VECTOR_LAKE_QUERY_EMBEDDING_FTS_BYPASS_MIN_RESULTS",
+        5,
+    )
+    minimum = min(max(1, int(top_k)), minimum)
+    return max(0, int(fts_result_count)) < minimum
 
 
 @functools.lru_cache(maxsize=64)
@@ -150,6 +174,7 @@ def _cached_query_embedding(
         max_retries=0,
         timeout_ms=timeout_ms,
         max_wait_seconds=max_wait_ms / 1000.0,
+        initialize_schema=False,
     )
     return tuple(embeddings[0]) if embeddings else ()
 
@@ -572,15 +597,21 @@ def _safe_eval(expr: str, context: dict) -> bool:
         return False
 
 def _load_search_index(index_path: str | os.PathLike) -> dict:
-    """Load only a current, sidecar-committed shared projection snapshot."""
+    """Load a current committed snapshot without waiting on the publisher lock.
+
+    The projection sidecar is published last. ``read_committed_index_snapshot``
+    verifies the sidecar, both artifact digests and their identities before and
+    after decoding, so a concurrent atomic publisher is detected without making
+    every search queue behind a potentially long rebuild lock.
+    """
     last_error = None
     for attempt in range(3):
         try:
-            return read_committed_index_snapshot(index_path)
+            return read_committed_index_snapshot(index_path, _acquire_lock=False)
         except Exception as exc:
             last_error = exc
             if attempt < 2:
-                time.sleep(0.2)
+                time.sleep(0.05)
     assert last_error is not None
     raise last_error
 
@@ -762,12 +793,24 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     def finish(value: str) -> str:
         timings["total_ms"] = (time.perf_counter() - search_started) * 1000.0
+        encoded_size = len(value.encode("utf-8"))
         _record_search_performance(
             timings,
             result_chars=len(value),
+            result_bytes=encoded_size,
             backend_issues=backend_issues,
         )
         return value
+
+    def fail(issue: str) -> None:
+        backend_issues.append(issue)
+        timings["total_ms"] = (time.perf_counter() - search_started) * 1000.0
+        _record_search_performance(
+            timings,
+            result_chars=0,
+            result_bytes=0,
+            backend_issues=backend_issues,
+        )
 
     wiki_dir = str(get_wiki_dir())
     index_path = str(get_index_path())
@@ -778,6 +821,8 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         index_data = _load_search_index(index_path)
     except Exception as exc:
         log.error(f"Failed to read index.json: {exc}")
+        timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
+        fail("projection_snapshot")
         raise SearchIndexError("The knowledge base index could not be read safely.") from exc
     timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
@@ -793,6 +838,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
     hybrid_scores = {}
+    fts_result_count = 0
 
     # 1. FTS5 Search
     phase_started = time.perf_counter()
@@ -800,6 +846,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
         fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
+        fts_result_count = len(fts_results)
         for row in fts_results:
             key = row['node_key']
             raw_score = row.get('rank')
@@ -820,10 +867,16 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     # 2. Vector Search (Hybrid blending)
     phase_started = time.perf_counter()
-    query_vector = _get_query_embedding(query)
+    embedding_requested = _should_query_embedding(
+        fts_result_count=fts_result_count,
+        top_k=top_k,
+    )
+    query_vector = _get_query_embedding(query) if embedding_requested else []
     timings["embedding_ms"] = (time.perf_counter() - phase_started) * 1000.0
+    timings["embedding_bypassed_by_fts"] = 0.0 if embedding_requested else 1.0
     if (
         not query_vector
+        and embedding_requested
         and _query_embedding_enabled()
         and os.environ.get("GEMINI_API_KEY")
     ):
@@ -848,6 +901,10 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     try:
         current_index_data = _load_search_index(index_path)
     except Exception as exc:
+        timings["generation_check_ms"] = (
+            time.perf_counter() - phase_started
+        ) * 1000.0
+        fail("projection_generation_check")
         raise SearchIndexError(
             "The knowledge base projection changed during search; retry after sync."
         ) from exc
@@ -965,6 +1022,8 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     result = ""
     result_char_limit = _search_result_char_limit()
+    result_byte_limit = _search_result_byte_limit()
+    result_bytes = 0
     phase_started = time.perf_counter()
     for index, (score, node) in enumerate(final_scored):
         filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
@@ -992,10 +1051,15 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             )
         else:
             block = f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
-        if len(result) + len(block) > result_char_limit:
+        block_bytes = len(block.encode("utf-8"))
+        if (
+            len(result) + len(block) > result_char_limit
+            or result_bytes + block_bytes > result_byte_limit
+        ):
             backend_issues.append("result_budget")
             break
         result += block
+        result_bytes += block_bytes
     timings["materialize_ms"] = (time.perf_counter() - phase_started) * 1000.0
     issues = sorted(set(backend_issues))
     if as_xml:

@@ -34,6 +34,7 @@ def test_query_embedding_is_cached_and_bounded(monkeypatch):
         "max_retries": 0,
         "timeout_ms": 1500,
         "max_wait_seconds": 0.2,
+        "initialize_schema": False,
     }
     _reset_query_embedding_state()
 

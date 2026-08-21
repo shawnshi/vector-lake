@@ -1,3 +1,11 @@
+# Vector Lake 11.16.0
+
+- Removed search-reader dependence on the projection publisher lock while retaining sidecar, digest, identity, and canonical-generation validation.
+- Added an independent UTF-8 byte budget and failure-path timing telemetry for page search results.
+- Made query embeddings adaptive: strong FTS candidate sets bypass the remote provider, while sparse lexical recall retains hybrid vector search and operators can force always-vector behavior.
+- Removed schema DDL bootstrap from the interactive embedding hot path so its quota deadline remains bounded.
+- Added bounded daily storage-growth baselines for database/WAL bytes, Claim/Evidence version rows and payload bytes, and maintenance-backup bytes; Doctor now reports deltas and configurable growth warnings.
+
 # Vector Lake 11.15.0
 
 - Added independently durable orphan-GC receipts that bind the approved fingerprint to the verified backup manifest and mutation outbox IDs; Doctor now detects missing or incomplete recovery evidence.

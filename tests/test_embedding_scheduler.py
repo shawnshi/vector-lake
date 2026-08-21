@@ -454,6 +454,29 @@ def test_interactive_rate_reservation_fails_fast(isolated_memory):
         limiter.reserve(10, max_wait_seconds=0.01)
 
 
+def test_interactive_rate_reservation_can_skip_schema_bootstrap(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    config = embedding_scheduler.EmbeddingRateConfig(
+        rpm=10,
+        tpm=1_000,
+        utilization=1.0,
+    )
+    monkeypatch.setattr(
+        db_store,
+        "init_db",
+        lambda: (_ for _ in ()).throw(AssertionError("DDL bootstrap in query path")),
+    )
+
+    limiter = embedding_scheduler.MinuteRateLimiter(
+        config,
+        initialize_schema=False,
+    )
+    limiter.reserve(10, max_wait_seconds=0.25)
+
+
 def test_start_embedding_run_marks_crashed_run_abandoned(isolated_memory, monkeypatch):
     db_store.init_db()
     conn = db_store.get_connection()

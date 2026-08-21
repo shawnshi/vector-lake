@@ -1816,7 +1816,7 @@ def test_dirty_graph_is_excluded_from_search_expansion(isolated_memory, monkeypa
     monkeypatch.setattr(
         tool_search,
         "read_committed_index_snapshot",
-        index_snapshot.load_index_snapshot,
+        lambda path, **_kwargs: index_snapshot.load_index_snapshot(path),
     )
     clear_index_snapshot_cache_for_tests()
 
@@ -1871,7 +1871,7 @@ def test_assemble_context_reuses_search_index_snapshot(isolated_memory, monkeypa
     monkeypatch.setattr(
         tool_search,
         "read_committed_index_snapshot",
-        index_snapshot.load_index_snapshot,
+        lambda path, **_kwargs: index_snapshot.load_index_snapshot(path),
     )
     clear_index_snapshot_cache_for_tests()
 
