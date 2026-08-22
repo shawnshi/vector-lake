@@ -97,6 +97,27 @@ def test_missing_source_stays_explicitly_unverified(isolated_memory):
     }
 
 
+def test_verified_source_without_segment_metadata_uses_artifact_locator(isolated_memory):
+    raw_path = isolated_memory / "raw" / "whole.txt"
+    raw_path.write_text("whole artifact", encoding="utf-8")
+
+    extracted = extract_page_objects(
+        "Concept_Evidence-Foundation.md",
+        _frontmatter("raw/whole.txt"),
+        "## 1. 编译事实\nWhole artifact claim.\n\n## 2. 证据时间线\n",
+    )
+
+    artifact = extracted["source_artifacts"][0]
+    locator = extracted["evidence"][0]["source_locator"]
+    assert locator == {
+        "kind": "artifact",
+        "scope": "whole-artifact",
+        "raw_ref": "raw/whole.txt",
+        "artifact_id": artifact["artifact_id"],
+        "sha256": artifact["sha256"],
+    }
+
+
 def test_change_application_keeps_append_only_claim_and_evidence_versions(isolated_memory):
     raw_path = isolated_memory / "raw" / "source.txt"
     raw_path.write_text("source", encoding="utf-8")
@@ -340,10 +361,10 @@ def test_foundation_backfill_is_merge_only_and_resumable(isolated_memory):
     assert current_claim["calibrated_probability"] == 0.91
     assert current_claim["extractor_name"] == "vector_lake.foundation_backfill"
     assert current_claim["extractor_version"] == "1.0"
-    assert current_evidence["source_locator"] == {
-        "kind": "unresolved",
-        "raw_ref": "raw/source.txt",
-    }
+    assert current_evidence["source_locator"]["kind"] == "artifact"
+    assert current_evidence["source_locator"]["scope"] == "whole-artifact"
+    assert current_evidence["source_locator"]["raw_ref"] == "raw/source.txt"
+    assert len(current_evidence["source_locator"]["sha256"]) == 64
     assert current_source["legacy_content_hash"] == "legacy-hash"
     assert current_source["content_hash"] == hashlib.sha256(b"source").hexdigest()
     assert current_source["integrity_status"] == "verified"
@@ -355,3 +376,65 @@ def test_foundation_backfill_is_merge_only_and_resumable(isolated_memory):
 
     second = tool_projection.evidence_foundation_backfill(dry_run=False, limit=10)
     assert second == "No pending evidence-foundation page revisions to backfill."
+
+
+def test_foundation_backfill_repairs_canonical_only_lineage_without_inventing_run(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "canonical-only.txt"
+    raw_path.write_text("canonical only source", encoding="utf-8")
+    content = _content("Canonical-only claim.", "raw/canonical-only.txt")
+    change_set = governance_store.prepare_change_set_from_content(
+        "Concept_Canonical-Only.md",
+        content.replace("id: concept_foundation", "id: concept_canonical_only").replace(
+            "title: Evidence Foundation", "title: Canonical Only"
+        ),
+        "test",
+    )
+    governance_store.apply_change_set(change_set)
+    conn = db_store.get_connection()
+    evidence_row = conn.execute(
+        "SELECT evidence_id, data_json FROM evidence LIMIT 1"
+    ).fetchone()
+    evidence = json.loads(evidence_row["data_json"])
+    for field in ("artifact_id", "source_locator", "independence_status", "lineage_safe"):
+        evidence.pop(field, None)
+    source_row = conn.execute("SELECT source_id, data_json FROM sources LIMIT 1").fetchone()
+    source = json.loads(source_row["data_json"])
+    for field in governance_store._SOURCE_FOUNDATION_FIELDS:
+        source.pop(field, None)
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE evidence SET data_json = ? WHERE evidence_id = ?",
+            (json.dumps(evidence, ensure_ascii=False), evidence_row["evidence_id"]),
+        )
+        conn.execute(
+            "UPDATE sources SET data_json = ? WHERE source_id = ?",
+            (json.dumps(source, ensure_ascii=False), source_row["source_id"]),
+        )
+        conn.execute("DELETE FROM source_artifacts")
+        conn.execute("DELETE FROM extraction_runs")
+    assert not (isolated_memory / "wiki" / "Concept_Canonical-Only.md").exists()
+
+    preview = tool_projection.evidence_foundation_backfill(dry_run=True, limit=10)
+    assert "pending_pages: 1" in preview
+    result = tool_projection.evidence_foundation_backfill(dry_run=False, limit=10)
+    assert "Backfilled 1 page revision(s)" in result
+
+    repaired_evidence = json.loads(
+        conn.execute(
+            "SELECT data_json FROM evidence WHERE evidence_id = ?",
+            (evidence_row["evidence_id"],),
+        ).fetchone()[0]
+    )
+    repaired_source = json.loads(
+        conn.execute(
+            "SELECT data_json FROM sources WHERE source_id = ?",
+            (source_row["source_id"],),
+        ).fetchone()[0]
+    )
+    assert repaired_evidence["source_locator"]["kind"] == "artifact"
+    assert repaired_evidence["lineage_safe"] is True
+    assert repaired_source["integrity_status"] == "verified"
+    assert len(repaired_source["content_hash"]) == 64
+    assert conn.execute("SELECT COUNT(*) FROM extraction_runs").fetchone()[0] == 0

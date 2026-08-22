@@ -9,6 +9,7 @@
   "properties": {
     "assessment_id": {"type": "string", "pattern": "^assessment_[0-9a-f]{24}$"},
     "claim_id": {"type": "string", "minLength": 1},
+    "claim_version": {"type": "string", "minLength": 1},
     "assessment_type": {"type": "string", "minLength": 1},
     "outcome": {"enum": ["supported", "unsupported", "contradicted", "inconclusive", "needs_review"]},
     "actor_id": {"type": "string", "minLength": 1},

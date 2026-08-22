@@ -56,6 +56,7 @@ _MCP_HEAVY_TASKS = {
     "sync_vector_lake": ("ingest_scan", 1800.0),
     "sync_critical_decision_registry": ("maintenance", 900.0),
     "topology_queue_cleanup": ("maintenance", 900.0),
+    "unsupported_claim_debt": ("maintenance", 900.0),
     "trigger_audit_graph": ("scan", 1800.0),
     "trigger_autonomous_research": ("ingest_scan", 1800.0),
     "visualize_vector_lake": ("scan", 900.0),
@@ -1276,6 +1277,58 @@ def memory_capabilities() -> str:
 
     return json.dumps(
         capability_manifest(),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def unsupported_claim_debt(
+    dry_run: bool = True,
+    review_days: int = 30,
+    confirmation: str = "",
+) -> str:
+    """Preview or apply one exact runtime unsupported-claim governance plan."""
+    return json.dumps(
+        tools.register_unsupported_claim_debt(
+            dry_run=dry_run,
+            review_days=review_days,
+            runtime_only=True,
+            confirmation=confirmation,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def record_claim_assessment(
+    claim_id: str,
+    assessment_type: str,
+    outcome: str,
+    actor_id: str,
+    method_version: str,
+    reason: str,
+    expected_claim_version: str,
+    details_json: str = "{}",
+) -> str:
+    """Append a review result only when the reviewed claim version is current."""
+    details = json.loads(details_json or "{}")
+    if not isinstance(details, dict):
+        raise ValueError("details_json must decode to a JSON object")
+    return json.dumps(
+        tools.record_claim_assessment(
+            claim_id,
+            assessment_type=assessment_type,
+            outcome=outcome,
+            actor_id=actor_id,
+            method_version=method_version,
+            reason=reason,
+            details=details,
+            expected_claim_version=expected_claim_version,
+        ),
         ensure_ascii=False,
         indent=2,
         sort_keys=True,

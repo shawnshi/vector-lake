@@ -100,10 +100,10 @@ def test_public_surface_counts_match_documented_contract():
     )
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert len(mcp_server.mcp._tool_manager.list_tools()) == 58
+    assert len(mcp_server.mcp._tool_manager.list_tools()) == 60
     assert len(mcp_server._MEMORY_MCP_SURFACE_TOOLS) == 8
-    assert len(subcommands) == 33
-    assert "58 MCP tools (`full`) / 8 MCP tools (`memory`) / 33 CLI commands" in readme
+    assert len(subcommands) == 35
+    assert "60 MCP tools (`full`) / 8 MCP tools (`memory`) / 35 CLI commands" in readme
 
 
 def test_remember_wrapper_rejects_payload_without_leaking_exception(monkeypatch):

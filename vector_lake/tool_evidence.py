@@ -12,6 +12,7 @@ from vector_lake import governance_store
 from vector_lake.claim_assessment import list_claim_assessments
 from vector_lake.db_store import get_connection, init_db
 from vector_lake.governance_metrics import infer_claim_validity
+from vector_lake.governance_metrics import claim_governance_version
 
 
 EVIDENCE_PACKET_CONTRACT_VERSION = "1.1"
@@ -104,6 +105,7 @@ def _project_claim(claim: dict) -> dict:
     projected = {field: claim.get(field) for field in fields if field in claim}
     projected["validity_state"] = claim.get("validity_state") or validity["validity_state"]
     projected["validity_reasons"] = claim.get("validity_reasons") or validity["reasons"]
+    projected["claim_version"] = claim_governance_version(claim)
     return projected
 
 

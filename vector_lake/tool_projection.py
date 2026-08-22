@@ -832,7 +832,11 @@ def _legacy_foundation_payload(
         }
         if artifact is not None:
             proposed["artifact_id"] = artifact["artifact_id"]
-            proposed["source_locator"] = source_locator_for(frontmatter, raw_ref)
+            proposed["source_locator"] = source_locator_for(
+                frontmatter,
+                raw_ref,
+                artifact=artifact,
+            )
             proposed.update(
                 evidence_independence(
                     raw_ref, path.name, artifact["generation_parent_refs"]
@@ -885,11 +889,111 @@ def _legacy_foundation_payload(
     }
 
 
+def _canonical_only_foundation_payload(page_key: str, snapshot: dict) -> dict:
+    """Repair provenance fields when canonical rows have no Wiki projection.
+
+    No extraction run is invented because the original page body is absent.
+    """
+    claims = list(snapshot["claims_by_page"].get(page_key) or [])
+    evidence = list(snapshot["evidence_by_page"].get(page_key) or [])
+    source_ids = {
+        str(source_id)
+        for claim in claims
+        for source_id in (claim.get("source_ids") or [])
+        if str(source_id)
+    }
+    source_ids.update(
+        str(record.get("source_id"))
+        for record in evidence
+        if str(record.get("source_id") or "")
+    )
+    sources = [
+        snapshot["sources_by_id"][source_id]
+        for source_id in sorted(source_ids)
+        if source_id in snapshot["sources_by_id"]
+    ]
+    artifacts = [
+        resolve_source_artifact(
+            str(source.get("raw_ref") or ""),
+            source_id=str(source["source_id"]),
+            metadata=source,
+        )
+        for source in sources
+        if str(source.get("raw_ref") or "")
+    ]
+    artifact_by_source = {str(item["source_id"]): item for item in artifacts}
+    proposed_evidence = []
+    for record in evidence:
+        source_id = str(record.get("source_id") or "")
+        source = snapshot["sources_by_id"].get(source_id) or {}
+        raw_ref = str(source.get("raw_ref") or "")
+        artifact = artifact_by_source.get(source_id)
+        proposed = {"evidence_id": record["evidence_id"]}
+        if artifact is not None:
+            proposed["artifact_id"] = artifact["artifact_id"]
+            proposed["source_locator"] = source_locator_for(
+                {},
+                raw_ref,
+                artifact=artifact,
+            )
+            proposed.update(
+                evidence_independence(
+                    raw_ref,
+                    f"{page_key}.md",
+                    artifact["generation_parent_refs"],
+                )
+            )
+        else:
+            proposed.update(
+                {
+                    "source_locator": {
+                        "kind": "unresolved",
+                        "source_id": source_id,
+                        "reason": "canonical-source-or-raw-reference-missing",
+                    },
+                    "independence_status": "unknown_missing_source",
+                    "lineage_safe": False,
+                }
+            )
+        proposed_evidence.append(proposed)
+    proposed_sources = []
+    for source in sources:
+        artifact = artifact_by_source.get(str(source["source_id"]))
+        if artifact is None:
+            continue
+        proposed_sources.append(
+            {
+                "source_id": source["source_id"],
+                "artifact_id": artifact["artifact_id"],
+                "content_hash": artifact.get("content_hash"),
+                "hash_algorithm": artifact.get("hash_algorithm"),
+                "byte_size": artifact.get("byte_size"),
+                "mime_type": artifact.get("mime_type"),
+                "storage_uri": artifact.get("storage_uri"),
+                "integrity_status": artifact.get("integrity_status"),
+                "classification": artifact.get("classification"),
+                "retention_policy": artifact.get("retention_policy"),
+                "legal_hold": artifact.get("legal_hold"),
+                "lineage_id": artifact.get("lineage_id"),
+                "generation_parent_refs": artifact.get("generation_parent_refs"),
+            }
+        )
+    return {
+        "page_key": page_key,
+        "entities": [],
+        "claims": [],
+        "evidence": proposed_evidence,
+        "sources": proposed_sources,
+        "source_artifacts": artifacts,
+        "extraction_runs": [],
+    }
+
+
 def _payload_needs_foundation_backfill(
     extracted: dict, existing_run_ids: set[str], snapshot: dict
 ) -> bool:
-    run_id = str(extracted["extraction_runs"][0]["run_id"])
-    if run_id not in existing_run_ids:
+    runs = list(extracted.get("extraction_runs") or [])
+    if runs and str(runs[0]["run_id"]) not in existing_run_ids:
         return True
     record_specs = (
         ("claims", "claim_id", governance_store._CLAIM_FOUNDATION_FIELDS),
@@ -907,20 +1011,16 @@ def _payload_needs_foundation_backfill(
         },
         "sources": snapshot["sources_by_id"],
     }
-    for table_name, key_field, fields in record_specs:
+    for table_name, key_field, _fields in record_specs:
         for proposed in extracted.get(table_name) or []:
             current = current_maps[table_name].get(str(proposed[key_field])) or {}
-            if any(field not in current for field in fields if field in proposed):
+            candidate = json.loads(json.dumps(current))
+            if governance_store.merge_foundation_record_fields(
+                table_name,
+                candidate,
+                proposed,
+            ):
                 return True
-            if table_name == "sources":
-                proposed_hash = str(proposed.get("content_hash") or "")
-                current_hash = str(current.get("content_hash") or "")
-                if (
-                    proposed.get("integrity_status") == "verified"
-                    and len(proposed_hash) == 64
-                    and len(current_hash) != 64
-                ):
-                    return True
     return False
 
 
@@ -937,6 +1037,7 @@ def _evidence_foundation_backfill_candidates(limit: int = 500) -> dict:
     invalid: list[str] = []
     pending_pages = 0
     current_pages = 0
+    projected_page_keys: set[str] = set()
     selected_limit = max(0, int(limit))
     for path in sorted(iter_markdown_files(get_wiki_dir()), key=lambda path: path.name):
         if (
@@ -955,8 +1056,25 @@ def _evidence_foundation_backfill_candidates(limit: int = 500) -> dict:
         except Exception as exc:
             invalid.append(f"{path.name}: {exc}")
             continue
+        projected_page_keys.add(path.stem)
         if not _payload_needs_foundation_backfill(
             extracted, existing_run_ids, snapshot
+        ):
+            current_pages += 1
+            continue
+        pending_pages += 1
+        if selected_limit == 0 or len(selected) < selected_limit:
+            selected.append(extracted)
+    for page_key in sorted(canonical_keys - projected_page_keys):
+        try:
+            extracted = _canonical_only_foundation_payload(page_key, snapshot)
+        except Exception as exc:
+            invalid.append(f"{page_key}: {exc}")
+            continue
+        if not _payload_needs_foundation_backfill(
+            extracted,
+            existing_run_ids,
+            snapshot,
         ):
             current_pages += 1
             continue
@@ -1027,19 +1145,15 @@ def evidence_foundation_backfill(
     for offset in range(0, len(selected), chunk_size):
         batch = selected[offset : offset + chunk_size]
         with transaction():
-            results = [
-                governance_store.backfill_evidence_foundation_records(extracted)
-                for extracted in batch
-            ]
-        totals["pages"] += len(results)
-        for result in results:
-            for key in (
-                "updated_claims",
-                "updated_evidence",
-                "updated_sources",
-                "source_artifacts",
-            ):
-                totals[key] += int(result[key])
+            result = governance_store.backfill_evidence_foundation_batch(batch)
+        totals["pages"] += int(result["pages"])
+        for key in (
+            "updated_claims",
+            "updated_evidence",
+            "updated_sources",
+            "source_artifacts",
+        ):
+            totals[key] += int(result[key])
         log.info(
             "Evidence-foundation backfill committed %s/%s pages",
             totals["pages"],

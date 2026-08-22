@@ -1185,7 +1185,8 @@ def _append_version_records(
     if table_name not in {"claim_versions", "evidence_versions"}:
         raise ValueError(f"Unsupported version table: {table_name}")
     conn = get_connection()
-    added = 0
+    prepared: list[tuple[str, str, str, str, str, str]] = []
+    seen_version_ids: set[str] = set()
     for record in records:
         record_id = str(record.get(id_field) or "")
         if not record_id:
@@ -1194,28 +1195,70 @@ def _append_version_records(
         serialized = _canonical_record_json(record)
         record_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         version_id = _stable_id(version_prefix, f"{family_id}:{record_hash}")
-        row = conn.execute(
-            f"SELECT COALESCE(MAX(version_no), 0) + 1 AS next_version FROM {table_name} "
-            f"WHERE {family_field} = ?",
-            (family_id,),
-        ).fetchone()
-        result = conn.execute(
-            f"INSERT OR IGNORE INTO {table_name} "
-            f"({version_prefix}_id, {id_field}, {family_field}, page_key, version_no, "
-            "record_hash, data_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        if version_id in seen_version_ids:
+            continue
+        seen_version_ids.add(version_id)
+        prepared.append(
+            (version_id, record_id, family_id, page_key, record_hash, serialized)
+        )
+    if not prepared:
+        return 0
+
+    existing_version_ids: set[str] = set()
+    ordered_version_ids = [item[0] for item in prepared]
+    for offset in range(0, len(ordered_version_ids), 500):
+        batch = ordered_version_ids[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        existing_version_ids.update(
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT {version_prefix}_id FROM {table_name} "
+                f"WHERE {version_prefix}_id IN ({placeholders})",
+                tuple(batch),
+            )
+        )
+    pending = [item for item in prepared if item[0] not in existing_version_ids]
+    if not pending:
+        return 0
+
+    family_ids = sorted({item[2] for item in pending})
+    next_versions = {family_id: 1 for family_id in family_ids}
+    for offset in range(0, len(family_ids), 500):
+        batch = family_ids[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            f"SELECT {family_field}, COALESCE(MAX(version_no), 0) AS max_version "
+            f"FROM {table_name} WHERE {family_field} IN ({placeholders}) "
+            f"GROUP BY {family_field}",
+            tuple(batch),
+        ):
+            next_versions[str(row[0])] = int(row[1]) + 1
+
+    recorded_at = _utc_now()
+    rows_to_insert = []
+    for version_id, record_id, family_id, page_key, record_hash, serialized in pending:
+        version_no = next_versions[family_id]
+        next_versions[family_id] = version_no + 1
+        rows_to_insert.append(
             (
                 version_id,
                 record_id,
                 family_id,
                 page_key,
-                int(row["next_version"]),
+                version_no,
                 record_hash,
                 serialized,
-                _utc_now(),
-            ),
+                recorded_at,
+            )
         )
-        added += int(bool(result.rowcount))
-    return added
+    before_changes = conn.total_changes
+    conn.executemany(
+        f"INSERT OR IGNORE INTO {table_name} "
+        f"({version_prefix}_id, {id_field}, {family_field}, page_key, version_no, "
+        "record_hash, data_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows_to_insert,
+    )
+    return int(conn.total_changes - before_changes)
 
 
 def _upsert_foundation_records(
@@ -1356,15 +1399,85 @@ def _merge_source_foundation_fields(current: dict, proposed: dict) -> bool:
     if (
         proposed.get("integrity_status") == "verified"
         and len(proposed_hash) == 64
-        and len(current_hash) != 64
+        and (
+            current.get("integrity_status") != "verified"
+            or current_hash != proposed_hash
+            or current.get("artifact_id") != proposed.get("artifact_id")
+        )
     ):
-        if current_hash and "legacy_content_hash" not in current:
+        if (
+            current_hash
+            and current_hash != proposed_hash
+            and "legacy_content_hash" not in current
+        ):
             current["legacy_content_hash"] = current_hash
-        current["content_hash"] = proposed_hash
-        current["hash_algorithm"] = "sha256"
-        current["integrity_status"] = "verified"
+        for field in (
+            "artifact_id",
+            "content_hash",
+            "hash_algorithm",
+            "byte_size",
+            "mime_type",
+            "storage_uri",
+            "integrity_status",
+            "lineage_id",
+        ):
+            if field in proposed:
+                current[field] = copy.deepcopy(proposed[field])
         changed = True
     return changed
+
+
+def _merge_evidence_foundation_fields(current: dict, proposed: dict) -> bool:
+    """Upgrade conservative placeholders without replacing reviewed locators."""
+    changed = _merge_missing_record_fields(current, proposed, _EVIDENCE_FOUNDATION_FIELDS)
+    current_locator = current.get("source_locator")
+    proposed_locator = proposed.get("source_locator")
+    current_kind = (
+        str(current_locator.get("kind") or "unresolved")
+        if isinstance(current_locator, dict)
+        else "unresolved"
+    )
+    proposed_kind = (
+        str(proposed_locator.get("kind") or "unresolved")
+        if isinstance(proposed_locator, dict)
+        else "unresolved"
+    )
+    if current_kind == "unresolved" and proposed_kind != "unresolved":
+        current["source_locator"] = copy.deepcopy(proposed_locator)
+        changed = True
+
+    current_independence = str(current.get("independence_status") or "")
+    proposed_independence = str(proposed.get("independence_status") or "")
+    if (
+        current_independence in {"", "unknown_missing_source"}
+        and proposed_independence
+        and proposed_independence != current_independence
+    ):
+        current["independence_status"] = proposed_independence
+        changed = True
+    if (
+        current.get("lineage_safe") is not True
+        and proposed.get("lineage_safe") is True
+        and current_independence != "projection_self_reference"
+    ):
+        current["lineage_safe"] = True
+        changed = True
+    return changed
+
+
+def merge_foundation_record_fields(
+    table_name: str,
+    current: dict,
+    proposed: dict,
+) -> bool:
+    """Apply the shared merge-only foundation upgrade contract."""
+    if table_name == "sources":
+        return _merge_source_foundation_fields(current, proposed)
+    if table_name == "evidence":
+        return _merge_evidence_foundation_fields(current, proposed)
+    if table_name == "claims":
+        return _merge_missing_record_fields(current, proposed, _CLAIM_FOUNDATION_FIELDS)
+    raise ValueError(f"Unsupported foundation table: {table_name}")
 
 
 def backfill_evidence_foundation_records(extracted: dict) -> dict:
@@ -1386,7 +1499,7 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
     )
     merged_by_table: dict[str, list[dict]] = {"claims": [], "evidence": [], "sources": []}
     changed_by_table = {"claims": 0, "evidence": 0, "sources": 0}
-    for table_name, key_field, fields, proposed_records in record_specs:
+    for table_name, key_field, _fields, proposed_records in record_specs:
         for proposed in proposed_records:
             record_id = str(proposed.get(key_field) or "")
             row = conn.execute(
@@ -1399,11 +1512,7 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
                     "is absent from canonical state."
                 )
             current = json.loads(row["data_json"])
-            if (
-                _merge_source_foundation_fields(current, proposed)
-                if table_name == "sources"
-                else _merge_missing_record_fields(current, proposed, fields)
-            ):
+            if merge_foundation_record_fields(table_name, current, proposed):
                 merged_by_table[table_name].append(current)
                 changed_by_table[table_name] += 1
 
@@ -1493,6 +1602,200 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
         "updated_evidence": changed_by_table["evidence"],
         "updated_sources": changed_by_table["sources"],
         "source_artifacts": len(extracted.get("source_artifacts") or []),
+    }
+
+
+def _foundation_rows_by_id(
+    conn,
+    table_name: str,
+    key_field: str,
+    record_ids: set[str],
+) -> dict[str, dict]:
+    records: dict[str, dict] = {}
+    ordered = sorted(record_ids)
+    for offset in range(0, len(ordered), 500):
+        batch = ordered[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            f"SELECT {key_field}, data_json FROM {table_name} "
+            f"WHERE {key_field} IN ({placeholders})",
+            tuple(batch),
+        ):
+            records[str(row[key_field])] = json.loads(row["data_json"])
+    return records
+
+
+def _dedupe_records(records: list[dict], key_field: str) -> list[dict]:
+    deduped: dict[str, dict] = {}
+    for record in records:
+        record_id = str(record.get(key_field) or "")
+        if record_id:
+            deduped[record_id] = record
+    return list(deduped.values())
+
+
+def backfill_evidence_foundation_batch(extracted_pages: list[dict]) -> dict:
+    """Merge a page batch with bounded SQLite round trips.
+
+    The caller owns the transaction. All current canonical rows are prefetched
+    before any mutation, and each changed record is versioned exactly once.
+    """
+    if not extracted_pages:
+        return {
+            "pages": 0,
+            "updated_claims": 0,
+            "updated_evidence": 0,
+            "updated_sources": 0,
+            "source_artifacts": 0,
+        }
+    conn = get_connection()
+    record_specs = (
+        ("claims", "claim_id", "claims"),
+        ("evidence", "evidence_id", "evidence"),
+        ("sources", "source_id", "sources"),
+    )
+    page_keys: list[str] = []
+    proposed_by_table: dict[str, list[tuple[str, dict]]] = {
+        "claims": [],
+        "evidence": [],
+        "sources": [],
+    }
+    all_entities: list[dict] = []
+    all_artifacts: list[dict] = []
+    all_runs: list[dict] = []
+    for extracted in extracted_pages:
+        page_key = str(extracted.get("page_key") or "")
+        runs = list(extracted.get("extraction_runs") or [])
+        if not page_key or len(runs) > 1:
+            raise ValueError(
+                "Evidence-foundation batch allows at most one extraction run per page."
+            )
+        page_keys.append(page_key)
+        for table_name, _key_field, payload_key in record_specs:
+            proposed_by_table[table_name].extend(
+                (page_key, record)
+                for record in list(extracted.get(payload_key) or [])
+            )
+        all_entities.extend(list(extracted.get("entities") or []))
+        all_artifacts.extend(list(extracted.get("source_artifacts") or []))
+        all_runs.extend(runs)
+
+    current_by_table: dict[str, dict[str, dict]] = {}
+    for table_name, key_field, _payload_key in record_specs:
+        record_ids = {
+            str(record.get(key_field) or "")
+            for _page_key, record in proposed_by_table[table_name]
+            if str(record.get(key_field) or "")
+        }
+        current_by_table[table_name] = _foundation_rows_by_id(
+            conn,
+            table_name,
+            key_field,
+            record_ids,
+        )
+
+    changed_by_table: dict[str, dict[str, dict]] = {
+        "claims": {},
+        "evidence": {},
+        "sources": {},
+    }
+    old_by_table: dict[str, dict[str, dict]] = {
+        "claims": {},
+        "evidence": {},
+        "sources": {},
+    }
+    for table_name, key_field, _payload_key in record_specs:
+        current_map = current_by_table[table_name]
+        for page_key, proposed in proposed_by_table[table_name]:
+            record_id = str(proposed.get(key_field) or "")
+            current = current_map.get(record_id)
+            if current is None:
+                raise ValueError(
+                    f"Cannot backfill {page_key}: extracted {table_name} ID "
+                    f"{record_id!r} is absent from canonical state."
+                )
+            if record_id not in old_by_table[table_name]:
+                old_by_table[table_name][record_id] = copy.deepcopy(current)
+            if merge_foundation_record_fields(table_name, current, proposed):
+                changed_by_table[table_name][record_id] = current
+
+    changed_claims = list(changed_by_table["claims"].values())
+    changed_evidence = list(changed_by_table["evidence"].values())
+    affected_page_keys = {_normalized_owner_page(page_key) for page_key in page_keys}
+    claim_owners = _proposed_id_owners(
+        changed_claims,
+        record_kind="claim",
+        id_field="claim_id",
+        affected_page_keys=affected_page_keys,
+    )
+    evidence_owners = _proposed_id_owners(
+        changed_evidence,
+        record_kind="evidence",
+        id_field="evidence_id",
+        affected_page_keys=affected_page_keys,
+    )
+    _validate_locator_id_ownership(conn, owners=claim_owners, record_kind="claim")
+    _validate_locator_id_ownership(
+        conn,
+        owners=evidence_owners,
+        record_kind="evidence",
+    )
+    _register_locator_id_ownership(conn, owners=claim_owners, record_kind="claim")
+    _register_locator_id_ownership(
+        conn,
+        owners=evidence_owners,
+        record_kind="evidence",
+    )
+    _append_version_records(
+        "claim_versions",
+        "claim_id",
+        "claim_family_id",
+        "claimfamily",
+        "claim_version",
+        [old_by_table["claims"][record["claim_id"]] for record in changed_claims],
+    )
+    _append_version_records(
+        "evidence_versions",
+        "evidence_id",
+        "evidence_family_id",
+        "evidencefamily",
+        "evidence_version",
+        [old_by_table["evidence"][record["evidence_id"]] for record in changed_evidence],
+    )
+    for table_name, key_field, _payload_key in record_specs:
+        _upsert_canonical_records(
+            table_name,
+            key_field,
+            list(changed_by_table[table_name].values()),
+        )
+    unique_artifacts = _dedupe_records(all_artifacts, "artifact_id")
+    _upsert_foundation_records(
+        _dedupe_records(all_entities, "entity_id"),
+        unique_artifacts,
+        _dedupe_records(all_runs, "run_id"),
+    )
+    _append_version_records(
+        "claim_versions",
+        "claim_id",
+        "claim_family_id",
+        "claimfamily",
+        "claim_version",
+        changed_claims,
+    )
+    _append_version_records(
+        "evidence_versions",
+        "evidence_id",
+        "evidence_family_id",
+        "evidencefamily",
+        "evidence_version",
+        changed_evidence,
+    )
+    return {
+        "pages": len(extracted_pages),
+        "updated_claims": len(changed_by_table["claims"]),
+        "updated_evidence": len(changed_by_table["evidence"]),
+        "updated_sources": len(changed_by_table["sources"]),
+        "source_artifacts": len(unique_artifacts),
     }
 
 

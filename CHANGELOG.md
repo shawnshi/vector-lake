@@ -1,3 +1,12 @@
+# Vector Lake 11.18.0
+
+- Added fingerprint-confirmed, runtime-scoped unsupported-claim debt registration with a complete recoverable backup and transaction-time candidate revalidation.
+- Added version-bound ClaimAssessment CLI and MCP surfaces so stale reviews cannot be attached to a changed claim.
+- Added verified whole-artifact raw locators when precise segment metadata is unavailable, while missing source bytes remain explicitly unresolved.
+- Extended evidence-foundation backfill to upgrade conservative unresolved or unverified placeholders without replacing reviewed locators.
+- Added canonical-only lineage and source-integrity repair without inventing missing Wiki projections or extraction runs.
+- Batched canonical prefetch and append-only Claim/Evidence version writes, reducing a 500-page repair transaction from minutes to seconds in the production-scale simulation.
+
 # Vector Lake 11.17.0
 
 - Added a repeatable local-only 12k+ corpus performance gate covering cold/warm index loads, serial and concurrent search, FTS fallback, exact-identity startup, throughput, errors, and RSS.

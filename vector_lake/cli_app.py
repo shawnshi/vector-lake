@@ -39,6 +39,7 @@ _CLI_HEAVY_TASKS = {
     "sync": ("ingest_scan", 1800.0),
     "timeline-rebuild": ("projection", 900.0),
     "topology-queue-cleanup": ("maintenance", 900.0),
+    "unsupported-claim-debt": ("maintenance", 900.0),
     "wiki-restore": ("maintenance", 900.0),
 }
 
@@ -575,6 +576,23 @@ Usage Examples:
         action="store_true",
         help="Register classified debt. Defaults to dry-run.",
     )
+    unsupported_debt_parser = subparsers.add_parser(
+        "unsupported-claim-debt",
+        help="[MAINTENANCE] Preview or register runtime unsupported claims as governed evidence debt.",
+    )
+    unsupported_debt_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the exact previewed candidate set. Defaults to dry-run.",
+    )
+    unsupported_debt_parser.add_argument(
+        "--review-days", type=int, default=30, help="Governance review window."
+    )
+    unsupported_debt_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact candidate fingerprint returned by the matching preview.",
+    )
 
     review_parser = subparsers.add_parser(
         "review",
@@ -664,6 +682,36 @@ Usage Examples:
         "--purpose",
         default="",
         help="Required bounded export purpose when --include-text is used.",
+    )
+    assessment_parser = subparsers.add_parser(
+        "claim-assessment",
+        help="[EVIDENCE] Append a version-bound review assessment to one claim.",
+    )
+    assessment_parser.add_argument("claim_id", help="Canonical claim identifier.")
+    assessment_parser.add_argument(
+        "--assessment-type", required=True, help="Review method category."
+    )
+    assessment_parser.add_argument(
+        "--outcome",
+        required=True,
+        choices=(
+            "supported",
+            "unsupported",
+            "contradicted",
+            "inconclusive",
+            "needs_review",
+        ),
+    )
+    assessment_parser.add_argument("--actor-id", required=True)
+    assessment_parser.add_argument("--method-version", required=True)
+    assessment_parser.add_argument("--reason", required=True)
+    assessment_parser.add_argument(
+        "--expected-claim-version",
+        required=True,
+        help="Version from the reviewed EvidencePacket; rejects stale assessments.",
+    )
+    assessment_parser.add_argument(
+        "--details-json", default="{}", help="Optional JSON object with review details."
     )
 
     merge_parser = subparsers.add_parser(
@@ -1000,6 +1048,41 @@ def main() -> int:
                     max_evidence_text_chars=getattr(args, "max_text_chars", 2000),
                     actor_id=getattr(args, "actor_id", ""),
                     purpose=getattr(args, "purpose", ""),
+                )
+            )
+        elif args.command == "unsupported-claim-debt":
+            print(
+                json.dumps(
+                    tools.register_unsupported_claim_debt(
+                        dry_run=not getattr(args, "apply", False),
+                        review_days=getattr(args, "review_days", 30),
+                        runtime_only=True,
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "claim-assessment":
+            details = json.loads(getattr(args, "details_json", "{}"))
+            if not isinstance(details, dict):
+                raise ValueError("--details-json must decode to a JSON object")
+            print(
+                json.dumps(
+                    tools.record_claim_assessment(
+                        args.claim_id,
+                        assessment_type=args.assessment_type,
+                        outcome=args.outcome,
+                        actor_id=args.actor_id,
+                        method_version=args.method_version,
+                        reason=args.reason,
+                        details=details,
+                        expected_claim_version=args.expected_claim_version,
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
                 )
             )
         elif args.command == "merge-suggestions":

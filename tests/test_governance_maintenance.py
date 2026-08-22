@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from vector_lake import db_store, governance_store
 from vector_lake.governance_metrics import claim_governance_version, compute_debt_metrics
 from vector_lake import tool_governance_maintenance as maintenance
@@ -339,10 +341,18 @@ def test_unsupported_claim_registration_closes_unmanaged_debt(isolated_memory):
         }
     )
 
-    result = maintenance.register_unsupported_claim_debt(dry_run=False)
+    preview = maintenance.register_unsupported_claim_debt(dry_run=True)
+    assert preview["to_register"] == 1
+    assert preview["candidate_fingerprint"].startswith("sha256:")
+
+    result = maintenance.register_unsupported_claim_debt(
+        dry_run=False,
+        confirmation=preview["candidate_fingerprint"],
+    )
     metrics = compute_debt_metrics(skip_heavy=True)
 
     assert result["registered"] == 1
+    assert result["backup"]
     item = next(
         item
         for item in governance_store.load_governance_queue()["items"]
@@ -354,6 +364,33 @@ def test_unsupported_claim_registration_closes_unmanaged_debt(isolated_memory):
     assert metrics["unsupported_claim_count"] == 1
     assert metrics["managed_unsupported_claim_count"] == 1
     assert metrics["unmanaged_unsupported_claim_count"] == 0
+
+
+def test_unsupported_claim_registration_rejects_unconfirmed_plan(isolated_memory):
+    db_store.init_db()
+    claim = {
+        "claim_id": "claim_unconfirmed",
+        "claim_text": "Claim needs evidence",
+        "status": "Active",
+        "confidence": 0.8,
+        "source_ids": [],
+        "evidence_ids": [],
+        "subject_entity_ids": [],
+        "locator": {"page_key": "Concept_Unconfirmed"},
+    }
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Unconfirmed.md"],
+            "proposed_entities": [],
+            "proposed_claims": [claim],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
+
+    with pytest.raises(ValueError, match="exact preview fingerprint"):
+        maintenance.register_unsupported_claim_debt(dry_run=False)
 
 
 def test_orphan_source_classification_is_non_destructive_and_resumable(isolated_memory):

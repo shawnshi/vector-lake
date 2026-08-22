@@ -11,6 +11,7 @@ from typing import Callable
 
 
 _GROUPS: dict[str, tuple[str, ...]] = {
+    "vector_lake.claim_assessment": ("record_claim_assessment",),
     "vector_lake.tool_delete": ("delete_source",),
     "vector_lake.tool_doctor": (
         "doctor_vector_lake",
@@ -62,6 +63,7 @@ _GROUPS: dict[str, tuple[str, ...]] = {
         "compact_change_set_history",
         "history_retention_maintenance",
         "operational_memory_search_index_maintenance",
+        "register_unsupported_claim_debt",
         "retire_legacy_topology_queue",
     ),
 }

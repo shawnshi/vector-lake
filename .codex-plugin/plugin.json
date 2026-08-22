@@ -1,6 +1,6 @@
 {
   "name": "vector-lake",
-  "version": "11.17.0+codex.20260822053009",
+  "version": "11.18.0+codex.20260822190435",
   "description": "Local file-first knowledge compiler with auditable Markdown, structured memory, and graph operations.",
   "author": {
     "name": "Local developer"

@@ -31,8 +31,33 @@ def test_query_and_timeline_codex_skills_are_packaged():
 
 def test_cbss_evidence_and_semantic_readiness_surfaces_are_registered():
     assert callable(mcp_server.export_evidence_packet)
+    assert callable(mcp_server.record_claim_assessment)
     assert callable(mcp_server.semantic_readiness)
     assert callable(mcp_server.sync_critical_decision_registry)
+
+
+def test_claim_assessment_cli_requires_version_bound_review_fields():
+    from vector_lake.cli_app import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "claim-assessment",
+            "claim_1",
+            "--assessment-type",
+            "evidence_review",
+            "--outcome",
+            "supported",
+            "--actor-id",
+            "reviewer:test",
+            "--method-version",
+            "review-v1",
+            "--reason",
+            "Reviewed current evidence.",
+            "--expected-claim-version",
+            "sha256:current",
+        ]
+    )
+    assert args.expected_claim_version == "sha256:current"
 
 
 def test_readiness_cli_accepts_verified_decision_scope():
@@ -110,6 +135,28 @@ def test_orphan_source_classification_is_preview_first_across_cli_and_mcp():
     args = build_parser().parse_args(["orphan-source-classify"])
     assert args.apply is False
     assert callable(mcp_server.orphan_source_classify)
+
+
+def test_unsupported_claim_debt_is_preview_first_and_fingerprint_gated():
+    from vector_lake.cli_app import build_parser
+
+    preview = build_parser().parse_args(["unsupported-claim-debt"])
+    apply = build_parser().parse_args(
+        [
+            "unsupported-claim-debt",
+            "--apply",
+            "--review-days",
+            "45",
+            "--confirm-fingerprint",
+            "sha256:approved",
+        ]
+    )
+    assert preview.apply is False
+    assert preview.review_days == 30
+    assert apply.apply is True
+    assert apply.review_days == 45
+    assert apply.confirm_fingerprint == "sha256:approved"
+    assert callable(mcp_server.unsupported_claim_debt)
 
 
 def test_backup_retention_is_preview_first_across_cli_and_mcp():

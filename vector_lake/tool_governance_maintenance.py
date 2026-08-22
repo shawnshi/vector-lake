@@ -1032,84 +1032,216 @@ def review_orphan_entry_points(
     }
 
 
-def register_unsupported_claim_debt(dry_run: bool = True) -> dict:
-    """Register unsupported canonical claims as acknowledged evidence debt."""
+def _unsupported_claim_debt_plan(
+    *,
+    review_days: int,
+    runtime_only: bool,
+) -> dict:
+    """Build a content-addressed plan without exposing claim text."""
     db_store.init_db()
-    rows = []
-    for row in db_store.get_connection().execute("SELECT data_json FROM claims"):
+    if not 1 <= int(review_days) <= 365:
+        raise ValueError("review_days must be between 1 and 365")
+    conn = db_store.get_connection()
+    runtime_claim_ids: set[str] = set()
+    if runtime_only:
+        runtime_claim_ids = {
+            str(row["claim_id"] or "")
+            for row in conn.execute(
+                "SELECT DISTINCT json_extract(data_json, '$.source_claim_id') AS claim_id "
+                "FROM operational_memory "
+                "WHERE json_extract(data_json, '$.validity_state') = 'unsupported'"
+            )
+            if str(row["claim_id"] or "")
+        }
+    rows: list[dict] = []
+    missing_runtime_claim_ids = set(runtime_claim_ids)
+    for row in conn.execute("SELECT claim_id, data_json FROM claims"):
+        claim_id = str(row["claim_id"] or "")
+        if runtime_only and claim_id not in runtime_claim_ids:
+            continue
         claim = json.loads(row["data_json"])
         if infer_claim_validity(claim).get("validity_state") == "unsupported":
             rows.append(claim)
-    existing = {
-        str(item.get("claim_id") or ""): item
-        for row in db_store.get_connection().execute(
+            missing_runtime_claim_ids.discard(claim_id)
+    existing: dict[str, list[dict]] = defaultdict(list)
+    for row in conn.execute(
             "SELECT data_json FROM governance_queue "
             "WHERE json_extract(data_json, '$.type') = 'evidence-gap' "
             "AND json_extract(data_json, '$.status') = 'acknowledged'"
-        )
-        for item in [json.loads(row["data_json"])]
-        if item.get("claim_id")
-    }
-    pending = []
+    ):
+        item = json.loads(row["data_json"])
+        claim_id = str(item.get("claim_id") or "")
+        if claim_id:
+            existing[claim_id].append(item)
+
+    candidates = []
     now_dt = datetime.now(timezone.utc)
     for claim in rows:
-        item = existing.get(str(claim.get("claim_id") or "")) or {}
-        try:
-            due_at = datetime.fromisoformat(
-                str(item.get("due_at") or "").replace("Z", "+00:00")
+        claim_id = str(claim.get("claim_id") or "")
+        claim_version = claim_governance_version(claim)
+        governance_items = existing.get(claim_id, [])
+        managed = False
+        for item in governance_items:
+            try:
+                due_at = datetime.fromisoformat(
+                    str(item.get("due_at") or "").replace("Z", "+00:00")
+                )
+                if due_at.tzinfo is None:
+                    due_at = due_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                due_at = None
+            if (
+                str(item.get("owner") or "").strip()
+                and due_at is not None
+                and due_at >= now_dt
+                and str(item.get("claim_version") or "") == claim_version
+            ):
+                managed = True
+                break
+        if managed:
+            continue
+        item_state = [
+            {
+                "item_id": str(item.get("item_id") or ""),
+                "owner": str(item.get("owner") or ""),
+                "due_at": str(item.get("due_at") or ""),
+                "claim_version": str(item.get("claim_version") or ""),
+            }
+            for item in sorted(
+                governance_items,
+                key=lambda value: str(value.get("item_id") or ""),
             )
-            if due_at.tzinfo is None:
-                due_at = due_at.replace(tzinfo=timezone.utc)
-        except ValueError:
-            due_at = None
-        if not (
-            str(item.get("owner") or "").strip()
-            and due_at is not None
-            and due_at >= now_dt
-            and str(item.get("claim_version") or "") == claim_governance_version(claim)
-        ):
-            pending.append(claim)
+        ]
+        candidates.append(
+            {
+                "claim_id": claim_id,
+                "claim_version": claim_version,
+                "item_id": _stable_item_id("evidence_gap", claim_id),
+                "governance_state": item_state,
+            }
+        )
+    candidates.sort(key=lambda item: item["claim_id"])
+    fingerprint_basis = {
+        "contract": "unsupported-claim-debt-plan-v1",
+        "runtime_only": bool(runtime_only),
+        "review_days": int(review_days),
+        "candidates": candidates,
+    }
+    fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(
+            fingerprint_basis,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "runtime_only": bool(runtime_only),
+        "review_days": int(review_days),
+        "unsupported_claims": len(rows),
+        "already_managed": len(rows) - len(candidates),
+        "to_register": len(candidates),
+        "missing_runtime_claims": len(missing_runtime_claim_ids),
+        "candidate_fingerprint": fingerprint,
+        "candidate_claim_ids": [item["claim_id"] for item in candidates],
+        "candidates": candidates,
+    }
+
+
+def register_unsupported_claim_debt(
+    dry_run: bool = True,
+    *,
+    review_days: int = 30,
+    runtime_only: bool = True,
+    confirmation: str = "",
+) -> dict:
+    """Register only an exact, previewed set of unsupported evidence debt."""
+    plan = _unsupported_claim_debt_plan(
+        review_days=review_days,
+        runtime_only=runtime_only,
+    )
     if dry_run:
         return {
             "dry_run": True,
-            "unsupported_claims": len(rows),
-            "already_managed": len(rows) - len(pending),
-            "to_register": len(pending),
+            **{key: value for key, value in plan.items() if key != "candidates"},
+            "candidate_sample": plan["candidate_claim_ids"][:10],
+            "confirmation_required": bool(plan["to_register"]),
         }
+    expected = str(plan["candidate_fingerprint"])
+    if not confirmation or not hmac.compare_digest(str(confirmation), expected):
+        raise ValueError(
+            "Unsupported-claim debt apply requires the exact preview fingerprint: "
+            f"{expected}"
+        )
+
+    from vector_lake.tool_projection import create_maintenance_backup
+
+    backup = create_maintenance_backup("unsupported_claim_debt")
     created = 0
     now = _utc_now()
-    due_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-    for claim in pending:
-        claim_id = str(claim.get("claim_id"))
-        locator = claim.get("locator") if isinstance(claim.get("locator"), dict) else {}
-        page_key = str(locator.get("page_key") or claim.get("source_page") or "")
-        created += int(
-            governance_store.upsert_governance_item(
-                {
-                    "item_id": _stable_item_id("evidence_gap", claim_id),
-                    "type": "evidence-gap",
-                    "status": "acknowledged",
-                    "title": f"Evidence gap for {claim_id}",
-                    "claim_id": claim_id,
-                    "claim_version": claim_governance_version(claim),
-                    "claim_text": str(claim.get("claim_text") or "")[:500],
-                    "affected_pages": [page_key] if page_key else [],
-                    "reason": "missing_evidence_and_source",
-                    "resolution": "research-required",
-                    "owner": "vector-lake-governance",
-                    "due_at": due_at,
-                    "source": "unsupported-claim-governance",
-                    "search_queries": [str(claim.get("claim_text") or "")[:200]],
-                    "acknowledged_at": now,
-                },
-                insert_only=False,
-            )
+    due_at = (datetime.now(timezone.utc) + timedelta(days=int(review_days))).isoformat()
+    with db_store.transaction():
+        current_plan = _unsupported_claim_debt_plan(
+            review_days=review_days,
+            runtime_only=runtime_only,
         )
+        if not hmac.compare_digest(
+            str(current_plan["candidate_fingerprint"]),
+            expected,
+        ):
+            raise RuntimeError(
+                "Unsupported-claim debt candidate set changed after preview; "
+                "run a new dry-run and review its fingerprint."
+            )
+        candidate_claim_ids = set(current_plan["candidate_claim_ids"])
+        claims_by_id = {
+            str(row["claim_id"]): json.loads(row["data_json"])
+            for row in db_store.get_connection().execute(
+                "SELECT claim_id, data_json FROM claims"
+            )
+            if str(row["claim_id"]) in candidate_claim_ids
+        }
+        for candidate in current_plan["candidates"]:
+            claim_id = str(candidate["claim_id"])
+            claim = claims_by_id[claim_id]
+            locator = (
+                claim.get("locator")
+                if isinstance(claim.get("locator"), dict)
+                else {}
+            )
+            page_key = str(locator.get("page_key") or claim.get("source_page") or "")
+            created += int(
+                governance_store.upsert_governance_item(
+                    {
+                        "item_id": candidate["item_id"],
+                        "type": "evidence-gap",
+                        "status": "acknowledged",
+                        "title": f"Evidence gap for {claim_id}",
+                        "claim_id": claim_id,
+                        "claim_version": candidate["claim_version"],
+                        "claim_text": str(claim.get("claim_text") or "")[:500],
+                        "affected_pages": [page_key] if page_key else [],
+                        "reason": "missing_evidence_and_source",
+                        "resolution": "research-required",
+                        "owner": "vector-lake-governance",
+                        "due_at": due_at,
+                        "source": "unsupported-claim-governance",
+                        "search_queries": [str(claim.get("claim_text") or "")[:200]],
+                        "acknowledged_at": now,
+                        "plan_fingerprint": expected,
+                    },
+                    insert_only=False,
+                )
+            )
     return {
         "dry_run": False,
-        "unsupported_claims": len(rows),
-        "already_managed": len(rows) - len(pending),
+        "runtime_only": bool(runtime_only),
+        "unsupported_claims": plan["unsupported_claims"],
+        "already_managed": plan["already_managed"],
         "registered": created,
+        "due_at": due_at,
+        "candidate_fingerprint": expected,
+        "backup": backup,
     }
 
 

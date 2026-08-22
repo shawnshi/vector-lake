@@ -139,14 +139,36 @@ def build_extraction_run(
 def source_locator_for(
     frontmatter: dict[str, Any],
     raw_ref: str,
+    *,
+    artifact: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return a raw-source locator, never a Wiki projection locator."""
+    """Return the most precise verified raw-source locator available.
+
+    Explicit source locators remain authoritative. When a source file exists
+    but no segment locator was declared, the verified artifact itself remains
+    a reproducible raw-source locator. Missing bytes stay unresolved.
+    """
     locators = frontmatter.get("source_locators") or {}
     locator: Any = None
     if isinstance(locators, dict):
         locator = locators.get(raw_ref) or locators.get(normalize_raw_ref(raw_ref))
     if isinstance(locator, dict) and locator:
         return {str(key): value for key, value in locator.items()}
+    artifact = dict(artifact or {})
+    sha256 = str(artifact.get("sha256") or artifact.get("content_hash") or "")
+    artifact_id = str(artifact.get("artifact_id") or "")
+    if (
+        artifact.get("integrity_status") == "verified"
+        and len(sha256) == 64
+        and artifact_id
+    ):
+        return {
+            "kind": "artifact",
+            "scope": "whole-artifact",
+            "raw_ref": normalize_raw_ref(raw_ref),
+            "artifact_id": artifact_id,
+            "sha256": sha256,
+        }
     return {
         "kind": "unresolved",
         "raw_ref": normalize_raw_ref(raw_ref),

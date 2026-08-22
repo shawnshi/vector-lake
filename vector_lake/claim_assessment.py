@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from vector_lake.db_store import get_connection, init_db, transaction
+from vector_lake.governance_metrics import claim_governance_version
 
 
 ALLOWED_OUTCOMES = {
@@ -38,6 +39,7 @@ def record_claim_assessment(
     reason: str,
     details: dict[str, Any] | None = None,
     assessment_id: str | None = None,
+    expected_claim_version: str = "",
 ) -> dict[str, Any]:
     normalized = {
         "claim_id": str(claim_id or "").strip(),
@@ -60,10 +62,20 @@ def record_claim_assessment(
 
     init_db()
     conn = get_connection()
-    if conn.execute(
-        "SELECT 1 FROM claims WHERE claim_id = ?", (normalized["claim_id"],)
-    ).fetchone() is None:
+    claim_row = conn.execute(
+        "SELECT data_json FROM claims WHERE claim_id = ?", (normalized["claim_id"],)
+    ).fetchone()
+    if claim_row is None:
         raise ValueError(f"Claim not found: {normalized['claim_id']}")
+    claim = json.loads(claim_row["data_json"])
+    current_claim_version = claim_governance_version(claim)
+    expected_version = str(expected_claim_version or "").strip()
+    if expected_version and expected_version != current_claim_version:
+        raise ValueError(
+            "Claim version changed before assessment: "
+            f"expected {expected_version}, observed {current_claim_version}"
+        )
+    normalized["claim_version"] = current_claim_version
 
     identity_json = json.dumps(
         normalized,

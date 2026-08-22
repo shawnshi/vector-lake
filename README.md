@@ -39,13 +39,13 @@ graph LR
 
 | Surface | Current contract |
 |---|---|
-| Plugin package | `11.17.0+codex.20260822053009` |
+| Plugin package | `11.18.0+codex.20260822190435` |
 | Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
 | SQLite migration schema | `PRAGMA user_version = 7` |
 | Canonical governance schema | `8.0` |
 | Index projection | `PROJECTION_CONTRACT_VERSION = 1` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 58 MCP tools (`full`) / 8 MCP tools (`memory`) / 33 CLI commands / 19 Codex skills / 19 Gemini command prompts |
+| Public surfaces | 60 MCP tools (`full`) / 8 MCP tools (`memory`) / 35 CLI commands / 19 Codex skills / 19 Gemini command prompts |
 
 通用 `init_db()` 遇到既有 v1–v6 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6 或 v7 数据库，按 v4→v5→v6→v7、
@@ -259,6 +259,7 @@ python cli.py readiness
 
 ```powershell
 python cli.py evidence-packet "<claim_id>"
+python cli.py claim-assessment "<claim_id>" --assessment-type evidence_review --outcome supported --actor-id "reviewer:id" --method-version "review-v1" --reason "Reviewed current evidence" --expected-claim-version "<claim_version>"
 ```
 
 扫描 raw sources 并持久化一个有界 ingest v5 批次：
@@ -394,6 +395,8 @@ python cli.py canonical-backfill --limit 100
 python cli.py canonical-backfill --apply --limit 100
 python cli.py evidence-foundation-backfill --limit 100
 python cli.py evidence-foundation-backfill --apply --limit 100 --batch-size 25
+python cli.py unsupported-claim-debt
+python cli.py unsupported-claim-debt --apply --confirm-fingerprint "<preview fingerprint>"
 python cli.py timeline-rebuild
 python cli.py timeline-rebuild --apply
 python cli.py projection-rebuild-index
@@ -421,7 +424,7 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hours 24 --apply --confirm-fingerprint "sha256:<preview-fingerprint>"
 ```
 
-除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` 的 preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥，二者都必须提交匹配的完整 fingerprint 与 `--confirm-no-writers`。checkpoint 只在 maintenance/heavy lock 内执行 `wal_checkpoint(TRUNCATE)`，不生成备份、不执行 DDL，并返回新的只读 preview/fingerprint。apply 在 DDL 前持久化备份和 pending manifest，成功收据返回备份路径/摘要及 `projection_rebuild_required=true`。普通 v7 输入是幂等 no-op；若 v7 preview 发现并校验到同数据库的 pending manifest，仍返回 `projection_rebuild_required=true`，apply 可补发 completed receipt，且不会新建备份。`canonical-backfill` 从 Wiki Markdown 回填缺失 canonical；`evidence-foundation-backfill` 只合并缺失的证据基础元数据；`projection-rebuild-index` 从 canonical 重建 `index.json`、FTS、`claim_graph.json` 和 sidecar，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐向量；`wiki-restore` 只做 projection-only 恢复；`memory-search-index` 每次推进一个有界索引批次；`history-retention` 只删除超龄且不再被引用的有界历史批次，apply 必须提交同一次预览返回的 `plan_as_of` 与完整 fingerprint；`change-set-compaction` 将旧 change-set 完整快照转换为受限 manifest 与内容寻址引用，apply 必须提交同一次预览的完整 fingerprint，后续批次只能使用上一次成功 apply 的 `result.safe_next_cursor` 作为 `--cursor`；`memory-cleanup`、`topology-queue-cleanup` 和 `orphan-source-classify` 均先返回候选或债务分类。
+除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` 的 preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥，二者都必须提交匹配的完整 fingerprint 与 `--confirm-no-writers`。checkpoint 只在 maintenance/heavy lock 内执行 `wal_checkpoint(TRUNCATE)`，不生成备份、不执行 DDL，并返回新的只读 preview/fingerprint。apply 在 DDL 前持久化备份和 pending manifest，成功收据返回备份路径/摘要及 `projection_rebuild_required=true`。普通 v7 输入是幂等 no-op；若 v7 preview 发现并校验到同数据库的 pending manifest，仍返回 `projection_rebuild_required=true`，apply 可补发 completed receipt，且不会新建备份。`canonical-backfill` 从 Wiki Markdown 回填缺失 canonical；`evidence-foundation-backfill` 以 merge-only 方式升级缺失、`unresolved` 或 `unverified` 的证据基础元数据，并保留已审查的精确 locator；`unsupported-claim-debt` 只处理 runtime unsupported claims，apply 前必须提交同一次预览的完整 fingerprint，并自动创建可恢复备份；`claim-assessment` 要求 EvidencePacket 中的当前 claim version，拒绝把过期审查写入新版本；`projection-rebuild-index` 从 canonical 重建 `index.json`、FTS、`claim_graph.json` 和 sidecar，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐向量；`wiki-restore` 只做 projection-only 恢复；`memory-search-index` 每次推进一个有界索引批次；`history-retention` 只删除超龄且不再被引用的有界历史批次，apply 必须提交同一次预览返回的 `plan_as_of` 与完整 fingerprint；`change-set-compaction` 将旧 change-set 完整快照转换为受限 manifest 与内容寻址引用，apply 必须提交同一次预览的完整 fingerprint，后续批次只能使用上一次成功 apply 的 `result.safe_next_cursor` 作为 `--cursor`；`memory-cleanup`、`topology-queue-cleanup` 和 `orphan-source-classify` 均先返回候选或债务分类。
 
 `backup-retention` 预览返回 fingerprint；apply 必须复用相同的 `keep-latest`、`min-age-days`、`stage-ttl-hours` 参数并提交该 fingerprint。默认保留最新 5 份完整备份、30 天内的完整备份和最新一份经实际校验可恢复的 canonical/projection 快照；过期但校验通过的删除 tombstone 也可作为恢复保护点，私有 staging 与失败删除 tombstone 至少保留 24 小时。预检和执行前重扫会核验 artifact SHA-256、SQLite 结构与完整性、投影/数据库代次；新备份还会复制并验证 sidecar，旧版无 sidecar 的 v3 备份继续按内嵌 pair contract 兼容校验。
 

@@ -149,6 +149,8 @@ def test_evidence_packet_reports_missing_references(isolated_memory):
 
 def test_claim_assessment_is_append_only_and_does_not_promote_fact(isolated_memory):
     _insert_packet_records()
+    reviewed_packet = build_evidence_packet("claim_cbss_1")
+    claim_version = reviewed_packet["claim"]["claim_version"]
     assessment = record_claim_assessment(
         "claim_cbss_1",
         assessment_type="evidence_review",
@@ -156,6 +158,7 @@ def test_claim_assessment_is_append_only_and_does_not_promote_fact(isolated_memo
         actor_id="reviewer:test",
         method_version="review-v1",
         reason="Source and locator were reviewed.",
+        expected_claim_version=claim_version,
     )
     replay = record_claim_assessment(
         "claim_cbss_1",
@@ -164,6 +167,7 @@ def test_claim_assessment_is_append_only_and_does_not_promote_fact(isolated_memo
         actor_id="reviewer:test",
         method_version="review-v1",
         reason="Source and locator were reviewed.",
+        expected_claim_version=claim_version,
     )
 
     packet = build_evidence_packet("claim_cbss_1")
@@ -175,6 +179,21 @@ def test_claim_assessment_is_append_only_and_does_not_promote_fact(isolated_memo
     assert db_store.get_connection().execute(
         "SELECT COUNT(*) FROM claim_assessments"
     ).fetchone()[0] == 1
+
+
+def test_claim_assessment_rejects_stale_claim_version(isolated_memory):
+    _insert_packet_records()
+
+    with pytest.raises(ValueError, match="Claim version changed before assessment"):
+        record_claim_assessment(
+            "claim_cbss_1",
+            assessment_type="evidence_review",
+            outcome="supported",
+            actor_id="reviewer:test",
+            method_version="review-v1",
+            reason="Reviewed stale material.",
+            expected_claim_version="sha256:stale",
+        )
 
 
 def test_evidence_packet_rejects_unknown_claim_and_invalid_text_limit(isolated_memory):
