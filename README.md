@@ -39,7 +39,7 @@ graph LR
 
 | Surface | Current contract |
 |---|---|
-| Plugin package | `11.18.0+codex.20260822190435` |
+| Plugin package | `11.18.1+codex.20260822113100` |
 | Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
 | SQLite migration schema | `PRAGMA user_version = 7` |
 | Canonical governance schema | `8.0` |

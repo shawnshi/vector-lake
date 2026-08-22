@@ -132,7 +132,11 @@ def test_rebuild_index_projection_dry_run_and_apply(isolated_memory):
 
     applied = rebuild_index_projection(dry_run=False)
     assert "Rebuilt index projection" in applied
+    assert "topology_refreshed=True" in applied
     assert (isolated_memory / "wiki" / "index.json").exists()
+    committed = indexer.read_committed_index_snapshot()
+    assert committed["graph_state"]["dirty"] is False
+    assert indexer.projection_pair_matches_current_generation() is True
 
 
 def test_reconcile_canonical_content_from_richer_wiki_projection(isolated_memory):

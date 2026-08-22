@@ -1,3 +1,8 @@
+# Vector Lake 11.18.1
+
+- Complete projection rebuilds with a bounded topology refresh and verify the
+  published pair is current before reporting success.
+
 # Vector Lake 11.18.0
 
 - Added fingerprint-confirmed, runtime-scoped unsupported-claim debt registration with a complete recoverable backup and transaction-time candidate revalidation.

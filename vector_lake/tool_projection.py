@@ -1183,10 +1183,16 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
 
     backup_dir = create_maintenance_backup("index_rebuild")
     output = indexer.generate_index()
+    topology_refreshed = indexer.refresh_graph_topology_if_dirty()
+    if not indexer.projection_pair_matches_current_generation():
+        raise RuntimeError(
+            "Projection rebuild did not publish a topology-current projection pair"
+        )
     after = _diff_sets()
     return (
         f"Rebuilt index projection at {output}. "
-        f"missing_index={len(after['missing_index'])}; extra_index={len(after['extra_index'])}; backup={backup_dir}"
+        f"missing_index={len(after['missing_index'])}; extra_index={len(after['extra_index'])}; "
+        f"topology_refreshed={topology_refreshed}; backup={backup_dir}"
     )
 
 
