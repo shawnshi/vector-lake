@@ -561,7 +561,7 @@ def test_schema_migration_parser_and_dispatch_are_cli_only_and_apply_gated(
         if isinstance(getattr(action, "choices", None), dict)
         and "schema-migrate" in action.choices
     )
-    assert len(command_choices) == 32
+    assert len(command_choices) == 33
 
     calls = []
     gate_calls = []

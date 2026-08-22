@@ -1,5 +1,12 @@
-# Vector Lake 11.16.0
+# Vector Lake 11.17.0
 
+- Added a repeatable local-only 12k+ corpus performance gate covering cold/warm index loads, serial and concurrent search, FTS fallback, exact-identity startup, throughput, errors, and RSS.
+- Made the generation-scoped exact-identity index single-flight so concurrent cold requests no longer repeat the full O(N) build and allocation.
+- Rate-limited repeated search-backend failure logs per backend while preserving degraded results and exposing the suppressed count in search telemetry.
+- Added deterministic exact recall for canonical keys, entity IDs, titles, and aliases ahead of fuzzy and vector ranking, including ambiguity-preserving alias results.
+- Added a read-only, versioned retrieval benchmark with dataset hashes and reproducible Precision, Recall, MRR, and nDCG metrics.
+- Added a stable Vector Lake-native Agent memory protocol plus an optional fail-closed eight-tool MCP surface; governed writes still flow through the existing operational-memory mutation contract.
+- Clarified that SQLite remains canonical, Markdown is a projection, and operational memory is a compiled Agent-facing read model rather than a second source of truth.
 - Removed search-reader dependence on the projection publisher lock while retaining sidecar, digest, identity, and canonical-generation validation.
 - Added an independent UTF-8 byte budget and failure-path timing telemetry for page search results.
 - Made query embeddings adaptive: strong FTS candidate sets bypass the remote provider, while sparse lexical recall retains hybrid vector search and operators can force always-vector behavior.

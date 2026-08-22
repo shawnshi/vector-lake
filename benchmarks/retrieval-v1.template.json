@@ -1,0 +1,20 @@
+{
+  "contract_version": "vector-lake-retrieval-benchmark/v1",
+  "dataset_id": "replace-with-dataset-id",
+  "dataset_version": "replace-with-version",
+  "top_k": 5,
+  "thresholds": {
+    "recall_at_k": 0.9,
+    "mrr": 0.75
+  },
+  "queries": [
+    {
+      "id": "replace-with-query-id",
+      "query": "replace with a representative query",
+      "relevant_keys": [
+        "Concept_Replace-With-Canonical-Key"
+      ],
+      "include_history": false
+    }
+  ]
+}

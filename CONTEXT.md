@@ -11,7 +11,7 @@ Current boundary:
 - Claim topology: `MEMORY/wiki/claim_graph.json`
 - Strategic intent: `MEMORY/purpose.md` (YAML contract parsed by `purpose_contract.py`)
 - Canonical governance store: `MEMORY/wiki/.meta/vector_lake.db` (SQLite)
-- Agent runtime memory: SQLite `operational_memory` table
+- Agent runtime read model: SQLite `operational_memory` table, compiled from canonical claims
 
 The durable architecture is:
 
@@ -64,12 +64,14 @@ Conflict rules:
 | `vector_lake/tool_ingest.py` | Raw-source scan and Subagent instructions generation |
 | `vector_lake/indexer.py` | Page index, weighted edges, claim graph refresh, pure-Python BM25 inverted index |
 | `vector_lake/claim_extractor.py` | Page-to-entity/claim/evidence/source extraction |
-| `vector_lake/tool_memory.py` | Wiki-as-Database operational memory persistence via MCP |
+| `vector_lake/tool_memory.py` | Governed operational-memory observation persistence via MCP |
+| `vector_lake/memory_protocol.py` | Stable Agent-memory verbs and bounded thin-client adapters |
+| `vector_lake/retrieval_benchmark.py` | Read-only, dataset-hash-bound retrieval evaluation |
 | `vector_lake/governance_store.py` | Canonical store, change sets, operational memory, conflict resolver |
 | `vector_lake/governance_metrics.py` | Debt, health metrics, and merge-candidate report orchestration |
 | `vector_lake/merge_analysis.py` | Unicode-safe duplicate recall, evidence scoring, four-state decisions, component grouping, and merge preflight |
 | `vector_lake/tokenizer_runtime.py` | Shared rjieba boundary for consistent index and query tokenization |
-| `vector_lake/tool_search.py` | Hybrid search (local query expansion + BM25 + Graph Traversal), Memory Packet assembly |
+| `vector_lake/tool_search.py` | Exact identity + local query expansion + BM25 + Graph Traversal, Memory Packet assembly |
 | `vector_lake/tool_query.py` | Query synthesis with Memory Packet first |
 | `vector_lake/tool_research.py` | Autonomous deep research and graph insight processing |
 | `vector_lake/purpose_contract.py` | Purpose parsing, ingestion admission, SIR review, and synthesis proposal thresholds |
@@ -148,6 +150,7 @@ python cli.py sync
 python cli.py search "query" --top_k 5
 python cli.py search "query" --mode memory --top_k 5
 python cli.py search "query" --mode claim --top_k 5
+python cli.py retrieval-benchmark "dataset.json"
 python cli.py query "question" [--dry-run]
 python cli.py review
 python cli.py audit-graph
@@ -185,6 +188,7 @@ The checked baseline is produced by the current CI commands rather than a fixed 
 8. Keep infrastructure health and semantic readiness separate: the first protects mutations and projections; the second reports evidence/governance fitness to consumers.
 9. Governance decision relevance must use explicit `critical_decision_refs`; never infer it from title or description text.
 10. Do not use Vector Lake Timeline, `Policy_*` pages, or operational-memory decisions as CBSS Event, executable Policy, or Decision records.
+11. `VECTOR_LAKE_MCP_SURFACE=memory` is an exact fail-closed thin surface. It does not change canonical ownership, payload sandboxing, or mutation authority.
 
 ## 7. System Capabilities & Architecture Defenses
 The Vector Lake system is designed for high-concurrency ingestion and graph maintenance with several defensive mechanisms:

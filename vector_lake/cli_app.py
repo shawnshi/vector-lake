@@ -33,6 +33,7 @@ _CLI_HEAVY_TASKS = {
     "orphan-source-classify": ("scan", 900.0),
     "projection-rebuild-index": ("projection", 1800.0),
     "projection-report": ("scan", 900.0),
+    "retrieval-benchmark": ("scan", 900.0),
     "research": ("ingest_scan", 1800.0),
     "schema-migrate": ("maintenance", 1800.0),
     "sync": ("ingest_scan", 1800.0),
@@ -223,6 +224,29 @@ Usage Examples:
         choices=["page", "memory", "claim"],
         default="page",
         help="Search page index, operational memory, or fact claims.",
+    )
+
+    benchmark_parser = subparsers.add_parser(
+        "retrieval-benchmark",
+        help="[EVAL] Run a deterministic, read-only retrieval benchmark.",
+    )
+    benchmark_parser.add_argument(
+        "dataset",
+        help="Path to a vector-lake-retrieval-benchmark/v1 JSON dataset.",
+    )
+    benchmark_parser.add_argument(
+        "--top-k",
+        type=_positive_int,
+        default=None,
+        help="Override dataset top_k for this run (maximum: 100).",
+    )
+    benchmark_parser.add_argument(
+        "--allow-remote-embeddings",
+        action="store_true",
+        help=(
+            "Allow the configured query embedding provider. The default is "
+            "local deterministic retrieval only."
+        ),
     )
 
     query_parser = subparsers.add_parser(
@@ -773,6 +797,23 @@ def main() -> int:
                     cluster=getattr(args, "cluster", None),
                     include_history=getattr(args, "include_history", False),
                     mode=getattr(args, "mode", "page"),
+                )
+            )
+        elif args.command == "retrieval-benchmark":
+            from vector_lake.retrieval_benchmark import run_retrieval_benchmark
+
+            print(
+                json.dumps(
+                    run_retrieval_benchmark(
+                        args.dataset,
+                        top_k_override=getattr(args, "top_k", None),
+                        allow_remote_embeddings=getattr(
+                            args, "allow_remote_embeddings", False
+                        ),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
                 )
             )
         elif args.command == "lint":

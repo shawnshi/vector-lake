@@ -45,6 +45,46 @@ def test_fts_failure_uses_index_fallback_and_marks_degraded(
     assert "**Alpha Policy**" in result
 
 
+def test_repeated_fts_failures_are_log_rate_limited(
+    isolated_memory,
+    monkeypatch,
+    caplog,
+):
+    _install_index(
+        isolated_memory,
+        monkeypatch,
+        {
+            "Concept_Alpha": {
+                "title": "Alpha Policy",
+                "summary": "alpha clinical policy",
+                "type": "concept",
+                "status": "active",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_get_fts_search_results",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            tool_search.SearchBackendError("fts5")
+        ),
+    )
+    tool_search._reset_search_backend_log_state()
+
+    for _ in range(20):
+        assert "**Alpha Policy**" in tool_search.search_vector_lake("alpha")
+
+    records = [
+        record
+        for record in caplog.records
+        if "Search backend fts5 failed" in record.getMessage()
+    ]
+    status = tool_search.search_performance_status()
+
+    assert len(records) == 1
+    assert status["backend_log_suppressed"] == {"fts5": 19}
+
+
 def test_vector_failure_keeps_fts_results_and_marks_degraded(
     isolated_memory,
     monkeypatch,

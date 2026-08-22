@@ -31,7 +31,7 @@ graph LR
     PACKET --> QUERY
 ```
 
-核心原则：**Markdown 是人类界面，`.meta` 是事实底座，`operational_memory` 是 Agent 运行层。**
+核心原则：**Markdown 是人类界面，`.meta` 是事实底座，`operational_memory` 是由 canonical claims 编译、驻留在同一 SQLite 中的 Agent read model。**
 
 ## Runtime Contract
 
@@ -39,13 +39,13 @@ graph LR
 
 | Surface | Current contract |
 |---|---|
-| Plugin package | `11.16.0+codex.20260821091500` |
+| Plugin package | `11.17.0+codex.20260822053009` |
 | Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
 | SQLite migration schema | `PRAGMA user_version = 7` |
 | Canonical governance schema | `8.0` |
 | Index projection | `PROJECTION_CONTRACT_VERSION = 1` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 51 MCP tools / 32 CLI commands / 19 Codex skills / 19 Gemini command prompts |
+| Public surfaces | 58 MCP tools (`full`) / 8 MCP tools (`memory`) / 33 CLI commands / 19 Codex skills / 19 Gemini command prompts |
 
 通用 `init_db()` 遇到既有 v1–v6 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6 或 v7 数据库，按 v4→v5→v6→v7、
@@ -179,11 +179,27 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 
 `query` 会优先生成 Memory Packet，再按预算拼接相关 wiki 页面。Memory Packet 包含当前偏好、决策、任务状态、相关事实、冲突/陈旧告警和证据指针。
 
+### Agent-memory verbs 与薄客户端表面
+
+`vector-lake-agent-memory/v1` 提供六个 Vector Lake 原生 verbs：
+
+- `recall`：统一查询 page、memory 或 claim。
+- `remember`：继续通过 sandboxed `payload_file` 和 Mutation Coordinator 受控写入。
+- `entity`：精确解析 key、canonical id、title 和 alias，并显式报告歧义。
+- `synthesize`：只组装 proposal-only dry-run 上下文，不提交 Synthesis 页面。
+- `context_pack`：在服务端字符预算内组装 Memory Packet 与页面上下文。
+- `delta`：返回指定时间后的当前页面投影更新；不声称包含删除历史。
+
+直接 `forget` 不属于该契约。Vector Lake 的运行态记忆来自 canonical claims；Agent
+不得直接删除派生 row 绕过证据历史、治理和 CBSS AcceptedFact 边界。需要轻量接入的
+Agent 可在独立 MCP 进程设置 `VECTOR_LAKE_MCP_SURFACE=memory`；默认 `full` 保持
+向后兼容。
+
 ## Storage Layout & Architecture
 
 Vector Lake 使用 SQLite canonical 与可重建投影分离的架构。
 
-- **SQLite (Canonical Store)**：`vector_lake.db` 保存 entities、claims、evidence、sources、graph edges、governance state、jobs、outbox 与 operational memory。
+- **SQLite (Canonical Store)**：`vector_lake.db` 保存 entities、claims、evidence、sources、graph edges、governance state、jobs 与 outbox；同库的 `operational_memory` 是由 canonical claims 编译的事务性 Agent read model，不构成第二事实源。
 - **Markdown (Human-Audit Projection)**：`wiki/*.md` 是可审计发布面；`raw/` 保存由扫描器识别和按 revision 跟踪的输入材料。
 - **Derived Projections**：`index.json`、FTS、`claim_graph.json`、`projection_pair_manifest.json`、Timeline 和 operational-memory packets 可从 canonical 状态与受治理信源重建。小型 sidecar 是 index/claim-graph 对的最后提交标记，绑定共同 generation、文件大小和 SHA-256；缺失、损坏或摘要不一致时读取链路失败关闭并要求重新同步。
 - **Commit Boundary**：canonical change set 与 outbox intent 在 SQLite 内原子提交；文件投影使用备份、原子替换和 fenced worker 恢复，但不宣称文件系统与 SQLite 之间存在分布式事务。
@@ -292,6 +308,33 @@ python cli.py search "部署目标" --mode memory --top_k 5
 ```powershell
 python cli.py search "Agent memory" --mode claim --top_k 5
 ```
+
+检索首先执行 generation-scoped 的 key/id/title/alias 精确身份匹配，再进入
+FTS5 BM25、可选 sqlite-vec 和多跳 PPR。精确匹配使用 NFKC + casefold，保留
+歧义 alias 的全部候选，并跳过远程 query embedding。
+
+运行只读、输入哈希绑定的检索基准：
+
+```powershell
+python cli.py retrieval-benchmark benchmarks/retrieval-v1.template.json
+```
+
+### 12k+ corpus 性能门禁
+
+本地 synthetic benchmark 覆盖真实 SQLite FTS5、index decoder/cache、exact identity、graph expansion、单线程与 8-worker 检索、FTS 故障 fallback、错误率和 RSS。它强制关闭远程 query embedding，fixture 结束后自动删除，不读写真实 canonical 数据。
+
+```powershell
+python benchmarks/corpus_scale_benchmark.py `
+  --workspace C:\Users\shich\MEMORY\scratch\vector-lake-stability-20260822 `
+  --nodes 12000 --serial-queries 120 --concurrent-queries 320 `
+  --workers 8 --fail-on-slo
+```
+
+SLO 与问题编号见 `docs/corpus-scale-stability-plan.md`，实测证据见 `docs/corpus-scale-stability-report.md`。
+
+模板必须替换为当前语料的真实 golden queries/keys。运行器输出 P@K、R@K、MRR、
+nDCG@K、逐查询排名、阈值失败和数据集 SHA-256；默认不调用远程 embedding，也不写
+`quality_evaluation_runs`。完整契约见 `benchmarks/README.md`。
 
 基于 Memory Packet 和 wiki 证据做 synthesis：
 
@@ -409,6 +452,7 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 - `VECTOR_LAKE_QUERY_EMBEDDING_TIMEOUT_MS` / `VECTOR_LAKE_QUERY_EMBEDDING_MAX_WAIT_MS` / `VECTOR_LAKE_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS`：查询向量默认 `2000 ms` 请求超时、`250 ms` 配额等待、失败后 `30 s` 冷却。
 - `VECTOR_LAKE_QUERY_EMBEDDING_FTS_BYPASS_MIN_RESULTS`：FTS 已返回足够候选时跳过远程查询向量，默认 `5`；设 `VECTOR_LAKE_QUERY_EMBEDDING_ALWAYS=1` 可恢复每次向量混合。
 - `VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS`：源码 revision 检查周期，默认 `5` 秒；设为 `0` 时每次检查。
+- `VECTOR_LAKE_MCP_SURFACE`：默认 `full`；设为 `memory` 时在 transport 启动前 fail-closed 过滤为 8 个工具：`mcp_runtime_status`、`memory_capabilities`、`recall`、`remember`、`entity`、`synthesize`、`context_pack`、`delta`。未知值或缺失必需工具会拒绝启动。
 - `VECTOR_LAKE_MCP_BLOCKING_WORKERS`：同步 MCP 工具 worker 数，默认 `1`，限制为 `1` 至 `8`；需要更高吞吐时可显式上调，并同步评估重型查询的并发内存。
 - `VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY`：等待队列容量，默认等于 worker 数，限制为 `0` 至 `64`。
 - `VECTOR_LAKE_MCP_HEAVY_WORKERS`：重型 MCP 工具独立 worker 数，默认 `1`，限制为 `1` 至 `2`。
@@ -450,11 +494,13 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 | `vector_lake/indexer.py` | `index.json` 生成，使用 Sparse Graph Traversal 优化计算拓扑边 |
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
 | `vector_lake/tool_memory.py` | 运行态记忆的受控写入入口 |
+| `vector_lake/memory_protocol.py` | 稳定 Agent-memory verbs、能力清单与有界 context/delta 适配器 |
+| `vector_lake/retrieval_benchmark.py` | 只读、数据集哈希绑定的 P@K/R@K/MRR/nDCG 检索评估器 |
 | `vector_lake/governance_store.py` | canonical store、change sets、operational memory 与冲突裁决 |
 | `vector_lake/governance_metrics.py` | debt metrics、治理统计与候选报告编排 |
 | `vector_lake/merge_analysis.py` | Unicode-safe 候选召回、证据评分、四态裁决、连通分组与合并预检 |
 | `vector_lake/tokenizer_runtime.py` | rjieba 统一分词边界，保证索引与查询词项一致 |
-| `vector_lake/tool_search.py` | 混合检索管线 (Local Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR) 与 Memory Packet |
+| `vector_lake/tool_search.py` | 精确 identity + Local Query Expansion + SQLite FTS5 BM25 + Multi-Hop PPR 与 Memory Packet |
 | `vector_lake/tool_query.py` | query-to-page synthesis |
 | `vector_lake/tool_research.py` | 拓扑图谱洞察分析与主动深度研究下发 |
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |
@@ -471,7 +517,7 @@ python cli.py backup-retention --keep-latest 5 --min-age-days 30 --stage-ttl-hou
 | `vector_lake/claim_assessment.py` | 追加式 ClaimAssessment；不产生 AcceptedFact |
 | `vector_lake/decision_registry.py` | 同步外部已验证 CriticalDecisionRegistry 并支持决策范围就绪度 |
 | `vector_lake/quality_registry.py` | 登记不可变 schema/dialect 版本与 golden dataset 评估结果 |
-| `vector_lake/mcp_server.py` | 51-tool MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
+| `vector_lake/mcp_server.py` | 58-tool full / 8-tool memory MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
 | `vector_lake/watchdog_app.py` | 增量监听后台服务，队列调度，定时自愈审计 (Scheduled Auto-Lint) |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
@@ -516,6 +562,7 @@ $env:PYTHONUTF8='1'; python cli.py doctor
 $env:PYTHONUTF8='1'; python cli.py readiness
 $env:PYTHONUTF8='1'; python cli.py projection-report --limit 5
 $env:PYTHONUTF8='1'; python cli.py evidence-packet "<claim_id>"
+$env:PYTHONUTF8='1'; python cli.py retrieval-benchmark "<dataset.json>"
 ```
 
 发布证据应记录每次运行的实际结果和实时收集的测试数量。`doctor` 健康不代表语义就绪；`readiness` 可以因治理积压、拓扑待刷新或断言有效性问题返回 `degraded` / `not_ready`。这两个 CLI 成功生成报告时都返回进程退出码 `0`，即使报告内容是 `FAIL`、`degraded` 或 `not_ready`；未捕获异常才返回非零。发布门必须解析输出内容，不能只检查 shell exit code。

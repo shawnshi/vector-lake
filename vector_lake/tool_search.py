@@ -1,9 +1,11 @@
 import logging
+import json
 import math
 import os
 import re
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
 from itertools import islice
@@ -77,6 +79,21 @@ _SEARCH_PERFORMANCE = {
     "last": {},
     "max_total_ms": 0.0,
 }
+_SEARCH_BACKEND_LOG_LOCK = threading.Lock()
+_SEARCH_BACKEND_LOG_STATE: dict[str, dict[str, float | int]] = {}
+_SEARCH_BACKEND_LOG_INTERVAL_SECONDS = 30.0
+_IDENTITY_LOOKUP_LOCK = threading.Lock()
+_IDENTITY_LOOKUP_CACHE: dict[str, object] = {
+    "signature": "",
+    "lookup": {},
+}
+
+_EXACT_IDENTITY_WEIGHTS = {
+    "key": 120.0,
+    "id": 118.0,
+    "title": 116.0,
+    "alias": 112.0,
+}
 
 
 
@@ -131,14 +148,121 @@ def _record_search_performance(
 
 def search_performance_status() -> dict:
     """Return query-text-free process-local search timing telemetry."""
+    with _SEARCH_BACKEND_LOG_LOCK:
+        suppressed = {
+            backend: int(state.get("suppressed", 0))
+            for backend, state in _SEARCH_BACKEND_LOG_STATE.items()
+            if int(state.get("suppressed", 0)) > 0
+        }
     with _SEARCH_PERFORMANCE_LOCK:
-        return {
+        status = {
             "completed_calls": int(_SEARCH_PERFORMANCE["completed_calls"]),
             "last": dict(_SEARCH_PERFORMANCE["last"]),
             "max_total_ms": float(_SEARCH_PERFORMANCE["max_total_ms"]),
             "result_char_limit": _search_result_char_limit(),
             "result_byte_limit": _search_result_byte_limit(),
         }
+    status["backend_log_suppressed"] = suppressed
+    return status
+
+
+def _log_search_backend_failure(backend: str) -> None:
+    """Rate-limit repeated backend failures without hiding degradation state."""
+    normalized = str(backend or "unknown").strip().lower() or "unknown"
+    now = time.monotonic()
+    with _SEARCH_BACKEND_LOG_LOCK:
+        state = _SEARCH_BACKEND_LOG_STATE.setdefault(
+            normalized,
+            {"last_logged": float("-inf"), "suppressed": 0},
+        )
+        elapsed = now - float(state["last_logged"])
+        if elapsed < _SEARCH_BACKEND_LOG_INTERVAL_SECONDS:
+            state["suppressed"] = int(state["suppressed"]) + 1
+            return
+        suppressed = int(state["suppressed"])
+        state["last_logged"] = now
+        state["suppressed"] = 0
+    suffix = f"; suppressed {suppressed} repeated failures" if suppressed else ""
+    log.error(
+        "Search backend %s failed; using bounded fallback%s",
+        normalized,
+        suffix,
+    )
+
+
+def _reset_search_backend_log_state() -> None:
+    with _SEARCH_BACKEND_LOG_LOCK:
+        _SEARCH_BACKEND_LOG_STATE.clear()
+
+
+def _normalize_identity_label(value: object) -> str:
+    """Normalize an identity label without turning fuzzy text into equality."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if text.casefold().endswith(".md"):
+        text = text[:-3]
+    return " ".join(text.split()).casefold()
+
+
+def _identity_lookup(index_data: dict) -> dict[str, tuple[tuple[str, float], ...]]:
+    """Build one generation-scoped exact key/title/alias lookup.
+
+    The existing projection-level alias map stores one target per spelling and
+    can therefore hide an ambiguous alias.  This cache is rebuilt from nodes so
+    every exact claimant remains visible and the O(N) scan is paid once per
+    committed projection generation rather than once per query.
+    """
+    signature = json.dumps(
+        index_data.get("projection_manifest") or {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    with _IDENTITY_LOOKUP_LOCK:
+        if _IDENTITY_LOOKUP_CACHE["signature"] == signature:
+            return _IDENTITY_LOOKUP_CACHE["lookup"]  # type: ignore[return-value]
+        # Build under the same lock as the generation check.  The work is O(N)
+        # and a concurrent cold start previously let every request repeat the
+        # full allocation before the first result reached the cache.
+        mutable: dict[str, dict[str, float]] = {}
+        for raw_key, raw_node in (index_data.get("nodes") or {}).items():
+            key = str(raw_key)
+            node = raw_node if isinstance(raw_node, dict) else {}
+            aliases = node.get("aliases") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            labels = [
+                (key, "key"),
+                (node.get("id"), "id"),
+                (node.get("title"), "title"),
+                *((alias, "alias") for alias in aliases),
+            ]
+            for label, kind in labels:
+                normalized = _normalize_identity_label(label)
+                if not normalized:
+                    continue
+                matches = mutable.setdefault(normalized, {})
+                matches[key] = max(
+                    matches.get(key, 0.0),
+                    _EXACT_IDENTITY_WEIGHTS[kind],
+                )
+
+        lookup = {
+            label: tuple(
+                sorted(matches.items(), key=lambda item: (-item[1], item[0]))
+            )
+            for label, matches in mutable.items()
+        }
+        _IDENTITY_LOOKUP_CACHE["signature"] = signature
+        _IDENTITY_LOOKUP_CACHE["lookup"] = lookup
+        return lookup
+
+
+def _exact_identity_scores(index_data: dict, query: str) -> dict[str, float]:
+    normalized = _normalize_identity_label(query)
+    if not normalized:
+        return {}
+    return dict(_identity_lookup(index_data).get(normalized, ()))
 
 
 def _query_embedding_enabled() -> bool:
@@ -616,6 +740,68 @@ def _load_search_index(index_path: str | os.PathLike) -> dict:
     raise last_error
 
 
+def resolve_exact_entities(
+    query: str,
+    *,
+    limit: int = 10,
+    domain: str | None = None,
+    cluster: str | None = None,
+    include_history: bool = False,
+) -> list[dict]:
+    """Resolve exact page keys, ids, titles, and aliases from one committed index."""
+    query = str(query or "").strip()
+    if not query:
+        return []
+    if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
+        raise ValueError(
+            f"identity query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters"
+        )
+    try:
+        limit = max(1, min(_SEARCH_TOP_K_LIMIT, int(limit)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    index_path = str(get_index_path())
+    if not os.path.exists(index_path):
+        return []
+    index_data = _load_search_index(index_path)
+    resolved = []
+    for key, score in sorted(
+        _exact_identity_scores(index_data, query).items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        raw_node = (index_data.get("nodes") or {}).get(key)
+        if not isinstance(raw_node, dict):
+            continue
+        node = {"_key": key, **raw_node}
+        if not _search_node_is_eligible(
+            node,
+            domain=domain,
+            cluster=cluster,
+            include_history=include_history,
+            filter_expr=None,
+        ):
+            continue
+        aliases = node.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        resolved.append(
+            {
+                "key": key,
+                "score": score,
+                "id": node.get("id"),
+                "title": node.get("title") or key,
+                "aliases": list(aliases),
+                "type": node.get("type"),
+                "status": node.get("status"),
+                "summary": node.get("summary") or "",
+                "updated_at": node.get("updated_at") or node.get("updated") or "",
+            }
+        )
+        if len(resolved) >= limit:
+            break
+    return resolved
+
+
 def _graph_expansion_scores(
     seed_keys: set[str],
     weighted_edges: list[dict],
@@ -706,6 +892,33 @@ def _search_node_is_eligible(
             )
             return False
     return True
+
+
+def _eligible_exact_identity_scores(
+    index_data: dict,
+    query: str,
+    *,
+    domain: str | None,
+    cluster: str | None,
+    include_history: bool,
+    filter_expr: str | None,
+) -> dict[str, float]:
+    eligible = {}
+    nodes = index_data.get("nodes") or {}
+    for key, score in _exact_identity_scores(index_data, query).items():
+        raw_node = nodes.get(key)
+        if not isinstance(raw_node, dict):
+            continue
+        node = {"_key": key, **raw_node}
+        if _search_node_is_eligible(
+            node,
+            domain=domain,
+            cluster=cluster,
+            include_history=include_history,
+            filter_expr=filter_expr,
+        ):
+            eligible[key] = score
+    return eligible
 
 def _lexical_fallback_scores(
     index_data: dict,
@@ -829,15 +1042,29 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     # ⚡ Bolt: Removed unused O(N) list comprehension of all index nodes to eliminate unnecessary memory allocation and CPU overhead in the search hot path.
     intent = _classify_intent(query)
     phase_started = time.perf_counter()
+    exact_identity_scores = _eligible_exact_identity_scores(
+        index_data,
+        query,
+        domain=domain,
+        cluster=cluster,
+        include_history=include_history,
+        filter_expr=filter_expr,
+    )
+    exact_identity_keys = set(exact_identity_scores)
+    timings["exact_identity_ms"] = (
+        time.perf_counter() - phase_started
+    ) * 1000.0
+    timings["exact_identity_hits"] = float(len(exact_identity_scores))
+    phase_started = time.perf_counter()
     tokens = _expand_query_locally(query)
     timings["tokenize_ms"] = (time.perf_counter() - phase_started) * 1000.0
-    if not tokens:
+    if not tokens and not exact_identity_scores:
         return finish("No valid search tokens.")
 
     scored = []
     
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
-    hybrid_scores = {}
+    hybrid_scores = dict(exact_identity_scores)
     fts_result_count = 0
 
     # 1. FTS5 Search
@@ -857,7 +1084,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     except Exception as exc:
         backend = exc.backend if isinstance(exc, SearchBackendError) else "fts5"
         backend_issues.append(backend)
-        log.error("FTS5 search failed; using index-only fallback: %s", exc)
+        _log_search_backend_failure(backend)
         hybrid_scores.update(
             _lexical_fallback_scores(
                 index_data, [query, *tokens], limit=top_k * 5
@@ -867,7 +1094,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     # 2. Vector Search (Hybrid blending)
     phase_started = time.perf_counter()
-    embedding_requested = _should_query_embedding(
+    embedding_requested = not exact_identity_scores and _should_query_embedding(
         fts_result_count=fts_result_count,
         top_k=top_k,
     )
@@ -917,6 +1144,17 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             [query, *tokens],
             limit=top_k * 5,
         )
+        exact_identity_scores = _eligible_exact_identity_scores(
+            index_data,
+            query,
+            domain=domain,
+            cluster=cluster,
+            include_history=include_history,
+            filter_expr=filter_expr,
+        )
+        exact_identity_keys = set(exact_identity_scores)
+        for key, score in exact_identity_scores.items():
+            hybrid_scores[key] = max(hybrid_scores.get(key, 0.0), score)
         backend_issues.append("projection_generation_changed")
     timings["generation_check_ms"] = (
         time.perf_counter() - phase_started
@@ -991,7 +1229,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     for score, node in scored:
         node_type = node.get("type", "").lower()
         if node_type == "source":
-            if source_count < max_sources_pool:
+            if source_count < max_sources_pool or node.get("_key") in exact_identity_keys:
                 candidate_pool.append((score, node))
                 source_count += 1
         else:
@@ -1012,7 +1250,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     for score, node in reranked:
         node_type = node.get("type", "").lower()
         if node_type == "source":
-            if source_count < max_sources_final:
+            if source_count < max_sources_final or node.get("_key") in exact_identity_keys:
                 final_scored.append((score, node))
                 source_count += 1
         else:

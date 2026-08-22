@@ -66,6 +66,19 @@ _MANUAL_INGEST_ADMIN_ENV = "VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN"
 _MANUAL_QUERY_SYNTHESIS_ENV = "VECTOR_LAKE_ALLOW_MANUAL_QUERY_SYNTHESIS"
 _SYSTEM_PAGE_WRITE_ENV = "VECTOR_LAKE_ALLOW_SYSTEM_PAGE_WRITE"
 _EVIDENCE_TEXT_EXPORT_ENV = "VECTOR_LAKE_ALLOW_EVIDENCE_TEXT_EXPORT"
+_MCP_SURFACE_ENV = "VECTOR_LAKE_MCP_SURFACE"
+_MEMORY_MCP_SURFACE_TOOLS = frozenset(
+    {
+        "mcp_runtime_status",
+        "memory_capabilities",
+        "recall",
+        "remember",
+        "entity",
+        "synthesize",
+        "context_pack",
+        "delta",
+    }
+)
 
 _RUNTIME_REVISION_ROOT_FILES = (
     ".mcp.json",
@@ -874,6 +887,9 @@ def mcp_runtime_status() -> str:
     from vector_lake.heavy_task_gate import heavy_task_gate_status
 
     status["heavy_task_gate"] = heavy_task_gate_status()
+    status["configured_surface"] = str(
+        os.environ.get(_MCP_SURFACE_ENV, "full")
+    ).strip().lower()
     return json.dumps(
         status,
         ensure_ascii=False,
@@ -1251,6 +1267,129 @@ def update_operational_memory(memory_type: str, payload_file: str) -> str:
     except Exception as e:
         return str(e)
     return tool_memory.update_operational_memory(memory_type, content)
+
+
+@mcp.tool()
+def memory_capabilities() -> str:
+    """Return the stable Vector Lake Agent-memory protocol manifest."""
+    from vector_lake.memory_protocol import capability_manifest
+
+    return json.dumps(
+        capability_manifest(),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def recall(
+    query: str,
+    top_k: int = 5,
+    mode: str = "page",
+    include_history: bool = False,
+) -> str:
+    """Recall pages, operational memory, or claims through one stable verb."""
+    from vector_lake.memory_protocol import recall as recall_memory
+
+    return json.dumps(
+        recall_memory(
+            query,
+            top_k=top_k,
+            mode=mode,
+            include_history=include_history,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def remember(memory_type: str, payload_file: str) -> str:
+    """Persist one governed operational-memory observation from a sandboxed file."""
+    from vector_lake.memory_protocol import MEMORY_PROTOCOL_VERSION
+    from vector_lake.memory_protocol import remember as remember_memory
+
+    try:
+        content = _read_payload(payload_file)
+    except Exception as exc:
+        logging.warning("remember payload rejected: %s", type(exc).__name__)
+        return json.dumps(
+            {
+                "contract_version": MEMORY_PROTOCOL_VERSION,
+                "verb": "remember",
+                "ok": False,
+                "committed": False,
+                "error_code": "invalid_payload",
+                "message": "Memory payload was rejected before mutation.",
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    return json.dumps(
+        remember_memory(memory_type, content),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def entity(name: str, limit: int = 10, include_history: bool = False) -> str:
+    """Resolve exact page keys, canonical ids, titles, and aliases."""
+    from vector_lake.memory_protocol import entity as resolve_memory_entity
+
+    return json.dumps(
+        resolve_memory_entity(
+            name,
+            limit=limit,
+            include_history=include_history,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def synthesize(query: str) -> str:
+    """Assemble proposal-only synthesis context without committing a page."""
+    from vector_lake.memory_protocol import synthesize as synthesize_memory
+
+    return json.dumps(
+        synthesize_memory(query),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def context_pack(query: str, max_chars: int = 32000) -> str:
+    """Build a server-budgeted context packet for an Agent session boundary."""
+    from vector_lake.memory_protocol import context_pack as pack_memory_context
+
+    return json.dumps(
+        pack_memory_context(query, max_chars=max_chars),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def delta(since: str, limit: int = 100) -> str:
+    """Return current page projection updates since an ISO 8601 timestamp."""
+    from vector_lake.memory_protocol import delta as memory_delta
+
+    return json.dumps(
+        memory_delta(since, limit=limit),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 
 @mcp.tool()
 def sync_vector_lake() -> str:
@@ -1762,5 +1901,44 @@ def bulk_reconciliation(payload_file: str, dry_run: bool = True) -> str:
     from vector_lake.tool_bulk_reconciliation import bulk_reconcile
     return bulk_reconcile(operations, dry_run)
 
-if __name__ == "__main__":
+
+def configure_mcp_surface(
+    server: FastMCP,
+    surface: str | None = None,
+) -> tuple[str, ...]:
+    """Apply an exact fail-closed MCP surface before transport startup."""
+    normalized = str(
+        surface if surface is not None else os.environ.get(_MCP_SURFACE_ENV, "full")
+    ).strip().lower()
+    available = {
+        tool.name for tool in server._tool_manager.list_tools()
+    }
+    if normalized == "full":
+        return tuple(sorted(available))
+    if normalized != "memory":
+        raise RuntimeError(
+            f"Unsupported {_MCP_SURFACE_ENV} value: {normalized!r}; "
+            "expected 'full' or 'memory'"
+        )
+    missing = sorted(_MEMORY_MCP_SURFACE_TOOLS - available)
+    if missing:
+        raise RuntimeError(
+            "Memory MCP surface is incomplete; missing tools: " + ", ".join(missing)
+        )
+    for name in sorted(available - _MEMORY_MCP_SURFACE_TOOLS):
+        server.remove_tool(name)
+    remaining = {
+        tool.name for tool in server._tool_manager.list_tools()
+    }
+    if remaining != _MEMORY_MCP_SURFACE_TOOLS:
+        raise RuntimeError("Memory MCP surface filtering did not close exactly")
+    return tuple(sorted(remaining))
+
+
+def main() -> None:
+    configure_mcp_surface(mcp)
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
