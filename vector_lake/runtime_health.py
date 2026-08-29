@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -49,6 +50,12 @@ _WRITE_GATE_CACHE: dict[str, Any] = {
     "checked_at": 0.0,
     "health": None,
 }
+_SEMANTIC_READINESS_EVALUATION_LOCK = threading.Lock()
+_SEMANTIC_READINESS_ENVELOPE_CACHE: dict[str, Any] = {
+    "fingerprint": None,
+    "checked_at": 0.0,
+    "envelope": None,
+}
 _WIKI_VERSION_CACHE: dict[
     str,
     tuple[tuple[int, int, int, int, int], str | None, str | None],
@@ -56,6 +63,54 @@ _WIKI_VERSION_CACHE: dict[
 _AUTO_INGEST_RECEIPT_SCAN_CAP = 256
 _AUTO_INGEST_RECEIPT_MAX_SCAN_CAP = 4096
 _AUTO_INGEST_RECEIPT_RETENTION_DAYS = 14
+_SEMANTIC_READINESS_CACHE_TTL_SECONDS = 5.0
+_SEMANTIC_READINESS_MAX_ITEMS = 8
+_SEMANTIC_READINESS_MAX_ITEM_CHARS = 256
+_SEMANTIC_READINESS_GENERATION_SURFACES = (
+    "canonical_identities",
+    "change_sets",
+    "claim_graph_edges",
+    "claim_versions",
+    "claims",
+    "entities",
+    "evidence",
+    "evidence_versions",
+    "governance_queue",
+    "jobs",
+    "mutation_outbox",
+    "operational_memory",
+    "page_graph_edges",
+    "sources",
+    "timeline_events",
+)
+_SEMANTIC_READINESS_CANONICAL_SURFACES = (
+    "canonical_identities",
+    "claim_graph_edges",
+    "claim_versions",
+    "claims",
+    "entities",
+    "evidence",
+    "evidence_versions",
+    "page_graph_edges",
+    "sources",
+)
+_SEMANTIC_READINESS_GOVERNANCE_SURFACES = (
+    "governance_queue",
+    "jobs",
+    "operational_memory",
+)
+_SEMANTIC_READINESS_POLICY_ENVIRONMENTS = (
+    "VECTOR_LAKE_MAX_PENDING_GOVERNANCE_ITEMS",
+    "VECTOR_LAKE_MAX_UNMANAGED_UNSUPPORTED_RUNTIME_CLAIMS",
+    "VECTOR_LAKE_MAX_UNSUPPORTED_RUNTIME_CLAIMS",
+    "VECTOR_LAKE_MIN_CLAIM_EVIDENCE_COVERAGE",
+    "VECTOR_LAKE_MIN_CLAIM_EXTRACTION_COVERAGE",
+    "VECTOR_LAKE_MIN_CLAIM_ASSESSMENT_COVERAGE",
+    "VECTOR_LAKE_MIN_EVIDENCE_LOCATOR_COVERAGE",
+    "VECTOR_LAKE_MIN_EVIDENCE_LINEAGE_COVERAGE",
+    "VECTOR_LAKE_MIN_SOURCE_INTEGRITY_COVERAGE",
+    "VECTOR_LAKE_MAX_AWAITING_SUBAGENT_AGE_SECONDS",
+)
 
 
 def _index_projection_signature(node: dict[str, Any]) -> str:
@@ -117,6 +172,12 @@ def _auto_ingest_health_config(meta_dir: Path) -> tuple[bool, dict[str, Any], st
     enabled = payload.get("enabled")
     if not isinstance(enabled, bool):
         return False, {}, "enabled_must_be_boolean"
+    if enabled:
+        consent = payload.get("allow_model_processing_raw_text")
+        if not isinstance(consent, bool):
+            return False, payload, "allow_model_processing_raw_text_must_be_boolean"
+        if not consent:
+            return False, payload, "model_raw_text_processing_not_authorized"
     return enabled, payload, ""
 
 
@@ -311,6 +372,20 @@ _RUNTIME_HEALTH_REQUIRED_COLUMNS = {
     },
     "runtime_generations": {"surface", "generation"},
     "operational_memory": {"memory_id", "data_json"},
+    "embedding_metadata_v8": {
+        "entity_id",
+        "content_sha256",
+        "input_contract",
+        "model",
+        "dimension",
+    },
+    "search_projection_state_v8": {
+        "singleton",
+        "status",
+        "projection_generation",
+        "expected_row_count",
+        "expected_corpus_sha256",
+    },
 }
 
 
@@ -378,6 +453,36 @@ def _open_runtime_database_read_only():
         raise
     return conn, db_path
 
+
+def _open_runtime_generation_database_read_only():
+    """Open only the generation ledger needed by readiness cache hits."""
+    from vector_lake.db_store import peek_db_path
+
+    db_path = peek_db_path().resolve()
+    if not db_path.is_file():
+        raise RuntimeDatabaseBlocked("database_missing")
+    wal_path = Path(str(db_path) + "-wal")
+    try:
+        wal_size = wal_path.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    uri = f"{db_path.as_uri()}?mode=ro"
+    if wal_size == 0:
+        uri += "&immutable=1"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("SELECT 1 FROM runtime_generations LIMIT 1").fetchone()
+    except sqlite3.Error as exc:
+        if "conn" in locals():
+            conn.close()
+        raise RuntimeDatabaseBlocked(
+            "semantic_runtime_generation_ledger_unavailable"
+        ) from exc
+    return conn, db_path
+
+
 def _sqlite_snapshot_identity(conn, db_path: Path) -> tuple:
     identities = []
     for path in (db_path, db_path.with_name(db_path.name + "-wal")):
@@ -429,6 +534,368 @@ def _index_snapshot(index_path: Path) -> tuple[dict[str, Any], Exception | None]
         return load_index_snapshot(index_path), None
     except Exception as exc:
         return {"nodes": {}}, exc
+
+
+def _semantic_readiness_file_fingerprint(paths: tuple[Path, ...]) -> str:
+    """Hash file identities without exposing canonical paths to callers."""
+    identities: list[tuple[Any, ...]] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            identities.append(
+                (
+                    int(stat.st_dev),
+                    int(stat.st_ino),
+                    int(stat.st_mtime_ns),
+                    int(stat.st_ctime_ns),
+                    int(stat.st_size),
+                )
+            )
+        except OSError:
+            identities.append(("missing",))
+    encoded = json.dumps(identities, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _semantic_readiness_generation_binding(
+    index_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Capture a cheap, verifiable generation token for semantic readiness.
+
+    Runtime generations cover canonical and governance surfaces. Database/WAL
+    identity additionally catches semantic tables that do not have a dedicated
+    runtime-generation counter. The projection is accepted only when its
+    verified canonical binding still matches the database.
+    """
+    from vector_lake.search_projection_contract import (
+        CANONICAL_PROJECTION_SURFACES,
+        verified_projection_runtime_generations,
+    )
+    from vector_lake.indexer import read_committed_index_snapshot
+    from vector_lake.wiki_utils import (
+        get_claim_graph_path,
+        get_index_path,
+        get_projection_manifest_path,
+    )
+
+    conn = None
+    index_path = get_index_path()
+    if not index_path.is_file():
+        raise RuntimeDatabaseBlocked("semantic_projection_missing")
+    try:
+        conn, db_path = _open_runtime_generation_database_read_only()
+        placeholders = ",".join(
+            "?" for _ in _SEMANTIC_READINESS_GENERATION_SURFACES
+        )
+        rows = conn.execute(
+            "SELECT surface, generation FROM runtime_generations "
+            f"WHERE surface IN ({placeholders})",
+            _SEMANTIC_READINESS_GENERATION_SURFACES,
+        ).fetchall()
+        runtime_generations = {
+            str(row["surface"]): int(row["generation"])
+            for row in rows
+        }
+        missing = set(_SEMANTIC_READINESS_GENERATION_SURFACES) - set(
+            runtime_generations
+        )
+        if missing:
+            raise RuntimeDatabaseBlocked("semantic_runtime_generations_incomplete")
+        database_fingerprint = _semantic_readiness_file_fingerprint(
+            (db_path, db_path.with_name(db_path.name + "-wal"))
+        )
+        committed_index_data = read_committed_index_snapshot(
+            index_path,
+            connection=conn,
+            _acquire_lock=False,
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if not isinstance(committed_index_data, dict):
+        raise RuntimeDatabaseBlocked("semantic_projection_invalid")
+    if index_data is not None and (
+        not isinstance(index_data, dict)
+        or index_data.get("projection_manifest")
+        != committed_index_data.get("projection_manifest")
+        or index_data.get("graph_state") != committed_index_data.get("graph_state")
+    ):
+        raise RuntimeDatabaseBlocked("semantic_projection_snapshot_mismatch")
+    index_data = committed_index_data
+
+    projection_generations = verified_projection_runtime_generations(index_data)
+    if projection_generations is None:
+        raise RuntimeDatabaseBlocked("semantic_projection_binding_unverified")
+    current_projection_generations = {
+        surface: runtime_generations[surface]
+        for surface in CANONICAL_PROJECTION_SURFACES
+    }
+    if projection_generations != current_projection_generations:
+        raise RuntimeDatabaseBlocked("semantic_projection_generation_mismatch")
+
+    manifest = index_data.get("projection_manifest")
+    if not isinstance(manifest, dict):
+        raise RuntimeDatabaseBlocked("semantic_projection_manifest_invalid")
+    projection_generation = str(manifest.get("generation") or "").strip()
+    if not projection_generation:
+        raise RuntimeDatabaseBlocked("semantic_projection_generation_missing")
+    projection_material = {
+        "generation": projection_generation,
+        "canonical_generation": projection_generations,
+        "graph_state": index_data.get("graph_state"),
+    }
+    projection_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(
+            projection_material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    policy_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(
+            {
+                name: os.environ.get(name)
+                for name in _SEMANTIC_READINESS_POLICY_ENVIRONMENTS
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    canonical_generations = {
+        surface: runtime_generations[surface]
+        for surface in _SEMANTIC_READINESS_CANONICAL_SURFACES
+    }
+    governance_generations = {
+        surface: runtime_generations[surface]
+        for surface in _SEMANTIC_READINESS_GOVERNANCE_SURFACES
+    }
+    supporting_generations = {
+        surface: runtime_generations[surface]
+        for surface in _SEMANTIC_READINESS_GENERATION_SURFACES
+        if surface not in _SEMANTIC_READINESS_CANONICAL_SURFACES
+        and surface not in _SEMANTIC_READINESS_GOVERNANCE_SURFACES
+    }
+    binding: dict[str, Any] = {
+        "canonical": canonical_generations,
+        "governance": governance_generations,
+        "supporting": supporting_generations,
+        "projection": {
+            "generation": projection_generation,
+            "fingerprint": projection_fingerprint,
+            "file_fingerprint": _semantic_readiness_file_fingerprint(
+                (
+                    index_path,
+                    get_claim_graph_path(),
+                    get_projection_manifest_path(),
+                )
+            ),
+        },
+        "database_fingerprint": database_fingerprint,
+        "policy_fingerprint": policy_fingerprint,
+    }
+    binding["fingerprint"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            binding,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return binding
+
+
+def _bounded_semantic_readiness_items(value: Any) -> tuple[list[str], int]:
+    raw_items = value if isinstance(value, (list, tuple)) else []
+    normalized = [
+        str(item).replace("\r", " ").replace("\n", " ")[
+            :_SEMANTIC_READINESS_MAX_ITEM_CHARS
+        ]
+        for item in raw_items[:_SEMANTIC_READINESS_MAX_ITEMS]
+    ]
+    return normalized, len(raw_items)
+
+
+def _semantic_readiness_debt_summary(assessment: dict[str, Any]) -> dict[str, Any]:
+    detail = assessment.get("detail")
+    if not isinstance(detail, dict):
+        detail = {}
+    validity = detail.get("runtime_validity_state_counts")
+    if not isinstance(validity, dict):
+        validity = {}
+    bounded_validity: dict[str, int] = {}
+    for key, value in sorted(validity.items(), key=lambda item: str(item[0]))[:8]:
+        if isinstance(value, bool):
+            continue
+        try:
+            bounded_validity[str(key)[:64]] = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+
+    def count(name: str) -> int:
+        value = detail.get(name, 0)
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "pending_governance_total": count("pending_governance_total"),
+        "critical_pending_governance": count("critical_pending_governance"),
+        "runtime_validity_state_counts": bounded_validity,
+        "awaiting_subagent_jobs": count("awaiting_subagent_jobs"),
+    }
+
+
+def _semantic_readiness_envelope(
+    assessment: dict[str, Any],
+    binding: dict[str, Any] | None,
+) -> dict[str, Any]:
+    issues, issue_count = _bounded_semantic_readiness_items(assessment.get("issues"))
+    warnings, warning_count = _bounded_semantic_readiness_items(
+        assessment.get("warnings")
+    )
+    requested_status = str(assessment.get("status") or "unknown").casefold()
+    if requested_status not in {"ready", "degraded", "not_ready", "unknown"}:
+        requested_status = "unknown"
+    ready = (
+        assessment.get("ready") is True
+        and requested_status == "ready"
+        and issue_count == 0
+        and warning_count == 0
+        and binding is not None
+    )
+    status = "ready" if ready else requested_status
+    if not ready and status == "ready":
+        status = "unknown"
+    captured_generation = None
+    captured_fingerprint = None
+    if isinstance(binding, dict):
+        captured_generation = {
+            key: copy.deepcopy(value)
+            for key, value in binding.items()
+            if key != "fingerprint"
+        }
+        captured_fingerprint = binding.get("fingerprint")
+    return {
+        "contract_version": "vector-lake-semantic-readiness-envelope/v1",
+        "ready": ready,
+        "status": status,
+        "issues": issues,
+        "warnings": warnings,
+        "issue_count": issue_count,
+        "warning_count": warning_count,
+        "issues_omitted": max(0, issue_count - len(issues)),
+        "warnings_omitted": max(0, warning_count - len(warnings)),
+        "debt_summary": _semantic_readiness_debt_summary(assessment),
+        "captured_generation": captured_generation,
+        "captured_fingerprint": captured_fingerprint,
+        "results_are_not_accepted_facts": True,
+    }
+
+
+def _unknown_semantic_readiness_envelope(
+    issue: str,
+    binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _semantic_readiness_envelope(
+        {
+            "ready": False,
+            "status": "unknown",
+            "issues": [issue],
+            "warnings": [],
+            "detail": {},
+        },
+        binding,
+    )
+
+
+def _clear_semantic_readiness_envelope_cache_for_tests() -> None:
+    """Reset the readiness snapshot cache; intentionally private to tests."""
+    with _SEMANTIC_READINESS_EVALUATION_LOCK:
+        with _CACHE_LOCK:
+            _SEMANTIC_READINESS_ENVELOPE_CACHE.update(
+                {"fingerprint": None, "checked_at": 0.0, "envelope": None}
+            )
+
+
+def get_semantic_readiness_envelope(
+    *,
+    cache_ttl_seconds: float = _SEMANTIC_READINESS_CACHE_TTL_SECONDS,
+    index_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a generation-bound readiness snapshot without blocking retrieval."""
+    try:
+        ttl_seconds = min(60.0, max(0.0, float(cache_ttl_seconds)))
+    except (TypeError, ValueError):
+        ttl_seconds = _SEMANTIC_READINESS_CACHE_TTL_SECONDS
+
+    with _SEMANTIC_READINESS_EVALUATION_LOCK:
+        try:
+            before = _semantic_readiness_generation_binding(index_data)
+        except Exception as exc:
+            return _unknown_semantic_readiness_envelope(
+                f"semantic_readiness_binding_unavailable:{type(exc).__name__}"
+            )
+
+        now = time.monotonic()
+        with _CACHE_LOCK:
+            cached = _SEMANTIC_READINESS_ENVELOPE_CACHE.get("envelope")
+            if (
+                cached is not None
+                and _SEMANTIC_READINESS_ENVELOPE_CACHE.get("fingerprint")
+                == before.get("fingerprint")
+                and now
+                - float(
+                    _SEMANTIC_READINESS_ENVELOPE_CACHE.get("checked_at") or 0.0
+                )
+                <= ttl_seconds
+            ):
+                return copy.deepcopy(cached)
+
+        try:
+            # The generation binding above verifies the durable projection pair.
+            # Re-read through the shared snapshot cache instead of trusting a
+            # caller-supplied mapping as semantic evidence.
+            assessment = assess_semantic_readiness(index_data=None)
+            if not isinstance(assessment, dict):
+                raise TypeError("semantic readiness assessment is not a mapping")
+        except Exception as exc:
+            assessment = {
+                "ready": False,
+                "status": "unknown",
+                "issues": [
+                    f"semantic_readiness_assessment_unavailable:{type(exc).__name__}"
+                ],
+                "warnings": [],
+                "detail": {},
+            }
+
+        try:
+            after = _semantic_readiness_generation_binding(index_data)
+        except Exception as exc:
+            return _unknown_semantic_readiness_envelope(
+                f"semantic_readiness_binding_unavailable:{type(exc).__name__}"
+            )
+        if before.get("fingerprint") != after.get("fingerprint"):
+            return _unknown_semantic_readiness_envelope(
+                "semantic_readiness_generation_changed",
+                after,
+            )
+
+        envelope = _semantic_readiness_envelope(assessment, after)
+        with _CACHE_LOCK:
+            _SEMANTIC_READINESS_ENVELOPE_CACHE.update(
+                {
+                    "fingerprint": after.get("fingerprint"),
+                    "checked_at": time.monotonic(),
+                    "envelope": copy.deepcopy(envelope),
+                }
+            )
+        return envelope
 
 
 def _wiki_cache_key(path: Path) -> str:
@@ -640,6 +1107,7 @@ def _clear_health_caches_for_tests() -> None:
         _CANONICAL_CACHE.update({"key": None, "value": None})
         _WIKI_VERSION_CACHE.clear()
         _WRITE_GATE_CACHE.update({"token": None, "checked_at": 0.0, "health": None})
+    _clear_semantic_readiness_envelope_cache_for_tests()
 
 def _recent_write_gate_health(token: str, cache_seconds: float):
     if cache_seconds <= 0:
@@ -659,7 +1127,9 @@ def _recent_write_gate_health(token: str, cache_seconds: float):
 def assess_runtime_health(
     max_watchdog_age_seconds: int = 120,
     deep_projection_checks: bool = False,
+    diagnostic_snapshot=None,
 ) -> dict[str, Any]:
+    from vector_lake.diagnostic_snapshot import current_durability_status
     from vector_lake.wiki_utils import (
         get_index_path,
         get_wiki_dir,
@@ -671,16 +1141,38 @@ def assess_runtime_health(
     warnings: list[str] = []
     detail: dict[str, Any] = {}
 
-    try:
-        conn, db_path = _open_runtime_database_read_only()
-    except RuntimeDatabaseBlocked as exc:
-        return {
-            "ok": False,
-            "status": "blocked",
-            "issues": [f"database_blocked:{exc}"],
-            "warnings": [],
-            "detail": {"database_access": "read_only", "database_error": str(exc)},
-        }
+    durability = (
+        dict(diagnostic_snapshot.durability)
+        if diagnostic_snapshot is not None
+        else current_durability_status()
+    )
+    detail["durability"] = durability
+    if durability["profile"] == "best_effort":
+        warnings.append("durability_profile_best_effort")
+    elif durability["profile"] == "invalid":
+        issues.append("durability_profile_invalid")
+
+    owns_connection = diagnostic_snapshot is None
+
+    if diagnostic_snapshot is not None:
+        conn = diagnostic_snapshot.connection
+        db_path = diagnostic_snapshot.db_path
+        detail["diagnostic_snapshot"] = diagnostic_snapshot.metadata()
+    else:
+        try:
+            conn, db_path = _open_runtime_database_read_only()
+        except RuntimeDatabaseBlocked as exc:
+            issues.append(f"database_blocked:{exc}")
+            detail.update(
+                {"database_access": "read_only", "database_error": str(exc)}
+            )
+            return {
+                "ok": False,
+                "status": "blocked",
+                "issues": issues,
+                "warnings": warnings,
+                "detail": detail,
+            }
 
     detail["db_path"] = str(db_path)
     detail["database_access"] = "read_only"
@@ -729,7 +1221,7 @@ def assess_runtime_health(
         warnings.append("storage_growth_history_invalid")
     elif deep_projection_checks and storage_growth["status"] == "not_initialized":
         warnings.append("storage_growth_baseline_missing")
-    delta = storage_growth.get("delta") or {}
+    delta = storage_growth.get("per_day_delta") or storage_growth.get("delta") or {}
     database_growth_warning_bytes = _bounded_env_int(
         "VECTOR_LAKE_DATABASE_DAILY_GROWTH_WARNING_BYTES",
         256 * 1024 * 1024,
@@ -740,6 +1232,54 @@ def assess_runtime_health(
             "database_daily_growth_high:"
             f"{int(delta['database_bytes'])}>={database_growth_warning_bytes}"
         )
+
+    from vector_lake.backup_capacity import backup_capacity_status
+
+    backup_capacity = backup_capacity_status()
+    detail["backup_capacity"] = backup_capacity
+    if not backup_capacity["inventory_complete"]:
+        issues.append("backup_capacity_inventory_incomplete")
+    if backup_capacity["free_space_insufficient"]:
+        issues.append("backup_minimum_free_space_not_preserved")
+    if (
+        backup_capacity["quota_exceeded"]
+        and backup_capacity["policy"]["quota_mode"] == "enforce"
+    ):
+        issues.append("backup_max_total_bytes_exceeded")
+    database_bytes = max(1, int(storage["database_bytes"] or 0))
+    backup_database_ratio = round(
+        int(backup_capacity["current_backup_bytes"] or 0) / database_bytes,
+        4,
+    )
+    backup_capacity["database_ratio"] = backup_database_ratio
+    if not backup_capacity["quota_configured"] and backup_database_ratio >= 8.0:
+        warnings.append(
+            "backup_quota_unconfigured_high_database_ratio:"
+            f"{backup_database_ratio:.4f}>=8.0000"
+        )
+
+    from vector_lake.governance_store import operational_memory_search_index_status
+
+    try:
+        memory_search = operational_memory_search_index_status(connection=conn)
+    except sqlite3.Error as exc:
+        memory_search = {
+            "configured": True,
+            "available": False,
+            "ready": False,
+            "status": "unavailable",
+            "warnings": [f"status_query_failed:{type(exc).__name__}"],
+        }
+    detail["operational_memory_search"] = memory_search
+    if memory_search.get("configured") and not memory_search.get("ready"):
+        warnings.append(
+            "operational_memory_search_not_ready:"
+            f"{memory_search.get('status') or 'unknown'}"
+        )
+        if not memory_search.get("auto_maintenance_configured"):
+            issues.append("operational_memory_search_auto_maintenance_disabled")
+        if memory_search.get("progress_stalled"):
+            issues.append("operational_memory_search_progress_stalled")
     version_growth = sum(
         int(value or 0) for value in (delta.get("row_counts") or {}).values()
     )
@@ -772,8 +1312,18 @@ def assess_runtime_health(
         _auto_ingest_health_config(meta_dir)
     )
     detail["auto_ingest_enabled"] = auto_ingest_enabled
+    try:
+        from vector_lake.tool_auto_ingest import auto_ingest_budget_status
+
+        detail["auto_ingest_budget"] = auto_ingest_budget_status(
+            include_actual_usage=False
+        )
+    except Exception as exc:
+        issues.append(f"auto_ingest_budget_status_failed:{type(exc).__name__}:{exc}")
     if auto_ingest_config_error:
         issues.append(f"auto_ingest_config_invalid:{auto_ingest_config_error}")
+    elif not auto_ingest_enabled:
+        warnings.append("auto_ingest_disabled")
     if auto_ingest_enabled:
         receipt_summary, receipt_warnings = _auto_ingest_attempt_receipt_summary(
             meta_dir,
@@ -980,6 +1530,20 @@ def assess_runtime_health(
             if age is None or age > max_watchdog_age_seconds:
                 issues.append(f"watchdog_stale:{age if age is not None else 'unknown'}")
 
+            status_schema = int(status.get("schema_version") or 0)
+            if status_schema >= 3:
+                from vector_lake.watchdog_status import _process_is_alive
+
+                process_id = status.get("process_id")
+                process_alive = _process_is_alive(process_id)
+                detail["watchdog_process_id"] = process_id
+                detail["watchdog_process_alive"] = process_alive
+                if not process_alive:
+                    issues.append(
+                        "watchdog_process_not_alive:"
+                        f"{process_id if process_id is not None else 'missing'}"
+                    )
+
             components = status.get("components")
             unhealthy_states = {"error", "halted", "stopped"}
             unhealthy_components: list[str] = []
@@ -1086,9 +1650,14 @@ def assess_runtime_health(
 
     excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
     wiki_dir = get_wiki_dir()
+    diagnostic_wiki_paths = (
+        diagnostic_snapshot.wiki_paths
+        if diagnostic_snapshot is not None
+        else iter_markdown_files(wiki_dir)
+    )
     wiki_paths = {
         path.stem: path
-        for path in iter_markdown_files(wiki_dir)
+        for path in diagnostic_wiki_paths
         if path.name.casefold() not in excluded
         and not path.name.casefold().startswith("system_")
     }
@@ -1098,7 +1667,29 @@ def assess_runtime_health(
     index_path = get_index_path()
     index_available = index_path.exists()
     index_data: dict[str, Any] = {"nodes": {}}
-    if index_path.exists():
+    if diagnostic_snapshot is not None:
+        index_data = diagnostic_snapshot.index_data
+        if diagnostic_snapshot.projection_status == "committed_current":
+            index_error = None
+            detail["projection_pair"] = "committed_current"
+        else:
+            index_error = RuntimeError(
+                diagnostic_snapshot.projection_error
+                or "diagnostic_projection_unavailable"
+            )
+            detail["projection_pair"] = "invalid"
+            detail["projection_pair_error"] = str(index_error)
+            issues.append(
+                "projection_pair_invalid:unavailable:" + str(index_error)
+            )
+        if index_error is None:
+            index_keys = {
+                key for key in index_data.get("nodes", {})
+                if not str(key).startswith("System_")
+            }
+        else:
+            index_keys = set()
+    elif index_path.exists():
         from vector_lake.indexer import (
             ProjectionPairContractError,
             read_committed_index_snapshot,
@@ -1156,6 +1747,65 @@ def assess_runtime_health(
             f"missing_canonical={drift['missing_canonical']},"
             f"extra_canonical={drift['extra_canonical']}"
         )
+
+    if index_available and detail.get("projection_pair") == "committed_current":
+        state_row = conn.execute(
+            "SELECT status, projection_generation, expected_row_count, "
+            "expected_corpus_sha256, updated_at FROM search_projection_state_v8 "
+            "WHERE singleton = 1"
+        ).fetchone()
+        actual_fts_count = int(
+            conn.execute("SELECT COUNT(*) FROM wiki_search_index").fetchone()[0]
+        )
+        manifest_generation = str(
+            (index_data.get("projection_manifest") or {}).get("generation") or ""
+        )
+        search_state = {
+            "status": str(state_row["status"] if state_row is not None else "missing"),
+            "projection_generation": str(
+                state_row["projection_generation"] if state_row is not None else ""
+            ),
+            "manifest_generation": manifest_generation,
+            "expected_row_count": int(
+                state_row["expected_row_count"] if state_row is not None else 0
+            ),
+            "actual_row_count": actual_fts_count,
+            "expected_corpus_sha256": str(
+                state_row["expected_corpus_sha256"] if state_row is not None else ""
+            ),
+        }
+        detail["search_projection"] = search_state
+        if search_state["status"] != "ready":
+            issues.append(f"fts_projection_state:{search_state['status']}")
+        if search_state["projection_generation"] != manifest_generation:
+            issues.append("fts_projection_generation_mismatch")
+        if search_state["expected_row_count"] != actual_fts_count:
+            issues.append(
+                "fts_projection_row_count_mismatch:"
+                f"expected={search_state['expected_row_count']},actual={actual_fts_count}"
+            )
+
+        if deep_projection_checks:
+            from vector_lake.indexer import _search_projection_upserts
+            from vector_lake.search_projection_contract import fts_corpus_sha256
+
+            expected_fts_rows = _search_projection_upserts(index_data)
+            actual_fts_rows = [
+                tuple(str(value) for value in row)
+                for row in conn.execute(
+                    "SELECT node_key, title, summary, text FROM wiki_search_index "
+                    "ORDER BY node_key"
+                )
+            ]
+            expected_fts_digest = fts_corpus_sha256(expected_fts_rows)
+            actual_fts_digest = fts_corpus_sha256(actual_fts_rows)
+            search_state["computed_expected_corpus_sha256"] = expected_fts_digest
+            search_state["actual_corpus_sha256"] = actual_fts_digest
+            if (
+                search_state["expected_corpus_sha256"] != expected_fts_digest
+                or actual_fts_digest != expected_fts_digest
+            ):
+                issues.append("fts_projection_corpus_mismatch")
 
     if deep_projection_checks:
         from vector_lake import governance_store
@@ -1322,7 +1972,8 @@ def assess_runtime_health(
             else:
                 warnings.append(message)
 
-    conn.close()
+    if owns_connection:
+        conn.close()
     return {
         "ok": not issues,
         "status": "blocked" if issues else ("degraded" if warnings else "ready"),
@@ -1584,6 +2235,7 @@ def _assess_decision_scope(
 def assess_semantic_readiness(
     index_data: dict[str, Any] | None = None,
     decision_id: str | None = None,
+    diagnostic_snapshot=None,
 ) -> dict[str, Any]:
     """Assess whether governed knowledge is ready for decision-support use.
 
@@ -1598,19 +2250,35 @@ def assess_semantic_readiness(
     issues: list[str] = []
     warnings: list[str] = []
     detail: dict[str, Any] = {}
-    try:
-        conn, db_path = _open_runtime_database_read_only()
-    except RuntimeDatabaseBlocked as exc:
-        return {
-            "ready": False,
-            "status": "not_ready",
-            "issues": [f"database_blocked:{exc}"],
-            "warnings": [],
-            "detail": {
-                "database_access": "read_only",
-                "database_error": str(exc),
-            },
-        }
+    owns_connection = diagnostic_snapshot is None
+    if diagnostic_snapshot is not None:
+        conn = diagnostic_snapshot.connection
+        db_path = diagnostic_snapshot.db_path
+        detail["diagnostic_snapshot"] = diagnostic_snapshot.metadata()
+        if index_data is None:
+            index_data = diagnostic_snapshot.index_data
+        if diagnostic_snapshot.projection_status != "committed_current":
+            issues.append(
+                "projection_pair_invalid:unavailable:"
+                + (
+                    diagnostic_snapshot.projection_error
+                    or "diagnostic_projection_unavailable"
+                )
+            )
+    else:
+        try:
+            conn, db_path = _open_runtime_database_read_only()
+        except RuntimeDatabaseBlocked as exc:
+            return {
+                "ready": False,
+                "status": "not_ready",
+                "issues": [f"database_blocked:{exc}"],
+                "warnings": [],
+                "detail": {
+                    "database_access": "read_only",
+                    "database_error": str(exc),
+                },
+            }
 
     if index_data is None:
         index_path = get_index_path()
@@ -1630,7 +2298,12 @@ def assess_semantic_readiness(
             dict(index_data or {}),
             issues,
         )
-        conn.close()
+        if diagnostic_snapshot is not None:
+            result.setdefault("detail", {})["diagnostic_snapshot"] = (
+                diagnostic_snapshot.metadata()
+            )
+        if owns_connection:
+            conn.close()
         return result
 
     graph_state = dict((index_data or {}).get("graph_state") or {})
@@ -1746,7 +2419,8 @@ def assess_semantic_readiness(
             issues.append(f"semantic_ingest_backlog:oldest={awaiting_age}s>{max_age}s")
 
     status = "not_ready" if issues else ("degraded" if warnings else "ready")
-    conn.close()
+    if owns_connection:
+        conn.close()
     return {
         "ready": status == "ready",
         "status": status,

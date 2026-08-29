@@ -42,7 +42,24 @@ def test_storage_growth_history_upserts_one_sample_per_day(isolated_memory):
     assert result["previous"]["database_bytes"] == 120
     assert result["delta"]["database_bytes"] == 50
     assert result["delta"]["row_counts"]["claim_versions"] == 5
+    assert result["elapsed_days"] == 1.0
+    assert result["per_day_delta"]["database_bytes"] == 50.0
     assert storage_growth_status(meta_dir=meta) == result
+
+
+def test_storage_growth_normalizes_sparse_samples_per_elapsed_day(isolated_memory):
+    meta = isolated_memory / "wiki" / ".meta"
+    record_storage_growth_sample(
+        sample=_sample("2026-08-20", 100, 10), meta_dir=meta
+    )
+    result = record_storage_growth_sample(
+        sample=_sample("2026-08-25", 200, 20), meta_dir=meta
+    )
+
+    assert result["delta"]["database_bytes"] == 100
+    assert result["elapsed_days"] == 5.0
+    assert result["per_day_delta"]["database_bytes"] == 20.0
+    assert result["per_day_delta"]["row_counts"]["claim_versions"] == 2.0
 
 
 def test_collect_storage_sample_is_read_only_and_counts_versions(isolated_memory):

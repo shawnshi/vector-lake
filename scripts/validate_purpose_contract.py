@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vector_lake.purpose_contract import (
+from vector_lake.purpose_contract import (  # noqa: E402 - import after repo bootstrap
     PurposeContractError,
     build_synthesis_proposals,
     load_purpose_contract,
@@ -15,10 +15,16 @@ from vector_lake.purpose_contract import (
     review_sir_lifecycle,
     validate_ingest_payload,
 )
-from vector_lake.schema_validator import SchemaViolationException, validate_schema
+from vector_lake.schema_validator import (  # noqa: E402 - import after repo bootstrap
+    SchemaViolationException,
+    validate_schema,
+)
 
 
 def main() -> int:
+    from vector_lake.runtime_paths import bootstrap_runtime_paths
+
+    bootstrap_runtime_paths(caller="Purpose contract validator")
     contract = load_purpose_contract()
     assert contract["purpose_version"] == "12.0"
     assert "SIR-1" in render_strategy_directive(contract)

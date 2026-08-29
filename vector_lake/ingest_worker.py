@@ -102,7 +102,7 @@ def process_jobs():
     requeue_legacy_ingest_jobs()
     if not _auto_ingest_dispatch_capacity_available():
         log.debug("Automatic ingest handoff is at its single-job capacity")
-        return
+        return 0
     jobs = claim_pending_jobs(
         limit=1,
         lease_seconds=3600,
@@ -110,7 +110,7 @@ def process_jobs():
         required_ingest_contract_version=INGEST_CONTRACT_VERSION,
     )
     if not jobs:
-        return
+        return 0
 
     for job in jobs:
         job_id = str(job["job_id"])
@@ -215,6 +215,7 @@ def process_jobs():
             else:
                 if not updated:
                     log.warning("Ignored stale failure update for job %s", job_id)
+    return len(jobs)
 
 
 def start_worker(stop_event: threading.Event | None = None):
@@ -225,20 +226,16 @@ def start_worker(stop_event: threading.Event | None = None):
     try:
         while not stop_event.is_set():
             try:
-                write_status(
-                    "processing",
-                    0,
-                    0,
-                    "Checking ingest dispatch queue",
-                    "",
-                    component="ingest",
-                )
-                process_jobs()
+                processed = process_jobs()
                 write_status(
                     "idle",
                     0,
                     0,
-                    "Ingest dispatcher heartbeat",
+                    (
+                        f"Ingest dispatcher handled {processed} job(s)"
+                        if processed
+                        else "Ingest dispatcher heartbeat"
+                    ),
                     "",
                     component="ingest",
                 )
@@ -268,4 +265,7 @@ def start_worker(stop_event: threading.Event | None = None):
 
 
 if __name__ == "__main__":
+    from vector_lake.runtime_paths import bootstrap_runtime_paths
+
+    bootstrap_runtime_paths(caller="Ingest worker")
     start_worker()

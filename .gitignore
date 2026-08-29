@@ -6,6 +6,10 @@ data/
 *.bak
 *.tmp
 .pytest_cache/
+.pytest-*/
+.ruff_cache/
+.tmp-*/
+*.prof
 .coverage
 tmp/
 brain/

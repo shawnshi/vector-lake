@@ -21,6 +21,7 @@ from vector_lake.raw_revision import stable_raw_revision
 def _enabled_config(**overrides):
     values = {
         "enabled": True,
+        "allow_model_processing_raw_text": True,
         "runner": "codex_exec",
         "codex_executable": "C:/codex.exe",
         "runner_codex_home": "C:/vector-lake-auto-ingest",
@@ -60,6 +61,7 @@ def _write_config(memory_dir: Path, **overrides):
     payload = {
         "schema_version": 1,
         "enabled": True,
+        "allow_model_processing_raw_text": True,
         "runner": "codex_exec",
         "codex_executable": "C:/codex.exe",
         "runner_codex_home": "C:/vector-lake-auto-ingest",
@@ -199,6 +201,49 @@ def test_auto_ingest_is_disabled_without_explicit_budget_config(isolated_memory)
     assert config.enabled is False
 
 
+def test_disabled_auto_ingest_reports_explicit_component_status(
+    isolated_memory,
+    monkeypatch,
+):
+    published = []
+
+    def capture_status(
+        state,
+        task_queue_size,
+        index_queue_size,
+        current_action,
+        last_error,
+        component="watchdog",
+    ):
+        published.append(
+            {
+                "state": state,
+                "task_queue_size": task_queue_size,
+                "index_queue_size": index_queue_size,
+                "current_action": current_action,
+                "last_error": last_error,
+                "component": component,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(auto_ingest_worker, "write_status", capture_status)
+
+    outcome = auto_ingest_worker.AutoIngestController().tick(threading.Event())
+
+    assert outcome == "disabled"
+    assert published == [
+        {
+            "state": "disabled",
+            "task_queue_size": 0,
+            "index_queue_size": 0,
+            "current_action": "Automatic ingest host disabled",
+            "last_error": "",
+            "component": "auto_ingest",
+        }
+    ]
+
+
 def test_verified_raw_input_requires_canonical_revision(
     isolated_memory,
 ):
@@ -231,10 +276,335 @@ def test_verified_raw_input_requires_canonical_revision(
         )
 
 
+@pytest.mark.parametrize("diary_name", ["Diary", "dIaRy"])
+def test_current_private_diary_claim_is_quarantined_before_raw_or_model_access(
+    isolated_memory,
+    monkeypatch,
+    diary_name,
+):
+    db_store.init_db()
+    private_path = isolated_memory / "privacy" / diary_name / "private.md"
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_text("private", encoding="utf-8")
+    job_id, claim = _claim_for_subagent(_valid_payload(str(private_path)))
+    raw_calls = []
+    model_calls = []
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "_verified_raw_input",
+        lambda *_args, **_kwargs: raw_calls.append(True),
+    )
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "_run_codex_generator",
+        lambda *_args, **_kwargs: model_calls.append(True),
+    )
+
+    outcome = auto_ingest_worker.AutoIngestController()._process_claimed_job(
+        claim,
+        Path("C:/codex.exe"),
+        _enabled_config(),
+        auto_ingest_worker._empty_state(),
+        threading.Event(),
+        datetime.now(timezone.utc),
+    )
+
+    row = db_store.get_connection().execute(
+        "SELECT status, retries, error_msg, result_json FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert outcome == "quarantined"
+    assert raw_calls == []
+    assert model_calls == []
+    assert row["status"] == "failed"
+    assert int(row["retries"]) >= 3
+    assert row["error_msg"] == "private_source_forbidden"
+    assert json.loads(row["result_json"])["failure_class"] == "input_policy"
+
+
+def test_private_diary_symlink_is_rejected_before_stable_read(
+    isolated_memory,
+    monkeypatch,
+):
+    private_path = isolated_memory / "privacy" / "Diary" / "private.md"
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_text("private", encoding="utf-8")
+    alias = isolated_memory / "raw" / "public-alias.md"
+    try:
+        alias.symlink_to(private_path)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    stable_calls = []
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "stable_raw_revision",
+        lambda *_args, **_kwargs: stable_calls.append(True),
+    )
+
+    with pytest.raises(
+        auto_ingest_worker.AutoIngestPolicyError,
+        match="private_source_forbidden",
+    ):
+        auto_ingest_worker._verified_raw_input(
+            {"filepath": str(alias), "hash": "sha256:" + "a" * 64},
+            _enabled_config(),
+        )
+
+    assert stable_calls == []
+
+
+def test_historical_private_jobs_are_cas_quarantined_before_claim(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    private_path = isolated_memory / "privacy" / "Diary" / "legacy.md"
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_text("private", encoding="utf-8")
+    awaiting_id = db_store.enqueue_job(
+        "ingest",
+        _valid_payload(str(private_path.with_name("awaiting.md"))),
+    )
+    claimed = db_store.claim_pending_jobs(limit=1, lease_seconds=300)
+    awaiting_claim = claimed[0]
+    assert awaiting_claim["job_id"] == awaiting_id
+    assert db_store.mark_job_awaiting_subagent(
+        awaiting_id,
+        "C:/task-packets/task.json",
+        lease_owner=awaiting_claim["lease_owner"],
+        lease_token=awaiting_claim["lease_token"],
+        lease_generation=awaiting_claim["lease_generation"],
+    )
+    queued_id = db_store.enqueue_job("ingest", _valid_payload(str(private_path)))
+    raw_calls = []
+    model_calls = []
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "stable_raw_revision",
+        lambda *_args, **_kwargs: raw_calls.append(True),
+    )
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "_run_codex_generator",
+        lambda *_args, **_kwargs: model_calls.append(True),
+    )
+
+    assert auto_ingest_worker._quarantine_pending_private_sources() == 2
+
+    rows = db_store.get_connection().execute(
+        "SELECT status, retries, error_msg, result_json FROM jobs "
+        "WHERE job_id IN (?, ?) ORDER BY job_id",
+        (queued_id, awaiting_id),
+    ).fetchall()
+    assert raw_calls == []
+    assert model_calls == []
+    assert len(rows) == 2
+    assert {row["status"] for row in rows} == {"failed"}
+    assert all(int(row["retries"]) >= 3 for row in rows)
+    assert {row["error_msg"] for row in rows} == {"private_source_forbidden"}
+    assert {
+        json.loads(row["result_json"])["state"] for row in rows
+    } == {"quarantined"}
+
+
 def test_enabled_config_requires_complete_valid_budget(isolated_memory):
     _write_config(isolated_memory, max_tasks_per_24h=0)
     with pytest.raises(ValueError, match="max_tasks_per_24h"):
         auto_ingest_worker.load_auto_ingest_config()
+
+
+def test_default_budget_contract_matches_requested_safety_ceiling():
+    config = auto_ingest_worker.AutoIngestConfig()
+
+    assert config.max_tasks_per_hour == 100
+    assert config.max_tasks_per_24h == 2000
+    assert config.max_tokens_per_task == 32768
+    assert config.max_reserved_tokens_per_hour == 100 * 32768
+    assert config.max_reserved_tokens_per_24h == 2000 * 32768
+    assert auto_ingest_worker._STATE_MAX_LAUNCHES == 2000
+    assert auto_ingest_worker._MAX_TOKENS_PER_TASK == 32768
+    assert (
+        auto_ingest_worker._LEGACY_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH
+        == 131072
+    )
+
+
+def test_enabled_config_accepts_requested_safety_ceiling(isolated_memory):
+    _write_config(
+        isolated_memory,
+        max_tasks_per_hour=100,
+        max_tasks_per_24h=2000,
+        max_tokens_per_task=32768,
+        max_reserved_tokens_per_hour=100 * 32768,
+        max_reserved_tokens_per_24h=2000 * 32768,
+    )
+
+    config = auto_ingest_worker.load_auto_ingest_config()
+
+    assert config.max_tasks_per_hour == 100
+    assert config.max_tasks_per_24h == 2000
+    assert config.max_tokens_per_task == 32768
+    assert config.max_reserved_tokens_per_hour == 100 * 32768
+    assert config.max_reserved_tokens_per_24h == 2000 * 32768
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("max_tasks_per_hour", 101),
+        ("max_tasks_per_24h", 2001),
+        ("max_tokens_per_task", 32769),
+    ),
+)
+def test_enabled_config_rejects_task_budget_above_safety_ceiling(
+    isolated_memory,
+    field,
+    value,
+):
+    _write_config(isolated_memory, **{field: value})
+
+    with pytest.raises(ValueError, match=field):
+        auto_ingest_worker.load_auto_ingest_config()
+
+
+def test_budget_state_accepts_2000_launches_and_rejects_2001(isolated_memory):
+    now = datetime.now(timezone.utc)
+    state = auto_ingest_worker._empty_state()
+    state["launches"] = [
+        _budget_launch(now, 32768, f"bounded-state-{index}")
+        for index in range(2000)
+    ]
+    auto_ingest_worker._save_state(state)
+
+    assert len(auto_ingest_worker._load_state(now)["launches"]) == 2000
+    assert auto_ingest_worker._state_path().stat().st_size < 1024 * 1024
+
+    state["launches"].append(_budget_launch(now, 32768, "overflow"))
+    auto_ingest_worker._save_state(state)
+    with pytest.raises(
+        auto_ingest_worker.AutoIngestInfrastructureError,
+        match="auto_ingest_state_invalid:launches",
+    ):
+        auto_ingest_worker._load_state(now)
+
+
+def test_expired_pre_budget_attempt_launch_is_pruned_but_active_one_blocks(
+    isolated_memory,
+):
+    now = datetime.now(timezone.utc)
+    state = auto_ingest_worker._empty_state()
+    historical = {
+        "at": (now - timedelta(hours=25)).isoformat(),
+        "revision": "a" * 64,
+        "job_id": "historical-job",
+        "attempt_id": "b" * 32,
+    }
+    state["launches"] = [historical]
+    auto_ingest_worker._save_state(state)
+
+    assert auto_ingest_worker._load_state(now)["launches"] == []
+
+    historical["at"] = (now - timedelta(hours=23)).isoformat()
+    auto_ingest_worker._save_state(state)
+    with pytest.raises(
+        auto_ingest_worker.AutoIngestInfrastructureError,
+        match="auto_ingest_state_invalid:launch_reserved_tokens",
+    ):
+        auto_ingest_worker._load_state(now)
+
+
+def test_requested_task_budget_boundaries_allow_last_slot_then_block():
+    now = datetime.now(timezone.utc)
+    config = auto_ingest_worker.AutoIngestConfig()
+    hourly = auto_ingest_worker._empty_state()
+    hourly["launches"] = [
+        _budget_launch(now, 0, f"hourly-{index}") for index in range(99)
+    ]
+    daily = auto_ingest_worker._empty_state()
+    daily["launches"] = [
+        _budget_launch(now - timedelta(hours=2), 0, f"daily-{index}")
+        for index in range(1999)
+    ]
+
+    assert auto_ingest_worker._global_budget_block(config, hourly, now) == ""
+    assert auto_ingest_worker._global_budget_block(config, daily, now) == ""
+
+    hourly["launches"].append(_budget_launch(now, 0, "hourly-100"))
+    daily["launches"].append(
+        _budget_launch(now - timedelta(hours=2), 0, "daily-2000")
+    )
+    assert auto_ingest_worker._global_budget_block(
+        config, hourly, now
+    ).startswith("hourly_budget_exhausted:100/100")
+    assert auto_ingest_worker._global_budget_block(
+        config, daily, now
+    ).startswith("daily_budget_exhausted:2000/2000")
+
+
+def test_enabled_config_requires_explicit_raw_text_model_processing_consent(
+    isolated_memory,
+):
+    _write_config(isolated_memory, allow_model_processing_raw_text=False)
+    with pytest.raises(
+        ValueError,
+        match="allow_model_processing_raw_text_must_be_true_when_enabled",
+    ):
+        auto_ingest_worker.load_auto_ingest_config()
+
+    config_path = isolated_memory / "wiki" / ".meta" / "auto_ingest_config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload.pop("allow_model_processing_raw_text")
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="allow_model_processing_raw_text_must_be_boolean",
+    ):
+        auto_ingest_worker.load_auto_ingest_config()
+
+
+def test_enabled_config_records_raw_text_model_processing_consent(isolated_memory):
+    _write_config(isolated_memory)
+
+    config = auto_ingest_worker.load_auto_ingest_config()
+
+    assert config.enabled is True
+    assert config.allow_model_processing_raw_text is True
+
+
+def test_generator_prompt_rejects_raw_text_without_explicit_consent():
+    processed_data = {
+        "canonical_name": "Source_Test.md",
+        "source_hash": "sha256:" + "a" * 64,
+        "source_projection_hash": "sha256:" + "b" * 64,
+        "ingest_contract_version": 5,
+        "integration_candidates": [],
+    }
+
+    with pytest.raises(
+        auto_ingest_worker.AutoIngestPolicyError,
+        match="model_raw_text_processing_not_authorized",
+    ):
+        auto_ingest_worker._build_generator_prompt(
+            "job-privacy-contract",
+            "private raw source",
+            processed_data,
+            _enabled_config(allow_model_processing_raw_text=False),
+        )
+
+
+def test_generator_process_rejects_launch_without_explicit_raw_text_consent():
+    with pytest.raises(
+        auto_ingest_worker.AutoIngestPolicyError,
+        match="model_raw_text_processing_not_authorized",
+    ):
+        auto_ingest_worker._run_codex_generator(
+            Path("C:/codex.exe"),
+            _enabled_config(allow_model_processing_raw_text=False),
+            "job-privacy-contract",
+            ("owner", "token", 1),
+            "prompt containing verified raw source",
+            threading.Event(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -867,6 +1237,8 @@ def test_codex_command_is_fixed_tool_free_and_contains_no_prompt_or_lease(tmp_pa
     )
     joined = " ".join(str(item) for item in command)
 
+    assert command[command.index("-a") + 1] == "never"
+    assert command[command.index("-s") + 1] == "read-only"
     assert "--ignore-user-config" in command
     assert "--ignore-rules" in command
     assert "read-only" in command

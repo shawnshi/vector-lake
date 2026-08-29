@@ -11,9 +11,11 @@ except ImportError:
     dotenv = None
 
 from vector_lake import tools
+from vector_lake.runtime_paths import bootstrap_runtime_paths
 
 
 _CLI_HEAVY_TASKS = {
+    "auto-ingest-receipt-retention": ("maintenance", 900.0),
     "audit-graph": ("scan", 1800.0),
     "backup-retention": ("maintenance", 900.0),
     "canonical-backfill": ("maintenance", 900.0),
@@ -32,10 +34,13 @@ _CLI_HEAVY_TASKS = {
     "merge-suggestions": ("scan", 1800.0),
     "orphan-source-classify": ("scan", 900.0),
     "projection-rebuild-index": ("projection", 1800.0),
+    "projection-object-gc": ("maintenance", 1800.0),
     "projection-report": ("scan", 900.0),
     "retrieval-benchmark": ("scan", 900.0),
     "research": ("ingest_scan", 1800.0),
+    "restore-snapshot": ("maintenance", 1800.0),
     "schema-migrate": ("maintenance", 1800.0),
+    "schema-rollback": ("maintenance", 1800.0),
     "sync": ("ingest_scan", 1800.0),
     "timeline-rebuild": ("projection", 900.0),
     "topology-queue-cleanup": ("maintenance", 900.0),
@@ -62,6 +67,10 @@ def _cli_heavy_task_policy(args) -> tuple[str, float] | None:
             or getattr(args, "checkpoint_wal", False)
         ):
             return None
+    if args.command in {"restore-snapshot", "schema-rollback"} and not getattr(
+        args, "apply", False
+    ):
+        return None
     return _CLI_HEAVY_TASKS.get(args.command)
 
 
@@ -110,6 +119,35 @@ def _positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("expected a positive integer")
     return parsed
+
+
+def _doctor_exit_code(report: str) -> int:
+    lines = [line.strip() for line in str(report).splitlines()]
+    if any(line.startswith("[FAIL]") for line in lines):
+        return 2
+    prefix = "Infrastructure Summary:"
+    summary_lines = [line for line in lines if line.startswith(prefix)]
+    if len(summary_lines) != 1:
+        raise ValueError("doctor report must contain one Infrastructure Summary")
+    status = summary_lines[0][len(prefix):].strip().lower()
+    if status in {"healthy", "healthy with warnings"}:
+        return 0
+    if status == "issues detected":
+        return 2
+    raise ValueError(f"unrecognized doctor infrastructure status: {status!r}")
+
+
+def _readiness_exit_code(report: str) -> int:
+    payload = json.loads(report)
+    if not isinstance(payload, dict):
+        raise ValueError("readiness report must be a JSON object")
+    status = str(payload.get("status") or "").strip().lower()
+    ready = payload.get("ready")
+    if status == "ready" and ready is True:
+        return 0
+    if status in {"degraded", "not_ready"} and ready is False:
+        return 2
+    raise ValueError("readiness report has an inconsistent status contract")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -183,6 +221,23 @@ Usage Examples:
         default=86400,
         help="Age threshold for --expire-stale.",
     )
+    budget_status_parser = subparsers.add_parser(
+        "auto-ingest-budget-status",
+        help="[READ] Report rolling automatic-ingest task and token budgets.",
+    )
+    budget_status_parser.add_argument(
+        "--reservations-only",
+        action="store_true",
+        help="Skip per-attempt receipt reads and report exact reservations only.",
+    )
+    receipt_retention_parser = subparsers.add_parser(
+        "auto-ingest-receipt-retention",
+        help="[MAINTENANCE] Preview or delete expired terminal attempt receipts.",
+    )
+    receipt_retention_parser.add_argument("--apply", action="store_true")
+    receipt_retention_parser.add_argument("--confirm-fingerprint", default="")
+    receipt_retention_parser.add_argument("--plan-as-of", default="")
+    receipt_retention_parser.add_argument("--limit", type=_positive_int, default=256)
     ingest_tasks_parser.add_argument(
         "--min-age-seconds",
         type=_nonnegative_int,
@@ -222,9 +277,12 @@ Usage Examples:
     )
     search_parser.add_argument(
         "--mode",
-        choices=["page", "memory", "claim"],
+        choices=["page", "memory", "fact", "claim"],
         default="page",
-        help="Search page index, operational memory, or fact claims.",
+        help=(
+            "Search pages, all operational memory, or fact-only operational "
+            "memory; claim is a deprecated alias for fact."
+        ),
     )
 
     benchmark_parser = subparsers.add_parser(
@@ -254,10 +312,16 @@ Usage Examples:
         "query", help="[QUERY] Deep reasoning with budget-controlled context."
     )
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
-    query_parser.add_argument(
+    query_mode = query_parser.add_mutually_exclusive_group()
+    query_mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Output Markdown to stdout only without persisting to disk.",
+        help="Preview only (the default; retained for compatibility).",
+    )
+    query_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Explicitly prepare a persisted query-synthesis job.",
     )
 
     subparsers.add_parser(
@@ -530,11 +594,40 @@ Usage Examples:
         default="",
         help="Exact fingerprint from a current preview; required with --apply.",
     )
+    projection_object_gc_parser = subparsers.add_parser(
+        "projection-object-gc",
+        help=(
+            "[MAINTENANCE] Preview or collect unreachable immutable "
+            "projection-v2 objects."
+        ),
+    )
+    projection_object_gc_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete only candidates bound to --confirm-fingerprint. Defaults to preview.",
+    )
+    projection_object_gc_parser.add_argument(
+        "--retention-days",
+        type=_positive_int,
+        default=7,
+        help="Minimum orphan-object age in days.",
+    )
+    projection_object_gc_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=1000,
+        help="Maximum objects to collect in one receipt-bound batch.",
+    )
+    projection_object_gc_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact fingerprint from the current preview; required with --apply.",
+    )
     schema_migrate_parser = subparsers.add_parser(
         "schema-migrate",
         help=(
             "[MAINTENANCE] Preview or apply the controlled SQLite "
-            "v4/v5/v6 to v7 migration."
+            "v4/v5/v6/v7/v8 to v9 migration."
         ),
     )
     schema_migrate_action = schema_migrate_parser.add_mutually_exclusive_group()
@@ -554,6 +647,65 @@ Usage Examples:
         help="Exact sha256 fingerprint returned by the matching preview.",
     )
     schema_migrate_parser.add_argument(
+        "--confirm-no-writers",
+        action="store_true",
+        help="Assert that MCP, watchdog, and every other database writer are stopped.",
+    )
+    schema_rollback_parser = subparsers.add_parser(
+        "schema-rollback",
+        help=(
+            "[MAINTENANCE] Preview or apply a completed-receipt-bound "
+            "SQLite v9 to v8 rollback."
+        ),
+    )
+    schema_rollback_parser.add_argument(
+        "--migration-receipt",
+        required=True,
+        help="Absolute path to the authoritative completed v8-to-v9 migration receipt.",
+    )
+    schema_rollback_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the exact previewed rollback. Defaults to physical read-only preview.",
+    )
+    schema_rollback_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact sha256 fingerprint returned by the matching rollback preview.",
+    )
+    schema_rollback_parser.add_argument(
+        "--confirm-no-writers",
+        action="store_true",
+        help="Assert that MCP, watchdog, and every other database writer are stopped.",
+    )
+    schema_rollback_parser.add_argument(
+        "--confirm-data-rewind",
+        action="store_true",
+        help="Explicitly accept loss of writes committed after the migration receipt.",
+    )
+    restore_snapshot_parser = subparsers.add_parser(
+        "restore-snapshot",
+        help=(
+            "[MAINTENANCE] Preview or apply a completed maintenance-backup "
+            "receipt-bound full recovery."
+        ),
+    )
+    restore_snapshot_parser.add_argument(
+        "--maintenance-receipt",
+        required=True,
+        help="Absolute path to an authoritative completed backup manifest.json.",
+    )
+    restore_snapshot_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the exact previewed restore. Defaults to read-only preview.",
+    )
+    restore_snapshot_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact sha256 fingerprint returned by the matching restore preview.",
+    )
+    restore_snapshot_parser.add_argument(
         "--confirm-no-writers",
         action="store_true",
         help="Assert that MCP, watchdog, and every other database writer are stopped.",
@@ -639,10 +791,16 @@ Usage Examples:
         "research",
         help="[RESEARCH] Autonomously scan graph gaps and governance queue to formulate web research directives.",
     )
-    research_parser.add_argument(
+    research_mode = research_parser.add_mutually_exclusive_group()
+    research_mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview the research queries without the SYSTEM DIRECTIVE execution hook.",
+        help="Preview only (the default; retained for compatibility).",
+    )
+    research_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Explicitly emit the authorized external-research action plan.",
     )
 
     debt_parser = subparsers.add_parser(
@@ -715,7 +873,8 @@ Usage Examples:
     )
 
     merge_parser = subparsers.add_parser(
-        "merge-suggestions", help="[MERGE] Detect and enqueue candidate entity merges."
+        "merge-suggestions",
+        help="[MERGE] Preview candidate entity merges; enqueue only with --apply.",
     )
     merge_parser.add_argument(
         "--limit",
@@ -723,10 +882,16 @@ Usage Examples:
         default=20,
         help="Maximum number of merge candidates to surface.",
     )
-    merge_parser.add_argument(
+    merge_mode = merge_parser.add_mutually_exclusive_group()
+    merge_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Enqueue eligible merge candidates for governance review.",
+    )
+    merge_mode.add_argument(
         "--preview",
         action="store_true",
-        help="Do not enqueue governance items; only preview candidates.",
+        help="Compatibility alias for the default zero-write preview mode.",
     )
 
     delete_parser = subparsers.add_parser(
@@ -778,7 +943,15 @@ Usage Examples:
 
 def main() -> int:
     _configure_stdout()
-    _load_env()
+    try:
+        # Resolve storage authority before a legacy ~/.gemini/.env is loaded.
+        # python-dotenv defaults to override=False, so the bound pair remains
+        # authoritative while unrelated credentials can still be imported.
+        bootstrap_runtime_paths(caller="CLI")
+        _load_env()
+    except RuntimeError as exc:
+        print(f"CLI runtime authority error: {exc}", file=sys.stderr)
+        return 1
     parser = build_parser()
     args = parser.parse_args()
 
@@ -869,7 +1042,36 @@ def main() -> int:
         elif args.command == "query":
             print(
                 tools.prepare_query_context(
-                    args.query_str, getattr(args, "dry_run", False)
+                    args.query_str, not getattr(args, "apply", False)
+                )
+            )
+        elif args.command == "auto-ingest-budget-status":
+            print(
+                json.dumps(
+                    tools.auto_ingest_budget_status(
+                        include_actual_usage=not getattr(
+                            args, "reservations_only", False
+                        )
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "auto-ingest-receipt-retention":
+            print(
+                json.dumps(
+                    tools.auto_ingest_attempt_receipt_retention(
+                        apply=getattr(args, "apply", False),
+                        confirm_fingerprint=getattr(
+                            args, "confirm_fingerprint", ""
+                        ),
+                        plan_as_of=getattr(args, "plan_as_of", ""),
+                        limit=getattr(args, "limit", 256),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
                 )
             )
         elif args.command == "graph":
@@ -984,6 +1186,22 @@ def main() -> int:
                     confirmation=getattr(args, "confirm_fingerprint", ""),
                 )
             )
+        elif args.command == "projection-object-gc":
+            from vector_lake.tool_projection import projection_object_gc
+
+            print(
+                json.dumps(
+                    projection_object_gc(
+                        dry_run=not getattr(args, "apply", False),
+                        retention_days=getattr(args, "retention_days", 7),
+                        limit=getattr(args, "limit", 1000),
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         elif args.command == "schema-migrate":
             from vector_lake import db_store
 
@@ -1029,13 +1247,17 @@ def main() -> int:
         elif args.command == "audit-graph":
             print(tools.audit_graph())
         elif args.command == "doctor":
-            print(tools.doctor_vector_lake())
+            report = tools.doctor_vector_lake()
+            print(report)
+            return _doctor_exit_code(report)
         elif args.command == "readiness":
-            print(
-                tools.semantic_readiness_vector_lake(getattr(args, "decision_id", None))
+            report = tools.semantic_readiness_vector_lake(
+                getattr(args, "decision_id", None)
             )
+            print(report)
+            return _readiness_exit_code(report)
         elif args.command == "research":
-            print(tools.research_vector_lake(getattr(args, "dry_run", False)))
+            print(tools.research_vector_lake(not getattr(args, "apply", False)))
         elif args.command == "debt":
             print(tools.debt_vector_lake(getattr(args, "top", 20)))
         elif args.command == "trace":
@@ -1089,7 +1311,46 @@ def main() -> int:
             print(
                 tools.merge_suggestions_vector_lake(
                     limit=getattr(args, "limit", 20),
-                    enqueue=not getattr(args, "preview", False),
+                    enqueue=getattr(args, "apply", False),
+                )
+            )
+        elif args.command == "schema-rollback":
+            from vector_lake import db_store
+
+            print(
+                json.dumps(
+                    db_store.schema_rollback_maintenance(
+                        migration_receipt=args.migration_receipt,
+                        apply=getattr(args, "apply", False),
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
+                        confirm_no_writers=getattr(
+                            args, "confirm_no_writers", False
+                        ),
+                        confirm_data_rewind=getattr(
+                            args, "confirm_data_rewind", False
+                        ),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "restore-snapshot":
+            from vector_lake.restore_snapshot import restore_snapshot_maintenance
+
+            print(
+                json.dumps(
+                    restore_snapshot_maintenance(
+                        maintenance_receipt=args.maintenance_receipt,
+                        apply=getattr(args, "apply", False),
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
+                        confirm_no_writers=getattr(
+                            args, "confirm_no_writers", False
+                        ),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
                 )
             )
         elif args.command == "delete":

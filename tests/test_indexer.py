@@ -27,6 +27,19 @@ from vector_lake.indexer import (
     update_index_items,
 )
 
+
+def _projection_v2_commit_receipt(memory_dir: Path) -> tuple[bytes, int, dict]:
+    """Capture the mutable v2 commit surfaces, excluding static locators."""
+    from vector_lake import db_store
+
+    marker = memory_dir / "wiki" / "projection_pair_manifest.json"
+    return (
+        marker.read_bytes(),
+        marker.stat().st_mtime_ns,
+        db_store.get_projection_runtime_v9(),
+    )
+
+
 class TestIndexer(unittest.TestCase):
     def test_incremental_relevance_frontier_excludes_unrelated_nodes(self):
         node_keys = ["Concept_Touched"] + [
@@ -368,6 +381,7 @@ def test_noop_full_rebuild_performs_zero_fts_dml(isolated_memory):
         "FROM wiki_search_index ORDER BY node_key"
     ).fetchall()
     before_changes = conn.total_changes
+    before_commit = _projection_v2_commit_receipt(isolated_memory)
 
     indexer.generate_index()
 
@@ -376,7 +390,10 @@ def test_noop_full_rebuild_performs_zero_fts_dml(isolated_memory):
         "FROM wiki_search_index ORDER BY node_key"
     ).fetchall()
     assert [tuple(row) for row in after_rows] == [tuple(row) for row in before_rows]
+    # Projection v2 generations are content-addressed. Identical roots bound to
+    # the same canonical generation are an exact byte/mtime/DB no-op.
     assert conn.total_changes == before_changes
+    assert _projection_v2_commit_receipt(isolated_memory) == before_commit
 
 
 def test_full_rebuild_repairs_only_changed_stale_and_duplicate_fts_keys(
@@ -490,27 +507,15 @@ def test_index_projection_allows_only_explicit_merge_alias_redirect(
     monkeypatch,
 ):
     from vector_lake import db_store, indexer
-    from vector_lake.wiki_utils import get_index_path
 
     db_store.init_db()
-    get_index_path().write_text(
-        json.dumps(
-            {
-                "nodes": {},
-                "aliases": {"Source_Alpha-ab12cd34": "Source_Alpha"},
-                "weighted_edges": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert index_projection_matches_canonical(["Source_Alpha-ab12cd34.md"]) is False
+    indexer.generate_index()
+    snapshot = indexer.read_committed_index_snapshot(_mutable=True)
+    snapshot["aliases"]["Source_Alpha-ab12cd34"] = "Source_Alpha"
     monkeypatch.setattr(
         indexer,
         "read_committed_index_snapshot",
-        lambda *_args, **_kwargs: json.loads(
-            get_index_path().read_text(encoding="utf-8")
-        ),
+        lambda *_args, **_kwargs: snapshot,
     )
     assert index_projection_matches_canonical(["Source_Alpha-ab12cd34.md"]) is False
     assert index_projection_matches_canonical(
@@ -527,8 +532,8 @@ def test_index_projection_proves_system_pages_are_intentionally_absent(
     from vector_lake.wiki_utils import get_index_path
 
     db_store.init_db()
-    get_index_path().write_text("{}", encoding="utf-8")
-    snapshot = {"nodes": {}, "aliases": {}, "weighted_edges": []}
+    indexer.generate_index()
+    snapshot = indexer.read_committed_index_snapshot(_mutable=True)
     monkeypatch.setattr(
         indexer,
         "read_committed_index_snapshot",
@@ -586,8 +591,6 @@ def test_index_projection_requires_both_mixed_partitions_to_match(
     monkeypatch,
 ):
     from vector_lake import db_store, governance_store, indexer
-    from vector_lake.wiki_utils import get_index_path
-
     db_store.init_db()
     entity = {
         "entity_id": "entity_mixed_projection",
@@ -602,7 +605,7 @@ def test_index_projection_requires_both_mixed_partitions_to_match(
     selected = ["Concept_Mixed-Projection.md", "System_Source.md"]
 
     assert index_projection_matches_canonical(selected) is True
-    snapshot = json.loads(get_index_path().read_text(encoding="utf-8"))
+    snapshot = indexer.read_committed_index_snapshot(_mutable=True)
     monkeypatch.setattr(
         indexer,
         "read_committed_index_snapshot",
@@ -681,37 +684,47 @@ def test_projection_sidecar_is_last_commit_marker_and_fast_matcher_skips_payload
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import db_store, indexer
+    from vector_lake import db_store, indexer, projection_format_v2
+    from vector_lake.projection_format_v2 import read_committed_sidecar
     from vector_lake.wiki_utils import get_projection_manifest_path
 
     db_store.init_db()
     published = []
-    real_replace = indexer._replace_projection_stage
+    real_replace = projection_format_v2._write_durable_replace
 
-    def record_replace(stage_path, output_path):
+    def record_replace(output_path, payload):
         published.append(Path(output_path).name)
-        return real_replace(stage_path, output_path)
+        return real_replace(output_path, payload)
 
-    monkeypatch.setattr(indexer, "_replace_projection_stage", record_replace)
+    monkeypatch.setattr(
+        projection_format_v2,
+        "_write_durable_replace",
+        record_replace,
+    )
     indexer.generate_index()
 
     assert published[-3:] == [
-        "claim_graph.json",
         "index.json",
+        "claim_graph.json",
         "projection_pair_manifest.json",
     ]
-    sidecar = json.loads(
-        get_projection_manifest_path().read_text(encoding="utf-8")
+    sidecar, _identity, runtime = read_committed_sidecar(
+        isolated_memory / "wiki"
     )
-    assert sidecar["contract"] == indexer.PROJECTION_SIDECAR_CONTRACT
-    assert set(sidecar["artifacts"]) == {"index.json", "claim_graph.json"}
+    assert sidecar["contract"] == projection_format_v2.SIDECAR_CONTRACT
+    assert sidecar["projection_generation"] == runtime["projection_generation"]
+    assert sidecar["index_root_sha256"]
+    assert sidecar["claim_graph_root_sha256"]
+    assert get_projection_manifest_path().read_bytes() == (
+        projection_format_v2.canonical_json_bytes(sidecar)
+    )
     assert indexer.projection_pair_matches_current_generation() is True
 
     monkeypatch.setattr(
-        indexer,
-        "_load_index_unlocked",
+        projection_format_v2,
+        "materialize_index",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("fast matcher must not parse index.json")
+            AssertionError("fast matcher must not materialize projection roots")
         ),
     )
     assert indexer.projection_pair_matches_current_generation() is True
@@ -760,7 +773,10 @@ def test_committed_index_reader_rejects_sidecar_and_blocking_canonical_drift(
     sidecar_path = get_projection_manifest_path()
     sidecar_bytes = sidecar_path.read_bytes()
     sidecar_path.unlink()
-    with pytest.raises(indexer.ProjectionPairContractError, match="incomplete"):
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="sidecar_unreadable",
+    ):
         indexer.read_committed_index_snapshot()
     sidecar_path.write_bytes(sidecar_bytes)
 
@@ -772,7 +788,7 @@ def test_committed_index_reader_rejects_sidecar_and_blocking_canonical_drift(
             "status": "pending",
         }
     )
-    assert indexer.read_committed_index_snapshot() is first
+    assert indexer.read_committed_index_snapshot() == first
 
     governance_store.upsert_entity(
         "entity_committed_reader_drift",
@@ -783,15 +799,22 @@ def test_committed_index_reader_rejects_sidecar_and_blocking_canonical_drift(
             "page_key": "Concept_Committed-Reader-Drift",
         },
     )
-    with pytest.raises(indexer.ProjectionPairContractError, match="stale"):
+    with pytest.raises(
+        indexer.ProjectionPairContractError,
+        match="canonical_generation_stale",
+    ):
         indexer.read_committed_index_snapshot()
 
 
-@pytest.mark.parametrize("damage", ["missing", "corrupt"])
-def test_incremental_writer_rebuilds_damaged_projection_sidecar(
+@pytest.mark.parametrize(
+    ("damage", "reason"),
+    [("missing", "sidecar_unreadable"), ("corrupt", "sidecar_json_invalid")],
+)
+def test_incremental_writer_fails_closed_for_damaged_projection_sidecar(
     isolated_memory,
     monkeypatch,
     damage,
+    reason,
 ):
     from vector_lake import db_store, governance_store, indexer
     from vector_lake.wiki_utils import get_projection_manifest_path
@@ -808,6 +831,7 @@ def test_incremental_writer_rebuilds_damaged_projection_sidecar(
     )
     indexer.generate_index()
     sidecar_path = get_projection_manifest_path()
+    sidecar_bytes = sidecar_path.read_bytes()
     if damage == "missing":
         sidecar_path.unlink()
     else:
@@ -824,12 +848,16 @@ def test_incremental_writer_rebuilds_damaged_projection_sidecar(
         )
 
     monkeypatch.setattr(indexer, "_generate_index_unlocked", track_rebuild)
-    indexer.update_index_items(["Concept_Damaged-Incremental-Pair.md"])
+    with pytest.raises(indexer.ProjectionV2ContractError, match=reason):
+        indexer.update_index_items(["Concept_Damaged-Incremental-Pair.md"])
 
-    assert rebuilds == [True]
+    # A ready commit with a missing/corrupt marker is not reconstructed from
+    # mutable canonical state by an incremental writer. It remains fail-closed.
+    assert rebuilds == []
+    assert indexer.projection_pair_matches_current_generation() is False
+    sidecar_path.write_bytes(sidecar_bytes)
     committed = indexer.read_committed_index_snapshot()
     assert "Concept_Damaged-Incremental-Pair" in committed["nodes"]
-    assert indexer.projection_pair_matches_current_generation() is True
 
 
 def test_topology_writer_rebuilds_damaged_projection_sidecar(
@@ -906,8 +934,12 @@ def test_full_index_rebuild_uses_shared_projection_publish_lock(
     assert seen == [(str(isolated_memory / "wiki" / "index.json") + ".lock", 15)]
 
 
-def test_claim_graph_projection_has_independent_parity_and_refresh(isolated_memory):
-    from vector_lake import db_store, governance_store
+def test_claim_graph_projection_has_independent_parity_and_refresh(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import db_store, governance_store, indexer
+    from vector_lake.projection_format_v2 import load_committed_claim_graph
 
     db_store.init_db()
     claim = {
@@ -939,22 +971,28 @@ def test_claim_graph_projection_has_independent_parity_and_refresh(isolated_memo
     assert claim_graph_projection_parity()["missing_nodes"] == 0
     assert claim_graph_projection_parity()["extra_nodes"] == 0
 
-    claim_graph_path = isolated_memory / "wiki" / "claim_graph.json"
-    stored = json.loads(claim_graph_path.read_text(encoding="utf-8"))
+    stored = load_committed_claim_graph(isolated_memory / "wiki")
     stored.setdefault("edges", []).append(
         {"source": "claim_graph_refresh", "target": "fake", "relation": "fake", "weight": 1.0}
     )
-    claim_graph_path.write_text(json.dumps(stored), encoding="utf-8")
-    assert claim_graph_projection_parity()["extra_edges"] == 1
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            indexer,
+            "_read_claim_graph_snapshot",
+            lambda *_args, **_kwargs: stored,
+        )
+        assert claim_graph_projection_parity()["extra_edges"] == 1
     refresh_claim_graph_projection()
     assert claim_graph_projection_parity()["extra_edges"] == 0
 
     claim["claim_text"] = "Changed graph claim"
     claim["updated_at"] = "2026-07-19T01:00:00+00:00"
     publish_claim()
-    drift = claim_graph_projection_parity()
-    assert drift["missing_nodes"] == 1
-    assert drift["extra_nodes"] == 1
+    with pytest.raises(
+        indexer.ProjectionSnapshotChanged,
+        match="canonical_generation_stale",
+    ):
+        claim_graph_projection_parity()
 
     refresh_claim_graph_projection()
     assert claim_graph_projection_parity()["missing_nodes"] == 0
@@ -1026,20 +1064,33 @@ def test_claim_graph_window_ignores_storage_timestamp_churn(isolated_memory):
 
 def test_claim_graph_parity_does_not_wait_for_publish_lock(
     isolated_memory,
-    monkeypatch,
 ):
-    from vector_lake import governance_store
-    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+    from vector_lake import db_store, governance_store, indexer
+    from vector_lake.wiki_utils import get_index_path
 
-    expected = {"nodes": [{"id": "claim"}], "edges": []}
-    monkeypatch.setattr(
-        governance_store,
-        "build_claim_graph_projection",
-        lambda: expected,
+    db_store.init_db()
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Lock-Free-Parity.md"],
+            "proposed_entities": [],
+            "proposed_claims": [
+                {
+                    "claim_id": "claim_lock_free_parity",
+                    "claim_text": "Parity reads do not take the publish lock.",
+                    "status": "Active",
+                    "source_ids": [],
+                    "evidence_ids": [],
+                    "subject_entity_ids": [],
+                    "updated_at": "2026-08-28T00:00:00+00:00",
+                    "locator": {"page_key": "Concept_Lock-Free-Parity"},
+                }
+            ],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
     )
-    claim_graph_path = get_claim_graph_path()
-    claim_graph_path.parent.mkdir(parents=True, exist_ok=True)
-    claim_graph_path.write_text(json.dumps(expected), encoding="utf-8")
+    indexer.generate_index()
 
     publish_lock = FileLock(str(get_index_path()) + ".lock")
     publish_lock.acquire(timeout=0)
@@ -1055,70 +1106,109 @@ def test_claim_graph_parity_does_not_wait_for_publish_lock(
     assert parity["extra_nodes"] == 0
 
 
-def test_projection_pair_publishes_shared_manifest_and_rotates_generation(
+def test_projection_pair_uses_shared_sidecar_and_rotates_for_changed_roots(
     isolated_memory,
 ):
-    from vector_lake import db_store, indexer
-    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+    from vector_lake import db_store, governance_store, indexer
+    from vector_lake.projection_format_v2 import (
+        load_committed_claim_graph,
+        read_committed_sidecar,
+    )
 
     db_store.init_db()
     indexer.generate_index()
 
-    first_index = json.loads(get_index_path().read_text(encoding="utf-8"))
-    first_graph = json.loads(get_claim_graph_path().read_text(encoding="utf-8"))
-    first_generation = indexer.validate_projection_pair(first_index, first_graph)
-    first_binding = indexer.projection_canonical_generation(
-        first_index,
-        first_graph,
+    first_index = indexer.read_committed_index_snapshot()
+    first_graph = load_committed_claim_graph(isolated_memory / "wiki")
+    first_sidecar, _identity, first_runtime = read_committed_sidecar(
+        isolated_memory / "wiki"
     )
-    assert first_index[indexer.PROJECTION_MANIFEST_KEY] == first_graph[
-        indexer.PROJECTION_MANIFEST_KEY
-    ]
-    assert first_binding["status"] == "verified"
-    assert first_binding["runtime_generations"] == (
+    first_commit = _projection_v2_commit_receipt(isolated_memory)
+    assert first_sidecar["canonical_generation"] == (
         indexer.canonical_runtime_generation_snapshot()
     )
+    assert first_sidecar["projection_generation"] == first_runtime[
+        "projection_generation"
+    ]
 
+    governance_store.apply_change_set(
+        {
+            "affected_pages": ["Concept_Shared-Sidecar.md"],
+            "proposed_entities": [],
+            "proposed_claims": [
+                {
+                    "claim_id": "claim_shared_sidecar",
+                    "claim_text": "Changed roots rotate the v2 generation.",
+                    "status": "Active",
+                    "source_ids": [],
+                    "evidence_ids": [],
+                    "subject_entity_ids": [],
+                    "updated_at": "2026-08-28T00:00:00+00:00",
+                    "locator": {"page_key": "Concept_Shared-Sidecar"},
+                }
+            ],
+            "proposed_evidence": [],
+            "proposed_source_updates": [],
+            "proposed_edges": [],
+        }
+    )
     indexer.refresh_claim_graph_projection()
 
-    refreshed_index = json.loads(get_index_path().read_text(encoding="utf-8"))
-    refreshed_graph = json.loads(
-        get_claim_graph_path().read_text(encoding="utf-8")
+    refreshed_index = indexer.read_committed_index_snapshot()
+    refreshed_graph = load_committed_claim_graph(isolated_memory / "wiki")
+    refreshed_sidecar, _identity, refreshed_runtime = read_committed_sidecar(
+        isolated_memory / "wiki"
     )
-    refreshed_generation = indexer.validate_projection_pair(
-        refreshed_index,
-        refreshed_graph,
+    assert set(refreshed_index) == set(first_index)
+    assert refreshed_graph != first_graph
+    assert any(
+        node.get("id") == "claim_shared_sidecar"
+        for node in refreshed_graph["nodes"]
     )
-    refreshed_binding = indexer.projection_canonical_generation(
-        refreshed_index,
-        refreshed_graph,
+    assert refreshed_sidecar["projection_generation"] != first_sidecar[
+        "projection_generation"
+    ]
+    assert refreshed_sidecar["canonical_generation"] == (
+        indexer.canonical_runtime_generation_snapshot()
     )
-    assert refreshed_generation != first_generation
-    assert refreshed_binding == first_binding
+    assert refreshed_runtime["projection_generation"] == refreshed_sidecar[
+        "projection_generation"
+    ]
+    assert _projection_v2_commit_receipt(isolated_memory) != first_commit
 
 
-def test_projection_pair_rejects_tampered_canonical_generation_token(
+def test_projection_pair_rejects_tampered_canonical_generation_sidecar(
     isolated_memory,
 ):
     from vector_lake import db_store, indexer
-    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+    from vector_lake.projection_format_v2 import (
+        ProjectionV2ContractError,
+        read_committed_sidecar,
+    )
+    from vector_lake.wiki_utils import get_projection_manifest_path
 
     db_store.init_db()
     indexer.generate_index()
-    index_data = json.loads(get_index_path().read_text(encoding="utf-8"))
-    claim_graph = json.loads(get_claim_graph_path().read_text(encoding="utf-8"))
-    index_data[indexer.PROJECTION_MANIFEST_KEY]["canonical_generation"][
-        "token"
-    ] = "tampered"
-    claim_graph[indexer.PROJECTION_MANIFEST_KEY]["canonical_generation"][
-        "token"
-    ] = "tampered"
-
-    with pytest.raises(
-        indexer.ProjectionPairContractError,
-        match="token does not match",
-    ):
-        indexer.validate_projection_pair(index_data, claim_graph)
+    sidecar_path = get_projection_manifest_path()
+    original = sidecar_path.read_bytes()
+    sidecar, _identity, _runtime = read_committed_sidecar(
+        isolated_memory / "wiki"
+    )
+    tampered = dict(sidecar)
+    tampered["canonical_generation"] = dict(sidecar["canonical_generation"])
+    tampered["canonical_generation"]["entities"] += 1
+    sidecar_path.write_text(
+        json.dumps(tampered, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    try:
+        with pytest.raises(
+            ProjectionV2ContractError,
+            match="projection_generation_mismatch",
+        ):
+            read_committed_sidecar(isolated_memory / "wiki")
+    finally:
+        sidecar_path.write_bytes(original)
 
 
 def test_full_projection_rebuild_rejects_moving_canonical_generation(
@@ -1178,7 +1268,7 @@ def test_full_projection_rebuild_rechecks_generation_after_write_lock(
 
     with pytest.raises(
         indexer.ProjectionCanonicalGenerationChanged,
-        match="write lock",
+        match="while publishing projection v2",
     ):
         indexer.generate_index()
 
@@ -1206,7 +1296,7 @@ def test_full_projection_rebuild_rechecks_generation_after_projection_commit(
 
     with pytest.raises(
         indexer.ProjectionCanonicalGenerationChanged,
-        match="immediately before publishing",
+        match="while publishing projection v2",
     ):
         indexer.generate_index()
 
@@ -1229,6 +1319,7 @@ def test_claim_graph_refresh_rechecks_generation_before_publish(
     indexer.generate_index()
     paths = (get_index_path(), get_claim_graph_path(), get_projection_manifest_path())
     before = {path: path.read_bytes() for path in paths}
+    before_commit = _projection_v2_commit_receipt(isolated_memory)
     stable = indexer.canonical_runtime_generation_snapshot()
     drifted = dict(stable)
     drifted["claims"] += 1
@@ -1241,11 +1332,12 @@ def test_claim_graph_refresh_rechecks_generation_before_publish(
 
     with pytest.raises(
         indexer.ProjectionCanonicalGenerationChanged,
-        match="immediately before publishing",
+        match="while publishing projection v2",
     ):
         indexer.refresh_claim_graph_projection()
 
     assert {path: path.read_bytes() for path in paths} == before
+    assert _projection_v2_commit_receipt(isolated_memory) == before_commit
 
 
 def test_claim_graph_refresh_rejects_generation_drift_during_computation(
@@ -1253,11 +1345,9 @@ def test_claim_graph_refresh_rejects_generation_drift_during_computation(
     monkeypatch,
 ):
     from vector_lake import db_store, indexer
-    from vector_lake.wiki_utils import get_index_path
-
     db_store.init_db()
     indexer.generate_index()
-    before_projection = get_index_path().read_bytes()
+    before_commit = _projection_v2_commit_receipt(isolated_memory)
     stable = indexer.canonical_runtime_generation_snapshot()
     drifted = dict(stable)
     drifted["claims"] += 1
@@ -1274,7 +1364,7 @@ def test_claim_graph_refresh_rejects_generation_drift_during_computation(
     ):
         indexer.refresh_claim_graph_projection()
 
-    assert get_index_path().read_bytes() == before_projection
+    assert _projection_v2_commit_receipt(isolated_memory) == before_commit
 
 
 def test_incremental_projection_heavy_computation_runs_outside_write_transaction(
@@ -1312,13 +1402,41 @@ def test_incremental_projection_heavy_computation_runs_outside_write_transaction
     )
 
 
+def test_incremental_projection_does_not_materialize_full_search_rows(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import db_store, governance_store, indexer
+
+    db_store.init_db()
+    governance_store.upsert_entity(
+        "entity_incremental_streamed_digest",
+        {
+            "entity_id": "entity_incremental_streamed_digest",
+            "canonical_name": "Incremental Streamed Digest",
+            "entity_type": "concept",
+            "page_key": "Concept_Incremental-Streamed-Digest",
+        },
+    )
+    indexer.generate_index()
+    monkeypatch.setattr(
+        indexer,
+        "_search_projection_upserts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("incremental update must not materialize every FTS row")
+        ),
+    )
+
+    indexer.update_index_items(["Concept_Incremental-Streamed-Digest.md"])
+
+    assert db_store.get_search_projection_state()["status"] == "ready"
+
+
 def test_incremental_projection_rechecks_generation_after_write_lock(
     isolated_memory,
     monkeypatch,
 ):
     from vector_lake import db_store, governance_store, indexer
-    from vector_lake.wiki_utils import get_index_path
-
     db_store.init_db()
     entity = {
         "entity_id": "entity_incremental_cas",
@@ -1328,7 +1446,7 @@ def test_incremental_projection_rechecks_generation_after_write_lock(
     }
     governance_store.upsert_entity(entity["entity_id"], entity)
     indexer.generate_index()
-    before_projection = get_index_path().read_bytes()
+    before_commit = _projection_v2_commit_receipt(isolated_memory)
 
     stable = indexer.canonical_runtime_generation_snapshot()
     drifted = dict(stable)
@@ -1337,16 +1455,16 @@ def test_incremental_projection_rechecks_generation_after_write_lock(
     monkeypatch.setattr(
         indexer,
         "canonical_runtime_generation_snapshot",
-        lambda: next(snapshots),
+        lambda *_args, **_kwargs: next(snapshots),
     )
 
     with pytest.raises(
         indexer.ProjectionCanonicalGenerationChanged,
-        match="write lock",
+        match="while publishing incremental projection v2",
     ):
         indexer.update_index_items(["Concept_Incremental-CAS.md"])
 
-    assert get_index_path().read_bytes() == before_projection
+    assert _projection_v2_commit_receipt(isolated_memory) == before_commit
 
 
 def test_incremental_projection_rechecks_generation_after_projection_commit(
@@ -1354,8 +1472,6 @@ def test_incremental_projection_rechecks_generation_after_projection_commit(
     monkeypatch,
 ):
     from vector_lake import db_store, governance_store, indexer
-    from vector_lake.wiki_utils import get_index_path
-
     db_store.init_db()
     entity = {
         "entity_id": "entity_incremental_publish_cas",
@@ -1365,7 +1481,7 @@ def test_incremental_projection_rechecks_generation_after_projection_commit(
     }
     governance_store.upsert_entity(entity["entity_id"], entity)
     indexer.generate_index()
-    before_projection = get_index_path().read_bytes()
+    before_commit = _projection_v2_commit_receipt(isolated_memory)
     stable = indexer.canonical_runtime_generation_snapshot()
     drifted = dict(stable)
     drifted["entities"] += 1
@@ -1378,11 +1494,11 @@ def test_incremental_projection_rechecks_generation_after_projection_commit(
 
     with pytest.raises(
         indexer.ProjectionCanonicalGenerationChanged,
-        match="immediately before publishing",
+        match="while publishing incremental projection v2",
     ):
         indexer.update_index_items(["Concept_Incremental-Publish-CAS.md"])
 
-    assert get_index_path().read_bytes() == before_projection
+    assert _projection_v2_commit_receipt(isolated_memory) == before_commit
 
 
 def test_topology_refresh_heavy_computation_runs_outside_write_transaction(
@@ -1422,11 +1538,9 @@ def test_topology_refresh_rechecks_generation_after_projection_commit(
     monkeypatch,
 ):
     from vector_lake import db_store, indexer
-    from vector_lake.wiki_utils import get_index_path
-
     db_store.init_db()
     indexer.generate_index()
-    before_projection = get_index_path().read_bytes()
+    before_commit = _projection_v2_commit_receipt(isolated_memory)
     stable = indexer.canonical_runtime_generation_snapshot()
     drifted = dict(stable)
     drifted["page_graph_edges"] += 1
@@ -1439,18 +1553,21 @@ def test_topology_refresh_rechecks_generation_after_projection_commit(
 
     with pytest.raises(
         indexer.ProjectionCanonicalGenerationChanged,
-        match="immediately before publishing",
+        match="while publishing topology projection v2",
     ):
         indexer.refresh_graph_topology_if_dirty()
 
-    assert get_index_path().read_bytes() == before_projection
+    assert _projection_v2_commit_receipt(isolated_memory) == before_commit
 
 
 def test_incremental_projection_rebuilds_stale_generation_as_verified(
     isolated_memory,
 ):
     from vector_lake import db_store, governance_store, indexer
-    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+    from vector_lake.projection_format_v2 import (
+        load_committed_claim_graph,
+        read_committed_sidecar,
+    )
 
     db_store.init_db()
     indexer.generate_index()
@@ -1466,13 +1583,18 @@ def test_incremental_projection_rebuilds_stale_generation_as_verified(
 
     indexer.update_index_items(["Concept_Incremental-Generation.md"])
 
-    index_data = json.loads(get_index_path().read_text(encoding="utf-8"))
-    claim_graph = json.loads(get_claim_graph_path().read_text(encoding="utf-8"))
-    binding = indexer.projection_canonical_generation(index_data, claim_graph)
-    assert binding["status"] == "verified"
-    assert binding["runtime_generations"] == (
+    index_data = indexer.read_committed_index_snapshot()
+    claim_graph = load_committed_claim_graph(isolated_memory / "wiki")
+    sidecar, _identity, runtime = read_committed_sidecar(
+        isolated_memory / "wiki"
+    )
+    assert "Concept_Incremental-Generation" in index_data["nodes"]
+    assert isinstance(claim_graph["nodes"], list)
+    assert sidecar["canonical_generation"] == (
         indexer.canonical_runtime_generation_snapshot()
     )
+    assert runtime["status"] == "ready"
+    assert runtime["projection_generation"] == sidecar["projection_generation"]
     assert indexer.projection_pair_matches_current_generation() is True
 
 
@@ -1514,7 +1636,9 @@ def test_full_rebuild_aborts_when_one_canonical_entity_cannot_project(
     monkeypatch.setattr(indexer, "_entity_to_index_node", fail_one_entity)
 
     with pytest.raises(RuntimeError, match="Canonical entity projection failed"):
-        indexer.generate_index()
+        indexer.generate_index(
+            invalidate_embedding_ids={"entity_projection_failure"}
+        )
 
     assert {path: path.read_bytes() for path in paths} == before
     assert indexer.projection_pair_matches_current_generation() is True
@@ -1563,7 +1687,7 @@ def test_full_rebuild_aborts_when_canonical_graph_edge_query_fails(
     monkeypatch.setattr(db_store, "get_connection", lambda: ConnectionProxy())
 
     with pytest.raises(RuntimeError, match="Canonical graph-edge query failed"):
-        indexer.generate_index()
+        indexer.generate_index(invalidate_embedding_ids={"force-rebuild"})
 
     assert {path: path.read_bytes() for path in paths} == before
     assert indexer.projection_pair_matches_current_generation() is True
@@ -1618,7 +1742,7 @@ def test_incremental_writer_aborts_when_canonical_graph_edge_query_fails(
     assert indexer.projection_pair_matches_current_generation() is True
 
 
-def test_graph_reader_fails_closed_for_legacy_and_mismatched_projection_pairs(
+def test_graph_reader_fails_closed_for_all_legacy_projection_pairs(
     isolated_memory,
 ):
     from vector_lake import indexer
@@ -1639,7 +1763,7 @@ def test_graph_reader_fails_closed_for_legacy_and_mismatched_projection_pairs(
 
     with pytest.raises(
         indexer.ProjectionPairContractError,
-        match="Legacy index/claim-graph projections",
+        match="Projection v2 static locators are required",
     ):
         _read_projection_pair(str(index_path), str(claim_graph_path))
 
@@ -1666,7 +1790,7 @@ def test_graph_reader_fails_closed_for_legacy_and_mismatched_projection_pairs(
 
     with pytest.raises(
         indexer.ProjectionPairContractError,
-        match="generations do not match",
+        match="Projection v2 static locators are required",
     ):
         _read_projection_pair(str(index_path), str(claim_graph_path))
 
@@ -1678,7 +1802,7 @@ def test_graph_reader_fails_closed_for_legacy_and_mismatched_projection_pairs(
     )
     with pytest.raises(
         indexer.ProjectionPairContractError,
-        match="no canonical_generation",
+        match="Projection v2 static locators are required",
     ):
         _read_projection_pair(
             str(index_path),
@@ -1687,29 +1811,14 @@ def test_graph_reader_fails_closed_for_legacy_and_mismatched_projection_pairs(
 
 
 def test_graph_reader_observes_shared_publish_lock(isolated_memory):
-    from vector_lake import indexer
+    from vector_lake import db_store, indexer
     from vector_lake.tool_graph import _read_projection_pair
     from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
 
+    db_store.init_db()
+    indexer.generate_index()
     index_path = get_index_path()
     claim_graph_path = get_claim_graph_path()
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "contract": indexer.PROJECTION_CONTRACT,
-        "version": indexer.PROJECTION_CONTRACT_VERSION,
-        "generation": "locked-generation",
-        "published_at": "2026-07-27T00:00:00+00:00",
-    }
-    index_path.write_text(
-        json.dumps({"nodes": {}, indexer.PROJECTION_MANIFEST_KEY: manifest}),
-        encoding="utf-8",
-    )
-    claim_graph_path.write_text(
-        json.dumps(
-            {"nodes": [], "edges": [], indexer.PROJECTION_MANIFEST_KEY: manifest}
-        ),
-        encoding="utf-8",
-    )
 
     publish_lock = FileLock(str(index_path) + ".lock")
     publish_lock.acquire(timeout=0)
@@ -1728,6 +1837,14 @@ def test_graph_reader_requires_sidecar_commit_marker_and_artifact_digest(
     isolated_memory,
 ):
     from vector_lake import db_store, indexer
+    from vector_lake.projection_format_v2 import (
+        load_committed_claim_graph,
+        read_committed_sidecar,
+    )
+    from vector_lake.projection_store_v2 import (
+        ProjectionStoreError,
+        ProjectionStoreV2,
+    )
     from vector_lake.tool_graph import _read_projection_pair
     from vector_lake.wiki_utils import (
         get_claim_graph_path,
@@ -1745,19 +1862,19 @@ def test_graph_reader_requires_sidecar_commit_marker_and_artifact_digest(
     sidecar_path.unlink()
     with pytest.raises(
         indexer.ProjectionPairContractError,
-        match="sidecar is missing",
+        match="sidecar is missing or unreadable",
     ):
         _read_projection_pair(str(index_path), str(claim_graph_path))
 
     sidecar_path.write_text(sidecar_content, encoding="utf-8")
-    index_data = json.loads(index_path.read_text(encoding="utf-8"))
-    index_data["nodes"]["Concept_Tampered"] = {"title": "Tampered"}
-    index_path.write_text(json.dumps(index_data), encoding="utf-8")
-    with pytest.raises(
-        indexer.ProjectionPairContractError,
-        match="sidecar (size|digest) does not match index.json",
-    ):
-        _read_projection_pair(str(index_path), str(claim_graph_path))
+    sidecar, _identity, _runtime = read_committed_sidecar(
+        isolated_memory / "wiki"
+    )
+    store = ProjectionStoreV2(isolated_memory / "wiki")
+    claim_root = store.object_path(sidecar["claim_graph_root_sha256"])
+    claim_root.write_bytes(claim_root.read_bytes() + b" ")
+    with pytest.raises(ProjectionStoreError, match="hash_mismatch"):
+        load_committed_claim_graph(isolated_memory / "wiki")
 
 
 def test_graph_reader_ignores_soft_drift_and_rebuilds_blocking_drift(
@@ -1802,13 +1919,12 @@ def test_graph_reader_ignores_soft_drift_and_rebuilds_blocking_drift(
     _read_projection_pair(str(index_path), str(claim_graph_path))
 
 
-@pytest.mark.parametrize("failure_step", [1, 2, 3])
-def test_projection_publish_failure_is_fail_closed_and_retryable(
+def test_projection_v2_sidecar_publish_failure_is_fail_closed_and_recoverable(
     isolated_memory,
     monkeypatch,
-    failure_step,
 ):
-    from vector_lake import db_store, indexer
+    from vector_lake import db_store, governance_store, indexer, projection_format_v2
+    from vector_lake.projection_format_v2 import recover_pending_publish
     from vector_lake.tool_graph import _read_projection_pair
     from vector_lake.wiki_utils import (
         get_claim_graph_path,
@@ -1820,28 +1936,50 @@ def test_projection_publish_failure_is_fail_closed_and_retryable(
     indexer.generate_index()
     index_path = get_index_path()
     claim_graph_path = get_claim_graph_path()
-    real_replace = indexer._replace_projection_stage
-    calls = 0
+    before_locator_bytes = {
+        index_path: index_path.read_bytes(),
+        claim_graph_path: claim_graph_path.read_bytes(),
+    }
+    governance_store.upsert_entity(
+        "entity_publish_failure",
+        {
+            "entity_id": "entity_publish_failure",
+            "canonical_name": "Publish Failure",
+            "entity_type": "concept",
+            "page_key": "Concept_Publish-Failure",
+        },
+    )
+    real_replace = projection_format_v2._write_durable_replace
 
-    def fail_one_replace(stage_path, output_path):
-        nonlocal calls
-        calls += 1
-        if calls == failure_step:
-            raise OSError(f"injected projection publish failure {failure_step}")
-        return real_replace(stage_path, output_path)
+    def fail_sidecar_replace(output_path, payload):
+        if Path(output_path).name == "projection_pair_manifest.json":
+            raise OSError("injected projection sidecar publish failure")
+        return real_replace(output_path, payload)
 
-    monkeypatch.setattr(indexer, "_replace_projection_stage", fail_one_replace)
-    with pytest.raises(OSError, match="injected projection publish failure"):
-        indexer.refresh_claim_graph_projection()
+    monkeypatch.setattr(
+        projection_format_v2,
+        "_write_durable_replace",
+        fail_sidecar_replace,
+    )
+    with pytest.raises(OSError, match="injected projection sidecar publish failure"):
+        indexer.generate_index()
 
-    if failure_step == 1:
+    assert {
+        index_path: index_path.read_bytes(),
+        claim_graph_path: claim_graph_path.read_bytes(),
+    } == before_locator_bytes
+    assert db_store.get_projection_runtime_v9()["status"] == "publish_pending"
+    with pytest.raises(indexer.ProjectionPairContractError, match="not_ready"):
         _read_projection_pair(str(index_path), str(claim_graph_path))
-    else:
-        with pytest.raises(indexer.ProjectionPairContractError):
-            _read_projection_pair(str(index_path), str(claim_graph_path))
 
-    monkeypatch.setattr(indexer, "_replace_projection_stage", real_replace)
-    indexer.refresh_claim_graph_projection()
+    monkeypatch.setattr(
+        projection_format_v2,
+        "_write_durable_replace",
+        real_replace,
+    )
+    assert recover_pending_publish(isolated_memory / "wiki") is True
     _read_projection_pair(str(index_path), str(claim_graph_path))
+    committed = indexer.read_committed_index_snapshot()
+    assert "Concept_Publish-Failure" in committed["nodes"]
     assert not list(index_path.parent.glob("*.tmp*"))
     assert get_projection_manifest_path().is_file()

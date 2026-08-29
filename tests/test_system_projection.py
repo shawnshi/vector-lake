@@ -1,5 +1,3 @@
-import json
-
 from vector_lake import db_store, indexer, governance_store
 
 
@@ -18,24 +16,23 @@ def test_warm_incremental_index_removes_legacy_system_nodes(isolated_memory):
             }
         }
     })
-    indexer.generate_index()
-    path = isolated_memory / "wiki" / "index.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["nodes"]["System_Legacy"] = {
-        "id": "system-legacy",
-        "title": "Legacy System",
-        "type": "system",
-        "aliases": [],
-        "categories": [],
-    }
-    data["aliases"]["system-legacy"] = "System_Legacy"
-    data["weighted_edges"].append({"source": "System_Legacy", "target": "Concept_User", "weight": 2.0})
-    path.write_text(json.dumps(data), encoding="utf-8")
+    governance_store.upsert_entity(
+        "system-legacy",
+        {
+            "entity_id": "system-legacy",
+            "canonical_name": "Legacy System",
+            "page_key": "System_Legacy",
+            "type": "system",
+            "status": "Active",
+        },
+    )
     db_store.upsert_search_index("System_Legacy", "legacy", "system", "legacy system")
 
-    indexer.update_index_items(["Concept_User.md"])
+    indexer.generate_index()
 
-    updated = json.loads(path.read_text(encoding="utf-8"))
+    updated = indexer.read_committed_index_snapshot(
+        isolated_memory / "wiki" / "index.json"
+    )
     assert "System_Legacy" not in updated["nodes"]
     assert "system-legacy" not in updated["aliases"]
     assert all("System_Legacy" not in (edge["source"], edge["target"]) for edge in updated["weighted_edges"])

@@ -113,10 +113,18 @@ def _contained_lexical_path(
 
 
 @dataclass(frozen=True)
+class StableRawMetadata:
+    path: Path
+    observed_mtime_ns: int
+    observed_size: int
+    stat_identity: tuple[int, int, int, int, int, int]
+
+
+@dataclass(frozen=True)
 class StableRawRevision:
     path: Path
     canonical_revision: str
-    legacy_md5: str
+    legacy_md5: str | None
     observed_mtime_ns: int
     observed_size: int
     stat_identity: tuple[int, int, int, int, int, int]
@@ -124,8 +132,44 @@ class StableRawRevision:
 
     def matches(self, revision: object) -> bool:
         kind, digest = parse_revision(revision)
-        actual = self.legacy_md5 if kind == "md5" else self.canonical_revision[7:]
+        if kind == "md5":
+            if self.legacy_md5 is None:
+                return False
+            actual = self.legacy_md5
+        else:
+            actual = self.canonical_revision[7:]
         return hmac.compare_digest(actual, digest)
+
+
+def stable_raw_metadata(
+    filepath: str | os.PathLike[str],
+    *,
+    allowed_roots: Iterable[str | os.PathLike[str]] | None = None,
+) -> StableRawMetadata:
+    """Capture stable path metadata without reading raw-file contents."""
+    lexical = (
+        _contained_lexical_path(filepath, allowed_roots)
+        if allowed_roots is not None
+        else Path(os.path.abspath(os.fspath(filepath)))
+    )
+    path = lexical.resolve(strict=True)
+    before_path = path.stat()
+    if not stat.S_ISREG(before_path.st_mode):
+        raise OSError(f"raw_source_is_not_a_regular_file:{path}")
+    after_path = path.stat()
+    if _path_identity(before_path) != _path_identity(after_path):
+        raise RawSourceUnstableError("raw_source_changed_during_metadata_read")
+    return StableRawMetadata(
+        path=path,
+        observed_mtime_ns=int(after_path.st_mtime_ns),
+        observed_size=int(after_path.st_size),
+        stat_identity=_path_identity(after_path),
+    )
+
+
+def _read_raw_chunk(handle) -> bytes:
+    """Keep raw byte reads observable in tests without changing file semantics."""
+    return handle.read(_READ_CHUNK_BYTES)
 
 
 def stable_raw_revision(
@@ -134,6 +178,7 @@ def stable_raw_revision(
     capture_bytes: bool = False,
     max_bytes: int | None = None,
     allowed_roots: Iterable[str | os.PathLike[str]] | None = None,
+    include_legacy_md5: bool = True,
 ) -> StableRawRevision:
     """Hash the file behind one stable handle and verify stat-read-stat identity."""
     lexical = (
@@ -149,10 +194,12 @@ def stable_raw_revision(
         raise RawSourceTooLargeError("raw_source_exceeds_byte_limit")
 
     sha256 = hashlib.sha256()
-    try:
-        md5 = hashlib.md5(usedforsecurity=False)
-    except TypeError:  # pragma: no cover - compatibility for older Python builds
-        md5 = hashlib.md5()
+    md5 = None
+    if include_legacy_md5:
+        try:
+            md5 = hashlib.md5(usedforsecurity=False)
+        except TypeError:  # pragma: no cover - compatibility for older Python builds
+            md5 = hashlib.md5()
     captured = bytearray() if capture_bytes else None
 
     with path.open("rb") as handle:
@@ -161,14 +208,15 @@ def stable_raw_revision(
             raise RawSourceUnstableError("raw_source_changed_before_read")
         total = 0
         while True:
-            chunk = handle.read(_READ_CHUNK_BYTES)
+            chunk = _read_raw_chunk(handle)
             if not chunk:
                 break
             total += len(chunk)
             if max_bytes is not None and total > int(max_bytes):
                 raise RawSourceTooLargeError("raw_source_exceeds_byte_limit")
             sha256.update(chunk)
-            md5.update(chunk)
+            if md5 is not None:
+                md5.update(chunk)
             if captured is not None:
                 captured.extend(chunk)
         after_handle = os.fstat(handle.fileno())
@@ -190,7 +238,7 @@ def stable_raw_revision(
     return StableRawRevision(
         path=path,
         canonical_revision=f"sha256:{sha256.hexdigest()}",
-        legacy_md5=md5.hexdigest(),
+        legacy_md5=md5.hexdigest() if md5 is not None else None,
         observed_mtime_ns=int(after_path.st_mtime_ns),
         observed_size=int(after_path.st_size),
         stat_identity=_path_identity(after_path),
@@ -219,7 +267,11 @@ def current_file_proves_revisions(
     ):
         return False
     try:
-        snapshot = stable_raw_revision(filepath, allowed_roots=allowed_roots)
+        snapshot = stable_raw_revision(
+            filepath,
+            allowed_roots=allowed_roots,
+            include_legacy_md5=False,
+        )
         return snapshot.matches(job_revision) and snapshot.matches(marker_revision)
     except (
         OSError,

@@ -3,7 +3,6 @@ import json
 from contextlib import closing
 import os
 import sqlite3
-import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -326,38 +325,79 @@ def _create_verified_backup(
     return path
 
 
-def test_restorable_verification_releases_each_projection_root_before_next_decode(
+def test_restorable_verification_uses_v4_closure_without_legacy_decode(
     isolated_memory,
     monkeypatch,
 ):
+    from vector_lake import tool_projection
+
     db_store.init_db()
     indexer.generate_index()
     path = Path(create_maintenance_backup("projection_root_lifetime"))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    real_loads = json.loads
-    root_refs = []
+    real_validate = tool_projection.validate_maintenance_backup_v4
+    validated = []
 
-    class TrackingProjectionRoot(dict):
-        pass
+    def record_validation(manifest_path):
+        validated.append(Path(manifest_path))
+        return real_validate(manifest_path)
 
-    def tracking_loads(payload):
-        decoded = real_loads(payload)
-        if root_refs:
-            assert root_refs[-1]() is None
-        root = TrackingProjectionRoot(decoded)
-        root_refs.append(weakref.ref(root))
-        return root
+    def reject_legacy_decode(*_args, **_kwargs):
+        raise AssertionError("v4 verification must not decode legacy projection roots")
 
-    class TrackingJson:
-        loads = staticmethod(tracking_loads)
-        JSONDecodeError = json.JSONDecodeError
-
-    monkeypatch.setattr(tool_backup_retention, "json", TrackingJson)
+    monkeypatch.setattr(
+        tool_projection,
+        "validate_maintenance_backup_v4",
+        record_validation,
+    )
+    monkeypatch.setattr(
+        tool_backup_retention,
+        "_read_projection_contract_stub",
+        reject_legacy_decode,
+    )
 
     tool_backup_retention._verify_restorable_backup_snapshot(path, manifest)
 
-    assert len(root_refs) == 3
-    assert all(reference() is None for reference in root_refs)
+    assert validated
+    assert set(validated) == {path / "manifest.json"}
+
+
+def test_restorable_verification_keeps_v4_legacy_projection_compatibility(
+    isolated_memory,
+):
+    from vector_lake.projection_format_v2 import (
+        materialize_claim_graph,
+        materialize_index,
+    )
+    from vector_lake.wiki_utils import (
+        get_claim_graph_path,
+        get_index_path,
+        get_projection_manifest_path,
+    )
+
+    db_store.init_db()
+    indexer.generate_index()
+    index_path = get_index_path()
+    graph_path = get_claim_graph_path()
+    sidecar_path = get_projection_manifest_path()
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    index_path.write_text(
+        json.dumps(materialize_index(index_path.parent, sidecar)),
+        encoding="utf-8",
+    )
+    graph_path.write_text(
+        json.dumps(materialize_claim_graph(index_path.parent, sidecar)),
+        encoding="utf-8",
+    )
+    sidecar_path.unlink()
+
+    path = Path(create_maintenance_backup("v4_legacy_projection"))
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["manifest_version"] == 4
+    assert manifest["projection_format"] == 1
+    assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is True
+    tool_backup_retention._verify_restorable_backup_snapshot(path, manifest)
 
 
 def test_backup_retention_falls_back_to_older_verified_guard_after_hash_failure(
@@ -390,7 +430,11 @@ def test_backup_retention_falls_back_to_older_verified_guard_after_hash_failure(
     assert preview["restorable_guard"]["name"] == older.name
     failures = preview["restorable_verification_failures"]
     assert [item["name"] for item in failures] == [newer.name]
-    assert "backup_artifact_hash_mismatch" in failures[0]["verification_error"]
+    assert "backup_v4_artifact_validation_failed" in failures[0]["verification_error"]
+    assert (
+        "maintenance_backup_artifact_mismatch:vector_lake.db"
+        in (failures[0]["verification_error"])
+    )
     protected = {item["name"]: item for item in preview["protected"]}
     assert "latest_restorable" in protected[older.name]["reason"]
     assert "restorable_verification_failed" in protected[newer.name]["reason"]
@@ -405,6 +449,147 @@ def test_backup_retention_falls_back_to_older_verified_guard_after_hash_failure(
     assert result["deleted_count"] == 0
     assert older.is_dir()
     assert newer.is_dir()
+
+
+def test_backup_retention_v4_nested_object_tamper_falls_back_to_older_guard(
+    isolated_memory,
+):
+    db_store.init_db()
+    indexer.generate_index()
+    current = datetime.now(timezone.utc)
+    older = _create_verified_backup(
+        "nested_guard_older",
+        created_at=current - timedelta(days=90),
+        age=timedelta(days=90),
+    )
+    newer = _create_verified_backup(
+        "nested_object_corrupt",
+        created_at=current - timedelta(days=60),
+        age=timedelta(days=60),
+    )
+    manifest = json.loads((newer / "manifest.json").read_text(encoding="utf-8"))
+    object_name = manifest["projection_v2"]["object_artifacts"][0]
+    object_path = newer / Path(object_name)
+    with object_path.open("r+b") as handle:
+        first = handle.read(1)
+        assert first
+        handle.seek(0)
+        handle.write(bytes([first[0] ^ 0xFF]))
+
+    preview = json.loads(
+        tool_backup_retention.backup_retention_maintenance(
+            keep_latest=1,
+            min_age_days=30,
+            stage_ttl_hours=24,
+        )
+    )
+
+    assert preview["candidate_count"] == 0
+    assert preview["restorable_guard"]["name"] == older.name
+    failures = preview["restorable_verification_failures"]
+    assert [item["name"] for item in failures] == [newer.name]
+    assert (
+        f"maintenance_backup_artifact_mismatch:{object_name}"
+        in (failures[0]["verification_error"])
+    )
+    assert older.is_dir()
+    assert newer.is_dir()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_object", "unknown_nested_artifact", "declared_non_object_path"],
+)
+def test_backup_retention_v4_rejects_inexact_nested_object_tree(
+    isolated_memory,
+    mutation,
+):
+    db_store.init_db()
+    indexer.generate_index()
+    candidate = Path(create_maintenance_backup(f"inexact_{mutation}"))
+    manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
+    if mutation == "missing_object":
+        object_name = manifest["projection_v2"]["object_artifacts"][0]
+        (candidate / Path(object_name)).unlink()
+    elif mutation == "unknown_nested_artifact":
+        unexpected = candidate / ".projection-store" / "unexpected.bin"
+        unexpected.write_bytes(b"unexpected")
+    else:
+        object_name = "unexpected.bin"
+        unexpected = candidate / object_name
+        unexpected.write_bytes(b"unexpected")
+        manifest["copied"] = sorted([*manifest["copied"], object_name])
+        manifest["artifact_sha256"][object_name] = hashlib.sha256(
+            b"unexpected"
+        ).hexdigest()
+        manifest["artifact_bytes"][object_name] = len(b"unexpected")
+        manifest["projection_v2"]["object_artifacts"] = sorted(
+            [*manifest["projection_v2"]["object_artifacts"], object_name]
+        )
+        manifest["projection_v2"]["object_count"] += 1
+        (candidate / "manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+    _set_manifest_created_at(
+        candidate,
+        created_at=datetime.now(timezone.utc) - timedelta(days=90),
+    )
+    _set_age(candidate, age=timedelta(days=90))
+
+    preview = json.loads(
+        tool_backup_retention.backup_retention_maintenance(
+            keep_latest=1,
+            min_age_days=30,
+            stage_ttl_hours=24,
+        )
+    )
+
+    assert preview["candidate_count"] == 0
+    assert preview["protected"] == []
+    assert preview["ignored"] == [
+        {
+            "name": candidate.name,
+            "reason": "not_complete_backup",
+        }
+    ]
+    assert candidate.is_dir()
+
+
+def test_backup_retention_v4_restorable_guard_rejects_canonical_binding_tamper(
+    isolated_memory,
+):
+    db_store.init_db()
+    indexer.generate_index()
+    current = datetime.now(timezone.utc)
+    older = _create_verified_backup(
+        "binding_guard_older",
+        created_at=current - timedelta(days=90),
+        age=timedelta(days=90),
+    )
+    newer = _create_verified_backup(
+        "binding_tampered_newer",
+        created_at=current - timedelta(days=60),
+        age=timedelta(days=60),
+    )
+    manifest_path = newer / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["projection_canonical_generation"]["token"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    preview = json.loads(
+        tool_backup_retention.backup_retention_maintenance(
+            keep_latest=1,
+            min_age_days=30,
+            stage_ttl_hours=24,
+        )
+    )
+
+    assert preview["candidate_count"] == 0
+    assert preview["restorable_guard"]["name"] == older.name
+    failures = preview["restorable_verification_failures"]
+    assert [item["name"] for item in failures] == [newer.name]
+    assert "backup_projection_binding_mismatch" in failures[0]["verification_error"]
 
 
 def test_backup_retention_rejects_schema_invalid_claim_with_matching_hash(
@@ -1253,3 +1438,35 @@ def test_backup_retention_empty_absent_root_apply_is_safe(tmp_path, monkeypatch)
     assert result["applied"] is True
     assert result["deleted_count"] == 0
     assert not (meta / "backups").exists()
+
+
+def test_backup_retention_reports_quota_that_protected_backup_cannot_reclaim(
+    backup_root,
+    monkeypatch,
+):
+    _complete_backup(
+        backup_root,
+        "older",
+        age=timedelta(days=90),
+    )
+    protected = _complete_backup(
+        backup_root,
+        "newest",
+        age=timedelta(days=60),
+    )
+    monkeypatch.setenv("VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES", "1")
+    monkeypatch.setenv("VECTOR_LAKE_BACKUP_MIN_FREE_BYTES", "0")
+    monkeypatch.setenv("VECTOR_LAKE_BACKUP_MIN_FREE_RATIO", "0")
+
+    result = json.loads(
+        tool_backup_retention.backup_retention_maintenance(
+            keep_latest=1,
+            min_age_days=30,
+            stage_ttl_hours=24,
+        )
+    )
+
+    assert result["capacity"]["quota_exceeded"] is True
+    assert result["capacity_after_candidate_reclaim"]["quota_exceeded"] is True
+    assert result["quota_unreclaimable"] is True
+    assert {item["name"] for item in result["protected"]} == {protected.name}

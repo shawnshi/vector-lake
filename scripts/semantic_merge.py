@@ -27,6 +27,9 @@ def merge_markdown_files(left_path, right_path):
     print(f"Merged {right} into {left} through the canonical mutation coordinator.")
 
 if __name__ == "__main__":
+    from vector_lake.runtime_paths import bootstrap_runtime_paths
+
+    bootstrap_runtime_paths(caller="Semantic merge")
     if len(sys.argv) < 3:
         print("Usage: python semantic_merge.py <left_path> <right_path>")
         sys.exit(1)

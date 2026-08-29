@@ -10,6 +10,11 @@ import pytest
 
 from vector_lake import db_store, governance_store, indexer
 from vector_lake.mutation_coordinator import execute_mutation_plan
+from vector_lake.projection_format_v2 import (
+    build_projection_roots,
+    load_committed_claim_graph,
+    publish_prepared_projection,
+)
 from vector_lake.runtime_health import assess_runtime_health, assess_semantic_readiness
 from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.watchdog_status import get_status_file, write_status
@@ -54,6 +59,15 @@ def test_runtime_health_surfaces_storage_growth_delta(isolated_memory):
     assert health["detail"]["storage_growth"]["delta"]["database_bytes"] == 50
 
 
+def test_runtime_health_warns_when_auto_ingest_is_disabled(isolated_memory):
+    db_store.init_db()
+
+    health = assess_runtime_health()
+
+    assert health["detail"]["auto_ingest_enabled"] is False
+    assert "auto_ingest_disabled" in health["warnings"]
+
+
 def test_watchdog_status_read_retries_transient_permission_error(tmp_path, monkeypatch):
     from vector_lake import runtime_health
 
@@ -74,6 +88,48 @@ def test_watchdog_status_read_retries_transient_permission_error(tmp_path, monke
 
     assert runtime_health._read_watchdog_status(status_path) == {}
     assert attempts == 2
+
+
+def test_fresh_watchdog_heartbeat_with_dead_process_is_not_healthy(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import runtime_health, watchdog_status
+
+    db_store.init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    components = {
+        name: {
+            "status": "idle",
+            "heartbeat_at": now,
+            "updated_at": now,
+            "process_id": 424242,
+            "run_id": "dead-run",
+        }
+        for name in ("watchdog", "outbox", "scheduler", "ingest")
+    }
+    status_path = isolated_memory / "wiki" / ".meta" / ".watchdog_status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "run_id": "dead-run",
+                "process_id": 424242,
+                "status": "idle",
+                "updated_at": now,
+                "components": components,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(watchdog_status, "_process_is_alive", lambda _pid: False)
+
+    health = runtime_health.assess_runtime_health(max_watchdog_age_seconds=120)
+
+    assert health["detail"]["watchdog_age_seconds"] <= 2
+    assert health["detail"]["watchdog_process_alive"] is False
+    assert "watchdog_process_not_alive:424242" in health["issues"]
+    assert health["ok"] is False
 
 
 def test_runtime_health_uses_immutable_read_only_uri_when_wal_is_empty(
@@ -163,6 +219,7 @@ def _write_auto_ingest_health_config(memory_dir, **updates):
     payload = {
         "schema_version": 1,
         "enabled": True,
+        "allow_model_processing_raw_text": True,
         "timeout_seconds": 1200,
     }
     payload.update(updates)
@@ -172,6 +229,38 @@ def _write_auto_ingest_health_config(memory_dir, **updates):
         json.dumps(payload),
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize(
+    ("consent", "expected_error"),
+    [
+        (None, "allow_model_processing_raw_text_must_be_boolean"),
+        (False, "model_raw_text_processing_not_authorized"),
+    ],
+)
+def test_auto_ingest_health_fails_closed_without_raw_text_consent(
+    isolated_memory,
+    consent,
+    expected_error,
+):
+    from vector_lake import runtime_health
+
+    updates = {"allow_model_processing_raw_text": consent}
+    if consent is None:
+        updates = {}
+    _write_auto_ingest_health_config(isolated_memory, **updates)
+    path = isolated_memory / "wiki" / ".meta" / "auto_ingest_config.json"
+    if consent is None:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("allow_model_processing_raw_text")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    enabled, _config, error = runtime_health._auto_ingest_health_config(
+        path.parent
+    )
+
+    assert enabled is False
+    assert error == expected_error
 
 
 def _write_complete_watchdog_status(
@@ -1073,6 +1162,22 @@ def test_full_write_gate_rejects_equal_key_wiki_content_drift(isolated_memory):
         )
 
 
+def _publish_index_projection_drift(isolated_memory, node_key, **changes):
+    """Publish a valid v2 pair with intentional index/canonical content drift."""
+    base = isolated_memory / "wiki"
+    index_data = indexer.read_committed_index_snapshot(_mutable=True)
+    node = dict(index_data["nodes"][node_key])
+    node.update(changes)
+    index_data["nodes"][node_key] = node
+    prepared = build_projection_roots(
+        base,
+        index_data,
+        load_committed_claim_graph(base),
+        canonical_generation=indexer.canonical_runtime_generation_snapshot(),
+    )
+    publish_prepared_projection(base, prepared)
+
+
 def test_deep_health_rejects_index_body_drift_with_equal_keys(isolated_memory):
     from vector_lake.watchdog_app import process_mutation_outbox_batch
 
@@ -1080,10 +1185,11 @@ def test_deep_health_rejects_index_body_drift_with_equal_keys(isolated_memory):
     content = _source_content("source_index_health", "Index Health")
     execute_mutation_plan("Source_Index-Health.md", content=content)
     assert process_mutation_outbox_batch()["completed"] == 1
-    index_path = isolated_memory / "wiki" / "index.json"
-    data = json.loads(index_path.read_text(encoding="utf-8"))
-    data["nodes"]["Source_Index-Health"]["raw_text"] = "Drifted index content."
-    index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    _publish_index_projection_drift(
+        isolated_memory,
+        "Source_Index-Health",
+        raw_text="Drifted index content.",
+    )
 
     health = assess_runtime_health(deep_projection_checks=True)
 
@@ -1098,10 +1204,11 @@ def test_deep_health_rejects_index_title_drift_with_equal_body(isolated_memory):
     content = _source_content("source_index_title", "Canonical Title")
     execute_mutation_plan("Source_Index-Title.md", content=content)
     assert process_mutation_outbox_batch()["completed"] == 1
-    index_path = isolated_memory / "wiki" / "index.json"
-    data = json.loads(index_path.read_text(encoding="utf-8"))
-    data["nodes"]["Source_Index-Title"]["title"] = "Wrong Title"
-    index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    _publish_index_projection_drift(
+        isolated_memory,
+        "Source_Index-Title",
+        title="Wrong Title",
+    )
 
     health = assess_runtime_health(deep_projection_checks=True)
 

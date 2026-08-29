@@ -11,9 +11,20 @@ def test_capability_manifest_is_explicit_about_governance_boundary():
     manifest = memory_protocol.capability_manifest()
 
     assert manifest["contract_version"] == "vector-lake-agent-memory/v1"
+    assert manifest["effective_surface"] == "full"
+    assert manifest["available_verbs"] == list(
+        memory_protocol.MEMORY_PROTOCOL_VERBS
+    )
+    assert manifest["omitted_by_surface"] == []
     assert tuple(manifest["verbs"]) == memory_protocol.MEMORY_PROTOCOL_VERBS
     assert "forget" in manifest["omitted_verbs"]
     assert manifest["verbs"]["remember"]["mutability"] == "governed_write"
+    assert manifest["verbs"]["recall"]["modes"] == ["page", "memory", "fact"]
+    claim_alias = manifest["verbs"]["recall"]["deprecated_mode_aliases"][
+        "claim"
+    ]
+    assert claim_alias["effective_mode"] == "fact"
+    assert claim_alias["canonical_claim_records"] is False
 
 
 def test_entity_verb_preserves_ambiguous_exact_matches(monkeypatch):
@@ -76,7 +87,63 @@ def _server_with_tools(names) -> FastMCP:
     return server
 
 
-def test_memory_surface_is_exact_and_fail_closed():
+@pytest.mark.parametrize(
+    ("surface", "expected_omitted"),
+    [
+        ("full", []),
+        ("memory", []),
+        ("readonly", ["remember"]),
+    ],
+)
+def test_memory_capabilities_match_effective_tools_list(
+    monkeypatch,
+    surface,
+    expected_omitted,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_SURFACE", "full")
+    public_tools = {
+        tool.name for tool in mcp_server.mcp._tool_manager.list_tools()
+    }
+    server = _server_with_tools(public_tools)
+    effective_tools = mcp_server.configure_mcp_surface(server, surface)
+    monkeypatch.setattr(mcp_server, "mcp", server)
+
+    manifest = json.loads(mcp_server.memory_capabilities())
+    expected_verbs = [
+        verb
+        for verb in memory_protocol.MEMORY_PROTOCOL_VERBS
+        if verb in effective_tools
+    ]
+
+    assert manifest["effective_surface"] == surface
+    assert manifest["available_verbs"] == expected_verbs
+    assert set(manifest["verbs"]) == set(expected_verbs)
+    assert manifest["omitted_by_surface"] == expected_omitted
+    if surface == "readonly":
+        assert "remember" not in manifest["verbs"]
+        assert "remember" not in manifest["available_verbs"]
+
+
+def test_recall_claim_mode_reports_fact_alias_semantics(monkeypatch):
+    calls = []
+
+    def fake_search(*_args, **kwargs):
+        calls.append(kwargs)
+        return "deprecated fact-only result"
+
+    monkeypatch.setattr(memory_protocol, "search_vector_lake", fake_search)
+
+    result = memory_protocol.recall("query", mode="claim")
+
+    assert calls[0]["mode"] == "claim"
+    assert result["requested_mode"] == "claim"
+    assert result["mode"] == "fact"
+    assert result["deprecated_alias"] is True
+    assert "not canonical Claim records" in result["semantic_warning"]
+
+
+def test_memory_surface_is_exact_and_fail_closed(monkeypatch):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_SURFACE", "full")
     server = _server_with_tools(
         [*mcp_server._MEMORY_MCP_SURFACE_TOOLS, "dangerous_extra"]
     )
@@ -100,10 +167,14 @@ def test_public_surface_counts_match_documented_contract():
     )
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert len(mcp_server.mcp._tool_manager.list_tools()) == 60
-    assert len(mcp_server._MEMORY_MCP_SURFACE_TOOLS) == 8
-    assert len(subcommands) == 35
-    assert "60 MCP tools (`full`) / 8 MCP tools (`memory`) / 35 CLI commands" in readme
+    assert len(mcp_server.mcp._tool_manager.list_tools()) == 63
+    assert len(mcp_server._MEMORY_MCP_SURFACE_TOOLS) == 9
+    assert len(mcp_server._READONLY_MCP_SURFACE_TOOLS) == 21
+    assert len(subcommands) == 40
+    assert (
+        "63 MCP tools (`full`) / 9 MCP tools (`memory`) / "
+        "21 MCP tools (`readonly`) / 40 CLI commands"
+    ) in readme
 
 
 def test_remember_wrapper_rejects_payload_without_leaking_exception(monkeypatch):

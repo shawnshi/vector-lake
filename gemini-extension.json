@@ -1,7 +1,7 @@
 {
   "name": "vector-lake",
-  "version": "11.18.1",
-  "description": "Local file-first knowledge compiler with auditable Markdown, structured memory, and graph operations.",
+  "version": "11.20.0",
+  "description": "Local file-first knowledge compiler for healthcare digitalization research, with auditable Markdown, structured memory, and graph governance.",
   "contextFileName": "CONTEXT.md",
   "mcpServers": {
     "vector-lake-mcp": {
@@ -13,7 +13,10 @@
       "cwd": "${extensionPath}",
       "env": {
         "PYTHONPATH": "${extensionPath}",
-        "VECTOR_LAKE_META_DIR": "~/.gemini/MEMORY/wiki/.meta",
+        "VECTOR_LAKE_MEMORY_DIR": "~/MEMORY",
+        "VECTOR_LAKE_META_DIR": "~/MEMORY/wiki/.meta",
+        "VECTOR_LAKE_OPERATIONAL_MEMORY_FTS": "1",
+        "VECTOR_LAKE_DURABILITY_PROFILE": "full",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1"
       }
@@ -21,7 +24,7 @@
   },
   "runtime": {
     "recommended_cwd": "plugins/vector-lake/",
-    "python_version": ">=3.10",
+    "python_version": ">=3.11",
     "setup": "pip install -r requirements.txt"
   },
   "excludeTools": [

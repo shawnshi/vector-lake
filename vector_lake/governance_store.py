@@ -8,6 +8,7 @@ import math
 import os
 import re
 import sqlite3
+import time
 import unicodedata
 import uuid
 import zlib
@@ -21,7 +22,20 @@ except ImportError:  # pragma: no cover - minimal installations use stdlib JSON
     _orjson = None
 
 from vector_lake.claim_extractor import classify_non_claim_text, extract_page_objects
-from vector_lake.db_store import get_connection, init_db, peek_db_path, transaction
+from vector_lake.db_store import (
+    OperationalMemorySearchIntegrityLimitExceeded,
+    certify_operational_memory_search_integrity,
+    get_connection,
+    init_db,
+    invalidate_operational_memory_search_proof,
+    mark_operational_memory_search_rebuild_required,
+    mcp_readonly_surface_enabled,
+    operational_memory_search_source_sha256,
+    peek_db_path,
+    require_current_schema_for_read,
+    transaction,
+    verify_operational_memory_search_integrity,
+)
 from vector_lake.evidence_foundation import version_family_id
 from vector_lake.wiki_utils import (
     get_meta_dir,
@@ -60,11 +74,17 @@ VALIDITY_FACTORS = {
 class OperationalMemoryNotReady(RuntimeError):
     """A read-only memory query cannot safely use the current projection."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, *, retry_after_seconds: int = 5):
         self.reason = str(reason)
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
         super().__init__(
-            f"Operational-memory projection unavailable: {self.reason}"
+            "Operational-memory projection unavailable: "
+            f"{self.reason}; retry_after_seconds={self.retry_after_seconds}"
         )
+
+
+class CanonicalStoreNotReady(RuntimeError):
+    """A read-only caller cannot bootstrap an empty canonical store."""
 
 
 
@@ -185,6 +205,9 @@ def _validate_table_name(table_name: str):
         raise ValueError(f"Security error: Invalid table name '{table_name}'. Expected one of {ALLOWED_TABLES}.")
 
 def initialize_meta_store():
+    if mcp_readonly_surface_enabled():
+        require_current_schema_for_read()
+        return
     init_db()
 
 
@@ -2434,21 +2457,64 @@ _MEMORY_QUERY_TERM_LIMIT = 128
 _MEMORY_QUERY_TERM_CHAR_LIMIT = 512
 _MEMORY_MATCHER_PATTERN_CHAR_LIMIT = 8_192
 _MEMORY_CANDIDATE_TERM_LIMIT = 12
-_MEMORY_SEARCH_INDEX_DEFAULT_BATCH = 256
+_MEMORY_SEARCH_INDEX_DEFAULT_BATCH = 512
 _MEMORY_SEARCH_INDEX_MAX_BATCH = 10_000
-_MEMORY_SEARCH_INDEX_SCHEMA_VERSION = 5
+_MEMORY_SEARCH_INDEX_SCHEMA_VERSION = 7
+_MEMORY_SEARCH_DEGRADED_ROW_LIMIT = 5_000
+_MEMORY_SEARCH_DEGRADED_ROW_LIMIT_MAX = 50_000
+_MEMORY_SEARCH_PROGRESS_STALL_SECONDS = 15 * 60
 _MEMORY_SEARCH_INDEX_TABLES = frozenset({
     "operational_memory_search_fts",
     "operational_memory_search_short_fts",
     "operational_memory_search_docs",
     "operational_memory_search_pending",
     "operational_memory_search_state",
+    "operational_memory_search_revision",
 })
 
 
 def _operational_memory_search_index_enabled() -> bool:
     value = os.environ.get("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "0")
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _operational_memory_search_auto_maintenance_enabled() -> bool:
+    value = os.environ.get("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_MAINTAIN", "1")
+    return _operational_memory_search_index_enabled() and str(value).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _operational_memory_degraded_row_limit() -> int:
+    raw = os.environ.get(
+        "VECTOR_LAKE_OPERATIONAL_MEMORY_DEGRADED_ROW_LIMIT",
+        str(_MEMORY_SEARCH_DEGRADED_ROW_LIMIT),
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = _MEMORY_SEARCH_DEGRADED_ROW_LIMIT
+    return max(1, min(_MEMORY_SEARCH_DEGRADED_ROW_LIMIT_MAX, value))
+
+
+def _operational_memory_unbounded_fallback_enabled() -> bool:
+    value = os.environ.get(
+        "VECTOR_LAKE_OPERATIONAL_MEMORY_ALLOW_UNBOUNDED_FALLBACK",
+        "0",
+    )
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _operational_memory_retry_after_seconds() -> int:
+    raw = os.environ.get("VECTOR_LAKE_OPERATIONAL_MEMORY_RETRY_AFTER_SECONDS", "5")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 5
+    return max(1, min(300, value))
 
 
 def _operational_memory_search_batch_size() -> int:
@@ -2469,7 +2535,87 @@ def _memory_search_index_schema_available(conn: sqlite3.Connection) -> bool:
         f"SELECT name FROM sqlite_master WHERE name IN ({placeholders})",
         tuple(sorted(_MEMORY_SEARCH_INDEX_TABLES)),
     ).fetchall()
-    return {str(row[0]) for row in rows} == _MEMORY_SEARCH_INDEX_TABLES
+    if {str(row[0]) for row in rows} != _MEMORY_SEARCH_INDEX_TABLES:
+        return False
+    docs_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(operational_memory_search_docs)"
+        )
+    }
+    state_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(operational_memory_search_state)"
+        )
+    }
+    revision_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(operational_memory_search_revision)"
+        )
+    }
+    return {
+        "doc_id",
+        "memory_id",
+        "source_updated_at",
+        "source_sha256",
+    }.issubset(docs_columns) and {
+        "singleton",
+        "backfill_cursor",
+        "backfill_target",
+        "schema_version",
+        "proof_status",
+        "proof_generation",
+        "canonical_corpus_sha256",
+        "docs_corpus_sha256",
+        "trigram_corpus_sha256",
+        "short_corpus_sha256",
+        "updated_at",
+    }.issubset(state_columns) and {
+        "singleton",
+        "revision",
+        "updated_at",
+    }.issubset(revision_columns)
+
+
+def _operational_memory_search_index_counts(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    """Return one-snapshot canonical and derived-row counts."""
+    return {
+        "canonical_documents": int(
+            conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0]
+        ),
+        "indexed_documents": int(
+            conn.execute(
+                "SELECT COUNT(*) FROM operational_memory_search_docs"
+            ).fetchone()[0]
+        ),
+        "trigram_indexed_documents": int(
+            conn.execute(
+                "SELECT COUNT(*) FROM operational_memory_search_fts"
+            ).fetchone()[0]
+        ),
+        "short_indexed_documents": int(
+            conn.execute(
+                "SELECT COUNT(*) FROM operational_memory_search_short_fts"
+            ).fetchone()[0]
+        ),
+    }
+
+
+def _operational_memory_search_index_count_mismatch(
+    counts: dict[str, int],
+    *,
+    backfill_complete: bool,
+) -> bool:
+    indexed = counts["indexed_documents"]
+    return (
+        (backfill_complete and indexed != counts["canonical_documents"])
+        or counts["trigram_indexed_documents"] != indexed
+        or counts["short_indexed_documents"] != indexed
+    )
 
 
 def _memory_search_document_ids(
@@ -2545,14 +2691,19 @@ def _upsert_memory_search_documents(
                 page_text,
                 type_text,
             ),
+            operational_memory_search_source_sha256(
+                memory_id,
+                payload,
+                updated_at,
+            ),
         ))
 
     memory_ids = [row[0] for row in decoded]
     existing = _memory_search_document_ids(conn, memory_ids)
     conn.executemany(
         "INSERT OR IGNORE INTO operational_memory_search_docs "
-        "(memory_id, source_updated_at) VALUES (?, ?)",
-        [(row[0], row[1]) for row in decoded],
+        "(memory_id, source_updated_at, source_sha256) VALUES (?, ?, ?)",
+        [(row[0], row[1], row[7]) for row in decoded],
     )
     documents = _memory_search_document_ids(conn, memory_ids)
     if len(documents) != len(set(memory_ids)):
@@ -2571,9 +2722,10 @@ def _upsert_memory_search_documents(
             existing_doc_ids,
         )
     conn.executemany(
-        "UPDATE operational_memory_search_docs SET source_updated_at = ? "
+        "UPDATE operational_memory_search_docs SET source_updated_at = ?, "
+        "source_sha256 = ? "
         "WHERE doc_id = ?",
-        [(row[1], documents[row[0]]) for row in decoded],
+        [(row[1], row[7], documents[row[0]]) for row in decoded],
     )
     conn.executemany(
         "INSERT INTO operational_memory_search_fts "
@@ -2591,6 +2743,10 @@ def _upsert_memory_search_documents(
     )
 
 
+def _operational_memory_search_certification_gap_hook() -> None:
+    """Fault-injection seam for the post-commit certification fence."""
+
+
 def _advance_operational_memory_search_index(
     conn: sqlite3.Connection,
     batch_size: int | None = None,
@@ -2600,15 +2756,61 @@ def _advance_operational_memory_search_index(
         batch_size = _operational_memory_search_batch_size()
     else:
         batch_size = max(0, min(_MEMORY_SEARCH_INDEX_MAX_BATCH, int(batch_size)))
+    should_certify = False
+    certification_data_version = None
     with transaction(max_wait_seconds=0.1):
         state = conn.execute(
-            "SELECT backfill_cursor, backfill_target "
+            "SELECT backfill_cursor, backfill_target, proof_status "
             "FROM operational_memory_search_state WHERE singleton = 1"
         ).fetchone()
         if state is None:
             raise sqlite3.OperationalError("operational-memory search state is missing")
         cursor = str(state[0] or "")
         target = str(state[1] or "")
+        proof_status = str(state[2] or "")
+        projection_changed = False
+
+        pending_exists = conn.execute(
+            "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
+        ).fetchone() is not None
+        if batch_size and cursor >= target and proof_status != "ready":
+            # A completed cursor without a ready proof is not a trustworthy
+            # projection. Certification may have failed after the previous
+            # replay, leaving physical FTS bytes exposed to equal-count drift.
+            # Restart the bounded replay before any later certification can
+            # adopt those existing bytes as a new baseline.
+            mark_operational_memory_search_rebuild_required(conn)
+            cursor = ""
+            target = str(
+                conn.execute(
+                    "SELECT COALESCE(MAX(memory_id), '') "
+                    "FROM operational_memory"
+                ).fetchone()[0]
+                or ""
+            )
+            proof_status = "rebuild_required"
+        if batch_size and cursor >= target and not pending_exists:
+            counts = _operational_memory_search_index_counts(conn)
+            count_mismatch = _operational_memory_search_index_count_mismatch(
+                counts,
+                backfill_complete=True,
+            )
+            if not count_mismatch and proof_status == "ready":
+                integrity = verify_operational_memory_search_integrity(conn)
+                if integrity.get("issue") in {
+                    "operational_memory_search_integrity",
+                    "operational_memory_search_integrity_state",
+                }:
+                    mark_operational_memory_search_rebuild_required(conn)
+                    cursor = ""
+                    target = str(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(memory_id), '') "
+                            "FROM operational_memory"
+                        ).fetchone()[0]
+                        or ""
+                    )
+                    proof_status = "rebuild_required"
 
         pending_rows = conn.execute(
             "SELECT p.memory_id, p.operation, om.data_json, om.updated_at "
@@ -2617,6 +2819,9 @@ def _advance_operational_memory_search_index(
             "ORDER BY COALESCE(p.queued_at, ''), p.memory_id LIMIT ?",
             (batch_size,),
         ).fetchall()
+        if pending_rows and proof_status == "ready":
+            invalidate_operational_memory_search_proof(conn)
+            proof_status = "rebuild_required"
         _delete_memory_search_documents(
             conn,
             [
@@ -2634,12 +2839,77 @@ def _advance_operational_memory_search_index(
             ],
         )
         if pending_rows:
+            projection_changed = True
             conn.executemany(
                 "DELETE FROM operational_memory_search_pending WHERE memory_id = ?",
                 [(str(row[0]),) for row in pending_rows],
             )
 
         remaining = max(0, batch_size - len(pending_rows))
+        if remaining:
+            orphan_memory_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT docs.memory_id "
+                    "FROM operational_memory_search_docs AS docs "
+                    "LEFT JOIN operational_memory AS om "
+                    "ON om.memory_id = docs.memory_id "
+                    "WHERE om.memory_id IS NULL "
+                    "ORDER BY docs.memory_id LIMIT ?",
+                    (remaining,),
+                )
+            ]
+            if orphan_memory_ids and proof_status == "ready":
+                invalidate_operational_memory_search_proof(conn)
+                proof_status = "rebuild_required"
+            _delete_memory_search_documents(conn, orphan_memory_ids)
+            projection_changed = projection_changed or bool(orphan_memory_ids)
+            remaining -= len(orphan_memory_ids)
+
+        for table_name in (
+            "operational_memory_search_fts",
+            "operational_memory_search_short_fts",
+        ):
+            if not remaining:
+                break
+            orphan_doc_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    f"SELECT search.rowid FROM {table_name} AS search "
+                    "LEFT JOIN operational_memory_search_docs AS docs "
+                    "ON docs.doc_id = search.rowid "
+                    "WHERE docs.doc_id IS NULL ORDER BY search.rowid LIMIT ?",
+                    (remaining,),
+                )
+            ]
+            if orphan_doc_ids:
+                if proof_status == "ready":
+                    invalidate_operational_memory_search_proof(conn)
+                    proof_status = "rebuild_required"
+                conn.executemany(
+                    f"DELETE FROM {table_name} WHERE rowid = ?",
+                    [(doc_id,) for doc_id in orphan_doc_ids],
+                )
+                projection_changed = True
+                remaining -= len(orphan_doc_ids)
+
+        if remaining and cursor >= target:
+            counts = _operational_memory_search_index_counts(conn)
+            if _operational_memory_search_index_count_mismatch(
+                counts,
+                backfill_complete=True,
+            ):
+                mark_operational_memory_search_rebuild_required(conn)
+                cursor = ""
+                target = str(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(memory_id), '') "
+                        "FROM operational_memory"
+                    ).fetchone()[0]
+                    or ""
+                )
+                proof_status = "rebuild_required"
+
         backfill_rows = []
         if remaining and cursor < target:
             backfill_rows = conn.execute(
@@ -2648,10 +2918,14 @@ def _advance_operational_memory_search_index(
                 "ORDER BY memory_id LIMIT ?",
                 (cursor, target, remaining),
             ).fetchall()
+            if backfill_rows and proof_status == "ready":
+                invalidate_operational_memory_search_proof(conn)
+                proof_status = "rebuild_required"
             _upsert_memory_search_documents(
                 conn,
                 [(str(row[0]), row[1], row[2]) for row in backfill_rows],
             )
+            projection_changed = projection_changed or bool(backfill_rows)
             cursor = str(backfill_rows[-1][0]) if backfill_rows else target
 
         conn.execute(
@@ -2659,6 +2933,60 @@ def _advance_operational_memory_search_index(
             "backfill_cursor = ?, updated_at = ? WHERE singleton = 1",
             (cursor, _utc_now()),
         )
+        pending_after = conn.execute(
+            "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
+        ).fetchone() is not None
+        counts_after = _operational_memory_search_index_counts(conn)
+        complete = bool(
+            cursor >= target
+            and not pending_after
+            and not _operational_memory_search_index_count_mismatch(
+                counts_after,
+                backfill_complete=True,
+            )
+        )
+        should_certify = complete and (
+            projection_changed or proof_status != "ready"
+        )
+        if should_certify:
+            certification_data_version = int(
+                conn.execute("PRAGMA data_version").fetchone()[0] or 0
+            )
+    if should_certify:
+        try:
+            # FTS5 can finalize segment bytes at transaction commit. Certify in
+            # a fresh write-locked snapshot so the stored physical digest is
+            # the exact post-commit representation readers will observe.
+            _operational_memory_search_certification_gap_hook()
+            with transaction(max_wait_seconds=0.1):
+                observed_data_version = int(
+                    conn.execute("PRAGMA data_version").fetchone()[0] or 0
+                )
+                if observed_data_version != certification_data_version:
+                    # An external commit in the only unlocked gap may have
+                    # changed contentless FTS bytes. Never absorb those bytes as
+                    # a new trusted baseline; force a full bounded replay.
+                    mark_operational_memory_search_rebuild_required(conn)
+                    cursor = ""
+                    target = str(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(memory_id), '') "
+                            "FROM operational_memory"
+                        ).fetchone()[0]
+                        or ""
+                    )
+                else:
+                    certify_operational_memory_search_integrity(conn)
+        except (
+            OperationalMemorySearchIntegrityLimitExceeded,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            log.warning(
+                "Operational-memory search proof remains unready: %s",
+                exc,
+            )
     return cursor, target
 
 
@@ -2669,15 +2997,35 @@ def _memory_fts_expression(terms: list[str]) -> str:
     )
 
 
-def operational_memory_search_index_status() -> dict:
+def _operational_memory_progress_age_seconds(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
+def operational_memory_search_index_status(
+    *,
+    connection: sqlite3.Connection | None = None,
+    allow_integrity_scan: bool = True,
+) -> dict:
     """Inspect derived-index progress without creating schema or changing state."""
     configured = _operational_memory_search_index_enabled()
-    if not peek_db_path().exists():
+    if connection is None and not peek_db_path().exists():
         warnings = (
             ["operational_memory_search_database_missing"] if configured else []
         )
         return {
             "configured": configured,
+            "auto_maintenance_configured": (
+                _operational_memory_search_auto_maintenance_enabled()
+            ),
             "available": False,
             "ready": False,
             "status": "unavailable" if configured else "disabled",
@@ -2687,8 +3035,10 @@ def operational_memory_search_index_status() -> dict:
             "trigram_indexed_documents": 0,
             "short_indexed_documents": 0,
             "pending": 0,
+            "degraded_row_limit": _operational_memory_degraded_row_limit(),
+            "retry_after_seconds": _operational_memory_retry_after_seconds(),
         }
-    conn = get_connection()
+    conn = connection or get_connection()
     if not _memory_search_index_schema_available(conn):
         canonical_documents = 0
         if conn.execute(
@@ -2700,6 +3050,9 @@ def operational_memory_search_index_status() -> dict:
             ).fetchone()[0])
         return {
             "configured": configured,
+            "auto_maintenance_configured": (
+                _operational_memory_search_auto_maintenance_enabled()
+            ),
             "available": False,
             "ready": False,
             "status": "unavailable" if configured else "disabled",
@@ -2713,29 +3066,31 @@ def operational_memory_search_index_status() -> dict:
             "trigram_indexed_documents": 0,
             "short_indexed_documents": 0,
             "pending": 0,
+            "degraded_row_limit": _operational_memory_degraded_row_limit(),
+            "retry_after_seconds": _operational_memory_retry_after_seconds(),
         }
     state = conn.execute(
-        "SELECT backfill_cursor, backfill_target, schema_version "
+        "SELECT backfill_cursor, backfill_target, schema_version, updated_at, "
+        "proof_status, proof_generation "
         "FROM operational_memory_search_state WHERE singleton = 1"
     ).fetchone()
     cursor = str(state[0] or "") if state is not None else ""
     target = str(state[1] or "") if state is not None else ""
+    progress_updated_at = str(state[3] or "") if state is not None else ""
+    progress_age_seconds = _operational_memory_progress_age_seconds(
+        progress_updated_at
+    )
     pending = int(conn.execute(
         "SELECT COUNT(*) FROM operational_memory_search_pending"
     ).fetchone()[0])
-    indexed_documents = int(conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0])
-    trigram_indexed_documents = int(conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_fts"
-    ).fetchone()[0])
-    short_indexed_documents = int(conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_short_fts"
-    ).fetchone()[0])
-    canonical_documents = int(conn.execute(
-        "SELECT COUNT(*) FROM operational_memory"
-    ).fetchone()[0])
+    counts = _operational_memory_search_index_counts(conn)
+    indexed_documents = counts["indexed_documents"]
+    trigram_indexed_documents = counts["trigram_indexed_documents"]
+    short_indexed_documents = counts["short_indexed_documents"]
+    canonical_documents = counts["canonical_documents"]
     schema_version = int(state[2]) if state is not None else None
+    proof_status = str(state[4] or "") if state is not None else "missing"
+    proof_generation = str(state[5] or "") if state is not None else ""
     warnings: list[str] = []
     if schema_version != _MEMORY_SEARCH_INDEX_SCHEMA_VERSION:
         warnings.append(
@@ -2761,9 +3116,49 @@ def operational_memory_search_index_status() -> dict:
             "operational_memory_search_trigram_index_count_mismatch:"
             f"{trigram_indexed_documents}!={indexed_documents}"
         )
+    integrity = None
+    nominally_complete = bool(
+        configured
+        and schema_version == _MEMORY_SEARCH_INDEX_SCHEMA_VERSION
+        and cursor >= target
+        and not pending
+        and not _operational_memory_search_index_count_mismatch(
+            counts,
+            backfill_complete=True,
+        )
+    )
+    if nominally_complete:
+        if proof_status != "ready":
+            warnings.append("operational_memory_search_integrity_state")
+        else:
+            integrity = verify_operational_memory_search_integrity(
+                conn,
+                allow_full_scan=allow_integrity_scan,
+            )
+            if integrity.get("status") != "ready":
+                warnings.append(
+                    str(
+                        integrity.get("issue")
+                        or "operational_memory_search_integrity"
+                    )
+                )
+    stalled = bool(
+        configured
+        and warnings
+        and progress_age_seconds is not None
+        and progress_age_seconds > _MEMORY_SEARCH_PROGRESS_STALL_SECONDS
+    )
+    if stalled:
+        warnings.append(
+            "operational_memory_search_progress_stalled:"
+            f"{int(progress_age_seconds)}s"
+        )
     ready = configured and not warnings
     return {
         "configured": configured,
+        "auto_maintenance_configured": (
+            _operational_memory_search_auto_maintenance_enabled()
+        ),
         "available": True,
         "ready": ready,
         "status": "ready" if ready else ("backfilling" if configured else "disabled"),
@@ -2776,6 +3171,36 @@ def operational_memory_search_index_status() -> dict:
         "trigram_indexed_documents": trigram_indexed_documents,
         "short_indexed_documents": short_indexed_documents,
         "pending": pending,
+        "proof_status": proof_status,
+        "proof_generation": proof_generation or None,
+        "integrity_status": (
+            str(integrity.get("status")) if integrity is not None else None
+        ),
+        "integrity_inspected_rows": (
+            int(integrity.get("inspected_rows", 0))
+            if integrity is not None
+            else None
+        ),
+        "integrity_inspected_bytes": (
+            int(integrity.get("inspected_bytes", 0))
+            if integrity is not None
+            else None
+        ),
+        "integrity_verification_kind": (
+            str(integrity.get("verification_kind"))
+            if integrity is not None
+            else None
+        ),
+        "integrity_next_attestation_in_seconds": (
+            float(integrity.get("next_attestation_in_seconds", 0.0))
+            if integrity is not None
+            else None
+        ),
+        "progress_updated_at": progress_updated_at or None,
+        "progress_age_seconds": progress_age_seconds,
+        "progress_stalled": stalled,
+        "degraded_row_limit": _operational_memory_degraded_row_limit(),
+        "retry_after_seconds": _operational_memory_retry_after_seconds(),
     }
 
 
@@ -2799,19 +3224,50 @@ def maintain_operational_memory_search_index(
         conn,
         batch_size=batch_size,
     )
-    pending = int(conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0])
-    indexed_documents = int(conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0])
+    status = operational_memory_search_index_status()
     return {
         "available": True,
-        "ready": cursor >= target and pending == 0,
+        "ready": bool(status["ready"]),
         "backfill_cursor": cursor,
         "backfill_target": target,
-        "indexed_documents": indexed_documents,
-        "pending": pending,
+        "canonical_documents": int(status["canonical_documents"]),
+        "indexed_documents": int(status["indexed_documents"]),
+        "pending": int(status["pending"]),
+    }
+
+
+def maintain_operational_memory_search_index_budget(
+    *,
+    batch_size: int | None = None,
+    max_batches: int = 4,
+    wall_seconds: float = 2.0,
+) -> dict:
+    """Advance automatic maintenance within explicit work and wall bounds."""
+    max_batches = max(1, min(100, int(max_batches)))
+    wall_seconds = max(0.05, min(60.0, float(wall_seconds)))
+    started = time.monotonic()
+    batches = 0
+    result = operational_memory_search_index_status()
+    if (
+        not result.get("configured")
+        or not result.get("available")
+        or result.get("ready")
+    ):
+        return {
+            **result,
+            "batches": 0,
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+        }
+    while batches < max_batches and time.monotonic() - started < wall_seconds:
+        result = maintain_operational_memory_search_index(batch_size)
+        batches += 1
+        if result.get("ready"):
+            break
+    final_status = operational_memory_search_index_status()
+    return {
+        **final_status,
+        "batches": batches,
+        "elapsed_seconds": round(time.monotonic() - started, 6),
     }
 
 
@@ -2906,12 +3362,72 @@ def _indexed_operational_memory_query(
     )
 
 
+def _bounded_operational_memory_source_ids(
+    conn: sqlite3.Connection,
+    *,
+    cursor: str | None = None,
+    target: str | None = None,
+    include_pending: bool = False,
+) -> tuple[int, bool]:
+    """Count at most one bounded degraded source window.
+
+    This intentionally counts source rows before applying text predicates. A rare
+    term must not turn an apparently bounded fallback into a canonical full scan.
+    """
+    limit = _operational_memory_degraded_row_limit()
+    params: tuple[object, ...]
+    if cursor is None or target is None:
+        sql = "SELECT memory_id FROM operational_memory ORDER BY memory_id LIMIT ?"
+        params = (limit + 1,)
+    else:
+        sql = (
+            "SELECT memory_id FROM operational_memory WHERE memory_id > ? "
+            "AND memory_id <= ? ORDER BY memory_id LIMIT ?"
+        )
+        params = (cursor, target, limit + 1)
+    source_ids = {str(row[0]) for row in conn.execute(sql, params)}
+    if len(source_ids) > limit:
+        return limit + 1, True
+    if include_pending:
+        remaining = limit - len(source_ids)
+        pending_rows = conn.execute(
+            "SELECT memory_id FROM operational_memory_search_pending "
+            "ORDER BY memory_id LIMIT ?",
+            (remaining + 1,),
+        )
+        source_ids.update(str(row[0]) for row in pending_rows)
+    return min(len(source_ids), limit + 1), len(source_ids) > limit
+
+
+def _raise_if_unbounded_operational_memory_fallback(
+    conn: sqlite3.Connection,
+    *,
+    reason: str,
+    cursor: str | None = None,
+    target: str | None = None,
+    include_pending: bool = False,
+) -> None:
+    if _operational_memory_unbounded_fallback_enabled():
+        return
+    _observed, exceeded = _bounded_operational_memory_source_ids(
+        conn,
+        cursor=cursor,
+        target=target,
+        include_pending=include_pending,
+    )
+    if exceeded:
+        raise OperationalMemoryNotReady(
+            reason,
+            retry_after_seconds=_operational_memory_retry_after_seconds(),
+        )
+
+
 def _indexed_operational_memory_rows(
     conn: sqlite3.Connection,
     terms: list[str],
     allowed_types: set[str] | None,
 ):
-    """Return exact-recall read-only candidates, or None without FTS schema."""
+    """Return candidates plus a ready-proof fence, or None without FTS."""
     if (
         not terms
         or not _operational_memory_search_index_enabled()
@@ -2943,7 +3459,62 @@ def _indexed_operational_memory_rows(
         include_pending = conn.execute(
             "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
         ).fetchone() is not None
+        if cursor >= target and not include_pending:
+            counts = _operational_memory_search_index_counts(conn)
+            if _operational_memory_search_index_count_mismatch(
+                counts,
+                backfill_complete=True,
+            ):
+                _raise_if_unbounded_operational_memory_fallback(
+                    conn,
+                    reason="search_index_integrity_mismatch",
+                )
+                log.warning(
+                    "Operational-memory FTS integrity mismatch; using bounded "
+                    "compatibility prefilter"
+                )
+                return None
+            integrity = verify_operational_memory_search_integrity(conn)
+            if integrity.get("status") != "ready" or not isinstance(
+                integrity.get("signature"),
+                tuple,
+            ):
+                issue = str(
+                    integrity.get("issue")
+                    or "operational_memory_search_integrity"
+                )
+                reason = {
+                    "operational_memory_search_integrity_limit": (
+                        "search_index_integrity_limit"
+                    ),
+                    "operational_memory_search_integrity_race": (
+                        "search_index_integrity_race"
+                    ),
+                    "operational_memory_search_integrity_state": (
+                        "search_index_integrity_state"
+                    ),
+                }.get(issue, "search_index_integrity_mismatch")
+                _raise_if_unbounded_operational_memory_fallback(
+                    conn,
+                    reason=reason,
+                )
+                log.warning(
+                    "Operational-memory FTS proof failed (%s); using bounded "
+                    "compatibility prefilter",
+                    issue,
+                )
+                return None
+            integrity_signature = integrity["signature"]
+        else:
+            integrity_signature = None
         if cursor < target or include_pending:
+            _raise_if_unbounded_operational_memory_fallback(
+                conn,
+                reason="search_index_backfilling",
+                cursor=cursor,
+                target=target,
+                include_pending=include_pending,
+            )
             log.warning(
                 "Operational-memory FTS is not ready; merging bounded backfill/pending rows"
             )
@@ -2954,7 +3525,7 @@ def _indexed_operational_memory_rows(
             target=target,
             include_pending=include_pending,
         )
-        return conn.execute(sql, params)
+        return conn.execute(sql, params), integrity_signature
     except sqlite3.Error as exc:
         log.warning(
             "Operational-memory FTS unavailable; using compatibility prefilter: %s",
@@ -3156,10 +3727,21 @@ def search_operational_memory_views(
         }
     terms = _bounded_memory_query_terms(query)
     matcher = _memory_term_matcher(terms)
-    indexed_rows = _indexed_operational_memory_rows(conn, terms, allowed_types)
+    indexed_result = _indexed_operational_memory_rows(conn, terms, allowed_types)
+    indexed_rows = indexed_result[0] if indexed_result is not None else None
+    indexed_signature = indexed_result[1] if indexed_result is not None else None
     candidate_sql = None
     candidate_params: list[object] = []
     if indexed_rows is None:
+        fallback_reason = (
+            "search_index_unavailable"
+            if _operational_memory_search_index_enabled()
+            else "search_index_disabled"
+        )
+        _raise_if_unbounded_operational_memory_fallback(
+            conn,
+            reason=fallback_reason,
+        )
         candidate_terms = _memory_candidate_terms(query, terms)
         prefilter_terms = (
             candidate_terms if len(candidate_terms) == len(terms) else []
@@ -3224,11 +3806,44 @@ def search_operational_memory_views(
             state = str(memory.get("validity_state", "active")).lower()
             if state not in _MEMORY_HIDDEN_STATES:
                 push_ranked(current_heap, current_top_k, rank, memory)
+        if indexed_signature is not None:
+            integrity_after = verify_operational_memory_search_integrity(conn)
+            if (
+                integrity_after.get("status") != "ready"
+                or integrity_after.get("signature") != indexed_signature
+            ):
+                issue = str(
+                    integrity_after.get("issue")
+                    or "operational_memory_search_integrity_race"
+                )
+                reason = {
+                    "operational_memory_search_integrity_limit": (
+                        "search_index_integrity_limit"
+                    ),
+                    "operational_memory_search_integrity_state": (
+                        "search_index_integrity_state"
+                    ),
+                }.get(issue, "search_index_integrity_race")
+                _raise_if_unbounded_operational_memory_fallback(
+                    conn,
+                    reason=reason,
+                )
+                return _legacy_operational_memory_views(
+                    query,
+                    current_top_k,
+                    history_top_k,
+                    allowed_types,
+                    include_polluted,
+                )
     except sqlite3.OperationalError as exc:
         log.warning(
             "Operational-memory candidate query unavailable; using compatibility "
             "scan: %s",
             exc,
+        )
+        _raise_if_unbounded_operational_memory_fallback(
+            conn,
+            reason="search_index_query_failed",
         )
         return _legacy_operational_memory_views(
             query,
@@ -5601,6 +6216,9 @@ def ensure_canonical_store_populated() -> dict:
             "sources": counts["sources"],
             "pages_scanned": wiki_pages,
         }
+
+    if mcp_readonly_surface_enabled():
+        raise CanonicalStoreNotReady("canonical_store_not_ready:empty")
 
     log.info("Canonical store is empty; bootstrapping V8 objects from existing wiki pages.")
     result = migrate_existing_wiki(dry_run=False)

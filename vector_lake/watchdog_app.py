@@ -2,9 +2,11 @@ import hashlib
 import logging
 import os
 import queue
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from itertools import islice
 import json
@@ -866,7 +868,15 @@ class RawWatchdogHandler(FileSystemEventHandler):
         self,
         retry_base_seconds: float = 1.0,
         stop_event: threading.Event | None = None,
+        *,
+        monotonic: Callable[[], float] | None = None,
+        debounce_wake_event: threading.Event | None = None,
+        utc_now: Callable[[], datetime] | None = None,
+        scrub_ledger_path: str | os.PathLike[str] | None = None,
+        thread_factory: Callable[..., threading.Thread] | None = None,
     ):
+        from vector_lake.raw_scrub_contract import RawScrubLedger
+
         self.stop_event = stop_event or threading.Event()
         self.lock = threading.RLock()
         self.sync_thread: threading.Thread | None = None
@@ -877,6 +887,32 @@ class RawWatchdogHandler(FileSystemEventHandler):
         self.retry_attempt = 0
         self.retry_timer = None
         self.retry_base_seconds = max(0.01, float(retry_base_seconds))
+        self._monotonic = monotonic or time.monotonic
+        self._thread_factory = thread_factory or threading.Thread
+        self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
+        self._scrub_ledger = RawScrubLedger(
+            scrub_ledger_path,
+            utc_now=self._utc_now,
+        )
+        self._pending_scrub_day_ordinal: int | None = None
+        self._pending_scrub_period_days: int | None = None
+        self._active_scrub_attempt = None
+        self._debounce_wake = debounce_wake_event or threading.Event()
+        self._debounce_thread: threading.Thread | None = None
+        self._pending_since: float | None = None
+        self._last_pending_at: float | None = None
+        self._debounce_quiet_seconds = _bounded_env_float(
+            "VECTOR_LAKE_RAW_EVENT_QUIET_SECONDS",
+            0.75,
+            minimum=0.01,
+            maximum=60.0,
+        )
+        self._debounce_max_wait_seconds = _bounded_env_float(
+            "VECTOR_LAKE_RAW_EVENT_MAX_WAIT_SECONDS",
+            5.0,
+            minimum=0.1,
+            maximum=300.0,
+        )
 
     @staticmethod
     def _full_scan_complete(result) -> bool:
@@ -885,11 +921,77 @@ class RawWatchdogHandler(FileSystemEventHandler):
         lines = str(result or "").splitlines()
         return bool(lines) and lines[0].strip() == FULL_SCAN_COMPLETE_TOKEN
 
+    @staticmethod
+    def _scrub_period_days() -> int:
+        from vector_lake.tool_ingest import _raw_full_scan_scrub_days
+
+        return _raw_full_scan_scrub_days()
+
+    def _queue_scrub_cycle_locked(self, day_ordinal: int, period_days: int) -> None:
+        self._queue_batch_locked([], True)
+        if (
+            self._pending_scrub_day_ordinal is None
+            or day_ordinal >= self._pending_scrub_day_ordinal
+        ):
+            self._pending_scrub_day_ordinal = int(day_ordinal)
+            self._pending_scrub_period_days = int(period_days)
+
     def request_full_scan(self) -> None:
         """Schedule a bounded startup/recovery scan through the single-flight queue."""
+        now = self._utc_now()
+        if now.tzinfo is None:
+            raise ValueError("utc_now must return a timezone-aware datetime")
+        period_days = self._scrub_period_days()
+        current_day_ordinal = now.astimezone(timezone.utc).date().toordinal()
         with self.lock:
-            self._queue_batch_locked([], True)
+            try:
+                due = self._scrub_ledger.due_status(period_days=period_days)
+            except Exception as exc:
+                log.error(
+                    "Could not inspect raw scrub ledger before full scan: %s",
+                    exc,
+                )
+                due = None
+            if due is not None and due.due and not due.retry_ready:
+                return
+            self._queue_scrub_cycle_locked(
+                due.day_ordinal if due is not None and due.due else current_day_ordinal,
+                period_days,
+            )
             self._submit_pending_locked()
+
+    def request_scrub_if_due(self) -> bool:
+        """Schedule one persisted UTC-day scrub without duplicating its cycle."""
+        with self.lock:
+            if self.shutting_down or self.stop_event.is_set():
+                return False
+            period_days = self._scrub_period_days()
+            try:
+                status = self._scrub_ledger.due_status(period_days=period_days)
+            except Exception as exc:
+                log.error("Could not inspect raw scrub ledger; scan remains due: %s", exc)
+                return False
+            if not status.due or not status.retry_ready:
+                return False
+            active = self._active_scrub_attempt
+            if (
+                active is not None
+                and active.day_ordinal == status.day_ordinal
+                and active.period_days == status.period_days
+            ):
+                return False
+            if (
+                self.pending_overflow
+                and self._pending_scrub_day_ordinal == status.day_ordinal
+                and self._pending_scrub_period_days == status.period_days
+            ):
+                return False
+            self._queue_scrub_cycle_locked(
+                status.day_ordinal,
+                status.period_days,
+            )
+            self._submit_pending_locked()
+            return True
 
     def _run_ingest(self, paths, overflow):
         from vector_lake.tool_ingest import prepare_ingest_batch
@@ -915,38 +1017,135 @@ class RawWatchdogHandler(FileSystemEventHandler):
     def _queue_batch_locked(self, paths, overflow) -> None:
         max_pending = _positive_env_int("VECTOR_LAKE_RAW_EVENT_BUFFER", 500)
         for path in paths:
+            normalized = str(path)
+            if normalized in self.pending_paths:
+                continue
             if len(self.pending_paths) < max_pending:
-                self.pending_paths.add(str(path))
+                self.pending_paths.add(normalized)
             else:
                 overflow = True
         self.pending_overflow = self.pending_overflow or bool(overflow)
 
+    def _pending_deadline_locked(self) -> float | None:
+        if self._pending_since is None or self._last_pending_at is None:
+            return None
+        return min(
+            self._last_pending_at + self._debounce_quiet_seconds,
+            self._pending_since + self._debounce_max_wait_seconds,
+        )
+
+    def _ensure_debounce_thread_locked(self) -> None:
+        if self.shutting_down or self.stop_event.is_set():
+            return
+        current = self._debounce_thread
+        if current is not None and current.is_alive():
+            return
+        worker = self._thread_factory(
+            target=self._debounce_loop,
+            daemon=True,
+            name="vector-lake-raw-debounce",
+        )
+        self._debounce_thread = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            self._debounce_thread = None
+            self.retry_attempt += 1
+            log.error(
+                "Could not start raw debounce coordinator; retry scheduled: %s",
+                exc,
+            )
+            self._schedule_retry_locked()
+
+    def _mark_event_pending_locked(self) -> None:
+        now = float(self._monotonic())
+        if self._pending_since is None:
+            self._pending_since = now
+        self._last_pending_at = now
+        self._ensure_debounce_thread_locked()
+        self._debounce_wake.set()
+
+    def _debounce_loop(self) -> None:
+        """Submit one trailing-edge batch without losing in-flight arrivals."""
+        current = threading.current_thread()
+        while True:
+            with self.lock:
+                if self.shutting_down or self.stop_event.is_set():
+                    if self._debounce_thread is current:
+                        self._debounce_thread = None
+                    return
+                if not self.pending_paths and not self.pending_overflow:
+                    if self._debounce_thread is current:
+                        self._debounce_thread = None
+                    return
+
+                deadline = self._pending_deadline_locked()
+                now = float(self._monotonic())
+                dispatch_blocked = (
+                    self.retry_timer is not None or self.sync_future is not None
+                )
+                if deadline is None:
+                    if dispatch_blocked:
+                        wait_seconds = None
+                    else:
+                        self._submit_pending_locked()
+                        continue
+                elif now < deadline:
+                    wait_seconds = max(0.0, deadline - now)
+                elif dispatch_blocked:
+                    wait_seconds = None
+                else:
+                    self._submit_pending_locked()
+                    continue
+                self._debounce_wake.clear()
+            self._debounce_wake.wait(wait_seconds)
+
     def _retry_timer_fired(self) -> None:
         with self.lock:
             self.retry_timer = None
-            self._submit_pending_locked()
+            if self._pending_deadline_locked() is None:
+                self._submit_pending_locked()
+            else:
+                self._ensure_debounce_thread_locked()
+                self._debounce_wake.set()
 
-    def _schedule_retry_locked(self) -> None:
+    def _retry_delay_locked(self) -> float:
+        return min(
+            60.0,
+            self.retry_base_seconds * (2 ** min(max(0, self.retry_attempt - 1), 10)),
+        )
+
+    def _schedule_retry_locked(self, delay_seconds: float | None = None) -> None:
         if (
             self.shutting_down
             or self.stop_event.is_set()
             or self.retry_timer is not None
         ):
             return
-        delay = min(
-            60.0,
-            self.retry_base_seconds * (2 ** min(max(0, self.retry_attempt - 1), 10)),
+        delay = (
+            self._retry_delay_locked()
+            if delay_seconds is None
+            else max(0.01, min(60.0, float(delay_seconds)))
         )
         timer = threading.Timer(delay, self._retry_timer_fired)
         timer.daemon = True
         self.retry_timer = timer
         timer.start()
 
-    def _run_ingest_future(self, future, paths, overflow) -> None:
+    def _run_ingest_future(
+        self,
+        future,
+        paths,
+        overflow,
+        scrub_day_ordinal: int | None,
+    ) -> None:
+        from vector_lake.raw_scrub_contract import bind_raw_scrub_day
+
         if not future.set_running_or_notify_cancel():
             return
         try:
-            result = self._run_ingest(paths, overflow)
+            with bind_raw_scrub_day(scrub_day_ordinal if overflow else None):
+                result = self._run_ingest(paths, overflow)
         except BaseException as exc:
             future.set_exception(exc)
         else:
@@ -959,7 +1158,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
             or self.retry_timer is not None
         ):
             return
-        if self.sync_future is not None and not self.sync_future.done():
+        if self.sync_future is not None:
             return
         if not self.pending_paths and not self.pending_overflow:
             return
@@ -967,43 +1166,107 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
         paths = sorted(self.pending_paths)
         overflow = self.pending_overflow
+        scrub_day_ordinal = None
+        scrub_period_days = None
+        scrub_attempt = None
+        if overflow:
+            scrub_day_ordinal = self._pending_scrub_day_ordinal
+            scrub_period_days = self._pending_scrub_period_days
+            if scrub_day_ordinal is None:
+                now = self._utc_now()
+                if now.tzinfo is None:
+                    log.error("Could not persist raw scrub attempt: naive UTC clock")
+                    self.retry_attempt += 1
+                    self._schedule_retry_locked()
+                    return
+                scrub_day_ordinal = (
+                    now.astimezone(timezone.utc).date().toordinal()
+                )
+            if scrub_period_days is None:
+                scrub_period_days = self._scrub_period_days()
+            try:
+                scrub_attempt = self._scrub_ledger.begin_attempt(
+                    day_ordinal=scrub_day_ordinal,
+                    period_days=scrub_period_days,
+                    retry_delay_seconds=self._retry_delay_locked(),
+                )
+            except Exception as exc:
+                log.error(
+                    "Could not persist raw scrub attempt; scan remains queued: %s",
+                    exc,
+                )
+                self.retry_attempt += 1
+                self._schedule_retry_locked()
+                return
+        pending_since = self._pending_since
+        last_pending_at = self._last_pending_at
         self.pending_paths.clear()
         self.pending_overflow = False
+        self._pending_scrub_day_ordinal = None
+        self._pending_scrub_period_days = None
+        self._pending_since = None
+        self._last_pending_at = None
         future = concurrent.futures.Future()
-        worker = threading.Thread(
+        worker = self._thread_factory(
             target=self._run_ingest_future,
-            args=(future, paths, overflow),
+            args=(future, paths, overflow, scrub_day_ordinal),
             daemon=True,
             name="vector-lake-raw-ingest",
         )
         self.sync_future = future
         self.sync_thread = worker
+        self._active_scrub_attempt = scrub_attempt
         try:
             worker.start()
-        except Exception:
+        except Exception as exc:
             self.sync_future = None
             self.sync_thread = None
+            self._active_scrub_attempt = None
             self._queue_batch_locked(paths, overflow)
-            raise
+            self.retry_attempt += 1
+            retry_delay = self._retry_delay_locked()
+            if overflow:
+                self._pending_scrub_day_ordinal = scrub_day_ordinal
+                self._pending_scrub_period_days = scrub_period_days
+                try:
+                    self._scrub_ledger.finish_attempt(
+                        scrub_attempt,
+                        result="failed",
+                        retry_delay_seconds=retry_delay,
+                    )
+                except Exception as ledger_exc:
+                    log.error(
+                        "Could not persist raw scrub launch failure: %s",
+                        ledger_exc,
+                    )
+            self._pending_since = pending_since
+            self._last_pending_at = last_pending_at
+            log.error(
+                "Could not start raw ingest worker; retry scheduled: %s",
+                exc,
+            )
+            self._schedule_retry_locked(retry_delay)
+            return
         future.add_done_callback(
-            lambda completed, submitted_paths=paths, submitted_overflow=overflow: (
+            lambda completed, submitted_paths=paths, submitted_overflow=overflow, submitted_attempt=scrub_attempt: (
                 self._ingest_done(
                     completed,
                     submitted_paths,
                     submitted_overflow,
+                    submitted_attempt,
                 )
             )
         )
 
-    def _ingest_done(self, future, paths, overflow):
+    def _ingest_done(self, future, paths, overflow, scrub_attempt=None):
+        from vector_lake.heavy_task_gate import HeavyTaskBusy
+
         result = None
         try:
             result = future.result()
             error = None
         except BaseException as exc:
             error = exc
-            from vector_lake.heavy_task_gate import HeavyTaskBusy
-
             if isinstance(error, HeavyTaskBusy):
                 log.info(
                     "Raw full scan deferred because the heavy-task gate is occupied."
@@ -1014,22 +1277,68 @@ class RawWatchdogHandler(FileSystemEventHandler):
             if self.sync_future is future:
                 self.sync_future = None
                 self.sync_thread = None
-            if error is not None:
+            if self._active_scrub_attempt == scrub_attempt:
+                self._active_scrub_attempt = None
+            full_scan_incomplete = (
+                overflow and error is None and not self._full_scan_complete(result)
+            )
+            unsuccessful = error is not None or full_scan_incomplete
+            if unsuccessful:
                 self._queue_batch_locked(paths, overflow)
-                from vector_lake.heavy_task_gate import HeavyTaskBusy
-
+                if overflow and scrub_attempt is not None:
+                    self._pending_scrub_day_ordinal = scrub_attempt.day_ordinal
+                    self._pending_scrub_period_days = scrub_attempt.period_days
                 if not isinstance(error, HeavyTaskBusy):
                     self.retry_attempt += 1
             else:
                 self.retry_attempt = 0
-                if overflow and not self._full_scan_complete(result):
-                    self.pending_overflow = True
+            retry_delay = self._retry_delay_locked()
+            if scrub_attempt is not None and unsuccessful:
+                retry_delay = min(
+                    60.0,
+                    self.retry_base_seconds
+                    * (2 ** min(scrub_attempt.prior_retry_count, 10)),
+                )
+            if scrub_attempt is not None:
+                scrub_result = (
+                    "busy"
+                    if isinstance(error, HeavyTaskBusy)
+                    else "failed"
+                    if error is not None
+                    else "incomplete"
+                    if full_scan_incomplete
+                    else "success"
+                )
+                try:
+                    self._scrub_ledger.finish_attempt(
+                        scrub_attempt,
+                        result=scrub_result,
+                        retry_delay_seconds=retry_delay if unsuccessful else 0.0,
+                    )
+                except Exception as exc:
+                    log.error(
+                        "Could not persist raw scrub result; scan remains due: %s",
+                        exc,
+                    )
+                    if not unsuccessful:
+                        unsuccessful = True
+                        self._queue_batch_locked(paths, overflow)
+                        self._pending_scrub_day_ordinal = scrub_attempt.day_ordinal
+                        self._pending_scrub_period_days = scrub_attempt.period_days
+                        self.retry_attempt += 1
+                        retry_delay = self._retry_delay_locked()
             if self.shutting_down or self.stop_event.is_set():
                 return
-            if error is not None:
-                self._schedule_retry_locked()
+            if unsuccessful:
+                self._schedule_retry_locked(retry_delay)
+            elif self.pending_paths or self.pending_overflow:
+                if self._pending_deadline_locked() is None:
+                    self._submit_pending_locked()
+                else:
+                    self._ensure_debounce_thread_locked()
+                    self._debounce_wake.set()
             else:
-                self._submit_pending_locked()
+                self._debounce_wake.set()
 
     def shutdown(self, timeout_seconds: float | None = None) -> bool:
         """Stop accepting work and wait only within the configured deadline."""
@@ -1043,10 +1352,22 @@ class RawWatchdogHandler(FileSystemEventHandler):
         deadline = time.monotonic() + timeout
         with self.lock:
             self.shutting_down = True
+            self._debounce_wake.set()
+            debounce_thread = self._debounce_thread
             retry_timer = self.retry_timer
             self.retry_timer = None
             worker_thread = self.sync_thread
             future = self.sync_future
+
+        if (
+            debounce_thread is not None
+            and debounce_thread is not threading.current_thread()
+        ):
+            debounce_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        debounce_done = debounce_thread is None or not debounce_thread.is_alive()
+        if not debounce_done:
+            log.warning("Raw ingest debounce shutdown exceeded its deadline.")
+            return False
 
         if retry_timer is not None:
             retry_timer.cancel()
@@ -1075,25 +1396,84 @@ class RawWatchdogHandler(FileSystemEventHandler):
         with self.lock:
             paths = sorted(self.pending_paths)
             overflow = self.pending_overflow
+            scrub_day_ordinal = self._pending_scrub_day_ordinal
+            scrub_period_days = self._pending_scrub_period_days
             self.pending_paths.clear()
             self.pending_overflow = False
+            self._pending_scrub_day_ordinal = None
+            self._pending_scrub_period_days = None
+            self._pending_since = None
+            self._last_pending_at = None
+            self._debounce_thread = None
             self.sync_thread = None
             self.sync_future = None
 
         drain_error: list[BaseException] = []
+        drain_incomplete = False
         if paths or overflow:
 
             def drain_pending() -> None:
+                nonlocal drain_incomplete
+                from vector_lake.raw_scrub_contract import bind_raw_scrub_day
+
+                drain_attempt = None
                 try:
-                    result = self._run_ingest(paths, overflow)
+                    bound_day = scrub_day_ordinal
+                    bound_period = scrub_period_days
+                    if overflow:
+                        if bound_day is None:
+                            now = self._utc_now()
+                            if now.tzinfo is None:
+                                raise ValueError(
+                                    "utc_now must return a timezone-aware datetime"
+                                )
+                            bound_day = (
+                                now.astimezone(timezone.utc).date().toordinal()
+                            )
+                        if bound_period is None:
+                            bound_period = self._scrub_period_days()
+                        drain_attempt = self._scrub_ledger.begin_attempt(
+                            day_ordinal=bound_day,
+                            period_days=bound_period,
+                            retry_delay_seconds=self.retry_base_seconds,
+                        )
+                    with bind_raw_scrub_day(bound_day if overflow else None):
+                        result = self._run_ingest(paths, overflow)
                     if overflow and not self._full_scan_complete(result):
+                        drain_incomplete = True
+                        self._scrub_ledger.finish_attempt(
+                            drain_attempt,
+                            result="incomplete",
+                            retry_delay_seconds=self.retry_base_seconds,
+                        )
                         log.warning(
                             "Raw ingest shutdown left additional full-scan work pending."
                         )
+                    elif overflow:
+                        self._scrub_ledger.finish_attempt(
+                            drain_attempt,
+                            result="success",
+                        )
                 except BaseException as exc:
+                    if drain_attempt is not None:
+                        try:
+                            from vector_lake.heavy_task_gate import HeavyTaskBusy
+
+                            self._scrub_ledger.finish_attempt(
+                                drain_attempt,
+                                result=(
+                                    "busy" if isinstance(exc, HeavyTaskBusy) else "failed"
+                                ),
+                                retry_delay_seconds=self.retry_base_seconds,
+                            )
+                        except BaseException as ledger_exc:
+                            log.error(
+                                "Could not persist raw scrub shutdown failure: %s",
+                                ledger_exc,
+                            )
                     drain_error.append(exc)
 
-            drain_thread = threading.Thread(
+            drain_thread = self._thread_factory(
                 target=drain_pending,
                 daemon=True,
                 name="vector-lake-raw-shutdown-drain",
@@ -1106,7 +1486,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
         if drain_error:
             log.error("Raw ingest shutdown drain failed: %s", drain_error[0])
             return False
-        return True
+        return not drain_incomplete
 
     def handle_event(self, event):
         if event.is_directory:
@@ -1124,10 +1504,8 @@ class RawWatchdogHandler(FileSystemEventHandler):
         with self.lock:
             if self.shutting_down or self.stop_event.is_set():
                 return
-            # pending_paths is the trailing-edge debounce. An event received
-            # during an in-flight preparation is retained for the next pass.
             self._queue_batch_locked([str(Path(filepath).resolve())], False)
-            self._submit_pending_locked()
+            self._mark_event_pending_locked()
 
         _log_raw_event(filename)
 
@@ -1279,23 +1657,94 @@ def _apply_outbox_index_projection(indexer, filenames: list[str]) -> None:
     system_filenames = [
         filename for filename in filenames if indexer.is_system_page_filename(filename)
     ]
-    if indexer.index_projection_matches_canonical(filenames):
-        if not indexer.projection_pair_matches_current_generation():
-            indexer.refresh_claim_graph_projection()
-    else:
-        indexer.update_index_items(filenames)
-        if system_filenames and not indexer.index_projection_matches_canonical(
-            system_filenames
-        ):
+    try:
+        if indexer.index_projection_matches_canonical(filenames):
+            if not indexer.projection_pair_matches_current_generation():
+                indexer.refresh_claim_graph_projection()
+        else:
+            indexer.update_index_items(filenames)
+    except (
+        indexer.ProjectionPairContractError,
+        indexer.ProjectionV2ContractError,
+    ) as exc:
+        # A malformed/missing v2 commit surface cannot be incrementally reused.
+        # Perform exactly one canonical full rebuild, retaining the touched
+        # embedding invalidations, then prove the selected rows before acking.
+        log.warning(
+            "Outbox projection pair is not safely reusable (%s); attempting "
+            "one bounded canonical rebuild.",
+            exc,
+        )
+        indexer.generate_index(
+            invalidate_embedding_ids={
+                filename[:-3]
+                for filename in filenames
+                if filename.casefold().endswith(".md")
+            }
+        )
+        if not indexer.index_projection_matches_canonical(filenames):
             raise RuntimeError(
                 "Selected index projection does not match canonical state after "
-                "outbox indexing."
-            )
+                "the bounded outbox rebuild."
+            ) from exc
+    if system_filenames and not indexer.index_projection_matches_canonical(
+        system_filenames
+    ):
+        raise RuntimeError(
+            "Selected index projection does not match canonical state after "
+            "outbox indexing."
+        )
     if not indexer.projection_pair_matches_current_generation():
         raise RuntimeError(
             "Projection pair is not committed against the current canonical "
             "generation after outbox indexing."
         )
+
+
+def _transient_outbox_error_code(exc: Exception, indexer=None) -> str | None:
+    generation_error = getattr(
+        indexer,
+        "ProjectionCanonicalGenerationChanged",
+        (),
+    )
+    if generation_error and isinstance(exc, generation_error):
+        return "projection_generation_changed"
+    if isinstance(exc, TimeoutError) or (
+        exc.__class__.__name__ == "Timeout"
+        and exc.__class__.__module__.startswith("filelock")
+    ):
+        return "projection_lock_timeout"
+    if isinstance(exc, sqlite3.OperationalError):
+        sqlite_code = getattr(exc, "sqlite_errorcode", None)
+        if sqlite_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} or any(
+            marker in str(exc).casefold()
+            for marker in ("database is locked", "database table is locked")
+        ):
+            return "sqlite_busy"
+    return None
+
+
+def _defer_transient_outbox_rows(
+    rows: list[dict],
+    *,
+    db_store,
+    exc: Exception,
+    error_code: str,
+    backoff_base: float,
+    stats: dict,
+) -> None:
+    for row in rows:
+        status = db_store.defer_mutation_outbox(
+            int(row["id"]),
+            str(exc),
+            row["lease_owner"],
+            row["lease_token"],
+            int(row["lease_generation"]),
+            error_code=error_code,
+            backoff_base=backoff_base,
+        )
+        if status != "stale":
+            stats["retrying"] += 1
 
 
 def _settle_outbox_index_partition(
@@ -1341,6 +1790,22 @@ def _settle_outbox_index_partition(
             ),
         )
     except Exception as exc:
+        transient_code = _transient_outbox_error_code(exc, indexer=indexer)
+        if transient_code is not None:
+            _defer_transient_outbox_rows(
+                current_rows,
+                db_store=db_store,
+                exc=exc,
+                error_code=transient_code,
+                backoff_base=backoff_base,
+                stats=stats,
+            )
+            log.warning(
+                "Outbox index batch deferred as transient (%s): %s",
+                transient_code,
+                exc,
+            )
+            return
         if len(current_rows) > 1 and time.monotonic() < deadline:
             midpoint = len(current_rows) // 2
             log.warning(
@@ -1475,13 +1940,24 @@ def process_mutation_outbox_batch(
             if _renew_mutation_outbox_lease(db_store, row, lease_seconds):
                 ready_for_index.append((row, filename))
         except Exception as exc:
-            status = db_store.fail_mutation_outbox(
-                outbox_id,
-                str(exc),
-                *lease_args,
-                max_attempts=max_attempts,
-                backoff_base=backoff_base,
-            )
+            transient_code = _transient_outbox_error_code(exc, indexer=indexer)
+            if transient_code is not None:
+                status = db_store.defer_mutation_outbox(
+                    outbox_id,
+                    str(exc),
+                    *lease_args,
+                    error_code=transient_code,
+                    backoff_base=backoff_base,
+                )
+            else:
+                status = db_store.fail_mutation_outbox(
+                    outbox_id,
+                    str(exc),
+                    *lease_args,
+                    max_attempts=max_attempts,
+                    backoff_base=backoff_base,
+                    error_code="materialization_error",
+                )
             if status != "stale":
                 stats["failed" if status == "failed" else "retrying"] += 1
             log.error(
@@ -2135,6 +2611,72 @@ def expire_stale_ingest_jobs_for_watchdog() -> int:
     return expire_stale_subagent_jobs(max_age_seconds=max_age_seconds)
 
 
+def maintain_operational_memory_search_for_watchdog() -> dict:
+    """Advance the derived memory index under bounded, non-blocking admission."""
+    from vector_lake import governance_store
+    from vector_lake.db_store import cleanup_connection_after_tool_call
+    from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
+
+    failed = False
+    status = {
+        "configured": str(
+            os.environ.get("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "0")
+        ).strip().lower()
+        in {"1", "true", "yes", "on"},
+        "auto_maintenance_configured": False,
+        "available": None,
+        "ready": False,
+        "status": "deferred",
+        "warnings": ["operational_memory_search_gate_busy"],
+    }
+    try:
+        status = governance_store.operational_memory_search_index_status(
+            allow_integrity_scan=False,
+        )
+        if not status.get("auto_maintenance_configured") or status.get("ready"):
+            return {**status, "batches": 0, "deferred": False}
+        with heavy_task(
+            "scan",
+            "watchdog-operational-memory-index",
+            origin="watchdog",
+            wait_timeout_seconds=0,
+            warn_after_seconds=60,
+        ):
+            status = governance_store.operational_memory_search_index_status()
+            if status.get("ready"):
+                return {**status, "batches": 0, "deferred": False}
+            result = governance_store.maintain_operational_memory_search_index_budget(
+                batch_size=min(
+                    10_000,
+                    _positive_env_int(
+                        "VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_BATCH",
+                        512,
+                    ),
+                ),
+                max_batches=min(
+                    100,
+                    _positive_env_int(
+                        "VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_MAX_BATCHES",
+                        4,
+                    ),
+                ),
+                wall_seconds=_bounded_env_float(
+                    "VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_WALL_SECONDS",
+                    2.0,
+                    minimum=0.05,
+                    maximum=60.0,
+                ),
+            )
+            return {**result, "deferred": False}
+    except HeavyTaskBusy:
+        return {**status, "batches": 0, "deferred": True}
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        cleanup_connection_after_tool_call(failed=failed)
+
+
 def scheduled_lint_loop(stop_event: threading.Event | None = None):
     """Run scheduled maintenance until the shared stop event is set."""
     stop_event = stop_event or threading.Event()
@@ -2143,6 +2685,7 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
     last_expiry_date_hour = ""
     last_storage_sample_date = ""
     last_storage_attempt_date_hour = ""
+    next_memory_search_attempt = 0.0
     pending_due = ""
     next_due = ""
 
@@ -2185,6 +2728,32 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                     log.info("Daily storage growth baseline recorded for %s.", storage_date)
                 except Exception as exc:
                     log.warning("Daily storage growth baseline failed: %s", exc)
+
+            monotonic_now = time.monotonic()
+            if monotonic_now >= next_memory_search_attempt:
+                memory_search = maintain_operational_memory_search_for_watchdog()
+                if memory_search.get("deferred"):
+                    log.info(
+                        "Operational-memory index maintenance deferred by heavy-task gate."
+                    )
+                elif memory_search.get("batches"):
+                    log.info(
+                        "Operational-memory index maintenance: batches=%s "
+                        "indexed=%s/%s pending=%s ready=%s elapsed=%ss",
+                        memory_search.get("batches"),
+                        memory_search.get("indexed_documents"),
+                        memory_search.get("canonical_documents"),
+                        memory_search.get("pending"),
+                        memory_search.get("ready"),
+                        memory_search.get("elapsed_seconds"),
+                    )
+                interval = _bounded_env_float(
+                    "VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_IDLE_SECONDS",
+                    5.0,
+                    minimum=1.0,
+                    maximum=300.0,
+                )
+                next_memory_search_attempt = time.monotonic() + interval
             observed_due = (
                 current_date_hour
                 if now.tm_hour in (10, 23) and now.tm_min == 0
@@ -2292,6 +2861,12 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                 wait_seconds = 60
             else:
                 wait_seconds = 30
+
+            until_memory_search = max(
+                0.1,
+                next_memory_search_attempt - time.monotonic(),
+            )
+            wait_seconds = min(wait_seconds, until_memory_search)
 
             write_status(
                 "idle",
@@ -2713,6 +3288,14 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
                         "prior subscriptions: %s",
                         exc,
                     )
+                if raw_handler is not None:
+                    try:
+                        raw_handler.request_scrub_if_due()
+                    except Exception as exc:
+                        log.error(
+                            "Could not schedule due raw scrub; it remains due: %s",
+                            exc,
+                        )
             if now - last_heartbeat >= heartbeat_seconds:
                 write_status(
                     "idle",
@@ -2841,4 +3424,7 @@ def start_watchdog(stop_event: threading.Event | None = None):
 
 
 if __name__ == "__main__":
+    from vector_lake.runtime_paths import bootstrap_runtime_paths
+
+    bootstrap_runtime_paths(caller="Watchdog app")
     start_watchdog()

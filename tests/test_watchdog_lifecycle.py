@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -16,6 +18,25 @@ from vector_lake.watchdog_status import (
     get_status_file,
     write_status,
 )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process probe regression")
+def test_process_is_alive_uses_windows_process_handle_for_foreign_pid():
+    from vector_lake.watchdog_status import _process_is_alive
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert _process_is_alive(process.pid) is True
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+    assert _process_is_alive(process.pid) is False
 
 
 def test_watchdog_run_generation_atomically_replaces_foreign_components(
@@ -93,6 +114,30 @@ def test_watchdog_run_refuses_a_live_foreign_generation(
 
     preserved = json.loads(status_path.read_text(encoding="utf-8"))
     assert preserved["run_id"] == "still-draining"
+
+
+def test_disabled_auto_ingest_is_explicit_without_overriding_idle_aggregate(
+    isolated_memory,
+):
+    components = ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")
+    begin_watchdog_run(components)
+
+    for component in components[:-1]:
+        assert write_status("idle", 0, 0, component=component) is True
+    assert (
+        write_status(
+            "disabled",
+            0,
+            0,
+            "Automatic ingest host disabled",
+            component="auto_ingest",
+        )
+        is True
+    )
+
+    status = json.loads(get_status_file().read_text(encoding="utf-8"))
+    assert status["status"] == "idle"
+    assert status["components"]["auto_ingest"]["status"] == "disabled"
 
 
 def test_component_heartbeat_staleness_is_not_hidden_by_fresh_top_level(
@@ -1775,6 +1820,7 @@ def test_watchdog_drains_auto_before_stopping_required_peer_workers(
             {
                 "schema_version": 1,
                 "enabled": True,
+                "allow_model_processing_raw_text": True,
                 "timeout_seconds": 1200,
             }
         ),

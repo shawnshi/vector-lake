@@ -1,4 +1,4 @@
 description = "Generate the interactive 3D HTML topology dashboard without running a full governance audit."
 prompt = """
-Please call the `visualize_vector_lake` MCP tool from the `vector-lake-mcp` server to generate the topology graph.
+Ask the user to approve an absolute output directory under their `.codex` or `.gemini` scratch area, then call `visualize_vector_lake` with that exact `output_dir`. Report completion only after the returned file resolves inside the approved directory and exists.
 """

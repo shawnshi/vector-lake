@@ -1,7 +1,7 @@
 {
   "name": "vector-lake",
-  "version": "11.18.1+codex.20260822113100",
-  "description": "Local file-first knowledge compiler with auditable Markdown, structured memory, and graph operations.",
+  "version": "11.20.0+codex.20260829201234",
+  "description": "Local file-first knowledge compiler for healthcare digitalization research, with auditable Markdown, structured memory, and graph governance.",
   "author": {
     "name": "Local developer"
   },
@@ -9,8 +9,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Vector Lake",
-    "shortDescription": "Compile and query local knowledge",
-    "longDescription": "Compile source material into auditable Markdown and structured memory, then query, review, and govern the resulting knowledge graph.",
+    "shortDescription": "Govern healthcare digitalization knowledge",
+    "longDescription": "Compile healthcare digitalization source material into auditable Markdown and structured memory, then query, review, and govern the resulting domain knowledge graph.",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": [
@@ -19,9 +19,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Search Vector Lake for relevant evidence",
-      "Review a Vector Lake knowledge entry",
-      "Audit Vector Lake governance health"
+      "Search Vector Lake for healthcare digitalization evidence",
+      "Review a healthcare digitalization knowledge entry",
+      "Audit healthcare digitalization knowledge governance"
     ]
   }
 }

@@ -3,8 +3,10 @@ from __future__ import annotations
 import errno
 import os
 import queue
+import sqlite3
 import threading
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -18,9 +20,242 @@ from vector_lake.watchdog_app import (
     _scan_wiki_reconcile_plan,
     _wiki_reconcile_marker_path,
     expire_stale_ingest_jobs_for_watchdog,
+    maintain_operational_memory_search_for_watchdog,
     process_legacy_projection_queue_batch,
     reconcile_wiki_overflow_once,
 )
+
+
+def test_operational_memory_auto_maintenance_is_bounded(monkeypatch):
+    from vector_lake import heavy_task_gate
+
+    observed = {}
+    monkeypatch.setattr(
+        governance_store,
+        "operational_memory_search_index_status",
+        lambda **_kwargs: {
+            "configured": True,
+            "available": True,
+            "ready": False,
+            "auto_maintenance_configured": True,
+        },
+    )
+
+    def maintain(**kwargs):
+        observed.update(kwargs)
+        return {
+            "configured": True,
+            "available": True,
+            "ready": True,
+            "batches": 3,
+        }
+
+    monkeypatch.setattr(
+        governance_store,
+        "maintain_operational_memory_search_index_budget",
+        maintain,
+    )
+    monkeypatch.setattr(
+        heavy_task_gate,
+        "heavy_task",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(db_store, "close_connection", lambda: None)
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_BATCH", "512")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_MAX_BATCHES", "4")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_WALL_SECONDS", "2")
+
+    result = maintain_operational_memory_search_for_watchdog()
+
+    assert result["ready"] is True
+    assert result["deferred"] is False
+    assert observed == {
+        "batch_size": 512,
+        "max_batches": 4,
+        "wall_seconds": 2.0,
+    }
+
+
+def test_operational_memory_gate_busy_defers_before_full_attestation(monkeypatch):
+    from vector_lake import heavy_task_gate
+
+    status_calls = []
+
+    def quick_status(*, allow_integrity_scan=True):
+        status_calls.append(allow_integrity_scan)
+        if allow_integrity_scan:
+            raise AssertionError("gate-busy path must not run a full attestation")
+        return {
+            "configured": True,
+            "available": True,
+            "ready": False,
+            "auto_maintenance_configured": True,
+            "status": "backfilling",
+            "warnings": ["operational_memory_search_attestation_required"],
+        }
+
+    class BusyLease:
+        def __enter__(self):
+            raise heavy_task_gate.HeavyTaskBusy(
+                task_class="scan",
+                operation="watchdog-operational-memory-index",
+                origin="watchdog",
+                wait_timeout_seconds=0,
+                gate_status={"current": {"operation": "external-holder"}},
+            )
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        governance_store,
+        "operational_memory_search_index_status",
+        quick_status,
+    )
+    monkeypatch.setattr(heavy_task_gate, "heavy_task", lambda *_a, **_k: BusyLease())
+
+    started = time.perf_counter()
+    result = maintain_operational_memory_search_for_watchdog()
+
+    assert time.perf_counter() - started < 0.1
+    assert result["deferred"] is True
+    assert result["batches"] == 0
+    assert status_calls == [False]
+
+
+def test_ready_watchdog_cycles_reuse_revision_cache_and_detect_external_tamper(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "60")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_MAINTAIN", "1")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_BATCH", "2")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_MAX_BATCHES", "1")
+    records = [
+        {
+            "memory_id": f"memory_{index}",
+            "memory_type": "fact",
+            "memory_key": f"watchdog_key_{index}",
+            "text": "watchdog proof needle" if index == 3 else "unrelated",
+            "source_page": "Concept_Watchdog-Proof.md",
+            "validity_state": "active",
+            "memory_score": 0.8,
+        }
+        for index in range(4)
+    ]
+    governance_store.initialize_meta_store()
+    governance_store.save_memory_objects({
+        "items": {record["memory_id"]: record for record in records}
+    })
+    assert governance_store.maintain_operational_memory_search_index(100)["ready"]
+    conn = db_store.get_connection()
+    state_before = tuple(conn.execute(
+        "SELECT proof_generation, updated_at "
+        "FROM operational_memory_search_state WHERE singleton = 1"
+    ).fetchone())
+    db_store.close_all_connections()
+
+    real_inspect = db_store.inspect_operational_memory_search_integrity
+    inspections = []
+
+    def counted_inspect(*args, **kwargs):
+        inspections.append(1)
+        return real_inspect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        db_store,
+        "inspect_operational_memory_search_integrity",
+        counted_inspect,
+    )
+    cold_started = time.perf_counter()
+    first = maintain_operational_memory_search_for_watchdog()
+    cold_seconds = time.perf_counter() - cold_started
+    watchdog_conn = db_store.get_connection()
+    hot_started = time.perf_counter()
+    second = maintain_operational_memory_search_for_watchdog()
+    hot_seconds = time.perf_counter() - hot_started
+
+    assert first["ready"] is second["ready"] is True
+    assert first["batches"] == second["batches"] == 0
+    assert db_store.get_connection() is watchdog_conn
+    assert inspections == [1]
+    assert tuple(watchdog_conn.execute(
+        "SELECT proof_generation, updated_at "
+        "FROM operational_memory_search_state WHERE singleton = 1"
+    ).fetchone()) == state_before
+
+    doc_id = int(watchdog_conn.execute(
+        "SELECT doc_id FROM operational_memory_search_docs WHERE memory_id = ?",
+        ("memory_3",),
+    ).fetchone()[0])
+    external = sqlite3.connect(str(db_store.get_db_path()))
+    try:
+        external.execute(
+            "DELETE FROM operational_memory_search_fts WHERE rowid = ?",
+            (doc_id,),
+        )
+        external.execute(
+            "INSERT INTO operational_memory_search_fts "
+            "(rowid, key_text, memory_text, page_text, type_text) "
+            "VALUES (?, 'stale', 'equal count tamper', 'stale', 'fact')",
+            (doc_id,),
+        )
+        external.execute(
+            "DELETE FROM operational_memory_search_short_fts WHERE rowid = ?",
+            (doc_id,),
+        )
+        external.execute(
+            "INSERT INTO operational_memory_search_short_fts "
+            "(rowid, short_text) VALUES (?, 'equal count tamper')",
+            (doc_id,),
+        )
+        external.commit()
+    finally:
+        external.close()
+
+    watchdog_conn._operational_memory_search_integrity_cache[
+        "attested_at_monotonic"
+    ] -= 61
+
+    repairing = maintain_operational_memory_search_for_watchdog()
+    assert repairing["ready"] is False
+    assert repairing["batches"] == 1
+    assert inspections == [1, 1]
+    repaired = maintain_operational_memory_search_for_watchdog()
+    assert repaired["ready"] is True
+    assert repaired["batches"] == 1
+    assert inspections == [1, 1, 1]
+    assert [
+        item["memory_id"]
+        for item in governance_store.search_operational_memory("needle", top_k=10)
+    ] == ["memory_3"]
+    print(
+        "watchdog operational-memory cache benchmark "
+        f"cold={cold_seconds:.6f}s hot={hot_seconds:.6f}s"
+    )
+
+
+def test_watchdog_memory_maintenance_failure_discards_connection(
+    isolated_memory, monkeypatch
+):
+    governance_store.initialize_meta_store()
+    failed_conn = db_store.get_connection()
+
+    def fail_status(**_kwargs):
+        assert db_store.get_connection() is failed_conn
+        raise RuntimeError("injected watchdog maintenance failure")
+
+    monkeypatch.setattr(
+        governance_store,
+        "operational_memory_search_index_status",
+        fail_status,
+    )
+    with pytest.raises(RuntimeError, match="injected watchdog maintenance failure"):
+        maintain_operational_memory_search_for_watchdog()
+
+    assert db_store.get_connection() is not failed_conn
+    with pytest.raises(sqlite3.ProgrammingError):
+        failed_conn.execute("SELECT 1")
 
 
 class _EmptyWatchdogIndexQueue:
@@ -998,6 +1233,9 @@ def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(
             return len(self.waits) == 2
 
     stop_event = StopAfterRetry()
+    # Keep this scheduled-lint retry test independent from the separate
+    # five-second operational-memory maintenance cadence.
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_IDLE_SECONDS", "300")
     monkeypatch.setattr(watchdog_app.time, "localtime", lambda: next(moments))
     monkeypatch.setattr(
         watchdog_app,

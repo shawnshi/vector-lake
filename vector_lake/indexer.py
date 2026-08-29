@@ -19,6 +19,29 @@ from filelock import FileLock, Timeout
 from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake import db_store
+from vector_lake.durability import durable_replace_file, sync_open_file
+from vector_lake.search_projection_contract import (
+    CANONICAL_PROJECTION_SURFACES,
+    fts_corpus_sha256,
+    fts_corpus_sha256_ordered,
+)
+from vector_lake.projection_format_v2 import (
+    MAX_FRONTIER,
+    ProjectionHeavyRebuildRequired,
+    ProjectionV2ContractError,
+    build_claim_graph_root,
+    build_projection_roots,
+    is_v2_locator,
+    load_committed_claim_graph,
+    load_committed_index,
+    load_component_roots,
+    prepare_projection_from_roots,
+    publish_prepared_projection,
+    read_committed_sidecar,
+    recover_pending_publish,
+    require_bounded_frontier,
+)
+from vector_lake.projection_store_v2 import ProjectionStoreV2
 from vector_lake.wiki_utils import (
     VALID_PREFIXES,
     get_claim_graph_path,
@@ -74,13 +97,6 @@ _PROJECTION_DIGEST_CACHE_MAX = 16
 _PROJECTION_DIGEST_CACHE_LOCK = threading.Lock()
 _PROJECTION_DIGEST_CACHE: dict[tuple[str, tuple[int, ...]], str] = {}
 
-CANONICAL_PROJECTION_SURFACES = (
-    "entities",
-    "claims",
-    "sources",
-    "page_graph_edges",
-    "claim_graph_edges",
-)
 CANONICAL_GENERATION_ALGORITHM = "runtime-generations-sha256-v2"
 
 def _topology_worker_timeout_seconds() -> float:
@@ -517,10 +533,11 @@ def _write_json_payload(output_path: str, data: dict):
     temp_path = output_path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+        sync_open_file(handle)
     import time
     for attempt in range(5):
         try:
-            os.replace(temp_path, output_path)
+            durable_replace_file(temp_path, output_path, source_synced=True)
             return
         except PermissionError as e:
             if attempt < 4:
@@ -536,8 +553,7 @@ def _write_json_payload(output_path: str, data: dict):
 def _write_json_stage(stage_path: str, data: dict):
     with open(stage_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
-        handle.flush()
-        os.fsync(handle.fileno())
+        sync_open_file(handle)
 
 
 def _deduplicate_weighted_edges(edges: list[dict]) -> list[dict]:
@@ -962,6 +978,40 @@ def read_committed_index_snapshot(
     they explicitly need to inspect broken state.
     """
     resolved_index = Path(index_path or get_index_path())
+    if is_v2_locator(resolved_index, "index"):
+        try:
+            if (
+                not _mutable
+                and connection is None
+                and _require_current_generation
+                and _require_verified_binding
+            ):
+                from vector_lake.index_snapshot import load_index_snapshot
+
+                return load_index_snapshot(resolved_index)
+            value = load_committed_index(
+                resolved_index.parent,
+                connection=connection,
+                require_current_generation=_require_current_generation,
+            )
+            if _mutable:
+                return value
+            from vector_lake.index_snapshot import _freeze_json_tree
+
+            return _freeze_json_tree(value)
+        except ProjectionV2ContractError as exc:
+            raise ProjectionPairContractError(
+                f"Committed projection v2 could not be verified ({exc}); run sync."
+            ) from exc
+    schema_connection = connection or db_store.get_connection()
+    schema_version = int(
+        schema_connection.execute("PRAGMA user_version").fetchone()[0] or 0
+    )
+    if schema_version >= 9:
+        raise ProjectionPairContractError(
+            "Schema v9 requires projection v2 static locators; legacy v1 is "
+            "accepted only by the explicit migration/rollback path."
+        )
     claim_graph_path = resolved_index.with_name(get_claim_graph_path().name)
     sidecar_path = resolved_index.with_name(get_projection_manifest_path().name)
     expected_names = {get_index_path().name, get_claim_graph_path().name}
@@ -1031,9 +1081,11 @@ def read_committed_index_snapshot(
                     "decoded; retry."
                 )
         else:
-            from vector_lake.index_snapshot import load_index_snapshot
+            from vector_lake.index_snapshot import (
+                load_legacy_index_snapshot_for_migration,
+            )
 
-            index_data = load_index_snapshot(resolved_index)
+            index_data = load_legacy_index_snapshot_for_migration(resolved_index)
         if (
             _projection_file_identity(str(resolved_index))
             != artifact_identities[resolved_index.name]
@@ -1098,6 +1150,20 @@ def read_committed_index_snapshot(
 def projection_pair_matches_current_generation() -> bool:
     """Prove current binding from the small commit marker and artifact digests."""
     index_path = get_index_path()
+    if is_v2_locator(index_path, "index"):
+        try:
+            read_committed_sidecar(index_path.parent)
+            return True
+        except (OSError, ProjectionV2ContractError, RuntimeError):
+            return False
+    try:
+        if int(
+            db_store.get_connection().execute("PRAGMA user_version").fetchone()[0]
+            or 0
+        ) >= 9:
+            return False
+    except Exception:
+        return False
     claim_graph_path = get_claim_graph_path()
     sidecar_path = get_projection_manifest_path()
     if (
@@ -1251,7 +1317,7 @@ def _stage_projection_pair(
 def _replace_projection_stage(stage_path: str, output_path: str):
     for attempt in range(5):
         try:
-            os.replace(stage_path, output_path)
+            durable_replace_file(stage_path, output_path, source_synced=True)
             return
         except PermissionError:
             if attempt == 4:
@@ -1303,23 +1369,41 @@ def _publish_projection_pair(
     canonical_generation: dict,
     expected_generation: dict[str, int],
 ) -> dict:
-    tmp_output, tmp_claim, manifest = _stage_projection_pair(
-        output_path,
+    prepared = build_projection_roots(
+        get_wiki_dir(),
         index_data,
         claim_graph_data,
-        canonical_generation,
+        canonical_generation=expected_generation,
     )
-    try:
-        _publish_staged_projection_pair_guarded(
-            output_path,
-            tmp_output,
-            tmp_claim,
-            expected_generation,
+    search_rows = _search_projection_upserts(index_data)
+
+    def refresh_search_state(transaction_connection, candidate):
+        return db_store.apply_search_projection_mutations(
+            transaction_connection,
+            projection_generation=candidate.projection_generation,
+            canonical_generation=candidate.canonical_generation,
+            expected_row_count=len(search_rows),
+            expected_corpus_sha256=fts_corpus_sha256(search_rows),
         )
-    except Exception:
-        _cleanup_projection_stages(tmp_claim, tmp_output)
-        raise
-    return manifest
+
+    publish_prepared_projection(
+        get_wiki_dir(),
+        prepared,
+        transaction_mutation=refresh_search_state,
+        assert_canonical=lambda: _assert_canonical_generation(
+            expected_generation,
+            context="while publishing projection v2",
+        ),
+    )
+    return {
+        "contract": PROJECTION_CONTRACT,
+        "version": PROJECTION_CONTRACT_VERSION,
+        "generation": prepared.projection_generation,
+        "published_at": prepared.sidecar["published_at_utc"],
+        "canonical_generation": _verified_canonical_generation(
+            prepared.canonical_generation
+        ),
+    }
 
 
 def _mark_graph_dirty(index_data: dict, reason: str):
@@ -1647,7 +1731,7 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
     return round(score, 3)
 
 
-def _calculate_weighted_edges(index_data: dict) -> list[dict]:
+def _calculate_weighted_edge_candidates(index_data: dict) -> list[dict]:
     nodes_dict = index_data["nodes"]
     node_keys = list(nodes_dict.keys())
 
@@ -1847,7 +1931,18 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 "weight": float(row["weight"]) if row["weight"] else 1.0,
             })
 
-    return _prune_weighted_edges(edges, set(node_keys))
+    return _deduplicate_weighted_edges(
+        edge
+        for edge in edges
+        if edge.get("source") in nodes_dict and edge.get("target") in nodes_dict
+    )
+
+
+def _calculate_weighted_edges(index_data: dict) -> list[dict]:
+    """Calculate and retain the bounded pre-prune frontier for projection v2."""
+    candidates = _calculate_weighted_edge_candidates(index_data)
+    index_data["_projection_edge_candidates"] = candidates
+    return _prune_weighted_edges(candidates, set(index_data["nodes"]))
 
 
 def _initialize_graph_topology_pending(index_data: dict, reason: str) -> None:
@@ -1997,10 +2092,38 @@ def _generate_index_unlocked(
     *,
     invalidate_embedding_ids: Iterable[str] = (),
 ):
+    invalidate_embedding_ids = tuple(invalidate_embedding_ids)
     index_data = _empty_index_data()
     from vector_lake.db_store import get_connection
     conn = get_connection()
     canonical_before = canonical_runtime_generation_snapshot()
+    if not invalidate_embedding_ids and is_v2_locator(
+        get_index_path(), "index"
+    ):
+        try:
+            sidecar, _identity, _runtime = read_committed_sidecar(
+                get_wiki_dir(),
+                connection=conn,
+            )
+        except (OSError, ProjectionV2ContractError, RuntimeError):
+            pass
+        else:
+            if sidecar["canonical_generation"] == canonical_before:
+                search_integrity = db_store.verify_search_projection_integrity(
+                    conn
+                )
+                if search_integrity.get("status") == "ready":
+                    log.info(
+                        "Projection v2 and its FTS materialization are already "
+                        "committed for the current canonical generation; full "
+                        "rebuild is a no-op."
+                    )
+                    return str(get_index_path())
+                log.warning(
+                    "Projection v2 roots are current but FTS materialization "
+                    "failed its bounded integrity proof (%s); rebuilding.",
+                    search_integrity.get("issue") or "unknown",
+                )
 
     # Read from canonical SQLite instead of Markdown files
     rows = conn.execute("SELECT entity_id, data_json FROM entities").fetchall()
@@ -2037,7 +2160,7 @@ def _generate_index_unlocked(
     
     index_data["categories"] = list(index_data["categories"])
     index_data["governance_metrics"] = governance_metrics.compute_debt_metrics(skip_heavy=True)
-    index_data["schema_version"] = "8.0"
+    index_data["schema_version"] = "9.0"
 
     output_path = str(get_index_path())
     claim_graph_data = governance_store.build_claim_graph_projection()
@@ -2061,41 +2184,49 @@ def _generate_index_unlocked(
         for entity_id in invalidate_embedding_ids
         if str(entity_id)
     )
-    tmp_output, tmp_claim, _ = _stage_projection_pair(
-        output_path,
+    prepared = build_projection_roots(
+        get_wiki_dir(),
         index_data,
         claim_graph_data,
-        _verified_canonical_generation(canonical_before),
+        canonical_generation=canonical_before,
     )
-    try:
-        with db_store.transaction():
-            _assert_canonical_generation(
-                canonical_before,
-                context="after acquiring the SQLite write lock",
-            )
-            search_stats = db_store.apply_search_projection_mutations(
-                vector_conn,
-                upserts=search_upserts,
-                embedding_deletes=stale_embedding_ids,
-                reset_search=True,
-            )
-        log.info(
-            "FTS projection delta committed: upserts=%s deletes=%s "
-            "payload_bytes=%s embedding_deletes=%s",
-            search_stats["search_upserts"],
-            search_stats["search_deletes"],
-            search_stats["search_payload_bytes"],
-            search_stats["embedding_deletes"],
+
+    def commit_search_projection(transaction_connection, candidate):
+        return db_store.apply_search_projection_mutations(
+            transaction_connection,
+            upserts=search_upserts,
+            embedding_deletes=stale_embedding_ids,
+            reset_search=True,
+            projection_generation=candidate.projection_generation,
+            canonical_generation=candidate.canonical_generation,
+            expected_row_count=len(search_upserts),
+            expected_corpus_sha256=fts_corpus_sha256(search_upserts),
         )
-        _publish_staged_projection_pair_guarded(
-            output_path,
-            tmp_output,
-            tmp_claim,
+
+    search_stats = publish_prepared_projection(
+        get_wiki_dir(),
+        prepared,
+        transaction_mutation=commit_search_projection,
+        noop_transaction_mutation=commit_search_projection,
+        assert_canonical=lambda: _assert_canonical_generation(
             canonical_before,
-        )
-    except Exception:
-        _cleanup_projection_stages(tmp_claim, tmp_output)
-        raise
+            context="while publishing projection v2",
+        ),
+    )
+    search_stats = search_stats or {
+        "search_upserts": 0,
+        "search_deletes": 0,
+        "search_payload_bytes": 0,
+        "embedding_deletes": 0,
+    }
+    log.info(
+        "FTS projection delta committed: upserts=%s deletes=%s "
+        "payload_bytes=%s embedding_deletes=%s",
+        search_stats["search_upserts"],
+        search_stats["search_deletes"],
+        search_stats["search_payload_bytes"],
+        search_stats["embedding_deletes"],
+    )
 
     log.info(
         f"Generated index.json with {len(index_data['nodes'])} nodes | "
@@ -2148,6 +2279,27 @@ def _read_claim_graph_snapshot(path: str) -> dict:
     """Read an atomically published graph without waiting on the writer lock."""
     if not os.path.exists(path):
         return {"nodes": [], "edges": []}
+    if is_v2_locator(path, "claim_graph"):
+        try:
+            return load_committed_claim_graph(Path(path).parent)
+        except ProjectionV2ContractError as exc:
+            raise ProjectionSnapshotChanged(
+                f"Committed claim graph v2 is unavailable: {exc}"
+            ) from exc
+    try:
+        schema_version = int(
+            db_store.get_connection().execute("PRAGMA user_version").fetchone()[0]
+            or 0
+        )
+    except Exception as exc:
+        raise ProjectionSnapshotChanged(
+            "Claim graph schema version could not be verified"
+        ) from exc
+    if schema_version >= 9:
+        raise ProjectionSnapshotChanged(
+            "Schema v9 requires a projection v2 claim-graph locator; legacy v1 "
+            "is accepted only by explicit migration or rollback"
+        )
     last_error = None
     for attempt in range(3):
         try:
@@ -2241,6 +2393,628 @@ def refresh_claim_graph_projection() -> str:
     return claim_graph_path
 
 
+def _projection_v2_aliases_for_node(node_key: str, node: dict | None) -> list[str]:
+    if node is None:
+        return []
+    values = {node_key}
+    for value in (node.get("id"), node.get("title")):
+        if value:
+            values.add(str(value))
+    values.update(str(value) for value in (node.get("aliases") or []) if value)
+    return sorted(values)
+
+
+def _projection_v2_edge_key(edge: dict) -> str:
+    source = str(edge.get("source") or "")
+    target = str(edge.get("target") or "")
+    pair = "\x1f".join((min(source, target), max(source, target)))
+    digest = hashlib.sha256(
+        json.dumps(
+            edge,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{pair}\x1finc\x1f{digest}"
+
+
+def _projection_v2_merged_search_rows(
+    connection,
+    upserts: dict[str, tuple[str, str, str, str]],
+    touched: set[str],
+):
+    pending = iter(sorted(upserts.items()))
+    next_upsert = next(pending, None)
+    for row in connection.execute(
+        "SELECT node_key, title, summary, text FROM wiki_search_index "
+        "ORDER BY node_key"
+    ):
+        key = str(row[0])
+        while next_upsert is not None and next_upsert[0] < key:
+            yield next_upsert[1]
+            next_upsert = next(pending, None)
+        if key in touched:
+            if next_upsert is not None and next_upsert[0] == key:
+                yield next_upsert[1]
+                next_upsert = next(pending, None)
+            continue
+        yield tuple(str(value) for value in row)
+    while next_upsert is not None:
+        yield next_upsert[1]
+        next_upsert = next(pending, None)
+
+
+def _update_index_items_v2_locked(
+    valid_filenames: list[str],
+    pre_parsed_data: dict[str, dict],
+    canonical_before: dict[str, int],
+    connection,
+) -> None:
+    """Apply a bounded v2 delta without materializing the nodes or edges maps."""
+    base = get_wiki_dir()
+    recover_pending_publish(base, connection=connection)
+    sidecar, _identity, _runtime = read_committed_sidecar(
+        base,
+        connection=connection,
+        require_current_generation=False,
+    )
+    previous_generation = sidecar["canonical_generation"]
+    # A page mutation can rewrite its entity plus extracted claims/sources.
+    # The index node delta is therefore attributable only when the entity
+    # generation remains bounded to the requested pages.  Claims and sources
+    # are safe to advance independently here because this path rebuilds the
+    # entire deliberately bounded (<= 2,500) claim projection below.  Manual
+    # page/claim graph-edge surfaces are only updated incrementally for the
+    # touched frontier, so any pre-existing drift there must still fail closed.
+    unchanged_surfaces = {"page_graph_edges", "claim_graph_edges"}
+    entity_delta = (
+        int(canonical_before["entities"])
+        - int(previous_generation["entities"])
+    )
+    bounded_projection_deltas = {
+        surface: int(canonical_before[surface])
+        - int(previous_generation[surface])
+        for surface in ("claims", "sources")
+    }
+    if (
+        any(
+            canonical_before[surface] != previous_generation[surface]
+            for surface in unchanged_surfaces
+        )
+        or any(delta < 0 for delta in bounded_projection_deltas.values())
+        or entity_delta < 0
+        # INSERT OR REPLACE fires one delete plus one insert generation trigger;
+        # a pure delete fires one. More than two changes per requested page is
+        # not attributable to this bounded batch and fails closed.
+        or entity_delta > 2 * len(valid_filenames)
+    ):
+        raise ProjectionPairContractError(
+            "Projection v2 delta cannot prove that canonical drift is bounded "
+            "to the requested entity batch; run a full sync."
+        )
+    roots = load_component_roots(base, sidecar, "index")
+    store = ProjectionStoreV2(base)
+    required_components = {
+        "nodes",
+        "aliases",
+        "aliases_by_node",
+        "edges",
+        "errors_by_file",
+        "categories",
+        "search_rows",
+        "reverse_links",
+        "reverse_sources",
+        "category_counts",
+        "edge_candidates",
+        "edge_incidence",
+        "edge_candidate_incidence",
+        "meta",
+    }
+    if not required_components.issubset(roots):
+        raise ProjectionPairContractError(
+            "Projection v2 incremental roots are incomplete; run a full sync."
+        )
+
+    touched = {filename[:-3] for filename in valid_filenames}
+    old_nodes = {
+        key: store.get(roots["nodes"], key, None) for key in sorted(touched)
+    }
+    new_nodes: dict[str, dict | None] = {}
+    for filename in valid_filenames:
+        node_key = filename[:-3]
+        new_nodes[node_key] = (
+            pre_parsed_data.get(node_key)
+            if filename.startswith(VALID_PREFIXES)
+            else None
+        )
+    if (
+        previous_generation == canonical_before
+        and all(old_nodes[key] == new_nodes[key] for key in sorted(touched))
+    ):
+        return
+
+    def resolved_link(value: object) -> str:
+        text = str(value)
+        return str(store.get(roots["aliases"], text, text))
+
+    frontier: set[str] = set(touched)
+    dependency_links: set[str] = set()
+    dependency_sources: set[str] = set()
+    for node in list(old_nodes.values()) + list(new_nodes.values()):
+        if not node:
+            continue
+        dependency_links.update(
+            resolved_link(value) for value in (node.get("links") or [])
+        )
+        dependency_sources.update(
+            str(value)
+            for value in (node.get("sources") or [])
+            if _is_informative_graph_source(value)
+        )
+    frontier.update(dependency_links)
+    for link in sorted(dependency_links | touched):
+        frontier.update(store.get(roots["reverse_links"], link, []))
+    for source in sorted(dependency_sources):
+        source_nodes = list(store.get(roots["reverse_sources"], source, []))
+        if len(source_nodes) <= MAX_SOURCE_FANOUT:
+            frontier.update(source_nodes)
+
+    manual_rows = []
+    for node_key in sorted(touched):
+        try:
+            manual_rows.extend(
+                connection.execute(
+                    "SELECT source_id, target_id, weight FROM claim_graph_edges "
+                    "WHERE source_id = ? OR target_id = ? "
+                    "UNION SELECT source_id, target_id, weight "
+                    "FROM page_graph_edges WHERE source_id = ? OR target_id = ?",
+                    (node_key, node_key, node_key, node_key),
+                ).fetchall()
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Canonical graph-edge query failed for projection v2 delta."
+            ) from exc
+    for row in manual_rows:
+        frontier.update((str(row[0]), str(row[1])))
+    frontier = set(require_bounded_frontier(sorted(frontier)))
+    frontier_nodes = {
+        key: (
+            new_nodes[key]
+            if key in new_nodes
+            else store.get(roots["nodes"], key, None)
+        )
+        for key in sorted(frontier)
+    }
+    frontier_nodes = {
+        key: value for key, value in frontier_nodes.items() if value is not None
+    }
+
+    # Common-neighbour scoring only needs nodes referenced by both members of
+    # the already-bounded frontier. Load those exact keys, never the node map.
+    common_link_keys: set[str] = set()
+    link_sets = {
+        key: {resolved_link(value) for value in (node.get("links") or [])}
+        for key, node in frontier_nodes.items()
+    }
+    for key in touched:
+        for other_key, links in link_sets.items():
+            if key == other_key or key not in link_sets:
+                continue
+            common_link_keys.update(link_sets[key] & links)
+    expanded = set(frontier) | common_link_keys
+    expanded = set(require_bounded_frontier(sorted(expanded)))
+    for key in sorted(expanded - set(frontier_nodes)):
+        value = store.get(roots["nodes"], key, None)
+        if value is not None:
+            frontier_nodes[key] = value
+
+    candidate_deletes: set[str] = set()
+    final_deletes: set[str] = set()
+    affected: set[str] = set(touched)
+    for key in sorted(touched):
+        candidate_deletes.update(
+            store.get(roots["edge_candidate_incidence"], key, [])
+        )
+        final_deletes.update(store.get(roots["edge_incidence"], key, []))
+    for edge_key in sorted(candidate_deletes):
+        edge = store.get(roots["edge_candidates"], edge_key, None)
+        if edge:
+            affected.update((str(edge.get("source")), str(edge.get("target"))))
+
+    new_candidate_edges: dict[str, dict] = {}
+    for node_key in sorted(touched):
+        node = new_nodes.get(node_key)
+        if node is None:
+            continue
+        node_copy = dict(node)
+        node_copy["_key"] = node_key
+        links_a = link_sets.get(node_key, set())
+        sources_a = {
+            str(value)
+            for value in (node.get("sources") or [])
+            if _is_informative_graph_source(value)
+        }
+        triples_a = {
+            resolved_link(item.get("target")): item.get("predicate", "mentions")
+            for item in (node.get("triples") or [])
+            if item.get("target")
+        }
+        weighted_targets: list[tuple[float, str]] = []
+        for other_key in sorted(frontier_nodes):
+            if other_key == node_key:
+                continue
+            other = dict(frontier_nodes[other_key])
+            other["_key"] = other_key
+            relevance = calculate_relevance(
+                node_copy,
+                other,
+                frontier_nodes,
+                links_a=links_a,
+                links_b=link_sets.get(other_key, set()),
+                sources_a=sources_a,
+                sources_b={
+                    str(value)
+                    for value in (other.get("sources") or [])
+                    if _is_informative_graph_source(value)
+                },
+                triples_a=triples_a,
+            )
+            if relevance >= 1.5:
+                weighted_targets.append((relevance, other_key))
+        for edge in _bounded_node_edge_candidates(node_key, weighted_targets):
+            normalized = {
+                "source": min(str(edge["source"]), str(edge["target"])),
+                "target": max(str(edge["source"]), str(edge["target"])),
+                "weight": float(edge.get("weight", 1.0)),
+            }
+            new_candidate_edges[_projection_v2_edge_key(normalized)] = normalized
+            affected.update((normalized["source"], normalized["target"]))
+    for row in manual_rows:
+        source, target = str(row[0]), str(row[1])
+        if source not in frontier_nodes or target not in frontier_nodes:
+            continue
+        edge = {
+            "source": min(source, target),
+            "target": max(source, target),
+            "weight": float(row[2]) if row[2] else 1.0,
+        }
+        new_candidate_edges[_projection_v2_edge_key(edge)] = edge
+        affected.update((source, target))
+    affected = set(require_bounded_frontier(sorted(affected)))
+
+    # Re-evaluate the retained component from the true bounded candidate
+    # frontier, including candidates that can backfill a removed high edge.
+    component_candidate_keys = set(new_candidate_edges)
+    for key in sorted(affected):
+        component_candidate_keys.update(
+            store.get(roots["edge_candidate_incidence"], key, [])
+        )
+    if len(component_candidate_keys) > MAX_FRONTIER * (
+        MAX_EDGES_PER_NODE * EDGE_CANDIDATE_MULTIPLIER
+    ):
+        raise ProjectionHeavyRebuildRequired()
+    component_candidates: dict[str, dict] = {}
+    for edge_key in sorted(component_candidate_keys - candidate_deletes):
+        edge = store.get(roots["edge_candidates"], edge_key, None)
+        if edge:
+            normalized = dict(edge)
+            normalized.pop("__ordinal__", None)
+            component_candidates[edge_key] = normalized
+    component_candidates.update(new_candidate_edges)
+
+    component_final_deletes = set(final_deletes)
+    for key in sorted(affected):
+        component_final_deletes.update(
+            store.get(roots["edge_incidence"], key, [])
+        )
+    external_degrees: dict[str, int] = {}
+    for key in sorted(affected):
+        all_incident = set(store.get(roots["edge_incidence"], key, []))
+        external_degrees[key] = len(all_incident - component_final_deletes)
+    retained: dict[str, dict] = {}
+    counts = dict(external_degrees)
+    for edge_key, edge in sorted(
+        component_candidates.items(),
+        key=lambda item: (
+            -float(item[1].get("weight", 1.0)),
+            str(item[1].get("source")),
+            str(item[1].get("target")),
+            item[0],
+        ),
+    ):
+        source, target = str(edge.get("source")), str(edge.get("target"))
+        if source not in frontier_nodes or target not in frontier_nodes:
+            continue
+        if counts.get(source, 0) >= MAX_EDGES_PER_NODE:
+            continue
+        if counts.get(target, 0) >= MAX_EDGES_PER_NODE:
+            continue
+        retained[edge_key] = edge
+        counts[source] = counts.get(source, 0) + 1
+        counts[target] = counts.get(target, 0) + 1
+
+    root_updates: dict[str, str] = {}
+    stats = [0, 0, 0, 0]
+
+    def mutate_component(name, *, sets=None, deletes=()):
+        result = store.apply(roots[name], sets=sets or {}, deletes=deletes)
+        root_updates[name] = result.root_digest
+        stats[0] += result.new_bytes
+        stats[1] += result.new_objects
+        stats[2] += result.reused_bytes
+        stats[3] += result.reused_objects
+
+    node_sets = {key: value for key, value in new_nodes.items() if value is not None}
+    node_deletes = {key for key, value in new_nodes.items() if value is None}
+    mutate_component("nodes", sets=node_sets, deletes=node_deletes)
+
+    alias_sets: dict[str, str] = {}
+    alias_deletes: set[str] = set()
+    aliases_by_node_sets: dict[str, list[str]] = {}
+    for key in sorted(touched):
+        old_aliases = set(store.get(roots["aliases_by_node"], key, []))
+        new_aliases = set(_projection_v2_aliases_for_node(key, new_nodes[key]))
+        alias_deletes.update(old_aliases - new_aliases)
+        alias_sets.update({alias: key for alias in new_aliases})
+        if new_aliases:
+            aliases_by_node_sets[key] = sorted(new_aliases)
+    # A merge can remove an alias from the source while assigning that exact
+    # alias to the surviving target in the same batch. The final set wins.
+    alias_deletes.difference_update(alias_sets)
+    mutate_component("aliases", sets=alias_sets, deletes=alias_deletes)
+    mutate_component(
+        "aliases_by_node",
+        sets=aliases_by_node_sets,
+        deletes=node_deletes,
+    )
+
+    reverse_link_sets: dict[str, list[str]] = {}
+    reverse_source_sets: dict[str, list[str]] = {}
+    reverse_link_keys: set[str] = set()
+    reverse_source_keys: set[str] = set()
+    for key in sorted(touched):
+        old = old_nodes[key] or {}
+        new = new_nodes[key] or {}
+        reverse_link_keys.update(
+            resolved_link(value)
+            for value in list(old.get("links") or []) + list(new.get("links") or [])
+        )
+        reverse_source_keys.update(
+            str(value)
+            for value in list(old.get("sources") or []) + list(new.get("sources") or [])
+            if _is_informative_graph_source(value)
+        )
+    for link in sorted(reverse_link_keys):
+        values = set(store.get(roots["reverse_links"], link, [])) - touched
+        values.update(
+            key
+            for key, node in new_nodes.items()
+            if node
+            and link
+            in {resolved_link(value) for value in (node.get("links") or [])}
+        )
+        require_bounded_frontier(sorted(values))
+        if values:
+            reverse_link_sets[link] = sorted(values)
+    mutate_component(
+        "reverse_links",
+        sets=reverse_link_sets,
+        deletes=reverse_link_keys - set(reverse_link_sets),
+    )
+    for source in sorted(reverse_source_keys):
+        values = set(store.get(roots["reverse_sources"], source, [])) - touched
+        values.update(
+            key
+            for key, node in new_nodes.items()
+            if node and source in {str(value) for value in (node.get("sources") or [])}
+        )
+        require_bounded_frontier(sorted(values))
+        if values:
+            reverse_source_sets[source] = sorted(values)
+    mutate_component(
+        "reverse_sources",
+        sets=reverse_source_sets,
+        deletes=reverse_source_keys - set(reverse_source_sets),
+    )
+
+    category_keys: set[str] = set()
+    for node in list(old_nodes.values()) + list(new_nodes.values()):
+        if node:
+            category_keys.update(str(value) for value in (node.get("categories") or []))
+    category_count_sets: dict[str, int] = {}
+    category_deletes: set[str] = set()
+    for category in sorted(category_keys):
+        value = int(store.get(roots["category_counts"], category, 0))
+        value -= sum(
+            category in {str(item) for item in ((old_nodes[key] or {}).get("categories") or [])}
+            for key in touched
+        )
+        value += sum(
+            category in {str(item) for item in ((new_nodes[key] or {}).get("categories") or [])}
+            for key in touched
+        )
+        if value > 0:
+            category_count_sets[category] = value
+        else:
+            category_deletes.add(category)
+    mutate_component(
+        "category_counts", sets=category_count_sets, deletes=category_deletes
+    )
+    mutate_component(
+        "categories",
+        sets={key: True for key in category_count_sets},
+        deletes=category_deletes,
+    )
+
+    search_upserts = {
+        key: _search_projection_row(key, node)
+        for key, node in new_nodes.items()
+        if node is not None
+    }
+    mutate_component(
+        "search_rows",
+        sets={key: list(value) for key, value in search_upserts.items()},
+        deletes=node_deletes,
+    )
+    error_sets = {
+        filename: [
+            {
+                "file": filename,
+                "error": "Schema violation: Missing valid entity prefix.",
+            }
+        ]
+        for filename in valid_filenames
+        if not filename.startswith(VALID_PREFIXES)
+    }
+    mutate_component(
+        "errors_by_file",
+        sets=error_sets,
+        deletes=set(valid_filenames) - set(error_sets),
+    )
+    mutate_component(
+        "edge_candidates",
+        sets=new_candidate_edges,
+        deletes=candidate_deletes,
+    )
+    candidate_incidence_sets: dict[str, list[str]] = {}
+    for key in sorted(affected):
+        values = set(store.get(roots["edge_candidate_incidence"], key, []))
+        values.difference_update(candidate_deletes)
+        values.update(
+            edge_key
+            for edge_key, edge in new_candidate_edges.items()
+            if key in {str(edge.get("source")), str(edge.get("target"))}
+        )
+        if values:
+            candidate_incidence_sets[key] = sorted(values)
+    mutate_component(
+        "edge_candidate_incidence",
+        sets=candidate_incidence_sets,
+        deletes=affected - set(candidate_incidence_sets),
+    )
+    mutate_component(
+        "edges",
+        sets=retained,
+        deletes=component_final_deletes,
+    )
+    final_incidence_sets: dict[str, list[str]] = {}
+    for key in sorted(affected):
+        values = set(store.get(roots["edge_incidence"], key, []))
+        values.difference_update(component_final_deletes)
+        values.update(
+            edge_key
+            for edge_key, edge in retained.items()
+            if key in {str(edge.get("source")), str(edge.get("target"))}
+        )
+        if values:
+            final_incidence_sets[key] = sorted(values)
+    mutate_component(
+        "edge_incidence",
+        sets=final_incidence_sets,
+        deletes=affected - set(final_incidence_sets),
+    )
+
+    meta_sets = {
+        "communities": {},
+        "community_labels": {},
+        "graph_insights": [],
+        "graph_state": {
+            "dirty": True,
+            "reason": f"Partial batch update for {len(valid_filenames)} items",
+            "updated_at": _utc_now(),
+        },
+        "schema_version": "9.0",
+    }
+    mutate_component("meta", sets=meta_sets)
+    descriptor_result = store.apply(
+        sidecar["index_root_sha256"],
+        sets=root_updates,
+    )
+    stats[0] += descriptor_result.new_bytes
+    stats[1] += descriptor_result.new_objects
+    stats[2] += descriptor_result.reused_bytes
+    stats[3] += descriptor_result.reused_objects
+
+    claim_graph_data = governance_store.build_claim_graph_projection()
+    claim_root, claim_stats = build_claim_graph_root(base, claim_graph_data)
+    for index, value in enumerate(claim_stats):
+        stats[index] += value
+    canonical_after = canonical_runtime_generation_snapshot(connection)
+    if canonical_before != canonical_after:
+        raise ProjectionCanonicalGenerationChanged(
+            "Canonical runtime generation changed during projection v2 delta."
+        )
+
+    old_node_count = int((sidecar.get("counts") or {}).get("index_nodes") or 0)
+    node_count = old_node_count - sum(
+        old_nodes[key] is not None and new_nodes[key] is None for key in touched
+    ) + sum(old_nodes[key] is None and new_nodes[key] is not None for key in touched)
+    edge_count = (
+        int((sidecar.get("counts") or {}).get("index_edges") or 0)
+        - len(component_final_deletes)
+        + len(retained)
+    )
+    prepared = prepare_projection_from_roots(
+        base,
+        index_root_sha256=descriptor_result.root_digest,
+        claim_graph_root_sha256=claim_root,
+        canonical_generation=canonical_before,
+        counts={
+            "index_nodes": max(0, node_count),
+            "index_edges": max(0, edge_count),
+            "claim_nodes": len(claim_graph_data.get("nodes") or []),
+            "claim_edges": len(claim_graph_data.get("edges") or []),
+        },
+        mutation_stats=tuple(stats),
+    )
+
+    existing_touched_rows = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM wiki_search_index WHERE node_key IN ("
+            + ",".join("?" for _ in sorted(touched))
+            + ")",
+            tuple(sorted(touched)),
+        ).fetchone()[0]
+    )
+    current_search_count = int(
+        connection.execute("SELECT COUNT(*) FROM wiki_search_index").fetchone()[0]
+    )
+    expected_search_count = (
+        current_search_count - existing_touched_rows + len(search_upserts)
+    )
+    expected_search_digest = fts_corpus_sha256_ordered(
+        _projection_v2_merged_search_rows(
+            connection,
+            search_upserts,
+            touched,
+        )
+    )
+
+    def commit_delta(transaction_connection, candidate):
+        return db_store.apply_search_projection_mutations(
+            transaction_connection,
+            upserts=[search_upserts[key] for key in sorted(search_upserts)],
+            search_deletes=node_deletes,
+            embedding_deletes=touched,
+            projection_generation=candidate.projection_generation,
+            canonical_generation=candidate.canonical_generation,
+            expected_row_count=expected_search_count,
+            expected_corpus_sha256=expected_search_digest,
+        )
+
+    publish_prepared_projection(
+        base,
+        prepared,
+        transaction_mutation=commit_delta,
+        assert_canonical=lambda: _assert_canonical_generation(
+            canonical_before,
+            context="while publishing incremental projection v2",
+        ),
+    )
+
+
 def update_index_items(filenames: list[str]):
     if not filenames:
         return
@@ -2332,6 +3106,25 @@ def update_index_items(filenames: list[str]):
     needs_full_rebuild = False
     try:
         with FileLock(lock_path, timeout=15):
+            if is_v2_locator(output_path, "index"):
+                try:
+                    _update_index_items_v2_locked(
+                        valid_filenames,
+                        pre_parsed_data,
+                        canonical_before,
+                        conn,
+                    )
+                except ProjectionHeavyRebuildRequired:
+                    current = db_store.get_projection_runtime_v9(conn)
+                    with db_store.transaction() as transaction_connection:
+                        db_store.mark_projection_runtime_rebuild_required(
+                            transaction_connection,
+                            expected_projection_generation=current.get(
+                                "projection_generation"
+                            ),
+                        )
+                    raise
+                return
             try:
                 index_data, canonical_binding = (
                     _read_verified_projection_for_writer_unlocked(
@@ -2546,7 +3339,7 @@ def update_index_items(filenames: list[str]):
                 index_data["governance_metrics"] = (
                     index_data.get("governance_metrics") or {}
                 )
-                index_data["schema_version"] = "8.0"
+                index_data["schema_version"] = "9.0"
 
                 claim_graph_data = governance_store.build_claim_graph_projection()
                 canonical_after = canonical_runtime_generation_snapshot()
@@ -2556,7 +3349,12 @@ def update_index_items(filenames: list[str]):
                         "projection computation; retry."
                     )
                 vector_conn = db_store.get_vector_connection()
-                tmp_output, tmp_claim, _ = _stage_projection_pair(
+                expected_search_row_count = len(all_nodes)
+                expected_search_corpus_sha256 = fts_corpus_sha256_ordered(
+                    _search_projection_row(node_key, all_nodes[node_key])
+                    for node_key in sorted(all_nodes)
+                )
+                tmp_output, tmp_claim, manifest = _stage_projection_pair(
                     output_path,
                     index_data,
                     claim_graph_data,
@@ -2576,6 +3374,12 @@ def update_index_items(filenames: list[str]):
                             ],
                             search_deletes=search_deletes,
                             embedding_deletes=embedding_deletes,
+                            projection_generation=manifest["generation"],
+                            canonical_generation=manifest["canonical_generation"],
+                            expected_row_count=expected_search_row_count,
+                            expected_corpus_sha256=(
+                                expected_search_corpus_sha256
+                            ),
                         )
                     _publish_staged_projection_pair_guarded(
                         output_path,
@@ -2665,40 +3469,42 @@ def refresh_graph_topology_if_dirty() -> bool:
                                 "Canonical runtime generation changed during "
                                 "topology projection computation; retry."
                             )
-                        mutation_conn = (
+                        if removed_system_keys:
                             db_store.get_vector_connection()
-                            if removed_system_keys
-                            else db_store.get_connection()
-                        )
-                        tmp_output, tmp_claim, _ = _stage_projection_pair(
-                            output_path,
+                        full_search_rows = _search_projection_upserts(index_data)
+                        prepared = build_projection_roots(
+                            get_wiki_dir(),
                             index_data,
                             claim_graph_data,
-                            canonical_binding,
+                            canonical_generation=canonical_before,
                         )
-                        try:
-                            with db_store.transaction():
-                                _assert_canonical_generation(
-                                    canonical_before,
-                                    context=(
-                                        "after acquiring the SQLite write lock"
-                                    ),
-                                )
-                                if removed_system_keys:
-                                    db_store.apply_search_projection_mutations(
-                                        mutation_conn,
-                                        search_deletes=removed_system_keys,
-                                        embedding_deletes=removed_system_keys,
-                                    )
-                            _publish_staged_projection_pair_guarded(
-                                output_path,
-                                tmp_output,
-                                tmp_claim,
-                                canonical_before,
+
+                        def commit_topology(transaction_connection, candidate):
+                            return db_store.apply_search_projection_mutations(
+                                transaction_connection,
+                                search_deletes=removed_system_keys,
+                                embedding_deletes=removed_system_keys,
+                                projection_generation=(
+                                    candidate.projection_generation
+                                ),
+                                canonical_generation=(
+                                    candidate.canonical_generation
+                                ),
+                                expected_row_count=len(full_search_rows),
+                                expected_corpus_sha256=fts_corpus_sha256(
+                                    full_search_rows
+                                ),
                             )
-                        except Exception:
-                            _cleanup_projection_stages(tmp_claim, tmp_output)
-                            raise
+
+                        publish_prepared_projection(
+                            get_wiki_dir(),
+                            prepared,
+                            transaction_mutation=commit_topology,
+                            assert_canonical=lambda: _assert_canonical_generation(
+                                canonical_before,
+                                context="while publishing topology projection v2",
+                            ),
+                        )
                         log.info(
                             "Graph topology refreshed outside the SQLite write "
                             "transaction and published."
@@ -2715,5 +3521,8 @@ def refresh_graph_topology_if_dirty() -> bool:
 
 
 if __name__ == "__main__":
+    from vector_lake.runtime_paths import bootstrap_runtime_paths
+
+    bootstrap_runtime_paths(caller="Indexer")
     generate_index()
 

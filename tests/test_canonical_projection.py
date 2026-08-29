@@ -45,7 +45,7 @@ def test_incremental_projection_reads_sqlite_not_markdown(isolated_memory, monke
 
     indexer.update_index_items(["Vendor_Acme.md"])
 
-    projected = json.loads(index_path.read_text(encoding="utf-8"))
+    projected = indexer.read_committed_index_snapshot(index_path)
     node = projected["nodes"]["Vendor_Acme"]
     assert node["title"] == "Acme Inc"
     assert node["type"] == "vendor"
@@ -80,7 +80,7 @@ def test_incremental_projection_updates_existing_node(isolated_memory):
     governance_store.upsert_entity("entity_acme", _entity(raw_text="Updated canonical body", title="Acme Updated"))
     indexer.update_index_items(["Vendor_Acme.md"])
 
-    projected = json.loads(index_path.read_text(encoding="utf-8"))
+    projected = indexer.read_committed_index_snapshot(index_path)
     assert projected["nodes"]["Vendor_Acme"]["title"] == "Acme Updated"
     assert projected["nodes"]["Vendor_Acme"]["raw_text"] == "Updated canonical body"
 
@@ -201,7 +201,9 @@ def test_full_rebuild_keeps_same_name_entities_and_clears_stale_fts(isolated_mem
 
     indexer.generate_index()
 
-    projected = json.loads((isolated_memory / "wiki" / "index.json").read_text(encoding="utf-8"))
+    projected = indexer.read_committed_index_snapshot(
+        isolated_memory / "wiki" / "index.json"
+    )
     assert {"Vendor_Acme", "Vendor_Beta"} <= set(projected["nodes"])
     assert len(projected["nodes"]) == 2
     fts_keys = {row["node_key"] for row in conn.execute("SELECT node_key FROM wiki_search_index")}

@@ -7,5 +7,5 @@ When presenting the result:
 - preserve the stable item_id shown by the tool
 
 If the user asks to resolve an item, use the `resolve_governance_item` MCP tool.
-If an item points to a missing page gap, you can suggest using the `trigger_autonomous_research` MCP tool to fetch real internet data to fill the gap.
+If an item points to a missing-page gap, you may preview `trigger_autonomous_research` with `dry_run=True`. External research, file writes, and `dry_run=False` each require explicit user authorization.
 """

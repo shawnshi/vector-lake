@@ -43,10 +43,55 @@ def test_cli_heavy_task_busy_returns_temporary_failure(
     assert not holder.is_alive()
     assert '"error": "heavy_task_busy"' in capsys.readouterr().err
 
+
+def test_projection_object_gc_is_preview_first_and_forwards_apply_fingerprint(
+    monkeypatch,
+):
+    from vector_lake import tool_projection
+
+    preview = cli_app.build_parser().parse_args(["projection-object-gc"])
+    assert preview.apply is False
+    assert preview.retention_days == 7
+    assert preview.limit == 1000
+    assert preview.confirm_fingerprint == ""
+
+    calls = []
+
+    def fake_gc(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(tool_projection, "projection_object_gc", fake_gc)
+    monkeypatch.setattr(cli_app, "_cli_heavy_task_policy", lambda _args: None)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cli.py",
+            "projection-object-gc",
+            "--apply",
+            "--retention-days",
+            "14",
+            "--limit",
+            "25",
+            "--confirm-fingerprint",
+            "sha256:" + "a" * 64,
+        ],
+    )
+
+    assert cli_app.main() == 0
+    assert calls == [
+        {
+            "dry_run": False,
+            "retention_days": 14,
+            "limit": 25,
+            "confirmation": "sha256:" + "a" * 64,
+        }
+    ]
+
 class TestCLI(unittest.TestCase):
     @patch('vector_lake.tools.doctor_vector_lake')
     def test_doctor_command(self, mock_doctor):
-        mock_doctor.return_value = "Healthy"
+        mock_doctor.return_value = "Infrastructure Summary: healthy"
         with patch('sys.argv', ['cli.py', 'doctor']):
             result = cli_app.main()
         self.assertEqual(result, 0)
@@ -67,6 +112,24 @@ class TestCLI(unittest.TestCase):
             result = cli_app.main()
         self.assertEqual(result, 0)
         mock_search.assert_called_once_with('test_query', 3, domain=None, cluster=None, include_history=False, mode='page')
+
+    @patch('vector_lake.tools.search_vector_lake')
+    def test_search_command_accepts_formal_fact_mode(self, mock_search):
+        mock_search.return_value = "Fact Results"
+        with patch(
+            'sys.argv',
+            ['cli.py', 'search', 'test_query', '--mode', 'fact'],
+        ):
+            result = cli_app.main()
+        self.assertEqual(result, 0)
+        mock_search.assert_called_once_with(
+            'test_query',
+            5,
+            domain=None,
+            cluster=None,
+            include_history=False,
+            mode='fact',
+        )
 
     @patch('vector_lake.tools.prepare_query_context')
     def test_query_command(self, mock_query):

@@ -208,6 +208,15 @@ def test_assemble_context_fails_closed_when_projection_changes_after_search(
             payload["schema_version"] = "tampered"
             index_path.write_text(json.dumps(payload), encoding="utf-8")
         elif damage == "projection_generation":
+            governance_store.upsert_entity(
+                "entity_context_projection_generation",
+                {
+                    "entity_id": "entity_context_projection_generation",
+                    "canonical_name": "Context Projection Generation",
+                    "entity_type": "concept",
+                    "page_key": "Concept_Context-Projection-Generation",
+                },
+            )
             indexer.generate_index()
         else:
             governance_store.upsert_entity(
@@ -336,7 +345,7 @@ def test_loaded_index_snapshot_is_deeply_read_only_and_json_compatible(
     )
     index_snapshot.clear_index_snapshot_cache_for_tests()
 
-    snapshot = index_snapshot.load_index_snapshot(index_path)
+    snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(index_path)
 
     assert isinstance(snapshot, dict)
     assert isinstance(snapshot["weighted_edges"], list)
@@ -378,7 +387,7 @@ def test_index_snapshot_uses_streaming_decoder_by_default(
     monkeypatch.delenv("VECTOR_LAKE_INDEX_FULL_LOAD", raising=False)
     index_snapshot.clear_index_snapshot_cache_for_tests()
 
-    snapshot = index_snapshot.load_index_snapshot(index_path)
+    snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(index_path)
 
     assert snapshot["nodes"] == {}
 
@@ -403,7 +412,7 @@ def test_index_snapshot_full_load_decoder_requires_explicit_opt_in(
     monkeypatch.setenv("VECTOR_LAKE_INDEX_FULL_LOAD", "1")
     index_snapshot.clear_index_snapshot_cache_for_tests()
 
-    snapshot = index_snapshot.load_index_snapshot(index_path)
+    snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(index_path)
 
     assert snapshot["nodes"] == {}
     assert calls == ['{"nodes": {}}']
@@ -430,7 +439,7 @@ def test_index_snapshot_orjson_decoder_requires_explicit_opt_in(
     monkeypatch.setenv("VECTOR_LAKE_INDEX_USE_ORJSON", "1")
     index_snapshot.clear_index_snapshot_cache_for_tests()
 
-    snapshot = index_snapshot.load_index_snapshot(index_path)
+    snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(index_path)
 
     assert snapshot["nodes"] == {}
     assert calls == [b'{"nodes": {}}']
@@ -457,7 +466,9 @@ def test_compact_graph_cache_reuses_snapshot_without_mutating_it_and_invalidates
     index_path.write_text(json.dumps(first_payload), encoding="utf-8")
     index_snapshot.clear_index_snapshot_cache_for_tests()
 
-    first_snapshot = index_snapshot.load_index_snapshot(index_path)
+    first_snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(
+        index_path
+    )
     before = json.dumps(first_snapshot, sort_keys=True)
     first_adjacency = index_snapshot.get_compact_graph_adjacency(first_snapshot)
     reused_adjacency = index_snapshot.get_compact_graph_adjacency(first_snapshot)
@@ -476,7 +487,9 @@ def test_compact_graph_cache_reuses_snapshot_without_mutating_it_and_invalidates
         ],
     }
     index_path.write_text(json.dumps(second_payload), encoding="utf-8")
-    second_snapshot = index_snapshot.load_index_snapshot(index_path)
+    second_snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(
+        index_path
+    )
     second_adjacency = index_snapshot.get_compact_graph_adjacency(second_snapshot)
 
     assert second_snapshot is not first_snapshot

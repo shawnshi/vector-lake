@@ -48,7 +48,13 @@ def strip_name(name: str) -> str:
     return name.lower()
 
 
-def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_summary: str = "") -> str:
+def check_duplicate_entity(
+    candidate_title: str,
+    candidate_type: str,
+    candidate_summary: str = "",
+    *,
+    register_pending: bool = True,
+) -> str:
     """PIEA Hook: Check if an entity or concept already exists in the graph using hard normalization and cosine similarity.
     
     Args:
@@ -165,6 +171,24 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
                 "match_type": "cosine_similarity_cross_type" if existing_type != candidate_type else "cosine_similarity",
                 "instruction": instruction
             })
+
+    if not register_pending:
+        from vector_lake.wiki_utils import normalize_entity_name
+
+        new_key = normalize_entity_name(
+            f"{candidate_type.capitalize()}_{candidate_title}"
+        )
+        return json.dumps(
+            {
+                "is_duplicate": False,
+                "pending_registry_checked": False,
+                "pending_registered": False,
+                "instruction": (
+                    "No committed duplicate found. Read-only preview cannot reserve "
+                    f"a pending name; proposed filename: {new_key}.md"
+                ),
+            }
+        )
 
     # --- NEW CONCURRENCY LOGIC (Pending Entities Registry) ---
     tmp_dir = get_extension_root() / "tmp"

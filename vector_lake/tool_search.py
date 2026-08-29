@@ -48,6 +48,11 @@ TOKEN_BUDGET = {
     "system_prompt": 0.15,
 }
 DEFAULT_MAX_CHARS = 200000
+CLAIM_MODE_DEPRECATION_WARNING = (
+    "mode='claim' is deprecated and is only a compatibility alias for "
+    "mode='fact'. Results are operational-memory facts, not canonical Claim "
+    "records; use export_evidence_packet with a claim_id for a canonical Claim."
+)
 
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 STOP_WORDS = {
@@ -382,34 +387,165 @@ _VECTOR_CACHE = {
     "matrix": None
 }
 
-def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> dict[str, float]:
+def _get_vector_search_results(
+    query_vector: list[float],
+    index_data: dict,
+    limit: int = 50,
+) -> dict[str, float]:
     try:
         from vector_lake.db_store import (
             get_vector_connection,
             serialize_float32_vector,
         )
         conn = get_vector_connection()
-        query_blob = serialize_float32_vector(query_vector)
+        from vector_lake.embedding_scheduler import load_embedding_rate_config
+        from vector_lake.search_projection_contract import (
+            EMBEDDING_INPUT_CONTRACT,
+            embedding_content_sha256,
+        )
+
+        config = load_embedding_rate_config()
+        requested_limit = max(1, int(limit))
+        if len(query_vector) != config.dimension:
+            return {}
+        query_norm = math.sqrt(
+            sum(float(value) * float(value) for value in query_vector)
+        )
+        if not math.isfinite(query_norm) or query_norm <= 0:
+            return {}
+        query_blob = serialize_float32_vector(
+            [float(value) / query_norm for value in query_vector]
+        )
+        owns_snapshot = not conn.in_transaction
+        if owns_snapshot:
+            conn.execute("BEGIN")
         # Using match because it's fast. It returns L2 distance.
         # Cosine similarity for normalized vectors: 1 - L2^2 / 2
         # But sqlite-vec also has vec_distance_cosine which returns cosine distance.
         # We can just use match and sort by distance.
-        cursor = conn.execute(
-            "SELECT entity_id, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (query_blob, limit)
-        )
-        
-        results = {}
-        for row in cursor.fetchall():
-            # distance is L2. convert to approx sim: 1 - (dist^2)/2
-            dist = row["distance"]
-            sim = 1.0 - (dist * dist) / 2.0
-            if sim > 0.5:
-                results[row["entity_id"]] = sim
-        return results
+        try:
+            crowding = conn.execute(
+                "SELECT COUNT(*) AS total_count, "
+                "COALESCE(SUM(CASE WHEN meta.entity_id IS NOT NULL "
+                "AND meta.model = ? AND meta.dimension = ? "
+                "AND meta.input_contract = ? THEN 0 ELSE 1 END), 0) "
+                "AS metadata_invalid_count "
+                "FROM vec_embeddings AS vec "
+                "LEFT JOIN embedding_metadata_v8 AS meta "
+                "ON meta.entity_id = vec.entity_id",
+                (config.model, config.dimension, EMBEDDING_INPUT_CONTRACT),
+            ).fetchone()
+            total_count = int(crowding["total_count"] or 0)
+            metadata_invalid_count = int(
+                crowding["metadata_invalid_count"] or 0
+            )
+            if total_count <= metadata_invalid_count:
+                return {}
+
+            # vec0 applies ``k`` before JOIN predicates. Account for every
+            # legacy/wrong-contract row in this fixed-dimension vec0 table so
+            # those rows cannot crowd a valid neighbor out of a small KNN.
+            knn_k = min(total_count, requested_limit + metadata_invalid_count)
+            nodes = index_data.get("nodes") or {}
+            while True:
+                cursor = conn.execute(
+                    "SELECT vec.entity_id, vec.distance, meta.content_sha256 "
+                    "FROM vec_embeddings AS vec JOIN embedding_metadata_v8 AS meta "
+                    "ON meta.entity_id = vec.entity_id "
+                    "WHERE vec.embedding MATCH ? AND vec.k = ? AND meta.model = ? "
+                    "AND meta.dimension = ? AND meta.input_contract = ? "
+                    "ORDER BY vec.distance",
+                    (
+                        query_blob,
+                        knn_k,
+                        config.model,
+                        config.dimension,
+                        EMBEDDING_INPUT_CONTRACT,
+                    ),
+                )
+
+                results = {}
+                candidate_invalid_count = 0
+                similarity_exhausted = False
+                for row in cursor.fetchall():
+                    # distance is L2. convert to approx sim: 1 - L2^2 / 2
+                    dist = float(row["distance"])
+                    sim = 1.0 - (dist * dist) / 2.0
+                    if sim <= 0.5:
+                        similarity_exhausted = True
+                        break
+                    entity_id = str(row["entity_id"])
+                    node = nodes.get(entity_id)
+                    if (
+                        node is None
+                        or str(row["content_sha256"])
+                        != embedding_content_sha256(
+                            node,
+                            max_chars=config.max_chars_per_item,
+                        )
+                    ):
+                        candidate_invalid_count += 1
+                        continue
+                    results[entity_id] = sim
+                    if len(results) >= requested_limit:
+                        return results
+
+                if similarity_exhausted or knn_k >= total_count:
+                    return results
+
+                # Content-invalid/orphan candidates are visible only after the
+                # KNN prefix is read. Grow geometrically, but never beyond the
+                # same-dimension table cardinality, until ``limit`` valid rows
+                # are provably reachable or the table is exhausted.
+                knn_k = min(
+                    total_count,
+                    max(
+                        knn_k + 1,
+                        knn_k * 2,
+                        requested_limit
+                        + metadata_invalid_count
+                        + candidate_invalid_count,
+                    ),
+                )
+        finally:
+            if owns_snapshot and conn.in_transaction:
+                conn.rollback()
     except Exception as exc:
         log.warning("Failed to query vec_embeddings: %s", exc)
         raise SearchBackendError("vector") from exc
+
+
+def _fts_projection_probe(index_data: dict) -> tuple[tuple | None, str | None]:
+    """Return one generation-bound FTS proof and any fail-closed issue."""
+    manifest_generation = str(
+        (index_data.get("projection_manifest") or {}).get("generation") or ""
+    )
+    # Unit-level callers may inject an in-memory index without a committed
+    # projection manifest. Real readers cannot reach this path because
+    # ``_load_search_index`` validates the sidecar contract first.
+    if not manifest_generation:
+        return ("unbound_in_memory_projection",), None
+    try:
+        from vector_lake.db_store import (
+            get_connection,
+            verify_search_projection_integrity,
+        )
+
+        conn = get_connection()
+        integrity = verify_search_projection_integrity(conn)
+        signature = integrity.get("signature")
+        if integrity.get("status") != "ready" or not isinstance(signature, tuple):
+            return None, str(integrity.get("issue") or "fts_projection_integrity")
+        if str(signature[0]) != manifest_generation:
+            return None, "fts_projection_state"
+        return signature, None
+    except Exception:
+        return None, "fts_projection_integrity"
+
+
+def _fts_projection_signature(index_data: dict) -> tuple | None:
+    """Compatibility wrapper returning only the verified FTS proof."""
+    return _fts_projection_probe(index_data)[0]
 
 def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     try:
@@ -520,10 +656,25 @@ def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool =
         )
     except governance_store.OperationalMemoryNotReady as exc:
         if as_xml:
-            return f"<MemoryResults State='unavailable' Reason={quoteattr(exc.reason)}/>"
+            return (
+                "<MemoryResults State='unavailable' "
+                f"Reason={quoteattr(exc.reason)} "
+                f"RetryAfterSeconds={quoteattr(str(exc.retry_after_seconds))}/>"
+            )
         return (
-            f"Operational memory unavailable ({exc.reason}); run projection maintenance."
+            f"Operational memory unavailable ({exc.reason}); retry after "
+            f"{exc.retry_after_seconds}s while automatic index maintenance runs."
         )
+    if memory_types:
+        allowed_memory_types = {
+            str(memory_type).strip().lower() for memory_type in memory_types
+        }
+        memories = [
+            memory
+            for memory in memories
+            if str(memory.get("memory_type") or "fact").strip().lower()
+            in allowed_memory_types
+        ]
     if not memories:
         return "<MemoryResults />" if as_xml else "No operational memory matched the query."
     formatted = "".join(
@@ -531,6 +682,27 @@ def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool =
         for index, memory in enumerate(memories)
     )
     return f"<MemoryResults>\n{formatted}</MemoryResults>" if as_xml else formatted
+
+
+def _format_claim_mode_compatibility(
+    result: str,
+    *,
+    as_xml: bool,
+    requested_mode: str,
+) -> str:
+    if as_xml:
+        return (
+            "<SearchCompatibility RequestedMode="
+            f"{quoteattr(requested_mode)} EffectiveMode='fact' Deprecated='true' "
+            "ActualSemantics='operational_memory_fact_not_canonical_claim'>\n"
+            f"<Warning>{escape(CLAIM_MODE_DEPRECATION_WARNING)}</Warning>\n"
+            f"{result}\n"
+            "</SearchCompatibility>"
+        )
+    return (
+        "DEPRECATION / ACTUAL SEMANTICS: "
+        f"{CLAIM_MODE_DEPRECATION_WARNING}\n\n{result}"
+    )
 
 
 def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
@@ -542,8 +714,9 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         )
     except governance_store.OperationalMemoryNotReady as exc:
         packet = (
-            f"<MEMORY_PACKET status='unavailable' reason={quoteattr(exc.reason)}>\n"
-            "Operational-memory projection requires explicit maintenance.\n"
+            f"<MEMORY_PACKET status='unavailable' reason={quoteattr(exc.reason)} "
+            f"retry_after_seconds={quoteattr(str(exc.retry_after_seconds))}>\n"
+            "Operational-memory projection is converging automatically.\n"
             "</MEMORY_PACKET>"
         )
         return {
@@ -551,6 +724,7 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
             "memory_count": 0,
             "warning_count": 1,
             "omitted_count": 0,
+            "retry_after_seconds": exc.retry_after_seconds,
         }
     stale_or_conflicted = [
         item for item in historical
@@ -983,6 +1157,59 @@ def _read_search_snippet(
         raise SearchIndexError("Wiki frontmatter exceeds the bounded search limit.")
 
 
+def _with_semantic_readiness(
+    result: str,
+    *,
+    as_xml: bool,
+    index_data: dict | None = None,
+) -> str:
+    """Attach non-blocking, generation-bound semantic readiness to retrieval."""
+    from vector_lake import runtime_health
+
+    try:
+        readiness = runtime_health.get_semantic_readiness_envelope(
+            index_data=index_data
+        )
+    except Exception as exc:
+        readiness = {
+            "contract_version": "vector-lake-semantic-readiness-envelope/v1",
+            "ready": False,
+            "status": "unknown",
+            "issues": [
+                f"semantic_readiness_envelope_unavailable:{type(exc).__name__}"
+            ],
+            "warnings": [],
+            "issue_count": 1,
+            "warning_count": 0,
+            "issues_omitted": 0,
+            "warnings_omitted": 0,
+            "debt_summary": {},
+            "captured_generation": None,
+            "captured_fingerprint": None,
+            "results_are_not_accepted_facts": True,
+        }
+    encoded = json.dumps(
+        readiness,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if as_xml:
+        body = result if str(result).lstrip().startswith("<") else escape(str(result))
+        return (
+            "<VectorLakeSearchResponse>\n"
+            f"<SemanticReadinessEnvelope>{escape(encoded)}</SemanticReadinessEnvelope>\n"
+            f"{body}\n"
+            "</VectorLakeSearchResponse>"
+        )
+    return (
+        "<SemanticReadinessEnvelope>\n"
+        f"{encoded}\n"
+        "</SemanticReadinessEnvelope>\n"
+        f"{result}"
+    )
+
+
 def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
     query = str(query or "").strip()
     if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
@@ -994,17 +1221,56 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     except (TypeError, ValueError) as exc:
         raise ValueError("top_k must be an integer") from exc
     top_k = max(1, min(_SEARCH_TOP_K_LIMIT, top_k))
-    normalized_mode = str(mode or "page").lower()
+    normalized_mode = str(mode or "page").strip().lower()
     if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
-        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history)
+        return _with_semantic_readiness(
+            format_operational_memory_results(
+                query,
+                top_k=top_k,
+                as_xml=as_xml,
+                include_history=include_history,
+            ),
+            as_xml=as_xml,
+        )
+    if normalized_mode == "fact":
+        return _with_semantic_readiness(
+            format_operational_memory_results(
+                query,
+                top_k=top_k,
+                as_xml=as_xml,
+                include_history=include_history,
+                memory_types=["fact"],
+            ),
+            as_xml=as_xml,
+        )
     if normalized_mode in {"claim", "claims"}:
-        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history, memory_types=["fact"])
+        fact_result = format_operational_memory_results(
+            query,
+            top_k=top_k,
+            as_xml=as_xml,
+            include_history=include_history,
+            memory_types=["fact"],
+        )
+        return _with_semantic_readiness(
+            _format_claim_mode_compatibility(
+                fact_result,
+                as_xml=as_xml,
+                requested_mode=normalized_mode,
+            ),
+            as_xml=as_xml,
+        )
 
     search_started = time.perf_counter()
     timings: dict[str, float] = {}
     backend_issues: list[str] = []
+    readiness_index_data = None
 
     def finish(value: str) -> str:
+        value = _with_semantic_readiness(
+            value,
+            as_xml=as_xml,
+            index_data=readiness_index_data,
+        )
         timings["total_ms"] = (time.perf_counter() - search_started) * 1000.0
         encoded_size = len(value.encode("utf-8"))
         _record_search_performance(
@@ -1037,6 +1303,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
         fail("projection_snapshot")
         raise SearchIndexError("The knowledge base index could not be read safely.") from exc
+    readiness_index_data = index_data
     timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
     # ⚡ Bolt: Removed unused O(N) list comprehension of all index nodes to eliminate unnecessary memory allocation and CPU overhead in the search hot path.
@@ -1069,7 +1336,12 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     # 1. FTS5 Search
     phase_started = time.perf_counter()
+    fts_signature, fts_integrity_issue = _fts_projection_probe(index_data)
     try:
+        if fts_signature is None:
+            raise SearchBackendError(
+                fts_integrity_issue or "fts_projection_integrity"
+            )
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
         fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
@@ -1081,6 +1353,14 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 raw_score = row.get('score', 0)
             fts_score = raw_score * -1.0  # SQLite BM25 is negative
             hybrid_scores[key] = hybrid_scores.get(key, 0.0) + fts_score
+        if fts_result_count < top_k:
+            hybrid_scores.update(
+                _lexical_fallback_scores(
+                    index_data,
+                    [query, *tokens],
+                    limit=top_k * 5,
+                )
+            )
     except Exception as exc:
         backend = exc.backend if isinstance(exc, SearchBackendError) else "fts5"
         backend_issues.append(backend)
@@ -1111,7 +1391,11 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     if query_vector:
         phase_started = time.perf_counter()
         try:
-            vector_results = _get_vector_search_results(query_vector, limit=top_k * 5)
+            vector_results = _get_vector_search_results(
+                query_vector,
+                index_data,
+                limit=top_k * 5,
+            )
             for key, sim in vector_results.items():
                 vec_score = (sim ** 2) * 15.0
                 hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
@@ -1139,6 +1423,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         "projection_manifest"
     ):
         index_data = current_index_data
+        readiness_index_data = current_index_data
         hybrid_scores = _lexical_fallback_scores(
             index_data,
             [query, *tokens],
@@ -1156,6 +1441,19 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         for key, score in exact_identity_scores.items():
             hybrid_scores[key] = max(hybrid_scores.get(key, 0.0), score)
         backend_issues.append("projection_generation_changed")
+    elif fts_signature is not None:
+        current_fts_signature, current_fts_issue = _fts_projection_probe(index_data)
+        if current_fts_signature != fts_signature:
+            hybrid_scores = _lexical_fallback_scores(
+                index_data,
+                [query, *tokens],
+                limit=top_k * 5,
+            )
+            for key, score in exact_identity_scores.items():
+                hybrid_scores[key] = max(hybrid_scores.get(key, 0.0), score)
+            backend_issues.append(
+                current_fts_issue or "fts_projection_state_changed"
+            )
     timings["generation_check_ms"] = (
         time.perf_counter() - phase_started
     ) * 1000.0

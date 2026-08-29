@@ -1,7 +1,5 @@
 {
-  "target_directories": [
-    "C:/Users/shich/MEMORY/raw"
-  ],
+  "target_directories": [],
   "exclude_paths": [
     "stocks/",
     "garmin/",

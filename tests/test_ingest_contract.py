@@ -21,6 +21,12 @@ from vector_lake import (
     tool_ingest,
 )
 from vector_lake.ingest_worker import _ingest_finalization_proven, process_jobs
+from vector_lake.cancellation import (
+    CancellationOperation,
+    CooperativeCancellation,
+    RequestDeadline,
+    bind_cancellation_operation,
+)
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.raw_revision import (
     RawRevisionFormatError,
@@ -320,6 +326,237 @@ def test_candidate_ingest_is_path_scoped_and_nested_names_do_not_collide(
     assert re.fullmatch(r"Source_team-b-report-[0-9a-f]{8}\.md", names[1])
     assert {item[1]["filepath"] for item in enqueued} == {str(left), str(right)}
     assert all(item[1]["filepath"] != str(unrelated) for item in enqueued)
+
+
+@pytest.mark.parametrize("trigger", ["cancel", "deadline"])
+def test_raw_inventory_stops_at_next_bounded_checkpoint_before_enqueue(
+    isolated_memory,
+    monkeypatch,
+    trigger,
+):
+    raw_paths = []
+    for position in range(3):
+        path = isolated_memory / "raw" / f"cancel-{position}.txt"
+        path.write_text(f"raw {position}", encoding="utf-8")
+        raw_paths.append(path)
+    operation = CancellationOperation(
+        tool_name="prepare_ingest_batch",
+        lane="heavy",
+        deadline=None,
+    )
+    operation.mark_running()
+    scanned = []
+    original_revision = tool_ingest.stable_raw_revision
+
+    def stop_after_first_revision(*args, **kwargs):
+        revision = original_revision(*args, **kwargs)
+        scanned.append(str(args[0]))
+        if len(scanned) == 1:
+            if trigger == "cancel":
+                operation.request_cancellation("client_cancelled", detached=True)
+            else:
+                operation._deadline = RequestDeadline(
+                    deadline_monotonic=time.monotonic() - 1.0,
+                    deadline_seconds=0.001,
+                    deadline_at="2026-08-28T00:00:00+00:00",
+                )
+        return revision
+
+    monkeypatch.setattr(tool_ingest, "stable_raw_revision", stop_after_first_revision)
+    monkeypatch.setattr(tool_ingest, "_RAW_SCAN_CHECKPOINT_ITEMS", 1, raising=False)
+    monkeypatch.setattr(
+        tool_ingest,
+        "_build_ingest_instructions",
+        lambda *_args, **_kwargs: "bounded instructions",
+    )
+    monkeypatch.setattr(
+        governance_store,
+        "canonical_page_versions",
+        lambda _keys: {},
+    )
+
+    with bind_cancellation_operation(operation):
+        with pytest.raises(CooperativeCancellation):
+            prepare_ingest_batch(
+                batch_size=3,
+                candidate_paths=[str(path) for path in raw_paths],
+            )
+
+    assert len(scanned) == 1
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
+    ).fetchone()[0] == 0
+    expected_reason = "client_cancelled" if trigger == "cancel" else "deadline_exceeded"
+    assert operation.snapshot()["cancellation_reason"] == expected_reason
+
+
+def test_raw_enqueue_batch_is_non_interruptible_after_atomic_entry(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_paths = []
+    for position in range(2):
+        path = isolated_memory / "raw" / f"enqueue-{position}.txt"
+        path.write_text(f"raw {position}", encoding="utf-8")
+        raw_paths.append(path)
+    operation = CancellationOperation(
+        tool_name="prepare_ingest_batch",
+        lane="heavy",
+        deadline=None,
+    )
+    operation.mark_running()
+    entered = threading.Event()
+    release = threading.Event()
+    errors = []
+    results = []
+    calls = []
+    original_enqueue = db_store.enqueue_job
+
+    def blocking_enqueue(task_type, payload):
+        calls.append(payload["filepath"])
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        return original_enqueue(task_type, payload)
+
+    monkeypatch.setattr(db_store, "enqueue_job", blocking_enqueue)
+    monkeypatch.setattr(
+        tool_ingest,
+        "_build_ingest_instructions",
+        lambda *_args, **_kwargs: "bounded instructions",
+    )
+    monkeypatch.setattr(
+        governance_store,
+        "canonical_page_versions",
+        lambda _keys: {},
+    )
+
+    def run_prepare():
+        try:
+            with bind_cancellation_operation(operation):
+                results.append(
+                    prepare_ingest_batch(
+                        batch_size=2,
+                        candidate_paths=[str(path) for path in raw_paths],
+                    )
+                )
+                operation.mark_completed()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_prepare)
+    worker.start()
+    assert entered.wait(timeout=5)
+    operation.request_cancellation("client_cancelled", detached=True)
+    try:
+        active = operation.snapshot()
+        assert active["status"] == "cancellation_pending"
+        assert active["atomic_phase_active"] is True
+        assert active["phase"] == "raw_ingest_enqueue"
+    finally:
+        release.set()
+        worker.join(timeout=10)
+
+    assert worker.is_alive() is False
+    assert errors == []
+    assert results == ["Successfully enqueued 2 files for ingestion."]
+    assert len(calls) == 2
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
+    ).fetchone()[0] == 2
+    completed = operation.snapshot()
+    assert completed["status"] == "completed_after_cancellation"
+    assert completed["detached"] is True
+
+
+def test_finalize_commit_is_non_interruptible_after_atomic_entry(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_path = isolated_memory / "raw" / "finalize-cancel.txt"
+    raw_path.write_text("finalize cancellation source", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path.resolve()),
+        calculate_hash(str(raw_path)),
+        "Source_Finalize-Cancel.md",
+    )
+    db_store.init_db()
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = db_store.claim_subagent_jobs(
+        limit=1,
+        lease_seconds=60,
+        lease_owner="cancel-test-owner",
+    )[0]
+    processed_data = _claimed_processed_data(
+        payload,
+        job_id,
+        claim,
+        integration={
+            "disposition": "rejected",
+            "reason": "Source is outside the active purpose contract.",
+        },
+    )
+    monkeypatch.setenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", "1")
+    monkeypatch.setattr(tool_ingest, "load_purpose_contract", lambda: {})
+    monkeypatch.setattr(
+        tool_ingest,
+        "validate_ingest_payload",
+        lambda _files, _contract: [],
+    )
+    operation = CancellationOperation(
+        tool_name="finalize_ingest",
+        lane="heavy",
+        deadline=None,
+    )
+    operation.mark_running()
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+    errors = []
+    original_finalize = db_store.finalize_ingest_job
+
+    def blocking_finalize(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(db_store, "finalize_ingest_job", blocking_finalize)
+
+    def run_finalize():
+        try:
+            with bind_cancellation_operation(operation):
+                results.append(
+                    tool_ingest.finalize_ingest_strict([], processed_data)
+                )
+                operation.mark_completed()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_finalize)
+    worker.start()
+    assert entered.wait(timeout=5)
+    operation.request_cancellation("client_cancelled", detached=True)
+    try:
+        active = operation.snapshot()
+        assert active["status"] == "cancellation_pending"
+        assert active["atomic_phase_active"] is True
+        assert active["phase"] == "ingest_finalize_commit"
+    finally:
+        release.set()
+        worker.join(timeout=10)
+
+    assert worker.is_alive() is False
+    assert errors == []
+    assert results[0].startswith("Successfully finalized ingestion")
+    row = db_store.get_connection().execute(
+        "SELECT status FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "finalized"
+    completed = operation.snapshot()
+    assert completed["status"] == "completed_after_cancellation"
+    assert completed["detached"] is True
 
 
 def test_same_content_at_different_paths_is_tracked_independently(
@@ -946,6 +1183,7 @@ def test_full_scan_hashes_same_size_change_with_restored_mtime(
     isolated_memory,
     monkeypatch,
 ):
+    monkeypatch.setenv("VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS", "1")
     raw_path = isolated_memory / "raw" / "same-metadata.txt"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_text("version-one", encoding="utf-8")

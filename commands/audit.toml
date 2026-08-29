@@ -1,4 +1,4 @@
 description = "Synthesize graph topology insights into the unified review surface."
 prompt = """
-Please use the `trigger_audit_graph` MCP tool from the `vector-lake-mcp` server to synthesize graph topology insights.
+Call `trigger_audit_graph` with `dry_run=True` to synthesize graph topology insights and show the exact plan fingerprint. Only after explicit user approval may you call it with `dry_run=False` and the matching `confirmation`; changed findings invalidate the approval.
 """

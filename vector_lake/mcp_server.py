@@ -16,15 +16,39 @@ import time
 import unicodedata
 import uuid
 import weakref
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
+from vector_lake.cancellation import (
+    CANCELLATION_CONTRACT_VERSION,
+    CancellationOperation,
+    CancellationRegistry,
+    CooperativeCancellation,
+    ToolDeadlineExceeded,
+    bind_cancellation_operation,
+    cancellation_checkpoint,
+    current_request_deadline,
+    make_request_deadline,
+    request_deadline_scope,
+)
 
-_DEFAULT_BLOCKING_WORKERS = 1
+
+_DEFAULT_BLOCKING_WORKERS = 2
+_DEFAULT_BLOCKING_QUEUE_CAPACITY = 4
 _DEFAULT_HEAVY_WORKERS = 1
+_DEFAULT_RUNTIME_REVISION_FULL_HASH_SECONDS = 60.0
+_RUNTIME_REVISION_STRICT_ENV = "VECTOR_LAKE_MCP_REVISION_STRICT"
+_RUNTIME_REVISION_MAX_FILES = 8192
+_RUNTIME_REVISION_MAX_DIRECTORIES = 2048
+_RUNTIME_REVISION_MAX_SCANNED_ENTRIES = 32768
+_MCP_CALL_DEADLINE_ARGUMENT = "_vector_lake_deadline_seconds"
+_MCP_CALL_DEADLINE_MAX_SECONDS = 3600.0
 
 _MCP_HEAVY_TASKS = {
+    "auto_ingest_budget_status": ("scan", 900.0),
+    "auto_ingest_receipt_retention": ("maintenance", 900.0),
     "backup_retention": ("maintenance", 900.0),
     "batch_replace_links": ("maintenance", 900.0),
     "bulk_reconciliation": ("maintenance", 1800.0),
@@ -53,6 +77,7 @@ _MCP_HEAVY_TASKS = {
     "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
     "rebuild_timeline_events": ("projection", 900.0),
     "rename_entity": ("maintenance", 900.0),
+    "semantic_readiness_campaign": ("scan", 900.0),
     "sync_vector_lake": ("ingest_scan", 1800.0),
     "sync_critical_decision_registry": ("maintenance", 900.0),
     "topology_queue_cleanup": ("maintenance", 900.0),
@@ -70,6 +95,7 @@ _EVIDENCE_TEXT_EXPORT_ENV = "VECTOR_LAKE_ALLOW_EVIDENCE_TEXT_EXPORT"
 _MCP_SURFACE_ENV = "VECTOR_LAKE_MCP_SURFACE"
 _MEMORY_MCP_SURFACE_TOOLS = frozenset(
     {
+        "auto_ingest_budget_status",
         "mcp_runtime_status",
         "memory_capabilities",
         "recall",
@@ -80,6 +106,35 @@ _MEMORY_MCP_SURFACE_TOOLS = frozenset(
         "delta",
     }
 )
+_READONLY_MCP_SURFACE_TOOLS = frozenset(
+    {
+        "auto_ingest_budget_status",
+        "check_duplicate_entity",
+        "context_pack",
+        "delta",
+        "doctor_vector_lake",
+        "entity",
+        "export_evidence_packet",
+        "get_governance_debt",
+        "list_ingest_tasks",
+        "mcp_runtime_status",
+        "memory_capabilities",
+        "projection_report",
+        "recall",
+        "review_governance_list",
+        "review_strategic_purpose",
+        "search_timeline",
+        "search_vector_lake",
+        "semantic_readiness",
+        "semantic_readiness_campaign",
+        "synthesize",
+        "trace_vector_lake",
+    }
+)
+_MCP_SURFACE_ALLOWLISTS = {
+    "memory": _MEMORY_MCP_SURFACE_TOOLS,
+    "readonly": _READONLY_MCP_SURFACE_TOOLS,
+}
 
 _RUNTIME_REVISION_ROOT_FILES = (
     ".mcp.json",
@@ -101,6 +156,9 @@ _RUNTIME_REVISION_ASSET_DIRS = (
     "contracts",
     "skills",
     "templates",
+)
+_RUNTIME_REVISION_PLUGIN_ROOT_ENTRIES = frozenset(
+    (*_RUNTIME_REVISION_ROOT_FILES, *_RUNTIME_REVISION_ASSET_DIRS)
 )
 
 
@@ -328,6 +386,297 @@ def _source_tree_revision(source_root: Path) -> str:
     return digest.hexdigest()
 
 
+@dataclass(frozen=True)
+class _RuntimeRevisionInventory:
+    source_root: Path
+    paths: tuple[tuple[str, Path], ...]
+    metadata_identity: tuple[tuple, ...]
+    directory_tokens: tuple[tuple[Path, str, tuple[tuple, ...]], ...]
+    scanned_entry_count: int
+
+
+def _runtime_revision_inventory_limit(kind: str, observed: int, limit: int) -> None:
+    if observed > limit:
+        raise RuntimeError(
+            "runtime revision inventory "
+            f"{kind} limit exceeded: observed={observed}, limit={limit}"
+        )
+
+
+def _runtime_revision_entry_token(entry) -> tuple[tuple, str] | None:
+    """Return a stable DirEntry metadata token and its traversal kind."""
+    try:
+        is_directory = entry.is_dir(follow_symlinks=False)
+        is_file = entry.is_file(follow_symlinks=True)
+    except FileNotFoundError:
+        return ((entry.name, "missing"), "missing")
+    if is_directory:
+        # Child names detect directory add/delete; each known child directory is
+        # scanned independently. Omitting directory timestamps also avoids
+        # delayed directory-mtime updates causing a spurious inventory rebuild.
+        return ((entry.name, "directory"), "directory")
+    kind = "file" if is_file else "other"
+    try:
+        try:
+            observed = entry.stat(follow_symlinks=True)
+        except FileNotFoundError:
+            observed = entry.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return ((entry.name, "missing"), "missing")
+    return (
+        (
+            entry.name,
+            kind,
+            int(observed.st_dev),
+            int(observed.st_ino),
+            int(observed.st_mode),
+            int(observed.st_size),
+            int(observed.st_mtime_ns),
+            int(observed.st_ctime_ns),
+        ),
+        kind,
+    )
+
+
+def _runtime_revision_directory_snapshot(
+    directory: Path,
+    mode: str,
+    *,
+    collect_children: bool = True,
+) -> tuple[tuple[tuple, ...], tuple[tuple[Path, str], ...], int]:
+    """Scan one known directory without recursion and return a bounded token."""
+    tokens = []
+    children = []
+    raw_entry_count = 0
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                raw_entry_count += 1
+                if (
+                    mode == "plugin_root"
+                    and entry.name not in _RUNTIME_REVISION_PLUGIN_ROOT_ENTRIES
+                ):
+                    continue
+                if mode == "python" and not entry.name.casefold().endswith(".py"):
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except FileNotFoundError:
+                        continue
+                token_and_kind = _runtime_revision_entry_token(entry)
+                if token_and_kind is None:
+                    continue
+                token, kind = token_and_kind
+                include = False
+                if mode == "all":
+                    include = kind in {"directory", "file"}
+                elif mode == "python":
+                    include = kind == "directory" or (
+                        kind == "file" and entry.name.casefold().endswith(".py")
+                    )
+                elif mode == "plugin_root":
+                    include = bool(
+                        (kind == "directory" and entry.name in _RUNTIME_REVISION_ASSET_DIRS)
+                        or (kind == "file" and entry.name in _RUNTIME_REVISION_ROOT_FILES)
+                    )
+                else:
+                    raise ValueError(f"unsupported runtime inventory mode: {mode}")
+                if include:
+                    tokens.append(token)
+                    if collect_children:
+                        children.append((Path(entry.path), kind))
+    except (FileNotFoundError, NotADirectoryError):
+        return (("<missing-directory>",),), (), 0
+    tokens.sort(key=lambda item: (str(item[0]).casefold(), str(item[0])))
+    if collect_children:
+        children.sort(
+            key=lambda item: (
+                os.path.normcase(str(item[0])),
+                str(item[0]),
+            )
+        )
+    return tuple(tokens), tuple(children), raw_entry_count
+
+
+def _runtime_revision_metadata_from_paths(
+    paths: tuple[tuple[str, Path], ...],
+) -> tuple[tuple, ...]:
+    identity = []
+    for relative_path, source_path in paths:
+        try:
+            observed = source_path.stat()
+        except FileNotFoundError:
+            continue
+        identity.append(
+            (
+                relative_path,
+                int(observed.st_dev),
+                int(observed.st_ino),
+                int(observed.st_mode),
+                int(observed.st_size),
+                int(observed.st_mtime_ns),
+                int(observed.st_ctime_ns),
+            )
+        )
+    return tuple(identity)
+
+
+def _build_runtime_revision_inventory(source_root: Path) -> _RuntimeRevisionInventory:
+    """Build the bounded startup inventory using iterative ``os.scandir``."""
+    source_root = Path(source_root).resolve()
+    if not source_root.is_dir():
+        raise RuntimeError(f"runtime revision source root is unavailable: {source_root}")
+    plugin_root = source_root.parent if source_root.name == "vector_lake" else source_root
+    paths: dict[str, Path] = {}
+    directory_tokens: dict[Path, tuple[str, tuple[tuple, ...]]] = {}
+    scanned_entry_count = 0
+
+    def add_file(candidate: Path) -> None:
+        relative = candidate.relative_to(plugin_root).as_posix()
+        if relative in paths:
+            return
+        paths[relative] = candidate
+        _runtime_revision_inventory_limit(
+            "file",
+            len(paths),
+            _RUNTIME_REVISION_MAX_FILES,
+        )
+
+    def scan_tree(root: Path, mode: str) -> None:
+        nonlocal scanned_entry_count
+        stack = [root]
+        while stack:
+            directory = stack.pop()
+            if directory in directory_tokens:
+                continue
+            _runtime_revision_inventory_limit(
+                "directory",
+                len(directory_tokens) + 1,
+                _RUNTIME_REVISION_MAX_DIRECTORIES,
+            )
+            token, children, entry_count = _runtime_revision_directory_snapshot(
+                directory,
+                mode,
+            )
+            if token == (("<missing-directory>",),):
+                raise RuntimeError(
+                    f"runtime revision directory disappeared during inventory: {directory}"
+                )
+            scanned_entry_count += entry_count
+            _runtime_revision_inventory_limit(
+                "scanned entry",
+                scanned_entry_count,
+                _RUNTIME_REVISION_MAX_SCANNED_ENTRIES,
+            )
+            directory_tokens[directory] = (mode, token)
+            for child, kind in children:
+                if kind == "directory":
+                    stack.append(child)
+                elif kind == "file":
+                    add_file(child)
+
+    scan_tree(source_root, "python")
+    if plugin_root != source_root:
+        _runtime_revision_inventory_limit(
+            "directory",
+            len(directory_tokens) + 1,
+            _RUNTIME_REVISION_MAX_DIRECTORIES,
+        )
+        root_token, root_children, entry_count = (
+            _runtime_revision_directory_snapshot(plugin_root, "plugin_root")
+        )
+        scanned_entry_count += entry_count
+        _runtime_revision_inventory_limit(
+            "scanned entry",
+            scanned_entry_count,
+            _RUNTIME_REVISION_MAX_SCANNED_ENTRIES,
+        )
+        directory_tokens[plugin_root] = ("plugin_root", root_token)
+        for child, kind in root_children:
+            if kind == "file":
+                add_file(child)
+        for dirname in _RUNTIME_REVISION_ASSET_DIRS:
+            asset_root = plugin_root / dirname
+            if asset_root.is_dir():
+                scan_tree(asset_root, "all")
+
+    ordered_paths = tuple(sorted(paths.items()))
+    ordered_directories = tuple(
+        (directory, mode, token)
+        for directory, (mode, token) in sorted(
+            directory_tokens.items(),
+            key=lambda item: (os.path.normcase(str(item[0])), str(item[0])),
+        )
+    )
+    return _RuntimeRevisionInventory(
+        source_root=source_root,
+        paths=ordered_paths,
+        metadata_identity=_runtime_revision_metadata_from_paths(ordered_paths),
+        directory_tokens=ordered_directories,
+        scanned_entry_count=scanned_entry_count,
+    )
+
+
+def _refresh_runtime_revision_inventory(
+    inventory: _RuntimeRevisionInventory,
+) -> tuple[_RuntimeRevisionInventory, bool]:
+    """Probe cached directories and rebuild only after a token changes."""
+    scanned_entry_count = 0
+    for directory, mode, expected_token in inventory.directory_tokens:
+        observed_token, _children, entry_count = (
+            _runtime_revision_directory_snapshot(
+                directory,
+                mode,
+                collect_children=False,
+            )
+        )
+        scanned_entry_count += entry_count
+        _runtime_revision_inventory_limit(
+            "scanned entry",
+            scanned_entry_count,
+            _RUNTIME_REVISION_MAX_SCANNED_ENTRIES,
+        )
+        if observed_token != expected_token:
+            return _build_runtime_revision_inventory(inventory.source_root), True
+    return inventory, False
+
+
+def _runtime_revision_metadata_identity(source_root: Path) -> tuple[tuple, ...]:
+    """Describe restart-sensitive files without reading their contents."""
+    return _build_runtime_revision_inventory(source_root).metadata_identity
+
+
+def _runtime_revision_seconds(env_name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(env_name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, value)
+
+
+def _validated_mcp_call_deadline(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("MCP tool deadline must be a finite number of seconds")
+    try:
+        deadline_seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MCP tool deadline must be a finite number of seconds"
+        ) from exc
+    if not math.isfinite(deadline_seconds) or deadline_seconds < 0:
+        raise ValueError("MCP tool deadline must be a finite non-negative number")
+    if deadline_seconds > _MCP_CALL_DEADLINE_MAX_SECONDS:
+        raise ValueError(
+            "MCP tool deadline exceeds hard limit: "
+            f"{_MCP_CALL_DEADLINE_MAX_SECONDS:g} seconds"
+        )
+    return None if deadline_seconds == 0 else deadline_seconds
+
+
 class MCPRuntimeGuard:
     """Fail closed when the running MCP no longer matches its source tree."""
 
@@ -335,28 +684,107 @@ class MCPRuntimeGuard:
         self,
         source_root: Path,
         check_interval_seconds: float | None = None,
+        full_hash_interval_seconds: float | None = None,
+        strict: bool | None = None,
     ):
         self.source_root = Path(source_root).resolve()
         if check_interval_seconds is None:
-            try:
-                check_interval_seconds = float(
-                    os.environ.get("VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS", "5")
-                )
-            except ValueError:
-                check_interval_seconds = 5.0
+            check_interval_seconds = _runtime_revision_seconds(
+                "VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS",
+                5.0,
+            )
+        elif not math.isfinite(check_interval_seconds):
+            check_interval_seconds = 5.0
+        if full_hash_interval_seconds is None:
+            full_hash_interval_seconds = _runtime_revision_seconds(
+                "VECTOR_LAKE_MCP_REVISION_FULL_HASH_SECONDS",
+                _DEFAULT_RUNTIME_REVISION_FULL_HASH_SECONDS,
+            )
+        elif not math.isfinite(full_hash_interval_seconds):
+            full_hash_interval_seconds = _DEFAULT_RUNTIME_REVISION_FULL_HASH_SECONDS
+        if strict is None:
+            strict = os.environ.get(_RUNTIME_REVISION_STRICT_ENV) == "1"
         self.check_interval_seconds = max(0.0, check_interval_seconds)
+        self.full_hash_interval_seconds = max(0.0, full_hash_interval_seconds)
+        self.strict = bool(strict)
         self.loaded_at = datetime.now(timezone.utc).isoformat()
+        started = time.perf_counter()
+        self._revision_inventory = _build_runtime_revision_inventory(
+            self.source_root
+        )
         self.loaded_revision = _source_tree_revision(self.source_root)
+        self._metadata_identity = self._revision_inventory.metadata_identity
         self._current_revision = self.loaded_revision
-        self._last_checked = time.monotonic()
+        now = time.monotonic()
+        checked_at = datetime.now(timezone.utc).isoformat()
+        self._last_checked = now
+        self._last_full_hash_monotonic = now
+        self._last_metadata_check_at = checked_at
+        self._last_full_hash_at = checked_at
+        self._last_check_kind = "startup_full"
+        self._last_check_duration_ms = (time.perf_counter() - started) * 1000.0
+        self._metadata_checks = 1
+        self._full_hashes = 1
+        self._cached_checks = 0
+        self._singleflight_waits = 0
+        self._inventory_rebuilds = 1
         self._lock = threading.Lock()
 
     def status(self, force: bool = False) -> dict:
-        with self._lock:
+        waited_for_refresh = not self._lock.acquire(blocking=False)
+        if waited_for_refresh:
+            self._lock.acquire()
+        try:
+            if waited_for_refresh:
+                self._singleflight_waits += 1
             now = time.monotonic()
-            if force or now - self._last_checked >= self.check_interval_seconds:
-                self._current_revision = _source_tree_revision(self.source_root)
-                self._last_checked = now
+            exact_check = bool(force or self.strict)
+            served_from_cache = bool(
+                not exact_check
+                and (
+                    waited_for_refresh
+                    or now - self._last_checked < self.check_interval_seconds
+                )
+            )
+            if served_from_cache:
+                self._cached_checks += 1
+            else:
+                started = time.perf_counter()
+                revision_inventory, inventory_rebuilt = (
+                    _refresh_runtime_revision_inventory(self._revision_inventory)
+                )
+                if inventory_rebuilt:
+                    self._inventory_rebuilds += 1
+                metadata_identity = revision_inventory.metadata_identity
+                self._metadata_checks += 1
+                metadata_changed = metadata_identity != self._metadata_identity
+                periodic_full_hash = bool(
+                    now - self._last_full_hash_monotonic
+                    >= self.full_hash_interval_seconds
+                )
+                if exact_check or metadata_changed or periodic_full_hash:
+                    self._current_revision = _source_tree_revision(self.source_root)
+                    self._full_hashes += 1
+                    self._last_full_hash_monotonic = time.monotonic()
+                    self._last_full_hash_at = datetime.now(timezone.utc).isoformat()
+                    if force:
+                        check_kind = "forced_full"
+                    elif self.strict:
+                        check_kind = "strict_full"
+                    elif metadata_changed:
+                        check_kind = "metadata_changed_full"
+                    else:
+                        check_kind = "periodic_full"
+                else:
+                    check_kind = "metadata"
+                self._revision_inventory = revision_inventory
+                self._metadata_identity = metadata_identity
+                self._last_checked = time.monotonic()
+                self._last_metadata_check_at = datetime.now(timezone.utc).isoformat()
+                self._last_check_kind = check_kind
+                self._last_check_duration_ms = (
+                    time.perf_counter() - started
+                ) * 1000.0
             stale = self._current_revision != self.loaded_revision
             return {
                 "pid": os.getpid(),
@@ -367,9 +795,36 @@ class MCPRuntimeGuard:
                 "stale": stale,
                 "restart_required": stale,
                 "check_interval_seconds": self.check_interval_seconds,
+                "full_hash_interval_seconds": self.full_hash_interval_seconds,
+                "strict": self.strict,
+                "revision_path_count": len(self._metadata_identity),
+                "inventory_file_count": len(self._revision_inventory.paths),
+                "inventory_directory_count": len(
+                    self._revision_inventory.directory_tokens
+                ),
+                "inventory_scanned_entry_count": (
+                    self._revision_inventory.scanned_entry_count
+                ),
+                "inventory_file_limit": _RUNTIME_REVISION_MAX_FILES,
+                "inventory_directory_limit": _RUNTIME_REVISION_MAX_DIRECTORIES,
+                "inventory_scanned_entry_limit": (
+                    _RUNTIME_REVISION_MAX_SCANNED_ENTRIES
+                ),
+                "inventory_rebuilds": self._inventory_rebuilds,
+                "metadata_checks": self._metadata_checks,
+                "full_hashes": self._full_hashes,
+                "cached_checks": self._cached_checks,
+                "singleflight_waits": self._singleflight_waits,
+                "last_check_kind": self._last_check_kind,
+                "last_check_duration_ms": round(self._last_check_duration_ms, 3),
+                "last_metadata_check_at": self._last_metadata_check_at,
+                "last_full_hash_at": self._last_full_hash_at,
+                "served_from_cache": served_from_cache,
             }
+        finally:
+            self._lock.release()
 
-    def assert_current(self, *, force: bool = True) -> None:
+    def assert_current(self, *, force: bool = False) -> None:
         status = self.status(force=force)
         if status["stale"]:
             raise RuntimeError(
@@ -391,6 +846,10 @@ class ReloadAwareFastMCP(FastMCP):
         self.runtime_guard = runtime_guard or MCPRuntimeGuard(
             Path(__file__).resolve().parent
         )
+        self._default_call_deadline_seconds = _validated_mcp_call_deadline(
+            os.environ.get("VECTOR_LAKE_MCP_TOOL_DEADLINE_SECONDS", "0")
+        )
+        self._cancellation_registry = CancellationRegistry()
         try:
             worker_count = int(
                 os.environ.get(
@@ -404,11 +863,12 @@ class ReloadAwareFastMCP(FastMCP):
         try:
             queue_capacity = int(
                 os.environ.get(
-                    "VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", str(worker_count)
+                    "VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY",
+                    str(_DEFAULT_BLOCKING_QUEUE_CAPACITY),
                 )
             )
         except (TypeError, ValueError):
-            queue_capacity = worker_count
+            queue_capacity = _DEFAULT_BLOCKING_QUEUE_CAPACITY
         queue_capacity = max(0, min(64, queue_capacity))
         try:
             admission_timeout = float(
@@ -571,6 +1031,58 @@ class ReloadAwareFastMCP(FastMCP):
         with self._lane_metrics_lock:
             self._lane_metrics[lane]["admission_rejections"] += 1
 
+    def _new_cancellation_operation(
+        self,
+        *,
+        tool_name: str,
+        lane: str,
+    ) -> CancellationOperation:
+        deadline = current_request_deadline()
+        if deadline is None:
+            deadline = make_request_deadline(self._default_call_deadline_seconds)
+        return self._cancellation_registry.create(
+            tool_name=tool_name,
+            lane=lane,
+            deadline=deadline,
+        )
+
+    def _readonly_scan_without_shared_gate(self, policy) -> bool:
+        """Keep the readonly MCP surface physically read-only in canonical meta.
+
+        The dedicated heavy executor already supplies bounded in-process
+        admission.  Readonly exposes only scan-class heavy tools, so acquiring
+        the cross-process file gate would add control-plane writes without
+        protecting any mutation performed by this surface.
+        """
+        if policy is None or policy[0] != "scan":
+            return False
+        effective_surface = str(
+            getattr(
+                self,
+                "_vector_lake_effective_surface",
+                os.environ.get(_MCP_SURFACE_ENV, "full"),
+            )
+        ).strip().lower()
+        return effective_surface == "readonly"
+
+    def _effective_call_deadline(self, requested_value) -> float | None:
+        requested = _validated_mcp_call_deadline(requested_value)
+        configured = self._default_call_deadline_seconds
+        if configured is None:
+            return requested
+        if requested is None:
+            return configured
+        return min(configured, requested)
+
+    @staticmethod
+    def _raise_if_operation_deadline_expired(
+        operation: CancellationOperation | None,
+    ) -> None:
+        if operation is None or not operation.deadline_expired():
+            return
+        operation.cancel_before_start("deadline_exceeded")
+        raise ToolDeadlineExceeded(operation)
+
     def _submit_admitted_blocking_call(self, call):
         released = False
 
@@ -605,7 +1117,11 @@ class ReloadAwareFastMCP(FastMCP):
         )
         if not admitted:
             self._record_admission_rejection("fast")
-            raise RuntimeError("Vector Lake MCP blocking executor is saturated; retry later")
+            raise RuntimeError(
+                "Vector Lake MCP blocking executor is saturated; retry later; "
+                f"retry_after_seconds={self._blocking_admission_timeout:.3f}; "
+                "lane=fast"
+            )
         return self._submit_admitted_blocking_call(call)
 
     def _submit_admitted_heavy_call(self, call):
@@ -647,22 +1163,41 @@ class ReloadAwareFastMCP(FastMCP):
             )
         return self._submit_admitted_heavy_call(call)
 
-    async def _acquire_blocking_slot(self) -> None:
+    async def _acquire_blocking_slot(
+        self,
+        operation: CancellationOperation | None = None,
+    ) -> None:
         deadline = time.monotonic() + self._blocking_admission_timeout
         while True:
+            self._raise_if_operation_deadline_expired(operation)
             self._assert_accepting_calls()
             if self._blocking_slots.acquire(blocking=False):
                 return
             if time.monotonic() >= deadline:
                 self._record_admission_rejection("fast")
                 raise RuntimeError(
-                    "Vector Lake MCP blocking executor is saturated; retry later"
+                    "Vector Lake MCP blocking executor is saturated; retry later; "
+                    f"retry_after_seconds={self._blocking_admission_timeout:.3f}; "
+                    "lane=fast"
                 )
-            await asyncio.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
+            sleep_seconds = min(0.01, max(0.001, deadline - time.monotonic()))
+            operation_remaining = (
+                None if operation is None else operation.remaining_seconds()
+            )
+            if operation_remaining is not None:
+                sleep_seconds = min(
+                    sleep_seconds,
+                    max(0.001, operation_remaining),
+                )
+            await asyncio.sleep(sleep_seconds)
 
-    async def _acquire_heavy_slot(self) -> None:
+    async def _acquire_heavy_slot(
+        self,
+        operation: CancellationOperation | None = None,
+    ) -> None:
         deadline = time.monotonic() + self._blocking_admission_timeout
         while True:
+            self._raise_if_operation_deadline_expired(operation)
             self._assert_accepting_calls()
             if self._heavy_slots.acquire(blocking=False):
                 return
@@ -672,25 +1207,117 @@ class ReloadAwareFastMCP(FastMCP):
                     "Vector Lake MCP heavy executor is saturated; "
                     f"retry_after_seconds={self._blocking_admission_timeout:.3f}"
                 )
-            await asyncio.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
+            sleep_seconds = min(0.01, max(0.001, deadline - time.monotonic()))
+            operation_remaining = (
+                None if operation is None else operation.remaining_seconds()
+            )
+            if operation_remaining is not None:
+                sleep_seconds = min(
+                    sleep_seconds,
+                    max(0.001, operation_remaining),
+                )
+            await asyncio.sleep(sleep_seconds)
 
-    async def _run_blocking_call(self, call):
-        await self._acquire_blocking_slot()
-        future = self._submit_admitted_blocking_call(call)
+    async def _run_executor_call(
+        self,
+        call,
+        *,
+        operation: CancellationOperation | None,
+        acquire_slot,
+        submit_call,
+    ):
+        def consume_detached_result(completed_future) -> None:
+            try:
+                completed_future.exception()
+            except BaseException:
+                # The operation registry is the authoritative detached outcome.
+                # Retrieving the exception prevents asyncio from emitting a
+                # misleading "Future exception was never retrieved" diagnostic.
+                pass
+
         try:
-            return await asyncio.wrap_future(future)
+            await acquire_slot(operation)
         except asyncio.CancelledError:
-            future.cancel()
+            if operation is not None:
+                operation.cancel_before_start("client_cancelled")
+            raise
+        except ToolDeadlineExceeded:
+            raise
+        except BaseException as exc:
+            if operation is not None:
+                operation.mark_failed(exc)
+            raise
+        try:
+            future = submit_call(call)
+        except BaseException as exc:
+            if operation is not None:
+                operation.mark_failed(exc)
+            raise
+        wrapped = asyncio.wrap_future(future)
+        try:
+            remaining = None if operation is None else operation.remaining_seconds()
+            if remaining is None:
+                return await asyncio.shield(wrapped)
+            completed, _pending = await asyncio.wait(
+                (wrapped,),
+                timeout=max(0.0, remaining),
+            )
+            if completed:
+                return await wrapped
+            queued_cancelled = future.cancel()
+            if operation is not None:
+                if queued_cancelled:
+                    operation.cancel_before_start("deadline_exceeded")
+                else:
+                    future.add_done_callback(consume_detached_result)
+                    operation.request_cancellation(
+                        "deadline_exceeded",
+                        detached=True,
+                    )
+                raise ToolDeadlineExceeded(operation)
+            raise TimeoutError("MCP blocking call deadline exceeded")
+        except asyncio.CancelledError:
+            queued_cancelled = future.cancel()
+            if operation is not None:
+                if queued_cancelled:
+                    operation.cancel_before_start("client_cancelled")
+                else:
+                    future.add_done_callback(consume_detached_result)
+                    operation.request_cancellation(
+                        "client_cancelled",
+                        detached=True,
+                    )
+                snapshot = operation.snapshot()
+                logging.getLogger(__name__).info(
+                    "MCP request cancelled; operation_id=%s status=%s",
+                    snapshot["operation_id"],
+                    snapshot["status"],
+                )
             raise
 
-    async def _run_heavy_call(self, call):
-        await self._acquire_heavy_slot()
-        future = self._submit_admitted_heavy_call(call)
-        try:
-            return await asyncio.wrap_future(future)
-        except asyncio.CancelledError:
-            future.cancel()
-            raise
+    async def _run_blocking_call(
+        self,
+        call,
+        operation: CancellationOperation | None = None,
+    ):
+        return await self._run_executor_call(
+            call,
+            operation=operation,
+            acquire_slot=self._acquire_blocking_slot,
+            submit_call=self._submit_admitted_blocking_call,
+        )
+
+    async def _run_heavy_call(
+        self,
+        call,
+        operation: CancellationOperation | None = None,
+    ):
+        return await self._run_executor_call(
+            call,
+            operation=operation,
+            acquire_slot=self._acquire_heavy_slot,
+            submit_call=self._submit_admitted_heavy_call,
+        )
 
     def blocking_executor_status(self) -> dict:
         executor_status = self._blocking_executor.status_snapshot()
@@ -737,6 +1364,26 @@ class ReloadAwareFastMCP(FastMCP):
         combined["fast_lane"] = fast_lane
         combined["heavy_lane"] = heavy_lane
         return combined
+
+    def cancellation_status(self, operation_id: str = "") -> dict:
+        operation_id = str(operation_id or "").strip()
+        if len(operation_id) > 128:
+            raise ValueError("operation_id exceeds 128 characters")
+        status = self._cancellation_registry.snapshot(operation_id)
+        status.update(
+            {
+                "contract_version": CANCELLATION_CONTRACT_VERSION,
+                "deadline_argument": _MCP_CALL_DEADLINE_ARGUMENT,
+                "default_deadline_seconds": self._default_call_deadline_seconds,
+                "deadline_max_seconds": _MCP_CALL_DEADLINE_MAX_SECONDS,
+                "checkpoint_contract": (
+                    "interruptible scans exit at the next cancellation checkpoint; "
+                    "non-interruptible phases remain atomic and report "
+                    "cancellation_pending until terminal"
+                ),
+            }
+        )
+        return status
 
     def shutdown_blocking_executor(
         self,
@@ -822,31 +1469,53 @@ class ReloadAwareFastMCP(FastMCP):
             @functools.wraps(fn)
             async def threaded_tool(*fn_args, **fn_kwargs):
                 policy = _MCP_HEAVY_TASKS.get(fn.__name__)
+                lane = "heavy" if policy is not None else "fast"
+                operation = self._new_cancellation_operation(
+                    tool_name=fn.__name__,
+                    lane=lane,
+                )
 
                 def invoke_current_tool():
-                    if fn.__name__ != "mcp_runtime_status":
-                        self.runtime_guard.assert_current()
-                    if policy is None:
-                        return fn(*fn_args, **fn_kwargs)
-                    from vector_lake.heavy_task_gate import heavy_task
+                    with bind_cancellation_operation(operation):
+                        operation.mark_running()
+                        try:
+                            cancellation_checkpoint("worker_start")
+                            if fn.__name__ != "mcp_runtime_status":
+                                self.runtime_guard.assert_current()
+                            cancellation_checkpoint("after_runtime_guard")
+                            if policy is None or self._readonly_scan_without_shared_gate(
+                                policy
+                            ):
+                                result = fn(*fn_args, **fn_kwargs)
+                            else:
+                                from vector_lake.heavy_task_gate import heavy_task
 
-                    task_class, warn_after_seconds = policy
-                    with heavy_task(
-                        task_class,
-                        fn.__name__,
-                        origin="mcp",
-                        wait_timeout_seconds=self._heavy_task_wait,
-                        warn_after_seconds=warn_after_seconds,
-                    ):
-                        return fn(*fn_args, **fn_kwargs)
+                                task_class, warn_after_seconds = policy
+                                cancellation_checkpoint("before_heavy_gate")
+                                with heavy_task(
+                                    task_class,
+                                    fn.__name__,
+                                    origin="mcp",
+                                    wait_timeout_seconds=self._heavy_task_wait,
+                                    warn_after_seconds=warn_after_seconds,
+                                ):
+                                    cancellation_checkpoint("after_heavy_gate")
+                                    result = fn(*fn_args, **fn_kwargs)
+                        except CooperativeCancellation:
+                            raise
+                        except BaseException as exc:
+                            operation.mark_failed(exc)
+                            raise
+                        operation.mark_completed()
+                        return result
 
                 call = functools.partial(
                     self._invoke_blocking_tool,
                     invoke_current_tool,
                 )
                 if policy is not None:
-                    return await self._run_heavy_call(call)
-                return await self._run_blocking_call(call)
+                    return await self._run_heavy_call(call, operation)
+                return await self._run_blocking_call(call, operation)
 
             register(threaded_tool)
             return fn
@@ -862,10 +1531,17 @@ class ReloadAwareFastMCP(FastMCP):
     async def call_tool(self, name: str, arguments: dict):
         self._assert_accepting_calls()
         if name != "mcp_runtime_status":
-            # Admission only needs the cached guard. The registered wrapper performs
-            # one authoritative forced check in the worker immediately before use.
+            # Admission and execution share the bounded cached guard. A due refresh
+            # is single-flight, while force remains reserved for runtime status.
             self.runtime_guard.assert_current(force=False)
-        return await super().call_tool(name, arguments)
+        tool_arguments = dict(arguments or {})
+        configured_deadline = tool_arguments.pop(
+            _MCP_CALL_DEADLINE_ARGUMENT,
+            None,
+        )
+        deadline_seconds = self._effective_call_deadline(configured_deadline)
+        with request_deadline_scope(deadline_seconds):
+            return await super().call_tool(name, tool_arguments)
 
 # Global lock against stdout pollution
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', force=True)
@@ -877,20 +1553,41 @@ from vector_lake.tool_timeline import search_timeline_events  # noqa: E402
 mcp = ReloadAwareFastMCP("vector-lake")
 
 
+def _mcp_surface_status(server: FastMCP) -> dict:
+    effective_tools = tuple(
+        sorted(tool.name for tool in server._tool_manager.list_tools())
+    )
+    requested_surface = str(
+        os.environ.get(_MCP_SURFACE_ENV, "full")
+    ).strip().lower()
+    return {
+        "configured_surface": str(
+            getattr(server, "_vector_lake_configured_surface", requested_surface)
+        ),
+        "effective_surface": str(
+            getattr(server, "_vector_lake_effective_surface", "unconfigured")
+        ),
+        "effective_tool_count": len(effective_tools),
+        "effective_tools": list(effective_tools),
+    }
+
+
 @mcp.tool()
-def mcp_runtime_status() -> str:
+def mcp_runtime_status(operation_id: str = "") -> str:
     """Report whether this MCP process still matches the on-disk source tree."""
     status = mcp.runtime_guard.status(force=True)
     status["blocking_executor"] = mcp.blocking_executor_status()
+    status["cancellation"] = mcp.cancellation_status(operation_id)
     from vector_lake.tool_search import search_performance_status
 
     status["search_performance"] = search_performance_status()
     from vector_lake.heavy_task_gate import heavy_task_gate_status
 
     status["heavy_task_gate"] = heavy_task_gate_status()
-    status["configured_surface"] = str(
-        os.environ.get(_MCP_SURFACE_ENV, "full")
-    ).strip().lower()
+    from vector_lake.tool_auto_ingest import auto_ingest_budget_status as budget_status
+
+    status["auto_ingest_budget"] = budget_status(include_actual_usage=False)
+    status.update(_mcp_surface_status(mcp))
     return json.dumps(
         status,
         ensure_ascii=False,
@@ -1090,7 +1787,9 @@ def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
     Args:
         query: The semantic query string.
         top_k: Number of results to return.
-        mode: Search mode, can be 'page', 'memory', or 'claim'.
+        mode: 'page', 'memory', or fact-only operational-memory 'fact'. The
+            legacy 'claim' value is a deprecated alias for 'fact' and does not
+            return canonical Claim records.
     """
     return tools.search_vector_lake(query, top_k, mode=mode)
 
@@ -1126,6 +1825,12 @@ def export_evidence_packet(
 def semantic_readiness(decision_id: str = "") -> str:
     """Report semantic readiness separately from infrastructure health."""
     return tools.semantic_readiness_vector_lake(decision_id or None)
+
+
+@mcp.tool()
+def semantic_readiness_campaign(limit: int = 50, cursor: str = "") -> str:
+    """Page exact semantic debt bound to current canonical and graph generations."""
+    return tools.semantic_readiness_campaign_report(limit=limit, cursor=cursor)
 
 
 @mcp.tool()
@@ -1272,14 +1977,27 @@ def update_operational_memory(memory_type: str, payload_file: str) -> str:
 
 @mcp.tool()
 def memory_capabilities() -> str:
-    """Return the stable Vector Lake Agent-memory protocol manifest."""
-    from vector_lake.memory_protocol import capability_manifest
-
+    """Return verbs available on this process's effective MCP tool surface."""
     return json.dumps(
-        capability_manifest(),
+        _memory_capability_manifest(mcp),
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
+    )
+
+
+def _memory_capability_manifest(server: FastMCP) -> dict:
+    """Bind the protocol manifest to one server's effective tools/list."""
+    from vector_lake.memory_protocol import capability_manifest
+
+    status = _mcp_surface_status(server)
+    effective_surface = str(status["effective_surface"])
+    if effective_surface not in {"full", "memory", "readonly"}:
+        # Before configure_mcp_surface runs, tools/list is still the full surface.
+        effective_surface = "full"
+    return capability_manifest(
+        effective_surface=effective_surface,
+        available_tools=status["effective_tools"],
     )
 
 
@@ -1342,7 +2060,7 @@ def recall(
     mode: str = "page",
     include_history: bool = False,
 ) -> str:
-    """Recall pages, operational memory, or claims through one stable verb."""
+    """Recall pages, memory, or facts; claim is a deprecated fact alias."""
     from vector_lake.memory_protocol import recall as recall_memory
 
     return json.dumps(
@@ -1527,7 +2245,7 @@ def resolve_governance_item(item_id: str, resolution: str, payload_file: str = N
             return str(e)
     return tools.review_vector_lake(action="resolve", index=item_id, resolution=resolution, change_manifest=manifest)
 @mcp.tool()
-def trigger_autonomous_research(dry_run: bool = False) -> str:
+def trigger_autonomous_research(dry_run: bool = True) -> str:
     """Autonomously scan graph gaps and governance queue to formulate web research directives.
     
     Args:
@@ -1716,7 +2434,46 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
         candidate_type: The specific type of the entity (e.g. 'vendor', 'product', 'person', 'event', 'concept').
         candidate_summary: A brief summary of the entity to use for similarity matching.
     """
-    return tools.check_duplicate_entity(candidate_title, candidate_type, candidate_summary)
+    return tools.check_duplicate_entity(
+        candidate_title,
+        candidate_type,
+        candidate_summary,
+        register_pending=(
+            str(os.environ.get(_MCP_SURFACE_ENV, "full")).strip().lower()
+            != "readonly"
+        ),
+    )
+
+
+@mcp.tool()
+def auto_ingest_budget_status() -> str:
+    """Report exact rolling reservations and receipt-verified token usage."""
+    from vector_lake.tool_auto_ingest import auto_ingest_budget_status as status
+
+    return json.dumps(status(), ensure_ascii=False, indent=2, sort_keys=True)
+
+
+@mcp.tool()
+def auto_ingest_receipt_retention(
+    apply: bool = False,
+    confirm_fingerprint: str = "",
+    plan_as_of: str = "",
+    limit: int = 256,
+) -> str:
+    """Preview or apply bounded retention of expired terminal attempt receipts."""
+    from vector_lake.tool_auto_ingest import auto_ingest_attempt_receipt_retention
+
+    return json.dumps(
+        auto_ingest_attempt_receipt_retention(
+            apply=apply,
+            confirm_fingerprint=confirm_fingerprint,
+            plan_as_of=plan_as_of,
+            limit=limit,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 
 @mcp.tool()
 def visualize_vector_lake(output_dir: str = None) -> str:
@@ -1967,28 +2724,43 @@ def configure_mcp_surface(
         tool.name for tool in server._tool_manager.list_tools()
     }
     if normalized == "full":
-        return tuple(sorted(available))
-    if normalized != "memory":
+        target_tools = available
+    else:
+        target_tools = _MCP_SURFACE_ALLOWLISTS.get(normalized)
+    if target_tools is None:
         raise RuntimeError(
             f"Unsupported {_MCP_SURFACE_ENV} value: {normalized!r}; "
-            "expected 'full' or 'memory'"
+            "expected 'full', 'memory', or 'readonly'"
         )
-    missing = sorted(_MEMORY_MCP_SURFACE_TOOLS - available)
+    missing = sorted(target_tools - available)
     if missing:
         raise RuntimeError(
-            "Memory MCP surface is incomplete; missing tools: " + ", ".join(missing)
+            f"{normalized.capitalize()} MCP surface is incomplete; missing tools: "
+            + ", ".join(missing)
         )
-    for name in sorted(available - _MEMORY_MCP_SURFACE_TOOLS):
+    for name in sorted(available - target_tools):
         server.remove_tool(name)
     remaining = {
         tool.name for tool in server._tool_manager.list_tools()
     }
-    if remaining != _MEMORY_MCP_SURFACE_TOOLS:
-        raise RuntimeError("Memory MCP surface filtering did not close exactly")
-    return tuple(sorted(remaining))
+    if remaining != target_tools:
+        raise RuntimeError(
+            f"{normalized.capitalize()} MCP surface filtering did not close exactly"
+        )
+    effective_tools = tuple(sorted(remaining))
+    # Keep the database layer and wrapper behavior aligned for embedded servers,
+    # not only for processes whose host pre-populated the environment.
+    os.environ[_MCP_SURFACE_ENV] = normalized
+    setattr(server, "_vector_lake_configured_surface", normalized)
+    setattr(server, "_vector_lake_effective_surface", normalized)
+    setattr(server, "_vector_lake_effective_tools", effective_tools)
+    return effective_tools
 
 
 def main() -> None:
+    from vector_lake.runtime_paths import bootstrap_runtime_paths
+
+    bootstrap_runtime_paths(caller="MCP server")
     configure_mcp_surface(mcp)
     mcp.run()
 

@@ -1,9 +1,12 @@
 import hashlib
-import json
 
 import pytest
 
-from vector_lake import mcp_server
+from vector_lake import db_store, indexer, mcp_server
+from vector_lake.projection_format_v2 import (
+    build_projection_roots,
+    publish_prepared_projection,
+)
 from vector_lake.schema_validator import SchemaViolationException, validate_schema
 from vector_lake.tool_rename import rename_vector_lake_entity
 from vector_lake.claim_extractor import _stable_id
@@ -78,13 +81,15 @@ def test_batch_replace_links_commits_once(isolated_memory, monkeypatch):
 
 
 def test_schema_tag_collision_is_not_swallowed(tmp_path):
-    index_path = tmp_path / "index.json"
-    index_path.write_text(
-        json.dumps(
-            {"nodes": {"Concept_Existing": {"title": "Existing", "aliases": []}}}
-        ),
-        encoding="utf-8",
+    db_store.init_db()
+    prepared = build_projection_roots(
+        tmp_path,
+        {"nodes": {"Concept_Existing": {"title": "Existing", "aliases": []}}},
+        {"nodes": [], "edges": []},
+        canonical_generation=indexer.canonical_runtime_generation_snapshot(),
     )
+    publish_prepared_projection(tmp_path, prepared)
+    index_path = tmp_path / "index.json"
     frontmatter = {
         "id": "source_test",
         "title": "Test",

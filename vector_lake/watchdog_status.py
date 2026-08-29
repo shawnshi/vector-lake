@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from vector_lake.wiki_utils import get_meta_dir
+from vector_lake.durability import durable_replace_file, sync_open_file
 
 _status_lock = threading.Lock()
 log = logging.getLogger("vector-lake-watchdog-status")
@@ -14,6 +15,26 @@ log = logging.getLogger("vector-lake-watchdog-status")
 _run_id = uuid.uuid4().hex
 _run_started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 _expected_components: tuple[str, ...] = ()
+_cached_status_path: Path | None = None
+_cached_status_identity: tuple[int, int, int, int] | None = None
+_cached_status_document: dict | None = None
+_component_published_at: dict[str, float] = {}
+
+
+def _monotonic_now() -> float:
+    return time.monotonic()
+
+
+def _heartbeat_interval_seconds() -> float:
+    try:
+        value = float(
+            os.environ.get("VECTOR_LAKE_WATCHDOG_STATUS_HEARTBEAT_SECONDS", "30")
+        )
+    except (TypeError, ValueError):
+        value = 30.0
+    if not 1.0 <= value <= 60.0:
+        value = 30.0
+    return value
 
 
 def current_watchdog_run_id() -> str:
@@ -37,6 +58,8 @@ def _process_is_alive(process_id: object) -> bool:
         return False
     if pid == os.getpid():
         return True
+    if os.name == "nt":
+        return _windows_process_is_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -46,6 +69,38 @@ def _process_is_alive(process_id: object) -> bool:
     except OSError:
         return False
     return True
+
+
+def _windows_process_is_alive(pid: int) -> bool:
+    """Query a Windows process without relying on unsupported signal 0."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code_process = kernel32.GetExitCodeProcess
+    get_exit_code_process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code_process.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        exit_code = wintypes.DWORD()
+        if not get_exit_code_process(handle, ctypes.byref(exit_code)):
+            return ctypes.get_last_error() == error_access_denied
+        return exit_code.value == still_active
+    finally:
+        close_handle(handle)
 
 
 def _component_payload(
@@ -87,6 +142,7 @@ def _status_document(
         "processing": 2,
         "starting": 1,
         "idle": 0,
+        "disabled": -1,
     }
     aggregate = max(
         components.values(),
@@ -109,13 +165,25 @@ def _status_document(
 
 
 def _publish_locked(status_file: Path, data: dict) -> bool:
+    global _cached_status_document, _cached_status_identity, _cached_status_path
+
     last_exception: PermissionError | None = None
     for _attempt in range(5):
         temp_file = status_file.with_name(f".watchdog_status_{uuid.uuid4().hex}.tmp")
         try:
             with open(temp_file, "w", encoding="utf-8") as handle:
                 json.dump(data, handle, indent=2)
-            temp_file.replace(status_file)
+                sync_open_file(handle)
+            durable_replace_file(temp_file, status_file, source_synced=True)
+            status = status_file.stat()
+            _cached_status_path = status_file
+            _cached_status_identity = (
+                int(status.st_dev),
+                int(status.st_ino),
+                int(status.st_size),
+                int(status.st_mtime_ns),
+            )
+            _cached_status_document = data
             return True
         except PermissionError as exc:
             last_exception = exc
@@ -139,6 +207,51 @@ def _publish_locked(status_file: Path, data: dict) -> bool:
         last_exception,
     )
     return False
+
+
+def _status_identity(status_file: Path) -> tuple[int, int, int, int] | None:
+    try:
+        if status_file.is_symlink():
+            raise RuntimeError("watchdog status path must not be a symbolic link")
+        status = status_file.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(
+            f"watchdog status identity is unavailable: {type(exc).__name__}"
+        ) from exc
+    return (
+        int(status.st_dev),
+        int(status.st_ino),
+        int(status.st_size),
+        int(status.st_mtime_ns),
+    )
+
+
+def _existing_status_locked(status_file: Path) -> tuple[dict, bool]:
+    """Return the status plus whether the durable identity changed externally."""
+    global _cached_status_document, _cached_status_identity, _cached_status_path
+
+    identity = _status_identity(status_file)
+    if (
+        _cached_status_path == status_file
+        and _cached_status_document is not None
+        and _cached_status_identity == identity
+    ):
+        return _cached_status_document, False
+    existing: dict = {}
+    if identity is not None:
+        try:
+            loaded = json.loads(status_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            existing = loaded
+    _cached_status_path = status_file
+    _cached_status_identity = identity
+    _cached_status_document = existing
+    _component_published_at.clear()
+    return existing, True
 
 
 def begin_watchdog_run(expected_components: tuple[str, ...] | list[str]) -> str:
@@ -203,6 +316,11 @@ def begin_watchdog_run(expected_components: tuple[str, ...] | list[str]) -> str:
         )
         if not _publish_locked(status_file, data):
             raise RuntimeError("Could not publish the atomic watchdog startup status")
+        published_at = _monotonic_now()
+        _component_published_at.clear()
+        _component_published_at.update(
+            {component: published_at for component in normalized}
+        )
     return _run_id
 
 def write_status(
@@ -224,12 +342,11 @@ def write_status(
                 _run_id,
             )
             return False
-        existing = {}
-        if status_file.exists():
-            try:
-                existing = json.loads(status_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
+        try:
+            existing, durable_identity_changed = _existing_status_locked(status_file)
+        except RuntimeError as exc:
+            log.error("Rejected unsafe watchdog status path: %s", exc)
+            return False
         existing_run = str(existing.get("run_id") or "")
         existing_pid = existing.get("process_id")
         if existing_run and (
@@ -257,7 +374,7 @@ def write_status(
             and detail.get("process_id") == os.getpid()
             and (not _expected_components or name in _expected_components)
         }
-        components[component] = _component_payload(
+        next_component = _component_payload(
             state,
             task_queue_size,
             index_queue_size,
@@ -265,10 +382,39 @@ def write_status(
             last_error,
             now=now,
         )
+        previous_component = components.get(component)
+        substantive_fields = (
+            "status",
+            "task_queue_size",
+            "index_queue_size",
+            "current_action",
+            "last_error",
+            "process_id",
+            "run_id",
+            "thread_name",
+            "thread_ident",
+        )
+        unchanged = isinstance(previous_component, dict) and all(
+            previous_component.get(field) == next_component.get(field)
+            for field in substantive_fields
+        )
+        now_monotonic = _monotonic_now()
+        last_published = _component_published_at.get(component)
+        if (
+            unchanged
+            and not durable_identity_changed
+            and last_published is not None
+            and now_monotonic - last_published < _heartbeat_interval_seconds()
+        ):
+            return True
+        components[component] = next_component
         data = _status_document(
             components,
             now=now,
             task_queue_size=task_queue_size,
             index_queue_size=index_queue_size,
         )
-        return _publish_locked(status_file, data)
+        published = _publish_locked(status_file, data)
+        if published:
+            _component_published_at[component] = now_monotonic
+        return published

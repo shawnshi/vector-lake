@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from vector_lake import db_store
+from vector_lake.durability import durable_replace_file, sync_open_file
 from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
 from vector_lake.native_llm import peek_subagent_scratch_dir
 from vector_lake.purpose_contract import render_strategy_directive
@@ -49,8 +50,21 @@ log = logging.getLogger("vector-lake-auto-ingest")
 _CONFIG_NAME = "auto_ingest_config.json"
 _STATE_NAME = ".auto_ingest_controller_state.json"
 _STATE_SCHEMA_VERSION = 1
-_STATE_MAX_LAUNCHES = 500
-_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH = 131072
+_MAX_TASKS_PER_HOUR = 100
+_MAX_TASKS_PER_24H = 2000
+_MAX_TOKENS_PER_TASK = 32768
+_DEFAULT_MAX_TOKENS_PER_TASK = _MAX_TOKENS_PER_TASK
+_DEFAULT_MAX_RESERVED_TOKENS_PER_HOUR = (
+    _MAX_TASKS_PER_HOUR * _DEFAULT_MAX_TOKENS_PER_TASK
+)
+_DEFAULT_MAX_RESERVED_TOKENS_PER_24H = (
+    _MAX_TASKS_PER_24H * _DEFAULT_MAX_TOKENS_PER_TASK
+)
+_STATE_MAX_LAUNCHES = _MAX_TASKS_PER_24H
+# Read-only compatibility ceiling for historical controller ledgers.  It must
+# never be used to authorize a new task; new work is capped by
+# ``_MAX_TOKENS_PER_TASK``.
+_LEGACY_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH = 131072
 _STATE_MAX_CONSECUTIVE_INFRA_FAILURES = 10
 _ATTEMPT_RECEIPT_SCHEMA_VERSION = 1
 _ATTEMPT_RECEIPT_DIR_NAME = "auto_ingest_attempt_receipts"
@@ -214,6 +228,7 @@ class _GeneratedOutput(dict[str, Any]):
 @dataclass(frozen=True)
 class AutoIngestConfig:
     enabled: bool = False
+    allow_model_processing_raw_text: bool = False
     runner: str = "codex_exec"
     codex_executable: str = ""
     runner_codex_home: str = ""
@@ -232,11 +247,11 @@ class AutoIngestConfig:
     max_output_bytes: int = 1048576
     max_files: int = 8
     max_attempts_per_revision: int = 3
-    max_tasks_per_hour: int = 6
-    max_tasks_per_24h: int = 20
-    max_tokens_per_task: int = 32768
-    max_reserved_tokens_per_hour: int = 131072
-    max_reserved_tokens_per_24h: int = 655360
+    max_tasks_per_hour: int = _MAX_TASKS_PER_HOUR
+    max_tasks_per_24h: int = _MAX_TASKS_PER_24H
+    max_tokens_per_task: int = _DEFAULT_MAX_TOKENS_PER_TASK
+    max_reserved_tokens_per_hour: int = _DEFAULT_MAX_RESERVED_TOKENS_PER_HOUR
+    max_reserved_tokens_per_24h: int = _DEFAULT_MAX_RESERVED_TOKENS_PER_24H
     max_consecutive_infra_failures: int = 3
     circuit_breaker_seconds: int = 3600
     max_scratch_runs: int = 100
@@ -318,6 +333,15 @@ def load_auto_ingest_config() -> AutoIngestConfig:
     enabled = _require_bool(raw, "enabled")
     if not enabled:
         return AutoIngestConfig(enabled=False)
+    allow_model_processing_raw_text = _require_bool(
+        raw,
+        "allow_model_processing_raw_text",
+    )
+    if not allow_model_processing_raw_text:
+        raise ValueError(
+            "auto_ingest_config_invalid:"
+            "allow_model_processing_raw_text_must_be_true_when_enabled"
+        )
 
     runner = str(raw.get("runner") or "")
     if runner != "codex_exec":
@@ -374,6 +398,7 @@ def load_auto_ingest_config() -> AutoIngestConfig:
 
     config = AutoIngestConfig(
         enabled=True,
+        allow_model_processing_raw_text=allow_model_processing_raw_text,
         runner=runner,
         codex_executable=str(executable_path),
         runner_codex_home=str(runner_home_path),
@@ -407,13 +432,16 @@ def load_auto_ingest_config() -> AutoIngestConfig:
             raw, "max_attempts_per_revision", minimum=1, maximum=3
         ),
         max_tasks_per_hour=_require_int(
-            raw, "max_tasks_per_hour", minimum=1, maximum=100
+            raw, "max_tasks_per_hour", minimum=1, maximum=_MAX_TASKS_PER_HOUR
         ),
         max_tasks_per_24h=_require_int(
-            raw, "max_tasks_per_24h", minimum=1, maximum=500
+            raw, "max_tasks_per_24h", minimum=1, maximum=_MAX_TASKS_PER_24H
         ),
         max_tokens_per_task=_require_int(
-            raw, "max_tokens_per_task", minimum=16384, maximum=131072
+            raw,
+            "max_tokens_per_task",
+            minimum=16384,
+            maximum=_MAX_TOKENS_PER_TASK,
         ),
         max_reserved_tokens_per_hour=_require_int(
             raw,
@@ -554,35 +582,45 @@ def _load_state(now: datetime | None = None) -> dict[str, Any]:
     cutoff = now - timedelta(hours=24)
     valid_launches = []
     for item in launches:
-        if not isinstance(item, dict) or frozenset(item) not in {
+        fields = frozenset(item) if isinstance(item, dict) else frozenset()
+        historical_attempt_fields = frozenset(
+            {"at", "revision", "job_id", "attempt_id"}
+        )
+        if not isinstance(item, dict) or fields not in {
             frozenset({"at", "revision", "reserved_tokens"}),
             frozenset(
                 {"at", "revision", "reserved_tokens", "job_id", "attempt_id"}
             ),
+            historical_attempt_fields,
         }:
             raise AutoIngestInfrastructureError(
                 "auto_ingest_state_invalid:launch_entry"
             )
         launched_at = parse_state_time(item["at"], "launch_at")
         revision = item["revision"]
-        reserved_tokens = item["reserved_tokens"]
         if not isinstance(revision, str) or not _SHA256_PATTERN.fullmatch(revision):
             raise AutoIngestInfrastructureError(
                 "auto_ingest_state_invalid:launch_revision"
             )
-        if (
+        reserved_tokens = item.get("reserved_tokens")
+        if "reserved_tokens" not in fields:
+            # Pre-budget attempt ledgers did not persist a reservation. They
+            # are safe to discard only after the complete rolling window has
+            # elapsed; an active unaccounted launch must remain fail-closed.
+            if launched_at >= cutoff:
+                raise AutoIngestInfrastructureError(
+                    "auto_ingest_state_invalid:launch_reserved_tokens"
+                )
+        elif (
             isinstance(reserved_tokens, bool)
             or not isinstance(reserved_tokens, int)
-            or not 0 <= reserved_tokens <= _STATE_MAX_RESERVED_TOKENS_PER_LAUNCH
+            or not 0
+            <= reserved_tokens
+            <= _LEGACY_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH
         ):
             raise AutoIngestInfrastructureError(
                 "auto_ingest_state_invalid:launch_reserved_tokens"
             )
-        normalized_launch = {
-            "at": launched_at.isoformat(),
-            "revision": revision,
-            "reserved_tokens": reserved_tokens,
-        }
         if "job_id" in item:
             job_id = item["job_id"]
             attempt_id = item["attempt_id"]
@@ -596,8 +634,16 @@ def _load_state(now: datetime | None = None) -> dict[str, Any]:
                 raise AutoIngestInfrastructureError(
                     "auto_ingest_state_invalid:launch_attempt_id"
                 )
-            normalized_launch.update({"job_id": job_id, "attempt_id": attempt_id})
         if launched_at >= cutoff:
+            normalized_launch = {
+                "at": launched_at.isoformat(),
+                "revision": revision,
+                "reserved_tokens": reserved_tokens,
+            }
+            if "job_id" in item:
+                normalized_launch.update(
+                    {"job_id": item["job_id"], "attempt_id": item["attempt_id"]}
+                )
             valid_launches.append(normalized_launch)
     state["launches"] = valid_launches
     failures = state.get("consecutive_infra_failures")
@@ -625,11 +671,11 @@ def _save_state(state: dict[str, Any]) -> None:
     payload["updated_at"] = _utc_now().isoformat()
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        os.replace(temp_path, path)
+        with temp_path.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            sync_open_file(handle)
+        durable_replace_file(temp_path, path, source_synced=True)
     except OSError as exc:
         raise AutoIngestInfrastructureError(
             f"auto_ingest_state_write_failed:{type(exc).__name__}"
@@ -900,16 +946,17 @@ class _AttemptReceipt:
         temp_path = root / f".{self.attempt_id}.{uuid.uuid4().hex}.tmp"
         try:
             root.mkdir(parents=True, exist_ok=True)
-            temp_path.write_text(
-                json.dumps(
+            with temp_path.open("x", encoding="utf-8", newline="\n") as handle:
+                json.dump(
                     self._payload,
+                    handle,
                     ensure_ascii=False,
                     indent=2,
                     sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-            os.replace(temp_path, receipt_path)
+                )
+                handle.write("\n")
+                sync_open_file(handle)
+            durable_replace_file(temp_path, receipt_path, source_synced=True)
             return True
         except OSError as exc:
             if strict:
@@ -1590,6 +1637,8 @@ def _build_generator_prompt(
     processed_data: dict[str, Any],
     config: AutoIngestConfig,
 ) -> str:
+    if not config.allow_model_processing_raw_text:
+        raise AutoIngestPolicyError("model_raw_text_processing_not_authorized")
     purpose_directive = render_strategy_directive()
     control_plane = {
         "job_id": job_id,
@@ -2199,6 +2248,8 @@ def _run_codex_generator(
     stop_event: threading.Event,
     health_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    if not config.allow_model_processing_raw_text:
+        raise AutoIngestPolicyError("model_raw_text_processing_not_authorized")
     if not _JOB_ID_PATTERN.fullmatch(job_id):
         raise AutoIngestPolicyError("job_id_is_not_safe_for_scratch_isolation")
     _clean_runner_dynamic_state(config)
@@ -2474,12 +2525,17 @@ def _verified_raw_input(
     processed_data: dict[str, Any],
     config: AutoIngestConfig,
 ) -> str:
-    from vector_lake.tool_ingest import get_ingest_target_directories
+    from vector_lake.tool_ingest import (
+        get_ingest_target_directories,
+        is_private_diary_path,
+    )
 
     try:
         raw_path = Path(str(processed_data.get("filepath") or ""))
         if not raw_path.is_absolute():
             raw_path = get_raw_dir().parent / raw_path
+        if is_private_diary_path(raw_path):
+            raise AutoIngestPolicyError("private_source_forbidden")
         roots = [path.resolve() for path in get_ingest_target_directories()]
     except OSError as exc:
         raise AutoIngestInfrastructureError(
@@ -2589,6 +2645,97 @@ def _processed_data_from_claim(
         }
     )
     return processed
+
+
+def _assert_not_private_source(processed_data: dict[str, Any]) -> None:
+    """Reject reserved Diary payloads before any raw byte or prompt access."""
+    from vector_lake.tool_ingest import is_private_diary_path
+
+    raw_path = Path(str(processed_data.get("filepath") or ""))
+    if not raw_path.is_absolute():
+        raw_path = get_raw_dir().parent / raw_path
+    if is_private_diary_path(raw_path):
+        raise AutoIngestPolicyError("private_source_forbidden")
+
+
+def _quarantine_pending_private_sources(limit: int = 1000) -> int:
+    """CAS-quarantine historical unowned Diary jobs before claim or model work."""
+    from vector_lake.tool_ingest import is_private_diary_path
+
+    if not db_store.peek_db_path().is_file():
+        return 0
+    conn = db_store.require_current_schema_for_read("jobs")
+    now = _utc_now().isoformat()
+    rows = conn.execute(
+        "SELECT job_id, status, retries, payload, updated_at, lease_until, "
+        "lease_owner, lease_token, lease_generation FROM jobs "
+        "WHERE task_type = 'ingest' AND ("
+        "status IN ('queued', 'dispatched', 'awaiting_subagent') OR "
+        "(status = 'failed' AND COALESCE(retries, 0) < 3) OR "
+        "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?)) "
+        "ORDER BY created_at ASC, job_id ASC LIMIT ?",
+        (now, max(1, min(10_000, int(limit)))),
+    ).fetchall()
+    candidates = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        try:
+            payload = json.loads(str(row.get("payload") or ""))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        filepath = str(payload.get("filepath") or "")
+        if not filepath:
+            continue
+        path = Path(filepath)
+        if not path.is_absolute():
+            path = get_raw_dir().parent / path
+        if is_private_diary_path(path):
+            candidates.append(row)
+    if not candidates:
+        return 0
+
+    result_json = json.dumps(
+        {
+            "maintenance": "auto_ingest_controller",
+            "state": "quarantined",
+            "failure_class": "private_source_forbidden",
+            "reason": "private_source_forbidden",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    quarantined = 0
+    with db_store.transaction():
+        for row in candidates:
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'failed', retries = MAX(3, "
+                "COALESCE(retries, 0) + 1), error_msg = ?, result_json = ?, "
+                "updated_at = ?, completed_at = ?, available_at = NULL, "
+                "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+                "WHERE job_id = ? AND task_type = 'ingest' AND status IS ? "
+                "AND retries IS ? AND payload IS ? AND updated_at IS ? "
+                "AND lease_until IS ? AND lease_owner IS ? AND lease_token IS ? "
+                "AND lease_generation IS ?",
+                (
+                    "private_source_forbidden",
+                    result_json,
+                    now,
+                    now,
+                    row["job_id"],
+                    row["status"],
+                    row["retries"],
+                    row["payload"],
+                    row["updated_at"],
+                    row["lease_until"],
+                    row["lease_owner"],
+                    row["lease_token"],
+                    row["lease_generation"],
+                ),
+            )
+            quarantined += int(cursor.rowcount or 0)
+    return quarantined
 
 
 def _job_state(
@@ -3103,6 +3250,7 @@ class AutoIngestController:
         with _ClaimHandle(job_id, lease) as handle:
             try:
                 processed_data = _processed_data_from_claim(claim, lease)
+                _assert_not_private_source(processed_data)
                 revision = _revision_key(processed_data)
                 if (
                     _revision_attempts(state, revision)
@@ -3481,7 +3629,7 @@ class AutoIngestController:
         if not config.enabled:
             self._sticky_error = ""
             write_status(
-                "idle",
+                "disabled",
                 0,
                 0,
                 "Automatic ingest host disabled",
@@ -3531,6 +3679,14 @@ class AutoIngestController:
                 component="auto_ingest",
             )
             return "state_unavailable"
+        try:
+            _quarantine_pending_private_sources()
+        except Exception as exc:
+            wrapped = AutoIngestInfrastructureError(
+                f"private_source_reconcile_failed:{type(exc).__name__}"
+            )
+            self._record_infrastructure(state, config, wrapped)
+            return "infrastructure_error"
         budget_block = _global_budget_block(config, state, now)
         if budget_block:
             write_status(

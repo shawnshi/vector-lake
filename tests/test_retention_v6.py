@@ -14,6 +14,21 @@ RECENT = "2026-08-03T00:00:00+00:00"
 
 
 def _drop_v6_contract(conn) -> None:
+    conn.execute("DROP TABLE IF EXISTS projection_runtime_v9")
+    conn.execute("DROP TABLE IF EXISTS embedding_metadata_v8")
+    conn.execute("DROP TABLE IF EXISTS search_projection_state_v8")
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(mutation_outbox)").fetchall()
+    }
+    for column_name in (
+        "poison_attempt_count",
+        "transient_attempt_count",
+        "last_error_code",
+        "first_transient_at",
+    ):
+        if column_name in columns:
+            conn.execute(f'ALTER TABLE mutation_outbox DROP COLUMN "{column_name}"')
     conn.execute("DROP TRIGGER trg_change_set_terminal_v6_immutable")
     for index_name in (
         "idx_change_set_payload_refs_payload_v6",
@@ -45,6 +60,14 @@ def _controlled_v6_migrate(path) -> None:
                 maintenance_lock=lock,
             )
             db_store._apply_controlled_schema_v7_migration(
+                conn,
+                maintenance_lock=lock,
+            )
+            db_store._apply_controlled_schema_v8_migration(
+                conn,
+                maintenance_lock=lock,
+            )
+            db_store._apply_controlled_schema_v9_migration(
                 conn,
                 maintenance_lock=lock,
             )

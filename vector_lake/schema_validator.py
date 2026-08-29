@@ -241,8 +241,13 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     # Check tag collision if index is passed
     if tags and index_path and index_path.exists():
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
+            # Schema-v9 index.json is a static locator, not the projection
+            # payload.  Use the committed reader so a stale/tampered v2
+            # binding fails closed instead of silently validating the locator
+            # as an empty legacy index.
+            from vector_lake.indexer import read_committed_index_snapshot
+
+            index_data = read_committed_index_snapshot(index_path)
             
             entities_in_index = set()
             for node_id, node_data in index_data.get("nodes", {}).items():

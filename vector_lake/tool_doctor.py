@@ -104,7 +104,57 @@ def _schema_readiness_reasons(schema_state: dict) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
-def doctor_vector_lake() -> str:
+def _diagnostic_snapshot_failure_report(reason: str) -> str:
+    from vector_lake.diagnostic_snapshot import current_durability_status
+
+    durability = current_durability_status()
+    durability_state = (
+        "OK"
+        if durability["profile"] == "full"
+        else ("WARN" if durability["profile"] == "best_effort" else "FAIL")
+    )
+    return "\n".join(
+        [
+            "=== Vector Lake Doctor ===",
+            f"[FAIL] Diagnostic Snapshot: {reason}",
+            f"[{durability_state}] Durability: profile={durability['profile']}",
+            "",
+            "Infrastructure Summary: issues detected",
+            "Semantic Readiness: not_ready",
+            f"Semantic issues: diagnostic_snapshot_failed:{reason}",
+            "Summary: infrastructure issues detected; semantic readiness not_ready",
+        ]
+    )
+
+
+def doctor_vector_lake(diagnostic_snapshot=None) -> str:
+    """Run Doctor against one shared diagnostic snapshot when available."""
+    if diagnostic_snapshot is not None:
+        return _doctor_vector_lake(diagnostic_snapshot=diagnostic_snapshot)
+
+    from vector_lake.diagnostic_snapshot import (
+        DiagnosticSnapshotChanged,
+        DiagnosticSnapshotUnavailable,
+        capture_diagnostic_snapshot,
+    )
+
+    try:
+        with capture_diagnostic_snapshot(timeout=5.0) as snapshot:
+            return _doctor_vector_lake(diagnostic_snapshot=snapshot)
+    except DiagnosticSnapshotChanged:
+        return _diagnostic_snapshot_failure_report("snapshot_changed")
+    except DiagnosticSnapshotUnavailable as exc:
+        reason = str(exc) or "diagnostic_snapshot_unavailable"
+        if reason != "database_missing":
+            return _diagnostic_snapshot_failure_report(reason)
+        return _doctor_vector_lake(snapshot_error=reason)
+
+
+def _doctor_vector_lake(
+    *,
+    diagnostic_snapshot=None,
+    snapshot_error: str | None = None,
+) -> str:
     checks = []
     semantic_readiness = {
         "ready": False,
@@ -113,6 +163,38 @@ def doctor_vector_lake() -> str:
         "warnings": [],
         "detail": {},
     }
+
+    if diagnostic_snapshot is not None:
+        snapshot_metadata = diagnostic_snapshot.metadata()
+        checks.append((
+            "Diagnostic Snapshot",
+            True,
+            (
+                f"captured_at={snapshot_metadata['captured_at']}; "
+                f"generation_fingerprint={snapshot_metadata['generation_fingerprint']}; "
+                f"source_fingerprint={snapshot_metadata['source_fingerprint']}"
+            ),
+        ))
+        durability = diagnostic_snapshot.durability
+    else:
+        from vector_lake.diagnostic_snapshot import current_durability_status
+
+        checks.append((
+            "Diagnostic Snapshot",
+            False,
+            snapshot_error or "diagnostic_snapshot_unavailable",
+        ))
+        durability = current_durability_status()
+    durability_ok = (
+        True
+        if durability["profile"] == "full"
+        else (None if durability["profile"] == "best_effort" else False)
+    )
+    checks.append((
+        "Durability",
+        durability_ok,
+        f"profile={durability['profile']}",
+    ))
 
     # 1. Environment & Config
     python_ok = sys.version_info >= (3, 10)
@@ -159,7 +241,14 @@ def doctor_vector_lake() -> str:
     # 3. Paths & Basic Files
     meta_path = peek_meta_dir()
     db_path = peek_db_path()
-    schema_state = inspect_schema_migration_state(db_path)
+    schema_state = (
+        db_store.inspect_schema_migration_connection(
+            diagnostic_snapshot.connection,
+            diagnostic_snapshot.db_path,
+        )
+        if diagnostic_snapshot is not None
+        else inspect_schema_migration_state(db_path)
+    )
     schema_reasons = _schema_readiness_reasons(schema_state)
     for label, path in [("MEMORY", get_memory_dir()), ("Raw", get_raw_dir()), ("Wiki", get_wiki_dir())]:
         checks.append((label, path.exists(), str(path)))
@@ -184,32 +273,54 @@ def doctor_vector_lake() -> str:
     committed_index_data = None
     projection_connection = None
     if index_exists and schema_state["ready"]:
-        try:
-            from vector_lake.indexer import read_committed_index_snapshot
-
-            projection_connection, _projection_db_path = (
-                _open_runtime_database_read_only()
+        if diagnostic_snapshot is not None:
+            committed_index_data = diagnostic_snapshot.index_data
+            projection_ok = (
+                diagnostic_snapshot.projection_status == "committed_current"
             )
-            committed_index_data = read_committed_index_snapshot(
-                get_index_path(),
-                lock_timeout=1.0,
-                connection=projection_connection,
-                _acquire_lock=False,
-            )
-            projection_manifest = committed_index_data.get(
-                "projection_manifest"
-            ) or {}
             checks.append((
                 "Projection Pair",
-                True,
-                "committed generation="
-                + str(projection_manifest.get("generation") or "unknown"),
+                projection_ok,
+                (
+                    "committed generation="
+                    + str(diagnostic_snapshot.projection_generation or "unknown")
+                    if projection_ok
+                    else "not committed/current: "
+                    + (
+                        diagnostic_snapshot.projection_error
+                        or "diagnostic_projection_unavailable"
+                    )
+                ),
             ))
-        except Exception as exc:
-            checks.append(("Projection Pair", False, f"not committed/current: {exc}"))
-        finally:
-            if projection_connection is not None:
-                projection_connection.close()
+            if not projection_ok:
+                committed_index_data = None
+        else:
+            try:
+                from vector_lake.indexer import read_committed_index_snapshot
+
+                projection_connection, _projection_db_path = (
+                    _open_runtime_database_read_only()
+                )
+                committed_index_data = read_committed_index_snapshot(
+                    get_index_path(),
+                    lock_timeout=1.0,
+                    connection=projection_connection,
+                    _acquire_lock=False,
+                )
+                projection_manifest = committed_index_data.get(
+                    "projection_manifest"
+                ) or {}
+                checks.append((
+                    "Projection Pair",
+                    True,
+                    "committed generation="
+                    + str(projection_manifest.get("generation") or "unknown"),
+                ))
+            except Exception as exc:
+                checks.append(("Projection Pair", False, f"not committed/current: {exc}"))
+            finally:
+                if projection_connection is not None:
+                    projection_connection.close()
     else:
         reason = "index missing" if not index_exists else "database schema not ready"
         checks.append(("Projection Pair", False, reason))
@@ -309,9 +420,14 @@ def doctor_vector_lake() -> str:
     # 7. State Projection Consistency
     try:
         excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
+        diagnostic_wiki_paths = (
+            diagnostic_snapshot.wiki_paths
+            if diagnostic_snapshot is not None
+            else iter_markdown_files(get_wiki_dir())
+        )
         wiki_keys = {
             path.stem
-            for path in iter_markdown_files(get_wiki_dir())
+            for path in diagnostic_wiki_paths
             if path.name.casefold() not in excluded
             and not path.name.casefold().startswith("system_")
         }
@@ -327,7 +443,13 @@ def doctor_vector_lake() -> str:
                 "database schema is not ready: "
                 + "; ".join(schema_reasons)
             )
-        db_state = _read_database_state(db_path)
+        db_state = (
+            _read_database_state_from_connection(
+                diagnostic_snapshot.connection
+            )
+            if diagnostic_snapshot is not None
+            else _read_database_state(db_path)
+        )
         canonical_keys = db_state["canonical_keys"]
         missing_index = canonical_keys - index_keys
         extra_index = index_keys - canonical_keys
@@ -355,7 +477,53 @@ def doctor_vector_lake() -> str:
             f"queued:{queued_jobs} awaiting_subagent:{awaiting_jobs} terminal_failed:{terminal_jobs}",
         ))
 
-        health = assess_runtime_health(deep_projection_checks=True)
+        health = assess_runtime_health(
+            deep_projection_checks=True,
+            diagnostic_snapshot=diagnostic_snapshot,
+        )
+        memory_search = health["detail"].get("operational_memory_search") or {}
+        memory_search_ok = (
+            True
+            if memory_search.get("ready")
+            else (
+                False
+                if memory_search.get("progress_stalled")
+                or (
+                    memory_search.get("configured")
+                    and not memory_search.get("auto_maintenance_configured")
+                )
+                else None
+            )
+        )
+        checks.append((
+            "Operational Memory Search",
+            memory_search_ok,
+            (
+                f"status={memory_search.get('status', 'unknown')}; "
+                f"indexed={memory_search.get('indexed_documents', 0)}/"
+                f"{memory_search.get('canonical_documents', 0)}; "
+                f"pending={memory_search.get('pending', 0)}; "
+                f"auto={bool(memory_search.get('auto_maintenance_configured'))}"
+            ),
+        ))
+        backup_capacity = health["detail"].get("backup_capacity") or {}
+        backup_policy = backup_capacity.get("policy") or {}
+        backup_capacity_ok = (
+            False
+            if not backup_capacity.get("allowed", False)
+            else (True if backup_capacity.get("quota_configured") else None)
+        )
+        checks.append((
+            "Backup Capacity",
+            backup_capacity_ok,
+            (
+                f"bytes={backup_capacity.get('current_backup_bytes', 0)}; "
+                f"free={backup_capacity.get('disk_free_bytes', 0)}; "
+                f"min_free={backup_capacity.get('minimum_free_required_bytes', 0)}; "
+                f"max_total={backup_policy.get('max_total_bytes', 0) or 'unconfigured'}; "
+                f"mode={backup_policy.get('quota_mode', 'unknown')}"
+            ),
+        ))
         checks.append((
             "Write Gate",
             health["ok"],
@@ -366,7 +534,15 @@ def doctor_vector_lake() -> str:
                 else "; ".join(health["issues"])
             ),
         ))
-        semantic_readiness = assess_semantic_readiness(index_data=index_data)
+        try:
+            semantic_readiness = assess_semantic_readiness(
+                index_data=index_data,
+                diagnostic_snapshot=diagnostic_snapshot,
+            )
+        except TypeError as exc:
+            if "diagnostic_snapshot" not in str(exc):
+                raise
+            semantic_readiness = assess_semantic_readiness(index_data=index_data)
     except Exception as e:
         checks.append(("State Consistency", False, f"Check failed: {e}"))
         semantic_readiness = {

@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from vector_lake import get_extension_root
+from vector_lake.cancellation import (
+    CooperativeCancellation,
+    cancellation_checkpoint,
+    current_cancellation_operation,
+    non_interruptible_phase,
+)
 from vector_lake.db_store import (
     mark_file_processed,
     update_processed_file_observations,
@@ -43,8 +49,10 @@ from vector_lake.raw_revision import (
     StableRawRevision,
     parse_revision,
     snapshot_still_current,
+    stable_raw_metadata,
     stable_raw_revision,
 )
+from vector_lake.raw_scrub_contract import current_raw_scrub_day_ordinal
 
 log = logging.getLogger("vector-lake-ingest")
 FULL_SCAN_COMPLETE_TOKEN = "VECTOR_LAKE_RAW_FULL_SCAN_COMPLETE_V1"
@@ -56,6 +64,16 @@ _INGEST_DEBT_APPLY_MAX_LIMIT = 100
 _MAX_FINALIZE_INLINE_FILES = 64
 _MAX_FINALIZE_INLINE_FILE_BYTES = 2 * 1024 * 1024
 _MAX_FINALIZE_INLINE_BATCH_BYTES = 5 * 1024 * 1024
+_RAW_FULL_SCAN_SCRUB_DAYS_ENV = "VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS"
+_DEFAULT_RAW_FULL_SCAN_SCRUB_DAYS = 7
+_MAX_RAW_FULL_SCAN_SCRUB_DAYS = 3650
+_RAW_SCAN_CHECKPOINT_ITEMS = 64
+
+
+def _raw_scan_checkpoint(label: str, position: int) -> None:
+    interval = max(1, int(_RAW_SCAN_CHECKPOINT_ITEMS))
+    if position % interval == 0:
+        cancellation_checkpoint(label)
 
 
 def _normalize_inline_files_written(files_written: list) -> list[dict]:
@@ -1751,7 +1769,10 @@ def _source_identity_index(
             {"status!=": "Merged", "type": "source"}
         )["items"].values()
         wiki_dir = get_wiki_dir()
-        wiki_paths = {path.stem: path for path in iter_markdown_files(wiki_dir)}
+        wiki_paths = {}
+        for position, path in enumerate(iter_markdown_files(wiki_dir)):
+            _raw_scan_checkpoint("raw_inventory:canonical_pages", position)
+            wiki_paths[path.stem] = path
     else:
         if connection is None:
             from vector_lake.db_store import get_connection, init_db
@@ -1775,7 +1796,8 @@ def _source_identity_index(
             if candidate.stem in scoped_page_keys
         }
     selected: dict[str, tuple[tuple[int, int, int, str], str]] = {}
-    for entity in items:
+    for position, entity in enumerate(items):
+        _raw_scan_checkpoint("raw_inventory:source_entities", position)
         page_key = _strip_markdown_suffix(str(entity.get("page_key") or "").strip())
         wiki_path = wiki_paths.get(page_key)
         if not page_key or wiki_path is None:
@@ -1887,6 +1909,7 @@ def calculate_hash(filepath: str) -> str:
         return stable_raw_revision(
             filepath,
             allowed_roots=get_ingest_target_directories(),
+            include_legacy_md5=False,
         ).canonical_revision
     except (OSError, RawSourceContainmentError, RawSourceUnstableError) as exc:
         log.error("Error calculating stable hash for %s: %s", filepath, exc)
@@ -3568,6 +3591,67 @@ def is_private_diary_path(path: str | Path) -> bool:
     return False
 
 
+def _raw_full_scan_scrub_days() -> int:
+    try:
+        configured = int(
+            os.environ.get(
+                _RAW_FULL_SCAN_SCRUB_DAYS_ENV,
+                str(_DEFAULT_RAW_FULL_SCAN_SCRUB_DAYS),
+            )
+        )
+    except (TypeError, ValueError):
+        configured = _DEFAULT_RAW_FULL_SCAN_SCRUB_DAYS
+    return max(0, min(_MAX_RAW_FULL_SCAN_SCRUB_DAYS, configured))
+
+
+def _raw_inventory_scrub_due(
+    filepath: str | os.PathLike[str],
+    *,
+    day_ordinal: int | None = None,
+) -> bool:
+    """Select one deterministic path bucket per UTC day for full rehashing."""
+    period_days = _raw_full_scan_scrub_days()
+    if period_days == 0:
+        return False
+    if day_ordinal is None:
+        day_ordinal = datetime.now(timezone.utc).date().toordinal()
+    normalized = os.path.normcase(os.path.abspath(os.fspath(filepath)))
+    bucket = int.from_bytes(
+        hashlib.sha256(normalized.encode("utf-8")).digest()[:8],
+        "big",
+    ) % period_days
+    return int(day_ordinal) % period_days == bucket
+
+
+def _full_inventory_stat_matches(
+    filepath: str,
+    processed_row: tuple | None,
+    *,
+    allowed_roots: list[Path],
+    scrub_day_ordinal: int | None = None,
+) -> bool:
+    """Trust only canonical rows with matching observations outside scrub."""
+    if processed_row is None:
+        return False
+    stored_hash, observed_mtime_ns, observed_size = processed_row
+    try:
+        kind, _digest = parse_revision(stored_hash)
+    except RawRevisionFormatError:
+        return False
+    if (
+        kind != "sha256"
+        or observed_mtime_ns is None
+        or observed_size is None
+        or _raw_inventory_scrub_due(filepath, day_ordinal=scrub_day_ordinal)
+    ):
+        return False
+    metadata = stable_raw_metadata(filepath, allowed_roots=allowed_roots)
+    return (
+        int(observed_mtime_ns) == metadata.observed_mtime_ns
+        and int(observed_size) == metadata.observed_size
+    )
+
+
 def prepare_ingest_batch(
     batch_size: int = 5,
     candidate_paths: list[str] | None = None,
@@ -3575,6 +3659,7 @@ def prepare_ingest_batch(
     _enqueue_all: bool = False,
 ) -> str:
     """Persist a bounded public batch or one private startup inventory."""
+    cancellation_checkpoint("raw_inventory:start")
     config = _load_ingest_config()
     target_dirs = get_ingest_target_directories(config)
     exclude_paths = config.get("exclude_paths", [])
@@ -3647,11 +3732,10 @@ def prepare_ingest_batch(
     files_to_process = set()
     inventory_errors = []
     if candidate_paths is not None:
-        files_to_process = {
-            str(Path(candidate).absolute())
-            for candidate in candidate_paths
-            if allowed_path(Path(candidate))
-        }
+        for position, candidate in enumerate(candidate_paths):
+            _raw_scan_checkpoint("raw_inventory:candidate_paths", position)
+            if allowed_path(Path(candidate)):
+                files_to_process.add(str(Path(candidate).absolute()))
     else:
         scan_target_dirs = get_ingest_target_directories(
             config,
@@ -3661,7 +3745,9 @@ def prepare_ingest_batch(
         def record_walk_error(exc):
             inventory_errors.append(f"inventory_walk_error:{type(exc).__name__}:{exc}")
 
+        walked_files = 0
         for target_dir in scan_target_dirs:
+            cancellation_checkpoint("raw_inventory:target_root")
             if is_private_diary_path(target_dir):
                 continue
             if any(path_is_excluded(target_dir, root) for root in target_dirs):
@@ -3685,6 +3771,8 @@ def prepare_ingest_batch(
                     )
                 ]
                 for filename in files:
+                    _raw_scan_checkpoint("raw_inventory:walk", walked_files)
+                    walked_files += 1
                     path = root_path / filename
                     if allowed_path(path):
                         files_to_process.add(str(path.absolute()))
@@ -3702,34 +3790,37 @@ def prepare_ingest_batch(
             "SELECT filepath, file_hash, observed_mtime_ns, observed_size "
             "FROM processed_files"
         )
-        processed = {
-            row["filepath"]: (
+        processed = {}
+        for position, row in enumerate(cur):
+            _raw_scan_checkpoint("raw_inventory:processed_files", position)
+            processed[row["filepath"]] = (
                 row["file_hash"],
                 row["observed_mtime_ns"],
                 row["observed_size"],
             )
-            for row in cur.fetchall()
-        }
-        legacy_ingest_identities = {
-            (
-                str(row["filepath"]),
-                str(row["file_hash"]),
-                str(row["canonical_name"]),
-            )
-            for row in conn.execute(
-                "SELECT CASE WHEN json_valid(payload) "
-                "THEN json_extract(payload, '$.filepath') END AS filepath, "
-                "CASE WHEN json_valid(payload) "
-                "THEN json_extract(payload, '$.hash') END AS file_hash, "
-                "CASE WHEN json_valid(payload) "
-                "THEN json_extract(payload, '$.canonical_name') "
-                "END AS canonical_name "
-                "FROM jobs WHERE task_type = 'ingest' AND idempotency_key IS NULL "
-                "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
-                "'subagent_processing') OR (status = 'failed' AND COALESCE(retries, 0) < 3))"
-            )
-            if row["filepath"] and row["file_hash"] and row["canonical_name"]
-        }
+        legacy_ingest_identities = set()
+        legacy_rows = conn.execute(
+            "SELECT CASE WHEN json_valid(payload) "
+            "THEN json_extract(payload, '$.filepath') END AS filepath, "
+            "CASE WHEN json_valid(payload) "
+            "THEN json_extract(payload, '$.hash') END AS file_hash, "
+            "CASE WHEN json_valid(payload) "
+            "THEN json_extract(payload, '$.canonical_name') "
+            "END AS canonical_name "
+            "FROM jobs WHERE task_type = 'ingest' AND idempotency_key IS NULL "
+            "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
+            "'subagent_processing') OR (status = 'failed' AND COALESCE(retries, 0) < 3))"
+        )
+        for position, row in enumerate(legacy_rows):
+            _raw_scan_checkpoint("raw_inventory:legacy_jobs", position)
+            if row["filepath"] and row["file_hash"] and row["canonical_name"]:
+                legacy_ingest_identities.add(
+                    (
+                        str(row["filepath"]),
+                        str(row["file_hash"]),
+                        str(row["canonical_name"]),
+                    )
+                )
         source_identity_index = _source_identity_index(target_dirs)
     else:
         cur = None
@@ -3748,16 +3839,34 @@ def prepare_ingest_batch(
 
     ingest_candidates = []
     observations_to_update = []
-    for filepath in files_to_process:
+    scrub_day_ordinal = (
+        current_raw_scrub_day_ordinal() if candidate_paths is None else None
+    )
+    for position, filepath in enumerate(files_to_process):
+        _raw_scan_checkpoint("raw_inventory:revision", position)
         try:
             processed_row = processed.get(filepath)
+            if candidate_paths is None and _full_inventory_stat_matches(
+                filepath,
+                processed_row,
+                allowed_roots=target_dirs,
+                scrub_day_ordinal=scrub_day_ordinal,
+            ):
+                continue
             state = "retry"
             classified_row = processed_row
             snapshot = None
             for _attempt in range(2):
+                revision_kind = None
+                if processed_row is not None:
+                    try:
+                        revision_kind, _digest = parse_revision(processed_row[0])
+                    except RawRevisionFormatError:
+                        pass
                 snapshot = stable_raw_revision(
                     filepath,
                     allowed_roots=target_dirs,
+                    include_legacy_md5=revision_kind == "md5",
                 )
                 if processed_row is None:
                     state, classified_row = "drifted", None
@@ -3869,7 +3978,10 @@ def prepare_ingest_batch(
     source_hashes = governance_store.canonical_page_versions(canonical_keys)
     preparation_errors = []
 
-    for filepath, file_hash, canonical_name in pending_files:
+    managed_operation = current_cancellation_operation()
+    prepared_payloads = []
+    for position, (filepath, file_hash, canonical_name) in enumerate(pending_files):
+        _raw_scan_checkpoint("raw_inventory:prepare_payload", position)
         try:
             canonical_key = _strip_markdown_suffix(canonical_name)
             source_hash = source_hashes.get(canonical_key, "")
@@ -3895,10 +4007,29 @@ def prepare_ingest_batch(
                 "ingest_contract_version": INGEST_CONTRACT_VERSION,
                 "instructions": instructions,
             }
-            enqueue_job("ingest", payload)
-            enqueued_count += 1
+            if managed_operation is None:
+                enqueue_job("ingest", payload)
+                enqueued_count += 1
+            else:
+                prepared_payloads.append(payload)
+        except CooperativeCancellation:
+            raise
         except Exception as exc:
             preparation_errors.append(f"{filepath}: {type(exc).__name__}: {exc}")
+
+    if prepared_payloads:
+        with non_interruptible_phase("raw_ingest_enqueue"):
+            for prepared_payload in prepared_payloads:
+                try:
+                    enqueue_job("ingest", prepared_payload)
+                    payload = prepared_payload
+                    enqueued_count += 1
+                except CooperativeCancellation:
+                    raise
+                except Exception as exc:
+                    preparation_errors.append(
+                        f"{prepared_payload['filepath']}: {type(exc).__name__}: {exc}"
+                    )
 
     batch_errors = [*inventory_errors, *preparation_errors]
     if batch_errors:
@@ -3929,6 +4060,7 @@ def _finalize_ingest_impl(
 ) -> str:
     """Finalize one ingest while preserving the public string-error contract."""
     try:
+        cancellation_checkpoint("ingest_finalize:start")
         from vector_lake.wiki_utils import SafeWriteError
         from vector_lake.db_store import (
             finalize_ingest_job,
@@ -3999,7 +4131,8 @@ def _finalize_ingest_impl(
 
         written_paths = []
         mutations = []
-        for item in files:
+        for position, item in enumerate(files):
+            _raw_scan_checkpoint("ingest_finalize:files", position)
             fname = os.path.basename(item["filename"])
             fcontent = item["content"]
 
@@ -4047,23 +4180,24 @@ def _finalize_ingest_impl(
                     str(job_row["task_packet_path"]),
                 )
 
-        if mutations:
-            execute_mutation_batch(
-                mutations,
-                canonical_callback=mark_ingest_processed,
-                precondition_callback=verify_source_link_closure,
-                origin="ingest_integration",
-                schema_maintenance_filenames=schema_maintenance_filenames,
-            )
-        else:
-            from vector_lake import db_store as ingest_db_store
-            from vector_lake.runtime_health import enforce_runtime_write_health
+        with non_interruptible_phase("ingest_finalize_commit"):
+            if mutations:
+                execute_mutation_batch(
+                    mutations,
+                    canonical_callback=mark_ingest_processed,
+                    precondition_callback=verify_source_link_closure,
+                    origin="ingest_integration",
+                    schema_maintenance_filenames=schema_maintenance_filenames,
+                )
+            else:
+                from vector_lake import db_store as ingest_db_store
+                from vector_lake.runtime_health import enforce_runtime_write_health
 
-            enforce_runtime_write_health(validation_mode="full")
-            ingest_db_store.init_db()
-            with ingest_db_store.transaction():
-                verify_source_link_closure()
-                mark_ingest_processed()
+                enforce_runtime_write_health(validation_mode="full")
+                ingest_db_store.init_db()
+                with ingest_db_store.transaction():
+                    verify_source_link_closure()
+                    mark_ingest_processed()
 
         try:
             cleanup = process_ingest_task_cleanup(limit=20)
@@ -4085,8 +4219,11 @@ def _finalize_ingest_impl(
                     if isinstance(edge, dict) and str(edge.get("target", "")).strip()
                 }
                 if target_names:
-                    with open(get_index_path(), "r", encoding="utf-8") as handle:
-                        index_nodes = json.load(handle).get("nodes", {}).values()
+                    from vector_lake.indexer import read_committed_index_snapshot
+
+                    index_nodes = read_committed_index_snapshot(
+                        get_index_path()
+                    ).get("nodes", {}).values()
                     for node in index_nodes:
                         edges = node.get("tension_edges", [])
                         if any(
@@ -4128,14 +4265,15 @@ def _finalize_ingest_impl(
         try:
             from vector_lake import db_store
 
-            requeued = db_store.requeue_ingest_subagent_baseline_conflict(
-                str(processed_data.get("job_id") or ""),
-                str(processed_data.get("lease_owner") or ""),
-                str(processed_data.get("lease_token") or ""),
-                int(processed_data.get("lease_generation")),
-                f"Ingest baseline changed after dispatch: {exc}",
-                current_ingest_contract_version=INGEST_CONTRACT_VERSION,
-            )
+            with non_interruptible_phase("ingest_finalize_requeue"):
+                requeued = db_store.requeue_ingest_subagent_baseline_conflict(
+                    str(processed_data.get("job_id") or ""),
+                    str(processed_data.get("lease_owner") or ""),
+                    str(processed_data.get("lease_token") or ""),
+                    int(processed_data.get("lease_generation")),
+                    f"Ingest baseline changed after dispatch: {exc}",
+                    current_ingest_contract_version=INGEST_CONTRACT_VERSION,
+                )
         except Exception as requeue_error:
             if propagate_errors:
                 raise IngestFinalizationInfrastructureError(
@@ -4161,6 +4299,8 @@ def _finalize_ingest_impl(
             "Error finalizing ingestion: baseline changed, but the lease was "
             f"no longer current: {exc}"
         )
+    except CooperativeCancellation:
+        raise
     except Exception as e:
         if propagate_errors:
             raise
@@ -4186,6 +4326,8 @@ def finalize_ingest_strict(files_written: list, processed_data: dict) -> str:
             propagate_errors=True,
         )
     except IngestFinalizationInfrastructureError:
+        raise
+    except CooperativeCancellation:
         raise
     except (OSError, sqlite3.Error, RuntimeError) as exc:
         raise IngestFinalizationInfrastructureError(

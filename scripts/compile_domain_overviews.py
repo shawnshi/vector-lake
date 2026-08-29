@@ -157,4 +157,7 @@ def compile_overviews():
             log.error(f"Failed to write {overview_filename}: {e}")
 
 if __name__ == "__main__":
+    from vector_lake.runtime_paths import bootstrap_runtime_paths
+
+    bootstrap_runtime_paths(caller="Domain overview compiler")
     compile_overviews()

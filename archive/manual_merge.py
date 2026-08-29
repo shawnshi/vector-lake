@@ -1,8 +1,7 @@
 import os
 import sys
-import yaml
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from vector_lake.yaml_utils import load_yaml, dump_yaml
+from vector_lake.yaml_utils import dump_yaml, load_yaml  # noqa: E402
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 

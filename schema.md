@@ -10,7 +10,7 @@ You generate or validate bounded Vector Lake page candidates. Candidates have no
 - **`MEMORY/raw/`**: Source documents. READ ONLY except for cascade deletes.
 - **`MEMORY/wiki/.meta/vector_lake.db`**: Transactional canonical store for entities, claims, evidence, sources, graph state, change sets and durable outbox intent. Do not edit it outside governed runtime entrypoints.
 - **`MEMORY/wiki/`**: Human-audit Markdown projection. Do not hand-edit derived pages unless an explicitly authorized legacy repair path requires it.
-- **`MEMORY/wiki/index.json`**: Search/topology projection generated from committed canonical state. DO NOT edit this directly. It includes `weighted_edges` with 4-signal relevance scores.
+- **`MEMORY/wiki/index.json` / `claim_graph.json`**: Small projection-v2 locators generated from committed canonical state. The immutable search/topology components, including the weighted-edge frontier, live under `MEMORY/wiki/.projection-store/objects/sha256/`. Do not edit locators or objects directly.
 - **SQLite `operational_memory` table in `MEMORY/wiki/.meta/vector_lake.db`**: Machine-facing Agent read model compiled from canonical claims. It resides in the canonical database for transactional consistency but is not an independent source of truth and must not be hand-edited.
 - **`MEMORY/wiki/log.md`**: The append-only chronological log. Append an entry here for every ingest, query-to-page, or lint operation. Format: `## [YYYY-MM-DD HH:MM] <Action> | <Target>`
 - **`MEMORY/wiki/overview.md`**: Human-readable bird's-eye summary of ALL wiki topics. Updated after each ingest batch.

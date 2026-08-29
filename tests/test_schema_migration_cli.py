@@ -30,6 +30,27 @@ def _downgrade_ledger(path: Path, version: int, *, duplicate_indexes=False) -> N
     db_store.close_all_connections()
     connection = sqlite3.connect(path)
     try:
+        if version < 9:
+            connection.execute("DROP TABLE IF EXISTS projection_runtime_v9")
+        if version < 8:
+            connection.execute("DROP TABLE IF EXISTS embedding_metadata_v8")
+            connection.execute("DROP TABLE IF EXISTS search_projection_state_v8")
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(mutation_outbox)"
+                ).fetchall()
+            }
+            for column_name in (
+                "poison_attempt_count",
+                "transient_attempt_count",
+                "last_error_code",
+                "first_transient_at",
+            ):
+                if column_name in columns:
+                    connection.execute(
+                        f'ALTER TABLE mutation_outbox DROP COLUMN "{column_name}"'
+                    )
         if version < 7:
             payloads = connection.execute(
                 "SELECT payload_sha256, codec, payload_blob, raw_bytes, "
@@ -127,7 +148,12 @@ def test_schema_migration_existing_preview_preserves_all_physical_identity(
 
     assert preview["can_apply"] is True
     assert preview["pre_schema_version"] == 5
-    assert preview["steps"] == ["schema_v5_to_v6", "schema_v6_to_v7"]
+    assert preview["steps"] == [
+        "schema_v5_to_v6",
+        "schema_v6_to_v7",
+        "schema_v7_to_v8",
+        "schema_v8_to_v9",
+    ]
     assert _physical_tree_identity(isolated_memory) == before
 
 
@@ -153,9 +179,28 @@ def test_schema_migration_explicitly_rejects_v1_to_v3(version, isolated_memory):
 @pytest.mark.parametrize(
     ("version", "expected_steps"),
     [
-        (4, ["schema_v4_to_v5", "schema_v5_to_v6", "schema_v6_to_v7"]),
-        (5, ["schema_v5_to_v6", "schema_v6_to_v7"]),
-        (6, ["schema_v6_to_v7"]),
+        (
+            4,
+            [
+                "schema_v4_to_v5",
+                "schema_v5_to_v6",
+                "schema_v6_to_v7",
+                "schema_v7_to_v8",
+                "schema_v8_to_v9",
+            ],
+        ),
+        (
+            5,
+            [
+                "schema_v5_to_v6",
+                "schema_v6_to_v7",
+                "schema_v7_to_v8",
+                "schema_v8_to_v9",
+            ],
+        ),
+        (6, ["schema_v6_to_v7", "schema_v7_to_v8", "schema_v8_to_v9"]),
+        (7, ["schema_v7_to_v8", "schema_v8_to_v9"]),
+        (8, ["schema_v8_to_v9"]),
     ],
 )
 def test_schema_migration_applies_with_verified_backup_and_receipt(
@@ -178,7 +223,7 @@ def test_schema_migration_applies_with_verified_backup_and_receipt(
     assert result["plan_fingerprint"] == preview["fingerprint"]
     assert result["pre"]["user_version"] == version
     assert result["post"]["ready"] is True
-    assert result["post"]["user_version"] == 7
+    assert result["post"]["user_version"] == 9
     backup_path = Path(result["backup"]["path"])
     assert backup_path.is_file()
     assert result["backup"]["sha256"] == _sha256(backup_path)
@@ -189,6 +234,26 @@ def test_schema_migration_applies_with_verified_backup_and_receipt(
     try:
         assert backup.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert backup.execute("PRAGMA user_version").fetchone()[0] == version
+        assert backup.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'projection_runtime_v9'"
+        ).fetchall() == []
+        v8_objects = backup.execute(
+            "SELECT name FROM sqlite_master WHERE name IN "
+            "('embedding_metadata_v8', 'search_projection_state_v8') "
+            "ORDER BY name"
+        ).fetchall()
+        assert bool(v8_objects) is (version >= 8)
+        outbox_columns = {
+            str(row[1])
+            for row in backup.execute("PRAGMA table_info(mutation_outbox)").fetchall()
+        }
+        v8_columns = {
+            "poison_attempt_count",
+            "transient_attempt_count",
+            "last_error_code",
+            "first_transient_at",
+        }
+        assert v8_columns.issubset(outbox_columns) is (version >= 8)
     finally:
         backup.close()
     assert not Path(str(backup_path) + "-wal").exists()
@@ -209,8 +274,8 @@ def test_schema_migration_applies_with_verified_backup_and_receipt(
     assert db_store.inspect_schema_migration_state(path)["ready"] is True
 
 
-def test_schema_migration_v7_apply_is_idempotent_no_op(isolated_memory):
-    path = _ready_database(7)
+def test_schema_migration_v9_apply_is_idempotent_no_op(isolated_memory):
+    path = _ready_database(9)
     preview = db_store.preview_schema_migration(path)
 
     result = db_store.schema_migration_maintenance(
@@ -338,7 +403,7 @@ def test_schema_migration_rejects_commit_after_locked_preview_before_backup(
     assert not (path.parent / "schema-migration-receipts").exists()
 
 
-def test_schema_migration_v4_to_v7_rolls_back_as_one_transaction(
+def test_schema_migration_v4_to_v9_rolls_back_when_v7_step_fails(
     isolated_memory,
     monkeypatch,
 ):
@@ -391,6 +456,113 @@ def test_schema_migration_v4_to_v7_rolls_back_as_one_transaction(
     assert manifest["backup"]["sha256"] == _sha256(backups[0])
 
 
+def test_schema_migration_v8_to_v9_failure_leaves_no_v9_database_artifact(
+    isolated_memory,
+    monkeypatch,
+):
+    path = _ready_database(8)
+    before_sha256 = _sha256(path)
+    preview = db_store.preview_schema_migration(path)
+    real_migrate = db_store._migrate_projection_runtime_schema_v9
+
+    def fail_after_v9_ddl(connection):
+        real_migrate(connection)
+        raise RuntimeError("injected v9 failure")
+
+    monkeypatch.setattr(
+        db_store,
+        "_migrate_projection_runtime_schema_v9",
+        fail_after_v9_ddl,
+    )
+    with pytest.raises(RuntimeError, match="injected v9 failure"):
+        db_store.schema_migration_maintenance(
+            apply=True,
+            confirmation=preview["fingerprint"],
+            confirm_no_writers=True,
+            db_path=path,
+        )
+
+    assert _sha256(path) == before_sha256
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'projection_runtime_v9'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT version FROM schema_migrations WHERE version = 9"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def test_schema_migration_v8_to_v9_preserves_existing_v8_runtime_data(
+    isolated_memory,
+):
+    path = _ready_database(8)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO entities (entity_id, canonical_name, data_json, updated_at) "
+            "VALUES ('v8-preserved', 'V8 Preserved', '{}', '2026-08-28T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO embedding_metadata_v8 "
+            "(entity_id, content_sha256, input_contract, model, dimension, "
+            "canonical_generation_json, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "v8-preserved",
+                "a" * 64,
+                "test-contract/v1",
+                "test-model",
+                3,
+                '{"entities":1}',
+                "2026-08-28T00:00:00Z",
+            ),
+        )
+        connection.execute(
+            "UPDATE search_projection_state_v8 SET status = 'ready', "
+            "projection_generation = 'v8-generation', "
+            "canonical_generation_json = '{\"entities\":1}', "
+            "expected_row_count = 1, expected_corpus_sha256 = ?, "
+            "updated_at = '2026-08-28T00:00:00Z' WHERE singleton = 1",
+            ("b" * 64,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    preview = db_store.preview_schema_migration(path)
+    result = db_store.schema_migration_maintenance(
+        apply=True,
+        confirmation=preview["fingerprint"],
+        confirm_no_writers=True,
+        db_path=path,
+    )
+
+    assert result["post"]["user_version"] == 9
+    migrated = sqlite3.connect(path)
+    try:
+        assert migrated.execute(
+            "SELECT canonical_name FROM entities WHERE entity_id = 'v8-preserved'"
+        ).fetchone() == ("V8 Preserved",)
+        assert migrated.execute(
+            "SELECT content_sha256, model, dimension FROM embedding_metadata_v8 "
+            "WHERE entity_id = 'v8-preserved'"
+        ).fetchone() == ("a" * 64, "test-model", 3)
+        assert migrated.execute(
+            "SELECT status, projection_generation, expected_row_count, "
+            "expected_corpus_sha256 FROM search_projection_state_v8 "
+            "WHERE singleton = 1"
+        ).fetchone() == ("ready", "v8-generation", 1, "b" * 64)
+        assert migrated.execute(
+            "SELECT format_version, status FROM projection_runtime_v9 "
+            "WHERE singleton = 1"
+        ).fetchone() == (2, "rebuild_required")
+    finally:
+        migrated.close()
+
+
 def test_schema_migration_pending_receipt_recovers_after_completion_publish_failure(
     isolated_memory,
     monkeypatch,
@@ -413,7 +585,7 @@ def test_schema_migration_pending_receipt_recovers_after_completion_publish_fail
             db_path=path,
         )
 
-    assert db_store.inspect_schema_migration_state(path)["user_version"] == 7
+    assert db_store.inspect_schema_migration_state(path)["user_version"] == 9
     completed_path, pending_path = db_store._schema_migration_receipt_paths(path)
     assert not completed_path.exists()
     assert json.loads(pending_path.read_text(encoding="utf-8"))["status"] == "pending"
@@ -561,7 +733,7 @@ def test_schema_migration_parser_and_dispatch_are_cli_only_and_apply_gated(
         if isinstance(getattr(action, "choices", None), dict)
         and "schema-migrate" in action.choices
     )
-    assert len(command_choices) == 35
+    assert len(command_choices) == 40
 
     calls = []
     gate_calls = []

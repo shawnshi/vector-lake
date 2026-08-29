@@ -8,7 +8,7 @@ from vector_lake.purpose_contract import PurposeContractError, render_strategy_d
 
 log = logging.getLogger("vector-lake-tool-research")
 
-def research_vector_lake(dry_run: bool = False):
+def research_vector_lake(dry_run: bool = True):
     index_path = str(get_index_path())
     insights = []
     

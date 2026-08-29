@@ -348,6 +348,30 @@ def _verified_survivor_source_title(
     return title if isinstance(title, str) and title else None
 
 
+def _legacy_storage_uri_normalized_to_canonical(
+    expected_uri: object,
+    observed_uri: object,
+    raw_ref: object,
+) -> bool:
+    """Accept only the historical .gemini/MEMORY -> canonical MEMORY URI move."""
+    if not all(isinstance(value, str) and value for value in (expected_uri, observed_uri, raw_ref)):
+        return False
+    normalized_raw_ref = str(raw_ref).replace("\\", "/")
+    if not normalized_raw_ref.startswith("raw/"):
+        return False
+    memory_root = get_memory_dir().resolve()
+    raw_root = (memory_root / "raw").resolve()
+    canonical_artifact = (memory_root / Path(normalized_raw_ref)).resolve()
+    if not canonical_artifact.is_relative_to(raw_root) or canonical_artifact == raw_root:
+        return False
+    legacy_memory_root = (memory_root.parent / ".gemini" / memory_root.name).resolve()
+    legacy_artifact = (legacy_memory_root / Path(normalized_raw_ref)).resolve()
+    return (
+        str(expected_uri).casefold() == legacy_artifact.as_uri().casefold()
+        and str(observed_uri).casefold() == canonical_artifact.as_uri().casefold()
+    )
+
+
 def _preserved_source_data_matches(
     expected: dict,
     observed: dict,
@@ -367,7 +391,9 @@ def _preserved_source_data_matches(
         return False
     expected_title = expected.get("title")
     observed_title = observed.get("title")
-    if (
+    if expected_title == observed_title and isinstance(expected_title, str):
+        title_matches = True
+    elif (
         isinstance(expected_title, str)
         and isinstance(observed_title, str)
         and expected_title.endswith(".md")
@@ -384,7 +410,15 @@ def _preserved_source_data_matches(
         return False
     expected_rest = {key: value for key, value in expected.items() if key != "title"}
     observed_rest = {key: value for key, value in observed.items() if key != "title"}
-    return observed_rest == expected_rest
+    if observed_rest == expected_rest:
+        return True
+    expected_storage_uri = expected_rest.pop("storage_uri", None)
+    observed_storage_uri = observed_rest.pop("storage_uri", None)
+    return observed_rest == expected_rest and _legacy_storage_uri_normalized_to_canonical(
+        expected_storage_uri,
+        observed_storage_uri,
+        expected_rest.get("raw_ref"),
+    )
 
 
 def _post_merge_errors(candidate: dict, journal: dict) -> list[str]:

@@ -4,6 +4,16 @@ import json
 from vector_lake import tool_search
 
 
+def _base_search_result(payload: str) -> str:
+    prefix = "<SemanticReadinessEnvelope>\n"
+    suffix = "\n</SemanticReadinessEnvelope>\n"
+    assert payload.startswith(prefix)
+    envelope_text, result = payload[len(prefix) :].split(suffix, 1)
+    envelope = json.loads(envelope_text)
+    assert envelope["results_are_not_accepted_facts"] is True
+    return result
+
+
 def _install_index(isolated_memory, monkeypatch, nodes):
     index_data = {
         "nodes": nodes,
@@ -41,8 +51,9 @@ def test_fts_failure_uses_index_fallback_and_marks_degraded(
 
     result = tool_search.search_vector_lake("alpha", top_k=3)
 
-    assert result.startswith("[Search degraded: fts5]")
-    assert "**Alpha Policy**" in result
+    base_result = _base_search_result(result)
+    assert base_result.startswith("[Search degraded: fts5]")
+    assert "**Alpha Policy**" in base_result
 
 
 def test_repeated_fts_failures_are_log_rate_limited(
@@ -115,8 +126,9 @@ def test_vector_failure_keeps_fts_results_and_marks_degraded(
 
     result = tool_search.search_vector_lake("alpha", top_k=3)
 
-    assert result.startswith("[Search degraded: vector]")
-    assert "**Alpha Policy**" in result
+    base_result = _base_search_result(result)
+    assert base_result.startswith("[Search degraded: vector]")
+    assert "**Alpha Policy**" in base_result
 
 
 def test_healthy_empty_search_is_explicit(isolated_memory, monkeypatch):
@@ -127,7 +139,9 @@ def test_healthy_empty_search_is_explicit(isolated_memory, monkeypatch):
         lambda *_args, **_kwargs: [],
     )
 
-    assert tool_search.search_vector_lake("absent") == "No matching evidence found.\n"
+    assert _base_search_result(
+        tool_search.search_vector_lake("absent")
+    ) == "No matching evidence found.\n"
 
 
 def test_search_snippet_never_uses_unbounded_read(monkeypatch):
@@ -203,7 +217,9 @@ def test_search_result_budget_and_phase_telemetry_are_enforced(
     result = tool_search.search_vector_lake("alpha", top_k=100)
     status = tool_search.search_performance_status()
 
-    assert result.startswith("[Search degraded: result_budget]")
+    assert _base_search_result(result).startswith(
+        "[Search degraded: result_budget]"
+    )
     assert len(result) < 1_200
     assert status["last"]["result_chars"] == len(result)
     assert status["last"]["result_bytes"] == len(result.encode("utf-8"))
@@ -244,7 +260,9 @@ def test_search_result_budget_is_enforced_in_utf8_bytes(
     result = tool_search.search_vector_lake("alpha", top_k=5)
     status = tool_search.search_performance_status()
 
-    assert result.startswith("[Search degraded: result_budget]")
+    assert _base_search_result(result).startswith(
+        "[Search degraded: result_budget]"
+    )
     assert status["result_byte_limit"] == 4096
     assert status["last"]["result_bytes"] == len(result.encode("utf-8"))
 

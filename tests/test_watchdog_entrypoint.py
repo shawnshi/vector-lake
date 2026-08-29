@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ def test_bootstrap_runtime_paths_uses_mcp_manifest_when_process_env_is_missing(
 ):
     monkeypatch.delenv("VECTOR_LAKE_MEMORY_DIR", raising=False)
     monkeypatch.delenv("VECTOR_LAKE_META_DIR", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_DB_PATH", raising=False)
     manifest = _write_manifest(
         tmp_path / ".mcp.json",
         {
@@ -42,8 +44,11 @@ def test_bootstrap_runtime_paths_uses_mcp_manifest_when_process_env_is_missing(
         "VECTOR_LAKE_MEMORY_DIR": "~/MEMORY",
         "VECTOR_LAKE_META_DIR": "~/MEMORY/wiki/.meta",
     }
-    assert watchdog_sync.os.environ["VECTOR_LAKE_MEMORY_DIR"] == "~/MEMORY"
-    assert watchdog_sync.os.environ["VECTOR_LAKE_META_DIR"] == "~/MEMORY/wiki/.meta"
+    assert os.environ["VECTOR_LAKE_MEMORY_DIR"] == "~/MEMORY"
+    assert os.environ["VECTOR_LAKE_META_DIR"] == "~/MEMORY/wiki/.meta"
+    assert Path(os.environ["VECTOR_LAKE_DB_PATH"]) == (
+        Path("~/MEMORY/wiki/.meta").expanduser() / "vector_lake.db"
+    )
 
 
 def test_bootstrap_runtime_paths_preserves_explicit_process_env_pair(
@@ -52,6 +57,7 @@ def test_bootstrap_runtime_paths_preserves_explicit_process_env_pair(
 ):
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", "D:/explicit-memory")
     monkeypatch.setenv("VECTOR_LAKE_META_DIR", "D:/explicit-memory/wiki/.meta")
+    monkeypatch.delenv("VECTOR_LAKE_DB_PATH", raising=False)
     manifest = _write_manifest(
         tmp_path / ".mcp.json",
         {
@@ -63,8 +69,11 @@ def test_bootstrap_runtime_paths_preserves_explicit_process_env_pair(
     applied = watchdog_sync._bootstrap_runtime_paths(manifest)
 
     assert applied == {}
-    assert watchdog_sync.os.environ["VECTOR_LAKE_MEMORY_DIR"] == "D:/explicit-memory"
-    assert watchdog_sync.os.environ["VECTOR_LAKE_META_DIR"] == "D:/explicit-memory/wiki/.meta"
+    assert os.environ["VECTOR_LAKE_MEMORY_DIR"] == "D:/explicit-memory"
+    assert os.environ["VECTOR_LAKE_META_DIR"] == "D:/explicit-memory/wiki/.meta"
+    assert Path(os.environ["VECTOR_LAKE_DB_PATH"]) == Path(
+        "D:/explicit-memory/wiki/.meta/vector_lake.db"
+    )
 
 
 def test_bootstrap_runtime_paths_rejects_partial_process_override(
@@ -101,5 +110,5 @@ def test_bootstrap_runtime_paths_fails_closed_for_invalid_manifest(
 
     with pytest.raises(RuntimeError, match=expected_message):
         watchdog_sync._bootstrap_runtime_paths(manifest)
-    assert "VECTOR_LAKE_MEMORY_DIR" not in watchdog_sync.os.environ
-    assert "VECTOR_LAKE_META_DIR" not in watchdog_sync.os.environ
+    assert "VECTOR_LAKE_MEMORY_DIR" not in os.environ
+    assert "VECTOR_LAKE_META_DIR" not in os.environ

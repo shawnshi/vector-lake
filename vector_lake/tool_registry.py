@@ -24,6 +24,10 @@ _GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "vector_lake.tool_gc": ("gc_vector_lake",),
     "vector_lake.tool_backup_retention": ("backup_retention_maintenance",),
+    "vector_lake.tool_auto_ingest": (
+        "auto_ingest_attempt_receipt_retention",
+        "auto_ingest_budget_status",
+    ),
     "vector_lake.tool_graph": ("audit_graph", "visualize_vector_lake"),
     "vector_lake.tool_lint": ("lint_vector_lake",),
     "vector_lake.tool_merge": ("merge_suggestions_vector_lake",),
@@ -43,6 +47,9 @@ _GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "vector_lake.tool_review": ("review_vector_lake",),
     "vector_lake.tool_search": ("assemble_context", "search_vector_lake"),
+    "vector_lake.tool_semantic_campaign": (
+        "semantic_readiness_campaign_report",
+    ),
     "vector_lake.tool_sync": ("sync_vector_lake",),
     "vector_lake.tool_trace": ("trace_vector_lake",),
     "vector_lake.tool_timeline": ("rebuild_timeline_events_from_claims",),

@@ -10,7 +10,7 @@ from typing import Any
 
 from vector_lake import governance_store
 from vector_lake.claim_assessment import list_claim_assessments
-from vector_lake.db_store import get_connection, init_db
+from vector_lake.db_store import get_connection, require_current_schema_for_read
 from vector_lake.governance_metrics import infer_claim_validity
 from vector_lake.governance_metrics import claim_governance_version
 
@@ -58,8 +58,13 @@ def _load_json_records(table: str, id_column: str, identifiers: list[str]) -> tu
 
 
 def _canonical_claim(claim_id: str) -> dict:
-    init_db()
-    row = get_connection().execute(
+    conn = require_current_schema_for_read(
+        "claims",
+        "evidence",
+        "sources",
+        "claim_assessments",
+    )
+    row = conn.execute(
         "SELECT claim_id, claim_text, status, data_json, updated_at FROM claims WHERE claim_id = ?",
         (claim_id,),
     ).fetchone()

@@ -14,7 +14,10 @@ def isolate_test_runtime(tmp_path: Path, monkeypatch):
     (memory_dir / "wiki").mkdir(parents=True)
     (memory_dir / "raw").mkdir(parents=True)
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(memory_dir))
-    monkeypatch.delenv("VECTOR_LAKE_META_DIR", raising=False)
+    monkeypatch.setenv(
+        "VECTOR_LAKE_META_DIR",
+        str(memory_dir / "wiki" / ".meta"),
+    )
     monkeypatch.delenv("VECTOR_LAKE_DB_PATH", raising=False)
     monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_BRAIN_ROOT", raising=False)
     monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_TASK_ROOT", raising=False)

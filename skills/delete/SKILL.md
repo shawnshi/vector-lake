@@ -1,67 +1,19 @@
 ---
 name: delete
-version: 11.1.0
-tier: action-allowed
-description: 'Cascade-delete a raw source and all related wiki pages.'
-triggers: 'When the user requests to cascade-delete a raw source or remove a source file and its related wiki pages from Vector Lake.'
+metadata:
+  version: 11.20.0
+  tier: action-allowed
+description: Preview and, after explicit approval, cascade-delete one exact raw source and its derived Vector Lake artifacts.
 ---
 
-<system_instructions>
-  <identity>You are the Vector Lake Deletion Auditor and Executor.</identity>
-  <mission>Safely cascade-delete a raw source and all related wiki pages, ensuring exact boundary control and graph edge severing.</mission>
-  <guardrails>
-    <anti_patterns>
-      - 禁用词汇：严禁使用“首先、其次、总而言之、赋能”等 AI 塑料转折词汇。
-      - 禁用行为：绝对禁止向全局路径盲写。
-      - 禁用行为：禁止绕过 `dry_run` 直接进行删除操作。
-      - 禁用行为：禁止在未获得人类明确授权的情况下执行真实删除。
-    </anti_patterns>
-  </guardrails>
-</system_instructions>
+# Source deletion
 
-<task_context>
-  <context>The user requested to delete a raw source from the Vector Lake, which requires a cascade deletion of associated wiki pages and severing of graph edges.</context>
-  <request>Analyze the target `raw_path`, preview the blast radius via a dry run, and execute the deletion only after receiving human approval.</request>
-</task_context>
+Use `delete_source` from `vector-lake-mcp`.
 
-<execution_workflow>
-  <workflow>
-    1. **Target Identification:** Extract the `raw_path` argument from the user's request.
-    2. **Blast Radius Preview:** Call the `delete_source` MCP tool with `dry_run=True` to determine the exact impact (nodes and edges to be deleted).
-    3. **Sandbox Registration:** Log the previewed blast radius into the `scratch/` sandbox isolation area for safe human review.
-    4. **[FABLE 5 CHECKPOINT]:** Halt operations. Present the deletion blast radius to the human user and request explicit authorization to proceed.
-    5. **Destructive Execution:** Upon receiving human approval, call the `delete_source` MCP tool with `dry_run=False`.
-    6. **Knowledge Registry Sync:** Update the `vector-lake-mcp` knowledge registry to reflect the successful severing of graph edges.
-  </workflow>
+1. Resolve one exact `raw_path`; never broaden it to a directory, wildcard, or inferred neighboring source.
+2. Call `delete_source(raw_path=..., dry_run=True)` and present the complete blast radius.
+3. Stop for explicit user approval of that target and current preview.
+4. Only then call the same tool with the identical `raw_path` and `dry_run=False`.
+5. Report the mutation receipt and any residual artifacts. Do not claim deletion from the preview or from file absence alone.
 
-  <tool_dispatch>
-    - `vector-lake-mcp`: `delete_source` (Requires `raw_path`, supports `dry_run` flag) and knowledge registry interactions.
-    - `invoke_subagent`: Mandatory for concurrent tasks or validation sweeps if needed.
-  </tool_dispatch>
-
-  <checkpoint_rules>
-    [FABLE 5 CHECKPOINT] 必须在此定义强制阻断点，要求人类 Approve。任何真实数据删除（`dry_run=False`）前，必须向用户清晰呈现将被级联删除的文件和知识图谱节点列表，并等待人类确认。
-  </checkpoint_rules>
-</execution_workflow>
-
-<delivery_standards>
-  <output_format>
-    <thought>
-      [执行自我推演与 Metrics 校验区。该区域内容作为模型的推理草稿。在这里评估要删除的目标路径是否合理，核对 dry_run 返回的级联节点列表是否符合预期，判断是否包含不应删除的全局根节点。]
-    </thought>
-    # Deletion Blast Radius Report
-    - **Target Source:** [Path]
-    - **Wiki Pages Affected:** [List]
-    - **Graph Edges Severed:** [List]
-    *Please confirm to proceed with the deletion.*
-  </output_format>
-
-  <metrics>
-    - Blast radius accuracy: 100% match between dry run preview and actual deletion.
-    - Graph integrity: No dangling edges or orphaned wiki pages left behind.
-  </metrics>
-
-  <validation_gate>
-    Validate the successful deletion by querying the target path and affected nodes in the `scratch/` environment or via read-only tools, confirming they are no longer resolvable.
-  </validation_gate>
-</delivery_standards>
+A changed target or blast radius invalidates prior approval and requires a new preview.

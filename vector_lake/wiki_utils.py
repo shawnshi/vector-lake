@@ -6,6 +6,7 @@ import random
 import re
 import shutil
 import string
+import time
 import uuid
 import io
 from pathlib import Path
@@ -13,9 +14,17 @@ from typing import List, TypedDict
 
 import yaml
 from vector_lake import get_extension_root
+from vector_lake.durability import (
+    commit_existing_file,
+    durable_replace_file,
+    sync_open_file,
+)
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 _META_DIR_CACHE = None
+
+_WINDOWS_REPLACE_RETRYABLE_ERRORS = frozenset({5, 32})
+_WINDOWS_REPLACE_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4)
 
 WIKI_LINK_PATTERN = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 _FENCE_OPEN = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)")
@@ -31,7 +40,59 @@ def semantic_text_hash(content: str) -> str:
 
 
 def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else ""
+    if not path.exists():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _annotate_compare_and_swap_os_error(
+    exc: OSError,
+    *,
+    phase: str,
+    path: Path,
+) -> None:
+    """Attach a non-secret CAS phase to an OSError without changing its type."""
+    original = exc.strerror or str(exc)
+    details = [f"errno={exc.errno}"]
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        details.append(f"winerror={winerror}")
+    message = (
+        f"Projection compare-and-swap phase={phase} failed for {path.name}: "
+        f"{original} ({', '.join(details)})"
+    )
+    arguments = list(exc.args)
+    if len(arguments) >= 2:
+        arguments[1] = message
+    else:
+        arguments = [exc.errno, message]
+    exc.args = tuple(arguments)
+    exc.strerror = message
+
+
+def _sleep_windows_replace_retry(delay_seconds: float) -> None:
+    time.sleep(delay_seconds)
+
+
+def _windows_replace_retry_state_is_intact(
+    replaced_path: Path,
+    replacement_path: Path,
+    backup_path: Path,
+) -> bool:
+    """Return whether a failed ReplaceFileW attempt left its inputs untouched."""
+    return bool(
+        os.path.lexists(replaced_path)
+        and not replaced_path.is_symlink()
+        and replaced_path.is_file()
+        and os.path.lexists(replacement_path)
+        and not replacement_path.is_symlink()
+        and replacement_path.is_file()
+        and not os.path.lexists(backup_path)
+    )
 
 
 def _replace_file_with_backup(
@@ -54,15 +115,31 @@ def _replace_file_with_backup(
         ctypes.c_void_p,
     )
     replace_file.restype = ctypes.c_int
-    if not replace_file(
-        str(replaced_path),
-        str(replacement_path),
-        str(backup_path),
-        0,
-        None,
-        None,
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
+    attempts = len(_WINDOWS_REPLACE_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        if replace_file(
+            str(replaced_path),
+            str(replacement_path),
+            str(backup_path),
+            0,
+            None,
+            None,
+        ):
+            return
+        error_code = ctypes.get_last_error()
+        if error_code not in _WINDOWS_REPLACE_RETRYABLE_ERRORS:
+            raise ctypes.WinError(error_code)
+        if not _windows_replace_retry_state_is_intact(
+            replaced_path,
+            replacement_path,
+            backup_path,
+        ):
+            raise ctypes.WinError(error_code)
+        if attempt >= len(_WINDOWS_REPLACE_RETRY_DELAYS_SECONDS):
+            raise ctypes.WinError(error_code)
+        _sleep_windows_replace_retry(
+            _WINDOWS_REPLACE_RETRY_DELAYS_SECONDS[attempt]
+        )
 
 
 def _replace_prepared_file_compare_and_swap(
@@ -71,7 +148,15 @@ def _replace_prepared_file_compare_and_swap(
     expected_current_hash: str,
 ) -> None:
     """Replace ``path`` and roll back if the atomically displaced file drifted."""
-    actual_hash = _file_sha256(path)
+    try:
+        actual_hash = _file_sha256(path)
+    except OSError as exc:
+        _annotate_compare_and_swap_os_error(
+            exc,
+            phase="current_hash_read",
+            path=path,
+        )
+        raise
     if actual_hash != expected_current_hash:
         raise RuntimeError(
             f"Projection compare-and-swap conflict for {path.name}: "
@@ -97,11 +182,35 @@ def _replace_prepared_file_compare_and_swap(
             "an existing projection is required."
         )
 
-    desired_hash = _file_sha256(temp_path)
+    try:
+        desired_hash = _file_sha256(temp_path)
+    except OSError as exc:
+        _annotate_compare_and_swap_os_error(
+            exc,
+            phase="replacement_hash_read",
+            path=temp_path,
+        )
+        raise
     backup_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.cas-backup")
     rollback_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.cas-rollback")
-    _replace_file_with_backup(path, temp_path, backup_path)
-    displaced_hash = _file_sha256(backup_path)
+    try:
+        _replace_file_with_backup(path, temp_path, backup_path)
+    except OSError as exc:
+        _annotate_compare_and_swap_os_error(
+            exc,
+            phase="replace_file",
+            path=path,
+        )
+        raise
+    try:
+        displaced_hash = _file_sha256(backup_path)
+    except OSError as exc:
+        _annotate_compare_and_swap_os_error(
+            exc,
+            phase="backup_hash_read",
+            path=backup_path,
+        )
+        raise
     if displaced_hash == expected_current_hash:
         backup_path.unlink()
         return
@@ -414,6 +523,11 @@ def _verify_writable_meta_dir(candidate: Path) -> Path:
 
 def get_meta_dir() -> Path:
     global _META_DIR_CACHE
+    if (
+        str(os.environ.get("VECTOR_LAKE_MCP_SURFACE", "full")).strip().lower()
+        == "readonly"
+    ):
+        return peek_meta_dir()
     if isinstance(_META_DIR_CACHE, Path):
         return _META_DIR_CACHE
 
@@ -682,14 +796,16 @@ def atomic_write_text(
     try:
         with open(temp_path, "w", encoding="utf-8", newline="") as handle:
             handle.write(content)
+            sync_open_file(handle)
         if expected_current_hash is not None:
             _replace_prepared_file_compare_and_swap(
                 path,
                 temp_path,
                 expected_current_hash,
             )
+            commit_existing_file(path)
         else:
-            os.replace(temp_path, path)
+            durable_replace_file(temp_path, path, source_synced=True)
     finally:
         if temp_path.exists():
             temp_path.unlink()

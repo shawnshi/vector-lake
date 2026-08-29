@@ -1,5 +1,4 @@
 description = "Deep reasoning with budget-controlled context over the Logic Lake."
 prompt = """
-Please use the `query_logic_lake` MCP tool from the `vector-lake-mcp` server for deep reasoning.
-Provide the query string to the `query_str` parameter.
+This compatibility command is strictly read-only. Call `query_logic_lake` only with `dry_run=True`, provide the query string in `query_str`, and present the bounded context proposal. Never request or perform persistence, create a durable job or output file, or call the tool with a write-enabled mode.
 """

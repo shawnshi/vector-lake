@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from vector_lake.backup_capacity import backup_capacity_status
 from vector_lake.wiki_utils import peek_meta_dir
 
 
@@ -29,7 +30,7 @@ _MAINTENANCE_ARTIFACT_NAMES = frozenset(
         "projection_pair_manifest.json",
     }
 )
-_MAINTENANCE_MANIFEST_KEYS = frozenset(
+_MAINTENANCE_MANIFEST_KEYS_V3 = frozenset(
     {
         "manifest_version",
         "created_at",
@@ -43,6 +44,24 @@ _MAINTENANCE_MANIFEST_KEYS = frozenset(
         "canonical_projection_consistency",
         "restorable_as_consistent_canonical_projection_snapshot",
         "complete",
+    }
+)
+_MAINTENANCE_MANIFEST_KEYS_V4 = frozenset(
+    {
+        *_MAINTENANCE_MANIFEST_KEYS_V3,
+        "artifact_bytes",
+        "projection_format",
+        "projection_v2",
+    }
+)
+_PROJECTION_V2_METADATA_KEYS = frozenset(
+    {
+        "format_version",
+        "roots",
+        "sidecar_sha256",
+        "object_count",
+        "reachable_object_bytes",
+        "object_artifacts",
     }
 )
 
@@ -214,6 +233,158 @@ def _valid_consistency(
     )
 
 
+def _is_lower_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _valid_v4_projection_tree_shape(
+    manifest: dict[str, Any],
+    copied: set[str],
+) -> bool:
+    projection_format = manifest.get("projection_format")
+    projection_metadata = manifest.get("projection_v2")
+    static_projection = {
+        "index.json",
+        "claim_graph.json",
+        "projection_pair_manifest.json",
+    }
+    if projection_format is None:
+        return projection_metadata is None and copied == {"vector_lake.db"}
+    if projection_format == 1:
+        return projection_metadata is None and copied == {
+            "vector_lake.db",
+            *static_projection,
+        }
+    if projection_format != 2 or not isinstance(projection_metadata, dict):
+        return False
+    if set(projection_metadata) != _PROJECTION_V2_METADATA_KEYS:
+        return False
+    roots = projection_metadata.get("roots")
+    object_artifacts = projection_metadata.get("object_artifacts")
+    if (
+        projection_metadata.get("format_version") != 2
+        or not isinstance(roots, dict)
+        or set(roots) != {"index", "claim_graph"}
+        or not all(_is_lower_sha256(value) for value in roots.values())
+        or not _is_lower_sha256(projection_metadata.get("sidecar_sha256"))
+        or not _is_lower_sha256(manifest.get("projection_generation"))
+        or not isinstance(object_artifacts, list)
+        or not all(isinstance(name, str) for name in object_artifacts)
+        or object_artifacts != sorted(object_artifacts)
+        or len(object_artifacts) != len(set(object_artifacts))
+        or isinstance(projection_metadata.get("object_count"), bool)
+        or projection_metadata.get("object_count") != len(object_artifacts)
+        or isinstance(projection_metadata.get("reachable_object_bytes"), bool)
+        or not isinstance(projection_metadata.get("reachable_object_bytes"), int)
+        or projection_metadata["reachable_object_bytes"] < 0
+    ):
+        return False
+    for name in object_artifacts:
+        parts = Path(name).parts
+        if (
+            len(parts) != 5
+            or parts[:3] != (".projection-store", "objects", "sha256")
+            or not parts[4].endswith(".json")
+        ):
+            return False
+        digest = parts[4][:-5]
+        if not _is_lower_sha256(digest) or parts[3] != digest[:2]:
+            return False
+    return copied == {"vector_lake.db", *static_projection, *object_artifacts}
+
+
+def _v4_declared_tree_is_exact(path: Path, manifest: dict[str, Any]) -> bool:
+    """Recognize an exact v4 tree without trusting artifact contents.
+
+    Retention must keep a structurally complete recovery claim visible even when
+    one declared artifact has been corrupted.  Content hashes and the v2 object
+    closure remain a destructive-boundary check in
+    ``_verify_complete_backup_artifacts``.
+    """
+    copied_raw = manifest.get("copied")
+    hashes = manifest.get("artifact_sha256")
+    sizes = manifest.get("artifact_bytes")
+    if (
+        not isinstance(copied_raw, list)
+        or not isinstance(hashes, dict)
+        or not isinstance(sizes, dict)
+    ):
+        return False
+
+    copied: list[str] = []
+    for value in copied_raw:
+        if not isinstance(value, str) or not value or "\\" in value:
+            return False
+        relative = Path(value)
+        if (
+            relative.is_absolute()
+            or bool(relative.drive)
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or relative.as_posix() != value
+        ):
+            return False
+        copied.append(value)
+    copied_set = set(copied)
+    if copied != sorted(copied) or len(copied) != len(copied_set):
+        return False
+    if not _valid_v4_projection_tree_shape(manifest, copied_set):
+        return False
+    if set(hashes) != copied_set or set(sizes) != copied_set:
+        return False
+    if any(
+        not isinstance(hashes[name], str)
+        or len(hashes[name]) != 64
+        or any(character not in "0123456789abcdef" for character in hashes[name])
+        or isinstance(sizes[name], bool)
+        or not isinstance(sizes[name], int)
+        or sizes[name] < 0
+        for name in copied
+    ):
+        return False
+
+    expected_directories = {path}
+    for name in copied:
+        parent = Path(name).parent
+        while parent != Path("."):
+            expected_directories.add(path / parent)
+            parent = parent.parent
+
+    actual_files: set[str] = set()
+    actual_directories = {path}
+    scanned = 0
+    try:
+        _directory_identity(path)
+        for current_root, directory_names, file_names in os.walk(
+            path,
+            followlinks=False,
+        ):
+            current = Path(current_root)
+            for name in directory_names:
+                candidate = current / name
+                details = candidate.lstat()
+                if _is_link_or_reparse(candidate, details) or not stat.S_ISDIR(
+                    details.st_mode
+                ):
+                    return False
+                actual_directories.add(candidate)
+            for name in file_names:
+                scanned += 1
+                if scanned > 200_000:
+                    return False
+                candidate = current / name
+                _plain_regular_file_stat(candidate)
+                relative = candidate.relative_to(path).as_posix()
+                if relative != "manifest.json":
+                    actual_files.add(relative)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return actual_files == copied_set and actual_directories == expected_directories
+
+
 def _read_complete_manifest(path: Path) -> tuple[dict[str, Any], str] | None:
     manifest_path = path / "manifest.json"
     try:
@@ -221,9 +392,79 @@ def _read_complete_manifest(path: Path) -> tuple[dict[str, Any], str] | None:
         manifest = json.loads(raw)
     except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
         return None
+    if isinstance(manifest, dict) and manifest.get("manifest_version") == 4:
+        if (
+            set(manifest) != _MAINTENANCE_MANIFEST_KEYS_V4
+            or manifest.get("complete") is not True
+            or not isinstance(manifest.get("label"), str)
+            or not manifest["label"].strip()
+            or not _valid_created_at(manifest.get("created_at"))
+            or not isinstance(manifest.get("copied"), list)
+            or not isinstance(manifest.get("artifact_sha256"), dict)
+            or not isinstance(manifest.get("artifact_bytes"), dict)
+            or not isinstance(manifest.get("canonical_projection_consistency"), dict)
+            or type(
+                manifest.get("restorable_as_consistent_canonical_projection_snapshot")
+            )
+            is not bool
+        ):
+            return None
+        inventory = None
+        try:
+            from vector_lake import tool_projection
+
+            _validated, inventory = tool_projection.validate_maintenance_backup_v4(
+                path / "manifest.json"
+            )
+        except (OSError, RuntimeError, UnicodeError, ValueError):
+            if not _v4_declared_tree_is_exact(path, manifest):
+                return None
+        copied_names = set(manifest["copied"])
+        database_generations = manifest["database_runtime_generations"]
+        database_error = manifest["database_runtime_generation_error"]
+        restorable = manifest["restorable_as_consistent_canonical_projection_snapshot"]
+        projection_format = manifest.get("projection_format")
+        projection_present = projection_format in {1, 2}
+        database_identity_valid = (
+            _valid_runtime_generations(database_generations) and database_error is None
+        ) or (
+            database_generations is None
+            and isinstance(database_error, str)
+            and bool(database_error)
+        )
+        projection_binding = manifest.get("projection_canonical_generation")
+        projection_identity_valid = (
+            projection_present
+            and isinstance(manifest.get("projection_generation"), str)
+            and bool(manifest["projection_generation"])
+            and isinstance(projection_binding, dict)
+            and projection_binding.get("status") in {"verified", "unverifiable"}
+        ) or (
+            not projection_present
+            and manifest.get("projection_generation") is None
+            and projection_binding is None
+        )
+        if (
+            not manifest["copied"]
+            or "vector_lake.db" not in copied_names
+            or not database_identity_valid
+            or not projection_identity_valid
+            or not _valid_consistency(
+                manifest["canonical_projection_consistency"],
+                projection_present=projection_present,
+                restorable=restorable,
+            )
+            or (
+                inventory is not None
+                and manifest.get("projection_generation")
+                != inventory.get("projection_generation")
+            )
+        ):
+            return None
+        return manifest, hashlib.sha256(raw).hexdigest()
     if (
         not isinstance(manifest, dict)
-        or set(manifest) != _MAINTENANCE_MANIFEST_KEYS
+        or set(manifest) != _MAINTENANCE_MANIFEST_KEYS_V3
         or manifest.get("manifest_version") != 3
         or manifest.get("complete") is not True
         or not isinstance(manifest.get("label"), str)
@@ -305,6 +546,16 @@ def _read_complete_manifest(path: Path) -> tuple[dict[str, Any], str] | None:
 
 
 def _verify_complete_backup_artifacts(path: Path, manifest: dict[str, Any]) -> None:
+    if manifest.get("manifest_version") == 4:
+        try:
+            from vector_lake import tool_projection
+
+            tool_projection.validate_maintenance_backup_v4(path / "manifest.json")
+        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+            raise RuntimeError(
+                f"backup_v4_artifact_validation_failed:{path}:{exc}"
+            ) from exc
+        return
     for name in manifest["copied"]:
         expected = manifest["artifact_sha256"][name]
         actual = _sha256_plain_file(path / name)
@@ -338,24 +589,44 @@ def _verify_restorable_backup_snapshot(
     """Prove that a claimed restorable backup is internally consistent."""
     from vector_lake import db_store, indexer
 
+    is_v4 = manifest.get("manifest_version") == 4
+    is_v2 = is_v4 and manifest.get("projection_format") == 2
+    copied = frozenset(manifest.get("copied", ()))
+    v4_required = {
+        "vector_lake.db",
+        "index.json",
+        "claim_graph.json",
+        "projection_pair_manifest.json",
+    }
     if (
         manifest.get("restorable_as_consistent_canonical_projection_snapshot")
         is not True
         or manifest.get("database_runtime_generation_error") is not None
         or manifest.get("canonical_projection_consistency", {}).get("status")
         != "verified"
-        or frozenset(manifest.get("copied", ()))
-        not in {
-            frozenset({"vector_lake.db", "index.json", "claim_graph.json"}),
-            frozenset(
-                {
-                    "vector_lake.db",
-                    "index.json",
-                    "claim_graph.json",
-                    "projection_pair_manifest.json",
-                }
-            ),
-        }
+        or (
+            is_v4
+            and (
+                manifest.get("projection_format") not in {1, 2}
+                or (is_v2 and not v4_required.issubset(copied))
+                or (
+                    not is_v2
+                    and copied
+                    not in {
+                        frozenset({"vector_lake.db", "index.json", "claim_graph.json"}),
+                        frozenset(v4_required),
+                    }
+                )
+            )
+        )
+        or (
+            not is_v4
+            and copied
+            not in {
+                frozenset({"vector_lake.db", "index.json", "claim_graph.json"}),
+                frozenset(v4_required),
+            }
+        )
     ):
         raise RuntimeError(f"backup_restorable_claim_is_incomplete:{path}")
 
@@ -402,6 +673,47 @@ def _verify_restorable_backup_snapshot(
 
     if database_generations != manifest.get("database_runtime_generations"):
         raise RuntimeError(f"backup_database_generation_mismatch:{path}")
+
+    if is_v2:
+        try:
+            from vector_lake import tool_projection
+
+            _validated, inventory = tool_projection.validate_maintenance_backup_v4(
+                path / "manifest.json"
+            )
+        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+            raise RuntimeError(f"backup_projection_v2_invalid:{path}:{exc}") from exc
+        if inventory is None:
+            raise RuntimeError(f"backup_projection_v2_missing:{path}")
+        projection_binding = manifest.get("projection_canonical_generation")
+        runtime_generations = inventory.get("canonical_generation")
+        expected_binding = {
+            "status": "verified",
+            "token": indexer._canonical_generation_token(runtime_generations),
+            "runtime_generations": runtime_generations,
+        }
+        if projection_binding != expected_binding:
+            raise RuntimeError(f"backup_projection_binding_mismatch:{path}")
+        covered_surfaces = list(indexer.CANONICAL_PROJECTION_SURFACES)
+        database_projection_generations = {
+            surface: database_generations.get(surface) for surface in covered_surfaces
+        }
+        if any(value is None for value in database_projection_generations.values()):
+            raise RuntimeError(f"backup_database_generation_coverage_incomplete:{path}")
+        if database_projection_generations != runtime_generations:
+            raise RuntimeError(f"backup_projection_database_generation_mismatch:{path}")
+        expected_consistency = {
+            "status": "verified",
+            "reason": "runtime-generations-match",
+            "verification_scope": "tracked-canonical-projection-surfaces",
+            "covered_surfaces": covered_surfaces,
+            "canonical_generation_token": projection_binding["token"],
+            "projection_runtime_generations": runtime_generations,
+            "database_runtime_generations": database_projection_generations,
+        }
+        if manifest.get("canonical_projection_consistency") != expected_consistency:
+            raise RuntimeError(f"backup_consistency_manifest_mismatch:{path}")
+        return
 
     try:
         index_contract = _read_projection_contract_stub(
@@ -451,8 +763,8 @@ def _verify_restorable_backup_snapshot(
         raise RuntimeError(f"backup_projection_binding_unverified:{path}")
     if sidecar is not None:
         try:
-            sidecar_manifest, sidecar_artifacts = (
-                indexer._validate_projection_sidecar(sidecar)
+            sidecar_manifest, sidecar_artifacts = indexer._validate_projection_sidecar(
+                sidecar
             )
         except Exception as exc:
             raise RuntimeError(
@@ -637,6 +949,10 @@ def _empty_plan(
 ) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     restorable_verification_failures: list[dict[str, Any]] = []
+    capacity = backup_capacity_status(
+        backup_roots=(root, root.parent / "schema-migration-backups"),
+        disk_anchor=root.parent,
+    )
     return {
         "backup_root": str(root),
         "root_state": root_state,
@@ -653,6 +969,38 @@ def _empty_plan(
         "restorable_verification_failures": restorable_verification_failures,
         "protected": [],
         "ignored": [],
+        "capacity": capacity,
+        "capacity_after_candidate_reclaim": _capacity_after_reclaim(
+            capacity,
+            0,
+        ),
+        "quota_unreclaimable": not bool(capacity["allowed"]),
+    }
+
+
+def _capacity_after_reclaim(capacity: dict, reclaimable_bytes: int) -> dict:
+    reclaimable_bytes = max(0, int(reclaimable_bytes))
+    policy = dict(capacity.get("policy") or {})
+    projected_backup_bytes = max(
+        0,
+        int(capacity.get("current_backup_bytes") or 0) - reclaimable_bytes,
+    )
+    projected_free_bytes = int(capacity.get("disk_free_bytes") or 0) + reclaimable_bytes
+    max_total_bytes = int(policy.get("max_total_bytes") or 0)
+    quota_exceeded = max_total_bytes > 0 and projected_backup_bytes > max_total_bytes
+    free_space_insufficient = projected_free_bytes < int(
+        capacity.get("minimum_free_required_bytes") or 0
+    )
+    quota_blocks = quota_exceeded and policy.get("quota_mode") == "enforce"
+    return {
+        "reclaimable_bytes": reclaimable_bytes,
+        "projected_backup_bytes": projected_backup_bytes,
+        "projected_free_bytes": projected_free_bytes,
+        "quota_exceeded": quota_exceeded,
+        "free_space_insufficient": free_space_insufficient,
+        "allowed": bool(capacity.get("inventory_complete"))
+        and not quota_blocks
+        and not free_space_insufficient,
     }
 
 
@@ -855,6 +1203,12 @@ def _scan_retention_plan(
             candidates.append(item)
 
     candidates.sort(key=lambda value: (value["type"], value["name"]))
+    candidate_bytes = sum(int(item["size"]) for item in candidates)
+    capacity = backup_capacity_status(
+        backup_roots=(root, root.parent / "schema-migration-backups"),
+        disk_anchor=root.parent,
+    )
+    capacity_after_reclaim = _capacity_after_reclaim(capacity, candidate_bytes)
     fingerprint = _fingerprint(
         candidates,
         restorable_guard=restorable_guard,
@@ -867,7 +1221,7 @@ def _scan_retention_plan(
         "options": options,
         "candidates": candidates,
         "candidate_count": len(candidates),
-        "candidate_bytes": sum(int(item["size"]) for item in candidates),
+        "candidate_bytes": candidate_bytes,
         "fingerprint": fingerprint,
         "restorable_guard": restorable_guard,
         "restorable_verification_failures": sorted(
@@ -876,6 +1230,9 @@ def _scan_retention_plan(
         ),
         "protected": sorted(protected, key=lambda value: value["name"]),
         "ignored": ignored,
+        "capacity": capacity,
+        "capacity_after_candidate_reclaim": capacity_after_reclaim,
+        "quota_unreclaimable": not bool(capacity_after_reclaim["allowed"]),
     }
 
 

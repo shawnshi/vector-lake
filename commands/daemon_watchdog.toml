@@ -1,4 +1,4 @@
 description = "Launch the real-time ingest watcher as the long-running background compiler for raw sources."
 prompt = '''
-Please start the long-running Vector Lake watchdog by executing `python watchdog_sync.py` as a background service. This is the persistent daemon path for ingest monitoring; do not substitute a one-off `sync` run for it. After starting it, tell the user that the watchdog daemon is running.
+First call `mcp_runtime_status` and require `stale=false` plus an absolute `source_root`. Resolve the plugin root from that source and require its `watchdog_sync.py` and `.mcp.json`; fail closed instead of using the current working directory or a fixed checkout. Start the authoritative script as a hidden background process and let it bootstrap its paired runtime paths. Report success only after the process remains alive and its status resolves to the same effective meta root; a PID alone is not health. Do not substitute a one-off `sync` run.
 '''

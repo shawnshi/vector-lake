@@ -1,21 +1,23 @@
 import os
 import sys
-import yaml
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from vector_lake.yaml_utils import load_yaml, dump_yaml
+from vector_lake.yaml_utils import dump_yaml, load_yaml  # noqa: E402
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 count = 0
 
 for filename in os.listdir(wiki_dir):
-    if not filename.endswith(".md"): continue
+    if not filename.endswith(".md"):
+        continue
     filepath = os.path.join(wiki_dir, filename)
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-        if not content.startswith("---"): continue
+        if not content.startswith("---"):
+            continue
         parts = content.split("---", 2)
-        if len(parts) < 3: continue
+        if len(parts) < 3:
+            continue
         
         fm = load_yaml(parts[1])
         changed = False
@@ -55,7 +57,7 @@ for filename in os.listdir(wiki_dir):
                 f.write(parts[2])
             count += 1
             print(f"Fixed {filename}")
-    except Exception as e:
+    except Exception:
         pass
 
 print(f"Total fixed: {count}")

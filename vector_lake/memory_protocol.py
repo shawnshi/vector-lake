@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import Any
 
+from vector_lake.runtime_health import get_semantic_readiness_envelope
 from vector_lake.tool_memory import update_operational_memory
 from vector_lake.tool_query import prepare_query_context
 from vector_lake.tool_search import (
+    CLAIM_MODE_DEPRECATION_WARNING,
     assemble_context,
     resolve_exact_entities,
     search_vector_lake,
@@ -27,38 +30,68 @@ _MAX_CONTEXT_CHARS = 200_000
 _MAX_DELTA_LIMIT = 1_000
 
 
-def capability_manifest() -> dict[str, Any]:
-    """Describe the stable thin-client surface without overstating compatibility."""
-    return {
-        "contract_version": MEMORY_PROTOCOL_VERSION,
-        "verbs": {
-            "recall": {
-                "mutability": "read",
-                "modes": ["page", "memory", "claim"],
-            },
-            "remember": {
-                "mutability": "governed_write",
-                "memory_types": ["fact", "preference", "decision", "task_state"],
-                "payload_transport": "sandboxed_payload_file",
-            },
-            "entity": {
-                "mutability": "read",
-                "matching": "nfkc_casefold_exact_key_id_title_alias",
-            },
-            "synthesize": {
-                "mutability": "read",
-                "mode": "proposal_only_dry_run",
-            },
-            "context_pack": {
-                "mutability": "read",
-                "budget_enforced_by_server": True,
-            },
-            "delta": {
-                "mutability": "read",
-                "scope": "current_page_projection_updates",
-                "includes_deletions": False,
+def capability_manifest(
+    *,
+    effective_surface: str = "full",
+    available_tools: Collection[str] | None = None,
+) -> dict[str, Any]:
+    """Describe only verbs callable through the effective MCP tool surface."""
+    normalized_surface = str(effective_surface or "full").strip().lower()
+    if normalized_surface not in {"full", "memory", "readonly"}:
+        raise ValueError("effective_surface must be full, memory, or readonly")
+    verb_contracts = {
+        "recall": {
+            "mutability": "read",
+            "modes": ["page", "memory", "fact"],
+            "deprecated_mode_aliases": {
+                "claim": {
+                    "effective_mode": "fact",
+                    "actual_semantics": "operational_memory_fact",
+                    "canonical_claim_records": False,
+                }
             },
         },
+        "remember": {
+            "mutability": "governed_write",
+            "memory_types": ["fact", "preference", "decision", "task_state"],
+            "payload_transport": "sandboxed_payload_file",
+        },
+        "entity": {
+            "mutability": "read",
+            "matching": "nfkc_casefold_exact_key_id_title_alias",
+        },
+        "synthesize": {
+            "mutability": "read",
+            "mode": "proposal_only_dry_run",
+        },
+        "context_pack": {
+            "mutability": "read",
+            "budget_enforced_by_server": True,
+        },
+        "delta": {
+            "mutability": "read",
+            "scope": "current_page_projection_updates",
+            "includes_deletions": False,
+        },
+    }
+    omitted_by_surface = ["remember"] if normalized_surface == "readonly" else []
+    omitted_set = set(omitted_by_surface)
+    available_tool_names = (
+        set(MEMORY_PROTOCOL_VERBS)
+        if available_tools is None
+        else {str(name) for name in available_tools}
+    )
+    available_verbs = [
+        verb
+        for verb in MEMORY_PROTOCOL_VERBS
+        if verb not in omitted_set and verb in available_tool_names
+    ]
+    return {
+        "contract_version": MEMORY_PROTOCOL_VERSION,
+        "effective_surface": normalized_surface,
+        "available_verbs": available_verbs,
+        "omitted_by_surface": omitted_by_surface,
+        "verbs": {verb: verb_contracts[verb] for verb in available_verbs},
         "omitted_verbs": {
             "forget": (
                 "Direct Agent retraction is intentionally unavailable. Vector Lake "
@@ -67,9 +100,12 @@ def capability_manifest() -> dict[str, Any]:
             )
         },
         "mcp_surface": {
-            "environment": "VECTOR_LAKE_MCP_SURFACE=memory",
+            "environment": f"VECTOR_LAKE_MCP_SURFACE={normalized_surface}",
             "fail_closed": True,
-            "includes_runtime_status": True,
+            "includes_runtime_status": (
+                available_tools is None
+                or "mcp_runtime_status" in available_tool_names
+            ),
         },
     }
 
@@ -82,13 +118,15 @@ def recall(
     include_history: bool = False,
 ) -> dict[str, Any]:
     normalized_mode = str(mode or "page").strip().lower()
-    if normalized_mode not in {"page", "memory", "claim"}:
-        raise ValueError("mode must be page, memory, or claim")
-    return {
+    if normalized_mode not in {"page", "memory", "fact", "claim"}:
+        raise ValueError("mode must be page, memory, fact, or claim")
+    effective_mode = "fact" if normalized_mode == "claim" else normalized_mode
+    response = {
         "contract_version": MEMORY_PROTOCOL_VERSION,
         "verb": "recall",
-        "mode": normalized_mode,
+        "mode": effective_mode,
         "include_history": bool(include_history),
+        "semantic_readiness": get_semantic_readiness_envelope(),
         "result": search_vector_lake(
             query,
             top_k=top_k,
@@ -96,6 +134,15 @@ def recall(
             include_history=include_history,
         ),
     }
+    if normalized_mode == "claim":
+        response.update(
+            {
+                "requested_mode": "claim",
+                "deprecated_alias": True,
+                "semantic_warning": CLAIM_MODE_DEPRECATION_WARNING,
+            }
+        )
+    return response
 
 
 def remember(memory_type: str, content: str) -> dict[str, Any]:
@@ -136,6 +183,7 @@ def synthesize(query: str) -> dict[str, Any]:
         "verb": "synthesize",
         "proposal_only": True,
         "committed": False,
+        "semantic_readiness": get_semantic_readiness_envelope(),
         "result": prepare_query_context(query, dry_run=True),
     }
 
@@ -151,6 +199,7 @@ def context_pack(query: str, *, max_chars: int = 32_000) -> dict[str, Any]:
         "contract_version": MEMORY_PROTOCOL_VERSION,
         "verb": "context_pack",
         "max_chars": bounded_chars,
+        "semantic_readiness": get_semantic_readiness_envelope(),
         "context": context,
     }
 

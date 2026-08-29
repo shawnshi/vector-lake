@@ -1,15 +1,15 @@
 import os
-import re
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from vector_lake.yaml_utils import load_yaml, dump_yaml
+from vector_lake.yaml_utils import dump_yaml, load_yaml  # noqa: E402
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 alias_map = {}
 file_contents = {}
 
 for f in os.listdir(wiki_dir):
-    if not f.endswith(".md"): continue
+    if not f.endswith(".md"):
+        continue
     p = os.path.join(wiki_dir, f)
     try:
         with open(p, "r", encoding="utf-8") as file:
@@ -17,24 +17,23 @@ for f in os.listdir(wiki_dir):
             file_contents[f] = content
             
             # Find aliases: [...] or aliases: \n  - ...
-            import yaml
             if content.startswith("---"):
                 parts = content.split("---", 2)
                 if len(parts) >= 3:
                     fm = load_yaml(parts[1])
                     if fm and "aliases" in fm:
                         aliases = fm["aliases"]
-                        if isinstance(aliases, str): aliases = [aliases]
+                        if isinstance(aliases, str):
+                            aliases = [aliases]
                         if isinstance(aliases, list):
                             for a in aliases:
-                                if a: alias_map.setdefault(str(a).strip(), []).append(f)
+                                if a:
+                                    alias_map.setdefault(str(a).strip(), []).append(f)
     except Exception as e:
         print(f"Error reading {f}: {e}")
 
 conflicts = {a: fs for a, fs in alias_map.items() if len(set(fs)) > 1}
 print(f"Found {len(conflicts)} alias conflicts.")
-
-import yaml
 
 for alias, fs in conflicts.items():
     fs = list(set(fs))
@@ -48,14 +47,17 @@ for alias, fs in conflicts.items():
         try:
             with open(p, "r", encoding="utf-8") as file:
                 content = file.read()
-            if not content.startswith("---"): continue
+            if not content.startswith("---"):
+                continue
             parts = content.split("---", 2)
-            if len(parts) < 3: continue
+            if len(parts) < 3:
+                continue
             
             fm = load_yaml(parts[1])
             if fm and "aliases" in fm:
                 aliases = fm["aliases"]
-                if isinstance(aliases, str): aliases = [aliases]
+                if isinstance(aliases, str):
+                    aliases = [aliases]
                 if isinstance(aliases, list) and alias in aliases:
                     aliases.remove(alias)
                     fm["aliases"] = aliases

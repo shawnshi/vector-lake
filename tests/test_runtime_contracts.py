@@ -1,10 +1,12 @@
 import asyncio
 import gc
+import hashlib
 import importlib
 import inspect
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -52,12 +54,13 @@ def test_merge_public_defaults_remain_explicit_and_unchanged():
 
     assert cli_args.limit == 20
     assert cli_args.preview is False
+    assert cli_args.apply is False
     assert mcp_enqueue.default is False
     assert tool_enqueue.default is True
 
 
 @pytest.mark.parametrize("configured_workers", [None, "invalid"])
-def test_mcp_blocking_executor_uses_memory_safe_default(
+def test_mcp_blocking_executor_uses_bounded_parallel_default(
     tmp_path,
     monkeypatch,
     configured_workers,
@@ -76,8 +79,10 @@ def test_mcp_blocking_executor_uses_memory_safe_default(
     )
     try:
         status = server.blocking_executor_status()
-        assert status["workers"] == 1
-        assert status["queue_capacity"] == 1
+        assert status["workers"] == 2
+        assert status["queue_capacity"] == 4
+        assert status["heavy_lane"]["workers"] == 1
+        assert status["heavy_lane"]["queue_capacity"] == 1
     finally:
         server.shutdown_blocking_executor(wait=True)
 
@@ -372,6 +377,7 @@ def test_meta_dir_cache_is_keyed_by_active_memory_root(tmp_path, monkeypatch):
     wiki_utils._META_DIR_CACHE = None
     first_root = tmp_path / "first"
     second_root = tmp_path / "second"
+    monkeypatch.delenv("VECTOR_LAKE_META_DIR", raising=False)
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(first_root))
     first_meta = get_meta_dir()
     monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(second_root))
@@ -571,6 +577,32 @@ def test_mcp_runtime_guard_detects_source_revision_drift(tmp_path):
         guard.assert_current()
 
 
+def test_mcp_source_tree_revision_preserves_legacy_digest_contract(tmp_path):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_bytes(b"VALUE = 1\n")
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes(b"{}\n")
+    template_path = tmp_path / "templates" / "query_prompt.md"
+    template_path.parent.mkdir()
+    template_path.write_bytes(b"prompt\n")
+    expected = hashlib.sha256()
+    for relative_path, path in sorted(
+        (
+            ("config.json", config_path),
+            ("templates/query_prompt.md", template_path),
+            ("vector_lake/runtime_probe.py", source_path),
+        )
+    ):
+        expected.update(relative_path.encode("utf-8"))
+        expected.update(b"\x00")
+        expected.update(path.read_bytes())
+        expected.update(b"\x00")
+
+    assert mcp_server._source_tree_revision(package_root) == expected.hexdigest()
+
+
 @pytest.mark.parametrize(
     ("relative_path", "initial", "changed"),
     [
@@ -591,7 +623,7 @@ def test_mcp_runtime_guard_detects_restart_sensitive_asset_drift(
     asset_path = tmp_path / relative_path
     asset_path.parent.mkdir(parents=True, exist_ok=True)
     asset_path.write_text(initial, encoding="utf-8")
-    guard = mcp_server.MCPRuntimeGuard(package_root, check_interval_seconds=60)
+    guard = mcp_server.MCPRuntimeGuard(package_root, check_interval_seconds=0)
 
     asset_path.write_text(changed, encoding="utf-8")
 
@@ -599,7 +631,7 @@ def test_mcp_runtime_guard_detects_restart_sensitive_asset_drift(
         guard.assert_current()
 
 
-def test_mcp_call_tool_uses_cached_admission_and_one_forced_execution_check(
+def test_mcp_call_tool_uses_cached_admission_and_execution_checks(
     tmp_path,
     monkeypatch,
 ):
@@ -609,13 +641,26 @@ def test_mcp_call_tool_uses_cached_admission_and_one_forced_execution_check(
     guard = mcp_server.MCPRuntimeGuard(package_root, check_interval_seconds=60)
     server = mcp_server.ReloadAwareFastMCP("revision-count-test", runtime_guard=guard)
     original_status = guard.status
+    real_refresh = mcp_server._refresh_runtime_revision_inventory
     force_values = []
+    refresh_calls = 0
 
     def observed_status(*, force=False):
         force_values.append(force)
         return original_status(force=force)
 
+    def counted_refresh(inventory):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return real_refresh(inventory)
+
     monkeypatch.setattr(guard, "status", observed_status)
+    monkeypatch.setattr(
+        mcp_server,
+        "_refresh_runtime_revision_inventory",
+        counted_refresh,
+    )
+    guard._last_checked -= 61
 
     @server.tool()
     def revision_probe() -> str:
@@ -626,7 +671,309 @@ def test_mcp_call_tool_uses_cached_admission_and_one_forced_execution_check(
     finally:
         server.shutdown_blocking_executor(wait=True, timeout=2)
 
-    assert force_values == [False, True]
+    assert force_values == [False, False]
+    assert refresh_calls == 1
+
+
+def test_mcp_runtime_guard_ttl_path_does_not_scan_or_hash(tmp_path, monkeypatch):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=60,
+    )
+
+    def forbidden_probe(*_args, **_kwargs):
+        raise AssertionError("cached guard performed filesystem work")
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_refresh_runtime_revision_inventory",
+        forbidden_probe,
+    )
+    monkeypatch.setattr(mcp_server, "_source_tree_revision", forbidden_probe)
+
+    guard.assert_current()
+    status = guard.status()
+
+    assert status["served_from_cache"] is True
+    assert status["metadata_checks"] == 1
+    assert status["full_hashes"] == 1
+    assert status["cached_checks"] == 2
+
+
+def test_mcp_runtime_guard_due_metadata_probe_does_not_use_path_rglob(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    nested_root = package_root / "nested"
+    nested_root.mkdir(parents=True)
+    (nested_root / "runtime_probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=0,
+        full_hash_interval_seconds=3600,
+    )
+
+    def forbidden_rglob(*_args, **_kwargs):
+        raise AssertionError("metadata probe performed a recursive glob")
+
+    monkeypatch.setattr(Path, "rglob", forbidden_rglob)
+
+    status = guard.status()
+
+    assert status["stale"] is False
+    assert status["last_check_kind"] == "metadata"
+    assert status["metadata_checks"] == 2
+    assert status["inventory_rebuilds"] == 1
+
+
+def test_mcp_runtime_guard_rebuilds_inventory_only_after_directory_token_change(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=0,
+        full_hash_interval_seconds=3600,
+    )
+    real_build = mcp_server._build_runtime_revision_inventory
+    build_calls = 0
+
+    def counted_build(source_root):
+        nonlocal build_calls
+        build_calls += 1
+        return real_build(source_root)
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_build_runtime_revision_inventory",
+        counted_build,
+    )
+
+    unchanged = guard.status()
+    (package_root / "added.py").write_text("ADDED = 1\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="restart"):
+        guard.assert_current()
+
+    assert unchanged["last_check_kind"] == "metadata"
+    assert build_calls == 1
+    assert guard.status()["inventory_rebuilds"] == 2
+
+
+def test_mcp_runtime_guard_inventory_enforces_file_limit(tmp_path, monkeypatch):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "one.py").write_text("ONE = 1\n", encoding="utf-8")
+    (package_root / "two.py").write_text("TWO = 2\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_RUNTIME_REVISION_MAX_FILES", 1)
+
+    with pytest.raises(RuntimeError, match="file limit"):
+        mcp_server.MCPRuntimeGuard(package_root)
+
+
+def test_mcp_runtime_guard_inventory_enforces_directory_limit(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    (package_root / "nested").mkdir(parents=True)
+    (package_root / "nested" / "probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mcp_server, "_RUNTIME_REVISION_MAX_DIRECTORIES", 1)
+
+    with pytest.raises(RuntimeError, match="directory limit"):
+        mcp_server.MCPRuntimeGuard(package_root)
+
+
+@pytest.mark.parametrize("operation", ["add", "modify", "delete"])
+def test_mcp_runtime_guard_metadata_change_triggers_full_hash(
+    tmp_path,
+    operation,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_text("VALUE = 1\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=0,
+        full_hash_interval_seconds=3600,
+    )
+
+    if operation == "add":
+        (package_root / "added.py").write_text("ADDED = 1\n", encoding="utf-8")
+    elif operation == "modify":
+        source_path.write_text("VALUE = 200\n", encoding="utf-8")
+    else:
+        source_path.unlink()
+
+    with pytest.raises(RuntimeError, match="restart"):
+        guard.assert_current()
+
+    status = guard.status()
+    assert status["stale"] is True
+    assert status["last_check_kind"] in {"metadata", "metadata_changed_full"}
+    assert status["full_hashes"] == 2
+
+
+def test_mcp_runtime_guard_periodic_hash_detects_metadata_preserving_tamper(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_text("VALUE = 1\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=0,
+        full_hash_interval_seconds=60,
+    )
+    original_inventory = guard._revision_inventory
+    source_path.write_text("VALUE = 200\n", encoding="utf-8")
+    monkeypatch.setattr(
+        mcp_server,
+        "_refresh_runtime_revision_inventory",
+        lambda _inventory: (original_inventory, False),
+    )
+    guard._last_full_hash_monotonic -= 61
+
+    status = guard.status()
+
+    assert status["stale"] is True
+    assert status["last_check_kind"] == "periodic_full"
+    assert status["loaded_revision"] != status["current_revision"]
+
+
+def test_mcp_runtime_guard_force_is_exact_even_with_cached_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    source_path = package_root / "runtime_probe.py"
+    source_path.write_text("VALUE = 1\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=60,
+        full_hash_interval_seconds=3600,
+    )
+    original_inventory = guard._revision_inventory
+    source_path.write_text("VALUE = 2\n", encoding="utf-8")
+    monkeypatch.setattr(
+        mcp_server,
+        "_refresh_runtime_revision_inventory",
+        lambda _inventory: (original_inventory, False),
+    )
+
+    cached = guard.status()
+    exact = guard.status(force=True)
+
+    assert cached["stale"] is False
+    assert cached["served_from_cache"] is True
+    assert exact["stale"] is True
+    assert exact["last_check_kind"] == "forced_full"
+    assert exact["loaded_revision"] != exact["current_revision"]
+
+
+def test_mcp_runtime_guard_refresh_is_single_flight(tmp_path, monkeypatch):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=60,
+        full_hash_interval_seconds=60,
+    )
+    guard._last_checked -= 61
+    guard._last_full_hash_monotonic -= 61
+    real_revision = mcp_server._source_tree_revision
+    hash_started = threading.Event()
+    release_hash = threading.Event()
+    hash_calls = 0
+    hash_lock = threading.Lock()
+
+    def slow_revision(source_root):
+        nonlocal hash_calls
+        with hash_lock:
+            hash_calls += 1
+        hash_started.set()
+        assert release_hash.wait(timeout=2)
+        return real_revision(source_root)
+
+    monkeypatch.setattr(mcp_server, "_source_tree_revision", slow_revision)
+    start = threading.Barrier(8)
+    statuses = []
+
+    def inspect_status():
+        start.wait(timeout=2)
+        statuses.append(guard.status())
+
+    threads = [threading.Thread(target=inspect_status) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    assert hash_started.wait(timeout=2)
+    time.sleep(0.05)
+    release_hash.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert hash_calls == 1
+    assert len(statuses) == 8
+    assert all(status["stale"] is False for status in statuses)
+    assert guard.status()["singleflight_waits"] >= 1
+
+
+def test_mcp_runtime_guard_strict_env_forces_each_check(tmp_path, monkeypatch):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VECTOR_LAKE_MCP_REVISION_STRICT", "1")
+    guard = mcp_server.MCPRuntimeGuard(
+        package_root,
+        check_interval_seconds=60,
+        full_hash_interval_seconds=3600,
+    )
+    real_revision = mcp_server._source_tree_revision
+    hash_calls = 0
+
+    def counted_revision(source_root):
+        nonlocal hash_calls
+        hash_calls += 1
+        return real_revision(source_root)
+
+    monkeypatch.setattr(mcp_server, "_source_tree_revision", counted_revision)
+
+    guard.assert_current()
+    guard.assert_current()
+
+    assert hash_calls == 2
+    assert guard.strict is True
+    assert guard._last_check_kind == "strict_full"
 
 
 def test_mcp_server_uses_reload_aware_dispatch():
@@ -649,7 +996,7 @@ def test_reload_aware_dispatch_rejects_stale_source_tree(tmp_path):
         "runtime-test",
         runtime_guard=guard,
     )
-    source_path.write_text("VALUE = 2\n", encoding="utf-8")
+    source_path.write_text("VALUE = 200\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="restart"):
         anyio.run(server.call_tool, "any_tool", {})
@@ -906,7 +1253,7 @@ def test_queued_sync_tool_rechecks_source_revision_at_execution(
     monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "1")
     guard = mcp_server.MCPRuntimeGuard(
         package_root,
-        check_interval_seconds=60,
+        check_interval_seconds=0,
     )
     server = mcp_server.ReloadAwareFastMCP(
         "queued-stale-test",
@@ -948,6 +1295,477 @@ def test_queued_sync_tool_rechecks_source_revision_at_execution(
     assert tool_ran.is_set() is False
 
 
+def test_mcp_cancelled_queued_tool_records_zero_execution(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "1")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "queued-cooperative-cancel-test",
+        runtime_guard=guard,
+    )
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    tool_ran = threading.Event()
+    blocker = server._submit_blocking_call(
+        lambda: blocker_started.set() or release_blocker.wait(timeout=2)
+    )
+    assert blocker_started.wait(timeout=2)
+
+    @server.tool()
+    def queued_cancel_probe() -> str:
+        tool_ran.set()
+        return "must-not-run"
+
+    registered = server._tool_manager.get_tool("queued_cancel_probe")
+
+    async def scenario():
+        assert registered is not None
+        task = asyncio.create_task(registered.fn())
+        with anyio.fail_after(2):
+            while server._blocking_executor.queued_work_items() < 1:
+                await anyio.sleep(0.005)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        anyio.run(scenario)
+        snapshot = server.cancellation_status()
+        operation = snapshot["operations"][0]
+        release_blocker.set()
+        blocker.result(timeout=2)
+    finally:
+        release_blocker.set()
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert tool_ran.is_set() is False
+    assert operation["tool_name"] == "queued_cancel_probe"
+    assert operation["status"] == "cancelled"
+    assert operation["started_at"] is None
+    assert operation["detached"] is False
+
+
+def test_mcp_queued_deadline_expires_without_tool_execution(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "1")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "queued-deadline-test",
+        runtime_guard=guard,
+    )
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    tool_ran = threading.Event()
+    blocker = server._submit_blocking_call(
+        lambda: blocker_started.set() or release_blocker.wait(timeout=2)
+    )
+    assert blocker_started.wait(timeout=2)
+
+    @server.tool()
+    def queued_deadline_probe() -> str:
+        tool_ran.set()
+        return "must-not-run"
+
+    async def scenario():
+        with pytest.raises(Exception, match="deadline exceeded") as rejected:
+            await server.call_tool(
+                "queued_deadline_probe",
+                {mcp_server._MCP_CALL_DEADLINE_ARGUMENT: 0.05},
+            )
+        return str(rejected.value)
+
+    try:
+        rejection = anyio.run(scenario)
+        operation_id = re.search(r"operation_id=([a-z0-9_-]+)", rejection).group(1)
+        operation = server.cancellation_status(operation_id)["operation"]
+        release_blocker.set()
+        blocker.result(timeout=2)
+    finally:
+        release_blocker.set()
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert tool_ran.is_set() is False
+    assert operation["status"] == "cancelled"
+    assert operation["cancellation_reason"] == "deadline_exceeded"
+    assert operation["started_at"] is None
+
+
+def test_mcp_configured_deadline_is_a_non_bypassable_hard_cap(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_TOOL_DEADLINE_SECONDS", "0.25")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "configured-deadline-cap-test",
+        runtime_guard=guard,
+    )
+    try:
+        assert server._effective_call_deadline(None) == 0.25
+        assert server._effective_call_deadline(0) == 0.25
+        assert server._effective_call_deadline(10) == 0.25
+        assert server._effective_call_deadline(0.05) == 0.05
+        with pytest.raises(ValueError, match="finite non-negative"):
+            server._effective_call_deadline(-1)
+        with pytest.raises(ValueError, match="hard limit"):
+            server._effective_call_deadline(3601)
+        status = server.cancellation_status()
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert status["default_deadline_seconds"] == 0.25
+    assert status["deadline_max_seconds"] == 3600.0
+    assert status["deadline_argument"] == mcp_server._MCP_CALL_DEADLINE_ARGUMENT
+
+
+@pytest.mark.parametrize("configured", ["invalid", "-1", "nan", "3601"])
+def test_mcp_invalid_configured_deadline_fails_closed(
+    tmp_path,
+    monkeypatch,
+    configured,
+):
+    monkeypatch.setenv("VECTOR_LAKE_MCP_TOOL_DEADLINE_SECONDS", configured)
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+
+    with pytest.raises(ValueError, match="deadline"):
+        mcp_server.ReloadAwareFastMCP(
+            "invalid-configured-deadline-test",
+            runtime_guard=guard,
+        )
+
+
+def test_readonly_heavy_scan_bypasses_canonical_meta_file_gate(
+    tmp_path,
+    monkeypatch,
+):
+    guard_root = tmp_path / "source"
+    guard_root.mkdir()
+    meta_root = tmp_path / "meta"
+    monkeypatch.setenv("VECTOR_LAKE_META_DIR", str(meta_root))
+    guard = mcp_server.MCPRuntimeGuard(guard_root, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "readonly-physical-zero-write-test",
+        runtime_guard=guard,
+    )
+    setattr(server, "_vector_lake_effective_surface", "readonly")
+
+    @server.tool()
+    def doctor_vector_lake() -> str:
+        return "ok"
+
+    def forbidden_gate(*_args, **_kwargs):
+        raise AssertionError("readonly scan must not acquire the shared file gate")
+
+    monkeypatch.setattr("vector_lake.heavy_task_gate.heavy_task", forbidden_gate)
+    try:
+        result = anyio.run(server.call_tool, "doctor_vector_lake", {})
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert result[0][0].text == "ok"
+    assert not meta_root.exists()
+
+
+def test_mcp_running_scan_honors_deadline_at_next_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    from vector_lake.cancellation import (
+        cancellation_checkpoint,
+        current_operation_id,
+    )
+
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "running-deadline-test",
+        runtime_guard=guard,
+    )
+    processed = []
+    stopped = threading.Event()
+
+    @server.tool()
+    def cooperative_scan_probe() -> str:
+        operation_id = current_operation_id()
+        try:
+            for item in range(100):
+                cancellation_checkpoint(f"scan_batch:{item}")
+                processed.append(item)
+                time.sleep(0.01)
+        finally:
+            stopped.set()
+        return operation_id
+
+    async def scenario():
+        started_at = time.monotonic()
+        with pytest.raises(Exception, match="deadline exceeded") as rejected:
+            await server.call_tool(
+                "cooperative_scan_probe",
+                {mcp_server._MCP_CALL_DEADLINE_ARGUMENT: 0.06},
+            )
+        return str(rejected.value), time.monotonic() - started_at
+
+    try:
+        rejection, response_elapsed = anyio.run(scenario)
+        operation_id = re.search(r"operation_id=([a-z0-9_-]+)", rejection).group(1)
+        assert stopped.wait(timeout=0.25)
+        operation = server.cancellation_status(operation_id)["operation"]
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert response_elapsed < 0.2
+    assert len(processed) <= 10
+    assert operation["status"] == "cancelled"
+    assert operation["detached"] is True
+    assert operation["checkpoints"] >= 2
+    assert operation["cancellation_reason"] == "deadline_exceeded"
+
+
+def test_mcp_running_scan_honors_client_cancel_at_next_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    from vector_lake.cancellation import cancellation_checkpoint
+
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "running-client-cancel-test",
+        runtime_guard=guard,
+    )
+    first_batch = threading.Event()
+    stopped = threading.Event()
+    processed = []
+
+    @server.tool()
+    def cancellable_batch_scan_probe() -> str:
+        try:
+            for item in range(100):
+                cancellation_checkpoint(f"batch:{item}")
+                processed.append(item)
+                first_batch.set()
+                time.sleep(0.01)
+        finally:
+            stopped.set()
+        return "complete"
+
+    registered = server._tool_manager.get_tool("cancellable_batch_scan_probe")
+
+    async def scenario():
+        assert registered is not None
+        task = asyncio.create_task(registered.fn())
+        with anyio.fail_after(1):
+            while not first_batch.is_set():
+                await anyio.sleep(0.005)
+        processed_at_cancel = len(processed)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return processed_at_cancel
+
+    try:
+        processed_at_cancel = anyio.run(scenario)
+        assert stopped.wait(timeout=0.25)
+        operation = server.cancellation_status()["operations"][0]
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert len(processed) <= processed_at_cancel + 1
+    assert operation["status"] == "cancelled"
+    assert operation["detached"] is True
+    assert operation["cancellation_reason"] == "client_cancelled"
+
+
+def test_atomic_phase_entry_is_linearized_against_cancellation(monkeypatch):
+    from vector_lake.cancellation import CancellationOperation
+
+    operation = CancellationOperation(
+        tool_name="atomic-entry-race-probe",
+        lane="write",
+        deadline=None,
+    )
+    operation.mark_running()
+    checkpoint_completed = threading.Event()
+    allow_atomic_transition = threading.Event()
+    cancellation_started = threading.Event()
+    cancellation_returned = threading.Event()
+    errors = []
+    original_checkpoint = operation.checkpoint
+
+    def pause_after_checkpoint(label):
+        result = original_checkpoint(label)
+        checkpoint_completed.set()
+        assert allow_atomic_transition.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(operation, "checkpoint", pause_after_checkpoint)
+
+    def enter_atomic_phase():
+        try:
+            operation.begin_atomic_phase("publish")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def cancel_operation():
+        cancellation_started.set()
+        operation.request_cancellation("client_cancelled", detached=True)
+        cancellation_returned.set()
+
+    worker = threading.Thread(target=enter_atomic_phase)
+    canceller = threading.Thread(target=cancel_operation)
+    worker.start()
+    assert checkpoint_completed.wait(timeout=2)
+    canceller.start()
+    assert cancellation_started.wait(timeout=2)
+    cancellation_won_gap = cancellation_returned.wait(timeout=0.1)
+    allow_atomic_transition.set()
+    worker.join(timeout=2)
+    canceller.join(timeout=2)
+
+    assert worker.is_alive() is False
+    assert canceller.is_alive() is False
+    assert errors == []
+    assert cancellation_won_gap is False
+    snapshot = operation.snapshot()
+    assert snapshot["atomic_phase_active"] is True
+    assert snapshot["status"] == "cancellation_pending"
+    assert snapshot["cancellation_pending"] is True
+
+
+def test_mcp_atomic_phase_records_pending_then_completes_after_cancellation(
+    tmp_path,
+    monkeypatch,
+):
+    from vector_lake.cancellation import (
+        cancellation_checkpoint,
+        non_interruptible_phase,
+    )
+
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "atomic-cancellation-test",
+        runtime_guard=guard,
+    )
+    entered_publish = threading.Event()
+    release_publish = threading.Event()
+    committed = []
+
+    @server.tool()
+    def atomic_publish_probe() -> str:
+        cancellation_checkpoint("before_publish")
+        with non_interruptible_phase("publish"):
+            entered_publish.set()
+            assert release_publish.wait(timeout=2)
+            committed.append("atomic")
+        return "committed"
+
+    async def scenario():
+        task = asyncio.create_task(
+            server.call_tool(
+                "atomic_publish_probe",
+                {mcp_server._MCP_CALL_DEADLINE_ARGUMENT: 0.06},
+            )
+        )
+        with anyio.fail_after(1):
+            while not entered_publish.is_set():
+                await anyio.sleep(0.005)
+        with pytest.raises(Exception, match="deadline exceeded") as rejected:
+            await task
+        return str(rejected.value)
+
+    try:
+        rejection = anyio.run(scenario)
+        operation_id = re.search(r"operation_id=([a-z0-9_-]+)", rejection).group(1)
+        pending = server.cancellation_status(operation_id)["operation"]
+        release_publish.set()
+        deadline = time.monotonic() + 1
+        completed = server.cancellation_status(operation_id)["operation"]
+        while completed["terminal"] is False and time.monotonic() < deadline:
+            time.sleep(0.005)
+            completed = server.cancellation_status(operation_id)["operation"]
+    finally:
+        release_publish.set()
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert pending["status"] == "cancellation_pending"
+    assert pending["phase"] == "publish"
+    assert pending["detached"] is True
+    assert pending["atomic_phase_started"] is True
+    assert pending["atomic_phase_active"] is True
+    assert committed == ["atomic"]
+    assert completed["status"] == "completed_after_cancellation"
+    assert completed["terminal"] is True
+    assert completed["atomic_phase_active"] is False
+
+
+def test_mcp_cancel_after_atomic_phase_stops_at_later_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    from vector_lake.cancellation import (
+        cancellation_checkpoint,
+        non_interruptible_phase,
+    )
+
+    monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "post-atomic-cancellation-test",
+        runtime_guard=guard,
+    )
+    atomic_completed = threading.Event()
+    stopped = threading.Event()
+    processed = []
+
+    @server.tool()
+    def post_atomic_scan_probe() -> str:
+        try:
+            with non_interruptible_phase("publish"):
+                processed.append("committed")
+            atomic_completed.set()
+            for item in range(100):
+                cancellation_checkpoint(f"post_publish_scan:{item}")
+                processed.append(item)
+                time.sleep(0.01)
+        finally:
+            stopped.set()
+        return "complete"
+
+    registered = server._tool_manager.get_tool("post_atomic_scan_probe")
+
+    async def scenario():
+        assert registered is not None
+        task = asyncio.create_task(registered.fn())
+        with anyio.fail_after(1):
+            while not atomic_completed.is_set() or len(processed) < 2:
+                await anyio.sleep(0.005)
+        processed_at_cancel = len(processed)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return processed_at_cancel
+
+    try:
+        processed_at_cancel = anyio.run(scenario)
+        assert stopped.wait(timeout=0.25)
+        operation = server.cancellation_status()["operations"][0]
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert len(processed) <= processed_at_cancel + 1
+    assert operation["status"] == "cancelled"
+    assert operation["atomic_phase_started"] is True
+    assert operation["atomic_phase_active"] is False
+    assert operation["phase"] is None
+
+
 def test_mcp_async_admission_wait_keeps_event_loop_responsive(
     tmp_path,
     monkeypatch,
@@ -975,13 +1793,13 @@ def test_mcp_async_admission_wait_keeps_event_loop_responsive(
         waiter = asyncio.create_task(server._run_blocking_call(lambda: None))
         await asyncio.sleep(0.02)
         heartbeat_at = time.monotonic() - started_at
-        with pytest.raises(RuntimeError, match="saturated"):
+        with pytest.raises(RuntimeError, match="saturated") as rejected:
             await waiter
         rejected_at = time.monotonic() - started_at
-        return heartbeat_at, rejected_at
+        return heartbeat_at, rejected_at, str(rejected.value)
 
     try:
-        heartbeat_at, rejected_at = anyio.run(scenario)
+        heartbeat_at, rejected_at, rejection = anyio.run(scenario)
     finally:
         release_blocker.set()
         blocker.result(timeout=2)
@@ -989,6 +1807,8 @@ def test_mcp_async_admission_wait_keeps_event_loop_responsive(
 
     assert heartbeat_at < 0.2
     assert rejected_at >= 0.4
+    assert "retry_after_seconds=0.500" in rejection
+    assert "lane=fast" in rejection
 
 
 def test_mcp_worker_reuses_clean_connection_and_closes_open_transaction(
@@ -1539,7 +2359,66 @@ def test_mcp_running_worker_does_not_delay_process_exit(tmp_path):
     )
 
 
-def test_mcp_blocking_executor_rejects_unbounded_queue(tmp_path, monkeypatch):
+def test_mcp_fast_lane_default_capacity_accepts_six_and_rejects_seventh(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS", raising=False)
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "default-capacity-test",
+        runtime_guard=guard,
+    )
+    release = threading.Event()
+    running_lock = threading.Lock()
+    running = 0
+    two_running = threading.Event()
+
+    def blocked_call():
+        nonlocal running
+        with running_lock:
+            running += 1
+            if running == 2:
+                two_running.set()
+        return release.wait(timeout=2)
+
+    futures = [server._submit_blocking_call(blocked_call) for _ in range(6)]
+    assert two_running.wait(timeout=2)
+
+    try:
+        status = server.blocking_executor_status()
+        assert status["workers"] == 2
+        assert status["queue_capacity"] == 4
+        assert status["inflight"] == 6
+        assert status["queued_items"] == 4
+        started_at = time.monotonic()
+        with pytest.raises(RuntimeError) as rejected:
+            server._submit_blocking_call(lambda: "seventh")
+        elapsed = time.monotonic() - started_at
+        message = str(rejected.value)
+        assert message.startswith(
+            "Vector Lake MCP blocking executor is saturated; retry later"
+        )
+        assert "retry_after_seconds=0.050" in message
+        assert "lane=fast" in message
+        assert elapsed >= 0.04
+        assert elapsed < 0.5
+    finally:
+        release.set()
+        assert all(future.result(timeout=2) is True for future in futures)
+        server.shutdown_blocking_executor(wait=True)
+
+    final_status = server.blocking_executor_status()
+    assert final_status["inflight"] == 0
+    assert final_status["metrics"]["admission_rejections"] == 1
+
+
+def test_mcp_blocking_executor_env_restores_legacy_one_by_one_capacity(
+    tmp_path,
+    monkeypatch,
+):
     monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_WORKERS", "1")
     monkeypatch.setenv("VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY", "1")
     monkeypatch.setenv("VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS", "0")
@@ -1562,8 +2441,14 @@ def test_mcp_blocking_executor_rejects_unbounded_queue(tmp_path, monkeypatch):
         assert status["workers"] == 1
         assert status["queue_capacity"] == 1
         assert status["inflight"] == 2
-        with pytest.raises(RuntimeError, match="saturated"):
+        with pytest.raises(RuntimeError) as rejected:
             server._submit_blocking_call(lambda: "unbounded")
+        message = str(rejected.value)
+        assert message.startswith(
+            "Vector Lake MCP blocking executor is saturated; retry later"
+        )
+        assert "retry_after_seconds=0.000" in message
+        assert "lane=fast" in message
         release.set()
         assert first.result(timeout=2) is True
         assert second.result(timeout=2) == "queued"
@@ -1816,7 +2701,9 @@ def test_dirty_graph_is_excluded_from_search_expansion(isolated_memory, monkeypa
     monkeypatch.setattr(
         tool_search,
         "read_committed_index_snapshot",
-        lambda path, **_kwargs: index_snapshot.load_index_snapshot(path),
+        lambda path, **_kwargs: (
+            index_snapshot.load_legacy_index_snapshot_for_migration(path)
+        ),
     )
     clear_index_snapshot_cache_for_tests()
 
@@ -1871,7 +2758,9 @@ def test_assemble_context_reuses_search_index_snapshot(isolated_memory, monkeypa
     monkeypatch.setattr(
         tool_search,
         "read_committed_index_snapshot",
-        lambda path, **_kwargs: index_snapshot.load_index_snapshot(path),
+        lambda path, **_kwargs: (
+            index_snapshot.load_legacy_index_snapshot_for_migration(path)
+        ),
     )
     clear_index_snapshot_cache_for_tests()
 
@@ -1891,7 +2780,13 @@ def test_assemble_context_reuses_search_index_snapshot(isolated_memory, monkeypa
 
 
 def test_search_and_runtime_health_share_index_snapshot(isolated_memory):
-    from vector_lake import db_store, indexer, runtime_health, tool_search
+    from vector_lake import (
+        db_store,
+        governance_store,
+        indexer,
+        runtime_health,
+        tool_search,
+    )
 
     index_path = get_wiki_dir() / "index.json"
     db_store.init_db()
@@ -1904,6 +2799,22 @@ def test_search_and_runtime_health_share_index_snapshot(isolated_memory):
     assert error is None
     assert health_snapshot is search_snapshot
 
+    # Rebuilding the same roots/generation is an exact v2 no-op, so every
+    # reader must retain the same shared snapshot object.
+    indexer.generate_index()
+    noop_snapshot = tool_search._load_search_index(index_path)
+    assert noop_snapshot is search_snapshot
+
+    governance_store.upsert_entity(
+        "entity_shared_snapshot_refresh",
+        {
+            "entity_id": "entity_shared_snapshot_refresh",
+            "canonical_name": "Shared Snapshot Refresh",
+            "page_key": "Concept_Shared-Snapshot-Refresh",
+            "type": "concept",
+            "raw_text": "A canonical change must rotate the commit marker.",
+        },
+    )
     indexer.generate_index()
     refreshed_snapshot = tool_search._load_search_index(index_path)
 

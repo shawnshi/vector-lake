@@ -462,25 +462,93 @@ def _reset_graph_cache_locked() -> None:
     )
 
 
-def index_snapshot_identity(path: str | Path) -> tuple[str, int, int, int]:
+def index_snapshot_identity(path: str | Path) -> tuple:
     resolved = Path(path).resolve()
     stat = resolved.stat()
-    return (
+    identity: tuple = (
         str(resolved),
         stat.st_mtime_ns,
         stat.st_ctime_ns,
         stat.st_size,
     )
+    # The v2 index filename is deliberately static. Its cache identity must
+    # therefore include the actual commit marker, otherwise a new generation
+    # would keep returning the object decoded for the previous sidecar.
+    from vector_lake.projection_format_v2 import (
+        SIDECAR_FILENAME,
+        is_v2_locator,
+        read_committed_sidecar,
+    )
+
+    if is_v2_locator(resolved, "index"):
+        marker = resolved.with_name(SIDECAR_FILENAME)
+        try:
+            marker_stat = marker.stat()
+        except OSError as exc:
+            from vector_lake.projection_format_v2 import ProjectionV2ContractError
+
+            raise ProjectionV2ContractError("sidecar_unreadable") from exc
+        # A static v2 locator and an unchanged sidecar are not sufficient for a
+        # cache hit: canonical SQLite state may have advanced without a new
+        # projection being published yet.  Revalidate the small commit marker
+        # and schema-v9 runtime row on every read, while retaining the already
+        # materialized immutable snapshot when that binding is still current.
+        sidecar, committed_identity, runtime = read_committed_sidecar(
+            resolved.parent
+        )
+        identity += (
+            marker_stat.st_dev,
+            marker_stat.st_ino,
+            marker_stat.st_mtime_ns,
+            marker_stat.st_ctime_ns,
+            marker_stat.st_size,
+            committed_identity,
+            sidecar["projection_generation"],
+            runtime.get("sidecar_sha256"),
+        )
+    return identity
 
 
 def load_index_snapshot(path: str | Path) -> dict[str, Any]:
     """Return one read-only parsed object for an unchanged index file identity."""
     resolved = Path(path).resolve()
     key = index_snapshot_identity(resolved)
+    from vector_lake.projection_format_v2 import (
+        ProjectionV2ContractError,
+        is_v2_locator,
+        load_committed_index,
+    )
+
+    if not is_v2_locator(resolved, "index"):
+        raise ProjectionV2ContractError(
+            "legacy_index_requires_explicit_migration_reader"
+        )
     with _CACHE_LOCK:
         if _CACHE.get("key") == key:
             return _CACHE["value"]
-        value = _decode_index_snapshot(resolved)
+        value = _freeze_json_tree(load_committed_index(resolved.parent))
+        _CACHE.update({"key": key, "value": value})
+        _reset_graph_cache_locked()
+        return value
+
+
+def load_legacy_index_snapshot_for_migration(
+    path: str | Path,
+) -> dict[str, Any]:
+    """Decode legacy payload bytes only for explicit migration/rollback code."""
+    resolved = Path(path).resolve()
+    key = ("legacy_migration", index_snapshot_identity(resolved))
+    from vector_lake.projection_format_v2 import (
+        ProjectionV2ContractError,
+        is_v2_locator,
+    )
+
+    if is_v2_locator(resolved, "index"):
+        raise ProjectionV2ContractError("v2_locator_passed_to_legacy_reader")
+    with _CACHE_LOCK:
+        if _CACHE.get("key") == key:
+            return _CACHE["value"]
+        value = _freeze_json_tree(_decode_index_snapshot(resolved))
         _CACHE.update({"key": key, "value": value})
         _reset_graph_cache_locked()
         return value

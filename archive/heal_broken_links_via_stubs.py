@@ -2,9 +2,8 @@ import os
 import re
 import datetime
 import sys
-import yaml
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from vector_lake.yaml_utils import dump_yaml
+from vector_lake.yaml_utils import dump_yaml  # noqa: E402
 
 wiki_dir = r"C:\Users\shich\.gemini\MEMORY\wiki"
 
@@ -13,7 +12,8 @@ existing_files = {name.replace(".md", "") for name in os.listdir(wiki_dir) if na
 broken_targets = set()
 
 for filename in os.listdir(wiki_dir):
-    if not filename.endswith(".md"): continue
+    if not filename.endswith(".md"):
+        continue
     filepath = os.path.join(wiki_dir, filename)
     try:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as handle:

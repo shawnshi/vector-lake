@@ -1,5 +1,4 @@
 import hashlib
-import json
 import os
 import threading
 import time
@@ -61,7 +60,7 @@ def test_worker_recovers_projection_without_signal(isolated_memory):
     assert target.read_text(encoding="utf-8") == _source_content()
     row = db_store.get_connection().execute("SELECT status FROM mutation_outbox").fetchone()
     assert row["status"] == "completed"
-    index_data = json.loads((isolated_memory / "wiki" / "index.json").read_text(encoding="utf-8"))
+    index_data = indexer.read_committed_index_snapshot()
     assert "Source_Test" in index_data["nodes"]
 
 

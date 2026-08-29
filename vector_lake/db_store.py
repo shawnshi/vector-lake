@@ -6,7 +6,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
+import stat
 import struct
 import sys
 import threading
@@ -25,8 +27,15 @@ from vector_lake.raw_revision import (
     parse_revision,
     stable_raw_revision,
 )
+from vector_lake.search_projection_contract import (
+    CANONICAL_PROJECTION_SURFACES,
+    normalize_runtime_generations,
+)
 from vector_lake.wiki_utils import (
+    get_claim_graph_path,
+    get_index_path,
     get_meta_dir,
+    get_projection_manifest_path,
     get_raw_dir,
     normalize_semantic_text,
     peek_meta_dir,
@@ -75,14 +84,128 @@ _WAL_AUTOCHECKPOINT_DEFAULT_PAGES = 1_000
 _WAL_AUTOCHECKPOINT_MAX_PAGES = 1_000_000
 _WAL_JOURNAL_SIZE_LIMIT_DEFAULT_BYTES = 64 * 1024 * 1024
 _WAL_JOURNAL_SIZE_LIMIT_MAX_BYTES = 16 * 1024 * 1024 * 1024
+_SEARCH_PROJECTION_INTEGRITY_MAX_ROWS_DEFAULT = 250_000
+_SEARCH_PROJECTION_INTEGRITY_MAX_ROWS_HARD = 2_000_000
+_SEARCH_PROJECTION_INTEGRITY_MAX_BYTES_DEFAULT = 512 * 1024 * 1024
+_SEARCH_PROJECTION_INTEGRITY_MAX_BYTES_HARD = 4 * 1024 * 1024 * 1024
+_OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_ROWS_DEFAULT = 1_000_000
+_OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_ROWS_HARD = 8_000_000
+_OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_BYTES_DEFAULT = 512 * 1024 * 1024
+_OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_BYTES_HARD = 4 * 1024 * 1024 * 1024
+_OPERATIONAL_MEMORY_SEARCH_ATTESTATION_SECONDS_DEFAULT = 60.0
+_OPERATIONAL_MEMORY_SEARCH_ATTESTATION_SECONDS_MAX = 3600.0
 _SCHEMA_MIGRATION_LOCK_FILENAME = ".schema-migration-v5.lock"
 _SCHEMA_MIGRATION_RUNTIME_LOCK_TIMEOUT_SECONDS = 5.0
 _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN = object()
 _SCHEMA_MIGRATION_PLAN_CONTRACT = "vector-lake-schema-migration-plan/v1"
 _SCHEMA_MIGRATION_RECEIPT_CONTRACT = "vector-lake-schema-migration-receipt/v1"
-_SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS = frozenset({4, 5, 6, 7})
-
-
+_SCHEMA_ROLLBACK_PLAN_CONTRACT = "vector-lake-schema-rollback-plan/v1"
+_SCHEMA_ROLLBACK_RECEIPT_CONTRACT = "vector-lake-schema-rollback-receipt/v1"
+_SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS = frozenset({4, 5, 6, 7, 8, 9})
+_SCHEMA_ROLLBACK_SOURCE_VERSION = 9
+_SCHEMA_ROLLBACK_TARGET_VERSION = 8
+_SCHEMA_ROLLBACK_PENDING_SCAN_LIMIT = 10_000
+_SCHEMA_ROLLBACK_RECEIPT_MAX_BYTES = 64 * 1024 * 1024
+_SCHEMA_ROLLBACK_RECEIPT_SCAN_MAX_BYTES = 256 * 1024 * 1024
+_SCHEMA_ROLLBACK_TERMINAL_PAIR_LIMIT = 256
+_SCHEMA_ROLLBACK_PLAN_CORE_KEYS = frozenset(
+    {
+        "contract",
+        "database_path",
+        "source_schema_version",
+        "target_schema_version",
+        "migration_receipt",
+        "current_source",
+        "restore",
+        "forward_recovery",
+        "data_loss_since_migration",
+        "changed_runtime_generations",
+        "confirm_data_rewind_required",
+        "projection_action",
+        "old_runtime_projection_rebuild_required",
+        "recovery_action",
+        "pending_rollback_receipt",
+        "completed_rollback_receipt",
+        "issues",
+        "can_apply",
+        "no_op",
+    }
+)
+_SCHEMA_ROLLBACK_PENDING_RECEIPT_KEYS = frozenset(
+    {
+        "contract",
+        "status",
+        "created_at",
+        "database_path",
+        "source_schema_version",
+        "target_schema_version",
+        "plan_fingerprint",
+        "plan",
+        "migration_receipt",
+        "from_source",
+        "to_target",
+        "forward_recovery",
+        "projection_action",
+        "old_runtime_projection_rebuild_required",
+        "receipt_fingerprint",
+    }
+)
+_SCHEMA_ROLLBACK_COMPLETED_RECEIPT_KEYS = (
+    _SCHEMA_ROLLBACK_PENDING_RECEIPT_KEYS | {"completed_at", "post"}
+)
+_SCHEMA_ROLLBACK_MIGRATION_BINDING_KEYS = frozenset(
+    {
+        "path",
+        "file_identity",
+        "file_sha256",
+        "receipt_fingerprint",
+        "plan_fingerprint",
+    }
+)
+_SCHEMA_ROLLBACK_CURRENT_SOURCE_KEYS = frozenset(
+    {
+        "physical_identity",
+        "database_sha256",
+        "logical_database_sha256",
+        "schema_state",
+        "runtime_generations",
+        "projection",
+    }
+)
+_SCHEMA_ROLLBACK_RESTORE_KEYS = frozenset(
+    {
+        "database",
+        "schema_state",
+        "runtime_generations",
+        "pre_projection",
+        "projection_backup",
+    }
+)
+_SCHEMA_ROLLBACK_PLAN_FORWARD_KEYS = frozenset(
+    {
+        "database_path",
+        "projection_directory",
+        "completed_receipt_path",
+        "pending_receipt_path",
+        "reuse_existing",
+        "reuse_database",
+        "reuse_projection",
+        "database",
+        "projection",
+    }
+)
+_SCHEMA_ROLLBACK_RECEIPT_FORWARD_KEYS = frozenset({"database", "projection"})
+_SCHEMA_ROLLBACK_POST_KEYS = frozenset(
+    {
+        "database_sha256",
+        "schema_state",
+        "runtime_generations",
+        "projection",
+        "quick_check",
+        "sqlite_sidecars",
+        "old_runtime_acceptance",
+    }
+)
 def _normalized_schema_sql(statement: object) -> str:
     sql = re.sub(
         r"\bIF\s+NOT\s+EXISTS\s+",
@@ -520,7 +643,132 @@ _CHANGE_SET_HISTORY_SCHEMA_OBJECTS_V6 = (
     ),
 )
 
-_SCHEMA_VERSION = 7
+_EMBEDDING_METADATA_TABLE_SCHEMA_V8 = """
+CREATE TABLE IF NOT EXISTS embedding_metadata_v8 (
+    entity_id TEXT PRIMARY KEY,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    input_contract TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dimension INTEGER NOT NULL CHECK (dimension > 0),
+    canonical_generation_json TEXT NOT NULL,
+    embedded_at TEXT NOT NULL
+)
+"""
+_SEARCH_PROJECTION_STATE_TABLE_SCHEMA_V8 = """
+CREATE TABLE IF NOT EXISTS search_projection_state_v8 (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    status TEXT NOT NULL CHECK (status IN ('ready', 'rebuild_required')),
+    projection_generation TEXT,
+    canonical_generation_json TEXT,
+    expected_row_count INTEGER NOT NULL DEFAULT 0 CHECK (expected_row_count >= 0),
+    expected_corpus_sha256 TEXT,
+    updated_at TEXT NOT NULL
+)
+"""
+_SEARCH_RUNTIME_SCHEMA_V8 = (
+    _EMBEDDING_METADATA_TABLE_SCHEMA_V8,
+    _SEARCH_PROJECTION_STATE_TABLE_SCHEMA_V8,
+    "mutation_outbox.poison_attempt_count INTEGER NOT NULL DEFAULT 0",
+    "mutation_outbox.transient_attempt_count INTEGER NOT NULL DEFAULT 0",
+    "mutation_outbox.last_error_code TEXT",
+    "mutation_outbox.first_transient_at TEXT",
+)
+_SEARCH_RUNTIME_SCHEMA_OBJECTS_V8 = (
+    ("table", "embedding_metadata_v8", _EMBEDDING_METADATA_TABLE_SCHEMA_V8),
+    (
+        "table",
+        "search_projection_state_v8",
+        _SEARCH_PROJECTION_STATE_TABLE_SCHEMA_V8,
+    ),
+)
+_MUTATION_OUTBOX_COLUMN_CONTRACT_V8 = (
+    ("poison_attempt_count", "INTEGER", True),
+    ("transient_attempt_count", "INTEGER", True),
+    ("last_error_code", "TEXT", False),
+    ("first_transient_at", "TEXT", False),
+)
+
+_PROJECTION_RUNTIME_V9_MAX_SIDECAR_BYTES = 64 * 1024
+_PROJECTION_RUNTIME_V9_MAX_GENERATIONS_BYTES = 4 * 1024
+_PROJECTION_RUNTIME_TABLE_SCHEMA_V9 = """
+CREATE TABLE IF NOT EXISTS projection_runtime_v9 (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    format_version INTEGER NOT NULL CHECK (format_version = 2),
+    status TEXT NOT NULL CHECK (
+        status IN ('rebuild_required', 'publish_pending', 'ready')
+    ),
+    projection_generation TEXT,
+    canonical_generation_json TEXT,
+    sidecar_sha256 TEXT,
+    sidecar_json TEXT,
+    previous_sidecar_json TEXT,
+    updated_at TEXT NOT NULL CHECK (
+        length(updated_at) BETWEEN 1 AND 64
+    ),
+    CHECK (
+        projection_generation IS NULL OR (
+            length(projection_generation) = 64
+            AND projection_generation NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        sidecar_sha256 IS NULL OR (
+            length(sidecar_sha256) = 64
+            AND sidecar_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        canonical_generation_json IS NULL OR (
+            json_valid(canonical_generation_json)
+            AND length(CAST(canonical_generation_json AS BLOB)) <= 4096
+        )
+    ),
+    CHECK (
+        sidecar_json IS NULL OR (
+            json_valid(sidecar_json)
+            AND length(CAST(sidecar_json AS BLOB)) <= 65536
+        )
+    ),
+    CHECK (
+        previous_sidecar_json IS NULL OR (
+            json_valid(previous_sidecar_json)
+            AND length(CAST(previous_sidecar_json AS BLOB)) <= 65536
+        )
+    ),
+    CHECK (
+        (status = 'rebuild_required'
+            AND projection_generation IS NULL
+            AND canonical_generation_json IS NULL
+            AND sidecar_sha256 IS NULL
+            AND sidecar_json IS NULL
+            AND previous_sidecar_json IS NULL)
+        OR
+        (status = 'publish_pending'
+            AND projection_generation IS NOT NULL
+            AND canonical_generation_json IS NOT NULL
+            AND sidecar_sha256 IS NOT NULL
+            AND sidecar_json IS NOT NULL)
+        OR
+        (status = 'ready'
+            AND projection_generation IS NOT NULL
+            AND canonical_generation_json IS NOT NULL
+            AND sidecar_sha256 IS NOT NULL
+            AND sidecar_json IS NOT NULL
+            AND previous_sidecar_json IS NULL)
+    )
+)
+"""
+_PROJECTION_RUNTIME_SCHEMA_V9 = (_PROJECTION_RUNTIME_TABLE_SCHEMA_V9,)
+_PROJECTION_RUNTIME_SCHEMA_OBJECTS_V9 = (
+    (
+        "table",
+        "projection_runtime_v9",
+        _PROJECTION_RUNTIME_TABLE_SCHEMA_V9,
+    ),
+)
+
+
+_SCHEMA_VERSION = 9
 _SCHEMA_MIGRATIONS = {
     1: (
         "baseline_schema_v1",
@@ -549,6 +797,14 @@ _SCHEMA_MIGRATIONS = {
     7: (
         "change_set_payload_limits_v7",
         _schema_contract_checksum(_CHANGE_SET_PAYLOAD_SCHEMA_V7),
+    ),
+    8: (
+        "search_projection_integrity_v8",
+        _schema_contract_checksum(_SEARCH_RUNTIME_SCHEMA_V8),
+    ),
+    9: (
+        "content_addressed_projection_runtime_v9",
+        _schema_contract_checksum(_PROJECTION_RUNTIME_SCHEMA_V9),
     ),
 }
 
@@ -971,6 +1227,262 @@ def _assert_change_set_payload_schema_v7_contract(
         )
 
 
+def _search_runtime_schema_v8_issues(conn: sqlite3.Connection) -> list[str]:
+    issues: list[str] = []
+    for object_type, name, expected_sql in _SEARCH_RUNTIME_SCHEMA_OBJECTS_V8:
+        row = conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            issues.append(f"search_runtime_schema_missing:{object_type}:{name}")
+            continue
+        if str(row["type"] or "") != object_type:
+            issues.append(f"search_runtime_schema_type_mismatch:{name}")
+            continue
+        if _normalized_schema_sql(row["sql"]) != _normalized_schema_sql(expected_sql):
+            issues.append(f"search_runtime_schema_sql_mismatch:{name}")
+
+    outbox_columns = {
+        str(row["name"]): (str(row["type"] or "").upper(), bool(row["notnull"]))
+        for row in conn.execute("PRAGMA table_info(mutation_outbox)")
+    }
+    for name, expected_type, expected_not_null in _MUTATION_OUTBOX_COLUMN_CONTRACT_V8:
+        observed = outbox_columns.get(name)
+        if observed is None:
+            issues.append(f"search_runtime_outbox_column_missing:{name}")
+        elif observed != (expected_type, expected_not_null):
+            issues.append(f"search_runtime_outbox_column_mismatch:{name}")
+
+    state_rows = conn.execute(
+        "SELECT singleton, status, expected_row_count FROM search_projection_state_v8"
+    ).fetchall() if not any("search_projection_state_v8" in issue for issue in issues) else []
+    if len(state_rows) != 1 or int(state_rows[0]["singleton"] or 0) != 1:
+        issues.append("search_projection_state_singleton_invalid")
+    elif (
+        str(state_rows[0]["status"] or "") not in {"ready", "rebuild_required"}
+        or int(state_rows[0]["expected_row_count"] or 0) < 0
+    ):
+        issues.append("search_projection_state_payload_invalid")
+    return issues
+
+
+def _assert_search_runtime_schema_v8_contract(conn: sqlite3.Connection) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 8:
+        return
+    issues = _search_runtime_schema_v8_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v8 search runtime contract is invalid: " + ", ".join(issues)
+        )
+
+
+def _projection_runtime_v9_json(
+    value: object,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[str, dict]:
+    """Normalize one projection control document to canonical UTF-8 JSON."""
+
+    def reject_duplicate_keys(pairs):
+        decoded = {}
+        for key, item in pairs:
+            if key in decoded:
+                raise ValueError(f"duplicate_key:{key}")
+            decoded[key] = item
+        return decoded
+
+    try:
+        decoded = (
+            json.loads(value, object_pairs_hook=reject_duplicate_keys)
+            if isinstance(value, str)
+            else value
+        )
+        if not isinstance(decoded, dict):
+            raise ValueError("object_required")
+        canonical = json.dumps(
+            decoded,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        encoded = canonical.encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label}_invalid:{exc}") from exc
+    if len(encoded) > max_bytes:
+        raise ValueError(f"{label}_too_large:{len(encoded)}>{max_bytes}")
+    return canonical, decoded
+
+
+def _projection_runtime_v9_digest(value: object, *, label: str) -> str:
+    digest = str(value or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError(f"{label}_invalid")
+    return digest
+
+
+def _projection_runtime_v9_generations(value: object) -> tuple[str, dict[str, int]]:
+    canonical, decoded = _projection_runtime_v9_json(
+        value,
+        label="canonical_generation",
+        max_bytes=_PROJECTION_RUNTIME_V9_MAX_GENERATIONS_BYTES,
+    )
+    normalized = normalize_runtime_generations(decoded)
+    if normalized is None:
+        raise ValueError("canonical_generation_invalid")
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return canonical, normalized
+
+
+def _projection_runtime_v9_sidecar(
+    value: object,
+    *,
+    expected_projection_generation: str | None = None,
+    expected_canonical_generation: dict[str, int] | None = None,
+    label: str = "sidecar",
+) -> tuple[str, dict]:
+    canonical, decoded = _projection_runtime_v9_json(
+        value,
+        label=label,
+        max_bytes=_PROJECTION_RUNTIME_V9_MAX_SIDECAR_BYTES,
+    )
+    try:
+        from vector_lake.projection_format_v2 import (
+            ProjectionV2ContractError,
+            validate_sidecar,
+        )
+
+        decoded = validate_sidecar(decoded)
+        generation = _projection_runtime_v9_digest(
+            decoded.get("projection_generation"),
+            label=f"{label}_projection_generation",
+        )
+        generations = normalize_runtime_generations(
+            decoded.get("canonical_generation")
+        )
+        if generations is None:
+            raise ValueError("canonical_generation")
+        published_at = decoded.get("published_at_utc")
+        if (
+            not isinstance(published_at, str)
+            or not published_at
+            or len(published_at) > 64
+        ):
+            raise ValueError("published_at_utc")
+    except (ValueError, ProjectionV2ContractError) as exc:
+        raise ValueError(f"{label}_contract_invalid:{exc}") from exc
+    if (
+        expected_projection_generation is not None
+        and generation != expected_projection_generation
+    ):
+        raise ValueError(f"{label}_projection_generation_mismatch")
+    if (
+        expected_canonical_generation is not None
+        and generations != expected_canonical_generation
+    ):
+        raise ValueError(f"{label}_canonical_generation_mismatch")
+    return canonical, decoded
+
+
+def _projection_runtime_schema_v9_issues(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    issues: list[str] = []
+    row = conn.execute(
+        "SELECT type, sql FROM sqlite_master WHERE name = 'projection_runtime_v9'"
+    ).fetchone()
+    if row is None:
+        return ["projection_runtime_schema_missing:table:projection_runtime_v9"]
+    object_type, observed_sql = str(row[0] or ""), row[1]
+    if object_type != "table":
+        return ["projection_runtime_schema_type_mismatch:projection_runtime_v9"]
+    if _normalized_schema_sql(observed_sql) != _normalized_schema_sql(
+        _PROJECTION_RUNTIME_TABLE_SCHEMA_V9
+    ):
+        issues.append("projection_runtime_schema_sql_mismatch:projection_runtime_v9")
+        return issues
+
+    rows = conn.execute(
+        "SELECT singleton, format_version, status, projection_generation, "
+        "canonical_generation_json, sidecar_sha256, sidecar_json, "
+        "previous_sidecar_json, updated_at FROM projection_runtime_v9"
+    ).fetchall()
+    if len(rows) != 1 or int(rows[0][0] or 0) != 1:
+        return ["projection_runtime_state_singleton_invalid"]
+    state = rows[0]
+    status = str(state[2] or "")
+    if int(state[1] or 0) != 2 or status not in {
+        "rebuild_required",
+        "publish_pending",
+        "ready",
+    }:
+        issues.append("projection_runtime_state_payload_invalid")
+        return issues
+    if not isinstance(state[8], str) or not state[8] or len(state[8]) > 64:
+        issues.append("projection_runtime_updated_at_invalid")
+    if status == "rebuild_required":
+        if any(value is not None for value in state[3:8]):
+            issues.append("projection_runtime_rebuild_payload_invalid")
+        return issues
+
+    try:
+        generation = _projection_runtime_v9_digest(
+            state[3], label="projection_generation"
+        )
+        canonical_json, generations = _projection_runtime_v9_generations(state[4])
+        if canonical_json != state[4]:
+            raise ValueError("canonical_generation_not_canonical")
+        sidecar_json, _sidecar = _projection_runtime_v9_sidecar(
+            state[6],
+            expected_projection_generation=generation,
+            expected_canonical_generation=generations,
+        )
+        if sidecar_json != state[6]:
+            raise ValueError("sidecar_not_canonical")
+        sidecar_sha256 = _projection_runtime_v9_digest(
+            state[5], label="sidecar_sha256"
+        )
+        if not hmac.compare_digest(
+            sidecar_sha256,
+            hashlib.sha256(sidecar_json.encode("utf-8")).hexdigest(),
+        ):
+            raise ValueError("sidecar_sha256_mismatch")
+        if state[7] is not None:
+            previous_json, _previous = _projection_runtime_v9_sidecar(
+                state[7], label="previous_sidecar"
+            )
+            if previous_json != state[7]:
+                raise ValueError("previous_sidecar_not_canonical")
+        if status == "ready" and state[7] is not None:
+            raise ValueError("ready_previous_sidecar_present")
+    except ValueError as exc:
+        issues.append(f"projection_runtime_state_invalid:{exc}")
+    return issues
+
+
+def _assert_projection_runtime_schema_v9_contract(
+    conn: sqlite3.Connection,
+) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 9:
+        return
+    issues = _projection_runtime_schema_v9_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v9 projection runtime contract is invalid: "
+            + ", ".join(issues)
+        )
+
+
 def _identity_validation_token(conn: sqlite3.Connection) -> tuple:
     """Detect schema and identity-relevant writes without unrelated invalidation."""
     schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0)
@@ -1007,6 +1519,8 @@ def _validate_cached_identity_state(conn: sqlite3.Connection) -> None:
     _assert_duplicate_index_cleanup_v5_contract(conn)
     _assert_change_set_history_schema_v6_contract(conn)
     _assert_change_set_payload_schema_v7_contract(conn)
+    _assert_search_runtime_schema_v8_contract(conn)
+    _assert_projection_runtime_schema_v9_contract(conn)
     db_key = str(get_db_path().resolve())
     with _IDENTITY_VALIDATION_LOCK:
         for _attempt in range(2):
@@ -1093,6 +1607,10 @@ def inspect_schema_migration_connection(
             result["issues"].extend(_change_set_history_schema_v6_issues(conn))
         if int(result["user_version"] or 0) >= 7:
             result["issues"].extend(_change_set_payload_schema_v7_issues(conn))
+        if int(result["user_version"] or 0) >= 8:
+            result["issues"].extend(_search_runtime_schema_v8_issues(conn))
+        if int(result["user_version"] or 0) >= 9:
+            result["issues"].extend(_projection_runtime_schema_v9_issues(conn))
     except (OSError, sqlite3.Error) as exc:
         result["status"] = "invalid"
         result["issues"].append(f"schema_inspection_failed:{exc}")
@@ -1199,6 +1717,24 @@ def _runtime_surfaces_written(sql: str) -> set[str]:
     }
 
 
+def _writes_search_projection(sql: str) -> bool:
+    return any(
+        _normalized_sql_identifier(match.group("table")) == "wiki_search_index"
+        for match in _WRITE_SURFACE_PATTERN.finditer(str(sql or ""))
+    )
+
+
+def _writes_operational_memory_search(sql: str) -> bool:
+    """Detect writes that can invalidate the optional memory-search proof."""
+    for match in _WRITE_SURFACE_PATTERN.finditer(str(sql or "")):
+        table = _normalized_sql_identifier(match.group("table"))
+        if table == "operational_memory" or table.startswith(
+            "operational_memory_search_"
+        ):
+            return True
+    return False
+
+
 class _GenerationTrackingCursor(sqlite3.Cursor):
     def execute(self, sql, parameters=()):
         self.connection._mark_runtime_surfaces(sql)
@@ -1218,6 +1754,10 @@ class _GenerationTrackingConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
         self._generation_dirty_surfaces: set[str] = set()
         self._persistent_runtime_generation_triggers = False
+        self._search_projection_write_epoch = 0
+        self._search_projection_integrity_cache: dict | None = None
+        self._operational_memory_search_write_epoch = 0
+        self._operational_memory_search_integrity_cache: dict | None = None
 
     def enable_persistent_runtime_generation_triggers(self) -> None:
         """Use durable schema-v3 triggers while retaining dirty-read fencing."""
@@ -1225,6 +1765,17 @@ class _GenerationTrackingConnection(sqlite3.Connection):
 
     def _mark_runtime_surfaces(self, sql: str) -> None:
         self._generation_dirty_surfaces.update(_runtime_surfaces_written(sql))
+        if _writes_search_projection(sql):
+            # Invalidate before execution. A failed or rolled-back statement may
+            # cause one harmless rescan, but can never preserve a stale proof.
+            self._search_projection_write_epoch += 1
+            self._search_projection_integrity_cache = None
+        if _writes_operational_memory_search(sql):
+            # The durable proof also covers canonical memory and every FTS5
+            # shadow table. Invalidate before execution so failed statements
+            # can only cause a harmless rescan, never a stale cache hit.
+            self._operational_memory_search_write_epoch += 1
+            self._operational_memory_search_integrity_cache = None
 
     def generation_dirty_snapshot(self) -> set[str]:
         return set(self._generation_dirty_surfaces)
@@ -1242,8 +1793,7 @@ class _GenerationTrackingConnection(sqlite3.Connection):
 
     def executescript(self, sql_script):
         """Track script writes even when SQLite auto-commits the script."""
-        surfaces = _runtime_surfaces_written(sql_script)
-        self._generation_dirty_surfaces.update(surfaces)
+        self._mark_runtime_surfaces(sql_script)
         try:
             result = super().executescript(sql_script)
         except BaseException:
@@ -1392,6 +1942,9 @@ def _job_idempotency_key(task_type: str, payload: dict | None) -> str | None:
 def get_db_path() -> Path:
     import os
 
+    bound = getattr(_LOCAL, "schema_maintenance_database_path", None)
+    if bound is not None:
+        return Path(bound)
     override = os.environ.get("VECTOR_LAKE_DB_PATH")
     if override:
         return Path(override)
@@ -1400,10 +1953,63 @@ def get_db_path() -> Path:
 
 def peek_db_path() -> Path:
     """Resolve the canonical database path without creating meta state."""
+    bound = getattr(_LOCAL, "schema_maintenance_database_path", None)
+    if bound is not None:
+        return Path(bound)
     override = os.environ.get("VECTOR_LAKE_DB_PATH")
     if override:
         return Path(override)
     return peek_meta_dir() / "vector_lake.db"
+
+
+@contextmanager
+def schema_maintenance_lock(
+    database_path: str | Path | None = None,
+):
+    """Serialize schema and projection maintenance for one database."""
+    path = (
+        Path(database_path) if database_path is not None else peek_db_path()
+    ).resolve()
+    lock_path = (path.parent / _SCHEMA_MIGRATION_LOCK_FILENAME).resolve()
+    held = getattr(_LOCAL, "schema_maintenance_lock", None)
+    if held is not None:
+        held_path, held_lock = held
+        held_database_path = getattr(
+            _LOCAL,
+            "schema_maintenance_database_path",
+            None,
+        )
+        if (
+            os.path.normcase(str(held_path))
+            != os.path.normcase(str(lock_path))
+            or os.path.normcase(str(held_database_path))
+            != os.path.normcase(str(path))
+            or not isinstance(held_lock, BaseFileLock)
+            or not held_lock.is_locked
+        ):
+            raise RuntimeError("schema_maintenance_lock_order_violation")
+        yield
+        return
+    maintenance_lock = FileLock(
+        str(lock_path),
+        timeout=0,
+    )
+    try:
+        maintenance_lock.acquire()
+    except FileLockTimeout as exc:
+        raise RuntimeError("schema_maintenance_lock_busy") from exc
+    _LOCAL.schema_maintenance_lock = (lock_path, maintenance_lock)
+    _LOCAL.schema_maintenance_database_path = path
+    try:
+        yield
+    finally:
+        if getattr(_LOCAL, "schema_maintenance_lock", None) == (
+            lock_path,
+            maintenance_lock,
+        ):
+            delattr(_LOCAL, "schema_maintenance_lock")
+            delattr(_LOCAL, "schema_maintenance_database_path")
+        maintenance_lock.release()
 
 
 class ReadOnlySnapshotUnavailable(RuntimeError):
@@ -1750,9 +2356,39 @@ def _configure_wal_retention(connection: sqlite3.Connection) -> None:
         raise RuntimeError("SQLite WAL journal size limit was not applied")
 
 
+def _mcp_readonly_surface_enabled() -> bool:
+    return str(os.environ.get("VECTOR_LAKE_MCP_SURFACE", "full")).strip().lower() == (
+        "readonly"
+    )
+
+
+def mcp_readonly_surface_enabled() -> bool:
+    """Return whether this process is bound to the read-only MCP surface."""
+    return _mcp_readonly_surface_enabled()
+
+
+def _configure_sqlite_durability(connection: sqlite3.Connection) -> None:
+    from vector_lake.durability import durability_profile
+
+    profile = durability_profile()
+    expected = 2 if profile == "full" else 1
+    connection.execute(
+        f"PRAGMA synchronous={'FULL' if expected == 2 else 'NORMAL'}"
+    )
+    observed = connection.execute("PRAGMA synchronous").fetchone()
+    if observed is None or int(observed[0]) != expected:
+        connection.close()
+        raise RuntimeError(
+            "SQLite durability profile could not be applied: "
+            f"profile={profile}:observed="
+            f"{int(observed[0]) if observed is not None else 'missing'}"
+        )
+
+
 def get_connection() -> sqlite3.Connection:
     db_path = get_db_path().resolve()
-    db_key = str(db_path)
+    read_only = _mcp_readonly_surface_enabled()
+    db_key = f"{db_path}|{'ro' if read_only else 'rw'}"
     conn = getattr(_LOCAL, "conn", None)
     with _CONNECTIONS_LOCK:
         tracked = conn is not None and id(conn) in _CONNECTIONS
@@ -1768,16 +2404,30 @@ def get_connection() -> sqlite3.Connection:
             _LOCAL.connection_owner = None
         conn = None
     if conn is None:
-        conn = sqlite3.connect(
-            str(db_path),
-            timeout=30.0,
-            check_same_thread=False,
-            factory=_GenerationTrackingConnection,
-        )
+        if read_only:
+            if not db_path.is_file():
+                raise ReadOnlySnapshotUnavailable(f"database_missing:{db_path}")
+            conn = sqlite3.connect(
+                f"{db_path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=30.0,
+                check_same_thread=False,
+                factory=_GenerationTrackingConnection,
+            )
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn = sqlite3.connect(
+                str(db_path),
+                timeout=30.0,
+                check_same_thread=False,
+                factory=_GenerationTrackingConnection,
+            )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA recursive_triggers=ON")
         conn.execute("PRAGMA foreign_keys=ON")
-        _configure_wal_retention(conn)
+        if not read_only:
+            _configure_sqlite_durability(conn)
+            _configure_wal_retention(conn)
         if int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
             conn.close()
             raise RuntimeError("SQLite foreign-key enforcement could not be enabled")
@@ -1793,6 +2443,56 @@ def get_vector_connection() -> sqlite3.Connection:
     """Return the thread connection after explicitly enabling vector access."""
     conn = get_connection()
     _load_sqlite_vec_extension(conn)
+    return conn
+
+
+def require_current_schema_for_read(
+    *required_tables: str,
+) -> sqlite3.Connection:
+    """Open an existing current database without initializing or migrating it."""
+    path = peek_db_path().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"database_not_initialized:{path}")
+    conn = get_connection()
+    current_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    ledger_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'schema_migrations'"
+    ).fetchone()
+    if current_version != _SCHEMA_VERSION or ledger_exists is None:
+        raise RuntimeError(
+            "database_schema_not_ready:"
+            f"expected={_SCHEMA_VERSION}:observed={current_version}"
+        )
+    rows = conn.execute(
+        "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    observed = {
+        int(row["version"]): (str(row["name"]), str(row["checksum"]))
+        for row in rows
+    }
+    expected = {
+        version: _SCHEMA_MIGRATIONS[version]
+        for version in range(1, _SCHEMA_VERSION + 1)
+    }
+    if observed != expected:
+        raise RuntimeError("database_schema_not_ready:migration_ledger_mismatch")
+    normalized_tables = sorted({str(name) for name in required_tables if str(name)})
+    if normalized_tables:
+        placeholders = ",".join("?" for _ in normalized_tables)
+        available = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
+                f"AND name IN ({placeholders})",
+                normalized_tables,
+            )
+        }
+        missing = sorted(set(normalized_tables) - available)
+        if missing:
+            raise RuntimeError(
+                "database_schema_not_ready:missing_tables:" + ",".join(missing)
+            )
     return conn
 
 
@@ -1891,6 +2591,8 @@ def _configured_transaction_max_wait_seconds() -> float:
 @contextmanager
 def transaction(max_wait_seconds: float | None = None):
     """Open a write transaction with a bounded lock-acquisition deadline."""
+    if _mcp_readonly_surface_enabled():
+        raise RuntimeError("readonly_mcp_surface_disallows_write_transaction")
     explicit_wait = None
     if max_wait_seconds is not None:
         explicit_wait = float(max_wait_seconds)
@@ -1992,9 +2694,35 @@ _INIT_DB_DONE = False
 _INIT_LOCK = threading.Lock()
 
 
+def _initialize_database_under_schema_lock(db_path: Path) -> None:
+    db_key = str(db_path.resolve())
+    if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
+        _validate_cached_identity_state(get_connection())
+        return
+    _INITIALIZED_DB_PATHS.discard(db_key)
+    _init_db_once(db_key)
+
+
 def init_db():
+    if _mcp_readonly_surface_enabled():
+        raise RuntimeError("readonly_mcp_surface_disallows_database_initialization")
     db_path = get_db_path()
     lock_path = db_path.parent / _SCHEMA_MIGRATION_LOCK_FILENAME
+    held = getattr(_LOCAL, "schema_maintenance_lock", None)
+    if held is not None:
+        held_path, held_lock = held
+        expected_path = lock_path.resolve()
+        if (
+            os.path.normcase(str(held_path))
+            != os.path.normcase(str(expected_path))
+            or not isinstance(held_lock, BaseFileLock)
+            or not held_lock.is_locked
+        ):
+            raise RuntimeError("schema_maintenance_lock_order_violation")
+        # The OS lock excludes every ordinary initializer. Acquiring _INIT_LOCK
+        # here would invert init_db's normal _INIT_LOCK -> file-lock order.
+        _initialize_database_under_schema_lock(db_path)
+        return
     with _INIT_LOCK:
         try:
             migration_guard = FileLock(
@@ -2007,12 +2735,7 @@ def init_db():
                 "Database schema migration maintenance window is active"
             ) from exc
         try:
-            db_key = str(db_path.resolve())
-            if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
-                _validate_cached_identity_state(get_connection())
-                return
-            _INITIALIZED_DB_PATHS.discard(db_key)
-            _init_db_once(db_key)
+            _initialize_database_under_schema_lock(db_path)
         finally:
             migration_guard.release()
 
@@ -2674,6 +3397,60 @@ def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_search_runtime_schema_v8(conn: sqlite3.Connection) -> None:
+    """Add fail-closed embedding metadata, FTS state, and split retry budgets."""
+    if _change_set_payload_schema_v7_issues(conn):
+        raise RuntimeError("Schema v8 requires the exact schema v7 contract")
+    conn.execute(_EMBEDDING_METADATA_TABLE_SCHEMA_V8)
+    conn.execute(_SEARCH_PROJECTION_STATE_TABLE_SCHEMA_V8)
+    for column_name, column_type in (
+        ("poison_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("transient_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_error_code", "TEXT"),
+        ("first_transient_at", "TEXT"),
+    ):
+        _add_column_if_missing(conn, "mutation_outbox", column_name, column_type)
+    conn.execute(
+        "UPDATE mutation_outbox SET poison_attempt_count = CASE "
+        "WHEN status = 'failed' THEN MAX(1, COALESCE(attempt_count, 0)) ELSE 0 END, "
+        "transient_attempt_count = 0, "
+        "last_error_code = CASE WHEN status = 'failed' "
+        "THEN 'legacy_unclassified' ELSE NULL END, first_transient_at = NULL"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO search_projection_state_v8 "
+        "(singleton, status, projection_generation, canonical_generation_json, "
+        "expected_row_count, expected_corpus_sha256, updated_at) "
+        "VALUES (1, 'rebuild_required', NULL, NULL, 0, NULL, ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    issues = _search_runtime_schema_v8_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v8 search runtime migration failed: " + ", ".join(issues)
+        )
+
+
+def _migrate_projection_runtime_schema_v9(conn: sqlite3.Connection) -> None:
+    """Seed projection format v2 as rebuild-required without trusting v1 files."""
+    if _search_runtime_schema_v8_issues(conn):
+        raise RuntimeError("Schema v9 requires the exact schema v8 contract")
+    conn.execute(_PROJECTION_RUNTIME_TABLE_SCHEMA_V9)
+    conn.execute(
+        "INSERT INTO projection_runtime_v9 "
+        "(singleton, format_version, status, projection_generation, "
+        "canonical_generation_json, sidecar_sha256, sidecar_json, "
+        "previous_sidecar_json, updated_at) "
+        "VALUES (1, 2, 'rebuild_required', NULL, NULL, NULL, NULL, NULL, ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    issues = _projection_runtime_schema_v9_issues(conn)
+    if issues:
+        raise RuntimeError(
+            "Schema v9 projection runtime migration failed: " + ", ".join(issues)
+        )
+
+
 def _assert_held_schema_migration_lock(
     conn: sqlite3.Connection,
     maintenance_lock: BaseFileLock,
@@ -2840,13 +3617,100 @@ def _apply_controlled_schema_v7_migration(
         )
     _assert_change_set_history_schema_v6_contract(conn)
     _migrate_change_set_payload_schema_v7(conn)
-    _record_schema_migrations(conn, current_version)
+    applied_at = datetime.now(timezone.utc).isoformat()
+    name, checksum = _SCHEMA_MIGRATIONS[7]
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
+        "VALUES (7, ?, ?, ?)",
+        (name, checksum, applied_at),
+    )
+    conn.execute("PRAGMA user_version = 7")
     if _validate_schema_migration_state(conn) != 7:
         raise RuntimeError("Controlled schema v7 migration ledger validation failed")
     _assert_change_set_history_schema_v6_contract(conn)
     _assert_change_set_payload_schema_v7_contract(conn)
     if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise RuntimeError("Controlled schema v7 migration foreign_key_check failed")
+
+
+def _apply_controlled_schema_v8_migration(
+    conn: sqlite3.Connection,
+    *,
+    maintenance_lock: BaseFileLock,
+) -> None:
+    """Apply v7->v8 inside the existing lock-bound exclusive transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError(
+            "Controlled schema v8 migration requires an active caller transaction"
+        )
+    _assert_held_schema_migration_lock(conn, maintenance_lock)
+    expected_authority = (
+        _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN,
+        id(conn),
+        id(maintenance_lock),
+    )
+    if getattr(_LOCAL, "controlled_schema_v5_context", None) != expected_authority:
+        raise RuntimeError(
+            "Controlled schema v8 migration requires the lock-bound transaction"
+        )
+    current_version = _validate_schema_migration_state(conn)
+    if current_version != 7:
+        raise RuntimeError(
+            f"Controlled schema v8 migration requires schema v7, found v{current_version}"
+        )
+    _assert_change_set_payload_schema_v7_contract(conn)
+    _migrate_search_runtime_schema_v8(conn)
+    applied_at = datetime.now(timezone.utc).isoformat()
+    name, checksum = _SCHEMA_MIGRATIONS[8]
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
+        "VALUES (8, ?, ?, ?)",
+        (name, checksum, applied_at),
+    )
+    conn.execute("PRAGMA user_version = 8")
+    if _validate_schema_migration_state(conn) != 8:
+        raise RuntimeError("Controlled schema v8 migration ledger validation failed")
+    _assert_search_runtime_schema_v8_contract(conn)
+
+
+def _apply_controlled_schema_v9_migration(
+    conn: sqlite3.Connection,
+    *,
+    maintenance_lock: BaseFileLock,
+) -> None:
+    """Apply v8->v9 inside the existing lock-bound exclusive transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError(
+            "Controlled schema v9 migration requires an active caller transaction"
+        )
+    _assert_held_schema_migration_lock(conn, maintenance_lock)
+    expected_authority = (
+        _CONTROLLED_SCHEMA_V5_CONTEXT_TOKEN,
+        id(conn),
+        id(maintenance_lock),
+    )
+    if getattr(_LOCAL, "controlled_schema_v5_context", None) != expected_authority:
+        raise RuntimeError(
+            "Controlled schema v9 migration requires the lock-bound transaction"
+        )
+    current_version = _validate_schema_migration_state(conn)
+    if current_version != 8:
+        raise RuntimeError(
+            f"Controlled schema v9 migration requires schema v8, found v{current_version}"
+        )
+    _assert_search_runtime_schema_v8_contract(conn)
+    _migrate_projection_runtime_schema_v9(conn)
+    applied_at = datetime.now(timezone.utc).isoformat()
+    name, checksum = _SCHEMA_MIGRATIONS[9]
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
+        "VALUES (9, ?, ?, ?)",
+        (name, checksum, applied_at),
+    )
+    conn.execute("PRAGMA user_version = 9")
+    if _validate_schema_migration_state(conn) != 9:
+        raise RuntimeError("Controlled schema v9 migration ledger validation failed")
+    _assert_projection_runtime_schema_v9_contract(conn)
 
 
 def _schema_migration_file_identity(path: Path) -> dict:
@@ -2888,11 +3752,26 @@ def _schema_migration_fingerprint(payload: dict) -> str:
 
 def _schema_migration_steps(version: int) -> list[str]:
     if version == 4:
-        return ["schema_v4_to_v5", "schema_v5_to_v6", "schema_v6_to_v7"]
+        return [
+            "schema_v4_to_v5",
+            "schema_v5_to_v6",
+            "schema_v6_to_v7",
+            "schema_v7_to_v8",
+            "schema_v8_to_v9",
+        ]
     if version == 5:
-        return ["schema_v5_to_v6", "schema_v6_to_v7"]
+        return [
+            "schema_v5_to_v6",
+            "schema_v6_to_v7",
+            "schema_v7_to_v8",
+            "schema_v8_to_v9",
+        ]
     if version == 6:
-        return ["schema_v6_to_v7"]
+        return ["schema_v6_to_v7", "schema_v7_to_v8", "schema_v8_to_v9"]
+    if version == 7:
+        return ["schema_v7_to_v8", "schema_v8_to_v9"]
+    if version == 8:
+        return ["schema_v8_to_v9"]
     return []
 
 
@@ -2907,6 +3786,8 @@ def _schema_migration_plan_core(plan: dict) -> dict:
             "steps",
             "source_identity",
             "pre_state",
+            "pre_runtime_generations",
+            "pre_projection",
             "issues",
             "can_apply",
             "no_op",
@@ -2982,6 +3863,8 @@ def _schema_migration_validate_receipt(
         "database_path": plan.get("database_path"),
         "source_identity": plan.get("source_identity"),
         "pre_state": plan.get("pre_state"),
+        "pre_runtime_generations": plan.get("pre_runtime_generations"),
+        "pre_projection": plan.get("pre_projection"),
     }
     if source_binding != expected_binding or receipt.get("steps") != plan.get("steps"):
         raise RuntimeError("pending_receipt_source_binding_mismatch")
@@ -3021,12 +3904,36 @@ def _schema_migration_validate_receipt(
     finally:
         if connection is not None:
             connection.close()
+    projection_backup = receipt.get("projection_backup")
+    _schema_migration_validate_projection_backup(
+        plan.get("pre_projection") or {},
+        projection_backup,
+        backup_root=expected_backup_dir,
+    )
+    recovery_bundle = receipt.get("recovery_bundle")
+    if (
+        not isinstance(recovery_bundle, dict)
+        or recovery_bundle.get("contract")
+        != "vector-lake-schema-migration-recovery/v1"
+        or int(recovery_bundle.get("source_schema_version") or -1)
+        != int(plan.get("pre_schema_version") or -2)
+        or recovery_bundle.get("database") != backup
+        or recovery_bundle.get("pre_projection") != projection_backup
+    ):
+        raise RuntimeError("pending_receipt_recovery_bundle_mismatch")
     if expected_status == "completed":
         post = receipt.get("post")
+        post_binding = recovery_bundle.get("post_target_binding")
         if (
             not isinstance(post, dict)
             or post.get("ready") is not True
             or int(post.get("user_version") or -1) != _SCHEMA_VERSION
+            or not isinstance(post_binding, dict)
+            or post_binding.get("schema_state_fingerprint")
+            != _schema_migration_fingerprint(post)
+            or not _schema_migration_runtime_generations_valid(
+                post_binding.get("runtime_generations")
+            )
         ):
             raise RuntimeError("completed_receipt_post_state_mismatch")
     return receipt
@@ -3065,6 +3972,7 @@ def preview_schema_migration(
     before = _schema_migration_physical_identity(path)
     issues: list[str] = []
     state = _schema_inspection_result(path)
+    runtime_generations = None
 
     if not path.is_file():
         issues.append("database_missing")
@@ -3083,6 +3991,10 @@ def preview_schema_migration(
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA query_only=ON")
                 state = inspect_schema_migration_connection(connection, path)
+                if int(state.get("user_version") or 0) >= 3:
+                    runtime_generations = _schema_migration_runtime_generations(
+                        connection
+                    )
                 quick_check = connection.execute("PRAGMA quick_check").fetchone()
                 if quick_check is None or str(quick_check[0]).casefold() != "ok":
                     issues.append(
@@ -3094,6 +4006,33 @@ def preview_schema_migration(
             finally:
                 if connection is not None:
                     connection.close()
+
+    pre_projection = _schema_migration_projection_snapshot()
+    if pre_projection["status"] == "incomplete":
+        issues.append("projection_pair_incomplete")
+    issues.extend(str(item) for item in pre_projection.get("issues") or [])
+    if (
+        pre_projection["status"] == "captured"
+        and runtime_generations is not None
+    ):
+        expected_projection_generations = {
+            surface: runtime_generations[surface]
+            for surface in CANONICAL_PROJECTION_SURFACES
+        }
+        projection_canonical_generation = (
+            pre_projection.get("canonical_generation") or {}
+        )
+        if not _schema_migration_projection_snapshot_is_v2(pre_projection):
+            projection_canonical_generation = (
+                projection_canonical_generation.get("runtime_generations")
+                if isinstance(projection_canonical_generation, dict)
+                else None
+            )
+        if (
+            normalize_runtime_generations(projection_canonical_generation)
+            != expected_projection_generations
+        ):
+            issues.append("projection_canonical_generation_stale")
 
     after = _schema_migration_physical_identity(path)
     if after != before:
@@ -3130,6 +4069,8 @@ def preview_schema_migration(
         "steps": _schema_migration_steps(version) if version is not None else [],
         "source_identity": before,
         "pre_state": state,
+        "pre_runtime_generations": runtime_generations,
+        "pre_projection": pre_projection,
         "issues": issues,
         "can_apply": bool(can_apply),
         "no_op": bool(no_op),
@@ -3153,6 +4094,392 @@ def _schema_migration_sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _schema_migration_runtime_generations(
+    connection: sqlite3.Connection,
+) -> dict[str, int]:
+    rows = connection.execute(
+        "SELECT surface, generation FROM runtime_generations ORDER BY surface"
+    ).fetchall()
+    result = {str(row[0]): int(row[1]) for row in rows}
+    if set(result) != set(_RUNTIME_GENERATION_SURFACES):
+        raise RuntimeError("runtime_generation_registry_incomplete")
+    if any(value < 0 for value in result.values()):
+        raise RuntimeError("runtime_generation_registry_invalid")
+    return result
+
+
+def _schema_migration_runtime_generations_valid(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == set(_RUNTIME_GENERATION_SURFACES)
+        and all(
+            not isinstance(generation, bool)
+            and isinstance(generation, int)
+            and generation >= 0
+            for generation in value.values()
+        )
+    )
+
+
+def _schema_migration_projection_v2_detected() -> bool:
+    """Detect v2 locators without importing the projection runtime eagerly."""
+    try:
+        from vector_lake.projection_format_v2 import is_v2_locator
+    except ImportError:
+        return False
+    return bool(
+        is_v2_locator(get_index_path(), "index")
+        or is_v2_locator(get_claim_graph_path(), "claim_graph")
+    )
+
+
+def _schema_migration_projection_v2_delegate(name: str, *args, **kwargs):
+    """Call the v2 recovery adapter or fail closed instead of copying locators."""
+    try:
+        from vector_lake import projection_format_v2
+    except ImportError as exc:
+        raise RuntimeError("projection_v2_recovery_delegate_unavailable") from exc
+    callback = getattr(projection_format_v2, name, None)
+    if not callable(callback):
+        raise RuntimeError(f"projection_v2_recovery_delegate_unavailable:{name}")
+    return callback(*args, **kwargs)
+
+
+def _schema_migration_projection_snapshot_is_v2(snapshot: object) -> bool:
+    return bool(
+        isinstance(snapshot, dict)
+        and (
+            snapshot.get("format_version") == 2
+            or snapshot.get("contract") == "vector-lake-pre-projection/v2"
+        )
+    )
+
+
+def _schema_migration_projection_paths() -> tuple[Path, Path, Path]:
+    return tuple(
+        path.resolve()
+        for path in (
+            get_index_path(),
+            get_claim_graph_path(),
+            get_projection_manifest_path(),
+        )
+    )
+
+
+def _schema_migration_projection_snapshot() -> dict:
+    """Hash the fixed projection set without creating files or lock state."""
+    if _schema_migration_projection_v2_detected():
+        snapshot = _schema_migration_projection_v2_delegate(
+            "schema_migration_projection_snapshot"
+        )
+        if not _schema_migration_projection_snapshot_is_v2(snapshot):
+            raise RuntimeError("projection_v2_recovery_snapshot_contract_invalid")
+        return snapshot
+    paths = _schema_migration_projection_paths()
+    before = [_schema_migration_file_identity(path) for path in paths]
+    existing = [item for item in before if item.get("exists")]
+    status = (
+        "absent"
+        if not existing
+        else ("captured" if len(existing) == len(paths) else "incomplete")
+    )
+    issues: list[str] = []
+    artifacts: list[dict] = []
+    for path, identity in zip(paths, before, strict=True):
+        artifact = {
+            "name": path.name,
+            "source_path": str(path),
+            "source_identity": identity,
+        }
+        if identity.get("exists"):
+            if path.is_symlink():
+                issues.append(f"projection_reparse_forbidden:{path.name}")
+            artifact.update(
+                {
+                    "sha256": _schema_migration_sha256(path),
+                    "bytes": int(identity["size"]),
+                }
+            )
+        artifacts.append(artifact)
+
+    generation = None
+    canonical_generation = None
+    if status == "incomplete":
+        issues.append("projection_pair_incomplete")
+    elif status == "captured":
+        sidecar_path = paths[2]
+        try:
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            manifest = sidecar.get("projection_manifest")
+            sidecar_artifacts = sidecar.get("artifacts")
+            if not isinstance(manifest, dict) or not isinstance(
+                sidecar_artifacts, dict
+            ):
+                raise ValueError("projection sidecar payload is incomplete")
+            if (
+                sidecar.get("contract") != "index-claim-graph-sidecar"
+                or sidecar.get("version") != 1
+                or manifest.get("contract") != "index-claim-graph-pair"
+                or manifest.get("version") != 1
+            ):
+                issues.append("projection_contract_invalid")
+            generation = manifest.get("generation")
+            canonical_generation = manifest.get("canonical_generation")
+            if not isinstance(generation, str) or not generation:
+                issues.append("projection_generation_invalid")
+            if not isinstance(canonical_generation, dict):
+                issues.append("projection_canonical_generation_invalid")
+            else:
+                normalized_generations = normalize_runtime_generations(
+                    canonical_generation.get("runtime_generations")
+                )
+                expected_token = (
+                    hashlib.sha256(
+                        json.dumps(
+                            normalized_generations,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if normalized_generations is not None
+                    else None
+                )
+                if (
+                    canonical_generation.get("status") != "verified"
+                    or canonical_generation.get("algorithm")
+                    != "runtime-generations-sha256-v2"
+                    or expected_token is None
+                    or canonical_generation.get("token") != expected_token
+                ):
+                    issues.append("projection_canonical_generation_invalid")
+            expected_names = {paths[0].name, paths[1].name}
+            if set(sidecar_artifacts) != expected_names:
+                issues.append("projection_sidecar_artifact_set_invalid")
+            for artifact in artifacts[:2]:
+                metadata = sidecar_artifacts.get(artifact["name"])
+                if not isinstance(metadata, dict):
+                    issues.append(
+                        f"projection_sidecar_artifact_missing:{artifact['name']}"
+                    )
+                    continue
+                if (
+                    str(metadata.get("sha256") or "")
+                    != str(artifact["sha256"]).removeprefix("sha256:")
+                    or int(metadata.get("bytes") or -1) != artifact["bytes"]
+                ):
+                    issues.append(
+                        f"projection_sidecar_artifact_mismatch:{artifact['name']}"
+                    )
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+            issues.append("projection_sidecar_invalid")
+
+    after = [_schema_migration_file_identity(path) for path in paths]
+    if before != after:
+        raise RuntimeError("Projection changed while its recovery binding was read")
+    return {
+        "contract": "vector-lake-pre-projection/v1",
+        "status": status,
+        "generation": generation,
+        "canonical_generation": canonical_generation,
+        "artifacts": artifacts,
+        "issues": list(dict.fromkeys(issues)),
+    }
+
+
+def _schema_migration_projection_existing_bytes(snapshot: dict) -> int:
+    if _schema_migration_projection_snapshot_is_v2(snapshot):
+        return int(
+            _schema_migration_projection_v2_delegate(
+                "schema_migration_projection_existing_bytes",
+                snapshot,
+            )
+        )
+    return sum(
+        int(item.get("bytes") or 0)
+        for item in snapshot.get("artifacts") or []
+        if isinstance(item, dict) and item.get("source_identity", {}).get("exists")
+    )
+
+
+def _schema_migration_projection_content_binding(snapshot: dict) -> dict:
+    if _schema_migration_projection_snapshot_is_v2(snapshot):
+        binding = _schema_migration_projection_v2_delegate(
+            "schema_migration_projection_content_binding",
+            snapshot,
+        )
+        if not isinstance(binding, dict):
+            raise RuntimeError("projection_v2_recovery_binding_contract_invalid")
+        return binding
+    return {
+        "contract": snapshot.get("contract"),
+        "status": snapshot.get("status"),
+        "generation": snapshot.get("generation"),
+        "canonical_generation": snapshot.get("canonical_generation"),
+        "artifacts": [
+            {
+                "name": item.get("name"),
+                "sha256": item.get("sha256"),
+                "bytes": item.get("bytes"),
+                "exists": bool(item.get("source_identity", {}).get("exists")),
+            }
+            for item in snapshot.get("artifacts") or []
+        ],
+        "issues": snapshot.get("issues") or [],
+    }
+
+
+def _schema_migration_projection_backup(
+    snapshot: dict,
+    *,
+    final_directory: Path,
+) -> dict:
+    """Copy a snapshot into one verified, atomically promoted recovery bundle."""
+    if _schema_migration_projection_snapshot_is_v2(snapshot):
+        backup = _schema_migration_projection_v2_delegate(
+            "schema_migration_projection_backup",
+            snapshot,
+            final_directory=final_directory,
+        )
+        if not isinstance(backup, dict):
+            raise RuntimeError("projection_v2_recovery_backup_contract_invalid")
+        return backup
+    status = str(snapshot.get("status") or "")
+    if status == "absent":
+        return {
+            "contract": "vector-lake-projection-backup/v1",
+            "status": "absent",
+            "directory": None,
+            "generation": None,
+            "canonical_generation": None,
+            "artifacts": [],
+        }
+    if status not in {"captured", "incomplete"}:
+        raise RuntimeError("Projection recovery snapshot status is invalid")
+    if final_directory.exists():
+        raise RuntimeError("Projection recovery backup already exists")
+    final_directory.parent.mkdir(parents=True, exist_ok=True)
+    staging_directory = final_directory.with_name(
+        f".{final_directory.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    copied: list[dict] = []
+    try:
+        staging_directory.mkdir()
+        for artifact in snapshot.get("artifacts") or []:
+            identity = artifact.get("source_identity") or {}
+            if not identity.get("exists"):
+                continue
+            source_path = Path(str(artifact["source_path"])).resolve()
+            destination = staging_directory / str(artifact["name"])
+            shutil.copyfile(source_path, destination)
+            _schema_migration_fsync_path(destination)
+            observed_sha256 = _schema_migration_sha256(destination)
+            if not hmac.compare_digest(
+                observed_sha256,
+                str(artifact.get("sha256") or ""),
+            ):
+                raise RuntimeError(
+                    f"Projection recovery copy hash mismatch: {destination.name}"
+                )
+            copied.append(
+                {
+                    "name": destination.name,
+                    "source_path": str(source_path),
+                    "path": str(final_directory / destination.name),
+                    "sha256": observed_sha256,
+                    "bytes": int(destination.stat().st_size),
+                    "source_identity": identity,
+                }
+            )
+        if _schema_migration_projection_snapshot() != snapshot:
+            raise RuntimeError("Projection changed while its recovery copy was created")
+        os.replace(staging_directory, final_directory)
+        _schema_migration_fsync_directory(final_directory.parent)
+        return {
+            "contract": "vector-lake-projection-backup/v1",
+            "status": status,
+            "directory": str(final_directory),
+            "generation": snapshot.get("generation"),
+            "canonical_generation": snapshot.get("canonical_generation"),
+            "artifacts": copied,
+        }
+    except BaseException:
+        if staging_directory.exists():
+            shutil.rmtree(staging_directory)
+        raise
+
+
+def _schema_migration_validate_projection_backup(
+    source_snapshot: dict,
+    backup: object,
+    *,
+    backup_root: Path,
+) -> None:
+    if _schema_migration_projection_snapshot_is_v2(source_snapshot):
+        _schema_migration_projection_v2_delegate(
+            "schema_migration_validate_projection_backup",
+            source_snapshot,
+            backup,
+            backup_root=backup_root,
+        )
+        return
+    if not isinstance(backup, dict):
+        raise RuntimeError("projection_backup_missing")
+    expected_status = str(source_snapshot.get("status") or "")
+    if (
+        backup.get("contract") != "vector-lake-projection-backup/v1"
+        or backup.get("status") != expected_status
+        or backup.get("generation") != source_snapshot.get("generation")
+        or backup.get("canonical_generation")
+        != source_snapshot.get("canonical_generation")
+    ):
+        raise RuntimeError("projection_backup_contract_mismatch")
+    if expected_status == "absent":
+        if backup.get("directory") is not None or backup.get("artifacts") != []:
+            raise RuntimeError("projection_backup_absent_state_mismatch")
+        return
+    try:
+        directory = Path(str(backup.get("directory") or "")).resolve()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("projection_backup_path_invalid") from exc
+    resolved_root = backup_root.resolve()
+    if directory.parent != resolved_root or not directory.is_dir():
+        raise RuntimeError("projection_backup_path_invalid")
+    expected = {
+        str(item["name"]): item
+        for item in source_snapshot.get("artifacts") or []
+        if item.get("source_identity", {}).get("exists")
+    }
+    observed = backup.get("artifacts")
+    if not isinstance(observed, list) or {
+        str(item.get("name")) for item in observed if isinstance(item, dict)
+    } != set(expected):
+        raise RuntimeError("projection_backup_artifact_set_mismatch")
+    for item in observed:
+        name = str(item["name"])
+        path = Path(str(item.get("path") or "")).resolve()
+        if (
+            path.parent != directory
+            or path.name != name
+            or not path.is_file()
+            or path.is_symlink()
+        ):
+            raise RuntimeError("projection_backup_artifact_path_invalid")
+        source = expected[name]
+        if (
+            item.get("source_identity") != source.get("source_identity")
+            or int(item.get("bytes") or -1) != int(source.get("bytes") or -2)
+            or not hmac.compare_digest(
+                str(item.get("sha256") or ""),
+                str(source.get("sha256") or ""),
+            )
+            or not hmac.compare_digest(
+                str(item.get("sha256") or ""),
+                _schema_migration_sha256(path),
+            )
+        ):
+            raise RuntimeError("projection_backup_artifact_mismatch")
 
 
 def _schema_migration_fsync_path(path: Path) -> None:
@@ -3206,15 +4533,39 @@ def _schema_migration_backup(
     *,
     database_path: Path,
     plan: dict,
+    extra_bytes: int = 0,
+    final_path: Path | None = None,
+    operation: str | None = None,
 ) -> tuple[Path, str, Path]:
+    from vector_lake.backup_capacity import (
+        assert_backup_capacity,
+        estimate_database_backup_bytes,
+    )
+
     backup_dir = database_path.parent / "schema-migration-backups"
+    assert_backup_capacity(
+        estimated_new_bytes=(
+            estimate_database_backup_bytes(database_path) + max(0, int(extra_bytes))
+        ),
+        operation=operation
+        or f"schema-migration:v{plan['pre_schema_version']}-to-v{_SCHEMA_VERSION}",
+        backup_roots=(peek_meta_dir() / "backups", backup_dir),
+        disk_anchor=backup_dir,
+    )
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     fingerprint_suffix = str(plan["fingerprint"]).split(":", 1)[-1][:16]
-    final_path = backup_dir / (
-        f"{database_path.stem}.pre-v{plan['pre_schema_version']}-to-v"
-        f"{_SCHEMA_VERSION}.{stamp}.{fingerprint_suffix}.db"
-    )
+    if final_path is None:
+        final_path = backup_dir / (
+            f"{database_path.stem}.pre-v{plan['pre_schema_version']}-to-v"
+            f"{_SCHEMA_VERSION}.{stamp}.{fingerprint_suffix}.db"
+        )
+    else:
+        final_path = final_path.resolve()
+        if final_path.parent != backup_dir.resolve():
+            raise RuntimeError("Schema recovery backup path escaped its authority root")
+        if final_path.exists():
+            raise RuntimeError("Schema recovery backup already exists")
     staging_path = final_path.with_name(
         f".{final_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     )
@@ -3334,6 +4685,7 @@ def _schema_migration_pending_payload(
     plan: dict,
     backup_path: Path,
     backup_sha256: str,
+    projection_backup: dict,
 ) -> dict:
     plan_core = _schema_migration_plan_core(plan)
     created_at = datetime.now(timezone.utc).isoformat()
@@ -3350,6 +4702,8 @@ def _schema_migration_pending_payload(
             "database_path": plan["database_path"],
             "source_identity": plan["source_identity"],
             "pre_state": plan["pre_state"],
+            "pre_runtime_generations": plan["pre_runtime_generations"],
+            "pre_projection": plan["pre_projection"],
         },
         "pre": plan["pre_state"],
         "backup": {
@@ -3358,20 +4712,43 @@ def _schema_migration_pending_payload(
             "quick_check": "ok",
             "standalone": True,
         },
+        "projection_backup": projection_backup,
+        "recovery_bundle": {
+            "contract": "vector-lake-schema-migration-recovery/v1",
+            "source_schema_version": plan["pre_schema_version"],
+            "database": {
+                "path": str(backup_path),
+                "sha256": backup_sha256,
+                "quick_check": "ok",
+                "standalone": True,
+            },
+            "pre_projection": projection_backup,
+            "post_target_binding": None,
+        },
         "projection_rebuild_required": True,
     }
     receipt["receipt_fingerprint"] = _schema_migration_fingerprint(receipt)
     return receipt
 
 
-def _schema_migration_completed_payload(pending: dict, post_state: dict) -> dict:
+def _schema_migration_completed_payload(
+    pending: dict,
+    post_state: dict,
+    post_runtime_generations: dict[str, int],
+) -> dict:
     receipt = dict(pending)
     receipt.pop("receipt_fingerprint", None)
+    recovery_bundle = dict(receipt["recovery_bundle"])
+    recovery_bundle["post_target_binding"] = {
+        "schema_state_fingerprint": _schema_migration_fingerprint(post_state),
+        "runtime_generations": post_runtime_generations,
+    }
     receipt.update(
         {
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "post": post_state,
+            "recovery_bundle": recovery_bundle,
         }
     )
     receipt["receipt_fingerprint"] = _schema_migration_fingerprint(receipt)
@@ -3386,7 +4763,7 @@ def schema_migration_maintenance(
     confirm_no_writers: bool = False,
     db_path: str | Path | None = None,
 ) -> dict:
-    """Preview or execute the CLI-only controlled v4/v5/v6 to v7 migration."""
+    """Preview or execute the CLI-only controlled v4-v8 to v9 migration."""
     initial_plan = preview_schema_migration(db_path)
     if apply and checkpoint_wal:
         raise RuntimeError(
@@ -3429,6 +4806,8 @@ def schema_migration_maintenance(
     backup_sha256 = None
     pending_receipt = None
     pending_receipt_path = None
+    projection_lock = None
+    projection_backup = None
     try:
         plan = preview_schema_migration(path)
         if not hmac.compare_digest(str(confirmation), str(plan["fingerprint"])):
@@ -3493,6 +4872,7 @@ def schema_migration_maintenance(
                 completed = _schema_migration_completed_payload(
                     pending_receipt,
                     plan["pre_state"],
+                    plan["pre_runtime_generations"],
                 )
                 try:
                     _schema_migration_atomic_json(completed_path, completed)
@@ -3509,6 +4889,7 @@ def schema_migration_maintenance(
                     "plan_fingerprint": plan["fingerprint"],
                     "migration_plan_fingerprint": completed["plan_fingerprint"],
                     "backup": completed["backup"],
+                    "projection_backup": completed["projection_backup"],
                     "pre": completed["pre"],
                     "post": completed["post"],
                     "projection_rebuild_required": True,
@@ -3530,6 +4911,15 @@ def schema_migration_maintenance(
                     "Schema migration requires all in-process database connections "
                     "to be closed"
                 )
+        projection_lock = FileLock(str(get_index_path()) + ".lock", timeout=0)
+        try:
+            projection_lock.acquire()
+        except FileLockTimeout as exc:
+            raise RuntimeError("Schema migration projection lock is busy") from exc
+        if _schema_migration_projection_snapshot() != plan["pre_projection"]:
+            raise RuntimeError(
+                "Projection changed after the locked schema migration preview"
+            )
         source = sqlite3.connect(
             f"{path.as_uri()}?mode=rw",
             uri=True,
@@ -3546,6 +4936,13 @@ def schema_migration_maintenance(
             source,
             database_path=path,
             plan=plan,
+            extra_bytes=_schema_migration_projection_existing_bytes(
+                plan["pre_projection"]
+            ),
+        )
+        projection_backup = _schema_migration_projection_backup(
+            plan["pre_projection"],
+            final_directory=backup_path.with_name(backup_path.name + ".projection"),
         )
 
         with _controlled_schema_v5_transaction(source, maintenance_lock):
@@ -3568,6 +4965,7 @@ def schema_migration_maintenance(
                 plan=plan,
                 backup_path=backup_path,
                 backup_sha256=str(backup_sha256),
+                projection_backup=projection_backup,
             )
             try:
                 _schema_migration_atomic_json(
@@ -3596,9 +4994,22 @@ def schema_migration_maintenance(
                     source,
                     maintenance_lock=maintenance_lock,
                 )
+                current_version = 7
+            if current_version == 7:
+                _apply_controlled_schema_v8_migration(
+                    source,
+                    maintenance_lock=maintenance_lock,
+                )
+                current_version = 8
+            if current_version == 8:
+                _apply_controlled_schema_v9_migration(
+                    source,
+                    maintenance_lock=maintenance_lock,
+                )
 
         source.execute("PRAGMA query_only=ON")
         post_state = inspect_schema_migration_connection(source, path)
+        post_runtime_generations = _schema_migration_runtime_generations(source)
         if not post_state.get("ready") or post_state.get("user_version") != _SCHEMA_VERSION:
             raise RuntimeError(
                 "Schema migration committed but read-only target verification failed: "
@@ -3606,7 +5017,11 @@ def schema_migration_maintenance(
             )
         if pending_receipt is None or pending_receipt_path is None:
             raise RuntimeError("Schema migration pending receipt was not published")
-        receipt = _schema_migration_completed_payload(pending_receipt, post_state)
+        receipt = _schema_migration_completed_payload(
+            pending_receipt,
+            post_state,
+            post_runtime_generations,
+        )
         receipt_path, expected_pending_path = _schema_migration_receipt_paths(path)
         if pending_receipt_path.resolve() != expected_pending_path.resolve():
             raise RuntimeError("Schema migration pending receipt path drifted")
@@ -3624,6 +5039,7 @@ def schema_migration_maintenance(
             "no_op": False,
             "plan_fingerprint": plan["fingerprint"],
             "backup": receipt["backup"],
+            "projection_backup": receipt["projection_backup"],
             "pre": receipt["pre"],
             "post": receipt["post"],
             "projection_rebuild_required": True,
@@ -3638,6 +5054,2038 @@ def schema_migration_maintenance(
             staging_path.unlink(missing_ok=True)
             Path(str(staging_path) + "-wal").unlink(missing_ok=True)
             Path(str(staging_path) + "-shm").unlink(missing_ok=True)
+        if projection_lock is not None:
+            projection_lock.release()
+        maintenance_lock.release()
+
+
+def _schema_rollback_plan_core(plan: dict) -> dict:
+    return {
+        key: plan[key]
+        for key in (
+            "contract",
+            "database_path",
+            "source_schema_version",
+            "target_schema_version",
+            "migration_receipt",
+            "current_source",
+            "restore",
+            "forward_recovery",
+            "data_loss_since_migration",
+            "changed_runtime_generations",
+            "confirm_data_rewind_required",
+            "projection_action",
+            "old_runtime_projection_rebuild_required",
+            "recovery_action",
+            "pending_rollback_receipt",
+            "completed_rollback_receipt",
+            "issues",
+            "can_apply",
+            "no_op",
+        )
+    }
+
+
+def _schema_rollback_receipt_paths(
+    database_path: Path,
+    migration_receipt: dict,
+) -> tuple[Path, Path]:
+    receipt_dir = database_path.parent / "schema-migration-receipts"
+    token = str(migration_receipt.get("receipt_fingerprint") or "").removeprefix(
+        "sha256:"
+    )[:24]
+    basename = (
+        f"{database_path.name}.rollback-v{_SCHEMA_ROLLBACK_SOURCE_VERSION}"
+        f"-to-v{_SCHEMA_ROLLBACK_TARGET_VERSION}.{token}"
+    )
+    return receipt_dir / f"{basename}.json", receipt_dir / f"{basename}.pending.json"
+
+
+def _schema_rollback_is_reparse(details: os.stat_result) -> bool:
+    reparse_marker = int(
+        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+    return stat.S_ISLNK(details.st_mode) or bool(
+        int(getattr(details, "st_file_attributes", 0) or 0) & reparse_marker
+    )
+
+
+def _schema_rollback_directory_identity(path: Path) -> tuple[int, ...]:
+    details = path.lstat()
+    if _schema_rollback_is_reparse(details) or not stat.S_ISDIR(details.st_mode):
+        raise ValueError("schema_rollback_receipt_directory_not_plain")
+    return (
+        int(details.st_dev),
+        int(details.st_ino),
+        int(details.st_size),
+        int(details.st_mtime_ns),
+        int(details.st_ctime_ns),
+    )
+
+
+def _schema_rollback_receipt_identity(
+    details: os.stat_result,
+) -> tuple[int, ...]:
+    if (
+        _schema_rollback_is_reparse(details)
+        or not stat.S_ISREG(details.st_mode)
+        or int(details.st_size) > _SCHEMA_ROLLBACK_RECEIPT_MAX_BYTES
+    ):
+        raise ValueError("schema_rollback_receipt_not_bounded_plain_file")
+    return (
+        int(details.st_dev),
+        int(details.st_ino),
+        int(details.st_size),
+        int(details.st_mtime_ns),
+        int(details.st_ctime_ns),
+    )
+
+
+def _schema_rollback_plain_receipt_identity(path: Path) -> tuple[int, ...]:
+    return _schema_rollback_receipt_identity(path.lstat())
+
+
+def _schema_rollback_bounded_receipt(
+    path: Path,
+) -> tuple[dict, tuple[int, ...], str]:
+    before = _schema_rollback_plain_receipt_identity(path)
+    with path.open("rb") as handle:
+        opened = _schema_rollback_receipt_identity(os.fstat(handle.fileno()))
+        # Windows fstat reports st_ctime_ns as last-write time while lstat
+        # reports creation time. Device/inode/size/mtime form the comparable
+        # handle-to-path identity; the path-level post-read check retains ctime.
+        if opened[:4] != before[:4]:
+            raise ValueError("schema_rollback_receipt_changed_before_open")
+        raw = handle.read(_SCHEMA_ROLLBACK_RECEIPT_MAX_BYTES + 1)
+    if len(raw) > _SCHEMA_ROLLBACK_RECEIPT_MAX_BYTES:
+        raise ValueError("schema_rollback_receipt_too_large")
+    after = _schema_rollback_plain_receipt_identity(path)
+    if after != before or len(raw) != before[2]:
+        raise ValueError("schema_rollback_receipt_changed_during_read")
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("schema_rollback_receipt_not_object")
+    return payload, before, "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _schema_rollback_receipt_is_self_bound(
+    receipt: dict,
+    database_path: Path,
+    *,
+    expected_status: str,
+) -> bool:
+    try:
+        plan = receipt.get("plan")
+        migration_receipt = receipt.get("migration_receipt")
+        current_source = receipt.get("from_source")
+        restore = receipt.get("to_target")
+        receipt_forward = receipt.get("forward_recovery")
+        plan_forward = plan.get("forward_recovery") if isinstance(plan, dict) else None
+        expected_receipt_keys = (
+            _SCHEMA_ROLLBACK_PENDING_RECEIPT_KEYS
+            if expected_status == "pending"
+            else _SCHEMA_ROLLBACK_COMPLETED_RECEIPT_KEYS
+        )
+        contract_bound = (
+            set(receipt) == expected_receipt_keys
+            and receipt.get("contract") == _SCHEMA_ROLLBACK_RECEIPT_CONTRACT
+            and receipt.get("status") == expected_status
+            and database_path.is_absolute()
+            and int(receipt.get("source_schema_version") or -1)
+            == _SCHEMA_ROLLBACK_SOURCE_VERSION
+            and int(receipt.get("target_schema_version") or -1)
+            == _SCHEMA_ROLLBACK_TARGET_VERSION
+            and _schema_migration_same_database(
+                receipt.get("database_path"), database_path
+            )
+            and isinstance(plan, dict)
+            and set(plan) == _SCHEMA_ROLLBACK_PLAN_CORE_KEYS
+            and plan.get("contract") == _SCHEMA_ROLLBACK_PLAN_CONTRACT
+            and int(plan.get("source_schema_version") or -1)
+            == _SCHEMA_ROLLBACK_SOURCE_VERSION
+            and int(plan.get("target_schema_version") or -1)
+            == _SCHEMA_ROLLBACK_TARGET_VERSION
+            and _schema_migration_same_database(
+                plan.get("database_path"), database_path
+            )
+            and isinstance(migration_receipt, dict)
+            and set(migration_receipt)
+            == _SCHEMA_ROLLBACK_MIGRATION_BINDING_KEYS
+            and Path(str(migration_receipt.get("path") or "")).is_absolute()
+            and all(
+                re.fullmatch(r"sha256:[0-9a-f]{64}", str(value or ""))
+                is not None
+                for value in (
+                    migration_receipt.get("file_sha256"),
+                    migration_receipt.get("receipt_fingerprint"),
+                    migration_receipt.get("plan_fingerprint"),
+                )
+            )
+            and migration_receipt == plan.get("migration_receipt")
+            and isinstance(current_source, dict)
+            and set(current_source) == _SCHEMA_ROLLBACK_CURRENT_SOURCE_KEYS
+            and current_source == plan.get("current_source")
+            and isinstance(restore, dict)
+            and set(restore) == _SCHEMA_ROLLBACK_RESTORE_KEYS
+            and restore == plan.get("restore")
+            and isinstance(plan_forward, dict)
+            and set(plan_forward) == _SCHEMA_ROLLBACK_PLAN_FORWARD_KEYS
+            and isinstance(receipt_forward, dict)
+            and set(receipt_forward) == _SCHEMA_ROLLBACK_RECEIPT_FORWARD_KEYS
+            and isinstance(receipt_forward.get("database"), dict)
+            and isinstance(receipt_forward.get("projection"), dict)
+            and receipt.get("projection_action")
+            == plan.get("projection_action")
+            and receipt.get("old_runtime_projection_rebuild_required")
+            == plan.get("old_runtime_projection_rebuild_required")
+            and plan.get("issues") == []
+            and plan.get("can_apply") is True
+            and plan.get("no_op") is False
+            and plan.get("recovery_action") is None
+            and plan.get("pending_rollback_receipt") is None
+            and plan.get("completed_rollback_receipt") is None
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    if not contract_bound:
+        return False
+    fingerprint_payload = dict(receipt)
+    fingerprint = str(fingerprint_payload.pop("receipt_fingerprint", ""))
+    plan_fingerprint = str(receipt.get("plan_fingerprint") or "")
+    return (
+        re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", plan_fingerprint) is not None
+        and hmac.compare_digest(
+            fingerprint,
+            _schema_migration_fingerprint(fingerprint_payload),
+        )
+        and hmac.compare_digest(
+            plan_fingerprint,
+            _schema_migration_fingerprint(plan),
+        )
+    )
+
+
+
+
+def _schema_rollback_terminal_receipt_pair(
+    pending_path: Path,
+    pending: dict,
+    pending_identity: tuple[int, ...],
+    completed_path: Path,
+    database_path: Path,
+    *,
+    remaining_bytes: int,
+) -> tuple[bool, int]:
+    try:
+        completed_identity = _schema_rollback_plain_receipt_identity(
+            completed_path
+        )
+        additional_bytes = completed_identity[2]
+        if additional_bytes > remaining_bytes:
+            raise RuntimeError(
+                "schema_rollback_pending_receipt_bytes_exceeded"
+            )
+        completed, observed_completed, _completed_sha256 = (
+            _schema_rollback_bounded_receipt(completed_path)
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return False, 0
+    if not _schema_rollback_receipt_is_self_bound(
+        pending,
+        database_path,
+        expected_status="pending",
+    ) or not _schema_rollback_receipt_is_self_bound(
+        completed,
+        database_path,
+        expected_status="completed",
+    ):
+        return False, 0
+
+    migration_receipt = pending.get("migration_receipt")
+    if not isinstance(migration_receipt, dict):
+        return False, 0
+    migration_fingerprint = str(
+        migration_receipt.get("receipt_fingerprint") or ""
+    )
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", migration_fingerprint) is None:
+        return False, 0
+    receipt_token = migration_fingerprint.removeprefix("sha256:")[:24]
+    pending_prefix = (
+        f"{database_path.name}.rollback-v{_SCHEMA_ROLLBACK_SOURCE_VERSION}"
+        f"-to-v{_SCHEMA_ROLLBACK_TARGET_VERSION}."
+    )
+    pending_suffix = ".pending.json"
+    observed_name = os.path.normcase(pending_path.name)
+    normalized_prefix = os.path.normcase(pending_prefix)
+    normalized_suffix = os.path.normcase(pending_suffix)
+    observed_token = observed_name[
+        len(normalized_prefix) : -len(normalized_suffix)
+    ]
+    if (
+        len(receipt_token) != 24
+        or os.path.normcase(receipt_token) != observed_token
+    ):
+        return False, 0
+
+    post = completed.get("post")
+    completed_at = completed.get("completed_at")
+    try:
+        post_schema_version = int(
+            post.get("schema_state", {}).get("user_version") or -1
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False, 0
+    if (
+        not isinstance(completed_at, str)
+        or not completed_at
+        or not isinstance(post, dict)
+        or set(post) != _SCHEMA_ROLLBACK_POST_KEYS
+        or not isinstance(post.get("schema_state"), dict)
+        or post.get("quick_check") != "ok"
+        or post.get("sqlite_sidecars") != {"-wal": False, "-shm": False}
+        or post_schema_version != _SCHEMA_ROLLBACK_TARGET_VERSION
+    ):
+        return False, 0
+    expected_completed = dict(pending)
+    expected_completed.pop("receipt_fingerprint", None)
+    expected_completed.update(
+        {
+            "status": "completed",
+            "completed_at": completed_at,
+            "post": post,
+        }
+    )
+    expected_completed["receipt_fingerprint"] = _schema_migration_fingerprint(
+        expected_completed
+    )
+    if completed != expected_completed:
+        return False, 0
+    try:
+        stable = (
+            _schema_rollback_plain_receipt_identity(pending_path)
+            == pending_identity
+            and _schema_rollback_plain_receipt_identity(completed_path)
+            == observed_completed
+        )
+    except (OSError, ValueError):
+        return False, 0
+    return stable, additional_bytes
+
+
+def assert_no_schema_rollback_pending_receipt(
+    database_path: str | Path | None = None,
+) -> None:
+    """Fail closed when a rollback receipt is active or cannot be classified."""
+    path = (
+        Path(database_path) if database_path is not None else peek_db_path()
+    ).resolve()
+    receipt_dir = path.parent / "schema-migration-receipts"
+    try:
+        directory_identity = _schema_rollback_directory_identity(receipt_dir)
+    except FileNotFoundError:
+        return
+    except ValueError as exc:
+        raise RuntimeError(
+            "schema_rollback_pending_scan_unsafe_directory"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError("schema_rollback_pending_scan_failed") from exc
+
+    broad_marker = os.path.normcase(".rollback-")
+    known_version = os.path.normcase(
+        f"v{_SCHEMA_ROLLBACK_SOURCE_VERSION}"
+        f"-to-v{_SCHEMA_ROLLBACK_TARGET_VERSION}"
+    )
+    suffix = os.path.normcase(".pending.json")
+    try:
+        observed: dict[str, str] = {}
+        with os.scandir(receipt_dir) as entries:
+            for scanned, entry in enumerate(entries, start=1):
+                if scanned > _SCHEMA_ROLLBACK_PENDING_SCAN_LIMIT:
+                    raise RuntimeError(
+                        "schema_rollback_pending_scan_limit_exceeded"
+                    )
+                name = os.path.normcase(entry.name)
+                if name in observed:
+                    raise RuntimeError(
+                        "schema_rollback_pending_scan_ambiguous_name"
+                    )
+                observed[name] = entry.name
+        if (
+            _schema_rollback_directory_identity(receipt_dir)
+            != directory_identity
+        ):
+            raise RuntimeError(
+                "schema_rollback_pending_scan_directory_changed"
+            )
+
+        terminal_pairs = 0
+        receipt_bytes = 0
+        for name, original_name in observed.items():
+            if not name.endswith(suffix):
+                continue
+            filename_database, marker, rollback_tail = name.rpartition(
+                broad_marker
+            )
+            if not marker or not filename_database:
+                continue
+            rollback_core = rollback_tail[: -len(suffix)]
+            if not rollback_core.startswith("v"):
+                continue
+            if rollback_core.count(".") != 1:
+                if "to" in rollback_core:
+                    raise RuntimeError(
+                        "schema_rollback_pending_unknown_contract"
+                    )
+                continue
+            observed_version, observed_token = rollback_core.split(".", 1)
+            if (
+                observed_version != known_version
+                or re.fullmatch(r"[0-9a-f]{24}", observed_token) is None
+            ):
+                raise RuntimeError(
+                    "schema_rollback_pending_unknown_contract"
+                )
+
+            pending_path = receipt_dir / original_name
+            try:
+                expected_pending_identity = (
+                    _schema_rollback_plain_receipt_identity(pending_path)
+                )
+                if (
+                    receipt_bytes + expected_pending_identity[2]
+                    > _SCHEMA_ROLLBACK_RECEIPT_SCAN_MAX_BYTES
+                ):
+                    raise RuntimeError(
+                        "schema_rollback_pending_receipt_bytes_exceeded"
+                    )
+                pending, pending_identity, _pending_sha256 = (
+                    _schema_rollback_bounded_receipt(pending_path)
+                )
+                if pending_identity != expected_pending_identity:
+                    raise ValueError("pending receipt identity changed")
+                receipt_bytes += pending_identity[2]
+                payload_database = Path(
+                    str(pending.get("database_path") or "")
+                )
+                if not _schema_rollback_receipt_is_self_bound(
+                    pending,
+                    payload_database,
+                    expected_status="pending",
+                ):
+                    raise ValueError("pending receipt is not self-bound")
+            except RuntimeError:
+                raise
+            except (
+                OSError,
+                RecursionError,
+                UnicodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise RuntimeError(
+                    "schema_rollback_pending_candidate_invalid"
+                ) from exc
+
+            filename_matches_payload = os.path.normcase(
+                payload_database.name
+            ) == os.path.normcase(filename_database)
+            payload_matches_current = _schema_migration_same_database(
+                pending.get("database_path"), path
+            )
+            filename_matches_current = os.path.normcase(
+                filename_database
+            ) == os.path.normcase(path.name)
+            migration_receipt = pending.get("migration_receipt")
+            expected_pending_path = (
+                _schema_rollback_receipt_paths(
+                    payload_database,
+                    migration_receipt,
+                )[1]
+                if payload_database.is_absolute()
+                and isinstance(migration_receipt, dict)
+                else None
+            )
+            pending_path_is_canonical = (
+                expected_pending_path is not None
+                and os.path.normcase(str(expected_pending_path.resolve()))
+                == os.path.normcase(str(pending_path.resolve()))
+            )
+            if (
+                not filename_matches_payload
+                or payload_matches_current != filename_matches_current
+                or not pending_path_is_canonical
+            ):
+                raise RuntimeError(
+                    "schema_rollback_pending_filename_database_mismatch"
+                )
+
+            completed_name = name[: -len(suffix)] + os.path.normcase(".json")
+            completed_original = observed.get(completed_name)
+            terminal = False
+            if completed_original is not None:
+                terminal_pairs += 1
+                if terminal_pairs > _SCHEMA_ROLLBACK_TERMINAL_PAIR_LIMIT:
+                    raise RuntimeError(
+                        "schema_rollback_pending_terminal_pair_limit_exceeded"
+                    )
+                completed_path = receipt_dir / completed_original
+                terminal, additional_bytes = (
+                    _schema_rollback_terminal_receipt_pair(
+                        pending_path,
+                        pending,
+                        pending_identity,
+                        completed_path,
+                        payload_database,
+                        remaining_bytes=(
+                            _SCHEMA_ROLLBACK_RECEIPT_SCAN_MAX_BYTES
+                            - receipt_bytes
+                        ),
+                    )
+                )
+                receipt_bytes += additional_bytes
+            if terminal:
+                continue
+            if not payload_matches_current and completed_original is None:
+                continue
+            # Name-first matching deliberately blocks malformed, symlink,
+            # reparse, non-regular, and ambiguous terminal candidates.
+            raise RuntimeError(
+                "schema_rollback_pending_blocks_projection_rebuild"
+            )
+
+        if (
+            _schema_rollback_directory_identity(receipt_dir)
+            != directory_identity
+        ):
+            raise RuntimeError(
+                "schema_rollback_pending_scan_directory_changed"
+            )
+    except RuntimeError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("schema_rollback_pending_scan_failed") from exc
+
+
+def _schema_rollback_completed_migration_receipt(
+    database_path: Path,
+    receipt_value: str | Path,
+) -> tuple[Path, dict]:
+    raw_path = Path(receipt_value)
+    if not raw_path.is_absolute():
+        raise RuntimeError("migration_receipt_path_must_be_absolute")
+    receipt_path = raw_path.resolve()
+    expected_path, _ = _schema_migration_receipt_paths(database_path)
+    if receipt_path != expected_path.resolve():
+        raise RuntimeError("migration_receipt_path_not_authoritative")
+    receipt = _schema_migration_validate_receipt(
+        database_path,
+        receipt_path,
+        expected_status="completed",
+    )
+    plan = receipt.get("plan") or {}
+    if (
+        int(plan.get("pre_schema_version") or -1)
+        != _SCHEMA_ROLLBACK_TARGET_VERSION
+        or plan.get("steps") != ["schema_v8_to_v9"]
+    ):
+        raise RuntimeError("rollback_requires_v8_source_receipt")
+    pre_projection = plan.get("pre_projection")
+    if (
+        not isinstance(pre_projection, dict)
+        or pre_projection.get("status") not in {"captured", "absent"}
+        or pre_projection.get("issues")
+    ):
+        raise RuntimeError("rollback_not_supported_by_receipt")
+    if not _schema_migration_runtime_generations_valid(
+        plan.get("pre_runtime_generations")
+    ):
+        raise RuntimeError("rollback_receipt_pre_generations_invalid")
+    return receipt_path, receipt
+
+
+
+
+def _schema_rollback_validate_receipt(
+    database_path: Path,
+    receipt_path: Path,
+    *,
+    expected_status: str,
+) -> dict:
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("rollback_receipt_unreadable") from exc
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("contract") != _SCHEMA_ROLLBACK_RECEIPT_CONTRACT
+        or receipt.get("status") != expected_status
+        or int(receipt.get("source_schema_version") or -1)
+        != _SCHEMA_ROLLBACK_SOURCE_VERSION
+        or int(receipt.get("target_schema_version") or -1)
+        != _SCHEMA_ROLLBACK_TARGET_VERSION
+        or not _schema_migration_same_database(
+            receipt.get("database_path"), database_path
+        )
+    ):
+        raise RuntimeError("rollback_receipt_contract_mismatch")
+    fingerprint = str(receipt.get("receipt_fingerprint") or "")
+    fingerprint_payload = dict(receipt)
+    fingerprint_payload.pop("receipt_fingerprint", None)
+    if not hmac.compare_digest(
+        fingerprint,
+        _schema_migration_fingerprint(fingerprint_payload),
+    ):
+        raise RuntimeError("rollback_receipt_fingerprint_mismatch")
+    plan = receipt.get("plan")
+    plan_fingerprint = str(receipt.get("plan_fingerprint") or "")
+    if (
+        not isinstance(plan, dict)
+        or plan.get("contract") != _SCHEMA_ROLLBACK_PLAN_CONTRACT
+        or not hmac.compare_digest(
+            plan_fingerprint,
+            _schema_migration_fingerprint(plan),
+        )
+        or not _schema_migration_same_database(
+            plan.get("database_path"), database_path
+        )
+        or receipt.get("migration_receipt") != plan.get("migration_receipt")
+        or receipt.get("from_source") != plan.get("current_source")
+        or receipt.get("to_target") != plan.get("restore")
+    ):
+        raise RuntimeError("rollback_receipt_plan_mismatch")
+    migration_binding = plan.get("migration_receipt") or {}
+    migration_path = Path(str(migration_binding.get("path") or "")).resolve()
+    try:
+        _schema_rollback_plain_receipt_identity(migration_path)
+        migration_path_is_plain = True
+    except (OSError, ValueError):
+        migration_path_is_plain = False
+    migration_binding_matches = (
+        migration_path_is_plain
+        and hmac.compare_digest(
+            str(migration_binding.get("file_sha256") or ""),
+            _schema_migration_sha256(migration_path),
+        )
+    )
+    if not migration_binding_matches:
+        raise RuntimeError("rollback_receipt_migration_binding_mismatch")
+    if not migration_path_is_plain:
+        raise RuntimeError("rollback_receipt_migration_binding_mismatch")
+
+    forward = receipt.get("forward_recovery")
+    if not isinstance(forward, dict):
+        raise RuntimeError("rollback_receipt_forward_recovery_missing")
+    forward_database = forward.get("database")
+    if not isinstance(forward_database, dict):
+        raise RuntimeError("rollback_receipt_forward_database_missing")
+    forward_path = Path(str(forward_database.get("path") or "")).resolve()
+    backup_root = (database_path.parent / "schema-migration-backups").resolve()
+    if (
+        forward_path.parent != backup_root
+        or not forward_path.is_file()
+        or forward_path.is_symlink()
+        or not hmac.compare_digest(
+            str(forward_database.get("sha256") or ""),
+            _schema_migration_sha256(forward_path),
+        )
+        or any(Path(str(forward_path) + suffix).exists() for suffix in ("-wal", "-shm"))
+    ):
+        raise RuntimeError("rollback_receipt_forward_database_invalid")
+    connection = sqlite3.connect(
+        f"{forward_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        timeout=5.0,
+    )
+    try:
+        connection.row_factory = sqlite3.Row
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        state = inspect_schema_migration_connection(connection, forward_path)
+        if (
+            quick_check is None
+            or str(quick_check[0]).casefold() != "ok"
+            or _schema_migration_state_binding(state)
+            != _schema_migration_state_binding(
+                plan["current_source"]["schema_state"]
+            )
+            or _schema_migration_runtime_generations(connection)
+            != plan["current_source"]["runtime_generations"]
+            or not hmac.compare_digest(
+                _schema_rollback_logical_database_sha256(connection),
+                str(
+                    plan["current_source"].get("logical_database_sha256") or ""
+                ),
+            )
+        ):
+            raise RuntimeError("rollback_receipt_forward_database_invalid")
+    finally:
+        connection.close()
+    _schema_migration_validate_projection_backup(
+        plan["current_source"]["projection"],
+        forward.get("projection"),
+        backup_root=backup_root,
+    )
+    if expected_status == "completed":
+        post = receipt.get("post")
+        if (
+            not isinstance(post, dict)
+            or post.get("quick_check") != "ok"
+            or post.get("sqlite_sidecars") != {"-wal": False, "-shm": False}
+            or int(post.get("schema_state", {}).get("user_version") or -1)
+            != _SCHEMA_ROLLBACK_TARGET_VERSION
+        ):
+            raise RuntimeError("rollback_completed_receipt_post_invalid")
+    return receipt
+
+
+def _schema_rollback_logical_database_sha256(
+    connection: sqlite3.Connection,
+) -> str:
+    """Hash the logical SQLite contents independently of page layout."""
+    _load_sqlite_vec_extension(connection)
+    digest = hashlib.sha256()
+    for pragma in ("application_id", "user_version"):
+        row = connection.execute(f"PRAGMA {pragma}").fetchone()
+        value = int(row[0]) if row is not None else 0
+        encoded = f"pragma:{pragma}:{value}".encode("ascii")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    for statement in connection.iterdump():
+        encoded = statement.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return "sha256:" + digest.hexdigest()
+
+
+def _schema_rollback_current_state(database_path: Path) -> dict:
+    physical_before = _schema_migration_physical_identity(database_path)
+    result = {
+        "physical_identity": physical_before,
+        "database_sha256": None,
+        "logical_database_sha256": None,
+        "schema_state": _schema_inspection_result(database_path),
+        "runtime_generations": None,
+        "projection": _schema_migration_projection_snapshot(),
+    }
+    if not database_path.is_file():
+        return result
+    if not _schema_migration_wal_is_quiescent(physical_before[1]):
+        return result
+    result["database_sha256"] = _schema_migration_sha256(database_path)
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        result["schema_state"] = inspect_schema_migration_connection(
+            connection,
+            database_path,
+        )
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        if quick_check is None or str(quick_check[0]).casefold() != "ok":
+            raise RuntimeError("rollback_source_quick_check_failed")
+        if int(result["schema_state"].get("user_version") or 0) >= 3:
+            result["runtime_generations"] = _schema_migration_runtime_generations(
+                connection
+            )
+        result["logical_database_sha256"] = (
+            _schema_rollback_logical_database_sha256(connection)
+        )
+    except sqlite3.Error as exc:
+        raise RuntimeError("rollback_source_unreadable") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    physical_after = _schema_migration_physical_identity(database_path)
+    if physical_before != physical_after:
+        raise RuntimeError("Database changed during schema rollback preview")
+    return result
+
+
+def _schema_rollback_database_matches(
+    database_path: Path,
+    *,
+    expected_sha256: str,
+    expected_state: dict,
+    expected_generations: dict,
+) -> bool:
+    try:
+        physical = _schema_migration_physical_identity(database_path)
+        if (
+            not database_path.is_file()
+            or not _schema_migration_wal_is_quiescent(physical[1])
+            or not hmac.compare_digest(
+                _schema_migration_sha256(database_path),
+                expected_sha256,
+            )
+        ):
+            return False
+        connection = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5.0,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()
+            state = inspect_schema_migration_connection(connection, database_path)
+            return bool(
+                quick_check is not None
+                and str(quick_check[0]).casefold() == "ok"
+                and _schema_migration_state_binding(state)
+                == _schema_migration_state_binding(expected_state)
+                and _schema_migration_runtime_generations(connection)
+                == expected_generations
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, RuntimeError):
+        return False
+
+
+def _schema_rollback_existing_forward_database(
+    path: Path,
+    current_source: dict,
+) -> dict:
+    """Validate and describe an orphaned forward database for safe adoption."""
+    expected_logical_sha256 = str(
+        current_source.get("logical_database_sha256") or ""
+    )
+    observed_sha256 = (
+        _schema_migration_sha256(path) if path.is_file() and not path.is_symlink() else ""
+    )
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or not expected_logical_sha256
+        or not observed_sha256
+        or any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm"))
+        or not _schema_rollback_database_matches(
+            path,
+            expected_sha256=observed_sha256,
+            expected_state=current_source["schema_state"],
+            expected_generations=current_source["runtime_generations"],
+        )
+    ):
+        raise RuntimeError("rollback_orphan_forward_database_invalid")
+    connection = sqlite3.connect(
+        f"{path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        timeout=5.0,
+    )
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        if not hmac.compare_digest(
+            _schema_rollback_logical_database_sha256(connection),
+            expected_logical_sha256,
+        ):
+            raise RuntimeError("rollback_orphan_forward_database_invalid")
+    except sqlite3.Error as exc:
+        raise RuntimeError("rollback_orphan_forward_database_invalid") from exc
+    finally:
+        connection.close()
+    return {
+        "path": str(path),
+        "sha256": observed_sha256,
+        "quick_check": "ok",
+        "standalone": True,
+    }
+
+
+def _schema_rollback_existing_forward_projection(
+    snapshot: dict,
+    directory: Path,
+) -> dict:
+    """Validate and describe an orphaned forward projection for safe adoption."""
+    status = str(snapshot.get("status") or "")
+    if status == "absent":
+        if os.path.lexists(directory):
+            raise RuntimeError("rollback_orphan_forward_projection_invalid")
+        if _schema_migration_projection_snapshot_is_v2(snapshot):
+            backup = {
+                "contract": "vector-lake-projection-backup/v2",
+                "format_version": 2,
+                "status": "absent",
+                "directory": None,
+                "generation": None,
+                "canonical_generation": None,
+                "index_root_sha256": None,
+                "claim_graph_root_sha256": None,
+                "artifacts": [],
+            }
+            try:
+                _schema_migration_validate_projection_backup(
+                    snapshot,
+                    backup,
+                    backup_root=directory.parent,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "rollback_orphan_forward_projection_invalid"
+                ) from exc
+            return backup
+        return {
+            "contract": "vector-lake-projection-backup/v1",
+            "status": "absent",
+            "directory": None,
+            "generation": None,
+            "canonical_generation": None,
+            "artifacts": [],
+        }
+    if (
+        status not in {"captured", "incomplete"}
+        or not directory.is_dir()
+        or directory.is_symlink()
+    ):
+        raise RuntimeError("rollback_orphan_forward_projection_invalid")
+
+    if _schema_migration_projection_snapshot_is_v2(snapshot):
+        expected: dict[str, dict] = {}
+        expected_directories: set[str] = set()
+        for source in snapshot.get("artifacts") or []:
+            if not isinstance(source, dict) or not source.get(
+                "source_identity", {}
+            ).get("exists"):
+                continue
+            relative_path = Path(str(source.get("relative_path") or ""))
+            if (
+                not relative_path.parts
+                or relative_path.is_absolute()
+                or ".." in relative_path.parts
+            ):
+                raise RuntimeError("rollback_orphan_forward_projection_invalid")
+            relative = relative_path.as_posix()
+            if relative in expected:
+                raise RuntimeError("rollback_orphan_forward_projection_invalid")
+            expected[relative] = source
+            parent = relative_path.parent
+            while parent != Path("."):
+                expected_directories.add(parent.as_posix())
+                parent = parent.parent
+
+        try:
+            observed_paths = list(directory.rglob("*"))
+        except OSError as exc:
+            raise RuntimeError("rollback_orphan_forward_projection_invalid") from exc
+        if any(path.is_symlink() for path in observed_paths):
+            raise RuntimeError("rollback_orphan_forward_projection_invalid")
+        try:
+            observed_files = {
+                path.relative_to(directory).as_posix()
+                for path in observed_paths
+                if path.is_file()
+            }
+            observed_directories = {
+                path.relative_to(directory).as_posix()
+                for path in observed_paths
+                if path.is_dir()
+            }
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("rollback_orphan_forward_projection_invalid") from exc
+        if (
+            any(not path.is_file() and not path.is_dir() for path in observed_paths)
+            or observed_files != set(expected)
+            or observed_directories != expected_directories
+        ):
+            raise RuntimeError("rollback_orphan_forward_projection_invalid")
+
+        artifacts = []
+        for relative, source in sorted(expected.items()):
+            path = (directory / Path(relative)).resolve()
+            try:
+                path.relative_to(directory.resolve())
+            except ValueError as exc:
+                raise RuntimeError(
+                    "rollback_orphan_forward_projection_invalid"
+                ) from exc
+            artifacts.append(
+                {
+                    "name": path.name,
+                    "relative_path": relative,
+                    "path": str(path),
+                    "sha256": str(source["sha256"]),
+                    "bytes": int(source["bytes"]),
+                }
+            )
+        backup = {
+            "contract": "vector-lake-projection-backup/v2",
+            "format_version": 2,
+            "status": status,
+            "directory": str(directory.resolve()),
+            "generation": snapshot.get("generation"),
+            "canonical_generation": snapshot.get("canonical_generation"),
+            "index_root_sha256": snapshot.get("index_root_sha256"),
+            "claim_graph_root_sha256": snapshot.get(
+                "claim_graph_root_sha256"
+            ),
+            "artifacts": artifacts,
+        }
+        try:
+            _schema_migration_validate_projection_backup(
+                snapshot,
+                backup,
+                backup_root=directory.parent,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "rollback_orphan_forward_projection_invalid"
+            ) from exc
+        return backup
+
+    expected = {
+        str(item["name"]): item
+        for item in snapshot.get("artifacts") or []
+        if item.get("source_identity", {}).get("exists")
+    }
+    try:
+        observed_paths = list(directory.iterdir())
+    except OSError as exc:
+        raise RuntimeError("rollback_orphan_forward_projection_invalid") from exc
+    if (
+        {item.name for item in observed_paths} != set(expected)
+        or any(not item.is_file() or item.is_symlink() for item in observed_paths)
+    ):
+        raise RuntimeError("rollback_orphan_forward_projection_invalid")
+
+    artifacts = []
+    for name, source in sorted(expected.items()):
+        path = directory / name
+        artifacts.append(
+            {
+                "name": name,
+                "source_path": str(Path(str(source["source_path"])).resolve()),
+                "path": str(path),
+                "sha256": str(source["sha256"]),
+                "bytes": int(source["bytes"]),
+                "source_identity": source["source_identity"],
+            }
+        )
+    backup = {
+        "contract": "vector-lake-projection-backup/v1",
+        "status": status,
+        "directory": str(directory),
+        "generation": snapshot.get("generation"),
+        "canonical_generation": snapshot.get("canonical_generation"),
+        "artifacts": artifacts,
+    }
+    try:
+        _schema_migration_validate_projection_backup(
+            snapshot,
+            backup,
+            backup_root=directory.parent,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError("rollback_orphan_forward_projection_invalid") from exc
+    return backup
+
+
+def _schema_rollback_pending_recovery_action(
+    pending: dict,
+    database_path: Path,
+) -> str | None:
+    plan = pending["plan"]
+    restore = plan["restore"]
+    if _schema_rollback_database_matches(
+        database_path,
+        expected_sha256=str(restore["database"]["sha256"]),
+        expected_state=restore["schema_state"],
+        expected_generations=restore["runtime_generations"],
+    ):
+        projection = _schema_migration_projection_snapshot()
+        if _schema_migration_projection_content_binding(projection) == (
+            _schema_migration_projection_content_binding(
+                restore["pre_projection"]
+            )
+        ):
+            return "publish_completed_receipt"
+        return "resume_projection_restore"
+    current_source = plan["current_source"]
+    if _schema_rollback_database_matches(
+        database_path,
+        expected_sha256=str(current_source["database_sha256"]),
+        expected_state=current_source["schema_state"],
+        expected_generations=current_source["runtime_generations"],
+    ):
+        projection = _schema_migration_projection_snapshot()
+        if _schema_migration_projection_content_binding(projection) == (
+            _schema_migration_projection_content_binding(
+                current_source["projection"]
+            )
+        ):
+            return "resume_database_and_projection_restore"
+    return None
+
+
+def _schema_rollback_recovery_preview(
+    receipt_path: Path,
+    receipt: dict,
+    *,
+    recovery_action: str,
+) -> dict:
+    core = dict(receipt["plan"])
+    core.update(
+        {
+            "issues": [],
+            "can_apply": recovery_action != "already_completed",
+            "no_op": True,
+            "recovery_action": recovery_action,
+            "pending_rollback_receipt": (
+                {
+                    "path": str(receipt_path),
+                    "file_identity": _schema_migration_file_identity(receipt_path),
+                    "file_sha256": _schema_migration_sha256(receipt_path),
+                    "receipt_fingerprint": receipt["receipt_fingerprint"],
+                }
+                if recovery_action != "already_completed"
+                else None
+            ),
+            "completed_rollback_receipt": (
+                {
+                    "path": str(receipt_path),
+                    "file_identity": _schema_migration_file_identity(receipt_path),
+                    "file_sha256": _schema_migration_sha256(receipt_path),
+                    "receipt_fingerprint": receipt["receipt_fingerprint"],
+                }
+                if recovery_action == "already_completed"
+                else None
+            ),
+        }
+    )
+    return {
+        **core,
+        "dry_run": True,
+        "applied": False,
+        "confirm_no_writers_required": recovery_action != "already_completed",
+        "fingerprint": _schema_migration_fingerprint(core),
+    }
+
+
+def preview_schema_rollback(
+    migration_receipt: str | Path,
+    db_path: str | Path | None = None,
+) -> dict:
+    """Build a content-bound v9-to-v8 rollback plan without physical writes."""
+    database_path = (
+        Path(db_path) if db_path is not None else peek_db_path()
+    ).resolve()
+    issues: list[str] = []
+    receipt_path = None
+    migration_receipt_payload = None
+    try:
+        receipt_path, migration_receipt_payload = (
+            _schema_rollback_completed_migration_receipt(
+                database_path,
+                migration_receipt,
+            )
+        )
+    except RuntimeError as exc:
+        issues.append(str(exc))
+
+    if receipt_path is not None and migration_receipt_payload is not None:
+        completed_path, pending_path = _schema_rollback_receipt_paths(
+            database_path,
+            migration_receipt_payload,
+        )
+        if completed_path.is_file():
+            try:
+                completed = _schema_rollback_validate_receipt(
+                    database_path,
+                    completed_path,
+                    expected_status="completed",
+                )
+                _schema_rollback_verify_target(completed["plan"], database_path)
+                return _schema_rollback_recovery_preview(
+                    completed_path,
+                    completed,
+                    recovery_action="already_completed",
+                )
+            except RuntimeError as exc:
+                issues.append(str(exc))
+        elif pending_path.is_file():
+            try:
+                pending = _schema_rollback_validate_receipt(
+                    database_path,
+                    pending_path,
+                    expected_status="pending",
+                )
+                recovery_action = _schema_rollback_pending_recovery_action(
+                    pending,
+                    database_path,
+                )
+                if recovery_action is None:
+                    raise RuntimeError("rollback_pending_target_is_ambiguous")
+                return _schema_rollback_recovery_preview(
+                    pending_path,
+                    pending,
+                    recovery_action=recovery_action,
+                )
+            except RuntimeError:
+                # A pending receipt with a still-v8 or partially restored target is
+                # intentionally handled by the normal fail-closed preview below.
+                pass
+
+    try:
+        current = _schema_rollback_current_state(database_path)
+    except RuntimeError as exc:
+        current = {
+            "physical_identity": _schema_migration_physical_identity(database_path),
+            "database_sha256": None,
+            "schema_state": _schema_inspection_result(database_path),
+            "runtime_generations": None,
+            "projection": _schema_migration_projection_snapshot(),
+        }
+        issues.append(str(exc))
+
+    if not database_path.is_file():
+        issues.append("database_missing")
+    elif not _schema_migration_wal_is_quiescent(current["physical_identity"][1]):
+        issues.append("database_has_uncheckpointed_wal")
+    state = current["schema_state"]
+    if (
+        int(state.get("user_version") or -1) != _SCHEMA_ROLLBACK_SOURCE_VERSION
+        or state.get("ready") is not True
+    ):
+        issues.append("rollback_requires_ready_v9_database")
+    if not _schema_migration_runtime_generations_valid(
+        current.get("runtime_generations")
+    ):
+        issues.append("rollback_current_generations_invalid")
+
+    receipt_binding = None
+    restore = None
+    forward_recovery = None
+    changed_generations: list[str] = []
+    projection_action = None
+    old_runtime_projection_rebuild_required = False
+    recovery_action = None
+    if receipt_path is not None and migration_receipt_payload is not None:
+        receipt_binding = {
+            "path": str(receipt_path),
+            "file_identity": _schema_migration_file_identity(receipt_path),
+            "file_sha256": _schema_migration_sha256(receipt_path),
+            "receipt_fingerprint": migration_receipt_payload["receipt_fingerprint"],
+            "plan_fingerprint": migration_receipt_payload["plan_fingerprint"],
+        }
+        migration_plan = migration_receipt_payload["plan"]
+        pre_projection = migration_plan["pre_projection"]
+        projection_action = (
+            "restore_pre_migration_pair"
+            if pre_projection["status"] == "captured"
+            else "restore_pre_migration_absence"
+        )
+        old_runtime_projection_rebuild_required = (
+            pre_projection["status"] == "absent"
+        )
+        restore = {
+            "database": migration_receipt_payload["backup"],
+            "schema_state": migration_plan["pre_state"],
+            "runtime_generations": migration_plan["pre_runtime_generations"],
+            "pre_projection": pre_projection,
+            "projection_backup": migration_receipt_payload["projection_backup"],
+        }
+        post_generations = migration_receipt_payload["recovery_bundle"][
+            "post_target_binding"
+        ]["runtime_generations"]
+        current_generations = current.get("runtime_generations") or {}
+        changed_generations = sorted(
+            surface
+            for surface in set(post_generations) | set(current_generations)
+            if post_generations.get(surface) != current_generations.get(surface)
+        )
+        token_payload = {
+            "migration_receipt_fingerprint": migration_receipt_payload[
+                "receipt_fingerprint"
+            ],
+            "current_database_sha256": current.get("database_sha256"),
+            "current_physical_identity": current.get("physical_identity"),
+            "current_projection": current.get("projection"),
+        }
+        token = _schema_migration_fingerprint(token_payload).removeprefix(
+            "sha256:"
+        )[:24]
+        backup_root = database_path.parent / "schema-migration-backups"
+        forward_db = backup_root / (
+            f"{database_path.stem}.forward-v9-before-v8-rollback.{token}.db"
+        )
+        forward_projection = forward_db.with_name(
+            forward_db.name + ".projection"
+        )
+        completed_path, pending_path = _schema_rollback_receipt_paths(
+            database_path,
+            migration_receipt_payload,
+        )
+        forward_recovery = {
+            "database_path": str(forward_db),
+            "projection_directory": str(forward_projection),
+            "completed_receipt_path": str(completed_path),
+            "pending_receipt_path": str(pending_path),
+            "reuse_existing": False,
+            "reuse_database": False,
+            "reuse_projection": False,
+            "database": None,
+            "projection": None,
+        }
+        forward_db_exists = os.path.lexists(forward_db)
+        forward_projection_exists = os.path.lexists(forward_projection)
+        orphan_issues: list[str] = []
+        if forward_db_exists:
+            try:
+                forward_recovery["database"] = (
+                    _schema_rollback_existing_forward_database(
+                        forward_db,
+                        current,
+                    )
+                )
+                forward_recovery["reuse_database"] = True
+            except RuntimeError as exc:
+                orphan_issues.append(str(exc))
+        if forward_projection_exists or (
+            forward_db_exists and current["projection"].get("status") == "absent"
+        ):
+            try:
+                forward_recovery["projection"] = (
+                    _schema_rollback_existing_forward_projection(
+                        current["projection"],
+                        forward_projection,
+                    )
+                )
+                forward_recovery["reuse_projection"] = True
+            except RuntimeError as exc:
+                orphan_issues.append(str(exc))
+        issues.extend(orphan_issues)
+        if (forward_db_exists or forward_projection_exists) and not orphan_issues:
+            reuse_database = bool(forward_recovery["reuse_database"])
+            reuse_projection = bool(forward_recovery["reuse_projection"])
+            forward_recovery["reuse_existing"] = (
+                reuse_database and reuse_projection
+            )
+            if reuse_database and reuse_projection:
+                recovery_action = "reuse_verified_forward_recovery"
+            elif reuse_database:
+                recovery_action = "resume_forward_recovery_projection"
+            elif reuse_projection:
+                recovery_action = "resume_forward_recovery_database"
+        for candidate, issue in (
+            (completed_path, "schema_rollback_already_completed"),
+            (pending_path, "schema_rollback_pending_receipt_exists"),
+        ):
+            if candidate.exists():
+                issues.append(issue)
+
+    issues.extend(str(item) for item in state.get("issues") or [])
+    issues = list(dict.fromkeys(issues))
+    core = {
+        "contract": _SCHEMA_ROLLBACK_PLAN_CONTRACT,
+        "database_path": str(database_path),
+        "source_schema_version": _SCHEMA_ROLLBACK_SOURCE_VERSION,
+        "target_schema_version": _SCHEMA_ROLLBACK_TARGET_VERSION,
+        "migration_receipt": receipt_binding,
+        "current_source": current,
+        "restore": restore,
+        "forward_recovery": forward_recovery,
+        "data_loss_since_migration": bool(changed_generations),
+        "changed_runtime_generations": changed_generations,
+        "confirm_data_rewind_required": bool(changed_generations),
+        "projection_action": projection_action,
+        "old_runtime_projection_rebuild_required": (
+            old_runtime_projection_rebuild_required
+        ),
+        "recovery_action": recovery_action,
+        "pending_rollback_receipt": None,
+        "completed_rollback_receipt": None,
+        "issues": issues,
+        "can_apply": not issues,
+        "no_op": False,
+    }
+    return {
+        **core,
+        "dry_run": True,
+        "applied": False,
+        "confirm_no_writers_required": True,
+        "fingerprint": _schema_migration_fingerprint(core),
+    }
+
+
+def _schema_rollback_stage_database(plan: dict, database_path: Path) -> Path:
+    restore = plan["restore"]
+    backup = restore["database"]
+    source_path = Path(str(backup["path"])).resolve()
+    staging_path = database_path.with_name(
+        f".{database_path.name}.rollback-v8.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        shutil.copyfile(source_path, staging_path)
+        _schema_migration_fsync_path(staging_path)
+        if not hmac.compare_digest(
+            _schema_migration_sha256(staging_path),
+            str(backup["sha256"]),
+        ):
+            raise RuntimeError("Rollback v8 database staging hash mismatch")
+        if any(Path(str(staging_path) + suffix).exists() for suffix in ("-wal", "-shm")):
+            raise RuntimeError("Rollback v8 database staging is not standalone")
+        connection = sqlite3.connect(
+            f"{staging_path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5.0,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or str(quick_check[0]).casefold() != "ok":
+                raise RuntimeError("Rollback v8 database quick_check failed")
+            state = inspect_schema_migration_connection(connection, staging_path)
+            if _schema_migration_state_binding(state) != (
+                _schema_migration_state_binding(restore["schema_state"])
+            ):
+                raise RuntimeError("Rollback v8 database schema binding mismatch")
+            if _schema_migration_runtime_generations(connection) != restore[
+                "runtime_generations"
+            ]:
+                raise RuntimeError("Rollback v8 database generation binding mismatch")
+        finally:
+            connection.close()
+        return staging_path
+    except BaseException:
+        staging_path.unlink(missing_ok=True)
+        Path(str(staging_path) + "-wal").unlink(missing_ok=True)
+        Path(str(staging_path) + "-shm").unlink(missing_ok=True)
+        raise
+
+
+def _schema_rollback_stage_projection(plan: dict) -> dict:
+    pre_projection = plan["restore"]["pre_projection"]
+    if _schema_migration_projection_snapshot_is_v2(pre_projection):
+        staged = _schema_migration_projection_v2_delegate(
+            "schema_rollback_stage_projection",
+            plan,
+        )
+        if (
+            not isinstance(staged, dict)
+            or staged.get("contract")
+            != "vector-lake-projection-rollback-stage/v2"
+            or staged.get("format_version") != 2
+        ):
+            raise RuntimeError("projection_v2_rollback_stage_contract_invalid")
+        return staged
+    if pre_projection["status"] == "absent":
+        return {}
+    backup = plan["restore"]["projection_backup"]
+    backup_artifacts = {
+        str(item["name"]): item for item in backup.get("artifacts") or []
+    }
+    staged: dict[str, Path] = {}
+    token = plan["fingerprint"].removeprefix("sha256:")[:16]
+    try:
+        for live_path in _schema_migration_projection_paths():
+            item = backup_artifacts.get(live_path.name)
+            if item is None:
+                raise RuntimeError(
+                    f"Rollback projection backup is missing {live_path.name}"
+                )
+            stage = live_path.with_name(
+                f".{live_path.name}.rollback-v8.{token}.{os.getpid()}.tmp"
+            )
+            if stage.exists():
+                raise RuntimeError("Rollback projection staging path already exists")
+            shutil.copyfile(Path(str(item["path"])), stage)
+            _schema_migration_fsync_path(stage)
+            if not hmac.compare_digest(
+                _schema_migration_sha256(stage),
+                str(item["sha256"]),
+            ):
+                raise RuntimeError(
+                    f"Rollback projection staging hash mismatch: {live_path.name}"
+                )
+            staged[live_path.name] = stage
+        return staged
+    except BaseException:
+        for stage in staged.values():
+            stage.unlink(missing_ok=True)
+        raise
+
+
+def _schema_rollback_publish_projection(
+    plan: dict,
+    staged: dict,
+) -> None:
+    if _schema_migration_projection_snapshot_is_v2(
+        plan["restore"]["pre_projection"]
+    ):
+        _schema_migration_projection_v2_delegate(
+            "schema_rollback_publish_projection",
+            plan,
+            staged,
+        )
+        return
+    index_path, claim_graph_path, manifest_path = (
+        _schema_migration_projection_paths()
+    )
+    manifest_path.unlink(missing_ok=True)
+    _schema_migration_fsync_directory(manifest_path.parent)
+    if plan["restore"]["pre_projection"]["status"] == "absent":
+        claim_graph_path.unlink(missing_ok=True)
+        index_path.unlink(missing_ok=True)
+        _schema_migration_fsync_directory(index_path.parent)
+        return
+    for live_path in (claim_graph_path, index_path, manifest_path):
+        stage = staged.get(live_path.name)
+        if stage is None:
+            raise RuntimeError(
+                f"Rollback projection staging is missing {live_path.name}"
+            )
+        os.replace(stage, live_path)
+        _schema_migration_fsync_path(live_path)
+        _schema_migration_fsync_directory(live_path.parent)
+
+
+def _schema_rollback_cleanup_projection_stage(staged: dict) -> None:
+    if not staged:
+        return
+    if (
+        staged.get("contract") == "vector-lake-projection-rollback-stage/v2"
+        and staged.get("format_version") == 2
+    ):
+        directory_value = staged.get("directory")
+        if directory_value is None:
+            return
+        directory = Path(str(directory_value)).resolve()
+        live_base = get_index_path().resolve().parent
+        expected_prefix = f".{live_base.name}.projection-v2-rollback."
+        if (
+            directory.parent != live_base.parent
+            or not directory.name.startswith(expected_prefix)
+            or not directory.name.endswith(".tmp")
+        ):
+            raise RuntimeError("projection_v2_rollback_cleanup_path_invalid")
+        if directory.exists():
+            if not directory.is_dir() or directory.is_symlink():
+                raise RuntimeError("projection_v2_rollback_cleanup_path_invalid")
+            shutil.rmtree(directory)
+        return
+    for stage in staged.values():
+        if not isinstance(stage, Path):
+            raise RuntimeError("rollback_projection_stage_contract_invalid")
+        stage.unlink(missing_ok=True)
+
+
+def _schema_rollback_verify_target(plan: dict, database_path: Path) -> dict:
+    restore = plan["restore"]
+    if not hmac.compare_digest(
+        _schema_migration_sha256(database_path),
+        str(restore["database"]["sha256"]),
+    ):
+        raise RuntimeError("Rollback target database hash mismatch")
+    sidecars = {
+        suffix: Path(str(database_path) + suffix).exists()
+        for suffix in ("-wal", "-shm")
+    }
+    if any(sidecars.values()):
+        raise RuntimeError("Rollback target database has SQLite sidecars")
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        timeout=5.0,
+    )
+    try:
+        connection.row_factory = sqlite3.Row
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        if quick_check is None or str(quick_check[0]).casefold() != "ok":
+            raise RuntimeError("Rollback target database quick_check failed")
+        state = inspect_schema_migration_connection(connection, database_path)
+        if _schema_migration_state_binding(state) != _schema_migration_state_binding(
+            restore["schema_state"]
+        ):
+            raise RuntimeError("Rollback target schema binding mismatch")
+        runtime_generations = _schema_migration_runtime_generations(connection)
+        if runtime_generations != restore["runtime_generations"]:
+            raise RuntimeError("Rollback target generation binding mismatch")
+    finally:
+        connection.close()
+    projection = _schema_migration_projection_snapshot()
+    if _schema_migration_projection_content_binding(projection) != (
+        _schema_migration_projection_content_binding(restore["pre_projection"])
+    ):
+        raise RuntimeError("Rollback target projection binding mismatch")
+    return {
+        "database_sha256": _schema_migration_sha256(database_path),
+        "schema_state": state,
+        "runtime_generations": runtime_generations,
+        "projection": projection,
+        "quick_check": "ok",
+        "sqlite_sidecars": sidecars,
+        "old_runtime_acceptance": {
+            "schema_version": _SCHEMA_ROLLBACK_TARGET_VERSION,
+            "projection_restored": projection["status"] == "captured",
+            "projection_rebuild_required": projection["status"] == "absent",
+            "runtime_switch_required": True,
+        },
+    }
+
+
+def _schema_rollback_pending_payload(
+    plan: dict,
+    *,
+    forward_database: dict,
+    forward_projection: dict,
+) -> dict:
+    receipt = {
+        "contract": _SCHEMA_ROLLBACK_RECEIPT_CONTRACT,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "database_path": plan["database_path"],
+        "source_schema_version": _SCHEMA_ROLLBACK_SOURCE_VERSION,
+        "target_schema_version": _SCHEMA_ROLLBACK_TARGET_VERSION,
+        "plan_fingerprint": plan["fingerprint"],
+        "plan": _schema_rollback_plan_core(plan),
+        "migration_receipt": plan["migration_receipt"],
+        "from_source": plan["current_source"],
+        "to_target": plan["restore"],
+        "forward_recovery": {
+            "database": forward_database,
+            "projection": forward_projection,
+        },
+        "projection_action": plan["projection_action"],
+        "old_runtime_projection_rebuild_required": plan[
+            "old_runtime_projection_rebuild_required"
+        ],
+    }
+    receipt["receipt_fingerprint"] = _schema_migration_fingerprint(receipt)
+    return receipt
+
+
+def _schema_rollback_completed_payload(pending: dict, post: dict) -> dict:
+    receipt = dict(pending)
+    receipt.pop("receipt_fingerprint", None)
+    receipt.update(
+        {
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "post": post,
+        }
+    )
+    receipt["receipt_fingerprint"] = _schema_migration_fingerprint(receipt)
+    return receipt
+
+
+def schema_rollback_maintenance(
+    *,
+    migration_receipt: str | Path,
+    apply: bool = False,
+    confirmation: str = "",
+    confirm_no_writers: bool = False,
+    confirm_data_rewind: bool = False,
+    db_path: str | Path | None = None,
+) -> dict:
+    """Preview or apply a receipt-bound v9-to-v8 recovery transaction."""
+    initial_plan = preview_schema_rollback(migration_receipt, db_path)
+    if not apply:
+        return initial_plan
+    if initial_plan.get("recovery_action") == "already_completed":
+        return {
+            **initial_plan,
+            "dry_run": False,
+            "applied": False,
+            "no_op": True,
+        }
+    if not confirm_no_writers:
+        raise RuntimeError("Schema rollback requires --confirm-no-writers")
+    if not hmac.compare_digest(str(confirmation), initial_plan["fingerprint"]):
+        raise RuntimeError(
+            "Schema rollback fingerprint mismatch; run a new read-only preview"
+        )
+    if not initial_plan["can_apply"]:
+        raise RuntimeError(
+            "Schema rollback cannot apply: "
+            + ", ".join(initial_plan["issues"] or ["unsupported_source_state"])
+        )
+    if initial_plan["confirm_data_rewind_required"] and not confirm_data_rewind:
+        raise RuntimeError(
+            "Schema rollback would discard post-migration writes; "
+            "--confirm-data-rewind is required"
+        )
+
+    database_path = Path(initial_plan["database_path"])
+    maintenance_lock = FileLock(
+        str(database_path.parent / _SCHEMA_MIGRATION_LOCK_FILENAME),
+        timeout=0,
+    )
+    try:
+        maintenance_lock.acquire()
+    except FileLockTimeout as exc:
+        raise RuntimeError("Schema rollback maintenance lock is busy") from exc
+
+    projection_lock = None
+    source = None
+    forward_stage = None
+    target_stage = None
+    projection_stages: dict[str, Path] = {}
+    try:
+        projection_lock = FileLock(str(get_index_path()) + ".lock", timeout=0)
+        try:
+            projection_lock.acquire()
+        except FileLockTimeout as exc:
+            raise RuntimeError("Schema rollback projection lock is busy") from exc
+        plan = preview_schema_rollback(migration_receipt, database_path)
+        if not hmac.compare_digest(str(confirmation), plan["fingerprint"]):
+            raise RuntimeError(
+                "Schema rollback fingerprint mismatch after lock acquisition"
+            )
+        if not plan["can_apply"]:
+            raise RuntimeError(
+                "Schema rollback cannot apply: "
+                + ", ".join(plan["issues"] or ["unsupported_source_state"])
+            )
+        if plan["confirm_data_rewind_required"] and not confirm_data_rewind:
+            raise RuntimeError(
+                "Schema rollback would discard post-migration writes; "
+                "--confirm-data-rewind is required"
+            )
+        with _CONNECTIONS_LOCK:
+            if _CONNECTIONS:
+                raise RuntimeError(
+                    "Schema rollback requires all in-process database connections "
+                    "to be closed"
+                )
+
+        recovery_action = plan.get("recovery_action")
+        if recovery_action in {
+            "publish_completed_receipt",
+            "resume_projection_restore",
+            "resume_database_and_projection_restore",
+        }:
+            pending_binding = plan.get("pending_rollback_receipt") or {}
+            pending_path = Path(str(pending_binding.get("path") or "")).resolve()
+            if (
+                not pending_path.is_file()
+                or not hmac.compare_digest(
+                    str(pending_binding.get("file_sha256") or ""),
+                    _schema_migration_sha256(pending_path),
+                )
+            ):
+                raise RuntimeError("Schema rollback pending receipt changed")
+            pending = _schema_rollback_validate_receipt(
+                database_path,
+                pending_path,
+                expected_status="pending",
+            )
+            if recovery_action == "resume_projection_restore":
+                projection_stages = _schema_rollback_stage_projection(
+                    plan
+                )
+                _schema_rollback_publish_projection(plan, projection_stages)
+                projection_stages = {}
+            elif recovery_action == "resume_database_and_projection_restore":
+                target_stage = _schema_rollback_stage_database(plan, database_path)
+                projection_stages = _schema_rollback_stage_projection(plan)
+                source = sqlite3.connect(
+                    f"{database_path.as_uri()}?mode=rw",
+                    uri=True,
+                    timeout=0,
+                    isolation_level=None,
+                )
+                source.row_factory = sqlite3.Row
+                source.execute("PRAGMA busy_timeout=0")
+                source_identity_before_hash = _schema_migration_file_identity(
+                    database_path
+                )
+                source_data_version = int(
+                    source.execute("PRAGMA data_version").fetchone()[0]
+                )
+                try:
+                    source_database_sha256 = _schema_migration_sha256(database_path)
+                except OSError as exc:
+                    raise RuntimeError(
+                        "Schema rollback pending recovery source hash failed "
+                        "before exclusive lock"
+                    ) from exc
+                source_identity_after_hash = _schema_migration_file_identity(
+                    database_path
+                )
+                if (
+                    not hmac.compare_digest(
+                        source_database_sha256,
+                        str(plan["current_source"]["database_sha256"]),
+                    )
+                    or source_identity_before_hash != source_identity_after_hash
+                ):
+                    raise RuntimeError(
+                        "Schema rollback pending recovery source changed"
+                    )
+                try:
+                    source.execute("BEGIN EXCLUSIVE")
+                except sqlite3.OperationalError as exc:
+                    raise RuntimeError(
+                        "Schema rollback detected an active SQLite writer "
+                        "during pending recovery"
+                    ) from exc
+                if (
+                    source_identity_after_hash
+                    != _schema_migration_file_identity(database_path)
+                    or source_data_version
+                    != int(source.execute("PRAGMA data_version").fetchone()[0])
+                    or _schema_migration_state_binding(
+                        inspect_schema_migration_connection(source, database_path)
+                    )
+                    != _schema_migration_state_binding(
+                        plan["current_source"]["schema_state"]
+                    )
+                    or _schema_migration_runtime_generations(source)
+                    != plan["current_source"]["runtime_generations"]
+                    or _schema_migration_projection_content_binding(
+                        _schema_migration_projection_snapshot()
+                    )
+                    != _schema_migration_projection_content_binding(
+                        plan["current_source"]["projection"]
+                    )
+                ):
+                    raise RuntimeError(
+                        "Schema rollback pending recovery source changed"
+                    )
+                source.execute("ROLLBACK")
+                source.close()
+                source = None
+                for suffix in ("-wal", "-shm"):
+                    sidecar = Path(str(database_path) + suffix)
+                    if sidecar.exists() and sidecar.stat().st_size > 0:
+                        raise RuntimeError(
+                            "Schema rollback pending recovery found a non-empty "
+                            "SQLite sidecar"
+                        )
+                    sidecar.unlink(missing_ok=True)
+                from vector_lake.wiki_utils import (
+                    _replace_prepared_file_compare_and_swap,
+                )
+
+                _replace_prepared_file_compare_and_swap(
+                    database_path,
+                    target_stage,
+                    str(plan["current_source"]["database_sha256"]).removeprefix(
+                        "sha256:"
+                    ),
+                )
+                target_stage = None
+                _schema_migration_fsync_path(database_path)
+                _schema_migration_fsync_directory(database_path.parent)
+                _schema_rollback_publish_projection(plan, projection_stages)
+                projection_stages = {}
+
+            post = _schema_rollback_verify_target(pending["plan"], database_path)
+            completed = _schema_rollback_completed_payload(pending, post)
+            completed_path = Path(
+                plan["forward_recovery"]["completed_receipt_path"]
+            )
+            _schema_migration_atomic_json(completed_path, completed)
+            return {
+                "contract": _SCHEMA_ROLLBACK_RECEIPT_CONTRACT,
+                "dry_run": False,
+                "applied": recovery_action
+                != "publish_completed_receipt",
+                "no_op": True,
+                "recovery_action": (
+                    "published_completed_receipt"
+                    if recovery_action == "publish_completed_receipt"
+                    else "resumed_and_completed_rollback"
+                ),
+                "plan_fingerprint": plan["fingerprint"],
+                "post": post,
+                "receipt_path": str(completed_path),
+                "pending_receipt_path": str(pending_path),
+                "receipt_fingerprint": completed["receipt_fingerprint"],
+            }
+
+        source = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=rw",
+            uri=True,
+            timeout=0,
+            isolation_level=None,
+        )
+        source.row_factory = sqlite3.Row
+        source.execute("PRAGMA busy_timeout=0")
+        source.execute("PRAGMA foreign_keys=ON")
+        data_version = int(source.execute("PRAGMA data_version").fetchone()[0])
+        if not hmac.compare_digest(
+            _schema_migration_sha256(database_path),
+            str(plan["current_source"]["database_sha256"]),
+        ):
+            raise RuntimeError("Schema rollback source changed before backup")
+        try:
+            source.execute("BEGIN EXCLUSIVE")
+            source.execute("ROLLBACK")
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(
+                "Schema rollback detected an active SQLite writer before backup"
+            ) from exc
+
+        forward_path = Path(plan["forward_recovery"]["database_path"])
+        forward_projection_path = Path(
+            plan["forward_recovery"]["projection_directory"]
+        )
+        reuse_database = bool(plan["forward_recovery"].get("reuse_database"))
+        reuse_projection = bool(
+            plan["forward_recovery"].get("reuse_projection")
+        )
+        if reuse_database:
+            forward_database = _schema_rollback_existing_forward_database(
+                forward_path,
+                plan["current_source"],
+            )
+            if forward_database != plan["forward_recovery"].get("database"):
+                raise RuntimeError(
+                    "Schema rollback orphaned forward database changed after preview"
+                )
+        else:
+            synthetic_backup_plan = {
+                "pre_schema_version": _SCHEMA_ROLLBACK_SOURCE_VERSION,
+                "fingerprint": plan["fingerprint"],
+                "pre_state": plan["current_source"]["schema_state"],
+            }
+            forward_stage, forward_sha256, expected_forward_path = (
+                _schema_migration_backup(
+                    source,
+                    database_path=database_path,
+                    plan=synthetic_backup_plan,
+                    extra_bytes=(
+                        0
+                        if reuse_projection
+                        else _schema_migration_projection_existing_bytes(
+                            plan["current_source"]["projection"]
+                        )
+                    ),
+                    final_path=forward_path,
+                    operation="schema-rollback:forward-v9-recovery",
+                )
+            )
+        if reuse_projection:
+            forward_projection = _schema_rollback_existing_forward_projection(
+                plan["current_source"]["projection"],
+                forward_projection_path,
+            )
+            if forward_projection != plan["forward_recovery"].get("projection"):
+                raise RuntimeError(
+                    "Schema rollback orphaned forward projection changed after preview"
+                )
+        else:
+            forward_projection = _schema_migration_projection_backup(
+                plan["current_source"]["projection"],
+                final_directory=forward_projection_path,
+            )
+        if not reuse_database:
+            _schema_migration_promote_backup(forward_stage, expected_forward_path)
+            forward_stage = None
+            forward_database = {
+                "path": str(expected_forward_path),
+                "sha256": forward_sha256,
+                "quick_check": "ok",
+                "standalone": True,
+            }
+        target_stage = _schema_rollback_stage_database(plan, database_path)
+        projection_stages = _schema_rollback_stage_projection(plan)
+
+        source.execute("BEGIN EXCLUSIVE")
+        if int(source.execute("PRAGMA data_version").fetchone()[0]) != data_version:
+            raise RuntimeError("Schema rollback source changed while backup was created")
+        locked_state = inspect_schema_migration_connection(source, database_path)
+        if _schema_migration_state_binding(locked_state) != (
+            _schema_migration_state_binding(plan["current_source"]["schema_state"])
+        ):
+            raise RuntimeError("Schema rollback source schema changed before replace")
+        if _schema_migration_runtime_generations(source) != plan["current_source"][
+            "runtime_generations"
+        ]:
+            raise RuntimeError("Schema rollback source generations changed before replace")
+        if _schema_migration_projection_snapshot() != plan["current_source"][
+            "projection"
+        ]:
+            raise RuntimeError("Schema rollback source projection changed before replace")
+
+        completed_path = Path(
+            plan["forward_recovery"]["completed_receipt_path"]
+        )
+        pending_path = Path(plan["forward_recovery"]["pending_receipt_path"])
+        pending = _schema_rollback_pending_payload(
+            plan,
+            forward_database=forward_database,
+            forward_projection=forward_projection,
+        )
+        try:
+            _schema_migration_atomic_json(pending_path, pending)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Schema rollback pending receipt publication failed before replace"
+            ) from exc
+
+        source.execute("ROLLBACK")
+        source.close()
+        source = None
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(database_path) + suffix)
+            if sidecar.exists() and sidecar.stat().st_size > 0:
+                raise RuntimeError(
+                    "Schema rollback source gained a non-empty SQLite sidecar"
+                )
+            sidecar.unlink(missing_ok=True)
+
+        from vector_lake.wiki_utils import _replace_prepared_file_compare_and_swap
+
+        _replace_prepared_file_compare_and_swap(
+            database_path,
+            target_stage,
+            str(plan["current_source"]["database_sha256"]).removeprefix("sha256:"),
+        )
+        target_stage = None
+        _schema_migration_fsync_path(database_path)
+        _schema_migration_fsync_directory(database_path.parent)
+        _schema_rollback_publish_projection(plan, projection_stages)
+        projection_stages = {}
+        post = _schema_rollback_verify_target(plan, database_path)
+        completed = _schema_rollback_completed_payload(pending, post)
+        try:
+            _schema_migration_atomic_json(completed_path, completed)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Schema rollback completed but receipt publication failed"
+            ) from exc
+        _INITIALIZED_DB_PATHS.discard(str(database_path.resolve()))
+        return {
+            "contract": _SCHEMA_ROLLBACK_RECEIPT_CONTRACT,
+            "dry_run": False,
+            "applied": True,
+            "no_op": False,
+            "recovery_action": plan.get("recovery_action"),
+            "plan_fingerprint": plan["fingerprint"],
+            "migration_receipt": plan["migration_receipt"],
+            "forward_recovery": completed["forward_recovery"],
+            "post": post,
+            "projection_action": plan["projection_action"],
+            "old_runtime_projection_rebuild_required": plan[
+                "old_runtime_projection_rebuild_required"
+            ],
+            "receipt_path": str(completed_path),
+            "pending_receipt_path": str(pending_path),
+            "receipt_fingerprint": completed["receipt_fingerprint"],
+        }
+    finally:
+        if source is not None:
+            if source.in_transaction:
+                source.execute("ROLLBACK")
+            source.close()
+        if forward_stage is not None:
+            forward_stage.unlink(missing_ok=True)
+            Path(str(forward_stage) + "-wal").unlink(missing_ok=True)
+            Path(str(forward_stage) + "-shm").unlink(missing_ok=True)
+        if target_stage is not None:
+            target_stage.unlink(missing_ok=True)
+            Path(str(target_stage) + "-wal").unlink(missing_ok=True)
+            Path(str(target_stage) + "-shm").unlink(missing_ok=True)
+        _schema_rollback_cleanup_projection_stage(projection_stages)
+        if projection_lock is not None:
+            projection_lock.release()
         maintenance_lock.release()
 
 
@@ -3958,6 +7406,12 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
             "trg_operational_memory_search_update",
             "trg_operational_memory_search_update_key",
             "trg_operational_memory_search_delete",
+            "trg_operational_memory_search_docs_insert_revision",
+            "trg_operational_memory_search_docs_update_revision",
+            "trg_operational_memory_search_docs_delete_revision",
+            "trg_operational_memory_search_pending_insert_revision",
+            "trg_operational_memory_search_pending_update_revision",
+            "trg_operational_memory_search_pending_delete_revision",
         ):
             conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
         return False
@@ -3987,9 +7441,16 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
         CREATE TABLE IF NOT EXISTS operational_memory_search_docs (
             doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
             memory_id TEXT NOT NULL UNIQUE,
-            source_updated_at TEXT
+            source_updated_at TEXT,
+            source_sha256 TEXT NOT NULL DEFAULT ''
         )
     """)
+    _add_column_if_missing(
+        conn,
+        "operational_memory_search_docs",
+        "source_sha256",
+        "TEXT NOT NULL DEFAULT ''",
+    )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS operational_memory_search_pending (
             memory_id TEXT PRIMARY KEY,
@@ -4002,7 +7463,13 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             backfill_cursor TEXT NOT NULL DEFAULT '',
             backfill_target TEXT NOT NULL DEFAULT '',
-            schema_version INTEGER NOT NULL DEFAULT 5,
+            schema_version INTEGER NOT NULL DEFAULT 7,
+            proof_status TEXT NOT NULL DEFAULT 'rebuild_required',
+            proof_generation TEXT,
+            canonical_corpus_sha256 TEXT,
+            docs_corpus_sha256 TEXT,
+            trigram_corpus_sha256 TEXT,
+            short_corpus_sha256 TEXT,
             updated_at TEXT
         )
     """
@@ -4018,6 +7485,12 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
         "backfill_cursor": "TEXT",
         "backfill_target": "TEXT",
         "schema_version": "INTEGER",
+        "proof_status": "TEXT",
+        "proof_generation": "TEXT",
+        "canonical_corpus_sha256": "TEXT",
+        "docs_corpus_sha256": "TEXT",
+        "trigram_corpus_sha256": "TEXT",
+        "short_corpus_sha256": "TEXT",
         "updated_at": "TEXT",
     }:
         conn.execute("DELETE FROM operational_memory_search_fts")
@@ -4028,14 +7501,24 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
         conn.execute(search_state_sql)
     conn.execute(
         "INSERT OR IGNORE INTO operational_memory_search_state "
-        "(singleton, backfill_cursor, backfill_target, schema_version, updated_at) "
-        "SELECT 1, '', COALESCE(MAX(memory_id), ''), 5, ? FROM operational_memory",
+        "(singleton, backfill_cursor, backfill_target, schema_version, "
+        "proof_status, updated_at) "
+        "SELECT 1, '', COALESCE(MAX(memory_id), ''), 7, "
+        "'rebuild_required', ? FROM operational_memory",
         (datetime.now(timezone.utc).isoformat(),),
     )
     state = conn.execute(
         "SELECT schema_version FROM operational_memory_search_state WHERE singleton = 1"
     ).fetchone()
-    if state is not None and int(state[0] or 0) != 5:
+    state_version = int(state[0] or 0) if state is not None else 0
+    if state_version == 6:
+        # v7 only adds a durable projection revision. Existing v6 proof bytes
+        # remain valid and do not require an O(N) replay during package upgrade.
+        conn.execute(
+            "UPDATE operational_memory_search_state SET schema_version = 7 "
+            "WHERE singleton = 1"
+        )
+    elif state is not None and state_version != 7:
         conn.execute("DELETE FROM operational_memory_search_fts")
         conn.execute("DELETE FROM operational_memory_search_short_fts")
         conn.execute("DELETE FROM operational_memory_search_docs")
@@ -4043,10 +7526,54 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
         conn.execute(
             "UPDATE operational_memory_search_state SET backfill_cursor = '', "
             "backfill_target = (SELECT COALESCE(MAX(memory_id), '') "
-            "FROM operational_memory), schema_version = 5, updated_at = ? "
+            "FROM operational_memory), schema_version = 7, "
+            "proof_status = 'rebuild_required', proof_generation = NULL, "
+            "canonical_corpus_sha256 = NULL, docs_corpus_sha256 = NULL, "
+            "trigram_corpus_sha256 = NULL, short_corpus_sha256 = NULL, "
+            "updated_at = ? "
             "WHERE singleton = 1",
             (datetime.now(timezone.utc).isoformat(),),
         )
+    revision_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'operational_memory_search_revision'"
+    ).fetchone() is not None
+    revision_sql = """
+        CREATE TABLE IF NOT EXISTS operational_memory_search_revision (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+            updated_at TEXT
+        )
+    """
+    conn.execute(revision_sql)
+    revision_columns = {
+        str(row[1]): str(row[2] or "").strip().upper()
+        for row in conn.execute(
+            "PRAGMA table_info(operational_memory_search_revision)"
+        )
+    }
+    if revision_columns != {
+        "singleton": "INTEGER",
+        "revision": "INTEGER",
+        "updated_at": "TEXT",
+    }:
+        conn.execute("DROP TABLE operational_memory_search_revision")
+        conn.execute(revision_sql)
+        if revision_table_exists:
+            conn.execute(
+                "UPDATE operational_memory_search_state SET "
+                "backfill_cursor = '', proof_status = 'rebuild_required', "
+                "proof_generation = NULL, canonical_corpus_sha256 = NULL, "
+                "docs_corpus_sha256 = NULL, trigram_corpus_sha256 = NULL, "
+                "short_corpus_sha256 = NULL, updated_at = ? "
+                "WHERE singleton = 1",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+    conn.execute(
+        "INSERT OR IGNORE INTO operational_memory_search_revision "
+        "(singleton, revision, updated_at) VALUES (1, 0, ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
     conn.execute("""
         CREATE TRIGGER IF NOT EXISTS trg_operational_memory_search_insert
         AFTER INSERT ON operational_memory
@@ -4096,6 +7623,25 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
                 queued_at = excluded.queued_at;
         END
     """)
+    for surface in ("docs", "pending"):
+        table_name = f"operational_memory_search_{surface}"
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            trigger_name = (
+                f"trg_operational_memory_search_{surface}_"
+                f"{operation.casefold()}_revision"
+            )
+            conn.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                AFTER {operation} ON {table_name}
+                BEGIN
+                    UPDATE operational_memory_search_revision
+                    SET revision = revision + 1,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE singleton = 1;
+                END
+            """)
+    if not conn.execute("SELECT 1 FROM operational_memory LIMIT 1").fetchone():
+        certify_operational_memory_search_integrity(conn)
     return True
 
 
@@ -4104,7 +7650,7 @@ def _init_db_once(db_key: str):
     in_tx = getattr(_LOCAL, "in_transaction", False)
     if not in_tx:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        _configure_sqlite_durability(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     with transaction():
         observed_schema_version = int(
@@ -4132,6 +7678,8 @@ def _init_db_once(db_key: str):
         _assert_duplicate_index_cleanup_v5_contract(conn)
         _assert_change_set_history_schema_v6_contract(conn)
         _assert_change_set_payload_schema_v7_contract(conn)
+        _assert_search_runtime_schema_v8_contract(conn)
+        _assert_projection_runtime_schema_v9_contract(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (
                 entity_id TEXT PRIMARY KEY,
@@ -4654,6 +8202,10 @@ def _init_db_once(db_key: str):
             _migrate_change_set_history_schema_v6(conn)
         if current_schema_version < 7:
             _migrate_change_set_payload_schema_v7(conn)
+        if current_schema_version < 8:
+            _migrate_search_runtime_schema_v8(conn)
+        if current_schema_version < 9:
+            _migrate_projection_runtime_schema_v9(conn)
         _record_schema_migrations(conn, current_schema_version)
     if current_schema_version < 2:
         _assert_identity_schema_contract(conn)
@@ -4662,6 +8214,8 @@ def _init_db_once(db_key: str):
         _assert_duplicate_index_cleanup_v5_contract(conn)
         _assert_change_set_history_schema_v6_contract(conn)
         _assert_change_set_payload_schema_v7_contract(conn)
+        _assert_search_runtime_schema_v8_contract(conn)
+        _assert_projection_runtime_schema_v9_contract(conn)
         with _IDENTITY_VALIDATION_LOCK:
             _IDENTITY_VALIDATION_TOKENS[db_key] = _identity_validation_token(conn)
     else:
@@ -4692,6 +8246,958 @@ def upsert_search_index(node_key: str, title: str, summary: str, text: str):
         """,
             (node_key, title_tok, summary_tok, text_tok),
         )
+        _mark_search_projection_rebuild_required(conn)
+
+
+def _mark_search_projection_rebuild_required(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "UPDATE search_projection_state_v8 SET status = 'rebuild_required', "
+        "projection_generation = NULL, canonical_generation_json = NULL, "
+        "expected_corpus_sha256 = NULL, updated_at = ? WHERE singleton = 1",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+
+
+def get_search_projection_state(
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    connection = conn or get_connection()
+    row = connection.execute(
+        "SELECT status, projection_generation, canonical_generation_json, "
+        "expected_row_count, expected_corpus_sha256, updated_at "
+        "FROM search_projection_state_v8 WHERE singleton = 1"
+    ).fetchone()
+    if row is None:
+        return {"status": "missing"}
+    result = dict(row)
+    raw_generation = result.pop("canonical_generation_json", None)
+    try:
+        result["canonical_generation"] = json.loads(raw_generation or "null")
+    except (TypeError, ValueError):
+        result["canonical_generation"] = None
+        result["status"] = "invalid"
+    result["expected_row_count"] = int(result.get("expected_row_count") or 0)
+    return result
+
+
+def _require_projection_runtime_v9_transaction(conn: sqlite3.Connection) -> None:
+    if not conn.in_transaction:
+        raise RuntimeError(
+            "projection_runtime_v9 mutation requires a caller-owned transaction"
+        )
+    _assert_projection_runtime_schema_v9_contract(conn)
+
+
+def get_projection_runtime_v9(
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Return the validated projection-v2 publication state."""
+    connection = conn or get_connection()
+    _assert_projection_runtime_schema_v9_contract(connection)
+    row = connection.execute(
+        "SELECT format_version, status, projection_generation, "
+        "canonical_generation_json, sidecar_sha256, sidecar_json, "
+        "previous_sidecar_json, updated_at FROM projection_runtime_v9 "
+        "WHERE singleton = 1"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("projection_runtime_v9 singleton is missing")
+    canonical_generation = None
+    sidecar = None
+    previous_sidecar = None
+    if row[3] is not None:
+        _canonical_json, canonical_generation = (
+            _projection_runtime_v9_generations(row[3])
+        )
+    if row[5] is not None:
+        _sidecar_json, sidecar = _projection_runtime_v9_sidecar(row[5])
+    if row[6] is not None:
+        _previous_json, previous_sidecar = _projection_runtime_v9_sidecar(
+            row[6], label="previous_sidecar"
+        )
+    return {
+        "format_version": int(row[0]),
+        "status": str(row[1]),
+        "projection_generation": row[2],
+        "canonical_generation": canonical_generation,
+        "canonical_generation_json": row[3],
+        "sidecar_sha256": row[4],
+        "sidecar": sidecar,
+        "sidecar_json": row[5],
+        "previous_sidecar": previous_sidecar,
+        "previous_sidecar_json": row[6],
+        "updated_at": str(row[7]),
+    }
+
+
+def cas_projection_runtime_publish_pending(
+    conn: sqlite3.Connection,
+    *,
+    expected_status: str,
+    expected_projection_generation: str | None,
+    projection_generation: str,
+    canonical_generation: object,
+    sidecar_json: object,
+    previous_sidecar_json: object | None = None,
+) -> dict:
+    """CAS a durable publish intent inside the caller's transaction."""
+    _require_projection_runtime_v9_transaction(conn)
+    if expected_status not in {"rebuild_required", "publish_pending", "ready"}:
+        raise ValueError("expected_status_invalid")
+    if expected_projection_generation is not None:
+        expected_projection_generation = _projection_runtime_v9_digest(
+            expected_projection_generation,
+            label="expected_projection_generation",
+        )
+    projection_generation = _projection_runtime_v9_digest(
+        projection_generation,
+        label="projection_generation",
+    )
+    canonical_json, generations = _projection_runtime_v9_generations(
+        canonical_generation
+    )
+    normalized_sidecar_json, _sidecar = _projection_runtime_v9_sidecar(
+        sidecar_json,
+        expected_projection_generation=projection_generation,
+        expected_canonical_generation=generations,
+    )
+    sidecar_sha256 = hashlib.sha256(
+        normalized_sidecar_json.encode("utf-8")
+    ).hexdigest()
+
+    current = conn.execute(
+        "SELECT status, projection_generation, sidecar_json, "
+        "previous_sidecar_json FROM projection_runtime_v9 WHERE singleton = 1"
+    ).fetchone()
+    if current is None:
+        raise RuntimeError("projection_runtime_v9 singleton is missing")
+    normalized_previous = None
+    if previous_sidecar_json is None:
+        if str(current[0]) == "ready" and current[2] is not None:
+            normalized_previous = str(current[2])
+        elif str(current[0]) == "publish_pending" and current[3] is not None:
+            normalized_previous = str(current[3])
+    else:
+        normalized_previous, _previous = _projection_runtime_v9_sidecar(
+            previous_sidecar_json,
+            label="previous_sidecar",
+        )
+    updated_at = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "UPDATE projection_runtime_v9 SET status = 'publish_pending', "
+        "projection_generation = ?, canonical_generation_json = ?, "
+        "sidecar_sha256 = ?, sidecar_json = ?, previous_sidecar_json = ?, "
+        "updated_at = ? WHERE singleton = 1 AND status = ? "
+        "AND projection_generation IS ?",
+        (
+            projection_generation,
+            canonical_json,
+            sidecar_sha256,
+            normalized_sidecar_json,
+            normalized_previous,
+            updated_at,
+            expected_status,
+            expected_projection_generation,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("projection_runtime_v9 publish CAS mismatch")
+    return get_projection_runtime_v9(conn)
+
+
+def mark_projection_runtime_ready(
+    conn: sqlite3.Connection,
+    *,
+    expected_projection_generation: str,
+    expected_sidecar_sha256: str,
+) -> dict:
+    """Commit a published pointer only from its exact pending intent."""
+    _require_projection_runtime_v9_transaction(conn)
+    generation = _projection_runtime_v9_digest(
+        expected_projection_generation,
+        label="expected_projection_generation",
+    )
+    sidecar_sha256 = _projection_runtime_v9_digest(
+        expected_sidecar_sha256,
+        label="expected_sidecar_sha256",
+    )
+    cursor = conn.execute(
+        "UPDATE projection_runtime_v9 SET status = 'ready', "
+        "previous_sidecar_json = NULL, updated_at = ? "
+        "WHERE singleton = 1 AND status = 'publish_pending' "
+        "AND projection_generation = ? AND sidecar_sha256 = ?",
+        (datetime.now(timezone.utc).isoformat(), generation, sidecar_sha256),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("projection_runtime_v9 ready CAS mismatch")
+    return get_projection_runtime_v9(conn)
+
+
+def mark_projection_runtime_rebuild_required(
+    conn: sqlite3.Connection,
+    *,
+    expected_projection_generation: str | None = None,
+) -> dict:
+    """Fail closed to a pointer-free rebuild state in the caller transaction."""
+    _require_projection_runtime_v9_transaction(conn)
+    sql = (
+        "UPDATE projection_runtime_v9 SET status = 'rebuild_required', "
+        "projection_generation = NULL, canonical_generation_json = NULL, "
+        "sidecar_sha256 = NULL, sidecar_json = NULL, "
+        "previous_sidecar_json = NULL, updated_at = ? WHERE singleton = 1"
+    )
+    parameters: tuple[object, ...] = (datetime.now(timezone.utc).isoformat(),)
+    if expected_projection_generation is not None:
+        generation = _projection_runtime_v9_digest(
+            expected_projection_generation,
+            label="expected_projection_generation",
+        )
+        sql += " AND projection_generation = ?"
+        parameters += (generation,)
+    cursor = conn.execute(sql, parameters)
+    if cursor.rowcount != 1:
+        raise RuntimeError("projection_runtime_v9 rebuild CAS mismatch")
+    return get_projection_runtime_v9(conn)
+
+
+def inspect_search_projection_corpus(
+    conn: sqlite3.Connection | None = None,
+    *,
+    max_rows: int | None = None,
+    max_bytes: int | None = None,
+) -> dict:
+    """Stream the ordered FTS corpus into its durable digest contract.
+
+    Optional limits turn this diagnostic into a fail-closed hot-path probe
+    without materializing the corpus in memory.
+    """
+    from vector_lake.search_projection_contract import encode_fts_corpus_row
+
+    connection = conn or get_connection()
+    digest = hashlib.sha256()
+    row_count = 0
+    payload_bytes = 0
+    for row in connection.execute(
+        "SELECT node_key, title, summary, text FROM wiki_search_index "
+        "ORDER BY node_key, title, summary, text"
+    ):
+        if max_rows is not None and row_count >= max(0, int(max_rows)):
+            raise SearchProjectionIntegrityLimitExceeded("row_limit")
+        encoded = encode_fts_corpus_row(row)
+        payload_bytes += len(encoded)
+        if max_bytes is not None and payload_bytes > max(0, int(max_bytes)):
+            raise SearchProjectionIntegrityLimitExceeded("byte_limit")
+        digest.update(encoded)
+        row_count += 1
+    return {
+        "row_count": row_count,
+        "corpus_sha256": digest.hexdigest(),
+        "payload_bytes": payload_bytes,
+    }
+
+
+class SearchProjectionIntegrityLimitExceeded(RuntimeError):
+    """Raised when a cold FTS proof exceeds its configured safety envelope."""
+
+
+def _search_projection_revision_token(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0)
+    data_version = int(conn.execute("PRAGMA data_version").fetchone()[0] or 0)
+    write_epoch = int(
+        getattr(conn, "_search_projection_write_epoch", conn.total_changes) or 0
+    )
+    return schema_version, data_version, write_epoch
+
+
+def _search_projection_state_proof(state: dict) -> tuple | None:
+    expected_digest = str(state.get("expected_corpus_sha256") or "")
+    projection_generation = str(state.get("projection_generation") or "")
+    canonical_generation = state.get("canonical_generation")
+    if (
+        state.get("status") != "ready"
+        or not projection_generation
+        or not isinstance(canonical_generation, dict)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+    ):
+        return None
+    try:
+        canonical_json = json.dumps(
+            canonical_generation,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+    return (
+        projection_generation,
+        canonical_json,
+        int(state.get("expected_row_count") or 0),
+        expected_digest,
+        str(state.get("updated_at") or ""),
+    )
+
+
+def verify_search_projection_integrity(
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Verify FTS bytes once per connection-visible SQLite revision.
+
+    The durable state binds the expected corpus digest to a projection
+    generation. A cold or changed revision is streamed under hard row/byte
+    limits; stable hot queries reuse the exact outcome. The revision and state
+    are fenced on both sides so a concurrent writer cannot validate a mixed
+    snapshot.
+    """
+    connection = conn or get_connection()
+    revision_before = _search_projection_revision_token(connection)
+    state_before = get_search_projection_state(connection)
+    proof = _search_projection_state_proof(state_before)
+    if proof is None:
+        return {
+            "status": "invalid",
+            "issue": "fts_projection_state",
+            "signature": None,
+        }
+
+    cache = getattr(connection, "_search_projection_integrity_cache", None)
+    cached_result = None
+    if (
+        isinstance(cache, dict)
+        and cache.get("proof") == proof
+        and cache.get("revision") == revision_before
+        and isinstance(cache.get("result"), dict)
+    ):
+        cached_result = dict(cache["result"])
+
+    if cached_result is None:
+        max_rows = _configured_nonnegative_int(
+            "VECTOR_LAKE_SEARCH_INTEGRITY_MAX_ROWS",
+            _SEARCH_PROJECTION_INTEGRITY_MAX_ROWS_DEFAULT,
+            _SEARCH_PROJECTION_INTEGRITY_MAX_ROWS_HARD,
+        )
+        max_bytes = _configured_nonnegative_int(
+            "VECTOR_LAKE_SEARCH_INTEGRITY_MAX_BYTES",
+            _SEARCH_PROJECTION_INTEGRITY_MAX_BYTES_DEFAULT,
+            _SEARCH_PROJECTION_INTEGRITY_MAX_BYTES_HARD,
+        )
+        if proof[2] > max_rows:
+            return {
+                "status": "invalid",
+                "issue": "fts_projection_integrity_limit",
+                "signature": None,
+            }
+        try:
+            observed = inspect_search_projection_corpus(
+                connection,
+                max_rows=max_rows,
+                max_bytes=max_bytes,
+            )
+        except SearchProjectionIntegrityLimitExceeded:
+            return {
+                "status": "invalid",
+                "issue": "fts_projection_integrity_limit",
+                "signature": None,
+            }
+        row_count_matches = int(observed["row_count"]) == proof[2]
+        digest_matches = str(observed["corpus_sha256"]) == proof[3]
+        valid = row_count_matches and digest_matches
+        cached_result = {
+            "status": "ready" if valid else "invalid",
+            "issue": (
+                None
+                if valid
+                else (
+                    "fts_projection_integrity"
+                    if row_count_matches
+                    else "fts_projection_state"
+                )
+            ),
+            "signature": (*proof, *revision_before) if valid else None,
+            "observed_row_count": int(observed["row_count"]),
+            "observed_corpus_sha256": str(observed["corpus_sha256"]),
+            "observed_payload_bytes": int(observed["payload_bytes"]),
+        }
+
+    state_after = get_search_projection_state(connection)
+    revision_after = _search_projection_revision_token(connection)
+    if (
+        revision_after != revision_before
+        or _search_projection_state_proof(state_after) != proof
+    ):
+        return {
+            "status": "invalid",
+            "issue": "fts_projection_integrity_race",
+            "signature": None,
+        }
+
+    try:
+        connection._search_projection_integrity_cache = {
+            "proof": proof,
+            "revision": revision_before,
+            "result": dict(cached_result),
+        }
+    except AttributeError:
+        pass
+    return cached_result
+
+
+class OperationalMemorySearchIntegrityLimitExceeded(RuntimeError):
+    """Raised when a bounded memory-search proof exceeds its safety envelope."""
+
+
+_OPERATIONAL_MEMORY_SEARCH_SHADOW_TABLES = {
+    "trigram": (
+        "operational_memory_search_fts_data",
+        "operational_memory_search_fts_idx",
+        "operational_memory_search_fts_docsize",
+        "operational_memory_search_fts_config",
+    ),
+    "short": (
+        "operational_memory_search_short_fts_data",
+        "operational_memory_search_short_fts_idx",
+        "operational_memory_search_short_fts_docsize",
+        "operational_memory_search_short_fts_config",
+    ),
+}
+
+
+def operational_memory_search_source_projection(payload: str) -> tuple[str, ...]:
+    """Return the exact normalized source fields consumed by both FTS indexes."""
+    memory = json.loads(payload)
+    if not isinstance(memory, dict):
+        raise ValueError("operational-memory payload must be a JSON object")
+    return (
+        str(memory.get("memory_key", "")).lower(),
+        str(memory.get("text", "")).lower(),
+        str(memory.get("source_page", "")).lower(),
+        str(memory.get("memory_type", "fact")).lower(),
+    )
+
+
+def _update_integrity_digest_value(digest, value: object) -> int:
+    if value is None:
+        marker = b"n"
+        payload = b""
+    elif isinstance(value, bytes):
+        marker = b"b"
+        payload = value
+    else:
+        marker = b"t"
+        payload = str(value).encode("utf-8")
+    encoded = marker + len(payload).to_bytes(8, "big") + payload
+    digest.update(encoded)
+    return len(encoded)
+
+
+def operational_memory_search_source_sha256(
+    memory_id: str,
+    payload: str,
+    updated_at: object,
+) -> str:
+    """Bind one indexed document to its exact canonical source row."""
+    digest = hashlib.sha256()
+    for value in (str(memory_id), str(payload), str(updated_at or "")):
+        _update_integrity_digest_value(digest, value)
+    return digest.hexdigest()
+
+
+def operational_memory_search_projection_sha256(
+    memory_id: str,
+    projection: tuple[str, ...],
+    updated_at: object,
+) -> str:
+    """Hash an already decoded four-field memory-search projection."""
+    if len(projection) != 4:
+        raise ValueError("operational-memory search projection must have four fields")
+    digest = hashlib.sha256()
+    for value in (
+        str(memory_id),
+        *(str(item) for item in projection),
+        str(updated_at or ""),
+    ):
+        _update_integrity_digest_value(digest, value)
+    return digest.hexdigest()
+
+
+class _OperationalMemorySearchIntegrityAccumulator:
+    def __init__(self, *, max_rows: int, max_bytes: int):
+        self.max_rows = max(0, int(max_rows))
+        self.max_bytes = max(0, int(max_bytes))
+        self.row_count = 0
+        self.payload_bytes = 0
+
+    def update_row(self, digest, row) -> None:
+        if self.row_count >= self.max_rows:
+            raise OperationalMemorySearchIntegrityLimitExceeded("row_limit")
+        encoded_bytes = 0
+        for value in row:
+            encoded_bytes += _update_integrity_digest_value(digest, value)
+        if self.payload_bytes + encoded_bytes > self.max_bytes:
+            raise OperationalMemorySearchIntegrityLimitExceeded("byte_limit")
+        self.payload_bytes += encoded_bytes
+        self.row_count += 1
+
+
+def _operational_memory_shadow_digest(
+    conn: sqlite3.Connection,
+    *,
+    surface: str,
+    accumulator: _OperationalMemorySearchIntegrityAccumulator,
+) -> str:
+    digest = hashlib.sha256()
+    for table_name in _OPERATIONAL_MEMORY_SEARCH_SHADOW_TABLES[surface]:
+        columns = list(conn.execute(f"PRAGMA table_info({table_name})"))
+        if not columns:
+            raise sqlite3.OperationalError(
+                f"operational-memory FTS shadow table is missing: {table_name}"
+            )
+        column_names = [str(row[1]) for row in columns]
+        primary_key = [
+            str(row[1])
+            for row in sorted(columns, key=lambda item: int(item[5] or 0))
+            if int(row[5] or 0) > 0
+        ]
+        if not primary_key:
+            primary_key = ["rowid"]
+        _update_integrity_digest_value(digest, table_name)
+        for column_name in column_names:
+            _update_integrity_digest_value(digest, column_name)
+        select_columns = ", ".join(f'"{name}"' for name in column_names)
+        order_columns = ", ".join(f'"{name}"' for name in primary_key)
+        for row in conn.execute(
+            f'SELECT {select_columns} FROM "{table_name}" '
+            f"ORDER BY {order_columns}"
+        ):
+            accumulator.update_row(digest, row)
+    return digest.hexdigest()
+
+
+def inspect_operational_memory_search_integrity(
+    conn: sqlite3.Connection,
+    *,
+    max_rows: int | None = None,
+    max_bytes: int | None = None,
+) -> dict:
+    """Stream canonical, mapping, and physical FTS bytes into exact digests."""
+    if max_rows is None:
+        max_rows = _configured_nonnegative_int(
+            "VECTOR_LAKE_OPERATIONAL_MEMORY_INTEGRITY_MAX_ROWS",
+            _OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_ROWS_DEFAULT,
+            _OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_ROWS_HARD,
+        )
+    if max_bytes is None:
+        max_bytes = _configured_nonnegative_int(
+            "VECTOR_LAKE_OPERATIONAL_MEMORY_INTEGRITY_MAX_BYTES",
+            _OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_BYTES_DEFAULT,
+            _OPERATIONAL_MEMORY_SEARCH_INTEGRITY_MAX_BYTES_HARD,
+        )
+    accumulator = _OperationalMemorySearchIntegrityAccumulator(
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+    )
+    canonical_digest = hashlib.sha256()
+    canonical_count = 0
+    for row in conn.execute(
+        "SELECT memory_id, data_json, updated_at FROM operational_memory "
+        "ORDER BY memory_id"
+    ):
+        source_sha256 = operational_memory_search_source_sha256(
+            str(row[0]),
+            str(row[1]),
+            row[2],
+        )
+        accumulator.update_row(
+            canonical_digest,
+            (str(row[0]), source_sha256),
+        )
+        canonical_count += 1
+
+    docs_digest = hashlib.sha256()
+    docs_count = 0
+    for row in conn.execute(
+        "SELECT memory_id, source_sha256 FROM operational_memory_search_docs "
+        "ORDER BY memory_id"
+    ):
+        accumulator.update_row(
+            docs_digest,
+            (str(row[0]), str(row[1] or "")),
+        )
+        docs_count += 1
+
+    trigram_digest = _operational_memory_shadow_digest(
+        conn,
+        surface="trigram",
+        accumulator=accumulator,
+    )
+    short_digest = _operational_memory_shadow_digest(
+        conn,
+        surface="short",
+        accumulator=accumulator,
+    )
+    return {
+        "canonical_corpus_sha256": canonical_digest.hexdigest(),
+        "docs_corpus_sha256": docs_digest.hexdigest(),
+        "trigram_corpus_sha256": trigram_digest,
+        "short_corpus_sha256": short_digest,
+        "canonical_documents": canonical_count,
+        "indexed_documents": docs_count,
+        "trigram_indexed_documents": int(
+            conn.execute(
+                "SELECT COUNT(*) FROM operational_memory_search_fts"
+            ).fetchone()[0]
+        ),
+        "short_indexed_documents": int(
+            conn.execute(
+                "SELECT COUNT(*) FROM operational_memory_search_short_fts"
+            ).fetchone()[0]
+        ),
+        "inspected_rows": accumulator.row_count,
+        "inspected_bytes": accumulator.payload_bytes,
+    }
+
+
+def _operational_memory_search_revision_token(
+    conn: sqlite3.Connection,
+) -> tuple[int, int, int]:
+    revision_row = conn.execute(
+        "SELECT revision FROM operational_memory_search_revision "
+        "WHERE singleton = 1"
+    ).fetchone()
+    if revision_row is None:
+        raise sqlite3.OperationalError(
+            "operational-memory search revision state is missing"
+        )
+    return (
+        int(conn.execute("PRAGMA schema_version").fetchone()[0] or 0),
+        int(revision_row[0] or 0),
+        int(
+            getattr(
+                conn,
+                "_operational_memory_search_write_epoch",
+                conn.total_changes,
+            )
+            or 0
+        ),
+    )
+
+
+def _operational_memory_search_data_version(conn: sqlite3.Connection) -> int:
+    """Fence one query without coupling cache validity to unrelated commits."""
+    return int(conn.execute("PRAGMA data_version").fetchone()[0] or 0)
+
+
+def _operational_memory_search_attestation_seconds() -> float:
+    raw = os.environ.get(
+        "VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS",
+        str(_OPERATIONAL_MEMORY_SEARCH_ATTESTATION_SECONDS_DEFAULT),
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = _OPERATIONAL_MEMORY_SEARCH_ATTESTATION_SECONDS_DEFAULT
+    if not math.isfinite(value):
+        value = _OPERATIONAL_MEMORY_SEARCH_ATTESTATION_SECONDS_DEFAULT
+    return max(
+        0.0,
+        min(_OPERATIONAL_MEMORY_SEARCH_ATTESTATION_SECONDS_MAX, value),
+    )
+
+
+def _operational_memory_search_proof_generation(digests: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    for value in digests:
+        _update_integrity_digest_value(digest, value)
+    return digest.hexdigest()
+
+
+def _operational_memory_search_state_proof(
+    conn: sqlite3.Connection,
+) -> tuple | None:
+    row = conn.execute(
+        "SELECT schema_version, proof_status, proof_generation, "
+        "canonical_corpus_sha256, docs_corpus_sha256, "
+        "trigram_corpus_sha256, short_corpus_sha256 "
+        "FROM operational_memory_search_state WHERE singleton = 1"
+    ).fetchone()
+    if row is None or int(row[0] or 0) != 7 or str(row[1] or "") != "ready":
+        return None
+    generation = str(row[2] or "")
+    digests = tuple(str(value or "") for value in row[3:7])
+    if not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in digests):
+        return None
+    if not hmac.compare_digest(
+        generation,
+        _operational_memory_search_proof_generation(digests),
+    ):
+        return None
+    return (7, generation, *digests)
+
+
+def _operational_memory_search_observed_result(
+    proof: tuple,
+    observed: dict,
+) -> dict:
+    expected = {
+        "canonical_corpus_sha256": proof[2],
+        "docs_corpus_sha256": proof[3],
+        "trigram_corpus_sha256": proof[4],
+        "short_corpus_sha256": proof[5],
+    }
+    counts = (
+        int(observed["canonical_documents"]),
+        int(observed["indexed_documents"]),
+        int(observed["trigram_indexed_documents"]),
+        int(observed["short_indexed_documents"]),
+    )
+    valid = (
+        len(set(counts)) == 1
+        and hmac.compare_digest(
+            str(observed["canonical_corpus_sha256"]),
+            str(observed["docs_corpus_sha256"]),
+        )
+        and all(
+            hmac.compare_digest(str(observed[key]), expected[key])
+            for key in expected
+        )
+    )
+    return {
+        "status": "ready" if valid else "invalid",
+        "issue": None if valid else "operational_memory_search_integrity",
+        "signature": None,
+        **observed,
+    }
+
+
+def verify_operational_memory_search_integrity(
+    conn: sqlite3.Connection,
+    *,
+    allow_full_scan: bool = True,
+) -> dict:
+    """Verify relevant revisions immediately and bypass writes periodically."""
+    try:
+        revision_before = _operational_memory_search_revision_token(conn)
+        data_version_before = _operational_memory_search_data_version(conn)
+    except sqlite3.Error:
+        return {
+            "status": "invalid",
+            "issue": "operational_memory_search_integrity_state",
+            "signature": None,
+        }
+    try:
+        proof = _operational_memory_search_state_proof(conn)
+    except sqlite3.Error:
+        proof = None
+    if proof is None:
+        return {
+            "status": "invalid",
+            "issue": "operational_memory_search_integrity_state",
+            "signature": None,
+        }
+
+    cache = getattr(conn, "_operational_memory_search_integrity_cache", None)
+    cached_result = None
+    verification_kind = "full"
+    now_monotonic = time.monotonic()
+    attestation_seconds = _operational_memory_search_attestation_seconds()
+    if (
+        isinstance(cache, dict)
+        and cache.get("proof") == proof
+        and cache.get("revision") == revision_before
+        and isinstance(cache.get("result"), dict)
+        and isinstance(cache.get("attested_at_monotonic"), (int, float))
+        and now_monotonic - float(cache["attested_at_monotonic"])
+        < attestation_seconds
+    ):
+        cached_result = dict(cache["result"])
+        verification_kind = "cached"
+
+    if cached_result is None:
+        if not allow_full_scan:
+            return {
+                "status": "deferred",
+                "issue": "operational_memory_search_attestation_required",
+                "signature": None,
+                "verification_kind": "deferred",
+                "attestation_seconds": attestation_seconds,
+                "next_attestation_in_seconds": 0.0,
+            }
+        try:
+            observed = inspect_operational_memory_search_integrity(conn)
+            cached_result = _operational_memory_search_observed_result(
+                proof,
+                observed,
+            )
+        except OperationalMemorySearchIntegrityLimitExceeded:
+            cached_result = {
+                "status": "invalid",
+                "issue": "operational_memory_search_integrity_limit",
+                "signature": None,
+            }
+        except (sqlite3.Error, TypeError, ValueError):
+            cached_result = {
+                "status": "invalid",
+                "issue": "operational_memory_search_integrity",
+                "signature": None,
+            }
+
+    try:
+        proof_after = _operational_memory_search_state_proof(conn)
+    except sqlite3.Error:
+        proof_after = None
+    try:
+        revision_after = _operational_memory_search_revision_token(conn)
+        data_version_after = _operational_memory_search_data_version(conn)
+    except sqlite3.Error:
+        revision_after = None
+        data_version_after = None
+    if (
+        revision_after != revision_before
+        or proof_after != proof
+        or data_version_after != data_version_before
+    ):
+        return {
+            "status": "invalid",
+            "issue": "operational_memory_search_integrity_race",
+            "signature": None,
+        }
+    if cached_result.get("status") == "ready":
+        cached_result["signature"] = (
+            *proof,
+            *revision_before,
+            data_version_before,
+        )
+    cached_result["verification_kind"] = verification_kind
+    attested_at = (
+        float(cache["attested_at_monotonic"])
+        if verification_kind == "cached"
+        else now_monotonic
+    )
+    cached_result["attestation_seconds"] = attestation_seconds
+    cached_result["next_attestation_in_seconds"] = max(
+        0.0,
+        round(attestation_seconds - (now_monotonic - attested_at), 6),
+    )
+    try:
+        conn._operational_memory_search_integrity_cache = {
+            "proof": proof,
+            "revision": revision_before,
+            "result": dict(cached_result),
+            "attested_at_monotonic": attested_at,
+        }
+    except AttributeError:
+        pass
+    return cached_result
+
+
+def mark_operational_memory_search_rebuild_required(
+    conn: sqlite3.Connection,
+) -> None:
+    if not getattr(_LOCAL, "in_transaction", False) or not conn.in_transaction:
+        raise RuntimeError(
+            "Operational-memory search repair requires an active transaction"
+        )
+    conn.execute(
+        "UPDATE operational_memory_search_state SET backfill_cursor = '', "
+        "backfill_target = (SELECT COALESCE(MAX(memory_id), '') "
+        "FROM operational_memory), proof_status = 'rebuild_required', "
+        "proof_generation = NULL, canonical_corpus_sha256 = NULL, "
+        "docs_corpus_sha256 = NULL, trigram_corpus_sha256 = NULL, "
+        "short_corpus_sha256 = NULL, updated_at = ? WHERE singleton = 1",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+
+
+def invalidate_operational_memory_search_proof(
+    conn: sqlite3.Connection,
+) -> None:
+    """Invalidate a proof while preserving pending/backfill progress."""
+    if not getattr(_LOCAL, "in_transaction", False) or not conn.in_transaction:
+        raise RuntimeError(
+            "Operational-memory search invalidation requires an active transaction"
+        )
+    conn.execute(
+        "UPDATE operational_memory_search_state SET "
+        "proof_status = 'rebuild_required', proof_generation = NULL, "
+        "canonical_corpus_sha256 = NULL, docs_corpus_sha256 = NULL, "
+        "trigram_corpus_sha256 = NULL, short_corpus_sha256 = NULL, "
+        "updated_at = ? WHERE singleton = 1",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+
+
+def certify_operational_memory_search_integrity(
+    conn: sqlite3.Connection,
+) -> dict:
+    """Persist a proof only for a complete, caller-locked derived projection."""
+    if not getattr(_LOCAL, "in_transaction", False) or not conn.in_transaction:
+        raise RuntimeError(
+            "Operational-memory search certification requires an active transaction"
+        )
+    state = conn.execute(
+        "SELECT backfill_cursor, backfill_target FROM "
+        "operational_memory_search_state WHERE singleton = 1"
+    ).fetchone()
+    pending = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+    )
+    if state is None or str(state[0] or "") < str(state[1] or "") or pending:
+        raise RuntimeError("operational-memory search projection is incomplete")
+    observed = inspect_operational_memory_search_integrity(conn)
+    counts = (
+        int(observed["canonical_documents"]),
+        int(observed["indexed_documents"]),
+        int(observed["trigram_indexed_documents"]),
+        int(observed["short_indexed_documents"]),
+    )
+    if len(set(counts)) != 1 or not hmac.compare_digest(
+        str(observed["canonical_corpus_sha256"]),
+        str(observed["docs_corpus_sha256"]),
+    ):
+        raise RuntimeError("operational-memory search projection cannot be certified")
+    digests = (
+        str(observed["canonical_corpus_sha256"]),
+        str(observed["docs_corpus_sha256"]),
+        str(observed["trigram_corpus_sha256"]),
+        str(observed["short_corpus_sha256"]),
+    )
+    generation = _operational_memory_search_proof_generation(digests)
+    conn.execute(
+        "UPDATE operational_memory_search_state SET proof_status = 'ready', "
+        "proof_generation = ?, canonical_corpus_sha256 = ?, "
+        "docs_corpus_sha256 = ?, trigram_corpus_sha256 = ?, "
+        "short_corpus_sha256 = ?, updated_at = ? WHERE singleton = 1",
+        (
+            generation,
+            *digests,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    proof = (7, generation, *digests)
+    result = {
+        "status": "ready",
+        "issue": None,
+        "signature": None,
+        **observed,
+    }
+    revision = _operational_memory_search_revision_token(conn)
+    data_version = _operational_memory_search_data_version(conn)
+    result["signature"] = (*proof, *revision, data_version)
+    result["verification_kind"] = "full"
+    result["attestation_seconds"] = _operational_memory_search_attestation_seconds()
+    result["next_attestation_in_seconds"] = result["attestation_seconds"]
+    attested_at = time.monotonic()
+    try:
+        conn._operational_memory_search_integrity_cache = {
+            "proof": proof,
+            "revision": revision,
+            "result": dict(result),
+            "attested_at_monotonic": attested_at,
+        }
+    except AttributeError:
+        pass
+    return result
 
 
 def apply_search_projection_mutations(
@@ -4701,6 +9207,10 @@ def apply_search_projection_mutations(
     search_deletes: set[str] | list[str] | tuple[str, ...] = (),
     embedding_deletes: set[str] | list[str] | tuple[str, ...] = (),
     reset_search: bool = False,
+    projection_generation: str | None = None,
+    canonical_generation: dict | None = None,
+    expected_row_count: int | None = None,
+    expected_corpus_sha256: str | None = None,
 ) -> dict:
     """Apply precomputed search mutations inside one caller-owned transaction."""
     if not getattr(_LOCAL, "in_transaction", False) or not conn.in_transaction:
@@ -4774,6 +9284,40 @@ def apply_search_projection_mutations(
             "DELETE FROM vec_embeddings WHERE entity_id = ?",
             [(node_key,) for node_key in sorted(stale_embedding_keys)],
         )
+        conn.executemany(
+            "DELETE FROM embedding_metadata_v8 WHERE entity_id = ?",
+            [(node_key,) for node_key in sorted(stale_embedding_keys)],
+        )
+    state_values = (
+        projection_generation,
+        canonical_generation,
+        expected_row_count,
+        expected_corpus_sha256,
+    )
+    if any(value is not None for value in state_values):
+        if (
+            not projection_generation
+            or not isinstance(canonical_generation, dict)
+            or expected_row_count is None
+            or int(expected_row_count) < 0
+            or not re.fullmatch(r"[0-9a-f]{64}", str(expected_corpus_sha256 or ""))
+        ):
+            raise ValueError("complete search projection state is required")
+        conn.execute(
+            "UPDATE search_projection_state_v8 SET status = 'ready', "
+            "projection_generation = ?, canonical_generation_json = ?, "
+            "expected_row_count = ?, expected_corpus_sha256 = ?, updated_at = ? "
+            "WHERE singleton = 1",
+            (
+                str(projection_generation),
+                json.dumps(canonical_generation, sort_keys=True, separators=(",", ":")),
+                int(expected_row_count),
+                str(expected_corpus_sha256),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    else:
+        _mark_search_projection_rebuild_required(conn)
     return {
         "search_upserts": len(normalized_upserts),
         "search_deletes": len(delete_keys),
@@ -4787,6 +9331,7 @@ def apply_search_projection_mutations(
 
 
 def upsert_embedding(entity_id: str, embedding: list[float]):
+    """Write a legacy vector without v8 metadata; it remains fail-closed to search."""
     if not embedding:
         return
     import math
@@ -4799,9 +9344,136 @@ def upsert_embedding(entity_id: str, embedding: list[float]):
     with transaction():
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (entity_id,))
         conn.execute(
+            "DELETE FROM embedding_metadata_v8 WHERE entity_id = ?", (entity_id,)
+        )
+        conn.execute(
             "INSERT INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)",
             (entity_id, query_blob),
         )
+
+
+def upsert_embeddings_if_current_batch(
+    embeddings: list[dict[str, object]],
+    *,
+    input_contract: str,
+    model: str,
+    dimension: int,
+    expected_runtime_generations: dict[str, int],
+) -> str:
+    """CAS one embedding batch against a single canonical-generation snapshot."""
+    if not embeddings:
+        return "empty"
+    declared_dimension = int(dimension)
+    if declared_dimension <= 0:
+        raise ValueError("embedding dimension does not match the declared contract")
+
+    prepared: list[tuple[str, bytes, str]] = []
+    entity_ids: set[str] = set()
+    for item in embeddings:
+        if not isinstance(item, dict):
+            raise TypeError("embedding batch items must be mappings")
+        entity_id = str(item.get("entity_id") or "")
+        if not entity_id:
+            raise ValueError("embedding entity_id must be non-empty")
+        if entity_id in entity_ids:
+            raise ValueError("embedding batch contains duplicate entity_id")
+        entity_ids.add(entity_id)
+        content_sha256 = str(item.get("content_sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", content_sha256):
+            raise ValueError("embedding content_sha256 must be lowercase SHA-256")
+        embedding = item.get("embedding")
+        if not isinstance(embedding, (list, tuple)) or not embedding:
+            raise ValueError("embedding batch items must contain a non-empty vector")
+        if len(embedding) != declared_dimension:
+            raise ValueError("embedding dimension does not match the declared contract")
+        vector = [float(value) for value in embedding]
+        norm = math.sqrt(sum(value * value for value in vector))
+        normalized = [value / norm for value in vector] if norm > 0 else vector
+        prepared.append(
+            (entity_id, serialize_float32_vector(normalized), content_sha256)
+        )
+
+    expected = normalize_runtime_generations(expected_runtime_generations)
+    if expected is None:
+        return "unverifiable"
+    conn = get_vector_connection()
+    with transaction():
+        placeholders = ",".join("?" for _ in expected)
+        observed = {
+            str(row["surface"]): int(row["generation"])
+            for row in conn.execute(
+                "SELECT surface, generation FROM runtime_generations "
+                f"WHERE surface IN ({placeholders})",
+                tuple(sorted(expected)),
+            )
+        }
+        if observed != expected:
+            return "stale"
+        entity_id_rows = [(entity_id,) for entity_id, _, _ in prepared]
+        conn.executemany(
+            "DELETE FROM vec_embeddings WHERE entity_id = ?",
+            entity_id_rows,
+        )
+        conn.executemany(
+            "DELETE FROM embedding_metadata_v8 WHERE entity_id = ?",
+            entity_id_rows,
+        )
+        conn.executemany(
+            "INSERT INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)",
+            [(entity_id, query_blob) for entity_id, query_blob, _ in prepared],
+        )
+        generation_json = json.dumps(
+            expected,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        embedded_at = datetime.now(timezone.utc).isoformat()
+        conn.executemany(
+            "INSERT INTO embedding_metadata_v8 "
+            "(entity_id, content_sha256, input_contract, model, dimension, "
+            "canonical_generation_json, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    entity_id,
+                    content_sha256,
+                    str(input_contract),
+                    str(model),
+                    declared_dimension,
+                    generation_json,
+                    embedded_at,
+                )
+                for entity_id, _, content_sha256 in prepared
+            ],
+        )
+    return "written"
+
+
+def upsert_embedding_if_current(
+    entity_id: str,
+    embedding: list[float],
+    *,
+    content_sha256: str,
+    input_contract: str,
+    model: str,
+    dimension: int,
+    expected_runtime_generations: dict[str, int],
+) -> str:
+    """CAS one vector while preserving the legacy scalar API."""
+    if not embedding:
+        return "empty"
+    return upsert_embeddings_if_current_batch(
+        [
+            {
+                "entity_id": entity_id,
+                "embedding": embedding,
+                "content_sha256": content_sha256,
+            }
+        ],
+        input_contract=input_contract,
+        model=model,
+        dimension=dimension,
+        expected_runtime_generations=expected_runtime_generations,
+    )
 
 
 def delete_embedding(entity_id: str):
@@ -4809,6 +9481,9 @@ def delete_embedding(entity_id: str):
     with transaction():
         conn.execute(
             "DELETE FROM vec_embeddings WHERE entity_id = ?", (str(entity_id),)
+        )
+        conn.execute(
+            "DELETE FROM embedding_metadata_v8 WHERE entity_id = ?", (str(entity_id),)
         )
 
 
@@ -4822,6 +9497,10 @@ def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
     with transaction():
         conn.executemany(
             "DELETE FROM vec_embeddings WHERE entity_id = ?",
+            [(entity_id,) for entity_id in stale],
+        )
+        conn.executemany(
+            "DELETE FROM embedding_metadata_v8 WHERE entity_id = ?",
             [(entity_id,) for entity_id in stale],
         )
     return len(stale)
@@ -4899,6 +9578,10 @@ def delete_search_index(node_key: str):
     with transaction():
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
+        conn.execute(
+            "DELETE FROM embedding_metadata_v8 WHERE entity_id = ?", (node_key,)
+        )
+        _mark_search_projection_rebuild_required(conn)
 
 
 def delete_node_cascade(node_key: str):
@@ -5041,6 +9724,11 @@ def delete_node_cascade(node_key: str):
             related_ids,
         )
         conn.execute(
+            f"DELETE FROM embedding_metadata_v8 WHERE entity_id IN ({placeholders})",
+            related_ids,
+        )
+        _mark_search_projection_rebuild_required(conn)
+        conn.execute(
             "DELETE FROM claims WHERE "
             "json_extract(data_json, '$.locator.page_key') = ? OR "
             "json_extract(data_json, '$.source_page') IN (?, ?)",
@@ -5113,7 +9801,9 @@ def enqueue_mutation(
                             "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
                             "last_error = NULL, available_at = ?, completed_at = NULL, "
                             "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
-                            "superseded_by = NULL WHERE id = ?",
+                            "superseded_by = NULL, poison_attempt_count = 0, "
+                            "transient_attempt_count = 0, last_error_code = NULL, "
+                            "first_transient_at = NULL WHERE id = ?",
                             (now, existing["id"]),
                         )
                         current_id = int(existing["id"])
@@ -5407,7 +10097,9 @@ def recover_failed_mutation_outbox(outbox_ids: list[int]) -> dict:
                 "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
                 "available_at = ?, started_at = NULL, completed_at = NULL, "
                 "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
-                "superseded_by = NULL WHERE id = ? AND status = 'failed'",
+                "superseded_by = NULL, poison_attempt_count = 0, "
+                "transient_attempt_count = 0, last_error_code = NULL, "
+                "first_transient_at = NULL WHERE id = ? AND status = 'failed'",
                 (now, outbox_id),
             )
             if updated.rowcount:
@@ -5511,7 +10203,8 @@ def complete_mutation_outbox(
     with transaction():
         updated = conn.execute(
             "UPDATE mutation_outbox SET status = 'completed', completed_at = ?, "
-            "lease_until = NULL, lease_owner = NULL, lease_token = NULL, last_error = NULL "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL, "
+            "last_error = NULL, last_error_code = NULL, first_transient_at = NULL "
             "WHERE id = ? AND status = 'processing' AND lease_owner = ? "
             "AND lease_token = ? AND lease_generation = ? AND COALESCE(lease_until, '') > ?",
             (now, outbox_id, lease_owner, lease_token, int(lease_generation), now),
@@ -5527,20 +10220,22 @@ def fail_mutation_outbox(
     lease_generation: int,
     max_attempts: int = 3,
     backoff_base: float = 2.0,
+    error_code: str = "poison",
 ) -> str:
     conn = get_connection()
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
     with transaction():
         row = conn.execute(
-            "SELECT attempt_count FROM mutation_outbox WHERE id = ? AND status = 'processing' "
+            "SELECT poison_attempt_count FROM mutation_outbox "
+            "WHERE id = ? AND status = 'processing' "
             "AND lease_owner = ? AND lease_token = ? AND lease_generation = ? "
             "AND COALESCE(lease_until, '') > ?",
             (outbox_id, lease_owner, lease_token, int(lease_generation), now),
         ).fetchone()
         if row is None:
             return "stale"
-        attempts = int(row["attempt_count"] or 0)
+        attempts = int(row["poison_attempt_count"] or 0) + 1
         terminal = attempts >= max(1, int(max_attempts))
         status = "failed" if terminal else "pending"
         delay_seconds = (
@@ -5550,7 +10245,8 @@ def fail_mutation_outbox(
         )
         available_at = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
         updated = conn.execute(
-            "UPDATE mutation_outbox SET status = ?, last_error = ?, available_at = ?, "
+            "UPDATE mutation_outbox SET status = ?, last_error = ?, last_error_code = ?, "
+            "poison_attempt_count = ?, available_at = ?, "
             "completed_at = ?, lease_until = NULL, lease_owner = NULL, "
             "lease_token = NULL WHERE id = ? "
             "AND status = 'processing' AND lease_owner = ? AND lease_token = ? "
@@ -5558,6 +10254,8 @@ def fail_mutation_outbox(
             (
                 status,
                 str(error)[:4000],
+                str(error_code or "poison")[:128],
+                attempts,
                 available_at,
                 now if terminal else None,
                 outbox_id,
@@ -5568,6 +10266,62 @@ def fail_mutation_outbox(
             ),
         )
         return status if updated.rowcount else "stale"
+
+
+def defer_mutation_outbox(
+    outbox_id: int,
+    error: str,
+    lease_owner: str,
+    lease_token: str,
+    lease_generation: int,
+    *,
+    error_code: str,
+    backoff_base: float = 2.0,
+    backoff_cap: float = 60.0,
+) -> str:
+    """Release a transient failure without consuming the poison retry budget."""
+    conn = get_connection()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    with transaction():
+        row = conn.execute(
+            "SELECT transient_attempt_count FROM mutation_outbox "
+            "WHERE id = ? AND status = 'processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (outbox_id, lease_owner, lease_token, int(lease_generation), now),
+        ).fetchone()
+        if row is None:
+            return "stale"
+        transient_attempts = int(row["transient_attempt_count"] or 0) + 1
+        delay_seconds = min(
+            max(0.0, float(backoff_cap)),
+            max(0.0, float(backoff_base))
+            * (2 ** min(16, max(0, transient_attempts - 1))),
+        )
+        available_at = (now_dt + timedelta(seconds=delay_seconds)).isoformat()
+        updated = conn.execute(
+            "UPDATE mutation_outbox SET status = 'pending', last_error = ?, "
+            "last_error_code = ?, transient_attempt_count = ?, available_at = ?, "
+            "completed_at = NULL, first_transient_at = COALESCE(first_transient_at, ?), "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+            "WHERE id = ? AND status = 'processing' AND lease_owner = ? "
+            "AND lease_token = ? AND lease_generation = ? "
+            "AND COALESCE(lease_until, '') > ?",
+            (
+                str(error)[:4000],
+                str(error_code or "transient")[:128],
+                transient_attempts,
+                available_at,
+                now,
+                outbox_id,
+                lease_owner,
+                lease_token,
+                int(lease_generation),
+                now,
+            ),
+        )
+        return "pending" if updated.rowcount else "stale"
 
 
 def search_wiki(query: str, limit: int = 50) -> list[dict]:
@@ -6073,8 +10827,7 @@ def get_pending_jobs(limit: int = 10) -> list[dict]:
 def get_jobs_by_status(statuses: list[str], limit: int = 20) -> list[dict]:
     if not statuses:
         return []
-    init_db()
-    conn = get_connection()
+    conn = require_current_schema_for_read("jobs")
     placeholders = ",".join("?" for _ in statuses)
     rows = conn.execute(
         f"SELECT * FROM jobs WHERE status IN ({placeholders}) "
@@ -7218,15 +11971,27 @@ def backup_database(destination_path: str | Path | None = None):
     """Create a transactionally consistent, standalone SQLite backup."""
     import time
 
+    from vector_lake.backup_capacity import (
+        assert_backup_capacity,
+        estimate_database_backup_bytes,
+    )
+
     if not get_db_path().exists():
         init_db()
     if destination_path is None:
         backup_dir = get_meta_dir() / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
         backup_path = backup_dir / f"vector_lake_{int(time.time())}.db.bak"
     else:
         backup_path = Path(destination_path)
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
+    disk_anchor = backup_path.parent
+    while not disk_anchor.exists() and disk_anchor != disk_anchor.parent:
+        disk_anchor = disk_anchor.parent
+    assert_backup_capacity(
+        estimated_new_bytes=estimate_database_backup_bytes(get_db_path()),
+        operation="sqlite-backup",
+        disk_anchor=disk_anchor,
+    )
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
     destination = sqlite3.connect(str(backup_path))
     try:
         get_connection().backup(destination)

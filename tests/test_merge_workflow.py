@@ -456,6 +456,77 @@ def test_preserved_source_data_allows_hash_verified_survivor_title():
     )
 
 
+def test_preserved_source_data_allows_legacy_storage_uri_normalization(
+    tmp_path,
+    monkeypatch,
+):
+    memory_root = tmp_path / "MEMORY"
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(memory_root))
+    raw_ref = "raw/study/Alpha Evidence.md"
+    expected = {
+        "source_id": "source_alpha",
+        "raw_ref": raw_ref,
+        "title": "Alpha.md",
+        "content_hash": "a" * 64,
+        "storage_uri": (tmp_path / ".gemini" / "MEMORY" / raw_ref).resolve().as_uri(),
+    }
+    observed = copy.deepcopy(expected)
+    observed["title"] = "Alpha"
+    observed["storage_uri"] = (memory_root / raw_ref).resolve().as_uri()
+
+    assert governance_service._preserved_source_data_matches(expected, observed)
+
+
+@pytest.mark.parametrize(
+    ("expected_suffix", "observed_suffix"),
+    [
+        ("MEMORY/raw/study/beta.md", "MEMORY/raw/study/alpha.md"),
+        (".codex/MEMORY/raw/study/alpha.md", "MEMORY/raw/study/alpha.md"),
+        ("MEMORY/raw/study/alpha.md", ".gemini/MEMORY/raw/study/alpha.md"),
+    ],
+)
+def test_preserved_source_data_rejects_other_storage_uri_changes(
+    tmp_path,
+    monkeypatch,
+    expected_suffix,
+    observed_suffix,
+):
+    memory_root = tmp_path / "MEMORY"
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(memory_root))
+    expected = {
+        "source_id": "source_alpha",
+        "raw_ref": "raw/study/alpha.md",
+        "title": "Alpha",
+        "content_hash": "a" * 64,
+        "storage_uri": (tmp_path / expected_suffix).resolve().as_uri(),
+    }
+    observed = copy.deepcopy(expected)
+    observed["storage_uri"] = (tmp_path / observed_suffix).resolve().as_uri()
+
+    assert not governance_service._preserved_source_data_matches(expected, observed)
+
+
+def test_preserved_source_data_keeps_other_fields_strict_during_uri_normalization(
+    tmp_path,
+    monkeypatch,
+):
+    memory_root = tmp_path / "MEMORY"
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(memory_root))
+    raw_ref = "raw/study/alpha.md"
+    expected = {
+        "source_id": "source_alpha",
+        "raw_ref": raw_ref,
+        "title": "Alpha",
+        "content_hash": "a" * 64,
+        "storage_uri": (tmp_path / ".gemini" / "MEMORY" / raw_ref).resolve().as_uri(),
+    }
+    observed = copy.deepcopy(expected)
+    observed["content_hash"] = "b" * 64
+    observed["storage_uri"] = (memory_root / raw_ref).resolve().as_uri()
+
+    assert not governance_service._preserved_source_data_matches(expected, observed)
+
+
 def test_verified_survivor_source_title_requires_matching_hash_and_source_type():
     content = _source_content(
         "source_alpha",
@@ -781,7 +852,6 @@ def test_approved_system_merge_resolves_with_intentional_index_exclusion(
     isolated_memory,
 ):
     from vector_lake import indexer
-    from vector_lake.wiki_utils import get_index_path
 
     _write_purpose_contract(isolated_memory)
     db_store.init_db()
@@ -869,7 +939,7 @@ def test_approved_system_merge_resolves_with_intentional_index_exclusion(
     assert db_store.get_merge_journal(resolved["merge_journal_id"])["status"] == (
         "completed"
     )
-    index_data = json.loads(get_index_path().read_text(encoding="utf-8"))
+    index_data = indexer.read_committed_index_snapshot()
     selected = {target_key, source_key}
     assert selected.isdisjoint(index_data["nodes"])
     assert all(

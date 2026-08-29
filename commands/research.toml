@@ -1,8 +1,4 @@
 description = "Autonomously scan graph gaps and the governance queue to formulate web research directives."
 prompt = """
-Please use the `trigger_autonomous_research` MCP tool from the `vector-lake-mcp` server to scan the graph topology and governance queue for knowledge gaps.
-
-If a directive is emitted, you (the Agent) MUST interpret the directive and execute the required web searches using your available search tools (`google_web_search`, `search_web`, or standard web clipper), save the results to `MEMORY/raw/research/`, and then finally execute the `sync_vector_lake` MCP tool to ingest the findings.
-
-If you are asked to dry-run the research command, pass `dry_run=True` to the MCP tool.
+Call `trigger_autonomous_research` with `dry_run=True` to preview bounded evidence-gap directives. Resolve the effective MEMORY root from `doctor_vector_lake` and accept only `<effective MEMORY>/raw/research` as the intake; fail closed if it is missing or ambiguous. Present the directives and obtain explicit authorization before calling with `dry_run=False`, performing external research, or writing sourced findings. If ingestion is then requested, call `sync_vector_lake` and report only its scan/enqueue receipt; it does not generate or finalize Wiki pages.
 """

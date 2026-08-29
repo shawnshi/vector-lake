@@ -148,7 +148,9 @@ def test_search_clamps_top_k_before_mode_dispatch(monkeypatch):
         lambda _query, **kwargs: captured.append(kwargs["top_k"]) or "ok",
     )
 
-    assert tool_search.search_vector_lake("query", mode="memory", top_k=10_000) == "ok"
+    result = tool_search.search_vector_lake("query", mode="memory", top_k=10_000)
+    assert result.startswith("<SemanticReadinessEnvelope>\n")
+    assert result.endswith("</SemanticReadinessEnvelope>\nok")
     assert captured == [tool_search._SEARCH_TOP_K_LIMIT]
 
 

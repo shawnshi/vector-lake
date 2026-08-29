@@ -1,3 +1,150 @@
+# Vector Lake 11.20.0
+
+## P2/P3 architecture remediation
+
+- Upgraded SQLite to schema v9 with an authoritative `projection_runtime_v9`
+  publish state. Controlled v4-v8 inputs migrate to v9, while rollback accepts
+  only the matching completed v8-to-v9 receipt and restores a verified v8
+  database/projection boundary.
+- Replaced full projection rewrites with content-addressed immutable projection
+  v2 objects and a sidecar commit pointer. Incremental page changes update only
+  affected HAMT paths and a bounded 512-node topology frontier; unchanged
+  generations are byte- and mtime-idempotent.
+- Allowed the explicit projection-rebuild migration command to read a retained
+  v1 pair only while schema v9 is pointer-free and `rebuild_required`. It
+  verifies the pair, sidecar, canonical generation and stable file identities;
+  ordinary readers remain fail-closed, and apply backs up before publication.
+  Legacy maintenance backup/restore accepts bounded files through 128 MiB with
+  actual-byte capacity preflight and exact hash validation; v2 object limits
+  remain unchanged.
+- Added maintenance-backup v4, transitive object-closure validation, generic
+  receipt-bound snapshot restore, and preview/fingerprint/apply projection-object
+  collection that protects live, pending, previous, backup and recovery roots.
+- Added a configurable durability profile. The default full profile applies
+  file and directory persistence barriers to acknowledged Wiki, projection,
+  backup and receipt publications; failure injection preserves an old-or-new
+  complete generation.
+- Made automatic-ingest budgets exactly observable and added bounded,
+  resumable attempt-receipt retention. The 100/hour, 2,000/24-hour and
+  32,768-token limits remain ceilings, and raw-text processing stays disabled
+  and unapproved by default.
+- Added a persistent raw-scrub ledger and daily due/retry scheduling so missed
+  filesystem events are rehashed within the configured period across restarts.
+- Batched embedding metadata/vector writes into one generation-CAS transaction
+  per provider batch, with all-or-nothing rollback and one progress update.
+- Reused generation-bound semantic campaign snapshots across first pages and
+  concurrent callers, with single-flight construction, sliding cursor leases
+  and a global accounted-byte cap.
+- Added cooperative cancellation/deadline state, observable detached atomic
+  completion, and checkpoints to semantic campaign scans, embedding batches and
+  raw-ingest inventory/enqueue/finalize boundaries.
+- Reduced runtime source-guard refreshes to bounded directory identity checks,
+  coalesced idle watchdog status publications, added worker-start retry, and
+  separated Operational Memory projection revision from unrelated database
+  commits while retaining periodic physical attestation.
+- Added a shared diagnostic snapshot for Doctor/health/readiness, a lightweight
+  semantic-readiness envelope on retrieval consumers, exact surface-aware memory
+  capabilities, and a formal `fact` mode with a deprecated `claim` alias.
+- Aligned Gemini/Codex command safety and environment parity. Read-only MCP scan
+  tools no longer acquire the canonical-meta file gate, while mutable tools and
+  ordinary CLI diagnostics retain their bounded control-plane telemetry.
+- Projection rebuild apply now shares the schema-maintenance lock with rollback,
+  rejects active or malformed rollback receipts before any backup or projection
+  write, and binds its database and projection roots across the guarded apply.
+  Receipt classification is bounded and self-contained; completed rollback
+  receipts remain terminal after later legitimate generation advances.
+- Pending rollback recovery now hashes the live database before acquiring the
+  Windows SQLite exclusive lock, then revalidates file identity, data version,
+  schema, generations and projection under lock. This avoids a Windows
+  `PermissionError` without weakening the no-writer compare-and-swap gate; CAS
+  failures also retain phase, errno and WinError diagnostics.
+- Split the bounded claim-graph node and edge ceilings so the canonical
+  2,500-node projection can retain its governed degree-limited edge set. The
+  edge surface remains fail-closed above 30,000 entries, and projection-v2
+  singleton leaves may exceed 256 KiB only within the existing 1 MiB object
+  ceiling; multi-entry leaves remain capped at 256 KiB. Root descriptors now
+  require their exact component key set before closure traversal, so surplus or
+  omitted components cannot hide behind a bounded descriptor read.
+- Added a fail-closed compatibility path for expired pre-budget auto-ingest
+  launch records that lack `reserved_tokens`: entries older than the complete
+  rolling 24-hour window are validated and pruned, while any such active entry
+  still blocks budget authorization instead of being assigned an inferred cost.
+
+# Vector Lake 11.19.1
+
+- Raised the default automatic-ingest safety ceiling to 100 tasks per hour and
+  2,000 tasks per rolling 24 hours while retaining the 32,768-token per-task
+  limit. Aggregate reservation ceilings now match those task ceilings at
+  3,276,800 and 65,536,000 tokens respectively, and the bounded launch ledger
+  accepts the full 2,000-entry window.
+- Kept automatic ingest disabled and raw-text model processing unapproved by
+  default. Budgeted normal tasks continue to use non-interactive, read-only
+  Codex execution; privacy, lease, circuit-breaker, and policy-failure gates are
+  unchanged.
+
+# Vector Lake 11.19.0
+
+## P1 architecture remediation
+
+- Added schema v8 embedding metadata and provider-return generation CAS so stale
+  provider responses cannot become current after a concurrent canonical update.
+  Persisted validity follows the node input hash/model/dimension/contract instead of
+  globally invalidating every vector on unrelated writes; bounded KNN expansion skips
+  nearer legacy or stale rows without false-empty results.
+- Added a completed-receipt-only v8-to-v7 schema rollback. Migration receipts now bind
+  the exact pre-v8 projection pair; rollback creates a verified forward v8 recovery
+  bundle, safely reuses verified complete or partial forward components after a
+  pre-receipt crash and rebuilds only missing components, rejects unconfirmed
+  post-migration writes, removes SQLite sidecars, and has fresh-process
+  Doctor/search/MCP acceptance against the frozen 11.18.3 runtime.
+- Bound the FTS projection to canonical generation, row count and corpus digest. Search
+  now bypasses incomplete FTS, uses a committed bounded lexical fallback, and exposes
+  shallow/deep health failures until a verified rebuild completes.
+- Split mutation-outbox poison attempts from transient generation, lease and SQLite
+  conflicts; deterministic payload failures still dead-letter, while transient races
+  remain retryable across process restarts.
+- Replaced unbounded operational-memory fallback with a source-row cap and stable
+  retry contract, and added bounded Watchdog maintenance that automatically converges
+  the derived FTS index. Search-index schema v6 now binds canonical rows, document
+  mappings, and both physical FTS surfaces to a durable proof; connection revision
+  caching keeps stable hot reads O(1), while equal-count tampering, lost pending work,
+  integrity-limit breaches, and certification races fail closed and trigger bounded
+  replay instead of returning a false-green empty result.
+- Reduced MCP runtime-revision overhead with a single-flight TTL/metadata/full-hash
+  guard, raised the bounded fast lane to 2 workers plus 4 queued calls, and added stable
+  retry metadata for saturation. Strict per-call hashing remains opt-in.
+- Added raw-inventory metadata fast paths, deterministic periodic content scrubbing and
+  true trailing-edge Watchdog event debounce with maximum staleness and overflow repair.
+- Added global backup inventory, quota/free-space telemetry and pre-staging capacity
+  gates for maintenance and schema-migration backups.
+- Added a generation-bound, read-only semantic-readiness campaign reporting exact
+  evidence, extraction, current-assessment, source-integrity and topology debt. Its
+  first snapshot now has hard row/JSON/graph/debt limits; cursor pages use a two-entry,
+  120-second source-bound LRU and never repeat the full database/graph scan.
+- Added a real read-only MCP surface; made merge suggestions preview-first; made failed
+  Doctor and non-ready Readiness CLI reports return non-zero status.
+- Aligned all plugin roots and skills with the enabled runtime, removed unsupported
+  direct queue/legacy janitor scripts, corrected command and sync semantics, removed
+  hidden-reasoning/fake-tool contracts, and made automatic raw-text model processing
+  require explicit configuration consent.
+- Declared the supported product boundary as a healthcare-digitalization, controlled
+  single-user expert workstation rather than a multi-tenant enterprise service.
+
+# Vector Lake 11.18.3
+
+- Enable the fail-closed automatic ingest host through an explicit, pinned
+  runtime policy while preserving bounded task and token budgets.
+- Report a disabled automatic ingest component explicitly and surface a Doctor
+  warning instead of presenting the autonomous closure path as merely idle.
+- Document the distinction between scan/enqueue sync and the automatic
+  claim/generate/finalize lifecycle.
+
+# Vector Lake 11.18.2
+
+- Accept the bounded historical `.gemini/MEMORY` to canonical `MEMORY`
+  storage-URI normalization during merge recovery only when raw identity and
+  all other preserved Source metadata remain unchanged.
+
 # Vector Lake 11.18.1
 
 - Complete projection rebuilds with a bounded topology refresh and verify the

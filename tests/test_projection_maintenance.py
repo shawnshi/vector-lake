@@ -21,7 +21,6 @@ import json
 import os
 import sqlite3
 import time
-import weakref
 from pathlib import Path
 import pytest
 
@@ -382,92 +381,129 @@ def _backup_entries():
     return list(backup_root.iterdir())
 
 
+def _replace_v2_locators_with_legacy_pair() -> tuple[Path, Path]:
+    from vector_lake.projection_format_v2 import (
+        materialize_claim_graph,
+        materialize_index,
+    )
+    from vector_lake.wiki_utils import (
+        get_claim_graph_path,
+        get_index_path,
+        get_projection_manifest_path,
+    )
+
+    index_path = get_index_path()
+    graph_path = get_claim_graph_path()
+    sidecar_path = get_projection_manifest_path()
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    index_payload = materialize_index(index_path.parent, sidecar)
+    graph_payload = materialize_claim_graph(index_path.parent, sidecar)
+    index_path.write_text(json.dumps(index_payload), encoding="utf-8")
+    graph_path.write_text(json.dumps(graph_payload), encoding="utf-8")
+    sidecar_path.unlink()
+    return index_path, graph_path
+
+
 def test_maintenance_backup_copies_one_projection_generation(isolated_memory):
-    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
+    from vector_lake.backup_capacity import projection_v2_reachable_inventory
 
     db_store.init_db()
     indexer.generate_index()
-    source_index = json.loads(get_index_path().read_text(encoding="utf-8"))
-    source_graph = json.loads(get_claim_graph_path().read_text(encoding="utf-8"))
-    source_generation = indexer.validate_projection_pair(source_index, source_graph)
-    source_canonical_generation = indexer.projection_canonical_generation(
-        source_index,
-        source_graph,
-    )
+    source_inventory = projection_v2_reachable_inventory()
+    assert source_inventory is not None
 
     backup_dir = Path(create_maintenance_backup("projection_pair"))
-    backup_index = json.loads((backup_dir / "index.json").read_text(encoding="utf-8"))
-    backup_graph = json.loads(
-        (backup_dir / "claim_graph.json").read_text(encoding="utf-8")
+    validated, backup_inventory = tool_projection.validate_maintenance_backup_v4(
+        backup_dir / "manifest.json"
     )
     manifest = json.loads((backup_dir / "manifest.json").read_text(encoding="utf-8"))
 
+    assert backup_inventory is not None
     assert (
-        indexer.validate_projection_pair(backup_index, backup_graph)
-        == source_generation
+        validated["projection_generation"] == source_inventory["projection_generation"]
     )
-    assert manifest["manifest_version"] == 3
-    assert manifest["projection_generation"] == source_generation
-    assert manifest["projection_canonical_generation"] == source_canonical_generation
+    assert (
+        backup_inventory["projection_generation"]
+        == source_inventory["projection_generation"]
+    )
+    assert (
+        backup_inventory["canonical_generation"]
+        == source_inventory["canonical_generation"]
+    )
+    assert backup_inventory["roots"] == source_inventory["roots"]
+    assert manifest["manifest_version"] == 4
+    assert manifest["projection_format"] == 2
+    assert (
+        manifest["projection_generation"] == source_inventory["projection_generation"]
+    )
+    assert (
+        manifest["projection_canonical_generation"]["runtime_generations"]
+        == (source_inventory["canonical_generation"])
+    )
     assert manifest["database_runtime_generation_error"] is None
     assert manifest["canonical_projection_consistency"]["status"] == "verified"
     assert (
         manifest["canonical_projection_consistency"]["canonical_generation_token"]
-        == source_canonical_generation["token"]
+        == manifest["projection_canonical_generation"]["token"]
     )
     assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is True
     assert manifest["complete"] is True
-    assert {
+    static_artifacts = {
         "index.json",
         "claim_graph.json",
         "projection_pair_manifest.json",
-    } <= set(manifest["copied"])
+        "vector_lake.db",
+    }
+    object_artifacts = set(manifest["projection_v2"]["object_artifacts"])
+    assert set(manifest["copied"]) == static_artifacts | object_artifacts
+    assert manifest["projection_v2"]["object_count"] == len(object_artifacts)
+    assert manifest["projection_v2"]["roots"] == source_inventory["roots"]
     assert set(manifest["artifact_sha256"]) == set(manifest["copied"])
+    assert set(manifest["artifact_bytes"]) == set(manifest["copied"])
     for name, expected_hash in manifest["artifact_sha256"].items():
-        assert hashlib.sha256((backup_dir / name).read_bytes()).hexdigest() == (
-            expected_hash
-        )
+        artifact = backup_dir / Path(name)
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == (expected_hash)
+        assert artifact.stat().st_size == manifest["artifact_bytes"][name]
 
 
-def test_projection_backup_releases_source_payloads_before_copy_validation(
+def test_projection_backup_copies_reachable_objects_without_legacy_decode(
     isolated_memory,
     monkeypatch,
 ):
-    class TrackedDict(dict):
-        __slots__ = ("__weakref__",)
+    from vector_lake.backup_capacity import projection_v2_reachable_inventory
 
     db_store.init_db()
     indexer.generate_index()
     backup_dir = isolated_memory / "wiki" / ".meta" / "projection-memory"
     backup_dir.mkdir(parents=True)
-    real_load = tool_projection.json.load
-    roots = []
-    peak_live_roots = 0
+    source_inventory = projection_v2_reachable_inventory()
+    assert source_inventory is not None
 
-    def tracking_load(handle):
-        nonlocal peak_live_roots
-        payload = TrackedDict(real_load(handle))
-        roots.append(weakref.ref(payload))
-        peak_live_roots = max(
-            peak_live_roots,
-            sum(reference() is not None for reference in roots),
-        )
-        return payload
+    def reject_legacy_decode(*_args, **_kwargs):
+        raise AssertionError("v2 backup must not decode legacy projection roots")
 
-    monkeypatch.setattr(tool_projection.json, "load", tracking_load)
+    monkeypatch.setattr(tool_projection.json, "load", reject_legacy_decode)
 
-    copied, generation, canonical_binding = (
+    copied, generation, canonical_binding, projection_v2 = (
         tool_projection._copy_projection_pair_to_backup(backup_dir)
     )
 
-    assert set(copied) == {
+    assert projection_v2 is not None
+    expected_objects = set(projection_v2["object_artifacts"])
+    assert set(copied) == expected_objects | {
         "index.json",
         "claim_graph.json",
         "projection_pair_manifest.json",
     }
-    assert generation
+    assert generation == source_inventory["projection_generation"]
     assert canonical_binding["status"] == "verified"
-    assert peak_live_roots <= 2
+    assert (
+        canonical_binding["runtime_generations"]
+        == source_inventory["canonical_generation"]
+    )
+    assert projection_v2["roots"] == source_inventory["roots"]
+    assert projection_v2["object_count"] == source_inventory["object_count"]
+    assert all((backup_dir / Path(name)).is_file() for name in copied)
 
 
 def test_maintenance_backup_marks_stale_projection_generation_unverifiable(
@@ -735,9 +771,7 @@ def test_maintenance_backup_ignores_soft_governance_generation_drift(
     assert consistency["covered_surfaces"] == list(
         indexer.CANONICAL_PROJECTION_SURFACES
     )
-    assert "governance_queue" not in consistency[
-        "projection_runtime_generations"
-    ]
+    assert "governance_queue" not in consistency["projection_runtime_generations"]
     assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is True
 
 
@@ -788,11 +822,9 @@ def test_maintenance_backup_compares_projection_to_copied_database_snapshot(
 def test_maintenance_backup_rejects_legacy_unbound_projection(
     isolated_memory,
 ):
-    from vector_lake.wiki_utils import get_claim_graph_path, get_index_path
-
     db_store.init_db()
     indexer.generate_index()
-    for path in (get_index_path(), get_claim_graph_path()):
+    for path in _replace_v2_locators_with_legacy_pair():
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload[indexer.PROJECTION_MANIFEST_KEY].pop("canonical_generation")
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -845,11 +877,9 @@ def test_maintenance_backup_rejects_legacy_projection_without_partial_backup(
 def test_maintenance_backup_rejects_mismatched_generation_without_partial_backup(
     isolated_memory,
 ):
-    from vector_lake.wiki_utils import get_claim_graph_path
-
     db_store.init_db()
     indexer.generate_index()
-    claim_graph_path = get_claim_graph_path()
+    _index_path, claim_graph_path = _replace_v2_locators_with_legacy_pair()
     claim_graph = json.loads(claim_graph_path.read_text(encoding="utf-8"))
     claim_graph[indexer.PROJECTION_MANIFEST_KEY]["generation"] = "mismatched"
     claim_graph_path.write_text(json.dumps(claim_graph), encoding="utf-8")
@@ -873,15 +903,15 @@ def test_maintenance_backup_rejects_half_published_pair_without_partial_backup(
     get_claim_graph_path().unlink()
 
     with pytest.raises(
-        indexer.ProjectionPairContractError,
-        match="projection pair is incomplete",
+        ValueError,
+        match="projection_v2_locator_pair_incomplete",
     ):
         create_maintenance_backup("half_published")
 
     assert _backup_entries() == []
 
 
-def test_maintenance_backup_synthesizes_missing_sidecar_only_inside_backup(
+def test_maintenance_backup_rejects_missing_v2_sidecar_without_partial_backup(
     isolated_memory,
 ):
     from vector_lake.wiki_utils import get_projection_manifest_path
@@ -891,16 +921,14 @@ def test_maintenance_backup_synthesizes_missing_sidecar_only_inside_backup(
     sidecar_path = get_projection_manifest_path()
     sidecar_path.unlink()
 
-    backup = Path(create_maintenance_backup("missing_sidecar"))
+    with pytest.raises(FileNotFoundError):
+        create_maintenance_backup("missing_sidecar")
 
     assert sidecar_path.exists() is False
-    copied_sidecar = json.loads(
-        (backup / sidecar_path.name).read_text(encoding="utf-8")
-    )
-    indexer._validate_projection_sidecar(copied_sidecar)
+    assert _backup_entries() == []
 
 
-def test_maintenance_backup_rejects_hard_stale_pair_when_sidecar_is_missing(
+def test_maintenance_backup_missing_v2_sidecar_fails_closed_after_database_drift(
     isolated_memory,
 ):
     from vector_lake import governance_store
@@ -919,10 +947,7 @@ def test_maintenance_backup_rejects_hard_stale_pair_when_sidecar_is_missing(
         },
     )
 
-    with pytest.raises(
-        indexer.ProjectionPairContractError,
-        match="binding is stale",
-    ):
+    with pytest.raises(FileNotFoundError):
         create_maintenance_backup("missing_stale_sidecar")
     assert _backup_entries() == []
 
@@ -930,16 +955,15 @@ def test_maintenance_backup_rejects_hard_stale_pair_when_sidecar_is_missing(
 def test_maintenance_backup_rejects_tampered_sidecar(
     isolated_memory,
 ):
-    from vector_lake.wiki_utils import get_index_path
+    from vector_lake.wiki_utils import get_projection_manifest_path
 
     db_store.init_db()
     indexer.generate_index()
-    index_payload = json.loads(get_index_path().read_text(encoding="utf-8"))
-    index_payload["nodes"]["Concept_Tampered"] = {"title": "Tampered"}
-    get_index_path().write_text(json.dumps(index_payload), encoding="utf-8")
+    sidecar_path = get_projection_manifest_path()
+    sidecar_path.write_bytes(sidecar_path.read_bytes() + b"\n")
     with pytest.raises(
-        indexer.ProjectionPairContractError,
-        match="sidecar digest does not match index.json",
+        ValueError,
+        match="projection_v2_sidecar_not_canonical",
     ):
         create_maintenance_backup("tampered_sidecar")
     assert _backup_entries() == []
@@ -968,21 +992,22 @@ def test_maintenance_backup_copies_projection_files_inside_publish_lock(
             state["inside"] = False
             return False
 
-    real_copy = tool_projection.shutil.copy2
+    source_inventory = tool_projection.projection_v2_reachable_inventory()
+    assert source_inventory is not None
+    real_copy = tool_projection.shutil.copyfile
 
     def guarded_copy(source, destination):
-        if Path(source).name in {"index.json", "claim_graph.json"}:
-            assert state["inside"] is True
-            state["projection_copies"] += 1
+        assert state["inside"] is True
+        state["projection_copies"] += 1
         return real_copy(source, destination)
 
     monkeypatch.setattr(tool_projection, "FileLock", RecordingLock)
-    monkeypatch.setattr(tool_projection.shutil, "copy2", guarded_copy)
+    monkeypatch.setattr(tool_projection.shutil, "copyfile", guarded_copy)
 
     backup_dir = Path(create_maintenance_backup("locked_copy"))
 
     assert state["lock"] == (str(get_index_path()) + ".lock", 15)
-    assert state["projection_copies"] == 2
+    assert state["projection_copies"] == source_inventory["object_count"] + 3
     assert state["inside"] is False
     assert (backup_dir / "index.json").exists()
     assert (backup_dir / "claim_graph.json").exists()
@@ -996,14 +1021,14 @@ def test_maintenance_backup_removes_stage_when_projection_copy_fails(
 
     db_store.init_db()
     indexer.generate_index()
-    real_copy = tool_projection.shutil.copy2
+    real_copy = tool_projection.shutil.copyfile
 
     def fail_claim_graph_copy(source, destination):
         if Path(source).name == "claim_graph.json":
             raise OSError("injected projection copy failure")
         return real_copy(source, destination)
 
-    monkeypatch.setattr(tool_projection.shutil, "copy2", fail_claim_graph_copy)
+    monkeypatch.setattr(tool_projection.shutil, "copyfile", fail_claim_graph_copy)
 
     with pytest.raises(OSError, match="injected projection copy failure"):
         create_maintenance_backup("copy_failure")

@@ -13,7 +13,6 @@ import gc
 import json
 import os
 import platform
-import sqlite3
 import statistics
 import sys
 import tempfile
@@ -29,7 +28,12 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from vector_lake import db_store, index_snapshot, tool_search  # noqa: E402
+from vector_lake import db_store, index_snapshot, indexer, tool_search  # noqa: E402
+from vector_lake.projection_format_v2 import (  # noqa: E402
+    build_projection_roots,
+    publish_prepared_projection,
+)
+from vector_lake.search_projection_contract import fts_corpus_sha256  # noqa: E402
 
 
 CONTRACT_VERSION = "vector-lake-corpus-scale-benchmark/v1"
@@ -169,42 +173,41 @@ def _build_fixture(root: Path, node_count: int) -> dict:
                 }
             )
     snapshot_payload = {
-        "projection_manifest": {
-            "contract": "synthetic-benchmark",
-            "version": 1,
-            "generation": f"synthetic-{node_count}",
-            "published_at": "2026-08-22T00:00:00+00:00",
-        },
         "graph_state": {"dirty": False},
         "nodes": nodes,
         "weighted_edges": edges,
     }
-    index_path = wiki_dir / "index.json"
-    index_path.write_text(
-        json.dumps(snapshot_payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
+    db_path = root / "vector_lake_benchmark.db"
+    if db_store.get_db_path().resolve() != db_path.resolve():
+        raise RuntimeError("benchmark database must be isolated inside its fixture")
+    db_store.init_db()
+    canonical_generation = indexer.canonical_runtime_generation_snapshot()
+    prepared = build_projection_roots(
+        wiki_dir,
+        snapshot_payload,
+        {"nodes": [], "edges": [], "schema_version": "1.0"},
+        canonical_generation=canonical_generation,
+        published_at_utc="2026-08-22T00:00:00+00:00",
     )
 
-    db_path = root / "vector_lake_benchmark.db"
-    connection = sqlite3.connect(db_path)
-    try:
-        connection.execute(
-            "CREATE VIRTUAL TABLE wiki_search_index USING fts5("
-            "node_key UNINDEXED, title, summary, text)"
+    def commit_search_projection(connection, candidate):
+        return db_store.apply_search_projection_mutations(
+            connection,
+            upserts=fts_rows,
+            reset_search=True,
+            projection_generation=candidate.projection_generation,
+            canonical_generation=candidate.canonical_generation,
+            expected_row_count=node_count,
+            expected_corpus_sha256=fts_corpus_sha256(fts_rows),
         )
-        connection.executemany(
-            "INSERT INTO wiki_search_index (node_key, title, summary, text) "
-            "VALUES (?, ?, ?, ?)",
-            fts_rows,
-        )
-        connection.execute(
-            "INSERT INTO wiki_search_index(wiki_search_index) VALUES('optimize')"
-        )
-        connection.commit()
-    finally:
-        connection.close()
+
+    publish_prepared_projection(
+        wiki_dir,
+        prepared,
+        transaction_mutation=commit_search_projection,
+    )
     return {
-        "index_path": index_path,
+        "index_path": wiki_dir / "index.json",
         "wiki_dir": wiki_dir,
         "db_path": db_path,
         "build_ms": (time.perf_counter() - started) * 1000.0,
@@ -287,7 +290,7 @@ def _query_once(query: str, expected_title: str | None) -> tuple[float, str | No
     started = time.perf_counter()
     try:
         result = tool_search.search_vector_lake(query, top_k=5)
-        if result.startswith("[Search degraded:"):
+        if "[Search degraded:" in result:
             return (time.perf_counter() - started) * 1000.0, "degraded"
         if expected_title and f"**{expected_title}**" not in result:
             return (time.perf_counter() - started) * 1000.0, "recall_miss"
@@ -305,7 +308,7 @@ def _fallback_query_once(
     started = time.perf_counter()
     try:
         result = tool_search.search_vector_lake(query, top_k=5)
-        if not result.startswith("[Search degraded: fts5]"):
+        if "[Search degraded: fts5]" not in result:
             return (time.perf_counter() - started) * 1000.0, "not_degraded"
         if expected_title and f"**{expected_title}**" not in result:
             return (time.perf_counter() - started) * 1000.0, "recall_miss"
@@ -378,32 +381,40 @@ def run_benchmark(
         prefix="vector-lake-corpus-scale-",
         dir=workspace_path,
     ) as fixture_dir:
-        fixture = _build_fixture(Path(fixture_dir), node_count)
-        index_snapshot.clear_index_snapshot_cache_for_tests()
-        cold_started = time.perf_counter()
-        snapshot = index_snapshot.load_index_snapshot(fixture["index_path"])
-        cold_load_ms = (time.perf_counter() - cold_started) * 1000.0
-        warm_loads = []
-        for _ in range(20):
-            started = time.perf_counter()
-            warm = index_snapshot.load_index_snapshot(fixture["index_path"])
-            if warm is not snapshot:
-                raise RuntimeError("warm index cache did not preserve snapshot identity")
-            warm_loads.append((time.perf_counter() - started) * 1000.0)
-
-        identity_concurrency = _measure_identity_cold_concurrency(snapshot, workers)
-        db_store.close_connection()
         previous_db_path = os.environ.get("VECTOR_LAKE_DB_PATH")
         previous_embedding = os.environ.get("VECTOR_LAKE_QUERY_EMBEDDING")
-        os.environ["VECTOR_LAKE_DB_PATH"] = str(fixture["db_path"])
+        fixture_root = Path(fixture_dir)
+        db_store.close_all_connections()
+        os.environ["VECTOR_LAKE_DB_PATH"] = str(
+            fixture_root / "vector_lake_benchmark.db"
+        )
         os.environ["VECTOR_LAKE_QUERY_EMBEDDING"] = "0"
-        rss_before = _working_set_bytes()
-        serial_cases = _workload(node_count, serial_queries)
-        concurrent_cases = _workload(node_count, concurrent_queries)
-        serial_results = []
-        concurrent_results = []
-        fallback_results = []
         try:
+            fixture = _build_fixture(fixture_root, node_count)
+            index_snapshot.clear_index_snapshot_cache_for_tests()
+            cold_started = time.perf_counter()
+            snapshot = index_snapshot.load_index_snapshot(fixture["index_path"])
+            cold_load_ms = (time.perf_counter() - cold_started) * 1000.0
+            warm_loads = []
+            for _ in range(20):
+                started = time.perf_counter()
+                warm = index_snapshot.load_index_snapshot(fixture["index_path"])
+                if warm is not snapshot:
+                    raise RuntimeError(
+                        "warm index cache did not preserve snapshot identity"
+                    )
+                warm_loads.append((time.perf_counter() - started) * 1000.0)
+
+            identity_concurrency = _measure_identity_cold_concurrency(
+                snapshot, workers
+            )
+            db_store.close_connection()
+            rss_before = _working_set_bytes()
+            serial_cases = _workload(node_count, serial_queries)
+            concurrent_cases = _workload(node_count, concurrent_queries)
+            serial_results = []
+            concurrent_results = []
+            fallback_results = []
             with ExitStack() as stack:
                 stack.enter_context(
                     patch.object(tool_search, "get_index_path", lambda: fixture["index_path"])

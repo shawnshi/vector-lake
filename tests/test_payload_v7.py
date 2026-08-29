@@ -14,6 +14,27 @@ from vector_lake import db_store, governance_store
 
 
 V6_CHECKSUM = "e7f0edcf4060bc6ddee68f46506d583c3c55428686f685a19affd5c414cb52fe"
+V8_CHECKSUM = "0bfa98f0e74063aed8c8cae28028bd48426b5f532e917f6e00f50c879c7d3278"
+
+
+def _downgrade_search_runtime_contract_to_v7(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TABLE IF EXISTS projection_runtime_v9")
+    connection.execute("DROP TABLE IF EXISTS embedding_metadata_v8")
+    connection.execute("DROP TABLE IF EXISTS search_projection_state_v8")
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(mutation_outbox)").fetchall()
+    }
+    for column_name in (
+        "poison_attempt_count",
+        "transient_attempt_count",
+        "last_error_code",
+        "first_transient_at",
+    ):
+        if column_name in columns:
+            connection.execute(
+                f'ALTER TABLE mutation_outbox DROP COLUMN "{column_name}"'
+            )
 
 
 def _change_set(
@@ -107,6 +128,7 @@ def _downgrade_payload_schema_to_v6(path: Path) -> tuple[list[tuple], list[tuple
     try:
         payloads, refs = _payload_snapshots(path)
         connection.execute("BEGIN IMMEDIATE")
+        _downgrade_search_runtime_contract_to_v7(connection)
         connection.execute("DROP TABLE change_set_payload_refs")
         connection.execute("DROP TABLE change_set_payloads")
         connection.execute(db_store._CHANGE_SET_PAYLOADS_TABLE_SCHEMA_V6)
@@ -123,7 +145,7 @@ def _downgrade_payload_schema_to_v6(path: Path) -> tuple[list[tuple], list[tuple
             "(change_set_id, payload_sha256, created_at) VALUES (?, ?, ?)",
             refs,
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 7")
+        connection.execute("DELETE FROM schema_migrations WHERE version > 6")
         connection.execute("PRAGMA user_version = 6")
         connection.commit()
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -173,25 +195,38 @@ def _v6_database_snapshot(path: Path) -> dict:
         connection.close()
 
 
-def test_fresh_v7_schema_ledger_and_exact_constants(isolated_memory):
+def test_fresh_current_schema_preserves_v7_v8_and_adds_exact_v9_contract(
+    isolated_memory,
+):
     db_store.init_db()
     connection = db_store.get_connection()
     ledger = connection.execute(
         "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
     ).fetchall()
 
-    assert db_store._SCHEMA_VERSION == 7
-    assert db_store._SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS == {4, 5, 6, 7}
-    assert [row[0] for row in ledger] == list(range(1, 8))
+    assert db_store._SCHEMA_VERSION == 9
+    assert db_store._SCHEMA_MIGRATION_SUPPORTED_SOURCE_VERSIONS == {
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+    }
+    assert [row[0] for row in ledger] == list(range(1, 10))
     assert ledger[5][1:] == ("change_set_delta_history_v6", V6_CHECKSUM)
     assert db_store._SCHEMA_MIGRATIONS[6][1] == V6_CHECKSUM
+    assert ledger[7][1:] == ("search_projection_integrity_v8", V8_CHECKSUM)
+    assert db_store._SCHEMA_MIGRATIONS[8][1] == V8_CHECKSUM
     assert governance_store._CHANGE_SET_MAX_PAYLOAD_BYTES == 8 * 1024 * 1024
     assert governance_store._CHANGE_SET_MAX_STORED_BYTES == 4 * 1024 * 1024 + 64 * 1024
     assert governance_store._CHANGE_SET_BATCH_MAX_PAYLOAD_BYTES == 32 * 1024 * 1024
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
     assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert db_store._change_set_payload_schema_v7_issues(connection) == []
+    assert db_store._search_runtime_schema_v8_issues(connection) == []
+    assert db_store._projection_runtime_schema_v9_issues(connection) == []
     for (
         object_type,
         name,
@@ -208,20 +243,37 @@ def test_fresh_v7_schema_ledger_and_exact_constants(isolated_memory):
         "schema_v4_to_v5",
         "schema_v5_to_v6",
         "schema_v6_to_v7",
+        "schema_v7_to_v8",
+        "schema_v8_to_v9",
     ]
     assert db_store._schema_migration_steps(5) == [
         "schema_v5_to_v6",
         "schema_v6_to_v7",
+        "schema_v7_to_v8",
+        "schema_v8_to_v9",
     ]
-    assert db_store._schema_migration_steps(6) == ["schema_v6_to_v7"]
-    assert db_store._schema_migration_steps(7) == []
+    assert db_store._schema_migration_steps(6) == [
+        "schema_v6_to_v7",
+        "schema_v7_to_v8",
+        "schema_v8_to_v9",
+    ]
+    assert db_store._schema_migration_steps(7) == [
+        "schema_v7_to_v8",
+        "schema_v8_to_v9",
+    ]
+    assert db_store._schema_migration_steps(8) == ["schema_v8_to_v9"]
+    assert db_store._schema_migration_steps(9) == []
 
 
-def test_v6_to_v7_preserves_payload_rows_refs_and_hydration(isolated_memory):
+def test_v6_to_current_preserves_v7_payload_rows_refs_and_hydration(isolated_memory):
     path, payloads_before, refs_before = _physical_v6_with_shared_pending_payload()
     preview = db_store.preview_schema_migration(path)
 
-    assert preview["steps"] == ["schema_v6_to_v7"]
+    assert preview["steps"] == [
+        "schema_v6_to_v7",
+        "schema_v7_to_v8",
+        "schema_v8_to_v9",
+    ]
     result = db_store.schema_migration_maintenance(
         apply=True,
         confirmation=preview["fingerprint"],
@@ -230,7 +282,7 @@ def test_v6_to_v7_preserves_payload_rows_refs_and_hydration(isolated_memory):
     )
 
     assert result["pre"]["user_version"] == 6
-    assert result["post"]["user_version"] == 7
+    assert result["post"]["user_version"] == 9
     assert result["post"]["ready"] is True
     backup_path = Path(result["backup"]["path"])
     backup = sqlite3.connect(backup_path)

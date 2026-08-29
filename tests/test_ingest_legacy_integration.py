@@ -3,12 +3,16 @@ import json
 
 import pytest
 
-from vector_lake import db_store, governance_store
+from vector_lake import db_store, governance_store, indexer
 from vector_lake.mutation_coordinator import (
     execute_mutation_batch,
     execute_mutation_plan,
 )
 from vector_lake.tool_ingest import claim_ingest_tasks, finalize_ingest
+from vector_lake.projection_format_v2 import (
+    build_projection_roots,
+    publish_prepared_projection,
+)
 from vector_lake.wiki_utils import split_frontmatter
 from tests.test_ingest_contract import (
     _claimed_processed_data,
@@ -46,6 +50,25 @@ def _seed_legacy_target(isolated_memory, *, colliding_tag=None):
     return target_name, target_path, target_version, projection_hash
 
 
+def _publish_dynamic_tag_collision(isolated_memory):
+    """Publish a valid v2 pair whose index exposes the legacy tag collision."""
+    base = isolated_memory / "wiki"
+    prepared = build_projection_roots(
+        base,
+        {
+            "nodes": {
+                "Concept_Agentic-AI": {
+                    "title": "Agentic_AI",
+                    "aliases": [],
+                }
+            }
+        },
+        {"nodes": [], "edges": []},
+        canonical_generation=indexer.canonical_runtime_generation_snapshot(),
+    )
+    publish_prepared_projection(base, prepared)
+
+
 def _integrated_job(target_name, target_version, projection_hash):
     payload = _v4_ingest_payload(
         "raw/legacy-integration.md",
@@ -61,7 +84,7 @@ def _integrated_job(target_name, target_version, projection_hash):
     )
     job_id = db_store.enqueue_job("ingest", payload)
     db_store.mark_job_awaiting_subagent(job_id, "")
-    claim = __import__("json").loads(
+    claim = json.loads(
         claim_ingest_tasks(limit=1, lease_seconds=60)
     )[0]
     processed_data = _claimed_processed_data(
@@ -148,19 +171,7 @@ def test_integrated_ingest_preserves_legacy_dynamic_tag_debt(
     target_name, target_path, target_version, projection_hash = (
         _seed_legacy_target(isolated_memory, colliding_tag="Agentic_AI")
     )
-    (isolated_memory / "wiki" / "index.json").write_text(
-        json.dumps(
-            {
-                "nodes": {
-                    "Concept_Agentic-AI": {
-                        "title": "Agentic_AI",
-                        "aliases": [],
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+    _publish_dynamic_tag_collision(isolated_memory)
     _job_id, processed_data = _integrated_job(
         target_name,
         target_version,

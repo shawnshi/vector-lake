@@ -176,6 +176,21 @@ def _drop_runtime_generation_triggers(conn: sqlite3.Connection) -> None:
 
 
 def _downgrade_payload_contract_to_v6(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS projection_runtime_v9")
+    conn.execute("DROP TABLE IF EXISTS embedding_metadata_v8")
+    conn.execute("DROP TABLE IF EXISTS search_projection_state_v8")
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(mutation_outbox)").fetchall()
+    }
+    for column_name in (
+        "poison_attempt_count",
+        "transient_attempt_count",
+        "last_error_code",
+        "first_transient_at",
+    ):
+        if column_name in columns:
+            conn.execute(f'ALTER TABLE mutation_outbox DROP COLUMN "{column_name}"')
     payloads = conn.execute(
         "SELECT payload_sha256, codec, payload_blob, raw_bytes, stored_bytes, "
         "created_at FROM change_set_payloads"
@@ -349,6 +364,14 @@ def _run_controlled_existing_schema_migration(path) -> None:
                 connection,
                 maintenance_lock=maintenance_lock,
             )
+            db_store._apply_controlled_schema_v8_migration(
+                connection,
+                maintenance_lock=maintenance_lock,
+            )
+            db_store._apply_controlled_schema_v9_migration(
+                connection,
+                maintenance_lock=maintenance_lock,
+            )
 
 
 def test_schema_v2_checksum_is_derived_from_normalized_ddl_contract():
@@ -493,7 +516,7 @@ def test_schema_ledger_is_durable_and_read_only_inspection_is_current(isolated_m
 
     assert state["ready"] is True
     assert state["status"] == "ready"
-    assert state["user_version"] == db_store._SCHEMA_VERSION == 7
+    assert state["user_version"] == db_store._SCHEMA_VERSION == 9
     expected_versions = list(range(1, db_store._SCHEMA_VERSION + 1))
     assert [item["version"] for item in state["ledger"]] == expected_versions
     assert [item["name"] for item in state["ledger"]] == [
@@ -579,8 +602,8 @@ def test_existing_schema_v2_migrates_runtime_generation_triggers_atomically(
     state = db_store.inspect_schema_migration_state(path)
 
     assert state["ready"] is True
-    assert state["user_version"] == 7
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6, 7]
+    assert state["user_version"] == 9
+    assert [item["version"] for item in state["ledger"]] == list(range(1, 10))
 
 
 def test_schema_v3_trigger_migration_failure_rolls_back_ledger_and_ddl(
@@ -642,8 +665,8 @@ def test_incomplete_cleanup_table_migrates_to_schema_v4(
     ).fetchone()
 
     assert state["ready"] is True
-    assert state["user_version"] == 7
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6, 7]
+    assert state["user_version"] == 9
+    assert [item["version"] for item in state["ledger"]] == list(range(1, 10))
     assert db_store._ingest_task_cleanup_schema_issues(
         db_store.get_connection()
     ) == []
@@ -847,7 +870,7 @@ def test_existing_schema_v4_removes_duplicate_indexes_but_preserves_deferred_tab
 
     with pytest.raises(
         RuntimeError,
-        match="Database schema upgrade required: 4->7",
+        match="Database schema upgrade required: 4->9",
     ):
         db_store.init_db()
     blocked = db_store.get_connection()
@@ -860,7 +883,7 @@ def test_existing_schema_v4_removes_duplicate_indexes_but_preserves_deferred_tab
     with held_lock:
         with pytest.raises(
             RuntimeError,
-            match="Database schema upgrade required: 4->7",
+            match="Database schema upgrade required: 4->9",
         ):
             db_store._init_db_once(str(path.resolve()))
 
@@ -869,8 +892,8 @@ def test_existing_schema_v4_removes_duplicate_indexes_but_preserves_deferred_tab
     state = db_store.inspect_schema_migration_connection(conn, path)
 
     assert state["ready"] is True
-    assert state["user_version"] == 7
-    assert [item["version"] for item in state["ledger"]] == [1, 2, 3, 4, 5, 6, 7]
+    assert state["user_version"] == 9
+    assert [item["version"] for item in state["ledger"]] == list(range(1, 10))
     assert _v5_duplicate_index_names(conn) == set()
     assert _deferred_external_consumer_table_names(conn) == set(
         db_store._DEFERRED_EXTERNAL_CONSUMER_TABLES_V5
@@ -929,7 +952,7 @@ def test_cached_init_refuses_a_database_downgraded_to_v4(isolated_memory):
     assert str(path.resolve()) in db_store._INITIALIZED_DB_PATHS
     with pytest.raises(
         RuntimeError,
-        match="Database schema upgrade required: 4->7",
+        match="Database schema upgrade required: 4->9",
     ):
         db_store.init_db()
 
