@@ -9,7 +9,7 @@ import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterable
 
 
 _LEGACY_MD5_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -172,6 +172,65 @@ def _read_raw_chunk(handle) -> bytes:
     return handle.read(_READ_CHUNK_BYTES)
 
 
+def _open_stable_raw_handle(path: Path) -> BinaryIO:
+    """Open one raw file while denying concurrent writes/deletes on Windows."""
+    if os.name != "nt":
+        return path.open("rb")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    sequential_scan = 0x08000000
+    invalid_handle = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    def windows_opener(_raw_path: str, _flags: int) -> int:
+        native_handle = create_file(
+            str(path),
+            generic_read,
+            file_share_read,
+            None,
+            open_existing,
+            sequential_scan,
+            None,
+        )
+        if native_handle in (None, 0, invalid_handle):
+            error_code = ctypes.get_last_error()
+            if error_code in {32, 33}:
+                raise RawSourceUnstableError("raw_source_has_active_writer")
+            raise ctypes.WinError(error_code)
+        try:
+            return msvcrt.open_osfhandle(
+                int(native_handle),
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOINHERIT", 0),
+            )
+        except BaseException:
+            close_handle(native_handle)
+            raise
+
+    return open(path, "rb", opener=windows_opener)
+
+
 def stable_raw_revision(
     filepath: str | os.PathLike[str],
     *,
@@ -202,7 +261,7 @@ def stable_raw_revision(
             md5 = hashlib.md5()
     captured = bytearray() if capture_bytes else None
 
-    with path.open("rb") as handle:
+    with _open_stable_raw_handle(path) as handle:
         before_handle = os.fstat(handle.fileno())
         if _handle_identity(before_handle) != _handle_identity(before_path):
             raise RawSourceUnstableError("raw_source_changed_before_read")
@@ -220,8 +279,7 @@ def stable_raw_revision(
             if captured is not None:
                 captured.extend(chunk)
         after_handle = os.fstat(handle.fileno())
-
-    after_path = path.stat()
+        after_path = path.stat()
     handle_identities = {
         _handle_identity(before_path),
         _handle_identity(before_handle),

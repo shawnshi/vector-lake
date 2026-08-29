@@ -300,16 +300,67 @@ def test_stable_revision_still_rejects_content_change_during_read(
     raw_path.write_bytes(original_bytes)
     real_read = raw_revision._read_raw_chunk
     changed = False
+    write_blocked = False
 
     def mutate_after_read(handle):
-        nonlocal changed
+        nonlocal changed, write_blocked
         chunk = real_read(handle)
         if chunk and not changed:
             changed = True
-            raw_path.write_bytes(b"B" * len(original_bytes))
+            try:
+                raw_path.write_bytes(b"B" * len(original_bytes))
+            except PermissionError:
+                write_blocked = True
+            else:
+                details = raw_path.stat()
+                os.utime(
+                    raw_path,
+                    ns=(details.st_atime_ns, details.st_mtime_ns + 1_000_000_000),
+                )
         return chunk
 
     monkeypatch.setattr(raw_revision, "_read_raw_chunk", mutate_after_read)
 
-    with pytest.raises(raw_revision.RawSourceUnstableError):
-        raw_revision.stable_raw_revision(raw_path)
+    if os.name == "nt":
+        snapshot = raw_revision.stable_raw_revision(raw_path)
+        assert write_blocked
+        assert raw_path.read_bytes() == original_bytes
+        assert snapshot.canonical_revision == (
+            "sha256:" + hashlib.sha256(original_bytes).hexdigest()
+        )
+    else:
+        with pytest.raises(raw_revision.RawSourceUnstableError):
+            raw_revision.stable_raw_revision(raw_path)
+        assert not write_blocked
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing contract")
+def test_windows_stable_raw_handle_allows_readers_and_denies_writers(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "shared-read.txt"
+    original_bytes = b"stable shared read"
+    replacement_bytes = b"replacement bytes!"
+    replacement_path = raw_path.with_name("replacement.txt")
+    assert len(replacement_bytes) == len(original_bytes)
+    raw_path.write_bytes(original_bytes)
+    replacement_path.write_bytes(replacement_bytes)
+
+    with raw_revision._open_stable_raw_handle(raw_path) as first:
+        with raw_revision._open_stable_raw_handle(raw_path) as second:
+            assert first.read() == original_bytes
+            assert second.read() == original_bytes
+            with pytest.raises(OSError):
+                raw_path.write_bytes(replacement_bytes)
+            with pytest.raises(OSError):
+                raw_path.unlink()
+            with pytest.raises(OSError):
+                os.replace(replacement_path, raw_path)
+            assert raw_path.read_bytes() == original_bytes
+
+    os.replace(replacement_path, raw_path)
+    assert raw_path.read_bytes() == replacement_bytes
+
+    with raw_path.open("r+b"):
+        with pytest.raises(raw_revision.RawSourceUnstableError):
+            raw_revision._open_stable_raw_handle(raw_path)
