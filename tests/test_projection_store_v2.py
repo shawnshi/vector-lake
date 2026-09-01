@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import random
 import statistics
+import threading
+import time
 
 import pytest
 
@@ -123,6 +125,125 @@ def test_batch_set_delete_get_iteration_and_bounded_diff(isolated_memory, monkey
     assert len(truncated.entries) == 2
 
 
+def test_deep_pagination_skips_cursor_preceding_trie_shards(
+    isolated_memory,
+    monkeypatch,
+):
+    store = _store(isolated_memory, monkeypatch)
+    item_count = 4_000
+    committed = store.apply(
+        store.empty_root_digest,
+        sets={f"key-{index:05d}": index for index in range(item_count)},
+    )
+    expected = store.iter_items(committed.root_digest, limit=item_count)
+    object_count = len(
+        store.object_paths(committed.root_digest, max_objects=10_000)
+    )
+    cursor_index = item_count - 20
+    visited = []
+    original_load = store._load_node
+
+    def tracked_load(digest, depth, prefix, reads):
+        visited.append((digest, prefix))
+        return original_load(digest, depth, prefix, reads)
+
+    monkeypatch.setattr(store, "_load_node", tracked_load)
+
+    page = store.iter_items(
+        committed.root_digest,
+        limit=10,
+        start_after=expected[cursor_index][0],
+    )
+
+    assert page == expected[cursor_index + 1 : cursor_index + 11]
+    assert len(visited) < max(5, object_count // 4)
+
+
+def test_bulk_materialization_matches_serial_with_bounded_secure_reads(
+    isolated_memory,
+    monkeypatch,
+):
+    store = _store(isolated_memory, monkeypatch)
+    item_count = 4_000
+    keys = [f"key-{index:05d}" for index in range(item_count)]
+    committed = store.apply(
+        store.empty_root_digest,
+        sets={key: index for index, key in enumerate(keys)},
+    )
+    first_slot_counts = {
+        slot: sum(store_v2.key_digest(key).startswith(slot) for key in keys)
+        for slot in "0123456789abcdef"
+    }
+    assert min(first_slot_counts.values()) <= store_v2.MAX_LEAF_ENTRIES
+    assert max(first_slot_counts.values()) > store_v2.MAX_LEAF_ENTRIES
+    expected = store.iter_items(committed.root_digest, limit=item_count)
+    expected_directories = {
+        path.parent for path in store.objects_dir.rglob("*.json")
+    }
+    active = 0
+    maximum_active = 0
+    active_lock = threading.Lock()
+    initial_checks: list[Path] = []
+    boundary_checks: list[Path] = []
+    original_read = store._read_node_file
+    original_initial = store._assert_secure_directory
+    original_boundary = store._assert_secure_read_directory_identity
+
+    def tracked_read(digest: str):
+        nonlocal active, maximum_active
+        with active_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.001)
+            return original_read(digest)
+        finally:
+            with active_lock:
+                active -= 1
+
+    def record_initial(path: Path) -> None:
+        initial_checks.append(path)
+        original_initial(path)
+
+    def record_boundary(path: Path, identity: tuple[int, int]) -> None:
+        boundary_checks.append(path)
+        original_boundary(path, identity)
+
+    monkeypatch.setattr(store, "_read_node_file", tracked_read)
+    monkeypatch.setattr(store, "_assert_secure_directory", record_initial)
+    monkeypatch.setattr(
+        store,
+        "_assert_secure_read_directory_identity",
+        record_boundary,
+    )
+
+    observed = store.materialize_items(committed.root_digest, limit=item_count)
+
+    assert observed == expected
+    assert 1 < maximum_active <= store_v2._BULK_READ_WORKERS
+    assert set(initial_checks) == expected_directories
+    assert len(initial_checks) == len(expected_directories)
+    assert set(boundary_checks) == expected_directories
+    assert len(boundary_checks) == len(expected_directories)
+
+    def reject_changed_directory(
+        _path: Path,
+        _identity: tuple[int, int],
+    ) -> None:
+        raise store_v2.ProjectionSecurityError("directory_changed_during_read:test")
+
+    monkeypatch.setattr(
+        store,
+        "_assert_secure_read_directory_identity",
+        reject_changed_directory,
+    )
+    with pytest.raises(
+        store_v2.ProjectionSecurityError,
+        match="directory_changed_during_read",
+    ):
+        store.materialize_items(committed.root_digest, limit=item_count)
+
+
 def test_randomized_batches_match_reference_and_delete_to_stable_empty_root(
     isolated_memory,
     monkeypatch,
@@ -181,6 +302,8 @@ def test_hash_tamper_and_noncanonical_or_invalid_shape_fail_closed(
     noncanonical_path.write_bytes(noncanonical)
     with pytest.raises(store_v2.ProjectionIntegrityError, match="noncanonical"):
         store.iter_items(noncanonical_digest, limit=3)
+    with pytest.raises(store_v2.ProjectionIntegrityError, match="noncanonical"):
+        store.materialize_items(noncanonical_digest, limit=3)
 
 
 def test_oversize_value_depth_limit_and_invalid_roots_fail_closed(

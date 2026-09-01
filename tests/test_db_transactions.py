@@ -91,22 +91,14 @@ def test_existing_database_identity_validation_runs_outside_write_transaction(
     db_store.close_all_connections()
     db_store._INITIALIZED_DB_PATHS.discard(str(path.resolve()))
     observed = []
-    real_registry = db_store._validate_canonical_identity_registry
     real_coverage = db_store._validate_canonical_identity_coverage
 
-    def checked_registry(conn):
-        observed.append(("registry", conn.in_transaction))
-        return real_registry(conn)
+    def checked_coverage(conn, **kwargs):
+        observed.append(
+            ("coverage", conn.in_transaction, kwargs.get("include_versions"))
+        )
+        return real_coverage(conn, **kwargs)
 
-    def checked_coverage(conn):
-        observed.append(("coverage", conn.in_transaction))
-        return real_coverage(conn)
-
-    monkeypatch.setattr(
-        db_store,
-        "_validate_canonical_identity_registry",
-        checked_registry,
-    )
     monkeypatch.setattr(
         db_store,
         "_validate_canonical_identity_coverage",
@@ -115,7 +107,7 @@ def test_existing_database_identity_validation_runs_outside_write_transaction(
 
     db_store.init_db()
 
-    assert observed == [("registry", False), ("coverage", False)]
+    assert observed == [("coverage", False, False)]
     assert str(path.resolve()) in db_store._INITIALIZED_DB_PATHS
 
 

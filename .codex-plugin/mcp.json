@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "vector-lake-mcp": {
+      "command": "python",
+      "args": [
+        "scripts/vector_lake_mcp.py",
+        "--profile",
+        "default",
+        "--surface",
+        "full"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "GEMINI_API_KEY",
+        "VECTOR_LAKE_QUERY_EMBEDDING"
+      ],
+      "env": {
+        "VECTOR_LAKE_PAYLOAD_ROOT": "~/.codex/brain",
+        "VECTOR_LAKE_AGENT_SANDBOX_ROOTS": "~/.codex"
+      }
+    }
+  }
+}

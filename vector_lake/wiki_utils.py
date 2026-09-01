@@ -450,7 +450,7 @@ def get_memory_dir() -> Path:
     override = os.environ.get("VECTOR_LAKE_MEMORY_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    return (Path(os.path.expanduser("~")) / ".gemini" / "MEMORY").resolve()
+    return (Path(os.path.expanduser("~")) / "MEMORY").resolve()
 
 
 def _uses_legacy_default_memory_root() -> bool:

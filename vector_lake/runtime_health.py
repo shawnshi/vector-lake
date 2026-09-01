@@ -51,6 +51,8 @@ _WRITE_GATE_CACHE: dict[str, Any] = {
     "health": None,
 }
 _SEMANTIC_READINESS_EVALUATION_LOCK = threading.Lock()
+_SEMANTIC_READINESS_REFRESH_LOCK = threading.Lock()
+_SEMANTIC_READINESS_REFRESH_THREAD: threading.Thread | None = None
 _SEMANTIC_READINESS_ENVELOPE_CACHE: dict[str, Any] = {
     "fingerprint": None,
     "checked_at": 0.0,
@@ -63,7 +65,7 @@ _WIKI_VERSION_CACHE: dict[
 _AUTO_INGEST_RECEIPT_SCAN_CAP = 256
 _AUTO_INGEST_RECEIPT_MAX_SCAN_CAP = 4096
 _AUTO_INGEST_RECEIPT_RETENTION_DAYS = 14
-_SEMANTIC_READINESS_CACHE_TTL_SECONDS = 5.0
+_SEMANTIC_READINESS_CACHE_TTL_SECONDS = 60.0
 _SEMANTIC_READINESS_MAX_ITEMS = 8
 _SEMANTIC_READINESS_MAX_ITEM_CHARS = 256
 _SEMANTIC_READINESS_GENERATION_SURFACES = (
@@ -341,6 +343,98 @@ def _effective_watchdog_component_status(
     return raw_status, ""
 
 
+def _watchdog_component_health(
+    status: dict[str, Any],
+    *,
+    now_utc: datetime,
+    component_max_age: int,
+    auto_ingest_enabled: bool,
+) -> dict[str, Any]:
+    """Classify watchdog workers once for every diagnostic surface."""
+    components = status.get("components")
+    component_map = components if isinstance(components, dict) else {}
+    unhealthy_states = {"error", "halted", "stopped"}
+    required_components = {
+        item.strip()
+        for item in os.environ.get(
+            "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+            "watchdog,outbox,ingest",
+        ).split(",")
+        if item.strip()
+    }
+    if auto_ingest_enabled:
+        required_components.add("auto_ingest")
+
+    unhealthy_required: list[str] = []
+    unhealthy_optional: list[str] = []
+    stale_required: list[str] = []
+    stale_optional: list[str] = []
+    paused_components: dict[str, str] = {}
+    effective_statuses: dict[str, str] = {}
+    component_ages: dict[str, int | None] = {}
+    for name, raw_component in component_map.items():
+        component_name = str(name)
+        component = raw_component if isinstance(raw_component, dict) else {}
+        heartbeat = _parse_dt(
+            component.get("heartbeat_at") or component.get("updated_at")
+        )
+        component_age = (
+            max(0, int((now_utc - heartbeat).total_seconds()))
+            if heartbeat is not None
+            else None
+        )
+        component_ages[component_name] = component_age
+        effective_status, pause_reason = _effective_watchdog_component_status(
+            component_name,
+            component,
+        )
+        effective_statuses[component_name] = effective_status
+        if pause_reason:
+            paused_components[component_name] = pause_reason
+        is_required = component_name in required_components
+        if component_age is None or component_age > component_max_age:
+            target = stale_required if is_required else stale_optional
+            target.append(component_name)
+        if effective_status in unhealthy_states:
+            target = unhealthy_required if is_required else unhealthy_optional
+            target.append(component_name)
+
+    missing_components = sorted(required_components - set(component_map))
+    aggregate_status = str(status.get("status", "")).lower()
+    aggregate_is_paused = bool(
+        aggregate_status in unhealthy_states
+        and not unhealthy_required
+        and not unhealthy_optional
+        and paused_components
+        and any(
+            str((component_map.get(name) or {}).get("status", "")).lower()
+            == aggregate_status
+            for name in paused_components
+        )
+    )
+    aggregate_requires_block = bool(
+        aggregate_status in unhealthy_states
+        and not aggregate_is_paused
+        and not unhealthy_optional
+    )
+    return {
+        "component_map_present": bool(component_map),
+        "required_components": sorted(required_components),
+        "component_ages_seconds": component_ages,
+        "effective_statuses": effective_statuses,
+        "paused_components": paused_components,
+        "unhealthy_required_components": sorted(unhealthy_required),
+        "unhealthy_optional_components": sorted(unhealthy_optional),
+        "stale_required_components": sorted(stale_required),
+        "stale_optional_components": sorted(stale_optional),
+        "missing_components": missing_components,
+        "missing_components_blocking": bool(
+            auto_ingest_enabled and "auto_ingest" in missing_components
+        ),
+        "aggregate_requires_block": aggregate_requires_block,
+    }
+
+
 _RUNTIME_HEALTH_REQUIRED_COLUMNS = {
     "entities": {"entity_id", "data_json"},
     "claims": {"claim_id", "data_json", "status"},
@@ -562,16 +656,24 @@ def _semantic_readiness_generation_binding(
 ) -> dict[str, Any]:
     """Capture a cheap, verifiable generation token for semantic readiness.
 
-    Runtime generations cover canonical and governance surfaces. Database/WAL
-    identity additionally catches semantic tables that do not have a dedicated
-    runtime-generation counter. The projection is accepted only when its
-    verified canonical binding still matches the database.
+    Runtime generations cover canonical and governance surfaces. Projection-v2
+    readiness is bound through its small, database-attested sidecar rather than
+    materializing every projection node. Supporting tables without generation
+    counters are refreshed by the bounded envelope TTL.
     """
+    from vector_lake.indexer import (
+        ProjectionPairContractError,
+        read_committed_index_snapshot,
+    )
+    from vector_lake.projection_format_v2 import (
+        ProjectionV2ContractError,
+        is_v2_locator,
+        read_committed_sidecar,
+    )
     from vector_lake.search_projection_contract import (
         CANONICAL_PROJECTION_SURFACES,
         verified_projection_runtime_generations,
     )
-    from vector_lake.indexer import read_committed_index_snapshot
     from vector_lake.wiki_utils import (
         get_claim_graph_path,
         get_index_path,
@@ -583,7 +685,7 @@ def _semantic_readiness_generation_binding(
     if not index_path.is_file():
         raise RuntimeDatabaseBlocked("semantic_projection_missing")
     try:
-        conn, db_path = _open_runtime_generation_database_read_only()
+        conn, _db_path = _open_runtime_generation_database_read_only()
         placeholders = ",".join(
             "?" for _ in _SEMANTIC_READINESS_GENERATION_SURFACES
         )
@@ -601,50 +703,104 @@ def _semantic_readiness_generation_binding(
         )
         if missing:
             raise RuntimeDatabaseBlocked("semantic_runtime_generations_incomplete")
-        database_fingerprint = _semantic_readiness_file_fingerprint(
-            (db_path, db_path.with_name(db_path.name + "-wal"))
-        )
-        committed_index_data = read_committed_index_snapshot(
-            index_path,
-            connection=conn,
-            _acquire_lock=False,
-        )
+
+        if is_v2_locator(index_path, "index"):
+            try:
+                sidecar, _sidecar_identity, _runtime_projection = (
+                    read_committed_sidecar(
+                        index_path.parent,
+                        connection=conn,
+                        require_current_generation=True,
+                    )
+                )
+            except ProjectionV2ContractError as exc:
+                raise ProjectionPairContractError(
+                    f"Committed projection v2 could not be verified ({exc}); run sync."
+                ) from exc
+            projection_generations = {
+                str(surface): int(generation)
+                for surface, generation in sidecar["canonical_generation"].items()
+            }
+            projection_generation = str(sidecar["projection_generation"])
+            projection_material = {
+                "generation": projection_generation,
+                "canonical_generation": projection_generations,
+                "index_root_sha256": sidecar["index_root_sha256"],
+                "claim_graph_root_sha256": sidecar[
+                    "claim_graph_root_sha256"
+                ],
+            }
+            if index_data is not None:
+                if not isinstance(index_data, dict):
+                    raise RuntimeDatabaseBlocked(
+                        "semantic_projection_snapshot_mismatch"
+                    )
+                provided_generations = verified_projection_runtime_generations(
+                    index_data
+                )
+                provided_manifest = index_data.get("projection_manifest")
+                if (
+                    provided_generations != projection_generations
+                    or not isinstance(provided_manifest, dict)
+                    or str(provided_manifest.get("generation") or "")
+                    != projection_generation
+                ):
+                    raise RuntimeDatabaseBlocked(
+                        "semantic_projection_snapshot_mismatch"
+                    )
+        else:
+            committed_index_data = read_committed_index_snapshot(
+                index_path,
+                connection=conn,
+                _acquire_lock=False,
+            )
+            if not isinstance(committed_index_data, dict):
+                raise RuntimeDatabaseBlocked("semantic_projection_invalid")
+            if index_data is not None and (
+                not isinstance(index_data, dict)
+                or index_data.get("projection_manifest")
+                != committed_index_data.get("projection_manifest")
+                or index_data.get("graph_state")
+                != committed_index_data.get("graph_state")
+            ):
+                raise RuntimeDatabaseBlocked(
+                    "semantic_projection_snapshot_mismatch"
+                )
+            index_data = committed_index_data
+            projection_generations = verified_projection_runtime_generations(
+                index_data
+            )
+            if projection_generations is None:
+                raise RuntimeDatabaseBlocked(
+                    "semantic_projection_binding_unverified"
+                )
+            manifest = index_data.get("projection_manifest")
+            if not isinstance(manifest, dict):
+                raise RuntimeDatabaseBlocked(
+                    "semantic_projection_manifest_invalid"
+                )
+            projection_generation = str(
+                manifest.get("generation") or ""
+            ).strip()
+            if not projection_generation:
+                raise RuntimeDatabaseBlocked(
+                    "semantic_projection_generation_missing"
+                )
+            projection_material = {
+                "generation": projection_generation,
+                "canonical_generation": projection_generations,
+                "graph_state": index_data.get("graph_state"),
+            }
     finally:
         if conn is not None:
             conn.close()
 
-    if not isinstance(committed_index_data, dict):
-        raise RuntimeDatabaseBlocked("semantic_projection_invalid")
-    if index_data is not None and (
-        not isinstance(index_data, dict)
-        or index_data.get("projection_manifest")
-        != committed_index_data.get("projection_manifest")
-        or index_data.get("graph_state") != committed_index_data.get("graph_state")
-    ):
-        raise RuntimeDatabaseBlocked("semantic_projection_snapshot_mismatch")
-    index_data = committed_index_data
-
-    projection_generations = verified_projection_runtime_generations(index_data)
-    if projection_generations is None:
-        raise RuntimeDatabaseBlocked("semantic_projection_binding_unverified")
     current_projection_generations = {
         surface: runtime_generations[surface]
         for surface in CANONICAL_PROJECTION_SURFACES
     }
     if projection_generations != current_projection_generations:
         raise RuntimeDatabaseBlocked("semantic_projection_generation_mismatch")
-
-    manifest = index_data.get("projection_manifest")
-    if not isinstance(manifest, dict):
-        raise RuntimeDatabaseBlocked("semantic_projection_manifest_invalid")
-    projection_generation = str(manifest.get("generation") or "").strip()
-    if not projection_generation:
-        raise RuntimeDatabaseBlocked("semantic_projection_generation_missing")
-    projection_material = {
-        "generation": projection_generation,
-        "canonical_generation": projection_generations,
-        "graph_state": index_data.get("graph_state"),
-    }
     projection_fingerprint = "sha256:" + hashlib.sha256(
         json.dumps(
             projection_material,
@@ -692,7 +848,6 @@ def _semantic_readiness_generation_binding(
                 )
             ),
         },
-        "database_fingerprint": database_fingerprint,
         "policy_fingerprint": policy_fingerprint,
     }
     binding["fingerprint"] = "sha256:" + hashlib.sha256(
@@ -822,16 +977,90 @@ def _clear_semantic_readiness_envelope_cache_for_tests() -> None:
             )
 
 
+def _schedule_semantic_readiness_refresh(
+    *,
+    cache_ttl_seconds: float,
+    index_data: dict[str, Any] | None,
+) -> bool:
+    """Start one daemon refresh without retaining more than one projection."""
+    global _SEMANTIC_READINESS_REFRESH_THREAD
+
+    def refresh() -> None:
+        global _SEMANTIC_READINESS_REFRESH_THREAD
+        try:
+            get_semantic_readiness_envelope(
+                cache_ttl_seconds=cache_ttl_seconds,
+                index_data=index_data,
+                nonblocking=False,
+            )
+        finally:
+            with _SEMANTIC_READINESS_REFRESH_LOCK:
+                if _SEMANTIC_READINESS_REFRESH_THREAD is threading.current_thread():
+                    _SEMANTIC_READINESS_REFRESH_THREAD = None
+
+    with _SEMANTIC_READINESS_REFRESH_LOCK:
+        if (
+            _SEMANTIC_READINESS_REFRESH_THREAD is not None
+            and _SEMANTIC_READINESS_REFRESH_THREAD.is_alive()
+        ):
+            return False
+        _SEMANTIC_READINESS_REFRESH_THREAD = threading.Thread(
+            target=refresh,
+            name="vector-lake-semantic-readiness-refresh",
+            daemon=True,
+        )
+        _SEMANTIC_READINESS_REFRESH_THREAD.start()
+        return True
+
+
 def get_semantic_readiness_envelope(
     *,
     cache_ttl_seconds: float = _SEMANTIC_READINESS_CACHE_TTL_SECONDS,
     index_data: dict[str, Any] | None = None,
+    nonblocking: bool = False,
 ) -> dict[str, Any]:
-    """Return a generation-bound readiness snapshot without blocking retrieval."""
+    """Return a generation-bound readiness snapshot.
+
+    Retrieval paths set ``nonblocking`` to return a matching cached envelope or
+    an explicit unknown result while one single-flight refresh runs in the
+    background. Doctor and governance surfaces retain synchronous evaluation.
+    """
     try:
         ttl_seconds = min(60.0, max(0.0, float(cache_ttl_seconds)))
     except (TypeError, ValueError):
         ttl_seconds = _SEMANTIC_READINESS_CACHE_TTL_SECONDS
+
+    if nonblocking:
+        try:
+            before = _semantic_readiness_generation_binding(index_data)
+        except Exception as exc:
+            return _unknown_semantic_readiness_envelope(
+                f"semantic_readiness_binding_unavailable:{type(exc).__name__}"
+            )
+        now = time.monotonic()
+        with _CACHE_LOCK:
+            cached = _SEMANTIC_READINESS_ENVELOPE_CACHE.get("envelope")
+            cached_fingerprint = _SEMANTIC_READINESS_ENVELOPE_CACHE.get(
+                "fingerprint"
+            )
+            checked_at = float(
+                _SEMANTIC_READINESS_ENVELOPE_CACHE.get("checked_at") or 0.0
+            )
+        if cached is not None and cached_fingerprint == before.get("fingerprint"):
+            if now - checked_at > ttl_seconds:
+                _schedule_semantic_readiness_refresh(
+                    cache_ttl_seconds=ttl_seconds,
+                    index_data=index_data,
+                )
+            return copy.deepcopy(cached)
+        _schedule_semantic_readiness_refresh(
+            cache_ttl_seconds=ttl_seconds,
+            index_data=index_data,
+        )
+        return _unknown_semantic_readiness_envelope(
+            "semantic_readiness_refresh_pending",
+            before,
+        )
 
     with _SEMANTIC_READINESS_EVALUATION_LOCK:
         try:
@@ -978,6 +1207,25 @@ def _write_health_surface_token() -> str:
         wiki_identity = (str(wiki_dir.resolve()), "missing")
     digest.update(repr(wiki_identity).encode("utf-8"))
 
+    # Bind cached deep audits to each Wiki file identity. This catches ordinary
+    # in-place edits that do not update the directory metadata while avoiding
+    # page-body parsing on every write.
+    try:
+        with os.scandir(wiki_dir) as entries:
+            for entry in entries:
+                if not entry.name.casefold().endswith(".md") or not entry.is_file():
+                    continue
+                stat = entry.stat()
+                file_identity = (
+                    entry.name,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                    stat.st_size,
+                )
+                digest.update(repr(file_identity).encode("utf-8"))
+    except OSError as exc:
+        digest.update(f"wiki-enumeration-error:{type(exc).__name__}".encode("ascii"))
+
     for path in (
         get_index_path(),
         get_claim_graph_path(),
@@ -1093,6 +1341,117 @@ def _write_health_surface_token() -> str:
     return digest.hexdigest()
 
 
+def _bounded_wiki_projection_freshness(
+    conn: sqlite3.Connection,
+    index_path: Path,
+) -> dict[str, Any]:
+    """Detect ordinary external Wiki drift without parsing page bodies."""
+    from vector_lake.wiki_utils import get_wiki_dir, iter_markdown_files
+
+    excluded = {
+        "index.md",
+        "log.md",
+        "overview.md",
+        "orphan_pages.md",
+        "wiki_link_stats.md",
+        "synthesis_log.md",
+    }
+    try:
+        projection_mtime_ns = int(index_path.stat().st_mtime_ns)
+    except OSError as exc:
+        return {
+            "status": "invalid",
+            "issue": f"projection_stat_failed:{type(exc).__name__}",
+        }
+
+    wiki_keys: set[str] = set()
+    newer_paths: list[Path] = []
+    unreadable_pages: list[str] = []
+    for path in iter_markdown_files(get_wiki_dir()):
+        folded_name = path.name.casefold()
+        if folded_name in excluded or folded_name.startswith("system_"):
+            continue
+        wiki_keys.add(path.stem)
+        try:
+            if int(path.stat().st_mtime_ns) > projection_mtime_ns:
+                newer_paths.append(path)
+        except OSError:
+            unreadable_pages.append(path.name)
+
+    canonical_keys = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT json_extract(data_json, '$.page_key') AS page_key "
+            "FROM entities "
+            "WHERE COALESCE(json_extract(data_json, '$.page_key'), '') <> '' "
+            "AND json_extract(data_json, '$.page_key') NOT LIKE 'System_%'"
+        )
+        if row[0] is not None
+    }
+    missing_canonical = sorted(wiki_keys - canonical_keys)
+    missing_wiki = sorted(canonical_keys - wiki_keys)
+
+    # Only pages newer than the committed projection need body verification.
+    # Ordinary healthy writes therefore pay O(page-count) stat/name checks plus
+    # O(changed-pages) parsing instead of a corpus-wide parity audit.
+    canonical_by_page: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    newer_keys = sorted({path.stem for path in newer_paths} & canonical_keys)
+    for offset in range(0, len(newer_keys), 500):
+        batch = newer_keys[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            "SELECT json_extract(data_json, '$.page_key') AS page_key, "
+            "entity_id, data_json FROM entities "
+            f"WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
+            tuple(batch),
+        ):
+            try:
+                entity = json.loads(str(row["data_json"]))
+            except (TypeError, ValueError):
+                unreadable_pages.append(str(row["page_key"]))
+                continue
+            canonical_by_page.setdefault(str(row["page_key"]), []).append(
+                (str(row["entity_id"]), entity)
+            )
+
+    from vector_lake import governance_store
+
+    content_drift: list[str] = []
+    for path in newer_paths:
+        records = canonical_by_page.get(path.stem)
+        if not records:
+            continue
+        try:
+            observed = governance_store.canonical_page_version_from_content(
+                path.name,
+                path.read_text(encoding="utf-8"),
+            )
+            expected = governance_store._canonical_entity_records_version(records)
+        except (OSError, UnicodeError, ValueError):
+            unreadable_pages.append(path.name)
+            continue
+        if observed != expected:
+            content_drift.append(path.name)
+
+    invalid = bool(
+        content_drift or unreadable_pages or missing_canonical or missing_wiki
+    )
+    return {
+        "status": "invalid" if invalid else "ready",
+        "wiki_count": len(wiki_keys),
+        "canonical_count": len(canonical_keys),
+        "newer_than_projection": len(newer_paths),
+        "content_drift": len(content_drift),
+        "unreadable": len(unreadable_pages),
+        "missing_canonical": len(missing_canonical),
+        "missing_wiki": len(missing_wiki),
+        "content_drift_samples": sorted(content_drift)[:10],
+        "unreadable_samples": sorted(unreadable_pages)[:10],
+        "missing_canonical_samples": missing_canonical[:10],
+        "missing_wiki_samples": missing_wiki[:10],
+    }
+
+
 def _prune_wiki_version_cache(active_paths: set[str]) -> None:
     with _CACHE_LOCK:
         stale = [key for key in _WIKI_VERSION_CACHE if key not in active_paths]
@@ -1128,6 +1487,8 @@ def assess_runtime_health(
     max_watchdog_age_seconds: int = 120,
     deep_projection_checks: bool = False,
     diagnostic_snapshot=None,
+    *,
+    bounded_write_checks: bool = False,
 ) -> dict[str, Any]:
     from vector_lake.diagnostic_snapshot import current_durability_status
     from vector_lake.wiki_utils import (
@@ -1297,7 +1658,9 @@ def assess_runtime_health(
     try:
         from vector_lake.tool_gc import verify_gc_recovery_receipts
 
-        gc_receipts = verify_gc_recovery_receipts(deep=deep_projection_checks)
+        gc_receipts = verify_gc_recovery_receipts(
+            deep=deep_projection_checks or bounded_write_checks
+        )
         detail["gc_recovery_receipts"] = gc_receipts
         issues.extend(str(item) for item in gc_receipts.get("issues") or [])
         warnings.extend(str(item) for item in gc_receipts.get("warnings") or [])
@@ -1544,109 +1907,164 @@ def assess_runtime_health(
                         f"{process_id if process_id is not None else 'missing'}"
                     )
 
-            components = status.get("components")
-            unhealthy_states = {"error", "halted", "stopped"}
-            unhealthy_components: list[str] = []
-            paused_components: dict[str, str] = {}
-            effective_component_statuses: dict[str, str] = {}
-            if isinstance(components, dict) and components:
-                component_max_age = _bounded_env_int(
-                    "VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS",
-                    default=max(5, int(max_watchdog_age_seconds)),
-                    minimum=5,
-                )
-                component_ages: dict[str, int | None] = {}
-                stale_components: list[str] = []
-                for name, raw_component in components.items():
-                    component = raw_component if isinstance(raw_component, dict) else {}
-                    heartbeat = _parse_dt(
-                        component.get("heartbeat_at") or component.get("updated_at")
-                    )
-                    component_age = (
-                        max(0, int((now_utc - heartbeat).total_seconds()))
-                        if heartbeat is not None
-                        else None
-                    )
-                    component_name = str(name)
-                    component_ages[component_name] = component_age
-                    effective_status, pause_reason = (
-                        _effective_watchdog_component_status(
-                            component_name,
-                            component,
-                        )
-                    )
-                    effective_component_statuses[component_name] = effective_status
-                    if pause_reason:
-                        paused_components[component_name] = pause_reason
-                    if component_age is None or component_age > component_max_age:
-                        stale_components.append(component_name)
-                    if effective_status in unhealthy_states:
-                        unhealthy_components.append(component_name)
-
-                required_components = {
-                    item.strip()
-                    for item in os.environ.get(
-                        "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
-                        "watchdog,outbox,scheduler,ingest",
-                    ).split(",")
-                    if item.strip()
-                }
-                if auto_ingest_enabled:
-                    required_components.add("auto_ingest")
-                missing_components = sorted(required_components - set(components))
+            component_max_age = _bounded_env_int(
+                "VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS",
+                default=max(5, int(max_watchdog_age_seconds)),
+                minimum=5,
+            )
+            component_health = _watchdog_component_health(
+                status,
+                now_utc=now_utc,
+                component_max_age=component_max_age,
+                auto_ingest_enabled=auto_ingest_enabled,
+            )
+            unhealthy_required_components = component_health[
+                "unhealthy_required_components"
+            ]
+            if component_health["component_map_present"]:
                 detail["watchdog_component_max_age_seconds"] = component_max_age
-                detail["watchdog_component_ages_seconds"] = component_ages
-                detail["watchdog_component_effective_statuses"] = (
-                    effective_component_statuses
+                detail["watchdog_component_ages_seconds"] = component_health[
+                    "component_ages_seconds"
+                ]
+                detail["watchdog_component_effective_statuses"] = component_health[
+                    "effective_statuses"
+                ]
+                detail["watchdog_required_components"] = component_health[
+                    "required_components"
+                ]
+                detail["watchdog_unhealthy_optional_components"] = (
+                    component_health["unhealthy_optional_components"]
                 )
-                detail["watchdog_paused_components"] = paused_components
-                detail["watchdog_missing_components"] = missing_components
-                for component_name, pause_reason in sorted(paused_components.items()):
+                detail["watchdog_paused_components"] = component_health[
+                    "paused_components"
+                ]
+                detail["watchdog_missing_components"] = component_health[
+                    "missing_components"
+                ]
+                for component_name, pause_reason in sorted(
+                    component_health["paused_components"].items()
+                ):
                     warnings.append(
                         f"watchdog_component_paused:{component_name}:{pause_reason}"
                     )
-                for component_name in sorted(stale_components):
-                    component_age = component_ages[component_name]
+                for component_name in component_health[
+                    "stale_required_components"
+                ]:
+                    component_age = component_health["component_ages_seconds"][
+                        component_name
+                    ]
                     issues.append(
                         "watchdog_component_stale:"
                         f"{component_name}:"
                         f"{component_age if component_age is not None else 'unknown'}"
                     )
+                for component_name in component_health[
+                    "stale_optional_components"
+                ]:
+                    component_age = component_health["component_ages_seconds"][
+                        component_name
+                    ]
+                    warnings.append(
+                        "watchdog_component_stale:"
+                        f"{component_name}:"
+                        f"{component_age if component_age is not None else 'unknown'}"
+                    )
+                for component_name in component_health[
+                    "unhealthy_optional_components"
+                ]:
+                    warnings.append(
+                        "watchdog_component_unhealthy:"
+                        f"{component_name}:"
+                        f"{component_health['effective_statuses'][component_name]}"
+                    )
+                missing_components = component_health["missing_components"]
                 if missing_components:
                     missing_message = "watchdog_components_missing:" + ",".join(
                         missing_components
                     )
-                    if auto_ingest_enabled and "auto_ingest" in missing_components:
-                        issues.append(missing_message)
-                    else:
-                        warnings.append(missing_message)
+                    target = (
+                        issues
+                        if component_health["missing_components_blocking"]
+                        else warnings
+                    )
+                    target.append(missing_message)
             else:
                 detail["watchdog_status_schema"] = "legacy"
                 warnings.append("watchdog_component_status_legacy")
 
-            aggregate_status = str(status.get("status", "")).lower()
-            aggregate_is_paused = bool(
-                aggregate_status in unhealthy_states
-                and not unhealthy_components
-                and paused_components
-                and any(
-                    str((components.get(name) or {}).get("status", "")).lower()
-                    == aggregate_status
-                    for name in paused_components
-                )
-            )
             if (
-                (aggregate_status in unhealthy_states and not aggregate_is_paused)
-                or unhealthy_components
+                component_health["aggregate_requires_block"]
+                or unhealthy_required_components
             ):
                 issues.append(
                     "watchdog_unhealthy:"
-                    + (",".join(sorted(unhealthy_components)) or str(status.get("status")))
+                    + (
+                        ",".join(unhealthy_required_components)
+                        or str(status.get("status"))
+                    )
                 )
         except Exception as exc:
             issues.append(f"watchdog_status_unreadable:{exc}")
     else:
         warnings.append("watchdog_status_missing")
+
+    if bounded_write_checks:
+        index_path = get_index_path()
+        if index_path.exists():
+            try:
+                projection_freshness = _bounded_wiki_projection_freshness(
+                    conn,
+                    index_path,
+                )
+                detail["write_projection_freshness"] = projection_freshness
+                if projection_freshness.get("status") != "ready":
+                    issues.append(
+                        "write_projection_drift:"
+                        f"content={projection_freshness.get('content_drift', 0)},"
+                        f"unreadable={projection_freshness.get('unreadable', 0)},"
+                        f"missing_canonical={projection_freshness.get('missing_canonical', 0)},"
+                        f"missing_wiki={projection_freshness.get('missing_wiki', 0)}"
+                    )
+            except Exception as exc:
+                issues.append(
+                    "write_projection_freshness_unavailable:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+            try:
+                detail["write_projection_binding"] = (
+                    _semantic_readiness_generation_binding()
+                )
+            except Exception as exc:
+                issues.append(
+                    "write_projection_binding_invalid:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+            try:
+                from vector_lake.db_store import verify_search_projection_integrity
+
+                search_integrity = verify_search_projection_integrity(conn)
+                detail["search_projection_integrity"] = search_integrity
+                if search_integrity.get("status") != "ready":
+                    issues.append(
+                        "fts_projection_integrity:"
+                        f"{search_integrity.get('issue') or 'invalid'}"
+                    )
+            except Exception as exc:
+                issues.append(
+                    "fts_projection_integrity_unavailable:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+        else:
+            warnings.append("index_missing")
+        if owns_connection:
+            conn.close()
+        return {
+            "ok": not issues,
+            "status": "blocked" if issues else ("degraded" if warnings else "ready"),
+            "issues": issues,
+            "warnings": warnings,
+            "detail": detail,
+        }
 
     excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
     wiki_dir = get_wiki_dir()
@@ -2444,11 +2862,33 @@ def enforce_runtime_write_health(validation_mode: str = "full"):
     init_db()
     try:
         cache_seconds = float(
-            os.environ.get("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "0")
+            os.environ.get("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
         )
     except (TypeError, ValueError):
         cache_seconds = 0.0
     cache_seconds = max(0.0, min(30.0, cache_seconds))
+
+    fresh_health = assess_runtime_health(
+        deep_projection_checks=False,
+        bounded_write_checks=True,
+    )
+    if not fresh_health["ok"]:
+        raise RuntimeError(
+            "Vector Lake write gate blocked this mutation because bounded runtime "
+            "safety checks failed. "
+            f"Issues: {'; '.join(fresh_health['issues'])}"
+        )
+
+    deep_checks_enabled = (
+        validation_mode == "deep"
+        or os.environ.get("VECTOR_LAKE_WRITE_HEALTH_DEEP_CHECKS") == "1"
+    )
+    if not deep_checks_enabled:
+        # Full projection parity is a Doctor-grade diagnostic. The fresh gate
+        # above still verifies watchdog state, generation binding, FTS integrity,
+        # recovery receipts, and mutation backlogs on every write.
+        return
+
     token = _write_health_surface_token()
     health = _recent_write_gate_health(token, cache_seconds)
     if health is None:
@@ -2476,6 +2916,8 @@ def enforce_runtime_write_health(validation_mode: str = "full"):
                     health = _recent_write_gate_health(token, cache_seconds)
                     if health is not None:
                         break
+    if health is None:
+        raise RuntimeError("Vector Lake write gate produced no health assessment.")
     if not health["ok"]:
         raise RuntimeError(
             "Vector Lake write gate blocked this mutation because runtime health is not clean. "

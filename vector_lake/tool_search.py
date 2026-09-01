@@ -1,8 +1,10 @@
 import logging
+import heapq
 import json
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 import unicodedata
@@ -20,11 +22,16 @@ from vector_lake.index_snapshot import (
     CompactGraphAdjacency,
     get_compact_graph_adjacency,
 )
-from vector_lake.indexer import read_committed_index_snapshot
+from vector_lake.indexer import (
+    canonical_runtime_generation_snapshot,
+    read_committed_index_snapshot,
+)
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("vector-lake-tool-search")
 
 
@@ -56,9 +63,42 @@ CLAIM_MODE_DEPRECATION_WARNING = (
 
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 STOP_WORDS = {
-    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
-    "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for",
-    "of", "and", "or", "but", "with", "by", "from", "as", "it", "this", "that",
+    "的",
+    "了",
+    "在",
+    "是",
+    "我",
+    "有",
+    "和",
+    "就",
+    "不",
+    "人",
+    "都",
+    "一",
+    "一个",
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "in",
+    "on",
+    "at",
+    "to",
+    "for",
+    "of",
+    "and",
+    "or",
+    "but",
+    "with",
+    "by",
+    "from",
+    "as",
+    "it",
+    "this",
+    "that",
 }
 
 QUERY_EXPANSION_DICT = {
@@ -75,9 +115,9 @@ _QUERY_EMBEDDING_OPT_IN_ENV = "VECTOR_LAKE_QUERY_EMBEDDING"
 _QUERY_EMBEDDING_STATE_LOCK = threading.Lock()
 _QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
 _QUERY_EMBEDDING_KEY_LOCKS = tuple(threading.Lock() for _ in range(16))
-_QUERY_EMBEDDING_CACHE_KEYS: OrderedDict[
-    tuple[str, str, int, int], None
-] = OrderedDict()
+_QUERY_EMBEDDING_CACHE_KEYS: OrderedDict[tuple[str, str, int, int], None] = (
+    OrderedDict()
+)
 _SEARCH_PERFORMANCE_LOCK = threading.Lock()
 _SEARCH_PERFORMANCE = {
     "completed_calls": 0,
@@ -99,7 +139,6 @@ _EXACT_IDENTITY_WEIGHTS = {
     "title": 116.0,
     "alias": 112.0,
 }
-
 
 
 def _query_embedding_int(name: str, default: int) -> int:
@@ -133,8 +172,7 @@ def _record_search_performance(
     backend_issues: list[str],
 ) -> None:
     normalized = {
-        key: round(max(0.0, float(value)), 3)
-        for key, value in timings.items()
+        key: round(max(0.0, float(value)), 3) for key, value in timings.items()
     }
     normalized["result_chars"] = max(0, int(result_chars))
     normalized["result_bytes"] = max(0, int(result_bytes))
@@ -253,9 +291,7 @@ def _identity_lookup(index_data: dict) -> dict[str, tuple[tuple[str, float], ...
                 )
 
         lookup = {
-            label: tuple(
-                sorted(matches.items(), key=lambda item: (-item[1], item[0]))
-            )
+            label: tuple(sorted(matches.items(), key=lambda item: (-item[1], item[0])))
             for label, matches in mutable.items()
         }
         _IDENTITY_LOOKUP_CACHE["signature"] = signature
@@ -320,9 +356,7 @@ def _get_query_embedding(query: str) -> list[float]:
     global _QUERY_EMBEDDING_FAILURE_UNTIL
     normalized_query = str(query or "").strip()
     if len(normalized_query) > _SEARCH_QUERY_CHAR_LIMIT:
-        raise ValueError(
-            f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters"
-        )
+        raise ValueError(f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters")
     if (
         not _query_embedding_enabled()
         or not os.environ.get("GEMINI_API_KEY")
@@ -381,11 +415,9 @@ def _get_query_embedding(query: str) -> list[float]:
             log.warning(f"Failed to get query embedding: {exc}")
             return []
 
-_VECTOR_CACHE = {
-    "mtime": 0.0,
-    "keys": [],
-    "matrix": None
-}
+
+_VECTOR_CACHE = {"mtime": 0.0, "keys": [], "matrix": None}
+
 
 def _get_vector_search_results(
     query_vector: list[float],
@@ -397,6 +429,7 @@ def _get_vector_search_results(
             get_vector_connection,
             serialize_float32_vector,
         )
+
         conn = get_vector_connection()
         from vector_lake.embedding_scheduler import load_embedding_rate_config
         from vector_lake.search_projection_contract import (
@@ -436,9 +469,7 @@ def _get_vector_search_results(
                 (config.model, config.dimension, EMBEDDING_INPUT_CONTRACT),
             ).fetchone()
             total_count = int(crowding["total_count"] or 0)
-            metadata_invalid_count = int(
-                crowding["metadata_invalid_count"] or 0
-            )
+            metadata_invalid_count = int(crowding["metadata_invalid_count"] or 0)
             if total_count <= metadata_invalid_count:
                 return {}
 
@@ -476,13 +507,11 @@ def _get_vector_search_results(
                         break
                     entity_id = str(row["entity_id"])
                     node = nodes.get(entity_id)
-                    if (
-                        node is None
-                        or str(row["content_sha256"])
-                        != embedding_content_sha256(
-                            node,
-                            max_chars=config.max_chars_per_item,
-                        )
+                    if node is None or str(
+                        row["content_sha256"]
+                    ) != embedding_content_sha256(
+                        node,
+                        max_chars=config.max_chars_per_item,
                     ):
                         candidate_invalid_count += 1
                         continue
@@ -547,37 +576,72 @@ def _fts_projection_signature(index_data: dict) -> tuple | None:
     """Compatibility wrapper returning only the verified FTS proof."""
     return _fts_projection_probe(index_data)[0]
 
+
+def _stable_fts_projection_signature(signature: tuple | None) -> tuple | None:
+    """Exclude connection revision noise after integrity has been re-proven."""
+    if signature is None or signature == ("unbound_in_memory_projection",):
+        return signature
+    return signature[:5]
+
+
 def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
     try:
         from vector_lake.tokenizer_runtime import tokenize_for_fts
+
         query_tok = tokenize_for_fts(query)
     except ImportError:
         query_tok = query if query else ""
-        
+
     # Sanitize query_tok for FTS5 (remove special syntax characters)
     import re
-    query_tok = re.sub(r'["*^&|()\-:\[\]{}]', ' ', query_tok)
+
+    query_tok = re.sub(r'["*^&|()\-:\[\]{}]', " ", query_tok)
     # Ensure it's not empty or just spaces
     if not query_tok.strip():
         return []
-        
+
     try:
         from vector_lake.db_store import get_connection
+
         conn = get_connection()
-        cur = conn.execute("""
+        cur = conn.execute(
+            """
             SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
             FROM wiki_search_index 
             WHERE wiki_search_index MATCH ? 
             ORDER BY rank LIMIT ?
-        """, (query_tok, limit))
+        """,
+            (query_tok, limit),
+        )
         return [dict(row) for row in cur.fetchall()]
     except Exception as exc:
         log.warning("Failed to query fts5: %s", exc)
         raise SearchBackendError("fts5") from exc
 
+
 def _classify_intent(query: str) -> str:
-    temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
-    entity_keywords = {"是谁", "哪里", "谁在", "who is", "where is", "公司", "人员", "关联", "图谱", "网络"}
+    temporal_keywords = {
+        "上周",
+        "去年",
+        "昨天",
+        "最近",
+        "历史",
+        "last week",
+        "yesterday",
+        "202",
+    }
+    entity_keywords = {
+        "是谁",
+        "哪里",
+        "谁在",
+        "who is",
+        "where is",
+        "公司",
+        "人员",
+        "关联",
+        "图谱",
+        "网络",
+    }
     for kw in temporal_keywords:
         if kw in query.lower():
             return "temporal"
@@ -630,7 +694,11 @@ def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) ->
     memory_type = memory.get("memory_type", "fact")
     score = memory.get("retrieval_score", memory.get("memory_score", 0))
     text = " ".join(str(memory.get("text", "")).split())[:420]
-    source = memory.get("source_page") or memory.get("source_claim_id") or "operational_memory"
+    source = (
+        memory.get("source_page")
+        or memory.get("source_claim_id")
+        or "operational_memory"
+    )
     if as_xml:
         attrs = (
             f"ID={quoteattr(f'Memory_{index}')} Type={quoteattr(str(memory_type))} "
@@ -646,7 +714,13 @@ def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) ->
     )
 
 
-def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool = False, include_history: bool = False, memory_types: list[str] | None = None) -> str:
+def format_operational_memory_results(
+    query: str,
+    top_k: int = 8,
+    as_xml: bool = False,
+    include_history: bool = False,
+    memory_types: list[str] | None = None,
+) -> str:
     try:
         memories = governance_store.search_operational_memory(
             query,
@@ -676,7 +750,11 @@ def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool =
             in allowed_memory_types
         ]
     if not memories:
-        return "<MemoryResults />" if as_xml else "No operational memory matched the query."
+        return (
+            "<MemoryResults />"
+            if as_xml
+            else "No operational memory matched the query."
+        )
     formatted = "".join(
         _format_memory_result(memory, as_xml=as_xml, index=index)
         for index, memory in enumerate(memories)
@@ -700,8 +778,7 @@ def _format_claim_mode_compatibility(
             "</SearchCompatibility>"
         )
     return (
-        "DEPRECATION / ACTUAL SEMANTICS: "
-        f"{CLAIM_MODE_DEPRECATION_WARNING}\n\n{result}"
+        f"DEPRECATION / ACTUAL SEMANTICS: {CLAIM_MODE_DEPRECATION_WARNING}\n\n{result}"
     )
 
 
@@ -727,8 +804,10 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
             "retry_after_seconds": exc.retry_after_seconds,
         }
     stale_or_conflicted = [
-        item for item in historical
-        if str(item.get("validity_state", "")).lower() in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
+        item
+        for item in historical
+        if str(item.get("validity_state", "")).lower()
+        in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
     ][:6]
 
     sections = {
@@ -746,7 +825,9 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
 
     evidence_pointers = []
     for memory in memories:
-        section = type_to_section.get(memory.get("memory_type", "fact"), "Relevant Facts")
+        section = type_to_section.get(
+            memory.get("memory_type", "fact"), "Relevant Facts"
+        )
         text = " ".join(str(memory.get("text", "")).split())
         line = (
             f"- [{memory.get('memory_score', 0):.2f}/{memory.get('validity_state', 'active')}] "
@@ -767,7 +848,12 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         "Policy: Use this packet as the machine-facing runtime memory. If it conflicts with wiki prose, prefer active non-conflicted memory items and surface the conflict.",
         "",
     ]
-    for title in ("Current Preferences", "Open Decisions", "Task State", "Relevant Facts"):
+    for title in (
+        "Current Preferences",
+        "Open Decisions",
+        "Task State",
+        "Relevant Facts",
+    ):
         lines.append(f"## {title}")
         lines.extend(sections[title] or ["- None matched."])
         lines.append("")
@@ -790,7 +876,10 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     packet = "\n".join(lines)
     omitted = 0
     if len(packet) > max_chars:
-        packet = packet[: max(0, max_chars - 80)].rstrip() + "\n...[memory packet truncated]\n</MEMORY_PACKET>"
+        packet = (
+            packet[: max(0, max_chars - 80)].rstrip()
+            + "\n...[memory packet truncated]\n</MEMORY_PACKET>"
+        )
         omitted = max(0, len(memories) - 12)
     return {
         "packet": packet,
@@ -800,7 +889,9 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     }
 
 
-def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
+def _rerank_candidates_locally(
+    query: str, candidates: list[tuple[float, dict]]
+) -> list[tuple[float, dict]]:
     """Apply a deterministic semantic-text boost without an external model call."""
     query_text = str(query or "").strip().casefold()
     terms = {
@@ -874,13 +965,13 @@ def _safe_eval(expr: str, context: dict) -> bool:
         elif isinstance(node, ast.Call):
             # To support node.get('key') == 'value' or just get('key')
             # The context is actually `node`. So get() refers to node.get.
-            if isinstance(node.func, ast.Attribute) and node.func.attr == 'get':
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "get":
                 obj = _eval(node.func.value)
                 if isinstance(obj, dict) and node.args:
                     key = _eval(node.args[0])
                     default = _eval(node.args[1]) if len(node.args) > 1 else None
                     return obj.get(key, default)
-            elif isinstance(node.func, ast.Name) and node.func.id == 'get':
+            elif isinstance(node.func, ast.Name) and node.func.id == "get":
                 if node.args:
                     key = _eval(node.args[0])
                     default = _eval(node.args[1]) if len(node.args) > 1 else None
@@ -888,11 +979,12 @@ def _safe_eval(expr: str, context: dict) -> bool:
         raise ValueError(f"Unsupported AST node: {type(node)}")
 
     try:
-        tree = ast.parse(expr, mode='eval')
+        tree = ast.parse(expr, mode="eval")
         return bool(_eval(tree.body))
     except Exception as e:
         log.warning(f"Failed to safe_eval expression '{expr}': {e}")
         return False
+
 
 def _load_search_index(index_path: str | os.PathLike) -> dict:
     """Load a current committed snapshot without waiting on the publisher lock.
@@ -1001,8 +1093,7 @@ def _graph_expansion_scores(
                     active_adjacency.setdefault(target, []).append((source, weight))
 
         next_scores = {
-            key: (1 - alpha) if key in seed_keys else 0.0
-            for key in ppr_scores
+            key: (1 - alpha) if key in seed_keys else 0.0 for key in ppr_scores
         }
         for node, current_score in ppr_scores.items():
             if adjacency is not None:
@@ -1010,10 +1101,9 @@ def _graph_expansion_scores(
                 if not math.isfinite(total_weight) or total_weight <= 0:
                     continue
                 for neighbor, weight in adjacency.iter_weighted_neighbors(node):
-                    next_scores[neighbor] = (
-                        next_scores.get(neighbor, 0.0)
-                        + alpha * current_score * (weight / total_weight)
-                    )
+                    next_scores[neighbor] = next_scores.get(
+                        neighbor, 0.0
+                    ) + alpha * current_score * (weight / total_weight)
             else:
                 assert active_adjacency is not None
                 neighbors = active_adjacency.get(node, ())
@@ -1023,10 +1113,9 @@ def _graph_expansion_scores(
                 if not math.isfinite(total_weight) or total_weight <= 0:
                     continue
                 for neighbor, weight in neighbors:
-                    next_scores[neighbor] = (
-                        next_scores.get(neighbor, 0.0)
-                        + alpha * current_score * (weight / total_weight)
-                    )
+                    next_scores[neighbor] = next_scores.get(
+                        neighbor, 0.0
+                    ) + alpha * current_score * (weight / total_weight)
         ppr_scores = next_scores
     return ppr_scores
 
@@ -1044,15 +1133,13 @@ def _search_node_is_eligible(
         return False
     if (
         cluster
-        and str(node.get("topic_cluster") or "").casefold()
-        != str(cluster).casefold()
+        and str(node.get("topic_cluster") or "").casefold() != str(cluster).casefold()
     ):
         return False
-    if (
-        not include_history
-        and str(node.get("status") or "").casefold()
-        in {"deprecated", "archived"}
-    ):
+    if not include_history and str(node.get("status") or "").casefold() in {
+        "deprecated",
+        "archived",
+    }:
         return False
     if filter_expr:
         try:
@@ -1094,39 +1181,67 @@ def _eligible_exact_identity_scores(
             eligible[key] = score
     return eligible
 
+
+def _lexical_fallback_node_limit() -> int:
+    try:
+        configured = int(
+            os.environ.get("VECTOR_LAKE_LEXICAL_FALLBACK_MAX_NODES", "20000")
+        )
+    except (TypeError, ValueError):
+        configured = 20_000
+    return max(1, min(100_000, configured))
+
+
 def _lexical_fallback_scores(
     index_data: dict,
     terms,
     *,
     limit: int,
 ) -> dict[str, float]:
-    """Provide a deterministic index-only fallback when FTS is unavailable."""
+    """Provide a bounded deterministic fallback only when FTS is unavailable."""
     normalized_terms = {
-        str(term).strip().casefold()
-        for term in terms
-        if str(term).strip()
+        str(term).strip().casefold() for term in terms if str(term).strip()
     }
     if not normalized_terms:
         return {}
-    scored: list[tuple[float, str]] = []
-    for key, node in index_data.get("nodes", {}).items():
-        fields = (
-            (str(key).casefold(), 4.0),
-            (str(node.get("title") or "").casefold(), 4.0),
-            (str(node.get("summary") or "").casefold(), 2.0),
-            (str(node.get("raw_text") or "").casefold(), 1.0),
-            (" ".join(map(str, node.get("aliases") or ())).casefold(), 1.0),
-        )
-        score = sum(
-            weight
-            for term in normalized_terms
-            for value, weight in fields
-            if term in value
-        )
-        if score > 0:
-            scored.append((score, str(key)))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return {key: score for score, key in scored[: max(1, int(limit))]}
+
+    def scored_nodes():
+        nodes = index_data.get("nodes", {})
+        for key, node in islice(nodes.items(), _lexical_fallback_node_limit()):
+            fields = (
+                (str(key)[:1024].casefold(), 4.0),
+                (str(node.get("title") or "")[:4096].casefold(), 4.0),
+                (str(node.get("summary") or "")[:4096].casefold(), 2.0),
+                (str(node.get("raw_text") or "")[:4096].casefold(), 1.0),
+                (
+                    " ".join(map(str, node.get("aliases") or ()))[:4096].casefold(),
+                    1.0,
+                ),
+            )
+            score = sum(
+                weight
+                for term in normalized_terms
+                for value, weight in fields
+                if term in value
+            )
+            if score > 0:
+                yield (score, str(key))
+
+    selected = heapq.nsmallest(
+        max(1, int(limit)),
+        scored_nodes(),
+        key=lambda item: (-item[0], item[1]),
+    )
+    return {key: score for score, key in selected}
+
+
+def _merge_fallback_scores(
+    hybrid_scores: dict[str, float],
+    fallback_scores: dict[str, float],
+) -> None:
+    """Add degraded fallback candidates without reducing stronger scores."""
+    for key, score in fallback_scores.items():
+        hybrid_scores[key] = max(hybrid_scores.get(key, score), score)
 
 
 def _read_search_snippet(
@@ -1168,16 +1283,15 @@ def _with_semantic_readiness(
 
     try:
         readiness = runtime_health.get_semantic_readiness_envelope(
-            index_data=index_data
+            index_data=index_data,
+            nonblocking=True,
         )
     except Exception as exc:
         readiness = {
             "contract_version": "vector-lake-semantic-readiness-envelope/v1",
             "ready": False,
             "status": "unknown",
-            "issues": [
-                f"semantic_readiness_envelope_unavailable:{type(exc).__name__}"
-            ],
+            "issues": [f"semantic_readiness_envelope_unavailable:{type(exc).__name__}"],
             "warnings": [],
             "issue_count": 1,
             "warning_count": 0,
@@ -1210,12 +1324,202 @@ def _with_semantic_readiness(
     )
 
 
-def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
+def _search_projection_generation_issue(conn) -> str | None:
+    from vector_lake.db_store import get_search_projection_state
+
+    state = get_search_projection_state(conn)
+    expected = state.get("canonical_generation")
+    if not isinstance(expected, dict):
+        return "canonical_generation_missing"
+    try:
+        current = canonical_runtime_generation_snapshot(conn)
+    except Exception:
+        return "canonical_generation_unreadable"
+    if expected != current:
+        return "canonical_generation_stale"
+    return None
+
+
+def _looks_like_exact_identity(query: str) -> bool:
+    normalized = str(query or "").strip()
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{2,}(?:\.md)?", normalized))
+
+
+def _sqlite_identity_rows(conn, query: str, limit: int) -> list[dict]:
+    """Resolve exact indexed ids and page keys from bounded canonical rows.
+
+    Names and aliases are already part of the verified FTS projection. Keeping
+    them out of this helper prevents a no-hit request from scanning every
+    entity JSON document through ``lower()`` or ``json_each``.
+    """
+    normalized = str(query or "").strip()
+    page_query = (
+        normalized[:-3] if normalized.casefold().endswith(".md") else normalized
+    )
+    rows = conn.execute(
+        "SELECT page_key, data_json FROM entity_identities WHERE "
+        "entity_id IN (?, ?) OR page_key IN (?, ?) "
+        "ORDER BY entity_id LIMIT ?",
+        (normalized, page_query, normalized, page_query, int(limit)),
+    ).fetchall()
+    if not rows:
+        rows = conn.execute(
+            "SELECT page_key, data_json FROM canonical_identities WHERE "
+            "(record_kind = 'claim' AND record_id IN (?, ?)) OR "
+            "(record_kind = 'evidence' AND record_id IN (?, ?)) OR "
+            "page_key IN (?, ?) ORDER BY record_kind, record_id LIMIT ?",
+            (
+                normalized,
+                page_query,
+                normalized,
+                page_query,
+                normalized,
+                page_query,
+                int(limit),
+            ),
+        ).fetchall()
+    results = []
+    hidden_states = {"archived", "decayed", "deleted", "expired", "superseded"}
+    for row in rows:
+        try:
+            record = json.loads(row["data_json"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if str(record.get("status") or "active").strip().lower() in hidden_states:
+            continue
+        page_key = str(row["page_key"] or record.get("page_key") or "")
+        results.append(
+            {
+                "node_key": page_key,
+                "title": str(
+                    record.get("canonical_name")
+                    or record.get("title")
+                    or page_key
+                    or "Untitled"
+                ),
+                "summary": str(record.get("summary") or ""),
+                "rank": -1000.0,
+            }
+        )
+    return results
+
+
+def _exact_fts_page_result(query: str, top_k: int, *, as_xml: bool) -> str | None:
+    """Return high-precision current-page hits without materializing graph state."""
+    from vector_lake.db_store import (
+        get_connection,
+        search_wiki,
+        verify_search_projection_integrity,
+    )
+
+    try:
+        conn = get_connection()
+        if _search_projection_generation_issue(conn) is not None:
+            return None
+        integrity_before = verify_search_projection_integrity(conn)
+        signature = integrity_before.get("signature")
+        if integrity_before.get("status") != "ready" or not isinstance(
+            signature, tuple
+        ):
+            return None
+        fts_rows = search_wiki(query, limit=top_k)
+        identity_rows = (
+            _sqlite_identity_rows(conn, query, top_k)
+            if not fts_rows or _looks_like_exact_identity(query)
+            else []
+        )
+    except (RuntimeError, sqlite3.Error):
+        return None
+    rows = []
+    seen_keys = set()
+    for row in [*identity_rows, *fts_rows]:
+        node_key = str(row.get("node_key") or "")
+        if not node_key or node_key in seen_keys:
+            continue
+        seen_keys.add(node_key)
+        rows.append(row)
+        if len(rows) >= top_k:
+            break
+    if not rows:
+        return None
+
+    eligible = []
+    hidden_states = {"archived", "decayed", "deleted", "expired", "superseded"}
+    page_keys = [str(row.get("node_key") or "") for row in rows]
+    placeholders = ",".join("?" for _ in page_keys)
+    try:
+        identity_rows = conn.execute(
+            "SELECT page_key, data_json FROM entity_identities "
+            f"WHERE page_key IN ({placeholders})",
+            tuple(page_keys),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    identities = {str(row["page_key"]): row for row in identity_rows}
+    for row in rows:
+        identity = identities.get(str(row.get("node_key") or ""))
+        if identity is None:
+            continue
+        try:
+            record = json.loads(identity["data_json"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if str(record.get("status") or "active").strip().lower() in hidden_states:
+            continue
+        eligible.append(row)
+
+    integrity_after = verify_search_projection_integrity(conn)
+    if _search_projection_generation_issue(conn) is not None:
+        raise SearchIndexError(
+            "The canonical generation changed during exact search; retry."
+        )
+    if _stable_fts_projection_signature(
+        integrity_after.get("signature")
+    ) != _stable_fts_projection_signature(signature):
+        raise SearchIndexError(
+            "The SQLite search projection changed during exact search; retry."
+        )
+    if not eligible:
+        return None
+
+    blocks = []
+    for index, row in enumerate(eligible[:top_k]):
+        title = str(row.get("title") or row.get("node_key") or "Untitled")
+        node_key = str(row.get("node_key") or "")
+        summary = " ".join(str(row.get("summary") or "").split())[:1600]
+        score = -float(row.get("rank") or 0.0)
+        if as_xml:
+            blocks.append(
+                f"<Evidence_Node ID={quoteattr(f'Wiki_{index}')} "
+                f"Source={quoteattr(node_key + '.md')}>\n"
+                f"{escape(summary)}\n</Evidence_Node>\n"
+            )
+        else:
+            blocks.append(
+                f"- **{title}** (score: {score:.1f})\n  {summary} [{node_key}]...\n\n"
+            )
+    if as_xml:
+        return (
+            '<EvidenceResults>\n<SearchStatus State="ok" Backends=""/>\n'
+            + "".join(blocks)
+            + "</EvidenceResults>"
+        )
+    return "".join(blocks)
+
+
+def search_vector_lake(
+    query: str,
+    top_k: int = 5,
+    as_xml: bool = False,
+    domain: str = None,
+    cluster: str = None,
+    include_history: bool = False,
+    mode: str = "page",
+    filter_expr: str = None,
+):
     query = str(query or "").strip()
     if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
-        raise ValueError(
-            f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters"
-        )
+        raise ValueError(f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters")
     try:
         top_k = int(top_k)
     except (TypeError, ValueError) as exc:
@@ -1294,7 +1598,23 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     wiki_dir = str(get_wiki_dir())
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
-        return finish("Lake is drying. No index.json found, please ingest sources first.")
+        return finish(
+            "Lake is drying. No index.json found, please ingest sources first."
+        )
+    if (
+        domain is None
+        and cluster is None
+        and not include_history
+        and filter_expr is None
+        and _looks_like_exact_identity(query)
+    ):
+        phase_started = time.perf_counter()
+        exact_result = _exact_fts_page_result(query, top_k, as_xml=as_xml)
+        timings["exact_fts_fast_path_ms"] = (
+            time.perf_counter() - phase_started
+        ) * 1000.0
+        if exact_result is not None:
+            return finish(exact_result)
     phase_started = time.perf_counter()
     try:
         index_data = _load_search_index(index_path)
@@ -1302,7 +1622,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         log.error(f"Failed to read index.json: {exc}")
         timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
         fail("projection_snapshot")
-        raise SearchIndexError("The knowledge base index could not be read safely.") from exc
+        raise SearchIndexError(
+            "The knowledge base index could not be read safely."
+        ) from exc
     readiness_index_data = index_data
     timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
@@ -1318,9 +1640,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         filter_expr=filter_expr,
     )
     exact_identity_keys = set(exact_identity_scores)
-    timings["exact_identity_ms"] = (
-        time.perf_counter() - phase_started
-    ) * 1000.0
+    timings["exact_identity_ms"] = (time.perf_counter() - phase_started) * 1000.0
     timings["exact_identity_hits"] = float(len(exact_identity_scores))
     phase_started = time.perf_counter()
     tokens = _expand_query_locally(query)
@@ -1329,7 +1649,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         return finish("No valid search tokens.")
 
     scored = []
-    
+
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
     hybrid_scores = dict(exact_identity_scores)
     fts_result_count = 0
@@ -1339,36 +1659,29 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     fts_signature, fts_integrity_issue = _fts_projection_probe(index_data)
     try:
         if fts_signature is None:
-            raise SearchBackendError(
-                fts_integrity_issue or "fts_projection_integrity"
-            )
+            raise SearchBackendError(fts_integrity_issue or "fts_projection_integrity")
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
         fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
         fts_result_count = len(fts_results)
         for row in fts_results:
-            key = row['node_key']
-            raw_score = row.get('rank')
+            key = row["node_key"]
+            raw_score = row.get("rank")
             if raw_score is None:
-                raw_score = row.get('score', 0)
+                raw_score = row.get("score", 0)
             fts_score = raw_score * -1.0  # SQLite BM25 is negative
             hybrid_scores[key] = hybrid_scores.get(key, 0.0) + fts_score
-        if fts_result_count < top_k:
-            hybrid_scores.update(
-                _lexical_fallback_scores(
-                    index_data,
-                    [query, *tokens],
-                    limit=top_k * 5,
-                )
-            )
     except Exception as exc:
         backend = exc.backend if isinstance(exc, SearchBackendError) else "fts5"
         backend_issues.append(backend)
         _log_search_backend_failure(backend)
-        hybrid_scores.update(
+        _merge_fallback_scores(
+            hybrid_scores,
             _lexical_fallback_scores(
-                index_data, [query, *tokens], limit=top_k * 5
-            )
+                index_data,
+                [query, *tokens],
+                limit=top_k * 5,
+            ),
         )
     timings["fts_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
@@ -1397,7 +1710,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
                 limit=top_k * 5,
             )
             for key, sim in vector_results.items():
-                vec_score = (sim ** 2) * 15.0
+                vec_score = (sim**2) * 15.0
                 hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
         except SearchBackendError as exc:
             backend_issues.append(exc.backend)
@@ -1412,9 +1725,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     try:
         current_index_data = _load_search_index(index_path)
     except Exception as exc:
-        timings["generation_check_ms"] = (
-            time.perf_counter() - phase_started
-        ) * 1000.0
+        timings["generation_check_ms"] = (time.perf_counter() - phase_started) * 1000.0
         fail("projection_generation_check")
         raise SearchIndexError(
             "The knowledge base projection changed during search; retry after sync."
@@ -1443,7 +1754,9 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
         backend_issues.append("projection_generation_changed")
     elif fts_signature is not None:
         current_fts_signature, current_fts_issue = _fts_projection_probe(index_data)
-        if current_fts_signature != fts_signature:
+        if _stable_fts_projection_signature(
+            current_fts_signature
+        ) != _stable_fts_projection_signature(fts_signature):
             hybrid_scores = _lexical_fallback_scores(
                 index_data,
                 [query, *tokens],
@@ -1451,16 +1764,12 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             )
             for key, score in exact_identity_scores.items():
                 hybrid_scores[key] = max(hybrid_scores.get(key, 0.0), score)
-            backend_issues.append(
-                current_fts_issue or "fts_projection_state_changed"
-            )
-    timings["generation_check_ms"] = (
-        time.perf_counter() - phase_started
-    ) * 1000.0
+            backend_issues.append(current_fts_issue or "fts_projection_state_changed")
+    timings["generation_check_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
     for key, score in hybrid_scores.items():
-        if key in index_data.get('nodes', {}):
-            node = {'_key': key, **index_data['nodes'][key]}
+        if key in index_data.get("nodes", {}):
+            node = {"_key": key, **index_data["nodes"][key]}
             if not _search_node_is_eligible(
                 node,
                 domain=domain,
@@ -1470,7 +1779,11 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             ):
                 continue
 
-            if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
+            if (
+                not include_history
+                and node.get("status", "").lower() == "decayed"
+                and intent != "temporal"
+            ):
                 score *= 0.2
             scored.append((score, node))
 
@@ -1490,13 +1803,13 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
         existing_keys = {node["_key"] for _, node in scored}
         expansion_limit = 12 if intent == "entity" else 5
-        
+
         sorted_expansions = sorted(
-            [(k, v) for k, v in ppr_scores.items() if k not in existing_keys], 
-            key=lambda x: x[1], 
-            reverse=True
+            [(k, v) for k, v in ppr_scores.items() if k not in existing_keys],
+            key=lambda x: x[1],
+            reverse=True,
         )
-        
+
         expansion_count = 0
         for expanded_key, ppr_weight in sorted_expansions:
             if expansion_count >= expansion_limit:
@@ -1527,14 +1840,17 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     for score, node in scored:
         node_type = node.get("type", "").lower()
         if node_type == "source":
-            if source_count < max_sources_pool or node.get("_key") in exact_identity_keys:
+            if (
+                source_count < max_sources_pool
+                or node.get("_key") in exact_identity_keys
+            ):
                 candidate_pool.append((score, node))
                 source_count += 1
         else:
             candidate_pool.append((score, node))
         if len(candidate_pool) >= pool_size:
             break
-            
+
     # Phase 2: Local deterministic ranking. Text-model reranking is delegated
     # to the host agent when explicitly requested, not performed by runtime code.
     phase_started = time.perf_counter()
@@ -1544,11 +1860,14 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     # Phase 3: Final top_k extraction
     final_scored = []
     source_count = 0
-    max_sources_final = int(top_k * 0.6)
+    max_sources_final = max(1, int(top_k * 0.6))
     for score, node in reranked:
         node_type = node.get("type", "").lower()
         if node_type == "source":
-            if source_count < max_sources_final or node.get("_key") in exact_identity_keys:
+            if (
+                source_count < max_sources_final
+                or node.get("_key") in exact_identity_keys
+            ):
                 final_scored.append((score, node))
                 source_count += 1
         else:
@@ -1570,14 +1889,14 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
             except SearchIndexError:
                 backend_issues.append("wiki_snippet")
                 snippet = "[Snippet unavailable]"
-            
+
         tension_edges = node.get("tension_edges", [])
         tension_info = ""
         if tension_edges:
             tension_info = "  [Tension Edges]:\n"
             for te in tension_edges:
                 tension_info += f"    -> {te.get('target')} (Polarity: {te.get('polarity')}, Intensity: {te.get('intensity')}): {te.get('context')}\n"
-                
+
         if as_xml:
             source_name = f"{node['_key']}.md"
             block = (
@@ -1613,14 +1932,117 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
     return finish(result)
 
 
-def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
+    """Build bounded request context without materializing the full graph index."""
+    memory_packet = build_memory_packet(query, max_chars=int(max_chars * 0.50))
+    wiki_budget = max(0, max_chars - len(memory_packet["packet"]))
+
+    from vector_lake.db_store import (
+        get_connection,
+        search_wiki,
+        verify_search_projection_integrity,
+    )
+
+    conn = get_connection()
+    generation_issue_before = _search_projection_generation_issue(conn)
+    if generation_issue_before is not None:
+        raise SearchIndexError(
+            "The canonical generation is not aligned with the SQLite search "
+            f"projection ({generation_issue_before})."
+        )
+    integrity_before = verify_search_projection_integrity(conn)
+    signature_before = integrity_before.get("signature")
+    if integrity_before.get("status") != "ready" or not isinstance(
+        signature_before, tuple
+    ):
+        raise SearchIndexError(
+            "The SQLite search projection could not be verified before context "
+            "assembly."
+        )
+    fts_rows = search_wiki(query, limit=15)
+    identity_rows = (
+        _sqlite_identity_rows(conn, query, 15)
+        if _looks_like_exact_identity(query)
+        else []
+    )
+    search_rows = []
+    seen_keys = set()
+    for row in [*identity_rows, *fts_rows]:
+        node_key = str(row.get("node_key") or "")
+        if not node_key or node_key in seen_keys:
+            continue
+        seen_keys.add(node_key)
+        search_rows.append(row)
+        if len(search_rows) >= 15:
+            break
+    integrity_after = verify_search_projection_integrity(conn)
+    generation_issue_after = _search_projection_generation_issue(conn)
+    if generation_issue_after is not None:
+        raise SearchIndexError(
+            "The canonical generation changed during context assembly "
+            f"({generation_issue_after}); retry."
+        )
+    if integrity_after.get("status") != "ready" or _stable_fts_projection_signature(
+        integrity_after.get("signature")
+    ) != _stable_fts_projection_signature(signature_before):
+        raise SearchIndexError(
+            "The SQLite search projection changed during context assembly; retry."
+        )
+
+    wiki_context = ""
+    page_count = 0
+    for row in search_rows:
+        title = str(row.get("title") or row.get("node_key") or "Untitled")
+        node_key = str(row.get("node_key") or "")
+        summary = " ".join(str(row.get("summary") or "").split())[:1200]
+        rank = float(row.get("rank") or 0.0)
+        block = (
+            f"- **{title}** (rank: {rank:.4f}, source: {node_key}.md)\n  {summary}\n\n"
+        )
+        if len(wiki_context) + len(block) > wiki_budget:
+            break
+        wiki_context += block
+        page_count += 1
+
+    purpose = ""
+    try:
+        from vector_lake.purpose_contract import render_strategy_directive
+
+        purpose = render_strategy_directive()
+    except Exception:
+        pass
+
+    return {
+        "memory_packet": memory_packet["packet"],
+        "memory_count": memory_packet["memory_count"],
+        "memory_warning_count": memory_packet["warning_count"],
+        "memory_omitted_count": memory_packet["omitted_count"],
+        "wiki_context": wiki_context,
+        "wiki_page_count": page_count,
+        "_retrieved_page_keys": [str(row.get("node_key") or "") for row in search_rows],
+        "index_summary": "",
+        "purpose": purpose,
+        "budget_used": len(memory_packet["packet"]) + len(wiki_context) + len(purpose),
+        "budget_max": max_chars,
+    }
+
+
+def assemble_context(
+    query: str,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    *,
+    lightweight: bool = False,
+) -> dict:
+    if lightweight:
+        return _assemble_sqlite_context(query, max_chars)
+
     index_budget = int(max_chars * TOKEN_BUDGET["index_summary"])
-    
+
     # P2-2: Dynamic Sliding Window for Budget
     # Allow memory to burst up to 50% if there are critical alerts
     memory_packet = build_memory_packet(query, max_chars=int(max_chars * 0.50))
     actual_memory_used = len(memory_packet["packet"])
-    
+
     # Wiki dynamically eats the remaining budget
     wiki_budget = max_chars - actual_memory_used - index_budget
 
@@ -1639,7 +2061,9 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     search_results = search_vector_lake(query, top_k=15, as_xml=False)
     wiki_context = ""
     page_count = 0
-    for match in re.finditer(r"\*\*(.+?)\*\*.*?\n\s+(.*?)\.\.\.\n", search_results, re.DOTALL):
+    for match in re.finditer(
+        r"\*\*(.+?)\*\*.*?\n\s+(.*?)\.\.\.\n", search_results, re.DOTALL
+    ):
         page_content = match.group(0)
         if len(wiki_context) + len(page_content) > wiki_budget:
             break
@@ -1674,6 +2098,7 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     purpose = ""
     try:
         from vector_lake.purpose_contract import render_strategy_directive
+
         purpose = render_strategy_directive()
     except Exception:
         pass
@@ -1687,6 +2112,9 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
         "wiki_page_count": page_count,
         "index_summary": index_summary,
         "purpose": purpose,
-        "budget_used": len(memory_packet["packet"]) + len(wiki_context) + len(index_summary) + len(purpose),
+        "budget_used": len(memory_packet["packet"])
+        + len(wiki_context)
+        + len(index_summary)
+        + len(purpose),
         "budget_max": max_chars,
     }

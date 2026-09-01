@@ -7,23 +7,22 @@
     "vector-lake-mcp": {
       "command": "python",
       "args": [
-        "-m",
-        "vector_lake.mcp_server"
+        "${extensionPath}/scripts/vector_lake_mcp.py",
+        "--profile",
+        "default",
+        "--surface",
+        "full"
       ],
       "cwd": "${extensionPath}",
       "env": {
-        "PYTHONPATH": "${extensionPath}",
-        "VECTOR_LAKE_MEMORY_DIR": "~/MEMORY",
-        "VECTOR_LAKE_META_DIR": "~/MEMORY/wiki/.meta",
-        "VECTOR_LAKE_OPERATIONAL_MEMORY_FTS": "1",
-        "VECTOR_LAKE_DURABILITY_PROFILE": "full",
-        "OPENBLAS_NUM_THREADS": "1",
-        "OMP_NUM_THREADS": "1"
+        "VECTOR_LAKE_PAYLOAD_ROOT": "~/.gemini/tmp",
+        "VECTOR_LAKE_AGENT_SANDBOX_ROOTS": "~/.gemini"
       }
     }
   },
   "runtime": {
-    "recommended_cwd": "plugins/vector-lake/",
+    "launcher": "scripts/vector_lake_mcp.py",
+    "profile": "default",
     "python_version": ">=3.11",
     "setup": "pip install -r requirements.txt"
   },

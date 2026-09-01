@@ -663,7 +663,7 @@ def _component_items(
 ) -> list[tuple[str, Any]]:
     root = _require_digest(descriptor.get(name), f"component_{name}")
     return list(
-        store.iter_items(
+        store.materialize_items(
             root,
             limit=MAX_COMPONENT_ITEMS,
             max_objects=MAX_CLOSURE_OBJECTS,

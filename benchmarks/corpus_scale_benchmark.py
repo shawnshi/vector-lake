@@ -47,7 +47,10 @@ DEFAULT_SLOS = {
     "warm_index_load_p95_ms": 25.0,
     "serial_search_p95_ms": 250.0,
     "serial_search_max_ms": 1_000.0,
+    "negative_search_p95_ms": 250.0,
+    "negative_search_max_ms": 1_000.0,
     "concurrent_search_p95_ms": 750.0,
+    "concurrent_search_max_ms": 2_500.0,
     "fts_fallback_p95_ms": 750.0,
     "minimum_concurrent_qps": 20.0,
     "maximum_error_rate": 0.0,
@@ -153,17 +156,86 @@ def _node(index: int) -> tuple[str, dict, tuple[str, str, str, str]]:
     return key, node, fts_row
 
 
-def _build_fixture(root: Path, node_count: int) -> dict:
+def _build_fixture(
+    root: Path,
+    node_count: int,
+    *,
+    materialize_wiki: bool = False,
+    canonical_entities: bool = False,
+    timeline_count: int = 0,
+) -> dict:
     started = time.perf_counter()
     wiki_dir = root / "wiki"
     wiki_dir.mkdir(parents=True, exist_ok=True)
     nodes = {}
     fts_rows = []
     edges = []
+    entity_rows = []
+    timeline_rows = []
     for index in range(node_count):
         key, node, fts_row = _node(index)
         nodes[key] = node
         fts_rows.append(fts_row)
+        if materialize_wiki:
+            (wiki_dir / f"{key}.md").write_text(
+                "---\n"
+                f'id: "{node["id"]}"\n'
+                f'title: "{node["title"]}"\n'
+                "aliases: []\n"
+                "type: concept\n"
+                "domain: synthetic\n"
+                f'topic_cluster: "{node["topic_cluster"]}"\n'
+                "status: Active\n"
+                "epistemic-status: evergreen\n"
+                "ttl: 1825\n"
+                "memory_type: fact\n"
+                f'memory_key: "benchmark-{index:05d}"\n'
+                "categories: [System_Architecture]\n"
+                "tags: [benchmark]\n"
+                "strategic_scope: core\n"
+                "evidence_tier: primary\n"
+                "---\n"
+                f"# [[{node['title']}]]\n\n"
+                "## 1. 编译事实 (Compiled Truth - READ MODEL)\n\n"
+                f"{node['summary']}.\n",
+                encoding="utf-8",
+            )
+        if canonical_entities:
+            entity = {
+                **node,
+                "page_key": key,
+                "canonical_name": node["title"],
+                "categories": ["System_Architecture"],
+                "sources": [],
+                "ttl": 1825,
+                "decay_weight": 1.0,
+            }
+            entity_rows.append(
+                (
+                    node["id"],
+                    node["title"],
+                    node["type"],
+                    node["status"],
+                    1825.0,
+                    1.0,
+                    json.dumps(entity, ensure_ascii=False, sort_keys=True),
+                    "2026-08-22T00:00:00+00:00",
+                )
+            )
+        if index < timeline_count:
+            timeline_rows.append(
+                (
+                    f"event-{index:05d}",
+                    f"2026-{(index % 12) + 1:02d}-{(index % 28) + 1:02d}",
+                    f"action-{index % 16:02d}",
+                    "positive" if index % 2 == 0 else "neutral",
+                    f"Synthetic timeline event {index:05d}",
+                    node["id"],
+                    node["title"],
+                    f"{key}.md",
+                    "2026-08-22T00:00:00+00:00",
+                )
+            )
         if index:
             edges.append(
                 {
@@ -181,6 +253,23 @@ def _build_fixture(root: Path, node_count: int) -> dict:
     if db_store.get_db_path().resolve() != db_path.resolve():
         raise RuntimeError("benchmark database must be isolated inside its fixture")
     db_store.init_db()
+    connection = db_store.get_connection()
+    with db_store.transaction():
+        if entity_rows:
+            connection.executemany(
+                "INSERT INTO entities "
+                "(entity_id, canonical_name, type, status, ttl, decay_weight, "
+                "data_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                entity_rows,
+            )
+        if timeline_rows:
+            connection.executemany(
+                "INSERT INTO timeline_events "
+                "(id, event_date, action, sentiment, description, entity_id, "
+                "entity_title, source_file, extracted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                timeline_rows,
+            )
     canonical_generation = indexer.canonical_runtime_generation_snapshot()
     prepared = build_projection_roots(
         wiki_dir,
@@ -210,6 +299,9 @@ def _build_fixture(root: Path, node_count: int) -> dict:
         "index_path": wiki_dir / "index.json",
         "wiki_dir": wiki_dir,
         "db_path": db_path,
+        "wiki_file_count": node_count if materialize_wiki else 0,
+        "canonical_entity_count": len(entity_rows),
+        "timeline_count": len(timeline_rows),
         "build_ms": (time.perf_counter() - started) * 1000.0,
     }
 
@@ -235,9 +327,7 @@ def _reset_identity_cache() -> None:
 def _measure_identity_cold_concurrency(snapshot: dict, workers: int) -> dict:
     counting_nodes = _CountingNodes(snapshot["nodes"])
     diagnostic_snapshot = {
-        "projection_manifest": {
-            "generation": f"identity-cold-{time.monotonic_ns()}"
-        },
+        "projection_manifest": {"generation": f"identity-cold-{time.monotonic_ns()}"},
         "nodes": counting_nodes,
     }
     _reset_identity_cache()
@@ -263,6 +353,15 @@ def _measure_identity_cold_concurrency(snapshot: dict, workers: int) -> dict:
     }
 
 
+def _prewarm_search_worker(snapshot: dict, barrier: threading.Barrier) -> float:
+    started = time.perf_counter()
+    signature, issue = tool_search._fts_projection_probe(snapshot)
+    if signature is None or issue:
+        raise RuntimeError(f"worker FTS prewarm failed: {issue}")
+    barrier.wait(timeout=30)
+    return (time.perf_counter() - started) * 1000.0
+
+
 def _workload(node_count: int, samples: int) -> list[tuple[str, str | None]]:
     cases = []
     for sample in range(samples):
@@ -270,15 +369,11 @@ def _workload(node_count: int, samples: int) -> list[tuple[str, str | None]]:
         suffix = f"{index:05d}"
         variant = sample % 5
         if variant == 0:
-            cases.append(
-                (f"Concept_Document-{suffix}", f"Synthetic Document {suffix}")
-            )
+            cases.append((f"Concept_Document-{suffix}", f"Synthetic Document {suffix}"))
         elif variant == 1:
             cases.append((f"entity-{suffix}", f"Synthetic Document {suffix}"))
         elif variant == 2:
-            cases.append(
-                (f"Synthetic Alias {suffix}", f"Synthetic Document {suffix}")
-            )
+            cases.append((f"Synthetic Alias {suffix}", f"Synthetic Document {suffix}"))
         elif variant == 3:
             cases.append((f"needle{suffix}", f"Synthetic Document {suffix}"))
         else:
@@ -329,11 +424,19 @@ def _evaluate_slos(report: dict, slos: dict) -> dict:
         <= slos["serial_search_p95_ms"],
         "serial_search_max_ms": report["search"]["serial"]["max_ms"]
         <= slos["serial_search_max_ms"],
+        "negative_search_p95_ms": (
+            report["search"]["negative"]["p95_ms"]
+            <= slos["negative_search_p95_ms"]
+            and report["search"]["negative_error_count"] == 0
+        ),
+        "negative_search_max_ms": report["search"]["negative"]["max_ms"]
+        <= slos["negative_search_max_ms"],
         "concurrent_search_p95_ms": report["search"]["concurrent"]["p95_ms"]
         <= slos["concurrent_search_p95_ms"],
+        "concurrent_search_max_ms": report["search"]["concurrent"]["max_ms"]
+        <= slos["concurrent_search_max_ms"],
         "fts_fallback_p95_ms": (
-            report["fts_fallback"]["latency"]["p95_ms"]
-            <= slos["fts_fallback_p95_ms"]
+            report["fts_fallback"]["latency"]["p95_ms"] <= slos["fts_fallback_p95_ms"]
             and report["fts_fallback"]["error_count"] == 0
         ),
         "minimum_concurrent_qps": report["search"]["concurrent_qps"]
@@ -382,15 +485,22 @@ def run_benchmark(
         dir=workspace_path,
     ) as fixture_dir:
         previous_db_path = os.environ.get("VECTOR_LAKE_DB_PATH")
+        previous_memory = os.environ.get("VECTOR_LAKE_MEMORY_DIR")
+        previous_meta = os.environ.get("VECTOR_LAKE_META_DIR")
         previous_embedding = os.environ.get("VECTOR_LAKE_QUERY_EMBEDDING")
+        previous_surface = os.environ.get("VECTOR_LAKE_MCP_SURFACE")
         fixture_root = Path(fixture_dir)
         db_store.close_all_connections()
         os.environ["VECTOR_LAKE_DB_PATH"] = str(
             fixture_root / "vector_lake_benchmark.db"
         )
+        os.environ["VECTOR_LAKE_MEMORY_DIR"] = str(fixture_root)
+        os.environ["VECTOR_LAKE_META_DIR"] = str(fixture_root / "wiki" / ".meta")
         os.environ["VECTOR_LAKE_QUERY_EMBEDDING"] = "0"
         try:
             fixture = _build_fixture(fixture_root, node_count)
+            db_store.close_all_connections()
+            os.environ["VECTOR_LAKE_MCP_SURFACE"] = "readonly"
             index_snapshot.clear_index_snapshot_cache_for_tests()
             cold_started = time.perf_counter()
             snapshot = index_snapshot.load_index_snapshot(fixture["index_path"])
@@ -405,31 +515,57 @@ def run_benchmark(
                     )
                 warm_loads.append((time.perf_counter() - started) * 1000.0)
 
-            identity_concurrency = _measure_identity_cold_concurrency(
-                snapshot, workers
-            )
+            identity_concurrency = _measure_identity_cold_concurrency(snapshot, workers)
             db_store.close_connection()
             rss_before = _working_set_bytes()
             serial_cases = _workload(node_count, serial_queries)
             concurrent_cases = _workload(node_count, concurrent_queries)
             serial_results = []
+            negative_results = []
             concurrent_results = []
             fallback_results = []
             with ExitStack() as stack:
                 stack.enter_context(
-                    patch.object(tool_search, "get_index_path", lambda: fixture["index_path"])
+                    patch.object(
+                        tool_search, "get_index_path", lambda: fixture["index_path"]
+                    )
                 )
                 stack.enter_context(
-                    patch.object(tool_search, "get_wiki_dir", lambda: fixture["wiki_dir"])
+                    patch.object(
+                        tool_search, "get_wiki_dir", lambda: fixture["wiki_dir"]
+                    )
                 )
                 stack.enter_context(
-                    patch.object(tool_search, "_load_search_index", lambda _path: snapshot)
+                    patch.object(
+                        tool_search, "_load_search_index", lambda _path: snapshot
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        tool_search,
+                        "_with_semantic_readiness",
+                        lambda value, **_kwargs: value,
+                    )
                 )
                 for query, expected in serial_cases:
                     serial_results.append(_query_once(query, expected))
+                for sample in range(20):
+                    negative_results.append(
+                        _query_once(f"zzzxqv-nohit-{sample:04d}-8f3b71", None)
+                    )
 
-                concurrent_started = time.perf_counter()
                 with ThreadPoolExecutor(max_workers=workers) as executor:
+                    prewarm_barrier = threading.Barrier(workers)
+                    prewarm_futures = [
+                        executor.submit(
+                            _prewarm_search_worker,
+                            snapshot,
+                            prewarm_barrier,
+                        )
+                        for _ in range(workers)
+                    ]
+                    worker_prewarm_ms = [future.result() for future in prewarm_futures]
+                    concurrent_started = time.perf_counter()
                     futures = [
                         executor.submit(_query_once, query, expected)
                         for query, expected in concurrent_cases
@@ -447,32 +583,39 @@ def run_benchmark(
                     side_effect=tool_search.SearchBackendError("fts5"),
                 ):
                     for query, expected in fallback_cases:
-                        fallback_results.append(
-                            _fallback_query_once(query, expected)
-                        )
+                        fallback_results.append(_fallback_query_once(query, expected))
                 fallback_status = tool_search.search_performance_status()
                 fallback_telemetry = fallback_status["last"]
-                fallback_suppressed = fallback_status[
-                    "backend_log_suppressed"
-                ]
+                fallback_suppressed = fallback_status["backend_log_suppressed"]
         finally:
             db_store.close_all_connections()
             if previous_db_path is None:
                 os.environ.pop("VECTOR_LAKE_DB_PATH", None)
             else:
                 os.environ["VECTOR_LAKE_DB_PATH"] = previous_db_path
+            if previous_memory is None:
+                os.environ.pop("VECTOR_LAKE_MEMORY_DIR", None)
+            else:
+                os.environ["VECTOR_LAKE_MEMORY_DIR"] = previous_memory
+            if previous_meta is None:
+                os.environ.pop("VECTOR_LAKE_META_DIR", None)
+            else:
+                os.environ["VECTOR_LAKE_META_DIR"] = previous_meta
             if previous_embedding is None:
                 os.environ.pop("VECTOR_LAKE_QUERY_EMBEDDING", None)
             else:
                 os.environ["VECTOR_LAKE_QUERY_EMBEDDING"] = previous_embedding
+            if previous_surface is None:
+                os.environ.pop("VECTOR_LAKE_MCP_SURFACE", None)
+            else:
+                os.environ["VECTOR_LAKE_MCP_SURFACE"] = previous_surface
         rss_after = _working_set_bytes()
         gc.collect()
 
-        all_results = serial_results + concurrent_results
+        all_results = serial_results + negative_results + concurrent_results
         errors = [error for _latency, error in all_results if error]
-        fallback_errors = [
-            error for _latency, error in fallback_results if error
-        ]
+        negative_errors = [error for _latency, error in negative_results if error]
+        fallback_errors = [error for _latency, error in fallback_results if error]
         report = {
             "contract_version": CONTRACT_VERSION,
             "runtime": {
@@ -481,6 +624,11 @@ def run_benchmark(
                 "processor": platform.processor(),
                 "workers": workers,
                 "remote_query_embeddings": False,
+                "semantic_readiness_stubbed": True,
+                "cold_definition": (
+                    "in-process projection cache cold; OS page cache and process "
+                    "startup are not cleared"
+                ),
             },
             "corpus": {
                 "node_count": node_count,
@@ -496,23 +644,25 @@ def run_benchmark(
             "identity_cold_concurrency": identity_concurrency,
             "search": {
                 "serial": _latency_summary([item[0] for item in serial_results]),
+                "negative": _latency_summary(
+                    [item[0] for item in negative_results]
+                ),
+                "negative_error_count": len(negative_errors),
                 "concurrent": _latency_summary(
                     [item[0] for item in concurrent_results]
                 ),
                 "concurrent_qps": round(
                     len(concurrent_results) / max(concurrent_elapsed, 1e-9), 6
                 ),
+                "worker_connections_prewarmed": True,
+                "worker_prewarm": _latency_summary(worker_prewarm_ms),
                 "error_count": len(errors),
                 "error_rate": round(len(errors) / len(all_results), 6),
-                "errors": {
-                    name: errors.count(name) for name in sorted(set(errors))
-                },
+                "errors": {name: errors.count(name) for name in sorted(set(errors))},
                 "last_internal_telemetry": normal_telemetry,
             },
             "fts_fallback": {
-                "latency": _latency_summary(
-                    [item[0] for item in fallback_results]
-                ),
+                "latency": _latency_summary([item[0] for item in fallback_results]),
                 "error_count": len(fallback_errors),
                 "errors": {
                     name: fallback_errors.count(name)
@@ -528,9 +678,7 @@ def run_benchmark(
                     else None
                 ),
                 "rss_after_mib": (
-                    round(rss_after / 1024 / 1024, 6)
-                    if rss_after is not None
-                    else None
+                    round(rss_after / 1024 / 1024, 6) if rss_after is not None else None
                 ),
                 "search_rss_delta_mib": (
                     round(max(0, rss_after - rss_before) / 1024 / 1024, 6)

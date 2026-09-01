@@ -52,13 +52,18 @@ _STATE_NAME = ".auto_ingest_controller_state.json"
 _STATE_SCHEMA_VERSION = 1
 _MAX_TASKS_PER_HOUR = 100
 _MAX_TASKS_PER_24H = 2000
-_MAX_TOKENS_PER_TASK = 32768
+_MAX_TOKENS_PER_TASK = 81920
+# Default per-task budget is the operational default (not the safety ceiling).
+# Reservation defaults must stay within the hard ceilings enforced by
+# ``_require_int`` so a fresh (config-less) runtime is self-consistent.
 _DEFAULT_MAX_TOKENS_PER_TASK = _MAX_TOKENS_PER_TASK
-_DEFAULT_MAX_RESERVED_TOKENS_PER_HOUR = (
-    _MAX_TASKS_PER_HOUR * _DEFAULT_MAX_TOKENS_PER_TASK
+_DEFAULT_MAX_RESERVED_TOKENS_PER_HOUR = min(
+    _MAX_TASKS_PER_HOUR * _DEFAULT_MAX_TOKENS_PER_TASK,
+    13107200,
 )
-_DEFAULT_MAX_RESERVED_TOKENS_PER_24H = (
-    _MAX_TASKS_PER_24H * _DEFAULT_MAX_TOKENS_PER_TASK
+_DEFAULT_MAX_RESERVED_TOKENS_PER_24H = min(
+    _MAX_TASKS_PER_24H * _DEFAULT_MAX_TOKENS_PER_TASK,
+    65536000,
 )
 _STATE_MAX_LAUNCHES = _MAX_TASKS_PER_24H
 # Read-only compatibility ceiling for historical controller ledgers.  It must
@@ -70,6 +75,9 @@ _ATTEMPT_RECEIPT_SCHEMA_VERSION = 1
 _ATTEMPT_RECEIPT_DIR_NAME = "auto_ingest_attempt_receipts"
 _OUTPUT_SCHEMA_VERSION = 1
 _RUNNER_PROBE_TTL_SECONDS = 300.0
+_PROBE_STREAM_MAX_BYTES = 64 * 1024
+_GENERATOR_STDERR_MAX_BYTES = 1024 * 1024
+_PIPE_READ_CHUNK_BYTES = 64 * 1024
 _MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,79}$")
 _JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _RUN_DIR_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}-\d+-[0-9a-f]{8}$")
@@ -103,12 +111,16 @@ _FORBIDDEN_EVENT_ITEM_TYPES = frozenset(
 )
 _SAFE_ENV_NAMES = frozenset(
     {
+        "ALL_PROXY",
         "APPDATA",
         "CODEX_HOME",
         "COMSPEC",
         "HOMEDRIVE",
         "HOMEPATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
         "LOCALAPPDATA",
+        "NO_PROXY",
         "NUMBER_OF_PROCESSORS",
         "OS",
         "PATH",
@@ -908,8 +920,12 @@ class _AttemptReceipt:
         revision: str,
         lease_generation: int,
         reserved_tokens: int,
+        attempt_id: str = "",
     ) -> None:
-        self.attempt_id = uuid.uuid4().hex
+        normalized_attempt_id = str(attempt_id or "").strip()
+        if normalized_attempt_id and not re.fullmatch(r"[0-9a-f]{32}", normalized_attempt_id):
+            raise AutoIngestInfrastructureError("ingest_attempt_id_is_invalid")
+        self.attempt_id = normalized_attempt_id or uuid.uuid4().hex
         self._started_monotonic = time.monotonic()
         started_at = _utc_now()
         self._receipt_bucket = started_at.strftime("%Y-%m-%d")
@@ -1293,6 +1309,36 @@ def _validated_runner_home(config: AutoIngestConfig) -> Path:
                 "codex_runner_models_cache_is_not_read_only"
             )
     return resolved
+
+
+def _unlock_runner_models_cache(config: AutoIngestConfig) -> bytes:
+    """Temporarily make the pinned Codex models cache writable.
+
+    Codex refreshes this cache during startup even for ephemeral, read-only
+    executions.  The baseline remains integrity-pinned: callers must restore
+    the returned bytes and read-only attribute before the next validation.
+    """
+    home = _validated_runner_home(config)
+    cache_path = home / "models_cache.json"
+    snapshot = cache_path.read_bytes()
+    cache_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    return snapshot
+
+
+def _restore_runner_models_cache(
+    config: AutoIngestConfig, snapshot: bytes
+) -> None:
+    cache_path = Path(config.runner_codex_home) / "models_cache.json"
+    cache_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    cache_path.write_bytes(snapshot)
+    if os.name == "nt":
+        cache_path.chmod(stat.S_IREAD)
+    restored_digest = hashlib.sha256(snapshot).hexdigest()
+    if restored_digest != config.required_models_cache_sha256:
+        raise AutoIngestInfrastructureError(
+            "codex_models_cache_snapshot_hash_mismatch"
+        )
+    _validated_runner_home(config)
 
 
 def _clean_runner_dynamic_state(config: AutoIngestConfig) -> Path:
@@ -1958,6 +2004,42 @@ def _resume_suspended_process(process: subprocess.Popen[Any]) -> None:
         )
 
 
+def _drain_bounded_pipe(
+    stream,
+    *,
+    max_bytes: int,
+    overflow: threading.Event,
+    errors: list[str],
+    captured: bytearray | None = None,
+    sink=None,
+) -> None:
+    """Drain a child pipe while retaining at most ``max_bytes`` bytes."""
+    retained = 0
+    try:
+        while True:
+            chunk = stream.read(_PIPE_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            remaining = max(0, max_bytes - retained)
+            if remaining:
+                bounded = chunk[:remaining]
+                if captured is not None:
+                    captured.extend(bounded)
+                if sink is not None:
+                    sink.write(bounded)
+                    sink.flush()
+                retained += len(bounded)
+            if len(chunk) > remaining:
+                overflow.set()
+    except (OSError, ValueError) as exc:
+        errors.append(type(exc).__name__)
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
 def _run_contained_probe(
     command: list[str],
     *,
@@ -1965,8 +2047,14 @@ def _run_contained_probe(
     env: dict[str, str],
     timeout: float,
 ) -> subprocess.CompletedProcess[str]:
-    process: subprocess.Popen[str] | None = None
+    process: subprocess.Popen[bytes] | None = None
     process_tree: _ChildProcessTree | None = None
+    readers: list[threading.Thread] = []
+    stdout_bytes = bytearray()
+    stderr_bytes = bytearray()
+    stdout_overflow = threading.Event()
+    stderr_overflow = threading.Event()
+    reader_errors: list[str] = []
     try:
         process = subprocess.Popen(
             command,
@@ -1975,27 +2063,86 @@ def _run_contained_probe(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             shell=False,
             creationflags=_creation_flags(suspended=True),
             start_new_session=os.name != "nt",
         )
-        process_tree = _ChildProcessTree(process)  # type: ignore[arg-type]
+        process_tree = _ChildProcessTree(process)
+        if process.stdout is None or process.stderr is None:
+            raise AutoIngestInfrastructureError("codex_probe_pipe_unavailable")
+        readers = [
+            threading.Thread(
+                target=_drain_bounded_pipe,
+                kwargs={
+                    "stream": process.stdout,
+                    "max_bytes": _PROBE_STREAM_MAX_BYTES,
+                    "overflow": stdout_overflow,
+                    "errors": reader_errors,
+                    "captured": stdout_bytes,
+                },
+                daemon=False,
+                name="vector-lake-codex-probe-stdout",
+            ),
+            threading.Thread(
+                target=_drain_bounded_pipe,
+                kwargs={
+                    "stream": process.stderr,
+                    "max_bytes": _PROBE_STREAM_MAX_BYTES,
+                    "overflow": stderr_overflow,
+                    "errors": reader_errors,
+                    "captured": stderr_bytes,
+                },
+                daemon=False,
+                name="vector-lake-codex-probe-stderr",
+            ),
+        ]
+        for reader in readers:
+            reader.start()
         _resume_suspended_process(process)
-        stdout, stderr = process.communicate(timeout=timeout)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while process.poll() is None:
+            if stdout_overflow.is_set() or stderr_overflow.is_set():
+                _terminate_child(process, process_tree)
+                stream_name = "stdout" if stdout_overflow.is_set() else "stderr"
+                raise AutoIngestInfrastructureError(
+                    f"codex_probe_output_exceeded:{stream_name}"
+                )
+            if reader_errors:
+                _terminate_child(process, process_tree)
+                raise AutoIngestInfrastructureError(
+                    "codex_probe_pipe_read_failed:" + reader_errors[0]
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_child(process, process_tree)
+                raise AutoIngestInfrastructureError("codex_probe_timeout")
+            time.sleep(min(0.01, remaining))
+        for reader in readers:
+            reader.join(timeout=5)
+        if any(reader.is_alive() for reader in readers):
+            _terminate_child(process, process_tree)
+            raise AutoIngestInfrastructureError("codex_probe_pipe_reader_stalled")
+        if stdout_overflow.is_set() or stderr_overflow.is_set():
+            stream_name = "stdout" if stdout_overflow.is_set() else "stderr"
+            raise AutoIngestInfrastructureError(
+                f"codex_probe_output_exceeded:{stream_name}"
+            )
+        if reader_errors:
+            raise AutoIngestInfrastructureError(
+                "codex_probe_pipe_read_failed:" + reader_errors[0]
+            )
         return subprocess.CompletedProcess(
             command,
             process.returncode,
-            stdout,
-            stderr,
+            stdout_bytes.decode("utf-8", errors="replace"),
+            stderr_bytes.decode("utf-8", errors="replace"),
         )
-    except subprocess.TimeoutExpired as exc:
-        if process is not None:
-            _terminate_child(process, process_tree)  # type: ignore[arg-type]
-        raise AutoIngestInfrastructureError("codex_probe_timeout") from exc
     finally:
         if process is not None and process.poll() is None:
-            _terminate_child(process, process_tree)  # type: ignore[arg-type]
+            _terminate_child(process, process_tree)
+        for reader in readers:
+            if reader.is_alive():
+                reader.join(timeout=5)
         if process_tree is not None:
             process_tree.close()
 
@@ -2252,11 +2399,16 @@ def _run_codex_generator(
         raise AutoIngestPolicyError("model_raw_text_processing_not_authorized")
     if not _JOB_ID_PATTERN.fullmatch(job_id):
         raise AutoIngestPolicyError("job_id_is_not_safe_for_scratch_isolation")
-    _clean_runner_dynamic_state(config)
+    runner_home = _clean_runner_dynamic_state(config)
     _verify_runner_identity(executable, config)
     prompt_bytes, schema_bytes = _serialized_generator_inputs(prompt, job_id, config)
     generation = lease[2]
     _prune_scratch_runs(config)
+    models_cache_snapshot = (
+        _unlock_runner_models_cache(config)
+        if isinstance(runner_home, Path)
+        else None
+    )
     try:
         root = _validated_auto_scratch_root()
         job_dir = root / f"{job_id}-{generation}-{uuid.uuid4().hex[:8]}"
@@ -2283,6 +2435,9 @@ def _run_codex_generator(
         process: subprocess.Popen[bytes] | None = None
         process_tree: _ChildProcessTree | None = None
         writer: threading.Thread | None = None
+        stderr_reader: threading.Thread | None = None
+        stderr_overflow = threading.Event()
+        stderr_errors: list[str] = []
         with (
             events_path.open("wb") as events_handle,
             stderr_path.open("wb") as error_handle,
@@ -2298,13 +2453,33 @@ def _run_codex_generator(
                         env=_safe_environment(config),
                         stdin=subprocess.PIPE,
                         stdout=events_handle,
-                        stderr=error_handle,
+                        stderr=subprocess.PIPE,
                         shell=False,
                         creationflags=_creation_flags(suspended=True),
                         start_new_session=os.name != "nt",
                     )
                 try:
                     process_tree = _ChildProcessTree(process)
+                    if process.stderr is None:
+                        raise AutoIngestInfrastructureError(
+                            "codex_stderr_pipe_unavailable"
+                        )
+                    stderr_reader = threading.Thread(
+                        target=_drain_bounded_pipe,
+                        kwargs={
+                            "stream": process.stderr,
+                            "max_bytes": _GENERATOR_STDERR_MAX_BYTES,
+                            "overflow": stderr_overflow,
+                            "errors": stderr_errors,
+                            "sink": error_handle,
+                        },
+                        daemon=False,
+                        name=(
+                            "vector-lake-auto-ingest-stderr-"
+                            f"{job_id[:24]}"
+                        ),
+                    )
+                    stderr_reader.start()
                     _resume_suspended_process(process)
                 except Exception:
                     _terminate_child(process, None)
@@ -2328,6 +2503,16 @@ def _run_codex_generator(
                         _terminate_child(process, process_tree)
                         raise AutoIngestInfrastructureError(
                             "codex_prompt_write_failed:" + writer_errors[0][:500]
+                        )
+                    if stderr_overflow.is_set():
+                        _terminate_child(process, process_tree)
+                        raise AutoIngestPolicyError(
+                            "codex_stderr_exceeded_1mb"
+                        )
+                    if stderr_errors:
+                        _terminate_child(process, process_tree)
+                        raise AutoIngestInfrastructureError(
+                            "codex_stderr_read_failed:" + stderr_errors[0]
                         )
                     if stop_event.is_set():
                         _terminate_child(process, process_tree)
@@ -2360,6 +2545,19 @@ def _run_codex_generator(
                 if writer.is_alive():
                     _terminate_child(process, process_tree)
                     raise AutoIngestInfrastructureError("codex_prompt_writer_stalled")
+                if stderr_reader is not None:
+                    stderr_reader.join(timeout=5)
+                    if stderr_reader.is_alive():
+                        _terminate_child(process, process_tree)
+                        raise AutoIngestInfrastructureError(
+                            "codex_stderr_reader_stalled"
+                        )
+                if stderr_overflow.is_set():
+                    raise AutoIngestPolicyError("codex_stderr_exceeded_1mb")
+                if stderr_errors:
+                    raise AutoIngestInfrastructureError(
+                        "codex_stderr_read_failed:" + stderr_errors[0]
+                    )
                 if writer_errors and process.returncode == 0:
                     raise AutoIngestInfrastructureError(
                         "codex_prompt_write_failed:" + writer_errors[0][:500]
@@ -2375,6 +2573,8 @@ def _run_codex_generator(
                     _terminate_child(process, process_tree)
                 if writer is not None and writer.is_alive():
                     writer.join(timeout=5)
+                if stderr_reader is not None and stderr_reader.is_alive():
+                    stderr_reader.join(timeout=5)
                 if process_tree is not None:
                     process_tree.close()
         if process is None or process.returncode != 0:
@@ -2418,7 +2618,11 @@ def _run_codex_generator(
                 _remove_job_dir(job_dir)
             except (OSError, RuntimeError) as exc:
                 log.error("Could not remove sensitive auto-ingest artifacts: %s", exc)
-        _clean_runner_dynamic_state(config)
+        try:
+            if models_cache_snapshot is not None:
+                _restore_runner_models_cache(config, models_cache_snapshot)
+        finally:
+            _clean_runner_dynamic_state(config)
 
 
 def _validate_generator_output(
@@ -2504,7 +2708,12 @@ def _validate_generator_output(
         raise AutoIngestPolicyError("non_rejected_output_cannot_be_excluded")
     elif disposition == "standalone":
         if relations:
-            raise AutoIngestPolicyError("standalone_output_relations_must_be_empty")
+            # The disposition is authoritative: standalone output cannot create
+            # graph edges.  Drop contradictory model relations rather than
+            # rejecting otherwise usable source content.
+            integration = dict(integration)
+            integration["relations"] = []
+            relations = []
         if len(str(integration["reason"] or "").strip()) < 12:
             raise AutoIngestPolicyError("standalone_output_reason_too_short")
     elif not relations:
@@ -2514,7 +2723,14 @@ def _validate_generator_output(
         canonical_count = sum(
             1 for item in files if item["filename"] == canonical_name
         )
-        if canonical_count != 1:
+        if canonical_count == 0:
+            # Model omitted the canonical Source page on a long input.  Auto-fill
+            # a provenance-only page from the queued raw baseline; the finalizer
+            # applies the same deterministic fallback.
+            from vector_lake.tool_ingest import _auto_source_page
+
+            files.append(_auto_source_page(processed_data))
+        elif canonical_count != 1:
             raise AutoIngestPolicyError(
                 "non_rejected_output_requires_one_canonical_source_page"
             )
@@ -2628,6 +2844,8 @@ def _processed_data_from_claim(
         "canonical_name",
         "source_hash",
         "source_projection_hash",
+        "source_observed_at",
+        "attempt_id",
         "integration_candidates",
         "ingest_contract_version",
     }
@@ -2769,6 +2987,81 @@ def _job_state(
     return status, processed_hash_matches
 
 
+def _record_ingest_stage_event_safe(
+    processed_data: dict[str, Any],
+    *,
+    stage: str,
+    transition: str,
+    attempt_id: str = "",
+    duration_ms: int | None = None,
+    error: BaseException | str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        error_fields = _receipt_error_fields(error)
+        lease_generation = int(processed_data.get("lease_generation") or 0)
+        db_store.record_ingest_stage_event(
+            job_id=str(processed_data.get("job_id") or ""),
+            revision=str(processed_data.get("hash") or ""),
+            stage=stage,
+            transition=transition,
+            attempt_id=attempt_id,
+            lease_generation=lease_generation or None,
+            duration_ms=duration_ms,
+            ordinal=max(1, lease_generation),
+            error_code=error_fields["error_code"],
+            error_fingerprint=error_fields["error_fingerprint"],
+            metadata=metadata,
+        )
+    except Exception as exc:
+        log.warning(
+            "Could not persist auto-ingest stage %s/%s: %s",
+            stage,
+            transition,
+            type(exc).__name__,
+        )
+
+
+@contextmanager
+def _ingest_stage(
+    processed_data: dict[str, Any],
+    stage: str,
+    *,
+    attempt_id: str = "",
+    metadata: dict[str, Any] | None = None,
+):
+    started = time.monotonic()
+    _record_ingest_stage_event_safe(
+        processed_data,
+        stage=stage,
+        transition="started",
+        attempt_id=attempt_id,
+        metadata=metadata,
+    )
+    try:
+        yield
+    except BaseException as exc:
+        _record_ingest_stage_event_safe(
+            processed_data,
+            stage=stage,
+            transition="failed",
+            attempt_id=attempt_id,
+            duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+            error=exc,
+            metadata=metadata,
+        )
+        raise
+    else:
+        _record_ingest_stage_event_safe(
+            processed_data,
+            stage=stage,
+            transition="completed",
+            attempt_id=attempt_id,
+            duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+            metadata=metadata,
+        )
+
+
 class _ClaimHandle:
     """Own one exact DB lease and close it on every Python control-flow exit."""
 
@@ -2780,6 +3073,7 @@ class _ClaimHandle:
         self.job_id = job_id
         self.lease = lease
         self.attempt_reserved = False
+        self.attempt_id = ""
         self.closed = False
         self._runtime_heartbeat: _RuntimeComponentHeartbeat | None = None
 
@@ -2802,6 +3096,9 @@ class _ClaimHandle:
             heartbeat.ensure_healthy()
         finally:
             self._runtime_heartbeat = None
+
+    def bind_attempt(self, attempt_id: str) -> None:
+        self.attempt_id = str(attempt_id or "")
 
     def mark_attempt_reserved(self) -> None:
         self.attempt_reserved = True
@@ -2848,6 +3145,7 @@ class _ClaimHandle:
             reason,
             retryable=retryable,
             failure_class=failure_class,
+            attempt_id=self.attempt_id,
         )
         if updated:
             self.closed = True
@@ -3248,10 +3546,26 @@ class AutoIngestController:
             return "infrastructure_error"
 
         with _ClaimHandle(job_id, lease) as handle:
+            receipt: _AttemptReceipt | None = None
             try:
                 processed_data = _processed_data_from_claim(claim, lease)
                 _assert_not_private_source(processed_data)
                 revision = _revision_key(processed_data)
+                receipt = _AttemptReceipt(
+                    job_id=job_id,
+                    revision=revision,
+                    lease_generation=lease[2],
+                    reserved_tokens=config.max_tokens_per_task,
+                    attempt_id=str(processed_data.get("attempt_id") or ""),
+                )
+                handle.bind_attempt(receipt.attempt_id)
+                _record_ingest_stage_event_safe(
+                    processed_data,
+                    stage="claim",
+                    transition="completed",
+                    attempt_id=receipt.attempt_id,
+                    metadata={"claim_kind": "automatic_enrichment"},
+                )
                 if (
                     _revision_attempts(state, revision)
                     >= config.max_attempts_per_revision
@@ -3262,7 +3576,12 @@ class AutoIngestController:
                 if stop_event.is_set():
                     handle.release("watchdog stopping before generation")
                     return "stopping"
-                raw_text = _verified_raw_input(processed_data, config)
+                with _ingest_stage(
+                    processed_data,
+                    "raw_verify",
+                    attempt_id=receipt.attempt_id,
+                ):
+                    raw_text = _verified_raw_input(processed_data, config)
                 prompt = _build_generator_prompt(
                     job_id,
                     raw_text,
@@ -3276,9 +3595,16 @@ class AutoIngestController:
                     state,
                     exc,
                     failure_class="input_policy",
+                    receipt=receipt,
                     stage="input_validation",
                 )
             except Exception as exc:
+                if receipt is not None:
+                    receipt.finish(
+                        "infrastructure_error",
+                        stage="input_validation",
+                        error=exc,
+                    )
                 return self._prelaunch_infrastructure_failure(
                     handle,
                     state,
@@ -3287,12 +3613,8 @@ class AutoIngestController:
                     stage="input_validation",
                 )
 
-            receipt = _AttemptReceipt(
-                job_id=job_id,
-                revision=revision,
-                lease_generation=lease[2],
-                reserved_tokens=config.max_tokens_per_task,
-            )
+            if receipt is None:
+                raise AutoIngestInfrastructureError("ingest_attempt_receipt_missing")
             try:
                 receipt.start()
                 _record_launch(
@@ -3322,15 +3644,20 @@ class AutoIngestController:
             handle.own_runtime_heartbeat(component_heartbeat)
             try:
                 component_heartbeat.start()
-                output = _run_codex_generator(
-                    runner,
-                    config,
-                    job_id,
-                    lease,
-                    prompt,
-                    stop_event,
-                    component_heartbeat.ensure_healthy,
-                )
+                with _ingest_stage(
+                    processed_data,
+                    "model",
+                    attempt_id=receipt.attempt_id,
+                ):
+                    output = _run_codex_generator(
+                        runner,
+                        config,
+                        job_id,
+                        lease,
+                        prompt,
+                        stop_event,
+                        component_heartbeat.ensure_healthy,
+                    )
             except AutoIngestInfrastructureError as exc:
                 return self._attempt_infrastructure_failure(
                     handle,
@@ -3364,12 +3691,17 @@ class AutoIngestController:
             usage = dict(getattr(output, "usage", {}))
             try:
                 component_heartbeat.ensure_healthy()
-                files, integration = _validate_generator_output(
-                    output,
-                    job_id,
+                with _ingest_stage(
                     processed_data,
-                    config,
-                )
+                    "validation",
+                    attempt_id=receipt.attempt_id,
+                ):
+                    files, integration = _validate_generator_output(
+                        output,
+                        job_id,
+                        processed_data,
+                        config,
+                    )
             except AutoIngestPolicyError as exc:
                 return self._policy_failure(
                     handle,
@@ -3411,6 +3743,7 @@ class AutoIngestController:
 
             trusted_processed_data = dict(processed_data)
             trusted_processed_data["integration"] = integration
+            trusted_processed_data["attempt_id"] = receipt.attempt_id
             if stop_event.is_set():
                 handle.fail(
                     "watchdog stopping before finalization",
@@ -3433,10 +3766,15 @@ class AutoIngestController:
                 )
                 heartbeat.start()
                 component_heartbeat.ensure_healthy()
-                finalize_receipt = finalize_ingest_strict(
-                    files,
+                with _ingest_stage(
                     trusted_processed_data,
-                )
+                    "finalization",
+                    attempt_id=receipt.attempt_id,
+                ):
+                    finalize_receipt = finalize_ingest_strict(
+                        files,
+                        trusted_processed_data,
+                    )
                 component_heartbeat.ensure_healthy()
             except BaseException as exc:
                 finalize_error = exc

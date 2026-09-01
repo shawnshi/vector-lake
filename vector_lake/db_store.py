@@ -150,9 +150,10 @@ _SCHEMA_ROLLBACK_PENDING_RECEIPT_KEYS = frozenset(
         "receipt_fingerprint",
     }
 )
-_SCHEMA_ROLLBACK_COMPLETED_RECEIPT_KEYS = (
-    _SCHEMA_ROLLBACK_PENDING_RECEIPT_KEYS | {"completed_at", "post"}
-)
+_SCHEMA_ROLLBACK_COMPLETED_RECEIPT_KEYS = _SCHEMA_ROLLBACK_PENDING_RECEIPT_KEYS | {
+    "completed_at",
+    "post",
+}
 _SCHEMA_ROLLBACK_MIGRATION_BINDING_KEYS = frozenset(
     {
         "path",
@@ -206,6 +207,8 @@ _SCHEMA_ROLLBACK_POST_KEYS = frozenset(
         "old_runtime_acceptance",
     }
 )
+
+
 def _normalized_schema_sql(statement: object) -> str:
     sql = re.sub(
         r"\bIF\s+NOT\s+EXISTS\s+",
@@ -940,8 +943,7 @@ def _ingest_task_cleanup_has_identity_index(conn: sqlite3.Connection) -> bool:
         if columns != ("job_id", "task_packet_path"):
             continue
         if any(
-            int(row["desc"] or 0) != 0
-            or str(row["coll"] or "").casefold() != "binary"
+            int(row["desc"] or 0) != 0 or str(row["coll"] or "").casefold() != "binary"
             for row in key_columns
         ):
             continue
@@ -963,9 +965,7 @@ def _ingest_task_cleanup_schema_issues(conn: sqlite3.Connection) -> list[str]:
         str(row["name"]): row
         for row in conn.execute("PRAGMA table_info('ingest_task_cleanup')").fetchall()
     }
-    expected_columns = {
-        item[0] for item in _INGEST_TASK_CLEANUP_COLUMN_CONTRACT_V4
-    }
+    expected_columns = {item[0] for item in _INGEST_TASK_CLEANUP_COLUMN_CONTRACT_V4}
     for name in sorted(set(observed) - expected_columns):
         issues.append(f"ingest_task_cleanup_schema_unexpected:column:{name}")
     for (
@@ -1059,11 +1059,10 @@ def _index_has_expected_shape(
         (
             item
             for item in conn.execute(
-                "SELECT name, \"unique\", partial FROM pragma_index_list(?)",
+                'SELECT name, "unique", partial FROM pragma_index_list(?)',
                 (expected_table,),
             ).fetchall()
-            if str(item["name"] or "").casefold()
-            == actual_index_name.casefold()
+            if str(item["name"] or "").casefold() == actual_index_name.casefold()
         ),
         None,
     )
@@ -1103,9 +1102,10 @@ def _duplicate_index_cleanup_v5_issues(conn: sqlite3.Connection) -> list[str]:
         f"{str(row['name'])}"
         for row in rows
     ]
-    for index_name, (expected_table, expected_columns) in (
-        _RETAINED_TIMELINE_INDEXES_V5.items()
-    ):
+    for index_name, (
+        expected_table,
+        expected_columns,
+    ) in _RETAINED_TIMELINE_INDEXES_V5.items():
         if not _index_has_expected_shape(
             conn,
             index_name,
@@ -1173,8 +1173,7 @@ def _change_set_history_schema_v6_issues(
         ).fetchone()
         if missing is not None:
             issues.append(
-                "change_set_history_lifecycle_missing:"
-                f"{str(missing['change_set_id'])}"
+                f"change_set_history_lifecycle_missing:{str(missing['change_set_id'])}"
             )
     return issues
 
@@ -1208,8 +1207,7 @@ def _assert_change_set_history_schema_v6_contract(
     issues = _change_set_history_schema_v6_issues(conn)
     if issues:
         raise RuntimeError(
-            "Schema v6 change-set history contract is invalid: "
-            + ", ".join(issues)
+            "Schema v6 change-set history contract is invalid: " + ", ".join(issues)
         )
 
 
@@ -1222,8 +1220,7 @@ def _assert_change_set_payload_schema_v7_contract(
     issues = _change_set_payload_schema_v7_issues(conn)
     if issues:
         raise RuntimeError(
-            "Schema v7 change-set payload contract is invalid: "
-            + ", ".join(issues)
+            "Schema v7 change-set payload contract is invalid: " + ", ".join(issues)
         )
 
 
@@ -1254,9 +1251,13 @@ def _search_runtime_schema_v8_issues(conn: sqlite3.Connection) -> list[str]:
         elif observed != (expected_type, expected_not_null):
             issues.append(f"search_runtime_outbox_column_mismatch:{name}")
 
-    state_rows = conn.execute(
-        "SELECT singleton, status, expected_row_count FROM search_projection_state_v8"
-    ).fetchall() if not any("search_projection_state_v8" in issue for issue in issues) else []
+    state_rows = (
+        conn.execute(
+            "SELECT singleton, status, expected_row_count FROM search_projection_state_v8"
+        ).fetchall()
+        if not any("search_projection_state_v8" in issue for issue in issues)
+        else []
+    )
     if len(state_rows) != 1 or int(state_rows[0]["singleton"] or 0) != 1:
         issues.append("search_projection_state_singleton_invalid")
     elif (
@@ -1366,9 +1367,7 @@ def _projection_runtime_v9_sidecar(
             decoded.get("projection_generation"),
             label=f"{label}_projection_generation",
         )
-        generations = normalize_runtime_generations(
-            decoded.get("canonical_generation")
-        )
+        generations = normalize_runtime_generations(decoded.get("canonical_generation"))
         if generations is None:
             raise ValueError("canonical_generation")
         published_at = decoded.get("published_at_utc")
@@ -1448,9 +1447,7 @@ def _projection_runtime_schema_v9_issues(
         )
         if sidecar_json != state[6]:
             raise ValueError("sidecar_not_canonical")
-        sidecar_sha256 = _projection_runtime_v9_digest(
-            state[5], label="sidecar_sha256"
-        )
+        sidecar_sha256 = _projection_runtime_v9_digest(state[5], label="sidecar_sha256")
         if not hmac.compare_digest(
             sidecar_sha256,
             hashlib.sha256(sidecar_json.encode("utf-8")).hexdigest(),
@@ -1478,8 +1475,7 @@ def _assert_projection_runtime_schema_v9_contract(
     issues = _projection_runtime_schema_v9_issues(conn)
     if issues:
         raise RuntimeError(
-            "Schema v9 projection runtime contract is invalid: "
-            + ", ".join(issues)
+            "Schema v9 projection runtime contract is invalid: " + ", ".join(issues)
         )
 
 
@@ -1527,8 +1523,10 @@ def _validate_cached_identity_state(conn: sqlite3.Connection) -> None:
             before = _identity_validation_token(conn)
             if _IDENTITY_VALIDATION_TOKENS.get(db_key) == before:
                 return
-            _validate_canonical_identity_registry(conn)
-            _validate_canonical_identity_coverage(conn)
+            _validate_canonical_identity_coverage(
+                conn,
+                include_versions=False,
+            )
             after = _identity_validation_token(conn)
             if before == after:
                 _IDENTITY_VALIDATION_TOKENS[db_key] = after
@@ -1939,6 +1937,163 @@ def _job_idempotency_key(task_type: str, payload: dict | None) -> str | None:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+_INGEST_STAGE_NAMES = frozenset(
+    {
+        "prepare",
+        "enqueue",
+        "claim",
+        "raw_verify",
+        "local_publication",
+        "model",
+        "validation",
+        "finalization",
+        "canonical_commit",
+        "markdown",
+        "outbox",
+        "index_visible",
+        "retry",
+    }
+)
+_INGEST_STAGE_TRANSITIONS = frozenset(
+    {
+        "started",
+        "completed",
+        "failed",
+        "retry_scheduled",
+        "quarantined",
+        "superseded",
+    }
+)
+_INGEST_STAGE_METADATA_MAX_BYTES = 16 * 1024
+
+
+def record_ingest_stage_event(
+    *,
+    job_id: str,
+    revision: str,
+    stage: str,
+    transition: str,
+    attempt_id: str = "",
+    lease_generation: int | None = None,
+    duration_ms: int | None = None,
+    ordinal: int = 1,
+    error_code: str = "",
+    error_fingerprint: str = "",
+    metadata: dict | None = None,
+    occurred_at: str | None = None,
+    connection: sqlite3.Connection | None = None,
+) -> bool:
+    """Append one content-free, revision-correlated ingest stage event."""
+    normalized_stage = str(stage or "").strip()
+    normalized_transition = str(transition or "").strip()
+    if normalized_stage not in _INGEST_STAGE_NAMES:
+        raise ValueError(f"unsupported ingest stage: {normalized_stage}")
+    if normalized_transition not in _INGEST_STAGE_TRANSITIONS:
+        raise ValueError(
+            f"unsupported ingest stage transition: {normalized_transition}"
+        )
+    normalized_job_id = str(job_id or "").strip()
+    normalized_revision = str(revision or "").strip()
+    if not normalized_job_id or not normalized_revision:
+        raise ValueError("job_id and revision are required for ingest telemetry")
+    normalized_attempt_id = str(attempt_id or "").strip()
+    if not normalized_attempt_id:
+        normalized_attempt_id = hashlib.sha256(
+            f"{normalized_job_id}\0{normalized_revision}\0legacy-attempt".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:32]
+    if not re.fullmatch(r"[0-9a-f]{32}", normalized_attempt_id):
+        raise ValueError("ingest attempt_id must be 32 lowercase hex characters")
+    normalized_ordinal = int(ordinal)
+    if normalized_ordinal < 1:
+        raise ValueError("ingest stage ordinal must be positive")
+    normalized_duration = None if duration_ms is None else int(duration_ms)
+    if normalized_duration is not None and normalized_duration < 0:
+        raise ValueError("ingest stage duration must be non-negative")
+    metadata_json = json.dumps(
+        dict(metadata or {}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(metadata_json.encode("utf-8")) > _INGEST_STAGE_METADATA_MAX_BYTES:
+        raise ValueError("ingest stage metadata exceeds the byte budget")
+    timestamp = str(occurred_at or datetime.now(timezone.utc).isoformat())
+
+    def insert_event(conn: sqlite3.Connection) -> bool:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO ingest_stage_events "
+            "(job_id, revision, attempt_id, lease_generation, stage, transition, "
+            "occurred_at, duration_ms, ordinal, error_code, error_fingerprint, "
+            "metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                normalized_job_id,
+                normalized_revision,
+                normalized_attempt_id,
+                None if lease_generation is None else int(lease_generation),
+                normalized_stage,
+                normalized_transition,
+                timestamp,
+                normalized_duration,
+                normalized_ordinal,
+                str(error_code or "")[:160],
+                str(error_fingerprint or "")[:256],
+                metadata_json,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    if connection is not None:
+        return insert_event(connection)
+    init_db()
+    with transaction():
+        return insert_event(get_connection())
+
+
+def link_ingest_outbox_events(
+    *,
+    outbox_ids: list[int],
+    job_id: str,
+    revision: str,
+    attempt_id: str = "",
+    lease_generation: int | None = None,
+    connection: sqlite3.Connection | None = None,
+) -> int:
+    """Correlate projection work with the ingest revision that created it."""
+    normalized_ids = sorted({int(value) for value in outbox_ids})
+    if not normalized_ids:
+        return 0
+    normalized_job_id = str(job_id or "").strip()
+    normalized_revision = str(revision or "").strip()
+    if not normalized_job_id or not normalized_revision:
+        raise ValueError("job_id and revision are required for ingest outbox links")
+
+    def insert_links(conn: sqlite3.Connection) -> int:
+        inserted = 0
+        for outbox_id in normalized_ids:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO ingest_outbox_links "
+                "(outbox_id, job_id, revision, attempt_id, lease_generation) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    outbox_id,
+                    normalized_job_id,
+                    normalized_revision,
+                    str(attempt_id or ""),
+                    None if lease_generation is None else int(lease_generation),
+                ),
+            )
+            inserted += max(0, cursor.rowcount)
+        return inserted
+
+    if connection is not None:
+        return insert_links(connection)
+    init_db()
+    with transaction():
+        return insert_links(get_connection())
+
+
 def get_db_path() -> Path:
     import os
 
@@ -1980,10 +2135,8 @@ def schema_maintenance_lock(
             None,
         )
         if (
-            os.path.normcase(str(held_path))
-            != os.path.normcase(str(lock_path))
-            or os.path.normcase(str(held_database_path))
-            != os.path.normcase(str(path))
+            os.path.normcase(str(held_path)) != os.path.normcase(str(lock_path))
+            or os.path.normcase(str(held_database_path)) != os.path.normcase(str(path))
             or not isinstance(held_lock, BaseFileLock)
             or not held_lock.is_locked
         ):
@@ -2257,9 +2410,7 @@ def read_only_transaction_snapshot(
             yield connection
         return
 
-    validated_wal_header, validated_shm_headers = _validate_nonempty_wal_sidecars(
-        path
-    )
+    validated_wal_header, validated_shm_headers = _validate_nonempty_wal_sidecars(path)
     connection = None
     try:
         connection = sqlite3.connect(
@@ -2272,8 +2423,8 @@ def read_only_transaction_snapshot(
         connection.execute("BEGIN")
         connection.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
         try:
-            current_wal_header, current_shm_headers = (
-                _validate_nonempty_wal_sidecars(path)
+            current_wal_header, current_shm_headers = _validate_nonempty_wal_sidecars(
+                path
             )
         except ReadOnlySnapshotUnavailable as exc:
             raise ReadOnlySnapshotUnavailable(
@@ -2372,9 +2523,7 @@ def _configure_sqlite_durability(connection: sqlite3.Connection) -> None:
 
     profile = durability_profile()
     expected = 2 if profile == "full" else 1
-    connection.execute(
-        f"PRAGMA synchronous={'FULL' if expected == 2 else 'NORMAL'}"
-    )
+    connection.execute(f"PRAGMA synchronous={'FULL' if expected == 2 else 'NORMAL'}")
     observed = connection.execute("PRAGMA synchronous").fetchone()
     if observed is None or int(observed[0]) != expected:
         connection.close()
@@ -2468,8 +2617,7 @@ def require_current_schema_for_read(
         "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
     ).fetchall()
     observed = {
-        int(row["version"]): (str(row["name"]), str(row["checksum"]))
-        for row in rows
+        int(row["version"]): (str(row["name"]), str(row["checksum"])) for row in rows
     }
     expected = {
         version: _SCHEMA_MIGRATIONS[version]
@@ -2713,8 +2861,7 @@ def init_db():
         held_path, held_lock = held
         expected_path = lock_path.resolve()
         if (
-            os.path.normcase(str(held_path))
-            != os.path.normcase(str(expected_path))
+            os.path.normcase(str(held_path)) != os.path.normcase(str(expected_path))
             or not isinstance(held_lock, BaseFileLock)
             or not held_lock.is_locked
         ):
@@ -2875,8 +3022,7 @@ def _migrate_runtime_generation_schema_v3(conn: sqlite3.Connection) -> None:
         )
         for operation_kind in ("insert", "update", "delete"):
             conn.execute(
-                f"DROP TRIGGER IF EXISTS "
-                f"trg_{surface}_generation_v1_{operation_kind}"
+                f"DROP TRIGGER IF EXISTS trg_{surface}_generation_v1_{operation_kind}"
             )
             conn.execute(
                 f"DROP TRIGGER IF EXISTS "
@@ -2897,9 +3043,7 @@ def _duplicate_index_cleanup_v5_preflight_issues(
     """Validate both duplicate indexes before executing the first DROP."""
     issues: list[str] = []
 
-    for index_name, (expected_table, expected_columns) in (
-        _DUPLICATE_INDEXES_V5.items()
-    ):
+    for index_name, (expected_table, expected_columns) in _DUPLICATE_INDEXES_V5.items():
         rows = conn.execute(
             "SELECT type, name, tbl_name FROM main.sqlite_master "
             "WHERE name = ? COLLATE NOCASE ORDER BY type, name COLLATE BINARY",
@@ -2911,8 +3055,7 @@ def _duplicate_index_cleanup_v5_preflight_issues(
         if (
             row is None
             or str(row["type"] or "") != "index"
-            or str(row["tbl_name"] or "").casefold()
-            != expected_table.casefold()
+            or str(row["tbl_name"] or "").casefold() != expected_table.casefold()
         ):
             issues.append(
                 f"duplicate_index_migration_shape_mismatch:index:{index_name}"
@@ -2928,9 +3071,10 @@ def _duplicate_index_cleanup_v5_preflight_issues(
                 f"duplicate_index_migration_shape_mismatch:index:{index_name}"
             )
 
-    for index_name, (expected_table, expected_columns) in (
-        _RETAINED_TIMELINE_INDEXES_V5.items()
-    ):
+    for index_name, (
+        expected_table,
+        expected_columns,
+    ) in _RETAINED_TIMELINE_INDEXES_V5.items():
         if not _index_has_expected_shape(
             conn,
             index_name,
@@ -2949,8 +3093,7 @@ def _migrate_duplicate_index_cleanup_v5(conn: sqlite3.Connection) -> None:
     issues = _duplicate_index_cleanup_v5_preflight_issues(conn)
     if issues:
         raise RuntimeError(
-            "Schema v5 duplicate index cleanup preflight failed: "
-            + ", ".join(issues)
+            "Schema v5 duplicate index cleanup preflight failed: " + ", ".join(issues)
         )
     for index_name in _DUPLICATE_INDEXES_V5:
         row = conn.execute(
@@ -2965,8 +3108,7 @@ def _migrate_duplicate_index_cleanup_v5(conn: sqlite3.Connection) -> None:
     issues = _duplicate_index_cleanup_v5_issues(conn)
     if issues:
         raise RuntimeError(
-            "Schema v5 duplicate index cleanup migration failed: "
-            + ", ".join(issues)
+            "Schema v5 duplicate index cleanup migration failed: " + ", ".join(issues)
         )
 
 
@@ -2978,9 +3120,7 @@ _CHANGE_SET_TERMINAL_TIME_FIELDS_V6 = {
     "rejected": "rejected_at",
     "superseded": "superseded_at",
 }
-_CHANGE_SET_STATUSES_V6 = frozenset(
-    {"pending", *_CHANGE_SET_TERMINAL_TIME_FIELDS_V6}
-)
+_CHANGE_SET_STATUSES_V6 = frozenset({"pending", *_CHANGE_SET_TERMINAL_TIME_FIELDS_V6})
 
 
 def _normalize_change_set_lifecycle_instant_v6(value: object) -> str | None:
@@ -3022,9 +3162,7 @@ def _change_set_lifecycle_from_legacy_v6(
             field_name: payload.get(field_name)
             for field_name in _CHANGE_SET_TERMINAL_TIME_FIELDS_V6.values()
         },
-        requires_human_review_is_false=(
-            payload.get("requires_human_review") is False
-        ),
+        requires_human_review_is_false=(payload.get("requires_human_review") is False),
         payload_guard=payload_guard,
     )
 
@@ -3044,9 +3182,7 @@ def _change_set_lifecycle_from_values_v6(
             f"Schema v6 change-set status is unsupported for {change_set_id!r}: "
             f"{status or '<missing>'}"
         )
-    created_at = _normalize_change_set_lifecycle_instant_v6(
-        created_at_value
-    )
+    created_at = _normalize_change_set_lifecycle_instant_v6(created_at_value)
     terminal_at = None
     time_source = "active_v6_backfill"
     if status in _CHANGE_SET_TERMINAL_TIME_FIELDS_V6:
@@ -3126,8 +3262,7 @@ def _migrate_change_set_history_schema_v6(conn: sqlite3.Connection) -> None:
         change_set_id = str(row["change_set_id"])
         if str(row["root_type"] or "") != "object":
             raise RuntimeError(
-                "Schema v6 change-set payload is not an object: "
-                f"{change_set_id!r}"
+                f"Schema v6 change-set payload is not an object: {change_set_id!r}"
             )
         lifecycle = _change_set_lifecycle_from_values_v6(
             change_set_id,
@@ -3205,8 +3340,7 @@ def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
     )
     if v6_issues:
         raise RuntimeError(
-            "Schema v7 requires the exact schema v6 contract: "
-            + ", ".join(v6_issues)
+            "Schema v7 requires the exact schema v6 contract: " + ", ".join(v6_issues)
         )
     quick_check = conn.execute("PRAGMA quick_check").fetchone()
     if quick_check is None or str(quick_check[0]).casefold() != "ok":
@@ -3243,8 +3377,7 @@ def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if invalid_payload is not None:
         raise RuntimeError(
-            "Schema v7 source payload metadata is invalid: "
-            f"{str(invalid_payload[0])}"
+            f"Schema v7 source payload metadata is invalid: {str(invalid_payload[0])}"
         )
     orphan_ref = conn.execute(
         "SELECT ref.change_set_id FROM change_set_payload_refs AS ref "
@@ -3256,7 +3389,9 @@ def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
         "LIMIT 1"
     ).fetchone()
     if orphan_ref is not None:
-        raise RuntimeError(f"Schema v7 source payload reference is orphaned: {orphan_ref[0]}")
+        raise RuntimeError(
+            f"Schema v7 source payload reference is orphaned: {orphan_ref[0]}"
+        )
 
     payload_columns = (
         "payload_sha256, codec, payload_blob, raw_bytes, stored_bytes, created_at"
@@ -3310,13 +3445,18 @@ def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
     )
     if int(conn.execute("SELECT changes()").fetchone()[0]) != expected_ref_count:
         raise RuntimeError("Schema v7 copied payload-reference row count differs")
-    if _change_set_payload_v7_scalar_state(
-        conn,
-        "change_set_payloads_v7_new",
-    ) != expected_payload_state:
+    if (
+        _change_set_payload_v7_scalar_state(
+            conn,
+            "change_set_payloads_v7_new",
+        )
+        != expected_payload_state
+    ):
         raise RuntimeError("Schema v7 copied payload scalar state differs")
     new_ref_count = int(
-        conn.execute("SELECT COUNT(*) FROM change_set_payload_refs_v7_new").fetchone()[0]
+        conn.execute("SELECT COUNT(*) FROM change_set_payload_refs_v7_new").fetchone()[
+            0
+        ]
     )
     if new_ref_count != expected_ref_count:
         raise RuntimeError("Schema v7 copied payload-reference scalar state differs")
@@ -3326,24 +3466,29 @@ def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
 
     conn.execute("DROP TABLE change_set_payload_refs")
     conn.execute("DROP TABLE change_set_payloads")
-    conn.execute(
-        "ALTER TABLE change_set_payloads_v7_new RENAME TO change_set_payloads"
-    )
+    conn.execute("ALTER TABLE change_set_payloads_v7_new RENAME TO change_set_payloads")
     conn.execute(
         "ALTER TABLE change_set_payload_refs_v7_new RENAME TO change_set_payload_refs"
     )
     conn.execute(_CHANGE_SET_PAYLOAD_REFS_INDEX_SCHEMA_V7)
 
-    if _change_set_payload_v7_scalar_state(
-        conn,
-        "change_set_payloads",
-    ) != expected_payload_state:
-        raise RuntimeError("Schema v7 final payload scalar state differs from the source")
+    if (
+        _change_set_payload_v7_scalar_state(
+            conn,
+            "change_set_payloads",
+        )
+        != expected_payload_state
+    ):
+        raise RuntimeError(
+            "Schema v7 final payload scalar state differs from the source"
+        )
     final_ref_count = int(
         conn.execute("SELECT COUNT(*) FROM change_set_payload_refs").fetchone()[0]
     )
     if final_ref_count != expected_ref_count:
-        raise RuntimeError("Schema v7 final payload-reference count differs from the source")
+        raise RuntimeError(
+            "Schema v7 final payload-reference count differs from the source"
+        )
 
     observed_fks = {
         (
@@ -3378,10 +3523,13 @@ def _migrate_change_set_payload_schema_v7(conn: sqlite3.Connection) -> None:
         raise RuntimeError("Schema v7 final payload foreign keys differ")
     if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise RuntimeError("Schema v7 final foreign_key_check failed")
-    if conn.execute(
-        f"SELECT name FROM sqlite_master WHERE name IN ({placeholders}) LIMIT 1",
-        temporary_names,
-    ).fetchone() is not None:
+    if (
+        conn.execute(
+            f"SELECT name FROM sqlite_master WHERE name IN ({placeholders}) LIMIT 1",
+            temporary_names,
+        ).fetchone()
+        is not None
+    ):
         raise RuntimeError("Schema v7 temporary objects remain after rebuild")
 
     issues = _change_set_payload_schema_v7_issues(conn)
@@ -3853,9 +4001,7 @@ def _schema_migration_validate_receipt(
             plan_fingerprint,
             _schema_migration_fingerprint(plan),
         )
-        or not _schema_migration_same_database(
-            plan.get("database_path"), database_path
-        )
+        or not _schema_migration_same_database(plan.get("database_path"), database_path)
     ):
         raise RuntimeError("pending_receipt_plan_mismatch")
     source_binding = receipt.get("source_binding")
@@ -3913,8 +4059,7 @@ def _schema_migration_validate_receipt(
     recovery_bundle = receipt.get("recovery_bundle")
     if (
         not isinstance(recovery_bundle, dict)
-        or recovery_bundle.get("contract")
-        != "vector-lake-schema-migration-recovery/v1"
+        or recovery_bundle.get("contract") != "vector-lake-schema-migration-recovery/v1"
         or int(recovery_bundle.get("source_schema_version") or -1)
         != int(plan.get("pre_schema_version") or -2)
         or recovery_bundle.get("database") != backup
@@ -3939,7 +4084,9 @@ def _schema_migration_validate_receipt(
     return receipt
 
 
-def _schema_migration_pending_receipt(database_path: Path) -> tuple[dict | None, list[str]]:
+def _schema_migration_pending_receipt(
+    database_path: Path,
+) -> tuple[dict | None, list[str]]:
     completed_path, pending_path = _schema_migration_receipt_paths(database_path)
     if completed_path.is_file():
         try:
@@ -3999,7 +4146,11 @@ def preview_schema_migration(
                 if quick_check is None or str(quick_check[0]).casefold() != "ok":
                     issues.append(
                         "database_quick_check_failed:"
-                        + (str(quick_check[0]) if quick_check is not None else "missing")
+                        + (
+                            str(quick_check[0])
+                            if quick_check is not None
+                            else "missing"
+                        )
                     )
             except (OSError, sqlite3.Error) as exc:
                 issues.append(f"schema_preview_failed:{exc}")
@@ -4011,10 +4162,7 @@ def preview_schema_migration(
     if pre_projection["status"] == "incomplete":
         issues.append("projection_pair_incomplete")
     issues.extend(str(item) for item in pre_projection.get("issues") or [])
-    if (
-        pre_projection["status"] == "captured"
-        and runtime_generations is not None
-    ):
+    if pre_projection["status"] == "captured" and runtime_generations is not None:
         expected_projection_generations = {
             surface: runtime_generations[surface]
             for surface in CANONICAL_PROJECTION_SURFACES
@@ -4506,9 +4654,7 @@ def _schema_migration_fsync_directory(path: Path) -> None:
 
 def _schema_migration_atomic_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-    )
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
@@ -4602,11 +4748,7 @@ def _schema_migration_backup(
             if quick_check is None or str(quick_check[0]).casefold() != "ok":
                 raise RuntimeError(
                     "Pre-migration backup quick_check failed: "
-                    + (
-                        str(quick_check[0])
-                        if quick_check is not None
-                        else "missing"
-                    )
+                    + (str(quick_check[0]) if quick_check is not None else "missing")
                 )
             backup_state = inspect_schema_migration_connection(
                 destination,
@@ -4614,10 +4756,8 @@ def _schema_migration_backup(
             )
             if (
                 backup_state.get("user_version") != plan.get("pre_schema_version")
-                or backup_state.get("ledger")
-                != plan.get("pre_state", {}).get("ledger")
-                or backup_state.get("issues")
-                != plan.get("pre_state", {}).get("issues")
+                or backup_state.get("ledger") != plan.get("pre_state", {}).get("ledger")
+                or backup_state.get("issues") != plan.get("pre_state", {}).get("issues")
             ):
                 raise RuntimeError(
                     "Pre-migration backup does not match the previewed schema"
@@ -4663,9 +4803,7 @@ def _schema_migration_assert_prebackup_source(plan: dict, database_path: Path) -
         or not _schema_migration_wal_is_quiescent(planned[1])
         or not _schema_migration_wal_is_quiescent(current[1])
     ):
-        raise RuntimeError(
-            "Database changed after the locked schema migration preview"
-        )
+        raise RuntimeError("Database changed after the locked schema migration preview")
 
 
 def _schema_migration_assert_checkpoint_source(
@@ -4675,9 +4813,7 @@ def _schema_migration_assert_checkpoint_source(
     planned = plan.get("source_identity") or []
     current = _schema_migration_physical_identity(database_path)
     if len(planned) != 3 or planned[:2] != current[:2]:
-        raise RuntimeError(
-            "Database changed after the locked schema migration preview"
-        )
+        raise RuntimeError("Database changed after the locked schema migration preview")
 
 
 def _schema_migration_pending_payload(
@@ -4772,9 +4908,7 @@ def schema_migration_maintenance(
     if not apply and not checkpoint_wal:
         return initial_plan
     if not confirm_no_writers:
-        raise RuntimeError(
-            "Schema migration maintenance requires --confirm-no-writers"
-        )
+        raise RuntimeError("Schema migration maintenance requires --confirm-no-writers")
     if not hmac.compare_digest(
         str(confirmation),
         str(initial_plan["fingerprint"]),
@@ -4788,7 +4922,9 @@ def schema_migration_maintenance(
             + ", ".join(initial_plan["issues"] or ["unsupported_source_state"])
         )
     if checkpoint_wal and not Path(initial_plan["database_path"]).is_file():
-        raise RuntimeError("Schema migration WAL checkpoint requires an existing database")
+        raise RuntimeError(
+            "Schema migration WAL checkpoint requires an existing database"
+        )
 
     path = Path(initial_plan["database_path"])
     maintenance_lock = FileLock(
@@ -4946,7 +5082,9 @@ def schema_migration_maintenance(
         )
 
         with _controlled_schema_v5_transaction(source, maintenance_lock):
-            data_version_after = int(source.execute("PRAGMA data_version").fetchone()[0])
+            data_version_after = int(
+                source.execute("PRAGMA data_version").fetchone()[0]
+            )
             if data_version_after != data_version_before:
                 raise RuntimeError(
                     "Database changed while the pre-migration backup was created"
@@ -5010,7 +5148,10 @@ def schema_migration_maintenance(
         source.execute("PRAGMA query_only=ON")
         post_state = inspect_schema_migration_connection(source, path)
         post_runtime_generations = _schema_migration_runtime_generations(source)
-        if not post_state.get("ready") or post_state.get("user_version") != _SCHEMA_VERSION:
+        if (
+            not post_state.get("ready")
+            or post_state.get("user_version") != _SCHEMA_VERSION
+        ):
             raise RuntimeError(
                 "Schema migration committed but read-only target verification failed: "
                 + ", ".join(post_state.get("issues") or ["schema_not_ready"])
@@ -5102,9 +5243,7 @@ def _schema_rollback_receipt_paths(
 
 
 def _schema_rollback_is_reparse(details: os.stat_result) -> bool:
-    reparse_marker = int(
-        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    )
+    reparse_marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
     return stat.S_ISLNK(details.st_mode) or bool(
         int(getattr(details, "st_file_attributes", 0) or 0) & reparse_marker
     )
@@ -5209,12 +5348,10 @@ def _schema_rollback_receipt_is_self_bound(
                 plan.get("database_path"), database_path
             )
             and isinstance(migration_receipt, dict)
-            and set(migration_receipt)
-            == _SCHEMA_ROLLBACK_MIGRATION_BINDING_KEYS
+            and set(migration_receipt) == _SCHEMA_ROLLBACK_MIGRATION_BINDING_KEYS
             and Path(str(migration_receipt.get("path") or "")).is_absolute()
             and all(
-                re.fullmatch(r"sha256:[0-9a-f]{64}", str(value or ""))
-                is not None
+                re.fullmatch(r"sha256:[0-9a-f]{64}", str(value or "")) is not None
                 for value in (
                     migration_receipt.get("file_sha256"),
                     migration_receipt.get("receipt_fingerprint"),
@@ -5234,8 +5371,7 @@ def _schema_rollback_receipt_is_self_bound(
             and set(receipt_forward) == _SCHEMA_ROLLBACK_RECEIPT_FORWARD_KEYS
             and isinstance(receipt_forward.get("database"), dict)
             and isinstance(receipt_forward.get("projection"), dict)
-            and receipt.get("projection_action")
-            == plan.get("projection_action")
+            and receipt.get("projection_action") == plan.get("projection_action")
             and receipt.get("old_runtime_projection_rebuild_required")
             == plan.get("old_runtime_projection_rebuild_required")
             and plan.get("issues") == []
@@ -5266,8 +5402,6 @@ def _schema_rollback_receipt_is_self_bound(
     )
 
 
-
-
 def _schema_rollback_terminal_receipt_pair(
     pending_path: Path,
     pending: dict,
@@ -5278,14 +5412,10 @@ def _schema_rollback_terminal_receipt_pair(
     remaining_bytes: int,
 ) -> tuple[bool, int]:
     try:
-        completed_identity = _schema_rollback_plain_receipt_identity(
-            completed_path
-        )
+        completed_identity = _schema_rollback_plain_receipt_identity(completed_path)
         additional_bytes = completed_identity[2]
         if additional_bytes > remaining_bytes:
-            raise RuntimeError(
-                "schema_rollback_pending_receipt_bytes_exceeded"
-            )
+            raise RuntimeError("schema_rollback_pending_receipt_bytes_exceeded")
         completed, observed_completed, _completed_sha256 = (
             _schema_rollback_bounded_receipt(completed_path)
         )
@@ -5305,9 +5435,7 @@ def _schema_rollback_terminal_receipt_pair(
     migration_receipt = pending.get("migration_receipt")
     if not isinstance(migration_receipt, dict):
         return False, 0
-    migration_fingerprint = str(
-        migration_receipt.get("receipt_fingerprint") or ""
-    )
+    migration_fingerprint = str(migration_receipt.get("receipt_fingerprint") or "")
     if re.fullmatch(r"sha256:[0-9a-f]{64}", migration_fingerprint) is None:
         return False, 0
     receipt_token = migration_fingerprint.removeprefix("sha256:")[:24]
@@ -5319,13 +5447,8 @@ def _schema_rollback_terminal_receipt_pair(
     observed_name = os.path.normcase(pending_path.name)
     normalized_prefix = os.path.normcase(pending_prefix)
     normalized_suffix = os.path.normcase(pending_suffix)
-    observed_token = observed_name[
-        len(normalized_prefix) : -len(normalized_suffix)
-    ]
-    if (
-        len(receipt_token) != 24
-        or os.path.normcase(receipt_token) != observed_token
-    ):
+    observed_token = observed_name[len(normalized_prefix) : -len(normalized_suffix)]
+    if len(receipt_token) != 24 or os.path.normcase(receipt_token) != observed_token:
         return False, 0
 
     post = completed.get("post")
@@ -5363,8 +5486,7 @@ def _schema_rollback_terminal_receipt_pair(
         return False, 0
     try:
         stable = (
-            _schema_rollback_plain_receipt_identity(pending_path)
-            == pending_identity
+            _schema_rollback_plain_receipt_identity(pending_path) == pending_identity
             and _schema_rollback_plain_receipt_identity(completed_path)
             == observed_completed
         )
@@ -5386,16 +5508,13 @@ def assert_no_schema_rollback_pending_receipt(
     except FileNotFoundError:
         return
     except ValueError as exc:
-        raise RuntimeError(
-            "schema_rollback_pending_scan_unsafe_directory"
-        ) from exc
+        raise RuntimeError("schema_rollback_pending_scan_unsafe_directory") from exc
     except OSError as exc:
         raise RuntimeError("schema_rollback_pending_scan_failed") from exc
 
     broad_marker = os.path.normcase(".rollback-")
     known_version = os.path.normcase(
-        f"v{_SCHEMA_ROLLBACK_SOURCE_VERSION}"
-        f"-to-v{_SCHEMA_ROLLBACK_TARGET_VERSION}"
+        f"v{_SCHEMA_ROLLBACK_SOURCE_VERSION}-to-v{_SCHEMA_ROLLBACK_TARGET_VERSION}"
     )
     suffix = os.path.normcase(".pending.json")
     try:
@@ -5403,31 +5522,20 @@ def assert_no_schema_rollback_pending_receipt(
         with os.scandir(receipt_dir) as entries:
             for scanned, entry in enumerate(entries, start=1):
                 if scanned > _SCHEMA_ROLLBACK_PENDING_SCAN_LIMIT:
-                    raise RuntimeError(
-                        "schema_rollback_pending_scan_limit_exceeded"
-                    )
+                    raise RuntimeError("schema_rollback_pending_scan_limit_exceeded")
                 name = os.path.normcase(entry.name)
                 if name in observed:
-                    raise RuntimeError(
-                        "schema_rollback_pending_scan_ambiguous_name"
-                    )
+                    raise RuntimeError("schema_rollback_pending_scan_ambiguous_name")
                 observed[name] = entry.name
-        if (
-            _schema_rollback_directory_identity(receipt_dir)
-            != directory_identity
-        ):
-            raise RuntimeError(
-                "schema_rollback_pending_scan_directory_changed"
-            )
+        if _schema_rollback_directory_identity(receipt_dir) != directory_identity:
+            raise RuntimeError("schema_rollback_pending_scan_directory_changed")
 
         terminal_pairs = 0
         receipt_bytes = 0
         for name, original_name in observed.items():
             if not name.endswith(suffix):
                 continue
-            filename_database, marker, rollback_tail = name.rpartition(
-                broad_marker
-            )
+            filename_database, marker, rollback_tail = name.rpartition(broad_marker)
             if not marker or not filename_database:
                 continue
             rollback_core = rollback_tail[: -len(suffix)]
@@ -5435,40 +5543,32 @@ def assert_no_schema_rollback_pending_receipt(
                 continue
             if rollback_core.count(".") != 1:
                 if "to" in rollback_core:
-                    raise RuntimeError(
-                        "schema_rollback_pending_unknown_contract"
-                    )
+                    raise RuntimeError("schema_rollback_pending_unknown_contract")
                 continue
             observed_version, observed_token = rollback_core.split(".", 1)
             if (
                 observed_version != known_version
                 or re.fullmatch(r"[0-9a-f]{24}", observed_token) is None
             ):
-                raise RuntimeError(
-                    "schema_rollback_pending_unknown_contract"
-                )
+                raise RuntimeError("schema_rollback_pending_unknown_contract")
 
             pending_path = receipt_dir / original_name
             try:
-                expected_pending_identity = (
-                    _schema_rollback_plain_receipt_identity(pending_path)
+                expected_pending_identity = _schema_rollback_plain_receipt_identity(
+                    pending_path
                 )
                 if (
                     receipt_bytes + expected_pending_identity[2]
                     > _SCHEMA_ROLLBACK_RECEIPT_SCAN_MAX_BYTES
                 ):
-                    raise RuntimeError(
-                        "schema_rollback_pending_receipt_bytes_exceeded"
-                    )
+                    raise RuntimeError("schema_rollback_pending_receipt_bytes_exceeded")
                 pending, pending_identity, _pending_sha256 = (
                     _schema_rollback_bounded_receipt(pending_path)
                 )
                 if pending_identity != expected_pending_identity:
                     raise ValueError("pending receipt identity changed")
                 receipt_bytes += pending_identity[2]
-                payload_database = Path(
-                    str(pending.get("database_path") or "")
-                )
+                payload_database = Path(str(pending.get("database_path") or ""))
                 if not _schema_rollback_receipt_is_self_bound(
                     pending,
                     payload_database,
@@ -5485,9 +5585,7 @@ def assert_no_schema_rollback_pending_receipt(
                 TypeError,
                 ValueError,
             ) as exc:
-                raise RuntimeError(
-                    "schema_rollback_pending_candidate_invalid"
-                ) from exc
+                raise RuntimeError("schema_rollback_pending_candidate_invalid") from exc
 
             filename_matches_payload = os.path.normcase(
                 payload_database.name
@@ -5518,9 +5616,7 @@ def assert_no_schema_rollback_pending_receipt(
                 or payload_matches_current != filename_matches_current
                 or not pending_path_is_canonical
             ):
-                raise RuntimeError(
-                    "schema_rollback_pending_filename_database_mismatch"
-                )
+                raise RuntimeError("schema_rollback_pending_filename_database_mismatch")
 
             completed_name = name[: -len(suffix)] + os.path.normcase(".json")
             completed_original = observed.get(completed_name)
@@ -5532,18 +5628,15 @@ def assert_no_schema_rollback_pending_receipt(
                         "schema_rollback_pending_terminal_pair_limit_exceeded"
                     )
                 completed_path = receipt_dir / completed_original
-                terminal, additional_bytes = (
-                    _schema_rollback_terminal_receipt_pair(
-                        pending_path,
-                        pending,
-                        pending_identity,
-                        completed_path,
-                        payload_database,
-                        remaining_bytes=(
-                            _SCHEMA_ROLLBACK_RECEIPT_SCAN_MAX_BYTES
-                            - receipt_bytes
-                        ),
-                    )
+                terminal, additional_bytes = _schema_rollback_terminal_receipt_pair(
+                    pending_path,
+                    pending,
+                    pending_identity,
+                    completed_path,
+                    payload_database,
+                    remaining_bytes=(
+                        _SCHEMA_ROLLBACK_RECEIPT_SCAN_MAX_BYTES - receipt_bytes
+                    ),
                 )
                 receipt_bytes += additional_bytes
             if terminal:
@@ -5552,17 +5645,10 @@ def assert_no_schema_rollback_pending_receipt(
                 continue
             # Name-first matching deliberately blocks malformed, symlink,
             # reparse, non-regular, and ambiguous terminal candidates.
-            raise RuntimeError(
-                "schema_rollback_pending_blocks_projection_rebuild"
-            )
+            raise RuntimeError("schema_rollback_pending_blocks_projection_rebuild")
 
-        if (
-            _schema_rollback_directory_identity(receipt_dir)
-            != directory_identity
-        ):
-            raise RuntimeError(
-                "schema_rollback_pending_scan_directory_changed"
-            )
+        if _schema_rollback_directory_identity(receipt_dir) != directory_identity:
+            raise RuntimeError("schema_rollback_pending_scan_directory_changed")
     except RuntimeError:
         raise
     except (OSError, ValueError) as exc:
@@ -5586,11 +5672,9 @@ def _schema_rollback_completed_migration_receipt(
         expected_status="completed",
     )
     plan = receipt.get("plan") or {}
-    if (
-        int(plan.get("pre_schema_version") or -1)
-        != _SCHEMA_ROLLBACK_TARGET_VERSION
-        or plan.get("steps") != ["schema_v8_to_v9"]
-    ):
+    if int(
+        plan.get("pre_schema_version") or -1
+    ) != _SCHEMA_ROLLBACK_TARGET_VERSION or plan.get("steps") != ["schema_v8_to_v9"]:
         raise RuntimeError("rollback_requires_v8_source_receipt")
     pre_projection = plan.get("pre_projection")
     if (
@@ -5604,8 +5688,6 @@ def _schema_rollback_completed_migration_receipt(
     ):
         raise RuntimeError("rollback_receipt_pre_generations_invalid")
     return receipt_path, receipt
-
-
 
 
 def _schema_rollback_validate_receipt(
@@ -5648,9 +5730,7 @@ def _schema_rollback_validate_receipt(
             plan_fingerprint,
             _schema_migration_fingerprint(plan),
         )
-        or not _schema_migration_same_database(
-            plan.get("database_path"), database_path
-        )
+        or not _schema_migration_same_database(plan.get("database_path"), database_path)
         or receipt.get("migration_receipt") != plan.get("migration_receipt")
         or receipt.get("from_source") != plan.get("current_source")
         or receipt.get("to_target") != plan.get("restore")
@@ -5663,12 +5743,9 @@ def _schema_rollback_validate_receipt(
         migration_path_is_plain = True
     except (OSError, ValueError):
         migration_path_is_plain = False
-    migration_binding_matches = (
-        migration_path_is_plain
-        and hmac.compare_digest(
-            str(migration_binding.get("file_sha256") or ""),
-            _schema_migration_sha256(migration_path),
-        )
+    migration_binding_matches = migration_path_is_plain and hmac.compare_digest(
+        str(migration_binding.get("file_sha256") or ""),
+        _schema_migration_sha256(migration_path),
     )
     if not migration_binding_matches:
         raise RuntimeError("rollback_receipt_migration_binding_mismatch")
@@ -5707,16 +5784,12 @@ def _schema_rollback_validate_receipt(
             quick_check is None
             or str(quick_check[0]).casefold() != "ok"
             or _schema_migration_state_binding(state)
-            != _schema_migration_state_binding(
-                plan["current_source"]["schema_state"]
-            )
+            != _schema_migration_state_binding(plan["current_source"]["schema_state"])
             or _schema_migration_runtime_generations(connection)
             != plan["current_source"]["runtime_generations"]
             or not hmac.compare_digest(
                 _schema_rollback_logical_database_sha256(connection),
-                str(
-                    plan["current_source"].get("logical_database_sha256") or ""
-                ),
+                str(plan["current_source"].get("logical_database_sha256") or ""),
             )
         ):
             raise RuntimeError("rollback_receipt_forward_database_invalid")
@@ -5794,8 +5867,8 @@ def _schema_rollback_current_state(database_path: Path) -> dict:
             result["runtime_generations"] = _schema_migration_runtime_generations(
                 connection
             )
-        result["logical_database_sha256"] = (
-            _schema_rollback_logical_database_sha256(connection)
+        result["logical_database_sha256"] = _schema_rollback_logical_database_sha256(
+            connection
         )
     except sqlite3.Error as exc:
         raise RuntimeError("rollback_source_unreadable") from exc
@@ -5854,11 +5927,11 @@ def _schema_rollback_existing_forward_database(
     current_source: dict,
 ) -> dict:
     """Validate and describe an orphaned forward database for safe adoption."""
-    expected_logical_sha256 = str(
-        current_source.get("logical_database_sha256") or ""
-    )
+    expected_logical_sha256 = str(current_source.get("logical_database_sha256") or "")
     observed_sha256 = (
-        _schema_migration_sha256(path) if path.is_file() and not path.is_symlink() else ""
+        _schema_migration_sha256(path)
+        if path.is_file() and not path.is_symlink()
+        else ""
     )
     if (
         not path.is_file()
@@ -6021,9 +6094,7 @@ def _schema_rollback_existing_forward_projection(
             "generation": snapshot.get("generation"),
             "canonical_generation": snapshot.get("canonical_generation"),
             "index_root_sha256": snapshot.get("index_root_sha256"),
-            "claim_graph_root_sha256": snapshot.get(
-                "claim_graph_root_sha256"
-            ),
+            "claim_graph_root_sha256": snapshot.get("claim_graph_root_sha256"),
             "artifacts": artifacts,
         }
         try:
@@ -6033,9 +6104,7 @@ def _schema_rollback_existing_forward_projection(
                 backup_root=directory.parent,
             )
         except RuntimeError as exc:
-            raise RuntimeError(
-                "rollback_orphan_forward_projection_invalid"
-            ) from exc
+            raise RuntimeError("rollback_orphan_forward_projection_invalid") from exc
         return backup
 
     expected = {
@@ -6047,9 +6116,8 @@ def _schema_rollback_existing_forward_projection(
         observed_paths = list(directory.iterdir())
     except OSError as exc:
         raise RuntimeError("rollback_orphan_forward_projection_invalid") from exc
-    if (
-        {item.name for item in observed_paths} != set(expected)
-        or any(not item.is_file() or item.is_symlink() for item in observed_paths)
+    if {item.name for item in observed_paths} != set(expected) or any(
+        not item.is_file() or item.is_symlink() for item in observed_paths
     ):
         raise RuntimeError("rollback_orphan_forward_projection_invalid")
 
@@ -6099,9 +6167,7 @@ def _schema_rollback_pending_recovery_action(
     ):
         projection = _schema_migration_projection_snapshot()
         if _schema_migration_projection_content_binding(projection) == (
-            _schema_migration_projection_content_binding(
-                restore["pre_projection"]
-            )
+            _schema_migration_projection_content_binding(restore["pre_projection"])
         ):
             return "publish_completed_receipt"
         return "resume_projection_restore"
@@ -6114,9 +6180,7 @@ def _schema_rollback_pending_recovery_action(
     ):
         projection = _schema_migration_projection_snapshot()
         if _schema_migration_projection_content_binding(projection) == (
-            _schema_migration_projection_content_binding(
-                current_source["projection"]
-            )
+            _schema_migration_projection_content_binding(current_source["projection"])
         ):
             return "resume_database_and_projection_restore"
     return None
@@ -6171,9 +6235,7 @@ def preview_schema_rollback(
     db_path: str | Path | None = None,
 ) -> dict:
     """Build a content-bound v9-to-v8 rollback plan without physical writes."""
-    database_path = (
-        Path(db_path) if db_path is not None else peek_db_path()
-    ).resolve()
+    database_path = (Path(db_path) if db_path is not None else peek_db_path()).resolve()
     issues: list[str] = []
     receipt_path = None
     migration_receipt_payload = None
@@ -6279,9 +6341,7 @@ def preview_schema_rollback(
             if pre_projection["status"] == "captured"
             else "restore_pre_migration_absence"
         )
-        old_runtime_projection_rebuild_required = (
-            pre_projection["status"] == "absent"
-        )
+        old_runtime_projection_rebuild_required = pre_projection["status"] == "absent"
         restore = {
             "database": migration_receipt_payload["backup"],
             "schema_state": migration_plan["pre_state"],
@@ -6306,16 +6366,14 @@ def preview_schema_rollback(
             "current_physical_identity": current.get("physical_identity"),
             "current_projection": current.get("projection"),
         }
-        token = _schema_migration_fingerprint(token_payload).removeprefix(
-            "sha256:"
-        )[:24]
+        token = _schema_migration_fingerprint(token_payload).removeprefix("sha256:")[
+            :24
+        ]
         backup_root = database_path.parent / "schema-migration-backups"
         forward_db = backup_root / (
             f"{database_path.stem}.forward-v9-before-v8-rollback.{token}.db"
         )
-        forward_projection = forward_db.with_name(
-            forward_db.name + ".projection"
-        )
+        forward_projection = forward_db.with_name(forward_db.name + ".projection")
         completed_path, pending_path = _schema_rollback_receipt_paths(
             database_path,
             migration_receipt_payload,
@@ -6362,9 +6420,7 @@ def preview_schema_rollback(
         if (forward_db_exists or forward_projection_exists) and not orphan_issues:
             reuse_database = bool(forward_recovery["reuse_database"])
             reuse_projection = bool(forward_recovery["reuse_projection"])
-            forward_recovery["reuse_existing"] = (
-                reuse_database and reuse_projection
-            )
+            forward_recovery["reuse_existing"] = reuse_database and reuse_projection
             if reuse_database and reuse_projection:
                 recovery_action = "reuse_verified_forward_recovery"
             elif reuse_database:
@@ -6427,7 +6483,9 @@ def _schema_rollback_stage_database(plan: dict, database_path: Path) -> Path:
             str(backup["sha256"]),
         ):
             raise RuntimeError("Rollback v8 database staging hash mismatch")
-        if any(Path(str(staging_path) + suffix).exists() for suffix in ("-wal", "-shm")):
+        if any(
+            Path(str(staging_path) + suffix).exists() for suffix in ("-wal", "-shm")
+        ):
             raise RuntimeError("Rollback v8 database staging is not standalone")
         connection = sqlite3.connect(
             f"{staging_path.resolve().as_uri()}?mode=ro&immutable=1",
@@ -6444,9 +6502,10 @@ def _schema_rollback_stage_database(plan: dict, database_path: Path) -> Path:
                 _schema_migration_state_binding(restore["schema_state"])
             ):
                 raise RuntimeError("Rollback v8 database schema binding mismatch")
-            if _schema_migration_runtime_generations(connection) != restore[
-                "runtime_generations"
-            ]:
+            if (
+                _schema_migration_runtime_generations(connection)
+                != restore["runtime_generations"]
+            ):
                 raise RuntimeError("Rollback v8 database generation binding mismatch")
         finally:
             connection.close()
@@ -6467,8 +6526,7 @@ def _schema_rollback_stage_projection(plan: dict) -> dict:
         )
         if (
             not isinstance(staged, dict)
-            or staged.get("contract")
-            != "vector-lake-projection-rollback-stage/v2"
+            or staged.get("contract") != "vector-lake-projection-rollback-stage/v2"
             or staged.get("format_version") != 2
         ):
             raise RuntimeError("projection_v2_rollback_stage_contract_invalid")
@@ -6514,18 +6572,14 @@ def _schema_rollback_publish_projection(
     plan: dict,
     staged: dict,
 ) -> None:
-    if _schema_migration_projection_snapshot_is_v2(
-        plan["restore"]["pre_projection"]
-    ):
+    if _schema_migration_projection_snapshot_is_v2(plan["restore"]["pre_projection"]):
         _schema_migration_projection_v2_delegate(
             "schema_rollback_publish_projection",
             plan,
             staged,
         )
         return
-    index_path, claim_graph_path, manifest_path = (
-        _schema_migration_projection_paths()
-    )
+    index_path, claim_graph_path, manifest_path = _schema_migration_projection_paths()
     manifest_path.unlink(missing_ok=True)
     _schema_migration_fsync_directory(manifest_path.parent)
     if plan["restore"]["pre_projection"]["status"] == "absent":
@@ -6761,12 +6815,9 @@ def schema_rollback_maintenance(
         }:
             pending_binding = plan.get("pending_rollback_receipt") or {}
             pending_path = Path(str(pending_binding.get("path") or "")).resolve()
-            if (
-                not pending_path.is_file()
-                or not hmac.compare_digest(
-                    str(pending_binding.get("file_sha256") or ""),
-                    _schema_migration_sha256(pending_path),
-                )
+            if not pending_path.is_file() or not hmac.compare_digest(
+                str(pending_binding.get("file_sha256") or ""),
+                _schema_migration_sha256(pending_path),
             ):
                 raise RuntimeError("Schema rollback pending receipt changed")
             pending = _schema_rollback_validate_receipt(
@@ -6775,9 +6826,7 @@ def schema_rollback_maintenance(
                 expected_status="pending",
             )
             if recovery_action == "resume_projection_restore":
-                projection_stages = _schema_rollback_stage_projection(
-                    plan
-                )
+                projection_stages = _schema_rollback_stage_projection(plan)
                 _schema_rollback_publish_projection(plan, projection_stages)
                 projection_stages = {}
             elif recovery_action == "resume_database_and_projection_restore":
@@ -6877,15 +6926,12 @@ def schema_rollback_maintenance(
 
             post = _schema_rollback_verify_target(pending["plan"], database_path)
             completed = _schema_rollback_completed_payload(pending, post)
-            completed_path = Path(
-                plan["forward_recovery"]["completed_receipt_path"]
-            )
+            completed_path = Path(plan["forward_recovery"]["completed_receipt_path"])
             _schema_migration_atomic_json(completed_path, completed)
             return {
                 "contract": _SCHEMA_ROLLBACK_RECEIPT_CONTRACT,
                 "dry_run": False,
-                "applied": recovery_action
-                != "publish_completed_receipt",
+                "applied": recovery_action != "publish_completed_receipt",
                 "no_op": True,
                 "recovery_action": (
                     "published_completed_receipt"
@@ -6923,13 +6969,9 @@ def schema_rollback_maintenance(
             ) from exc
 
         forward_path = Path(plan["forward_recovery"]["database_path"])
-        forward_projection_path = Path(
-            plan["forward_recovery"]["projection_directory"]
-        )
+        forward_projection_path = Path(plan["forward_recovery"]["projection_directory"])
         reuse_database = bool(plan["forward_recovery"].get("reuse_database"))
-        reuse_projection = bool(
-            plan["forward_recovery"].get("reuse_projection")
-        )
+        reuse_projection = bool(plan["forward_recovery"].get("reuse_projection"))
         if reuse_database:
             forward_database = _schema_rollback_existing_forward_database(
                 forward_path,
@@ -6989,24 +7031,30 @@ def schema_rollback_maintenance(
 
         source.execute("BEGIN EXCLUSIVE")
         if int(source.execute("PRAGMA data_version").fetchone()[0]) != data_version:
-            raise RuntimeError("Schema rollback source changed while backup was created")
+            raise RuntimeError(
+                "Schema rollback source changed while backup was created"
+            )
         locked_state = inspect_schema_migration_connection(source, database_path)
         if _schema_migration_state_binding(locked_state) != (
             _schema_migration_state_binding(plan["current_source"]["schema_state"])
         ):
             raise RuntimeError("Schema rollback source schema changed before replace")
-        if _schema_migration_runtime_generations(source) != plan["current_source"][
-            "runtime_generations"
-        ]:
-            raise RuntimeError("Schema rollback source generations changed before replace")
-        if _schema_migration_projection_snapshot() != plan["current_source"][
-            "projection"
-        ]:
-            raise RuntimeError("Schema rollback source projection changed before replace")
+        if (
+            _schema_migration_runtime_generations(source)
+            != plan["current_source"]["runtime_generations"]
+        ):
+            raise RuntimeError(
+                "Schema rollback source generations changed before replace"
+            )
+        if (
+            _schema_migration_projection_snapshot()
+            != plan["current_source"]["projection"]
+        ):
+            raise RuntimeError(
+                "Schema rollback source projection changed before replace"
+            )
 
-        completed_path = Path(
-            plan["forward_recovery"]["completed_receipt_path"]
-        )
+        completed_path = Path(plan["forward_recovery"]["completed_receipt_path"])
         pending_path = Path(plan["forward_recovery"]["pending_receipt_path"])
         pending = _schema_rollback_pending_payload(
             plan,
@@ -7310,7 +7358,11 @@ def _normalized_identity_page_sql(expression: str) -> str:
     )
 
 
-def _validate_canonical_identity_coverage(conn: sqlite3.Connection) -> None:
+def _validate_canonical_identity_coverage(
+    conn: sqlite3.Connection,
+    *,
+    include_versions: bool = True,
+) -> None:
     """Use SQLite to select anomalies, then diagnose only those rows in Python."""
     for (
         record_kind,
@@ -7322,13 +7374,20 @@ def _validate_canonical_identity_coverage(conn: sqlite3.Connection) -> None:
         owner_page = _normalized_identity_page_sql("parsed.owner_page_key")
         version_page = _normalized_identity_page_sql("parsed.version_page_key")
         embedded_id_path = f"$.{record_kind}_id"
+        records_sql = (
+            f"SELECT {id_field} AS record_id, data_json, "
+            f"NULL AS version_page_key FROM {current_table}"
+        )
+        if include_versions:
+            records_sql += (
+                " UNION ALL "
+                f"SELECT {id_field} AS record_id, data_json, "
+                f"page_key AS version_page_key FROM {version_table}"
+            )
         rows = conn.execute(
             "WITH records AS ("
-            f"SELECT {id_field} AS record_id, data_json, "
-            f"NULL AS version_page_key FROM {current_table} UNION ALL "
-            f"SELECT {id_field} AS record_id, data_json, "
-            f"page_key AS version_page_key FROM {version_table}"
-            "), parsed AS ("
+            + records_sql
+            + "), parsed AS ("
             "SELECT records.*, owner.record_id AS owner_record_id, "
             "owner.page_key AS owner_page_key, "
             "CASE WHEN json_valid(records.data_json) = 1 "
@@ -7476,9 +7535,7 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
     conn.execute(search_state_sql)
     state_columns = {
         str(row[1]): str(row[2] or "").strip().upper()
-        for row in conn.execute(
-            "PRAGMA table_info(operational_memory_search_state)"
-        )
+        for row in conn.execute("PRAGMA table_info(operational_memory_search_state)")
     }
     if state_columns != {
         "singleton": "INTEGER",
@@ -7534,10 +7591,13 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
             "WHERE singleton = 1",
             (datetime.now(timezone.utc).isoformat(),),
         )
-    revision_table_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'operational_memory_search_revision'"
-    ).fetchone() is not None
+    revision_table_exists = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'operational_memory_search_revision'"
+        ).fetchone()
+        is not None
+    )
     revision_sql = """
         CREATE TABLE IF NOT EXISTS operational_memory_search_revision (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -7548,9 +7608,7 @@ def _init_operational_memory_search_schema(conn: sqlite3.Connection) -> bool:
     conn.execute(revision_sql)
     revision_columns = {
         str(row[1]): str(row[2] or "").strip().upper()
-        for row in conn.execute(
-            "PRAGMA table_info(operational_memory_search_revision)"
-        )
+        for row in conn.execute("PRAGMA table_info(operational_memory_search_revision)")
     }
     if revision_columns != {
         "singleton": "INTEGER",
@@ -8059,6 +8117,26 @@ def _init_db_once(db_key: str):
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_timeline_entity ON timeline_events(entity_id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_date_id "
+            "ON timeline_events(event_date DESC, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_entity_date_id "
+            "ON timeline_events(entity_id COLLATE NOCASE, event_date DESC, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_title_date_id "
+            "ON timeline_events(entity_title COLLATE NOCASE, event_date DESC, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_sentiment_date_id "
+            "ON timeline_events(sentiment, event_date DESC, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_action_date_id "
+            "ON timeline_events(action COLLATE NOCASE, event_date DESC, id)"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_files (
                 filepath TEXT PRIMARY KEY,
@@ -8137,6 +8215,61 @@ def _init_db_once(db_key: str):
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
             "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_stage_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                revision TEXT NOT NULL,
+                attempt_id TEXT NOT NULL DEFAULT '',
+                lease_generation INTEGER,
+                stage TEXT NOT NULL,
+                transition TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                duration_ms INTEGER CHECK (
+                    duration_ms IS NULL OR duration_ms >= 0
+                ),
+                ordinal INTEGER NOT NULL DEFAULT 1 CHECK (ordinal >= 1),
+                error_code TEXT NOT NULL DEFAULT '',
+                error_fingerprint TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+                    CHECK (
+                        json_valid(metadata_json)
+                        AND json_type(metadata_json) = 'object'
+                    ),
+                UNIQUE (
+                    job_id,
+                    revision,
+                    attempt_id,
+                    stage,
+                    transition,
+                    ordinal
+                )
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingest_stage_events_revision "
+            "ON ingest_stage_events(revision, occurred_at, event_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingest_stage_events_job_attempt "
+            "ON ingest_stage_events(job_id, attempt_id, occurred_at, event_id)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_outbox_links (
+                outbox_id INTEGER NOT NULL,
+                job_id TEXT NOT NULL,
+                revision TEXT NOT NULL,
+                attempt_id TEXT NOT NULL DEFAULT '',
+                lease_generation INTEGER,
+                PRIMARY KEY (outbox_id, job_id),
+                FOREIGN KEY (outbox_id) REFERENCES mutation_outbox(id)
+                    ON DELETE CASCADE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingest_outbox_links_revision "
+            "ON ingest_outbox_links(revision, outbox_id)"
         )
         ingest_filepath_index_sql = (
             "CREATE INDEX IF NOT EXISTS idx_jobs_ingest_filepath_status "
@@ -8306,8 +8439,8 @@ def get_projection_runtime_v9(
     sidecar = None
     previous_sidecar = None
     if row[3] is not None:
-        _canonical_json, canonical_generation = (
-            _projection_runtime_v9_generations(row[3])
+        _canonical_json, canonical_generation = _projection_runtime_v9_generations(
+            row[3]
         )
     if row[5] is not None:
         _sidecar_json, sidecar = _projection_runtime_v9_sidecar(row[5])
@@ -8361,9 +8494,7 @@ def cas_projection_runtime_publish_pending(
         expected_projection_generation=projection_generation,
         expected_canonical_generation=generations,
     )
-    sidecar_sha256 = hashlib.sha256(
-        normalized_sidecar_json.encode("utf-8")
-    ).hexdigest()
+    sidecar_sha256 = hashlib.sha256(normalized_sidecar_json.encode("utf-8")).hexdigest()
 
     current = conn.execute(
         "SELECT status, projection_generation, sidecar_json, "
@@ -8478,8 +8609,7 @@ def inspect_search_projection_corpus(
     row_count = 0
     payload_bytes = 0
     for row in connection.execute(
-        "SELECT node_key, title, summary, text FROM wiki_search_index "
-        "ORDER BY node_key, title, summary, text"
+        "SELECT node_key, title, summary, text FROM wiki_search_index ORDER BY node_key"
     ):
         if max_rows is not None and row_count >= max(0, int(max_rows)):
             raise SearchProjectionIntegrityLimitExceeded("row_limit")
@@ -8619,11 +8749,11 @@ def verify_search_projection_integrity(
         }
 
     state_after = get_search_projection_state(connection)
-    revision_after = _search_projection_revision_token(connection)
-    if (
-        revision_after != revision_before
-        or _search_projection_state_proof(state_after) != proof
-    ):
+    # Unrelated WAL commits change SQLite data_version but cannot invalidate a
+    # corpus digest proven by one SELECT snapshot. The durable projection proof
+    # is the semantic fence; retaining revision_before in the cache forces the
+    # next call to rescan after any concurrent commit.
+    if _search_projection_state_proof(state_after) != proof:
         return {
             "status": "invalid",
             "issue": "fts_projection_integrity_race",
@@ -8765,8 +8895,7 @@ def _operational_memory_shadow_digest(
         select_columns = ", ".join(f'"{name}"' for name in column_names)
         order_columns = ", ".join(f'"{name}"' for name in primary_key)
         for row in conn.execute(
-            f'SELECT {select_columns} FROM "{table_name}" '
-            f"ORDER BY {order_columns}"
+            f'SELECT {select_columns} FROM "{table_name}" ORDER BY {order_columns}'
         ):
             accumulator.update_row(digest, row)
     return digest.hexdigest()
@@ -8860,8 +8989,7 @@ def _operational_memory_search_revision_token(
     conn: sqlite3.Connection,
 ) -> tuple[int, int, int]:
     revision_row = conn.execute(
-        "SELECT revision FROM operational_memory_search_revision "
-        "WHERE singleton = 1"
+        "SELECT revision FROM operational_memory_search_revision WHERE singleton = 1"
     ).fetchone()
     if revision_row is None:
         raise sqlite3.OperationalError(
@@ -8956,8 +9084,7 @@ def _operational_memory_search_observed_result(
             str(observed["docs_corpus_sha256"]),
         )
         and all(
-            hmac.compare_digest(str(observed[key]), expected[key])
-            for key in expected
+            hmac.compare_digest(str(observed[key]), expected[key]) for key in expected
         )
     )
     return {
@@ -8972,11 +9099,16 @@ def verify_operational_memory_search_integrity(
     conn: sqlite3.Connection,
     *,
     allow_full_scan: bool = True,
+    allow_durable_proof: bool = False,
 ) -> dict:
-    """Verify relevant revisions immediately and bypass writes periodically."""
+    """Verify relevant revisions immediately and bypass writes periodically.
+
+    Retrieval may trust a stable durable proof without synchronously streaming
+    the entire derived corpus. Doctor and watchdog callers retain full periodic
+    attestation by leaving ``allow_durable_proof`` disabled.
+    """
     try:
         revision_before = _operational_memory_search_revision_token(conn)
-        data_version_before = _operational_memory_search_data_version(conn)
     except sqlite3.Error:
         return {
             "status": "invalid",
@@ -8996,6 +9128,7 @@ def verify_operational_memory_search_integrity(
 
     cache = getattr(conn, "_operational_memory_search_integrity_cache", None)
     cached_result = None
+    durable_only = False
     verification_kind = "full"
     now_monotonic = time.monotonic()
     attestation_seconds = _operational_memory_search_attestation_seconds()
@@ -9005,40 +9138,44 @@ def verify_operational_memory_search_integrity(
         and cache.get("revision") == revision_before
         and isinstance(cache.get("result"), dict)
         and isinstance(cache.get("attested_at_monotonic"), (int, float))
-        and now_monotonic - float(cache["attested_at_monotonic"])
-        < attestation_seconds
+        and now_monotonic - float(cache["attested_at_monotonic"]) < attestation_seconds
     ):
         cached_result = dict(cache["result"])
         verification_kind = "cached"
 
     if cached_result is None:
-        if not allow_full_scan:
-            return {
-                "status": "deferred",
-                "issue": "operational_memory_search_attestation_required",
-                "signature": None,
-                "verification_kind": "deferred",
-                "attestation_seconds": attestation_seconds,
-                "next_attestation_in_seconds": 0.0,
-            }
-        try:
-            observed = inspect_operational_memory_search_integrity(conn)
-            cached_result = _operational_memory_search_observed_result(
-                proof,
-                observed,
-            )
-        except OperationalMemorySearchIntegrityLimitExceeded:
-            cached_result = {
-                "status": "invalid",
-                "issue": "operational_memory_search_integrity_limit",
-                "signature": None,
-            }
-        except (sqlite3.Error, TypeError, ValueError):
-            cached_result = {
-                "status": "invalid",
-                "issue": "operational_memory_search_integrity",
-                "signature": None,
-            }
+        if not allow_full_scan and allow_durable_proof and attestation_seconds > 0:
+            cached_result = {"status": "ready", "issue": None}
+            durable_only = True
+            verification_kind = "durable_proof"
+        else:
+            if not allow_full_scan and not allow_durable_proof:
+                return {
+                    "status": "deferred",
+                    "issue": "operational_memory_search_attestation_required",
+                    "signature": None,
+                    "verification_kind": "deferred",
+                    "attestation_seconds": attestation_seconds,
+                    "next_attestation_in_seconds": 0.0,
+                }
+            try:
+                observed = inspect_operational_memory_search_integrity(conn)
+                cached_result = _operational_memory_search_observed_result(
+                    proof,
+                    observed,
+                )
+            except OperationalMemorySearchIntegrityLimitExceeded:
+                cached_result = {
+                    "status": "invalid",
+                    "issue": "operational_memory_search_integrity_limit",
+                    "signature": None,
+                }
+            except (sqlite3.Error, TypeError, ValueError):
+                cached_result = {
+                    "status": "invalid",
+                    "issue": "operational_memory_search_integrity",
+                    "signature": None,
+                }
 
     try:
         proof_after = _operational_memory_search_state_proof(conn)
@@ -9046,37 +9183,33 @@ def verify_operational_memory_search_integrity(
         proof_after = None
     try:
         revision_after = _operational_memory_search_revision_token(conn)
-        data_version_after = _operational_memory_search_data_version(conn)
     except sqlite3.Error:
         revision_after = None
-        data_version_after = None
-    if (
-        revision_after != revision_before
-        or proof_after != proof
-        or data_version_after != data_version_before
-    ):
+    # The revision table changes only for operational-memory projection writes.
+    # Unrelated WAL commits may change PRAGMA data_version during a long digest
+    # scan, but they cannot invalidate the consistent SELECT snapshot already
+    # bound to this durable proof.
+    if revision_after != revision_before or proof_after != proof:
         return {
             "status": "invalid",
             "issue": "operational_memory_search_integrity_race",
             "signature": None,
         }
     if cached_result.get("status") == "ready":
-        cached_result["signature"] = (
-            *proof,
-            *revision_before,
-            data_version_before,
-        )
+        cached_result["signature"] = (*proof, *revision_before)
     cached_result["verification_kind"] = verification_kind
     attested_at = (
         float(cache["attested_at_monotonic"])
         if verification_kind == "cached"
-        else now_monotonic
+        else (now_monotonic - attestation_seconds if durable_only else now_monotonic)
     )
     cached_result["attestation_seconds"] = attestation_seconds
     cached_result["next_attestation_in_seconds"] = max(
         0.0,
         round(attestation_seconds - (now_monotonic - attested_at), 6),
     )
+    if durable_only:
+        return cached_result
     try:
         conn._operational_memory_search_integrity_cache = {
             "proof": proof,
@@ -9203,7 +9336,8 @@ def certify_operational_memory_search_integrity(
 def apply_search_projection_mutations(
     conn: sqlite3.Connection,
     *,
-    upserts: list[tuple[str, str, str, str]] | tuple[tuple[str, str, str, str], ...] = (),
+    upserts: list[tuple[str, str, str, str]]
+    | tuple[tuple[str, str, str, str], ...] = (),
     search_deletes: set[str] | list[str] | tuple[str, ...] = (),
     embedding_deletes: set[str] | list[str] | tuple[str, ...] = (),
     reset_search: bool = False,
@@ -9227,15 +9361,9 @@ def apply_search_projection_mutations(
         if row[0] in desired_by_key:
             raise ValueError(f"duplicate search projection key: {row[0]}")
         desired_by_key[row[0]] = row
-    delete_keys = {
-        str(node_key)
-        for node_key in search_deletes
-        if str(node_key)
-    }
+    delete_keys = {str(node_key) for node_key in search_deletes if str(node_key)}
     stale_embedding_keys = {
-        str(node_key)
-        for node_key in embedding_deletes
-        if str(node_key)
+        str(node_key) for node_key in embedding_deletes if str(node_key)
     }
 
     if reset_search:
@@ -9280,6 +9408,7 @@ def apply_search_projection_mutations(
             normalized_upserts,
         )
     if stale_embedding_keys:
+        _load_sqlite_vec_extension(conn)
         conn.executemany(
             "DELETE FROM vec_embeddings WHERE entity_id = ?",
             [(node_key,) for node_key in sorted(stale_embedding_keys)],
@@ -9322,9 +9451,7 @@ def apply_search_projection_mutations(
         "search_upserts": len(normalized_upserts),
         "search_deletes": len(delete_keys),
         "search_payload_bytes": sum(
-            len(value.encode("utf-8"))
-            for row in normalized_upserts
-            for value in row
+            len(value.encode("utf-8")) for row in normalized_upserts for value in row
         ),
         "embedding_deletes": len(stale_embedding_keys),
     }
@@ -9955,13 +10082,17 @@ def claim_mutation_outbox(
 def mutation_outbox_has_claimable() -> bool:
     """Return whether one outbox row is ready without claiming or mutating it."""
     now = datetime.now(timezone.utc).isoformat()
-    row = get_connection().execute(
-        "SELECT 1 FROM mutation_outbox WHERE "
-        "((status = 'pending' AND COALESCE(available_at, created_at, '') <= ?) "
-        "OR (status = 'processing' AND COALESCE(lease_until, '') <= ?)) "
-        "LIMIT 1",
-        (now, now),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT 1 FROM mutation_outbox WHERE "
+            "((status = 'pending' AND COALESCE(available_at, created_at, '') <= ?) "
+            "OR (status = 'processing' AND COALESCE(lease_until, '') <= ?)) "
+            "LIMIT 1",
+            (now, now),
+        )
+        .fetchone()
+    )
     return row is not None
 
 
@@ -10037,6 +10168,53 @@ def mutation_outbox_intents(outbox_ids: list[int]) -> dict[int, dict]:
     return {int(row["id"]): dict(row) for row in rows}
 
 
+def _failed_mutation_outbox_recovery_plan(
+    conn: sqlite3.Connection,
+    ids: list[int],
+) -> dict:
+    result = {"requeued": [], "superseded": {}, "skipped": {}}
+    if not ids:
+        return result
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, filename, status FROM mutation_outbox "
+        f"WHERE id IN ({placeholders}) ORDER BY id",
+        ids,
+    ).fetchall()
+    observed_ids = {int(row["id"]) for row in rows}
+    for missing_id in set(ids) - observed_ids:
+        result["skipped"][missing_id] = "missing"
+    for row in rows:
+        outbox_id = int(row["id"])
+        if str(row["status"]) != "failed":
+            result["skipped"][outbox_id] = f"status:{row['status']}"
+            continue
+        newer = conn.execute(
+            "SELECT id, status FROM mutation_outbox "
+            "WHERE filename = ? AND id > ? AND status != 'superseded' "
+            "ORDER BY id DESC LIMIT 1",
+            (str(row["filename"]), outbox_id),
+        ).fetchone()
+        if newer is None:
+            result["requeued"].append(outbox_id)
+            continue
+        newer_id = int(newer["id"])
+        if str(newer["status"]) == "failed":
+            result["skipped"][outbox_id] = f"newer_failed_intent:{newer_id}"
+            continue
+        result["superseded"][outbox_id] = newer_id
+    return result
+
+
+def preview_failed_mutation_outbox_recovery(outbox_ids: list[int]) -> dict:
+    """Preview exact failed-intent recovery without changing durable state."""
+    ids = sorted({int(value) for value in outbox_ids})
+    if not ids:
+        return {"requeued": [], "superseded": {}, "skipped": {}}
+    init_db()
+    return _failed_mutation_outbox_recovery_plan(get_connection(), ids)
+
+
 def recover_failed_mutation_outbox(outbox_ids: list[int]) -> dict:
     """Explicitly recover selected failed intents without overtaking newer work.
 
@@ -10046,53 +10224,14 @@ def recover_failed_mutation_outbox(outbox_ids: list[int]) -> dict:
     manual blocker; replaying older payload behind it would violate ordering.
     """
     ids = sorted({int(value) for value in outbox_ids})
-    result = {"requeued": [], "superseded": {}, "skipped": {}}
     if not ids:
-        return result
+        return {"requeued": [], "superseded": {}, "skipped": {}}
     init_db()
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    placeholders = ",".join("?" for _ in ids)
     with transaction():
-        rows = conn.execute(
-            f"SELECT id, filename, status FROM mutation_outbox "
-            f"WHERE id IN ({placeholders}) ORDER BY id",
-            ids,
-        ).fetchall()
-        observed_ids = {int(row["id"]) for row in rows}
-        for missing_id in set(ids) - observed_ids:
-            result["skipped"][missing_id] = "missing"
-        for row in rows:
-            outbox_id = int(row["id"])
-            if str(row["status"]) != "failed":
-                result["skipped"][outbox_id] = f"status:{row['status']}"
-                continue
-            newer = conn.execute(
-                "SELECT id, status FROM mutation_outbox "
-                "WHERE filename = ? AND id > ? AND status != 'superseded' "
-                "ORDER BY id DESC LIMIT 1",
-                (str(row["filename"]), outbox_id),
-            ).fetchone()
-            if newer is not None:
-                newer_id = int(newer["id"])
-                newer_status = str(newer["status"])
-                if newer_status == "failed":
-                    result["skipped"][outbox_id] = (
-                        f"newer_failed_intent:{newer_id}"
-                    )
-                    continue
-                updated = conn.execute(
-                    "UPDATE mutation_outbox SET status = 'superseded', "
-                    "superseded_by = ?, completed_at = COALESCE(completed_at, ?), "
-                    "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
-                    "WHERE id = ? AND status = 'failed'",
-                    (newer_id, now, outbox_id),
-                )
-                if updated.rowcount:
-                    result["superseded"][outbox_id] = newer_id
-                else:
-                    result["skipped"][outbox_id] = "state_changed"
-                continue
+        result = _failed_mutation_outbox_recovery_plan(conn, ids)
+        for outbox_id in list(result["requeued"]):
             updated = conn.execute(
                 "UPDATE mutation_outbox SET status = 'pending', attempt_count = 0, "
                 "available_at = ?, started_at = NULL, completed_at = NULL, "
@@ -10102,9 +10241,19 @@ def recover_failed_mutation_outbox(outbox_ids: list[int]) -> dict:
                 "first_transient_at = NULL WHERE id = ? AND status = 'failed'",
                 (now, outbox_id),
             )
-            if updated.rowcount:
-                result["requeued"].append(outbox_id)
-            else:
+            if not updated.rowcount:
+                result["requeued"].remove(outbox_id)
+                result["skipped"][outbox_id] = "state_changed"
+        for outbox_id, newer_id in result["superseded"].copy().items():
+            updated = conn.execute(
+                "UPDATE mutation_outbox SET status = 'superseded', "
+                "superseded_by = ?, completed_at = COALESCE(completed_at, ?), "
+                "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+                "WHERE id = ? AND status = 'failed'",
+                (newer_id, now, outbox_id),
+            )
+            if not updated.rowcount:
+                del result["superseded"][outbox_id]
                 result["skipped"][outbox_id] = "state_changed"
     return result
 
@@ -10209,6 +10358,25 @@ def complete_mutation_outbox(
             "AND lease_token = ? AND lease_generation = ? AND COALESCE(lease_until, '') > ?",
             (now, outbox_id, lease_owner, lease_token, int(lease_generation), now),
         )
+        if updated.rowcount:
+            links = conn.execute(
+                "SELECT job_id, revision, attempt_id, lease_generation "
+                "FROM ingest_outbox_links WHERE outbox_id = ? ORDER BY job_id",
+                (int(outbox_id),),
+            ).fetchall()
+            for link in links:
+                record_ingest_stage_event(
+                    job_id=str(link["job_id"]),
+                    revision=str(link["revision"]),
+                    attempt_id=str(link["attempt_id"] or ""),
+                    lease_generation=link["lease_generation"],
+                    stage="index_visible",
+                    transition="completed",
+                    ordinal=max(1, int(outbox_id)),
+                    metadata={"outbox_id": int(outbox_id)},
+                    occurred_at=now,
+                    connection=conn,
+                )
     return bool(updated.rowcount)
 
 
@@ -10339,19 +10507,66 @@ def search_wiki(query: str, limit: int = 50) -> list[dict]:
     if not query_tok:
         return []
 
-    query_esc = " ".join(f'"{t}"' for t in query_tok.split())
+    terms = query_tok.split()
+    query_esc = " ".join(f'"{term}"' for term in terms)
 
     conn = get_connection()
-    cur = conn.execute(
-        """
-        SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
-        FROM wiki_search_index 
-        WHERE wiki_search_index MATCH ? 
-        ORDER BY rank LIMIT ?
-    """,
-        (query_esc, limit),
-    )
-    return [dict(row) for row in cur.fetchall()]
+
+    def _search(match_expression: str) -> list[dict]:
+        cur = conn.execute(
+            """
+            SELECT node_key, title, summary, bm25(wiki_search_index) as rank
+            FROM wiki_search_index
+            WHERE wiki_search_index MATCH ?
+            ORDER BY rank LIMIT ?
+        """,
+            (match_expression, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    rows = _search(query_esc)
+    if rows or len(terms) < 2:
+        return rows
+
+    # Natural-language questions often have no page containing every token.
+    # Retry once with a bounded OR over meaningful terms so provenance tracing
+    # receives indexed page candidates instead of scanning the claims corpus.
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "current",
+        "does",
+        "evidence",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "lake",
+        "of",
+        "or",
+        "supports",
+        "the",
+        "to",
+        "what",
+        "which",
+        "why",
+        "with",
+    }
+    fallback_terms = []
+    for term in terms:
+        normalized = term.casefold()
+        if normalized in stopwords or (normalized.isascii() and len(normalized) < 3):
+            continue
+        if normalized not in fallback_terms:
+            fallback_terms.append(normalized)
+        if len(fallback_terms) >= 8:
+            break
+    if not fallback_terms:
+        return rows
+    return _search(" OR ".join(f'"{term}"' for term in fallback_terms))
 
 
 def get_processed_files() -> dict[str, str]:
@@ -10470,11 +10685,7 @@ def mark_file_processed(
                 filepath,
                 file_hash,
                 now_str,
-                (
-                    None
-                    if observed_mtime_ns is None
-                    else int(observed_mtime_ns)
-                ),
+                (None if observed_mtime_ns is None else int(observed_mtime_ns)),
                 None if observed_size is None else int(observed_size),
             ),
         )
@@ -10560,9 +10771,7 @@ def _ingest_identity_owner_is_releasable(
         return False
     except OSError:
         return True
-    return not (
-        snapshot.matches(job_revision) and snapshot.matches(marker_revision)
-    )
+    return not (snapshot.matches(job_revision) and snapshot.matches(marker_revision))
 
 
 def _release_releasable_ingest_identity_owner(
@@ -10630,10 +10839,10 @@ def enqueue_job(
                     "WHERE task_type = 'ingest' "
                     "AND CASE WHEN json_valid(payload) "
                     "THEN json_extract(payload, '$.filepath') END = ? "
-                     "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
-                     "'subagent_processing') OR "
-                     "(status = 'failed' AND COALESCE(retries, 0) < 3)) "
-                     "ORDER BY job_id ASC",
+                    "AND (status IN ('queued', 'dispatched', 'awaiting_subagent', "
+                    "'subagent_processing') OR "
+                    "(status = 'failed' AND COALESCE(retries, 0) < 3)) "
+                    "ORDER BY job_id ASC",
                     (filepath,),
                 ).fetchall()
                 if superseded_rows:
@@ -10711,6 +10920,21 @@ def _current_ingest_contract_sql(payload_column: str = "payload") -> str:
         "WHEN COALESCE(json_type(payload, '$.source_hash'), '') <> 'text' THEN 0 "
         "WHEN COALESCE(json_type(payload, '$.source_projection_hash'), '') <> 'text' "
         "THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.source_observed_at'), '') <> 'text' "
+        "THEN 0 "
+        "WHEN COALESCE(TRIM(json_extract(payload, '$.source_observed_at')), '') = '' "
+        "THEN 0 "
+        "WHEN length(json_extract(payload, '$.source_observed_at')) < 20 THEN 0 "
+        "WHEN substr(json_extract(payload, '$.source_observed_at'), 5, 1) <> '-' "
+        "THEN 0 "
+        "WHEN substr(json_extract(payload, '$.source_observed_at'), 8, 1) <> '-' "
+        "THEN 0 "
+        "WHEN substr(json_extract(payload, '$.source_observed_at'), 11, 1) <> 'T' "
+        "THEN 0 "
+        "WHEN datetime(json_extract(payload, '$.source_observed_at')) IS NULL THEN 0 "
+        "WHEN COALESCE(json_type(payload, '$.attempt_id'), '') <> 'text' THEN 0 "
+        "WHEN length(json_extract(payload, '$.attempt_id')) <> 32 THEN 0 "
+        "WHEN json_extract(payload, '$.attempt_id') GLOB '*[^0-9a-f]*' THEN 0 "
         "WHEN COALESCE(json_type(payload, '$.integration_candidates'), '') "
         "<> 'array' THEN 0 "
         "WHEN COALESCE(CAST(json_extract("
@@ -11165,29 +11389,31 @@ def fail_ingest_task_cleanup(
 
 
 _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX = "Recovered by ingest debt reconciliation:"
-_AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX = (
-    "Auto-ingest budget ledger prepared: "
-)
+_AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX = "Auto-ingest budget ledger prepared: "
 _AUTO_INGEST_BUDGET_RESET_ACK_PREFIX = "Auto-ingest budget ledger reconciled: "
 
 
 def list_auto_ingest_budget_resets() -> list[dict]:
     """Return new or prepared debt resets that still require JSON-ledger closure."""
     init_db()
-    rows = get_connection().execute(
-        "SELECT job_id, payload, CASE "
-        "WHEN error_msg LIKE ? THEN 'pending' "
-        "WHEN error_msg LIKE ? THEN 'prepared' END AS reconcile_phase "
-        "FROM jobs WHERE task_type = 'ingest' "
-        "AND COALESCE(retries, 0) = 0 "
-        "AND (error_msg LIKE ? OR error_msg LIKE ?) ORDER BY job_id",
-        (
-            _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX + "%",
-            _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX + "%",
-            _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX + "%",
-            _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX + "%",
-        ),
-    ).fetchall()
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT job_id, payload, CASE "
+            "WHEN error_msg LIKE ? THEN 'pending' "
+            "WHEN error_msg LIKE ? THEN 'prepared' END AS reconcile_phase "
+            "FROM jobs WHERE task_type = 'ingest' "
+            "AND COALESCE(retries, 0) = 0 "
+            "AND (error_msg LIKE ? OR error_msg LIKE ?) ORDER BY job_id",
+            (
+                _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX + "%",
+                _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX + "%",
+                _AUTO_INGEST_BUDGET_RESET_SOURCE_PREFIX + "%",
+                _AUTO_INGEST_BUDGET_RESET_PREPARED_PREFIX + "%",
+            ),
+        )
+        .fetchall()
+    )
     return [dict(row) for row in rows]
 
 
@@ -11280,6 +11506,14 @@ def claim_subagent_jobs(
         scope_sql = f" AND ({_current_ingest_contract_sql()})"
         scope_params.append(str(contract_version))
     forbidden_prefix = str(forbid_live_owner_prefix or "")
+    projection_ready_sql = (
+        " AND NOT EXISTS ("
+        "SELECT 1 FROM ingest_outbox_links AS ingest_link "
+        "JOIN mutation_outbox AS ingest_outbox "
+        "ON ingest_outbox.id = ingest_link.outbox_id "
+        "WHERE ingest_link.job_id = jobs.job_id "
+        "AND ingest_outbox.status <> 'completed')"
+    )
     with transaction():
         if require_no_live_processing:
             live_processing = conn.execute(
@@ -11300,11 +11534,81 @@ def claim_subagent_jobs(
             ).fetchone()
             if live_forbidden_owner is not None:
                 return []
+        projection_conflicts = conn.execute(
+            "SELECT jobs.job_id, jobs.payload, "
+            "GROUP_CONCAT(DISTINCT ingest_outbox.status) AS outbox_statuses "
+            "FROM jobs JOIN ingest_outbox_links AS ingest_link "
+            "ON ingest_link.job_id = jobs.job_id "
+            "JOIN mutation_outbox AS ingest_outbox "
+            "ON ingest_outbox.id = ingest_link.outbox_id "
+            "WHERE jobs.task_type = 'ingest' "
+            "AND jobs.status = 'awaiting_subagent' "
+            "AND ingest_outbox.status IN ('failed', 'superseded') "
+            "GROUP BY jobs.job_id, jobs.payload"
+        ).fetchall()
+        for conflict in projection_conflicts:
+            statuses = sorted(
+                value
+                for value in str(conflict["outbox_statuses"] or "").split(",")
+                if value
+            )
+            reason = "local Source projection requires reconciliation: " + ",".join(
+                statuses
+            )
+            result_json = json.dumps(
+                {
+                    "maintenance": "ingest_projection_admission",
+                    "state": "quarantined",
+                    "failure_class": "local_source_projection_conflict",
+                    "outbox_statuses": statuses,
+                    "reason": reason,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            updated = conn.execute(
+                "UPDATE jobs SET status = 'failed', retries = MAX(3, retries), "
+                "error_msg = ?, result_json = ?, completed_at = ?, updated_at = ?, "
+                "available_at = ?, lease_until = NULL, lease_owner = NULL, "
+                "lease_token = NULL WHERE job_id = ? AND task_type = 'ingest' "
+                "AND status = 'awaiting_subagent' AND payload IS ?",
+                (
+                    reason,
+                    result_json,
+                    now,
+                    now,
+                    now,
+                    str(conflict["job_id"]),
+                    conflict["payload"],
+                ),
+            )
+            if updated.rowcount != 1:
+                continue
+            try:
+                conflict_payload = json.loads(str(conflict["payload"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                conflict_payload = {}
+            if isinstance(conflict_payload, dict) and conflict_payload.get("hash"):
+                record_ingest_stage_event(
+                    job_id=str(conflict["job_id"]),
+                    revision=str(conflict_payload["hash"]),
+                    attempt_id=str(conflict_payload.get("attempt_id") or ""),
+                    stage="retry",
+                    transition="quarantined",
+                    ordinal=max(1, int(conflict_payload.get("lease_generation") or 1)),
+                    metadata={
+                        "failure_class": "local_source_projection_conflict",
+                        "outbox_statuses": statuses,
+                    },
+                    occurred_at=now,
+                    connection=conn,
+                )
         rows = conn.execute(
             "SELECT job_id FROM jobs WHERE task_type = 'ingest' AND "
             "(status = 'awaiting_subagent' OR "
             "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?))"
             + scope_sql
+            + projection_ready_sql
             + " ORDER BY created_at ASC, job_id ASC LIMIT ?",
             (now, *scope_params, max(1, int(limit))),
         ).fetchall()
@@ -11320,7 +11624,8 @@ def claim_subagent_jobs(
                 "lease_generation = COALESCE(lease_generation, 0) + 1, updated_at = ? "
                 "WHERE job_id = ? AND (status = 'awaiting_subagent' OR "
                 "(status = 'subagent_processing' AND COALESCE(lease_until, '') <= ?))"
-                + scope_sql,
+                + scope_sql
+                + projection_ready_sql,
                 (
                     lease_until,
                     owner,
@@ -11431,6 +11736,7 @@ def fail_auto_ingest_subagent_task_claim(
     *,
     retryable: bool,
     failure_class: str,
+    attempt_id: str = "",
 ) -> bool:
     """Fail or quarantine an auto-ingest result under its exact current lease."""
     lease = _dispatch_lease_credentials(
@@ -11445,8 +11751,10 @@ def fail_auto_ingest_subagent_task_claim(
     with transaction():
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
-        row = get_connection().execute(
-            "SELECT retries FROM jobs WHERE job_id = ? AND task_type = 'ingest' "
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT retries, payload FROM jobs WHERE job_id = ? "
+            "AND task_type = 'ingest' "
             "AND status = 'subagent_processing' AND lease_owner = ? "
             "AND lease_token = ? AND lease_generation = ? "
             "AND COALESCE(lease_until, '') > ?",
@@ -11454,9 +11762,25 @@ def fail_auto_ingest_subagent_task_claim(
         ).fetchone()
         if row is None:
             return False
+        try:
+            payload = json.loads(str(row["payload"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        current_attempt_id = str(attempt_id or payload.get("attempt_id") or "")
         prior_retries = int(row["retries"] or 0)
         next_retry = prior_retries + 1 if retryable else max(3, prior_retries + 1)
         terminal = next_retry >= 3
+        if not terminal:
+            payload["attempt_id"] = hashlib.sha256(
+                f"{job_id}\0{generation + 1}\0{token}".encode("utf-8")
+            ).hexdigest()[:32]
+        refreshed_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         available_at = (
             now_dt + timedelta(seconds=5 * (2 ** max(0, next_retry - 1)))
         ).isoformat()
@@ -11472,8 +11796,8 @@ def fail_auto_ingest_subagent_task_claim(
                 ensure_ascii=False,
                 sort_keys=True,
             )
-        cursor = get_connection().execute(
-            "UPDATE jobs SET status = 'failed', retries = ?, error_msg = ?, "
+        cursor = conn.execute(
+            "UPDATE jobs SET payload = ?, status = 'failed', retries = ?, error_msg = ?, "
             "updated_at = ?, available_at = ?, completed_at = ?, result_json = ?, "
             "lease_until = NULL, lease_owner = NULL, lease_token = NULL "
             "WHERE job_id = ? AND task_type = 'ingest' "
@@ -11481,6 +11805,7 @@ def fail_auto_ingest_subagent_task_claim(
             "AND lease_token = ? AND lease_generation = ? "
             "AND COALESCE(lease_until, '') > ?",
             (
+                refreshed_payload,
                 next_retry,
                 str(error_msg)[:4000],
                 now,
@@ -11494,7 +11819,27 @@ def fail_auto_ingest_subagent_task_claim(
                 now,
             ),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return False
+        revision = str(payload.get("hash") or "")
+        if revision:
+            record_ingest_stage_event(
+                job_id=str(job_id),
+                revision=revision,
+                stage="retry",
+                transition="quarantined" if terminal else "retry_scheduled",
+                attempt_id=current_attempt_id,
+                lease_generation=generation,
+                ordinal=max(1, generation),
+                metadata={
+                    "available_at": None if terminal else available_at,
+                    "failure_class": failure_kind,
+                    "retry_count": next_retry,
+                },
+                occurred_at=now,
+                connection=conn,
+            )
+        return True
 
 
 def replace_ingest_subagent_task_packet(
@@ -11713,6 +12058,7 @@ def requeue_ingest_subagent_baseline_conflict(
         )
         return cursor.rowcount == 1
 
+
 def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     """Bind finalization to the exact leased job payload."""
     init_db()
@@ -11765,9 +12111,7 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     try:
         parse_revision(payload.get("hash"))
     except RawRevisionFormatError as exc:
-        raise ValueError(
-            f"Job {job_id} raw revision format is unsupported"
-        ) from exc
+        raise ValueError(f"Job {job_id} raw revision format is unsupported") from exc
     expected_name = str(payload.get("canonical_name") or "")
     supplied_name = str(processed_data.get("canonical_name") or "")
     if expected_name and supplied_name != expected_name:

@@ -406,7 +406,7 @@ def test_schema_readiness_reasons_explain_migratable_older_schema():
     assert reasons == ["database_schema_upgrade_required:4->5"]
 
 
-def test_doctor_rejects_stale_watchdog_component(
+def test_doctor_warns_for_stale_optional_watchdog_component(
     isolated_memory,
     monkeypatch,
 ):
@@ -444,8 +444,79 @@ def test_doctor_rejects_stale_watchdog_component(
     watchdog_line = next(
         line for line in doctor.splitlines() if "Watchdog Status:" in line
     )
-    assert watchdog_line.startswith("[FAIL]")
+    assert watchdog_line.startswith("[WARN]")
     assert "stale=scheduler" in watchdog_line
+    assert "optional_stale=scheduler" in watchdog_line
+
+
+def test_doctor_warns_for_isolated_optional_scheduler(isolated_memory):
+    db_store.init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    status_path = isolated_memory / "wiki" / ".meta" / ".watchdog_status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "status": "error",
+                "current_action": "Scheduler isolated",
+                "updated_at": now,
+                "components": {
+                    "scheduler": {
+                        "status": "error",
+                        "heartbeat_at": now,
+                        "last_error": "restart budget exhausted",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    doctor = doctor_vector_lake()
+    watchdog_line = next(
+        line for line in doctor.splitlines() if "Watchdog Status:" in line
+    )
+
+    assert watchdog_line.startswith("[WARN]")
+    assert "optional_unhealthy=scheduler" in watchdog_line
+
+
+def test_doctor_rejects_scheduler_when_explicitly_required(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    status_path = isolated_memory / "wiki" / ".meta" / ".watchdog_status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "status": "error",
+                "current_action": "Scheduler isolated",
+                "updated_at": now,
+                "components": {
+                    "scheduler": {
+                        "status": "error",
+                        "heartbeat_at": now,
+                        "last_error": "restart budget exhausted",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+        "watchdog,outbox,ingest,scheduler",
+    )
+
+    doctor = doctor_vector_lake()
+    watchdog_line = next(
+        line for line in doctor.splitlines() if "Watchdog Status:" in line
+    )
+
+    assert watchdog_line.startswith("[FAIL]")
+    assert "unhealthy=scheduler" in watchdog_line
+    assert "optional_unhealthy=none" in watchdog_line
 
 
 def test_doctor_rejects_stopped_watchdog_component(isolated_memory):

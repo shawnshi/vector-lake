@@ -151,6 +151,10 @@ def process_jobs():
                     "source_projection_hash": str(
                         payload.get("source_projection_hash") or ""
                     ),
+                    "source_observed_at": str(
+                        payload.get("source_observed_at") or ""
+                    ),
+                    "attempt_id": str(payload.get("attempt_id") or ""),
                     "integration_candidates": list(
                         payload.get("integration_candidates") or []
                     ),

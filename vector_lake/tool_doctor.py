@@ -1,4 +1,4 @@
-import importlib
+import importlib.util
 import sqlite3
 import os
 import sys
@@ -19,7 +19,9 @@ from vector_lake.db_store import inspect_schema_migration_state, peek_db_path
 from vector_lake import db_store, get_extension_root
 from vector_lake.native_llm import native_llm_ready
 from vector_lake.runtime_health import (
+    _auto_ingest_health_config,
     _open_runtime_database_read_only,
+    _watchdog_component_health,
     assess_runtime_health,
     assess_semantic_readiness,
 )
@@ -41,6 +43,68 @@ def _check_ast(module_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Error: {e}"
 
+
+def _doctor_watchdog_status(
+    status: dict,
+    *,
+    now_utc: datetime,
+    component_max_age: int,
+    auto_ingest_enabled: bool,
+) -> tuple[bool | None, str]:
+    """Render the shared required-versus-optional worker policy."""
+    updated_at = status.get("updated_at")
+    updated_dt = (
+        datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+        if updated_at
+        else None
+    )
+    if updated_dt is not None and updated_dt.tzinfo is None:
+        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+    age_seconds = (
+        max(0, int((now_utc - updated_dt).total_seconds()))
+        if updated_dt is not None
+        else None
+    )
+    health = _watchdog_component_health(
+        status,
+        now_utc=now_utc,
+        component_max_age=component_max_age,
+        auto_ingest_enabled=auto_ingest_enabled,
+    )
+    unhealthy_required = health["unhealthy_required_components"]
+    unhealthy_optional = health["unhealthy_optional_components"]
+    stale_required = health["stale_required_components"]
+    stale_optional = health["stale_optional_components"]
+    paused_components = health["paused_components"]
+    blocking = bool(
+        age_seconds is None
+        or age_seconds > 120
+        or health["aggregate_requires_block"]
+        or unhealthy_required
+        or stale_required
+        or health["missing_components_blocking"]
+    )
+    degraded = bool(
+        unhealthy_optional
+        or stale_optional
+        or paused_components
+        or health["missing_components"]
+    )
+    result = False if blocking else (None if degraded else True)
+    all_unhealthy = sorted(unhealthy_required + unhealthy_optional)
+    all_stale = sorted(stale_required + stale_optional)
+    detail = (
+        f"[{status.get('status', 'unknown')}] "
+        f"{status.get('current_action', '')}; "
+        f"age={age_seconds if age_seconds is not None else 'unknown'}s; "
+        f"unhealthy={','.join(all_unhealthy) or 'none'}; "
+        f"optional_unhealthy={','.join(unhealthy_optional) or 'none'}; "
+        f"stale={','.join(all_stale) or 'none'}; "
+        f"optional_stale={','.join(stale_optional) or 'none'}; "
+        f"paused={','.join(sorted(paused_components)) or 'none'}; "
+        f"missing={','.join(health['missing_components']) or 'none'}"
+    )
+    return result, detail
 
 
 def _read_database_state_from_connection(conn: sqlite3.Connection) -> dict:
@@ -127,8 +191,33 @@ def _diagnostic_snapshot_failure_report(reason: str) -> str:
     )
 
 
+def quick_doctor_vector_lake() -> str:
+    """Return bounded infrastructure health without deep projection comparison."""
+    health = assess_runtime_health(deep_projection_checks=False)
+    payload = {
+        "schema_version": 1,
+        "mode": "quick",
+        "ok": bool(health.get("ok")),
+        "paths": {
+            "memory": str(get_memory_dir()),
+            "raw": str(get_raw_dir()),
+            "wiki": str(get_wiki_dir()),
+            "meta": str(peek_meta_dir()),
+            "database": str(peek_db_path()),
+            "index": str(get_index_path()),
+        },
+        "infrastructure": health,
+        "semantic_readiness": {
+            "status": "not_checked",
+            "reason": "requires_deep_doctor",
+        },
+        "next_action": "Call doctor_vector_lake(mode='deep') for projection and semantic checks.",
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+
 def doctor_vector_lake(diagnostic_snapshot=None) -> str:
-    """Run Doctor against one shared diagnostic snapshot when available."""
+    """Run deep Doctor against one shared diagnostic snapshot when available."""
     if diagnostic_snapshot is not None:
         return _doctor_vector_lake(diagnostic_snapshot=diagnostic_snapshot)
 
@@ -348,14 +437,6 @@ def _doctor_vector_lake(
         try:
             with open(status_path, "r", encoding="utf-8") as f:
                 status = json.load(f)
-            updated_at = status.get("updated_at")
-            age_seconds = None
-            if updated_at:
-                updated_dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
-                if updated_dt.tzinfo is None:
-                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
-                age_seconds = max(0, int((datetime.now(timezone.utc) - updated_dt).total_seconds()))
-            unhealthy_states = {"error", "halted", "stopped"}
             try:
                 component_max_age = max(
                     5,
@@ -368,50 +449,16 @@ def _doctor_vector_lake(
                 )
             except (TypeError, ValueError):
                 component_max_age = 120
-            now_utc = datetime.now(timezone.utc)
-            unhealthy_components = []
-            stale_components = []
-            for name, raw_component in (status.get("components") or {}).items():
-                component = (
-                    raw_component if isinstance(raw_component, dict) else {}
-                )
-                component_state = str(component.get("status", "")).lower()
-                if component_state in unhealthy_states:
-                    unhealthy_components.append(str(name))
-                component_updated = component.get("heartbeat_at") or component.get(
-                    "updated_at"
-                )
-                component_dt = (
-                    datetime.fromisoformat(
-                        str(component_updated).replace("Z", "+00:00")
-                    )
-                    if component_updated
-                    else None
-                )
-                if component_dt is not None and component_dt.tzinfo is None:
-                    component_dt = component_dt.replace(tzinfo=timezone.utc)
-                component_age = (
-                    max(0, int((now_utc - component_dt).total_seconds()))
-                    if component_dt is not None
-                    else None
-                )
-                if component_age is None or component_age > component_max_age:
-                    stale_components.append(str(name))
-            heartbeat_ok = (
-                age_seconds is not None
-                and age_seconds <= 120
-                and str(status.get("status", "")).lower() not in unhealthy_states
-                and not unhealthy_components
-                and not stale_components
+            auto_ingest_enabled, _auto_config, _auto_config_error = (
+                _auto_ingest_health_config(meta_path)
             )
-            detail = (
-                f"[{status.get('status', 'unknown')}] "
-                f"{status.get('current_action', '')}; "
-                f"age={age_seconds if age_seconds is not None else 'unknown'}s; "
-                f"unhealthy={','.join(sorted(unhealthy_components)) or 'none'}; "
-                f"stale={','.join(sorted(stale_components)) or 'none'}"
+            watchdog_ok, detail = _doctor_watchdog_status(
+                status,
+                now_utc=datetime.now(timezone.utc),
+                component_max_age=component_max_age,
+                auto_ingest_enabled=auto_ingest_enabled,
             )
-            checks.append(("Watchdog Status", heartbeat_ok, detail))
+            checks.append(("Watchdog Status", watchdog_ok, detail))
         except Exception as e:
             checks.append(("Watchdog Status", False, f"Parse error: {e}"))
     else:

@@ -39,3 +39,12 @@ jobs:
           PYTHONIOENCODING: utf-8
           PYTHONHASHSEED: "0"
         run: python -m pytest -p no:cacheprovider -q
+      - name: Run 10k search performance gate
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONIOENCODING: utf-8
+          PYTHONHASHSEED: "0"
+        run: >-
+          python benchmarks/corpus_scale_benchmark.py --workspace .
+          --nodes 10000 --serial-queries 20
+          --concurrent-queries 40 --workers 4 --fail-on-slo

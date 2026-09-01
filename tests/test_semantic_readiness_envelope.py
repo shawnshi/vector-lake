@@ -53,6 +53,68 @@ def _read_text_envelope(payload: str) -> tuple[dict, str]:
     return json.loads(envelope_text), result
 
 
+def test_projection_v2_generation_binding_does_not_materialize_index(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import indexer, projection_format_v2
+
+    db_store.init_db()
+    indexer.generate_index()
+
+    def reject_materialization(*_args, **_kwargs):
+        raise AssertionError("projection materialization entered readiness hot path")
+
+    monkeypatch.setattr(
+        indexer,
+        "read_committed_index_snapshot",
+        reject_materialization,
+    )
+    monkeypatch.setattr(
+        projection_format_v2,
+        "materialize_index",
+        reject_materialization,
+    )
+
+    binding = runtime_health._semantic_readiness_generation_binding()
+
+    assert binding["projection"]["generation"]
+    assert binding["projection"]["fingerprint"].startswith("sha256:")
+    assert "database_fingerprint" not in binding
+
+
+def test_nonblocking_readiness_schedules_refresh_without_assessment(monkeypatch):
+    runtime_health._clear_semantic_readiness_envelope_cache_for_tests()
+    scheduled = []
+    assessments = []
+    monkeypatch.setattr(
+        runtime_health,
+        "_semantic_readiness_generation_binding",
+        lambda _index_data=None: _binding("cold"),
+    )
+    monkeypatch.setattr(
+        runtime_health,
+        "assess_semantic_readiness",
+        lambda **_kwargs: assessments.append(True),
+    )
+    monkeypatch.setattr(
+        runtime_health,
+        "_schedule_semantic_readiness_refresh",
+        lambda **kwargs: scheduled.append(kwargs) or True,
+    )
+
+    envelope = runtime_health.get_semantic_readiness_envelope(
+        cache_ttl_seconds=60,
+        nonblocking=True,
+    )
+
+    assert assessments == []
+    assert len(scheduled) == 1
+    assert envelope["status"] == "unknown"
+    assert envelope["issues"] == ["semantic_readiness_refresh_pending"]
+    assert envelope["captured_fingerprint"] == "sha256:cold"
+
+
 def test_not_ready_envelope_is_bounded_and_does_not_suppress_results(
     monkeypatch,
 ):
@@ -76,6 +138,7 @@ def test_not_ready_envelope_is_bounded_and_does_not_suppress_results(
         "format_operational_memory_results",
         lambda *_args, **_kwargs: "BASE RETRIEVAL RESULT",
     )
+    runtime_health.get_semantic_readiness_envelope(cache_ttl_seconds=60)
 
     payload = tool_search.search_vector_lake("query", mode="memory")
     envelope, result = _read_text_envelope(payload)

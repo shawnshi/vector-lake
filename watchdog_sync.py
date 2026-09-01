@@ -4,7 +4,7 @@ from pathlib import Path
 from vector_lake.runtime_paths import bootstrap_runtime_paths
 
 def _bootstrap_runtime_paths(config_path: Path | None = None) -> dict[str, str]:
-    """Fill missing standalone runtime paths from the packaged MCP manifest."""
+    """Fill missing standalone runtime settings from the packaged profile."""
     return bootstrap_runtime_paths(config_path, caller="Watchdog")
 
 

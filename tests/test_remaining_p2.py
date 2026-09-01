@@ -20,6 +20,10 @@ def _current_payload(filepath: str, file_hash: str, *, candidates=None) -> dict:
         "canonical_name": f"Source_{Path(filepath).stem}.md",
         "source_hash": "",
         "source_projection_hash": "",
+        "source_observed_at": "2026-09-01T00:00:00+00:00",
+        "attempt_id": hashlib.sha256(
+            f"{filepath}\0{canonical_hash}".encode("utf-8")
+        ).hexdigest()[:32],
         "integration_candidates": list(candidates or []),
         "ingest_contract_version": INGEST_CONTRACT_VERSION,
         "instructions": "isolated current-contract instructions",
@@ -122,8 +126,7 @@ def test_job_queues_break_created_at_ties_with_stable_job_id(isolated_memory):
         "dispatch-z",
     ]
     assert [
-        row["job_id"]
-        for row in db_store.get_jobs_by_status(["queued"], limit=2)
+        row["job_id"] for row in db_store.get_jobs_by_status(["queued"], limit=2)
     ] == ["dispatch-a", "dispatch-z"]
     assert [
         row["job_id"]

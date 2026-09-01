@@ -139,7 +139,7 @@ def test_same_thread_reenters_while_other_thread_gets_structured_busy(tmp_path):
         meta_dir=meta_dir,
     ) as outer:
         with heavy_task(
-            "scan",
+            "projection",
             "nested",
             origin="pytest",
             wait_timeout_seconds=0,
@@ -150,7 +150,7 @@ def test_same_thread_reenters_while_other_thread_gets_structured_busy(tmp_path):
             def contend():
                 try:
                     with heavy_task(
-                        "maintenance",
+                        "projection",
                         "contender",
                         origin="thread",
                         wait_timeout_seconds=0.05,
@@ -169,10 +169,53 @@ def test_same_thread_reenters_while_other_thread_gets_structured_busy(tmp_path):
     busy = results[0]
     assert isinstance(busy, dict)
     assert busy["error"] == "heavy_task_busy"
-    assert busy["requested"]["task_class"] == "maintenance"
+    assert busy["requested"]["task_class"] == "projection"
     assert busy["requested"]["operation"] == "contender"
     assert busy["gate"]["physical_state"] == "locked"
     assert busy["gate"]["current"]["task_id"] == outer.task_id
+
+
+def test_different_task_classes_share_one_capacity(tmp_path):
+    meta_dir = tmp_path / "meta"
+    outcomes: list[dict[str, object] | str] = []
+
+    with heavy_task(
+        "scan",
+        "scan-holder",
+        origin="pytest",
+        wait_timeout_seconds=0,
+        meta_dir=meta_dir,
+    ):
+        def contend() -> None:
+            try:
+                with heavy_task(
+                    "embedding",
+                    "embedding-contender",
+                    origin="thread",
+                    wait_timeout_seconds=0.05,
+                    meta_dir=meta_dir,
+                ):
+                    outcomes.append("unexpected-acquire")
+            except HeavyTaskBusy as exc:
+                outcomes.append(exc.to_dict())
+
+        thread = threading.Thread(target=contend, name="cross-class-contender")
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert len(outcomes) == 1
+    busy = outcomes[0]
+    assert isinstance(busy, dict)
+    requested = busy["requested"]
+    gate = busy["gate"]
+    assert isinstance(requested, dict)
+    assert isinstance(gate, dict)
+    current = gate["current"]
+    assert isinstance(current, dict)
+    assert requested["task_class"] == "embedding"
+    assert current["task_class"] == "scan"
+    assert current["operation"] == "scan-holder"
 
 
 def test_different_meta_roots_do_not_share_capacity(tmp_path):
@@ -204,7 +247,7 @@ def test_cross_process_contention_is_bounded_and_reports_owner(tmp_path):
         started = time.monotonic()
         with pytest.raises(HeavyTaskBusy) as captured:
             with heavy_task(
-                "maintenance",
+                "scan",
                 "parent-contender",
                 origin="pytest",
                 wait_timeout_seconds=0.15,

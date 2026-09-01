@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "vector-lake-mcp": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/vector_lake_mcp.py",
+        "--profile",
+        "default",
+        "--surface",
+        "full"
+      ],
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {
+        "VECTOR_LAKE_PAYLOAD_ROOT": "${PLUGIN_DATA}/payloads",
+        "VECTOR_LAKE_AGENT_SANDBOX_ROOTS": "${PLUGIN_DATA}"
+      }
+    }
+  }
+}

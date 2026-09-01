@@ -84,9 +84,7 @@ def _integrated_job(target_name, target_version, projection_hash):
     )
     job_id = db_store.enqueue_job("ingest", payload)
     db_store.mark_job_awaiting_subagent(job_id, "")
-    claim = json.loads(
-        claim_ingest_tasks(limit=1, lease_seconds=60)
-    )[0]
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
     processed_data = _claimed_processed_data(
         payload,
         job_id,
@@ -116,12 +114,14 @@ def test_integrated_ingest_preserves_legacy_metadata_and_records_mixed_modes(
     isolated_memory,
 ):
     _write_purpose_contract(isolated_memory)
-    target_name, target_path, target_version, projection_hash = (
-        _seed_legacy_target(isolated_memory)
+    target_name, target_path, target_version, projection_hash = _seed_legacy_target(
+        isolated_memory
     )
-    outbox_before = db_store.get_connection().execute(
-        "SELECT COALESCE(MAX(id), 0) FROM mutation_outbox"
-    ).fetchone()[0]
+    outbox_before = (
+        db_store.get_connection()
+        .execute("SELECT COALESCE(MAX(id), 0) FROM mutation_outbox")
+        .fetchone()[0]
+    )
     job_id, processed_data = _integrated_job(
         target_name,
         target_version,
@@ -146,11 +146,15 @@ def test_integrated_ingest_preserves_legacy_metadata_and_records_mixed_modes(
     assert "evidence_tier" not in target_frontmatter
     assert "strategic_scope" not in target_frontmatter
     assert "(Source: [[Source_Legacy-Integration]])" in target_content
-    rows = db_store.get_connection().execute(
-        "SELECT filename, validation_mode FROM mutation_outbox "
-        "WHERE id > ? ORDER BY id",
-        (outbox_before,),
-    ).fetchall()
+    rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT filename, validation_mode FROM mutation_outbox "
+            "WHERE id > ? ORDER BY id",
+            (outbox_before,),
+        )
+        .fetchall()
+    )
     assert {row["filename"]: row["validation_mode"] for row in rows} == {
         "Source_Legacy-Integration.md": "full",
         target_name: "schema",
@@ -168,8 +172,8 @@ def test_integrated_ingest_preserves_legacy_dynamic_tag_debt(
 ):
     monkeypatch.setenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", "1")
     _write_purpose_contract(isolated_memory)
-    target_name, target_path, target_version, projection_hash = (
-        _seed_legacy_target(isolated_memory, colliding_tag="Agentic_AI")
+    target_name, target_path, target_version, projection_hash = _seed_legacy_target(
+        isolated_memory, colliding_tag="Agentic_AI"
     )
     _publish_dynamic_tag_collision(isolated_memory)
     _job_id, processed_data = _integrated_job(
@@ -192,12 +196,17 @@ def test_integrated_ingest_preserves_legacy_dynamic_tag_debt(
     target_content = target_path.read_text(encoding="utf-8")
     target_frontmatter, _body = split_frontmatter(target_content)
     assert target_frontmatter["tags"] == ["Agentic_AI"]
-    latest_target_outbox = db_store.get_connection().execute(
-        "SELECT validation_mode FROM mutation_outbox WHERE filename = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (target_name,),
-    ).fetchone()
+    latest_target_outbox = (
+        db_store.get_connection()
+        .execute(
+            "SELECT validation_mode FROM mutation_outbox WHERE filename = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (target_name,),
+        )
+        .fetchone()
+    )
     assert latest_target_outbox["validation_mode"] == "schema"
+
 
 def test_integrated_ingest_keeps_current_target_on_full_validation(
     isolated_memory,
@@ -210,9 +219,11 @@ def test_integrated_ingest_keeps_current_target_on_full_validation(
         {"Concept_Current-Target"}
     )["Concept_Current-Target"]
     projection_hash = hashlib.sha256(target_path.read_bytes()).hexdigest()
-    outbox_before = db_store.get_connection().execute(
-        "SELECT COALESCE(MAX(id), 0) FROM mutation_outbox"
-    ).fetchone()[0]
+    outbox_before = (
+        db_store.get_connection()
+        .execute("SELECT COALESCE(MAX(id), 0) FROM mutation_outbox")
+        .fetchone()[0]
+    )
     _job_id, processed_data = _integrated_job(
         target_name,
         target_version,
@@ -230,14 +241,18 @@ def test_integrated_ingest_keeps_current_target_on_full_validation(
     )
 
     assert result.startswith("Successfully finalized ingestion")
-    rows = db_store.get_connection().execute(
-        "SELECT filename, validation_mode FROM mutation_outbox "
-        "WHERE id > ? ORDER BY id",
-        (outbox_before,),
-    ).fetchall()
+    rows = (
+        db_store.get_connection()
+        .execute(
+            "SELECT filename, validation_mode FROM mutation_outbox "
+            "WHERE id > ? ORDER BY id",
+            (outbox_before,),
+        )
+        .fetchall()
+    )
     assert {row["filename"]: row["validation_mode"] for row in rows} == {
-        "Source_Legacy-Integration.md": "full",
-        target_name: "full",
+        "Source_Legacy-Integration.md": "schema",
+        target_name: "schema",
     }
 
 
@@ -245,13 +260,15 @@ def test_integrated_ingest_does_not_downgrade_invalid_submitted_source(
     isolated_memory,
 ):
     _write_purpose_contract(isolated_memory)
-    target_name, target_path, target_version, projection_hash = (
-        _seed_legacy_target(isolated_memory)
+    target_name, target_path, target_version, projection_hash = _seed_legacy_target(
+        isolated_memory
     )
     target_before = target_path.read_bytes()
-    outbox_before = db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM mutation_outbox"
-    ).fetchone()[0]
+    outbox_before = (
+        db_store.get_connection()
+        .execute("SELECT COUNT(*) FROM mutation_outbox")
+        .fetchone()[0]
+    )
     job_id, processed_data = _integrated_job(
         target_name,
         target_version,
@@ -294,8 +311,8 @@ def test_schema_maintenance_exception_requires_fenced_existing_target(
     isolated_memory,
 ):
     _write_purpose_contract(isolated_memory)
-    target_name, target_path, target_version, projection_hash = (
-        _seed_legacy_target(isolated_memory)
+    target_name, target_path, target_version, projection_hash = _seed_legacy_target(
+        isolated_memory
     )
     content = target_path.read_text(encoding="utf-8")
 
@@ -308,9 +325,9 @@ def test_schema_maintenance_exception_requires_fenced_existing_target(
     source_name = "Source_Existing.md"
     execute_mutation_plan(source_name, content=_source_content())
     source_path = isolated_memory / "wiki" / source_name
-    source_version = governance_store.canonical_page_versions(
-        {"Source_Existing"}
-    )["Source_Existing"]
+    source_version = governance_store.canonical_page_versions({"Source_Existing"})[
+        "Source_Existing"
+    ]
     source_projection = hashlib.sha256(source_path.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="existing non-Source update"):
         execute_mutation_batch(

@@ -5,6 +5,7 @@ import queue
 import sqlite3
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,6 +90,20 @@ def _bounded_env_float(
 ) -> float:
     try:
         value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int = 10,
+) -> int:
+    try:
+        value = int(os.environ.get(name, default))
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
@@ -310,14 +325,12 @@ class WikiIndexEventBuffer:
         self._next_reconcile_attempt_at = 0.0
         self._persist_reconcile_marker = bool(persist_reconcile_marker)
         self._reconcile_plan_generation: int | None = None
-        self._reconcile_plan_candidates: tuple[str, ...] = ()
-        self._reconcile_plan_cursor = 0
+        self._reconcile_plan_candidates: deque[str] = deque()
         self._reconcile_plan_unplanned = 0
 
     def _invalidate_reconcile_plan_locked(self) -> None:
         self._reconcile_plan_generation = None
-        self._reconcile_plan_candidates = ()
-        self._reconcile_plan_cursor = 0
+        self._reconcile_plan_candidates = deque()
         self._reconcile_plan_unplanned = 0
 
     def _persist_full_reconcile_locked(self) -> bool:
@@ -420,7 +433,7 @@ class WikiIndexEventBuffer:
         total_drift: int,
     ) -> bool:
         """Install a bounded in-process plan only for the scanned generation."""
-        bounded = tuple(str(item) for item in islice(candidates, 50_000))
+        bounded = deque(str(item) for item in islice(candidates, 50_000))
         with self._lock:
             if not self._full_reconcile_required or self._reconcile_generation != int(
                 expected_generation
@@ -428,7 +441,6 @@ class WikiIndexEventBuffer:
                 return False
             self._reconcile_plan_generation = int(expected_generation)
             self._reconcile_plan_candidates = bounded
-            self._reconcile_plan_cursor = 0
             self._reconcile_plan_unplanned = max(
                 0,
                 int(total_drift) - len(bounded),
@@ -446,12 +458,12 @@ class WikiIndexEventBuffer:
                 expected_generation
             ) or self._reconcile_generation != int(expected_generation):
                 return None
-            end = min(
-                len(self._reconcile_plan_candidates),
-                self._reconcile_plan_cursor + max(1, int(batch_size)),
-            )
             return list(
-                self._reconcile_plan_candidates[self._reconcile_plan_cursor : end]
+                islice(
+                    self._reconcile_plan_candidates,
+                    0,
+                    max(1, int(batch_size)),
+                )
             )
 
     def acknowledge_reconcile_plan_batch(
@@ -466,13 +478,12 @@ class WikiIndexEventBuffer:
                 expected_generation
             ) or self._reconcile_generation != int(expected_generation):
                 return False
-            end = self._reconcile_plan_cursor + len(completed)
-            if (
-                self._reconcile_plan_candidates[self._reconcile_plan_cursor : end]
-                != completed
-            ):
+            if tuple(
+                islice(self._reconcile_plan_candidates, 0, len(completed))
+            ) != completed:
                 return False
-            self._reconcile_plan_cursor = end
+            for _item in completed:
+                self._reconcile_plan_candidates.popleft()
             return True
 
     def reconcile_plan_remaining(
@@ -485,8 +496,7 @@ class WikiIndexEventBuffer:
                 expected_generation
             ) or self._reconcile_generation != int(expected_generation):
                 return None
-            queued = len(self._reconcile_plan_candidates) - self._reconcile_plan_cursor
-            return queued, self._reconcile_plan_unplanned
+            return len(self._reconcile_plan_candidates), self._reconcile_plan_unplanned
 
     @staticmethod
     def _path_key(path: str) -> str:
@@ -751,10 +761,17 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
 
         if self.shutting_down or self.stop_event.is_set():
             return False
-        sync_script = os.path.expanduser("~/.gemini/scripts/sync_focus.py")
-        if not os.path.exists(sync_script):
+        configured = os.environ.get("VECTOR_LAKE_DIARY_SYNC_SCRIPT", "").strip()
+        if not configured:
             return False
-        log.info("Diary modified: %s. Triggering sync_focus.py...", filename)
+        sync_path = Path(configured).expanduser()
+        if not sync_path.is_absolute() or not sync_path.is_file():
+            log.error(
+                "VECTOR_LAKE_DIARY_SYNC_SCRIPT must name an existing absolute file"
+            )
+            return False
+        sync_script = str(sync_path.resolve())
+        log.info("Diary modified: %s. Triggering configured sync script...", filename)
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         try:
@@ -765,7 +782,7 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
                 stderr=subprocess.DEVNULL,
             )
         except Exception as exc:
-            log.error("Failed to trigger sync_focus.py: %s", exc)
+            log.error("Failed to trigger configured diary sync: %s", exc)
             return False
         self.sync_process = process
         monitor = threading.Thread(
@@ -2295,7 +2312,7 @@ def index_worker_loop(stop_event: threading.Event | None = None):
         gate_entered = False
         gate_failure = None
         no_completed_work = False
-        successful_outbox_batch = False
+        successful_projection_batch = False
         retry_wait_seconds = 0.0
         try:
             if consecutive_failures >= max_failures:
@@ -2381,7 +2398,7 @@ def index_worker_loop(stop_event: threading.Event | None = None):
 
             with global_task_lock:
                 stats = process_mutation_outbox_batch(limit=50)
-            successful_outbox_batch = bool(stats["completed"])
+            successful_projection_batch = bool(stats["completed"])
 
             if consecutive_failures:
                 write_status(
@@ -2428,8 +2445,10 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                     index_queue,
                     pending_legacy,
                 )
-                projection_completed = projection_completed or bool(
-                    legacy_stats["completed"]
+                legacy_completed = bool(legacy_stats["completed"])
+                projection_completed = projection_completed or legacy_completed
+                successful_projection_batch = (
+                    successful_projection_batch or legacy_completed
                 )
                 write_status(
                     "error" if legacy_stats["failed"] else "idle",
@@ -2488,8 +2507,10 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                     log.info("Wiki overflow reconciliation: %s", reconcile_stats)
 
             if reconcile_stats is not None:
-                projection_completed = projection_completed or bool(
-                    reconcile_stats.get("completed")
+                reconcile_completed = bool(reconcile_stats.get("completed"))
+                projection_completed = projection_completed or reconcile_completed
+                successful_projection_batch = (
+                    successful_projection_batch or reconcile_completed
                 )
             if projection_completed:
                 topology_dirty_since, topology_refresh_due = (
@@ -2584,7 +2605,11 @@ def index_worker_loop(stop_event: threading.Event | None = None):
 
         wait_seconds = (
             retry_wait_seconds
-            or (_outbox_batch_yield_seconds() if successful_outbox_batch else 0.0)
+            or (
+                _outbox_batch_yield_seconds()
+                if successful_projection_batch
+                else 0.0
+            )
             or (1.0 if no_completed_work else 0.0)
         )
         if wait_seconds and stop_event.wait(wait_seconds):
@@ -2685,6 +2710,7 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
     last_expiry_date_hour = ""
     last_storage_sample_date = ""
     last_storage_attempt_date_hour = ""
+    last_retention_sample_date = ""
     next_memory_search_attempt = 0.0
     pending_due = ""
     next_due = ""
@@ -2783,6 +2809,41 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                     last_expiry_date_hour = current_date_hour
                 finally:
                     close_connection()
+
+            # Bound database growth: keep a small version history per family
+            # once per day.  Bounded to 128 MiB of deletes per run so a single
+            # pass can never stall the scheduler or starve writes.
+            if (
+                storage_date != last_retention_sample_date
+                and now.tm_hour == 3
+                and now.tm_min == 0
+            ):
+                last_retention_sample_date = storage_date
+                try:
+                    from vector_lake.db_store import close_connection as _close_db
+                    from vector_lake.tool_governance_maintenance import (
+                        history_retention_maintenance,
+                    )
+
+                    log.info("Running daily history retention...")
+                    history_retention_maintenance(
+                        dry_run=False,
+                        ttl_days=30,
+                        batch_size=500,
+                        max_delete_bytes=128 * 1024 * 1024,
+                        keep_change_sets=1000,
+                        keep_terminal_jobs=1000,
+                        keep_terminal_outbox=1000,
+                        keep_versions_per_family=2,
+                    )
+                    log.info("Daily history retention completed.")
+                except Exception as exc:
+                    log.warning("Daily history retention failed: %s", exc)
+                finally:
+                    try:
+                        _close_db()
+                    except Exception:
+                        pass
 
             # Run at 10:00 and 23:00. Once observed, a due slot remains pending
             # across minute boundaries until the heavy-task gate admits it.
@@ -2902,6 +2963,37 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
     )
 
 
+def _self_heal_projection_store() -> None:
+    """Rebuild a missing or empty projection store from SQLite canonical state.
+
+    The content-addressed store under ``wiki/.projection-store`` is derived data:
+    if it is entirely absent or empty (for example after an interrupted GC or a
+    manual wipe), every ingest/search fails with ``directory_missing``.  On
+    watchdog startup we detect that condition and rebuild the projection pair
+    from canonical rows.  Rebuild is intentionally rare (disaster recovery) and
+    runs under the schema lock; a fresh maintenance backup is created and the
+    automatic retention cap bounds its growth.
+    """
+    try:
+        from vector_lake.wiki_utils import get_wiki_dir
+
+        store_root = get_wiki_dir() / ".projection-store"
+        objects = store_root / "objects" / "sha256"
+        healthy = objects.is_dir() and any(objects.iterdir())
+        if healthy:
+            return
+        log.warning(
+            "Projection store is missing or empty (%s); rebuilding from canonical state",
+            store_root,
+        )
+        from vector_lake.tool_projection import rebuild_index_projection
+
+        rebuild_index_projection(dry_run=False)
+        log.info("Projection store self-healed")
+    except Exception as exc:
+        log.error("Projection store self-heal failed: %s", exc)
+
+
 def _start_watchdog_locked(stop_event: threading.Event | None = None):
     stop_event = stop_event or threading.Event()
     worker_stop_event = threading.Event()
@@ -2917,34 +3009,50 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
     from vector_lake.auto_ingest_worker import start_auto_ingest_worker
     from vector_lake.ingest_worker import start_worker
 
-    worker_threads = {
-        "outbox": threading.Thread(
-            target=index_worker_loop,
-            args=(worker_stop_event,),
-            daemon=True,
-            name="vector-lake-outbox-worker",
+    worker_specs: dict[
+        str,
+        tuple[Callable[[threading.Event], None], threading.Event, bool, str],
+    ] = {
+        "outbox": (
+            index_worker_loop,
+            worker_stop_event,
+            True,
+            "vector-lake-outbox-worker",
         ),
-        "scheduler": threading.Thread(
-            target=scheduled_lint_loop,
-            args=(worker_stop_event,),
-            daemon=True,
-            name="vector-lake-scheduled-lint-worker",
+        "scheduler": (
+            scheduled_lint_loop,
+            worker_stop_event,
+            True,
+            "vector-lake-scheduled-lint-worker",
         ),
-        "ingest": threading.Thread(
-            target=start_worker,
-            args=(worker_stop_event,),
-            daemon=True,
-            name="vector-lake-ingest-worker",
+        "ingest": (
+            start_worker,
+            worker_stop_event,
+            True,
+            "vector-lake-ingest-worker",
         ),
-        "auto_ingest": threading.Thread(
-            target=start_auto_ingest_worker,
-            args=(auto_stop_event,),
-            daemon=False,
-            name="vector-lake-auto-ingest-worker",
+        "auto_ingest": (
+            start_auto_ingest_worker,
+            auto_stop_event,
+            False,
+            "vector-lake-auto-ingest-worker",
         ),
     }
+
+    def build_worker(name: str) -> threading.Thread:
+        target, target_stop_event, daemon, thread_name = worker_specs[name]
+        return threading.Thread(
+            target=target,
+            args=(target_stop_event,),
+            daemon=daemon,
+            name=thread_name,
+        )
+
+    worker_threads = {name: build_worker(name) for name in worker_specs}
     _register_background_threads(worker_threads)
     started_workers: dict[str, threading.Thread] = {}
+
+    _self_heal_projection_store()
 
     observer = Observer()
     observer_started = False
@@ -3049,6 +3157,22 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
             minimum=0.05,
             maximum=10.0,
         )
+        worker_restart_limit = _bounded_env_int(
+            "VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT",
+            2,
+        )
+        required_workers = {
+            item.strip()
+            for item in os.environ.get(
+                "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+                "watchdog,outbox,ingest",
+            ).split(",")
+            if item.strip() in worker_specs
+        }
+        # Automatic ingest owns a non-daemon finalizer and remains fail-closed.
+        required_workers.add("auto_ingest")
+        restart_attempts = {name: 0 for name in worker_specs}
+        isolated_workers: set[str] = set()
         last_heartbeat = 0.0
         last_raw_watch_refresh = time.monotonic()
         while not stop_event.wait(monitor_seconds):
@@ -3059,21 +3183,88 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
             dead_workers = sorted(
                 name
                 for name, thread in started_workers.items()
-                if not thread.is_alive()
+                if name not in isolated_workers and not thread.is_alive()
             )
-            if dead_workers:
-                failure_reason = "background worker stopped unexpectedly: " + ",".join(
-                    dead_workers
+            required_failures: list[str] = []
+            for component in dead_workers:
+                attempts = restart_attempts[component]
+                if attempts < worker_restart_limit:
+                    attempts += 1
+                    restart_attempts[component] = attempts
+                    replacement = build_worker(component)
+                    started_workers[component] = replacement
+                    _register_background_threads(started_workers)
+                    detail = (
+                        f"restart_attempt={attempts}/{worker_restart_limit}"
+                    )
+                    try:
+                        replacement.start()
+                    except Exception as exc:
+                        detail += f"; start_failed={type(exc).__name__}:{exc}"
+                        log.error(
+                            "Background worker %s restart failed: %s",
+                            component,
+                            exc,
+                        )
+                        write_status(
+                            "error",
+                            0,
+                            index_queue.qsize(),
+                            "Background worker restart failed",
+                            detail,
+                            component=component,
+                        )
+                    else:
+                        log.warning(
+                            "Restarted background worker %s (%s).",
+                            component,
+                            detail,
+                        )
+                        write_status(
+                            "starting",
+                            0,
+                            index_queue.qsize(),
+                            "Background worker restarted",
+                            detail,
+                            component=component,
+                        )
+                    continue
+
+                detail = (
+                    "background worker restart budget exhausted: "
+                    f"{component}; attempts={attempts}/{worker_restart_limit}"
                 )
-                for component in dead_workers:
+                if component in required_workers:
+                    required_failures.append(component)
                     write_status(
                         "halted",
                         0,
                         index_queue.qsize(),
-                        "Background worker died",
-                        failure_reason,
+                        "Required background worker unavailable",
+                        detail,
                         component=component,
                     )
+                else:
+                    isolated_workers.add(component)
+                    write_status(
+                        "error",
+                        0,
+                        index_queue.qsize(),
+                        "Non-critical background worker isolated",
+                        detail,
+                        component=component,
+                    )
+                    log.error(
+                        "Isolated non-critical background worker %s after %s "
+                        "restart attempt(s); core watchdog remains active.",
+                        component,
+                        attempts,
+                    )
+            if required_failures:
+                failure_reason = (
+                    "required background worker unavailable after restart budget: "
+                    + ",".join(required_failures)
+                )
                 log.error(failure_reason)
                 stop_event.set()
                 break

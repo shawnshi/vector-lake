@@ -1,4 +1,0 @@
-description = "Resolve a pending Vector Lake governance item."
-prompt = """
-First use `review_governance_list` to show the current stable `item_id`, status, and proposed resolution. Call `resolve_governance_item` only after the user explicitly approves that exact item and resolution (`skip`, `create`, `merge`, or `acknowledge`); if the item changes, review it again.
-"""

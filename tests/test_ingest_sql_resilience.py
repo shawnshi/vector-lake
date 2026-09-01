@@ -17,6 +17,11 @@ from vector_lake.tool_ingest import (
 from tests.test_mutation_coordinator import _write_purpose_contract
 
 
+@pytest.fixture(autouse=True)
+def _install_ingest_purpose_contract(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+
+
 def _v4_payload(filepath, file_hash, canonical_name):
     if not is_supported_revision(file_hash):
         file_hash = "sha256:" + hashlib.sha256(
@@ -28,6 +33,10 @@ def _v4_payload(filepath, file_hash, canonical_name):
         "canonical_name": canonical_name,
         "source_hash": "",
         "source_projection_hash": "",
+        "source_observed_at": "2026-08-31T12:00:00+00:00",
+        "attempt_id": hashlib.sha256(
+            f"{filepath}\0{file_hash}".encode("utf-8")
+        ).hexdigest()[:32],
         "integration_candidates": [],
         "ingest_contract_version": INGEST_CONTRACT_VERSION,
         "instructions": "compile this source",
@@ -642,6 +651,8 @@ def _packet_processed_data(payload, job_id):
         "canonical_name": payload["canonical_name"],
         "source_hash": payload["source_hash"],
         "source_projection_hash": payload["source_projection_hash"],
+        "source_observed_at": payload["source_observed_at"],
+        "attempt_id": payload["attempt_id"],
         "integration_candidates": payload["integration_candidates"],
         "ingest_contract_version": payload["ingest_contract_version"],
         "job_id": job_id,

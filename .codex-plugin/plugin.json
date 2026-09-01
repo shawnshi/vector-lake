@@ -6,7 +6,7 @@
     "name": "Local developer"
   },
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "Vector Lake",
     "shortDescription": "Govern healthcare digitalization knowledge",

@@ -138,6 +138,38 @@ def test_rebuild_index_projection_dry_run_and_apply(isolated_memory):
     assert indexer.projection_pair_matches_current_generation() is True
 
 
+def test_rebuild_index_projection_repairs_stale_canonical_generation(
+    isolated_memory,
+):
+    _purpose(isolated_memory)
+    execute_mutation_plan("Concept_Existing.md", content=_page("Existing"))
+    indexer.generate_index()
+    assert indexer.projection_pair_matches_current_generation() is True
+
+    governance_store.upsert_entity(
+        "entity_projection_generation_drift",
+        {
+            "entity_id": "entity_projection_generation_drift",
+            "page_key": "Concept_Projection-Generation-Drift",
+            "canonical_name": "Projection Generation Drift",
+            "type": "concept",
+        },
+    )
+    assert indexer.projection_pair_matches_current_generation() is False
+
+    dry = rebuild_index_projection(dry_run=True)
+    assert "[DRY RUN]" in dry
+    assert "missing_index=1" in dry
+
+    applied = rebuild_index_projection(dry_run=False)
+    assert "Rebuilt index projection" in applied
+    assert indexer.projection_pair_matches_current_generation() is True
+    assert (
+        "Concept_Projection-Generation-Drift"
+        in indexer.read_committed_index_snapshot()["nodes"]
+    )
+
+
 def test_reconcile_canonical_content_from_richer_wiki_projection(isolated_memory):
     _purpose(isolated_memory)
     original = _page("Reconcile Content")

@@ -432,11 +432,46 @@ Primary source content.
 """
 
 
+def test_write_health_gate_defaults_to_fresh_bounded_checks(monkeypatch):
+    from vector_lake import runtime_health
+
+    calls = []
+    monkeypatch.delenv("VECTOR_LAKE_WRITE_HEALTH_DEEP_CHECKS", raising=False)
+    monkeypatch.setattr(
+        runtime_health,
+        "_write_health_surface_token",
+        lambda: pytest.fail("default write gate must not enter deep audit"),
+    )
+    monkeypatch.setattr(
+        runtime_health,
+        "assess_runtime_health",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "ok": True,
+                "issues": [],
+                "warnings": [],
+                "detail": {},
+            }
+        ),
+    )
+    runtime_health._clear_health_caches_for_tests()
+
+    runtime_health.enforce_runtime_write_health()
+    runtime_health.enforce_runtime_write_health()
+
+    assert calls == [
+        {"deep_projection_checks": False, "bounded_write_checks": True},
+        {"deep_projection_checks": False, "bounded_write_checks": True},
+    ]
+
+
 def test_write_health_gate_reuses_recent_unchanged_deep_check(monkeypatch):
     from vector_lake import runtime_health
 
     calls = []
-    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.delenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_WRITE_HEALTH_DEEP_CHECKS", raising=False)
     monkeypatch.setattr(
         runtime_health,
         "_write_health_surface_token",
@@ -457,24 +492,26 @@ def test_write_health_gate_reuses_recent_unchanged_deep_check(monkeypatch):
     )
     runtime_health._clear_health_caches_for_tests()
 
-    runtime_health.enforce_runtime_write_health()
-    runtime_health.enforce_runtime_write_health()
+    runtime_health.enforce_runtime_write_health(validation_mode="deep")
+    runtime_health.enforce_runtime_write_health(validation_mode="deep")
 
-    assert calls == [{"deep_projection_checks": True}]
+    assert calls == [
+        {"deep_projection_checks": False, "bounded_write_checks": True},
+        {"deep_projection_checks": True},
+        {"deep_projection_checks": False, "bounded_write_checks": True},
+    ]
 
 
-@pytest.mark.parametrize("configured", [None, "not-a-number"])
-def test_write_health_gate_is_strict_by_default_and_on_invalid_ttl(
+@pytest.mark.parametrize("configured", ["not-a-number", "-1"])
+def test_write_health_gate_is_strict_on_invalid_or_disabled_ttl(
     monkeypatch,
     configured,
 ):
     from vector_lake import runtime_health
 
     calls = []
-    if configured is None:
-        monkeypatch.delenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", raising=False)
-    else:
-        monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", configured)
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", configured)
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_DEEP_CHECKS", "1")
     monkeypatch.setattr(
         runtime_health,
         "_write_health_surface_token",
@@ -499,8 +536,37 @@ def test_write_health_gate_is_strict_by_default_and_on_invalid_ttl(
     runtime_health.enforce_runtime_write_health()
 
     assert calls == [
+        {"deep_projection_checks": False, "bounded_write_checks": True},
         {"deep_projection_checks": True},
+        {"deep_projection_checks": False, "bounded_write_checks": True},
         {"deep_projection_checks": True},
+    ]
+
+
+def test_write_health_gate_runs_fresh_bounded_safety_before_cache(monkeypatch):
+    from vector_lake import runtime_health
+
+    calls = []
+    monkeypatch.setattr(
+        runtime_health,
+        "assess_runtime_health",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "ok": False,
+                "issues": ["mutation_outbox_stalled:301s"],
+                "warnings": [],
+                "detail": {},
+            }
+        ),
+    )
+    runtime_health._clear_health_caches_for_tests()
+
+    with pytest.raises(RuntimeError, match="bounded runtime safety checks failed"):
+        runtime_health.enforce_runtime_write_health()
+
+    assert calls == [
+        {"deep_projection_checks": False, "bounded_write_checks": True}
     ]
 
 
@@ -510,6 +576,7 @@ def test_write_health_gate_invalidates_when_projection_identity_changes(monkeypa
     tokens = iter(["surface-a", "surface-a", "surface-b", "surface-b"])
     calls = []
     monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_DEEP_CHECKS", "1")
     monkeypatch.setattr(
         runtime_health,
         "_write_health_surface_token",
@@ -533,7 +600,12 @@ def test_write_health_gate_invalidates_when_projection_identity_changes(monkeypa
     runtime_health.enforce_runtime_write_health()
     runtime_health.enforce_runtime_write_health()
 
-    assert len(calls) == 2
+    assert calls == [
+        {"deep_projection_checks": False, "bounded_write_checks": True},
+        {"deep_projection_checks": True},
+        {"deep_projection_checks": False, "bounded_write_checks": True},
+        {"deep_projection_checks": True},
+    ]
 
 
 def test_write_health_gate_deep_check_is_single_flight(monkeypatch):
@@ -544,6 +616,7 @@ def test_write_health_gate_deep_check_is_single_flight(monkeypatch):
     started = threading.Event()
     release = threading.Event()
     monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_DEEP_CHECKS", "1")
     monkeypatch.setattr(
         runtime_health,
         "_write_health_surface_token",
@@ -552,8 +625,9 @@ def test_write_health_gate_deep_check_is_single_flight(monkeypatch):
 
     def assess(**kwargs):
         calls.append(kwargs)
-        started.set()
-        assert release.wait(timeout=2)
+        if kwargs.get("deep_projection_checks"):
+            started.set()
+            assert release.wait(timeout=2)
         return {"ok": True, "issues": [], "warnings": [], "detail": {}}
 
     monkeypatch.setattr(runtime_health, "assess_runtime_health", assess)
@@ -578,7 +652,10 @@ def test_write_health_gate_deep_check_is_single_flight(monkeypatch):
     assert errors == []
     assert not first.is_alive()
     assert not second.is_alive()
-    assert calls == [{"deep_projection_checks": True}]
+    assert calls.count(
+        {"deep_projection_checks": False, "bounded_write_checks": True}
+    ) == 2
+    assert calls.count({"deep_projection_checks": True}) == 1
 
 
 def test_write_health_gate_fails_closed_when_snapshot_keeps_changing(monkeypatch):
@@ -587,6 +664,7 @@ def test_write_health_gate_fails_closed_when_snapshot_keeps_changing(monkeypatch
     tokens = iter(["surface-a", "surface-b", "surface-c"])
     calls = []
     monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", "30")
+    monkeypatch.setenv("VECTOR_LAKE_WRITE_HEALTH_DEEP_CHECKS", "1")
     monkeypatch.setattr(
         runtime_health,
         "_write_health_surface_token",
@@ -610,7 +688,11 @@ def test_write_health_gate_fails_closed_when_snapshot_keeps_changing(monkeypatch
     with pytest.raises(RuntimeError, match="changed during validation"):
         runtime_health.enforce_runtime_write_health()
 
-    assert len(calls) == 2
+    assert calls == [
+        {"deep_projection_checks": False, "bounded_write_checks": True},
+        {"deep_projection_checks": True},
+        {"deep_projection_checks": True},
+    ]
 
 
 def test_write_gate_migrates_existing_database_before_retry(
@@ -659,7 +741,9 @@ def test_write_gate_migrates_existing_database_before_retry(
         "mutation_outbox",
         "jobs",
     } <= surfaces
-    assert len(calls) == 1
+    assert calls == [
+        {"deep_projection_checks": False, "bounded_write_checks": True}
+    ]
 
 
 def test_write_health_token_changes_when_watchdog_becomes_stale(isolated_memory):
@@ -699,17 +783,17 @@ def test_write_health_token_tracks_blocking_policy_changes(
     assert len({initial, backlog_blocking, timeline_blocking, ready_age_policy}) == 4
 
 
-def test_write_health_token_does_not_enumerate_wiki_files(isolated_memory, monkeypatch):
+def test_write_health_token_tracks_in_place_wiki_file_edits(isolated_memory):
     from vector_lake import runtime_health
 
     db_store.init_db()
+    page = isolated_memory / "wiki" / "Source_Tracked.md"
+    page.write_text("before", encoding="utf-8")
+    before = runtime_health._write_health_surface_token()
 
-    def fail_scandir(*_args, **_kwargs):
-        raise AssertionError("write-health token must not enumerate Wiki files")
+    page.write_text("after with a different size", encoding="utf-8")
 
-    monkeypatch.setattr(runtime_health.os, "scandir", fail_scandir)
-
-    assert runtime_health._write_health_surface_token()
+    assert runtime_health._write_health_surface_token() != before
 
 
 def test_write_health_tracks_pending_wiki_reconcile_marker(isolated_memory):
@@ -843,12 +927,6 @@ def test_default_write_gate_detects_external_in_place_wiki_edit(
     indexer.generate_index()
     runtime_health._clear_health_caches_for_tests()
     monkeypatch.delenv("VECTOR_LAKE_WRITE_HEALTH_CACHE_SECONDS", raising=False)
-    monkeypatch.setattr(
-        runtime_health,
-        "_write_health_surface_token",
-        lambda: "intentionally-stable-token",
-    )
-
     runtime_health.enforce_runtime_write_health()
     page = isolated_memory / "wiki" / "Source_Healthy.md"
     page.write_text(
@@ -901,6 +979,31 @@ def test_watchdog_error_component_is_not_cleared_by_heartbeat(isolated_memory):
     health = assess_runtime_health()
     assert health["ok"] is False
     assert any("watchdog_unhealthy" in issue for issue in health["issues"])
+
+
+def test_scheduler_error_degrades_without_blocking_core_health(isolated_memory):
+    db_store.init_db()
+    for component in ("watchdog", "outbox", "ingest"):
+        write_status("idle", 0, 0, f"{component} heartbeat", "", component=component)
+    write_status(
+        "error",
+        0,
+        0,
+        "Scheduler isolated",
+        "restart budget exhausted",
+        component="scheduler",
+    )
+
+    health = assess_runtime_health()
+
+    assert not any(
+        issue.startswith("watchdog_unhealthy") for issue in health["issues"]
+    )
+    assert "watchdog_component_unhealthy:scheduler:error" in health["warnings"]
+    assert health["detail"]["watchdog_unhealthy_optional_components"] == [
+        "scheduler"
+    ]
+    assert "scheduler" not in health["detail"]["watchdog_required_components"]
 
 
 def test_fresh_watchdog_heartbeat_is_not_reported_stale(isolated_memory):

@@ -1,7 +1,0 @@
-description = "Search the Vector Lake index for knowledge graph nodes and entities."
-prompt = """
-Please use the `search_vector_lake` MCP tool from the `vector-lake-mcp` server to query the index.
-Provide the semantic query string to the `query` parameter.
-You can adjust the `top_k` parameter and choose the formal `mode` ('page', 'memory', or 'fact').
-Legacy `claim` is only a deprecated compatibility alias for `fact`: it returns fact-only operational memory, not canonical Claim records. Use `export_evidence_packet` with a `claim_id` for canonical Claim provenance.
-"""

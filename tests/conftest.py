@@ -19,6 +19,7 @@ def isolate_test_runtime(tmp_path: Path, monkeypatch):
         str(memory_dir / "wiki" / ".meta"),
     )
     monkeypatch.delenv("VECTOR_LAKE_DB_PATH", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", raising=False)
     monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_BRAIN_ROOT", raising=False)
     monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_TASK_ROOT", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)

@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import functools
 import hashlib
 import importlib
 import inspect
@@ -608,7 +609,7 @@ def test_mcp_source_tree_revision_preserves_legacy_digest_contract(tmp_path):
     [
         ("config.json", "{}\n", '{"changed": true}\n'),
         ("templates/query_prompt.md", "before\n", "after\n"),
-        (".codex-plugin/plugin.json", "{}\n", '{"version": "next"}\n'),
+        ("runtime_profiles.json", "{}\n", '{"schema_version": 1}\n'),
     ],
 )
 def test_mcp_runtime_guard_detects_restart_sensitive_asset_drift(
@@ -629,6 +630,69 @@ def test_mcp_runtime_guard_detects_restart_sensitive_asset_drift(
 
     with pytest.raises(RuntimeError, match="restart"):
         guard.assert_current()
+
+
+def test_revision_paths_partition_runtime_from_host_adapters(tmp_path):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "runtime_profiles.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / ".mcp.json").write_text("{}\n", encoding="utf-8")
+    skill_path = tmp_path / "skills" / "query" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("skill\n", encoding="utf-8")
+
+    runtime_paths = {
+        relative for relative, _path in mcp_server._runtime_revision_paths(package_root)
+    }
+    host_paths = {
+        relative
+        for relative, _path in mcp_server._host_adapter_revision_paths(package_root)
+    }
+
+    assert "vector_lake/runtime_probe.py" in runtime_paths
+    assert "runtime_profiles.json" in runtime_paths
+    assert ".mcp.json" not in runtime_paths
+    assert "skills/query/SKILL.md" not in runtime_paths
+    assert ".mcp.json" in host_paths
+    assert "skills/query/SKILL.md" in host_paths
+    assert runtime_paths.isdisjoint(host_paths)
+
+
+def test_host_adapter_drift_requires_host_reload_not_mcp_restart(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "vector_lake"
+    package_root.mkdir()
+    (package_root / "runtime_probe.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    skill_path = tmp_path / "skills" / "query" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("before\n", encoding="utf-8")
+    guard = mcp_server.MCPRuntimeGuard(package_root, check_interval_seconds=0)
+
+    skill_path.write_text("after\n", encoding="utf-8")
+
+    runtime_status = guard.status(force=True)
+    assert runtime_status["stale"] is False
+    assert (
+        mcp_server._host_adapter_revision(package_root)
+        != guard.loaded_host_adapter_revision
+    )
+
+    monkeypatch.setattr(mcp_server.mcp, "runtime_guard", guard)
+    reported = json.loads(mcp_server.mcp_runtime_status())
+    assert reported["runtime_revision"]["stale"] is False
+    assert reported["runtime_revision"]["mcp_restart_required"] is False
+    assert reported["host_adapter_revision"]["changed_since_start"] is True
+    assert reported["host_adapter_revision"]["mcp_restart_required"] is False
+    assert reported["host_adapter_revision"]["host_reload_required"] is True
 
 
 def test_mcp_call_tool_uses_cached_admission_and_execution_checks(
@@ -1064,6 +1128,55 @@ def test_mcp_runtime_status_bypasses_saturated_heavy_tool_lane(tmp_path, monkeyp
     assert elapsed < 0.5
 
 
+def test_mcp_runtime_status_hashing_runs_off_the_event_loop(tmp_path, monkeypatch):
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "status-event-loop-test",
+        runtime_guard=guard,
+    )
+    release = threading.Event()
+    original_status = guard.status
+
+    def slow_status(force=False):
+        assert release.wait(timeout=2)
+        return original_status(force=force)
+
+    monkeypatch.setattr(guard, "status", slow_status)
+
+    @server.tool()
+    def mcp_runtime_status() -> str:
+        return mcp_server.json.dumps(guard.status(force=True))
+
+    async def scenario():
+        results = []
+
+        async def invoke():
+            results.append(await server.call_tool("mcp_runtime_status", {}))
+
+        timer = threading.Timer(0.25, release.set)
+        timer.start()
+        started_at = time.monotonic()
+        heartbeat_elapsed = float("inf")
+        try:
+            async with anyio.create_task_group() as group:
+                group.start_soon(invoke)
+                await anyio.sleep(0.05)
+                heartbeat_elapsed = time.monotonic() - started_at
+        finally:
+            timer.cancel()
+            release.set()
+        return heartbeat_elapsed, results
+
+    try:
+        heartbeat_elapsed, results = anyio.run(scenario)
+    finally:
+        release.set()
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+    assert heartbeat_elapsed < 0.15
+    assert results
+
+
 def test_mcp_sync_tools_run_off_the_event_loop(tmp_path):
     package_root = tmp_path / "vector_lake"
     package_root.mkdir()
@@ -1153,6 +1266,87 @@ def test_mcp_heavy_tool_busy_releases_executor_capacity(
         assert result == "ok"
     finally:
         server.shutdown_blocking_executor(wait=True, timeout=2)
+
+
+def test_mcp_doctor_defaults_to_quick_and_deep_is_explicit(monkeypatch):
+    from vector_lake import tool_doctor
+
+    monkeypatch.setattr(
+        tool_doctor,
+        "quick_doctor_vector_lake",
+        lambda: "quick-report",
+    )
+    monkeypatch.setattr(
+        mcp_server.tools,
+        "doctor_vector_lake",
+        lambda: "deep-report",
+    )
+
+    assert mcp_server.doctor_vector_lake() == "quick-report"
+    assert mcp_server.doctor_vector_lake(mode="QUICK") == "quick-report"
+    assert mcp_server.doctor_vector_lake(mode="deep") == "deep-report"
+    with pytest.raises(ValueError, match="quick.*deep"):
+        mcp_server.doctor_vector_lake(mode="full")
+
+
+def test_mcp_quick_doctor_bypasses_heavy_gate_but_deep_does_not(
+    isolated_memory,
+    tmp_path,
+    monkeypatch,
+):
+    from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
+
+    monkeypatch.setenv("VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS", "0.05")
+    guard = mcp_server.MCPRuntimeGuard(tmp_path, check_interval_seconds=60)
+    server = mcp_server.ReloadAwareFastMCP(
+        "doctor-mode-gate-test",
+        runtime_guard=guard,
+    )
+
+    @server.tool()
+    def doctor_vector_lake(mode: str = "quick") -> str:
+        return mode
+
+    registered = server._tool_manager.get_tool("doctor_vector_lake")
+    assert registered is not None
+    try:
+        with heavy_task(
+            "maintenance",
+            "external-holder",
+            origin="pytest",
+            wait_timeout_seconds=0,
+        ):
+            assert anyio.run(registered.fn) == "quick"
+            with pytest.raises(HeavyTaskBusy):
+                anyio.run(functools.partial(registered.fn, mode="deep"))
+    finally:
+        server.shutdown_blocking_executor(wait=True, timeout=2)
+
+
+def test_quick_doctor_marks_semantic_readiness_unchecked(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import tool_doctor
+
+    observed: dict[str, object] = {}
+
+    def shallow_health(**kwargs):
+        observed.update(kwargs)
+        return {"ok": True, "issues": [], "warnings": [], "detail": {}}
+
+    monkeypatch.setattr(tool_doctor, "assess_runtime_health", shallow_health)
+
+    report = json.loads(tool_doctor.quick_doctor_vector_lake())
+
+    assert observed == {"deep_projection_checks": False}
+    assert report["mode"] == "quick"
+    assert report["ok"] is True
+    assert report["semantic_readiness"] == {
+        "status": "not_checked",
+        "reason": "requires_deep_doctor",
+    }
+    assert report["paths"]["memory"] == str(isolated_memory)
 
 
 def test_all_known_mcp_rescan_entrypoints_are_heavy_task_gated():

@@ -2125,10 +2125,9 @@ def _generate_index_unlocked(
                     search_integrity.get("issue") or "unknown",
                 )
 
-    # Read from canonical SQLite instead of Markdown files
-    rows = conn.execute("SELECT entity_id, data_json FROM entities").fetchall()
-    
-    for row in rows:
+    # Stream canonical rows into the already-required projection map instead of
+    # retaining a second full corpus list during rebuild.
+    for row in conn.execute("SELECT entity_id, data_json FROM entities"):
         try:
             entity_data = json.loads(row["data_json"])
             node_key, node_data = _entity_to_index_node(entity_data, row["entity_id"])

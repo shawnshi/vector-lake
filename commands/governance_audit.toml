@@ -1,4 +1,0 @@
-description = "Audit topology gaps and push graph-derived governance items into the review queue."
-prompt = """
-Call `trigger_audit_graph` with `dry_run=True` and show the exact plan fingerprint and findings. Call it again with `dry_run=False` and the matching `confirmation` fingerprint only after explicit user approval; if the plan changes, discard the approval and preview again.
-"""

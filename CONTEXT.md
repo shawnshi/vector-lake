@@ -4,7 +4,7 @@
 
 Vector Lake is a local knowledge compiler with an inspectable Markdown publication surface and a SQLite canonical runtime. It should not be treated as a classic vector database, a stateless RAG service, or a CBSS business execution runtime.
 
-The supported deployment is a controlled Windows/Codex, single-user, expert-operated healthcare-digitalization research workbench. It is not an enterprise multi-tenant service or an unattended GA system. Concurrency claims below refer only to bounded workers inside one trusted local runtime.
+The supported deployment is a controlled Windows, single-user, expert-operated healthcare-digitalization research workbench. One host-neutral MCP runtime is connected through separate Codex, Pi/Agent Plugins, and Gemini adapters. It is not an enterprise multi-tenant service or an unattended GA system. Concurrency claims below refer only to bounded workers inside one trusted local runtime.
 
 Current boundary:
 
@@ -19,9 +19,12 @@ Current boundary:
 The durable architecture is:
 
 ```text
+host adapter -> scripts/vector_lake_mcp.py -> runtime profile -> MCP core
 raw source -> page-scoped coordinator -> SQLite canonical + fenced outbox -> Markdown + projection-v2 roots/locators
 SQLite canonical -> operational memory -> Memory Packet -> query context
 ```
+
+The launcher anchors imports and `runtime_profiles.json` to its own plugin root, not the caller's current directory or `PYTHONPATH`. Process path overrides must set `VECTOR_LAKE_MEMORY_DIR` and `VECTOR_LAKE_META_DIR` together, and both profile and override roots must resolve to absolute paths after `~` expansion. Core code does not infer Codex, Gemini, or Pi sandbox and dotenv locations; those belong to the host adapter.
 
 CBSS boundary:
 
@@ -87,6 +90,8 @@ Conflict rules:
 | `vector_lake/claim_assessment.py` | Append-only claim assessments without AcceptedFact promotion |
 | `vector_lake/decision_registry.py` | Verified external decision registry adapter and scoped readiness |
 | `vector_lake/quality_registry.py` | Immutable schema versions and quality-evaluation ledger |
+| `scripts/vector_lake_mcp.py` | Host-neutral, profile-aware stdio MCP launcher |
+| `vector_lake/runtime_paths.py` | Validated runtime-profile and path bootstrap |
 | `vector_lake/mcp_server.py` | Standard Model Context Protocol (MCP) server entrypoint |
 | `vector_lake/watchdog_app.py` | Real-time ingest watcher, background job orchestration, scheduled auto-lint |
 | `vector_lake/watchdog_status.py` | Status JSON telemetry broadcaster for the daemon |
@@ -104,9 +109,10 @@ Conflict rules:
 | `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
 | `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
 | `vector_lake/yaml_utils.py` | YAML helpers |
+| `scripts/benchmark_multi_host_runtime.py` | Isolated multi-MCP/watchdog startup, RSS, soak, and runtime-status gate |
 | `scripts/community_clustering_daemon.py` | Deprecated/unsupported legacy Louvain operator script; disabled by default and never scheduled by watchdog |
 | `schema.md` | Wiki and runtime memory contract |
-| `commands/` | Macro-level workflows (e.g. research/review) for Agents |
+| `skills/` | Host-loadable Agent workflows (e.g. research/review) |
 | `contracts/cbss/` | Evidence, authority-acceptance, business-event, decision-registry, and readiness contracts |
 
 `scripts/semantic_dedup_daemon.py` and `scripts/community_clustering_daemon.py`
@@ -122,32 +128,19 @@ maintenance plus the preview-first `projection-rebuild-index`,
 
 **Note (v8.3+)**: Agents interact with the system entirely through the `vector_lake/mcp_server.py` MCP tools (e.g. `search_vector_lake`, `sync_vector_lake`).
 
-**Command surfaces**: Gemini CLI loads compatibility prompts from `commands/*.toml` and exposes them with `/`. Codex does not load plugin-defined slash commands; invoke the corresponding plugin skills with `$vector-lake:<name>` or ask the agent to call the MCP tool directly.
+**Host workflow surface**: the current release packages 19 skills under `skills/`; Codex may invoke them with `$vector-lake:<name>`, Agent Plugins clients may load the same directory, and every host may call MCP tools directly. The former Gemini `commands/*.toml` slash-command layer remains deleted.
 
-Gemini CLI compatibility commands:
-- `/sync`: Scan configured raw sources and enqueue a bounded ingest batch; it does not generate or finalize Wiki pages
-- `/search`: Semantic query
-- `/query`: Deep logic reasoning
-- `/review`: Check governance queue
-- `/resolve`: Resolve pending items
-- `/audit`: Synthesize topology and audit
-- `/debt`: View governance debt metrics
-- `/lint`: Self-healing audit of nodes
-- `/research`: Autonomous web research directive
-- `/graph`: Generate interactive 3D HTML topology
-- `/doctor`: Validate runtime dependencies and health
-- `/gc`: Garbage collect orphaned entities
-- `/delete`: Cascade-delete sources and sever graph edges
-- `/trace`: Audit provenance traces
-- `/merge`: Surface candidate entity merges
-- `/timeline`: SQL query against historical timeline_events (via MCP)
-- `review_strategic_purpose(as_of="")`: emits due `SIR-Review-Proposal` records without mutating the Wiki.
-- `semantic_readiness(decision_id="")`: reports global semantic debt or, with a verified registry ID, only evidence and governance mapped to that decision; it does not change write-gate behavior.
-- `export_evidence_packet(claim_id, include_evidence_text=False, max_evidence_text_chars=2000)`: exports a claim candidate and its provenance without accepting it as fact.
-- `sync_critical_decision_registry(payload_file, expected_sha256, actor_id)`: imports only a sandboxed registry snapshot pinned by an operator-supplied SHA-256 digest and records the import receipt.
+**Thin adapters**: Codex uses `.codex-plugin/plugin.json` plus `.codex-plugin/mcp.json`; Pi/Agent Plugins 1.0 uses root `plugin.json` plus `mcp.json`; the Gemini thin adapter uses `gemini-extension.json`. All three target the same launcher/profile/surface contract. The Gemini CLI is unavailable on the current validation host, so Gemini manifest and raw stdio checks are evidence for the adapter contract, not a real Gemini-host smoke claim.
+
+Server-runtime revision covers loaded Python, runtime profiles, contracts, templates, and restart-sensitive root assets. Host-adapter revision separately covers skills, host manifests, context, and launcher. Adapter drift may require host reload but must not mark the running MCP server stale.
+
+The MCP surface remains the host-neutral contract. Important direct tools include:
+- `sync_vector_lake`: scan configured raw sources and enqueue a bounded ingest batch; it does not generate or finalize Wiki pages.
+- `review_strategic_purpose(as_of="")`: emit due `SIR-Review-Proposal` records without mutating the Wiki.
+- `semantic_readiness(decision_id="")`: report global semantic debt or, with a verified registry ID, only evidence and governance mapped to that decision; it does not change write-gate behavior.
+- `export_evidence_packet(claim_id, include_evidence_text=False, max_evidence_text_chars=2000)`: export a claim candidate and its provenance without accepting it as fact.
+- `sync_critical_decision_registry(payload_file, expected_sha256, actor_id)`: import only a sandboxed registry snapshot pinned by an operator-supplied SHA-256 digest and record the import receipt.
 - `operational_memory_cleanup(dry_run=True, limit=0)` and `topology_queue_cleanup(dry_run=True)`: preview-first remediation surfaces for generated runtime artifacts and obsolete indexer naming work.
-
-Codex equivalents include `$vector-lake:query` and `$vector-lake:timeline`.
 
 The following CLI commands remain the ground truth operating surface for *human operators*:
 
@@ -205,7 +198,8 @@ For Windows validation, prefer:
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'; python -m pytest -q -p no:cacheprovider
-$env:PYTHONIOENCODING='utf-8'; python -m compileall -q vector_lake tests
+$env:PYTHONIOENCODING='utf-8'; python -m compileall -q vector_lake tests scripts
+$env:PYTHONIOENCODING='utf-8'; python scripts/benchmark_multi_host_runtime.py --duration-seconds 300
 ```
 
 ## 5. Current Validation Baseline
@@ -215,7 +209,7 @@ The checked baseline is produced by the current CI commands rather than a fixed 
 ## 6. Operating Rules
 
 1. Preserve the split: Markdown is for humans; `.meta` is canonical state; `operational_memory` is for Agents.
-2. Keep `schema.md`, `README.md`, `commands/`, and `contracts/` aligned when the runtime surface changes.
+2. Keep `schema.md`, `README.md`, `skills/`, and `contracts/` aligned when the runtime surface changes.
 3. Do not hand-edit derived runtime files unless the task is explicitly data repair. Prefer rebuild paths.
 4. Use preview first for delete, gc, retention, restore, schema change, and any operation that removes or replaces assets.
 5. Treat lock contention as environmental state, not proof that a code patch failed. Note that `daemon_watchdog` and `sync` operations are protected by cross-process `filelock` to prevent meta and index corruption.
@@ -225,6 +219,8 @@ The checked baseline is produced by the current CI commands rather than a fixed 
 9. Governance decision relevance must use explicit `critical_decision_refs`; never infer it from title or description text.
 10. Do not use Vector Lake Timeline, `Policy_*` pages, or operational-memory decisions as CBSS Event, executable Policy, or Decision records.
 11. `VECTOR_LAKE_MCP_SURFACE=memory` is an exact 9-tool thin surface that includes the governed `remember` mutation and read-only automatic-ingest budget status. `VECTOR_LAKE_MCP_SURFACE=readonly` is an exact 21-tool physical-read surface backed by SQLite `mode=ro` and `query_only`; its scan-class heavy tools remain bounded by the dedicated executor but bypass the canonical-meta file gate. It is not an operating-system ACL, so snapshot/generation drift still fails closed and independent read-only snapshots remain preferable for forensic audits. CLI diagnostics and the other MCP surfaces may still publish heavy-task lock/status telemetry.
+12. Watchdog workers use a bounded restart budget. Outbox, ingest, and automatic-ingest exhaustion remain fail-closed; scheduler exhaustion is isolated as an optional-component warning unless the operator adds it to `VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS`.
+13. The multi-host capacity decision is evidence-bound to `docs/multi-host-runtime-report.md`. Independent stdio remains the target until a reproducible benchmark breaches an approved gate; do not add shared transport preemptively.
 
 ## 7. System Capabilities & Architecture Defenses
 The Vector Lake system uses bounded single-host concurrency for ingestion and graph maintenance, with several defensive mechanisms:

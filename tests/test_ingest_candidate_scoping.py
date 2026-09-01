@@ -2,6 +2,8 @@ import json
 from datetime import datetime, timezone
 
 from vector_lake import db_store, tool_ingest
+from vector_lake.mutation_coordinator import execute_mutation_plan
+from tests.test_mutation_coordinator import _write_purpose_contract
 
 
 class _RecordingRows(list):
@@ -77,33 +79,23 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
     raw_path = isolated_memory / "raw" / "candidate-scoped.md"
     raw_path.write_text("candidate revision", encoding="utf-8")
     wiki_path = isolated_memory / "wiki" / "Source_Existing-Candidate.MD"
-    wiki_path.write_text("existing source", encoding="utf-8")
-    db_store.init_db()
+    _write_purpose_contract(isolated_memory)
+    raw_stat = raw_path.stat()
+    source_page = tool_ingest._auto_source_page(
+        {
+            "filepath": str(raw_path.resolve()),
+            "hash": tool_ingest.calculate_hash(str(raw_path)),
+            "canonical_name": wiki_path.name,
+            "source_observed_at": datetime.fromtimestamp(
+                raw_stat.st_mtime_ns / 1_000_000_000,
+                tz=timezone.utc,
+            ).isoformat(),
+        }
+    )
+    execute_mutation_plan(wiki_path.name, content=source_page["content"])
     connection = db_store.get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    entity = {
-        "entity_id": "source_existing_candidate",
-        "page_key": "Source_Existing-Candidate",
-        "canonical_name": "Existing Candidate",
-        "type": "source",
-        "status": "Active",
-        "categories": [],
-        "sources": ["MEMORY/raw/candidate-scoped.md"],
-    }
     with db_store.transaction():
-        connection.execute(
-            "INSERT INTO entities "
-            "(entity_id, canonical_name, type, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                entity["entity_id"],
-                entity["canonical_name"],
-                entity["type"],
-                entity["status"],
-                json.dumps(entity),
-                now,
-            ),
-        )
         connection.execute(
             "INSERT INTO processed_files "
             "(filepath, file_hash, processed_at, observed_mtime_ns, observed_size) "
@@ -134,11 +126,6 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
         "_build_ingest_instructions",
         lambda *_args: "scoped instructions",
     )
-    monkeypatch.setattr(
-        tool_ingest,
-        "_projection_hash_for_canonical_version",
-        lambda *_args: "a" * 64,
-    )
     traced_sql = []
     connection.set_trace_callback(traced_sql.append)
 
@@ -153,7 +140,7 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
     normalized_sql = [" ".join(statement.split()) for statement in traced_sql]
     assert result["filepath"] == str(raw_path.resolve())
     assert result["canonical_name"] == wiki_path.name
-    assert result["source_projection_hash"] == "a" * 64
+    assert len(result["source_projection_hash"]) == 64
     assert any(
         "FROM processed_files WHERE filepath IN (" in statement
         for statement in normalized_sql
@@ -174,10 +161,7 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
     ]
     assert legacy_reads
     assert all("$.filepath') END IN (" in statement for statement in legacy_reads)
-    assert (
-        sum("JOIN json_each" in statement for statement in normalized_sql)
-        == 1
-    )
+    assert sum("JOIN json_each" in statement for statement in normalized_sql) == 1
     assert not any(
         statement.startswith("SELECT data_json FROM entities WHERE")
         and "status != 'Merged'" in statement
@@ -192,6 +176,7 @@ def test_full_scan_keeps_existing_unscoped_inventory_queries(
 ):
     raw_path = isolated_memory / "raw" / "full-scan.md"
     raw_path.write_text("full scan revision", encoding="utf-8")
+    _write_purpose_contract(isolated_memory)
     db_store.init_db()
     connection = db_store.get_connection()
     monkeypatch.setattr(tool_ingest, "_load_ingest_config", lambda: {})

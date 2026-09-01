@@ -1,4 +1,0 @@
-description = "Preview or enqueue V8 merge suggestions for duplicate entities."
-prompt = """
-Please use `merge_suggestions_vector_lake` with `enqueue=False` and show the bounded candidate set, evidence, and uncertainty. Enqueueing changes the governance queue: use `enqueue=True` only after the user explicitly approves that current candidate set. If the candidates change, preview again; never report a suggestion as a completed merge.
-"""

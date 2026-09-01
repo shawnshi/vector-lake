@@ -88,6 +88,7 @@ _MCP_HEAVY_TASKS = {
     "wiki_restore": ("maintenance", 900.0),
 }
 
+# Trusted-host-only gate for explicitly authorized recovery of ingest leases.
 _MANUAL_INGEST_ADMIN_ENV = "VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN"
 _MANUAL_QUERY_SYNTHESIS_ENV = "VECTOR_LAKE_ALLOW_MANUAL_QUERY_SYNTHESIS"
 _SYSTEM_PAGE_WRITE_ENV = "VECTOR_LAKE_ALLOW_SYSTEM_PAGE_WRITE"
@@ -137,11 +138,8 @@ _MCP_SURFACE_ALLOWLISTS = {
 }
 
 _RUNTIME_REVISION_ROOT_FILES = (
-    ".mcp.json",
     "config.json",
-    "gemini-extension.json",
-    "mcp_config.json",
-    "plugin.json",
+    "runtime_profiles.json",
     "requirements-ci-bootstrap.lock.txt",
     "requirements-ci.lock.txt",
     "requirements.lock.txt",
@@ -151,14 +149,26 @@ _RUNTIME_REVISION_ROOT_FILES = (
     "watchdog_sync.py",
 )
 _RUNTIME_REVISION_ASSET_DIRS = (
-    ".codex-plugin",
-    "commands",
     "contracts",
-    "skills",
     "templates",
 )
 _RUNTIME_REVISION_PLUGIN_ROOT_ENTRIES = frozenset(
     (*_RUNTIME_REVISION_ROOT_FILES, *_RUNTIME_REVISION_ASSET_DIRS)
+)
+_HOST_ADAPTER_REVISION_ROOT_FILES = (
+    ".mcp.json",
+    "CONTEXT.md",
+    "gemini-extension.json",
+    "mcp.json",
+    "mcp_config.json",
+    "plugin.json",
+)
+_HOST_ADAPTER_REVISION_ASSET_DIRS = (
+    ".codex-plugin",
+    "skills",
+)
+_HOST_ADAPTER_REVISION_FILES = (
+    "scripts/vector_lake_mcp.py",
 )
 
 
@@ -371,10 +381,9 @@ def _runtime_revision_paths(source_root: Path) -> list[tuple[str, Path]]:
     return sorted(paths.items())
 
 
-def _source_tree_revision(source_root: Path) -> str:
-    """Hash loaded code and restart-sensitive assets for drift detection."""
+def _revision_digest(paths: list[tuple[str, Path]]) -> str:
     digest = hashlib.sha256()
-    for relative_path, source_path in _runtime_revision_paths(source_root):
+    for relative_path, source_path in paths:
         try:
             source_bytes = source_path.read_bytes()
         except FileNotFoundError:
@@ -384,6 +393,36 @@ def _source_tree_revision(source_root: Path) -> str:
         digest.update(source_bytes)
         digest.update(b"\x00")
     return digest.hexdigest()
+
+
+def _source_tree_revision(source_root: Path) -> str:
+    """Hash loaded code and restart-sensitive assets for drift detection."""
+    return _revision_digest(_runtime_revision_paths(source_root))
+
+
+def _host_adapter_revision_paths(source_root: Path) -> list[tuple[str, Path]]:
+    """Return host manifests, launcher, context, and skill assets."""
+    source_root = Path(source_root).resolve()
+    plugin_root = source_root.parent if source_root.name == "vector_lake" else source_root
+    if plugin_root == source_root:
+        return []
+    paths: dict[str, Path] = {}
+    for filename in (*_HOST_ADAPTER_REVISION_ROOT_FILES, *_HOST_ADAPTER_REVISION_FILES):
+        candidate = plugin_root / filename
+        if candidate.is_file():
+            paths[candidate.relative_to(plugin_root).as_posix()] = candidate
+    for dirname in _HOST_ADAPTER_REVISION_ASSET_DIRS:
+        asset_root = plugin_root / dirname
+        if not asset_root.is_dir():
+            continue
+        for candidate in asset_root.rglob("*"):
+            if candidate.is_file():
+                paths[candidate.relative_to(plugin_root).as_posix()] = candidate
+    return sorted(paths.items())
+
+
+def _host_adapter_revision(source_root: Path) -> str:
+    return _revision_digest(_host_adapter_revision_paths(source_root))
 
 
 @dataclass(frozen=True)
@@ -713,6 +752,7 @@ class MCPRuntimeGuard:
             self.source_root
         )
         self.loaded_revision = _source_tree_revision(self.source_root)
+        self.loaded_host_adapter_revision = _host_adapter_revision(self.source_root)
         self._metadata_identity = self._revision_inventory.metadata_identity
         self._current_revision = self.loaded_revision
         now = time.monotonic()
@@ -935,6 +975,14 @@ class ReloadAwareFastMCP(FastMCP):
             max_workers=heavy_worker_count,
             thread_name_prefix="vector-lake-mcp-heavy",
         )
+        self._control_worker_count = 1
+        self._control_queue_capacity = 1
+        self._control_slots = threading.BoundedSemaphore(2)
+        self._control_inflight = 0
+        self._control_executor = _DaemonThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="vector-lake-mcp-control",
+        )
         self._lane_metrics_lock = threading.Lock()
         self._lane_metrics = {
             lane: {
@@ -948,7 +996,7 @@ class ReloadAwareFastMCP(FastMCP):
                 "execution_seconds_total": 0.0,
                 "execution_seconds_max": 0.0,
             }
-            for lane in ("fast", "heavy")
+            for lane in ("fast", "heavy", "control")
         }
         self._executor_shutdown_lock = threading.Lock()
         self._executor_shutdown_started = False
@@ -958,6 +1006,9 @@ class ReloadAwareFastMCP(FastMCP):
         )
         self._heavy_executor_finalizer = weakref.finalize(
             self, _finalize_blocking_executor, self._heavy_executor
+        )
+        self._control_executor_finalizer = weakref.finalize(
+            self, _finalize_blocking_executor, self._control_executor
         )
 
     @staticmethod
@@ -1163,6 +1214,54 @@ class ReloadAwareFastMCP(FastMCP):
             )
         return self._submit_admitted_heavy_call(call)
 
+    def _submit_admitted_control_call(self, call):
+        released = False
+
+        def release_slot():
+            nonlocal released
+            with self._executor_shutdown_lock:
+                if released:
+                    return
+                released = True
+                self._control_inflight -= 1
+            self._control_slots.release()
+
+        with self._executor_shutdown_lock:
+            if self._executor_shutdown_started:
+                self._control_slots.release()
+                raise RuntimeError("Vector Lake MCP server is shutting down")
+            self._control_inflight += 1
+            try:
+                return self._control_executor.submit_tracked(
+                    self._observed_lane_call("control", call),
+                    release_slot,
+                )
+            except BaseException:
+                self._control_inflight -= 1
+                self._control_slots.release()
+                raise
+
+    async def _acquire_control_slot(
+        self,
+        operation: CancellationOperation | None = None,
+    ) -> None:
+        deadline = time.monotonic() + self._blocking_admission_timeout
+        while True:
+            self._raise_if_operation_deadline_expired(operation)
+            self._assert_accepting_calls()
+            if self._control_slots.acquire(blocking=False):
+                return
+            if time.monotonic() >= deadline:
+                self._record_admission_rejection("control")
+                raise RuntimeError(
+                    "Vector Lake MCP control executor is saturated; retry later; "
+                    f"retry_after_seconds={self._blocking_admission_timeout:.3f}; "
+                    "lane=control"
+                )
+            await asyncio.sleep(
+                min(0.01, max(0.001, deadline - time.monotonic()))
+            )
+
     async def _acquire_blocking_slot(
         self,
         operation: CancellationOperation | None = None,
@@ -1295,6 +1394,18 @@ class ReloadAwareFastMCP(FastMCP):
                 )
             raise
 
+    async def _run_control_call(
+        self,
+        call,
+        operation: CancellationOperation | None = None,
+    ):
+        return await self._run_executor_call(
+            call,
+            operation=operation,
+            acquire_slot=self._acquire_control_slot,
+            submit_call=self._submit_admitted_control_call,
+        )
+
     async def _run_blocking_call(
         self,
         call,
@@ -1322,11 +1433,13 @@ class ReloadAwareFastMCP(FastMCP):
     def blocking_executor_status(self) -> dict:
         executor_status = self._blocking_executor.status_snapshot()
         heavy_executor_status = self._heavy_executor.status_snapshot()
+        control_executor_status = self._control_executor.status_snapshot()
         with self._executor_shutdown_lock:
             shutdown_started = self._executor_shutdown_started
             inflight = self._blocking_inflight
             timed_out = self._executor_shutdown_timed_out
             heavy_inflight = self._heavy_inflight
+            control_inflight = self._control_inflight
         fast_lane = {
             "workers": self._blocking_worker_count,
             "queue_capacity": self._blocking_queue_capacity,
@@ -1357,12 +1470,30 @@ class ReloadAwareFastMCP(FastMCP):
             "shutdown_timed_out": timed_out,
             "metrics": self._lane_metrics_snapshot("heavy"),
         }
+        control_lane = {
+            "workers": self._control_worker_count,
+            "queue_capacity": self._control_queue_capacity,
+            "inflight": control_inflight,
+            "queued_items": control_executor_status["queued_items"],
+            "admission_timeout_seconds": self._blocking_admission_timeout,
+            "shutdown_timeout_seconds": self._blocking_shutdown_timeout,
+            "workers_daemon": control_executor_status["workers_daemon"],
+            "running_workers": control_executor_status["running_workers"],
+            "shutdown_started": shutdown_started,
+            "shutdown_completed": shutdown_started
+            and control_executor_status["shutdown_completed"],
+            "shutdown_timed_out": timed_out,
+            "metrics": self._lane_metrics_snapshot("control"),
+        }
         combined = dict(fast_lane)
         combined["shutdown_completed"] = (
-            fast_lane["shutdown_completed"] and heavy_lane["shutdown_completed"]
+            fast_lane["shutdown_completed"]
+            and heavy_lane["shutdown_completed"]
+            and control_lane["shutdown_completed"]
         )
         combined["fast_lane"] = fast_lane
         combined["heavy_lane"] = heavy_lane
+        combined["control_lane"] = control_lane
         return combined
 
     def cancellation_status(self, operation_id: str = "") -> dict:
@@ -1408,6 +1539,8 @@ class ReloadAwareFastMCP(FastMCP):
                 self._executor_finalizer.detach()
             if self._heavy_executor_finalizer.alive:
                 self._heavy_executor_finalizer.detach()
+            if self._control_executor_finalizer.alive:
+                self._control_executor_finalizer.detach()
         if first_shutdown or wait:
             deadline = time.monotonic() + timeout if wait else None
             fast_completed = self._blocking_executor.shutdown(
@@ -1425,7 +1558,19 @@ class ReloadAwareFastMCP(FastMCP):
                 cancel_futures=True,
                 timeout=heavy_timeout,
             )
-            if wait and not (fast_completed and heavy_completed):
+            control_timeout = (
+                max(0.0, deadline - time.monotonic())
+                if deadline is not None
+                else None
+            )
+            control_completed = self._control_executor.shutdown(
+                wait=wait,
+                cancel_futures=True,
+                timeout=control_timeout,
+            )
+            if wait and not (
+                fast_completed and heavy_completed and control_completed
+            ):
                 with self._executor_shutdown_lock:
                     self._executor_shutdown_timed_out = True
                 logging.getLogger(__name__).warning(
@@ -1441,10 +1586,14 @@ class ReloadAwareFastMCP(FastMCP):
 
                 @functools.wraps(fn)
                 async def direct_runtime_status(*fn_args, **fn_kwargs):
-                    # This endpoint performs only bounded source/status reads. Keep it
-                    # available when the single heavy-tool lane is occupied.
+                    # Keep status independent from the fast/heavy lanes without
+                    # hashing source files on the event-loop thread.
                     self._assert_accepting_calls()
-                    return fn(*fn_args, **fn_kwargs)
+                    call = functools.partial(
+                        self._invoke_blocking_tool,
+                        functools.partial(fn, *fn_args, **fn_kwargs),
+                    )
+                    return await self._run_control_call(call)
 
                 register(direct_runtime_status)
                 return fn
@@ -1469,6 +1618,12 @@ class ReloadAwareFastMCP(FastMCP):
             @functools.wraps(fn)
             async def threaded_tool(*fn_args, **fn_kwargs):
                 policy = _MCP_HEAVY_TASKS.get(fn.__name__)
+                if (
+                    fn.__name__ == "doctor_vector_lake"
+                    and str(fn_kwargs.get("mode") or "quick").strip().casefold()
+                    == "quick"
+                ):
+                    policy = None
                 lane = "heavy" if policy is not None else "fast"
                 operation = self._new_cancellation_operation(
                     tool_name=fn.__name__,
@@ -1478,6 +1633,7 @@ class ReloadAwareFastMCP(FastMCP):
                 def invoke_current_tool():
                     with bind_cancellation_operation(operation):
                         operation.mark_running()
+                        result = None
                         try:
                             cancellation_checkpoint("worker_start")
                             if fn.__name__ != "mcp_runtime_status":
@@ -1501,13 +1657,13 @@ class ReloadAwareFastMCP(FastMCP):
                                 ):
                                     cancellation_checkpoint("after_heavy_gate")
                                     result = fn(*fn_args, **fn_kwargs)
+                            operation.mark_completed()
+                            return result
                         except CooperativeCancellation:
                             raise
                         except BaseException as exc:
                             operation.mark_failed(exc)
                             raise
-                        operation.mark_completed()
-                        return result
 
                 call = functools.partial(
                     self._invoke_blocking_tool,
@@ -1574,8 +1730,28 @@ def _mcp_surface_status(server: FastMCP) -> dict:
 
 @mcp.tool()
 def mcp_runtime_status(operation_id: str = "") -> str:
-    """Report whether this MCP process still matches the on-disk source tree."""
+    """Report runtime staleness separately from host-adapter drift."""
     status = mcp.runtime_guard.status(force=True)
+    host_paths = _host_adapter_revision_paths(mcp.runtime_guard.source_root)
+    current_host_revision = _revision_digest(host_paths)
+    host_changed = (
+        current_host_revision
+        != mcp.runtime_guard.loaded_host_adapter_revision
+    )
+    status["runtime_revision"] = {
+        "loaded": status["loaded_revision"],
+        "current": status["current_revision"],
+        "stale": status["stale"],
+        "mcp_restart_required": status["restart_required"],
+    }
+    status["host_adapter_revision"] = {
+        "loaded": mcp.runtime_guard.loaded_host_adapter_revision,
+        "current": current_host_revision,
+        "changed_since_start": host_changed,
+        "path_count": len(host_paths),
+        "mcp_restart_required": False,
+        "host_reload_required": host_changed,
+    }
     status["blocking_executor"] = mcp.blocking_executor_status()
     status["cancellation"] = mcp.cancellation_status(operation_id)
     from vector_lake.tool_search import search_performance_status
@@ -1606,10 +1782,10 @@ def search_timeline(entity_name: str = "", sentiment: str = "", action: str = ""
         limit: Number of events to return (default 10).
     """
     return search_timeline_events(
-        entity_name=entity_name if entity_name else None,
-        sentiment=sentiment if sentiment else None,
-        action=action if action else None,
-        limit=limit
+        entity_name=entity_name,
+        sentiment=sentiment,
+        action=action,
+        limit=limit,
     )
 
 @mcp.tool()
@@ -1702,6 +1878,41 @@ def operational_memory_search_index(
 def operational_memory_cleanup(dry_run: bool = True, limit: int = 0) -> str:
     """Preview or archive known generated/template artifacts in operational memory."""
     return tools.cleanup_operational_memory(dry_run=dry_run, limit=limit)
+
+
+@mcp.tool()
+def recover_failed_mutation_outbox(
+    outbox_ids: list[int],
+    dry_run: bool = True,
+) -> str:
+    """Preview or explicitly recover exact failed mutation-outbox rows."""
+    if not outbox_ids:
+        raise ValueError("At least one outbox id is required.")
+    if len(outbox_ids) > 100:
+        raise ValueError("At most 100 outbox ids may be recovered at once.")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in outbox_ids
+    ):
+        raise ValueError("Outbox ids must be positive integers.")
+    selected_ids = sorted(set(outbox_ids))
+    from vector_lake import db_store
+
+    result = (
+        db_store.preview_failed_mutation_outbox_recovery(selected_ids)
+        if dry_run
+        else db_store.recover_failed_mutation_outbox(selected_ids)
+    )
+    return json.dumps(
+        {
+            "dry_run": dry_run,
+            "requested_ids": selected_ids,
+            **result,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 @mcp.tool()
@@ -1875,7 +2086,6 @@ def _read_payload(payload_file: str) -> str:
         allowed = False
         brain_roots = [
             Path(os.path.abspath(str(peek_subagent_brain_root()))),
-            Path(os.path.abspath(os.path.expanduser("~/.codex/brain"))),
         ]
         for root in brain_roots:
             if not lexical_path.is_relative_to(root):
@@ -2224,7 +2434,11 @@ def review_governance_list() -> str:
     return tools.review_vector_lake(action="list")
 
 @mcp.tool()
-def resolve_governance_item(item_id: str, resolution: str, payload_file: str = None) -> str:
+def resolve_governance_item(
+    item_id: str,
+    resolution: str,
+    payload_file: str | None = None,
+) -> str:
     """Resolve a governance item.
 
     Args:
@@ -2287,9 +2501,16 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
     return tools.delete_source(raw_path, dry_run=dry_run)
 
 @mcp.tool()
-def doctor_vector_lake() -> str:
-    """Validate runtime dependencies and filesystem layout health."""
-    return tools.doctor_vector_lake()
+def doctor_vector_lake(mode: str = "quick") -> str:
+    """Run bounded quick health or an explicit deep projection diagnosis."""
+    normalized_mode = str(mode or "").strip().casefold()
+    if normalized_mode == "quick":
+        from vector_lake.tool_doctor import quick_doctor_vector_lake
+
+        return quick_doctor_vector_lake()
+    if normalized_mode == "deep":
+        return tools.doctor_vector_lake()
+    raise ValueError("mode must be 'quick' or 'deep'")
 
 @mcp.tool()
 def rename_entity(old_name: str, new_name: str, dry_run: bool = True) -> str:
@@ -2398,8 +2619,8 @@ def reconcile_orphan_ingest_packets(
 
 @mcp.tool()
 def finalize_ingest(
-    files_written: list = None,
-    processed_data: dict = None,
+    files_written: list | None = None,
+    processed_data: dict | None = None,
     files_written_payload_file: str = "",
     raw_files_payload_file: str = "",
 ) -> str:
@@ -2476,15 +2697,23 @@ def auto_ingest_receipt_retention(
     )
 
 @mcp.tool()
-def visualize_vector_lake(output_dir: str = None) -> str:
+def visualize_vector_lake(output_dir: str | None = None) -> str:
     """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
     if output_dir:
-        from pathlib import Path
-        import os
-        abs_dir = Path(output_dir).resolve()
-        allowed_roots = [Path(os.path.expanduser("~/.gemini")).resolve(), Path(os.path.expanduser("~/.codex")).resolve()]
+        configured_roots = os.environ.get(
+            "VECTOR_LAKE_AGENT_SANDBOX_ROOTS", ""
+        ).strip()
+        allowed_roots = [
+            Path(value).expanduser().resolve()
+            for value in configured_roots.split(os.pathsep)
+            if value.strip() and Path(value).expanduser().is_absolute()
+        ]
+        abs_dir = Path(output_dir).expanduser().resolve()
         if not any(abs_dir.is_relative_to(root) for root in allowed_roots):
-            return "Error: Write operations must be contained within an approved agent sandbox."
+            return (
+                "Error: Write operations must be contained within an approved "
+                "agent sandbox configured by VECTOR_LAKE_AGENT_SANDBOX_ROOTS."
+            )
     return tools.visualize_vector_lake(output_dir)
 
 @mcp.tool()
@@ -2559,6 +2788,8 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
             origin="mcp_write_wiki_page",
             return_details=True,
         )
+        if not isinstance(details, dict):
+            raise RuntimeError("Mutation coordinator did not return detail fields.")
         outbox_ids = [int(value) for value in details.get("outbox_ids", [])]
         deferred = [str(value) for value in details.get("deferred", [])]
         raw_warnings = list(details.get("post_commit_warnings", []))

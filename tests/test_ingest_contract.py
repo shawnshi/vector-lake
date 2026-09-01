@@ -50,6 +50,12 @@ from vector_lake.tool_ingest import (
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
 
 
+@pytest.fixture(autouse=True)
+def _install_ingest_purpose_contract(isolated_memory):
+    """Preparation now publishes a validated local Source before enqueueing."""
+    _write_purpose_contract(isolated_memory)
+
+
 def _use_explicit_bare_index_test_seam(monkeypatch):
     """Keep ranking-only fixtures independent from the committed-pair contract."""
     monkeypatch.setattr(
@@ -85,6 +91,10 @@ def _v4_ingest_payload(
         "canonical_name": canonical_name,
         "source_hash": source_hash,
         "source_projection_hash": source_projection_hash,
+        "source_observed_at": "2026-08-31T12:00:00+00:00",
+        "attempt_id": hashlib.sha256(
+            f"{filepath}\0{file_hash}".encode("utf-8")
+        ).hexdigest()[:32],
         "integration_candidates": list(integration_candidates or []),
         "ingest_contract_version": INGEST_CONTRACT_VERSION,
         "instructions": instructions,
@@ -167,10 +177,14 @@ def test_scanner_requeues_public_md5_collision_instead_of_upgrading_marker(
         prepare_ingest_batch(batch_size=1, candidate_paths=[str(raw_path)])
     )
 
-    marker = db_store.get_connection().execute(
-        "SELECT file_hash FROM processed_files WHERE filepath = ?",
-        (str(raw_path.absolute()),),
-    ).fetchone()["file_hash"]
+    marker = (
+        db_store.get_connection()
+        .execute(
+            "SELECT file_hash FROM processed_files WHERE filepath = ?",
+            (str(raw_path.absolute()),),
+        )
+        .fetchone()["file_hash"]
+    )
     assert first.legacy_md5 == second.legacy_md5
     assert first.canonical_revision != second.canonical_revision
     assert payload["hash"] == second.canonical_revision
@@ -207,20 +221,27 @@ def test_scanner_requeues_matching_legacy_md5_marker_for_canonical_proof(
         )
     )
 
-    row = db_store.get_connection().execute(
-        "SELECT file_hash, observed_mtime_ns, observed_size "
-        "FROM processed_files WHERE filepath = ?",
-        (str(raw_path.absolute()),),
-    ).fetchone()
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT file_hash, observed_mtime_ns, observed_size "
+            "FROM processed_files WHERE filepath = ?",
+            (str(raw_path.absolute()),),
+        )
+        .fetchone()
+    )
     assert dict(row) == {
         "file_hash": snapshot.legacy_md5,
         "observed_mtime_ns": None,
         "observed_size": None,
     }
     assert payload["hash"] == snapshot.canonical_revision
-    assert db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
-    ).fetchone()[0] == 1
+    assert (
+        db_store.get_connection()
+        .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")
+        .fetchone()[0]
+        == 1
+    )
 
 
 def test_scanner_requeues_changed_bytes_behind_legacy_marker(
@@ -242,10 +263,14 @@ def test_scanner_requeues_changed_bytes_behind_legacy_marker(
 
     assert payload["hash"] == current.canonical_revision
     assert payload["hash"] != legacy.canonical_revision
-    marker = db_store.get_connection().execute(
-        "SELECT file_hash FROM processed_files WHERE filepath = ?",
-        (str(raw_path.absolute()),),
-    ).fetchone()["file_hash"]
+    marker = (
+        db_store.get_connection()
+        .execute(
+            "SELECT file_hash FROM processed_files WHERE filepath = ?",
+            (str(raw_path.absolute()),),
+        )
+        .fetchone()["file_hash"]
+    )
     assert marker == legacy.legacy_md5
 
 
@@ -262,9 +287,12 @@ def test_scanner_fails_closed_on_unknown_processed_revision(
             candidate_paths=[str(raw_path)],
         )
 
-    assert db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
-    ).fetchone()[0] == 0
+    assert (
+        db_store.get_connection()
+        .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")
+        .fetchone()[0]
+        == 0
+    )
 
 
 def test_stable_revision_rejects_reparse_escape_from_raw_root(
@@ -310,13 +338,13 @@ def test_candidate_ingest_is_path_scoped_and_nested_names_do_not_collide(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     enqueued = []
-    monkeypatch.setattr(
-        db_store,
-        "enqueue_job",
-        lambda task_type, payload: (
-            enqueued.append((task_type, payload)) or f"job-{len(enqueued)}"
-        ),
-    )
+    real_enqueue = db_store.enqueue_job
+
+    def capture_enqueue(task_type, payload):
+        enqueued.append((task_type, payload))
+        return real_enqueue(task_type, payload)
+
+    monkeypatch.setattr(db_store, "enqueue_job", capture_enqueue)
 
     prepare_ingest_batch(batch_size=2, candidate_paths=[str(left), str(right)])
 
@@ -383,9 +411,12 @@ def test_raw_inventory_stops_at_next_bounded_checkpoint_before_enqueue(
             )
 
     assert len(scanned) == 1
-    assert db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
-    ).fetchone()[0] == 0
+    assert (
+        db_store.get_connection()
+        .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")
+        .fetchone()[0]
+        == 0
+    )
     expected_reason = "client_cancelled" if trigger == "cancel" else "deadline_exceeded"
     assert operation.snapshot()["cancellation_reason"] == expected_reason
 
@@ -452,7 +483,7 @@ def test_raw_enqueue_batch_is_non_interruptible_after_atomic_entry(
         active = operation.snapshot()
         assert active["status"] == "cancellation_pending"
         assert active["atomic_phase_active"] is True
-        assert active["phase"] == "raw_ingest_enqueue"
+        assert active["phase"] == "raw_ingest_local_publication"
     finally:
         release.set()
         worker.join(timeout=10)
@@ -461,9 +492,12 @@ def test_raw_enqueue_batch_is_non_interruptible_after_atomic_entry(
     assert errors == []
     assert results == ["Successfully enqueued 2 files for ingestion."]
     assert len(calls) == 2
-    assert db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'"
-    ).fetchone()[0] == 2
+    assert (
+        db_store.get_connection()
+        .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")
+        .fetchone()[0]
+        == 2
+    )
     completed = operation.snapshot()
     assert completed["status"] == "completed_after_cancellation"
     assert completed["detached"] is True
@@ -526,9 +560,7 @@ def test_finalize_commit_is_non_interruptible_after_atomic_entry(
     def run_finalize():
         try:
             with bind_cancellation_operation(operation):
-                results.append(
-                    tool_ingest.finalize_ingest_strict([], processed_data)
-                )
+                results.append(tool_ingest.finalize_ingest_strict([], processed_data))
                 operation.mark_completed()
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
@@ -549,10 +581,14 @@ def test_finalize_commit_is_non_interruptible_after_atomic_entry(
     assert worker.is_alive() is False
     assert errors == []
     assert results[0].startswith("Successfully finalized ingestion")
-    row = db_store.get_connection().execute(
-        "SELECT status FROM jobs WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
     assert row["status"] == "finalized"
     completed = operation.snapshot()
     assert completed["status"] == "completed_after_cancellation"
@@ -569,13 +605,13 @@ def test_same_content_at_different_paths_is_tracked_independently(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("same content", encoding="utf-8")
     enqueued = []
-    monkeypatch.setattr(
-        db_store,
-        "enqueue_job",
-        lambda task_type, payload: (
-            enqueued.append((task_type, payload)) or f"job-{len(enqueued)}"
-        ),
-    )
+    real_enqueue = db_store.enqueue_job
+
+    def capture_enqueue(task_type, payload):
+        enqueued.append((task_type, payload))
+        return real_enqueue(task_type, payload)
+
+    monkeypatch.setattr(db_store, "enqueue_job", capture_enqueue)
 
     prepare_ingest_batch(batch_size=1, candidate_paths=[str(left)])
     prepare_ingest_batch(batch_size=1, candidate_paths=[str(right)])
@@ -614,9 +650,7 @@ def test_new_source_names_are_bounded_and_strictly_valid(
 ):
     raw_dir = isolated_memory / "raw"
     raw_path = (
-        raw_dir
-        / ("nested_folder_" * 8)
-        / ("very_long_source_name_" * 8 + "\u3400.txt")
+        raw_dir / ("nested_folder_" * 8) / ("very_long_source_name_" * 8 + "\u3400.txt")
     )
     raw_path.parent.mkdir(parents=True)
     raw_path.write_text("bounded", encoding="utf-8")
@@ -627,6 +661,7 @@ def test_new_source_names_are_bounded_and_strictly_valid(
     assert "__" not in name
     assert "\u3400" not in name
     tool_ingest.validate_wiki_filename(name)
+
 
 def test_external_roots_with_same_basename_get_distinct_canonical_names(
     isolated_memory,
@@ -911,12 +946,13 @@ def test_ingest_enqueue_failure_is_immediately_retryable(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_text("retryable", encoding="utf-8")
     attempts = []
+    real_enqueue = db_store.enqueue_job
 
     def flaky_enqueue(task_type, payload):
         attempts.append((task_type, payload))
         if len(attempts) == 1:
             raise RuntimeError("injected enqueue interruption")
-        return "job-retried"
+        return real_enqueue(task_type, payload)
 
     monkeypatch.setattr(db_store, "enqueue_job", flaky_enqueue)
 
@@ -1718,6 +1754,8 @@ def test_ingest_worker_does_not_overwrite_reclaimed_dispatch_packet(
         "canonical_name": "Source_Dispatch-Race.md",
         "source_hash": "",
         "source_projection_hash": "",
+        "source_observed_at": "2026-08-31T12:00:00+00:00",
+        "attempt_id": "d" * 32,
         "integration_candidates": [],
         "ingest_contract_version": INGEST_CONTRACT_VERSION,
         "instructions": "compile this source",
@@ -2200,6 +2238,10 @@ def test_ingest_worker_creates_subagent_task_packet(isolated_memory):
     assert task["metadata"]["processed_data"]["filepath"] == "raw/native.md"
     assert task["metadata"]["processed_data"]["source_hash"] == "native-source-version"
     assert task["metadata"]["processed_data"]["source_projection_hash"] == "a" * 64
+    assert task["metadata"]["processed_data"]["source_observed_at"] == (
+        "2026-08-31T12:00:00+00:00"
+    )
+    assert task["metadata"]["processed_data"]["attempt_id"] == payload["attempt_id"]
     assert task["metadata"]["processed_data"]["integration_candidates"] == []
     assert (
         task["metadata"]["processed_data"]["ingest_contract_version"]
@@ -2215,6 +2257,9 @@ def test_ingest_worker_creates_subagent_task_packet(isolated_memory):
     assert claimed_processed["lease_owner"] == claimed["lease_owner"]
     assert claimed_processed["lease_token"] == claimed["lease_token"]
     assert claimed_processed["lease_generation"] == claimed["lease_generation"]
+    assert tool_ingest._auto_source_page(claimed_processed) == (
+        tool_ingest._auto_source_page(payload)
+    )
     import os
 
     os.remove(task_path)
@@ -2288,10 +2333,14 @@ def test_v4_invalid_nested_source_name_migrates_to_v5(
 
     migrated = tool_ingest.requeue_legacy_ingest_jobs()
 
-    row = db_store.get_connection().execute(
-        "SELECT status, payload FROM jobs WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, payload FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
     refreshed = json.loads(row["payload"])
     assert migrated == 1
     assert row["status"] == "queued"
@@ -2299,6 +2348,7 @@ def test_v4_invalid_nested_source_name_migrates_to_v5(
     assert refreshed["canonical_name"] != payload["canonical_name"]
     assert "__" not in refreshed["canonical_name"]
     tool_ingest.validate_wiki_filename(refreshed["canonical_name"])
+
 
 def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
     isolated_memory,
@@ -2344,6 +2394,8 @@ def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
                 "canonical_name": f"Source_Current-Batch-{index:03d}.md",
                 "source_hash": "current-version",
                 "source_projection_hash": "",
+                "source_observed_at": "2026-08-31T12:00:00+00:00",
+                "attempt_id": f"{index + 1:032x}",
                 "integration_candidates": [],
                 "ingest_contract_version": INGEST_CONTRACT_VERSION,
                 "instructions": "current instructions",
@@ -2535,6 +2587,8 @@ def test_subagent_task_claim_uses_lease_and_can_reclaim_expired_work(isolated_me
         "canonical_name": "Source_Lease.md",
         "source_hash": "",
         "source_projection_hash": "",
+        "source_observed_at": "2026-08-31T12:00:00+00:00",
+        "attempt_id": "e" * 32,
         "integration_candidates": [],
         "ingest_contract_version": INGEST_CONTRACT_VERSION,
         "instructions": "compile this source",
@@ -2618,9 +2672,7 @@ def test_manual_claim_does_not_overlap_an_existing_live_auto_claim(isolated_memo
     db_store.init_db()
     first_id = db_store.enqueue_job(
         "ingest",
-        _v4_ingest_payload(
-            "raw/auto-live.md", "auto-live-hash", "Source_Auto-Live.md"
-        ),
+        _v4_ingest_payload("raw/auto-live.md", "auto-live-hash", "Source_Auto-Live.md"),
     )
     second_id = db_store.enqueue_job(
         "ingest",
@@ -2676,9 +2728,7 @@ def test_finalize_ingest_rejects_mismatched_job_payload(isolated_memory, monkeyp
 
     result = mcp_server.tools.finalize_ingest(
         [],
-        _claimed_processed_data(
-            payload, job_id, claim, filepath="raw/other.md"
-        ),
+        _claimed_processed_data(payload, job_id, claim, filepath="raw/other.md"),
     )
 
     row = (
@@ -2777,6 +2827,7 @@ def test_v4_payload_without_projection_baseline_is_not_claimable(isolated_memory
         == "awaiting_subagent"
     )
 
+
 def test_finalize_ingest_rejects_contract_version_not_bound_to_job_payload(
     isolated_memory, monkeypatch
 ):
@@ -2796,9 +2847,7 @@ def test_finalize_ingest_rejects_contract_version_not_bound_to_job_payload(
 
     result = mcp_server.tools.finalize_ingest(
         [],
-        _claimed_processed_data(
-            payload, job_id, claim, ingest_contract_version=1
-        ),
+        _claimed_processed_data(payload, job_id, claim, ingest_contract_version=1),
     )
 
     assert result.startswith("Error finalizing ingestion")
@@ -2889,23 +2938,35 @@ def test_legacy_md5_job_must_be_requeued_before_finalization(
         ),
     )
 
-    assert db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM processed_files WHERE filepath = ?",
-        (payload["filepath"],),
-    ).fetchone()[0] == 0
+    assert (
+        db_store.get_connection()
+        .execute(
+            "SELECT COUNT(*) FROM processed_files WHERE filepath = ?",
+            (payload["filepath"],),
+        )
+        .fetchone()[0]
+        == 0
+    )
     assert "job requeued for a fresh dispatch" in result
-    assert db_store.get_connection().execute(
-        "SELECT status FROM jobs WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()["status"] == "queued"
+    assert (
+        db_store.get_connection()
+        .execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()["status"]
+        == "queued"
+    )
     assert payload["hash"] == snapshot.legacy_md5
 
     assert tool_ingest.requeue_legacy_ingest_jobs() == 1
     refreshed = json.loads(
-        db_store.get_connection().execute(
+        db_store.get_connection()
+        .execute(
             "SELECT payload FROM jobs WHERE job_id = ?",
             (job_id,),
-        ).fetchone()["payload"]
+        )
+        .fetchone()["payload"]
     )
     assert refreshed["hash"] == snapshot.canonical_revision
 
@@ -2934,8 +2995,7 @@ def test_finalize_ingest_rejects_oversize_inline_content():
             [
                 {
                     "filename": "Concept_Oversize.md",
-                    "content": "x"
-                    * (tool_ingest._MAX_FINALIZE_INLINE_FILE_BYTES + 1),
+                    "content": "x" * (tool_ingest._MAX_FINALIZE_INLINE_FILE_BYTES + 1),
                 }
             ]
         )
@@ -2980,21 +3040,27 @@ def test_cleanup_failure_after_durable_finalize_remains_success(
         ),
     )
 
-    row = db_store.get_connection().execute(
-        "SELECT status FROM jobs WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
-    cleanup_row = db_store.get_connection().execute(
-        "SELECT status FROM ingest_task_cleanup WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    cleanup_row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status FROM ingest_task_cleanup WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
     assert result.startswith("Successfully finalized ingestion")
     assert row["status"] == "finalized"
     assert cleanup_row["status"] == "pending"
     assert task_path.exists() is True
-    assert _ingest_finalization_proven(
-        payload["filepath"], payload["hash"]
-    ) is True
+    assert _ingest_finalization_proven(payload["filepath"], payload["hash"]) is True
 
 
 def test_empty_rejected_finalize_obeys_real_unhealthy_full_write_gate(
@@ -3186,9 +3252,7 @@ def test_stale_subagent_lease_cannot_finalize_after_reclaim(
     monkeypatch.setattr(
         "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
     )
-    payload = _v4_ingest_payload(
-        "raw/fenced.md", "fenced-hash", "Source_Fenced.md"
-    )
+    payload = _v4_ingest_payload("raw/fenced.md", "fenced-hash", "Source_Fenced.md")
     job_id = db_store.enqueue_job("ingest", payload)
     db_store.mark_job_awaiting_subagent(job_id, "")
     stale = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
@@ -3663,6 +3727,40 @@ def test_standalone_ingest_cannot_overwrite_existing_source_without_queued_versi
     ).read_text(encoding="utf-8")
 
 
+def test_standalone_ingest_skips_unscoped_existing_model_page(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    existing_name = "Concept_Agentic-Automation.md"
+    execute_mutation_plan(existing_name, content=_concept_content("Agentic Automation"))
+    payload = _v4_ingest_payload(
+        "raw/standalone-collision.md",
+        "standalone-collision",
+        "Source_Standalone-Collision.md",
+    )
+    payload["integration"] = {
+        "disposition": "standalone",
+        "reason": "No approved existing target has a source-supported relation.",
+    }
+
+    files, disposition, applied_targets = tool_ingest._apply_integration_disposition(
+        [
+            {
+                "filename": payload["canonical_name"],
+                "content": _source_content(),
+            },
+            {
+                "filename": existing_name,
+                "content": _concept_content("Unauthorized Replacement"),
+            },
+        ],
+        payload,
+    )
+
+    assert disposition == "standalone"
+    assert applied_targets == set()
+    assert [item["filename"] for item in files] == [payload["canonical_name"]]
+    assert payload["_skipped_unscoped_existing_pages"] == [existing_name]
+
+
 def test_finalize_ingest_projection_cas_preserves_racing_manual_target_edit(
     isolated_memory,
     monkeypatch,
@@ -3765,7 +3863,10 @@ def test_finalize_ingest_projection_cas_preserves_racing_manual_target_edit(
     assert _ingest_finalization_proven(payload["filepath"], payload["hash"]) is False
 
 
-def test_finalize_ingest_integrates_source_and_target_atomically(isolated_memory):
+def test_finalize_ingest_integrates_source_and_target_atomically(
+    isolated_memory,
+    monkeypatch,
+):
     _write_purpose_contract(isolated_memory)
     target_content = _concept_content()
     target_path = isolated_memory / "wiki" / "Concept_Target.md"
@@ -3794,6 +3895,18 @@ def test_finalize_ingest_integrates_source_and_target_atomically(isolated_memory
     job_id = db_store.enqueue_job("ingest", payload)
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+    validation_modes = []
+    real_execute = mutation_coordinator.execute_mutation_batch
+
+    def capture_validation_mode(*args, **kwargs):
+        validation_modes.append(kwargs.get("validation_mode"))
+        return real_execute(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "execute_mutation_batch",
+        capture_validation_mode,
+    )
 
     result = mcp_server.tools.finalize_ingest(
         [{"filename": "Source_Integrated.md", "content": _source_content()}],
@@ -3822,6 +3935,7 @@ def test_finalize_ingest_integrates_source_and_target_atomically(isolated_memory
     )
 
     assert result.startswith("Successfully finalized ingestion")
+    assert validation_modes == ["schema"]
     source = (isolated_memory / "wiki" / "Source_Integrated.md").read_text(
         encoding="utf-8"
     )
@@ -3834,6 +3948,106 @@ def test_finalize_ingest_integrates_source_and_target_atomically(isolated_memory
         .fetchone()[0]
         == outbox_before + 2
     )
+
+
+def test_finalize_ingest_normalizes_model_page_and_relation_vocabulary(isolated_memory):
+    _write_purpose_contract(isolated_memory)
+    target_path = isolated_memory / "wiki" / "Concept_Target.md"
+    execute_mutation_plan("Concept_Target.md", content=_concept_content())
+    target_version = governance_store.canonical_page_versions({"Concept_Target"})[
+        "Concept_Target"
+    ]
+    target_projection_hash = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    db_store.init_db()
+    payload = _v4_ingest_payload(
+        "raw/normalized-model-output.md",
+        "normalized-model-output-hash",
+        "Source_Normalized.md",
+        integration_candidates=[
+            _integration_candidate(
+                "Concept_Target.md", target_version, target_projection_hash
+            )
+        ],
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+
+    result = mcp_server.tools.finalize_ingest(
+        [
+            {
+                "filename": "Source_Normalized.md",
+                "content": (
+                    "# Model summary\n\n"
+                    "strategic_scope: core\n"
+                    "evidence_tier: production-acceptance\n\n"
+                    "The source supplies bounded evidence for the target."
+                ),
+            }
+        ],
+        {
+            **payload,
+            "integration": {
+                "disposition": "integrated",
+                "reason": "The source supplies bounded integration evidence.",
+                "relations": [
+                    {
+                        "target": "Concept_Target.md",
+                        "target_hash": target_version,
+                        "target_projection_hash": target_projection_hash,
+                        "predicate": "documents clinical workflow integration pattern",
+                        "evidence": "The source directly supports the target mechanism.",
+                        "confidence": 0.93,
+                        "event_date": "2026-07-15",
+                        "event_tag": "clinical-workflow-integration",
+                    }
+                ],
+            },
+            "job_id": job_id,
+            "lease_owner": claim["lease_owner"],
+            "lease_token": claim["lease_token"],
+            "lease_generation": claim["lease_generation"],
+        },
+    )
+
+    assert result.startswith("Successfully finalized ingestion")
+    source = (isolated_memory / "wiki" / "Source_Normalized.md").read_text(
+        encoding="utf-8"
+    )
+    target = target_path.read_text(encoding="utf-8")
+    assert source.startswith("---\n")
+    assert "[related_to:: [[Concept_Target]]]" in source
+    assert "[2026-07-15] [Observation]" in target
+
+
+def test_model_page_normalizer_repairs_incomplete_frontmatter_and_prefix(
+    isolated_memory,
+):
+    _write_purpose_contract(isolated_memory)
+    files = tool_ingest._normalize_codex_output_pages(
+        [
+            {
+                "filename": "Ingest_Rural-Health-Update.md",
+                "content": (
+                    "---\n"
+                    "strategic_scope: core\n"
+                    "evidence_tier: primary\n"
+                    "source: Source_Test\n"
+                    "---\n\n"
+                    "# Rural health update\n\n"
+                    "A bounded event summary."
+                ),
+            }
+        ]
+    )
+
+    assert files[0]["filename"] == "Event_Rural-Health-Update.md"
+    frontmatter, body = tool_ingest.split_frontmatter(files[0]["content"])
+    assert frontmatter["id"]
+    assert frontmatter["type"] == "event"
+    assert frontmatter["sources"] == ["Source_Test"]
+    assert "## 1. 编译事实" in body
+    assert "## 2. 证据时间线" in body
 
 
 def test_integration_uses_canonical_outbox_snapshot_when_markdown_projection_is_stale(
@@ -4270,10 +4484,14 @@ def test_baseline_requeue_requires_exact_current_lease(isolated_memory):
         current_ingest_contract_version=INGEST_CONTRACT_VERSION,
     )
 
-    row = db_store.get_connection().execute(
-        "SELECT status, payload FROM jobs WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, payload FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
     assert stale is False
     assert row["status"] == "subagent_processing"
     assert json.loads(row["payload"])["ingest_contract_version"] == (
@@ -4297,16 +4515,23 @@ def test_baseline_requeue_requires_exact_current_lease(isolated_memory):
         current_ingest_contract_version=INGEST_CONTRACT_VERSION,
     )
 
-    row = db_store.get_connection().execute(
-        "SELECT status, payload, lease_owner, lease_token FROM jobs WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, payload, lease_owner, lease_token FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
     assert current is True
     assert replay is False
     assert row["status"] == "queued"
-    assert json.loads(row["payload"])["ingest_contract_version"] == 4
+    assert json.loads(row["payload"])["ingest_contract_version"] == (
+        INGEST_CONTRACT_VERSION - 1
+    )
     assert row["lease_owner"] is None
     assert row["lease_token"] is None
+
 
 def test_finalize_ingest_requeues_changed_target_baseline(isolated_memory):
     _write_purpose_contract(isolated_memory)
@@ -4362,18 +4587,25 @@ def test_finalize_ingest_requeues_changed_target_baseline(isolated_memory):
 
     assert result.startswith("Ingest baseline changed; job requeued")
     assert "target_hash is stale or missing" in result
-    row = db_store.get_connection().execute(
-        "SELECT status, payload, lease_owner, lease_token, lease_until "
-        "FROM jobs WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, payload, lease_owner, lease_token, lease_until "
+            "FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
     assert row["status"] == "queued"
-    assert json.loads(row["payload"])["ingest_contract_version"] == 4
+    assert json.loads(row["payload"])["ingest_contract_version"] == (
+        INGEST_CONTRACT_VERSION - 1
+    )
     assert row["lease_owner"] is None
     assert row["lease_token"] is None
     assert row["lease_until"] is None
     assert not (isolated_memory / "wiki" / payload["canonical_name"]).exists()
     assert _ingest_finalization_proven(payload["filepath"], payload["hash"]) is False
+
 
 def test_init_db_migrates_legacy_jobs_without_changing_payload(isolated_memory):
     path = db_store.get_db_path()
@@ -4588,19 +4820,26 @@ def test_auto_quarantine_reconcile_preview_and_cas_requeue_same_revision(
 
     preview = json.loads(reconcile_ingest_job_debt(dry_run=True, limit=0))
 
-    assert preview["counts"] == {"requeue_current": 1}
+    # Model-capability failures (output_policy) are intentionally NOT requeued:
+    # retrying them cannot succeed and would burn model tokens plus a full
+    # maintenance backup per round.  Debt reconciliation keeps them terminal.
+    assert preview["counts"] == {"leave_awaiting": 1}
     assert preview["samples"] == [
         {
             "job_id": job_id,
-            "action": "requeue_current",
-            "reason": "terminal failure",
+            "action": "leave_awaiting",
+            "reason": "current task packet still matches the raw source",
         }
     ]
-    unchanged = db_store.get_connection().execute(
-        "SELECT status, retries, result_json, lease_generation FROM jobs "
-        "WHERE job_id = ?",
-        (job_id,),
-    ).fetchone()
+    unchanged = (
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, result_json, lease_generation FROM jobs "
+            "WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
     assert dict(unchanged) == {
         "status": "failed",
         "retries": 3,
@@ -4610,7 +4849,8 @@ def test_auto_quarantine_reconcile_preview_and_cas_requeue_same_revision(
 
     applied = json.loads(reconcile_ingest_job_debt(dry_run=False, limit=0))
 
-    assert applied["applied_counts"] == {"requeue_current": 1}
+    # Output-policy failures stay terminal under debt reconciliation.
+    assert applied.get("applied_counts", {}) == {}
     recovered = dict(
         db_store.get_connection()
         .execute(
@@ -4620,20 +4860,13 @@ def test_auto_quarantine_reconcile_preview_and_cas_requeue_same_revision(
         )
         .fetchone()
     )
-    assert recovered["status"] == "queued"
-    assert recovered["retries"] == 0
-    assert recovered["result_json"] is None
-    recovered_payload = json.loads(recovered["payload"])
-    assert recovered_payload["filepath"] == payload["filepath"]
-    assert recovered_payload["hash"] == payload["hash"]
-    assert recovered["idempotency_key"] == db_store._job_idempotency_key(
-        "ingest",
-        recovered_payload,
-    )
+    assert recovered["status"] == "failed"
+    assert recovered["retries"] == 3
+    assert recovered["result_json"] == quarantined["result_json"]
     assert recovered["lease_owner"] is None
     assert recovered["lease_token"] is None
-    assert recovered["completed_at"] is None
-    assert db_store.enqueue_job("ingest", recovered_payload) == job_id
+    assert recovered["completed_at"] is not None
+    assert db_store.enqueue_job("ingest", payload) == job_id
 
 
 def test_reconcile_ingest_job_debt_deduplicates_current_raw_identity(
@@ -4741,6 +4974,7 @@ def test_reconcile_failed_legacy_name_uses_current_revision_owner(
     assert rows[owner_job]["idempotency_key"] == owner_key
     assert json.loads(rows[owner_job]["payload"]) == owner_payload
 
+
 def test_reconcile_failed_revision_blocks_multiple_effective_owners(
     isolated_memory,
 ):
@@ -4807,6 +5041,7 @@ def test_reconcile_failed_revision_blocks_multiple_effective_owners(
     assert blocked["state"] == "blocked"
     assert blocked["action"] == "blocked_revision_identity_conflict"
     assert all(rows[job_id]["status"] == "awaiting_subagent" for job_id in owner_jobs)
+
 
 def test_reconcile_failed_revision_rechecks_owner_uniqueness_at_apply(
     isolated_memory,
@@ -4884,6 +5119,7 @@ def test_reconcile_failed_revision_rechecks_owner_uniqueness_at_apply(
     assert failed["status"] == "failed"
     assert failed["retries"] == 3
     assert failed["idempotency_key"] is not None
+
 
 def test_reconcile_requeue_rechecks_revision_owner_set_at_apply(
     isolated_memory,
@@ -5045,6 +5281,7 @@ def test_reconcile_conflict_rechecks_ambiguity_at_apply(
     assert failed["idempotency_key"] is not None
     assert failed["result_json"] is None
 
+
 def test_reconcile_conflict_rechecks_exact_owner_signature_at_apply(
     isolated_memory,
     monkeypatch,
@@ -5142,6 +5379,7 @@ def test_reconcile_conflict_rechecks_exact_owner_signature_at_apply(
     assert failed["idempotency_key"] is not None
     assert failed["result_json"] is None
 
+
 def test_reconcile_conflict_signature_tracks_invalid_owner_key_changes(
     isolated_memory,
     monkeypatch,
@@ -5211,6 +5449,7 @@ def test_reconcile_conflict_signature_tracks_invalid_owner_key_changes(
     assert failed["retries"] == 3
     assert failed["idempotency_key"] is not None
     assert failed["result_json"] is None
+
 
 def test_reconcile_preview_does_not_create_missing_database(isolated_memory):
     db_path = db_store.get_db_path()
@@ -6162,6 +6401,7 @@ def test_finalize_requires_every_lease_credential(isolated_memory, missing_key):
 
     with pytest.raises(ValueError, match=missing_key):
         db_store.validate_ingest_job_finalization(job_id, processed)
+
 
 def test_explicit_private_diary_root_is_never_walked(
     isolated_memory,

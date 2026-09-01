@@ -1,4 +1,0 @@
-description = "Show the current V8 governance debt dashboard."
-prompt = """
-Please use the `get_governance_debt` tool and show the resulting dashboard to the user.
-"""

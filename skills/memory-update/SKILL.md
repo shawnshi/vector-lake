@@ -1,5 +1,5 @@
 ---
-name: memory_update
+name: memory-update
 metadata:
   version: 11.20.0
   tier: action-allowed

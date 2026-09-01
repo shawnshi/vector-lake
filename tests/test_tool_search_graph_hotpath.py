@@ -2,7 +2,7 @@ import tracemalloc
 
 import pytest
 
-from vector_lake import tool_search
+from vector_lake import db_store, tool_search
 
 
 def _legacy_graph_expansion_scores(seed_keys, weighted_edges, *, hops=2, alpha=0.85):
@@ -16,19 +16,15 @@ def _legacy_graph_expansion_scores(seed_keys, weighted_edges, *, hops=2, alpha=0
 
     scores = {key: 1.0 for key in seed_keys}
     for _ in range(hops):
-        next_scores = {
-            key: (1 - alpha) if key in seed_keys else 0.0
-            for key in scores
-        }
+        next_scores = {key: (1 - alpha) if key in seed_keys else 0.0 for key in scores}
         for node, current_score in scores.items():
             neighbors = adjacency.get(node, ())
             if neighbors:
                 total_weight = sum(weight for _, weight in neighbors)
                 for neighbor, weight in neighbors:
-                    next_scores[neighbor] = (
-                        next_scores.get(neighbor, 0.0)
-                        + alpha * current_score * (weight / total_weight)
-                    )
+                    next_scores[neighbor] = next_scores.get(
+                        neighbor, 0.0
+                    ) + alpha * current_score * (weight / total_weight)
         scores = next_scores
     return scores
 
@@ -50,9 +46,7 @@ def test_graph_expansion_preserves_legacy_two_hop_scores():
 
     expected = _legacy_graph_expansion_scores({"Seed"}, edges)
     actual = tool_search._graph_expansion_scores({"Seed"}, edges)
-    adjacency = index_snapshot.get_compact_graph_adjacency(
-        {"weighted_edges": edges}
-    )
+    adjacency = index_snapshot.get_compact_graph_adjacency({"weighted_edges": edges})
     compact = tool_search._graph_expansion_scores(
         {"Seed"},
         FailOnIteration(edges),
@@ -72,9 +66,7 @@ def test_graph_expansion_skips_invalid_total_weight_in_both_paths(weight):
     from vector_lake import index_snapshot
 
     edges = [{"source": "Seed", "target": "Invalid", "weight": weight}]
-    adjacency = index_snapshot.get_compact_graph_adjacency(
-        {"weighted_edges": edges}
-    )
+    adjacency = index_snapshot.get_compact_graph_adjacency({"weighted_edges": edges})
 
     fallback = tool_search._graph_expansion_scores({"Seed"}, edges)
     compact = tool_search._graph_expansion_scores(
@@ -107,6 +99,127 @@ def test_graph_expansion_does_not_allocate_disconnected_adjacency():
 
     assert set(scores) == {"Seed", "Neighbor"}
     assert peak_bytes < 256 * 1024
+
+
+def test_lightweight_context_uses_bounded_sqlite_projection(
+    isolated_memory,
+    monkeypatch,
+):
+    signatures = iter(
+        [
+            ("ready", "generation", 1, "digest", "canonical", 1),
+            ("ready", "generation", 1, "digest", "canonical", 2),
+        ]
+    )
+    monkeypatch.setattr(db_store, "get_connection", lambda: object())
+    monkeypatch.setattr(
+        db_store,
+        "verify_search_projection_integrity",
+        lambda _conn: {
+            "status": "ready",
+            "signature": next(signatures),
+        },
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_search_projection_generation_issue",
+        lambda _conn: None,
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_sqlite_identity_rows",
+        lambda _conn, _query, _limit: [],
+    )
+    monkeypatch.setattr(
+        db_store,
+        "search_wiki",
+        lambda _query, limit: [
+            {
+                "node_key": "Source_Seed",
+                "title": "Seed",
+                "summary": "bounded evidence",
+                "rank": -2.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "build_memory_packet",
+        lambda *_args, **_kwargs: {
+            "packet": "memory",
+            "memory_count": 1,
+            "warning_count": 0,
+            "omitted_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_load_search_index",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lightweight context must not materialize the graph index")
+        ),
+    )
+
+    context = tool_search.assemble_context(
+        "seed",
+        max_chars=12_000,
+        lightweight=True,
+    )
+
+    assert context["wiki_page_count"] == 1
+    assert "Source_Seed.md" in context["wiki_context"]
+    assert "bounded evidence" in context["wiki_context"]
+    assert context["index_summary"] == ""
+
+
+def test_lightweight_question_without_fts_hits_skips_identity_scan(
+    isolated_memory,
+    monkeypatch,
+):
+    signatures = iter(
+        [
+            ("ready", "generation", 1, "digest", "canonical", 1),
+            ("ready", "generation", 1, "digest", "canonical", 2),
+        ]
+    )
+    monkeypatch.setattr(db_store, "get_connection", lambda: object())
+    monkeypatch.setattr(
+        db_store,
+        "verify_search_projection_integrity",
+        lambda _conn: {"status": "ready", "signature": next(signatures)},
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_search_projection_generation_issue",
+        lambda _conn: None,
+    )
+    monkeypatch.setattr(db_store, "search_wiki", lambda _query, limit: [])
+    monkeypatch.setattr(
+        tool_search,
+        "_sqlite_identity_rows",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("natural-language questions must not scan identity JSON")
+        ),
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "build_memory_packet",
+        lambda *_args, **_kwargs: {
+            "packet": "memory",
+            "memory_count": 1,
+            "warning_count": 0,
+            "omitted_count": 0,
+        },
+    )
+
+    context = tool_search.assemble_context(
+        "What evidence supports a current architecture decision?",
+        max_chars=12_000,
+        lightweight=True,
+    )
+
+    assert context["wiki_page_count"] == 0
+    assert context["wiki_context"] == ""
 
 
 def test_assemble_context_reads_at_most_fifty_summary_nodes(
@@ -459,16 +572,12 @@ def test_compact_graph_cache_reuses_snapshot_without_mutating_it_and_invalidates
             "Seed": {"title": "Seed"},
             "A": {"title": "A"},
         },
-        "weighted_edges": [
-            {"source": "Seed", "target": "A", "weight": 1.0}
-        ],
+        "weighted_edges": [{"source": "Seed", "target": "A", "weight": 1.0}],
     }
     index_path.write_text(json.dumps(first_payload), encoding="utf-8")
     index_snapshot.clear_index_snapshot_cache_for_tests()
 
-    first_snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(
-        index_path
-    )
+    first_snapshot = index_snapshot.load_legacy_index_snapshot_for_migration(index_path)
     before = json.dumps(first_snapshot, sort_keys=True)
     first_adjacency = index_snapshot.get_compact_graph_adjacency(first_snapshot)
     reused_adjacency = index_snapshot.get_compact_graph_adjacency(first_snapshot)
@@ -496,9 +605,7 @@ def test_compact_graph_cache_reuses_snapshot_without_mutating_it_and_invalidates
     assert second_adjacency is not first_adjacency
     assert second_adjacency.edge_count == 2
 
-    rebuilt_first_adjacency = index_snapshot.get_compact_graph_adjacency(
-        first_snapshot
-    )
+    rebuilt_first_adjacency = index_snapshot.get_compact_graph_adjacency(first_snapshot)
     assert rebuilt_first_adjacency is not first_adjacency
 
 
@@ -571,7 +678,6 @@ def test_compact_graph_cache_builds_once_for_concurrent_readers(
     assert all(result is results[0] for result in results)
 
 
-
 def test_streaming_index_decoder_matches_stdlib_for_nested_json(
     isolated_memory,
     monkeypatch,
@@ -582,14 +688,14 @@ def test_streaming_index_decoder_matches_stdlib_for_nested_json(
 
     payload = {
         "nodes": {
-            "多语言\\\"键": {
-                "title": "换行\\n制表\\t反斜杠\\\\引号\\\"",
+            '多语言\\"键': {
+                "title": '换行\\n制表\\t反斜杠\\\\引号\\"',
                 "values": [None, True, False, -7, 1.25, 6.02e23],
                 "nested": {"empty_object": {}, "empty_list": []},
             }
         },
         "weighted_edges": [
-            {"source": "多语言\\\"键", "target": "Other", "weight": 0.75}
+            {"source": '多语言\\"键', "target": "Other", "weight": 0.75}
         ],
     }
     index_path = isolated_memory / "wiki" / "index.json"
@@ -606,7 +712,7 @@ def test_streaming_index_decoder_matches_stdlib_for_nested_json(
     assert snapshot == payload
     assert isinstance(snapshot, index_snapshot.FrozenDict)
     assert isinstance(
-        snapshot["nodes"]["多语言\\\"键"]["values"],
+        snapshot["nodes"]['多语言\\"键']["values"],
         index_snapshot.FrozenList,
     )
 
@@ -707,15 +813,9 @@ def test_streaming_decoder_preserves_stdlib_supported_nesting_depth(
 def test_stale_graph_build_does_not_retain_previous_snapshot(monkeypatch):
     from vector_lake import index_snapshot
 
-    old_snapshot = {
-        "weighted_edges": [
-            {"source": "Old", "target": "A", "weight": 1.0}
-        ]
-    }
+    old_snapshot = {"weighted_edges": [{"source": "Old", "target": "A", "weight": 1.0}]}
     current_snapshot = {
-        "weighted_edges": [
-            {"source": "Current", "target": "B", "weight": 1.0}
-        ]
+        "weighted_edges": [{"source": "Current", "target": "B", "weight": 1.0}]
     }
     real_build = index_snapshot._build_compact_graph_adjacency
 
@@ -730,9 +830,7 @@ def test_stale_graph_build_does_not_retain_previous_snapshot(monkeypatch):
 
     index_snapshot.clear_index_snapshot_cache_for_tests()
     with index_snapshot._CACHE_LOCK:
-        index_snapshot._CACHE.update(
-            {"key": ("old", 1, 1, 1), "value": old_snapshot}
-        )
+        index_snapshot._CACHE.update({"key": ("old", 1, 1, 1), "value": old_snapshot})
     monkeypatch.setattr(
         index_snapshot,
         "_build_compact_graph_adjacency",
@@ -745,7 +843,9 @@ def test_stale_graph_build_does_not_retain_previous_snapshot(monkeypatch):
     with index_snapshot._CACHE_LOCK:
         assert index_snapshot._CACHE["value"] is current_snapshot
         assert index_snapshot._GRAPH_CACHE["snapshot"] is not old_snapshot
-        assert index_snapshot._GRAPH_CACHE["edges"] is not old_snapshot["weighted_edges"]
+        assert (
+            index_snapshot._GRAPH_CACHE["edges"] is not old_snapshot["weighted_edges"]
+        )
 
 
 def test_streaming_decoder_has_stable_nesting_limit(isolated_memory):

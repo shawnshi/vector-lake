@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_mutation_coordinator import _write_purpose_contract
 from vector_lake import db_store, raw_revision, tool_ingest
+
+
+@pytest.fixture(autouse=True)
+def _install_ingest_purpose_contract(isolated_memory):
+    _write_purpose_contract(isolated_memory)
 
 
 def _configure_isolated_scan(monkeypatch) -> None:
@@ -15,11 +21,6 @@ def _configure_isolated_scan(monkeypatch) -> None:
         tool_ingest,
         "_build_ingest_instructions",
         lambda *_args: "isolated raw inventory instructions",
-    )
-    monkeypatch.setattr(
-        tool_ingest,
-        "_projection_hash_for_canonical_version",
-        lambda *_args: "a" * 64,
     )
 
 

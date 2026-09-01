@@ -770,10 +770,10 @@ def test_cached_identity_validation_ignores_unrelated_local_writes(
     calls = 0
     real_validate = db_store._validate_canonical_identity_coverage
 
-    def counted_validate(conn):
+    def counted_validate(conn, **kwargs):
         nonlocal calls
         calls += 1
-        return real_validate(conn)
+        return real_validate(conn, **kwargs)
 
     monkeypatch.setattr(
         db_store,
@@ -806,10 +806,10 @@ def test_cached_identity_validation_ignores_unrelated_cross_connection_writes(
     calls = 0
     real_validate = db_store._validate_canonical_identity_coverage
 
-    def counted_validate(conn):
+    def counted_validate(conn, **kwargs):
         nonlocal calls
         calls += 1
-        return real_validate(conn)
+        return real_validate(conn, **kwargs)
 
     monkeypatch.setattr(
         db_store,
@@ -837,10 +837,10 @@ def test_cached_identity_validation_detects_relevant_cross_connection_writes(
     calls = 0
     real_validate = db_store._validate_canonical_identity_coverage
 
-    def counted_validate(conn):
+    def counted_validate(conn, **kwargs):
         nonlocal calls
         calls += 1
-        return real_validate(conn)
+        return real_validate(conn, **kwargs)
 
     monkeypatch.setattr(
         db_store,
@@ -890,11 +890,11 @@ def test_cached_identity_validation_is_shared_across_worker_connections(
     start = threading.Barrier(2)
     real_validate = db_store._validate_canonical_identity_coverage
 
-    def counted_validate(conn):
+    def counted_validate(conn, **kwargs):
         nonlocal calls
         with calls_lock:
             calls += 1
-        return real_validate(conn)
+        return real_validate(conn, **kwargs)
 
     monkeypatch.setattr(
         db_store,
@@ -998,6 +998,32 @@ def test_identity_coverage_reports_non_object_payload_after_sql_filter(
         db_store._validate_canonical_identity_coverage(conn)
 
 
+def test_current_only_identity_validation_defers_history_to_deep_audit(
+    isolated_memory,
+):
+    db_store.init_db()
+    governance_store.apply_change_set(
+        _change_set(
+            "Concept_History-Audit-Boundary",
+            entity_id="entity_history_audit_boundary",
+            claim_id="claim_history_audit_boundary",
+        )
+    )
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE claim_versions SET data_json = '[]' "
+            "WHERE claim_id = 'claim_history_audit_boundary'"
+        )
+
+    db_store._validate_canonical_identity_coverage(
+        conn,
+        include_versions=False,
+    )
+    with pytest.raises(RuntimeError, match="identity JSON is not an object"):
+        db_store._validate_canonical_identity_coverage(conn)
+
+
 def test_cached_identity_validation_caches_only_stable_snapshot(
     isolated_memory,
     monkeypatch,
@@ -1010,6 +1036,7 @@ def test_cached_identity_validation_caches_only_stable_snapshot(
     token_after = (1, 2, (("claims", 2),))
     tokens = iter((token_before, token_after, token_after, token_after))
     coverage_calls = 0
+    coverage_modes = []
 
     monkeypatch.setattr(
         db_store,
@@ -1022,9 +1049,10 @@ def test_cached_identity_validation_caches_only_stable_snapshot(
         lambda _conn: None,
     )
 
-    def count_coverage(_conn):
+    def count_coverage(_conn, **kwargs):
         nonlocal coverage_calls
         coverage_calls += 1
+        coverage_modes.append(kwargs.get("include_versions"))
 
     monkeypatch.setattr(
         db_store,
@@ -1035,6 +1063,7 @@ def test_cached_identity_validation_caches_only_stable_snapshot(
     db_store._validate_cached_identity_state(conn)
 
     assert coverage_calls == 2
+    assert coverage_modes == [False, False]
     assert db_store._IDENTITY_VALIDATION_TOKENS[db_key] == token_after
 
 

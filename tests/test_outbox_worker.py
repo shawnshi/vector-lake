@@ -84,7 +84,7 @@ def test_watchdog_busy_gate_preserves_signal_and_does_not_claim(
 
     def hold_gate():
         with heavy_task(
-            "maintenance",
+            "projection",
             "external-holder",
             origin="pytest",
             wait_timeout_seconds=0,

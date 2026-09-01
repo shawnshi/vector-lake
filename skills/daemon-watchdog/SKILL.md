@@ -1,5 +1,5 @@
 ---
-name: daemon_watchdog
+name: daemon-watchdog
 metadata:
   version: 11.20.0
   tier: action-allowed

@@ -68,6 +68,7 @@ _EXPECTED_READONLY_DENIED_TOOLS = frozenset(
         "reconcile_ingest_tasks",
         "reconcile_orphan_ingest_packets",
         "record_claim_assessment",
+        "recover_failed_mutation_outbox",
         "remember",
         "rename_entity",
         "resolve_governance_item",

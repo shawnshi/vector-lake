@@ -1,4 +1,0 @@
-description = "Scan configured raw sources and enqueue a bounded ingest batch; this does not generate or finalize Wiki pages."
-prompt = """
-Please use the `sync_vector_lake` MCP tool from the `vector-lake-mcp` server, report the scan/enqueue receipt and remaining queue debt, and do not claim that ingestion or Wiki finalization is complete.
-"""

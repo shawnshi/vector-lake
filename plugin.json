@@ -1,3 +1,11 @@
 {
-  "name": "vector-lake"
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "vector-lake",
+  "version": "11.20.0",
+  "description": "Local file-first knowledge compiler for healthcare digitalization research.",
+  "keywords": [
+    "knowledge-compiler",
+    "healthcare-digitalization",
+    "mcp"
+  ]
 }

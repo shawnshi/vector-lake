@@ -27,9 +27,11 @@ PACKAGE_MODULE_ENTRYPOINTS = frozenset(
 )
 SUPPORTED_SCRIPT_ENTRYPOINTS = frozenset(
     {
+        "scripts/benchmark_multi_host_runtime.py",
         "scripts/compile_domain_overviews.py",
         "scripts/semantic_merge.py",
         "scripts/validate_purpose_contract.py",
+        "scripts/vector_lake_mcp.py",
     }
 )
 LEGACY_FAIL_CLOSED_ENTRYPOINTS = frozenset(
@@ -207,6 +209,7 @@ def test_storage_entrypoints_bind_packaged_runtime_authority_before_work():
         "scripts/compile_domain_overviews.py",
         "scripts/semantic_merge.py",
         "scripts/validate_purpose_contract.py",
+        "scripts/vector_lake_mcp.py",
     }
     for relative_path in authority_bound:
         source = (ROOT / relative_path).read_text(encoding="utf-8")
@@ -228,6 +231,18 @@ def test_every_release_entrypoint_compiles(relative_path):
 def test_removed_unsupported_entrypoints_are_not_packaged(relative_path):
     assert relative_path not in RELEASE_ENTRYPOINTS
     assert not (ROOT / relative_path).exists()
+
+
+def test_capacity_benchmark_help_runs_from_isolated_cwd(tmp_path):
+    result = _run_script(
+        "scripts/benchmark_multi_host_runtime.py",
+        "--help",
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode == 0, _result_detail(result)
+    assert "--max-total-rss-mib" in result.stdout
+    assert not list(tmp_path.glob("vector-lake-capacity-*"))
 
 
 def test_cli_help_runs_against_an_isolated_runtime(tmp_path):
@@ -273,6 +288,186 @@ def test_cli_fresh_shell_ignores_stale_dotenv_storage_paths(tmp_path):
     assert not stale_root.exists()
 
 
+@pytest.mark.parametrize(
+    "adapter",
+    ("codex", "agent-plugin", "gemini"),
+)
+def test_host_adapter_launches_shared_stdio_contract_without_pythonpath(
+    adapter,
+    tmp_path,
+):
+    if adapter == "codex":
+        payload = json.loads(
+            (ROOT / ".codex-plugin" / "mcp.json").read_text(encoding="utf-8")
+        )
+    elif adapter == "agent-plugin":
+        payload = json.loads((ROOT / "mcp.json").read_text(encoding="utf-8"))
+    else:
+        payload = json.loads(
+            (ROOT / "gemini-extension.json").read_text(encoding="utf-8")
+        )
+    server = payload["mcpServers"]["vector-lake-mcp"]
+    plugin_data = tmp_path / "plugin-data"
+    plugin_data.mkdir()
+    replacements = {
+        "${PLUGIN_ROOT}": str(ROOT),
+        "${PLUGIN_DATA}": str(plugin_data),
+        "${extensionPath}": str(ROOT),
+    }
+
+    def materialize(value):
+        for marker, replacement in replacements.items():
+            value = value.replace(marker, replacement)
+        return value
+
+    env, _, _ = _isolated_env(tmp_path)
+    env.pop("PYTHONPATH", None)
+    env.update(
+        {key: materialize(value) for key, value in server.get("env", {}).items()}
+    )
+    cwd = ROOT if server.get("cwd") == "." else Path(materialize(server["cwd"]))
+    args = [materialize(value) for value in server["args"]]
+
+    result = subprocess.run(
+        [sys.executable, "-B", *args],
+        cwd=cwd,
+        env=env,
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert server["command"] == "python"
+    assert result.returncode == 0, _result_detail(result)
+
+
+def test_launcher_stdio_initializes_lists_tools_and_runs_quick_doctor(tmp_path):
+    env, _, _ = _isolated_env(tmp_path)
+    env.pop("PYTHONPATH", None)
+    launcher = ROOT / "scripts" / "vector_lake_mcp.py"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-B",
+            str(launcher),
+            "--profile",
+            "default",
+            "--surface",
+            "full",
+        ],
+        cwd=tmp_path,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    def request(payload: dict, *, expect_response: bool = True) -> dict:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        if not expect_response:
+            return {}
+        assert process.stdout is not None
+        response = json.loads(process.stdout.readline())
+        assert response.get("error") is None
+        return response["result"]
+
+    try:
+        initialized = request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "release-smoke", "version": "1"},
+                },
+            }
+        )
+        request(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            },
+            expect_response=False,
+        )
+        listed = request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            }
+        )
+        called = request(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "doctor_vector_lake",
+                    "arguments": {"mode": "quick"},
+                },
+            }
+        )
+
+        assert initialized["protocolVersion"] == "2024-11-05"
+        assert len(listed["tools"]) == 64
+        doctor = json.loads(called["content"][0]["text"])
+        assert doctor["mode"] == "quick"
+        assert doctor["semantic_readiness"] == {
+            "status": "not_checked",
+            "reason": "requires_deep_doctor",
+        }
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            returncode = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            returncode = process.wait(timeout=5)
+        assert returncode == 0
+
+
+def test_cli_dotenv_loading_requires_an_explicit_absolute_file(
+    tmp_path,
+    monkeypatch,
+):
+    from vector_lake import cli_app
+
+    calls = []
+
+    class DotenvProbe:
+        @staticmethod
+        def load_dotenv(path):
+            calls.append(Path(path))
+
+    monkeypatch.setattr(cli_app, "dotenv", DotenvProbe())
+    monkeypatch.delenv("VECTOR_LAKE_ENV_FILE", raising=False)
+    cli_app._load_env()
+    assert calls == []
+
+    monkeypatch.setenv("VECTOR_LAKE_ENV_FILE", "relative.env")
+    with pytest.raises(RuntimeError, match="absolute path"):
+        cli_app._load_env()
+
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text("VECTOR_LAKE_QUERY_EMBEDDING=0\n", encoding="utf-8")
+    monkeypatch.setenv("VECTOR_LAKE_ENV_FILE", str(env_file.resolve()))
+    cli_app._load_env()
+    assert calls == [env_file.resolve()]
+
+
 def test_cli_partial_runtime_override_fails_before_storage_write(tmp_path):
     home = tmp_path / "partial-home"
     explicit_memory = tmp_path / "partial-memory"
@@ -306,16 +501,48 @@ def test_watchdog_stop_runs_against_an_isolated_runtime(tmp_path):
 def test_packaged_mcp_manifest_entrypoint_starts_and_closes_on_eof(tmp_path):
     manifest = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
     server = manifest["mcpServers"]["vector-lake-mcp"]
-    module_name = server["args"][1]
-    module_path = f"{module_name.replace('.', '/')}.py"
     env, _, _ = _isolated_env(tmp_path)
 
     assert server["command"] == "python"
-    assert server["args"] == ["-m", "vector_lake.mcp_server"]
-    assert module_path in PACKAGE_MODULE_ENTRYPOINTS
+    assert server["args"] == [
+        "scripts/vector_lake_mcp.py",
+        "--profile",
+        "default",
+        "--surface",
+        "full",
+    ]
+    assert server["cwd"] == "."
+    assert "PYTHONPATH" not in server.get("env", {})
 
     result = subprocess.run(
         [sys.executable, "-B", *server["args"]],
+        cwd=ROOT,
+        env=env,
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, _result_detail(result)
+
+
+def test_mcp_launcher_is_independent_of_cwd_and_pythonpath(tmp_path):
+    env, _, _ = _isolated_env(tmp_path)
+    env.pop("PYTHONPATH", None)
+    launcher = ROOT / "scripts" / "vector_lake_mcp.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(launcher),
+            "--profile",
+            "default",
+            "--surface",
+            "readonly",
+        ],
         cwd=tmp_path,
         env=env,
         input="",

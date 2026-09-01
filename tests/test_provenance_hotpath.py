@@ -98,7 +98,7 @@ def test_trace_uses_bounded_claims_and_referenced_labels(
     monkeypatch.setattr(
         db_store,
         "search_wiki",
-        lambda _query, limit=10: [{"node_key": "PageBoost"}],
+        lambda _query, limit=10: [{"node_key": "Concept_Boost"}],
     )
 
     def reject_full_load(*_args, **_kwargs):
@@ -107,6 +107,11 @@ def test_trace_uses_bounded_claims_and_referenced_labels(
     monkeypatch.setattr(governance_store, "load_claims", reject_full_load)
     monkeypatch.setattr(governance_store, "load_entities", reject_full_load)
     monkeypatch.setattr(governance_store, "load_sources", reject_full_load)
+    monkeypatch.setattr(
+        governance_store,
+        "initialize_meta_store",
+        lambda: reject_full_load(),
+    )
 
     trace = provenance.build_trace_for_query("alpha beta", top_k=2)
 
@@ -118,6 +123,31 @@ def test_trace_uses_bounded_claims_and_referenced_labels(
     assert trace["items"][0]["source_pages"] == ["Source_Boost.md"]
     assert trace["items"][1]["subject_entities"] == ["Text Entity"]
     assert trace["items"][1]["source_pages"] == ["Source_Text.md"]
+
+
+def test_trace_reuses_preselected_pages_without_second_search(
+    isolated_memory,
+    monkeypatch,
+):
+    _seed_trace_records()
+    monkeypatch.setattr(
+        db_store,
+        "search_wiki",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preselected trace pages must not repeat FTS search")
+        ),
+    )
+
+    trace = provenance.build_trace_for_query(
+        "alpha beta",
+        top_k=2,
+        relevant_pages={"Concept_Boost"},
+    )
+
+    assert [item["claim_id"] for item in trace["items"]] == [
+        "claim_boost",
+        "claim_text",
+    ]
 
 
 def test_canonical_store_population_check_uses_scalar_counts(
@@ -173,6 +203,52 @@ def test_trace_preserves_unicode_case_matching(isolated_memory):
     assert [claim["claim_id"] for claim in claims] == ["claim_unicode"]
 
 
+def test_search_wiki_retries_natural_language_question_with_bounded_or(
+    monkeypatch,
+):
+    matches = []
+
+    class Cursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class Connection:
+        def execute(self, _sql, args):
+            matches.append(args[0])
+            if len(matches) == 1:
+                return Cursor([])
+            return Cursor(
+                [
+                    {
+                        "node_key": "Concept_Agentic-Automation",
+                        "title": "Agentic Automation",
+                        "summary": "bounded evidence",
+                        "rank": -2.0,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(db_store, "get_connection", lambda: Connection())
+    monkeypatch.setattr(
+        "vector_lake.tokenizer_runtime.tokenize_for_fts",
+        lambda _query: "what evidence supports agentic automation in the current lake",
+    )
+
+    rows = db_store.search_wiki(
+        "What evidence supports Agentic Automation in the current lake?",
+        limit=5,
+    )
+
+    assert rows[0]["node_key"] == "Concept_Agentic-Automation"
+    assert matches == [
+        '"what" "evidence" "supports" "agentic" "automation" "in" "the" "current" "lake"',
+        '"agentic" OR "automation"',
+    ]
+
+
 def test_trace_ties_use_stable_claim_id_not_insertion_rowid(isolated_memory):
     db_store.init_db()
     for claim_id in ("claim_z", "claim_a"):
@@ -189,12 +265,8 @@ def test_trace_ties_use_stable_claim_id_not_insertion_rowid(isolated_memory):
             )
         )
 
-    ascii_claims = governance_store.select_trace_claims(
-        ["same"], set(), top_k=2
-    )
-    unicode_claims = governance_store.select_trace_claims(
-        ["café"], set(), top_k=2
-    )
+    ascii_claims = governance_store.select_trace_claims(["same"], set(), top_k=2)
+    unicode_claims = governance_store.select_trace_claims(["café"], set(), top_k=2)
 
     assert [claim["claim_id"] for claim in ascii_claims] == [
         "claim_a",

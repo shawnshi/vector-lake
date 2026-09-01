@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from vector_lake import db_store, governance_store
 from vector_lake.tool_timeline import (
     rebuild_timeline_events_from_claims,
@@ -164,7 +166,7 @@ def test_page_delete_only_removes_its_own_timeline_event(isolated_memory):
     assert [row["description"] for row in rows] == ["Event B"]
 
 
-def test_timeline_search_falls_back_when_projection_count_is_stale(isolated_memory):
+def test_timeline_parity_detects_stale_projection_count(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     first = _claim("claim_current", "Source_Current", "Canonical current event")
@@ -188,13 +190,14 @@ def test_timeline_search_falls_back_when_projection_count_is_stale(isolated_memo
             ),
         )
 
-    output = search_timeline_events(limit=10)
-    assert "Canonical current event" in output
-    assert "Second canonical event" in output
-    assert "Stale event" not in output
+    parity = timeline_projection_parity()
+    assert parity["canonical"] == 2
+    assert parity["projection"] == 1
+    assert parity["missing"] == 2
+    assert parity["extra"] == 1
 
 
-def test_timeline_search_rejects_equal_count_wrong_event_ids(isolated_memory):
+def test_timeline_parity_rejects_equal_count_wrong_event_ids(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     current = _claim("claim_equal", "Source_Equal", "Canonical equal-count event")
@@ -216,10 +219,12 @@ def test_timeline_search_rejects_equal_count_wrong_event_ids(isolated_memory):
             ("wrong-id", "2000-01-01", "old", "neutral", "Stale equal-count event", "", "", "", "2000-01-01"),
         )
 
-    output = search_timeline_events(limit=10)
-
-    assert "Canonical equal-count event" in output
-    assert "Stale equal-count event" not in output
+    assert timeline_projection_parity() == {
+        "canonical": 1,
+        "projection": 1,
+        "missing": 1,
+        "extra": 1,
+    }
 
 
 def test_apply_change_set_rolls_back_claim_when_timeline_projection_fails(isolated_memory, monkeypatch):
@@ -270,9 +275,6 @@ def test_timeline_parity_detects_same_id_payload_drift(isolated_memory):
         "missing": 1,
         "extra": 1,
     }
-    output = search_timeline_events(limit=10)
-    assert "Canonical payload" in output
-    assert "Stale projected payload" not in output
 
 
 def test_timeline_parity_ignores_extraction_timestamp_drift(isolated_memory):
@@ -295,7 +297,7 @@ def test_timeline_parity_ignores_extraction_timestamp_drift(isolated_memory):
     }
 
 
-def test_timeline_dirty_fallback_filters_by_canonical_entity_fields(
+def test_timeline_projection_filters_exact_and_substring_entity_fields(
     isolated_memory,
 ):
     db_store.init_db()
@@ -303,14 +305,10 @@ def test_timeline_dirty_fallback_filters_by_canonical_entity_fields(
     entity = {
         "entity_id": "entity_acme",
         "canonical_name": "Acme Hospital",
-        "title": "Acme Medical Center",
-        "page_key": "Institution_Acme",
-        "aliases": ["Acme Alias"],
-        "locator": {"page_key": "Institution_Acme"},
     }
     claim = _claim(
-        "claim_entity_fallback",
-        "Source_EntityFallback",
+        "claim_entity_filter",
+        "Source_EntityFilter",
         "Canonical event without a display name in its text",
     )
     claim["subject_entity_ids"] = [entity["entity_id"]]
@@ -327,26 +325,138 @@ def test_timeline_dirty_fallback_filters_by_canonical_entity_fields(
                 "2026-07-14T00:00:00+00:00",
             ),
         )
-    _apply_page("Source_EntityFallback", [claim])
-    with db_store.transaction():
-        conn.execute(
-            "UPDATE timeline_events SET description = ?",
-            ("Dirty projected event",),
-        )
+    _apply_page("Source_EntityFilter", [claim])
 
     for search_term in (
+        "entity_acme",
         "Acme Hospital",
-        "Acme Medical Center",
-        "Acme Alias",
-        "Institution_Acme",
-        "Source_EntityFallback",
+        "Hospital",
+        "without a display name",
     ):
         output = search_timeline_events(entity_name=search_term, limit=5)
         assert "Canonical event without a display name in its text" in output
-        assert "Dirty projected event" not in output
-        assert "no such column" not in output
 
     assert (
         search_timeline_events(entity_name="Unrelated Entity", limit=5)
         == "No timeline events found matching the criteria."
     )
+
+
+def test_timeline_search_does_not_run_full_parity_on_hot_path(
+    isolated_memory,
+    monkeypatch,
+):
+    db_store.init_db()
+    _apply_page(
+        "Source_HotPath",
+        [_claim("claim_hot_path", "Source_HotPath", "Bounded event")],
+    )
+
+    def reject_parity(*_args, **_kwargs):
+        raise AssertionError("full parity entered Timeline search hot path")
+
+    monkeypatch.setattr(
+        "vector_lake.tool_timeline.timeline_projection_parity",
+        reject_parity,
+    )
+
+    assert "Bounded event" in search_timeline_events(limit=10)
+
+
+def test_timeline_search_caps_limit_and_output_bytes(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    large_rows = [
+        (
+            f"large-{index:03d}",
+            f"2026-07-{(index % 28) + 1:02d}",
+            "large",
+            "positive",
+            "x" * 5000,
+            "entity_acme",
+            "Acme Hospital",
+            "Source_Test",
+            "2026-07-14T00:00:00+00:00",
+        )
+        for index in range(150)
+    ]
+    compact_rows = [
+        (
+            f"compact-{index:03d}",
+            f"2026-06-{(index % 28) + 1:02d}",
+            "compact",
+            "neutral",
+            "small",
+            "entity_acme",
+            "Acme Hospital",
+            "Source_Test",
+            "2026-06-14T00:00:00+00:00",
+        )
+        for index in range(150)
+    ]
+    with db_store.transaction():
+        conn.executemany(
+            "INSERT INTO timeline_events "
+            "(id, event_date, action, sentiment, description, entity_id, "
+            "entity_title, source_file, extracted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            large_rows + compact_rows,
+        )
+
+    limited = search_timeline_events(action="compact", limit=10_000)
+    output = search_timeline_events(action="large", limit=10_000)
+
+    assert limited.count("\n  -> ") == 100
+    assert len(output.encode("utf-8")) <= 64 * 1024
+    assert output.count("\n  -> ") <= 100
+    assert "Timeline output truncated" in output
+
+
+def test_timeline_rebuild_rejects_limited_apply(isolated_memory):
+    db_store.init_db()
+
+    with pytest.raises(ValueError, match="only supported.*dry-runs"):
+        rebuild_timeline_events_from_claims(dry_run=False, limit=1)
+
+
+def test_timeline_query_indexes_match_exact_filters(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    plans = {
+        "date": conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
+            "ORDER BY event_date DESC, id ASC LIMIT 10"
+        ).fetchall(),
+        "entity": conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
+            "WHERE entity_id = ? COLLATE NOCASE "
+            "ORDER BY event_date DESC, id ASC LIMIT 10",
+            ("entity_acme",),
+        ).fetchall(),
+        "title": conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
+            "WHERE entity_title = ? COLLATE NOCASE "
+            "ORDER BY event_date DESC, id ASC LIMIT 10",
+            ("Acme Hospital",),
+        ).fetchall(),
+        "sentiment": conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
+            "WHERE sentiment = ? ORDER BY event_date DESC, id ASC LIMIT 10",
+            ("positive",),
+        ).fetchall(),
+        "action": conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
+            "WHERE action = ? COLLATE NOCASE "
+            "ORDER BY event_date DESC, id ASC LIMIT 10",
+            ("release",),
+        ).fetchall(),
+    }
+    plan_text = {
+        name: " ".join(str(row[3]) for row in rows)
+        for name, rows in plans.items()
+    }
+
+    assert "idx_timeline_date_id" in plan_text["date"]
+    assert "idx_timeline_entity_date_id" in plan_text["entity"]
+    assert "idx_timeline_title_date_id" in plan_text["title"]
+    assert "idx_timeline_sentiment_date_id" in plan_text["sentiment"]
+    assert "idx_timeline_action_date_id" in plan_text["action"]

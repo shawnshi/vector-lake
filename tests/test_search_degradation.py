@@ -96,6 +96,80 @@ def test_repeated_fts_failures_are_log_rate_limited(
     assert status["backend_log_suppressed"] == {"fts5": 19}
 
 
+def test_healthy_fts_does_not_scan_index_fallback(
+    isolated_memory,
+    monkeypatch,
+):
+    _install_index(
+        isolated_memory,
+        monkeypatch,
+        {
+            "Concept_Alpha": {
+                "title": "Alpha Policy",
+                "type": "concept",
+                "status": "active",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_fts_projection_probe",
+        lambda _snapshot: (("ready",), None),
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_get_fts_search_results",
+        lambda *_args, **_kwargs: [{"node_key": "Concept_Alpha", "rank": -1.0}],
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "_lexical_fallback_scores",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("healthy FTS must not trigger corpus fallback")
+        ),
+    )
+
+    assert "**Alpha Policy**" in tool_search.search_vector_lake("alpha", top_k=5)
+
+
+def test_degraded_lexical_fallback_has_hard_node_budget(monkeypatch):
+    observed = []
+
+    class CountingNodes:
+        def __init__(self, values):
+            self.values = values
+
+        def items(self):
+            for item in self.values.items():
+                observed.append(item[0])
+                yield item
+
+    nodes = CountingNodes(
+        {
+            f"Concept_{index}": {"raw_text": "needle"}
+            for index in range(10)
+        }
+    )
+    monkeypatch.setenv("VECTOR_LAKE_LEXICAL_FALLBACK_MAX_NODES", "3")
+
+    scores = tool_search._lexical_fallback_scores(
+        {"nodes": nodes},
+        ["needle"],
+        limit=2,
+    )
+
+    assert observed == ["Concept_0", "Concept_1", "Concept_2"]
+    assert list(scores) == ["Concept_0", "Concept_1"]
+
+
+def test_degraded_fallback_cannot_reduce_exact_identity_score():
+    scores = {"Concept_Alpha": 120.0}
+
+    tool_search._merge_fallback_scores(scores, {"Concept_Alpha": 1.0})
+
+    assert scores == {"Concept_Alpha": 120.0}
+
+
 def test_vector_failure_keeps_fts_results_and_marks_degraded(
     isolated_memory,
     monkeypatch,

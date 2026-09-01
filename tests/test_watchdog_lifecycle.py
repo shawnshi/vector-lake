@@ -11,13 +11,50 @@ from types import SimpleNamespace
 import pytest
 
 from vector_lake import db_store
-from vector_lake.runtime_health import assess_runtime_health
+from vector_lake.runtime_health import _read_watchdog_status, assess_runtime_health
 from vector_lake.watchdog_status import (
     begin_watchdog_run,
     current_watchdog_run_id,
     get_status_file,
     write_status,
 )
+
+
+def _install_lightweight_local_publication(monkeypatch, tool_ingest) -> None:
+    def publish(payload, **_kwargs):
+        job_id = db_store.enqueue_job("ingest", payload)
+        return dict(payload), job_id
+
+    monkeypatch.setattr(tool_ingest, "_publish_local_source_and_enqueue", publish)
+
+
+def _write_test_purpose(memory_dir: Path) -> None:
+    (memory_dir / "purpose.md").write_text(
+        """---
+purpose_version: "12.0"
+intent_keywords: [test, ingest, raw, source]
+intent_weight_boost: 0.1
+scope:
+  core: [test, ingest, raw, source]
+  edge: [edge]
+  excluded: [excluded]
+  marketing_noise: [noise]
+evidence_tiers:
+  primary: Primary evidence
+  derived: Derived evidence
+sir_registry:
+  - id: SIR_TEST
+    status: active
+    review_after: 2099-01-01
+    signal_keywords: [test]
+synthesis_policy:
+  min_distinct_sources: 2
+  min_tension_intensity: 0.5
+---
+Test ingest purpose.
+""",
+        encoding="utf-8",
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process probe regression")
@@ -52,12 +89,12 @@ def test_watchdog_run_generation_atomically_replaces_foreign_components(
     assert status["process_id"] == os.getpid()
     assert status["expected_components"] == list(expected)
     assert set(status["components"]) == set(expected)
-    assert {
-        component["run_id"] for component in status["components"].values()
-    } == {run_id}
-    assert {
-        component["status"] for component in status["components"].values()
-    } == {"starting"}
+    assert {component["run_id"] for component in status["components"].values()} == {
+        run_id
+    }
+    assert {component["status"] for component in status["components"].values()} == {
+        "starting"
+    }
 
     foreign = dict(status)
     foreign["run_id"] = "foreign-generation"
@@ -310,6 +347,7 @@ def test_watchdog_detects_dead_worker_and_joins_remaining_workers(
     monkeypatch.setattr(ingest_worker, "start_worker", cooperative_worker)
     monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_MONITOR_SECONDS", "0.05")
     monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT", "0")
 
     watchdog_app._start_watchdog_locked(threading.Event())
 
@@ -322,6 +360,193 @@ def test_watchdog_detects_dead_worker_and_joins_remaining_workers(
         "ingest": False,
         "auto_ingest": False,
     }
+
+
+def test_watchdog_restarts_transient_scheduler_failure(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import auto_ingest_worker, ingest_worker, watchdog_app
+
+    class FakeObserver:
+        def __init__(self):
+            self.alive = False
+
+        def schedule(self, *_args, **_kwargs):
+            return None
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def stop(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            return None
+
+    supervisor_stop = threading.Event()
+    scheduler_restarted = threading.Event()
+    scheduler_attempts = 0
+    errors = []
+    missing = isolated_memory / "not-watched"
+
+    def cooperative_worker(stop_event):
+        stop_event.wait(10)
+
+    def scheduler_worker(stop_event):
+        nonlocal scheduler_attempts
+        scheduler_attempts += 1
+        if scheduler_attempts == 1:
+            return
+        scheduler_restarted.set()
+        stop_event.wait(10)
+
+    monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
+    monkeypatch.setattr(
+        watchdog_app,
+        "_watch_directories",
+        lambda *_args: {"wiki": missing, "diary": missing, "raw": missing},
+    )
+    monkeypatch.setattr(watchdog_app, "index_worker_loop", cooperative_worker)
+    monkeypatch.setattr(watchdog_app, "scheduled_lint_loop", scheduler_worker)
+    monkeypatch.setattr(ingest_worker, "start_worker", cooperative_worker)
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "start_auto_ingest_worker",
+        cooperative_worker,
+    )
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_MONITOR_SECONDS", "0.05")
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT", "1")
+
+    def run_watchdog():
+        try:
+            watchdog_app._start_watchdog_locked(supervisor_stop)
+        except BaseException as exc:
+            errors.append(exc)
+
+    watchdog_thread = threading.Thread(target=run_watchdog, daemon=False)
+    watchdog_thread.start()
+    try:
+        assert scheduler_restarted.wait(2)
+        deadline = time.monotonic() + 2
+        scheduler_status = {}
+        while time.monotonic() < deadline:
+            status = json.loads(get_status_file().read_text(encoding="utf-8"))
+            scheduler_status = status["components"]["scheduler"]
+            if scheduler_status["current_action"] == "Background worker restarted":
+                break
+            time.sleep(0.01)
+
+        assert scheduler_attempts == 2
+        assert scheduler_status["status"] == "starting"
+        assert "restart_attempt=1/1" in scheduler_status["last_error"]
+        assert watchdog_thread.is_alive()
+    finally:
+        supervisor_stop.set()
+        watchdog_thread.join(timeout=3)
+    assert not watchdog_thread.is_alive()
+    assert errors == []
+
+
+def test_watchdog_isolates_scheduler_after_restart_budget(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import auto_ingest_worker, ingest_worker, watchdog_app
+
+    class FakeObserver:
+        def __init__(self):
+            self.alive = False
+
+        def schedule(self, *_args, **_kwargs):
+            return None
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def stop(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            return None
+
+    supervisor_stop = threading.Event()
+    scheduler_attempts = 0
+    errors = []
+    missing = isolated_memory / "not-watched"
+
+    def cooperative_worker(stop_event):
+        stop_event.wait(10)
+
+    def stopped_scheduler(_stop_event):
+        nonlocal scheduler_attempts
+        scheduler_attempts += 1
+
+    monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
+    monkeypatch.setattr(
+        watchdog_app,
+        "_watch_directories",
+        lambda *_args: {"wiki": missing, "diary": missing, "raw": missing},
+    )
+    monkeypatch.setattr(watchdog_app, "index_worker_loop", cooperative_worker)
+    monkeypatch.setattr(watchdog_app, "scheduled_lint_loop", stopped_scheduler)
+    monkeypatch.setattr(ingest_worker, "start_worker", cooperative_worker)
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "start_auto_ingest_worker",
+        cooperative_worker,
+    )
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_MONITOR_SECONDS", "0.05")
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT", "1")
+    monkeypatch.delenv("VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS", raising=False)
+
+    def run_watchdog():
+        try:
+            watchdog_app._start_watchdog_locked(supervisor_stop)
+        except BaseException as exc:
+            errors.append(exc)
+
+    watchdog_thread = threading.Thread(target=run_watchdog, daemon=False)
+    watchdog_thread.start()
+    try:
+        deadline = time.monotonic() + 3
+        scheduler_status = {}
+        status_path = get_status_file()
+        while time.monotonic() < deadline:
+            if not status_path.exists():
+                time.sleep(0.01)
+                continue
+            status = _read_watchdog_status(status_path)
+            if not status:
+                time.sleep(0.01)
+                continue
+            scheduler_status = status["components"]["scheduler"]
+            if scheduler_status["current_action"] == (
+                "Non-critical background worker isolated"
+            ):
+                break
+            time.sleep(0.01)
+
+        assert scheduler_attempts == 2
+        assert scheduler_status["status"] == "error"
+        assert "restart budget exhausted" in scheduler_status["last_error"]
+        assert supervisor_stop.is_set() is False
+        assert watchdog_thread.is_alive()
+        assert watchdog_app.background_thread_health()["scheduler"] is False
+        assert watchdog_app.background_thread_health()["outbox"] is True
+    finally:
+        supervisor_stop.set()
+        watchdog_thread.join(timeout=3)
+    assert not watchdog_thread.is_alive()
+    assert errors == []
 
 
 def test_watchdog_stops_emitters_after_partial_observer_start_failure(
@@ -1414,6 +1639,9 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
     monkeypatch,
 ):
     from vector_lake import tool_ingest
+
+    _write_test_purpose(isolated_memory)
+    _install_lightweight_local_publication(monkeypatch, tool_ingest)
     from vector_lake.watchdog_app import RawWatchdogHandler
 
     raw_dir = isolated_memory / "raw"
@@ -1506,6 +1734,9 @@ def test_raw_full_scan_preserves_event_arriving_during_inventory(
     monkeypatch,
 ):
     from vector_lake import tool_ingest
+
+    _write_test_purpose(isolated_memory)
+    _install_lightweight_local_publication(monkeypatch, tool_ingest)
     from vector_lake.watchdog_app import RawWatchdogHandler
 
     raw_dir = isolated_memory / "raw"
@@ -1599,6 +1830,9 @@ def test_raw_watchdog_processes_quick_same_path_revision_and_supersedes_old_job(
     monkeypatch,
 ):
     from vector_lake import tool_ingest, watchdog_app
+
+    _write_test_purpose(isolated_memory)
+    _install_lightweight_local_publication(monkeypatch, tool_ingest)
     from vector_lake.watchdog_app import RawWatchdogHandler
 
     monkeypatch.setattr(watchdog_app, "DEBOUNCE_SECONDS", 60)
@@ -1780,8 +2014,7 @@ def test_raw_event_logging_aggregates_bursts_in_a_small_window(
     ]
     assert len(detail) == 2
     assert aggregate == [
-        "Raw source events aggregated: suppressed=2 unique_files=2 "
-        "window_seconds=0.20"
+        "Raw source events aggregated: suppressed=2 unique_files=2 window_seconds=0.20"
     ]
 
 
@@ -1915,11 +2148,7 @@ def test_watchdog_drains_auto_before_stopping_required_peer_workers(
             last_error,
             component=component,
         )
-        if (
-            drain_publish_raises
-            and state == "draining"
-            and not injected_drain_failure
-        ):
+        if drain_publish_raises and state == "draining" and not injected_drain_failure:
             injected_drain_failure = True
             raise OSError("injected drain heartbeat publish failure")
         return published
@@ -1969,9 +2198,7 @@ def test_watchdog_drains_auto_before_stopping_required_peer_workers(
         time.sleep(0.01)
     assert ("watchdog", "draining") in statuses
     drain_health = runtime_health.assess_runtime_health()
-    effective_statuses = drain_health["detail"][
-        "watchdog_component_effective_statuses"
-    ]
+    effective_statuses = drain_health["detail"]["watchdog_component_effective_statuses"]
     assert all(
         effective_statuses[component] != "stopped"
         for component in ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")

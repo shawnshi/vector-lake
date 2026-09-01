@@ -1,4 +1,0 @@
-description = "Autonomously scan graph gaps and the governance queue to formulate web research directives."
-prompt = """
-Call `trigger_autonomous_research` with `dry_run=True` to preview bounded evidence-gap directives. Resolve the effective MEMORY root from `doctor_vector_lake` and accept only `<effective MEMORY>/raw/research` as the intake; fail closed if it is missing or ambiguous. Present the directives and obtain explicit authorization before calling with `dry_run=False`, performing external research, or writing sourced findings. If ingestion is then requested, call `sync_vector_lake` and report only its scan/enqueue receipt; it does not generate or finalize Wiki pages.
-"""

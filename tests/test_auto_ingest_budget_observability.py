@@ -77,7 +77,7 @@ def test_budget_status_reports_exact_100_and_2000_reservation_boundaries(
         "launches": 100,
         "launches_remaining": 0,
         "reserved_tokens": 3_276_800,
-        "reserved_tokens_remaining": 0,
+        "reserved_tokens_remaining": 4_915_200,
         "next_release_at": (now + timedelta(minutes=30)).isoformat(),
     }
     assert report["rolling_24h"]["launches"] == 2000
@@ -99,7 +99,7 @@ def test_budget_status_rejects_task_token_limit_above_hard_ceiling(
         json.dumps(
             {
                 "schema_version": 1,
-                "max_tokens_per_task": 32769,
+                "max_tokens_per_task": 81921,
             }
         ),
         encoding="utf-8",

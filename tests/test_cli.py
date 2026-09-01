@@ -17,7 +17,7 @@ def test_cli_heavy_task_busy_returns_temporary_failure(
 
     def hold_gate():
         with heavy_task(
-            "maintenance",
+            "scan",
             "external-holder",
             origin="pytest",
             wait_timeout_seconds=0,

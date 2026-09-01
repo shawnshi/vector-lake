@@ -27,7 +27,9 @@ from vector_lake.wiki_utils import (
 )
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("vector-lake-tool-query")
 
 _QUERY_JOB_CONTRACT = "vector-lake-query-job/v1"
@@ -98,7 +100,9 @@ def _prune_query_payloads(payload_dir: Path) -> None:
                 if candidate.stat().st_mtime < cutoff:
                     candidate.unlink()
             except OSError as exc:
-                log.warning("Could not prune stale query artifact %s: %s", candidate, exc)
+                log.warning(
+                    "Could not prune stale query artifact %s: %s", candidate, exc
+                )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -106,7 +110,9 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _manifest_hash(payload: dict[str, Any]) -> str:
-    unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
+    unsigned = {
+        key: value for key, value in payload.items() if key != "manifest_sha256"
+    }
     return _sha256_text(_canonical_json(unsigned))
 
 
@@ -163,12 +169,17 @@ def prepare_query_context(query_str: str, dry_run: bool = True) -> str:
     if not dry_run:
         _require_manual_query_synthesis()
 
-    context = assemble_context(query_str)
+    context = assemble_context(query_str, lightweight=True)
     envelope = _context_envelope(query_str, context)
     envelope_text = _canonical_json(envelope)
 
     if dry_run:
-        trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
+        trace = provenance.format_trace(
+            provenance.build_trace_for_query(
+                query_str,
+                relevant_pages=set(context.get("_retrieved_page_keys") or []),
+            )
+        )
         return (
             f"[DRY RUN] Untrusted context assembled in memory ({len(envelope_text)} chars)\n\n"
             f"{envelope_text}\n\nTrace:\n{trace}"
@@ -274,12 +285,17 @@ def _validate_completion(
         str(job.get("nonce_sha256") or ""),
     ):
         raise ValueError("Query completion nonce mismatch")
-    if not hmac.compare_digest(_sha256_text(query_str), str(job.get("query_sha256") or "")):
+    if not hmac.compare_digest(
+        _sha256_text(query_str), str(job.get("query_sha256") or "")
+    ):
         raise ValueError("Query completion does not match the prepared query")
     if time.time() > float(job.get("expires_at_epoch") or 0):
         raise ValueError("Query job has expired")
     proposals = completion.get("proposals")
-    if not isinstance(proposals, list) or not 1 <= len(proposals) <= _MAX_SYNTHESIS_PAGES:
+    if (
+        not isinstance(proposals, list)
+        or not 1 <= len(proposals) <= _MAX_SYNTHESIS_PAGES
+    ):
         raise ValueError(
             f"Query completion requires 1..{_MAX_SYNTHESIS_PAGES} synthesis proposals"
         )
@@ -310,7 +326,9 @@ def _validate_completion(
         if total_chars > _MAX_SYNTHESIS_TOTAL_CHARS:
             raise ValueError("Query synthesis proposals exceed the total size limit")
         actual_hash = _sha256_text(content)
-        if not isinstance(expected_hash, str) or not _DIGEST_PATTERN.fullmatch(expected_hash):
+        if not isinstance(expected_hash, str) or not _DIGEST_PATTERN.fullmatch(
+            expected_hash
+        ):
             raise ValueError(f"Query proposal sha256 is invalid: {filename}")
         if not hmac.compare_digest(actual_hash, expected_hash):
             raise ValueError(f"Query proposal digest mismatch: {filename}")
@@ -365,20 +383,29 @@ def _stub_content(target: str) -> str:
         "## 2. 证据时间线\n\n"
         f"- [{today}] [Observation] Bounded query finalization created this seed stub.\n"
     )
-    return "---\n" + yaml.safe_dump(
-        frontmatter,
-        allow_unicode=True,
-        sort_keys=False,
-    ) + "---\n" + body
+    return (
+        "---\n"
+        + yaml.safe_dump(
+            frontmatter,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        + "---\n"
+        + body
+    )
 
 
 def _build_stub_mutations(proposals: list[dict[str, str]]) -> list[dict[str, Any]]:
     wiki_dir = get_wiki_dir()
-    existing = {
-        normalize_entity_name(path.name[:-3])
-        for path in wiki_dir.iterdir()
-        if path.is_file() and path.suffix.casefold() == ".md"
-    } if wiki_dir.exists() else set()
+    existing = (
+        {
+            normalize_entity_name(path.name[:-3])
+            for path in wiki_dir.iterdir()
+            if path.is_file() and path.suffix.casefold() == ".md"
+        }
+        if wiki_dir.exists()
+        else set()
+    )
     proposed_names = {
         normalize_entity_name(proposal["filename"][:-3]) for proposal in proposals
     }
@@ -451,7 +478,9 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
             "projection_sha256": expected_projection,
             "canonical_version": expected_version,
         }:
-            raise ValueError(f"Query synthesis baseline changed after prepare: {filename}")
+            raise ValueError(
+                f"Query synthesis baseline changed after prepare: {filename}"
+            )
         mutations.append(
             {
                 "filename": filename,
@@ -479,7 +508,9 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
         return_details=True,
     )
     if not isinstance(details, dict) or details.get("committed") is not True:
-        raise RuntimeError("Query synthesis coordinator returned no durable commit receipt")
+        raise RuntimeError(
+            "Query synthesis coordinator returned no durable commit receipt"
+        )
 
     completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     receipt_core = {

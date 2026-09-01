@@ -3,6 +3,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import sys
 
 try:
@@ -94,11 +95,15 @@ def _configure_stdout():
 
 
 def _load_env():
-    if dotenv is None:
+    configured = os.environ.get("VECTOR_LAKE_ENV_FILE", "").strip()
+    if not configured or dotenv is None:
         return
-    env_path = os.path.join(os.path.expanduser("~"), ".gemini", ".env")
-    if os.path.exists(env_path):
-        dotenv.load_dotenv(env_path)
+    env_path = Path(configured).expanduser()
+    if not env_path.is_absolute():
+        raise RuntimeError("VECTOR_LAKE_ENV_FILE must be an absolute path")
+    if not env_path.is_file():
+        raise RuntimeError(f"VECTOR_LAKE_ENV_FILE does not exist: {env_path}")
+    dotenv.load_dotenv(env_path)
 
 
 def _nonnegative_int(value: str) -> int:
@@ -944,7 +949,7 @@ Usage Examples:
 def main() -> int:
     _configure_stdout()
     try:
-        # Resolve storage authority before a legacy ~/.gemini/.env is loaded.
+        # Resolve storage authority before an explicitly selected dotenv is loaded.
         # python-dotenv defaults to override=False, so the bound pair remains
         # authoritative while unrelated credentials can still be imported.
         bootstrap_runtime_paths(caller="CLI")

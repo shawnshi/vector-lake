@@ -1,6 +1,6 @@
 # Vector Lake
 
-Vector Lake 是一个面向医疗数字化研究的本地文件优先知识编译器。它不是传统向量库，也不是一次性 RAG 后端，而是把原始材料持续编译成可审计的 Markdown wiki，并同步生成面向 Agent 的结构化运行态记忆。当前发布定位是受控 Windows/Codex 单用户、专家值守的内部研究工作台；它不宣称具备企业多租户隔离、跨租户权限治理或无人值守 GA 能力。
+Vector Lake 是一个面向医疗数字化研究的本地文件优先知识编译器。它不是传统向量库，也不是一次性 RAG 后端，而是把原始材料持续编译成可审计的 Markdown wiki，并同步生成面向 Agent 的结构化运行态记忆。当前发布定位是受控 Windows 单用户、专家值守的内部研究工作台；核心 MCP 与宿主适配分离，Codex、Pi 和 Gemini 通过独立薄适配器连接。它不宣称具备企业多租户隔离、跨租户权限治理或无人值守 GA 能力。
 
 当前架构边界：
 
@@ -45,7 +45,7 @@ graph LR
 | Canonical governance schema | `8.0` |
 | Index projection | logical `PROJECTION_CONTRACT_VERSION = 1` / physical `format_version = 2` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 63 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 40 CLI commands / 19 Codex skills / 19 Gemini command prompts |
+| Public surfaces | 64 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 40 CLI commands / 19 Agent skills |
 
 通用 `init_db()` 遇到既有 v1–v8 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6、v7 或 v8 数据库，并按受控历史链最终
@@ -169,7 +169,7 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 同时把 `enabled` 与 `allow_model_processing_raw_text` 设为 `true`；不要把示例文件本身当作
 已验证的运行配置。
 
-默认安全预算为每小时 100 项、滚动 24 小时 2000 项，单任务最多 32768 tokens；对应的最坏预留上限为每小时 3,276,800 tokens、滚动 24 小时 65,536,000 tokens。完成一次性启用与 raw-text 模型处理授权后，正常 `integrated` / `standalone` 任务固定以 Codex `-a never -s read-only` 自动运行和 finalize，不逐项再次请求确认；异常和策略拒绝仍按配置 fail-closed。以上均为成本与安全上限，不是吞吐 SLA，实际吞吐仍受单 worker、任务时长、heavy-task gate 和熔断器约束。启用或提高预算会启动独立 Codex 子进程并产生模型用量；变更后应使用一个真实的新 raw revision 做 canary，验证 `queued → awaiting_subagent → subagent_processing → finalized`、`processed_files` 当前哈希、outbox drain 与 Wiki/SQLite/index 三面一致。
+默认安全预算为每小时 100 项、滚动 24 小时 2000 项，单任务最多 81,920 tokens；对应的预留上限为每小时 8,192,000 tokens、滚动 24 小时 65,536,000 tokens（24 小时预留额度独立限制总量）。完成一次性启用与 raw-text 模型处理授权后，正常 `integrated` / `standalone` 任务固定以 Codex `-a never -s read-only` 自动运行和 finalize，不逐项再次请求确认；异常和策略拒绝仍按配置 fail-closed。以上均为成本与安全上限，不是吞吐 SLA，实际吞吐仍受单 worker、任务时长、heavy-task gate 和熔断器约束。启用或提高预算会启动独立 Codex 子进程并产生模型用量；变更后应使用一个真实的新 raw revision 做 canary，验证 `queued → awaiting_subagent → subagent_processing → finalized`、`processed_files` 当前哈希、outbox drain 与 Wiki/SQLite/index 三面一致。
 
 ### Ingest v5 task-packet contract
 
@@ -186,7 +186,7 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 - 向量保存在 SQLite `vec_embeddings`；只有同时匹配当前内容、模型、维度和 canonical generation 的 v8 metadata 才可用。provider 返回后在同一事务做 CAS，过期响应被丢弃；索引重建不隐式调用 embedding API，缺失向量由 `embedding-backfill` 断点补齐。
 - FTS 是 generation-bound 可重建投影。state、generation、行数或 deep corpus digest 不一致时，搜索绕过 FTS 并使用 committed `index.json` 的有界 lexical fallback；健康检查明确报错，重建后再恢复 FTS。
 - 同步 MCP 工具使用独立的快速读取与重型任务有界通道；快速通道默认 2 个 worker、4 个等待位，重型通道默认 1/1。源码 identity 在 5 秒 TTL 内 O(1)，到期检查 metadata，并至少每 60 秒或 metadata 变化时完整哈希；`force`/strict 仍执行精确哈希。
-- watchdog 负责 raw/Wiki 增量事件、queued ingest 分发、outbox 投影和确定性维护；raw 事件采用 750 ms trailing quiet window 与 5 s 最大等待，in-flight 到达在下一轮合并，溢出升级为补偿全扫。研究、去重、聚类及 Janitor 脚本不会被隐式启动。
+- watchdog 负责 raw/Wiki 增量事件、queued ingest 分发、outbox 投影和确定性维护；raw 事件采用 750 ms trailing quiet window 与 5 s 最大等待，in-flight 到达在下一轮合并，溢出升级为补偿全扫。后台 worker 默认最多重启 2 次；`outbox`、`ingest`、`auto_ingest` 耗尽预算后 fail-closed，非关键 `scheduler` 默认隔离并降级报告，不拖停核心观察与投影链。研究、去重、聚类及 Janitor 脚本不会被隐式启动。
 - Watchdog schema v3 心跳除时间和组件状态外还必须指向仍存活的 owner PID；新鲜但 owner 已退出的状态不会再被健康检查判为绿色。PID 重用仍不等同于完整命令行身份，部署验收必须同时核对启动路径与 run generation。
 - 长文本 MCP 工具只接受批准 sandbox 内、受大小限制的 `payload_file`；不通过 shell 拼接外部文本。
 - 删除和保留策略采用 preview/apply 分离；孤儿 GC 与备份保留还要求当前候选 fingerprint 确认。
@@ -270,34 +270,23 @@ MEMORY/
       vector_lake.db       <-- Unified SQLite Store (Entities, Claims, Graph, Timeline, Operational Memory)
 ```
 
+## Host adapters and runtime profiles
+
+稳定 MCP 入口是 `scripts/vector_lake_mcp.py --profile <name> --surface <surface>`。它先以脚本自身位置锚定插件根、加载 `runtime_profiles.json`，再导入 MCP server；因此可以从非仓库工作目录启动，也不依赖 `PYTHONPATH="."`。完整成对的进程级 `VECTOR_LAKE_MEMORY_DIR` / `VECTOR_LAKE_META_DIR` 仍优先于 profile，单边覆盖会失败关闭；profile 与进程覆盖中的两个根都必须在展开 `~` 后成为绝对路径，不能随启动工作目录漂移。`VECTOR_LAKE_ENV_FILE` 只有在显式指向绝对文件时才加载，不再猜测任何宿主的 dotenv 路径。
+
+宿主薄适配器只负责定位同一个 launcher 和声明宿主 sandbox：
+
+- **Codex**：`.codex-plugin/plugin.json` → `.codex-plugin/mcp.json`；源码树本地入口为根 `.mcp.json`。
+- **Pi / Agent Plugins 1.0**：根 `plugin.json` + `mcp.json`，使用 `${PLUGIN_ROOT}` / `${PLUGIN_DATA}`；Pi 侧需要把本仓库绝对路径加入受信的 `agentPluginPaths`，本仓库不会自动改写用户配置。
+- **Gemini 薄适配器**：`gemini-extension.json` 使用 `${extensionPath}`。旧 `commands/*.toml` slash-command 层保持删除；Gemini CLI 未参与当前机器的真实宿主冒烟，因此 manifest 与原始 stdio 合同通过不等于宿主端已验证。
+
+`mcp_runtime_status` 分别返回 `runtime_revision` 与 `host_adapter_revision`。Python、runtime profile、contract 或 template 漂移要求重启 MCP；skill、context、launcher 或宿主 manifest 漂移只要求宿主 reload，不再把正在运行的 MCP 错报为 stale。
+
 ## Commands
 
-> **Note**: `vector_lake/mcp_server.py` 提供主要 MCP 工具表面；CLI 继续作为操作、诊断和维护入口。
-> 
-> **Gemini CLI Slash Commands**: 我们已将常用功能映射为快捷指令（在聊天框输入 `/` 触发）：
-> 以下 `/...` 入口属于 Gemini CLI 的 `commands/*.toml` 兼容层。Codex 不加载插件自定义 slash command；在 Codex 中使用对应的 `$vector-lake:<skill>`，或直接要求调用 MCP 工具。两宿主各有 19 个入口，但名称并非逐项相同：Gemini 的 `governance_merge` / `governance_trace` 对应 Codex 的 `merge` / `trace`；Codex 另有 `check_duplicate` 与 `memory_update` 工作流。
->
-> - `/sync`：扫描未处理 raw revision，并把一个有界批次持久化为 ingest v5 job
-> - `/search`：语义搜索向量湖索引
-> - `/query`：深度逻辑推理与查询
-> - `/review`：检查统一治理队列
-> - `/resolve`：处理治理队列中的待办项
-> - `/audit`：合成图拓扑并执行审查
-> - `/debt`：查看图谱治理债务指标
-> - `/governance_audit`：以 dry-run 预览治理审计计划；apply 需复用当前计划指纹
-> - `/governance_debt`：读取治理债务报告
-> - `/governance_merge`：预览合并候选；确认未变集合后才允许入队
-> - `/governance_trace`：读取治理实体或断言的溯源
-> - `/lint`：默认 `auto_fix=False` 只预览；显式确认当前修复集合后才可二次调用 `auto_fix=True`
-> - `/research`：默认只预览研究缺口；外网检索、写入研究材料和非 dry-run 各需显式授权
-> - `/graph`：直接生成并刷新 3D 可视化拓扑面板
-> - `/doctor`：运行环境与依赖发现性体检；重型依赖的实际导入由对应运行路径和测试验证
-> - `/daemon_watchdog`：启动长期运行的增量监听与 ingest dispatcher
-> - `/gc`：垃圾回收与孤儿节点自动清理
-> - `/delete`：级联删除信源与切断图谱边
-> - `/timeline`：搜索与提取战略时间线事件
-> 
-> 以下底层 CLI 命令仍然保留，供人类开发者日常手动调试与状态维护。
+`vector_lake/mcp_server.py` 提供主要 MCP 工具表面；CLI 作为操作、诊断和维护入口。`skills/*/SKILL.md` 暴露 19 个工作流；Codex 或支持 Agent Plugins skills 的宿主可加载它们，也可直接要求 Agent 调用 MCP 工具。
+
+以下底层 CLI 命令供人类开发者手动调试与状态维护。
 
 基础体检：
 
@@ -353,10 +342,10 @@ python watchdog_sync.py
 ```
 
 `watchdog_sync.py` 是独立进程，不会自动继承 MCP 子进程的环境。入口会在导入
-Vector Lake 运行时前，从同目录 `.mcp.json` 补齐缺失的
-`VECTOR_LAKE_MEMORY_DIR` 与 `VECTOR_LAKE_META_DIR`；调用方成对显式设置的环境
-变量优先。只覆盖其中一个、清单缺失或路径字段无效时，入口会失败关闭，不会静默回退到旧
-`~/.gemini/MEMORY`。
+Vector Lake 运行时前，从同目录 `runtime_profiles.json` 加载默认 profile；调用方成对
+显式设置的 `VECTOR_LAKE_MEMORY_DIR` 与 `VECTOR_LAKE_META_DIR` 优先。只覆盖其中
+一个、两个根在展开 `~` 后不是绝对路径、profile 清单缺失或字段无效时，入口会失败关闭，
+不会猜测 Gemini、Codex 或 Pi 的私有目录。
 
 搜索页面层：
 
@@ -524,7 +513,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 
 `config.json` 只控制 raw 扫描范围；运行时调度使用环境变量和 SQLite 状态：
 
-- `VECTOR_LAKE_MEMORY_DIR`：覆盖默认 `~/.gemini/MEMORY` 根目录。`VECTOR_LAKE_META_DIR` 显式指定 canonical meta 目录；`VECTOR_LAKE_ALLOW_META_FALLBACK=1` 只用于显式允许既存 primary 的 fallback。
+- `VECTOR_LAKE_MEMORY_DIR`：覆盖默认 `~/MEMORY` 根目录。`VECTOR_LAKE_META_DIR` 显式指定 canonical meta 目录；`VECTOR_LAKE_ALLOW_META_FALLBACK=1` 只用于显式允许既存 primary 的 fallback。
 - `target_directories`：raw source 扫描根目录。
 - `exclude_paths`：按大小写不敏感的完整路径组件或连续组件排除，并在目录遍历阶段剪枝；不会用裸字符串误匹配相似目录名。
 - `supported_extensions`：允许扫描的扩展名。
@@ -536,7 +525,8 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_RAW_WATCH_RETRY_MAX_SECONDS`：单个不可监听目录的最大重试退避，默认 `300` 秒。
 - `VECTOR_LAKE_SUBAGENT_RUN_ID`：当前宿主运行标识；经清洗后决定 `brain/<run>/scratch/` 隔离目录。任务包路径不是 `config.json` 键。
 - `VECTOR_LAKE_INGEST_WORKER_RUN_ID`：ingest dispatcher 的 lease owner；未设置时使用主机名与 PID。`VECTOR_LAKE_INGEST_TASK_MAX_AGE_SECONDS` 控制 watchdog 回收 awaiting job 的阈值，默认 `86400` 秒。
-- `VECTOR_LAKE_PAYLOAD_ROOT`：显式覆盖 MCP `payload_file` 的批准根目录；未设置时只接受插件 `brain/<run>/scratch/` 或 `~/.codex/brain/<run>/scratch/`。
+- `VECTOR_LAKE_PAYLOAD_ROOT`：显式覆盖 MCP `payload_file` 的批准根目录；未设置时只接受活动数据库同级的 `brain/<run>/scratch/`。Codex、Pi 与 Gemini 的其他 sandbox 必须由各自薄适配器显式映射，core 不猜宿主目录。
+- `VECTOR_LAKE_AGENT_SANDBOX_ROOTS`：以 `os.pathsep` 分隔的绝对 sandbox 根；只有这些根内的显式 graph 输出目录可写。未配置时 graph 仍可使用自身默认受控输出路径，但拒绝调用方指定任意目录。
 - `VECTOR_LAKE_PAYLOAD_MAX_BYTES`：单个 MCP sandbox payload 上限，默认 `5 MiB`。
 - Timeline 重建通过 `timeline-rebuild` 命令执行，不读取 `timeline.projection_rebuild` 配置键。
 - `VECTOR_LAKE_EMBEDDING_MODEL`：embedding 模型，默认 `gemini-embedding-2`；非 embedding 文本推理不由插件调用外部模型 API。
@@ -551,7 +541,10 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_MAINTAIN`：FTS 启用时默认 `1`；Watchdog 自动推进派生索引。`VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_BATCH` / `AUTO_MAX_BATCHES` / `AUTO_WALL_SECONDS` / `AUTO_IDLE_SECONDS` 默认 `512` / `4` / `2` / `5`。
 - `VECTOR_LAKE_OPERATIONAL_MEMORY_INTEGRITY_MAX_ROWS` / `VECTOR_LAKE_OPERATIONAL_MEMORY_INTEGRITY_MAX_BYTES`：Operational Memory 冷 proof 的共享硬预算，默认 `1000000` 行 / `536870912` bytes；超过即 not-ready，不会接受未核验索引。稳定 revision 的热查询复用连接内 proof cache。
 - `VECTOR_LAKE_OPERATIONAL_MEMORY_DEGRADED_ROW_LIMIT`：索引未 ready 时可检查的 source-row 硬上限，默认 `5000`、最大 `50000`；超过返回 not-ready。`VECTOR_LAKE_OPERATIONAL_MEMORY_ALLOW_UNBOUNDED_FALLBACK=1` 是仅供受控兼容的显式高风险开关。
-- `VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS`：源码 identity TTL，默认 `5` 秒；设为 `0` 时每次检查 metadata。`VECTOR_LAKE_MCP_REVISION_FULL_HASH_SECONDS` 默认 `60` 秒；`VECTOR_LAKE_MCP_REVISION_STRICT=1` 恢复每次完整哈希。
+- `VECTOR_LAKE_RUNTIME_PROFILE` / `VECTOR_LAKE_RUNTIME_PROFILE_PATH`：选择受控运行 profile 及其清单；默认分别为 `default` 和仓库根 `runtime_profiles.json`。
+- `VECTOR_LAKE_ENV_FILE`：可选绝对 dotenv 路径；未设置时不自动搜索任何宿主目录。
+- `VECTOR_LAKE_DIARY_SYNC_SCRIPT`：可选绝对日记同步脚本；未设置时 watchdog 不触发宿主专属同步。
+- `VECTOR_LAKE_MCP_REVISION_CHECK_SECONDS`：server-runtime identity TTL，默认 `5` 秒；设为 `0` 时每次检查 metadata。`VECTOR_LAKE_MCP_REVISION_FULL_HASH_SECONDS` 默认 `60` 秒；`VECTOR_LAKE_MCP_REVISION_STRICT=1` 恢复每次完整哈希。skills 与宿主 manifests 使用独立 adapter revision，不触发 MCP stale。
 - `VECTOR_LAKE_MCP_SURFACE`：默认 `full`；`memory` 是含 `remember` 与只读自动摄取预算状态的 9-tool 记忆表面；`readonly` 是启动前按显式 21-tool allowlist 过滤的物理只读工具表面。其 SQLite handle 使用 `mode=ro` 与 `PRAGMA query_only=ON`，数据库缺失时拒绝初始化；只读 scan 仍进入有界 heavy executor，但不会获取 canonical meta 下的跨进程 heavy-task 文件门。未知值、缺失必需工具或 allowlist 漂移会拒绝启动。它不是操作系统 ACL，外部进程仍可改变被读取的目录，因此报告同时绑定 snapshot/generation 并在漂移时 fail-closed。
 - `VECTOR_LAKE_MCP_BLOCKING_WORKERS`：同步 MCP 快速通道 worker 数，默认 `2`，限制为 `1` 至 `8`；设回 `1` 可恢复旧兼容配置。
 - `VECTOR_LAKE_MCP_BLOCKING_QUEUE_CAPACITY`：快速通道等待队列容量，默认 `4`，限制为 `0` 至 `64`。
@@ -559,6 +552,8 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_MCP_HEAVY_QUEUE_CAPACITY`：重型工具独立等待队列，默认等于重型 worker 数，限制为 `0` 至 `8`。
 - `VECTOR_LAKE_MCP_ADMISSION_TIMEOUT_SECONDS`：饱和 admission 等待，默认 `0.05` 秒，限制为 `0` 至 `5` 秒；超时返回“retry later”。
 - `VECTOR_LAKE_MCP_SHUTDOWN_TIMEOUT_SECONDS`：transport 结束后的排空等待，默认 `5` 秒，限制为 `0.1` 至 `30` 秒；超时取消未开始项，已运行 daemon worker 可能在后台完成。
+- `VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT`：单个后台 worker 的进程生命周期内重启预算，默认 `2`、范围 `0..10`。
+- `VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS`：耗尽重启预算后必须拖停 watchdog 的组件；默认 `watchdog,outbox,ingest`，`auto_ingest` 始终保持 fail-closed。`scheduler` 默认非关键，可按运维要求显式加入。Runtime Health 与 Deep Doctor 共用同一分类器：可选 scheduler 隔离或陈旧只告警，显式列为必需后才阻断。
 - `VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS`：MCP 重任务等待共享跨进程门的时间，默认 `0.5` 秒，限制为 `0` 至 `5` 秒；超时返回结构化 `heavy_task_busy`。
 - `VECTOR_LAKE_MCP_TOOL_DEADLINE_SECONDS`：同步 MCP 调用的全局 deadline 上限；默认 `0` 表示不另设 deadline，合法范围为 `0..3600` 秒，非法值拒绝 server 启动。请求可用保留参数 `_vector_lake_deadline_seconds` 缩短但不能放宽该上限；排队取消不执行，已进入不可中断 publish 的操作返回可查询的 `cancellation_pending`，后台完成后记录 `completed_after_cancellation`。
 - `VECTOR_LAKE_SEMANTIC_CAMPAIGN_CURSOR_TTL_SECONDS`：只读 semantic campaign snapshot/cursor 的 sliding lease，默认 `120` 秒。相同 source/generation 的首屏并发 single-flight 复用；全局 accounted cache 上限 `384 MiB`，generation 或物理 source identity 改变会立即使旧 cursor stale。
@@ -574,7 +569,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_TOPOLOGY_WORKER_TIMEOUT_SECONDS`：Louvain 拓扑隔离进程超时，默认 `60` 秒，限制为 `5` 至 `300` 秒；失败时回退到确定性的 connected-components。
 - `VECTOR_LAKE_WAL_AUTOCHECKPOINT_PAGES`：每个可写 SQLite 连接的自动回写阈值，默认 `1000` 页；它在事务提交后生效，不限制单个大事务的峰值。
 - `VECTOR_LAKE_WAL_JOURNAL_SIZE_LIMIT_BYTES`：checkpoint/reset 后允许保留的 WAL 高水位，默认 `67108864` bytes（64 MiB）；它不是活动事务期间的硬体积上限。
-- MCP、CLI 与 watchdog 以 canonical meta 根下的 `.heavy-task.lock` 共享单容量重任务门；同线程可重入，跨线程/进程互斥，soft deadline 只告警而不抢锁。`mcp_runtime_status` 返回源码 revision、快/重通道 worker、队列、inflight、准入拒绝、排队/执行耗时、搜索阶段耗时以及 heavy-task owner 状态；它是源码漂移后仍允许调用的诊断工具。
+- MCP、CLI 与 watchdog 以 canonical meta 根下的 `.heavy-task.lock` 共享单容量重任务门；同线程可重入，跨线程/进程互斥，soft deadline 只告警而不抢锁。`mcp_runtime_status` 分开返回 server-runtime 与 host-adapter revision，并返回快/重通道 worker、队列、inflight、准入拒绝、排队/执行耗时、搜索阶段耗时以及 heavy-task owner 状态；它是源码漂移后仍允许调用的诊断工具。
 - `auto_ingest_budget_status` / `auto-ingest-budget-status` 从有界 controller ledger 与 content-free attempt receipts 返回滚动小时/24小时 launches、reserved/actual usage、remaining、next release、circuit 与 completeness；receipt 目录截断或坏记录会明确 `completeness=false`，不会给出伪精确余额。`auto_ingest_receipt_retention` / `auto-ingest-receipt-retention` 以 preview fingerprint、UTC cutoff、有限 batch 和 durable operation receipt 幂等清理过期 terminal receipts，活动或未终结记录不删除。
 - 只读 Lint/Doctor 通过 SQLite 只读事务读取已提交 WAL 状态，不以 WAL 文件非空判定失败，也不执行 checkpoint；WAL 截断继续使用要求 fingerprint 与无写入者确认的显式维护入口。
 - 所有进程通过 SQLite 滚动窗口共享 embedding RPM/TPM 预算；索引重建和增量索引不调用 embedding API。
@@ -634,8 +629,9 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `vector_lake/claim_assessment.py` | 追加式 ClaimAssessment；不产生 AcceptedFact |
 | `vector_lake/decision_registry.py` | 同步外部已验证 CriticalDecisionRegistry 并支持决策范围就绪度 |
 | `vector_lake/quality_registry.py` | 登记不可变 schema/dialect 版本与 golden dataset 评估结果 |
-| `vector_lake/mcp_server.py` | 63-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
-| `vector_lake/watchdog_app.py` | trailing-edge 增量监听、队列调度、运行态记忆索引维护与定时自愈审计 |
+| `vector_lake/mcp_server.py` | 64-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
+| `vector_lake/watchdog_app.py` | trailing-edge 增量监听、队列调度、worker 有界重启/故障隔离、运行态记忆索引维护与定时自愈审计 |
+| `scripts/benchmark_multi_host_runtime.py` | 在隔离 MEMORY 上测量多 MCP + watchdog 的启动、RSS、soak 与 runtime-status P95 |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
 | `vector_lake/db_store.py` | SQLite connection pooling, schema init logic, `_INIT_LOCK` guarding, and WAL settings |
@@ -648,7 +644,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `vector_lake/yaml_utils.py` | YAML helpers |
 | `scripts/community_clustering_daemon.py` | Deprecated/unsupported legacy Louvain operator script; disabled by default |
 | `schema.md` | Wiki 与运行态记忆契约 |
-| `commands/` | 19 个 Gemini CLI slash-command 兼容提示；Codex 提供 19 个对应工作流的 namespaced skills，但两侧名称不要求一一相同 |
+| `skills/` | 19 个 Agent workflows；技能文档引用实际 MCP 工具并保留 preview/approval 门 |
 | `contracts/cbss/` | Vector Lake 与 CBSS 的证据、权限确认、业务事件及就绪度契约 |
 
 ### Deprecated legacy operator daemons
@@ -667,12 +663,13 @@ DB、`index.json` 或 governance 访问前失败关闭。仅隔离恢复场景�
 
 ## Validation
 
-验证基线由当前命令生成，不在文档中固化测试数量或运行态数据计数：
+验证基线由当前命令生成，不在文档中固化测试数量或运行态数据计数。多宿主容量门使用隔离数据运行；最新五分钟实测与限制见 `docs/multi-host-runtime-report.md`：
 
 ```powershell
 python -m pip check
-python -m ruff check --no-cache --isolated --select E4,E7,E9,F vector_lake tests
-$env:PYTHONIOENCODING='utf-8'; python -m compileall -q vector_lake tests
+python -m ruff check --no-cache --isolated --select E4,E7,E9,F vector_lake tests scripts
+$env:PYTHONIOENCODING='utf-8'; python -m compileall -q vector_lake tests scripts
+$env:PYTHONIOENCODING='utf-8'; python scripts/benchmark_multi_host_runtime.py --duration-seconds 300
 $env:PYTHONIOENCODING='utf-8'; python -m pytest -q -p no:cacheprovider tests
 $env:PYTHONIOENCODING='utf-8'; python -m pytest --collect-only -q -p no:cacheprovider tests
 $env:PYTHONUTF8='1'; python cli.py doctor

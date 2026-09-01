@@ -9,11 +9,15 @@ def _load_json(relative_path: str) -> dict:
     return json.loads((ROOT / relative_path).read_text(encoding="utf-8"))
 
 
-def test_release_metadata_and_runtime_config_are_consistent():
+def test_release_metadata_runtime_profile_and_host_adapters_are_consistent():
+    agent_manifest = _load_json("plugin.json")
+    agent_mcp = _load_json("mcp.json")
     codex_manifest = _load_json(".codex-plugin/plugin.json")
     gemini_manifest = _load_json("gemini-extension.json")
-    codex_mcp = _load_json(".mcp.json")
+    codex_mcp = _load_json(".codex-plugin/mcp.json")
+    shared_mcp = _load_json(".mcp.json")
     compatibility_mcp = _load_json("mcp_config.json")
+    runtime_profiles = _load_json("runtime_profiles.json")
     runtime_config = _load_json("config.json")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -23,11 +27,21 @@ def test_release_metadata_and_runtime_config_are_consistent():
 
     assert package_version in readme
     assert f"# Vector Lake {base_version}" in changelog
+    assert agent_manifest["version"] == base_version
     assert gemini_manifest["version"] == base_version
-    assert gemini_manifest["runtime"]["python_version"] == ">=3.11"
-    assert gemini_manifest["mcpServers"]["vector-lake-mcp"]["cwd"] == (
-        "${extensionPath}"
+    assert codex_manifest["mcpServers"] == "./.codex-plugin/mcp.json"
+    assert agent_manifest["$schema"] == (
+        "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
     )
+    assert agent_mcp["$schema"] == (
+        "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+    )
+    assert gemini_manifest["runtime"] == {
+        "launcher": "scripts/vector_lake_mcp.py",
+        "profile": "default",
+        "python_version": ">=3.11",
+        "setup": "pip install -r requirements.txt",
+    }
     assert set(runtime_config) == {
         "target_directories",
         "exclude_paths",
@@ -36,26 +50,77 @@ def test_release_metadata_and_runtime_config_are_consistent():
     assert runtime_config["target_directories"] == []
     assert "processed_files_path" not in runtime_config
 
-    codex_env = codex_mcp["mcpServers"]["vector-lake-mcp"]["env"]
-    compatibility_env = compatibility_mcp["mcpServers"]["vector-lake-mcp"]["env"]
-    gemini_env = gemini_manifest["mcpServers"]["vector-lake-mcp"]["env"]
-    functional_env_names = (
-        "VECTOR_LAKE_MEMORY_DIR",
-        "VECTOR_LAKE_META_DIR",
-        "VECTOR_LAKE_OPERATIONAL_MEMORY_FTS",
-        "VECTOR_LAKE_DURABILITY_PROFILE",
-        "OPENBLAS_NUM_THREADS",
-        "OMP_NUM_THREADS",
+    relative_args = [
+        "scripts/vector_lake_mcp.py",
+        "--profile",
+        "default",
+        "--surface",
+        "full",
+    ]
+    codex_server = codex_mcp["mcpServers"]["vector-lake-mcp"]
+    shared_server = shared_mcp["mcpServers"]["vector-lake-mcp"]
+    compatibility_server = compatibility_mcp["mcpServers"]["vector-lake-mcp"]
+    agent_server = agent_mcp["mcpServers"]["vector-lake-mcp"]
+    gemini_server = gemini_manifest["mcpServers"]["vector-lake-mcp"]
+
+    assert (
+        codex_server["args"]
+        == shared_server["args"]
+        == compatibility_server["args"]
+        == relative_args
     )
-    for name in functional_env_names:
-        assert gemini_env[name] == codex_env[name] == compatibility_env[name]
-    assert gemini_env["VECTOR_LAKE_OPERATIONAL_MEMORY_FTS"] == "1"
-    assert gemini_env["VECTOR_LAKE_DURABILITY_PROFILE"] == "full"
+    assert (
+        codex_server["cwd"]
+        == shared_server["cwd"]
+        == compatibility_server["cwd"]
+        == "."
+    )
+    assert codex_server["env"] == {
+        "VECTOR_LAKE_PAYLOAD_ROOT": "~/.codex/brain",
+        "VECTOR_LAKE_AGENT_SANDBOX_ROOTS": "~/.codex",
+    }
+    assert agent_server["type"] == "stdio"
+    assert agent_server["args"] == [
+        "${PLUGIN_ROOT}/scripts/vector_lake_mcp.py",
+        *relative_args[1:],
+    ]
+    assert agent_server["cwd"] == "${PLUGIN_ROOT}"
+    assert gemini_server["args"] == [
+        "${extensionPath}/scripts/vector_lake_mcp.py",
+        *relative_args[1:],
+    ]
+    assert gemini_server["cwd"] == "${extensionPath}"
+    assert agent_server["env"] == {
+        "VECTOR_LAKE_PAYLOAD_ROOT": "${PLUGIN_DATA}/payloads",
+        "VECTOR_LAKE_AGENT_SANDBOX_ROOTS": "${PLUGIN_DATA}",
+    }
+    assert gemini_server["env"] == {
+        "VECTOR_LAKE_PAYLOAD_ROOT": "~/.gemini/tmp",
+        "VECTOR_LAKE_AGENT_SANDBOX_ROOTS": "~/.gemini",
+    }
+    for server in (
+        codex_server,
+        shared_server,
+        compatibility_server,
+        agent_server,
+        gemini_server,
+    ):
+        assert "PYTHONPATH" not in server.get("env", {})
+        assert "VECTOR_LAKE_MEMORY_DIR" not in server.get("env", {})
+        assert "VECTOR_LAKE_META_DIR" not in server.get("env", {})
+
+    profile_env = runtime_profiles["profiles"]["default"]["env"]
+    assert runtime_profiles["schema_version"] == 1
+    assert profile_env["VECTOR_LAKE_MEMORY_DIR"] == "~/MEMORY"
+    assert profile_env["VECTOR_LAKE_META_DIR"] == "~/MEMORY/wiki/.meta"
+    assert profile_env["VECTOR_LAKE_OPERATIONAL_MEMORY_FTS"] == "1"
+    assert profile_env["VECTOR_LAKE_DURABILITY_PROFILE"] == "full"
 
     positioning = "healthcare digitalization"
     assert positioning in codex_manifest["description"].lower()
     assert positioning in codex_manifest["interface"]["longDescription"].lower()
     assert positioning in gemini_manifest["description"].lower()
+    assert positioning in agent_manifest["description"].lower()
 
 
 def test_readonly_docs_do_not_claim_physical_zero_write():
@@ -72,16 +137,15 @@ def test_readonly_docs_do_not_claim_physical_zero_write():
     assert "CLI diagnostics and the other MCP surfaces may still publish" in context
 
 
-def test_command_documentation_matches_the_exact_gemini_inventory():
+def test_gemini_thin_adapter_does_not_restore_legacy_slash_commands():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
-    commands = sorted(path.stem for path in (ROOT / "commands").glob("*.toml"))
 
-    assert len(commands) == 19
-    for command in commands:
-        assert f"`/{command}`" in readme
-    assert "名称并非逐项相同" in readme
-    assert "`/vl_sync`" not in context
+    assert not list((ROOT / "commands").glob("*.toml"))
+    assert "Gemini thin adapter" in context
+    assert "Gemini 薄适配器" in readme
+    assert "commands/*.toml" in readme
+    assert "commands/*.toml" in context
 
 
 def test_auto_ingest_template_is_explicitly_disabled_and_unapproved():
@@ -93,9 +157,9 @@ def test_auto_ingest_template_is_explicitly_disabled_and_unapproved():
     assert template["auto_finalize_rejected"] is False
     assert template["max_tasks_per_hour"] == 100
     assert template["max_tasks_per_24h"] == 2000
-    assert template["max_tokens_per_task"] == 32768
-    assert template["max_reserved_tokens_per_hour"] == 100 * 32768
-    assert template["max_reserved_tokens_per_24h"] == 2000 * 32768
+    assert template["max_tokens_per_task"] == 81920
+    assert template["max_reserved_tokens_per_hour"] == 100 * 81920
+    assert template["max_reserved_tokens_per_24h"] == 65536000
     assert "absolute/path" in template["codex_executable"]
     for key in (
         "required_codex_sha256",

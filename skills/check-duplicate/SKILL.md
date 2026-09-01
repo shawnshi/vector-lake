@@ -1,5 +1,5 @@
 ---
-name: check_duplicate
+name: check-duplicate
 metadata:
   version: 11.20.0
   tier: read-only

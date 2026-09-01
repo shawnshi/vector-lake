@@ -4,6 +4,7 @@ import errno
 import os
 import queue
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -540,6 +541,20 @@ def test_successful_partial_overflow_batch_is_immediately_claimable(monkeypatch)
         )
         == generation
     )
+
+
+def test_reconcile_plan_acknowledgement_releases_completed_candidates():
+    events = WikiIndexEventBuffer(max_pending=1)
+    generation = events.require_full_reconcile()
+    candidates = [f"Concept_{index}.md" for index in range(100)]
+
+    assert events.install_reconcile_plan(generation, candidates, len(candidates))
+    first_batch = events.reconcile_plan_batch(generation, 25)
+    assert first_batch == candidates[:25]
+    assert events.acknowledge_reconcile_plan_batch(generation, first_batch)
+
+    assert events.reconcile_plan_remaining(generation) == (75, 0)
+    assert list(events._reconcile_plan_candidates) == candidates[25:]
 
 
 def test_quiet_reconcile_plan_scans_only_initial_and_final(monkeypatch):
@@ -1140,7 +1155,7 @@ def test_raw_watchdog_gate_busy_defers_full_scan_without_failure_count(
 
     def hold_gate():
         with heavy_task(
-            "maintenance",
+            "ingest_scan",
             "external-holder",
             origin="pytest",
             wait_timeout_seconds=0,
@@ -1234,7 +1249,12 @@ def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(
 
     stop_event = StopAfterRetry()
     # Keep this scheduled-lint retry test independent from the separate
-    # five-second operational-memory maintenance cadence.
+    # operational-memory maintenance cadence and its own heavy-task lease.
+    monkeypatch.setattr(
+        watchdog_app,
+        "maintain_operational_memory_search_for_watchdog",
+        lambda: {"deferred": False, "batches": 0},
+    )
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_IDLE_SECONDS", "300")
     monkeypatch.setattr(watchdog_app.time, "localtime", lambda: next(moments))
     monkeypatch.setattr(
@@ -1317,6 +1337,76 @@ def test_outbox_worker_yields_after_successful_batch(
             "retrying": 0,
             "failed": 0,
         },
+    )
+    monkeypatch.setattr(watchdog_app, "write_status", lambda *_args, **_kwargs: None)
+
+    watchdog_app.index_worker_loop(StopOnYield())
+
+    assert waits == [0.025]
+
+
+def test_outbox_worker_yields_after_successful_legacy_batch(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import watchdog_app
+
+    waits = []
+
+    class StopOnYield:
+        @staticmethod
+        def is_set():
+            return False
+
+        @staticmethod
+        def wait(seconds):
+            waits.append(seconds)
+            return True
+
+    class OneLegacyQueue:
+        full_reconcile_required = False
+        max_pending = 1
+
+        def __init__(self):
+            self.pending = ["Concept_Legacy.md"]
+
+        def qsize(self):
+            return len(self.pending)
+
+        def empty(self):
+            return not self.pending
+
+        def get_nowait(self):
+            if not self.pending:
+                raise queue.Empty
+            return self.pending.pop()
+
+        @staticmethod
+        def task_done():
+            return None
+
+        @staticmethod
+        def claim_full_reconcile_marker(**_kwargs):
+            return None
+
+    monkeypatch.setenv("VECTOR_LAKE_OUTBOX_BATCH_YIELD_SECONDS", "0.025")
+    monkeypatch.setattr(watchdog_app, "index_queue", OneLegacyQueue())
+    monkeypatch.setattr(db_store, "mutation_outbox_has_claimable", lambda: False)
+    monkeypatch.setattr(db_store, "close_connection", lambda: None)
+    monkeypatch.setattr(
+        watchdog_app,
+        "process_mutation_outbox_batch",
+        lambda **_kwargs: {
+            "claimed": 0,
+            "completed": 0,
+            "retrying": 0,
+            "failed": 0,
+        },
+    )
+    monkeypatch.setattr(
+        watchdog_app,
+        "process_legacy_projection_queue_batch",
+        lambda _queue, filenames: {"completed": len(filenames), "failed": 0},
     )
     monkeypatch.setattr(watchdog_app, "write_status", lambda *_args, **_kwargs: None)
 
@@ -1442,7 +1532,27 @@ def test_raw_watchdog_overflow_runs_one_complete_inventory(
     ]
 
 
-def test_diary_watchdog_runs_one_trailing_sync_for_coalesced_events(monkeypatch):
+def test_diary_watchdog_does_not_infer_a_host_specific_sync_script(monkeypatch):
+    monkeypatch.delenv("VECTOR_LAKE_DIARY_SYNC_SCRIPT", raising=False)
+
+    def forbidden_popen(*_args, **_kwargs):
+        raise AssertionError("diary sync must be explicitly configured")
+
+    monkeypatch.setattr("subprocess.Popen", forbidden_popen)
+    handler = DiaryWatchdogHandler()
+
+    handler.handle_event(
+        SimpleNamespace(is_directory=False, src_path="Diary_Alpha.md")
+    )
+
+    assert handler.sync_process is None
+    assert handler.sync_dirty is False
+
+
+def test_diary_watchdog_runs_one_trailing_sync_for_coalesced_events(
+    tmp_path,
+    monkeypatch,
+):
     class FakeProcess:
         def __init__(self):
             self.completed = threading.Event()
@@ -1463,10 +1573,9 @@ def test_diary_watchdog_runs_one_trailing_sync_for_coalesced_events(monkeypatch)
         processes.append(process)
         return process
 
-    monkeypatch.setattr(
-        "vector_lake.watchdog_app.os.path.exists",
-        lambda _path: True,
-    )
+    sync_script = tmp_path / "sync_focus.py"
+    sync_script.write_text("# test\n", encoding="utf-8")
+    monkeypatch.setenv("VECTOR_LAKE_DIARY_SYNC_SCRIPT", str(sync_script))
     monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     handler = DiaryWatchdogHandler()
@@ -1482,6 +1591,7 @@ def test_diary_watchdog_runs_one_trailing_sync_for_coalesced_events(monkeypatch)
         time.sleep(0.01)
 
     assert len(launches) == 2
+    assert launches[0][0] == [sys.executable, str(sync_script.resolve())]
     assert handler.sync_process is processes[1]
     assert handler.sync_dirty is False
     processes[1].completed.set()

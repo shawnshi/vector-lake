@@ -1,4 +1,0 @@
-description = "Run self-healing audit on the Vector Lake Wiki nodes."
-prompt = """
-Please use the `lint_vector_lake` MCP tool from the `vector-lake-mcp` server with `auto_fix=False` first and present the affected pages and issue categories. Use `auto_fix=True` only after the user explicitly approves the proposed fixes and scope, then rerun read-only lint and report fixed, remaining, and newly surfaced issues.
-"""

@@ -581,6 +581,7 @@ def heavy_task(
         allow_none=True,
         minimum=0.001,
     )
+    assert normalized_wait is not None
     return HeavyTaskLease(
         task_class=normalized_class,
         operation=normalized_operation,

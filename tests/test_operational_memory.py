@@ -70,9 +70,7 @@ def test_claim_alias_xml_is_well_formed_and_machine_readable(monkeypatch):
         lambda *_args, **_kwargs: _mixed_memory_results(),
     )
 
-    root = ET.fromstring(
-        search_vector_lake("query", mode="claim", as_xml=True)
-    )
+    root = ET.fromstring(search_vector_lake("query", mode="claim", as_xml=True))
 
     assert root.tag == "VectorLakeSearchResponse"
     assert root.find("SemanticReadinessEnvelope") is not None
@@ -149,9 +147,7 @@ class TestOperationalMemoryExactMatcher(unittest.TestCase):
 
         for case_index in range(300):
             memory = {
-                field: "".join(
-                    rng.choice(alphabet) for _ in range(rng.randint(0, 96))
-                )
+                field: "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 96)))
                 for field in fields
             }
             corpus = "".join(str(memory[field]).lower() for field in fields)
@@ -164,8 +160,7 @@ class TestOperationalMemoryExactMatcher(unittest.TestCase):
                 else:
                     terms.append(
                         "".join(
-                            rng.choice(alphabet)
-                            for _ in range(rng.randint(1, 8))
+                            rng.choice(alphabet) for _ in range(rng.randint(1, 8))
                         ).lower()
                     )
             matcher = governance_store._ExactTermMatcher(terms)
@@ -179,7 +174,6 @@ class TestOperationalMemoryExactMatcher(unittest.TestCase):
                     ),
                     _reference_memory_relevance(memory, terms),
                 )
-
 
     def test_query_limits_fail_before_matcher_construction(self):
         with mock.patch.object(
@@ -198,10 +192,7 @@ class TestOperationalMemoryExactMatcher(unittest.TestCase):
             )
 
     def test_matcher_pattern_budget_falls_back_without_changing_terms(self):
-        terms = [
-            f"term{index:03d}-" + ("x" * 80)
-            for index in range(100)
-        ]
+        terms = [f"term{index:03d}-" + ("x" * 80) for index in range(100)]
 
         self.assertGreater(
             sum(map(len, terms)),
@@ -320,7 +311,8 @@ class TestOperationalMemory(unittest.TestCase):
         self._seed_claims()
         store = governance_store.rebuild_operational_memory()
         preferences = [
-            item for item in store["items"].values()
+            item
+            for item in store["items"].values()
             if item["memory_type"] == "preference"
         ]
 
@@ -375,28 +367,30 @@ class TestOperationalMemory(unittest.TestCase):
             }
             for index in range(500)
         }
-        store["items"].update({
-            "matching_active": {
-                "memory_id": "matching_active",
-                "memory_type": "fact",
-                "memory_key": "needle_target",
-                "text": "Needle target is active.",
-                "source_page": "Concept_Target.md",
-                "validity_state": "active",
-                "memory_score": 0.8,
-                "updated_at": "2026-01-02T00:00:00+00:00",
-            },
-            "matching_old": {
-                "memory_id": "matching_old",
-                "memory_type": "fact",
-                "memory_key": "needle_target_history",
-                "text": "Needle target was superseded.",
-                "source_page": "Concept_Target.md",
-                "validity_state": "superseded",
-                "memory_score": 0.7,
-                "updated_at": "2026-01-01T00:00:00+00:00",
-            },
-        })
+        store["items"].update(
+            {
+                "matching_active": {
+                    "memory_id": "matching_active",
+                    "memory_type": "fact",
+                    "memory_key": "needle_target",
+                    "text": "Needle target is active.",
+                    "source_page": "Concept_Target.md",
+                    "validity_state": "active",
+                    "memory_score": 0.8,
+                    "updated_at": "2026-01-02T00:00:00+00:00",
+                },
+                "matching_old": {
+                    "memory_id": "matching_old",
+                    "memory_type": "fact",
+                    "memory_key": "needle_target_history",
+                    "text": "Needle target was superseded.",
+                    "source_page": "Concept_Target.md",
+                    "validity_state": "superseded",
+                    "memory_score": 0.7,
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                },
+            }
+        )
         governance_store.save_memory_objects(store)
 
         with mock.patch.object(
@@ -428,20 +422,28 @@ class TestOperationalMemory(unittest.TestCase):
         governance_store.rebuild_operational_memory()
         remaining = claims["items"]["claim_old"]
 
-        governance_store.apply_change_sets_batch([{
-            "affected_pages": ["Entity_Runtime.md"],
-            "proposed_entities": [],
-            "proposed_claims": [remaining],
-            "proposed_evidence": [],
-            "proposed_source_updates": [],
-            "proposed_edges": [],
-        }])
+        governance_store.apply_change_sets_batch(
+            [
+                {
+                    "affected_pages": ["Entity_Runtime.md"],
+                    "proposed_entities": [],
+                    "proposed_claims": [remaining],
+                    "proposed_evidence": [],
+                    "proposed_source_updates": [],
+                    "proposed_edges": [],
+                }
+            ]
+        )
 
         memories = governance_store.load_memory_objects()["items"].values()
-        preference = next(item for item in memories if item.get("source_claim_id") == "claim_old")
+        preference = next(
+            item for item in memories if item.get("source_claim_id") == "claim_old"
+        )
         self.assertEqual(preference["validity_state"], "active")
         self.assertNotIn("superseded_by", preference)
-        self.assertFalse(any(item.get("source_claim_id") == "claim_new" for item in memories))
+        self.assertFalse(
+            any(item.get("source_claim_id") == "claim_new" for item in memories)
+        )
 
     def test_search_excludes_template_artifacts_and_audit_reports_them(self):
         store = governance_store.load_memory_objects()
@@ -545,27 +547,34 @@ class TestOperationalMemory(unittest.TestCase):
         claims["items"] = {claim["claim_id"]: claim}
         self._replace_claims(claims)
         memory = governance_store._memory_object_from_claim(claim)
-        memory.update({
-            "validity_state": "archived",
-            "validity_reasons": ["infrastructure_artifact:generated_stub"],
-            "memory_score": 0.0,
-        })
+        memory.update(
+            {
+                "validity_state": "archived",
+                "validity_reasons": ["infrastructure_artifact:generated_stub"],
+                "memory_score": 0.0,
+            }
+        )
         store = governance_store.load_memory_objects()
         store["items"] = {memory["memory_id"]: memory}
         governance_store.save_memory_objects(store)
 
-        governance_store.apply_change_sets_batch([{
-            "affected_pages": ["Concept_Delta.md"],
-            "proposed_entities": [],
-            "proposed_claims": [],
-            "proposed_evidence": [],
-            "proposed_source_updates": [],
-            "proposed_edges": [],
-        }])
+        governance_store.apply_change_sets_batch(
+            [
+                {
+                    "affected_pages": ["Concept_Delta.md"],
+                    "proposed_entities": [],
+                    "proposed_claims": [],
+                    "proposed_evidence": [],
+                    "proposed_source_updates": [],
+                    "proposed_edges": [],
+                }
+            ]
+        )
 
         memories = governance_store.load_memory_objects()["items"].values()
         archived = [
-            item for item in memories
+            item
+            for item in memories
             if item.get("source_claim_id") == "claim_delta_stub"
         ]
         self.assertEqual(len(archived), 1)
@@ -585,7 +594,6 @@ class TestOperationalMemory(unittest.TestCase):
 
         self.assertEqual(memory["validity_state"], "unsupported")
 
-
     def test_candidate_prefilter_keeps_the_hundredth_query_term(self):
         query = " ".join(f"term{index:03d}" for index in range(100))
         memory = {
@@ -598,9 +606,7 @@ class TestOperationalMemory(unittest.TestCase):
             "memory_score": 0.8,
             "updated_at": "2026-01-01T00:00:00+00:00",
         }
-        governance_store.save_memory_objects(
-            {"items": {memory["memory_id"]: memory}}
-        )
+        governance_store.save_memory_objects({"items": {memory["memory_id"]: memory}})
 
         current, history = governance_store.search_operational_memory_views(
             query,
@@ -621,7 +627,6 @@ class TestOperationalMemory(unittest.TestCase):
         self.assertEqual(history, legacy_history)
         self.assertEqual([item["memory_id"] for item in current], ["late_term_match"])
 
-
     def test_candidate_prefilter_keeps_long_cjk_tail_terms(self):
         query = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申"
         memory = {
@@ -634,9 +639,7 @@ class TestOperationalMemory(unittest.TestCase):
             "memory_score": 0.8,
             "updated_at": "2026-01-01T00:00:00+00:00",
         }
-        governance_store.save_memory_objects(
-            {"items": {memory["memory_id"]: memory}}
-        )
+        governance_store.save_memory_objects({"items": {memory["memory_id"]: memory}})
 
         current, history = governance_store.search_operational_memory_views(
             query,
@@ -660,9 +663,9 @@ class TestOperationalMemory(unittest.TestCase):
 
 def _seed_isolated_search_memories(records):
     governance_store.initialize_meta_store()
-    governance_store.save_memory_objects({
-        "items": {record["memory_id"]: record for record in records}
-    })
+    governance_store.save_memory_objects(
+        {"items": {record["memory_id"]: record for record in records}}
+    )
     return db_store.get_connection()
 
 
@@ -693,14 +696,16 @@ def test_lazy_fts_backfill_preserves_exact_results(isolated_memory, monkeypatch)
             "memory_score": 0.5 + (index / 100),
             "updated_at": f"2026-01-0{index + 1}T00:00:00+00:00",
         }
-        for index, text in enumerate([
-            "needle alpha",
-            "unrelated beta",
-            "needle gamma",
-            "仅有甲可匹配",
-            "needle delta",
-            "unrelated epsilon",
-        ])
+        for index, text in enumerate(
+            [
+                "needle alpha",
+                "unrelated beta",
+                "needle gamma",
+                "仅有甲可匹配",
+                "needle delta",
+                "unrelated epsilon",
+            ]
+        )
     ]
     conn = _seed_isolated_search_memories(records)
     _reset_search_index_as_legacy(conn)
@@ -718,25 +723,29 @@ def test_lazy_fts_backfill_preserves_exact_results(isolated_memory, monkeypatch)
 
     assert actual == expected
     state = conn.execute(
-        "SELECT backfill_cursor, backfill_target "
-        "FROM operational_memory_search_state"
+        "SELECT backfill_cursor, backfill_target FROM operational_memory_search_state"
     ).fetchone()
     assert state[0] == "" < state[1]
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 0
+    )
 
     progress = governance_store.maintain_operational_memory_search_index(2)
     assert progress["backfill_cursor"] == "memory_1"
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 2
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 2
+    )
     conn.execute("VACUUM")
     for _ in range(3):
         governance_store.maintain_operational_memory_search_index(2)
     state = conn.execute(
-        "SELECT backfill_cursor, backfill_target "
-        "FROM operational_memory_search_state"
+        "SELECT backfill_cursor, backfill_target FROM operational_memory_search_state"
     ).fetchone()
     assert state[0] == state[1]
     assert conn.execute(
@@ -845,6 +854,7 @@ def test_ready_dual_fts_matches_legacy_cjk_and_has_no_canonical_scan(
             cursor=str(state[0]),
             target=str(state[1]),
             include_pending=False,
+            candidate_limit=256,
         )
         assert "instr(" not in sql.casefold()
         plan = [
@@ -955,12 +965,18 @@ def test_pending_rows_keep_update_and_delete_results_exact(
 
     governance_store.maintain_operational_memory_search_index(10)
     assert governance_store.search_operational_memory("new", top_k=10) == []
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 0
+    )
 
 
 def test_ready_short_fts_update_removes_stale_tokens_without_canonical_scan(
@@ -1019,6 +1035,7 @@ def test_ready_short_fts_update_removes_stale_tokens_without_canonical_scan(
         cursor=str(state[0]),
         target=str(state[1]),
         include_pending=False,
+        candidate_limit=256,
     )
     assert "instr(" not in sql.casefold()
     plan = [
@@ -1035,7 +1052,6 @@ def test_ready_short_fts_update_removes_stale_tokens_without_canonical_scan(
         item["memory_id"]
         for item in governance_store.search_operational_memory("乙", top_k=10)
     ] == ["memory_cjk_update"]
-
 
 
 def test_search_falls_back_quickly_when_lazy_index_write_is_locked(
@@ -1067,23 +1083,34 @@ def test_search_falls_back_quickly_when_lazy_index_write_is_locked(
 
     assert [item["memory_id"] for item in result] == ["memory_locked"]
     assert elapsed < 1.0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0] == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 0
+    )
 
     result = governance_store.search_operational_memory("locked", top_k=10)
     assert [item["memory_id"] for item in result] == ["memory_locked"]
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+        == 1
+    )
     governance_store.maintain_operational_memory_search_index(10)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0] == 0
-
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_disabling_fts_removes_triggers_without_reclaiming_derived_tables(
@@ -1102,12 +1129,18 @@ def test_disabling_fts_removes_triggers_without_reclaiming_derived_tables(
     }
     conn = _seed_isolated_search_memories([record])
     governance_store.maintain_operational_memory_search_index(10)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+        == 0
+    )
 
     db_path = db_store.get_db_path().resolve()
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "0")
@@ -1131,12 +1164,18 @@ def test_disabling_fts_removes_triggers_without_reclaiming_derived_tables(
                 changed["memory_id"],
             ),
         )
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 1
+    )
 
 
 def test_memory_search_index_tool_is_preview_first(
@@ -1162,9 +1201,12 @@ def test_memory_search_index_tool_is_preview_first(
     )
     assert preview["dry_run"] is True
     assert preview["before"]["pending"] == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 0
+    )
 
     applied = governance_store.json.loads(
         tools.operational_memory_search_index_maintenance(
@@ -1175,9 +1217,13 @@ def test_memory_search_index_tool_is_preview_first(
     assert applied["dry_run"] is False
     assert applied["after"]["ready"] is True
     assert applied["after"]["indexed_documents"] == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
+        == 0
+    )
+
 
 def test_search_index_v5_to_v7_upgrade_resets_only_derived_state(
     isolated_memory, monkeypatch
@@ -1195,9 +1241,7 @@ def test_search_index_v5_to_v7_upgrade_resets_only_derived_state(
     conn = _seed_isolated_search_memories([record])
     governance_store.maintain_operational_memory_search_index(10)
     with db_store.transaction():
-        conn.execute(
-            "UPDATE operational_memory_search_state SET schema_version = 5"
-        )
+        conn.execute("UPDATE operational_memory_search_state SET schema_version = 5")
         assert db_store._init_operational_memory_search_schema(conn) is True
 
     state = conn.execute(
@@ -1205,15 +1249,22 @@ def test_search_index_v5_to_v7_upgrade_resets_only_derived_state(
         "FROM operational_memory_search_state"
     ).fetchone()
     assert tuple(state) == ("", "memory_upgrade", 7)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_fts"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_short_fts"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 0
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_fts").fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_short_fts"
+        ).fetchone()[0]
+        == 0
+    )
     assert conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0] == 1
     assert [
         item["memory_id"]
@@ -1262,9 +1313,7 @@ def test_search_index_v6_to_v7_adds_revision_without_replaying_derived_state(
         ):
             conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
         conn.execute("DROP TABLE operational_memory_search_revision")
-        conn.execute(
-            "UPDATE operational_memory_search_state SET schema_version = 6"
-        )
+        conn.execute("UPDATE operational_memory_search_state SET schema_version = 6")
         assert db_store._init_operational_memory_search_schema(conn) is True
 
     after = tuple(
@@ -1283,12 +1332,18 @@ def test_search_index_v6_to_v7_adds_revision_without_replaying_derived_state(
     )
     assert after == before
     assert after_counts == before_counts == (1, 1, 1)
-    assert conn.execute(
-        "SELECT schema_version FROM operational_memory_search_state"
-    ).fetchone()[0] == 7
-    assert conn.execute(
-        "SELECT revision FROM operational_memory_search_revision"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT schema_version FROM operational_memory_search_state"
+        ).fetchone()[0]
+        == 7
+    )
+    assert (
+        conn.execute(
+            "SELECT revision FROM operational_memory_search_revision"
+        ).fetchone()[0]
+        == 0
+    )
     assert governance_store.operational_memory_search_index_status()["ready"]
 
 
@@ -1320,17 +1375,14 @@ def test_search_index_v7_rebuilds_legacy_integer_cursor_affinity(
             "schema_version INTEGER NOT NULL DEFAULT 4, updated_at TEXT)"
         )
         conn.execute(
-            "INSERT INTO operational_memory_search_state "
-            "VALUES (1, 0, 10, ?, NULL)",
+            "INSERT INTO operational_memory_search_state VALUES (1, 0, 10, ?, NULL)",
             (legacy_schema_version,),
         )
         assert db_store._init_operational_memory_search_schema(conn) is True
 
     column_types = {
         row[1]: row[2]
-        for row in conn.execute(
-            "PRAGMA table_info(operational_memory_search_state)"
-        )
+        for row in conn.execute("PRAGMA table_info(operational_memory_search_state)")
     }
     state = conn.execute(
         "SELECT backfill_cursor, backfill_target, schema_version "
@@ -1347,14 +1399,15 @@ def test_search_index_v7_rebuilds_legacy_integer_cursor_affinity(
     progress = governance_store.maintain_operational_memory_search_index(1)
     assert progress["ready"] is True
     assert progress["backfill_cursor"] == "010"
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 2
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 2
+    )
 
 
-def test_empty_search_index_is_ready_without_backfill(
-    isolated_memory, monkeypatch
-):
+def test_empty_search_index_is_ready_without_backfill(isolated_memory, monkeypatch):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
     governance_store.initialize_meta_store()
     conn = db_store.get_connection()
@@ -1365,14 +1418,15 @@ def test_empty_search_index_is_ready_without_backfill(
         "FROM operational_memory_search_state"
     ).fetchone()
     assert tuple(state) == ("", "", 7)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM operational_memory_search_docs").fetchone()[
+            0
+        ]
+        == 0
+    )
 
 
-def test_operational_memory_cjk_search_scalable_benchmark(
-    isolated_memory, monkeypatch
-):
+def test_operational_memory_cjk_search_scalable_benchmark(isolated_memory, monkeypatch):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "60")
     row_count = max(
@@ -1400,15 +1454,17 @@ def test_operational_memory_cjk_search_scalable_benchmark(
                 "memory_score": 0.8,
                 "updated_at": "2026-01-01T00:00:00+00:00",
             }
-            batch.append((
-                memory_id,
-                "fact",
-                0.8,
-                "Active",
-                365.0,
-                governance_store.json.dumps(payload, ensure_ascii=False),
-                payload["updated_at"],
-            ))
+            batch.append(
+                (
+                    memory_id,
+                    "fact",
+                    0.8,
+                    "Active",
+                    365.0,
+                    governance_store.json.dumps(payload, ensure_ascii=False),
+                    payload["updated_at"],
+                )
+            )
         with db_store.transaction():
             conn.executemany(
                 "INSERT INTO operational_memory "
@@ -1442,21 +1498,24 @@ def test_operational_memory_cjk_search_scalable_benchmark(
     hot = governance_store.search_operational_memory("医疗AI", top_k=10)
     hot_seconds = time.perf_counter() - started
 
-    assert [item["memory_id"] for item in cold] == [
-        f"benchmark_{row_count - 1:06d}"
-    ]
+    assert [item["memory_id"] for item in cold] == [f"benchmark_{row_count - 1:06d}"]
     assert hot == cold
-    assert inspections == [1]
+    assert inspections == []
     assert cold_seconds < 2.0
     assert hot_seconds < 0.5
+    assert governance_store.operational_memory_search_index_status()["ready"]
+    assert inspections == [1]
 
     _tamper_memory_fts_with_equal_counts(
         f"benchmark_{row_count - 1:06d}",
         text="equal count benchmark corruption",
     )
-    db_store.get_connection()._operational_memory_search_integrity_cache[
-        "attested_at_monotonic"
-    ] -= 61
+    integrity_cache = getattr(
+        db_store.get_connection(),
+        "_operational_memory_search_integrity_cache",
+    )
+    assert isinstance(integrity_cache, dict)
+    integrity_cache["attested_at_monotonic"] -= 61
     repair_batch_size = 10_000
     expected_repair_batches = (row_count + repair_batch_size - 1) // repair_batch_size
     repair_started = time.perf_counter()
@@ -1577,9 +1636,7 @@ def test_legacy_v5_readonly_status_is_unavailable_and_large_search_fails_closed(
         )
         assert status["available"] is False
         assert status["ready"] is False
-        assert status["warnings"] == [
-            "operational_memory_search_schema_unavailable"
-        ]
+        assert status["warnings"] == ["operational_memory_search_schema_unavailable"]
         with pytest.raises(governance_store.OperationalMemoryNotReady) as error:
             governance_store.search_operational_memory("needle", top_k=10)
         assert error.value.reason == "search_index_unavailable"
@@ -1655,16 +1712,16 @@ def test_bounded_auto_maintenance_converges_to_ready(isolated_memory, monkeypatc
     assert result["indexed_documents"] == 6
 
 
-def test_ready_auto_maintenance_budget_is_zero_work(
-    isolated_memory, monkeypatch
-):
+def test_ready_auto_maintenance_budget_is_zero_work(isolated_memory, monkeypatch):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
     conn = _seed_isolated_search_memories(_integrity_test_records())
     assert governance_store.maintain_operational_memory_search_index(100)["ready"]
-    state_before = tuple(conn.execute(
-        "SELECT proof_generation, updated_at "
-        "FROM operational_memory_search_state WHERE singleton = 1"
-    ).fetchone())
+    state_before = tuple(
+        conn.execute(
+            "SELECT proof_generation, updated_at "
+            "FROM operational_memory_search_state WHERE singleton = 1"
+        ).fetchone()
+    )
     total_changes_before = conn.total_changes
 
     def forbid_advance(*_args, **_kwargs):
@@ -1684,10 +1741,15 @@ def test_ready_auto_maintenance_budget_is_zero_work(
     assert result["ready"] is True
     assert result["batches"] == 0
     assert conn.total_changes == total_changes_before
-    assert tuple(conn.execute(
-        "SELECT proof_generation, updated_at "
-        "FROM operational_memory_search_state WHERE singleton = 1"
-    ).fetchone()) == state_before
+    assert (
+        tuple(
+            conn.execute(
+                "SELECT proof_generation, updated_at "
+                "FROM operational_memory_search_state WHERE singleton = 1"
+            ).fetchone()
+        )
+        == state_before
+    )
 
 
 def test_ready_index_corruption_fails_closed_and_bounded_maintenance_repairs(
@@ -1695,6 +1757,7 @@ def test_ready_index_corruption_fails_closed_and_bounded_maintenance_repairs(
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_DEGRADED_ROW_LIMIT", "3")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "0")
     records = [
         {
             "memory_id": f"memory_{index}",
@@ -1742,10 +1805,12 @@ def test_ready_index_corruption_fails_closed_and_bounded_maintenance_repairs(
         for item in governance_store.search_operational_memory("needle", top_k=10)
     ] == ["memory_3"]
 
-    doc_id = int(conn.execute(
-        "SELECT doc_id FROM operational_memory_search_docs WHERE memory_id = ?",
-        ("memory_3",),
-    ).fetchone()[0])
+    doc_id = int(
+        conn.execute(
+            "SELECT doc_id FROM operational_memory_search_docs WHERE memory_id = ?",
+            ("memory_3",),
+        ).fetchone()[0]
+    )
     with db_store.transaction():
         conn.execute(
             "DELETE FROM operational_memory_search_fts WHERE rowid = ?",
@@ -1853,6 +1918,7 @@ def test_canonical_drift_with_lost_pending_fails_closed_and_replays(
     isolated_memory, monkeypatch
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "0")
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_DEGRADED_ROW_LIMIT", "3")
     records = _integrity_test_records()
     conn = _seed_isolated_search_memories(records)
@@ -1894,6 +1960,7 @@ def test_operational_memory_query_race_discards_fts_results(
     isolated_memory, monkeypatch
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "0")
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_DEGRADED_ROW_LIMIT", "3")
     _seed_isolated_search_memories(_integrity_test_records())
     assert governance_store.maintain_operational_memory_search_index(100)["ready"]
@@ -2050,6 +2117,7 @@ def test_operational_memory_integrity_limit_fails_closed_without_rebuild(
     isolated_memory, monkeypatch
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "0")
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_DEGRADED_ROW_LIMIT", "3")
     conn = _seed_isolated_search_memories(_integrity_test_records())
     assert governance_store.maintain_operational_memory_search_index(100)["ready"]
@@ -2077,7 +2145,7 @@ def test_operational_memory_integrity_limit_fails_closed_without_rebuild(
     assert state_after == state_before
 
 
-def test_operational_memory_integrity_scan_is_cached_for_hot_queries(
+def test_operational_memory_retrieval_uses_durable_proof_without_full_scan(
     isolated_memory, monkeypatch
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
@@ -2096,10 +2164,19 @@ def test_operational_memory_integrity_scan_is_cached_for_hot_queries(
         "inspect_operational_memory_search_integrity",
         counted_inspect,
     )
+
+    def fail_count_scan(*_args, **_kwargs):
+        raise AssertionError("retrieval must not scan every FTS table for counts")
+
+    monkeypatch.setattr(
+        governance_store,
+        "_operational_memory_search_index_counts",
+        fail_count_scan,
+    )
     first = governance_store.search_operational_memory("needle", top_k=10)
     second = governance_store.search_operational_memory("needle", top_k=10)
     assert second == first
-    assert inspections == [1]
+    assert inspections == []
 
 
 def test_unrelated_external_commit_does_not_rescan_operational_memory_integrity(
@@ -2139,6 +2216,48 @@ def test_unrelated_external_commit_does_not_rescan_operational_memory_integrity(
     second = governance_store.search_operational_memory("needle", top_k=10)
 
     assert second == first
+    assert inspections == []
+
+
+def test_unrelated_commit_during_integrity_scan_preserves_proven_result(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    conn = _seed_isolated_search_memories(_integrity_test_records())
+    with db_store.transaction():
+        conn.execute(
+            "CREATE TABLE operational_memory_unrelated_race_probe "
+            "(probe_id INTEGER PRIMARY KEY, payload TEXT)"
+        )
+    assert governance_store.maintain_operational_memory_search_index(100)["ready"]
+    db_store.close_all_connections()
+    real_inspect = db_store.inspect_operational_memory_search_integrity
+    inspections = []
+
+    def inspect_with_unrelated_commit(*args, **kwargs):
+        observed = real_inspect(*args, **kwargs)
+        inspections.append(1)
+        external = sqlite3.connect(str(db_store.get_db_path()))
+        try:
+            external.execute(
+                "INSERT INTO operational_memory_unrelated_race_probe "
+                "(probe_id, payload) VALUES (1, 'unrelated')"
+            )
+            external.commit()
+        finally:
+            external.close()
+        return observed
+
+    monkeypatch.setattr(
+        db_store,
+        "inspect_operational_memory_search_integrity",
+        inspect_with_unrelated_commit,
+    )
+    first = governance_store.operational_memory_search_index_status()
+    second = governance_store.operational_memory_search_index_status()
+
+    assert first["ready"] is True
+    assert second["ready"] is True
     assert inspections == [1]
 
 
@@ -2236,26 +2355,29 @@ def test_invalid_persisted_proof_fails_closed_and_bounded_maintenance_recovers(
         wall_seconds=2.0,
     )
     assert repaired["ready"] is True
-    assert governance_store.operational_memory_search_index_status()[
-        "proof_status"
-    ] == "ready"
+    assert (
+        governance_store.operational_memory_search_index_status()["proof_status"]
+        == "ready"
+    )
 
 
 def test_ready_index_orphan_is_removed_within_maintenance_budget(
     isolated_memory, monkeypatch
 ):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
-    conn = _seed_isolated_search_memories([
-        {
-            "memory_id": "memory_valid",
-            "memory_type": "fact",
-            "memory_key": "valid",
-            "text": "valid memory",
-            "source_page": "Concept_Repair.md",
-            "validity_state": "active",
-            "memory_score": 0.8,
-        }
-    ])
+    conn = _seed_isolated_search_memories(
+        [
+            {
+                "memory_id": "memory_valid",
+                "memory_type": "fact",
+                "memory_key": "valid",
+                "text": "valid memory",
+                "source_page": "Concept_Repair.md",
+                "validity_state": "active",
+                "memory_score": 0.8,
+            }
+        ]
+    )
     assert governance_store.maintain_operational_memory_search_index(10)["ready"]
     with db_store.transaction():
         conn.execute(
@@ -2267,10 +2389,13 @@ def test_ready_index_orphan_is_removed_within_maintenance_budget(
     assert governance_store.operational_memory_search_index_status()["ready"] is False
     repaired = governance_store.maintain_operational_memory_search_index(1)
     assert repaired["ready"] is True
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_docs "
-        "WHERE memory_id = 'memory_orphan'"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_docs "
+            "WHERE memory_id = 'memory_orphan'"
+        ).fetchone()[0]
+        == 0
+    )
 
     with db_store.transaction():
         conn.execute(
@@ -2285,12 +2410,18 @@ def test_ready_index_orphan_is_removed_within_maintenance_budget(
     assert governance_store.operational_memory_search_index_status()["ready"] is False
     repaired = governance_store.maintain_operational_memory_search_index(2)
     assert repaired["ready"] is True
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_fts WHERE rowid = 999"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_short_fts WHERE rowid = 999"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_fts WHERE rowid = 999"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_short_fts WHERE rowid = 999"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_large_disabled_index_requires_explicit_legacy_opt_in(
@@ -2325,17 +2456,19 @@ def test_large_disabled_index_requires_explicit_legacy_opt_in(
 
 def test_search_index_status_reports_stalled_progress(isolated_memory, monkeypatch):
     monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
-    conn = _seed_isolated_search_memories([
-        {
-            "memory_id": "memory_stalled",
-            "memory_type": "fact",
-            "memory_key": "stalled",
-            "text": "stalled progress",
-            "source_page": "Concept_Stalled.md",
-            "validity_state": "active",
-            "memory_score": 0.8,
-        }
-    ])
+    conn = _seed_isolated_search_memories(
+        [
+            {
+                "memory_id": "memory_stalled",
+                "memory_type": "fact",
+                "memory_key": "stalled",
+                "text": "stalled progress",
+                "source_page": "Concept_Stalled.md",
+                "validity_state": "active",
+                "memory_score": 0.8,
+            }
+        ]
+    )
     _reset_search_index_as_legacy(conn)
     with db_store.transaction():
         conn.execute(
@@ -2352,16 +2485,14 @@ def test_search_index_status_reports_stalled_progress(isolated_memory, monkeypat
     )
 
 
-def test_rc_mcp_configs_enable_operational_memory_fts():
+def test_default_runtime_profile_enables_operational_memory_fts():
     root = Path(__file__).resolve().parents[1]
-    for filename in (".mcp.json", "mcp_config.json"):
-        payload = governance_store.json.loads(
-            (root / filename).read_text(encoding="utf-8")
-        )
-        env = payload["mcpServers"]["vector-lake-mcp"]["env"]
-        assert env["VECTOR_LAKE_OPERATIONAL_MEMORY_FTS"] == "1"
+    payload = governance_store.json.loads(
+        (root / "runtime_profiles.json").read_text(encoding="utf-8")
+    )
 
-
+    env = payload["profiles"]["default"]["env"]
+    assert env["VECTOR_LAKE_OPERATIONAL_MEMORY_FTS"] == "1"
 
 
 if __name__ == "__main__":

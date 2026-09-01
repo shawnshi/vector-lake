@@ -1,7 +1,0 @@
-description = "Auto-prune isolated low-degree nodes and long-tail debris to perform anti-entropy maintenance."
-prompt = """
-Please use the `gc_vector_lake` tool to identify and prune isolated wiki nodes (degree <= 1).
-First run it with `dry_run=True`, show the exact candidate set and returned fingerprint, and do not apply a preview that has no fingerprint.
-Only after the user confirms that exact preview may you run it with `dry_run=False`, passing the unchanged fingerprint as `orphan_confirmation`.
-If the candidate set or fingerprint changes, discard the earlier confirmation and repeat the dry run.
-"""

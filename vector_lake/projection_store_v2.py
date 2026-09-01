@@ -9,6 +9,7 @@ cannot modify or invalidate the previously published root.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -32,6 +33,9 @@ MAX_BATCH_MUTATIONS = 1_000_000
 MAX_ITER_LIMIT = 1_000_000
 MAX_DIFF_LIMIT = 1_000_000
 DEFAULT_READ_OBJECT_LIMIT = 8_192
+_BULK_READ_WORKERS = 4
+_BULK_READ_MIN_OBJECTS = 32
+_BULK_READ_BATCH_SIZE = 256
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _EMPTY_LEAF = {"entries": [], "kind": "leaf", "version": FORMAT_VERSION}
@@ -290,12 +294,73 @@ class ProjectionStoreV2:
         )
         result: list[tuple[str, Any]] = []
         try:
-            for key, value in self._iter_subtree(root_digest, 0, "", reads):
-                if cursor is not None and _entry_order(key) <= cursor:
-                    continue
+            iterator = (
+                self._iter_subtree(root_digest, 0, "", reads)
+                if cursor is None
+                else self._iter_subtree_after(
+                    root_digest,
+                    0,
+                    "",
+                    reads,
+                    cursor,
+                )
+            )
+            for key, value in iterator:
                 if len(result) >= limit:
                     break
                 result.append((key, value))
+            return tuple(result)
+        finally:
+            self._verify_secure_read_directories(reads)
+
+    def materialize_items(
+        self,
+        root_digest: str,
+        *,
+        limit: int,
+        max_objects: int = DEFAULT_READ_OBJECT_LIMIT,
+    ) -> tuple[tuple[str, Any], ...]:
+        """Materialize a complete trie with bounded parallel secure reads."""
+        self._validate_digest(root_digest)
+        self._validate_read_bounds(limit, max_objects, MAX_ITER_LIMIT)
+        reads = _ReadContext(
+            max_objects=max_objects,
+            defer_directory_rechecks=True,
+        )
+        frontier: list[tuple[str, int, str]] = [(root_digest, 0, "")]
+        leaf_blocks: list[tuple[str, list[list[Any]]]] = []
+        try:
+            with ThreadPoolExecutor(
+                max_workers=_BULK_READ_WORKERS,
+                thread_name_prefix="vector-lake-projection-read",
+            ) as executor:
+                while frontier:
+                    self._prefetch_frontier(frontier, reads, executor)
+                    next_frontier: list[tuple[str, int, str]] = []
+                    for digest, depth, prefix in frontier:
+                        node, size = reads.raw_cache[digest]
+                        self._validate_node(node, size, depth, prefix)
+                        if node["kind"] == "leaf":
+                            leaf_blocks.append((prefix, node["entries"]))
+                            continue
+                        for slot, child in node["children"]:
+                            next_frontier.append(
+                                (
+                                    child,
+                                    depth + 1,
+                                    prefix + format(slot, "x"),
+                                )
+                            )
+                    frontier = next_frontier
+
+            result: list[tuple[str, Any]] = []
+            # A valid trie has no leaf prefix that is an ancestor of another.
+            # Prefix order therefore matches the serial depth-first key order.
+            for _prefix, entries in sorted(leaf_blocks, key=lambda item: item[0]):
+                for key, value in entries:
+                    if len(result) >= limit:
+                        return tuple(result)
+                    result.append((key, value))
             return tuple(result)
         finally:
             self._verify_secure_read_directories(reads)
@@ -430,7 +495,11 @@ class ProjectionStoreV2:
 
     @staticmethod
     def _validate_read_bounds(limit: int, max_objects: int, maximum: int) -> None:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= maximum:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 0 <= limit <= maximum
+        ):
             raise ProjectionObjectLimitError("read_limit")
         if (
             isinstance(max_objects, bool)
@@ -465,7 +534,9 @@ class ProjectionStoreV2:
                 writes.record_reused(digest, node_size)
                 return digest
             if not updated:
-                writes.record_reused(EMPTY_ROOT_DIGEST, len(canonical_json_bytes(_EMPTY_LEAF)))
+                writes.record_reused(
+                    EMPTY_ROOT_DIGEST, len(canonical_json_bytes(_EMPTY_LEAF))
+                )
                 return EMPTY_ROOT_DIGEST
             return self._build_subtree(updated, depth, prefix, writes)
 
@@ -515,7 +586,9 @@ class ProjectionStoreV2:
             writes.record_reused(digest, node_size)
             return digest
         if not children:
-            writes.record_reused(EMPTY_ROOT_DIGEST, len(canonical_json_bytes(_EMPTY_LEAF)))
+            writes.record_reused(
+                EMPTY_ROOT_DIGEST, len(canonical_json_bytes(_EMPTY_LEAF))
+            )
             return EMPTY_ROOT_DIGEST
         return self._store_node(self._branch_node(children), writes)
 
@@ -528,9 +601,7 @@ class ProjectionStoreV2:
     ) -> str:
         leaf = self._leaf_node(entries)
         leaf_payload = canonical_json_bytes(leaf)
-        leaf_byte_limit = (
-            MAX_OBJECT_BYTES if len(entries) == 1 else MAX_LEAF_BYTES
-        )
+        leaf_byte_limit = MAX_OBJECT_BYTES if len(entries) == 1 else MAX_LEAF_BYTES
         if len(entries) <= MAX_LEAF_ENTRIES and len(leaf_payload) <= leaf_byte_limit:
             return self._store_node(leaf, writes)
         if depth >= MAX_DEPTH:
@@ -674,27 +745,90 @@ class ProjectionStoreV2:
             raise ProjectionDepthError(f"depth_limit:{depth}")
         cached = reads.raw_cache.get(digest)
         if cached is None:
-            path = self.object_path(digest)
-            if digest == EMPTY_ROOT_DIGEST and not self._lexists(path):
-                node = dict(_EMPTY_LEAF)
-                size = len(canonical_json_bytes(node))
-            else:
-                if reads.objects_read >= reads.max_objects:
-                    raise ProjectionObjectLimitError("read_object_limit")
-                payload = self._secure_read_object(path, digest, reads=reads)
-                reads.objects_read += 1
-                decoded = _decode_json_strict(payload)
-                if payload != canonical_json_bytes(decoded):
-                    raise ProjectionIntegrityError("noncanonical_object")
-                if not isinstance(decoded, dict):
-                    raise ProjectionIntegrityError("node_not_object")
-                node = decoded
-                size = len(payload)
-            reads.raw_cache[digest] = (node, size)
-        else:
-            node, size = cached
+            cached = self._read_raw_node(digest, reads)
+            reads.raw_cache[digest] = cached
+        node, size = cached
         self._validate_node(node, size, depth, prefix)
         return node, size
+
+    def _read_raw_node(
+        self,
+        digest: str,
+        reads: _ReadContext,
+    ) -> tuple[dict[str, Any], int]:
+        path = self.objects_dir / digest[:2] / f"{digest}.json"
+        if digest == EMPTY_ROOT_DIGEST and not self._lexists(path):
+            node = dict(_EMPTY_LEAF)
+            return node, len(canonical_json_bytes(node))
+        if reads.objects_read >= reads.max_objects:
+            raise ProjectionObjectLimitError("read_object_limit")
+        payload = self._secure_read_object(path, digest, reads=reads)
+        reads.objects_read += 1
+        return self._decode_node_payload(payload)
+
+    @staticmethod
+    def _decode_node_payload(payload: bytes) -> tuple[dict[str, Any], int]:
+        decoded = _decode_json_strict(payload)
+        if payload != canonical_json_bytes(decoded):
+            raise ProjectionIntegrityError("noncanonical_object")
+        if not isinstance(decoded, dict):
+            raise ProjectionIntegrityError("node_not_object")
+        return decoded, len(payload)
+
+    def _prefetch_frontier(
+        self,
+        frontier: list[tuple[str, int, str]],
+        reads: _ReadContext,
+        executor: ThreadPoolExecutor,
+    ) -> None:
+        missing: list[str] = []
+        seen: set[str] = set()
+        for digest, depth, _prefix in frontier:
+            self._validate_digest(digest)
+            if depth > MAX_DEPTH:
+                raise ProjectionDepthError(f"depth_limit:{depth}")
+            if digest in reads.raw_cache or digest in seen:
+                continue
+            seen.add(digest)
+            path = self.objects_dir / digest[:2] / f"{digest}.json"
+            if digest == EMPTY_ROOT_DIGEST and not self._lexists(path):
+                node = dict(_EMPTY_LEAF)
+                reads.raw_cache[digest] = (
+                    node,
+                    len(canonical_json_bytes(node)),
+                )
+                continue
+            missing.append(digest)
+
+        if not missing:
+            return
+        if reads.objects_read + len(missing) > reads.max_objects:
+            raise ProjectionObjectLimitError("read_object_limit")
+        if len(missing) < _BULK_READ_MIN_OBJECTS:
+            for digest in missing:
+                reads.raw_cache[digest] = self._read_raw_node(digest, reads)
+            return
+
+        for digest in missing:
+            shard = digest[:2]
+            self._assert_secure_read_directory(
+                self.objects_dir / shard,
+                reads,
+                cache_key=shard,
+            )
+        for offset in range(0, len(missing), _BULK_READ_BATCH_SIZE):
+            batch = missing[offset : offset + _BULK_READ_BATCH_SIZE]
+            for digest, node, size in executor.map(self._read_node_file, batch):
+                reads.raw_cache[digest] = (node, size)
+                reads.objects_read += 1
+
+    def _read_node_file(self, digest: str) -> tuple[str, dict[str, Any], int]:
+        # The coordinator validates the shard before scheduling this bounded
+        # worker batch and revalidates every shard after traversal completes.
+        path = self.objects_dir / digest[:2] / f"{digest}.json"
+        payload = self._read_object_file(path, digest)
+        node, size = self._decode_node_payload(payload)
+        return digest, node, size
 
     def _validate_node(
         self,
@@ -714,9 +848,7 @@ class ProjectionStoreV2:
                 raise ProjectionIntegrityError("leaf_entries")
             if len(entries) > MAX_LEAF_ENTRIES:
                 raise ProjectionIntegrityError("leaf_entry_limit")
-            leaf_byte_limit = (
-                MAX_OBJECT_BYTES if len(entries) == 1 else MAX_LEAF_BYTES
-            )
+            leaf_byte_limit = MAX_OBJECT_BYTES if len(entries) == 1 else MAX_LEAF_BYTES
             if size > leaf_byte_limit:
                 raise ProjectionObjectLimitError("leaf_bytes")
             previous: tuple[str, str] | None = None
@@ -745,7 +877,11 @@ class ProjectionStoreV2:
             if not isinstance(child, list) or len(child) != 2:
                 raise ProjectionIntegrityError("branch_child_shape")
             slot, digest = child
-            if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot < 16:
+            if (
+                isinstance(slot, bool)
+                or not isinstance(slot, int)
+                or not 0 <= slot < 16
+            ):
                 raise ProjectionIntegrityError("branch_slot")
             if slot <= previous_slot:
                 raise ProjectionIntegrityError("branch_slot_order")
@@ -773,6 +909,46 @@ class ProjectionStoreV2:
                 reads,
             )
 
+    def _iter_subtree_after(
+        self,
+        digest: str,
+        depth: int,
+        prefix: str,
+        reads: _ReadContext,
+        cursor: tuple[str, str],
+    ) -> Iterator[tuple[str, Any]]:
+        """Resume ordered iteration without rereading cursor-preceding shards."""
+        node, _size = self._load_node(digest, depth, prefix, reads)
+        if node["kind"] == "leaf":
+            yield from (
+                (entry[0], entry[1])
+                for entry in node["entries"]
+                if _entry_order(entry[0]) > cursor
+            )
+            return
+
+        cursor_digest = cursor[0]
+        for slot, child in node["children"]:
+            child_prefix = prefix + format(slot, "x")
+            cursor_prefix = cursor_digest[: len(child_prefix)]
+            if child_prefix < cursor_prefix:
+                continue
+            if child_prefix == cursor_prefix:
+                yield from self._iter_subtree_after(
+                    child,
+                    depth + 1,
+                    child_prefix,
+                    reads,
+                    cursor,
+                )
+            else:
+                yield from self._iter_subtree(
+                    child,
+                    depth + 1,
+                    child_prefix,
+                    reads,
+                )
+
     def _secure_read_object(
         self,
         path: Path,
@@ -786,7 +962,16 @@ class ProjectionStoreV2:
         if reads is None:
             self._assert_secure_directory(path.parent)
         else:
-            self._assert_secure_read_directory(path.parent, reads)
+            shard = digest[:2]
+            self._assert_secure_read_directory(
+                self.objects_dir / shard,
+                reads,
+                cache_key=shard,
+            )
+        return self._read_object_file(path, digest)
+
+    def _read_object_file(self, path: Path, digest: str) -> bytes:
+        """Read one object after its containing directory was validated."""
         try:
             before = os.lstat(path)
         except OSError as exc:
@@ -840,9 +1025,11 @@ class ProjectionStoreV2:
         self,
         path: Path,
         reads: _ReadContext,
+        *,
+        cache_key: str | None = None,
     ) -> None:
         """Amortize path resolution without weakening in-read race checks."""
-        key = _normal_path(path)
+        key = cache_key if cache_key is not None else _normal_path(path)
         expected = reads.secure_directories.get(key)
         if expected is None:
             self._assert_secure_directory(path)

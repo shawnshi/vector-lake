@@ -12,15 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = ROOT / "skills"
 SKILL_TOOLS = {
     "audit": ("trigger_audit_graph",),
-    "check_duplicate": ("check_duplicate_entity",),
-    "daemon_watchdog": ("mcp_runtime_status",),
+    "check-duplicate": ("check_duplicate_entity",),
+    "daemon-watchdog": ("mcp_runtime_status",),
     "debt": ("get_governance_debt",),
     "delete": ("delete_source",),
     "doctor": ("doctor_vector_lake",),
     "gc": ("gc_vector_lake",),
     "graph": ("visualize_vector_lake",),
     "lint": ("lint_vector_lake",),
-    "memory_update": ("update_operational_memory",),
+    "memory-update": ("update_operational_memory",),
     "merge": ("merge_suggestions_vector_lake",),
     "query": ("query_logic_lake",),
     "research": (
@@ -66,6 +66,7 @@ def test_skill_surface_is_exact_and_uses_current_contract_version():
         metadata = _frontmatter(text)
         contract = metadata["metadata"]
         assert metadata["name"] == name
+        assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", metadata["name"])
         assert contract["version"] == "11.20.0"
         assert contract["tier"] in {"read-only", "action-allowed"}
         assert metadata["description"]
@@ -123,7 +124,39 @@ def test_mutating_skills_preserve_preview_and_explicit_approval_boundary(
     assert "explicit" in text.lower()
 
 
-@pytest.mark.parametrize("skill_name", ["memory_update", "resolve"])
+def test_host_workflow_skills_preserve_the_removed_command_safety_contracts():
+    required_tokens = {
+        "audit": ("dry_run=True", "fingerprint", "explicit"),
+        "daemon-watchdog": (
+            "mcp_runtime_status",
+            "stale=false",
+            "source_root",
+            "success",
+        ),
+        "delete": ("dry_run=True", "approval", "dry_run=False"),
+        "gc": (
+            "dry_run=True",
+            "fingerprint",
+            "orphan_confirmation",
+            "dry_run=False",
+        ),
+        "graph": ("approve", "output_dir", "exists"),
+        "lint": ("auto_fix=False", "explicit", "auto_fix=True"),
+        "merge": ("enqueue=False", "explicit", "enqueue=True"),
+        "query": ("dry_run: true", "do not create"),
+        "research": ("dry_run=True", "explicit", "dry_run=False"),
+        "resolve": ("review_governance_list", "explicit", "exact"),
+        "review": ("read-only", "do not"),
+        "search": ("`page`", "`memory`", "`fact`", "deprecated"),
+        "sync": ("scan configured roots and enqueue", "does not mean"),
+    }
+
+    for skill_name, tokens in required_tokens.items():
+        contract = _skill_text(skill_name).casefold()
+        assert all(token.casefold() in contract for token in tokens), skill_name
+
+
+@pytest.mark.parametrize("skill_name", ["memory-update", "resolve"])
 def test_payload_mutations_require_exact_payload_and_explicit_approval(skill_name):
     text = _skill_text(skill_name).lower()
 
@@ -142,7 +175,7 @@ def test_search_skill_uses_fact_mode_without_overstating_claim_semantics():
 
 
 def test_authority_research_and_sync_skills_fail_closed_on_known_drifts():
-    daemon = _skill_text("daemon_watchdog")
+    daemon = _skill_text("daemon-watchdog")
     research = _skill_text("research")
     sync = _skill_text("sync")
 

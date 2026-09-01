@@ -4,12 +4,13 @@ import hashlib
 import logging
 import re
 import sqlite3
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, cast
 
 from vector_lake import get_extension_root
 from vector_lake.cancellation import (
@@ -36,6 +37,7 @@ from vector_lake.wiki_utils import (
     validate_wiki_filename,
 )
 from vector_lake.purpose_contract import (
+    ALLOWED_SCOPES,
     PurposeContractError,
     build_synthesis_proposals,
     load_purpose_contract,
@@ -154,6 +156,8 @@ _INGEST_PACKET_BINDING_FIELDS = (
     "canonical_name",
     "source_hash",
     "source_projection_hash",
+    "source_observed_at",
+    "attempt_id",
     "integration_candidates",
     "ingest_contract_version",
     "job_id",
@@ -179,6 +183,8 @@ def _ingest_task_packet_contract(row: dict) -> tuple[dict, str]:
         "canonical_name": str(payload.get("canonical_name") or ""),
         "source_hash": str(payload.get("source_hash") or ""),
         "source_projection_hash": str(payload.get("source_projection_hash") or ""),
+        "source_observed_at": str(payload.get("source_observed_at") or ""),
+        "attempt_id": str(payload.get("attempt_id") or ""),
         "integration_candidates": list(payload.get("integration_candidates") or []),
         "ingest_contract_version": payload.get("ingest_contract_version"),
         "job_id": str(row.get("job_id") or ""),
@@ -804,6 +810,7 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
         f"SELECT file_hash FROM processed_files WHERE filepath IN ({placeholders})",
         tuple(lookup_paths),
     ).fetchall()
+
     def marker_matches_current(row) -> bool:
         try:
             return current_snapshot.matches(str(row["file_hash"] or ""))
@@ -813,7 +820,6 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
     if not any(marker_matches_current(row) for row in rows):
         return "processed_files no longer proves the current raw revision"
     return ""
-
 
 
 def _ingest_debt_effective_revision_owners(
@@ -908,6 +914,7 @@ def _ingest_debt_effective_revision_owners(
         )
     return owners, conflicts
 
+
 def _ingest_debt_revision_owner_signature(
     owners: list[dict],
     conflicts: list[dict],
@@ -939,6 +946,27 @@ def _ingest_debt_revision_owner_signature(
         )
     )
     return owner_signature, conflict_signature
+
+
+def _job_is_non_retryable_policy_failure(record: dict) -> bool:
+    """Return True for deterministic model-capability failures.
+
+    These failure classes mean the model cannot produce schema-conformant output
+    for this input at its current capability level.  Requeuing them (and paying
+    the 3.5GB maintenance backup each round) cannot succeed, so debt
+    reconciliation must leave them terminal instead of re-arming them.
+    """
+    try:
+        result = json.loads(str(record.get("result_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(result, dict):
+        return False
+    failure_class = str(result.get("failure_class") or "")
+    if failure_class in {"input_policy", "output_policy", "generator_policy"}:
+        return True
+    return False
+
 
 def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
     """Classify and safely recover abandoned ingest jobs without discarding valid work."""
@@ -1125,8 +1153,13 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             and "source_projection_hash" in payload
             and isinstance(payload.get("integration_candidates"), list)
         )
+        # Model-capability failures are deterministic and retrying them burns
+        # model tokens plus a full 3.5GB backup per round with no benefit.
+        # Keep them terminal so a reconcile pass does not re-arm an endless
+        # quarantine -> requeue storm.
+        non_retryable_policy = _job_is_non_retryable_policy_failure(record)
         needs_requeue = (
-            record.get("status") == "failed"
+            (record.get("status") == "failed" and not non_retryable_policy)
             or payload_hash != current_hash
             or not contract_current
         )
@@ -1200,7 +1233,15 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
                 continue
 
         canonical_name = str(payload.get("canonical_name") or "").strip()
-        if record.get("status") == "failed" or not canonical_name:
+        local_publication = payload.get("local_publication")
+        has_local_source_identity = bool(
+            isinstance(local_publication, dict)
+            and local_publication.get("contract") == "deterministic-source/v1"
+            and canonical_name
+        )
+        if (
+            record.get("status") == "failed" and not has_local_source_identity
+        ) or not canonical_name:
             if reconcile_source_identity_index is None:
                 if dry_run:
                     reconcile_source_identity_index = (
@@ -1223,6 +1264,16 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             "filepath": str(raw_path),
             "hash": current_hash,
             "canonical_name": canonical_name,
+            "source_observed_at": datetime.fromtimestamp(
+                current_snapshot.observed_mtime_ns / 1_000_000_000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "attempt_id": hashlib.sha256(
+                (
+                    f"{record['job_id']}\0{current_hash}\0"
+                    f"{record.get('updated_at') or ''}\0reconcile-v6"
+                ).encode("utf-8")
+            ).hexdigest()[:32],
             "ingest_contract_version": INGEST_CONTRACT_VERSION,
         }
         if dry_run:
@@ -1695,6 +1746,57 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
                         }
                     )
                 continue
+            if action == "requeue_current":
+                conn.execute(
+                    "DELETE FROM ingest_outbox_links WHERE job_id = ?",
+                    (job_id,),
+                )
+                refreshed_payload = item["payload"]
+                refreshed_revision = str(refreshed_payload.get("hash") or "")
+                refreshed_attempt_id = str(refreshed_payload.get("attempt_id") or "")
+                latest_source_outbox = conn.execute(
+                    "SELECT id, status FROM mutation_outbox WHERE filename = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (str(refreshed_payload.get("canonical_name") or ""),),
+                ).fetchone()
+                if latest_source_outbox is not None:
+                    source_outbox_id = int(latest_source_outbox["id"])
+                    source_outbox_status = str(latest_source_outbox["status"])
+                    if source_outbox_status != "completed":
+                        db_store.link_ingest_outbox_events(
+                            outbox_ids=[source_outbox_id],
+                            job_id=job_id,
+                            revision=refreshed_revision,
+                            attempt_id=refreshed_attempt_id,
+                            connection=conn,
+                        )
+                        db_store.record_ingest_stage_event(
+                            job_id=job_id,
+                            revision=refreshed_revision,
+                            attempt_id=refreshed_attempt_id,
+                            stage="outbox",
+                            transition="completed",
+                            metadata={
+                                "outbox_ids": [source_outbox_id],
+                                "state": "reconciled_projection_barrier",
+                                "status": source_outbox_status,
+                            },
+                            connection=conn,
+                        )
+                    else:
+                        db_store.record_ingest_stage_event(
+                            job_id=job_id,
+                            revision=refreshed_revision,
+                            attempt_id=refreshed_attempt_id,
+                            stage="index_visible",
+                            transition="completed",
+                            ordinal=max(1, source_outbox_id),
+                            metadata={
+                                "outbox_id": source_outbox_id,
+                                "state": "visible_before_requeue",
+                            },
+                            connection=conn,
+                        )
             applied_counts[action] += 1
             if packet_path:
                 db_store.enqueue_ingest_task_cleanup(job_id, packet_path)
@@ -1824,7 +1926,11 @@ def _source_identity_index(
         sources = entity.get("sources") or []
         if not isinstance(sources, list):
             sources = [sources]
-        for source in sources:
+        for source_position, source in enumerate(sources):
+            _raw_scan_checkpoint(
+                "raw_inventory:source_entity_sources",
+                source_position,
+            )
             identity = normalize_source_identity(source)
             if scoped_identities is not None and identity not in scoped_identities:
                 continue
@@ -1948,7 +2054,7 @@ def _read_purpose() -> str:
 
 
 INTEGRATION_DISPOSITIONS = {"integrated", "standalone", "rejected"}
-INGEST_CONTRACT_VERSION = 5
+INGEST_CONTRACT_VERSION = 6
 
 
 class IngestBaselineConflict(ValueError):
@@ -2497,6 +2603,556 @@ def _verify_ingest_source_baseline(processed_data: dict) -> None:
             f"current {actual_projection_hash or '<absent>'}"
         )
 
+
+def _source_observed_datetime(processed_data: dict) -> datetime:
+    raw = str(processed_data.get("source_observed_at") or "").strip()
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    # Legacy queued jobs predate source_observed_at. Preserve their historical
+    # behavior without weakening deterministic bytes for newly prepared jobs.
+    return datetime.now(timezone.utc)
+
+
+def _auto_source_page(
+    processed_data: dict,
+) -> dict:
+    """Build a provenance-only Source page from one queued raw revision."""
+    canonical_name = str(processed_data.get("canonical_name") or "").strip()
+    filepath = str(processed_data.get("filepath") or "")
+    source_hash = str(processed_data.get("hash") or "")
+    raw_name = os.path.basename(filepath) if filepath else canonical_name
+    raw_source_identity = _raw_identity_for_path(filepath) if filepath else raw_name
+    safe_raw_name = raw_name.replace("`", "'")
+    observed = _source_observed_datetime(processed_data)
+    observed_day = observed.strftime("%Y-%m-%d")
+    raw_identity = hashlib.sha256(
+        f"{filepath}\0{source_hash}".encode("utf-8")
+    ).hexdigest()[:12]
+    page_id = f"{observed.strftime('%Y%m%d')}_{raw_identity}"
+    memory_key = f"ingest_source_{raw_identity}"
+    title = _strip_markdown_suffix(canonical_name).replace("-", " ").replace("_", " ")
+    from vector_lake.purpose_contract import load_purpose_contract
+
+    evidence_tiers = set(load_purpose_contract().get("evidence_tiers") or {})
+    evidence_tier = next(
+        (
+            candidate
+            for candidate in ("code-availability", "primary", "derived")
+            if candidate in evidence_tiers
+        ),
+        min(evidence_tiers) if evidence_tiers else "",
+    )
+    if not evidence_tier:
+        raise RuntimeError("active purpose contract has no evidence tiers")
+    frontmatter = (
+        "---\n"
+        f"id: {json.dumps(page_id, ensure_ascii=False)}\n"
+        f"title: {json.dumps(title, ensure_ascii=False)}\n"
+        "aliases: []\n"
+        'type: "source"\n'
+        'domain: "Medical_IT"\n'
+        'topic_cluster: "General"\n'
+        'status: "Active"\n'
+        'epistemic-status: "seed"\n'
+        "ttl: 365\n"
+        'memory_type: "fact"\n'
+        f"memory_key: {json.dumps(memory_key, ensure_ascii=False)}\n"
+        'categories: ["Uncategorized"]\n'
+        "tags: []\n"
+        f'created: "{observed_day}"\n'
+        f'updated: "{observed_day}"\n'
+        f"sources: [{json.dumps(raw_source_identity, ensure_ascii=False)}]\n"
+        'strategic_scope: "core"\n'
+        f"evidence_tier: {json.dumps(evidence_tier, ensure_ascii=False)}\n"
+        "---\n"
+    )
+    revision_marker = f"<!-- ingest-revision:{source_hash or '-'} -->"
+    body = (
+        f"# {title}\n\n"
+        "## 来源范围\n\n"
+        f"该页面为摄入引擎自动生成的 provenance-only Source 记录，源文件 `{safe_raw_name}` "
+        "（hash `" + (source_hash or "-") + "`）。本页面仅登记来源身份，不包含任何"
+        "从原文提取的事实、主张或关系。\n\n"
+        "## 摄入修订\n\n"
+        f"- {revision_marker} 原始修订 `{source_hash or '-'}`，观测时间 "
+        f"`{observed.isoformat()}`。\n\n"
+        "## 核心内容\n\n"
+        "本自动生成页面不推断或断言任何内容；原文中可核验的信号应通过后续"
+        "人工或模型补全的实体页面承载。\n"
+    )
+    return {"filename": canonical_name, "content": frontmatter + body}
+
+
+def _publish_local_source_and_enqueue(
+    payload: dict,
+    *,
+    idempotency_key: str,
+    prepare_started_at: str,
+    prepare_duration_ms: int,
+) -> tuple[dict, str]:
+    """Atomically publish a new Source seed and queue remote enrichment."""
+    from vector_lake import db_store
+
+    revision = str(payload.get("hash") or "")
+    canonical_name = str(payload.get("canonical_name") or "")
+    existing_source_version = str(payload.get("source_hash") or "")
+    prepared_at = datetime.now(timezone.utc).isoformat()
+    if db_store._job_idempotency_key("ingest", payload) != idempotency_key:
+        raise RuntimeError("ingest idempotency key changed before local publication")
+
+    def refresh_queued_job_payload_if_source_changed(
+        connection,
+        job_id: str,
+        desired_payload: dict,
+    ) -> None:
+        row = connection.execute(
+            "SELECT status, payload FROM jobs WHERE job_id = ? AND task_type = 'ingest'",
+            (job_id,),
+        ).fetchone()
+        if row is None or str(row["status"] or "") != "queued":
+            return
+        try:
+            current_payload = json.loads(str(row["payload"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            current_payload = {}
+        if isinstance(current_payload, dict) and all(
+            str(current_payload.get(field) or "")
+            == str(desired_payload.get(field) or "")
+            for field in ("source_hash", "source_projection_hash")
+        ):
+            return
+        cursor = connection.execute(
+            "UPDATE jobs SET payload = ?, updated_at = ? "
+            "WHERE job_id = ? AND task_type = 'ingest' AND status = 'queued' "
+            "AND payload IS ?",
+            (
+                json.dumps(desired_payload, ensure_ascii=False, sort_keys=True),
+                prepared_at,
+                job_id,
+                row["payload"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "queued ingest payload changed before local Source publication commit"
+            )
+
+    def require_queueable_enrichment_job(connection, job_id: str) -> None:
+        row = connection.execute(
+            "SELECT status, retries FROM jobs WHERE job_id = ? AND task_type = 'ingest'",
+            (job_id,),
+        ).fetchone()
+        status = str(row["status"] or "") if row is not None else ""
+        retries = int(row["retries"] or 0) if row is not None else 0
+        if status in {
+            "queued",
+            "dispatched",
+            "awaiting_subagent",
+            "subagent_processing",
+        } or (status == "failed" and retries < 3):
+            return
+        raise RuntimeError(
+            "ingest enrichment identity is retained by a terminal job; "
+            "run reconcile_ingest_job_debt preview/apply before retry"
+        )
+
+    def record_initial_events(
+        connection,
+        job_id: str,
+        *,
+        publication_mode: str,
+        outbox_ids: list[int] | None = None,
+    ) -> None:
+        attempt_id = str(payload.get("attempt_id") or "")
+        if not attempt_id:
+            raise RuntimeError("ingest attempt correlation is missing")
+        common = {
+            "job_id": job_id,
+            "revision": revision,
+            "attempt_id": attempt_id,
+            "connection": connection,
+        }
+        db_store.record_ingest_stage_event(
+            **common,
+            stage="prepare",
+            transition="completed",
+            occurred_at=prepared_at,
+            duration_ms=prepare_duration_ms,
+            metadata={"prepared_started_at": prepare_started_at},
+        )
+        db_store.record_ingest_stage_event(
+            **common,
+            stage="local_publication",
+            transition="completed",
+            metadata={
+                "canonical_name": canonical_name,
+                "mode": publication_mode,
+            },
+        )
+        if outbox_ids is not None:
+            db_store.link_ingest_outbox_events(
+                outbox_ids=outbox_ids,
+                job_id=job_id,
+                revision=revision,
+                attempt_id=attempt_id,
+                connection=connection,
+            )
+            db_store.record_ingest_stage_event(
+                **common,
+                stage="canonical_commit",
+                transition="completed",
+                metadata={"outbox_count": len(outbox_ids)},
+            )
+            db_store.record_ingest_stage_event(
+                **common,
+                stage="outbox",
+                transition="completed",
+                metadata={"outbox_ids": [int(item) for item in outbox_ids]},
+            )
+        db_store.record_ingest_stage_event(
+            **common,
+            stage="enqueue",
+            transition="completed",
+        )
+
+    source_page = _auto_source_page(payload)
+    source_content = str(source_page["content"])
+    # Local publication is a bounded provenance-only write. Run the complete
+    # schema + purpose validation once here, then use the schema mutation lane
+    # so every raw revision does not trigger a whole-lake deep health scan.
+    from vector_lake.defense_hook import verify_asset
+
+    source_frontmatter, _source_body = split_frontmatter(source_content)
+    verify_asset(
+        source_content,
+        canonical_name,
+        source_frontmatter,
+        get_index_path(),
+    )
+    desired_source_version = governance_store.canonical_page_version_from_content(
+        canonical_name,
+        source_content,
+    )
+    desired_projection_hash = hashlib.sha256(source_content.encode("utf-8")).hexdigest()
+    queued_payload = dict(payload)
+    queued_payload.update(
+        {
+            "source_hash": desired_source_version,
+            "source_projection_hash": desired_projection_hash,
+            "local_publication": {
+                "contract": "deterministic-source/v1",
+                "observed_at": str(payload.get("source_observed_at") or ""),
+            },
+        }
+    )
+
+    if existing_source_version == desired_source_version:
+        with db_store.transaction():
+            connection = db_store.get_connection()
+            job_id = db_store.enqueue_job("ingest", queued_payload)
+            refresh_queued_job_payload_if_source_changed(
+                connection,
+                job_id,
+                queued_payload,
+            )
+            require_queueable_enrichment_job(connection, job_id)
+            inherited_outbox = connection.execute(
+                "SELECT id, status FROM mutation_outbox WHERE filename = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (canonical_name,),
+            ).fetchone()
+            inherited_ids = (
+                [int(inherited_outbox["id"])]
+                if inherited_outbox is not None
+                and str(inherited_outbox["status"]) != "completed"
+                else []
+            )
+            if inherited_ids:
+                db_store.link_ingest_outbox_events(
+                    outbox_ids=inherited_ids,
+                    job_id=job_id,
+                    revision=revision,
+                    attempt_id=str(payload.get("attempt_id") or ""),
+                    connection=connection,
+                )
+            record_initial_events(
+                connection,
+                job_id,
+                publication_mode="reused_existing_source",
+            )
+            if inherited_ids:
+                db_store.record_ingest_stage_event(
+                    job_id=job_id,
+                    revision=revision,
+                    attempt_id=str(payload.get("attempt_id") or ""),
+                    stage="outbox",
+                    transition="completed",
+                    metadata={
+                        "outbox_ids": inherited_ids,
+                        "state": "inherited_projection_barrier",
+                    },
+                    connection=connection,
+                )
+        return queued_payload, job_id
+
+    job_holder: dict[str, str] = {}
+
+    def enqueue_enrichment(outbox_ids: list[int]) -> None:
+        job_id = db_store.enqueue_job("ingest", queued_payload)
+        connection = db_store.get_connection()
+        refresh_queued_job_payload_if_source_changed(
+            connection,
+            job_id,
+            queued_payload,
+        )
+        require_queueable_enrichment_job(connection, job_id)
+        job_holder["job_id"] = job_id
+        record_initial_events(
+            db_store.get_connection(),
+            job_id,
+            publication_mode=(
+                "updated_source_seed"
+                if existing_source_version
+                else "created_source_seed"
+            ),
+            outbox_ids=outbox_ids,
+        )
+
+    from vector_lake.mutation_coordinator import execute_mutation_batch
+
+    details = execute_mutation_batch(
+        [
+            {
+                "filename": canonical_name,
+                "content": source_content,
+                "expected_version": existing_source_version,
+                "expected_projection_hash": str(
+                    payload.get("source_projection_hash") or ""
+                ),
+            }
+        ],
+        validation_mode="schema",
+        origin="ingest_local_publication",
+        return_details=True,
+        transaction_callback=enqueue_enrichment,
+    )
+    if not isinstance(details, dict):
+        raise RuntimeError("local Source publication did not return mutation details")
+    details = cast(dict, details)
+    job_id = job_holder.get("job_id")
+    if not job_id:
+        raise RuntimeError("local Source publication committed without enrichment job")
+    try:
+        db_store.record_ingest_stage_event(
+            job_id=job_id,
+            revision=revision,
+            attempt_id=str(payload.get("attempt_id") or ""),
+            stage="markdown",
+            transition=(
+                "failed"
+                if canonical_name in set(details.get("deferred") or [])
+                else "completed"
+            ),
+            metadata={
+                "deferred": canonical_name in set(details.get("deferred") or []),
+            },
+        )
+    except Exception as exc:
+        log.warning(
+            "Local Source publication telemetry failed for %s: %s",
+            job_id,
+            type(exc).__name__,
+        )
+    return queued_payload, job_id
+
+
+_NORMALIZE_PREFIX_TYPE = {
+    "Concept": "concept",
+    "Vendor": "vendor",
+    "Institution": "institution",
+    "Product": "product",
+    "Person": "person",
+    "Event": "event",
+    "Policy": "policy",
+    "Standard": "standard",
+    "Source": "source",
+    "Synthesis": "synthesis",
+    "System": "system",
+    "Ingest": "event",
+}
+_NORMALIZE_TYPE_PREFIX = {
+    "concept": "Concept",
+    "vendor": "Vendor",
+    "institution": "Institution",
+    "product": "Product",
+    "person": "Person",
+    "event": "Event",
+    "policy": "Policy",
+    "standard": "Standard",
+    "source": "Source",
+    "synthesis": "Synthesis",
+    "system": "System",
+}
+
+
+def _normalize_codex_output_pages(
+    files: list[dict], contract: dict | None = None
+) -> list[dict]:
+    """Repair missing or incomplete model-authored page shells.
+
+    Model content and evidence text are preserved.  Only deterministic schema
+    fields, filename prefixes and required section containers are supplied.
+    Already complete pages pass through unchanged.
+    """
+    if not files:
+        return files
+    active_contract = contract or load_purpose_contract()
+    permitted_tiers = list(active_contract.get("evidence_tiers") or {})
+    if not permitted_tiers:
+        raise ValueError("purpose contract has no permitted evidence tiers")
+    required_fields = {
+        "id",
+        "title",
+        "type",
+        "domain",
+        "status",
+        "epistemic-status",
+        "categories",
+        "updated",
+        "sources",
+        "strategic_scope",
+        "evidence_tier",
+    }
+    normalized: list[dict] = []
+    for item in files:
+        filename = str(item.get("filename") or "")
+        content = str(item.get("content") or "")
+        try:
+            existing, parsed_body = split_frontmatter(content)
+        except Exception:
+            existing, parsed_body = {}, content
+        prefix = filename.split("_", 1)[0]
+        candidate_type = (
+            str(existing.get("type") or existing.get("node_type") or "").strip().lower()
+        )
+        doc_type = (
+            candidate_type
+            if candidate_type in _NORMALIZE_TYPE_PREFIX
+            else _NORMALIZE_PREFIX_TYPE.get(prefix, "concept")
+        )
+        expected_prefix = _NORMALIZE_TYPE_PREFIX[doc_type]
+        prefix_matches = prefix == expected_prefix
+        body_has_schema = (
+            doc_type in {"source", "system"}
+            or (
+                doc_type == "synthesis"
+                and "## 核心合成论点 (Core Synthesized Claims)" in parsed_body
+                and "## 支撑拓扑 (Supporting Topology)" in parsed_body
+            )
+            or ("## 1. 编译事实" in parsed_body and "## 2. 证据时间线" in parsed_body)
+        )
+        existing_tier = str(existing.get("evidence_tier") or "")
+        existing_scope = str(existing.get("strategic_scope") or "").lower()
+        if (
+            required_fields.issubset(existing)
+            and prefix_matches
+            and body_has_schema
+            and existing_tier in permitted_tiers
+            and existing_scope in ALLOWED_SCOPES
+        ):
+            normalized.append(item)
+            continue
+
+        if content.lstrip().startswith("---") and (
+            existing_tier not in permitted_tiers or existing_scope not in ALLOWED_SCOPES
+        ):
+            # Governed classifications in explicit frontmatter are validation
+            # inputs, not mechanical shell fields. Preserve invalid or missing
+            # values so the final validator fails closed instead of inventing
+            # a permitted classification.
+            normalized.append(item)
+            continue
+
+        if not prefix_matches:
+            tail = filename.split("_", 1)[1] if "_" in filename else filename
+            filename = f"{expected_prefix}_{tail}"
+        scope_match = re.search(r"\*\*strategic_scope:\*\*\s*(\w+)", parsed_body)
+        tier_match = re.search(r"\*\*evidence_tier:\*\*\s*([\w-]+)", parsed_body)
+        scope_val = existing_scope or (
+            scope_match.group(1).lower() if scope_match else "core"
+        )
+        if scope_val not in ALLOWED_SCOPES:
+            scope_val = "core"
+        tier_val = existing_tier or (tier_match.group(1) if tier_match else "")
+        if tier_val not in permitted_tiers:
+            tier_val = permitted_tiers[0]
+        body_lines = [
+            line
+            for line in parsed_body.splitlines()
+            if not re.match(r"^\s*\*\*(strategic_scope|evidence_tier):", line)
+        ]
+        body = "\n".join(body_lines).strip()
+        heading = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+        title = str(existing.get("title") or "").strip()
+        if not title:
+            title = (
+                heading.group(1).strip() if heading else filename[:-3].replace("_", " ")
+            )
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        raw_identity = hashlib.sha256(
+            f"{filename}\0{content}".encode("utf-8")
+        ).hexdigest()[:8]
+        source_values = existing.get("sources")
+        if not isinstance(source_values, list):
+            legacy_source = str(existing.get("source") or "").strip()
+            source_values = [legacy_source] if legacy_source else []
+        aliases = existing.get("aliases")
+        if not isinstance(aliases, list):
+            aliases = []
+        frontmatter = (
+            "---\n"
+            f"id: {json.dumps(f'{today.replace('-', '')}_{raw_identity}', ensure_ascii=False)}\n"
+            f"title: {json.dumps(title, ensure_ascii=False)}\n"
+            f"aliases: {json.dumps(aliases, ensure_ascii=False)}\n"
+            f"type: {json.dumps(doc_type)}\n"
+            'domain: "Medical_IT"\n'
+            'topic_cluster: "General"\n'
+            'status: "Active"\n'
+            'epistemic-status: "seed"\n'
+            "ttl: 90\n"
+            'memory_type: "fact"\n'
+            f"memory_key: {json.dumps(f'norm_{doc_type}_{raw_identity}')}\n"
+            'categories: ["Uncategorized"]\n'
+            "tags: []\n"
+            f"created: {json.dumps(today)}\n"
+            f"updated: {json.dumps(today)}\n"
+            f"sources: {json.dumps(source_values, ensure_ascii=False)}\n"
+            f"strategic_scope: {json.dumps(scope_val)}\n"
+            f"evidence_tier: {json.dumps(tier_val)}\n"
+            "---\n"
+        )
+        if doc_type in {"source", "system"}:
+            wrapped = body + "\n"
+        elif doc_type == "synthesis":
+            wrapped = (
+                "## 核心合成论点 (Core Synthesized Claims)\n\n"
+                f"{body}\n\n## 支撑拓扑 (Supporting Topology)\n"
+            )
+        else:
+            wrapped = (
+                f"## 1. 编译事实 (Compiled Facts)\n\n{body}\n\n"
+                "## 2. 证据时间线 (Evidence Timeline)\n\n"
+            )
+        normalized.append({"filename": filename, "content": frontmatter + wrapped})
+    return normalized
+
+
 def _apply_integration_disposition(
     files_written: list, processed_data: dict
 ) -> tuple[list, str, set[str]]:
@@ -2526,6 +3182,15 @@ def _apply_integration_disposition(
         for item in files
         if os.path.basename(str(item.get("filename", ""))) == canonical_name
     ]
+    if len(source_items) == 0:
+        # Model omitted the canonical Source page on a long input.  Auto-fill a
+        # provenance-only page from the queued raw baseline instead of failing.
+        files.append(_auto_source_page(processed_data))
+        source_items = [
+            item
+            for item in files
+            if os.path.basename(str(item.get("filename", ""))) == canonical_name
+        ]
     if len(source_items) != 1:
         raise ValueError(
             f"{disposition} ingest disposition requires exactly one canonical source page: {canonical_name}"
@@ -2539,6 +3204,33 @@ def _apply_integration_disposition(
         if item is not source_item:
             item.setdefault("expected_version", "")
             item.setdefault("expected_projection_hash", "")
+
+    # Model output may independently propose a page that already exists but is
+    # not an approved integration target. Never turn that name collision into
+    # an overwrite or quarantine of the whole raw revision: retain the Source
+    # and drop only the unscoped colliding proposal.
+    unscoped_items = [
+        item
+        for item in files
+        if item is not source_item and not str(item.get("expected_version") or "")
+    ]
+    unscoped_keys = {
+        _strip_markdown_suffix(os.path.basename(str(item.get("filename") or "")))
+        for item in unscoped_items
+    }
+    existing_unscoped = governance_store.canonical_page_versions(unscoped_keys)
+    skipped_existing = []
+    filtered_files = []
+    for item in files:
+        key = _strip_markdown_suffix(os.path.basename(str(item.get("filename") or "")))
+        if item is not source_item and key in existing_unscoped:
+            skipped_existing.append(os.path.basename(str(item.get("filename") or "")))
+            continue
+        filtered_files.append(item)
+    files = filtered_files
+    if skipped_existing:
+        processed_data["_skipped_unscoped_existing_pages"] = sorted(skipped_existing)
+
     relations = integration.get("relations") or []
     if disposition == "standalone":
         if relations:
@@ -2576,7 +3268,9 @@ def _apply_integration_disposition(
             str(candidate.get("target_projection_hash") or "").casefold(),
         )
     target_mutations = []
+    applied_targets = set()
     seen_targets = set()
+    filtered_relations = []
     for relation in relations:
         if not isinstance(relation, dict):
             raise ValueError("integration relations must be objects")
@@ -2589,10 +3283,26 @@ def _apply_integration_disposition(
             or target in submitted_names
             or target in seen_targets
         ):
-            raise ValueError(
-                f"integration target is duplicated or conflicts with submitted files: {target}"
-            )
+            # Model erroneously pointed a relation at a page it is submitting
+            # itself (or duplicated a target).  The submitted page already
+            # exists; drop the conflicting relation instead of failing the
+            # whole ingest.
+            continue
         seen_targets.add(target)
+        filtered_relations.append(relation)
+    relations = filtered_relations
+    if not relations:
+        # The model pointed every relation at a page it submits itself.
+        # The submitted pages are real content; degrade to a standalone
+        # disposition so they are still written, without fabricating
+        # integration edges.
+        if len(reason) < 12:
+            raise ValueError(
+                "integrated ingest disposition requires at least one relation"
+            )
+        return files, "standalone", set()
+    for relation in relations:
+        target = os.path.basename(str(relation.get("target") or ""))
         queued_candidate = allowed_candidates.get(target)
         if queued_candidate is None:
             raise ValueError(
@@ -2634,7 +3344,9 @@ def _apply_integration_disposition(
         )
         predicate = str(relation.get("predicate") or "").strip()
         if predicate not in INTEGRATION_PREDICATES:
-            raise ValueError(f"unsupported integration predicate: {predicate}")
+            # Preserve the evidence-bearing edge while collapsing free-form
+            # model predicates onto the controlled generic relation.
+            predicate = "related_to"
         evidence = " ".join(str(relation.get("evidence") or "").split())
         if len(evidence) < 12:
             raise ValueError(f"integration evidence is too short for {target}")
@@ -2655,9 +3367,9 @@ def _apply_integration_disposition(
             ) from exc
         event_tag = str(relation.get("event_tag") or "").strip().strip("[]")
         if event_tag not in INTEGRATION_EVENT_TAGS:
-            raise ValueError(
-                f"unsupported integration event_tag for {target}: {event_tag}"
-            )
+            # Unknown model labels remain auditable as a neutral observation;
+            # dates, evidence, confidence and candidate baselines stay strict.
+            event_tag = "Observation"
         relation_id = hashlib.sha256(
             f"{source_key}\x00{target_key}".encode("utf-8")
         ).hexdigest()[:16]
@@ -2696,9 +3408,12 @@ def _apply_integration_disposition(
                 "expected_projection_hash": target_projection_hash,
             }
         )
+        applied_targets.add(target)
 
+    if not target_mutations:
+        return files, "standalone", set()
     source_item["content"] = _updated_now(source_content)
-    return files + target_mutations, disposition, seen_targets
+    return files + target_mutations, disposition, applied_targets
 
 
 _TEMPORAL_WIKI_LINK = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -2804,7 +3519,10 @@ def _assert_source_link_closure(
             labels.setdefault(identity, set()).add(page_key)
 
     for page_key, title, raw_aliases in canonical_rows:
-        if not page_key or _strict_link_identity(page_key) in prepared.proposed_page_keys:
+        if (
+            not page_key
+            or _strict_link_identity(page_key) in prepared.proposed_page_keys
+        ):
             continue
         register(page_key, page_key)
         register(title, page_key)
@@ -2865,9 +3583,7 @@ def _validate_final_ingest_files(
     )
     node_records = []
     schema_maintenance_names = set()
-    file_names = {
-        os.path.basename(str(item.get("filename") or "")) for item in files
-    }
+    file_names = {os.path.basename(str(item.get("filename") or "")) for item in files}
     if not integration_target_names <= file_names:
         raise ValueError("Integration target mutations are incomplete.")
     for item in files:
@@ -2885,12 +3601,10 @@ def _validate_final_ingest_files(
             # Match mutation_coordinator's fenced schema-maintenance path:
             # preserve historical dynamic tag debt while validating structure.
             validate_schema(frontmatter, content, filename)
-            strategic_scope = str(
-                frontmatter.get("strategic_scope") or ""
-            ).strip().lower()
-            evidence_tier = str(
-                frontmatter.get("evidence_tier") or ""
-            ).strip()
+            strategic_scope = (
+                str(frontmatter.get("strategic_scope") or "").strip().lower()
+            )
+            evidence_tier = str(frontmatter.get("evidence_tier") or "").strip()
             has_legacy_purpose_metadata = (
                 strategic_scope not in {"core", "edge"}
                 or evidence_tier not in permitted_tiers
@@ -2899,9 +3613,7 @@ def _validate_final_ingest_files(
                 raise
             aliases = frontmatter.get("aliases")
             if aliases is not None and not isinstance(aliases, list):
-                raise PurposeContractError(
-                    f"{filename}: aliases must be a list."
-                )
+                raise PurposeContractError(f"{filename}: aliases must be a list.")
             categories = frontmatter.get("categories")
             if not isinstance(categories, list) or len(categories) != 1:
                 raise PurposeContractError(
@@ -3118,6 +3830,15 @@ def requeue_legacy_ingest_jobs() -> int:
                 "canonical_name": canonical_name,
                 "source_hash": source_hash,
                 "source_projection_hash": source_projection_hash,
+                "source_observed_at": datetime.fromtimestamp(
+                    raw_path.stat().st_mtime_ns / 1_000_000_000,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "attempt_id": hashlib.sha256(
+                    (f"{record['job_id']}\0{current_hash}\0legacy-migration-v6").encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:32],
                 "integration_candidates": integration_candidates,
                 "ingest_contract_version": INGEST_CONTRACT_VERSION,
                 "instructions": instructions,
@@ -3616,10 +4337,13 @@ def _raw_inventory_scrub_due(
     if day_ordinal is None:
         day_ordinal = datetime.now(timezone.utc).date().toordinal()
     normalized = os.path.normcase(os.path.abspath(os.fspath(filepath)))
-    bucket = int.from_bytes(
-        hashlib.sha256(normalized.encode("utf-8")).digest()[:8],
-        "big",
-    ) % period_days
+    bucket = (
+        int.from_bytes(
+            hashlib.sha256(normalized.encode("utf-8")).digest()[:8],
+            "big",
+        )
+        % period_days
+    )
     return int(day_ordinal) % period_days == bucket
 
 
@@ -3838,6 +4562,7 @@ def prepare_ingest_batch(
         )
 
     ingest_candidates = []
+    candidate_observed_at: dict[str, str] = {}
     observations_to_update = []
     scrub_day_ordinal = (
         current_raw_scrub_day_ordinal() if candidate_paths is None else None
@@ -3929,6 +4654,11 @@ def prepare_ingest_batch(
                 },
             )
             ingest_candidates.append((identity_key, identity))
+            if identity_key:
+                candidate_observed_at[str(identity_key)] = datetime.fromtimestamp(
+                    snapshot.observed_mtime_ns / 1_000_000_000,
+                    tz=timezone.utc,
+                ).isoformat()
         except (OSError, RawSourceUnstableError) as exc:
             inventory_errors.append(
                 f"source_stat_error:{filepath}:{type(exc).__name__}:{exc}"
@@ -3966,8 +4696,6 @@ def prepare_ingest_batch(
     if not _enqueue_all:
         pending_files = pending_files[:batch_size]
 
-    from vector_lake.db_store import enqueue_job
-
     enqueued_count = 0
     payload = None
     instruction_context = _LazyIngestInstructionContext()
@@ -3979,9 +4707,11 @@ def prepare_ingest_batch(
     preparation_errors = []
 
     managed_operation = current_cancellation_operation()
-    prepared_payloads = []
+    prepared_payloads: list[tuple[dict, str, str, int]] = []
     for position, (filepath, file_hash, canonical_name) in enumerate(pending_files):
         _raw_scan_checkpoint("raw_inventory:prepare_payload", position)
+        prepare_started_at = datetime.now(timezone.utc).isoformat()
+        prepare_started_monotonic = time.monotonic()
         try:
             canonical_key = _strip_markdown_suffix(canonical_name)
             source_hash = source_hashes.get(canonical_key, "")
@@ -3997,32 +4727,74 @@ def prepare_ingest_batch(
                 instruction_context,
                 integration_candidates,
             )
+            identity_key = _job_idempotency_key(
+                "ingest",
+                {
+                    "filepath": filepath,
+                    "hash": file_hash,
+                    "canonical_name": canonical_name,
+                },
+            )
+            if not identity_key:
+                raise RuntimeError("ingest identity key could not be derived")
             payload = {
                 "filepath": str(filepath),
                 "hash": file_hash,
                 "canonical_name": canonical_name,
                 "source_hash": source_hash,
                 "source_projection_hash": source_projection_hash,
+                "source_observed_at": candidate_observed_at.get(
+                    str(identity_key),
+                    "",
+                ),
+                "attempt_id": hashlib.sha256(
+                    f"{identity_key}\0{prepare_started_at}".encode("utf-8")
+                ).hexdigest()[:32],
                 "integration_candidates": integration_candidates,
                 "ingest_contract_version": INGEST_CONTRACT_VERSION,
                 "instructions": instructions,
             }
+            prepare_duration_ms = max(
+                0,
+                int((time.monotonic() - prepare_started_monotonic) * 1000),
+            )
             if managed_operation is None:
-                enqueue_job("ingest", payload)
+                payload, _job_id = _publish_local_source_and_enqueue(
+                    payload,
+                    idempotency_key=str(identity_key),
+                    prepare_started_at=prepare_started_at,
+                    prepare_duration_ms=prepare_duration_ms,
+                )
                 enqueued_count += 1
             else:
-                prepared_payloads.append(payload)
+                prepared_payloads.append(
+                    (
+                        payload,
+                        str(identity_key),
+                        prepare_started_at,
+                        prepare_duration_ms,
+                    )
+                )
         except CooperativeCancellation:
             raise
         except Exception as exc:
             preparation_errors.append(f"{filepath}: {type(exc).__name__}: {exc}")
 
     if prepared_payloads:
-        with non_interruptible_phase("raw_ingest_enqueue"):
-            for prepared_payload in prepared_payloads:
+        with non_interruptible_phase("raw_ingest_local_publication"):
+            for (
+                prepared_payload,
+                identity_key,
+                prepare_started_at,
+                prepare_duration_ms,
+            ) in prepared_payloads:
                 try:
-                    enqueue_job("ingest", prepared_payload)
-                    payload = prepared_payload
+                    payload, _job_id = _publish_local_source_and_enqueue(
+                        prepared_payload,
+                        idempotency_key=identity_key,
+                        prepare_started_at=prepare_started_at,
+                        prepare_duration_ms=prepare_duration_ms,
+                    )
                     enqueued_count += 1
                 except CooperativeCancellation:
                     raise
@@ -4111,12 +4883,13 @@ def _finalize_ingest_impl(
         lease_owner = str(processed_data.get("lease_owner") or "")
         lease_token = str(processed_data.get("lease_token") or "")
         lease_generation = int(processed_data.get("lease_generation"))
+        contract = load_purpose_contract()
+        files = _normalize_codex_output_pages(files, contract)
         (
             files,
             integration_disposition,
             integration_target_names,
         ) = _apply_integration_disposition(files, processed_data)
-        contract = load_purpose_contract()
         (
             node_records,
             schema_maintenance_filenames,
@@ -4155,6 +4928,7 @@ def _finalize_ingest_impl(
             written_paths.append(str(wiki_dir / fname))
 
         filepath = processed_data["filepath"]
+        attempt_id = str(processed_data.get("attempt_id") or "")
         from vector_lake.mutation_coordinator import execute_mutation_batch
 
         def mark_ingest_processed():
@@ -4180,15 +4954,68 @@ def _finalize_ingest_impl(
                     str(job_row["task_packet_path"]),
                 )
 
+        def record_ingest_commit(outbox_ids: list[int]) -> None:
+            from vector_lake import db_store as ingest_db_store
+
+            connection = ingest_db_store.get_connection()
+            ingest_db_store.link_ingest_outbox_events(
+                outbox_ids=outbox_ids,
+                job_id=str(job_id),
+                revision=queued_hash,
+                attempt_id=attempt_id,
+                lease_generation=lease_generation,
+                connection=connection,
+            )
+            common = {
+                "job_id": str(job_id),
+                "revision": queued_hash,
+                "attempt_id": attempt_id,
+                "lease_generation": lease_generation,
+                "ordinal": max(1, lease_generation),
+                "connection": connection,
+            }
+            ingest_db_store.record_ingest_stage_event(
+                **common,
+                stage="canonical_commit",
+                transition="completed",
+                metadata={"outbox_count": len(outbox_ids)},
+            )
+            if outbox_ids:
+                ingest_db_store.record_ingest_stage_event(
+                    **common,
+                    stage="outbox",
+                    transition="completed",
+                    metadata={
+                        "outbox_ids": [int(item) for item in outbox_ids],
+                        "state": "enqueued",
+                    },
+                )
+
+        mutation_details = None
         with non_interruptible_phase("ingest_finalize_commit"):
             if mutations:
-                execute_mutation_batch(
+                # Every generated page has already passed complete schema,
+                # purpose, payload, and integration validation above. Use the
+                # bounded lane unless legacy schema-maintenance exceptions are
+                # explicitly present; those exceptions remain full-gate only.
+                mutation_validation_mode = (
+                    "full" if schema_maintenance_filenames else "schema"
+                )
+                result = execute_mutation_batch(
                     mutations,
+                    validation_mode=mutation_validation_mode,
                     canonical_callback=mark_ingest_processed,
                     precondition_callback=verify_source_link_closure,
                     origin="ingest_integration",
                     schema_maintenance_filenames=schema_maintenance_filenames,
+                    return_details=True,
+                    transaction_callback=record_ingest_commit,
                 )
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        "ingest finalization did not return mutation details"
+                    )
+                mutation_details = cast(dict, result)
             else:
                 from vector_lake import db_store as ingest_db_store
                 from vector_lake.runtime_health import enforce_runtime_write_health
@@ -4198,6 +5025,32 @@ def _finalize_ingest_impl(
                 with ingest_db_store.transaction():
                     verify_source_link_closure()
                     mark_ingest_processed()
+                    record_ingest_commit([])
+
+        if mutation_details is not None:
+            deferred = set(mutation_details.get("deferred") or [])
+            try:
+                from vector_lake import db_store as ingest_db_store
+
+                ingest_db_store.record_ingest_stage_event(
+                    job_id=str(job_id),
+                    revision=queued_hash,
+                    attempt_id=attempt_id,
+                    lease_generation=lease_generation,
+                    stage="markdown",
+                    transition="failed" if deferred else "completed",
+                    ordinal=max(1, lease_generation),
+                    metadata={
+                        "deferred_count": len(deferred),
+                        "mutation_count": len(mutations),
+                    },
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not persist ingest Markdown telemetry for %s: %s",
+                    job_id,
+                    type(exc).__name__,
+                )
 
         try:
             cleanup = process_ingest_task_cleanup(limit=20)
@@ -4221,9 +5074,11 @@ def _finalize_ingest_impl(
                 if target_names:
                     from vector_lake.indexer import read_committed_index_snapshot
 
-                    index_nodes = read_committed_index_snapshot(
-                        get_index_path()
-                    ).get("nodes", {}).values()
+                    index_nodes = (
+                        read_committed_index_snapshot(get_index_path())
+                        .get("nodes", {})
+                        .values()
+                    )
                     for node in index_nodes:
                         edges = node.get("tension_edges", [])
                         if any(
@@ -4286,10 +5141,7 @@ def _finalize_ingest_impl(
                 f"automatic baseline requeue failed: {type(requeue_error).__name__}"
             )
         if requeued:
-            return (
-                "Ingest baseline changed; job requeued for a fresh dispatch: "
-                f"{exc}"
-            )
+            return f"Ingest baseline changed; job requeued for a fresh dispatch: {exc}"
         if propagate_errors:
             raise IngestFinalizationInfrastructureError(
                 "baseline changed, but the exact finalization lease was no longer current: "

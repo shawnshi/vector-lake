@@ -103,8 +103,7 @@ def capability_manifest(
             "environment": f"VECTOR_LAKE_MCP_SURFACE={normalized_surface}",
             "fail_closed": True,
             "includes_runtime_status": (
-                available_tools is None
-                or "mcp_runtime_status" in available_tool_names
+                available_tools is None or "mcp_runtime_status" in available_tool_names
             ),
         },
     }
@@ -126,7 +125,7 @@ def recall(
         "verb": "recall",
         "mode": effective_mode,
         "include_history": bool(include_history),
-        "semantic_readiness": get_semantic_readiness_envelope(),
+        "semantic_readiness": get_semantic_readiness_envelope(nonblocking=True),
         "result": search_vector_lake(
             query,
             top_k=top_k,
@@ -183,7 +182,7 @@ def synthesize(query: str) -> dict[str, Any]:
         "verb": "synthesize",
         "proposal_only": True,
         "committed": False,
-        "semantic_readiness": get_semantic_readiness_envelope(),
+        "semantic_readiness": get_semantic_readiness_envelope(nonblocking=True),
         "result": prepare_query_context(query, dry_run=True),
     }
 
@@ -194,12 +193,16 @@ def context_pack(query: str, *, max_chars: int = 32_000) -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise ValueError("max_chars must be an integer") from exc
     bounded_chars = max(1_000, min(_MAX_CONTEXT_CHARS, bounded_chars))
-    context = assemble_context(query, max_chars=bounded_chars)
+    context = assemble_context(
+        query,
+        max_chars=bounded_chars,
+        lightweight=True,
+    )
     return {
         "contract_version": MEMORY_PROTOCOL_VERSION,
         "verb": "context_pack",
         "max_chars": bounded_chars,
-        "semantic_readiness": get_semantic_readiness_envelope(),
+        "semantic_readiness": get_semantic_readiness_envelope(nonblocking=True),
         "context": context,
     }
 

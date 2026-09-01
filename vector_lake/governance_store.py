@@ -47,7 +47,9 @@ from vector_lake.wiki_utils import (
 )
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("vector-lake-governance-store")
 
 SCHEMA_VERSION = "8.0"
@@ -71,6 +73,7 @@ VALIDITY_FACTORS = {
     "archived": 0.0,
 }
 
+
 class OperationalMemoryNotReady(RuntimeError):
     """A read-only memory query cannot safely use the current projection."""
 
@@ -85,7 +88,6 @@ class OperationalMemoryNotReady(RuntimeError):
 
 class CanonicalStoreNotReady(RuntimeError):
     """A read-only caller cannot bootstrap an empty canonical store."""
-
 
 
 class CanonicalIdOwnershipError(ValueError):
@@ -143,17 +145,18 @@ _CHANGE_SET_COMPACTION_MAX_CURSOR_BYTES = 1024
 _PURPOSE_VECTORS_CACHE = None
 _PURPOSE_VECTORS_MTIME = 0
 
+
 def get_purpose_vectors() -> dict:
     global _PURPOSE_VECTORS_CACHE, _PURPOSE_VECTORS_MTIME
     path = get_meta_dir() / "purpose_vectors.json"
-    
+
     current_mtime = 0
     if path.exists():
         current_mtime = path.stat().st_mtime
-        
+
     if _PURPOSE_VECTORS_CACHE is not None and _PURPOSE_VECTORS_MTIME == current_mtime:
         return _PURPOSE_VECTORS_CACHE
-        
+
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -162,7 +165,7 @@ def get_purpose_vectors() -> dict:
             _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
     else:
         _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
-        
+
     _PURPOSE_VECTORS_MTIME = current_mtime
     return _PURPOSE_VECTORS_CACHE
 
@@ -193,16 +196,31 @@ def _default_queue_store() -> dict:
 
 
 ALLOWED_TABLES = {
-    "entities", "claims", "evidence", "sources", "change_sets",
-    "governance_queue", "wiki_search_index", "alias_registry",
-    "operational_memory", "claim_graph_nodes", "claim_graph_edges", "page_graph_edges",
-    "timeline_events", "processed_files", "mutation_outbox"
+    "entities",
+    "claims",
+    "evidence",
+    "sources",
+    "change_sets",
+    "governance_queue",
+    "wiki_search_index",
+    "alias_registry",
+    "operational_memory",
+    "claim_graph_nodes",
+    "claim_graph_edges",
+    "page_graph_edges",
+    "timeline_events",
+    "processed_files",
+    "mutation_outbox",
 }
+
 
 def _validate_table_name(table_name: str):
     """🛡️ Sentinel: Prevent SQL injection by validating table names against a strict whitelist."""
     if table_name not in ALLOWED_TABLES:
-        raise ValueError(f"Security error: Invalid table name '{table_name}'. Expected one of {ALLOWED_TABLES}.")
+        raise ValueError(
+            f"Security error: Invalid table name '{table_name}'. Expected one of {ALLOWED_TABLES}."
+        )
+
 
 def initialize_meta_store():
     if mcp_readonly_surface_enabled():
@@ -239,8 +257,7 @@ def _load_db_queue(table_name: str, pk_col: str):
     conn = get_connection()
     store = _default_queue_store()
     rows = conn.execute(
-        f"SELECT data_json FROM {table_name} "
-        f"ORDER BY updated_at ASC, {pk_col} ASC"
+        f"SELECT data_json FROM {table_name} ORDER BY updated_at ASC, {pk_col} ASC"
     ).fetchall()
     for row in rows:
         store["items"].append(json.loads(row["data_json"]))
@@ -259,27 +276,32 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
     data["updated_at"] = now
     if extra_cols is None:
         extra_cols = []
-    
+
     with transaction():
-        existing_rows = conn.execute(f"SELECT {pk_col}, data_json FROM {table_name}").fetchall()
+        existing_rows = conn.execute(
+            f"SELECT {pk_col}, data_json FROM {table_name}"
+        ).fetchall()
         existing_map = {row[0]: row["data_json"] for row in existing_rows}
         new_keys = set(data.get("items", {}).keys())
         keys_to_delete = set(existing_map.keys()) - new_keys
-        
+
         if keys_to_delete:
-            conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
-            
+            conn.executemany(
+                f"DELETE FROM {table_name} WHERE {pk_col} = ?",
+                [(k,) for k in keys_to_delete],
+            )
+
         if data.get("items"):
             cols = [pk_col] + [c[0] for c in extra_cols] + ["data_json", "updated_at"]
             placeholders = ["?"] * len(cols)
-            
+
             all_vals = []
             for key, item in data.get("items", {}).items():
                 new_json = json.dumps(item, ensure_ascii=False)
                 # Skip SQLite I/O if the row hasn't changed at all
                 if key in existing_map and existing_map[key] == new_json:
                     continue
-                    
+
                 params = [key]
                 for c_name, c_key, c_type in extra_cols:
                     val = item.get(c_key)
@@ -292,9 +314,12 @@ def _save_db_map(table_name: str, pk_col: str, data: dict, extra_cols: list = No
                 params.append(new_json)
                 params.append(now)
                 all_vals.append(tuple(params))
-                
+
             if all_vals:
-                conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", all_vals)
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})",
+                    all_vals,
+                )
 
 
 def _save_db_queue(table_name: str, pk_col: str, data: dict):
@@ -307,21 +332,29 @@ def _save_db_queue(table_name: str, pk_col: str, data: dict):
         for item in data.get("items", []):
             if not item.get(pk_col):
                 item[pk_col] = uuid.uuid4().hex
-                
-        existing_keys_query = conn.execute(f"SELECT {pk_col} FROM {table_name}").fetchall()
+
+        existing_keys_query = conn.execute(
+            f"SELECT {pk_col} FROM {table_name}"
+        ).fetchall()
         existing_keys = {row[0] for row in existing_keys_query}
         new_keys = {item[pk_col] for item in data.get("items", [])}
         keys_to_delete = existing_keys - new_keys
-        
+
         if keys_to_delete:
-            conn.executemany(f"DELETE FROM {table_name} WHERE {pk_col} = ?", [(k,) for k in keys_to_delete])
-            
+            conn.executemany(
+                f"DELETE FROM {table_name} WHERE {pk_col} = ?",
+                [(k,) for k in keys_to_delete],
+            )
+
         if data.get("items"):
             all_vals = []
             for item in data.get("items", []):
                 k = item.get(pk_col)
                 all_vals.append((k, json.dumps(item, ensure_ascii=False), now))
-            conn.executemany(f"INSERT OR REPLACE INTO {table_name} ({pk_col}, data_json, updated_at) VALUES (?, ?, ?)", all_vals)
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {table_name} ({pk_col}, data_json, updated_at) VALUES (?, ?, ?)",
+                all_vals,
+            )
 
 
 def load_entities():
@@ -358,7 +391,6 @@ def query_entities(
     return store
 
 
-
 def load_claims():
     return _load_db_map("claims", "claim_id")
 
@@ -374,12 +406,16 @@ def load_sources():
 def canonical_store_counts() -> dict[str, int]:
     """Return canonical row counts without materializing domain objects."""
     initialize_meta_store()
-    row = get_connection().execute(
-        "SELECT "
-        "(SELECT COUNT(*) FROM entities) AS entities, "
-        "(SELECT COUNT(*) FROM claims) AS claims, "
-        "(SELECT COUNT(*) FROM sources) AS sources"
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM entities) AS entities, "
+            "(SELECT COUNT(*) FROM claims) AS claims, "
+            "(SELECT COUNT(*) FROM sources) AS sources"
+        )
+        .fetchone()
+    )
     return {
         "entities": int(row["entities"]),
         "claims": int(row["claims"]),
@@ -402,24 +438,55 @@ def _select_trace_claims_streaming(
     relevant_pages: set[str],
     top_k: int,
 ) -> list[dict]:
-    """Preserve Python Unicode matching while retaining only a top-K heap."""
+    """Rank indexed page claims, then use one bounded compatibility scan."""
     normalized_tokens = [str(token).lower() for token in tokens]
     normalized_pages = {str(page) for page in relevant_pages}
     retained: list[tuple[int, str, str]] = []
-    rows = get_connection().execute(
-        "SELECT claim_id AS source_key, claim_text, "
-        "COALESCE(json_extract(data_json, '$.source_page'), '') AS source_page, "
-        "data_json FROM claims"
-    )
-    for row in rows:
+    seen: set[str] = set()
+    conn = get_connection()
+    candidate_rows = []
+    if normalized_pages:
+        page_limit = max(64, min(2048, top_k * 64))
+        per_page_limit = max(16, page_limit // len(normalized_pages))
+        for page_key in sorted(normalized_pages):
+            candidate_rows.extend(
+                conn.execute(
+                    "SELECT claim_id AS source_key, claim_text, "
+                    "COALESCE(json_extract(data_json, '$.source_page'), '') "
+                    "AS source_page, COALESCE(json_extract(data_json, "
+                    "'$.locator.page_key'), '') AS locator_page, data_json "
+                    "FROM claims WHERE "
+                    "json_extract(data_json, '$.locator.page_key') = ? "
+                    "ORDER BY claim_id ASC LIMIT ?",
+                    (page_key, per_page_limit),
+                )
+            )
+    if len(candidate_rows) < top_k:
+        fallback_limit = max(256, min(4096, top_k * 256))
+        candidate_rows.extend(
+            conn.execute(
+                "SELECT claim_id AS source_key, claim_text, "
+                "COALESCE(json_extract(data_json, '$.source_page'), '') "
+                "AS source_page, COALESCE(json_extract(data_json, "
+                "'$.locator.page_key'), '') AS locator_page, data_json "
+                "FROM claims "
+                "ORDER BY claim_id ASC LIMIT ?",
+                (fallback_limit,),
+            )
+        )
+    for row in candidate_rows:
+        source_key = str(row["source_key"])
+        if source_key in seen:
+            continue
+        seen.add(source_key)
         source_page = str(row["source_page"] or "")
+        page_key = str(row["locator_page"] or "")
         haystack = f"{row['claim_text'] or ''} {source_page}".lower()
-        score = (5 if source_page in normalized_pages else 0) + sum(
+        score = (5 if page_key in normalized_pages else 0) + sum(
             1 for token in normalized_tokens if token in haystack
         )
         if score <= 0:
             continue
-        source_key = str(row["source_key"])
         candidate = (score, source_key, str(row["data_json"]))
         if len(retained) < top_k:
             retained.append(candidate)
@@ -445,10 +512,12 @@ def select_trace_claims(
         raise ValueError("top_k must be non-negative")
     if top_k == 0 or (not tokens and not relevant_pages):
         return []
-    initialize_meta_store()
-    if _needs_unicode_trace_fallback(tokens):
+    # Trace is read-only and must not pay the first-process migration path.
+    # Validate the existing schema ledger, then query the established store.
+    conn = require_current_schema_for_read("claims")
+    if relevant_pages or _needs_unicode_trace_fallback(tokens):
         return _select_trace_claims_streaming(tokens, relevant_pages, top_k)
-    rows = get_connection().execute(
+    rows = conn.execute(
         "WITH query_terms(term) AS ("
         "SELECT CAST(value AS TEXT) FROM json_each(?)"
         "), relevant_pages(page_key) AS ("
@@ -468,7 +537,9 @@ def select_trace_claims(
         "ORDER BY trace_score DESC, source_key ASC LIMIT ?",
         (
             json.dumps([str(token).lower() for token in tokens], ensure_ascii=False),
-            json.dumps(sorted(str(page) for page in relevant_pages), ensure_ascii=False),
+            json.dumps(
+                sorted(str(page) for page in relevant_pages), ensure_ascii=False
+            ),
             int(top_k),
         ),
     ).fetchall()
@@ -480,14 +551,13 @@ def load_trace_labels(
     source_ids: set[str],
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Load labels only for entities and sources referenced by selected claims."""
-    initialize_meta_store()
-    conn = get_connection()
+    conn = require_current_schema_for_read("entities", "sources")
     entity_names: dict[str, str] = {}
     source_pages: dict[str, str] = {}
 
     ordered_entities = sorted(str(value) for value in entity_ids if value)
     for offset in range(0, len(ordered_entities), 500):
-        batch = ordered_entities[offset:offset + 500]
+        batch = ordered_entities[offset : offset + 500]
         placeholders = ",".join("?" for _ in batch)
         rows = conn.execute(
             "SELECT entity_id, canonical_name, data_json FROM entities "
@@ -502,7 +572,7 @@ def load_trace_labels(
 
     ordered_sources = sorted(str(value) for value in source_ids if value)
     for offset in range(0, len(ordered_sources), 500):
-        batch = ordered_sources[offset:offset + 500]
+        batch = ordered_sources[offset : offset + 500]
         placeholders = ",".join("?" for _ in batch)
         rows = conn.execute(
             "SELECT source_id, data_json FROM sources "
@@ -530,10 +600,14 @@ def load_alias_registry():
 def get_alias(key: str) -> str | None:
     """Return one alias target without loading the complete registry."""
     initialize_meta_store()
-    row = get_connection().execute(
-        "SELECT value FROM alias_registry WHERE key = ?",
-        (key,),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT value FROM alias_registry WHERE key = ?",
+            (key,),
+        )
+        .fetchone()
+    )
     return row["value"] if row else None
 
 
@@ -664,13 +738,18 @@ def load_governance_queue():
 
 
 def save_entities(data):
-    _save_db_map("entities", "entity_id", data, [
-        ("canonical_name", "canonical_name", str),
-        ("type", "type", str),
-        ("status", "status", str),
-        ("ttl", "ttl", float),
-        ("decay_weight", "decay_weight", float)
-    ])
+    _save_db_map(
+        "entities",
+        "entity_id",
+        data,
+        [
+            ("canonical_name", "canonical_name", str),
+            ("type", "type", str),
+            ("status", "status", str),
+            ("ttl", "ttl", float),
+            ("decay_weight", "decay_weight", float),
+        ],
+    )
 
 
 def save_claims(_data):
@@ -695,7 +774,13 @@ def save_graph_edges(edges: list[dict]):
     conn = get_connection()
     with transaction():
         for edge in edges:
-            params = (edge["source_id"], edge["target_id"], edge["relation"], edge.get("weight", 1.0), edge.get("updated_at", _utc_now()))
+            params = (
+                edge["source_id"],
+                edge["target_id"],
+                edge["relation"],
+                edge.get("weight", 1.0),
+                edge.get("updated_at", _utc_now()),
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO claim_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
                 params,
@@ -711,22 +796,35 @@ def save_alias_registry(data):
     now = _utc_now()
     data["updated_at"] = now
     with transaction():
-        existing_keys = {row["key"] for row in conn.execute("SELECT key FROM alias_registry")}
+        existing_keys = {
+            row["key"] for row in conn.execute("SELECT key FROM alias_registry")
+        }
         new_keys = set(data.get("items", {}))
         stale_keys = existing_keys - new_keys
         if stale_keys:
-            conn.executemany("DELETE FROM alias_registry WHERE key = ?", [(key,) for key in stale_keys])
+            conn.executemany(
+                "DELETE FROM alias_registry WHERE key = ?",
+                [(key,) for key in stale_keys],
+            )
         for k, v in data.get("items", {}).items():
-            conn.execute("INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)", (k, v, now))
+            conn.execute(
+                "INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)",
+                (k, v, now),
+            )
 
 
 def save_memory_objects(data):
-    _save_db_map("operational_memory", "memory_id", data, [
-        ("memory_type", "memory_type", str), 
-        ("score", "memory_score", float),
-        ("status", "status", str),
-        ("ttl", "ttl", float)
-    ])
+    _save_db_map(
+        "operational_memory",
+        "memory_id",
+        data,
+        [
+            ("memory_type", "memory_type", str),
+            ("score", "memory_score", float),
+            ("status", "status", str),
+            ("ttl", "ttl", float),
+        ],
+    )
 
 
 def save_change_sets(_data):
@@ -734,6 +832,7 @@ def save_change_sets(_data):
         "Full-history change-set replacement is disabled; use "
         "record_prepared_change_sets or confirmed history maintenance"
     )
+
 
 def save_governance_queue(data):
     """Compatibility writer that upserts the supplied rows without deleting peers."""
@@ -757,10 +856,14 @@ def save_governance_queue(data):
 
 def get_governance_item(item_id: str) -> dict | None:
     init_db()
-    row = get_connection().execute(
-        "SELECT data_json FROM governance_queue WHERE item_id = ?",
-        (str(item_id),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT data_json FROM governance_queue WHERE item_id = ?",
+            (str(item_id),),
+        )
+        .fetchone()
+    )
     return json.loads(row["data_json"]) if row else None
 
 
@@ -789,14 +892,21 @@ def update_governance_item(
     """Apply a serialized read-modify-write to one governance row."""
     init_db()
     with transaction():
-        row = get_connection().execute(
-            "SELECT data_json FROM governance_queue WHERE item_id = ?",
-            (str(item_id),),
-        ).fetchone()
+        row = (
+            get_connection()
+            .execute(
+                "SELECT data_json FROM governance_queue WHERE item_id = ?",
+                (str(item_id),),
+            )
+            .fetchone()
+        )
         if row is None:
             return None
         item = json.loads(row["data_json"])
-        if expected_statuses is not None and str(item.get("status")) not in expected_statuses:
+        if (
+            expected_statuses is not None
+            and str(item.get("status")) not in expected_statuses
+        ):
             return None
         item.update(copy.deepcopy(updates))
         get_connection().execute(
@@ -851,7 +961,9 @@ def normalize_governance_item(item: dict) -> dict:
     elif verified_refs:
         priority = "P0"
     else:
-        priority = _GOVERNANCE_DEFAULT_PRIORITY.get(str(normalized.get("type") or ""), "P2")
+        priority = _GOVERNANCE_DEFAULT_PRIORITY.get(
+            str(normalized.get("type") or ""), "P2"
+        )
     normalized["priority"] = priority
     normalized["priority_score"] = (4 - _GOVERNANCE_PRIORITY_ORDER[priority]) * 100
     normalized["critical_decision_refs"] = refs
@@ -889,12 +1001,20 @@ def insert_governance_item_if_absent(
     init_db()
     with transaction():
         if dedup_fields and all(item.get(field) is not None for field in dedup_fields):
-            clauses = [f"json_extract(data_json, '$.{field}') = ?" for field in dedup_fields]
+            clauses = [
+                f"json_extract(data_json, '$.{field}') = ?" for field in dedup_fields
+            ]
             values = [item[field] for field in dedup_fields]
-            existing = get_connection().execute(
-                "SELECT 1 FROM governance_queue WHERE " + " AND ".join(clauses) + " LIMIT 1",
-                values,
-            ).fetchone()
+            existing = (
+                get_connection()
+                .execute(
+                    "SELECT 1 FROM governance_queue WHERE "
+                    + " AND ".join(clauses)
+                    + " LIMIT 1",
+                    values,
+                )
+                .fetchone()
+            )
             if existing:
                 return False
         result = get_connection().execute(
@@ -910,10 +1030,14 @@ def update_governance_items_by_field(field: str, value: str, updates: dict) -> i
     init_db()
     updated = 0
     with transaction():
-        rows = get_connection().execute(
-            f"SELECT item_id, data_json FROM governance_queue WHERE json_extract(data_json, '$.{field}') = ?",
-            (value,),
-        ).fetchall()
+        rows = (
+            get_connection()
+            .execute(
+                f"SELECT item_id, data_json FROM governance_queue WHERE json_extract(data_json, '$.{field}') = ?",
+                (value,),
+            )
+            .fetchall()
+        )
         for row in rows:
             item = json.loads(row["data_json"])
             item.update(copy.deepcopy(updates))
@@ -924,12 +1048,15 @@ def update_governance_items_by_field(field: str, value: str, updates: dict) -> i
             updated += 1
     return updated
 
+
 # =============================================================================
 # V10.1 TARGETED ATOMIC CRUD (Replaces load_all -> save_all pattern)
 # =============================================================================
 def get_entity(entity_id: str) -> dict | None:
     conn = get_connection()
-    row = conn.execute("SELECT data_json FROM entities WHERE entity_id = ?", (entity_id,)).fetchone()
+    row = conn.execute(
+        "SELECT data_json FROM entities WHERE entity_id = ?", (entity_id,)
+    ).fetchone()
     if row:
         return json.loads(row["data_json"])
     return None
@@ -968,8 +1095,7 @@ def canonical_page_version_from_content(filename: str, content: str) -> str:
     frontmatter, body = split_frontmatter(content)
     extracted = extract_page_objects(filename, frontmatter, body, entity_only=True)
     records = [
-        (str(record["entity_id"]), record)
-        for record in extracted.get("entities", [])
+        (str(record["entity_id"]), record) for record in extracted.get("entities", [])
     ]
     if not records:
         return ""
@@ -1021,29 +1147,51 @@ def canonical_page_versions(
         for page_key, page_records in records_by_page.items()
     }
 
+
 def upsert_entity(entity_id: str, data: dict):
     conn = get_connection()
     now = _utc_now()
-    cols = ["entity_id", "canonical_name", "type", "status", "ttl", "decay_weight", "data_json", "updated_at"]
+    cols = [
+        "entity_id",
+        "canonical_name",
+        "type",
+        "status",
+        "ttl",
+        "decay_weight",
+        "data_json",
+        "updated_at",
+    ]
     placeholders = ["?"] * len(cols)
     params = [
         entity_id,
-        str(data.get("canonical_name") or data.get("title") or data.get("page_key") or entity_id),
+        str(
+            data.get("canonical_name")
+            or data.get("title")
+            or data.get("page_key")
+            or entity_id
+        ),
         str(data.get("type", "")),
         str(data.get("status", "Active")),
         float(data.get("ttl") or 0.0),
         float(data.get("decay_weight") or 0.0),
         json.dumps(data, ensure_ascii=False),
-        now
+        now,
     ]
     with transaction():
-        conn.execute(f"INSERT OR REPLACE INTO entities ({', '.join(cols)}) VALUES ({', '.join(placeholders)})", params)
+        conn.execute(
+            f"INSERT OR REPLACE INTO entities ({', '.join(cols)}) VALUES ({', '.join(placeholders)})",
+            params,
+        )
+
 
 def delete_entity(entity_id: str):
     conn = get_connection()
     with transaction():
         conn.execute("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
+
+
 # =============================================================================
+
 
 def _upsert_map_records(store: dict, records: list, key_name: str):
     for record in records:
@@ -1130,7 +1278,12 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
             [
                 (
                     record[key_name],
-                    str(record.get("canonical_name") or record.get("title") or record.get("page_key") or record[key_name]),
+                    str(
+                        record.get("canonical_name")
+                        or record.get("title")
+                        or record.get("page_key")
+                        or record[key_name]
+                    ),
                     str(record.get("type", "")),
                     str(record.get("status", "Active")),
                     json.dumps(record, ensure_ascii=False),
@@ -1180,7 +1333,9 @@ def _canonical_record_json(record: dict) -> str:
     return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _record_family(record: dict, family_field: str, family_prefix: str) -> tuple[str, str]:
+def _record_family(
+    record: dict, family_field: str, family_prefix: str
+) -> tuple[str, str]:
     locator = dict(record.get("locator") or record.get("projection_locator") or {})
     page_key = str(locator.get("page_key") or "")
     family_id = str(record.get(family_field) or "")
@@ -1192,7 +1347,9 @@ def _record_family(record: dict, family_field: str, family_prefix: str) -> tuple
                 locator["kind"] = record.get("evidence_type")
             family_id = version_family_id(family_prefix, page_key, locator)
         else:
-            family_id = _stable_id(family_prefix, str(record.get("claim_id") or record.get("evidence_id")))
+            family_id = _stable_id(
+                family_prefix, str(record.get("claim_id") or record.get("evidence_id"))
+            )
     return family_id, page_key
 
 
@@ -1404,7 +1561,9 @@ _SOURCE_FOUNDATION_FIELDS = (
 )
 
 
-def _merge_missing_record_fields(current: dict, proposed: dict, fields: tuple[str, ...]) -> bool:
+def _merge_missing_record_fields(
+    current: dict, proposed: dict, fields: tuple[str, ...]
+) -> bool:
     """Add absent foundation fields without overwriting reviewed canonical values."""
     changed = False
     for field in fields:
@@ -1452,7 +1611,9 @@ def _merge_source_foundation_fields(current: dict, proposed: dict) -> bool:
 
 def _merge_evidence_foundation_fields(current: dict, proposed: dict) -> bool:
     """Upgrade conservative placeholders without replacing reviewed locators."""
-    changed = _merge_missing_record_fields(current, proposed, _EVIDENCE_FOUNDATION_FIELDS)
+    changed = _merge_missing_record_fields(
+        current, proposed, _EVIDENCE_FOUNDATION_FIELDS
+    )
     current_locator = current.get("source_locator")
     proposed_locator = proposed.get("source_locator")
     current_kind = (
@@ -1513,14 +1674,35 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
     page_key = str(extracted.get("page_key") or "")
     runs = list(extracted.get("extraction_runs") or [])
     if not page_key or len(runs) != 1:
-        raise ValueError("Evidence-foundation backfill requires one page and one extraction run.")
+        raise ValueError(
+            "Evidence-foundation backfill requires one page and one extraction run."
+        )
 
     record_specs = (
-        ("claims", "claim_id", _CLAIM_FOUNDATION_FIELDS, list(extracted.get("claims") or [])),
-        ("evidence", "evidence_id", _EVIDENCE_FOUNDATION_FIELDS, list(extracted.get("evidence") or [])),
-        ("sources", "source_id", _SOURCE_FOUNDATION_FIELDS, list(extracted.get("sources") or [])),
+        (
+            "claims",
+            "claim_id",
+            _CLAIM_FOUNDATION_FIELDS,
+            list(extracted.get("claims") or []),
+        ),
+        (
+            "evidence",
+            "evidence_id",
+            _EVIDENCE_FOUNDATION_FIELDS,
+            list(extracted.get("evidence") or []),
+        ),
+        (
+            "sources",
+            "source_id",
+            _SOURCE_FOUNDATION_FIELDS,
+            list(extracted.get("sources") or []),
+        ),
     )
-    merged_by_table: dict[str, list[dict]] = {"claims": [], "evidence": [], "sources": []}
+    merged_by_table: dict[str, list[dict]] = {
+        "claims": [],
+        "evidence": [],
+        "sources": [],
+    }
     changed_by_table = {"claims": 0, "evidence": 0, "sources": 0}
     for table_name, key_field, _fields, proposed_records in record_specs:
         for proposed in proposed_records:
@@ -1585,11 +1767,17 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
             )
         ]
         _append_version_records(
-            "claim_versions", "claim_id", "claim_family_id", "claimfamily",
-            "claim_version", old_claims,
+            "claim_versions",
+            "claim_id",
+            "claim_family_id",
+            "claimfamily",
+            "claim_version",
+            old_claims,
         )
     if changed_evidence:
-        current_evidence_ids = tuple(record["evidence_id"] for record in changed_evidence)
+        current_evidence_ids = tuple(
+            record["evidence_id"] for record in changed_evidence
+        )
         placeholders = ",".join("?" for _ in current_evidence_ids)
         old_evidence = [
             json.loads(row["data_json"])
@@ -1599,8 +1787,12 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
             )
         ]
         _append_version_records(
-            "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
-            "evidence_version", old_evidence,
+            "evidence_versions",
+            "evidence_id",
+            "evidence_family_id",
+            "evidencefamily",
+            "evidence_version",
+            old_evidence,
         )
 
     for table_name, key_field, _, _ in record_specs:
@@ -1611,12 +1803,20 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
         runs,
     )
     _append_version_records(
-        "claim_versions", "claim_id", "claim_family_id", "claimfamily",
-        "claim_version", changed_claims,
+        "claim_versions",
+        "claim_id",
+        "claim_family_id",
+        "claimfamily",
+        "claim_version",
+        changed_claims,
     )
     _append_version_records(
-        "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
-        "evidence_version", changed_evidence,
+        "evidence_versions",
+        "evidence_id",
+        "evidence_family_id",
+        "evidencefamily",
+        "evidence_version",
+        changed_evidence,
     )
     return {
         "page_key": page_key,
@@ -1696,8 +1896,7 @@ def backfill_evidence_foundation_batch(extracted_pages: list[dict]) -> dict:
         page_keys.append(page_key)
         for table_name, _key_field, payload_key in record_specs:
             proposed_by_table[table_name].extend(
-                (page_key, record)
-                for record in list(extracted.get(payload_key) or [])
+                (page_key, record) for record in list(extracted.get(payload_key) or [])
             )
         all_entities.extend(list(extracted.get("entities") or []))
         all_artifacts.extend(list(extracted.get("source_artifacts") or []))
@@ -1783,7 +1982,10 @@ def backfill_evidence_foundation_batch(extracted_pages: list[dict]) -> dict:
         "evidence_family_id",
         "evidencefamily",
         "evidence_version",
-        [old_by_table["evidence"][record["evidence_id"]] for record in changed_evidence],
+        [
+            old_by_table["evidence"][record["evidence_id"]]
+            for record in changed_evidence
+        ],
     )
     for table_name, key_field, _payload_key in record_specs:
         _upsert_canonical_records(
@@ -1846,7 +2048,9 @@ def _upsert_operational_memory_records(records: list[dict]):
     )
 
 
-def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: list[dict]):
+def _refresh_operational_memory_delta(
+    old_claim_ids: set[str], proposed_claims: list[dict]
+):
     """Rebuild memory only for changed claims and their direct conflict peers."""
     from vector_lake import governance_metrics
 
@@ -1959,8 +2163,16 @@ def _refresh_alias_delta(old_entity_ids: set[str], proposed_entities: list[dict]
     aliases = []
     for entity in proposed_entities:
         entity_id = entity["entity_id"]
-        aliases.append((str(entity.get("canonical_name") or entity.get("title") or entity_id), entity_id, now))
-        aliases.extend((str(alias), entity_id, now) for alias in entity.get("aliases", []) if alias)
+        aliases.append(
+            (
+                str(entity.get("canonical_name") or entity.get("title") or entity_id),
+                entity_id,
+                now,
+            )
+        )
+        aliases.extend(
+            (str(alias), entity_id, now) for alias in entity.get("aliases", []) if alias
+        )
     if aliases:
         conn.executemany(
             "INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)",
@@ -2006,7 +2218,9 @@ def _stable_id(prefix: str, value: str) -> str:
     return f"{prefix}_{digest}"
 
 
-def _coerce_float(value, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+def _coerce_float(
+    value, default: float, minimum: float = 0.0, maximum: float = 1.0
+) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -2083,17 +2297,58 @@ def infer_memory_type(claim: dict) -> str:
         return claim_type
 
     text = f"{claim.get('claim_text', '')} {claim.get('source_page', '')}".lower()
-    if any(token in text for token in ("preference", "preferred", "用户偏好", "偏好", "首选", "不要", "倾向")):
+    if any(
+        token in text
+        for token in (
+            "preference",
+            "preferred",
+            "用户偏好",
+            "偏好",
+            "首选",
+            "不要",
+            "倾向",
+        )
+    ):
         return "preference"
-    if any(token in text for token in ("decision", "decided", "approved", "决策", "决定", "方案", "采用", "选型")):
+    if any(
+        token in text
+        for token in (
+            "decision",
+            "decided",
+            "approved",
+            "决策",
+            "决定",
+            "方案",
+            "采用",
+            "选型",
+        )
+    ):
         return "decision"
-    if any(token in text for token in ("task", "todo", "pending", "blocked", "open item", "待办", "未完成", "阻塞", "状态")):
+    if any(
+        token in text
+        for token in (
+            "task",
+            "todo",
+            "pending",
+            "blocked",
+            "open item",
+            "待办",
+            "未完成",
+            "阻塞",
+            "状态",
+        )
+    ):
         return "task_state"
     return "fact"
 
 
 def _infer_memory_key(claim: dict, memory_type: str) -> str:
-    explicit = claim.get("memory_key") or claim.get("preference_key") or claim.get("decision_key") or claim.get("task_key")
+    explicit = (
+        claim.get("memory_key")
+        or claim.get("preference_key")
+        or claim.get("decision_key")
+        or claim.get("task_key")
+    )
     if explicit:
         return _normalize_memory_key(explicit)
 
@@ -2115,12 +2370,16 @@ def _freshness_score(record: dict, now=None) -> float:
     if valid_to and valid_to < now:
         return 0.0
 
-    updated_at = _parse_dt(record.get("updated_at")) or _parse_dt(record.get("created_at"))
+    updated_at = _parse_dt(record.get("updated_at")) or _parse_dt(
+        record.get("created_at")
+    )
     if not updated_at:
         return 0.55
 
     age_days = max(0, (now - updated_at).days)
-    ttl_days = record.get("ttl_days") or MEMORY_TTL_DAYS.get(record.get("memory_type", "fact"), 365)
+    ttl_days = record.get("ttl_days") or MEMORY_TTL_DAYS.get(
+        record.get("memory_type", "fact"), 365
+    )
     try:
         ttl_days = max(1.0, float(ttl_days))
     except (TypeError, ValueError):
@@ -2132,7 +2391,7 @@ def score_memory_object(memory: dict, now=None) -> dict:
     confidence_score = _coerce_float(memory.get("confidence"), 0.72)
     authority_score = _coerce_float(memory.get("authority_score"), 0.65)
     importance_score = _coerce_float(memory.get("importance_score"), 0.55)
-    
+
     purpose_vectors = get_purpose_vectors()
     intent_weight = 0.0
     if purpose_vectors.get("keywords"):
@@ -2142,13 +2401,17 @@ def score_memory_object(memory: dict, now=None) -> dict:
             if kw.lower() in text or kw.lower() in key:
                 intent_weight = float(purpose_vectors.get("weight_boost", 0.20))
                 break
-                
+
     importance_score = min(1.0, importance_score + intent_weight)
-    
+
     freshness_score = _freshness_score(memory, now=now)
     reinforcement_count = int(memory.get("reinforcement_count") or 0)
-    reinforcement_score = min(1.0, math.log1p(max(0, reinforcement_count)) / math.log(8))
-    validity_factor = VALIDITY_FACTORS.get(str(memory.get("validity_state", "active")).lower(), 0.5)
+    reinforcement_score = min(
+        1.0, math.log1p(max(0, reinforcement_count)) / math.log(8)
+    )
+    validity_factor = VALIDITY_FACTORS.get(
+        str(memory.get("validity_state", "active")).lower(), 0.5
+    )
     memory_score = (
         0.30 * confidence_score
         + 0.25 * freshness_score
@@ -2206,7 +2469,9 @@ def _memory_object_from_claim(claim: dict) -> dict:
     return memory
 
 
-def _rank_memory_for_conflict(memory: dict, explicit_contradiction: bool = False) -> tuple:
+def _rank_memory_for_conflict(
+    memory: dict, explicit_contradiction: bool = False
+) -> tuple:
     if explicit_contradiction:
         return (
             memory.get("authority_score", 0),
@@ -2255,14 +2520,20 @@ def _resolve_memory_conflicts(store: dict) -> dict:
                 other["validity_state"] = "conflicted"
                 memory.update(score_memory_object(memory))
                 other.update(score_memory_object(other))
-                conflict_events.append({
-                    "type": "unresolved-explicit-contradiction",
-                    "memory_ids": sorted([memory["memory_id"], other["memory_id"]]),
-                })
+                conflict_events.append(
+                    {
+                        "type": "unresolved-explicit-contradiction",
+                        "memory_ids": sorted([memory["memory_id"], other["memory_id"]]),
+                    }
+                )
             elif left_rank > right_rank:
-                _mark_superseded(other, memory, "explicit-contradiction:authority-confidence-recency")
+                _mark_superseded(
+                    other, memory, "explicit-contradiction:authority-confidence-recency"
+                )
             else:
-                _mark_superseded(memory, other, "explicit-contradiction:authority-confidence-recency")
+                _mark_superseded(
+                    memory, other, "explicit-contradiction:authority-confidence-recency"
+                )
 
     grouped = {}
     for memory in items.values():
@@ -2270,7 +2541,9 @@ def _resolve_memory_conflicts(store: dict) -> dict:
             continue
         if str(memory.get("validity_state", "")).lower() in {"expired", "archived"}:
             continue
-        grouped.setdefault((memory.get("memory_type"), memory.get("memory_key")), []).append(memory)
+        grouped.setdefault(
+            (memory.get("memory_type"), memory.get("memory_key")), []
+        ).append(memory)
 
     for (memory_type, memory_key), candidates in grouped.items():
         # Reset validity state so superseded ones can compete again
@@ -2279,7 +2552,7 @@ def _resolve_memory_conflicts(store: dict) -> dict:
                 c["validity_state"] = "active"
                 c.pop("superseded_by", None)
                 c.pop("conflict_resolution", None)
-                
+
         if len(candidates) <= 1:
             continue
         ordered = sorted(candidates, key=_rank_memory_for_conflict, reverse=True)
@@ -2292,19 +2565,23 @@ def _resolve_memory_conflicts(store: dict) -> dict:
         }
         for loser in ordered[1:]:
             _mark_superseded(loser, winner, f"{memory_type}:newer-authority-confidence")
-        conflict_events.append({
-            "type": "typed-memory-supersession",
-            "memory_type": memory_type,
-            "memory_key": memory_key,
-            "winner": winner["memory_id"],
-            "losers": [item["memory_id"] for item in ordered[1:]],
-        })
+        conflict_events.append(
+            {
+                "type": "typed-memory-supersession",
+                "memory_type": memory_type,
+                "memory_key": memory_key,
+                "winner": winner["memory_id"],
+                "losers": [item["memory_id"] for item in ordered[1:]],
+            }
+        )
 
     store["conflict_events"] = conflict_events
     store["memory_type_counts"] = {}
     for memory in items.values():
         memory_type = memory.get("memory_type", "fact")
-        store["memory_type_counts"][memory_type] = store["memory_type_counts"].get(memory_type, 0) + 1
+        store["memory_type_counts"][memory_type] = (
+            store["memory_type_counts"].get(memory_type, 0) + 1
+        )
     return store
 
 
@@ -2316,9 +2593,8 @@ def rebuild_operational_memory() -> dict:
         reasons = memory.get("validity_reasons") or []
         if not isinstance(reasons, list):
             reasons = [str(reasons)]
-        if (
-            str(memory.get("validity_state") or "").lower() == "archived"
-            and any(str(reason).startswith("infrastructure_artifact:") for reason in reasons)
+        if str(memory.get("validity_state") or "").lower() == "archived" and any(
+            str(reason).startswith("infrastructure_artifact:") for reason in reasons
         ):
             store["items"][memory_id] = memory
     for claim in claims:
@@ -2373,9 +2649,7 @@ class _ExactTermMatcher:
             closure[matched_term] = matched_mask
 
         direct_masks = (
-            term_masks
-            if any(len(term) <= 2 for term in term_masks)
-            else None
+            term_masks if any(len(term) <= 2 for term in term_masks) else None
         )
         self._pattern = (
             re.compile(
@@ -2463,14 +2737,16 @@ _MEMORY_SEARCH_INDEX_SCHEMA_VERSION = 7
 _MEMORY_SEARCH_DEGRADED_ROW_LIMIT = 5_000
 _MEMORY_SEARCH_DEGRADED_ROW_LIMIT_MAX = 50_000
 _MEMORY_SEARCH_PROGRESS_STALL_SECONDS = 15 * 60
-_MEMORY_SEARCH_INDEX_TABLES = frozenset({
-    "operational_memory_search_fts",
-    "operational_memory_search_short_fts",
-    "operational_memory_search_docs",
-    "operational_memory_search_pending",
-    "operational_memory_search_state",
-    "operational_memory_search_revision",
-})
+_MEMORY_SEARCH_INDEX_TABLES = frozenset(
+    {
+        "operational_memory_search_fts",
+        "operational_memory_search_short_fts",
+        "operational_memory_search_docs",
+        "operational_memory_search_pending",
+        "operational_memory_search_state",
+        "operational_memory_search_revision",
+    }
+)
 
 
 def _operational_memory_search_index_enabled() -> bool:
@@ -2480,7 +2756,9 @@ def _operational_memory_search_index_enabled() -> bool:
 
 def _operational_memory_search_auto_maintenance_enabled() -> bool:
     value = os.environ.get("VECTOR_LAKE_OPERATIONAL_MEMORY_AUTO_MAINTAIN", "1")
-    return _operational_memory_search_index_enabled() and str(value).strip().lower() not in {
+    return _operational_memory_search_index_enabled() and str(
+        value
+    ).strip().lower() not in {
         "0",
         "false",
         "no",
@@ -2539,44 +2817,42 @@ def _memory_search_index_schema_available(conn: sqlite3.Connection) -> bool:
         return False
     docs_columns = {
         str(row[1])
-        for row in conn.execute(
-            "PRAGMA table_info(operational_memory_search_docs)"
-        )
+        for row in conn.execute("PRAGMA table_info(operational_memory_search_docs)")
     }
     state_columns = {
         str(row[1])
-        for row in conn.execute(
-            "PRAGMA table_info(operational_memory_search_state)"
-        )
+        for row in conn.execute("PRAGMA table_info(operational_memory_search_state)")
     }
     revision_columns = {
         str(row[1])
-        for row in conn.execute(
-            "PRAGMA table_info(operational_memory_search_revision)"
-        )
+        for row in conn.execute("PRAGMA table_info(operational_memory_search_revision)")
     }
-    return {
-        "doc_id",
-        "memory_id",
-        "source_updated_at",
-        "source_sha256",
-    }.issubset(docs_columns) and {
-        "singleton",
-        "backfill_cursor",
-        "backfill_target",
-        "schema_version",
-        "proof_status",
-        "proof_generation",
-        "canonical_corpus_sha256",
-        "docs_corpus_sha256",
-        "trigram_corpus_sha256",
-        "short_corpus_sha256",
-        "updated_at",
-    }.issubset(state_columns) and {
-        "singleton",
-        "revision",
-        "updated_at",
-    }.issubset(revision_columns)
+    return (
+        {
+            "doc_id",
+            "memory_id",
+            "source_updated_at",
+            "source_sha256",
+        }.issubset(docs_columns)
+        and {
+            "singleton",
+            "backfill_cursor",
+            "backfill_target",
+            "schema_version",
+            "proof_status",
+            "proof_generation",
+            "canonical_corpus_sha256",
+            "docs_corpus_sha256",
+            "trigram_corpus_sha256",
+            "short_corpus_sha256",
+            "updated_at",
+        }.issubset(state_columns)
+        and {
+            "singleton",
+            "revision",
+            "updated_at",
+        }.issubset(revision_columns)
+    )
 
 
 def _operational_memory_search_index_counts(
@@ -2678,25 +2954,27 @@ def _upsert_memory_search_documents(
     decoded = []
     for memory_id, payload, updated_at in rows:
         memory = _decode_operational_memory_json(payload)
-        decoded.append((
-            memory_id,
-            updated_at,
-            key_text := str(memory.get("memory_key", "")).lower(),
-            memory_text := str(memory.get("text", "")).lower(),
-            page_text := str(memory.get("source_page", "")).lower(),
-            type_text := str(memory.get("memory_type", "fact")).lower(),
-            _memory_short_token_projection(
-                key_text,
-                memory_text,
-                page_text,
-                type_text,
-            ),
-            operational_memory_search_source_sha256(
+        decoded.append(
+            (
                 memory_id,
-                payload,
                 updated_at,
-            ),
-        ))
+                key_text := str(memory.get("memory_key", "")).lower(),
+                memory_text := str(memory.get("text", "")).lower(),
+                page_text := str(memory.get("source_page", "")).lower(),
+                type_text := str(memory.get("memory_type", "fact")).lower(),
+                _memory_short_token_projection(
+                    key_text,
+                    memory_text,
+                    page_text,
+                    type_text,
+                ),
+                operational_memory_search_source_sha256(
+                    memory_id,
+                    payload,
+                    updated_at,
+                ),
+            )
+        )
 
     memory_ids = [row[0] for row in decoded]
     existing = _memory_search_document_ids(conn, memory_ids)
@@ -2731,10 +3009,7 @@ def _upsert_memory_search_documents(
         "INSERT INTO operational_memory_search_fts "
         "(rowid, key_text, memory_text, page_text, type_text) "
         "VALUES (?, ?, ?, ?, ?)",
-        [
-            (documents[row[0]], row[2], row[3], row[4], row[5])
-            for row in decoded
-        ],
+        [(documents[row[0]], row[2], row[3], row[4], row[5]) for row in decoded],
     )
     conn.executemany(
         "INSERT INTO operational_memory_search_short_fts (rowid, short_text) "
@@ -2770,9 +3045,12 @@ def _advance_operational_memory_search_index(
         proof_status = str(state[2] or "")
         projection_changed = False
 
-        pending_exists = conn.execute(
-            "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
-        ).fetchone() is not None
+        pending_exists = (
+            conn.execute(
+                "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
+            ).fetchone()
+            is not None
+        )
         if batch_size and cursor >= target and proof_status != "ready":
             # A completed cursor without a ready proof is not a trustworthy
             # projection. Certification may have failed after the previous
@@ -2783,8 +3061,7 @@ def _advance_operational_memory_search_index(
             cursor = ""
             target = str(
                 conn.execute(
-                    "SELECT COALESCE(MAX(memory_id), '') "
-                    "FROM operational_memory"
+                    "SELECT COALESCE(MAX(memory_id), '') FROM operational_memory"
                 ).fetchone()[0]
                 or ""
             )
@@ -2903,8 +3180,7 @@ def _advance_operational_memory_search_index(
                 cursor = ""
                 target = str(
                     conn.execute(
-                        "SELECT COALESCE(MAX(memory_id), '') "
-                        "FROM operational_memory"
+                        "SELECT COALESCE(MAX(memory_id), '') FROM operational_memory"
                     ).fetchone()[0]
                     or ""
                 )
@@ -2933,9 +3209,12 @@ def _advance_operational_memory_search_index(
             "backfill_cursor = ?, updated_at = ? WHERE singleton = 1",
             (cursor, _utc_now()),
         )
-        pending_after = conn.execute(
-            "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
-        ).fetchone() is not None
+        pending_after = (
+            conn.execute(
+                "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
+            ).fetchone()
+            is not None
+        )
         counts_after = _operational_memory_search_index_counts(conn)
         complete = bool(
             cursor >= target
@@ -2945,9 +3224,7 @@ def _advance_operational_memory_search_index(
                 backfill_complete=True,
             )
         )
-        should_certify = complete and (
-            projection_changed or proof_status != "ready"
-        )
+        should_certify = complete and (projection_changed or proof_status != "ready")
         if should_certify:
             certification_data_version = int(
                 conn.execute("PRAGMA data_version").fetchone()[0] or 0
@@ -2991,10 +3268,7 @@ def _advance_operational_memory_search_index(
 
 
 def _memory_fts_expression(terms: list[str]) -> str:
-    return " OR ".join(
-        f'"{term.replace(chr(34), chr(34) * 2)}"'
-        for term in terms
-    )
+    return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
 
 
 def _operational_memory_progress_age_seconds(value: object) -> float | None:
@@ -3018,9 +3292,7 @@ def operational_memory_search_index_status(
     """Inspect derived-index progress without creating schema or changing state."""
     configured = _operational_memory_search_index_enabled()
     if connection is None and not peek_db_path().exists():
-        warnings = (
-            ["operational_memory_search_database_missing"] if configured else []
-        )
+        warnings = ["operational_memory_search_database_missing"] if configured else []
         return {
             "configured": configured,
             "auto_maintenance_configured": (
@@ -3045,9 +3317,9 @@ def operational_memory_search_index_status(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'operational_memory'"
         ).fetchone():
-            canonical_documents = int(conn.execute(
-                "SELECT COUNT(*) FROM operational_memory"
-            ).fetchone()[0])
+            canonical_documents = int(
+                conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0]
+            )
         return {
             "configured": configured,
             "auto_maintenance_configured": (
@@ -3057,9 +3329,7 @@ def operational_memory_search_index_status(
             "ready": False,
             "status": "unavailable" if configured else "disabled",
             "warnings": (
-                ["operational_memory_search_schema_unavailable"]
-                if configured
-                else []
+                ["operational_memory_search_schema_unavailable"] if configured else []
             ),
             "canonical_documents": canonical_documents,
             "indexed_documents": 0,
@@ -3077,12 +3347,12 @@ def operational_memory_search_index_status(
     cursor = str(state[0] or "") if state is not None else ""
     target = str(state[1] or "") if state is not None else ""
     progress_updated_at = str(state[3] or "") if state is not None else ""
-    progress_age_seconds = _operational_memory_progress_age_seconds(
-        progress_updated_at
+    progress_age_seconds = _operational_memory_progress_age_seconds(progress_updated_at)
+    pending = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM operational_memory_search_pending"
+        ).fetchone()[0]
     )
-    pending = int(conn.execute(
-        "SELECT COUNT(*) FROM operational_memory_search_pending"
-    ).fetchone()[0])
     counts = _operational_memory_search_index_counts(conn)
     indexed_documents = counts["indexed_documents"]
     trigram_indexed_documents = counts["trigram_indexed_documents"]
@@ -3137,10 +3407,7 @@ def operational_memory_search_index_status(
             )
             if integrity.get("status") != "ready":
                 warnings.append(
-                    str(
-                        integrity.get("issue")
-                        or "operational_memory_search_integrity"
-                    )
+                    str(integrity.get("issue") or "operational_memory_search_integrity")
                 )
     stalled = bool(
         configured
@@ -3150,8 +3417,7 @@ def operational_memory_search_index_status(
     )
     if stalled:
         warnings.append(
-            "operational_memory_search_progress_stalled:"
-            f"{int(progress_age_seconds)}s"
+            f"operational_memory_search_progress_stalled:{int(progress_age_seconds)}s"
         )
     ready = configured and not warnings
     return {
@@ -3177,19 +3443,13 @@ def operational_memory_search_index_status(
             str(integrity.get("status")) if integrity is not None else None
         ),
         "integrity_inspected_rows": (
-            int(integrity.get("inspected_rows", 0))
-            if integrity is not None
-            else None
+            int(integrity.get("inspected_rows", 0)) if integrity is not None else None
         ),
         "integrity_inspected_bytes": (
-            int(integrity.get("inspected_bytes", 0))
-            if integrity is not None
-            else None
+            int(integrity.get("inspected_bytes", 0)) if integrity is not None else None
         ),
         "integrity_verification_kind": (
-            str(integrity.get("verification_kind"))
-            if integrity is not None
-            else None
+            str(integrity.get("verification_kind")) if integrity is not None else None
         ),
         "integrity_next_attestation_in_seconds": (
             float(integrity.get("next_attestation_in_seconds", 0.0))
@@ -3271,7 +3531,9 @@ def maintain_operational_memory_search_index_budget(
     }
 
 
-def _memory_sql_term_filter(terms: list[str], alias: str = "om") -> tuple[str, list[str]]:
+def _memory_sql_term_filter(
+    terms: list[str], alias: str = "om"
+) -> tuple[str, list[str]]:
     search_text_sql = (
         f"lower(COALESCE(json_extract({alias}.data_json, '$.memory_key'), '') || ' ' || "
         f"COALESCE(json_extract({alias}.data_json, '$.text'), '') || ' ' || "
@@ -3291,16 +3553,14 @@ def _indexed_operational_memory_query(
     cursor: str,
     target: str,
     include_pending: bool,
+    candidate_limit: int,
 ) -> tuple[str, tuple[object, ...]]:
     """Build an indexed candidate union with only bounded canonical tails."""
     type_sql = ""
     type_params: list[object] = []
     if allowed_types:
         placeholders = ", ".join("?" for _ in allowed_types)
-        type_sql = (
-            " AND lower(COALESCE(om.memory_type, 'fact')) "
-            f"IN ({placeholders})"
-        )
+        type_sql = f" AND lower(COALESCE(om.memory_type, 'fact')) IN ({placeholders})"
         type_params = sorted(allowed_types)
 
     candidate_queries: list[str] = []
@@ -3309,24 +3569,32 @@ def _indexed_operational_memory_query(
     short_terms = [term for term in terms if len(term) <= 2]
     if long_terms:
         candidate_queries.append(
+            "SELECT source_key, data_json FROM ("
             "SELECT om.memory_id AS source_key, om.data_json AS data_json "
             "FROM operational_memory_search_fts "
             "JOIN operational_memory_search_docs AS docs "
             "ON docs.doc_id = operational_memory_search_fts.rowid "
             "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
-            "WHERE operational_memory_search_fts MATCH ?" + type_sql
+            "WHERE operational_memory_search_fts MATCH ?" + type_sql + " "
+            "ORDER BY bm25(operational_memory_search_fts) LIMIT ?)"
         )
-        candidate_params.extend((_memory_fts_expression(long_terms), *type_params))
+        candidate_params.extend(
+            (_memory_fts_expression(long_terms), *type_params, candidate_limit)
+        )
     if short_terms:
         candidate_queries.append(
+            "SELECT source_key, data_json FROM ("
             "SELECT om.memory_id AS source_key, om.data_json AS data_json "
             "FROM operational_memory_search_short_fts "
             "JOIN operational_memory_search_docs AS docs "
             "ON docs.doc_id = operational_memory_search_short_fts.rowid "
             "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
-            "WHERE operational_memory_search_short_fts MATCH ?" + type_sql
+            "WHERE operational_memory_search_short_fts MATCH ?" + type_sql + " "
+            "ORDER BY bm25(operational_memory_search_short_fts) LIMIT ?)"
         )
-        candidate_params.extend((_memory_fts_expression(short_terms), *type_params))
+        candidate_params.extend(
+            (_memory_fts_expression(short_terms), *type_params, candidate_limit)
+        )
 
     residual_filter, residual_params = _memory_sql_term_filter(terms)
     if cursor < target:
@@ -3335,21 +3603,21 @@ def _indexed_operational_memory_query(
             "FROM operational_memory AS om WHERE om.memory_id > ? "
             "AND om.memory_id <= ? AND " + residual_filter + type_sql
         )
-        candidate_params.extend((
-            cursor,
-            target,
-            *residual_params,
-            *type_params,
-        ))
+        candidate_params.extend(
+            (
+                cursor,
+                target,
+                *residual_params,
+                *type_params,
+            )
+        )
     if include_pending:
         candidate_queries.append(
             "SELECT om.memory_id AS source_key, om.data_json AS data_json "
             "FROM operational_memory_search_pending AS pending "
             "CROSS JOIN operational_memory AS om "
             "ON om.memory_id = pending.memory_id "
-            "WHERE pending.operation = 'upsert' AND "
-            + residual_filter
-            + type_sql
+            "WHERE pending.operation = 'upsert' AND " + residual_filter + type_sql
         )
         candidate_params.extend((*residual_params, *type_params))
 
@@ -3426,6 +3694,8 @@ def _indexed_operational_memory_rows(
     conn: sqlite3.Connection,
     terms: list[str],
     allowed_types: set[str] | None,
+    *,
+    candidate_limit: int,
 ):
     """Return candidates plus a ready-proof fence, or None without FTS."""
     if (
@@ -3456,32 +3726,29 @@ def _indexed_operational_memory_rows(
                 _MEMORY_SEARCH_INDEX_SCHEMA_VERSION,
             )
             return None
-        include_pending = conn.execute(
-            "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
-        ).fetchone() is not None
+        include_pending = (
+            conn.execute(
+                "SELECT 1 FROM operational_memory_search_pending LIMIT 1"
+            ).fetchone()
+            is not None
+        )
         if cursor >= target and not include_pending:
-            counts = _operational_memory_search_index_counts(conn)
-            if _operational_memory_search_index_count_mismatch(
-                counts,
-                backfill_complete=True,
-            ):
-                _raise_if_unbounded_operational_memory_fallback(
-                    conn,
-                    reason="search_index_integrity_mismatch",
-                )
-                log.warning(
-                    "Operational-memory FTS integrity mismatch; using bounded "
-                    "compatibility prefilter"
-                )
-                return None
-            integrity = verify_operational_memory_search_integrity(conn)
+            # Retrieval is fenced by the durable corpus proof and the
+            # operational-memory revision token. Do not COUNT every FTS
+            # virtual table on each request: those scans are O(corpus) and
+            # dominate latency once the memory projection reaches six figures.
+            # Doctor/watchdog retain synchronous count and digest attestation.
+            integrity = verify_operational_memory_search_integrity(
+                conn,
+                allow_full_scan=False,
+                allow_durable_proof=True,
+            )
             if integrity.get("status") != "ready" or not isinstance(
                 integrity.get("signature"),
                 tuple,
             ):
                 issue = str(
-                    integrity.get("issue")
-                    or "operational_memory_search_integrity"
+                    integrity.get("issue") or "operational_memory_search_integrity"
                 )
                 reason = {
                     "operational_memory_search_integrity_limit": (
@@ -3524,6 +3791,7 @@ def _indexed_operational_memory_rows(
             cursor=cursor,
             target=target,
             include_pending=include_pending,
+            candidate_limit=candidate_limit,
         )
         return conn.execute(sql, params), integrity_signature
     except sqlite3.Error as exc:
@@ -3538,8 +3806,7 @@ def _bounded_memory_query_terms(query: str) -> list[str]:
     text = str(query or "")
     if len(text) > _MEMORY_QUERY_CHAR_LIMIT:
         raise ValueError(
-            "operational-memory query exceeds "
-            f"{_MEMORY_QUERY_CHAR_LIMIT} characters"
+            f"operational-memory query exceeds {_MEMORY_QUERY_CHAR_LIMIT} characters"
         )
     terms = _query_terms(text)
     if any(len(term) > _MEMORY_QUERY_TERM_CHAR_LIMIT for term in terms):
@@ -3604,17 +3871,11 @@ def _operational_memory_candidate_sql(
             filters.append(f"({exact_clause} OR ({supporting_clause}))")
     if allowed_types:
         placeholders = ", ".join("?" for _ in allowed_types)
-        filters.append(
-            "lower(COALESCE(memory_type, 'fact')) "
-            f"IN ({placeholders})"
-        )
+        filters.append(f"lower(COALESCE(memory_type, 'fact')) IN ({placeholders})")
         params.extend(sorted(allowed_types))
 
     where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
-    sql = (
-        f"SELECT data_json FROM operational_memory {where_sql} "
-        "ORDER BY memory_id ASC"
-    )
+    sql = f"SELECT data_json FROM operational_memory {where_sql} ORDER BY memory_id ASC"
     return sql, params
 
 
@@ -3686,6 +3947,7 @@ def _legacy_operational_memory_views(
 
     return materialize(current_heap), materialize(history_heap)
 
+
 def search_operational_memory_views(
     query: str,
     current_top_k: int = 12,
@@ -3722,12 +3984,20 @@ def search_operational_memory_views(
     allowed_types = None
     if memory_types:
         allowed_types = {
-            str(item).strip().lower().replace("-", "_")
-            for item in memory_types
+            str(item).strip().lower().replace("-", "_") for item in memory_types
         }
     terms = _bounded_memory_query_terms(query)
     matcher = _memory_term_matcher(terms)
-    indexed_result = _indexed_operational_memory_rows(conn, terms, allowed_types)
+    candidate_limit = min(
+        _operational_memory_degraded_row_limit(),
+        max(128, (current_top_k + history_top_k) * 8),
+    )
+    indexed_result = _indexed_operational_memory_rows(
+        conn,
+        terms,
+        allowed_types,
+        candidate_limit=candidate_limit,
+    )
     indexed_rows = indexed_result[0] if indexed_result is not None else None
     indexed_signature = indexed_result[1] if indexed_result is not None else None
     candidate_sql = None
@@ -3743,9 +4013,7 @@ def search_operational_memory_views(
             reason=fallback_reason,
         )
         candidate_terms = _memory_candidate_terms(query, terms)
-        prefilter_terms = (
-            candidate_terms if len(candidate_terms) == len(terms) else []
-        )
+        prefilter_terms = candidate_terms if len(candidate_terms) == len(terms) else []
         candidate_sql, candidate_params = _operational_memory_candidate_sql(
             prefilter_terms,
             allowed_types,
@@ -3807,7 +4075,11 @@ def search_operational_memory_views(
             if state not in _MEMORY_HIDDEN_STATES:
                 push_ranked(current_heap, current_top_k, rank, memory)
         if indexed_signature is not None:
-            integrity_after = verify_operational_memory_search_integrity(conn)
+            integrity_after = verify_operational_memory_search_integrity(
+                conn,
+                allow_full_scan=False,
+                allow_durable_proof=True,
+            )
             if (
                 integrity_after.get("status") != "ready"
                 or integrity_after.get("signature") != indexed_signature
@@ -3961,7 +4233,9 @@ def build_claim_graph_projection(
     entity_window = 6
     source_window = 4
     if limit_nodes is None:
-        limit_nodes = 2500  # Hard cap to prevent 3D-force-graph from freezing the browser
+        limit_nodes = (
+            2500  # Hard cap to prevent 3D-force-graph from freezing the browser
+        )
     from vector_lake import governance_metrics
 
     conn = connection or get_connection()
@@ -3983,16 +4257,16 @@ def build_claim_graph_projection(
         for entity_id in claim.get("subject_entity_ids", [])
     }
     referenced_source_ids = {
-        str(source_id)
-        for claim in claims
-        for source_id in claim.get("source_ids", [])
+        str(source_id) for claim in claims for source_id in claim.get("source_ids", [])
     }
 
-    def load_referenced(table_name: str, id_column: str, ids: set[str]) -> dict[str, dict]:
+    def load_referenced(
+        table_name: str, id_column: str, ids: set[str]
+    ) -> dict[str, dict]:
         records = {}
         ordered = sorted(ids)
         for offset in range(0, len(ordered), 500):
-            batch = ordered[offset:offset + 500]
+            batch = ordered[offset : offset + 500]
             if not batch:
                 continue
             placeholders = ",".join("?" for _ in batch)
@@ -4025,25 +4299,29 @@ def build_claim_graph_projection(
             if source_id in sources
         ]
         compact_text = _compact_claim_text(claim.get("claim_text", ""))
-        nodes.append({
-            "id": claim["claim_id"],
-            "name": claim.get("claim_text", "")[:96] or claim["claim_id"],
-            "group": "Claim",
-            "validity_state": claim.get("validity_state", "unknown"),
-            "claim_type": claim.get("claim_type", "claim"),
-            "confidence": claim.get("confidence"),
-            "summary": compact_text,
-            "subject_entities": subject_names,
-            "source_pages": source_pages,
-            "degree": 0,
-            "updated": claim.get("updated_at", ""),
-        })
+        nodes.append(
+            {
+                "id": claim["claim_id"],
+                "name": claim.get("claim_text", "")[:96] or claim["claim_id"],
+                "group": "Claim",
+                "validity_state": claim.get("validity_state", "unknown"),
+                "claim_type": claim.get("claim_type", "claim"),
+                "confidence": claim.get("confidence"),
+                "summary": compact_text,
+                "subject_entities": subject_names,
+                "source_pages": source_pages,
+                "degree": 0,
+                "updated": claim.get("updated_at", ""),
+            }
+        )
         node_lookup[claim["claim_id"]] = nodes[-1]
         degree_map[claim["claim_id"]] = 0
 
     edge_records = {}
 
-    def _record_edge(left_id: str, right_id: str, relation: str, weight: float, force: bool = False):
+    def _record_edge(
+        left_id: str, right_id: str, relation: str, weight: float, force: bool = False
+    ):
         if left_id == right_id or left_id not in claim_ids or right_id not in claim_ids:
             return
         source_id, target_id = sorted((left_id, right_id))
@@ -4056,7 +4334,9 @@ def build_claim_graph_projection(
                 existing["relation"] = relation
             return
 
-        if not force and (degree_map[source_id] >= max_degree or degree_map[target_id] >= max_degree):
+        if not force and (
+            degree_map[source_id] >= max_degree or degree_map[target_id] >= max_degree
+        ):
             return
 
         edge_records[edge_key] = {
@@ -4093,7 +4373,9 @@ def build_claim_graph_projection(
                 edge_key = tuple(sorted((left_id, right_id)))
                 entity_pair_counts[edge_key] = entity_pair_counts.get(edge_key, 0) + 1
 
-    for (source_id, target_id), shared_count in sorted(entity_pair_counts.items(), key=lambda item: (-item[1], item[0])):
+    for (source_id, target_id), shared_count in sorted(
+        entity_pair_counts.items(), key=lambda item: (-item[1], item[0])
+    ):
         weight = 2.5 + min(shared_count, 3) * 0.5
         _record_edge(source_id, target_id, "shared-entity", weight)
 
@@ -4105,13 +4387,18 @@ def build_claim_graph_projection(
                 edge_key = tuple(sorted((left_id, right_id)))
                 source_pair_counts[edge_key] = source_pair_counts.get(edge_key, 0) + 1
 
-    for (source_id, target_id), shared_count in sorted(source_pair_counts.items(), key=lambda item: (-item[1], item[0])):
+    for (source_id, target_id), shared_count in sorted(
+        source_pair_counts.items(), key=lambda item: (-item[1], item[0])
+    ):
         if (source_id, target_id) in edge_records:
             continue
         weight = 1.5 + min(shared_count, 3) * 0.5
         _record_edge(source_id, target_id, "shared-source", weight)
 
-    edges = sorted(edge_records.values(), key=lambda edge: (-edge["weight"], edge["source"], edge["target"]))
+    edges = sorted(
+        edge_records.values(),
+        key=lambda edge: (-edge["weight"], edge["source"], edge["target"]),
+    )
     for claim_id, degree in degree_map.items():
         if claim_id in node_lookup:
             node_lookup[claim_id]["degree"] = degree
@@ -4167,7 +4454,10 @@ def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
             "status": "pending",
             "source": "merge-suggestions",
             "pair_key": suggestion["pair_key"],
-            "affected_ids": [suggestion["left_entity_id"], suggestion["right_entity_id"]],
+            "affected_ids": [
+                suggestion["left_entity_id"],
+                suggestion["right_entity_id"],
+            ],
             "search_queries": [suggestion["left_name"], suggestion["right_name"]],
             "affected_pages": [
                 f"{suggestion['left_page_key']}.md",
@@ -4370,7 +4660,9 @@ def _legacy_terminal_change_set_manifest(
     """Detach an already-applied legacy snapshot without rebuilding its payload."""
     status = _normalized_change_set_status(change_set.get("status"))
     if status not in _CHANGE_SET_TERMINAL_STATUSES:
-        raise ChangeSetPayloadCorrupt("Legacy detached manifests require terminal status")
+        raise ChangeSetPayloadCorrupt(
+            "Legacy detached manifests require terminal status"
+        )
     if not re.fullmatch(r"[0-9a-f]{64}", raw_sha256):
         raise ChangeSetPayloadCorrupt("Legacy detached manifest digest is invalid")
     if raw_bytes < 0 or raw_bytes > _CHANGE_SET_COMPACTION_MAX_INPUT_BYTES:
@@ -4399,9 +4691,7 @@ def _legacy_terminal_change_set_manifest(
         if not isinstance(records, list) or any(
             not isinstance(record, dict) for record in records
         ):
-            raise ChangeSetPayloadCorrupt(
-                f"Legacy change-set {section} must be a list"
-            )
+            raise ChangeSetPayloadCorrupt(f"Legacy change-set {section} must be a list")
         record_counts[section] = len(records)
     manifest_keys = (
         "change_set_id",
@@ -4465,7 +4755,7 @@ def _validate_change_set_batch_limits(
         raise ChangeSetBatchTooLarge(
             "Change-set batch item count exceeds hard limit: "
             f"{len(change_sets)} > {_CHANGE_SET_MAX_BATCH_ITEMS}"
-    )
+        )
     prepared: list[tuple[dict, bytes]] = []
     aggregate = 0
     aggregate_affected_ids = 0
@@ -4617,7 +4907,8 @@ def _validate_loaded_change_set_manifest(
         else _CHANGE_SET_MAX_PAYLOAD_BYTES
     )
     if (
-        codec not in {
+        codec
+        not in {
             _CHANGE_SET_PAYLOAD_CODEC,
             _CHANGE_SET_DETACHED_LEGACY_CODEC,
         }
@@ -4632,8 +4923,7 @@ def _validate_loaded_change_set_manifest(
         or not isinstance(record_counts, dict)
         or set(record_counts) != set(_CHANGE_SET_PAYLOAD_SECTIONS)
         or any(
-            not isinstance(value, int) or value < 0
-            for value in record_counts.values()
+            not isinstance(value, int) or value < 0 for value in record_counts.values()
         )
         or not isinstance(available, bool)
         or (status == "pending") is not available
@@ -4802,7 +5092,10 @@ def _load_change_set_payload(
         raise ChangeSetPayloadCorrupt(
             f"Change-set payload JSON is invalid: {payload_sha256}"
         ) from exc
-    if not isinstance(payload, dict) or payload.get("delta_kind") != _CHANGE_SET_DELTA_KIND:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("delta_kind") != _CHANGE_SET_DELTA_KIND
+    ):
         raise ChangeSetPayloadCorrupt(
             f"Change-set payload delta contract is invalid: {payload_sha256}"
         )
@@ -4938,7 +5231,9 @@ def _persist_prepared_change_set(
             ) from exc
         existing_descriptor = existing_manifest.get("payload") or {}
         existing_payload_sha256 = str(existing_descriptor.get("sha256") or "")
-        if not existing_payload_sha256 and existing_manifest.get("manifest_version") in {
+        if not existing_payload_sha256 and existing_manifest.get(
+            "manifest_version"
+        ) in {
             None,
             1,
         }:
@@ -4952,9 +5247,7 @@ def _persist_prepared_change_set(
                 f"{idempotency_key}"
             )
         existing_status = _normalized_change_set_status(existing["status"])
-        manifest_status = _normalized_change_set_status(
-            existing_manifest.get("status")
-        )
+        manifest_status = _normalized_change_set_status(existing_manifest.get("status"))
         if manifest_status != existing_status:
             raise ChangeSetPayloadCorrupt(
                 f"Existing idempotency lifecycle drifted: {idempotency_key}"
@@ -5209,9 +5502,17 @@ def create_change_set(
             "transactional": True,
             "idempotent": True,
             "canonical_targets": [
-                "entities", "claims", "evidence", "sources", "operational_memory",
-                "source_artifacts", "extraction_runs", "claim_versions",
-                "evidence_versions", "entity_identities", "canonical_identities",
+                "entities",
+                "claims",
+                "evidence",
+                "sources",
+                "operational_memory",
+                "source_artifacts",
+                "extraction_runs",
+                "claim_versions",
+                "evidence_versions",
+                "entity_identities",
+                "canonical_identities",
             ],
         },
     }
@@ -5254,7 +5555,9 @@ def prepare_change_set_from_content(
 
     page_key = extracted["page_key"]
     fingerprint = hashlib.sha1(content.encode("utf-8")).hexdigest()
-    idempotency_key = _stable_id("changeset_idem", "|".join([origin, page_key, fingerprint]))
+    idempotency_key = _stable_id(
+        "changeset_idem", "|".join([origin, page_key, fingerprint])
+    )
 
     proposed_entities = extracted.get("entities", [])
     proposed_claims = extracted.get("claims", [])
@@ -5267,10 +5570,12 @@ def prepare_change_set_from_content(
         "summary": summary or f"Sync page: {page_key}",
         "risk_level": "low",
         "requires_human_review": not auto_approve,
-        "affected_ids": sorted({
-            *[record["entity_id"] for record in proposed_entities],
-            *[record["claim_id"] for record in proposed_claims],
-        }),
+        "affected_ids": sorted(
+            {
+                *[record["entity_id"] for record in proposed_entities],
+                *[record["claim_id"] for record in proposed_claims],
+            }
+        ),
         "affected_pages": [filename],
         "proposed_entities": proposed_entities,
         "proposed_claims": proposed_claims,
@@ -5283,9 +5588,17 @@ def prepare_change_set_from_content(
             "transactional": True,
             "idempotent": True,
             "canonical_targets": [
-                "entities", "claims", "evidence", "sources", "operational_memory",
-                "source_artifacts", "extraction_runs", "claim_versions",
-                "evidence_versions", "entity_identities", "canonical_identities",
+                "entities",
+                "claims",
+                "evidence",
+                "sources",
+                "operational_memory",
+                "source_artifacts",
+                "extraction_runs",
+                "claim_versions",
+                "evidence_versions",
+                "entity_identities",
+                "canonical_identities",
             ],
         },
     }
@@ -5390,9 +5703,7 @@ def apply_and_record_change_sets_batch(change_sets: list[dict]) -> list[dict]:
     ordered = []
     for change_set in change_sets:
         idempotency_key = str(
-            change_set.get("idempotency_key")
-            or change_set.get("change_set_id")
-            or ""
+            change_set.get("idempotency_key") or change_set.get("change_set_id") or ""
         )
         outcome = outcomes.get(idempotency_key)
         if outcome is None:
@@ -5579,7 +5890,9 @@ def _register_locator_id_ownership(
     if not owners:
         return
     if not conn.in_transaction:
-        raise RuntimeError("Canonical identity registration requires an active transaction")
+        raise RuntimeError(
+            "Canonical identity registration requires an active transaction"
+        )
     now = _utc_now()
     for record_id, owner in sorted(owners.items()):
         page_key = owner[0]
@@ -5632,6 +5945,7 @@ def _register_locator_id_ownership(
                 f"Canonical {record_kind}_id {record_id!r} is reserved by identity page "
                 f"{registered_page!r}, not {page_key!r}."
             )
+
 
 def _validate_locator_id_ownership(
     conn,
@@ -5713,6 +6027,7 @@ def _validate_locator_id_ownership(
                 f"Canonical {id_field} {record_id!r} is reserved by historical page "
                 f"{historical_page!r}, not {proposed_page!r}."
             )
+
 
 def _validate_canonical_id_ownership(
     conn,
@@ -5801,6 +6116,7 @@ def _validate_canonical_id_ownership(
     )
     return claim_owners, evidence_owners
 
+
 def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     """Apply a page-scoped canonical delta inside an existing transaction."""
     if not change_sets:
@@ -5820,21 +6136,34 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
         for change_set in change_sets
         for page in change_set.get("affected_pages", [])
     }
-    affected_page_keys = {
-        _normalized_owner_page(page)
-        for page in affected_pages
-    }
-    proposed_entities = [record for item in change_sets for record in item.get("proposed_entities", [])]
-    proposed_claims = [record for item in change_sets for record in item.get("proposed_claims", [])]
-    proposed_evidence = [record for item in change_sets for record in item.get("proposed_evidence", [])]
-    proposed_sources = [record for item in change_sets for record in item.get("proposed_source_updates", [])]
+    affected_page_keys = {_normalized_owner_page(page) for page in affected_pages}
+    proposed_entities = [
+        record for item in change_sets for record in item.get("proposed_entities", [])
+    ]
+    proposed_claims = [
+        record for item in change_sets for record in item.get("proposed_claims", [])
+    ]
+    proposed_evidence = [
+        record for item in change_sets for record in item.get("proposed_evidence", [])
+    ]
+    proposed_sources = [
+        record
+        for item in change_sets
+        for record in item.get("proposed_source_updates", [])
+    ]
     proposed_source_artifacts = [
-        record for item in change_sets for record in item.get("proposed_source_artifacts", [])
+        record
+        for item in change_sets
+        for record in item.get("proposed_source_artifacts", [])
     ]
     proposed_extraction_runs = [
-        record for item in change_sets for record in item.get("proposed_extraction_runs", [])
+        record
+        for item in change_sets
+        for record in item.get("proposed_extraction_runs", [])
     ]
-    proposed_edges = [record for item in change_sets for record in item.get("proposed_edges", [])]
+    proposed_edges = [
+        record for item in change_sets for record in item.get("proposed_edges", [])
+    ]
 
     conn = get_connection()
     claim_owners, evidence_owners = _validate_canonical_id_ownership(
@@ -5881,14 +6210,24 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             f"WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
             affected_page_params,
         ).fetchall()
-        old_evidence_records = [json.loads(row["data_json"]) for row in old_evidence_rows]
+        old_evidence_records = [
+            json.loads(row["data_json"]) for row in old_evidence_rows
+        ]
         _append_version_records(
-            "claim_versions", "claim_id", "claim_family_id", "claimfamily",
-            "claim_version", old_claim_records,
+            "claim_versions",
+            "claim_id",
+            "claim_family_id",
+            "claimfamily",
+            "claim_version",
+            old_claim_records,
         )
         _append_version_records(
-            "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
-            "evidence_version", old_evidence_records,
+            "evidence_versions",
+            "evidence_id",
+            "evidence_family_id",
+            "evidencefamily",
+            "evidence_version",
+            old_evidence_records,
         )
         conn.execute(
             f"DELETE FROM entities WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
@@ -5921,12 +6260,20 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
         proposed_extraction_runs,
     )
     _append_version_records(
-        "claim_versions", "claim_id", "claim_family_id", "claimfamily",
-        "claim_version", proposed_claims,
+        "claim_versions",
+        "claim_id",
+        "claim_family_id",
+        "claimfamily",
+        "claim_version",
+        proposed_claims,
     )
     _append_version_records(
-        "evidence_versions", "evidence_id", "evidence_family_id", "evidencefamily",
-        "evidence_version", proposed_evidence,
+        "evidence_versions",
+        "evidence_id",
+        "evidence_family_id",
+        "evidencefamily",
+        "evidence_version",
+        proposed_evidence,
     )
     _refresh_alias_delta(old_entity_ids, proposed_entities)
     _refresh_operational_memory_delta(old_claim_ids, proposed_claims)
@@ -5940,7 +6287,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     # Obsolete view_builder block removed to prevent ImportError warnings
     # try:
     #     from vector_lake import view_builder
-    # 
+    #
     #     change_set["view_rebuild"] = view_builder.rebuild_views_for_change_set(change_set)
     # except Exception as exc:
     #     log.warning(f"View rebuild failed for {change_set.get('change_set_id')}: {exc}")
@@ -5967,13 +6314,9 @@ def apply_change_sets_batch(change_sets: list[dict]) -> list[dict]:
         _payload, payload_bytes = _canonical_change_set_payload(change_set)
         payload_sha256 = _change_set_payload_digest(payload_bytes)
         if not str(change_set.get("change_set_id") or "").strip():
-            change_set["change_set_id"] = (
-                f"changeset_direct_{payload_sha256[:16]}"
-            )
+            change_set["change_set_id"] = f"changeset_direct_{payload_sha256[:16]}"
         if not str(change_set.get("idempotency_key") or "").strip():
-            change_set["idempotency_key"] = (
-                f"changeset_direct_idem_{payload_sha256}"
-            )
+            change_set["idempotency_key"] = f"changeset_direct_idem_{payload_sha256}"
         prepared.append(change_set)
     outcomes = apply_and_record_change_sets_batch(prepared)
     for original, outcome in zip(change_sets, outcomes):
@@ -5990,14 +6333,14 @@ def _validated_change_set_limit(limit: int | None, *, default: int = 100) -> int
     normalized = default if limit is None else int(limit)
     if normalized < 1 or normalized > _CHANGE_SET_MAX_BATCH_ITEMS:
         raise ValueError(
-            "change-set limit must be between 1 and "
-            f"{_CHANGE_SET_MAX_BATCH_ITEMS}"
+            f"change-set limit must be between 1 and {_CHANGE_SET_MAX_BATCH_ITEMS}"
         )
     return normalized
 
 
 def publish_change_sets(limit: int | None = None) -> dict:
     from vector_lake.db_store import get_connection, transaction
+
     conn = get_connection()
     normalized_limit = _validated_change_set_limit(limit)
     rows = conn.execute(
@@ -6043,8 +6386,10 @@ def publish_change_sets(limit: int | None = None) -> dict:
         )
     return {"published": published, "change_set_ids": published_ids}
 
+
 def pending_change_sets(limit: int = 100) -> list:
     from vector_lake.db_store import get_connection
+
     conn = get_connection()
     normalized_limit = _validated_change_set_limit(limit)
     rows = conn.execute(
@@ -6062,7 +6407,11 @@ def pending_change_sets(limit: int = 100) -> list:
 
 
 def pending_governance_items() -> list:
-    return [item for item in load_governance_queue()["items"] if item.get("status") == "pending"]
+    return [
+        item
+        for item in load_governance_queue()["items"]
+        if item.get("status") == "pending"
+    ]
 
 
 def reviewable_governance_items() -> list:
@@ -6075,14 +6424,16 @@ def reviewable_governance_items() -> list:
         item
         for item in load_governance_queue()["items"]
         if item.get("status") == "pending"
-        or (
-            item.get("type") == "merge"
-            and item.get("status") == "projection_pending"
-        )
+        or (item.get("type") == "merge" and item.get("status") == "projection_pending")
     ]
 
 
-def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bool = True, summary: str | None = None) -> dict | None:
+def sync_pages_to_canonical(
+    page_paths: list[str],
+    origin: str,
+    auto_approve: bool = True,
+    summary: str | None = None,
+) -> dict | None:
     existing_paths = []
     deleted_paths = []
     for path in page_paths:
@@ -6091,7 +6442,7 @@ def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bo
                 existing_paths.append(str(path))
             else:
                 deleted_paths.append(str(path))
-                
+
     # V10.1 Delete orphaned entities in SQLite when Markdown file is deleted/renamed
     if deleted_paths:
         for path in deleted_paths:
@@ -6101,11 +6452,16 @@ def sync_pages_to_canonical(page_paths: list[str], origin: str, auto_approve: bo
                 entity_id = _stable_id("entity", page_key)
                 delete_entity(entity_id)
                 import logging
-                logging.getLogger("governance").info(f"Deleted orphan entity {entity_id} ({page_key}) from SQLite due to missing markdown file.")
+
+                logging.getLogger("governance").info(
+                    f"Deleted orphan entity {entity_id} ({page_key}) from SQLite due to missing markdown file."
+                )
 
     if not existing_paths:
         return None
-    return create_change_set(existing_paths, origin=origin, summary=summary, auto_approve=auto_approve)
+    return create_change_set(
+        existing_paths, origin=origin, summary=summary, auto_approve=auto_approve
+    )
 
 
 def migrate_existing_wiki(dry_run: bool = False) -> dict:
@@ -6118,11 +6474,19 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
     ]
 
     if dry_run:
-        counts = {"entities": 0, "claims": 0, "evidence": 0, "sources": 0, "valid_pages": 0}
+        counts = {
+            "entities": 0,
+            "claims": 0,
+            "evidence": 0,
+            "sources": 0,
+            "valid_pages": 0,
+        }
         for page_path in page_paths:
             frontmatter, body, _ = read_markdown_file(page_path)
             extracted = extract_page_objects(page_path, frontmatter, body)
-            if extracted.get("entities") or os.path.basename(page_path).startswith("System_"):
+            if extracted.get("entities") or os.path.basename(page_path).startswith(
+                "System_"
+            ):
                 counts["valid_pages"] += 1
             counts["entities"] += len(extracted.get("entities", []))
             counts["claims"] += len(extracted.get("claims", []))
@@ -6186,7 +6550,11 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
             force=True,
         )
         change_set_ids.append(change_set["change_set_id"])
-    canonical_page_keys = {item.get("page_key") for item in load_entities()["items"].values() if item.get("page_key")}
+    canonical_page_keys = {
+        item.get("page_key")
+        for item in load_entities()["items"].values()
+        if item.get("page_key")
+    }
     stale_entities = canonical_page_keys - migrated_page_keys
 
     return {
@@ -6220,7 +6588,9 @@ def ensure_canonical_store_populated() -> dict:
     if mcp_readonly_surface_enabled():
         raise CanonicalStoreNotReady("canonical_store_not_ready:empty")
 
-    log.info("Canonical store is empty; bootstrapping V8 objects from existing wiki pages.")
+    log.info(
+        "Canonical store is empty; bootstrapping V8 objects from existing wiki pages."
+    )
     result = migrate_existing_wiki(dry_run=False)
     result["bootstrapped"] = True
     return result
@@ -6240,9 +6610,13 @@ def governance_projection() -> dict:
         "entity_index": copy.deepcopy(entities["items"]),
         "claim_index": claim_index,
         "memory_index": copy.deepcopy(memory_objects["items"]),
-        "memory_type_counts": copy.deepcopy(memory_objects.get("memory_type_counts", {})),
+        "memory_type_counts": copy.deepcopy(
+            memory_objects.get("memory_type_counts", {})
+        ),
         "source_index": copy.deepcopy(sources["items"]),
-        "pending_change_set_count": len([item for item in queue["items"] if item.get("status") == "pending"]),
+        "pending_change_set_count": len(
+            [item for item in queue["items"] if item.get("status") == "pending"]
+        ),
         "claim_graph": build_claim_graph_projection(),
     }
 
@@ -6258,6 +6632,7 @@ def enqueue_governance_item(
     critical_decision_refs: list[str] | None = None,
 ):
     import uuid
+
     item = {
         "item_id": f"gov_{uuid.uuid4().hex[:12]}",
         "type": item_type,
@@ -6275,8 +6650,6 @@ def enqueue_governance_item(
     item = normalize_governance_item(item)
     upsert_governance_item(item, insert_only=True)
     return item
-
-
 
 
 _HISTORY_TERMINAL_CHANGE_SET_STATUSES = (
@@ -6406,8 +6779,7 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
     if len(active_rows) > _HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS:
         protected["block_version_retention"].add("active_change_set_row_limit")
         protected["guard_parts"].add(
-            "active_change_set_row_limit:"
-            + str(_HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS)
+            "active_change_set_row_limit:" + str(_HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS)
         )
         active_rows = active_rows[:_HISTORY_ACTIVE_CHANGE_SET_MAX_ROWS]
     active_bytes = 0
@@ -6430,9 +6802,7 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
             f"{manifest_version}:{manifest_bytes}:{payload_raw_bytes}"
         )
         if manifest_version not in {0, 1, _CHANGE_SET_MANIFEST_VERSION}:
-            protected["block_version_retention"].add(
-                "unbounded_active_change_set"
-            )
+            protected["block_version_retention"].add("unbounded_active_change_set")
             continue
         max_inline_bytes = (
             _CHANGE_SET_MAX_MANIFEST_BYTES
@@ -6448,9 +6818,7 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
             protected["block_version_retention"].add("unbounded_active_change_set")
             continue
         if active_bytes > _HISTORY_ACTIVE_CHANGE_SET_MAX_BYTES:
-            protected["block_version_retention"].add(
-                "active_change_set_byte_limit"
-            )
+            protected["block_version_retention"].add("active_change_set_byte_limit")
             continue
         manifest_row = conn.execute(
             "SELECT data_json FROM change_sets WHERE change_set_id = ? "
@@ -6541,8 +6909,7 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
         guard_bytes = int(metadata["guard_bytes"] or 0)
         if (
             guard_bytes < 0
-            or active_outbox_bytes + guard_bytes
-            > _HISTORY_ACTIVE_OUTBOX_MAX_BYTES
+            or active_outbox_bytes + guard_bytes > _HISTORY_ACTIVE_OUTBOX_MAX_BYTES
         ):
             protected["block_version_retention"].add("active_outbox_byte_limit")
             protected["guard_parts"].add(
@@ -6557,17 +6924,13 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
         ).fetchone()
         if row is None:
             protected["block_version_retention"].add("active_outbox_guard_drift")
-            protected["guard_parts"].add(
-                f"active_outbox_guard_drift:{metadata['id']}"
-            )
+            protected["guard_parts"].add(f"active_outbox_guard_drift:{metadata['id']}")
             break
         active_outbox_bytes += guard_bytes
         if page_key := _history_page_key(row["filename"]):
             protected["page_keys"].add(page_key)
         else:
-            protected["block_version_retention"].add(
-                "missing_active_outbox_filename"
-            )
+            protected["block_version_retention"].add("missing_active_outbox_filename")
         protected["guard_parts"].add(
             "outbox:"
             + ":".join(
@@ -6628,15 +6991,12 @@ def _history_active_protections(conn: sqlite3.Connection) -> dict[str, set[str]]
         active_job_bytes += guard_bytes
         payload = _history_json_object(row["payload"])
         if not payload:
-            protected["block_version_retention"].add(
-                "malformed_active_job_payload"
-            )
+            protected["block_version_retention"].add("malformed_active_job_payload")
             continue
         protected["guard_parts"].add(
             "job:"
             + ":".join(
-                str(row[field] or "")
-                for field in ("job_id", "status", "lease_until")
+                str(row[field] or "") for field in ("job_id", "status", "lease_until")
             )
             + ":"
             + hashlib.sha256(str(row["payload"]).encode("utf-8")).hexdigest()
@@ -6697,6 +7057,7 @@ def _select_change_set_retention_candidates(
         if str(row["change_set_id"]) not in active_change_set_ids
     ][:batch_size]
 
+
 def _select_job_retention_candidates(
     conn: sqlite3.Connection,
     cutoff: str,
@@ -6725,6 +7086,7 @@ def _select_job_retention_candidates(
         (cutoff, keep_latest, batch_size),
     ).fetchall()
     return [str(row["job_id"]) for row in rows]
+
 
 def _select_outbox_retention_candidates(
     conn: sqlite3.Connection,
@@ -6760,6 +7122,7 @@ def _select_outbox_retention_candidates(
         ),
     ).fetchall()
     return [int(row["id"]) for row in rows]
+
 
 def _select_version_retention_candidates(
     conn: sqlite3.Connection,
@@ -6811,8 +7174,7 @@ def _select_version_retention_candidates(
     normalized_cursor = str(cursor or "")
     if (
         "\x00" in normalized_cursor
-        or len(normalized_cursor.encode("utf-8"))
-        > _HISTORY_VERSION_MAX_CURSOR_BYTES
+        or len(normalized_cursor.encode("utf-8")) > _HISTORY_VERSION_MAX_CURSOR_BYTES
     ):
         raise ValueError(f"{table_name} retention cursor is malformed")
     scan_limit = min(
@@ -6874,18 +7236,14 @@ def _select_version_retention_candidates(
     cutoff_dt = datetime.fromisoformat(cutoff)
     for row in rows:
         raw_version_id = row[version_id_field]
-        if (
-            not isinstance(raw_version_id, str)
-            or not raw_version_id
-        ):
+        if not isinstance(raw_version_id, str) or not raw_version_id:
             raise RuntimeError(
                 f"{table_name} contains an unresumable version identifier"
             )
         version_id = raw_version_id
         if (
             "\x00" in version_id
-            or len(version_id.encode("utf-8"))
-            > _HISTORY_VERSION_MAX_CURSOR_BYTES
+            or len(version_id.encode("utf-8")) > _HISTORY_VERSION_MAX_CURSOR_BYTES
         ):
             raise RuntimeError(
                 f"{table_name} contains an unresumable version identifier"
@@ -6895,9 +7253,7 @@ def _select_version_retention_candidates(
         skipped["last_scanned_cursor"] = version_id
         recorded_at = _strict_utc_instant(row["recorded_at"])
         if recorded_at is None:
-            skipped["invalid_business_time"] = (
-                int(skipped["invalid_business_time"]) + 1
-            )
+            skipped["invalid_business_time"] = int(skipped["invalid_business_time"]) + 1
             trace.append((version_id, None))
             continue
         if datetime.fromisoformat(recorded_at) >= cutoff_dt:
@@ -6920,9 +7276,7 @@ def _select_version_retention_candidates(
             f"{version_id_field} DESC LIMIT ?",
             (row[family_field], keep_per_family),
         ).fetchall()
-        if version_id in {
-            str(newest[version_id_field]) for newest in newest_rows
-        }:
+        if version_id in {str(newest[version_id_field]) for newest in newest_rows}:
             skipped["newest_family_versions"] = (
                 int(skipped["newest_family_versions"]) + 1
             )
@@ -6939,9 +7293,7 @@ def _select_version_retention_candidates(
                 canonical_bytes < 0
                 or canonical_bytes > _HISTORY_CANONICAL_GUARD_MAX_BYTES
             ):
-                skipped["oversize_canonical"] = (
-                    int(skipped["oversize_canonical"]) + 1
-                )
+                skipped["oversize_canonical"] = int(skipped["oversize_canonical"]) + 1
                 trace.append((version_id, None))
                 continue
             canonical_row = conn.execute(
@@ -6956,26 +7308,20 @@ def _select_version_retention_candidates(
                 ),
             ).fetchone()
             if canonical_row is None:
-                skipped["malformed_canonical"] = (
-                    int(skipped["malformed_canonical"]) + 1
-                )
+                skipped["malformed_canonical"] = int(skipped["malformed_canonical"]) + 1
                 trace.append((version_id, None))
                 continue
             current_data = canonical_row["data_json"]
             current_record = _history_json_object(current_data)
             if not current_record:
-                skipped["malformed_canonical"] = (
-                    int(skipped["malformed_canonical"]) + 1
-                )
+                skipped["malformed_canonical"] = int(skipped["malformed_canonical"]) + 1
                 trace.append((version_id, None))
                 continue
             current_hash = hashlib.sha256(
                 _canonical_record_json(current_record).encode("utf-8")
             ).hexdigest()
             if current_hash == str(row["record_hash"] or ""):
-                skipped["current_canonical"] = (
-                    int(skipped["current_canonical"]) + 1
-                )
+                skipped["current_canonical"] = int(skipped["current_canonical"]) + 1
                 trace.append((version_id, None))
                 continue
         selected.append(version_id)
@@ -7011,8 +7357,7 @@ def _history_runtime_generations(conn: sqlite3.Connection) -> dict[str, int]:
     missing = sorted(set(_HISTORY_GENERATION_SURFACES) - set(generations))
     if missing:
         raise RuntimeError(
-            "History retention generation registry is incomplete: "
-            + ", ".join(missing)
+            "History retention generation registry is incomplete: " + ", ".join(missing)
         )
     return generations
 
@@ -7203,9 +7548,7 @@ def _version_cursor_policy(
 ) -> dict[str, object]:
     return {
         "cursor_semantics": "last-safe-key-v2",
-        "version_id_invariant": (
-            "storage-class-text-nonempty-no-nul-max1024-utf8-v2"
-        ),
+        "version_id_invariant": ("storage-class-text-nonempty-no-nul-max1024-utf8-v2"),
         "plan_as_of": plan_as_of,
         "cutoff": cutoff,
         "max_delete_rows": int(batch_size),
@@ -7255,15 +7598,17 @@ def _validate_version_cursor_receipt(
     ):
         raise RuntimeError("Version retention cursor receipt is malformed")
     receipt_cursors = receipt.get("version_resume_cursors")
-    if not isinstance(receipt_cursors, dict) or {
-        table_name: str(receipt_cursors.get(table_name) or "")
-        for table_name in cursors
-    } != cursors:
+    if (
+        not isinstance(receipt_cursors, dict)
+        or {
+            table_name: str(receipt_cursors.get(table_name) or "")
+            for table_name in cursors
+        }
+        != cursors
+    ):
         raise RuntimeError("Version retention cursors do not match the prior receipt")
     receipt_policy = receipt.get("version_cursor_policy")
-    receipt_policy_sha256 = str(
-        receipt.get("version_cursor_policy_sha256") or ""
-    )
+    receipt_policy_sha256 = str(receipt.get("version_cursor_policy_sha256") or "")
     if (
         not isinstance(receipt_policy, dict)
         or not re.fullmatch(r"[0-9a-f]{64}", receipt_policy_sha256)
@@ -7496,9 +7841,7 @@ def plan_history_retention(
             evidence_trace,
         ),
     ):
-        finally_selected = {
-            str(value) for value in selected.get(table_name, [])
-        }
+        finally_selected = {str(value) for value in selected.get(table_name, [])}
         scan_stats = dict(stats)
         scan_stats["eligible_rows"] = len(eligible_ids)
         scan_stats["scheduled_rows"] = len(finally_selected)
@@ -7521,9 +7864,7 @@ def plan_history_retention(
         "schema_cookie": int(conn.execute("PRAGMA schema_version").fetchone()[0]),
         "plan_as_of": normalized_as_of,
         "cutoff": normalized_cutoff,
-        "version_cursor_policy_sha256": _version_cursor_policy_sha256(
-            cursor_policy
-        ),
+        "version_cursor_policy_sha256": _version_cursor_policy_sha256(cursor_policy),
         "rules": {
             "max_delete_rows": batch_size,
             "max_delete_bytes": int(max_delete_bytes),
@@ -7635,10 +7976,7 @@ def apply_history_retention_plan(
         raise ValueError("History retention plan bounds are malformed") from exc
     if max_delete_rows < 1 or max_delete_rows > 500:
         raise ValueError("History retention row bound is outside the hard limit")
-    if (
-        max_delete_bytes < 1
-        or max_delete_bytes > _HISTORY_RETENTION_MAX_DELETE_BYTES
-    ):
+    if max_delete_bytes < 1 or max_delete_bytes > _HISTORY_RETENTION_MAX_DELETE_BYTES:
         raise ValueError("History retention byte bound is outside the hard limit")
     if not isinstance(rules.get("scan_version_history"), bool):
         raise ValueError("History retention version-scan policy is malformed")
@@ -7705,7 +8043,9 @@ def apply_history_retention_plan(
     ):
         raise RuntimeError("History retention schema cookie drifted after preview")
     if _history_runtime_generations(conn) != plan.get("runtime_generations"):
-        raise RuntimeError("History retention runtime generations drifted after preview")
+        raise RuntimeError(
+            "History retention runtime generations drifted after preview"
+        )
     protected = _history_active_protections(conn)
     if not hmac.compare_digest(
         _history_protection_digest(protected),
@@ -7837,9 +8177,7 @@ def apply_history_retention_plan(
             for table_name in ("claim_versions", "evidence_versions")
         },
         "version_cursor_policy": cursor_policy,
-        "version_cursor_policy_sha256": _version_cursor_policy_sha256(
-            cursor_policy
-        ),
+        "version_cursor_policy_sha256": _version_cursor_policy_sha256(cursor_policy),
         "runtime_generations_after": _history_runtime_generations(conn),
         "applied_at": _utc_now(),
     }
@@ -7956,9 +8294,7 @@ def plan_change_set_history_compaction(
         raise RuntimeError("Change-set history compaction requires schema v6")
     _assert_change_set_compaction_id_domain(conn)
     cursor_policy = _change_set_compaction_cursor_policy()
-    cursor_policy_sha256 = _change_set_compaction_cursor_policy_sha256(
-        cursor_policy
-    )
+    cursor_policy_sha256 = _change_set_compaction_cursor_policy_sha256(cursor_policy)
     scan_rows = conn.execute(
         "SELECT change_sets.rowid AS storage_rowid, change_sets.change_set_id, "
         "change_sets.updated_at, "
@@ -8124,10 +8460,7 @@ def plan_change_set_history_compaction(
         and not uncompactable_count
     )
     remaining_legacy_lower_bound = (
-        len(candidates)
-        + oversize_count
-        + uncompactable_count
-        + int(scan_truncated)
+        len(candidates) + oversize_count + uncompactable_count + int(scan_truncated)
     )
     plan = {
         "contract": "change-set-history-compaction-plan-v1",
@@ -8178,7 +8511,9 @@ def apply_change_set_history_compaction_plan(
         raise ValueError("Unsupported change-set compaction plan")
     fingerprint = str(plan.get("fingerprint") or "")
     if not confirmation or not hmac.compare_digest(confirmation, fingerprint):
-        raise RuntimeError("Change-set compaction requires the exact preview fingerprint")
+        raise RuntimeError(
+            "Change-set compaction requires the exact preview fingerprint"
+        )
     if not hmac.compare_digest(fingerprint, _history_plan_fingerprint(plan)):
         raise RuntimeError("Change-set compaction plan fingerprint is invalid")
     if int(conn.execute("PRAGMA user_version").fetchone()[0]) != int(
@@ -8194,12 +8529,9 @@ def apply_change_set_history_compaction_plan(
     expected_cursor_policy_sha256 = _change_set_compaction_cursor_policy_sha256(
         expected_cursor_policy
     )
-    if (
-        plan.get("cursor_policy") != expected_cursor_policy
-        or not hmac.compare_digest(
-            str(plan.get("cursor_policy_sha256") or ""),
-            expected_cursor_policy_sha256,
-        )
+    if plan.get("cursor_policy") != expected_cursor_policy or not hmac.compare_digest(
+        str(plan.get("cursor_policy_sha256") or ""),
+        expected_cursor_policy_sha256,
     ):
         raise ValueError("Change-set compaction cursor policy is invalid")
 
@@ -8210,10 +8542,7 @@ def apply_change_set_history_compaction_plan(
         raise ValueError("Change-set compaction bounds are malformed") from exc
     if max_rows < 1 or max_rows > 500:
         raise ValueError("Change-set compaction max_rows is outside the hard limit")
-    if (
-        max_input_bytes < 1
-        or max_input_bytes > _CHANGE_SET_COMPACTION_MAX_INPUT_BYTES
-    ):
+    if max_input_bytes < 1 or max_input_bytes > _CHANGE_SET_COMPACTION_MAX_INPUT_BYTES:
         raise ValueError("Change-set compaction byte bound is outside the hard limit")
     input_cursor = str(plan.get("input_cursor") or "")
     safe_next_cursor = str(plan.get("safe_next_cursor") or "")
@@ -8226,9 +8555,7 @@ def apply_change_set_history_compaction_plan(
             or len(cursor_value.encode("utf-8"))
             > _CHANGE_SET_COMPACTION_MAX_CURSOR_BYTES
         ):
-            raise ValueError(
-                f"Change-set compaction {cursor_name} cursor is malformed"
-            )
+            raise ValueError(f"Change-set compaction {cursor_name} cursor is malformed")
     if safe_next_cursor < input_cursor:
         raise ValueError("Change-set compaction cursor moves backwards")
     candidates = plan.get("candidates")
@@ -8245,12 +8572,16 @@ def apply_change_set_history_compaction_plan(
             or candidate_id <= input_cursor
             or candidate_id > safe_next_cursor
         ):
-            raise ValueError("Change-set compaction candidate is outside its cursor window")
+            raise ValueError(
+                "Change-set compaction candidate is outside its cursor window"
+            )
         candidate_ids.append(candidate_id)
         try:
             candidate_bytes = int(candidate.get("input_bytes"))
         except (TypeError, ValueError) as exc:
-            raise ValueError("Change-set compaction candidate size is malformed") from exc
+            raise ValueError(
+                "Change-set compaction candidate size is malformed"
+            ) from exc
         if candidate_bytes < 0 or candidate_bytes > max_input_bytes:
             raise ValueError("Change-set compaction candidate exceeds the byte bound")
         expected_input_bytes += candidate_bytes
@@ -8258,9 +8589,10 @@ def apply_change_set_history_compaction_plan(
         raise ValueError("Change-set compaction batch exceeds the byte bound")
     if candidate_ids != sorted(set(candidate_ids)):
         raise ValueError("Change-set compaction candidates are not a unique keyset")
-    if int(plan.get("selected_rows") or 0) != len(candidates) or int(
-        plan.get("selected_input_bytes") or 0
-    ) != expected_input_bytes:
+    if (
+        int(plan.get("selected_rows") or 0) != len(candidates)
+        or int(plan.get("selected_input_bytes") or 0) != expected_input_bytes
+    ):
         raise ValueError("Change-set compaction plan totals are inconsistent")
     if int(plan.get("preflight_input_bytes") or 0) > max_input_bytes:
         raise ValueError("Change-set compaction preflight exceeds the byte bound")
@@ -8309,15 +8641,12 @@ def apply_change_set_history_compaction_plan(
             rowid=int(row["storage_rowid"]),
             expected_bytes=input_bytes,
         )
-        if (
-            not hmac.compare_digest(
-                raw_guard,
-                str(candidate.get("row_guard_sha256") or ""),
-            )
-            or not hmac.compare_digest(
-                raw_guard,
-                str(row["payload_guard_sha256"] or ""),
-            )
+        if not hmac.compare_digest(
+            raw_guard,
+            str(candidate.get("row_guard_sha256") or ""),
+        ) or not hmac.compare_digest(
+            raw_guard,
+            str(row["payload_guard_sha256"] or ""),
         ):
             raise RuntimeError(
                 f"Change-set compaction row drifted after preview: {change_set_id}"
@@ -8359,8 +8688,7 @@ def apply_change_set_history_compaction_plan(
         )
         if compaction_kind != str(candidate.get("compaction_kind") or ""):
             raise RuntimeError(
-                "Change-set compaction strategy drifted after preview: "
-                f"{change_set_id}"
+                f"Change-set compaction strategy drifted after preview: {change_set_id}"
             )
         payload_available = bool(payload_bytes)
         manifest_json = _canonical_json_bytes(manifest).decode("utf-8")

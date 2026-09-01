@@ -13,6 +13,9 @@ _STABLE_EVENT_PAYLOAD_FIELDS = (
     "entity_title",
     "source_file",
 )
+_TIMELINE_LIMIT_MAX = 100
+_TIMELINE_OUTPUT_BYTE_LIMIT = 64 * 1024
+_TIMELINE_FILTER_CHAR_LIMIT = 256
 
 
 def _stable_event_payload_signature(event) -> str:
@@ -75,80 +78,42 @@ def _entity_title_map(
     return {str(row["entity_id"]): str(row["canonical_name"] or row["entity_id"]) for row in rows}
 
 
-def _locator_search_terms(locator) -> set[str]:
-    if not isinstance(locator, dict):
-        return set()
-    terms: set[str] = set()
-    for value in locator.values():
-        if isinstance(value, (str, int, float)):
-            terms.add(str(value))
-        elif isinstance(value, list):
-            terms.update(
-                str(item)
-                for item in value
-                if isinstance(item, (str, int, float))
-            )
-    return terms
+def _bounded_timeline_text(value, max_chars: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
 
 
-def _entity_search_term_map(entity_ids: set[str]) -> dict[str, set[str]]:
-    """Build canonical entity search terms without relying on denormalized claim columns."""
-    if not entity_ids:
-        return {}
-    conn = get_connection()
-    placeholders = ",".join("?" for _ in entity_ids)
-    rows = conn.execute(
-        f"SELECT entity_id, canonical_name, data_json FROM entities "
-        f"WHERE entity_id IN ({placeholders})",
-        tuple(sorted(entity_ids)),
-    ).fetchall()
-    terms_by_id: dict[str, set[str]] = {
-        entity_id: {entity_id}
-        for entity_id in entity_ids
-    }
+def _format_timeline_rows(rows) -> str:
+    marker = "\n\n[Timeline output truncated to the 65536-byte budget.]"
+    marker_bytes = len(marker.encode("utf-8"))
+    block_budget = _TIMELINE_OUTPUT_BYTE_LIMIT - marker_bytes
+    blocks: list[str] = []
+    used_bytes = 0
+    truncated = False
     for row in rows:
-        entity_id = str(row["entity_id"])
-        terms = terms_by_id.setdefault(entity_id, {entity_id})
-        if row["canonical_name"]:
-            terms.add(str(row["canonical_name"]))
-        try:
-            data = json.loads(row["data_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            data = {}
-        for field in ("canonical_name", "title", "page_key", "name"):
-            if data.get(field):
-                terms.add(str(data[field]))
-        aliases = data.get("aliases") or []
-        if isinstance(aliases, str):
-            aliases = [aliases]
-        terms.update(str(alias) for alias in aliases if alias)
-        terms.update(_locator_search_terms(data.get("locator")))
-    return terms_by_id
-
-
-def _canonical_row_matches_entity(
-    row,
-    entity_name: str,
-    entity_terms: dict[str, set[str]],
-) -> bool:
-    """Match a canonical claim using its payload and referenced entity records."""
-    needle = str(entity_name).casefold()
-    data = json.loads(row["data_json"])
-    subjects = data.get("subject_entity_ids") or []
-    if isinstance(subjects, str):
-        subjects = [subjects]
-    terms = {
-        str(row["claim_text"] or ""),
-        str(data.get("title") or ""),
-        str(data.get("entity_title") or ""),
-        str(data.get("source_page") or ""),
-    }
-    terms.update(_locator_search_terms(data.get("locator")))
-    for subject in subjects:
-        subject_id = str(subject)
-        terms.add(subject_id)
-        terms.update(entity_terms.get(subject_id, ()))
-    return any(needle in term.casefold() for term in terms if term)
+        block = (
+            f"[{_bounded_timeline_text(row['event_date'], 128)}] "
+            f"<{_bounded_timeline_text(row['entity_title'] or row['entity_id'], 512)}>\n"
+            f"  -> {_bounded_timeline_text(row['description'], 4096)}\n"
+            f"  Action: {_bounded_timeline_text(row['action'], 512)} | "
+            f"Sentiment: {_bounded_timeline_text(row['sentiment'], 128)} | "
+            f"Source: {_bounded_timeline_text(row['source_file'], 1024)}"
+        )
+        separator_bytes = 2 if blocks else 0
+        encoded_bytes = len(block.encode("utf-8"))
+        if used_bytes + separator_bytes + encoded_bytes > block_budget:
+            truncated = True
+            break
+        blocks.append(block)
+        used_bytes += separator_bytes + encoded_bytes
+    if not blocks:
+        return "No timeline events found matching the criteria."
+    result = "\n\n".join(blocks)
+    if truncated:
+        result += marker
+    return result
 
 
 def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: list[dict]) -> dict:
@@ -240,6 +205,8 @@ def timeline_projection_parity(*, connection=None) -> dict:
 
 def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None = None) -> str:
     """Rebuild the timeline_events projection from timeline-event claims."""
+    if not dry_run and limit is not None:
+        raise ValueError("limit is only supported for timeline rebuild dry-runs")
     conn = get_connection()
     query = (
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
@@ -275,98 +242,78 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
         )
     return f"Rebuilt {len(events)} timeline_events row(s) from timeline-event claims."
 
-def search_timeline_events(entity_name: str = None, sentiment: str = None, action: str = None, limit: int = 10) -> str:
-    """Query the timeline_events projection; fall back to timeline-event claims if the projection is empty."""
-    conn = get_connection()
-    cursor = conn.cursor()
+def search_timeline_events(
+    entity_name: str = "",
+    sentiment: str = "",
+    action: str = "",
+    limit: int = 10,
+) -> str:
+    """Query the bounded Timeline projection without running full parity.
 
-    parity = timeline_projection_parity()
-    if parity["projection"] and not parity["missing"] and not parity["extra"]:
-        query = "SELECT event_date, action, sentiment, description, entity_id, entity_title, source_file FROM timeline_events WHERE 1=1"
-        params = []
-        if entity_name:
-            query += " AND (entity_id LIKE ? OR entity_title LIKE ? OR description LIKE ?)"
-            params.extend([f"%{entity_name}%", f"%{entity_name}%", f"%{entity_name}%"])
-        if sentiment:
-            query += " AND sentiment = ?"
-            params.append(sentiment)
-        if action:
-            query += " AND action LIKE ?"
-            params.append(f"%{action}%")
-        query += " ORDER BY event_date DESC LIMIT ?"
-        params.append(max(1, int(limit)))
-        try:
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-        except Exception as e:
-            return f"Error executing timeline query: {e}"
-        if not rows:
-            return "No timeline events found matching the criteria."
-        return "\n\n".join(
-            f"[{r['event_date']}] <{r['entity_title'] or r['entity_id']}>\n"
-            f"  -> {r['description']}\n"
-            f"  Action: {r['action']} | Sentiment: {r['sentiment']} | Source: {r['source_file']}"
-            for r in rows
-        )
-
-    query = "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
-    params = []
-    if sentiment:
-        query += " AND COALESCE(json_extract(data_json, '$.sentiment'), 'neutral') = ?"
-        params.append(sentiment)
-    if action:
-        query += (
-            " AND COALESCE("
-            "json_extract(data_json, '$.action'), "
-            "json_extract(data_json, '$.event_tag'), "
-            "json_extract(data_json, '$.claim_type'), "
-            "'timeline-event') LIKE ?"
-        )
-        params.append(f"%{action}%")
-
-    query += " ORDER BY updated_at DESC"
-    
+    Canonical mutations and Timeline projection updates share one transaction.
+    Full payload parity remains a Doctor/repair concern instead of request-path
+    work. Exact filters use composite indexes; substring fallback preserves the
+    existing discovery behavior while result count and bytes remain bounded.
+    """
     try:
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-    except Exception as e:
-        return f"Error executing timeline query: {e}"
-        
-    if entity_name and rows:
-        entity_ids: set[str] = set()
-        for row in rows:
-            data = json.loads(row["data_json"])
-            subjects = data.get("subject_entity_ids") or []
-            if isinstance(subjects, str):
-                subjects = [subjects]
-            entity_ids.update(str(item) for item in subjects)
-        entity_terms = _entity_search_term_map(entity_ids)
-        rows = [
-            row
-            for row in rows
-            if _canonical_row_matches_entity(row, entity_name, entity_terms)
-        ]
+        bounded_limit = min(_TIMELINE_LIMIT_MAX, max(1, int(limit)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
 
-    rows = rows[:max(1, int(limit))]
-    if not rows:
-        return "No timeline events found matching the criteria."
+    filters = {
+        "entity_name": str(entity_name or "").strip(),
+        "sentiment": str(sentiment or "").strip(),
+        "action": str(action or "").strip(),
+    }
+    for name, value in filters.items():
+        if len(value) > _TIMELINE_FILTER_CHAR_LIMIT:
+            raise ValueError(
+                f"{name} exceeds {_TIMELINE_FILTER_CHAR_LIMIT} characters"
+            )
 
-    entity_ids: set[str] = set()
-    for row in rows:
-        data = json.loads(row["data_json"])
-        subjects = data.get("subject_entity_ids") or []
-        if isinstance(subjects, str):
-            subjects = [subjects]
-        entity_ids.update(str(item) for item in subjects)
-    entity_titles = _entity_title_map(entity_ids)
-    events = [
-        _event_from_claim_row(row, entity_titles=entity_titles)
-        for row in rows
-    ]
-    return "\n\n".join(
-        f"[{event['event_date']}] <{event['entity_title'] or event['entity_id']}>\n"
-        f"  -> {event['description']}\n"
-        f"  Action: {event['action']} | Sentiment: {event['sentiment']} | "
-        f"Source: {event['source_file']}"
-        for event in events
-    )
+    conn = get_connection()
+
+    def execute_query(*, exact_text_filters: bool):
+        query = (
+            "SELECT id, event_date, action, sentiment, description, entity_id, "
+            "entity_title, source_file FROM timeline_events WHERE 1=1"
+        )
+        params: list = []
+        if filters["entity_name"]:
+            if exact_text_filters:
+                query += (
+                    " AND (entity_id = ? COLLATE NOCASE "
+                    "OR entity_title = ? COLLATE NOCASE)"
+                )
+                params.extend(
+                    [filters["entity_name"], filters["entity_name"]]
+                )
+            else:
+                query += (
+                    " AND (instr(lower(COALESCE(entity_id, '')), lower(?)) > 0 "
+                    "OR instr(lower(COALESCE(entity_title, '')), lower(?)) > 0 "
+                    "OR instr(lower(COALESCE(description, '')), lower(?)) > 0)"
+                )
+                params.extend([filters["entity_name"]] * 3)
+        if filters["sentiment"]:
+            query += " AND sentiment = ?"
+            params.append(filters["sentiment"])
+        if filters["action"]:
+            if exact_text_filters:
+                query += " AND action = ? COLLATE NOCASE"
+            else:
+                query += (
+                    " AND instr(lower(COALESCE(action, '')), lower(?)) > 0"
+                )
+            params.append(filters["action"])
+        query += " ORDER BY event_date DESC, id ASC LIMIT ?"
+        params.append(bounded_limit)
+        return conn.execute(query, params).fetchall()
+
+    try:
+        rows = execute_query(exact_text_filters=True)
+        if not rows and (filters["entity_name"] or filters["action"]):
+            rows = execute_query(exact_text_filters=False)
+    except Exception as exc:
+        return f"Error executing timeline query: {exc}"
+    return _format_timeline_rows(rows)

@@ -35,6 +35,7 @@ from vector_lake.durability import sync_directory
 from vector_lake.projection_format_v2 import (
     SIDECAR_CONTRACT,
     is_v2_locator,
+    load_committed_index,
     validate_root_closure,
     validate_sidecar,
 )
@@ -89,6 +90,11 @@ EXCLUDED_WIKI_FILES = {
     "synthesis_log.md",
 }
 log = logging.getLogger("vector-lake-projection")
+
+_MAINTENANCE_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+# Best-effort housekeeping after each maintenance snapshot: keep the newest
+# N complete backups and prune older ones.
+_AUTO_RETAIN_KEEP_LATEST = 5
 
 _MAINTENANCE_MANIFEST_V4_KEYS = frozenset(
     {
@@ -215,7 +221,7 @@ def validate_maintenance_backup_v4(
     if path.name != "manifest.json":
         raise ValueError("maintenance_backup_manifest_name_invalid")
     digest, size = _sha256_plain_file(path)
-    if size > 1024 * 1024:
+    if size > _MAINTENANCE_MANIFEST_MAX_BYTES:
         raise ValueError("maintenance_backup_manifest_too_large")
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or set(manifest) != set(
@@ -1098,12 +1104,23 @@ def _load_legacy_index_for_projection_rebuild(
         connection.close()
 
 
-def _index_keys(*, legacy_rebuild_capability: object | None = None) -> set[str]:
+def _index_keys(
+    *,
+    legacy_rebuild_capability: object | None = None,
+    allow_stale_generation: bool = False,
+) -> set[str]:
     index_path = get_index_path()
     if not index_path.exists():
         return set()
     if legacy_rebuild_capability is None:
-        data = load_index_snapshot(index_path)
+        data = (
+            load_committed_index(
+                index_path.parent,
+                require_current_generation=False,
+            )
+            if allow_stale_generation
+            else load_index_snapshot(index_path)
+        )
     else:
         data = _load_legacy_index_for_projection_rebuild(
             index_path,
@@ -1116,10 +1133,14 @@ def _diff_sets(
     *,
     allow_initialize: bool = False,
     legacy_rebuild_capability: object | None = None,
+    allow_stale_generation: bool = False,
 ) -> dict[str, set[str]]:
     wiki = _wiki_keys()
     canonical = _canonical_keys(allow_initialize=allow_initialize)
-    index = _index_keys(legacy_rebuild_capability=legacy_rebuild_capability)
+    index = _index_keys(
+        legacy_rebuild_capability=legacy_rebuild_capability,
+        allow_stale_generation=allow_stale_generation,
+    )
     return {
         "wiki": wiki,
         "canonical": canonical,
@@ -1422,10 +1443,53 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
         validate_maintenance_backup_v4(stage_dir / "manifest.json")
         stage_dir.replace(backup_dir)
         sync_directory(backup_root)
+        _auto_retain_backups(backup_root)
     except Exception:
         shutil.rmtree(stage_dir, ignore_errors=True)
         raise
     return str(backup_dir)
+
+
+def _auto_retain_backups(backup_root: Path) -> None:
+    """Bound backup growth after every maintenance snapshot.
+
+    Keeps the newest ``_AUTO_RETAIN_KEEP_LATEST`` complete backups and prunes
+    older ones.  The age-based guard in the retention scanner protects recent
+    snapshots, so this helper applies a hard keep-latest cap on top of it.
+    Every pruned directory is re-validated (complete manifest + restorable
+    snapshot) immediately before removal.  Best-effort: failures only log.
+    """
+    try:
+        from vector_lake.tool_backup_retention import (
+            _created_at_ns,
+            _read_complete_manifest,
+            _verify_restorable_backup_snapshot,
+        )
+
+        complete: list[tuple[str, int]] = []  # (name, created_at_ns)
+        for child in sorted(backup_root.iterdir(), key=lambda value: value.name):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            manifest = _read_complete_manifest(child)
+            if manifest is None:
+                continue
+            created_ns = _created_at_ns(manifest[0]["created_at"])
+            if created_ns is None:
+                continue
+            complete.append((child.name, created_ns))
+        if len(complete) <= _AUTO_RETAIN_KEEP_LATEST:
+            return
+        complete.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        for name, _created_ns in complete[_AUTO_RETAIN_KEEP_LATEST:]:
+            target = backup_root / name
+            manifest = _read_complete_manifest(target)
+            if manifest is None:
+                continue
+            _verify_restorable_backup_snapshot(target, manifest[0])
+            shutil.rmtree(target, ignore_errors=True)
+            log.info("Automatic retention pruned old backup: %s", name)
+    except Exception as exc:  # pragma: no cover - best-effort housekeeping
+        log.warning("Automatic backup retention failed: %s", exc)
 
 
 def projection_diff_report(limit: int = 20) -> str:
@@ -2152,6 +2216,7 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
         diff = _diff_sets(
             allow_initialize=False,
             legacy_rebuild_capability=legacy_capability,
+            allow_stale_generation=True,
         )
         return (
             "[DRY RUN] Would rebuild index.json, wiki_search_index, and claim_graph.json "
@@ -2173,8 +2238,11 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
         _diff_sets(
             # Apply re-runs the authoritative schema/projection preflight only
             # after the schema lock and pending-receipt guard are both held.
+            # A structurally valid but generation-stale pair is the exact state
+            # this maintenance operation must be able to repair.
             allow_initialize=False,
             legacy_rebuild_capability=legacy_capability,
+            allow_stale_generation=True,
         )
         _assert_projection_rebuild_root_snapshot(root_snapshot)
         backup_dir = create_maintenance_backup("index_rebuild")
