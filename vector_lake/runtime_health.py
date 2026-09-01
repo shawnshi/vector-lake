@@ -563,17 +563,19 @@ def _open_runtime_generation_database_read_only():
     uri = f"{db_path.as_uri()}?mode=ro"
     if wal_size == 0:
         uri += "&immutable=1"
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("SELECT 1 FROM runtime_generations LIMIT 1").fetchone()
     except sqlite3.Error as exc:
-        if "conn" in locals():
+        if conn is not None:
             conn.close()
         raise RuntimeDatabaseBlocked(
             "semantic_runtime_generation_ledger_unavailable"
         ) from exc
+    assert conn is not None
     return conn, db_path
 
 
@@ -2209,7 +2211,7 @@ def assess_runtime_health(
 
             expected_fts_rows = _search_projection_upserts(index_data)
             actual_fts_rows = [
-                tuple(str(value) for value in row)
+                (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
                 for row in conn.execute(
                     "SELECT node_key, title, summary, text FROM wiki_search_index "
                     "ORDER BY node_key"
@@ -2410,7 +2412,7 @@ def _evidence_foundation_metrics(conn) -> dict[str, Any]:
     claim_total = count("SELECT COUNT(*) FROM claims")
     evidence_total = count("SELECT COUNT(*) FROM evidence")
     source_total = count("SELECT COUNT(*) FROM sources")
-    metrics = {
+    metrics: dict[str, Any] = {
         "claim_total": claim_total,
         "claim_with_evidence_refs": count(
             "SELECT COUNT(*) FROM claims WHERE "

@@ -10,7 +10,8 @@ import threading
 import time
 import unicodedata
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping
+from typing import cast
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -556,7 +557,7 @@ def _write_json_stage(stage_path: str, data: dict):
         sync_open_file(handle)
 
 
-def _deduplicate_weighted_edges(edges: list[dict]) -> list[dict]:
+def _deduplicate_weighted_edges(edges: Iterable[dict]) -> list[dict]:
     """Collapse repeated undirected edges and retain the strongest weight."""
     strongest: dict[tuple[str, str], dict] = {}
     for edge in edges:
@@ -639,7 +640,7 @@ def canonical_runtime_generation_snapshot(
     connection = connection or db_store.get_connection()
     dirty_reader = getattr(connection, "generation_dirty_snapshot", None)
     if callable(dirty_reader):
-        dirty_surfaces = set(dirty_reader())
+        dirty_surfaces = set(cast(Iterable[str], dirty_reader()))
         if dirty_surfaces.intersection(CANONICAL_PROJECTION_SURFACES):
             raise ProjectionPairContractError(
                 "Cannot bind a projection to uncommitted canonical mutations."
@@ -2013,7 +2014,7 @@ def _apply_graph_topology(index_data: dict):
         components.append(sorted(component))
     components.sort(key=lambda members: (-len(members), members[0] if members else ""))
 
-    raw_partition: dict[str, object] = {}
+    raw_partition: Mapping[str, object] = {}
     if index_data["weighted_edges"]:
         try:
             raw_partition = _louvain_partition_in_subprocess(
@@ -2422,7 +2423,7 @@ def _projection_v2_merged_search_rows(
     connection,
     upserts: dict[str, tuple[str, str, str, str]],
     touched: set[str],
-):
+) -> Iterator[tuple[str, str, str, str]]:
     pending = iter(sorted(upserts.items()))
     next_upsert = next(pending, None)
     for row in connection.execute(
@@ -2438,7 +2439,7 @@ def _projection_v2_merged_search_rows(
                 yield next_upsert[1]
                 next_upsert = next(pending, None)
             continue
-        yield tuple(str(value) for value in row)
+        yield (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
     while next_upsert is not None:
         yield next_upsert[1]
         next_upsert = next(pending, None)
@@ -2966,7 +2967,7 @@ def _update_index_items_v2_locked(
             "claim_nodes": len(claim_graph_data.get("nodes") or []),
             "claim_edges": len(claim_graph_data.get("edges") or []),
         },
-        mutation_stats=tuple(stats),
+        mutation_stats=(stats[0], stats[1], stats[2], stats[3]),
     )
 
     existing_touched_rows = int(
@@ -3103,6 +3104,10 @@ def update_index_items(filenames: list[str]):
 
     lock_path = output_path + ".lock"
     needs_full_rebuild = False
+    index_data: dict | None = None
+    canonical_binding: dict | None = None
+    search_deletes: set[str] = set()
+    embedding_deletes: set[str] = set()
     try:
         with FileLock(lock_path, timeout=15):
             if is_v2_locator(output_path, "index"):
@@ -3353,6 +3358,7 @@ def update_index_items(filenames: list[str]):
                     _search_projection_row(node_key, all_nodes[node_key])
                     for node_key in sorted(all_nodes)
                 )
+                assert canonical_binding is not None
                 tmp_output, tmp_claim, manifest = _stage_projection_pair(
                     output_path,
                     index_data,

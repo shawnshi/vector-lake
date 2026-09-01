@@ -716,8 +716,8 @@ class WikiIndexHandler(FileSystemEventHandler):
     def on_moved(self, event):
         if event.is_directory:
             return
-        self.queue_path(event.src_path)
-        self.queue_path(event.dest_path)
+        self.queue_path(os.fsdecode(event.src_path))
+        self.queue_path(os.fsdecode(event.dest_path))
 
 
 class DiaryWatchdogHandler(FileSystemEventHandler):
@@ -1245,6 +1245,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
             if overflow:
                 self._pending_scrub_day_ordinal = scrub_day_ordinal
                 self._pending_scrub_period_days = scrub_period_days
+                assert scrub_attempt is not None
                 try:
                     self._scrub_ledger.finish_attempt(
                         scrub_attempt,
@@ -1456,21 +1457,25 @@ class RawWatchdogHandler(FileSystemEventHandler):
                         )
                     with bind_raw_scrub_day(bound_day if overflow else None):
                         result = self._run_ingest(paths, overflow)
-                    if overflow and not self._full_scan_complete(result):
-                        drain_incomplete = True
-                        self._scrub_ledger.finish_attempt(
-                            drain_attempt,
-                            result="incomplete",
-                            retry_delay_seconds=self.retry_base_seconds,
-                        )
-                        log.warning(
-                            "Raw ingest shutdown left additional full-scan work pending."
-                        )
-                    elif overflow:
-                        self._scrub_ledger.finish_attempt(
-                            drain_attempt,
-                            result="success",
-                        )
+                    if overflow:
+                        if drain_attempt is None:
+                            raise RuntimeError("Raw scrub attempt was not initialized")
+                        completed_attempt = drain_attempt
+                        if not self._full_scan_complete(result):
+                            drain_incomplete = True
+                            self._scrub_ledger.finish_attempt(
+                                completed_attempt,
+                                result="incomplete",
+                                retry_delay_seconds=self.retry_base_seconds,
+                            )
+                            log.warning(
+                                "Raw ingest shutdown left additional full-scan work pending."
+                            )
+                        else:
+                            self._scrub_ledger.finish_attempt(
+                                completed_attempt,
+                                result="success",
+                            )
                 except BaseException as exc:
                     if drain_attempt is not None:
                         try:
@@ -1932,14 +1937,15 @@ def process_mutation_outbox_batch(
             if not _renew_mutation_outbox_lease(db_store, row, lease_seconds):
                 continue
             target = get_wiki_dir() / filename
+            payload_text = row.get("payload_text")
             already_materialized = (
                 not target.exists()
                 if row["mutation_type"] == "delete"
                 else (
-                    row.get("payload_text") is not None
+                    payload_text is not None
                     and target.exists()
                     and normalize_semantic_text(target.read_text(encoding="utf-8"))
-                    == normalize_semantic_text(row.get("payload_text"))
+                    == normalize_semantic_text(payload_text)
                 )
             )
             if not already_materialized:
@@ -1950,7 +1956,7 @@ def process_mutation_outbox_batch(
                 materialize_markdown_projection(
                     filename,
                     row["mutation_type"],
-                    row.get("payload_text"),
+                    payload_text,
                     validation_mode=row.get("validation_mode") or "full",
                     projection_base_hash=row.get("projection_base_hash"),
                 )
@@ -2700,6 +2706,7 @@ def maintain_operational_memory_search_for_watchdog() -> dict:
         raise
     finally:
         cleanup_connection_after_tool_call(failed=failed)
+    return {**status, "batches": 0, "deferred": True}
 
 
 def scheduled_lint_loop(stop_event: threading.Event | None = None):
@@ -2819,6 +2826,7 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                 and now.tm_min == 0
             ):
                 last_retention_sample_date = storage_date
+                _close_db: Callable[[], None] | None = None
                 try:
                     from vector_lake.db_store import close_connection as _close_db
                     from vector_lake.tool_governance_maintenance import (
@@ -2840,10 +2848,11 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                 except Exception as exc:
                     log.warning("Daily history retention failed: %s", exc)
                 finally:
-                    try:
-                        _close_db()
-                    except Exception:
-                        pass
+                    if _close_db is not None:
+                        try:
+                            _close_db()
+                        except Exception:
+                            pass
 
             # Run at 10:00 and 23:00. Once observed, a due slot remains pending
             # across minute boundaries until the heavy-task gate admits it.
@@ -3098,9 +3107,15 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
             observer.schedule(diary_handler, diary_dir, recursive=False)
             log.info("Diary monitor active on directory: %s", diary_dir)
 
+        raw_target_value = watch_dirs.get("raw_targets", watch_dirs["raw"])
+        raw_targets = (
+            raw_target_value
+            if isinstance(raw_target_value, list)
+            else [raw_target_value]
+        )
         raw_dirs = [
             str(path)
-            for path in watch_dirs.get("raw_targets", [watch_dirs["raw"]])
+            for path in raw_targets
             if os.path.exists(path)
         ]
         if raw_dirs:

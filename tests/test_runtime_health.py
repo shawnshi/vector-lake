@@ -1080,6 +1080,22 @@ def test_raw_watchdog_uses_single_flight_path_scoped_ingest(
     ]
 
 
+def test_wiki_watchdog_decodes_bytes_moved_paths(monkeypatch):
+    from watchdog.events import FileMovedEvent
+
+    from vector_lake.watchdog_app import WikiIndexHandler
+
+    source = os.fsencode("Concept_Old.md")
+    destination = os.fsencode("Concept_New.md")
+    queued: list[str] = []
+    handler = WikiIndexHandler()
+    monkeypatch.setattr(handler, "queue_path", queued.append)
+
+    handler.on_moved(FileMovedEvent(source, destination))
+
+    assert queued == [os.fsdecode(source), os.fsdecode(destination)]
+
+
 def test_raw_watchdog_moved_event_ingests_destination_path(
     isolated_memory, monkeypatch
 ):
@@ -1098,15 +1114,12 @@ def test_raw_watchdog_moved_event_ingests_destination_path(
         completed.set()
         return "ok"
 
-    class Event:
-        is_directory = False
-        src_path = str(source)
-        dest_path = str(destination)
+    from watchdog.events import FileMovedEvent
 
     monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
     handler = RawWatchdogHandler()
     try:
-        handler.on_moved(Event())
+        handler.on_moved(FileMovedEvent(str(source), str(destination)))
         assert completed.wait(timeout=2)
     finally:
         handler.shutdown()
