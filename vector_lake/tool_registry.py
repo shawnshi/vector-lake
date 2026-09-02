@@ -38,6 +38,7 @@ _GROUPS: dict[str, tuple[str, ...]] = {
         "finalize_ingest",
         "list_ingest_tasks",
         "prepare_ingest_batch",
+        "recover_terminal_ingest_outputs",
         "reconcile_ingest_job_debt",
         "reconcile_orphan_ingest_task_packets",
     ),

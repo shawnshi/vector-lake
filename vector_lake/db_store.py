@@ -12164,6 +12164,312 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     return result
 
 
+def _terminal_ingest_recovery_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    attempt_id: str,
+    artifact_generation: int,
+) -> dict:
+    row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown ingest job: {job_id}")
+    record = dict(row)
+    if record.get("task_type") != "ingest":
+        raise ValueError(f"Job {job_id} is not an ingest job")
+    status = str(record.get("status") or "")
+    already_recovered = False
+    if status == "finalized":
+        try:
+            finalized_result = json.loads(str(record.get("result_json") or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Job {job_id} has invalid finalization evidence") from exc
+        recovery = (
+            finalized_result.get("recovery")
+            if isinstance(finalized_result, dict)
+            else None
+        )
+        already_recovered = bool(
+            isinstance(recovery, dict)
+            and recovery.get("contract")
+            == "vector-lake-terminal-ingest-output-recovery/v1"
+            and str(recovery.get("attempt_id") or "") == str(attempt_id)
+            and int(recovery.get("artifact_generation") or 0)
+            == int(artifact_generation)
+        )
+        if not already_recovered:
+            raise ValueError(f"Job {job_id} was finalized outside this recovery selection")
+    elif status != "failed" or int(record.get("retries") or 0) < 3:
+        raise ValueError(f"Job {job_id} is not a terminal failed ingest job")
+    lease_until = str(record.get("lease_until") or "")
+    if lease_until:
+        parsed_lease = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+        if parsed_lease.tzinfo is None:
+            parsed_lease = parsed_lease.replace(tzinfo=timezone.utc)
+        if parsed_lease > datetime.now(timezone.utc):
+            raise ValueError(f"Job {job_id} still has an active lease")
+    try:
+        payload = json.loads(str(record.get("payload") or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Job {job_id} has an invalid payload") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Job {job_id} payload is not an object")
+    revision = str(payload.get("hash") or "")
+    filepath = str(payload.get("filepath") or "")
+    parse_revision(revision)
+    processed = conn.execute(
+        "SELECT file_hash FROM processed_files WHERE filepath = ?",
+        (filepath,),
+    ).fetchone()
+    revision_is_processed = bool(
+        processed is not None and str(processed["file_hash"] or "") == revision
+    )
+    if already_recovered and not revision_is_processed:
+        raise ValueError(f"Job {job_id} lacks its committed processed revision")
+    if not already_recovered and revision_is_processed:
+        raise ValueError(f"Job {job_id} revision is already processed")
+    validation = conn.execute(
+        "SELECT transition FROM ingest_stage_events WHERE job_id = ? "
+        "AND attempt_id = ? AND lease_generation = ? AND revision = ? "
+        "AND stage = 'validation' ORDER BY event_id ASC",
+        (
+            str(job_id),
+            str(attempt_id),
+            int(artifact_generation),
+            revision,
+        ),
+    ).fetchall()
+    transitions = [str(item["transition"] or "") for item in validation]
+    if "completed" not in transitions or "failed" in transitions:
+        raise ValueError(
+            f"Job {job_id} has no clean completed validation event for the retained output"
+        )
+    pending_outbox = conn.execute(
+        "SELECT COUNT(*) AS count FROM ingest_outbox_links AS link "
+        "JOIN mutation_outbox AS outbox ON outbox.id = link.outbox_id "
+        "WHERE link.job_id = ? "
+        "AND outbox.status NOT IN ('completed', 'superseded')",
+        (str(job_id),),
+    ).fetchone()
+    if pending_outbox is not None and int(pending_outbox["count"] or 0):
+        raise ValueError(f"Job {job_id} has unresolved projection outbox work")
+    guarded = {
+        key: record.get(key)
+        for key in (
+            "job_id",
+            "task_type",
+            "status",
+            "payload",
+            "retries",
+            "error_msg",
+            "result_json",
+            "completed_at",
+            "updated_at",
+            "available_at",
+            "lease_generation",
+            "idempotency_key",
+            "task_packet_path",
+        )
+    }
+    guard = hashlib.sha256(
+        json.dumps(
+            guarded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "job": record,
+        "payload": payload,
+        "row_guard": guard,
+        "attempt_id": str(attempt_id),
+        "artifact_generation": int(artifact_generation),
+        "terminal_snapshot": guarded,
+        "already_recovered": already_recovered,
+        "stored_recovery": recovery if already_recovered else None,
+    }
+
+
+def record_terminal_recovery_selection_digest(
+    job_id: str,
+    attempt_id: str,
+    artifact_generation: int,
+    selection_digest: str,
+) -> bool:
+    """Bind one already-finalized recovery to its exact retained selection."""
+    init_db()
+    if re.fullmatch(r"[0-9a-f]{64}", str(selection_digest)) is None:
+        raise ValueError("terminal recovery selection digest is invalid")
+    snapshot = _terminal_ingest_recovery_snapshot(
+        get_connection(),
+        job_id=job_id,
+        attempt_id=attempt_id,
+        artifact_generation=artifact_generation,
+    )
+    if not snapshot.get("already_recovered"):
+        raise ValueError(f"Job {job_id} is not an already-finalized recovery")
+    recovery = snapshot.get("stored_recovery")
+    if not isinstance(recovery, dict):
+        raise ValueError(f"Job {job_id} has no recovery provenance")
+    existing = str(recovery.get("selection_digest") or "")
+    if existing:
+        if not hmac.compare_digest(existing, str(selection_digest)):
+            raise ValueError(f"Job {job_id} recovery selection digest conflicts")
+        return False
+    result = json.loads(str(snapshot["job"].get("result_json") or "{}"))
+    if not isinstance(result, dict) or not isinstance(result.get("recovery"), dict):
+        raise ValueError(f"Job {job_id} has invalid recovery provenance")
+    result["recovery"]["selection_digest"] = str(selection_digest)
+    now_str = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        cursor = get_connection().execute(
+            "UPDATE jobs SET result_json = ?, updated_at = ? "
+            "WHERE job_id = ? AND status = 'finalized' AND result_json = ?",
+            (
+                json.dumps(result, ensure_ascii=False, sort_keys=True),
+                now_str,
+                str(job_id),
+                str(snapshot["job"].get("result_json") or ""),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"Job {job_id} recovery provenance changed")
+    return True
+
+
+def inspect_terminal_ingest_recovery(
+    job_id: str,
+    attempt_id: str,
+    artifact_generation: int,
+) -> dict:
+    """Return a guarded, read-only snapshot for one exact retained-output recovery."""
+    init_db()
+    return _terminal_ingest_recovery_snapshot(
+        get_connection(),
+        job_id=str(job_id),
+        attempt_id=str(attempt_id),
+        artifact_generation=int(artifact_generation),
+    )
+
+
+def claim_terminal_ingest_recoveries(
+    candidates: list[dict],
+    *,
+    lease_seconds: int = 1800,
+) -> list[dict]:
+    """Atomically fence and lease an exact guarded terminal-ingest recovery batch."""
+    import secrets
+    import socket
+
+    if not candidates or len(candidates) > 3:
+        raise ValueError("terminal ingest recovery requires between 1 and 3 candidates")
+    init_db()
+    conn = get_connection()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    lease_until = (now_dt + timedelta(seconds=max(60, int(lease_seconds)))).isoformat()
+    owner = f"terminal-ingest-recovery:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(8)}"
+    claimed: list[dict] = []
+    with transaction():
+        refreshed = []
+        for candidate in candidates:
+            snapshot = _terminal_ingest_recovery_snapshot(
+                conn,
+                job_id=str(candidate["job_id"]),
+                attempt_id=str(candidate["attempt_id"]),
+                artifact_generation=int(candidate["artifact_generation"]),
+            )
+            if not hmac.compare_digest(
+                str(candidate.get("row_guard") or ""),
+                str(snapshot["row_guard"]),
+            ):
+                raise RuntimeError(
+                    f"Terminal ingest recovery state changed for {candidate['job_id']}"
+                )
+            refreshed.append(snapshot)
+        for snapshot in refreshed:
+            job_id = str(snapshot["job"]["job_id"])
+            lease_token = secrets.token_urlsafe(32)
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'subagent_processing', lease_until = ?, "
+                "lease_owner = ?, lease_token = ?, "
+                "lease_generation = COALESCE(lease_generation, 0) + 1, updated_at = ? "
+                "WHERE job_id = ? AND status = 'failed' AND retries >= 3 "
+                "AND COALESCE(lease_until, '') <= ? AND payload IS ? "
+                "AND result_json IS ? AND updated_at IS ?",
+                (
+                    lease_until,
+                    owner,
+                    lease_token,
+                    now,
+                    job_id,
+                    now,
+                    snapshot["job"].get("payload"),
+                    snapshot["job"].get("result_json"),
+                    snapshot["job"].get("updated_at"),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Terminal ingest recovery claim raced for {job_id}")
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"Terminal ingest recovery lost job {job_id}")
+            item = dict(row)
+            item["terminal_snapshot"] = snapshot["terminal_snapshot"]
+            claimed.append(item)
+    return claimed
+
+
+def restore_terminal_ingest_recovery_claim(
+    claim: dict,
+    *,
+    reason: str,
+) -> bool:
+    """Restore one uncommitted recovery lease without reviving stale credentials."""
+    job_id = str(claim.get("job_id") or "")
+    terminal = claim.get("terminal_snapshot")
+    if not isinstance(terminal, dict):
+        raise ValueError("terminal recovery claim is missing its guarded snapshot")
+    init_db()
+    conn = get_connection()
+    payload = json.loads(str(claim.get("payload") or "{}"))
+    filepath = str(payload.get("filepath") or "")
+    revision = str(payload.get("hash") or "")
+    with transaction():
+        processed = conn.execute(
+            "SELECT file_hash FROM processed_files WHERE filepath = ?",
+            (filepath,),
+        ).fetchone()
+        if processed is not None and str(processed["file_hash"] or "") == revision:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = conn.execute(
+            "UPDATE jobs SET status = ?, retries = ?, error_msg = ?, result_json = ?, "
+            "completed_at = ?, updated_at = ?, available_at = ?, "
+            "idempotency_key = ?, task_packet_path = ?, lease_until = NULL, "
+            "lease_owner = NULL, lease_token = NULL "
+            "WHERE job_id = ? AND status = 'subagent_processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ?",
+            (
+                terminal.get("status"),
+                terminal.get("retries"),
+                terminal.get("error_msg"),
+                terminal.get("result_json"),
+                terminal.get("completed_at"),
+                now,
+                terminal.get("available_at"),
+                terminal.get("idempotency_key"),
+                terminal.get("task_packet_path"),
+                job_id,
+                claim.get("lease_owner"),
+                claim.get("lease_token"),
+                int(claim.get("lease_generation") or 0),
+            ),
+        )
+        return cursor.rowcount == 1
+
+
 def finalize_ingest_job(
     job_id: str,
     lease_owner: str,

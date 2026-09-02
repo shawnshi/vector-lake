@@ -6518,3 +6518,277 @@ def test_ingest_candidate_manifest_is_not_parsed_from_untrusted_skeleton(
             "target_projection_hash": "a" * 64,
         }
     ]
+
+
+def test_terminal_ingest_recovery_claim_is_exact_atomic_and_restorable(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "terminal-recovery.md"
+    raw_path.write_text("terminal recovery", encoding="utf-8")
+    revision = calculate_hash(str(raw_path))
+    attempt_id = "a" * 32
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        revision,
+        "Source_terminal-recovery.md",
+    )
+    payload["attempt_id"] = attempt_id
+    job_id = db_store.enqueue_job("ingest", payload)
+    now = datetime.now(timezone.utc).isoformat()
+    with db_store.transaction():
+        connection = db_store.get_connection()
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3, error_msg = ?, "
+            "result_json = ?, completed_at = ?, updated_at = ? WHERE job_id = ?",
+            (
+                "model attempt budget exhausted",
+                json.dumps({"failure_class": "input_policy"}),
+                now,
+                now,
+                job_id,
+            ),
+        )
+        db_store.record_ingest_stage_event(
+            job_id=job_id,
+            revision=revision,
+            attempt_id=attempt_id,
+            lease_generation=2,
+            stage="validation",
+            transition="completed",
+            ordinal=2,
+            metadata={},
+            connection=connection,
+        )
+
+    snapshot = db_store.inspect_terminal_ingest_recovery(job_id, attempt_id, 2)
+    claims = db_store.claim_terminal_ingest_recoveries(
+        [
+            {
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "artifact_generation": 2,
+                "row_guard": snapshot["row_guard"],
+            }
+        ],
+        lease_seconds=300,
+    )
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim["status"] == "subagent_processing"
+    assert claim["lease_generation"] == 1
+    assert claim["lease_owner"].startswith("terminal-ingest-recovery:")
+    assert claim["lease_token"]
+
+    assert db_store.restore_terminal_ingest_recovery_claim(
+        claim,
+        reason="test rollback",
+    )
+    restored = db_store.get_connection().execute(
+        "SELECT status, retries, lease_owner, lease_token, lease_until, "
+        "lease_generation FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(restored) == {
+        "status": "failed",
+        "retries": 3,
+        "lease_owner": None,
+        "lease_token": None,
+        "lease_until": None,
+        "lease_generation": 1,
+    }
+    with pytest.raises(RuntimeError, match="state changed"):
+        db_store.claim_terminal_ingest_recoveries(
+            [
+                {
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "artifact_generation": 2,
+                    "row_guard": snapshot["row_guard"],
+                }
+            ]
+        )
+
+
+def test_terminal_ingest_recovery_recognizes_exact_prior_commit(isolated_memory):
+    raw_path = isolated_memory / "raw" / "already-recovered.md"
+    raw_path.write_text("already recovered", encoding="utf-8")
+    revision = calculate_hash(str(raw_path))
+    attempt_id = "b" * 32
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        revision,
+        "Source_already-recovered.md",
+    )
+    payload["attempt_id"] = attempt_id
+    job_id = db_store.enqueue_job("ingest", payload)
+    now = datetime.now(timezone.utc).isoformat()
+    recovery = {
+        "contract": "vector-lake-terminal-ingest-output-recovery/v1",
+        "fingerprint": "sha256:" + "c" * 64,
+        "attempt_id": attempt_id,
+        "artifact_generation": 4,
+    }
+    with db_store.transaction():
+        connection = db_store.get_connection()
+        connection.execute(
+            "UPDATE jobs SET status = 'finalized', retries = 3, result_json = ?, "
+            "completed_at = ?, updated_at = ? WHERE job_id = ?",
+            (json.dumps({"recovery": recovery}), now, now, job_id),
+        )
+        db_store.mark_file_processed(str(raw_path), revision)
+        db_store.record_ingest_stage_event(
+            job_id=job_id,
+            revision="sha256:" + "0" * 64,
+            attempt_id=attempt_id,
+            lease_generation=4,
+            stage="validation",
+            transition="completed",
+            ordinal=4,
+            metadata={},
+            connection=connection,
+        )
+
+    with pytest.raises(ValueError, match="no clean completed validation event"):
+        db_store.inspect_terminal_ingest_recovery(job_id, attempt_id, 4)
+
+    db_store.record_ingest_stage_event(
+        job_id=job_id,
+        revision=revision,
+        attempt_id=attempt_id,
+        lease_generation=4,
+        stage="validation",
+        transition="completed",
+        ordinal=5,
+        metadata={},
+    )
+    digest = "d" * 64
+    assert db_store.record_terminal_recovery_selection_digest(
+        job_id, attempt_id, 4, digest
+    )
+    assert not db_store.record_terminal_recovery_selection_digest(
+        job_id, attempt_id, 4, digest
+    )
+    with pytest.raises(ValueError, match="selection digest conflicts"):
+        db_store.record_terminal_recovery_selection_digest(
+            job_id, attempt_id, 4, "e" * 64
+        )
+
+    snapshot = db_store.inspect_terminal_ingest_recovery(job_id, attempt_id, 4)
+    assert snapshot["already_recovered"] is True
+    assert snapshot["stored_recovery"]["selection_digest"] == digest
+    assert snapshot["job"]["status"] == "finalized"
+
+
+def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeypatch):
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from vector_lake import auto_ingest_worker
+
+    selections = []
+    snapshots = {}
+    for index in range(3):
+        job_id = f"{index + 1:032x}"
+        attempt_id = f"{index + 11:032x}"
+        output = {
+            "files_written": [
+                {
+                    "filename": f"Source_recovery-{index}.md",
+                    "content": f"content-{index}",
+                }
+            ],
+            "integration": {
+                "disposition": "standalone",
+                "reason": "bounded recovery test reason",
+                "relations": [],
+            },
+        }
+        output_sha256 = hashlib.sha256(
+            json.dumps(
+                output,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        selection = {
+            "job_id": job_id,
+            "attempt_id": attempt_id,
+            "artifact_generation": index + 1,
+            "events_sha256": f"{index + 21:064x}",
+            "operator_adjustment": "No semantic adjustment in this bounded test.",
+            "output": output,
+        }
+        digest = tool_ingest._terminal_recovery_selection_digest(
+            job_id=job_id,
+            attempt_id=attempt_id,
+            artifact_generation=index + 1,
+            events_sha256=selection["events_sha256"],
+            operator_adjustment=selection["operator_adjustment"],
+            output_sha256=output_sha256,
+        )
+        selections.append(selection)
+        snapshots[job_id] = {
+            "payload": {
+                "filepath": f"C:/approved/raw-{index}.md",
+                "hash": f"sha256:{index + 31:064x}",
+                "source_hash": f"{index + 41:064x}",
+                "source_projection_hash": f"{index + 51:064x}",
+                "integration_candidates": [],
+            },
+            "row_guard": f"{index + 61:064x}",
+            "already_recovered": True,
+            "stored_recovery": {
+                "fingerprint": f"sha256:{index + 71:064x}",
+                "selection_digest": digest,
+            },
+        }
+
+    monkeypatch.setattr(
+        db_store,
+        "inspect_terminal_ingest_recovery",
+        lambda job_id, _attempt_id, _generation: snapshots[job_id],
+    )
+    monkeypatch.setattr(
+        tool_ingest,
+        "_stable_current_raw_revision",
+        lambda _path: SimpleNamespace(
+            canonical_revision="sha256:" + "f" * 64,
+            matches=lambda _revision: True,
+        ),
+    )
+    monkeypatch.setattr(tool_ingest, "is_private_diary_path", lambda _path: False)
+    monkeypatch.setattr(tool_ingest, "load_purpose_contract", lambda: object())
+    monkeypatch.setattr(auto_ingest_worker, "load_auto_ingest_config", lambda: object())
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "_validate_generator_output",
+        lambda output, *_args: (output["files_written"], output["integration"]),
+    )
+    monkeypatch.setattr(
+        tool_ingest,
+        "_normalize_codex_output_pages",
+        lambda files, _contract: files,
+    )
+    monkeypatch.setattr(
+        tool_ingest,
+        "_validate_final_ingest_files",
+        lambda _files, _targets, _contract: None,
+    )
+
+    first, _materials = tool_ingest._terminal_ingest_recovery_plan(selections)
+    second, _materials = tool_ingest._terminal_ingest_recovery_plan(
+        deepcopy(selections)
+    )
+    assert first["fingerprint"] == second["fingerprint"]
+    assert all(item["state"] == "already_recovered" for item in first["items"])
+
+    for mutate in ("events_sha256", "operator_adjustment", "output"):
+        changed = deepcopy(selections)
+        if mutate == "events_sha256":
+            changed[0][mutate] = "a" * 64
+        elif mutate == "operator_adjustment":
+            changed[0][mutate] = "Changed bounded operator adjustment."
+        else:
+            changed[0][mutate]["files_written"][0]["content"] = "changed"
+        with pytest.raises(ValueError, match="does not match stored provenance"):
+            tool_ingest._terminal_ingest_recovery_plan(changed)

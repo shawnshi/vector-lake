@@ -1362,6 +1362,7 @@ def test_all_known_mcp_rescan_entrypoints_are_heavy_task_gated():
         "propose_schema_mutation": ("maintenance", 900.0),
         "reconcile_ingest_tasks": ("maintenance", 1800.0),
         "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
+        "recover_terminal_ingest_outputs": ("projection", 1800.0),
         "sync_vector_lake": ("ingest_scan", 1800.0),
         "sync_critical_decision_registry": ("maintenance", 900.0),
         "trigger_audit_graph": ("scan", 1800.0),
@@ -1401,6 +1402,66 @@ def test_manual_ingest_admin_endpoints_apply_hard_bounds(monkeypatch):
     assert mcp_server.claim_ingest_tasks(limit=999, lease_seconds=999999) == "[]"
     assert mcp_server.expire_ingest_tasks(max_age_seconds=1) == "ok"
     assert observed == {"claim": (5, 3600), "expire": 300}
+
+
+def test_terminal_ingest_recovery_mcp_requires_exact_manifest(monkeypatch):
+    manifest = {
+        "contract": "vector-lake-terminal-ingest-output-recovery/v1",
+        "selections": [{"job_id": "a" * 32}],
+    }
+    observed = {}
+    monkeypatch.setattr(
+        mcp_server,
+        "_read_payload",
+        lambda path: json.dumps(manifest),
+    )
+
+    def recover(selections, *, dry_run, confirmation):
+        observed.update(
+            selections=selections,
+            dry_run=dry_run,
+            confirmation=confirmation,
+        )
+        return "ok"
+
+    monkeypatch.setattr(
+        mcp_server.tools,
+        "recover_terminal_ingest_outputs",
+        recover,
+    )
+    monkeypatch.setenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", "1")
+    assert (
+        mcp_server.recover_terminal_ingest_outputs(
+            "C:/approved/manifest.json",
+            dry_run=False,
+            confirmation="sha256:abc",
+        )
+        == "ok"
+    )
+    assert observed == {
+        "selections": manifest["selections"],
+        "dry_run": False,
+        "confirmation": "sha256:abc",
+    }
+
+
+def test_terminal_ingest_recovery_apply_requires_manual_admin(monkeypatch):
+    manifest = {
+        "contract": "vector-lake-terminal-ingest-output-recovery/v1",
+        "selections": [],
+    }
+    monkeypatch.setattr(
+        mcp_server,
+        "_read_payload",
+        lambda path: json.dumps(manifest),
+    )
+    monkeypatch.delenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", raising=False)
+    with pytest.raises(PermissionError, match="disabled by default"):
+        mcp_server.recover_terminal_ingest_outputs(
+            "C:/approved/manifest.json",
+            dry_run=False,
+            confirmation="sha256:abc",
+        )
 
 
 def test_audit_graph_defaults_to_stable_read_only_preview(monkeypatch):

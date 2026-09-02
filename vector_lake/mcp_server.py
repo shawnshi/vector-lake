@@ -74,6 +74,7 @@ _MCP_HEAVY_TASKS = {
     "projection_report": ("scan", 900.0),
     "propose_schema_mutation": ("maintenance", 900.0),
     "reconcile_ingest_tasks": ("maintenance", 1800.0),
+    "recover_terminal_ingest_outputs": ("projection", 1800.0),
     "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
     "rebuild_timeline_events": ("projection", 900.0),
     "rename_entity": ("maintenance", 900.0),
@@ -2594,6 +2595,36 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
         limit=bounded_limit,
         lease_seconds=bounded_lease,
     )
+
+@mcp.tool()
+def recover_terminal_ingest_outputs(
+    payload_file: str,
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or apply one exact, fingerprint-bound retained-output recovery batch."""
+    try:
+        manifest = json.loads(_read_payload(payload_file))
+    except json.JSONDecodeError as exc:
+        raise ValueError("terminal ingest recovery payload must be valid JSON") from exc
+    if not isinstance(manifest, dict) or set(manifest) != {"contract", "selections"}:
+        raise ValueError("terminal ingest recovery manifest fields are not exact")
+    if manifest.get("contract") != "vector-lake-terminal-ingest-output-recovery/v1":
+        raise ValueError("terminal ingest recovery manifest contract is unsupported")
+    selections = manifest.get("selections")
+    if not isinstance(selections, list):
+        raise ValueError("terminal ingest recovery selections must be a list")
+    if not dry_run:
+        _require_explicit_capability(
+            _MANUAL_INGEST_ADMIN_ENV,
+            "terminal ingest output recovery",
+        )
+    return tools.recover_terminal_ingest_outputs(
+        selections,
+        dry_run=dry_run,
+        confirmation=confirmation,
+    )
+
 
 @mcp.tool()
 def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:

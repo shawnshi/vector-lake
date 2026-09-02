@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import hmac
 import logging
 import re
 import sqlite3
@@ -1867,9 +1868,11 @@ def _source_identity_index(
             if (normalized := normalize_source_identity(value))
         }
     if scoped_identities is None:
-        items = governance_store.query_entities(
+        query_result = governance_store.query_entities(
             {"status!=": "Merged", "type": "source"}
-        )["items"].values()
+        )
+        query_items = query_result.get("items") if isinstance(query_result, dict) else None
+        items = query_items.values() if isinstance(query_items, dict) else ()
         wiki_dir = get_wiki_dir()
         wiki_paths = {}
         for position, path in enumerate(iter_markdown_files(wiki_dir)):
@@ -4824,6 +4827,421 @@ def prepare_ingest_batch(
     return f"Successfully enqueued {enqueued_count} files for ingestion."
 
 
+def _terminal_recovery_selection_digest(
+    *,
+    job_id: str,
+    attempt_id: str,
+    artifact_generation: int,
+    events_sha256: str,
+    operator_adjustment: str,
+    output_sha256: str,
+) -> str:
+    selection_identity = {
+        "contract": "vector-lake-terminal-ingest-output-recovery/v1",
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "artifact_generation": artifact_generation,
+        "events_sha256": events_sha256,
+        "operator_adjustment": operator_adjustment,
+        "output_sha256": output_sha256,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            selection_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _terminal_ingest_recovery_plan(selections: list[dict]) -> tuple[dict, list[dict]]:
+    """Build a content-bound recovery plan without leasing or mutating jobs."""
+    from vector_lake import db_store
+    from vector_lake.auto_ingest_worker import (
+        _validate_generator_output,
+        load_auto_ingest_config,
+    )
+
+    if not isinstance(selections, list) or len(selections) != 3:
+        raise ValueError("terminal ingest recovery requires exactly three selections")
+    allowed_fields = {
+        "job_id",
+        "attempt_id",
+        "artifact_generation",
+        "events_sha256",
+        "operator_adjustment",
+        "output",
+    }
+    job_ids: list[str] = []
+    plan_items: list[dict] = []
+    materials: list[dict] = []
+    config = load_auto_ingest_config()
+    contract = load_purpose_contract()
+    for selection in selections:
+        if not isinstance(selection, dict) or set(selection) != allowed_fields:
+            raise ValueError("terminal ingest recovery selection fields are not exact")
+        job_id = str(selection.get("job_id") or "")
+        attempt_id = str(selection.get("attempt_id") or "")
+        if re.fullmatch(r"[0-9a-f]{32}", job_id) is None:
+            raise ValueError("terminal ingest recovery job_id is invalid")
+        if re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
+            raise ValueError("terminal ingest recovery attempt_id is invalid")
+        if job_id in job_ids:
+            raise ValueError("terminal ingest recovery job_ids must be unique")
+        job_ids.append(job_id)
+        raw_artifact_generation = selection.get("artifact_generation")
+        if isinstance(raw_artifact_generation, bool) or not isinstance(
+            raw_artifact_generation, int
+        ):
+            raise ValueError("artifact_generation must be a positive integer")
+        artifact_generation = raw_artifact_generation
+        if artifact_generation < 1:
+            raise ValueError("artifact_generation must be a positive integer")
+        events_sha256 = str(selection.get("events_sha256") or "")
+        if re.fullmatch(r"[0-9a-f]{64}", events_sha256) is None:
+            raise ValueError("events_sha256 must be a lowercase SHA-256 digest")
+        operator_adjustment = str(selection.get("operator_adjustment") or "").strip()
+        if not 12 <= len(operator_adjustment) <= 500:
+            raise ValueError("operator_adjustment must be 12 to 500 characters")
+        output = selection.get("output")
+        if not isinstance(output, dict):
+            raise ValueError("terminal ingest recovery output must be an object")
+        output_sha256 = hashlib.sha256(
+            json.dumps(
+                output,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        selection_digest = _terminal_recovery_selection_digest(
+            job_id=job_id,
+            attempt_id=attempt_id,
+            artifact_generation=artifact_generation,
+            events_sha256=events_sha256,
+            operator_adjustment=operator_adjustment,
+            output_sha256=output_sha256,
+        )
+        snapshot = db_store.inspect_terminal_ingest_recovery(
+            job_id,
+            attempt_id,
+            artifact_generation,
+        )
+        payload = dict(snapshot["payload"])
+        filepath = str(payload.get("filepath") or "")
+        if is_private_diary_path(filepath):
+            raise ValueError("private sources cannot use terminal ingest recovery")
+        current_raw = _stable_current_raw_revision(filepath)
+        queued_revision = str(payload.get("hash") or "")
+        if not current_raw.matches(queued_revision):
+            raise IngestBaselineConflict(
+                f"Raw source changed after terminal job {job_id} was produced"
+            )
+        processed_data = dict(payload)
+        processed_data.update({"job_id": job_id, "attempt_id": attempt_id})
+        processed_data["_queued_integration_candidates"] = list(
+            payload.get("integration_candidates") or []
+        )
+        already_recovered = bool(snapshot.get("already_recovered"))
+        stored_recovery = snapshot.get("stored_recovery")
+        if already_recovered:
+            if not isinstance(stored_recovery, dict):
+                raise ValueError(f"Job {job_id} has no stored recovery provenance")
+            stored_selection_digest = str(
+                stored_recovery.get("selection_digest") or ""
+            )
+            if not hmac.compare_digest(stored_selection_digest, selection_digest):
+                raise ValueError(
+                    f"Job {job_id} recovery selection does not match stored provenance"
+                )
+        else:
+            _verify_ingest_source_baseline(processed_data)
+        files, integration = _validate_generator_output(
+            output,
+            job_id,
+            processed_data,
+            config,
+        )
+        processed_data["integration"] = integration
+        normalized_files = _normalize_codex_output_pages(files, contract)
+        planned_output_files = normalized_files
+        if not already_recovered:
+            (
+                planned_output_files,
+                _planned_disposition,
+                planned_target_names,
+            ) = _apply_integration_disposition(normalized_files, processed_data)
+            _prepare_source_link_precondition(planned_output_files)()
+        else:
+            planned_target_names = set()
+        _validate_final_ingest_files(
+            planned_output_files,
+            planned_target_names,
+            contract,
+        )
+        planned_files = [
+            {
+                "filename": str(item["filename"]),
+                "content_sha256": hashlib.sha256(
+                    str(item["content"]).encode("utf-8")
+                ).hexdigest(),
+            }
+            for item in planned_output_files
+        ]
+        plan_items.append(
+            {
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "artifact_generation": artifact_generation,
+                "events_sha256": events_sha256,
+                "operator_adjustment": operator_adjustment,
+                "output_sha256": output_sha256,
+                "selection_digest": selection_digest,
+                "stored_recovery_fingerprint": (
+                    str(stored_recovery.get("fingerprint") or "")
+                    if isinstance(stored_recovery, dict)
+                    else ""
+                ),
+                "row_guard": snapshot["row_guard"],
+                "state": (
+                    "already_recovered"
+                    if already_recovered
+                    else "recoverable"
+                ),
+                "raw_revision": current_raw.canonical_revision,
+                "source_hash": str(payload.get("source_hash") or ""),
+                "source_projection_hash": str(
+                    payload.get("source_projection_hash") or ""
+                ),
+                "planned_files": planned_files,
+            }
+        )
+        materials.append(
+            {
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "artifact_generation": artifact_generation,
+                "operator_adjustment": operator_adjustment,
+                "selection_digest": selection_digest,
+                "stored_recovery_fingerprint": (
+                    str(stored_recovery.get("fingerprint") or "")
+                    if isinstance(stored_recovery, dict)
+                    else ""
+                ),
+                "row_guard": snapshot["row_guard"],
+                "already_recovered": already_recovered,
+                "files": files,
+                "processed_data": processed_data,
+            }
+        )
+    plan = {
+        "contract": "vector-lake-terminal-ingest-output-recovery/v1",
+        "requested": 3,
+        "items": plan_items,
+        "can_apply": True,
+    }
+    fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(
+            plan,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    plan["fingerprint"] = fingerprint
+    return plan, materials
+
+
+def _wait_for_terminal_recovery_projection(*, timeout_seconds: float = 90.0) -> None:
+    """Wait boundedly for the watchdog to publish the preceding recovery commit."""
+    from vector_lake import indexer
+
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        if indexer.projection_pair_matches_current_generation():
+            return
+        time.sleep(0.25)
+    raise RuntimeError(
+        "Timed out waiting for the preceding terminal recovery projection commit"
+    )
+
+
+def recover_terminal_ingest_outputs(
+    selections: list[dict],
+    *,
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or apply one exact three-job retained-output recovery batch."""
+    from vector_lake import db_store
+
+    if not isinstance(dry_run, bool):
+        raise ValueError("dry_run must be boolean")
+    plan, materials = _terminal_ingest_recovery_plan(selections)
+    fingerprint = str(plan["fingerprint"])
+    if dry_run:
+        return json.dumps(
+            {"ok": True, "committed": False, "dry_run": True, "plan": plan},
+            ensure_ascii=False,
+            indent=2,
+        )
+    if not hmac.compare_digest(str(confirmation or ""), fingerprint):
+        raise PermissionError("terminal ingest recovery confirmation mismatch")
+    pending_materials = [
+        item for item in materials if not item.get("already_recovered")
+    ]
+    claims = (
+        db_store.claim_terminal_ingest_recoveries(
+            pending_materials,
+            lease_seconds=1800,
+        )
+        if pending_materials
+        else []
+    )
+    claim_by_job = {str(item["job_id"]): item for item in claims}
+    committed: list[str] = [
+        str(item["job_id"]) for item in materials if item.get("already_recovered")
+    ]
+    restored: list[str] = []
+    indeterminate: list[str] = []
+    errors: list[dict] = []
+    for position, material in enumerate(pending_materials):
+        job_id = str(material["job_id"])
+        claim = claim_by_job[job_id]
+        processed_data = dict(material["processed_data"])
+        processed_data.update(
+            {
+                "lease_owner": claim["lease_owner"],
+                "lease_token": claim["lease_token"],
+                "lease_generation": claim["lease_generation"],
+                "_recovery_provenance": {
+                    "contract": plan["contract"],
+                    "fingerprint": fingerprint,
+                    "attempt_id": material["attempt_id"],
+                    "artifact_generation": material["artifact_generation"],
+                    "operator_adjustment": material["operator_adjustment"],
+                    "selection_digest": material["selection_digest"],
+                },
+            }
+        )
+        try:
+            finalize_ingest_strict(material["files"], processed_data)
+            row = db_store.get_connection().execute(
+                "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None or str(row["status"] or "") != "finalized":
+                raise RuntimeError("recovery finalizer returned without durable finalization")
+            committed.append(job_id)
+        except Exception as exc:
+            errors.append(
+                {
+                    "job_id": job_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+            )
+            for pending in pending_materials[position:]:
+                pending_id = str(pending["job_id"])
+                pending_claim = claim_by_job[pending_id]
+                try:
+                    if db_store.restore_terminal_ingest_recovery_claim(
+                        pending_claim,
+                        reason=f"recovery batch stopped after {job_id}: {type(exc).__name__}",
+                    ):
+                        restored.append(pending_id)
+                    else:
+                        row = db_store.get_connection().execute(
+                            "SELECT status FROM jobs WHERE job_id = ?", (pending_id,)
+                        ).fetchone()
+                        if row is not None and str(row["status"] or "") == "finalized":
+                            committed.append(pending_id)
+                        else:
+                            indeterminate.append(pending_id)
+                except Exception:
+                    indeterminate.append(pending_id)
+            break
+        if position + 1 < len(pending_materials):
+            try:
+                _wait_for_terminal_recovery_projection()
+            except Exception as exc:
+                errors.append(
+                    {
+                        "job_id": job_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:500],
+                    }
+                )
+                for pending in pending_materials[position + 1 :]:
+                    pending_id = str(pending["job_id"])
+                    pending_claim = claim_by_job[pending_id]
+                    try:
+                        if db_store.restore_terminal_ingest_recovery_claim(
+                            pending_claim,
+                            reason=(
+                                f"recovery projection did not settle after {job_id}: "
+                                f"{type(exc).__name__}"
+                            ),
+                        ):
+                            restored.append(pending_id)
+                        else:
+                            indeterminate.append(pending_id)
+                    except Exception:
+                        indeterminate.append(pending_id)
+                break
+    projection_settled = False
+    if len(set(committed)) == 3:
+        try:
+            _wait_for_terminal_recovery_projection()
+            projection_settled = True
+        except Exception as exc:
+            errors.append(
+                {
+                    "job_id": "",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+            )
+    unattempted = [
+        str(item["job_id"])
+        for item in materials
+        if str(item["job_id"]) not in set(committed) | set(restored) | set(indeterminate)
+    ]
+    fully_committed = len(set(committed)) == 3
+    state = (
+        "completed"
+        if fully_committed and projection_settled
+        else "committed_projection_pending"
+        if fully_committed
+        else "partial"
+    )
+    recovery_fingerprints = {
+        str(item["job_id"]): (
+            str(item["stored_recovery_fingerprint"])
+            if item.get("already_recovered")
+            else fingerprint
+        )
+        for item in materials
+    }
+    receipt = {
+        "ok": state == "completed",
+        "committed": fully_committed,
+        "projection_settled": projection_settled,
+        "dry_run": False,
+        "state": state,
+        "fingerprint": fingerprint,
+        "confirmation_fingerprint": fingerprint,
+        "recovery_fingerprints": recovery_fingerprints,
+        "requested": 3,
+        "committed_job_ids": sorted(set(committed)),
+        "restored_terminal_job_ids": sorted(set(restored)),
+        "unattempted_job_ids": unattempted,
+        "indeterminate_job_ids": sorted(set(indeterminate)),
+        "errors": errors,
+    }
+    return json.dumps(receipt, ensure_ascii=False, indent=2)
+
+
 def _finalize_ingest_impl(
     files_written: list,
     processed_data: dict,
@@ -4882,7 +5300,12 @@ def _finalize_ingest_impl(
         _verify_ingest_source_baseline(processed_data)
         lease_owner = str(processed_data.get("lease_owner") or "")
         lease_token = str(processed_data.get("lease_token") or "")
-        lease_generation = int(processed_data.get("lease_generation"))
+        raw_lease_generation = processed_data.get("lease_generation")
+        if isinstance(raw_lease_generation, bool) or not isinstance(
+            raw_lease_generation, int
+        ):
+            raise ValueError("lease_generation must be an integer")
+        lease_generation = raw_lease_generation
         contract = load_purpose_contract()
         files = _normalize_codex_output_pages(files, contract)
         (
@@ -4939,12 +5362,16 @@ def _finalize_ingest_impl(
                 observed_mtime_ns=final_snapshot.observed_mtime_ns,
                 observed_size=final_snapshot.observed_size,
             )
+            result_data = {"integration": processed_data.get("integration")}
+            recovery_provenance = processed_data.get("_recovery_provenance")
+            if isinstance(recovery_provenance, dict):
+                result_data["recovery"] = recovery_provenance
             finalize_ingest_job(
                 str(job_id),
                 lease_owner,
                 lease_token,
                 lease_generation,
-                result_data={"integration": processed_data.get("integration")},
+                result_data=result_data,
             )
             if job_row.get("task_packet_path"):
                 from vector_lake import db_store
@@ -5120,12 +5547,17 @@ def _finalize_ingest_impl(
         try:
             from vector_lake import db_store
 
+            raw_lease_generation = processed_data.get("lease_generation")
+            if isinstance(raw_lease_generation, bool) or not isinstance(
+                raw_lease_generation, int
+            ):
+                raise ValueError("lease_generation must be an integer")
             with non_interruptible_phase("ingest_finalize_requeue"):
                 requeued = db_store.requeue_ingest_subagent_baseline_conflict(
                     str(processed_data.get("job_id") or ""),
                     str(processed_data.get("lease_owner") or ""),
                     str(processed_data.get("lease_token") or ""),
-                    int(processed_data.get("lease_generation")),
+                    raw_lease_generation,
                     f"Ingest baseline changed after dispatch: {exc}",
                     current_ingest_contract_version=INGEST_CONTRACT_VERSION,
                 )
