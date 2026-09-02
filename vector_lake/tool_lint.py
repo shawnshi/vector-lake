@@ -98,11 +98,16 @@ def _register_link_target(
     normalized_map: dict[str, set[str]],
     label: str,
     node_key: str,
+    *,
+    canonical: bool = False,
 ) -> None:
     cleaned = str(label or "").strip()
     if not cleaned:
         return
-    exact_map[cleaned] = node_key
+    if canonical:
+        exact_map[cleaned] = node_key
+    else:
+        exact_map.setdefault(cleaned, node_key)
     normalized = normalize_name(cleaned)
     if normalized:
         normalized_map[normalized].add(node_key)
@@ -229,6 +234,7 @@ def lint_vector_lake(auto_fix: bool = False):
             normalized_link_target_map,
             node_key,
             node_key,
+            canonical=True,
         )
         title = frontmatter.get("title")
         if title:

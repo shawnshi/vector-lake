@@ -34,6 +34,46 @@ def test_ambiguous_normalized_link_remains_unresolved():
     assert _resolve_link_target("Meta", exact, normalized) is None
 
 
+def test_canonical_key_outranks_alias_registered_after_it():
+    exact = {}
+    normalized = defaultdict(set)
+    _register_link_target(
+        exact,
+        normalized,
+        "Concept_TEFCA",
+        "Concept_TEFCA",
+        canonical=True,
+    )
+    _register_link_target(
+        exact,
+        normalized,
+        "Concept_TEFCA",
+        "Policy_TEFCA-可信交换框架",
+    )
+
+    assert _resolve_link_target("Concept_TEFCA", exact, normalized) == "Concept_TEFCA"
+
+
+def test_canonical_key_outranks_alias_registered_before_it():
+    exact = {}
+    normalized = defaultdict(set)
+    _register_link_target(
+        exact,
+        normalized,
+        "Concept_TEFCA",
+        "Policy_TEFCA-可信交换框架",
+    )
+    _register_link_target(
+        exact,
+        normalized,
+        "Concept_TEFCA",
+        "Concept_TEFCA",
+        canonical=True,
+    )
+
+    assert _resolve_link_target("Concept_TEFCA", exact, normalized) == "Concept_TEFCA"
+
+
 def test_link_iterator_excludes_fenced_and_inline_code():
     content = """[[Visible]]
 
