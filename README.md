@@ -45,7 +45,7 @@ graph LR
 | Canonical governance schema | `8.0` |
 | Index projection | logical `PROJECTION_CONTRACT_VERSION = 1` / physical `format_version = 2` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 64 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 40 CLI commands / 19 Agent skills |
+| Public surfaces | 65 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 40 CLI commands / 19 Agent skills |
 
 通用 `init_db()` 遇到既有 v1–v8 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6、v7 或 v8 数据库，并按受控历史链最终
@@ -189,6 +189,7 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 - watchdog 负责 raw/Wiki 增量事件、queued ingest 分发、outbox 投影和确定性维护；raw 事件采用 750 ms trailing quiet window 与 5 s 最大等待，in-flight 到达在下一轮合并，溢出升级为补偿全扫。后台 worker 默认最多重启 2 次；`outbox`、`ingest`、`auto_ingest` 耗尽预算后 fail-closed，非关键 `scheduler` 默认隔离并降级报告，不拖停核心观察与投影链。研究、去重、聚类及 Janitor 脚本不会被隐式启动。
 - Watchdog schema v3 心跳除时间和组件状态外还必须指向仍存活的 owner PID；新鲜但 owner 已退出的状态不会再被健康检查判为绿色。PID 重用仍不等同于完整命令行身份，部署验收必须同时核对启动路径与 run generation。
 - 长文本 MCP 工具只接受批准 sandbox 内、受大小限制的 `payload_file`；不通过 shell 拼接外部文本。
+- `write_wiki_batch` 只接受最多 50 项、canonical version 与当前 Markdown SHA-256 双重绑定的 manifest；dry-run 返回的精确 fingerprint 是 apply 的必要条件。批次只原子提交 canonical change sets 与 outbox intents，Markdown 投影在提交后逐页发布，失败项进入 deferred/watchdog 修复。普通页面执行完整 Defense Hook；旧页面 schema-maintenance 仅允许可信宿主通过 `VECTOR_LAKE_WIKI_BATCH_SCHEMA_MAINTENANCE_ALLOWLIST` 配置的精确文件清单，manifest 不能自行降级验证，`System_*` 仍默认禁止写入。
 - 删除和保留策略采用 preview/apply 分离；孤儿 GC 与备份保留还要求当前候选 fingerprint 确认。
 
 ## Operational Memory
@@ -528,6 +529,8 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_PAYLOAD_ROOT`：显式覆盖 MCP `payload_file` 的批准根目录；未设置时只接受活动数据库同级的 `brain/<run>/scratch/`。Codex、Pi 与 Gemini 的其他 sandbox 必须由各自薄适配器显式映射，core 不猜宿主目录。
 - `VECTOR_LAKE_AGENT_SANDBOX_ROOTS`：以 `os.pathsep` 分隔的绝对 sandbox 根；只有这些根内的显式 graph 输出目录可写。未配置时 graph 仍可使用自身默认受控输出路径，但拒绝调用方指定任意目录。
 - `VECTOR_LAKE_PAYLOAD_MAX_BYTES`：单个 MCP sandbox payload 上限，默认 `5 MiB`。
+- `VECTOR_LAKE_WIKI_BATCH_MAX_BYTES`：`write_wiki_batch` 全批 payload 的 UTF-8 字节上限，默认 `16 MiB`，无论配置如何都不能超过 `64 MiB`。
+- `VECTOR_LAKE_WIKI_BATCH_SCHEMA_MAINTENANCE_ALLOWLIST`：可信宿主提供的 JSON 文件名数组；未设置时 schema-maintenance 一律拒绝。manifest 请求必须是该精确清单的子集，且每项仍需绑定非空 canonical version 与 projection SHA-256；该能力不接受 `Source_*` 维护例外。
 - Timeline 重建通过 `timeline-rebuild` 命令执行，不读取 `timeline.projection_rebuild` 配置键。
 - `VECTOR_LAKE_EMBEDDING_MODEL`：embedding 模型，默认 `gemini-embedding-2`；非 embedding 文本推理不由插件调用外部模型 API。
 - `VECTOR_LAKE_EMBEDDING_RPM` / `VECTOR_LAKE_EMBEDDING_TPM`：embedding 调度限额，默认 `3000` / `1000000`。
@@ -629,13 +632,14 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `vector_lake/claim_assessment.py` | 追加式 ClaimAssessment；不产生 AcceptedFact |
 | `vector_lake/decision_registry.py` | 同步外部已验证 CriticalDecisionRegistry 并支持决策范围就绪度 |
 | `vector_lake/quality_registry.py` | 登记不可变 schema/dialect 版本与 golden dataset 评估结果 |
-| `vector_lake/mcp_server.py` | 64-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
+| `vector_lake/mcp_server.py` | 65-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
 | `vector_lake/watchdog_app.py` | trailing-edge 增量监听、队列调度、worker 有界重启/故障隔离、运行态记忆索引维护与定时自愈审计 |
 | `scripts/benchmark_multi_host_runtime.py` | 在隔离 MEMORY 上测量多 MCP + watchdog 的启动、RSS、soak 与 runtime-status P95 |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
 | `vector_lake/db_store.py` | SQLite connection pooling, schema init logic, `_INIT_LOCK` guarding, and WAL settings |
 | `vector_lake/mutation_coordinator.py` | page/multi-page mutation 编排、canonical/outbox 提交、投影备份与恢复 |
+| `vector_lake/tool_wiki_batch.py` | manifest/hash/version/fingerprint 绑定的受限批量 Wiki canonical 提交与可信宿主 schema-maintenance 白名单 |
 | `vector_lake/defense_hook.py` | Pre-flight constraints and guardrails |
 | `vector_lake/skeleton_parser.py` | Parsers for structural validation |
 | `vector_lake/provenance.py` | Tracing entities to raw sources |

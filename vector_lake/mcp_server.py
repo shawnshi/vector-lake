@@ -86,12 +86,16 @@ _MCP_HEAVY_TASKS = {
     "trigger_autonomous_research": ("ingest_scan", 1800.0),
     "visualize_vector_lake": ("scan", 900.0),
     "wiki_restore": ("maintenance", 900.0),
+    "write_wiki_batch": ("maintenance", 900.0),
 }
 
 # Trusted-host-only gate for explicitly authorized recovery of ingest leases.
 _MANUAL_INGEST_ADMIN_ENV = "VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN"
 _MANUAL_QUERY_SYNTHESIS_ENV = "VECTOR_LAKE_ALLOW_MANUAL_QUERY_SYNTHESIS"
 _SYSTEM_PAGE_WRITE_ENV = "VECTOR_LAKE_ALLOW_SYSTEM_PAGE_WRITE"
+_WIKI_BATCH_SCHEMA_MAINTENANCE_ENV = (
+    "VECTOR_LAKE_WIKI_BATCH_SCHEMA_MAINTENANCE_ALLOWLIST"
+)
 _EVIDENCE_TEXT_EXPORT_ENV = "VECTOR_LAKE_ALLOW_EVIDENCE_TEXT_EXPORT"
 _MCP_SURFACE_ENV = "VECTOR_LAKE_MCP_SURFACE"
 _MEMORY_MCP_SURFACE_TOOLS = frozenset(
@@ -2839,6 +2843,87 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
             error_code="write_failed",
             message="Wiki mutation failed before commit.",
         )
+
+@mcp.tool()
+def write_wiki_batch(
+    payload_file: str,
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or atomically commit one bounded canonical Wiki batch.
+
+    The manifest and every page payload must be in an approved agent sandbox.
+    Apply requires the exact fingerprint returned by a current dry-run.
+    Markdown projections are post-commit and may be deferred for repair.
+    """
+    from vector_lake.tool_wiki_batch import (
+        SchemaMaintenanceNotAuthorized,
+        SystemPageWriteNotAuthorized,
+        run_wiki_batch,
+        schema_maintenance_allowlist_from_env,
+    )
+
+    try:
+        manifest_text = _read_payload(payload_file)
+        allowed_maintenance = schema_maintenance_allowlist_from_env(
+            os.environ.get(_WIKI_BATCH_SCHEMA_MAINTENANCE_ENV)
+        )
+        result = run_wiki_batch(
+            manifest_text,
+            _read_payload,
+            dry_run=dry_run,
+            confirmation=confirmation,
+            allow_system_pages=os.environ.get(_SYSTEM_PAGE_WRITE_ENV) == "1",
+            allowed_schema_maintenance_filenames=allowed_maintenance,
+        )
+        return json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except SystemPageWriteNotAuthorized as exc:
+        logging.warning("write_wiki_batch system write rejected: %s", type(exc).__name__)
+        error_code = "system_page_write_forbidden"
+        message = "System wiki page writes are disabled by default."
+    except SchemaMaintenanceNotAuthorized as exc:
+        logging.warning(
+            "write_wiki_batch schema maintenance rejected: %s",
+            type(exc).__name__,
+        )
+        error_code = "schema_maintenance_forbidden"
+        message = "Wiki batch schema maintenance was not authorized by the host."
+    except ValueError as exc:
+        logging.warning("write_wiki_batch invalid request: %s", type(exc).__name__)
+        error_code = "invalid_request"
+        message = "Wiki batch request is invalid."
+    except Exception as exc:
+        logging.warning("write_wiki_batch failed: %s", type(exc).__name__)
+        error_code = "write_failed"
+        message = "Wiki batch failed before commit."
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "ok": False,
+            "dry_run": bool(dry_run),
+            "committed": False,
+            "operation_count": 0,
+            "aggregate_payload_bytes": 0,
+            "schema_maintenance_count": 0,
+            "confirmation_required": True,
+            "fingerprint": "",
+            "operations": [],
+            "outbox_ids": [],
+            "deferred": [],
+            "post_commit_warnings": [],
+            "error_code": error_code,
+            "message": message,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
 
 @mcp.tool()
 def propose_schema_mutation(new_category: str, payload_file: str, parent_category: str = "Uncategorized") -> str:

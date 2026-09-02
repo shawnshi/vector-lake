@@ -270,11 +270,12 @@ def _signal_outbox_consumer() -> str | None:
     return None
 
 
-def _prepare_mutations(
+def validate_mutation_batch_metadata(
     mutations: Iterable[dict],
     validation_mode: str = "full",
     schema_maintenance_filenames: Iterable[str] | None = None,
 ) -> list[dict]:
+    """Validate a complete mutation batch without reading or validating content."""
     if validation_mode not in {"full", "schema"}:
         raise ValueError(f"Unsupported validation_mode: {validation_mode}")
     maintenance_names = list(schema_maintenance_filenames or ())
@@ -292,7 +293,8 @@ def _prepare_mutations(
         for filename in maintenance_set
     ):
         raise ValueError("Schema maintenance filenames must be wiki basenames.")
-    prepared = []
+
+    metadata: list[dict] = []
     prepared_maintenance_names = set()
     seen_filenames: dict[str, str] = {}
     existing_filenames: dict[str, set[str]] = {}
@@ -305,6 +307,7 @@ def _prepare_mutations(
             _filename_identity(existing_path.name),
             set(),
         ).add(existing_path.name)
+
     for mutation in mutations:
         filename = mutation.get("filename")
         if not isinstance(filename, str):
@@ -327,7 +330,6 @@ def _prepare_mutations(
                 f"Mutation filename is an alias of existing page: "
                 f"{filename} -> {existing_name}"
             )
-        content = mutation.get("content")
         is_delete = bool(mutation.get("is_delete", False))
         has_expected_version = "expected_version" in mutation
         expected_version = mutation.get("expected_version")
@@ -370,42 +372,61 @@ def _prepare_mutations(
                     "update with non-empty canonical and projection baselines."
                 )
             prepared_maintenance_names.add(filename)
-
         seen_filenames[filename_identity] = filename
-
-        mutation_type = "delete" if is_delete else "update"
-        if not is_delete:
-            if content is None:
-                raise ValueError("Update mutations require full Markdown content.")
-            frontmatter, _ = split_frontmatter(content)
-            if item_validation_mode == "full":
-                verify_asset(content, filename, frontmatter, get_index_path())
-            else:
-                # Schema mode is a bounded legacy-maintenance path. Dynamic
-                # tag/entity collision checks belong to full writes because
-                # existing pages may predate the current index taxonomy.
-                validate_schema(frontmatter, content, filename)
-
-        prepared.append(
+        metadata.append(
             {
                 "filename": filename,
-                "content": content,
                 "filepath": filepath,
-                "mutation_type": mutation_type,
+                "mutation_type": "delete" if is_delete else "update",
                 "has_expected_version": has_expected_version,
                 "expected_version": expected_version,
                 "projection_base_hash": projection_base_hash,
-                "idempotency_key": None,
                 "validation_mode": item_validation_mode,
             }
         )
-    if not prepared:
+
+    if not metadata:
         raise ValueError("A mutation batch must contain at least one mutation.")
     missing_maintenance_names = maintenance_set - prepared_maintenance_names
     if missing_maintenance_names:
         raise ValueError(
             "Schema maintenance filenames are absent from the mutation batch: "
             + ", ".join(sorted(missing_maintenance_names))
+        )
+    return metadata
+
+
+def _prepare_mutations(
+    mutations: Iterable[dict],
+    validation_mode: str = "full",
+    schema_maintenance_filenames: Iterable[str] | None = None,
+) -> list[dict]:
+    mutation_list = list(mutations)
+    metadata = validate_mutation_batch_metadata(
+        mutation_list,
+        validation_mode=validation_mode,
+        schema_maintenance_filenames=schema_maintenance_filenames,
+    )
+    prepared = []
+    for mutation, item in zip(mutation_list, metadata):
+        content = mutation.get("content")
+        if item["mutation_type"] == "update":
+            if content is None:
+                raise ValueError("Update mutations require full Markdown content.")
+            frontmatter, _ = split_frontmatter(content)
+            if item["validation_mode"] == "full":
+                verify_asset(content, item["filename"], frontmatter, get_index_path())
+            else:
+                # Schema mode is a bounded legacy-maintenance path. Dynamic
+                # tag/entity collision checks belong to full writes because
+                # existing pages may predate the current index taxonomy.
+                validate_schema(frontmatter, content, item["filename"])
+        prepared.append(
+            {
+                **item,
+                "content": content,
+                "idempotency_key": None,
+            }
         )
     return prepared
 

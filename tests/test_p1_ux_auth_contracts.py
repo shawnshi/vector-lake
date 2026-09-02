@@ -81,6 +81,7 @@ _EXPECTED_READONLY_DENIED_TOOLS = frozenset(
         "update_operational_memory",
         "visualize_vector_lake",
         "wiki_restore",
+        "write_wiki_batch",
         "write_wiki_page",
     }
 )

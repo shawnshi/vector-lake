@@ -421,7 +421,7 @@ def test_launcher_stdio_initializes_lists_tools_and_runs_quick_doctor(tmp_path):
         )
 
         assert initialized["protocolVersion"] == "2024-11-05"
-        assert len(listed["tools"]) == 64
+        assert len(listed["tools"]) == 65
         doctor = json.loads(called["content"][0]["text"])
         assert doctor["mode"] == "quick"
         assert doctor["semantic_readiness"] == {

@@ -167,12 +167,12 @@ def test_public_surface_counts_match_documented_contract():
     )
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert len(mcp_server.mcp._tool_manager.list_tools()) == 64
+    assert len(mcp_server.mcp._tool_manager.list_tools()) == 65
     assert len(mcp_server._MEMORY_MCP_SURFACE_TOOLS) == 9
     assert len(mcp_server._READONLY_MCP_SURFACE_TOOLS) == 21
     assert len(subcommands) == 40
     assert (
-        "64 MCP tools (`full`) / 9 MCP tools (`memory`) / "
+        "65 MCP tools (`full`) / 9 MCP tools (`memory`) / "
         "21 MCP tools (`readonly`) / 40 CLI commands"
     ) in readme
 
