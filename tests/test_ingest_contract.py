@@ -19,6 +19,7 @@ from vector_lake import (
     mcp_server,
     mutation_coordinator,
     tool_ingest,
+    tool_projection,
 )
 from vector_lake.ingest_worker import _ingest_finalization_proven, process_jobs
 from vector_lake.cancellation import (
@@ -4869,6 +4870,215 @@ def test_auto_quarantine_reconcile_preview_and_cas_requeue_same_revision(
     assert db_store.enqueue_job("ingest", payload) == job_id
 
 
+def test_retry_terminal_ingest_job_is_exact_fingerprint_bound(isolated_memory):
+    raw_path = isolated_memory / "raw" / "runner-error.md"
+    raw_path.write_text("runner error retry", encoding="utf-8")
+    prepare_ingest_batch(batch_size=1, candidate_paths=[str(raw_path)])
+    row = (
+        db_store.get_connection()
+        .execute(
+            "SELECT job_id, payload FROM jobs WHERE task_type = 'ingest' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        .fetchone()
+    )
+    job_id = str(row["job_id"])
+    original_payload = json.loads(row["payload"])
+    connection = db_store.get_connection()
+    connection.execute(
+        "UPDATE jobs SET status = 'failed', retries = 3, result_json = ?, "
+        "completed_at = updated_at WHERE job_id = ?",
+        (
+            json.dumps(
+                {
+                    "maintenance": "auto_ingest_controller",
+                    "state": "quarantined",
+                    "failure_class": "generator_policy",
+                    "reason": "codex_event_log_type_is_not_allowed:error",
+                }
+            ),
+            job_id,
+        ),
+    )
+    connection.commit()
+
+    preview = json.loads(
+        tool_ingest.retry_terminal_ingest_job(job_id, dry_run=True)
+    )
+    assert preview["plan"]["contract"] == "vector-lake-terminal-ingest-retry/v1"
+    assert preview["plan"]["job_id"] == job_id
+    assert preview["plan"]["action"] == "requeue_current"
+    fingerprint = preview["plan"]["fingerprint"]
+
+    with pytest.raises(PermissionError, match="confirmation mismatch"):
+        tool_ingest.retry_terminal_ingest_job(
+            job_id,
+            dry_run=False,
+            confirmation="sha256:wrong",
+        )
+    still_failed = db_store.get_connection().execute(
+        "SELECT status, retries FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert tuple(still_failed) == ("failed", 3)
+
+    applied = json.loads(
+        tool_ingest.retry_terminal_ingest_job(
+            job_id,
+            dry_run=False,
+            confirmation=fingerprint,
+        )
+    )
+    assert applied["ok"] is True
+    assert applied["committed"] is True
+    assert applied["state"] == "queued"
+    assert applied["reconciliation"]["applied_counts"] == {"requeue_current": 1}
+    queued = db_store.get_connection().execute(
+        "SELECT status, retries, result_json, lease_owner, lease_token, payload "
+        "FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert queued["status"] == "queued"
+    assert queued["retries"] == 0
+    assert queued["result_json"] is None
+    assert queued["lease_owner"] is None
+    assert queued["lease_token"] is None
+    refreshed_payload = json.loads(queued["payload"])
+    assert refreshed_payload["hash"] == original_payload["hash"]
+    assert refreshed_payload["attempt_id"] != original_payload["attempt_id"]
+
+
+@pytest.mark.parametrize(
+    "race",
+    [
+        "classification_changed",
+        "raw_removed",
+        "processed_marker_added",
+        "processed_during_backup",
+    ],
+)
+def test_retry_terminal_ingest_job_races_fail_without_job_mutation(
+    isolated_memory,
+    monkeypatch,
+    race,
+):
+    raw_path = isolated_memory / "raw" / f"runner-error-{race}.md"
+    raw_path.write_text("runner error retry", encoding="utf-8")
+    prepare_ingest_batch(batch_size=1, candidate_paths=[str(raw_path)])
+    connection = db_store.get_connection()
+    row = connection.execute(
+        "SELECT job_id FROM jobs WHERE task_type = 'ingest' "
+        "ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    job_id = str(row["job_id"])
+    legacy_result = json.dumps(
+        {
+            "maintenance": "auto_ingest_controller",
+            "state": "quarantined",
+            "failure_class": "generator_policy",
+            "reason": "codex_event_log_type_is_not_allowed:error",
+        }
+    )
+    connection.execute(
+        "UPDATE jobs SET status = 'failed', retries = 3, result_json = ?, "
+        "completed_at = updated_at WHERE job_id = ?",
+        (legacy_result, job_id),
+    )
+    connection.commit()
+    preview = json.loads(
+        tool_ingest.retry_terminal_ingest_job(job_id, dry_run=True)
+    )
+    fingerprint = preview["plan"]["fingerprint"]
+    revision = preview["plan"]["raw_revision"]
+    original_reconcile = tool_ingest.reconcile_ingest_job_debt
+
+    def inject_race(*args, **kwargs):
+        if race == "classification_changed":
+            connection.execute(
+                "UPDATE jobs SET result_json = ?, updated_at = updated_at "
+                "WHERE job_id = ?",
+                (
+                    json.dumps(
+                        {
+                            "maintenance": "auto_ingest_controller",
+                            "state": "quarantined",
+                            "failure_class": "generator_infrastructure",
+                            "reason": "transport failure",
+                        }
+                    ),
+                    job_id,
+                ),
+            )
+            connection.commit()
+        elif race == "raw_removed":
+            raw_path.unlink()
+        else:
+            db_store.mark_file_processed(str(raw_path), revision)
+        return original_reconcile(*args, **kwargs)
+
+    if race == "processed_during_backup":
+        original_backup = tool_projection.create_maintenance_backup
+
+        def inject_backup(*args, **kwargs):
+            backup = original_backup(*args, **kwargs)
+            db_store.mark_file_processed(str(raw_path), revision)
+            return backup
+
+        monkeypatch.setattr(
+            tool_projection,
+            "create_maintenance_backup",
+            inject_backup,
+        )
+    else:
+        monkeypatch.setattr(tool_ingest, "reconcile_ingest_job_debt", inject_race)
+    with pytest.raises(
+        tool_ingest.IngestBaselineConflict,
+        match="changed after confirmation|became processed|precondition changed",
+    ):
+        tool_ingest.retry_terminal_ingest_job(
+            job_id,
+            dry_run=False,
+            confirmation=fingerprint,
+        )
+
+    unchanged = connection.execute(
+        "SELECT status, retries FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert tuple(unchanged) == ("failed", 3)
+
+
+def test_retry_terminal_ingest_job_rejects_other_policy_failures(isolated_memory):
+    raw_path = isolated_memory / "raw" / "output-policy.md"
+    raw_path.write_text("output policy", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_Output-Policy.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    connection = db_store.get_connection()
+    connection.execute(
+        "UPDATE jobs SET status = 'failed', retries = 3, result_json = ?, "
+        "completed_at = updated_at WHERE job_id = ?",
+        (
+            json.dumps(
+                {
+                    "maintenance": "auto_ingest_controller",
+                    "state": "quarantined",
+                    "failure_class": "output_policy",
+                    "reason": "schema violation",
+                }
+            ),
+            job_id,
+        ),
+    )
+    connection.commit()
+
+    with pytest.raises(ValueError, match="not an approved legacy runner-error retry"):
+        tool_ingest.retry_terminal_ingest_job(job_id, dry_run=True)
+
+
 def test_reconcile_ingest_job_debt_deduplicates_current_raw_identity(
     isolated_memory,
 ):
@@ -6679,6 +6889,81 @@ def test_terminal_ingest_recovery_recognizes_exact_prior_commit(isolated_memory)
     assert snapshot["job"]["status"] == "finalized"
 
 
+def test_terminal_recovery_prepare_pipeline_is_clock_independent(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_path = isolated_memory / "raw" / "clock-independent.md"
+    raw_path.write_text("clock independent recovery", encoding="utf-8")
+    processed_data = {
+        "filepath": str(raw_path),
+        "hash": calculate_hash(str(raw_path)),
+        "canonical_name": "Source_clock-independent.md",
+        "source_hash": "",
+        "source_projection_hash": "",
+        "_recovery_updated_at": "2026-09-03T00:00:00Z",
+        "integration": {
+            "disposition": "standalone",
+            "reason": "No evidence-backed integration target is required.",
+            "relations": [],
+        },
+    }
+    files = [{"filename": "Policy_clock-independent.md", "content": "# Clock"}]
+    contract = tool_ingest.load_purpose_contract()
+
+    first, first_disposition, first_targets = tool_ingest._prepare_final_ingest_files(
+        files,
+        processed_data,
+        contract,
+    )
+
+    class FutureDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2031, 1, 2, tzinfo=tz or timezone.utc)
+
+    monkeypatch.setattr(tool_ingest, "datetime", FutureDateTime)
+    second, second_disposition, second_targets = tool_ingest._prepare_final_ingest_files(
+        files,
+        processed_data,
+        contract,
+    )
+
+    def content_hashes(prepared):
+        return {
+            item["filename"]: hashlib.sha256(item["content"].encode("utf-8")).hexdigest()
+            for item in prepared
+        }
+
+    assert content_hashes(first) == content_hashes(second)
+    assert first_disposition == second_disposition == "standalone"
+    assert first_targets == second_targets == set()
+    assert any("created: \"2026-09-03\"" in item["content"] for item in first)
+
+
+def test_terminal_recovery_relation_updates_use_stable_timestamp():
+    content = "---\nupdated: 2026-09-01\n---\n# Target\n\n## 2. 证据时间线\n"
+    timestamp = "2026-09-03T00:00:00Z"
+
+    first = tool_ingest._upsert_section_relation(
+        content,
+        "## 2. 证据时间线",
+        "<!-- vector-lake-relation:test -->",
+        "- [2026-09-03] [Observation] bounded recovery relation",
+        update_timestamp=timestamp,
+    )
+    second = tool_ingest._upsert_section_relation(
+        content,
+        "## 2. 证据时间线",
+        "<!-- vector-lake-relation:test -->",
+        "- [2026-09-03] [Observation] bounded recovery relation",
+        update_timestamp=timestamp,
+    )
+
+    assert first == second
+    assert "updated: 2026-09-03T00:00:00+00:00" in first
+
+
 def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeypatch):
     from copy import deepcopy
     from types import SimpleNamespace
@@ -6728,6 +7013,7 @@ def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeyp
         )
         selections.append(selection)
         snapshots[job_id] = {
+            "job": {"updated_at": "2026-09-03T00:00:00+00:00"},
             "payload": {
                 "filepath": f"C:/approved/raw-{index}.md",
                 "hash": f"sha256:{index + 31:064x}",
@@ -6767,7 +7053,7 @@ def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeyp
     monkeypatch.setattr(
         tool_ingest,
         "_normalize_codex_output_pages",
-        lambda files, _contract: files,
+        lambda files, _contract, **_kwargs: files,
     )
     monkeypatch.setattr(
         tool_ingest,
@@ -6781,6 +7067,16 @@ def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeyp
     )
     assert first["fingerprint"] == second["fingerprint"]
     assert all(item["state"] == "already_recovered" for item in first["items"])
+
+    single, _materials = tool_ingest._terminal_ingest_recovery_plan(
+        deepcopy(selections[:1])
+    )
+    assert single["requested"] == 1
+    assert len(single["items"]) == 1
+    with pytest.raises(ValueError, match="between one and three"):
+        tool_ingest._terminal_ingest_recovery_plan([])
+    with pytest.raises(ValueError, match="between one and three"):
+        tool_ingest._terminal_ingest_recovery_plan(selections + [selections[0]])
 
     for mutate in ("events_sha256", "operator_adjustment", "output"):
         changed = deepcopy(selections)

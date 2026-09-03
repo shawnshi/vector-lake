@@ -75,6 +75,7 @@ _MCP_HEAVY_TASKS = {
     "propose_schema_mutation": ("maintenance", 900.0),
     "reconcile_ingest_tasks": ("maintenance", 1800.0),
     "recover_terminal_ingest_outputs": ("projection", 1800.0),
+    "retry_terminal_ingest_job": ("maintenance", 1800.0),
     "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
     "rebuild_timeline_events": ("projection", 900.0),
     "rename_entity": ("maintenance", 900.0),
@@ -90,7 +91,7 @@ _MCP_HEAVY_TASKS = {
     "write_wiki_batch": ("maintenance", 900.0),
 }
 
-# Trusted-host-only gate for explicitly authorized recovery of ingest leases.
+# Trusted-host-only gate for authorized ingest claims, expiry, and terminal recovery.
 _MANUAL_INGEST_ADMIN_ENV = "VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN"
 _MANUAL_QUERY_SYNTHESIS_ENV = "VECTOR_LAKE_ALLOW_MANUAL_QUERY_SYNTHESIS"
 _SYSTEM_PAGE_WRITE_ENV = "VECTOR_LAKE_ALLOW_SYSTEM_PAGE_WRITE"
@@ -2621,6 +2622,25 @@ def recover_terminal_ingest_outputs(
         )
     return tools.recover_terminal_ingest_outputs(
         selections,
+        dry_run=dry_run,
+        confirmation=confirmation,
+    )
+
+
+@mcp.tool()
+def retry_terminal_ingest_job(
+    job_id: str,
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or requeue one exact legacy runner-error ingest job."""
+    if not dry_run:
+        _require_explicit_capability(
+            _MANUAL_INGEST_ADMIN_ENV,
+            "terminal ingest job retry",
+        )
+    return tools.retry_terminal_ingest_job(
+        job_id,
         dry_run=dry_run,
         confirmation=confirmation,
     )

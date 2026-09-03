@@ -609,6 +609,7 @@ def test_worker_projection_cas_rolls_back_edit_injected_after_hash(
     assert "compare-and-swap conflict" in row["last_error"]
 
     pending = governance_service.resolve_governance_item(item_id, resolution="merge")
+    assert pending is not None
     assert pending["status"] == "projection_pending"
     assert pending["merge_outbox_statuses"] == {
         outbox_id: "pending",
@@ -859,6 +860,7 @@ def test_projection_pending_review_recovers_terminal_failed_outbox(
         resolution="merge",
     )
 
+    assert resolved is not None
     assert resolved["status"] == "resolved"
     assert resolved["merge_outbox_statuses"] == {
         target_outbox_id: "completed",
@@ -869,7 +871,9 @@ def test_projection_pending_review_recovers_terminal_failed_outbox(
         target_outbox_id: "completed",
         source_outbox_id: "completed",
     }
-    assert db_store.get_merge_journal(journal_id)["status"] == "completed"
+    journal = db_store.get_merge_journal(journal_id)
+    assert journal is not None
+    assert journal["status"] == "completed"
 
 
 def test_worker_does_not_materialize_or_index_after_lease_is_superseded(
@@ -996,3 +1000,143 @@ def test_watchdog_promotes_manual_projection_edit_to_canonical_and_outbox(
     ).fetchone()
     assert outbox["mutation_type"] == "update"
     assert outbox["payload_text"] == edited
+
+
+def test_watchdog_does_not_promote_stale_projection_over_pending_canonical_intent(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    old_content = _source_content()
+    new_content = old_content.replace(
+        "Primary source content.",
+        "New canonical source content awaiting projection.",
+    )
+    execute_mutation_plan("Source_Test.md", content=old_content)
+    process_mutation_outbox_batch(limit=10)
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    old_projection_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    def fail_projection_stage(*_args, **_kwargs):
+        raise RuntimeError("defer projection for race test")
+
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "_stage_markdown_projection",
+        fail_projection_stage,
+    )
+    execute_mutation_plan("Source_Test.md", content=new_content)
+    pending = db_store.get_connection().execute(
+        "SELECT id, status, payload_text, projection_base_hash "
+        "FROM mutation_outbox ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    outbox_count = db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0]
+    expected_version = governance_store.canonical_page_version_from_content(
+        "Source_Test.md",
+        new_content,
+    )
+
+    stats = process_legacy_projection_batch(["Source_Test.md"])
+
+    assert stats == {"completed": 1, "failed": 0}
+    assert pending["status"] == "pending"
+    assert pending["payload_text"] == new_content
+    assert pending["projection_base_hash"] == old_projection_hash
+    assert target.read_text(encoding="utf-8") == old_content
+    assert governance_store.canonical_page_versions({"Source_Test"})[
+        "Source_Test"
+    ] == expected_version
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0] == outbox_count
+
+
+def test_watchdog_does_not_delete_pending_canonical_create_with_absent_projection(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    content = _source_content()
+    target = isolated_memory / "wiki" / "Source_Test.md"
+
+    def fail_projection_stage(*_args, **_kwargs):
+        raise RuntimeError("defer create projection for race test")
+
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "_stage_markdown_projection",
+        fail_projection_stage,
+    )
+    execute_mutation_plan("Source_Test.md", content=content)
+    pending = db_store.get_connection().execute(
+        "SELECT id, status, payload_text, projection_base_hash "
+        "FROM mutation_outbox ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    outbox_count = db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0]
+    expected_version = governance_store.canonical_page_version_from_content(
+        "Source_Test.md",
+        content,
+    )
+
+    stats = process_legacy_projection_batch(["Source_Test.md"])
+
+    assert stats == {"completed": 1, "failed": 0}
+    assert pending["status"] == "pending"
+    assert pending["payload_text"] == content
+    assert pending["projection_base_hash"] == ""
+    assert not target.exists()
+    assert governance_store.canonical_page_versions({"Source_Test"})[
+        "Source_Test"
+    ] == expected_version
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0] == outbox_count
+
+
+def test_watchdog_does_not_suppress_manual_edit_after_echo_snapshot(
+    isolated_memory,
+    monkeypatch,
+):
+    _write_purpose_contract(isolated_memory)
+    canonical_content = _source_content()
+    manual_content = canonical_content.replace(
+        "Primary source content.",
+        "Manual edit after the projection echo snapshot.",
+    )
+    execute_mutation_plan("Source_Test.md", content=canonical_content)
+    process_mutation_outbox_batch(limit=10)
+    target = isolated_memory / "wiki" / "Source_Test.md"
+    expected_version = governance_store.canonical_page_version_from_content(
+        "Source_Test.md",
+        canonical_content,
+    )
+    outbox_count = db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0]
+    original_reason = watchdog_app._legacy_projection_echo_reason
+
+    def mutate_before_echo_suppression(filename, projection_hash):
+        reason = original_reason(filename, projection_hash)
+        target.write_text(manual_content, encoding="utf-8")
+        return reason
+
+    monkeypatch.setattr(
+        watchdog_app,
+        "_legacy_projection_echo_reason",
+        mutate_before_echo_suppression,
+    )
+
+    stats = process_legacy_projection_batch(["Source_Test.md"])
+
+    assert stats == {"completed": 0, "failed": 1}
+    assert target.read_text(encoding="utf-8") == manual_content
+    assert governance_store.canonical_page_versions({"Source_Test"})[
+        "Source_Test"
+    ] == expected_version
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM mutation_outbox"
+    ).fetchone()[0] == outbox_count

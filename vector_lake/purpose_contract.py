@@ -45,8 +45,8 @@ def _parse_node_frontmatter(content: str, filename: str) -> dict[str, Any]:
 
 
 def validate_purpose_contract(contract: dict[str, Any]) -> dict[str, Any]:
-    if contract.get("purpose_version") != "12.0":
-        raise PurposeContractError("purpose contract requires purpose_version to be exactly '12.0'.")
+    if contract.get("purpose_version") != "12.1":
+        raise PurposeContractError("purpose contract requires purpose_version to be exactly '12.1'.")
 
     contract["intent_keywords"] = _as_string_list(contract.get("intent_keywords"), "intent_keywords")
     try:
@@ -92,9 +92,13 @@ def validate_purpose_contract(contract: dict[str, Any]) -> dict[str, Any]:
     policy = contract.get("synthesis_policy")
     if not isinstance(policy, dict):
         raise PurposeContractError("purpose contract requires a synthesis_policy object.")
+    raw_minimum_sources = policy.get("min_distinct_sources")
+    raw_minimum_intensity = policy.get("min_tension_intensity")
+    if raw_minimum_sources is None or raw_minimum_intensity is None:
+        raise PurposeContractError("synthesis_policy has invalid thresholds.")
     try:
-        minimum_sources = int(policy.get("min_distinct_sources"))
-        minimum_intensity = float(policy.get("min_tension_intensity"))
+        minimum_sources = int(raw_minimum_sources)
+        minimum_intensity = float(raw_minimum_intensity)
     except (TypeError, ValueError) as exc:
         raise PurposeContractError("synthesis_policy has invalid thresholds.") from exc
     if minimum_sources < 2 or not 0.0 <= minimum_intensity <= 1.0:

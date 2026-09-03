@@ -1951,7 +1951,11 @@ class _ChildProcessTree:
             raise AutoIngestInfrastructureError(
                 f"windows_job_limit_failed:{error}"
             )
-        process_handle = wintypes.HANDLE(int(self.process._handle))  # noqa: SLF001
+        process_handle_value = getattr(self.process, "_handle", None)
+        if process_handle_value is None:
+            kernel32.CloseHandle(handle)
+            raise AutoIngestInfrastructureError("windows_process_handle_is_unavailable")
+        process_handle = wintypes.HANDLE(int(process_handle_value))
         if not kernel32.AssignProcessToJobObject(handle, process_handle):
             error = ctypes.get_last_error()
             kernel32.CloseHandle(handle)
@@ -1997,7 +2001,12 @@ def _resume_suspended_process(process: subprocess.Popen[Any]) -> None:
     ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
     ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
     ntdll.NtResumeProcess.restype = ctypes.c_long
-    status = int(ntdll.NtResumeProcess(wintypes.HANDLE(int(process._handle))))  # noqa: SLF001
+    process_handle_value = getattr(process, "_handle", None)
+    if process_handle_value is None:
+        raise AutoIngestInfrastructureError("windows_process_handle_is_unavailable")
+    status = int(
+        ntdll.NtResumeProcess(wintypes.HANDLE(int(process_handle_value)))
+    )
     if status != 0:
         raise AutoIngestInfrastructureError(
             f"windows_suspended_process_resume_failed:{status:#x}"
@@ -2328,6 +2337,10 @@ def _validate_event_log(path: Path, config: AutoIngestConfig) -> dict[str, int]:
                             f"{item_type or 'missing'}"
                         )
                     continue
+                if event_type == "error":
+                    raise AutoIngestInfrastructureError(
+                        "codex_runner_reported_error_event"
+                    )
                 if event_type != "turn.completed":
                     raise AutoIngestPolicyError(
                         f"codex_event_log_type_is_not_allowed:{event_type or 'missing'}"
@@ -2409,6 +2422,7 @@ def _run_codex_generator(
         if isinstance(runner_home, Path)
         else None
     )
+    job_dir: Path | None = None
     try:
         root = _validated_auto_scratch_root()
         job_dir = root / f"{job_id}-{generation}-{uuid.uuid4().hex[:8]}"
@@ -2613,7 +2627,7 @@ def _run_codex_generator(
             f"codex_workspace_failed:{type(exc).__name__}:{exc}"
         ) from exc
     finally:
-        if "job_dir" in locals() and not config.retain_artifacts:
+        if job_dir is not None and not config.retain_artifacts:
             try:
                 _remove_job_dir(job_dir)
             except (OSError, RuntimeError) as exc:
@@ -2802,8 +2816,11 @@ def _verified_raw_input(
 def _lease_from_claim(claim: dict[str, Any]) -> tuple[str, str, int]:
     owner = str(claim.get("lease_owner") or "")
     token = str(claim.get("lease_token") or "")
+    generation_value = claim.get("lease_generation")
     try:
-        generation = int(claim.get("lease_generation"))
+        if generation_value is None:
+            raise TypeError("missing lease generation")
+        generation = int(generation_value)
     except (TypeError, ValueError) as exc:
         raise AutoIngestInfrastructureError("claimed_lease_is_invalid") from exc
     if not owner or not token or generation < 1:
@@ -3429,8 +3446,11 @@ class AutoIngestController:
         job_id = str(claim.get("job_id") or "")
         owner = str(claim.get("lease_owner") or "")
         token = str(claim.get("lease_token") or "")
+        generation_value = claim.get("lease_generation")
         try:
-            generation = int(claim.get("lease_generation"))
+            if generation_value is None:
+                raise TypeError("missing lease generation")
+            generation = int(generation_value)
         except (TypeError, ValueError):
             return
         if not job_id or not owner or not token or generation < 1:
@@ -3961,6 +3981,9 @@ class AutoIngestController:
                 stage="finalize_contract",
                 usage=usage,
             )
+        raise AutoIngestInfrastructureError(
+            "claim_handler_exited_without_outcome"
+        )
 
     def tick(self, stop_event: threading.Event) -> str:
         config = load_auto_ingest_config()
@@ -4117,6 +4140,9 @@ class AutoIngestController:
             )
             self._record_infrastructure(state, config, wrapped)
             return "infrastructure_error"
+        raise AutoIngestInfrastructureError(
+            "auto_ingest_tick_exited_without_outcome"
+        )
 
 
 def start_auto_ingest_worker(stop_event: threading.Event | None = None) -> None:

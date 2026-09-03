@@ -2448,6 +2448,24 @@ def test_event_log_is_fail_closed_for_malformed_or_unknown_events(
         auto_ingest_worker._validate_event_log(events, _enabled_config())
 
 
+def test_event_log_classifies_top_level_runner_error_as_infrastructure(tmp_path):
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        _jsonl(
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {"type": "error", "message": "upstream service unavailable"},
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        auto_ingest_worker.AutoIngestInfrastructureError,
+        match="codex_runner_reported_error_event",
+    ):
+        auto_ingest_worker._validate_event_log(events, _enabled_config())
+
+
 @pytest.mark.parametrize(
     "message",
     [

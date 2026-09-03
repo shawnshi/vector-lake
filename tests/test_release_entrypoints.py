@@ -53,7 +53,7 @@ REMOVED_UNSUPPORTED_ENTRYPOINTS = (
 )
 
 PURPOSE_CONTRACT = """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [healthcare]
 intent_weight_boost: 0.1
 scope:
@@ -421,7 +421,7 @@ def test_launcher_stdio_initializes_lists_tools_and_runs_quick_doctor(tmp_path):
         )
 
         assert initialized["protocolVersion"] == "2024-11-05"
-        assert len(listed["tools"]) == 66
+        assert len(listed["tools"]) == 67
         doctor = json.loads(called["content"][0]["text"])
         assert doctor["mode"] == "quick"
         assert doctor["semantic_readiness"] == {

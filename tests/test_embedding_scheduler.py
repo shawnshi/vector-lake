@@ -23,7 +23,7 @@ from vector_lake.mutation_coordinator import execute_mutation_plan
 def _purpose(memory_dir):
     (memory_dir / "purpose.md").write_text(
         """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [test]
 scope:
   core: [test]

@@ -15,7 +15,7 @@ from vector_lake.wiki_utils import atomic_write_text
 def _write_purpose_contract(memory_dir):
     (memory_dir / "purpose.md").write_text(
         """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [test]
 intent_weight_boost: 0.1
 scope:

@@ -41,7 +41,7 @@ def _set_backup_created_at(path: Path, timestamp: float) -> None:
 def _purpose(memory_dir):
     (memory_dir / "purpose.md").write_text(
         """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [test]
 scope:
   core: [test]

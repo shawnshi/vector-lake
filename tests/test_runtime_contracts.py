@@ -1363,6 +1363,7 @@ def test_all_known_mcp_rescan_entrypoints_are_heavy_task_gated():
         "reconcile_ingest_tasks": ("maintenance", 1800.0),
         "reconcile_orphan_ingest_packets": ("maintenance", 900.0),
         "recover_terminal_ingest_outputs": ("projection", 1800.0),
+        "retry_terminal_ingest_job": ("maintenance", 1800.0),
         "sync_vector_lake": ("ingest_scan", 1800.0),
         "sync_critical_decision_registry": ("maintenance", 900.0),
         "trigger_audit_graph": ("scan", 1800.0),
@@ -1462,6 +1463,43 @@ def test_terminal_ingest_recovery_apply_requires_manual_admin(monkeypatch):
             dry_run=False,
             confirmation="sha256:abc",
         )
+
+
+def test_terminal_ingest_retry_mcp_requires_manual_admin(monkeypatch):
+    observed = {}
+
+    def retry(job_id, *, dry_run, confirmation):
+        observed.update(
+            job_id=job_id,
+            dry_run=dry_run,
+            confirmation=confirmation,
+        )
+        return "ok"
+
+    monkeypatch.setattr(mcp_server.tools, "retry_terminal_ingest_job", retry)
+    monkeypatch.delenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", raising=False)
+    with pytest.raises(PermissionError, match="disabled by default"):
+        mcp_server.retry_terminal_ingest_job(
+            "a" * 32,
+            dry_run=False,
+            confirmation="sha256:abc",
+        )
+    assert observed == {}
+
+    monkeypatch.setenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", "1")
+    assert (
+        mcp_server.retry_terminal_ingest_job(
+            "a" * 32,
+            dry_run=False,
+            confirmation="sha256:abc",
+        )
+        == "ok"
+    )
+    assert observed == {
+        "job_id": "a" * 32,
+        "dry_run": False,
+        "confirmation": "sha256:abc",
+    }
 
 
 def test_audit_graph_defaults_to_stable_read_only_preview(monkeypatch):

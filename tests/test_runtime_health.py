@@ -191,7 +191,7 @@ def test_canonical_entity_version_ignores_transport_only_raw_text_differences():
 def _write_purpose_contract(memory_dir):
     (memory_dir / "purpose.md").write_text(
         """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [test]
 scope:
   core: [test]

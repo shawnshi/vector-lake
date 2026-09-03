@@ -71,6 +71,8 @@ _RAW_FULL_SCAN_SCRUB_DAYS_ENV = "VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS"
 _DEFAULT_RAW_FULL_SCAN_SCRUB_DAYS = 7
 _MAX_RAW_FULL_SCAN_SCRUB_DAYS = 3650
 _RAW_SCAN_CHECKPOINT_ITEMS = 64
+_TERMINAL_RETRY_CONTRACT = "vector-lake-terminal-ingest-retry/v1"
+_LEGACY_RETRYABLE_GENERATOR_REASON = "codex_event_log_type_is_not_allowed:error"
 
 
 def _raw_scan_checkpoint(label: str, position: int) -> None:
@@ -797,7 +799,7 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
         except (OSError, UnicodeError, ValueError):
             return ""
         return "projection baseline became valid after preview"
-    if action != "complete_already_processed":
+    if action not in {"complete_already_processed", "requeue_current"}:
         return ""
 
     lookup_paths = [
@@ -818,7 +820,14 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
         except RawRevisionFormatError:
             return False
 
-    if not any(marker_matches_current(row) for row in rows):
+    marker_matches = any(marker_matches_current(row) for row in rows)
+    if action == "requeue_current":
+        return (
+            "processed_files now proves the current raw revision"
+            if marker_matches
+            else ""
+        )
+    if not marker_matches:
         return "processed_files no longer proves the current raw revision"
     return ""
 
@@ -969,7 +978,182 @@ def _job_is_non_retryable_policy_failure(record: dict) -> bool:
     return False
 
 
-def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
+def _is_legacy_retryable_generator_failure(record: dict) -> bool:
+    """Recognize the one runner error previously misclassified as model policy."""
+    try:
+        result = json.loads(str(record.get("result_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(result, dict)
+        and result.get("maintenance") == "auto_ingest_controller"
+        and result.get("state") == "quarantined"
+        and result.get("failure_class") == "generator_policy"
+        and result.get("reason") == _LEGACY_RETRYABLE_GENERATOR_REASON
+    )
+
+
+def _terminal_retry_row_guard(record: dict, raw_revision: str) -> str:
+    guarded = {
+        key: record.get(key)
+        for key in (
+            "job_id",
+            "task_type",
+            "status",
+            "payload",
+            "retries",
+            "error_msg",
+            "result_json",
+            "completed_at",
+            "updated_at",
+            "available_at",
+            "lease_until",
+            "lease_owner",
+            "lease_token",
+            "lease_generation",
+            "idempotency_key",
+            "task_packet_path",
+        )
+    }
+    guarded["raw_revision"] = raw_revision
+    return hashlib.sha256(
+        json.dumps(
+            guarded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _terminal_ingest_retry_plan(job_id: str) -> tuple[dict, str]:
+    normalized_job_id = str(job_id or "").strip()
+    if re.fullmatch(r"[0-9a-f]{32}", normalized_job_id) is None:
+        raise ValueError("terminal ingest retry job_id is invalid")
+    conn, preview_error = _open_ingest_debt_preview_connection()
+    if conn is None:
+        raise RuntimeError(preview_error or "terminal ingest retry state is unavailable")
+    try:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (normalized_job_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown ingest job: {normalized_job_id}")
+        record = dict(row)
+        if record.get("task_type") != "ingest":
+            raise ValueError(f"Job {normalized_job_id} is not an ingest job")
+        if record.get("status") != "failed" or int(record.get("retries") or 0) < 3:
+            raise ValueError(f"Job {normalized_job_id} is not terminal failed")
+        if not _is_legacy_retryable_generator_failure(record):
+            raise ValueError(
+                f"Job {normalized_job_id} is not an approved legacy runner-error retry"
+            )
+        lease_until = str(record.get("lease_until") or "")
+        if lease_until:
+            parsed_lease = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+            if parsed_lease.tzinfo is None:
+                parsed_lease = parsed_lease.replace(tzinfo=timezone.utc)
+            if parsed_lease > datetime.now(timezone.utc):
+                raise ValueError(f"Job {normalized_job_id} still has an active lease")
+        try:
+            payload = json.loads(str(record.get("payload") or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Job {normalized_job_id} has invalid payload") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Job {normalized_job_id} payload is not an object")
+        filepath = str(payload.get("filepath") or "")
+        queued_revision = str(payload.get("hash") or "")
+        current_raw = _stable_current_raw_revision(filepath)
+        if not current_raw.matches(queued_revision):
+            raise IngestBaselineConflict(
+                f"Raw source changed after terminal job {normalized_job_id} failed"
+            )
+        processed = conn.execute(
+            "SELECT file_hash FROM processed_files WHERE filepath = ?",
+            (filepath,),
+        ).fetchone()
+        if processed is not None and current_raw.matches(
+            str(processed["file_hash"] or "")
+        ):
+            raise ValueError(f"Job {normalized_job_id} revision is already processed")
+        row_guard = _terminal_retry_row_guard(record, current_raw.canonical_revision)
+        plan = {
+            "contract": _TERMINAL_RETRY_CONTRACT,
+            "job_id": normalized_job_id,
+            "action": "requeue_current",
+            "reason": "legacy runner error event was misclassified as generator policy",
+            "raw_revision": current_raw.canonical_revision,
+            "row_guard": row_guard,
+            "can_apply": True,
+        }
+        fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(
+                plan,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        plan["fingerprint"] = fingerprint
+        return plan, row_guard
+    finally:
+        conn.close()
+
+
+def retry_terminal_ingest_job(
+    job_id: str,
+    *,
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or requeue one exact legacy runner-error ingest job."""
+    if not isinstance(dry_run, bool):
+        raise ValueError("dry_run must be boolean")
+    plan, row_guard = _terminal_ingest_retry_plan(job_id)
+    if dry_run:
+        return json.dumps(
+            {"ok": True, "committed": False, "dry_run": True, "plan": plan},
+            ensure_ascii=False,
+            indent=2,
+        )
+    fingerprint = str(plan["fingerprint"])
+    if not hmac.compare_digest(str(confirmation or ""), fingerprint):
+        raise PermissionError("terminal ingest retry confirmation mismatch")
+    reconciliation = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            limit=1,
+            _operator_retry_job_id=str(job_id),
+            _expected_operator_retry_guard=row_guard,
+            _expected_operator_retry_revision=str(plan["raw_revision"]),
+        )
+    )
+    if reconciliation.get("applied_counts", {}).get("requeue_current") != 1:
+        raise RuntimeError("terminal ingest retry did not requeue the exact job")
+    return json.dumps(
+        {
+            "ok": True,
+            "committed": True,
+            "dry_run": False,
+            "state": "queued",
+            "job_id": str(job_id),
+            "confirmation_fingerprint": fingerprint,
+            "reconciliation": reconciliation,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def reconcile_ingest_job_debt(
+    dry_run: bool = True,
+    limit: int = 0,
+    *,
+    _operator_retry_job_id: str = "",
+    _expected_operator_retry_guard: str = "",
+    _expected_operator_retry_revision: str = "",
+) -> str:
     """Classify and safely recover abandoned ingest jobs without discarding valid work."""
     from vector_lake import db_store
 
@@ -1007,8 +1191,28 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
         "AND json_extract(result_json, '$.state') = 'blocked' THEN 0 "
         "ELSE 1 END = 1"
     )
+    operator_retry_job_id = str(_operator_retry_job_id or "").strip()
+    operator_retry_arguments = (
+        operator_retry_job_id,
+        str(_expected_operator_retry_guard or ""),
+        str(_expected_operator_retry_revision or ""),
+    )
+    if any(operator_retry_arguments) and not all(operator_retry_arguments):
+        raise ValueError(
+            "operator retry job, row guard, and revision must be supplied together"
+        )
+    filtered_predicate = debt_predicate
+    predicate_params: tuple[object, ...] = ()
+    if operator_retry_job_id:
+        if re.fullmatch(r"[0-9a-f]{32}", operator_retry_job_id) is None:
+            raise ValueError("operator retry job_id is invalid")
+        filtered_predicate += " AND job_id = ?"
+        predicate_params = (operator_retry_job_id,)
     available_jobs = int(
-        conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {debt_predicate}").fetchone()[0]
+        conn.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE {filtered_predicate}",
+            predicate_params,
+        ).fetchone()[0]
     )
     selected_limit = max(0, int(limit))
     if not dry_run:
@@ -1017,12 +1221,12 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             selected_limit or _INGEST_DEBT_APPLY_DEFAULT_LIMIT,
         )
     select_sql = (
-        f"SELECT * FROM jobs WHERE {debt_predicate} ORDER BY created_at, job_id"
+        f"SELECT * FROM jobs WHERE {filtered_predicate} ORDER BY created_at, job_id"
     )
-    select_params: tuple[int, ...] = ()
+    select_params = predicate_params
     if selected_limit:
         select_sql += " LIMIT ?"
-        select_params = (selected_limit,)
+        select_params = (*select_params, selected_limit)
     rows = conn.execute(select_sql, select_params).fetchall()
 
     plans: list[dict] = []
@@ -1033,6 +1237,22 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
 
     for row in rows:
         record = dict(row)
+        if operator_retry_job_id:
+            if not _is_legacy_retryable_generator_failure(record):
+                raise IngestBaselineConflict(
+                    "terminal ingest retry failure classification changed after confirmation"
+                )
+            confirmed_guard = _terminal_retry_row_guard(
+                record,
+                str(_expected_operator_retry_revision),
+            )
+            if not hmac.compare_digest(
+                confirmed_guard,
+                str(_expected_operator_retry_guard),
+            ):
+                raise IngestBaselineConflict(
+                    "terminal ingest retry state changed after confirmation"
+                )
         expected_state = {
             "status": record.get("status"),
             "retries": int(record.get("retries") or 0),
@@ -1055,6 +1275,10 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
         except json.JSONDecodeError:
             payload = None
         if not isinstance(payload, dict):
+            if operator_retry_job_id:
+                raise IngestBaselineConflict(
+                    "terminal ingest retry payload changed after confirmation"
+                )
             plans.append(
                 {
                     "job_id": record["job_id"],
@@ -1068,6 +1292,10 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
 
         raw_value = str(payload.get("filepath") or "").strip()
         if not raw_value:
+            if operator_retry_job_id:
+                raise IngestBaselineConflict(
+                    "terminal ingest retry filepath changed after confirmation"
+                )
             plans.append(
                 {
                     "job_id": record["job_id"],
@@ -1083,6 +1311,10 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             raw_path = get_raw_dir().parent / raw_path
         raw_path = raw_path.resolve()
         if not raw_path.is_file():
+            if operator_retry_job_id:
+                raise IngestBaselineConflict(
+                    "terminal ingest retry raw source changed after confirmation"
+                )
             plans.append(
                 {
                     "job_id": record["job_id"],
@@ -1101,6 +1333,10 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
                 allowed_roots=reconcile_target_dirs,
             )
         except (OSError, RawSourceUnstableError):
+            if operator_retry_job_id:
+                raise IngestBaselineConflict(
+                    "terminal ingest retry raw source changed after confirmation"
+                )
             plans.append(
                 {
                     "job_id": record["job_id"],
@@ -1113,6 +1349,13 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             )
             continue
         current_hash = current_snapshot.canonical_revision
+        if operator_retry_job_id and not hmac.compare_digest(
+            current_hash,
+            str(_expected_operator_retry_revision),
+        ):
+            raise IngestBaselineConflict(
+                "terminal ingest retry raw revision changed after confirmation"
+            )
 
         processed_lookup_paths = list(dict.fromkeys([str(raw_path), raw_value]))
         placeholders = ", ".join("?" for _ in processed_lookup_paths)
@@ -1133,6 +1376,10 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
         except RawRevisionFormatError:
             processed_matches_current = False
         if processed_matches_current:
+            if operator_retry_job_id:
+                raise IngestBaselineConflict(
+                    "terminal ingest retry revision became processed after confirmation"
+                )
             plans.append(
                 {
                     "job_id": record["job_id"],
@@ -1157,8 +1404,14 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
         # Model-capability failures are deterministic and retrying them burns
         # model tokens plus a full 3.5GB backup per round with no benefit.
         # Keep them terminal so a reconcile pass does not re-arm an endless
-        # quarantine -> requeue storm.
-        non_retryable_policy = _job_is_non_retryable_policy_failure(record)
+        # quarantine -> requeue storm. The only override is an exact,
+        # fingerprint-bound retry of the historical top-level runner error.
+        operator_retry = bool(
+            operator_retry_job_id == str(record.get("job_id") or "")
+        )
+        non_retryable_policy = (
+            _job_is_non_retryable_policy_failure(record) and not operator_retry
+        )
         needs_requeue = (
             (record.get("status") == "failed" and not non_retryable_policy)
             or payload_hash != current_hash
@@ -1337,7 +1590,9 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             "job_id": record["job_id"],
             "action": "requeue_current",
             "reason": (
-                "terminal failure"
+                "operator-authorized legacy runner-error retry"
+                if operator_retry
+                else "terminal failure"
                 if record.get("status") == "failed"
                 else "raw hash or ingest contract changed"
             ),
@@ -1345,6 +1600,7 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             "payload": refreshed,
             "raw_path": str(raw_path),
             "expected_raw_hash": current_hash,
+            "processed_lookup_paths": processed_lookup_paths,
             "target_key": target_key,
             "created_at": str(record.get("created_at") or ""),
             "expected_state": expected_state,
@@ -1416,6 +1672,14 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
             plans.append(item)
 
     plans.sort(key=lambda item: str(item["job_id"]))
+    if operator_retry_job_id and (
+        len(plans) != 1
+        or plans[0].get("job_id") != operator_retry_job_id
+        or plans[0].get("action") != "requeue_current"
+    ):
+        raise IngestBaselineConflict(
+            "terminal ingest retry no longer resolves to the confirmed requeue action"
+        )
     counts = Counter(item["action"] for item in plans)
     result = {
         "dry_run": bool(dry_run),
@@ -1508,6 +1772,11 @@ def reconcile_ingest_job_debt(dry_run: bool = True, limit: int = 0) -> str:
                 item,
             )
             if raw_precondition_error:
+                if operator_retry_job_id:
+                    raise IngestBaselineConflict(
+                        "terminal ingest retry precondition changed before mutation: "
+                        + raw_precondition_error
+                    )
                 result["concurrent_skips"].append(
                     {
                         "job_id": job_id,
@@ -1907,14 +2176,12 @@ def _source_identity_index(
         wiki_path = wiki_paths.get(page_key)
         if not page_key or wiki_path is None:
             continue
+        raw_categories = entity.get("categories")
+        category_values = (
+            raw_categories if isinstance(raw_categories, list) else [raw_categories]
+        )
         categories = {
-            str(value).casefold()
-            for value in (
-                entity.get("categories")
-                if isinstance(entity.get("categories"), list)
-                else [entity.get("categories")]
-            )
-            if value
+            str(value).casefold() for value in category_values if value
         }
         is_backlog = (
             str(entity.get("topic_cluster") or "").casefold() == "raw_ingest_backlog"
@@ -2435,8 +2702,16 @@ def _read_relevant_index_context(
         ) from exc
 
 
-def _updated_now(content: str) -> str:
-    updated = datetime.now(timezone.utc).isoformat()
+def _updated_now(content: str, *, timestamp: str = "") -> str:
+    updated = timestamp or datetime.now(timezone.utc).isoformat()
+    if timestamp:
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("ingest update timestamp must be ISO-8601") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        updated = parsed.astimezone(timezone.utc).isoformat()
     return re.sub(r"(?m)^updated:\s*.*$", f"updated: {updated}", content, count=1)
 
 
@@ -2531,6 +2806,8 @@ def _upsert_section_relation(
     marker: str,
     line: str,
     legacy_tokens: tuple[str, ...] = (),
+    *,
+    update_timestamp: str = "",
 ) -> str:
     start = content.find(heading)
     if start < 0:
@@ -2558,14 +2835,17 @@ def _upsert_section_relation(
             cursor = duplicate.end()
         chunks.append(section[cursor:])
         merged = "".join(chunks)
-        return _updated_now(content[:section_start] + merged + content[section_end:])
+        return _updated_now(
+            content[:section_start] + merged + content[section_end:],
+            timestamp=update_timestamp,
+        )
     insert_at = section_end
     prefix = content[:insert_at].rstrip()
     suffix = content[insert_at:].lstrip("\n")
     merged = f"{prefix}\n\n{line}\n"
     if suffix:
         merged += f"\n{suffix}"
-    return _updated_now(merged)
+    return _updated_now(merged, timestamp=update_timestamp)
 
 
 def _verify_ingest_source_baseline(processed_data: dict) -> None:
@@ -2608,7 +2888,11 @@ def _verify_ingest_source_baseline(processed_data: dict) -> None:
 
 
 def _source_observed_datetime(processed_data: dict) -> datetime:
-    raw = str(processed_data.get("source_observed_at") or "").strip()
+    raw = str(
+        processed_data.get("source_observed_at")
+        or processed_data.get("_recovery_updated_at")
+        or ""
+    ).strip()
     if raw:
         try:
             parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -2617,8 +2901,9 @@ def _source_observed_datetime(processed_data: dict) -> datetime:
             return parsed.astimezone(timezone.utc)
         except ValueError:
             pass
-    # Legacy queued jobs predate source_observed_at. Preserve their historical
-    # behavior without weakening deterministic bytes for newly prepared jobs.
+    # Ordinary legacy jobs preserve their historical behavior. Governed recovery
+    # injects the guarded terminal-row timestamp above so preview and apply bytes
+    # remain identical even when the original payload predates source_observed_at.
     return datetime.now(timezone.utc)
 
 
@@ -3005,7 +3290,10 @@ _NORMALIZE_TYPE_PREFIX = {
 
 
 def _normalize_codex_output_pages(
-    files: list[dict], contract: dict | None = None
+    files: list[dict],
+    contract: dict | None = None,
+    *,
+    default_updated_at: str = "",
 ) -> list[dict]:
     """Repair missing or incomplete model-authored page shells.
 
@@ -3107,7 +3395,19 @@ def _normalize_codex_output_pages(
             title = (
                 heading.group(1).strip() if heading else filename[:-3].replace("_", " ")
             )
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if default_updated_at:
+            try:
+                normalization_time = datetime.fromisoformat(
+                    default_updated_at.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError("ingest normalization timestamp must be ISO-8601") from exc
+            if normalization_time.tzinfo is None:
+                normalization_time = normalization_time.replace(tzinfo=timezone.utc)
+            normalization_time = normalization_time.astimezone(timezone.utc)
+        else:
+            normalization_time = datetime.now(timezone.utc)
+        today = normalization_time.strftime("%Y-%m-%d")
         raw_identity = hashlib.sha256(
             f"{filename}\0{content}".encode("utf-8")
         ).hexdigest()[:8]
@@ -3272,6 +3572,9 @@ def _apply_integration_disposition(
         )
     target_mutations = []
     applied_targets = set()
+    integration_update_timestamp = str(
+        processed_data.get("_recovery_updated_at") or ""
+    )
     seen_targets = set()
     filtered_relations = []
     for relation in relations:
@@ -3384,6 +3687,7 @@ def _apply_integration_disposition(
             f"- [{predicate}:: [[{target_key}]]] {evidence} "
             f"(confidence: {confidence:.2f}) {marker}",
             legacy_tokens=(f"[[{target_key}]]",),
+            update_timestamp=integration_update_timestamp,
         )
         source_anchor = f"(Source: [[{source_key}]])"
         target_heading = (
@@ -3402,6 +3706,7 @@ def _apply_integration_disposition(
             marker,
             target_line,
             legacy_tokens=(source_anchor,),
+            update_timestamp=integration_update_timestamp,
         )
         target_mutations.append(
             {
@@ -3415,8 +3720,25 @@ def _apply_integration_disposition(
 
     if not target_mutations:
         return files, "standalone", set()
-    source_item["content"] = _updated_now(source_content)
+    source_item["content"] = _updated_now(
+        source_content,
+        timestamp=integration_update_timestamp,
+    )
     return files + target_mutations, disposition, applied_targets
+
+
+def _prepare_final_ingest_files(
+    files: list[dict],
+    processed_data: dict,
+    contract: dict,
+) -> tuple[list[dict], str, set[str]]:
+    """Build the exact deterministic mutation set used by preview and finalize."""
+    normalized = _normalize_codex_output_pages(
+        files,
+        contract,
+        default_updated_at=str(processed_data.get("_recovery_updated_at") or ""),
+    )
+    return _apply_integration_disposition(normalized, processed_data)
 
 
 _TEMPORAL_WIKI_LINK = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -4863,8 +5185,9 @@ def _terminal_ingest_recovery_plan(selections: list[dict]) -> tuple[dict, list[d
         load_auto_ingest_config,
     )
 
-    if not isinstance(selections, list) or len(selections) != 3:
-        raise ValueError("terminal ingest recovery requires exactly three selections")
+    if not isinstance(selections, list) or not 1 <= len(selections) <= 3:
+        raise ValueError("terminal ingest recovery requires between one and three selections")
+    requested_count = len(selections)
     allowed_fields = {
         "job_id",
         "attempt_id",
@@ -4939,7 +5262,16 @@ def _terminal_ingest_recovery_plan(selections: list[dict]) -> tuple[dict, list[d
                 f"Raw source changed after terminal job {job_id} was produced"
             )
         processed_data = dict(payload)
-        processed_data.update({"job_id": job_id, "attempt_id": attempt_id})
+        recovery_updated_at = str(snapshot["job"].get("updated_at") or "")
+        if not recovery_updated_at:
+            raise ValueError(f"Job {job_id} has no stable recovery timestamp")
+        processed_data.update(
+            {
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "_recovery_updated_at": recovery_updated_at,
+            }
+        )
         processed_data["_queued_integration_candidates"] = list(
             payload.get("integration_candidates") or []
         )
@@ -4964,16 +5296,19 @@ def _terminal_ingest_recovery_plan(selections: list[dict]) -> tuple[dict, list[d
             config,
         )
         processed_data["integration"] = integration
-        normalized_files = _normalize_codex_output_pages(files, contract)
-        planned_output_files = normalized_files
         if not already_recovered:
             (
                 planned_output_files,
                 _planned_disposition,
                 planned_target_names,
-            ) = _apply_integration_disposition(normalized_files, processed_data)
+            ) = _prepare_final_ingest_files(files, processed_data, contract)
             _prepare_source_link_precondition(planned_output_files)()
         else:
+            planned_output_files = _normalize_codex_output_pages(
+                files,
+                contract,
+                default_updated_at=recovery_updated_at,
+            )
             planned_target_names = set()
         _validate_final_ingest_files(
             planned_output_files,
@@ -5004,6 +5339,7 @@ def _terminal_ingest_recovery_plan(selections: list[dict]) -> tuple[dict, list[d
                     else ""
                 ),
                 "row_guard": snapshot["row_guard"],
+                "effective_updated_at": recovery_updated_at,
                 "state": (
                     "already_recovered"
                     if already_recovered
@@ -5037,7 +5373,7 @@ def _terminal_ingest_recovery_plan(selections: list[dict]) -> tuple[dict, list[d
         )
     plan = {
         "contract": "vector-lake-terminal-ingest-output-recovery/v1",
-        "requested": 3,
+        "requested": requested_count,
         "items": plan_items,
         "can_apply": True,
     }
@@ -5073,7 +5409,7 @@ def recover_terminal_ingest_outputs(
     dry_run: bool = True,
     confirmation: str = "",
 ) -> str:
-    """Preview or apply one exact three-job retained-output recovery batch."""
+    """Preview or apply one exact, bounded retained-output recovery batch."""
     from vector_lake import db_store
 
     if not isinstance(dry_run, bool):
@@ -5189,8 +5525,9 @@ def recover_terminal_ingest_outputs(
                     except Exception:
                         indeterminate.append(pending_id)
                 break
+    requested_count = len(materials)
     projection_settled = False
-    if len(set(committed)) == 3:
+    if len(set(committed)) == requested_count:
         try:
             _wait_for_terminal_recovery_projection()
             projection_settled = True
@@ -5207,7 +5544,7 @@ def recover_terminal_ingest_outputs(
         for item in materials
         if str(item["job_id"]) not in set(committed) | set(restored) | set(indeterminate)
     ]
-    fully_committed = len(set(committed)) == 3
+    fully_committed = len(set(committed)) == requested_count
     state = (
         "completed"
         if fully_committed and projection_settled
@@ -5232,7 +5569,7 @@ def recover_terminal_ingest_outputs(
         "fingerprint": fingerprint,
         "confirmation_fingerprint": fingerprint,
         "recovery_fingerprints": recovery_fingerprints,
-        "requested": 3,
+        "requested": requested_count,
         "committed_job_ids": sorted(set(committed)),
         "restored_terminal_job_ids": sorted(set(restored)),
         "unattempted_job_ids": unattempted,
@@ -5307,12 +5644,11 @@ def _finalize_ingest_impl(
             raise ValueError("lease_generation must be an integer")
         lease_generation = raw_lease_generation
         contract = load_purpose_contract()
-        files = _normalize_codex_output_pages(files, contract)
         (
             files,
             integration_disposition,
             integration_target_names,
-        ) = _apply_integration_disposition(files, processed_data)
+        ) = _prepare_final_ingest_files(files, processed_data, contract)
         (
             node_records,
             schema_maintenance_filenames,

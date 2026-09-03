@@ -58,7 +58,7 @@ evidence_tier: primary
 def _seed_snapshot(isolated_memory: Path) -> tuple[Path, Path, dict[str, str]]:
     (isolated_memory / "purpose.md").write_text(
         """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [test, restore]
 scope:
   core: [test, restore]

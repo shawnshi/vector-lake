@@ -1,4 +1,4 @@
-# Vector Lake Schema & Governance (Schema V8.0; Strategic Contract V12.0)
+# Vector Lake Schema & Governance (Schema V8.0; Strategic Contract V12.1)
 
 ## 1. Core Mandate
 [CRITICAL SYSTEM OVERRIDE]
@@ -38,7 +38,7 @@ You generate or validate bounded Vector Lake page candidates. Candidates have no
   updated: "YYYY-MM-DD"
   sources: ["raw/doc1.pdf", "raw/doc2.txt"]
   strategic_scope: "core | edge" # Required for newly ingested nodes
-  evidence_tier: "code-availability | engineering-performance | commercial-commitment | production-acceptance"
+  evidence_tier: "code-availability | policy-directive | engineering-performance | commercial-commitment | production-acceptance"
   tension_edges: 
     - target: "Concept_Cloud_Native"
       polarity: -1.0  
@@ -156,4 +156,4 @@ Rule 1: NEVER use an existing entity name as a tag.
 Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换). Use rchitecture_patterns in YAML for technical jargon.
 Rule 3: An entity MUST NOT have more than 3 tags.
 ***
-*(System Notification: Schema V8.0 with Strategic Contract V12.0. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*
+*(System Notification: Schema V8.0 with Strategic Contract V12.1. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*

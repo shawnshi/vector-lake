@@ -124,7 +124,7 @@ def _write_auto_ingest_config(memory_dir: Path) -> None:
 def _write_purpose_contract(memory_dir: Path) -> None:
     (memory_dir / "purpose.md").write_text(
         """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [test]
 intent_weight_boost: 0.1
 scope:

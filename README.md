@@ -45,7 +45,7 @@ graph LR
 | Canonical governance schema | `8.0` |
 | Index projection | logical `PROJECTION_CONTRACT_VERSION = 1` / physical `format_version = 2` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 66 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 40 CLI commands / 19 Agent skills |
+| Public surfaces | 67 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 40 CLI commands / 19 Agent skills |
 
 通用 `init_db()` 遇到既有 v1–v8 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6、v7 或 v8 数据库，并按受控历史链最终
@@ -181,9 +181,11 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 
 ### Terminal ingest output recovery
 
-`recover_terminal_ingest_outputs` 是仅供受控事故恢复的 full-surface MCP 工具，不改变普通 `claim_ingest_tasks` 的禁用边界。它只接受批准 sandbox 中、合同为 `vector-lake-terminal-ingest-output-recovery/v1` 的 manifest，并要求精确三个互异的终止 ingest job、历史 attempt/generation、验证事件摘要、当前待复核输出和显式 `operator_adjustment`。dry-run 会重新校验 raw revision、Source 基线、历史验证事件的精确 revision、完整 integration/final-purpose 合同，并返回内容绑定的确认指纹；apply 还要求可信宿主设置 `VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN=1` 和逐字匹配的指纹。
+`recover_terminal_ingest_outputs` 是仅供受控事故恢复的 full-surface MCP 工具，不改变普通 `claim_ingest_tasks` 的禁用边界。它只接受批准 sandbox 中、合同为 `vector-lake-terminal-ingest-output-recovery/v1` 的 manifest，并要求 1–3 个互异的终止 ingest job、历史 attempt/generation、验证事件摘要、当前待复核输出和显式 `operator_adjustment`。dry-run 会重新校验 raw revision、Source 基线、历史验证事件的精确 revision、完整 integration/final-purpose 合同，并返回内容绑定的确认指纹；apply 还要求可信宿主设置 `VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN=1` 和逐字匹配的指纹。
 
 成功提交会在 job recovery provenance 中保存 output/events/artifact/operator-adjustment 的 `selection_digest`。后续重放只有在该摘要完全一致时才可把 job 识别为 `already_recovered`；receipt 分别返回当前确认指纹和各 job 的实际恢复指纹。工具使用原子批量 lease、owner/token/generation fencing 和失败状态恢复；最后一项提交后仍执行有界 projection 收敛检查，若 canonical 已提交但 projection 未收敛，返回 `committed_projection_pending`，不得报告完整成功。
+
+`retry_terminal_ingest_job` 只处理历史上被错误归类为 `generator_policy` 的顶层 Codex runner `error` 事件。该入口要求一个精确终止 job、当前 raw revision、无活动 lease、未处理 marker、内容绑定 dry-run 指纹及管理员 apply 门禁；apply 复用 ingest debt 的 CAS、Source/candidate 基线刷新和维护备份，不允许重试一般 input/output/model policy 失败。新版 runner 事件校验把顶层 `error` 视为基础设施失败，仍拒绝其输出，但交由有界基础设施重试和熔断器处理，而不再永久隔离为模型策略错误。
 
 ### Current runtime boundaries
 
@@ -638,7 +640,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `vector_lake/claim_assessment.py` | 追加式 ClaimAssessment；不产生 AcceptedFact |
 | `vector_lake/decision_registry.py` | 同步外部已验证 CriticalDecisionRegistry 并支持决策范围就绪度 |
 | `vector_lake/quality_registry.py` | 登记不可变 schema/dialect 版本与 golden dataset 评估结果 |
-| `vector_lake/mcp_server.py` | 66-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
+| `vector_lake/mcp_server.py` | 67-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
 | `vector_lake/watchdog_app.py` | trailing-edge 增量监听、队列调度、worker 有界重启/故障隔离、运行态记忆索引维护与定时自愈审计 |
 | `scripts/benchmark_multi_host_runtime.py` | 在隔离 MEMORY 上测量多 MCP + watchdog 的启动、RSS、soak 与 runtime-status P95 |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |

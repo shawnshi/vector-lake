@@ -1,6 +1,7 @@
 """Deterministic validation gate for the Vector Lake strategic-purpose contract."""
 
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +27,7 @@ def main() -> int:
 
     bootstrap_runtime_paths(caller="Purpose contract validator")
     contract = load_purpose_contract()
-    assert contract["purpose_version"] == "12.0"
+    assert contract["purpose_version"] == "12.1"
     assert "SIR-1" in render_strategy_directive(contract)
 
     content = """---
@@ -75,7 +76,18 @@ evidence_tier: engineering-performance
         {"filename": "Concept_B.md", "sources": ["Source_B"], "tension_edges": [{"target": "Concept_Cloud", "intensity": 0.90}]},
     ], contract)
     assert len(proposals) == 1 and proposals[0]["type"] == "Synthesis-Proposal"
-    assert len(review_sir_lifecycle("2026-10-11", contract)) == 5
+    active_sirs = [
+        sir for sir in contract["sir_registry"]
+        if str(sir["status"]).lower() == "active"
+    ]
+    if active_sirs:
+        latest_review = max(
+            date.fromisoformat(str(sir["review_after"])) for sir in active_sirs
+        )
+        review_probe = (latest_review + timedelta(days=1)).isoformat()
+        assert len(review_sir_lifecycle(review_probe, contract)) == len(active_sirs)
+    else:
+        assert review_sir_lifecycle(contract=contract) == []
     print("purpose-contract validation: OK")
     return 0
 

@@ -31,7 +31,7 @@ def _install_lightweight_local_publication(monkeypatch, tool_ingest) -> None:
 def _write_test_purpose(memory_dir: Path) -> None:
     (memory_dir / "purpose.md").write_text(
         """---
-purpose_version: "12.0"
+purpose_version: "12.1"
 intent_keywords: [test, ingest, raw, source]
 intent_weight_boost: 0.1
 scope:

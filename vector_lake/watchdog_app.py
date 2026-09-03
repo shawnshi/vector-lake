@@ -2000,6 +2000,46 @@ def process_mutation_outbox_batch(
     return stats
 
 
+class _LegacyProjectionEcho(RuntimeError):
+    """Stop a projection-originated file event from reversing canonical state."""
+
+
+def _legacy_projection_echo_reason(filename: str, projection_hash: str) -> str:
+    """Return why the newest durable projection intent owns this file snapshot."""
+    from vector_lake import db_store
+
+    row = db_store.get_connection().execute(
+        "SELECT status, payload_text, projection_base_hash "
+        "FROM mutation_outbox WHERE filename = ? AND status != 'superseded' "
+        "ORDER BY id DESC LIMIT 1",
+        (filename,),
+    ).fetchone()
+    if row is None:
+        return ""
+    payload_text = row["payload_text"]
+    payload_hash = (
+        hashlib.sha256(str(payload_text).encode("utf-8")).hexdigest()
+        if payload_text is not None
+        else ""
+    )
+    if payload_hash and payload_hash == projection_hash:
+        return "projection_echo"
+    status = str(row["status"] or "")
+    raw_projection_base_hash = row["projection_base_hash"]
+    projection_base_hash = (
+        str(raw_projection_base_hash)
+        if raw_projection_base_hash is not None
+        else None
+    )
+    if (
+        status in {"pending", "processing", "failed"}
+        and projection_base_hash is not None
+        and projection_base_hash == projection_hash
+    ):
+        return f"projection_base_owned_by_{status}_intent"
+    return ""
+
+
 def process_legacy_projection_batch(filenames) -> dict:
     """Promote bounded manual Markdown edits into canonical state and durable outbox rows."""
     from vector_lake.mutation_coordinator import execute_mutation_batch
@@ -2024,10 +2064,35 @@ def process_legacy_projection_batch(filenames) -> dict:
                 mutation["expected_projection_hash"] = hashlib.sha256(
                     content_bytes
                 ).hexdigest()
+
+            def reject_projection_echo() -> None:
+                expected_hash = str(mutation["expected_projection_hash"])
+                reason = _legacy_projection_echo_reason(filename, expected_hash)
+                if not reason:
+                    return
+                live_exists = target.exists()
+                live_hash = (
+                    hashlib.sha256(target.read_bytes()).hexdigest()
+                    if live_exists
+                    else ""
+                )
+                if live_exists != target_exists or live_hash != expected_hash:
+                    raise RuntimeError(
+                        "Projection changed before legacy echo suppression for "
+                        f"{filename}"
+                    )
+                raise _LegacyProjectionEcho(reason)
+
             execute_mutation_batch(
-                [mutation], validation_mode="schema", origin="watchdog"
+                [mutation],
+                validation_mode="schema",
+                origin="watchdog",
+                precondition_callback=reject_projection_echo,
             )
             stats["completed"] += 1
+        except _LegacyProjectionEcho as exc:
+            stats["completed"] += 1
+            log.debug("Ignored projection echo for %s: %s", filename, exc)
         except Exception as exc:
             stats["failed"] += 1
             log.error("Failed to process manual edit for %s: %s", filename, exc)
