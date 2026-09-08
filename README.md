@@ -631,6 +631,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_PAYLOAD_ROOT`：显式覆盖 MCP `payload_file` 的批准根目录；未设置时只接受活动数据库同级的 `brain/<run>/scratch/`。Codex、Pi 与 Gemini 的其他 sandbox 必须由各自薄适配器显式映射，core 不猜宿主目录。
 - `VECTOR_LAKE_AGENT_SANDBOX_ROOTS`：由宿主显式配置、以 `os.pathsep` 分隔的绝对 sandbox 根（Windows 为 `;`）；graph 的显式与默认输出均须位于这些根内。省略 `output_dir` 时选第一个根；未配置/空根列表、空输出目录、相对路径、`..`、symlink/reparse 路径均失败关闭，不推断目录或扩权。
 - `visualize_vector_lake` / `graph` 只导出已提交且通过当前 canonical generation 校验的投影快照，不 bootstrap、不重建；缺失、陈旧或损坏时须另行显式修复。MCP 保留 bounded heavy executor，但此唯一导出工具不占 canonical heavy gate，仍使用 projection publish lock。HTML 原子写入 sandbox，结果报告 as-of generation、节点数及 claim 投影默认上游 2500 节点截断边界。页面含本地摘要等数据，打开本身无外联；只有用户主动点击 CDN 加载按钮才加载外部渲染器，外部脚本可访问文件内全部图谱数据。浏览器启动失败不代表文件保存失败。
+- 图谱详情的「相关 Wiki」仅按当前导出 `pageGraph.edges` 的已有有限权重排序：双向邻居、同目标取最强边、同权重按 ID 排序；默认 5 项，可展开。它不是相似概率或新的全局评分。节点选择与「打开文件」分离，支持返回；隐藏目标须明确同意显示该分类。直接链接度数不等于加权邻居数。摘要只作安全纯文本摘录展示，清理明确的模板指令和 Markdown 标记，可展开并查看原始字段，不改索引。来源与技术指标默认折叠；Claim 视图不显示相关 Wiki。筛选/配色不重置布局；「冻结布局」固定模拟节点但保留相机和选择交互。当前导出边无显式方向，不显示方向粒子。
 - `VECTOR_LAKE_PAYLOAD_MAX_BYTES`：单个 MCP sandbox payload 上限，默认 `5 MiB`。
 - `VECTOR_LAKE_WIKI_BATCH_MAX_BYTES`：`write_wiki_batch` 全批 payload 的 UTF-8 字节上限，默认 `16 MiB`，无论配置如何都不能超过 `64 MiB`。
 - `VECTOR_LAKE_WIKI_BATCH_SCHEMA_MAINTENANCE_ALLOWLIST`：可信宿主提供的 JSON 文件名数组；未设置时 schema-maintenance 一律拒绝。manifest 请求必须是该精确清单的子集，且每项仍需绑定非空 canonical version 与 projection SHA-256；该能力不接受 `Source_*` 维护例外。
