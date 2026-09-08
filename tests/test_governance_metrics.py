@@ -1,6 +1,6 @@
 import hashlib
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -240,7 +240,7 @@ def test_governance_debt_missing_tables_is_structured_and_read_only(
 ):
     database_path = db_store.peek_db_path()
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute("CREATE TABLE unrelated (value TEXT)")
     before = _database_identity(database_path)
     forbidden_initializer = _fail_storage_initialization

@@ -5,6 +5,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1438,6 +1439,212 @@ def test_backup_retention_empty_absent_root_apply_is_safe(tmp_path, monkeypatch)
     assert result["applied"] is True
     assert result["deleted_count"] == 0
     assert not (meta / "backups").exists()
+
+
+def _recovery_retention_backups(memory: Path):
+    from tests.test_projection_v2_recovery import _different_pending_roots
+    from vector_lake import tool_projection
+
+    pending, previous_paths, pending_paths = _different_pending_roots(memory)
+    recovery = Path(create_maintenance_backup("retention_pending"))
+    _set_manifest_created_at(
+        recovery, created_at=datetime.now(timezone.utc) - timedelta(days=120),
+    )
+    root = recovery.parent
+    ordinary = _complete_backup(root, "ordinary_old", age=timedelta(days=90))
+    newest = _complete_backup(root, "ordinary_new", age=timedelta(days=60))
+    unique = pending_paths - previous_paths
+    assert unique
+    closure = {
+        tool_projection._projection_gc_object_relative(path): path.read_bytes()
+        for path in previous_paths | pending_paths
+    }
+    return recovery, ordinary, newest, pending, closure
+
+
+def _retention_physical_snapshot(root: Path):
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat().st_mtime_ns,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in [root, *root.rglob("*")]
+    }
+
+
+@pytest.mark.parametrize("state", ["pending", "retired", "tombstone"])
+def test_backup_retention_pins_unfinished_recovery_and_unique_closure(
+    isolated_memory, state,
+):
+    from vector_lake import tool_projection
+
+    recovery, ordinary, newest, pending, closure = _recovery_retention_backups(isolated_memory)
+    if state == "retired":
+        assert tool_projection._retire_pending_projection_from_backup(recovery) is True
+        assert db_store.get_projection_runtime_v9()["status"] == "rebuild_required"
+    else:
+        assert db_store.get_projection_runtime_v9() == pending
+    if state == "tombstone":
+        tombstone = recovery.parent / ".retention-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tombstone"
+        recovery.rename(tombstone)
+        recovery = tombstone
+        _set_age(recovery, age=timedelta(hours=72))
+    kwargs: dict[str, Any] = {"keep_latest": 1, "min_age_days": 30, "stage_ttl_hours": 24}
+    before = _retention_physical_snapshot(isolated_memory)
+
+    preview = json.loads(tool_backup_retention.backup_retention_maintenance(**kwargs))
+
+    assert _retention_physical_snapshot(isolated_memory) == before
+    assert {item["name"] for item in preview["candidates"]} == {ordinary.name}
+    protected = {item["name"]: item for item in preview["protected"]}
+    assert protected[recovery.name]["reason"] == "projection_recovery_unverified_completion"
+    assert protected[newest.name]["reason"] == "keep_latest"
+    result = json.loads(tool_backup_retention.backup_retention_maintenance(
+        dry_run=False, confirmation=preview["fingerprint"], **kwargs,
+    ))
+    assert result["deleted"] == [ordinary.name]
+    assert result["failed_count"] == 0
+    assert not ordinary.exists()
+    assert newest.is_dir() and recovery.is_dir()
+    for relative, content in closure.items():
+        assert (recovery / relative).read_bytes() == content
+
+
+@pytest.mark.parametrize("damage", [
+    "missing_receipt", "stripped_receipt", "corrupt_receipt", "mismatched_receipt",
+    "missing_manifest", "missing_unique_object",
+])
+def test_backup_retention_refuses_damaged_recovery_after_preview(isolated_memory, damage):
+    recovery, ordinary, newest, _pending, closure = _recovery_retention_backups(isolated_memory)
+    kwargs: dict[str, Any] = {"keep_latest": 1, "min_age_days": 30, "stage_ttl_hours": 24}
+    preview = json.loads(tool_backup_retention.backup_retention_maintenance(**kwargs))
+    receipt_path = recovery / "projection_recovery.json"
+    manifest_path = recovery / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if damage in {"missing_receipt", "stripped_receipt"}:
+        receipt_path.unlink()
+        if damage == "stripped_receipt":
+            manifest["copied"].remove(receipt_path.name)
+            del manifest["artifact_sha256"][receipt_path.name]
+            del manifest["artifact_bytes"][receipt_path.name]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif damage in {"corrupt_receipt", "mismatched_receipt"}:
+        if damage == "corrupt_receipt":
+            raw = b"{broken"
+        else:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["database_sha256"] = "0" * 64
+            raw = json.dumps(receipt).encode("utf-8")
+        receipt_path.write_bytes(raw)
+        # Match the outer inventory: the receipt validator must still reject the proof.
+        manifest["artifact_sha256"][receipt_path.name] = hashlib.sha256(raw).hexdigest()
+        manifest["artifact_bytes"][receipt_path.name] = len(raw)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif damage == "missing_manifest":
+        manifest_path.unlink()
+    else:
+        ordinary_objects = set(manifest["projection_v2"]["object_artifacts"])
+        unique_objects = set(closure) - ordinary_objects
+        assert unique_objects
+        (recovery / sorted(unique_objects)[0]).unlink()
+    before = _retention_physical_snapshot(isolated_memory)
+
+    for dry_run in (True, False):
+        with pytest.raises(RuntimeError, match="projection_recovery_protection_failed"):
+            tool_backup_retention.backup_retention_maintenance(
+                dry_run=dry_run, confirmation=preview["fingerprint"], **kwargs,
+            )
+        assert _retention_physical_snapshot(isolated_memory) == before
+    assert recovery.is_dir() and ordinary.is_dir() and newest.is_dir()
+
+
+def test_backup_retention_fingerprint_binds_valid_recovery_receipt(isolated_memory):
+    recovery, ordinary, _newest, _pending, _closure = _recovery_retention_backups(isolated_memory)
+    kwargs: dict[str, Any] = {"keep_latest": 1, "min_age_days": 30, "stage_ttl_hours": 24}
+    preview = json.loads(tool_backup_retention.backup_retention_maintenance(**kwargs))
+    receipt_path = recovery / "projection_recovery.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["successor"]["updated_at"] = "2026-01-01T00:00:00+00:00"
+    raw = json.dumps(receipt).encode("utf-8")
+    receipt_path.write_bytes(raw)
+    manifest_path = recovery / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_sha256"][receipt_path.name] = hashlib.sha256(raw).hexdigest()
+    manifest["artifact_bytes"][receipt_path.name] = len(raw)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    current = json.loads(tool_backup_retention.backup_retention_maintenance(**kwargs))
+
+    assert current["candidates"] == preview["candidates"]
+    assert current["fingerprint"] != preview["fingerprint"]
+    with pytest.raises(ValueError, match="exactly match"):
+        tool_backup_retention.backup_retention_maintenance(
+            dry_run=False, confirmation=preview["fingerprint"], **kwargs,
+        )
+    assert ordinary.is_dir() and recovery.is_dir()
+
+
+def test_backup_retention_rechecks_recovery_after_candidate_preflight(isolated_memory, monkeypatch):
+    recovery, ordinary, _newest, _pending, _closure = _recovery_retention_backups(isolated_memory)
+    kwargs: dict[str, Any] = {"keep_latest": 1, "min_age_days": 30, "stage_ttl_hours": 24}
+    preview = json.loads(tool_backup_retention.backup_retention_maintenance(**kwargs))
+    real_revalidate = tool_backup_retention._revalidate_candidate
+    changed = False
+
+    def remove_receipt_after_preflight(root, item, **options):
+        nonlocal changed
+        result = real_revalidate(root, item, **options)
+        if item["name"] == ordinary.name and not changed:
+            (recovery / "projection_recovery.json").unlink()
+            changed = True
+        return result
+
+    monkeypatch.setattr(tool_backup_retention, "_revalidate_candidate", remove_receipt_after_preflight)
+    result = json.loads(tool_backup_retention.backup_retention_maintenance(
+        dry_run=False, confirmation=preview["fingerprint"], **kwargs,
+    ))
+
+    assert changed
+    assert result["deleted_count"] == 0 and result["failed_count"] == 1
+    assert "projection_recovery_protection_failed" in result["failed"][0]["reason"]
+    assert ordinary.is_dir() and recovery.is_dir()
+    assert not list(recovery.parent.glob(".retention-*.tombstone"))
+
+
+@pytest.mark.parametrize("failure", ["scan_error", "scan_limit"])
+def test_backup_retention_refuses_incomplete_protection_scan(backup_root, monkeypatch, failure):
+    from contextlib import contextmanager
+
+    candidate = _complete_backup(backup_root, "old", age=timedelta(days=90))
+    _complete_backup(backup_root, "new", age=timedelta(days=60))
+    kwargs: dict[str, Any] = {"keep_latest": 1, "min_age_days": 30, "stage_ttl_hours": 24}
+    preview = json.loads(tool_backup_retention.backup_retention_maintenance(**kwargs))
+    assert [item["name"] for item in preview["candidates"]] == [candidate.name]
+    real_scandir = os.scandir
+    (backup_root / "scan-entry").write_bytes(b"not a backup")
+
+    @contextmanager
+    def incomplete_scan(path):
+        if Path(path) != backup_root:
+            with real_scandir(path) as entries:
+                yield entries
+            return
+        if failure == "scan_error":
+            raise PermissionError("injected protection scan failure")
+        with real_scandir(path) as entries:
+            entry = next(item for item in entries if item.name == "scan-entry")
+            yield iter([entry] * 10_001)
+
+    monkeypatch.setattr(tool_backup_retention.os, "scandir", incomplete_scan)
+    expected = "injected protection scan failure" if failure == "scan_error" else "backup_limit_exceeded"
+    for dry_run in (True, False):
+        with pytest.raises(RuntimeError, match=expected):
+            tool_backup_retention.backup_retention_maintenance(
+                dry_run=dry_run, confirmation=preview["fingerprint"], **kwargs,
+            )
+    monkeypatch.setattr(tool_backup_retention.os, "scandir", real_scandir)
+    assert candidate.is_dir()
+    assert not list(backup_root.glob(".retention-*.tombstone"))
 
 
 def test_backup_retention_reports_quota_that_protected_backup_cannot_reclaim(

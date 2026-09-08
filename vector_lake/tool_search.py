@@ -689,28 +689,59 @@ def _expand_query_locally(query: str) -> list[str]:
     return list(tokens)
 
 
+def _bounded_excerpt(text: str, limit: int) -> tuple[str, bool]:
+    limit = max(0, limit)
+    if len(text) <= limit:
+        return text, False
+    marker = "...[truncated]"[:limit]
+    return text[:limit - len(marker)] + marker, True
+
+
 def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) -> str:
     state = memory.get("validity_state", "active")
     memory_type = memory.get("memory_type", "fact")
     score = memory.get("retrieval_score", memory.get("memory_score", 0))
-    text = " ".join(str(memory.get("text", "")).split())[:420]
+    text, truncated = _bounded_excerpt(
+        " ".join(str(memory.get("text", "")).split()), 420
+    )
     source = (
         memory.get("source_page")
         or memory.get("source_claim_id")
         or "operational_memory"
     )
+    identities = {
+        field: str(memory[field])
+        for field in ("memory_id", "source_claim_id", "source_page")
+        if memory.get(field)
+    }
     if as_xml:
         attrs = (
             f"ID={quoteattr(f'Memory_{index}')} Type={quoteattr(str(memory_type))} "
             f"State={quoteattr(str(state))} Score={quoteattr(str(score))} "
-            f"Source={quoteattr(str(source))}"
+            f"Source={quoteattr(str(source))} Truncated={quoteattr(str(truncated).lower())}"
+        )
+        attrs += "".join(
+            f" {field}={quoteattr(value)}" for field, value in identities.items()
         )
         return f"<Memory_Item {attrs}>{escape(text)}</Memory_Item>\n"
+    identity_text = "".join(
+        f"  {field}: {value}\n" for field, value in identities.items()
+    )
     return (
         f"- **{memory_type}:{memory.get('memory_key', memory.get('memory_id'))}** "
         f"(score: {score:.2f}, state: {state})\n"
         f"  {text}\n"
-        f"  Source: {source}\n\n"
+        f"  Source: {source}\n"
+        f"{identity_text}\n"
+    )
+
+
+def _operational_memory_unavailable_guidance(reason: str) -> str:
+    return (
+        f"Operational memory unavailable ({reason}). "
+        "Run `python cli.py doctor` to diagnose; verify the configured memory/meta "
+        "paths and ask the operator to repair or rebuild the reported projection "
+        "before retrying. No running maintenance worker has been verified."
     )
 
 
@@ -720,6 +751,8 @@ def format_operational_memory_results(
     as_xml: bool = False,
     include_history: bool = False,
     memory_types: list[str] | None = None,
+    *,
+    _raise_on_unavailable: bool = False,
 ) -> str:
     try:
         memories = governance_store.search_operational_memory(
@@ -729,16 +762,15 @@ def format_operational_memory_results(
             memory_types=memory_types,
         )
     except governance_store.OperationalMemoryNotReady as exc:
+        if _raise_on_unavailable:
+            raise
         if as_xml:
             return (
                 "<MemoryResults State='unavailable' "
                 f"Reason={quoteattr(exc.reason)} "
                 f"RetryAfterSeconds={quoteattr(str(exc.retry_after_seconds))}/>"
             )
-        return (
-            f"Operational memory unavailable ({exc.reason}); retry after "
-            f"{exc.retry_after_seconds}s while automatic index maintenance runs."
-        )
+        return _operational_memory_unavailable_guidance(exc.reason)
     if memory_types:
         allowed_memory_types = {
             str(memory_type).strip().lower() for memory_type in memory_types
@@ -782,7 +814,30 @@ def _format_claim_mode_compatibility(
     )
 
 
+_MEMORY_PACKET_TRUNCATION_SUFFIX = "\n...[memory packet truncated]\n</MEMORY_PACKET>"
+
+
+def _bounded_memory_packet_text(packet: str, max_chars: int) -> str:
+    if len(packet) <= max_chars:
+        return packet
+    room = max_chars - len(_MEMORY_PACKET_TRUNCATION_SUFFIX)
+    if room <= 0:
+        return ""
+    # Cut only at complete text lines, never inside the opening tag or an
+    # escaped XML entity. The closing element and disclosure are reserved.
+    boundary = packet.rfind("\n", 0, room + 1)
+    if boundary < 0:
+        return ""
+    return packet[:boundary] + _MEMORY_PACKET_TRUNCATION_SUFFIX
+
+
 def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
+    if max_chars <= 0:
+        return {
+            "packet": "", "memory_count": 0, "warning_count": 1,
+            "omitted_count": None, "budget_truncated": True,
+            "text_truncated_count": 0,
+        }
     try:
         memories, historical = governance_store.search_operational_memory_views(
             query,
@@ -793,14 +848,16 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         packet = (
             f"<MEMORY_PACKET status='unavailable' reason={quoteattr(exc.reason)} "
             f"retry_after_seconds={quoteattr(str(exc.retry_after_seconds))}>\n"
-            "Operational-memory projection is converging automatically.\n"
+            f"{escape(_operational_memory_unavailable_guidance(exc.reason))}\n"
             "</MEMORY_PACKET>"
         )
         return {
-            "packet": packet,
+            "packet": _bounded_memory_packet_text(packet, max_chars),
             "memory_count": 0,
             "warning_count": 1,
-            "omitted_count": 0,
+            "omitted_count": None,
+            "budget_truncated": len(packet) > max_chars,
+            "text_truncated_count": 0,
             "retry_after_seconds": exc.retry_after_seconds,
         }
     stale_or_conflicted = [
@@ -828,14 +885,16 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         section = type_to_section.get(
             memory.get("memory_type", "fact"), "Relevant Facts"
         )
-        text = " ".join(str(memory.get("text", "")).split())
+        text, truncated = _bounded_excerpt(
+            " ".join(str(memory.get("text", "")).split()), 420
+        )
         line = (
             f"- [{memory.get('memory_score', 0):.2f}/{memory.get('validity_state', 'active')}] "
-            f"{text[:420]}"
+            f"{text}"
         )
         if memory.get("source_page"):
             line += f" ({memory['source_page']})"
-        sections[section].append(line)
+        sections[section].append((line, truncated))
         if memory.get("source_claim_id"):
             evidence_pointers.append(
                 f"- {memory.get('source_claim_id')} -> {memory.get('source_page', 'unknown')}"
@@ -848,6 +907,8 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         "Policy: Use this packet as the machine-facing runtime memory. If it conflicts with wiki prose, prefer active non-conflicted memory items and surface the conflict.",
         "",
     ]
+    memory_lines = set()
+    truncated_lines = set()
     for title in (
         "Current Preferences",
         "Open Decisions",
@@ -855,15 +916,24 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         "Relevant Facts",
     ):
         lines.append(f"## {title}")
-        lines.extend(sections[title] or ["- None matched."])
+        for line, truncated in sections[title]:
+            memory_lines.add(len(lines))
+            if truncated:
+                truncated_lines.add(len(lines))
+            lines.append(line)
+        if not sections[title]:
+            lines.append("- None matched.")
         lines.append("")
 
     lines.append("## Conflicts / Stale Warnings")
     if stale_or_conflicted:
         for memory in stale_or_conflicted:
+            text, truncated = _bounded_excerpt(str(memory.get("text", "")), 260)
+            if truncated:
+                truncated_lines.add(len(lines))
             lines.append(
                 f"- [{memory.get('validity_state')}] {memory.get('memory_type')}:{memory.get('memory_key')} "
-                f"-> {str(memory.get('text', ''))[:260]}"
+                f"-> {text}"
             )
     else:
         lines.append("- None matched.")
@@ -873,19 +943,28 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     lines.extend(evidence_pointers[:12] or ["- None matched."])
     lines.append("</MEMORY_PACKET>")
 
-    packet = "\n".join(lines)
-    omitted = 0
-    if len(packet) > max_chars:
-        packet = (
-            packet[: max(0, max_chars - 80)].rstrip()
-            + "\n...[memory packet truncated]\n</MEMORY_PACKET>"
-        )
-        omitted = max(0, len(memories) - 12)
+    # This is an XML element containing Markdown text, not trusted markup.
+    lines[1:-1] = [escape(line) for line in lines[1:-1]]
+    full_packet = "\n".join(lines)
+    packet = _bounded_memory_packet_text(full_packet, max_chars)
+    budget_truncated = len(full_packet) > max_chars
+    prefix_chars = len(packet)
+    if budget_truncated:
+        prefix_chars = max(0, prefix_chars - len(_MEMORY_PACKET_TRUNCATION_SUFFIX))
+    included = text_truncated_count = end = 0
+    for index, line in enumerate(lines):
+        end += len(line) + bool(index)
+        if end > prefix_chars:
+            break
+        included += index in memory_lines
+        text_truncated_count += index in truncated_lines
     return {
         "packet": packet,
-        "memory_count": len(memories),
+        "memory_count": included,
         "warning_count": len(stale_or_conflicted),
-        "omitted_count": omitted,
+        "omitted_count": len(memories) - included,
+        "budget_truncated": budget_truncated,
+        "text_truncated_count": text_truncated_count,
     }
 
 
@@ -1516,6 +1595,8 @@ def search_vector_lake(
     include_history: bool = False,
     mode: str = "page",
     filter_expr: str = None,
+    *,
+    _raise_on_unavailable: bool = False,
 ):
     query = str(query or "").strip()
     if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
@@ -1533,6 +1614,7 @@ def search_vector_lake(
                 top_k=top_k,
                 as_xml=as_xml,
                 include_history=include_history,
+                _raise_on_unavailable=_raise_on_unavailable,
             ),
             as_xml=as_xml,
         )
@@ -1544,6 +1626,7 @@ def search_vector_lake(
                 as_xml=as_xml,
                 include_history=include_history,
                 memory_types=["fact"],
+                _raise_on_unavailable=_raise_on_unavailable,
             ),
             as_xml=as_xml,
         )
@@ -1554,6 +1637,7 @@ def search_vector_lake(
             as_xml=as_xml,
             include_history=include_history,
             memory_types=["fact"],
+            _raise_on_unavailable=_raise_on_unavailable,
         )
         return _with_semantic_readiness(
             _format_claim_mode_compatibility(
@@ -1598,6 +1682,11 @@ def search_vector_lake(
     wiki_dir = str(get_wiki_dir())
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
+        if _raise_on_unavailable:
+            raise SearchIndexError(
+                "Search unavailable (index_missing). Run `python cli.py doctor` "
+                "to diagnose the configured paths and projection before retrying."
+            )
         return finish(
             "Lake is drying. No index.json found, please ingest sources first."
         )
@@ -1883,13 +1972,15 @@ def search_vector_lake(
     for index, (score, node) in enumerate(final_scored):
         filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
         snippet = ""
+        snippet_status = "missing"
         if os.path.exists(filepath):
             try:
                 snippet = _read_search_snippet(filepath)
+                snippet_status = "available" if snippet.strip() else "empty"
             except SearchIndexError:
                 backend_issues.append("wiki_snippet")
                 snippet = "[Snippet unavailable]"
-
+                snippet_status = "unavailable"
         tension_edges = node.get("tension_edges", [])
         tension_info = ""
         if tension_edges:
@@ -1901,9 +1992,14 @@ def search_vector_lake(
             source_name = f"{node['_key']}.md"
             block = (
                 f"<Evidence_Node ID={quoteattr(f'Wiki_{index}')} "
-                f"Source={quoteattr(source_name)}>\n"
+                f"Source={quoteattr(source_name)} ContentStatus={quoteattr(snippet_status)}>\n"
                 f"{escape(tension_info + snippet)}\n</Evidence_Node>\n"
             )
+        elif snippet_status != "available":
+            # Keep the discovery result, but not the evidence-snippet shape
+            # consumed by legacy context assembly. No unavailable body is read.
+            title = " ".join(str(node.get("title", node["_key"])).split()).replace("*", r"\*")
+            block = f"- **{title}** (score: {score:.1f}; snippet: {snippet_status})\n\n"
         else:
             block = f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
         block_bytes = len(block.encode("utf-8"))
@@ -1932,10 +2028,31 @@ def search_vector_lake(
     return finish(result)
 
 
+def _context_purpose(max_chars: int) -> str:
+    from vector_lake.purpose_contract import PurposeContractError, render_strategy_directive
+
+    try:
+        purpose = render_strategy_directive()
+    except PurposeContractError as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+        purpose = (
+            "[STRATEGIC PURPOSE STATUS: missing]\n"
+            "purpose.md is absent; strategic alignment has not been checked."
+        )
+    if len(purpose) > max_chars:
+        raise ValueError(
+            f"max_chars must be at least {len(purpose)} to preserve the strategic purpose"
+        )
+    return purpose
+
+
 def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
     """Build bounded request context without materializing the full graph index."""
-    memory_packet = build_memory_packet(query, max_chars=int(max_chars * 0.50))
-    wiki_budget = max(0, max_chars - len(memory_packet["packet"]))
+    purpose = _context_purpose(max_chars)
+    retrieval_budget = max_chars - len(purpose)
+    memory_packet = build_memory_packet(query, max_chars=int(retrieval_budget * 0.50))
+    wiki_budget = max(0, retrieval_budget - len(memory_packet["packet"]))
 
     from vector_lake.db_store import (
         get_connection,
@@ -1991,10 +2108,18 @@ def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
 
     wiki_context = ""
     page_count = 0
+    truncated_count = 0
+    retrieval_degraded = False
+    included_keys = []
     for row in search_rows:
         title = str(row.get("title") or row.get("node_key") or "Untitled")
         node_key = str(row.get("node_key") or "")
-        summary = " ".join(str(row.get("summary") or "").split())[:1200]
+        summary, truncated = _bounded_excerpt(
+            " ".join(str(row.get("summary") or "").split()), 1200
+        )
+        if not summary:
+            retrieval_degraded = True
+            continue
         rank = float(row.get("rank") or 0.0)
         block = (
             f"- **{title}** (rank: {rank:.4f}, source: {node_key}.md)\n  {summary}\n\n"
@@ -2003,24 +2128,24 @@ def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
             break
         wiki_context += block
         page_count += 1
-
-    purpose = ""
-    try:
-        from vector_lake.purpose_contract import render_strategy_directive
-
-        purpose = render_strategy_directive()
-    except Exception:
-        pass
+        truncated_count += truncated
+        included_keys.append(node_key)
 
     return {
         "memory_packet": memory_packet["packet"],
         "memory_count": memory_packet["memory_count"],
         "memory_warning_count": memory_packet["warning_count"],
         "memory_omitted_count": memory_packet["omitted_count"],
+        "memory_packet_truncated": memory_packet.get("budget_truncated", False),
+        "memory_text_truncated_count": memory_packet.get("text_truncated_count", 0),
         "wiki_context": wiki_context,
         "wiki_page_count": page_count,
-        "_retrieved_page_keys": [str(row.get("node_key") or "") for row in search_rows],
+        "wiki_omitted_count": len(search_rows) - page_count,
+        "wiki_text_truncated_count": truncated_count,
+        "wiki_retrieval_degraded": retrieval_degraded,
+        "_retrieved_page_keys": included_keys,
         "index_summary": "",
+        "index_summary_truncated": False,
         "purpose": purpose,
         "budget_used": len(memory_packet["packet"]) + len(wiki_context) + len(purpose),
         "budget_max": max_chars,
@@ -2036,15 +2161,14 @@ def assemble_context(
     if lightweight:
         return _assemble_sqlite_context(query, max_chars)
 
-    index_budget = int(max_chars * TOKEN_BUDGET["index_summary"])
+    purpose = _context_purpose(max_chars)
+    retrieval_budget = max_chars - len(purpose)
+    index_budget = int(retrieval_budget * TOKEN_BUDGET["index_summary"])
 
-    # P2-2: Dynamic Sliding Window for Budget
-    # Allow memory to burst up to 50% if there are critical alerts
-    memory_packet = build_memory_packet(query, max_chars=int(max_chars * 0.50))
+    # Reserve the complete strategic purpose before sharing the retrieval budget.
+    memory_packet = build_memory_packet(query, max_chars=int(retrieval_budget * 0.50))
     actual_memory_used = len(memory_packet["packet"])
-
-    # Wiki dynamically eats the remaining budget
-    wiki_budget = max_chars - actual_memory_used - index_budget
+    wiki_budget = retrieval_budget - actual_memory_used - index_budget
 
     index_path = str(get_index_path())
     index_existed_before_search = os.path.exists(index_path)
@@ -2059,11 +2183,25 @@ def assemble_context(
             ) from exc
 
     search_results = search_vector_lake(query, top_k=15, as_xml=False)
+    retrieval_text = search_results.split("</SemanticReadinessEnvelope>\n", 1)[-1]
+    unavailable_count = len(re.findall(
+        r"^- \*\*[^\n]+?\*\* \(score: [^;\n)]+; snippet: (?:missing|empty|unavailable)\)\n",
+        retrieval_text, re.MULTILINE,
+    ))
+    first_line = retrieval_text.partition("\n")[0]
+    note = first_line if first_line.startswith("[Search degraded:") else ""
+    if unavailable_count and not note:
+        note = "[Search degraded: wiki_snippet_unavailable]"
+    retrieval_degraded = bool(note)
     wiki_context = ""
+    if note and len(note) + 2 <= wiki_budget:
+        wiki_context = note + "\n\n"
     page_count = 0
-    for match in re.finditer(
-        r"\*\*(.+?)\*\*.*?\n\s+(.*?)\.\.\.\n", search_results, re.DOTALL
-    ):
+    matches = list(re.finditer(
+        r"\*\*([^\n]+?)\*\*(?![^\n]*; snippet: (?:missing|empty|unavailable)\))[^\n]*\n\s+(.*?)\.\.\.\n",
+        retrieval_text, re.DOTALL,
+    ))
+    for match in matches:
         page_content = match.group(0)
         if len(wiki_context) + len(page_content) > wiki_budget:
             break
@@ -2071,6 +2209,7 @@ def assemble_context(
         page_count += 1
 
     index_summary = ""
+    index_summary_truncated = False
     if index_existed_before_search:
         try:
             index_data = _load_search_index(index_path)
@@ -2087,30 +2226,39 @@ def assemble_context(
                 "assembly; retry."
             )
         lines = []
-        for key, node in islice(index_data.get("nodes", {}).items(), 50):
+        nodes = index_data.get("nodes", {})
+        for key, node in islice(nodes.items(), 50):
             lines.append(f"[{node.get('type', '?')}] {node.get('title', key)}")
-        index_summary = "\n".join(lines)[:index_budget]
+        full_summary = "\n".join(lines)
+        index_summary = full_summary[:index_budget]
+        index_summary_truncated = len(full_summary) > index_budget
+        if not index_summary_truncated:
+            if isinstance(nodes, dict):
+                index_summary_truncated = len(nodes) > len(lines)
+            elif len(lines) == 50:
+                # A lazy view need not expose a count. Do not read a 51st node
+                # just to turn unknown completeness into a boolean.
+                index_summary_truncated = None
     elif os.path.exists(index_path):
         raise SearchIndexError(
             "The knowledge base projection appeared during context assembly; retry."
         )
-
-    purpose = ""
-    try:
-        from vector_lake.purpose_contract import render_strategy_directive
-
-        purpose = render_strategy_directive()
-    except Exception:
-        pass
 
     return {
         "memory_packet": memory_packet["packet"],
         "memory_count": memory_packet["memory_count"],
         "memory_warning_count": memory_packet["warning_count"],
         "memory_omitted_count": memory_packet["omitted_count"],
+        "memory_packet_truncated": memory_packet.get("budget_truncated", False),
+        "memory_text_truncated_count": memory_packet.get("text_truncated_count", 0),
         "wiki_context": wiki_context,
         "wiki_page_count": page_count,
+        "wiki_omitted_count": len(matches) - page_count + unavailable_count,
+        # This path consumes pre-rendered search snippets, not full source text.
+        "wiki_text_truncated_count": None,
+        "wiki_retrieval_degraded": retrieval_degraded,
         "index_summary": index_summary,
+        "index_summary_truncated": index_summary_truncated,
         "purpose": purpose,
         "budget_used": len(memory_packet["packet"])
         + len(wiki_context)

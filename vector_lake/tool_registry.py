@@ -5,13 +5,13 @@ the available tools. Keeping this registry lazy avoids loading graph,
 projection, embedding, and scientific dependencies into every idle process.
 """
 
+from collections.abc import Callable
 from importlib import import_module
 from threading import RLock
-from typing import Callable
-
 
 _GROUPS: dict[str, tuple[str, ...]] = {
     "vector_lake.claim_assessment": ("record_claim_assessment",),
+    "vector_lake.tool_claim_provenance": ("repair_claim_provenance",),
     "vector_lake.tool_delete": ("delete_source",),
     "vector_lake.tool_doctor": (
         "doctor_vector_lake",
@@ -36,6 +36,7 @@ _GROUPS: dict[str, tuple[str, ...]] = {
         "claim_ingest_tasks",
         "expire_ingest_tasks",
         "finalize_ingest",
+        "finalize_exact_reviewed_ingest_outputs",
         "list_ingest_tasks",
         "prepare_ingest_batch",
         "recover_terminal_ingest_outputs",
@@ -49,9 +50,7 @@ _GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "vector_lake.tool_review": ("review_vector_lake",),
     "vector_lake.tool_search": ("assemble_context", "search_vector_lake"),
-    "vector_lake.tool_semantic_campaign": (
-        "semantic_readiness_campaign_report",
-    ),
+    "vector_lake.tool_semantic_campaign": ("semantic_readiness_campaign_report",),
     "vector_lake.tool_sync": ("sync_vector_lake",),
     "vector_lake.tool_trace": ("trace_vector_lake",),
     "vector_lake.tool_timeline": ("rebuild_timeline_events_from_claims",),

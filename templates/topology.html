@@ -3,7 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <title>Vector Lake Topology</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: radial-gradient(circle at center, #111827 0%, #030712 100%); overflow: hidden; font-family: 'Inter', sans-serif; color: #E5E7EB; }
         #3d-graph { width: 100%; height: 100%; position: absolute; inset: 0; z-index: 1; }
@@ -61,14 +60,21 @@
             background: rgba(0,0,0,0.8); padding: 20px 40px; border-radius: 8px; color: #fff; z-index: 100;
         }
     </style>
-    <script src="https://unpkg.com/3d-force-graph"></script>
 </head>
 <body>
+    <div id="renderer-consent" style="position:fixed;inset:0;z-index:10000;background:#111827;padding:3em;overflow:auto">
+        <h2>Local graph export</h2>
+        <p>This file embeds local graph data, including summaries. Nothing is loaded from the network until you choose below.</p>
+        <p><strong>External scripts can access all graph data embedded in this file.</strong> Loading the renderer contacts unpkg.com and trusts its third-party code.</p>
+        <pre id="export-metadata" style="white-space:pre-wrap"></pre>
+        <button id="load-renderer" type="button">Load external CDN renderer and display graph</button>
+        <p id="renderer-status" role="status"></p>
+    </div>
     <div id="loading">Computing Topology...</div>
     <div id="3d-graph"></div>
 
     <div id="info-panel">
-        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible'); selectedNode = null; if(typeof Graph !== 'undefined') Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());">×</div>
+        <div id="close-btn">×</div>
         <h2 id="info-title"></h2>
         <div id="info-meta"></div>
         <div class="info-section">
@@ -143,16 +149,25 @@
             if (!url) return null;
             const strUrl = String(url).trim();
             if (!strUrl) return null;
-            const schemeMatch = strUrl.match(/^([a-z][a-z0-9+.-]*):/i);
-            if (schemeMatch) {
-                const scheme = schemeMatch[1].toLowerCase();
-                if (!['http', 'https', 'file'].includes(scheme)) return null;
+            try {
+                const parsed = new URL(strUrl);
+                if (!['http:', 'https:', 'file:'].includes(parsed.protocol)) return null;
+                return parsed.href;
+            } catch {
+                return null;
             }
-            return encodeURI(strUrl);
         }
 
         const rawData = %%GRAPH_DATA%%;
-        const memoryBasePath = "%%MEMORY_BASE_PATH%%";
+        const memoryBasePath = %%MEMORY_BASE_PATH%%;
+
+        function memoryFileURL(relativePath) {
+            // The base is already encoded by Path.as_uri(); encode only raw path components.
+            const encodedPath = String(relativePath).split('/').map(encodeURIComponent).join('/');
+            return `${memoryBasePath}${encodedPath}`;
+        }
+
+        function initializeGraph() {
 
         const PAGE_COLORS = {
             "Vendor": "#8B5CF6",
@@ -308,7 +323,7 @@
             container.innerHTML = '';
             Object.entries(validityCounts).forEach(([state, count]) => {
                 const color = CLAIM_STATE_COLORS[state] || CLAIM_STATE_COLORS.unknown;
-                container.innerHTML += `<div class="metric-item"><div class="metric-color" style="background:${escapeHTML(color)}"></div>${escapeHTML(state)}: ${count}</div>`;
+                container.innerHTML += `<div class="metric-item"><div class="metric-color" style="background:${escapeHTML(color)}"></div>${escapeHTML(state)}: ${escapeHTML(count)}</div>`;
             });
             if (!container.innerHTML) {
                 container.innerHTML = '<div class="metric-item">No governance metrics.</div>';
@@ -324,7 +339,7 @@
             if (activeGraphKey === 'claim') {
                 const counts = rawData.governanceMetrics && rawData.governanceMetrics.validity_state_counts ? rawData.governanceMetrics.validity_state_counts : {};
                 Object.entries(counts).forEach(([state, count]) => {
-                    stats.innerHTML += `<div class="stat-item">${escapeHTML(state)}: ${count}</div>`;
+                    stats.innerHTML += `<div class="stat-item">${escapeHTML(state)}: ${escapeHTML(count)}</div>`;
                 });
             }
         }
@@ -414,12 +429,19 @@
             return src === focusNode.id || tgt === focusNode.id;
         }
 
+        function clearSelection() {
+            selectedNode = null;
+            document.getElementById('info-panel').classList.remove('visible');
+            Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
+        }
+        document.getElementById('close-btn').onclick = clearSelection;
+
         function renderGraph() {
             const data = toGraphData(currentGraph());
             neighbors = buildNeighbors(data);
             Graph.graphData(data)
                 .nodeId('id')
-                .nodeLabel(node => `[${node.raw_type || node.group}] ${node.name || node.id} (关联: ${node.degree || 0})`)
+                .nodeLabel(node => escapeHTML(`[${node.raw_type || node.group}] ${node.name || node.id} (关联: ${node.degree || 0})`))
                 .nodeVal(node => Math.max(2.5, Math.sqrt(node.degree || 1) * 3.8))
                 .nodeRelSize(7)
                 .nodeColor(currentColor)
@@ -464,11 +486,7 @@
                     Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
                 })
                 .onNodeClick(node => selectNode(node.id))
-                 .onBackgroundClick(() => {
-                     selectedNode = null;
-                     document.getElementById('info-panel').classList.remove('visible');
-                     Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
-                 });
+                .onBackgroundClick(clearSelection);
 
             // Adjust Forces for 1500+ nodes
             Graph.d3Force('charge').strength(-200);
@@ -493,7 +511,7 @@
 
         function nodeHref(node) {
             if (activeGraphKey === 'claim') return null;
-            return `${memoryBasePath}wiki/${node.id}.md`;
+            return memoryFileURL(`wiki/${node.id}.md`);
         }
 
         function selectNode(nodeId) {
@@ -565,7 +583,7 @@
             if (links.children.length === 0) links.innerHTML = '<li>None</li>';
 
             (Array.isArray(node.sources) ? node.sources : []).forEach(source => {
-                const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
+                const hrefValue = memoryFileURL(activeGraphKey === 'claim' ? `wiki/${source}` : source);
                 const li = document.createElement('li');
                 const safeSourceHref = sanitizeURL(hrefValue);
                 if (safeSourceHref) {
@@ -642,6 +660,28 @@
         renderSearch();
         renderGraph();
         setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 800);
+        }
+
+        document.getElementById('export-metadata').textContent = JSON.stringify(rawData.exportMetadata, null, 2);
+        document.getElementById('load-renderer').onclick = () => {
+            const button = document.getElementById('load-renderer');
+            button.disabled = true;
+            document.getElementById('renderer-status').textContent = 'Loading external renderer…';
+            const script = document.createElement('script');
+            script.src = 'https://unpkg.com/3d-force-graph';
+            script.onload = () => {
+                try {
+                    initializeGraph();
+                    document.getElementById('renderer-consent').style.display = 'none';
+                } catch (error) {
+                    document.getElementById('renderer-status').textContent = 'Renderer initialization failed. The local export remains saved.';
+                }
+            };
+            script.onerror = () => {
+                document.getElementById('renderer-status').textContent = 'External renderer could not load. The local export remains saved.';
+            };
+            document.head.appendChild(script);
+        };
     </script>
 </body>
 </html>

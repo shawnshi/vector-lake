@@ -7,6 +7,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from itertools import islice
@@ -1898,8 +1899,13 @@ def process_mutation_outbox_batch(
 ) -> dict:
     """Process one durable outbox batch; per-row failures never abort peers."""
     from vector_lake import db_store, indexer
-    from vector_lake.mutation_coordinator import materialize_markdown_projection
-    from vector_lake.wiki_utils import get_wiki_dir, normalize_semantic_text
+    from vector_lake.mutation_coordinator import (
+        _discard_staged_projection,
+        _publish_staged_projection,
+        _stage_markdown_projection,
+        resolve_wiki_mutation_path,
+    )
+    from vector_lake.wiki_utils import normalize_semantic_text
 
     budget_seconds = _outbox_batch_budget_seconds()
     deadline = time.monotonic() + budget_seconds
@@ -1936,7 +1942,12 @@ def process_mutation_outbox_batch(
                 continue
             if not _renew_mutation_outbox_lease(db_store, row, lease_seconds):
                 continue
-            target = get_wiki_dir() / filename
+            validation_mode = row.get("validation_mode") or "full"
+            target = resolve_wiki_mutation_path(
+                filename,
+                allow_existing_legacy_name=validation_mode == "schema",
+                allow_missing_legacy_delete=row["mutation_type"] == "delete",
+            )
             payload_text = row.get("payload_text")
             already_materialized = (
                 not target.exists()
@@ -1953,13 +1964,32 @@ def process_mutation_outbox_batch(
                     outbox_id, *lease_args
                 ):
                     continue
-                materialize_markdown_projection(
-                    filename,
-                    row["mutation_type"],
-                    payload_text,
-                    validation_mode=row.get("validation_mode") or "full",
-                    projection_base_hash=row.get("projection_base_hash"),
-                )
+                projection_base_hash = row.get("projection_base_hash")
+                if projection_base_hash is None:
+                    # Legacy rows had no historical CAS baseline. Capture an
+                    # observation, never replace an explicit committed baseline.
+                    projection_base_hash = (
+                        hashlib.sha256(target.read_bytes()).hexdigest()
+                        if target.exists()
+                        else ""
+                    )
+                staged = None
+                try:
+                    staged = _stage_markdown_projection(
+                        filename,
+                        row["mutation_type"],
+                        payload_text,
+                        validation_mode=validation_mode,
+                        projection_base_hash=projection_base_hash,
+                    )
+                    with db_store.transaction():
+                        if not db_store.mutation_outbox_lease_is_current(
+                            outbox_id, *lease_args
+                        ) or not db_store.mutation_outbox_is_latest_intent(outbox_id):
+                            continue
+                        _publish_staged_projection(staged)
+                finally:
+                    _discard_staged_projection(staged)
             if _renew_mutation_outbox_lease(db_store, row, lease_seconds):
                 ready_for_index.append((row, filename))
         except Exception as exc:
@@ -2782,7 +2812,9 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
     last_expiry_date_hour = ""
     last_storage_sample_date = ""
     last_storage_attempt_date_hour = ""
-    last_retention_sample_date = ""
+    last_retention_preview_date = ""
+    retention_message = "Scheduled lint heartbeat"
+    retention_error = ""
     next_memory_search_attempt = 0.0
     pending_due = ""
     next_due = ""
@@ -2882,15 +2914,14 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                 finally:
                     close_connection()
 
-            # Bound database growth: keep a small version history per family
-            # once per day.  Bounded to 128 MiB of deletes per run so a single
-            # pass can never stall the scheduler or starve writes.
+            # Preview only: deletion requires a separately approved plan.
+            # Failed previews remain eligible during the 03:00 local window.
+            retention_date = f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
             if (
-                storage_date != last_retention_sample_date
+                retention_date != last_retention_preview_date
                 and now.tm_hour == 3
                 and now.tm_min == 0
             ):
-                last_retention_sample_date = storage_date
                 _close_db: Callable[[], None] | None = None
                 try:
                     from vector_lake.db_store import close_connection as _close_db
@@ -2898,9 +2929,9 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                         history_retention_maintenance,
                     )
 
-                    log.info("Running daily history retention...")
-                    history_retention_maintenance(
-                        dry_run=False,
+                    log.info("Running daily history retention preview...")
+                    preview = json.loads(history_retention_maintenance(
+                        dry_run=True,
                         ttl_days=30,
                         batch_size=500,
                         max_delete_bytes=128 * 1024 * 1024,
@@ -2908,10 +2939,25 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                         keep_terminal_jobs=1000,
                         keep_terminal_outbox=1000,
                         keep_versions_per_family=2,
+                    ))
+                    if preview.get("preview_error"):
+                        raise RuntimeError(preview["preview_error"])
+                    if preview.get("dry_run") is not True or preview.get("applied") is not False:
+                        raise RuntimeError("History retention preview returned invalid mode")
+                    last_retention_preview_date = retention_date
+                    retention_error = ""
+                    retention_message = (
+                        "Daily history retention preview ready; operator approval required "
+                        "via history-retention preview/confirmed apply"
                     )
-                    log.info("Daily history retention completed.")
+                    log.info(
+                        "%s (candidates=%s)", retention_message,
+                        preview.get("selected_count_total"),
+                    )
                 except Exception as exc:
-                    log.warning("Daily history retention failed: %s", exc)
+                    retention_message = "Daily history retention preview failed"
+                    retention_error = str(exc)
+                    log.warning("%s: %s", retention_message, exc)
                 finally:
                     if _close_db is not None:
                         try:
@@ -3004,11 +3050,11 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
             wait_seconds = min(wait_seconds, until_memory_search)
 
             write_status(
-                "idle",
+                "error" if retention_error else "idle",
                 0,
                 index_queue.qsize(),
-                "Scheduled lint heartbeat",
-                "",
+                retention_message,
+                retention_error,
                 component="scheduler",
             )
             if stop_event.wait(wait_seconds):
@@ -3037,35 +3083,61 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
     )
 
 
-def _self_heal_projection_store() -> None:
-    """Rebuild a missing or empty projection store from SQLite canonical state.
+def _check_projection_store_for_startup() -> None:
+    """Check durable roots without traversing or repairing the object closure.
 
-    The content-addressed store under ``wiki/.projection-store`` is derived data:
-    if it is entirely absent or empty (for example after an interrupted GC or a
-    manual wipe), every ingest/search fails with ``directory_missing``.  On
-    watchdog startup we detect that condition and rebuild the projection pair
-    from canonical rows.  Rebuild is intentionally rare (disaster recovery) and
-    runs under the schema lock; a fresh maintenance backup is created and the
-    automatic retention cap bounds its growth.
+    A fresh runtime may have no projection yet. Existing locators or publication
+    state must not be mistaken for that case when their object storage is lost.
+    This bounded check is not a replacement for deep doctor/maintenance gates.
     """
-    try:
-        from vector_lake.wiki_utils import get_wiki_dir
+    from vector_lake import db_store
+    from vector_lake.projection_format_v2 import SIDECAR_FILENAME
+    from vector_lake.projection_store_v2 import ProjectionStoreV2
+    from vector_lake.wiki_utils import get_wiki_dir
 
-        store_root = get_wiki_dir() / ".projection-store"
-        objects = store_root / "objects" / "sha256"
-        healthy = objects.is_dir() and any(objects.iterdir())
-        if healthy:
-            return
-        log.warning(
-            "Projection store is missing or empty (%s); rebuilding from canonical state",
-            store_root,
+    wiki_dir = get_wiki_dir()
+    store = ProjectionStoreV2(wiki_dir)
+    durable = any(
+        (wiki_dir / name).exists()
+        for name in ("index.json", "claim_graph.json", SIDECAR_FILENAME)
+    )
+    missing_root = False
+    database = db_store.peek_db_path().resolve()
+    if database.is_file():
+        wal = database.with_name(database.name + "-wal")
+        # Avoid creating SQLite sidecars on a closed DB. An active WAL uses
+        # normal read locks, without scanning its frames or checkpointing it.
+        snapshot = (
+            db_store.checkpointed_read_only_snapshot(database)
+            if not wal.exists() or wal.stat().st_size == 0
+            else closing(sqlite3.connect(
+                f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0,
+            ))
         )
-        from vector_lake.tool_projection import rebuild_index_projection
-
-        rebuild_index_projection(dry_run=False)
-        log.info("Projection store self-healed")
-    except Exception as exc:
-        log.error("Projection store self-heal failed: %s", exc)
+        with snapshot as connection:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            has_runtime = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='projection_runtime_v9'"
+            ).fetchone()
+            if has_runtime:
+                runtime = db_store.get_projection_runtime_v9(connection)
+                sidecar = runtime.get("sidecar")
+                durable = durable or sidecar is not None
+                if sidecar is not None:
+                    missing_root = any(
+                        not store.object_path(sidecar[key]).is_file()
+                        for key in ("index_root_sha256", "claim_graph_root_sha256")
+                    )
+    objects = wiki_dir / ".projection-store" / "objects" / "sha256"
+    if durable and (missing_root or not objects.is_dir() or not any(objects.iterdir())):
+        raise RuntimeError(
+            "projection_recovery_required: durable projection object storage is missing; "
+            "keep watchdog stopped, preserve DB/locators and remaining objects, and obtain "
+            "operator-authorized recovery from a validated consistent snapshot. "
+            "Startup does not regenerate objects or bypass maintenance preflight."
+        )
 
 
 def _start_watchdog_locked(stop_event: threading.Event | None = None):
@@ -3077,6 +3149,16 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
     begin_watchdog_run(
         ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")
     )
+    try:
+        _check_projection_store_for_startup()
+    except Exception as exc:
+        log.error("Watchdog startup projection check failed: %s", exc)
+        write_status(
+            "halted", 0, index_queue.qsize(),
+            "Watchdog startup projection check failed; recovery required", str(exc),
+            component="watchdog",
+        )
+        raise
     if index_queue.restore_full_reconcile_marker():
         log.warning("Restored pending Wiki reconciliation marker after restart.")
 
@@ -3125,8 +3207,6 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
     worker_threads = {name: build_worker(name) for name in worker_specs}
     _register_background_threads(worker_threads)
     started_workers: dict[str, threading.Thread] = {}
-
-    _self_heal_projection_store()
 
     observer = Observer()
     observer_started = False

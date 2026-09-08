@@ -8,11 +8,27 @@ from datetime import datetime, timezone
 import pytest
 
 from vector_lake import db_store
+from vector_lake import diagnostic_snapshot, indexer
 from vector_lake.runtime_health import assess_runtime_health
 from vector_lake import tool_doctor
 from vector_lake.tool_doctor import doctor_vector_lake
 from vector_lake.wiki_utils import peek_meta_dir
 from vector_lake.tool_projection import projection_diff_report
+
+
+def _seed_committed_projection() -> Path:
+    db_store.init_db()
+    indexer.generate_index()
+    db_store.get_connection().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    db_store.close_all_connections()
+    return db_store.get_db_path().resolve()
+
+
+def _file_identity(path: Path):
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    return path.stat().st_size, hashlib.sha256(data).hexdigest()
 
 
 def test_read_only_diagnostics_do_not_create_meta_state(isolated_memory):
@@ -370,6 +386,76 @@ def test_doctor_uses_immutable_snapshot_for_closed_database(
 
     assert "[OK] Schema Migrations:" in report
     assert before == after
+
+
+def test_deep_doctor_keeps_committed_claim_graph_read_only(
+    isolated_memory,
+    monkeypatch,
+):
+    db_path = _seed_committed_projection()
+    wal_path = Path(str(db_path) + "-wal")
+    db_before = _file_identity(db_path)
+    wal_before = _file_identity(wal_path)
+    writer_calls: list[str] = []
+
+    def reject(label):
+        def _reject(*_args, **_kwargs):
+            writer_calls.append(label)
+            raise AssertionError(f"unexpected {label}")
+
+        return _reject
+
+    with diagnostic_snapshot.capture_diagnostic_snapshot() as snapshot:
+        monkeypatch.setattr(db_store, "get_connection", reject("get_connection"))
+        monkeypatch.setattr(
+            db_store,
+            "get_vector_connection",
+            reject("get_vector_connection"),
+        )
+        monkeypatch.setattr(
+            db_store,
+            "_load_sqlite_vec_extension",
+            reject("_load_sqlite_vec_extension"),
+        )
+
+        parity = indexer.claim_graph_projection_parity(connection=snapshot.connection)
+        assert parity["canonical_nodes"] == parity["projection_nodes"]
+        assert parity["canonical_edges"] == parity["projection_edges"]
+
+        class _LegacyConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql):
+                self.calls.append(sql)
+
+                class _Cursor:
+                    def fetchone(self_inner):
+                        return (8,)
+
+                return _Cursor()
+
+        legacy_conn = _LegacyConnection()
+        with monkeypatch.context() as context:
+            context.setattr(indexer, "is_v2_locator", lambda *_args, **_kwargs: False)
+            legacy_graph = indexer._read_claim_graph_snapshot(
+                str(indexer.get_claim_graph_path()),
+                connection=legacy_conn,
+            )
+
+        assert legacy_conn.calls == ["PRAGMA user_version"]
+        assert legacy_graph == json.loads(
+            indexer.get_claim_graph_path().read_text(encoding="utf-8")
+        )
+
+        report = doctor_vector_lake(diagnostic_snapshot=snapshot)
+
+    assert "[OK] State Consistency:" in report
+    assert "[OK] Projection Pair:" in report
+    assert "claim_graph_projection_unavailable" not in report
+    assert writer_calls == []
+    assert _file_identity(db_path) == db_before
+    assert _file_identity(wal_path) == wal_before
 
 
 def test_dependency_probe_does_not_execute_installed_module(monkeypatch):

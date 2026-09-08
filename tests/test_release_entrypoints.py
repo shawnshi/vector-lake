@@ -1,12 +1,12 @@
 import ast
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from contextlib import ExitStack
+from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -421,7 +421,7 @@ def test_launcher_stdio_initializes_lists_tools_and_runs_quick_doctor(tmp_path):
         )
 
         assert initialized["protocolVersion"] == "2024-11-05"
-        assert len(listed["tools"]) == 67
+        assert len(listed["tools"]) == 68
         doctor = json.loads(called["content"][0]["text"])
         assert doctor["mode"] == "quick"
         assert doctor["semantic_readiness"] == {
@@ -429,14 +429,25 @@ def test_launcher_stdio_initializes_lists_tools_and_runs_quick_doctor(tmp_path):
             "reason": "requires_deep_doctor",
         }
     finally:
-        if process.stdin is not None:
-            process.stdin.close()
         try:
-            returncode = process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            returncode = process.wait(timeout=5)
-        assert returncode == 0
+            if process.stdin is not None:
+                process.stdin.close()
+            try:
+                returncode = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                returncode = process.wait(timeout=5)
+            assert returncode == 0
+        finally:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            finally:
+                with ExitStack() as streams:
+                    for stream in (process.stdin, process.stdout, process.stderr):
+                        if stream is not None:
+                            streams.callback(stream.close)
 
 
 def test_cli_dotenv_loading_requires_an_explicit_absolute_file(

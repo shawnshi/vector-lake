@@ -46,6 +46,7 @@ _CLI_HEAVY_TASKS = {
     "timeline-rebuild": ("projection", 900.0),
     "topology-queue-cleanup": ("maintenance", 900.0),
     "unsupported-claim-debt": ("maintenance", 900.0),
+    "claim-provenance-repair": ("maintenance", 900.0),
     "wiki-restore": ("maintenance", 900.0),
 }
 
@@ -219,6 +220,21 @@ Usage Examples:
         "--apply",
         action="store_true",
         help="Apply the selected repair or cleanup operation.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--job-id",
+        default="",
+        help="Exact 32-hex ingest job id for --repair-debt duplicate retirement.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--expected-action",
+        default="",
+        help="Expected exact repair action; currently only supersede_duplicate.",
+    )
+    ingest_tasks_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Preview fingerprint required to apply an exact --repair-debt operation.",
     )
     ingest_tasks_parser.add_argument(
         "--max-age-seconds",
@@ -750,6 +766,25 @@ Usage Examples:
         default="",
         help="Exact candidate fingerprint returned by the matching preview.",
     )
+    provenance_repair_parser = subparsers.add_parser(
+        "claim-provenance-repair",
+        help="[MAINTENANCE] Preview or repair exact source-backed unsupported claims.",
+    )
+    provenance_repair_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the exact previewed candidate set. Defaults to dry-run.",
+    )
+    provenance_repair_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact candidate fingerprint returned by the matching preview.",
+    )
+    provenance_repair_parser.add_argument(
+        "--source-map",
+        default="",
+        help="Frozen claim-provenance-source-map/v1 JSON file inside MEMORY.",
+    )
 
     review_parser = subparsers.add_parser(
         "review",
@@ -986,6 +1021,9 @@ def main() -> int:
                     tools.reconcile_ingest_job_debt(
                         dry_run=not getattr(args, "apply", False),
                         limit=getattr(args, "limit", 20),
+                        job_id=getattr(args, "job_id", ""),
+                        expected_action=getattr(args, "expected_action", ""),
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
                     )
                 )
             elif getattr(args, "cleanup_orphans", False):
@@ -1023,25 +1061,19 @@ def main() -> int:
                     cluster=getattr(args, "cluster", None),
                     include_history=getattr(args, "include_history", False),
                     mode=getattr(args, "mode", "page"),
+                    _raise_on_unavailable=True,
                 )
             )
         elif args.command == "retrieval-benchmark":
             from vector_lake.retrieval_benchmark import run_retrieval_benchmark
 
-            print(
-                json.dumps(
-                    run_retrieval_benchmark(
-                        args.dataset,
-                        top_k_override=getattr(args, "top_k", None),
-                        allow_remote_embeddings=getattr(
-                            args, "allow_remote_embeddings", False
-                        ),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
+            report = run_retrieval_benchmark(
+                args.dataset,
+                top_k_override=getattr(args, "top_k", None),
+                allow_remote_embeddings=getattr(args, "allow_remote_embeddings", False),
             )
+            print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0 if report["status"] == "pass" else 2
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, "auto_fix", False)))
         elif args.command == "query":
@@ -1291,6 +1323,20 @@ def main() -> int:
                     sort_keys=True,
                 )
             )
+        elif args.command == "claim-provenance-repair":
+            print(
+                json.dumps(
+                    tools.repair_claim_provenance(
+                        dry_run=not getattr(args, "apply", False),
+                        runtime_only=True,
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
+                        source_map_path=getattr(args, "source_map", ""),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         elif args.command == "claim-assessment":
             details = json.loads(getattr(args, "details_json", "{}"))
             if not isinstance(details, dict):
@@ -1376,7 +1422,13 @@ def main() -> int:
     except Exception as exc:
         lease_failure = exc
         from vector_lake.heavy_task_gate import HeavyTaskBusy
+        from vector_lake.governance_store import OperationalMemoryNotReady
 
+        if isinstance(exc, OperationalMemoryNotReady):
+            from vector_lake.tool_search import _operational_memory_unavailable_guidance
+
+            print(_operational_memory_unavailable_guidance(exc.reason), file=sys.stderr)
+            return 1
         if isinstance(exc, HeavyTaskBusy):
             print(
                 json.dumps(exc.to_dict(), ensure_ascii=False, sort_keys=True),

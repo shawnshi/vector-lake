@@ -1,3 +1,5 @@
+from contextlib import ExitStack
+
 import json
 import os
 from pathlib import Path
@@ -57,37 +59,80 @@ def _start_holder(meta_dir: Path, *, crash_on_input: bool = False):
         stderr=subprocess.PIPE,
         text=True,
     )
-    deadline = time.monotonic() + 5
-    while not ready_path.exists() and process.poll() is None:
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.02)
-    if not ready_path.exists():
-        process.kill()
-        process.wait(timeout=5)
-        stderr = process.stderr.read() if process.stderr is not None else ""
-        pytest.fail(f"holder did not start: stderr={stderr!r}")
-    for attempt in range(10):
-        try:
-            ready_path.unlink()
-            break
-        except PermissionError:
-            if attempt == 9:
-                pytest.fail(f"holder readiness marker stayed locked: {ready_path}")
+    try:
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.02)
-    return process
+        if not ready_path.exists():
+            process.kill()
+            process.wait(timeout=5)
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            pytest.fail(f"holder did not start: stderr={stderr!r}")
+        for attempt in range(10):
+            try:
+                ready_path.unlink()
+                break
+            except PermissionError:
+                if attempt == 9:
+                    pytest.fail(f"holder readiness marker stayed locked: {ready_path}")
+                time.sleep(0.02)
+        return process
+    except BaseException:
+        _finish_holder(process)
+        raise
 
 
 def _finish_holder(process: subprocess.Popen) -> None:
-    if process.poll() is None and process.stdin is not None:
-        process.stdin.write("\n")
-        process.stdin.flush()
     try:
+        if process.poll() is None and process.stdin is not None:
+            process.stdin.write("\n")
+            process.stdin.flush()
         process.wait(timeout=5)
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
+        try:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        finally:
+            with ExitStack() as streams:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        streams.callback(stream.close)
+
+
+@pytest.mark.parametrize("failure", [None, "assertion", "timeout"])
+def test_finish_holder_reaps_and_closes_owned_streams(tmp_path, monkeypatch, failure):
+    holder = _start_holder(tmp_path / "meta")
+    original_wait = holder.wait
+    if failure == "timeout":
+        calls = 0
+
+        def wait(*, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise subprocess.TimeoutExpired(holder.args, timeout)
+            return original_wait(timeout=timeout)
+
+        monkeypatch.setattr(holder, "wait", wait)
+
+    if failure == "assertion":
+        with pytest.raises(AssertionError, match="injected assertion"):
+            try:
+                raise AssertionError("injected assertion")
+            finally:
+                _finish_holder(holder)
+    elif failure == "timeout":
+        with pytest.raises(subprocess.TimeoutExpired):
+            _finish_holder(holder)
+    else:
+        _finish_holder(holder)
+
+    assert holder.poll() is not None
+    assert holder.stdin is not None and holder.stdin.closed
+    assert holder.stderr is not None and holder.stderr.closed
 
 
 def test_default_gate_is_scoped_to_canonical_meta_root(isolated_memory):
@@ -267,29 +312,32 @@ def test_cross_process_contention_is_bounded_and_reports_owner(tmp_path):
 def test_process_crash_releases_os_lock_and_marks_stale_metadata(tmp_path):
     meta_dir = tmp_path / "meta"
     holder = _start_holder(meta_dir, crash_on_input=True)
-    assert holder.stdin is not None
-    holder.stdin.write("\n")
-    holder.stdin.flush()
-    assert holder.wait(timeout=5) == 23
+    try:
+        assert holder.stdin is not None
+        holder.stdin.write("\n")
+        holder.stdin.flush()
+        assert holder.wait(timeout=5) == 23
 
-    stale = heavy_task_gate_status(meta_dir=meta_dir)
-    assert stale["physical_state"] == "free"
-    assert stale["stale_metadata"] is True
-    assert stale["current"]["operation"] == "child-holder"
+        stale = heavy_task_gate_status(meta_dir=meta_dir)
+        assert stale["physical_state"] == "free"
+        assert stale["stale_metadata"] is True
+        assert stale["current"]["operation"] == "child-holder"
 
-    with heavy_task(
-        "projection",
-        "recovery",
-        origin="pytest",
-        wait_timeout_seconds=1,
-        meta_dir=meta_dir,
-    ):
-        recovered = heavy_task_gate_status(meta_dir=meta_dir)
-        assert recovered["physical_state"] == "locked"
-        assert recovered["stale_metadata"] is False
-        assert recovered["current"]["operation"] == "recovery"
-        assert recovered["last"]["outcome"] == "abandoned"
-        assert recovered["last"]["operation"] == "child-holder"
+        with heavy_task(
+            "projection",
+            "recovery",
+            origin="pytest",
+            wait_timeout_seconds=1,
+            meta_dir=meta_dir,
+        ):
+            recovered = heavy_task_gate_status(meta_dir=meta_dir)
+            assert recovered["physical_state"] == "locked"
+            assert recovered["stale_metadata"] is False
+            assert recovered["current"]["operation"] == "recovery"
+            assert recovered["last"]["outcome"] == "abandoned"
+            assert recovered["last"]["operation"] == "child-holder"
+    finally:
+        _finish_holder(holder)
 
 
 def test_release_error_still_releases_process_thread_lock(tmp_path, monkeypatch):

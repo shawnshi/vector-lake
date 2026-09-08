@@ -34,6 +34,21 @@ _NON_CLAIM_ARTIFACTS = (
         ),
     ),
     (
+        "generated_reshaped_stub",
+        re.compile(
+            r"^auto-generated stub for (?P<subject>[^.!?。！？]{1,160})\. "
+            r"\(last reshaped: \d{4}-\d{2}-\d{2}\)$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "generated_entity_stub",
+        re.compile(
+            r"^(?P<subject>[^.!?。！？]{1,160}) auto-generated stub\.$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "schema_migration_marker",
         re.compile(
             r"^(?:\[[^\]]+\]\s*){0,2}node auto-migrated to v\d+(?:\.\d+)* schema\.?$",
@@ -97,25 +112,44 @@ def _clean_claim_text(text: str, limit: int = 360) -> str:
     return cleaned[:limit]
 
 
-def classify_non_claim_text(raw_text: str, cleaned_text: str = "") -> str | None:
-    """Return a stable reason for infrastructure prose that is not knowledge."""
+def classify_non_claim_text(
+    raw_text: str, cleaned_text: str = "", *, page_key: str = "",
+) -> str | None:
+    """Recognize whole-block maintenance prose; entity stubs require page identity."""
     text = _collapse_text(cleaned_text or raw_text)
     for reason, pattern in _NON_CLAIM_ARTIFACTS:
-        if pattern.fullmatch(text):
-            return reason
+        match = pattern.fullmatch(text)
+        if not match:
+            continue
+        if "subject" in match.groupdict():
+            page = str(page_key or "").replace("\\", "/").rsplit("/", 1)[-1]
+            if page.endswith(".md"):
+                page = page[:-3]
+            short_page = re.sub(
+                r"^(?:Concept|Product|Institution|Event|Policy|Vendor|Entity|Source)_",
+                "", page,
+            )
+            subject = _collapse_text(match.group("subject").replace("_", " ")).casefold()
+            identities = {
+                _collapse_text(value.replace("_", " ")).casefold()
+                for value in (page, short_page) if value
+            }
+            if subject not in identities:
+                continue
+        return reason
     return None
 
 
-def _is_non_claim_block(raw_text: str, cleaned_text: str) -> bool:
+def _is_non_claim_block(raw_text: str, cleaned_text: str, *, page_key: str = "") -> bool:
     raw = str(raw_text or "").strip()
-    if classify_non_claim_text(raw, cleaned_text):
+    if classify_non_claim_text(raw, cleaned_text, page_key=page_key):
         return True
     if re.match(r"^\[\^[^\]]+\]:", raw):
         return True
     return False
 
 
-def _iter_blocks(body: str) -> list[dict]:
+def _iter_blocks(body: str, *, page_key: str = "") -> list[dict]:
     import mistune
     markdown = mistune.create_markdown(renderer='ast')
     ast = markdown(body or "")
@@ -142,7 +176,7 @@ def _iter_blocks(body: str) -> list[dict]:
         elif node["type"] == "paragraph":
             raw_text = extract_text(node).strip()
             text = _clean_claim_text(raw_text)
-            if text and not _is_non_claim_block(raw_text, text):
+            if text and not _is_non_claim_block(raw_text, text, page_key=page_key):
                 blocks.append({
                     "kind": "paragraph",
                     "heading": current_heading,
@@ -154,7 +188,7 @@ def _iter_blocks(body: str) -> list[dict]:
                 if child["type"] == "list_item":
                     raw_text = extract_text(child).strip()
                     text = _clean_claim_text(raw_text)
-                    if text and not _is_non_claim_block(raw_text, text):
+                    if text and not _is_non_claim_block(raw_text, text, page_key=page_key):
                         blocks.append({
                             "kind": "bullet",
                             "heading": current_heading,
@@ -308,7 +342,7 @@ def extract_page_objects(
             "page_type": page_type,
         }
 
-    blocks = _iter_blocks(body)
+    blocks = _iter_blocks(body, page_key=page_key)
     if not blocks and summary:
         blocks = [{
             "kind": "paragraph",

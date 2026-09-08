@@ -72,6 +72,8 @@ _DEFAULT_RAW_FULL_SCAN_SCRUB_DAYS = 7
 _MAX_RAW_FULL_SCAN_SCRUB_DAYS = 3650
 _RAW_SCAN_CHECKPOINT_ITEMS = 64
 _TERMINAL_RETRY_CONTRACT = "vector-lake-terminal-ingest-retry/v1"
+_INGEST_DEBT_EXACT_CONTRACT = "vector-lake-ingest-debt-exact/v1"
+_INGEST_DEBT_EXACT_ACTIONS = {"supersede_duplicate"}
 _LEGACY_RETRYABLE_GENERATOR_REASON = "codex_event_log_type_is_not_allowed:error"
 
 
@@ -1026,6 +1028,150 @@ def _terminal_retry_row_guard(record: dict, raw_revision: str) -> str:
     ).hexdigest()
 
 
+def _ingest_debt_exact_row_guard(expected_state: dict) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            expected_state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _ingest_debt_exact_fingerprint(plan: dict) -> str:
+    fingerprint_material = dict(plan)
+    fingerprint_material.pop("fingerprint", None)
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            fingerprint_material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _ingest_debt_exact_supersede_plan(conn, item: dict) -> dict:
+    if item.get("action") != "supersede_duplicate":
+        raise IngestBaselineConflict(
+            "exact ingest debt target no longer resolves to supersede_duplicate"
+        )
+    job_id = str(item.get("job_id") or "")
+    owner_job_id = str(item.get("owner_job_id") or "")
+    target_key = str(item.get("target_key") or "")
+    raw_value = str(item.get("raw_path") or "")
+    current_hash = str(item.get("expected_raw_hash") or "")
+    candidate_payload = item.get("payload")
+    if (
+        not job_id
+        or not owner_job_id
+        or not target_key
+        or not raw_value
+        or not current_hash
+        or not isinstance(candidate_payload, dict)
+    ):
+        raise IngestBaselineConflict(
+            "exact ingest debt supersede plan is missing owner or raw evidence"
+        )
+    try:
+        raw_path = Path(raw_value).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise IngestBaselineConflict(
+            "exact ingest debt raw source path cannot be resolved"
+        ) from exc
+    revision_owners, revision_conflicts = _ingest_debt_effective_revision_owners(
+        conn,
+        candidate_job_id=job_id,
+        raw_path=raw_path,
+        current_hash=current_hash,
+        candidate_payload=candidate_payload,
+    )
+    owner_is_unique = (
+        not revision_conflicts
+        and len(revision_owners) == 1
+        and revision_owners[0]["job_id"] == owner_job_id
+        and revision_owners[0]["target_key"] == target_key
+    )
+    if not owner_is_unique:
+        raise IngestBaselineConflict(
+            "exact ingest debt target does not have one confirmed current owner"
+        )
+    owner_record = conn.execute(
+        "SELECT * FROM jobs WHERE job_id = ?",
+        (owner_job_id,),
+    ).fetchone()
+    if owner_record is None:
+        raise IngestBaselineConflict(
+            "exact ingest debt current owner disappeared before confirmation"
+        )
+    owner_snapshot = {
+        "owners": [
+            {
+                "job_id": str(revision_owners[0]["job_id"]),
+                "target_key": str(revision_owners[0]["target_key"]),
+                "owner_row_guard": _ingest_debt_exact_row_guard(dict(owner_record)),
+            }
+        ],
+        "conflicts": [],
+    }
+    exact_plan = {
+        "contract": _INGEST_DEBT_EXACT_CONTRACT,
+        "version": 1,
+        "job_id": job_id,
+        "action": "supersede_duplicate",
+        "raw_path": str(raw_path),
+        "raw_revision": current_hash,
+        "owner_job_id": owner_job_id,
+        "target_key": target_key,
+        "target_row_guard": _ingest_debt_exact_row_guard(
+            item.get("expected_state") or {}
+        ),
+        "current_owner_snapshot": owner_snapshot,
+    }
+    exact_plan["fingerprint"] = _ingest_debt_exact_fingerprint(exact_plan)
+    return exact_plan
+
+
+def _ingest_debt_exact_revalidate_postbackup(conn, exact_plan: dict) -> None:
+    target_job_id = str(exact_plan.get("job_id") or "")
+    target_guard = str(exact_plan.get("target_row_guard") or "")
+    owner_snapshot = exact_plan.get("current_owner_snapshot") or {}
+    owners = owner_snapshot.get("owners") if isinstance(owner_snapshot, dict) else None
+    if (
+        not target_job_id
+        or not target_guard
+        or not isinstance(owners, list)
+        or len(owners) != 1
+    ):
+        raise IngestBaselineConflict("exact ingest debt guard snapshot is invalid")
+    owner_snapshot_row = owners[0]
+    if not isinstance(owner_snapshot_row, dict):
+        raise IngestBaselineConflict("exact ingest debt owner guard snapshot is invalid")
+    owner_job_id = str(owner_snapshot_row.get("job_id") or "")
+    owner_guard = str(owner_snapshot_row.get("owner_row_guard") or "")
+    if not owner_job_id or not owner_guard:
+        raise IngestBaselineConflict("exact ingest debt owner guard snapshot is incomplete")
+    target_row = conn.execute(
+        "SELECT * FROM jobs WHERE job_id = ?",
+        (target_job_id,),
+    ).fetchone()
+    if target_row is None:
+        raise IngestBaselineConflict("exact ingest debt target disappeared after backup")
+    current_target_guard = _ingest_debt_exact_row_guard(dict(target_row))
+    if not hmac.compare_digest(current_target_guard, target_guard):
+        raise IngestBaselineConflict("exact ingest debt target row changed after backup")
+    owner_row = conn.execute(
+        "SELECT * FROM jobs WHERE job_id = ?",
+        (owner_job_id,),
+    ).fetchone()
+    if owner_row is None:
+        raise IngestBaselineConflict("exact ingest debt current owner disappeared after backup")
+    current_owner_guard = _ingest_debt_exact_row_guard(dict(owner_row))
+    if not hmac.compare_digest(current_owner_guard, owner_guard):
+        raise IngestBaselineConflict("exact ingest debt current owner row changed after backup")
+
+
 def _terminal_ingest_retry_plan(job_id: str) -> tuple[dict, str]:
     normalized_job_id = str(job_id or "").strip()
     if re.fullmatch(r"[0-9a-f]{32}", normalized_job_id) is None:
@@ -1150,6 +1296,9 @@ def reconcile_ingest_job_debt(
     dry_run: bool = True,
     limit: int = 0,
     *,
+    job_id: str = "",
+    expected_action: str = "",
+    confirmation: str = "",
     _operator_retry_job_id: str = "",
     _expected_operator_retry_guard: str = "",
     _expected_operator_retry_revision: str = "",
@@ -1157,10 +1306,39 @@ def reconcile_ingest_job_debt(
     """Classify and safely recover abandoned ingest jobs without discarding valid work."""
     from vector_lake import db_store
 
+    exact_job_id = str(job_id or "").strip()
+    exact_expected_action = str(expected_action or "").strip()
+    exact_confirmation = str(confirmation or "").strip()
+    exact_arguments = (exact_job_id, exact_expected_action, exact_confirmation)
+    private_operator_arguments = (
+        str(_operator_retry_job_id or ""),
+        str(_expected_operator_retry_guard or ""),
+        str(_expected_operator_retry_revision or ""),
+    )
+    if any(exact_arguments) and any(private_operator_arguments):
+        raise ValueError(
+            "exact ingest debt arguments cannot be mixed with private operator retry arguments"
+        )
+    if any(exact_arguments):
+        if not exact_job_id or not exact_expected_action:
+            raise ValueError(
+                "exact ingest debt job_id and expected_action are required together"
+            )
+        if re.fullmatch(r"[0-9a-f]{32}", exact_job_id) is None:
+            raise ValueError("exact ingest debt job_id is invalid")
+        if exact_expected_action not in _INGEST_DEBT_EXACT_ACTIONS:
+            raise ValueError("exact ingest debt expected_action is unsupported")
+        if not dry_run and not exact_confirmation:
+            raise PermissionError("exact ingest debt confirmation is required")
+
     preview_error = ""
     if dry_run:
         conn, preview_error = _open_ingest_debt_preview_connection()
         if conn is None:
+            if exact_job_id:
+                raise RuntimeError(
+                    preview_error or "exact ingest debt state is unavailable"
+                )
             return json.dumps(
                 {
                     "dry_run": True,
@@ -1208,6 +1386,9 @@ def reconcile_ingest_job_debt(
             raise ValueError("operator retry job_id is invalid")
         filtered_predicate += " AND job_id = ?"
         predicate_params = (operator_retry_job_id,)
+    elif exact_job_id:
+        filtered_predicate += " AND job_id = ?"
+        predicate_params = (exact_job_id,)
     available_jobs = int(
         conn.execute(
             f"SELECT COUNT(*) FROM jobs WHERE {filtered_predicate}",
@@ -1215,7 +1396,9 @@ def reconcile_ingest_job_debt(
         ).fetchone()[0]
     )
     selected_limit = max(0, int(limit))
-    if not dry_run:
+    if exact_job_id:
+        selected_limit = 1
+    elif not dry_run:
         selected_limit = min(
             _INGEST_DEBT_APPLY_MAX_LIMIT,
             selected_limit or _INGEST_DEBT_APPLY_DEFAULT_LIMIT,
@@ -1254,6 +1437,9 @@ def reconcile_ingest_job_debt(
                     "terminal ingest retry state changed after confirmation"
                 )
         expected_state = {
+            "job_id": record.get("job_id"),
+            "task_type": record.get("task_type"),
+            "created_at": record.get("created_at"),
             "status": record.get("status"),
             "retries": int(record.get("retries") or 0),
             "lease_generation": int(record.get("lease_generation") or 0),
@@ -1672,6 +1858,24 @@ def reconcile_ingest_job_debt(
             plans.append(item)
 
     plans.sort(key=lambda item: str(item["job_id"]))
+    exact_plan = None
+    if exact_job_id:
+        if len(rows) != 1 or available_jobs != 1:
+            raise ValueError(f"Unknown or ineligible ingest job: {exact_job_id}")
+        if (
+            len(plans) != 1
+            or str(plans[0].get("job_id") or "") != exact_job_id
+            or str(plans[0].get("action") or "") != exact_expected_action
+        ):
+            raise IngestBaselineConflict(
+                "exact ingest debt target no longer resolves to the expected action"
+            )
+        exact_plan = _ingest_debt_exact_supersede_plan(conn, plans[0])
+        if not dry_run and not hmac.compare_digest(
+            exact_confirmation,
+            str(exact_plan.get("fingerprint") or ""),
+        ):
+            raise PermissionError("exact ingest debt confirmation mismatch")
     if operator_retry_job_id and (
         len(plans) != 1
         or plans[0].get("job_id") != operator_retry_job_id
@@ -1706,6 +1910,12 @@ def reconcile_ingest_job_debt(
             for item in plans[:20]
         ],
     }
+    if exact_plan is not None:
+        result["exact"] = {
+            "contract": _INGEST_DEBT_EXACT_CONTRACT,
+            "fingerprint": exact_plan["fingerprint"],
+            "plan": exact_plan,
+        }
     if dry_run:
         conn.close()
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -1784,6 +1994,8 @@ def reconcile_ingest_job_debt(
                     }
                 )
                 continue
+            if exact_job_id and action == "supersede_duplicate":
+                _ingest_debt_exact_revalidate_postbackup(conn, exact_plan or {})
             owner_sensitive_actions = {
                 "blocked_revision_identity_conflict",
                 "requeue_current",
@@ -2072,6 +2284,18 @@ def reconcile_ingest_job_debt(
                 db_store.enqueue_ingest_task_cleanup(job_id, packet_path)
 
     result["applied_counts"] = dict(sorted(applied_counts.items()))
+    if exact_job_id:
+        exact_mutations = int(applied_counts.get(exact_expected_action, 0))
+        if (
+            result["concurrent_skips"]
+            or exact_mutations != 1
+            or sum(applied_counts.values()) != 1
+        ):
+            raise IngestBaselineConflict(
+                "exact ingest debt apply conflicted before mutating the requested job"
+            )
+        result["exact"]["committed"] = True
+        result["exact"]["mutation_count"] = exact_mutations
     result["cleanup"] = process_ingest_task_cleanup(
         limit=max(20, sum(applied_counts.values()))
     )
@@ -2891,6 +3115,7 @@ def _source_observed_datetime(processed_data: dict) -> datetime:
     raw = str(
         processed_data.get("source_observed_at")
         or processed_data.get("_recovery_updated_at")
+        or processed_data.get("_reviewed_updated_at")
         or ""
     ).strip()
     if raw:
@@ -3573,7 +3798,9 @@ def _apply_integration_disposition(
     target_mutations = []
     applied_targets = set()
     integration_update_timestamp = str(
-        processed_data.get("_recovery_updated_at") or ""
+        processed_data.get("_recovery_updated_at")
+        or processed_data.get("_reviewed_updated_at")
+        or ""
     )
     seen_targets = set()
     filtered_relations = []
@@ -3736,7 +3963,11 @@ def _prepare_final_ingest_files(
     normalized = _normalize_codex_output_pages(
         files,
         contract,
-        default_updated_at=str(processed_data.get("_recovery_updated_at") or ""),
+        default_updated_at=str(
+            processed_data.get("_recovery_updated_at")
+            or processed_data.get("_reviewed_updated_at")
+            or ""
+        ),
     )
     return _apply_integration_disposition(normalized, processed_data)
 
@@ -5149,6 +5380,556 @@ def prepare_ingest_batch(
     return f"Successfully enqueued {enqueued_count} files for ingestion."
 
 
+_EXACT_REVIEWED_INGEST_CONTRACT = (
+    "vector-lake-exact-reviewed-ingest-finalization/v1"
+)
+_REVIEWED_INGEST_PROVENANCE_FIELDS = frozenset(
+    {"contract", "fingerprint", "selection_digest", "review_sha256", "output_sha256"}
+)
+
+
+@dataclass(frozen=True)
+class _ReviewedIngestFinalizerContext:
+    """Process-local reviewed-ingest attestation; not constructible from caller JSON."""
+
+    job_id: str
+    lease_owner: str
+    lease_generation: int
+    raw_revision: str
+    selection_digest: str
+    review_sha256: str
+    output_sha256: str
+    provenance: dict[str, str]
+
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_exact_review_metadata(review: object) -> dict[str, str]:
+    allowed_fields = {"review_id", "approved_at", "approver", "scope", "reason"}
+    if not isinstance(review, dict) or set(review) != allowed_fields:
+        raise ValueError("exact reviewed ingest review fields are not exact")
+    normalized = {key: str(review.get(key) or "").strip() for key in allowed_fields}
+    if not 1 <= len(normalized["review_id"]) <= 128:
+        raise ValueError("exact reviewed ingest review_id is invalid")
+    if not 1 <= len(normalized["approved_at"]) <= 128:
+        raise ValueError("exact reviewed ingest approved_at is invalid")
+    if not 1 <= len(normalized["approver"]) <= 128:
+        raise ValueError("exact reviewed ingest approver is invalid")
+    if normalized["scope"] != "exact-ingest-finalization":
+        raise ValueError("exact reviewed ingest review scope is unsupported")
+    if not 12 <= len(normalized["reason"]) <= 500:
+        raise ValueError("exact reviewed ingest review reason must be 12 to 500 characters")
+    return normalized
+
+
+def _exact_reviewed_selection_digest(
+    *,
+    job_id: str,
+    filepath: str,
+    raw_hash: str,
+    canonical_name: str,
+    source_hash: str,
+    source_projection_hash: str,
+    ingest_contract_version: int,
+    integration_candidates_sha256: str,
+    output_sha256: str,
+    review_sha256: str,
+    disposition: str,
+) -> str:
+    selection_identity = {
+        "contract": _EXACT_REVIEWED_INGEST_CONTRACT,
+        "job_id": job_id,
+        "filepath": filepath,
+        "hash": raw_hash,
+        "canonical_name": canonical_name,
+        "source_hash": source_hash,
+        "source_projection_hash": source_projection_hash,
+        "ingest_contract_version": ingest_contract_version,
+        "integration_candidates_sha256": integration_candidates_sha256,
+        "output_sha256": output_sha256,
+        "review_sha256": review_sha256,
+        "disposition": disposition,
+    }
+    return _canonical_json_sha256(selection_identity)
+
+
+def _trusted_reviewed_ingest_provenance(
+    context: _ReviewedIngestFinalizerContext,
+    *,
+    processed_data: dict,
+    queued_hash: str,
+) -> dict[str, str]:
+    if not isinstance(context, _ReviewedIngestFinalizerContext):
+        raise ValueError("reviewed ingest provenance requires internal context")
+    if "_reviewed_ingest_provenance" in processed_data:
+        raise ValueError("reviewed ingest provenance cannot be supplied in processed_data")
+    if str(processed_data.get("job_id") or "") != context.job_id:
+        raise ValueError("reviewed ingest context job binding mismatch")
+    if str(processed_data.get("lease_owner") or "") != context.lease_owner:
+        raise ValueError("reviewed ingest context lease owner mismatch")
+    if int(processed_data.get("lease_generation") or 0) != context.lease_generation:
+        raise ValueError("reviewed ingest context lease generation mismatch")
+    if str(queued_hash or "") != context.raw_revision:
+        raise ValueError("reviewed ingest context raw revision mismatch")
+    provenance = dict(context.provenance)
+    if set(provenance) != set(_REVIEWED_INGEST_PROVENANCE_FIELDS):
+        raise ValueError("reviewed ingest provenance fields are not exact")
+    if provenance.get("contract") != _EXACT_REVIEWED_INGEST_CONTRACT:
+        raise ValueError("reviewed ingest provenance contract mismatch")
+    expected = {
+        "selection_digest": context.selection_digest,
+        "review_sha256": context.review_sha256,
+        "output_sha256": context.output_sha256,
+    }
+    for key, value in expected.items():
+        if not hmac.compare_digest(str(provenance.get(key) or ""), str(value)):
+            raise ValueError(f"reviewed ingest provenance {key} mismatch")
+    if not str(provenance.get("fingerprint") or "").startswith("sha256:"):
+        raise ValueError("reviewed ingest provenance fingerprint is invalid")
+    return provenance
+
+
+def _exact_reviewed_ingest_plan(selections: list[dict]) -> tuple[dict, list[dict]]:
+    """Build a one-job, exact, human-reviewed ingest plan without leasing."""
+    from vector_lake import db_store
+    from vector_lake.auto_ingest_worker import (
+        _validate_generator_output,
+        load_auto_ingest_config,
+    )
+
+    if not isinstance(selections, list) or len(selections) != 1:
+        raise ValueError("exact reviewed ingest finalization requires exactly one selection")
+    config = load_auto_ingest_config()
+    if config.enabled:
+        raise RuntimeError(
+            "automatic ingest is enabled; task claims are controller-exclusive"
+        )
+    contract = load_purpose_contract()
+    selection = selections[0]
+    allowed_fields = {
+        "job_id",
+        "filepath",
+        "hash",
+        "canonical_name",
+        "source_hash",
+        "source_projection_hash",
+        "ingest_contract_version",
+        "integration_candidates_sha256",
+        "review",
+        "output",
+    }
+    if not isinstance(selection, dict) or set(selection) != allowed_fields:
+        raise ValueError("exact reviewed ingest selection fields are not exact")
+    job_id = str(selection.get("job_id") or "")
+    if re.fullmatch(r"[0-9a-f]{32}", job_id) is None:
+        raise ValueError("exact reviewed ingest job_id is invalid")
+    filepath = str(selection.get("filepath") or "")
+    raw_hash = str(selection.get("hash") or "")
+    parse_revision(raw_hash)
+    canonical_name = str(selection.get("canonical_name") or "")
+    validate_wiki_filename(canonical_name)
+    source_hash = str(selection.get("source_hash") or "")
+    source_projection_hash = str(selection.get("source_projection_hash") or "")
+    raw_contract_version = selection.get("ingest_contract_version")
+    if isinstance(raw_contract_version, bool) or not isinstance(raw_contract_version, int):
+        raise ValueError("exact reviewed ingest_contract_version must be an integer")
+    ingest_contract_version = raw_contract_version
+    integration_candidates_sha256 = str(
+        selection.get("integration_candidates_sha256") or ""
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", integration_candidates_sha256) is None:
+        raise ValueError("integration_candidates_sha256 must be a lowercase SHA-256 digest")
+    review = _validate_exact_review_metadata(selection.get("review"))
+    output = selection.get("output")
+    if not isinstance(output, dict):
+        raise ValueError("exact reviewed ingest output must be an object")
+    review_sha256 = _canonical_json_sha256(review)
+    output_sha256 = _canonical_json_sha256(output)
+    snapshot = db_store.inspect_exact_reviewed_ingest_candidate(job_id)
+    payload = dict(snapshot["payload"])
+    identity_checks = {
+        "filepath": filepath,
+        "hash": raw_hash,
+        "canonical_name": canonical_name,
+        "source_hash": source_hash,
+        "source_projection_hash": source_projection_hash,
+        "ingest_contract_version": str(ingest_contract_version),
+    }
+    for key, expected in identity_checks.items():
+        queued = payload.get(key)
+        if key == "ingest_contract_version":
+            queued_value = str(queued or "")
+        else:
+            queued_value = str(queued or "")
+        if str(expected) != queued_value:
+            raise ValueError(f"exact reviewed ingest {key} does not match queued payload")
+    queued_candidates = payload.get("integration_candidates")
+    if not isinstance(queued_candidates, list):
+        raise ValueError("exact reviewed ingest queued integration_candidates missing")
+    if not hmac.compare_digest(
+        integration_candidates_sha256,
+        _canonical_json_sha256(queued_candidates),
+    ):
+        raise ValueError("exact reviewed ingest integration candidates digest mismatch")
+    if is_private_diary_path(filepath):
+        raise ValueError("private sources cannot use exact reviewed ingest finalization")
+    try:
+        current_raw = _stable_current_raw_revision(filepath)
+    except (OSError, RawRevisionFormatError, RawSourceContainmentError, RawSourceUnstableError, ValueError):
+        raise IngestBaselineConflict(
+            "Raw source is not available for exact reviewed ingest finalization"
+        ) from None
+    if not current_raw.matches(raw_hash):
+        raise IngestBaselineConflict(
+            f"Raw source changed after exact reviewed ingest job {job_id} was produced"
+        )
+    job_record = snapshot["job"]
+    reviewed_updated_at = str(
+        job_record.get("updated_at") or job_record.get("created_at") or ""
+    )
+    if not reviewed_updated_at:
+        raise ValueError(f"Job {job_id} has no stable reviewed ingest timestamp")
+    processed_data = dict(payload)
+    processed_data.update(
+        {
+            "job_id": job_id,
+            "_reviewed_updated_at": reviewed_updated_at,
+        }
+    )
+    processed_data["_queued_integration_candidates"] = list(queued_candidates)
+    already_reviewed = bool(snapshot.get("already_reviewed"))
+    stored_reviewed = snapshot.get("stored_reviewed_ingest")
+    raw_integration = output.get("integration")
+    reviewed_rejected_requested = bool(
+        isinstance(raw_integration, dict)
+        and str(raw_integration.get("disposition") or "").lower() == "rejected"
+    )
+    files, integration = _validate_generator_output(
+        output,
+        job_id,
+        processed_data,
+        config,
+        human_reviewed_rejected=reviewed_rejected_requested,
+    )
+    disposition = str(integration.get("disposition") or "")
+    if str(job_record.get("status") or "") == "failed" and disposition != "rejected":
+        raise ValueError(
+            "terminal failed exact reviewed ingest only supports reviewed rejected output"
+        )
+    selection_digest = _exact_reviewed_selection_digest(
+        job_id=job_id,
+        filepath=filepath,
+        raw_hash=raw_hash,
+        canonical_name=canonical_name,
+        source_hash=source_hash,
+        source_projection_hash=source_projection_hash,
+        ingest_contract_version=ingest_contract_version,
+        integration_candidates_sha256=integration_candidates_sha256,
+        output_sha256=output_sha256,
+        review_sha256=review_sha256,
+        disposition=disposition,
+    )
+    if already_reviewed:
+        if not isinstance(stored_reviewed, dict):
+            raise ValueError(f"Job {job_id} has no stored reviewed ingest provenance")
+        stored_selection_digest = str(stored_reviewed.get("selection_digest") or "")
+        if not hmac.compare_digest(stored_selection_digest, selection_digest):
+            raise ValueError(
+                f"Job {job_id} reviewed ingest selection does not match stored provenance"
+            )
+    else:
+        _verify_ingest_source_baseline(processed_data)
+    processed_data["integration"] = integration
+    if not already_reviewed:
+        (
+            planned_output_files,
+            _planned_disposition,
+            planned_target_names,
+        ) = _prepare_final_ingest_files(files, processed_data, contract)
+        _prepare_source_link_precondition(planned_output_files)()
+    else:
+        planned_output_files = _normalize_codex_output_pages(
+            files,
+            contract,
+            default_updated_at=reviewed_updated_at,
+        )
+        planned_target_names = set()
+    _validate_final_ingest_files(
+        planned_output_files,
+        planned_target_names,
+        contract,
+    )
+    planned_files = [
+        {
+            "filename": str(item["filename"]),
+            "content_sha256": hashlib.sha256(
+                str(item["content"]).encode("utf-8")
+            ).hexdigest(),
+        }
+        for item in planned_output_files
+    ]
+    item = {
+        "job_id": job_id,
+        "output_sha256": output_sha256,
+        "review_sha256": review_sha256,
+        "selection_digest": selection_digest,
+        "stored_reviewed_fingerprint": (
+            str(stored_reviewed.get("fingerprint") or "")
+            if isinstance(stored_reviewed, dict)
+            else ""
+        ),
+        "row_guard": snapshot["row_guard"],
+        "effective_updated_at": reviewed_updated_at,
+        "state": "already_finalized" if already_reviewed else "finalizable",
+        "original_status": str(job_record.get("status") or ""),
+        "disposition": disposition,
+        "raw_revision": current_raw.canonical_revision,
+        "source_hash": source_hash,
+        "source_projection_hash": source_projection_hash,
+        "integration_candidates_sha256": integration_candidates_sha256,
+        "planned_files": planned_files,
+    }
+    plan = {
+        "contract": _EXACT_REVIEWED_INGEST_CONTRACT,
+        "requested": 1,
+        "items": [item],
+        "can_apply": True,
+    }
+    fingerprint = "sha256:" + _canonical_json_sha256(plan)
+    plan["fingerprint"] = fingerprint
+    material = {
+        "job_id": job_id,
+        "row_guard": snapshot["row_guard"],
+        "original_status": str(job_record.get("status") or ""),
+        "already_reviewed": already_reviewed,
+        "files": files,
+        "processed_data": processed_data,
+        "selection_digest": selection_digest,
+        "stored_reviewed_fingerprint": item["stored_reviewed_fingerprint"],
+        "review": review,
+        "output_sha256": output_sha256,
+        "review_sha256": review_sha256,
+    }
+    return plan, [material]
+
+
+def _verify_exact_reviewed_claim(material: dict, claim: dict) -> None:
+    from vector_lake import db_store
+
+    original = claim.get("exact_reviewed_snapshot")
+    if not isinstance(original, dict):
+        raise RuntimeError("exact reviewed ingest claim lacks original snapshot")
+    row = db_store.get_connection().execute(
+        "SELECT * FROM jobs WHERE job_id = ?", (str(material.get("job_id") or ""),)
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("exact reviewed ingest claimed row disappeared")
+    current = dict(row)
+    for key in (
+        "job_id",
+        "task_type",
+        "payload",
+        "retries",
+        "error_msg",
+        "result_json",
+        "completed_at",
+        "created_at",
+        "available_at",
+        "idempotency_key",
+        "task_packet_path",
+    ):
+        if str(claim.get(key) or "") != str(current.get(key) or ""):
+            raise RuntimeError("exact reviewed ingest claimed row changed")
+    if str(original.get("status") or "") != str(material.get("original_status") or ""):
+        raise RuntimeError("exact reviewed ingest claimed original status changed")
+    if str(current.get("status") or "") != "subagent_processing":
+        raise RuntimeError("exact reviewed ingest claim did not enter processing state")
+    if str(current.get("lease_owner") or "") != str(claim.get("lease_owner") or ""):
+        raise RuntimeError("exact reviewed ingest claim owner changed")
+    if str(current.get("lease_token") or "") != str(claim.get("lease_token") or ""):
+        raise RuntimeError("exact reviewed ingest claim token changed")
+    if not str(claim.get("lease_owner") or "").startswith("exact-reviewed-ingest:"):
+        raise RuntimeError("exact reviewed ingest claim owner is invalid")
+    if not str(claim.get("lease_token") or ""):
+        raise RuntimeError("exact reviewed ingest claim token is missing")
+    if int(claim.get("lease_generation") or 0) <= int(original.get("lease_generation") or 0):
+        raise RuntimeError("exact reviewed ingest claim generation did not advance")
+    if str(claim.get("payload") or "") != str(original.get("payload") or ""):
+        raise RuntimeError("exact reviewed ingest payload changed during claim")
+
+
+def _projection_pair_settled_now() -> bool:
+    try:
+        from vector_lake import indexer
+
+        return bool(indexer.projection_pair_matches_current_generation())
+    except Exception:
+        return False
+
+
+def finalize_exact_reviewed_ingest_outputs(
+    selections: list[dict],
+    *,
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or apply one exact HUMAN-reviewed ingest finalization."""
+    from vector_lake import db_store
+
+    if not isinstance(dry_run, bool):
+        raise ValueError("dry_run must be boolean")
+    plan, materials = _exact_reviewed_ingest_plan(selections)
+    fingerprint = str(plan["fingerprint"])
+    if dry_run:
+        return json.dumps(
+            {"ok": True, "committed": False, "dry_run": True, "plan": plan},
+            ensure_ascii=False,
+            indent=2,
+        )
+    if not hmac.compare_digest(str(confirmation or ""), fingerprint):
+        raise PermissionError("exact reviewed ingest confirmation mismatch")
+    pending_materials = [item for item in materials if not item.get("already_reviewed")]
+    claims = (
+        db_store.claim_exact_reviewed_ingest_jobs(
+            pending_materials,
+            lease_seconds=1800,
+        )
+        if pending_materials
+        else []
+    )
+    claim_by_job = {str(item["job_id"]): item for item in claims}
+    committed: list[str] = [
+        str(item["job_id"]) for item in materials if item.get("already_reviewed")
+    ]
+    already_finalized = list(committed)
+    restored: list[str] = []
+    indeterminate: list[str] = []
+    errors: list[dict] = []
+    for position, material in enumerate(pending_materials):
+        job_id = str(material["job_id"])
+        claim = claim_by_job[job_id]
+        try:
+            _verify_exact_reviewed_claim(material, claim)
+            processed_data = dict(material["processed_data"])
+            processed_data.update(
+                {
+                    "lease_owner": claim["lease_owner"],
+                    "lease_token": claim["lease_token"],
+                    "lease_generation": claim["lease_generation"],
+                }
+            )
+            reviewed_ingest_context = _ReviewedIngestFinalizerContext(
+                job_id=job_id,
+                lease_owner=str(claim["lease_owner"]),
+                lease_generation=int(claim["lease_generation"]),
+                raw_revision=str(material["processed_data"].get("hash") or ""),
+                selection_digest=str(material["selection_digest"]),
+                review_sha256=str(material["review_sha256"]),
+                output_sha256=str(material["output_sha256"]),
+                provenance={
+                    "contract": str(plan["contract"]),
+                    "fingerprint": fingerprint,
+                    "selection_digest": str(material["selection_digest"]),
+                    "review_sha256": str(material["review_sha256"]),
+                    "output_sha256": str(material["output_sha256"]),
+                },
+            )
+            _finalize_exact_reviewed_ingest_strict(
+                material["files"],
+                processed_data,
+                reviewed_ingest_context=reviewed_ingest_context,
+            )
+            row = db_store.get_connection().execute(
+                "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None or str(row["status"] or "") != "finalized":
+                raise RuntimeError("reviewed finalizer returned without durable finalization")
+            committed.append(job_id)
+        except Exception as exc:
+            errors.append(
+                {
+                    "job_id": job_id,
+                    "error_type": type(exc).__name__,
+                    "error": "exact reviewed ingest finalization failed",
+                }
+            )
+            for pending in pending_materials[position:]:
+                pending_id = str(pending["job_id"])
+                pending_claim = claim_by_job[pending_id]
+                try:
+                    if db_store.restore_exact_reviewed_ingest_claim(
+                        pending_claim,
+                        reason=f"exact reviewed ingest stopped after {job_id}",
+                    ):
+                        restored.append(pending_id)
+                    else:
+                        row = db_store.get_connection().execute(
+                            "SELECT status FROM jobs WHERE job_id = ?", (pending_id,)
+                        ).fetchone()
+                        if row is not None and str(row["status"] or "") == "finalized":
+                            committed.append(pending_id)
+                        else:
+                            indeterminate.append(pending_id)
+                except Exception:
+                    indeterminate.append(pending_id)
+            break
+    requested_count = len(materials)
+    unattempted = [
+        str(item["job_id"])
+        for item in materials
+        if str(item["job_id"]) not in set(committed) | set(restored) | set(indeterminate)
+    ]
+    fully_committed = len(set(committed)) == requested_count
+    projection_settled = _projection_pair_settled_now() if fully_committed else False
+    state = (
+        "completed"
+        if fully_committed and projection_settled
+        else "committed_projection_pending"
+        if fully_committed
+        else "partial"
+    )
+    reviewed_fingerprints = {
+        str(item["job_id"]): (
+            str(item["stored_reviewed_fingerprint"])
+            if item.get("already_reviewed")
+            else fingerprint
+        )
+        for item in materials
+    }
+    receipt = {
+        "ok": state == "completed",
+        "committed": fully_committed,
+        "projection_settled": projection_settled,
+        "dry_run": False,
+        "state": state,
+        "fingerprint": fingerprint,
+        "confirmation_fingerprint": fingerprint,
+        "reviewed_ingest_fingerprints": reviewed_fingerprints,
+        "requested": requested_count,
+        "committed_job_ids": sorted(set(committed)),
+        "already_finalized_job_ids": sorted(set(already_finalized)),
+        "restored_job_ids": sorted(set(restored)),
+        "unattempted_job_ids": unattempted,
+        "indeterminate_job_ids": sorted(set(indeterminate)),
+        "selection_digests": {
+            str(item["job_id"]): str(item["selection_digest"])
+            for item in materials
+        },
+        "errors": errors,
+    }
+    return json.dumps(receipt, ensure_ascii=False, indent=2)
+
+
 def _terminal_recovery_selection_digest(
     *,
     job_id: str,
@@ -5584,6 +6365,7 @@ def _finalize_ingest_impl(
     processed_data: dict,
     *,
     propagate_errors: bool,
+    reviewed_ingest_context: _ReviewedIngestFinalizerContext | None = None,
 ) -> str:
     """Finalize one ingest while preserving the public string-error contract."""
     try:
@@ -5643,6 +6425,15 @@ def _finalize_ingest_impl(
         ):
             raise ValueError("lease_generation must be an integer")
         lease_generation = raw_lease_generation
+        reviewed_ingest_provenance = None
+        if reviewed_ingest_context is not None:
+            reviewed_ingest_provenance = _trusted_reviewed_ingest_provenance(
+                reviewed_ingest_context,
+                processed_data=processed_data,
+                queued_hash=queued_hash,
+            )
+        elif "_reviewed_ingest_provenance" in processed_data:
+            raise ValueError("reviewed ingest provenance is reserved for internal finalization")
         contract = load_purpose_contract()
         (
             files,
@@ -5702,6 +6493,8 @@ def _finalize_ingest_impl(
             recovery_provenance = processed_data.get("_recovery_provenance")
             if isinstance(recovery_provenance, dict):
                 result_data["recovery"] = recovery_provenance
+            if reviewed_ingest_provenance is not None:
+                result_data["reviewed_ingest"] = reviewed_ingest_provenance
             finalize_ingest_job(
                 str(job_id),
                 lease_owner,
@@ -5926,6 +6719,21 @@ def _finalize_ingest_impl(
             raise
         log.exception("Public ingest finalization failed")
         return f"Error finalizing ingestion: {e}"
+
+
+def _finalize_exact_reviewed_ingest_strict(
+    files_written: list,
+    processed_data: dict,
+    *,
+    reviewed_ingest_context: _ReviewedIngestFinalizerContext,
+) -> str:
+    """Finalize exact reviewed ingest with a process-local attestation context."""
+    return _finalize_ingest_impl(
+        files_written,
+        processed_data,
+        propagate_errors=True,
+        reviewed_ingest_context=reviewed_ingest_context,
+    )
 
 
 def finalize_ingest(files_written: list, processed_data: dict) -> str:

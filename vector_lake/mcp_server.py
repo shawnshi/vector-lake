@@ -60,6 +60,7 @@ _MCP_HEAVY_TASKS = {
     "embedding_backfill": ("embedding", 3600.0),
     "evidence_foundation_backfill": ("maintenance", 1800.0),
     "finalize_ingest": ("projection", 900.0),
+    "finalize_exact_reviewed_ingest_outputs": ("projection", 900.0),
     "finalize_query_synthesis": ("projection", 900.0),
     "gc_vector_lake": ("maintenance", 1800.0),
     "get_governance_debt": ("scan", 900.0),
@@ -84,6 +85,7 @@ _MCP_HEAVY_TASKS = {
     "sync_critical_decision_registry": ("maintenance", 900.0),
     "topology_queue_cleanup": ("maintenance", 900.0),
     "unsupported_claim_debt": ("maintenance", 900.0),
+    "claim_provenance_repair": ("maintenance", 900.0),
     "trigger_audit_graph": ("scan", 1800.0),
     "trigger_autonomous_research": ("ingest_scan", 1800.0),
     "visualize_vector_lake": ("scan", 900.0),
@@ -1645,8 +1647,11 @@ class ReloadAwareFastMCP(FastMCP):
                             if fn.__name__ != "mcp_runtime_status":
                                 self.runtime_guard.assert_current()
                             cancellation_checkpoint("after_runtime_guard")
-                            if policy is None or self._readonly_scan_without_shared_gate(
-                                policy
+                            # Export is canonical-read-only but retains heavy-lane admission.
+                            if (
+                                policy is None
+                                or fn.__name__ == "visualize_vector_lake"
+                                or self._readonly_scan_without_shared_gate(policy)
                             ):
                                 result = fn(*fn_args, **fn_kwargs)
                             else:
@@ -1881,9 +1886,19 @@ def operational_memory_search_index(
 
 
 @mcp.tool()
-def operational_memory_cleanup(dry_run: bool = True, limit: int = 0) -> str:
-    """Preview or archive known generated/template artifacts in operational memory."""
-    return tools.cleanup_operational_memory(dry_run=dry_run, limit=limit)
+def operational_memory_cleanup(
+    dry_run: bool = True,
+    limit: int = 0,
+    source_claim_ids: list[str] | None = None,
+    confirmation: str = "",
+) -> str:
+    """Archive templates; exact claim-id scopes require preview fingerprint confirmation."""
+    if source_claim_ids is None:
+        return tools.cleanup_operational_memory(dry_run=dry_run, limit=limit)
+    return tools.cleanup_operational_memory(
+        dry_run=dry_run, limit=limit,
+        source_claim_ids=source_claim_ids, confirmation=confirmation,
+    )
 
 
 @mcp.tool()
@@ -2230,6 +2245,30 @@ def unsupported_claim_debt(
             review_days=review_days,
             runtime_only=True,
             confirmation=confirmation,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+def claim_provenance_repair(
+    dry_run: bool = True,
+    confirmation: str = "",
+    source_map_path: str = "",
+    source_claim_ids: list[str] | None = None,
+    official_evidence_map_path: str = "",
+) -> str:
+    """Preview or apply exact source-backed repairs for unsupported claims."""
+    return json.dumps(
+        tools.repair_claim_provenance(
+            dry_run=dry_run,
+            runtime_only=True,
+            confirmation=confirmation,
+            source_map_path=source_map_path,
+            source_claim_ids=source_claim_ids,
+            official_evidence_map_path=official_evidence_map_path,
         ),
         ensure_ascii=False,
         indent=2,
@@ -2628,6 +2667,36 @@ def recover_terminal_ingest_outputs(
 
 
 @mcp.tool()
+def finalize_exact_reviewed_ingest_outputs(
+    payload_file: str,
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or apply one exact HUMAN-reviewed ingest finalization manifest."""
+    try:
+        manifest = json.loads(_read_payload(payload_file))
+    except json.JSONDecodeError as exc:
+        raise ValueError("exact reviewed ingest payload must be valid JSON") from exc
+    if not isinstance(manifest, dict) or set(manifest) != {"contract", "selections"}:
+        raise ValueError("exact reviewed ingest manifest fields are not exact")
+    if manifest.get("contract") != "vector-lake-exact-reviewed-ingest-finalization/v1":
+        raise ValueError("exact reviewed ingest manifest contract is unsupported")
+    selections = manifest.get("selections")
+    if not isinstance(selections, list) or len(selections) != 1:
+        raise ValueError("exact reviewed ingest selections must contain exactly one item")
+    if not dry_run:
+        _require_explicit_capability(
+            _MANUAL_INGEST_ADMIN_ENV,
+            "exact reviewed ingest finalization",
+        )
+    return tools.finalize_exact_reviewed_ingest_outputs(
+        selections,
+        dry_run=dry_run,
+        confirmation=confirmation,
+    )
+
+
+@mcp.tool()
 def retry_terminal_ingest_job(
     job_id: str,
     dry_run: bool = True,
@@ -2655,9 +2724,21 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
 
 
 @mcp.tool()
-def reconcile_ingest_tasks(dry_run: bool = True, limit: int = 0) -> str:
+def reconcile_ingest_tasks(
+    dry_run: bool = True,
+    limit: int = 0,
+    job_id: str = "",
+    expected_action: str = "",
+    confirmation: str = "",
+) -> str:
     """Classify and safely recover abandoned or terminal ingest tasks."""
-    return tools.reconcile_ingest_job_debt(dry_run=dry_run, limit=limit)
+    return tools.reconcile_ingest_job_debt(
+        dry_run=dry_run,
+        limit=limit,
+        job_id=job_id,
+        expected_action=expected_action,
+        confirmation=confirmation,
+    )
 
 
 @mcp.tool()
@@ -2753,23 +2834,18 @@ def auto_ingest_receipt_retention(
 
 @mcp.tool()
 def visualize_vector_lake(output_dir: str | None = None) -> str:
-    """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
-    if output_dir:
-        configured_roots = os.environ.get(
-            "VECTOR_LAKE_AGENT_SANDBOX_ROOTS", ""
-        ).strip()
-        allowed_roots = [
-            Path(value).expanduser().resolve()
-            for value in configured_roots.split(os.pathsep)
-            if value.strip() and Path(value).expanduser().is_absolute()
-        ]
-        abs_dir = Path(output_dir).expanduser().resolve()
-        if not any(abs_dir.is_relative_to(root) for root in allowed_roots):
-            return (
-                "Error: Write operations must be contained within an approved "
-                "agent sandbox configured by VECTOR_LAKE_AGENT_SANDBOX_ROOTS."
-            )
-    return tools.visualize_vector_lake(output_dir)
+    """Export committed topology to an approved sandbox; no bootstrap or rebuild.
+
+    Omitted output_dir selects the first VECTOR_LAKE_AGENT_SANDBOX_ROOTS root.
+    Opening the HTML is offline until the user opts into loading the CDN renderer.
+    """
+    from vector_lake.tool_graph import _graph_output_path
+
+    try:
+        authorized = _graph_output_path(output_dir)
+    except (ValueError, OSError) as exc:
+        return f"Error: {exc}"
+    return tools.visualize_vector_lake(str(authorized.parent))
 
 @mcp.tool()
 def write_wiki_page(filename: str, payload_file: str) -> str:

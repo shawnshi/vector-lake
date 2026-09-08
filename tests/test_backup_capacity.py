@@ -1,5 +1,6 @@
 from collections import namedtuple
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -142,7 +143,13 @@ def test_incomplete_inventory_fails_closed(tmp_path, monkeypatch):
 
 def test_estimate_adds_headroom_and_one_megabyte_floor(tmp_path, monkeypatch):
     sources = [tmp_path / name for name in ("db", "index", "graph", "manifest")]
-    for source in sources:
+    connection = sqlite3.connect(sources[0])
+    try:
+        connection.execute("CREATE TABLE backup_estimate_probe (id INTEGER)")
+        connection.commit()
+    finally:
+        connection.close()
+    for source in sources[1:]:
         source.write_bytes(b"x" * 100)
     monkeypatch.setattr(backup_capacity, "peek_db_path", lambda: sources[0])
     monkeypatch.setattr(backup_capacity, "get_index_path", lambda: sources[1])
@@ -263,12 +270,16 @@ def test_schema_migration_preflight_uses_target_volume_before_staging(
         lambda _path: 123,
     )
 
-    with pytest.raises(backup_capacity.BackupCapacityError):
-        db_store._schema_migration_backup(
-            None,
-            database_path=database_path,
-            plan={"pre_schema_version": 7, "fingerprint": "sha256:" + "a" * 64},
-        )
+    connection = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(backup_capacity.BackupCapacityError):
+            db_store._schema_migration_backup(
+                connection,
+                database_path=database_path,
+                plan={"pre_schema_version": 7, "fingerprint": "sha256:" + "a" * 64},
+            )
+    finally:
+        connection.close()
 
     assert observed["estimated_new_bytes"] == 123
     assert observed["disk_anchor"] == backup_dir

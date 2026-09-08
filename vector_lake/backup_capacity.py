@@ -434,6 +434,46 @@ def assert_backup_capacity(
     raise BackupCapacityError(reason, status)
 
 
+def pending_projection_inventory(
+    *, database_path: Path | None = None, wiki_dir: Path | None = None,
+) -> dict | None:
+    """Read pending authority and validate both closures without opening a writer."""
+    import sqlite3
+
+    from vector_lake import db_store
+
+    database = database_path if database_path is not None else peek_db_path()
+    if not database.is_file():
+        return None
+    connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='projection_runtime_v9'"
+        ).fetchone():
+            return None
+        runtime = db_store.get_projection_runtime_v9(connection)
+    finally:
+        connection.close()
+    if runtime["status"] != "publish_pending":
+        return None
+    sidecar = validate_sidecar(runtime["sidecar"])
+    if (
+        hashlib.sha256(canonical_json_bytes(sidecar)).hexdigest()
+        != runtime["sidecar_sha256"]
+        or sidecar["projection_generation"] != runtime["projection_generation"]
+        or sidecar["canonical_generation"] != runtime["canonical_generation"]
+    ):
+        raise ValueError("pending_projection_runtime_binding_invalid")
+    root = wiki_dir if wiki_dir is not None else get_wiki_dir()
+    paths = set(validate_root_closure(root, sidecar))
+    if runtime["previous_sidecar"] is not None:
+        paths.update(validate_root_closure(root, runtime["previous_sidecar"]))
+    if len(paths) > _MAX_PROJECTION_OBJECTS:
+        raise ValueError("pending_projection_object_limit_exceeded")
+    return {"runtime": runtime, "paths": sorted(paths)}
+
+
 def estimate_maintenance_backup_bytes() -> int:
     """Estimate the next SQLite/projection snapshot with explicit headroom."""
     paths = (peek_db_path(), Path(str(peek_db_path()) + "-wal"))
@@ -458,6 +498,11 @@ def estimate_maintenance_backup_bytes() -> int:
                     source_bytes += int(path.stat().st_size)
             except OSError:
                 continue
+    pending = pending_projection_inventory()
+    if pending is not None:
+        # Conservative double counting is preferable to omitting a unique root.
+        source_bytes += sum(path.stat().st_size for path in pending["paths"])
+        source_bytes += _MAX_PROJECTION_SIDECAR_BYTES
     return max(
         1024 * 1024,
         math.ceil(source_bytes * (1.0 + _DEFAULT_ESTIMATE_HEADROOM_RATIO)),

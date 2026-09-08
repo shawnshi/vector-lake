@@ -12,12 +12,13 @@ import stat
 import struct
 import sys
 import threading
-from contextlib import contextmanager
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from filelock import BaseFileLock, FileLock, Timeout as FileLockTimeout
+from filelock import BaseFileLock, FileLock
+from filelock import Timeout as FileLockTimeout
 
 from vector_lake.raw_revision import (
     RawRevisionFormatError,
@@ -1999,9 +2000,7 @@ def record_ingest_stage_event(
     normalized_attempt_id = str(attempt_id or "").strip()
     if not normalized_attempt_id:
         normalized_attempt_id = hashlib.sha256(
-            f"{normalized_job_id}\0{normalized_revision}\0legacy-attempt".encode(
-                "utf-8"
-            )
+            f"{normalized_job_id}\0{normalized_revision}\0legacy-attempt".encode()
         ).hexdigest()[:32]
     if not re.fullmatch(r"[0-9a-f]{32}", normalized_attempt_id):
         raise ValueError("ingest attempt_id must be 32 lowercase hex characters")
@@ -7385,9 +7384,7 @@ def _validate_canonical_identity_coverage(
                 f"page_key AS version_page_key FROM {version_table}"
             )
         rows = conn.execute(
-            "WITH records AS ("
-            + records_sql
-            + "), parsed AS ("
+            "WITH records AS (" + records_sql + "), parsed AS ("
             "SELECT records.*, owner.record_id AS owner_record_id, "
             "owner.page_key AS owner_page_key, "
             "CASE WHEN json_valid(records.data_json) = 1 "
@@ -8591,6 +8588,33 @@ def mark_projection_runtime_rebuild_required(
     return get_projection_runtime_v9(conn)
 
 
+def retire_projection_runtime_pending(
+    conn: sqlite3.Connection,
+    *,
+    expected_runtime: dict,
+    successor_updated_at: str,
+) -> dict:
+    """CAS only after the maintenance caller validates durable recovery evidence.
+
+    The receipt binds the full predecessor and this exact pointer-free successor.
+    This primitive never restores an old projection or modifies canonical tables.
+    """
+    _require_projection_runtime_v9_transaction(conn)
+    if (
+        expected_runtime.get("status") != "publish_pending"
+        or get_projection_runtime_v9(conn) != expected_runtime
+    ):
+        raise RuntimeError("projection_runtime_v9 retirement CAS mismatch")
+    conn.execute(
+        "UPDATE projection_runtime_v9 SET status = 'rebuild_required', "
+        "projection_generation = NULL, canonical_generation_json = NULL, "
+        "sidecar_sha256 = NULL, sidecar_json = NULL, "
+        "previous_sidecar_json = NULL, updated_at = ? WHERE singleton = 1",
+        (successor_updated_at,),
+    )
+    return get_projection_runtime_v9(conn)
+
+
 def inspect_search_projection_corpus(
     conn: sqlite3.Connection | None = None,
     *,
@@ -9100,12 +9124,15 @@ def verify_operational_memory_search_integrity(
     *,
     allow_full_scan: bool = True,
     allow_durable_proof: bool = False,
+    allow_forced_attestation: bool = True,
 ) -> dict:
     """Verify relevant revisions immediately and bypass writes periodically.
 
     Retrieval may trust a stable durable proof without synchronously streaming
-    the entire derived corpus. Doctor and watchdog callers retain full periodic
-    attestation by leaving ``allow_durable_proof`` disabled.
+    the entire derived corpus. Deep doctor and watchdog callers retain full
+    periodic attestation by leaving ``allow_durable_proof`` disabled. Bounded
+    quick diagnostics also disable ``allow_forced_attestation`` so an interval
+    of zero defers instead of forcing the normal retrieval fallback scan.
     """
     try:
         revision_before = _operational_memory_search_revision_token(conn)
@@ -9149,7 +9176,9 @@ def verify_operational_memory_search_integrity(
             durable_only = True
             verification_kind = "durable_proof"
         else:
-            if not allow_full_scan and not allow_durable_proof:
+            if not allow_full_scan and (
+                not allow_durable_proof or not allow_forced_attestation
+            ):
                 return {
                     "status": "deferred",
                     "issue": "operational_memory_search_attestation_required",
@@ -11774,7 +11803,7 @@ def fail_auto_ingest_subagent_task_claim(
         terminal = next_retry >= 3
         if not terminal:
             payload["attempt_id"] = hashlib.sha256(
-                f"{job_id}\0{generation + 1}\0{token}".encode("utf-8")
+                f"{job_id}\0{generation + 1}\0{token}".encode()
             ).hexdigest()[:32]
         refreshed_payload = json.dumps(
             payload,
@@ -12164,6 +12193,274 @@ def validate_ingest_job_finalization(job_id: str, processed_data: dict) -> dict:
     return result
 
 
+def _exact_reviewed_active_lease(record: dict) -> bool:
+    lease_until = str(record.get("lease_until") or "")
+    if not lease_until:
+        return False
+    parsed_lease = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+    if parsed_lease.tzinfo is None:
+        parsed_lease = parsed_lease.replace(tzinfo=timezone.utc)
+    return parsed_lease > datetime.now(timezone.utc)
+
+
+def _exact_reviewed_ingest_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+) -> dict:
+    row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown ingest job: {job_id}")
+    record = dict(row)
+    if record.get("task_type") != "ingest":
+        raise ValueError(f"Job {job_id} is not an ingest job")
+    status = str(record.get("status") or "")
+    already_reviewed = False
+    reviewed = None
+    if status == "finalized":
+        try:
+            finalized_result = json.loads(str(record.get("result_json") or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Job {job_id} has invalid finalization evidence") from exc
+        reviewed = (
+            finalized_result.get("reviewed_ingest")
+            if isinstance(finalized_result, dict)
+            else None
+        )
+        already_reviewed = bool(
+            isinstance(reviewed, dict)
+            and reviewed.get("contract")
+            == "vector-lake-exact-reviewed-ingest-finalization/v1"
+        )
+        if not already_reviewed:
+            raise ValueError(
+                f"Job {job_id} was finalized outside exact reviewed ingest finalization"
+            )
+    elif status == "awaiting_subagent":
+        if _exact_reviewed_active_lease(record):
+            raise ValueError(f"Job {job_id} still has an active lease")
+    elif status == "failed" and int(record.get("retries") or 0) >= 3:
+        if _exact_reviewed_active_lease(record):
+            raise ValueError(f"Job {job_id} still has an active lease")
+    else:
+        raise ValueError(
+            f"Job {job_id} is not eligible for exact reviewed ingest finalization"
+        )
+    try:
+        payload = json.loads(str(record.get("payload") or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Job {job_id} has an invalid payload") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Job {job_id} payload is not an object")
+    revision = str(payload.get("hash") or "")
+    filepath = str(payload.get("filepath") or "")
+    parse_revision(revision)
+    processed = conn.execute(
+        "SELECT file_hash FROM processed_files WHERE filepath = ?",
+        (filepath,),
+    ).fetchone()
+    revision_is_processed = bool(
+        processed is not None and str(processed["file_hash"] or "") == revision
+    )
+    if already_reviewed and not revision_is_processed:
+        raise ValueError(f"Job {job_id} lacks its committed processed revision")
+    if not already_reviewed and revision_is_processed:
+        raise ValueError(f"Job {job_id} revision is already processed")
+    pending_outbox = conn.execute(
+        "SELECT COUNT(*) AS count FROM ingest_outbox_links AS link "
+        "JOIN mutation_outbox AS outbox ON outbox.id = link.outbox_id "
+        "WHERE link.job_id = ? "
+        "AND outbox.status NOT IN ('completed', 'superseded')",
+        (str(job_id),),
+    ).fetchone()
+    if pending_outbox is not None and int(pending_outbox["count"] or 0):
+        raise ValueError(f"Job {job_id} has unresolved projection outbox work")
+    guarded = {
+        key: record.get(key)
+        for key in (
+            "job_id",
+            "task_type",
+            "status",
+            "payload",
+            "retries",
+            "error_msg",
+            "result_json",
+            "completed_at",
+            "created_at",
+            "updated_at",
+            "available_at",
+            "lease_generation",
+            "idempotency_key",
+            "task_packet_path",
+            "lease_owner",
+            "lease_until",
+            "lease_token",
+        )
+    }
+    guard = hashlib.sha256(
+        json.dumps(
+            guarded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    public_record = dict(record)
+    public_record.pop("lease_token", None)
+    return {
+        "job": public_record,
+        "payload": payload,
+        "row_guard": guard,
+        "original_snapshot": guarded,
+        "already_reviewed": already_reviewed,
+        "stored_reviewed_ingest": reviewed if already_reviewed else None,
+    }
+
+
+def inspect_exact_reviewed_ingest_candidate(job_id: str) -> dict:
+    """Return a guarded, read-only snapshot for one exact reviewed ingest finalization."""
+    init_db()
+    return _exact_reviewed_ingest_snapshot(get_connection(), job_id=str(job_id))
+
+
+def claim_exact_reviewed_ingest_jobs(
+    candidates: list[dict],
+    *,
+    lease_seconds: int = 1800,
+) -> list[dict]:
+    """Atomically fence and lease exact reviewed ingest jobs selected by job_id."""
+    import secrets
+    import socket
+
+    if not candidates or len(candidates) != 1:
+        raise ValueError("exact reviewed ingest finalization requires exactly one candidate")
+    init_db()
+    conn = get_connection()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    lease_until = (now_dt + timedelta(seconds=max(60, int(lease_seconds)))).isoformat()
+    owner = f"exact-reviewed-ingest:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(8)}"
+    claimed: list[dict] = []
+    with transaction():
+        refreshed = []
+        for candidate in candidates:
+            snapshot = _exact_reviewed_ingest_snapshot(
+                conn,
+                job_id=str(candidate["job_id"]),
+            )
+            if snapshot.get("already_reviewed"):
+                raise RuntimeError(
+                    f"Exact reviewed ingest state changed for {candidate['job_id']}"
+                )
+            if not hmac.compare_digest(
+                str(candidate.get("row_guard") or ""),
+                str(snapshot["row_guard"]),
+            ):
+                raise RuntimeError(
+                    f"Exact reviewed ingest state changed for {candidate['job_id']}"
+                )
+            original_status = str(candidate.get("original_status") or "")
+            if original_status != str(snapshot["job"].get("status") or ""):
+                raise RuntimeError(
+                    f"Exact reviewed ingest status changed for {candidate['job_id']}"
+                )
+            refreshed.append(snapshot)
+        for snapshot in refreshed:
+            job_id = str(snapshot["job"]["job_id"])
+            original = snapshot["original_snapshot"]
+            original_status = str(original.get("status") or "")
+            if original_status not in {"awaiting_subagent", "failed"}:
+                raise RuntimeError(f"Exact reviewed ingest job is no longer eligible: {job_id}")
+            if original_status == "failed" and int(original.get("retries") or 0) < 3:
+                raise RuntimeError(f"Exact reviewed ingest job is no longer eligible: {job_id}")
+            lease_token = secrets.token_urlsafe(32)
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'subagent_processing', lease_until = ?, "
+                "lease_owner = ?, lease_token = ?, "
+                "lease_generation = COALESCE(lease_generation, 0) + 1, updated_at = ? "
+                "WHERE job_id = ? AND status = ? "
+                "AND (? != 'failed' OR retries >= 3) "
+                "AND COALESCE(lease_until, '') <= ? AND payload IS ? "
+                "AND result_json IS ? AND updated_at IS ? AND task_type = 'ingest'",
+                (
+                    lease_until,
+                    owner,
+                    lease_token,
+                    now,
+                    job_id,
+                    original_status,
+                    original_status,
+                    now,
+                    original.get("payload"),
+                    original.get("result_json"),
+                    original.get("updated_at"),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Exact reviewed ingest claim raced for {job_id}")
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Exact reviewed ingest lost job {job_id}")
+            item = dict(row)
+            item["exact_reviewed_snapshot"] = original
+            claimed.append(item)
+    return claimed
+
+
+def restore_exact_reviewed_ingest_claim(
+    claim: dict,
+    *,
+    reason: str,
+) -> bool:
+    """Restore one uncommitted exact-reviewed lease without reviving credentials."""
+    job_id = str(claim.get("job_id") or "")
+    original = claim.get("exact_reviewed_snapshot")
+    if not isinstance(original, dict):
+        raise ValueError("exact reviewed ingest claim is missing its guarded snapshot")
+    init_db()
+    conn = get_connection()
+    try:
+        payload = json.loads(str(claim.get("payload") or "{}"))
+    except json.JSONDecodeError:
+        payload = {}
+    filepath = str(payload.get("filepath") or "")
+    revision = str(payload.get("hash") or "")
+    with transaction():
+        processed = conn.execute(
+            "SELECT file_hash FROM processed_files WHERE filepath = ?",
+            (filepath,),
+        ).fetchone()
+        if processed is not None and str(processed["file_hash"] or "") == revision:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = conn.execute(
+            "UPDATE jobs SET status = ?, retries = ?, error_msg = ?, result_json = ?, "
+            "completed_at = ?, updated_at = ?, available_at = ?, "
+            "idempotency_key = ?, task_packet_path = ?, lease_until = NULL, "
+            "lease_owner = NULL, lease_token = NULL "
+            "WHERE job_id = ? AND status = 'subagent_processing' "
+            "AND lease_owner = ? AND lease_token = ? AND lease_generation = ?",
+            (
+                original.get("status"),
+                original.get("retries"),
+                original.get("error_msg"),
+                original.get("result_json"),
+                original.get("completed_at"),
+                now,
+                original.get("available_at"),
+                original.get("idempotency_key"),
+                original.get("task_packet_path"),
+                job_id,
+                claim.get("lease_owner"),
+                claim.get("lease_token"),
+                int(claim.get("lease_generation") or 0),
+            ),
+        )
+        return cursor.rowcount == 1
+
+
 def _terminal_ingest_recovery_snapshot(
     conn: sqlite3.Connection,
     *,
@@ -12198,7 +12495,9 @@ def _terminal_ingest_recovery_snapshot(
             == int(artifact_generation)
         )
         if not already_recovered:
-            raise ValueError(f"Job {job_id} was finalized outside this recovery selection")
+            raise ValueError(
+                f"Job {job_id} was finalized outside this recovery selection"
+            )
     elif status != "failed" or int(record.get("retries") or 0) < 3:
         raise ValueError(f"Job {job_id} is not a terminal failed ingest job")
     lease_until = str(record.get("lease_until") or "")
@@ -12412,7 +12711,9 @@ def claim_terminal_ingest_recoveries(
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"Terminal ingest recovery claim raced for {job_id}")
-            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
             if row is None:
                 raise RuntimeError(f"Terminal ingest recovery lost job {job_id}")
             item = dict(row)

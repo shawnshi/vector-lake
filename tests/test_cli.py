@@ -1,4 +1,6 @@
 import unittest
+
+import pytest
 import threading
 from unittest.mock import patch
 
@@ -88,6 +90,58 @@ def test_projection_object_gc_is_preview_first_and_forwards_apply_fingerprint(
         }
     ]
 
+@pytest.mark.parametrize("mode", ["memory", "fact", "claim", "page"])
+def test_search_cli_unavailable_backend_fails_without_creating_database(
+    isolated_memory, monkeypatch, capsys, mode,
+):
+    from vector_lake import db_store
+
+    monkeypatch.setattr(cli_app, "_configure_stdout", lambda: None)
+    monkeypatch.setattr("sys.argv", ["cli.py", "search", "query", "--mode", mode])
+    assert cli_app.main() == 1
+    captured = capsys.readouterr()
+    assert "doctor" in captured.err
+    assert ("index_missing" if mode == "page" else "database_missing") in captured.err
+    assert "converging automatically" not in captured.err
+    assert captured.out == ""
+    assert not db_store.peek_db_path().exists()
+
+
+@pytest.mark.parametrize("mode", ["memory", "fact", "claim"])
+@pytest.mark.parametrize("has_hit", [False, True])
+def test_search_cli_available_zero_hits_and_semantic_not_ready_succeed(
+    isolated_memory, monkeypatch, capsys, mode, has_hit,
+):
+    from vector_lake import db_store, governance_store, runtime_health
+
+    db_store.init_db()
+    if has_hit:
+        governance_store.apply_change_set({
+            "affected_pages": ["Concept_CLI.md"],
+            "proposed_entities": [], "proposed_evidence": [],
+            "proposed_source_updates": [], "proposed_edges": [],
+            "proposed_claims": [{
+                "claim_id": "claim_cli", "claim_text": "absentzzzz synthetic fact",
+                "claim_type": "assertion", "memory_type": "fact", "status": "active",
+                "source_page": "Concept_CLI.md", "locator": {"page_key": "Concept_CLI"},
+                "evidence_ids": ["ev_cli"], "confidence": 0.9,
+            }],
+        })
+        governance_store.rebuild_operational_memory()
+    monkeypatch.setattr(runtime_health, "get_semantic_readiness_envelope", lambda **_k: {
+        "contract_version": "vector-lake-semantic-readiness-envelope/v1",
+        "status": "not_ready", "ready": False,
+        "results_are_not_accepted_facts": True,
+    })
+    monkeypatch.setattr(cli_app, "_configure_stdout", lambda: None)
+    monkeypatch.setattr("sys.argv", ["cli.py", "search", "absentzzzz", "--mode", mode])
+    assert cli_app.main() == 0
+    captured = capsys.readouterr()
+    assert ("source_claim_id: claim_cli" if has_hit else "No operational memory matched") in captured.out
+    assert '"status":"not_ready"' in captured.out
+    assert captured.err == ""
+
+
 class TestCLI(unittest.TestCase):
     @patch('vector_lake.tools.doctor_vector_lake')
     def test_doctor_command(self, mock_doctor):
@@ -111,7 +165,7 @@ class TestCLI(unittest.TestCase):
         with patch('sys.argv', ['cli.py', 'search', 'test_query', '--top_k', '3']):
             result = cli_app.main()
         self.assertEqual(result, 0)
-        mock_search.assert_called_once_with('test_query', 3, domain=None, cluster=None, include_history=False, mode='page')
+        mock_search.assert_called_once_with('test_query', 3, domain=None, cluster=None, include_history=False, mode='page', _raise_on_unavailable=True)
 
     @patch('vector_lake.tools.search_vector_lake')
     def test_search_command_accepts_formal_fact_mode(self, mock_search):
@@ -129,6 +183,7 @@ class TestCLI(unittest.TestCase):
             cluster=None,
             include_history=False,
             mode='fact',
+            _raise_on_unavailable=True,
         )
 
     @patch('vector_lake.tools.prepare_query_context')

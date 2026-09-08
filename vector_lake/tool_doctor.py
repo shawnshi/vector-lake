@@ -193,7 +193,10 @@ def _diagnostic_snapshot_failure_report(reason: str) -> str:
 
 def quick_doctor_vector_lake() -> str:
     """Return bounded infrastructure health without deep projection comparison."""
-    health = assess_runtime_health(deep_projection_checks=False)
+    health = assess_runtime_health(
+        deep_projection_checks=False,
+        bounded_memory_checks=True,
+    )
     payload = {
         "schema_version": 1,
         "mode": "quick",

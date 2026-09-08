@@ -15,7 +15,6 @@ from typing import Any
 from vector_lake.db_store import get_connection, init_db, transaction
 from vector_lake.governance_metrics import claim_governance_version
 
-
 ALLOWED_OUTCOMES = {
     "supported",
     "unsupported",
@@ -62,33 +61,33 @@ def record_claim_assessment(
 
     init_db()
     conn = get_connection()
-    claim_row = conn.execute(
-        "SELECT data_json FROM claims WHERE claim_id = ?", (normalized["claim_id"],)
-    ).fetchone()
-    if claim_row is None:
-        raise ValueError(f"Claim not found: {normalized['claim_id']}")
-    claim = json.loads(claim_row["data_json"])
-    current_claim_version = claim_governance_version(claim)
-    expected_version = str(expected_claim_version or "").strip()
-    if expected_version and expected_version != current_claim_version:
-        raise ValueError(
-            "Claim version changed before assessment: "
-            f"expected {expected_version}, observed {current_claim_version}"
-        )
-    normalized["claim_version"] = current_claim_version
-
-    identity_json = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    normalized["assessment_id"] = str(assessment_id or "").strip() or (
-        "assessment_" + hashlib.sha256(identity_json.encode("utf-8")).hexdigest()[:24]
-    )
-    normalized["recorded_at"] = _utc_now()
-    serialized = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
     with transaction():
+        claim_row = conn.execute(
+            "SELECT data_json FROM claims WHERE claim_id = ?", (normalized["claim_id"],)
+        ).fetchone()
+        if claim_row is None:
+            raise ValueError(f"Claim not found: {normalized['claim_id']}")
+        claim = json.loads(claim_row["data_json"])
+        current_claim_version = claim_governance_version(claim)
+        expected_version = str(expected_claim_version or "").strip()
+        if expected_version and expected_version != current_claim_version:
+            raise ValueError(
+                "Claim version changed before assessment: "
+                f"expected {expected_version}, observed {current_claim_version}"
+            )
+        normalized["claim_version"] = current_claim_version
+
+        identity_json = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        normalized["assessment_id"] = str(assessment_id or "").strip() or (
+            "assessment_" + hashlib.sha256(identity_json.encode("utf-8")).hexdigest()[:24]
+        )
+        normalized["recorded_at"] = _utc_now()
+        serialized = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
         existing = conn.execute(
             "SELECT data_json FROM claim_assessments WHERE assessment_id = ?",
             (normalized["assessment_id"],),

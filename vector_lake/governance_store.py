@@ -1,6 +1,6 @@
 import copy
-import heapq
 import hashlib
+import heapq
 import hmac
 import json
 import logging
@@ -45,7 +45,6 @@ from vector_lake.wiki_utils import (
     read_markdown_file,
     split_frontmatter,
 )
-
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -154,12 +153,12 @@ def get_purpose_vectors() -> dict:
     if path.exists():
         current_mtime = path.stat().st_mtime
 
-    if _PURPOSE_VECTORS_CACHE is not None and _PURPOSE_VECTORS_MTIME == current_mtime:
+    if _PURPOSE_VECTORS_CACHE is not None and current_mtime == _PURPOSE_VECTORS_MTIME:
         return _PURPOSE_VECTORS_CACHE
 
     if path.exists():
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 _PURPOSE_VECTORS_CACHE = json.load(f)
         except Exception:
             _PURPOSE_VECTORS_CACHE = {"keywords": [], "weight_boost": 0.0}
@@ -1402,7 +1401,7 @@ def _append_version_records(
         return 0
 
     family_ids = sorted({item[2] for item in pending})
-    next_versions = {family_id: 1 for family_id in family_ids}
+    next_versions = dict.fromkeys(family_ids, 1)
     for offset in range(0, len(family_ids), 500):
         batch = family_ids[offset : offset + 500]
         placeholders = ",".join("?" for _ in batch)
@@ -2048,6 +2047,47 @@ def _upsert_operational_memory_records(records: list[dict]):
     )
 
 
+def _validate_operational_memory_delta_scope(
+    old_claim_ids: set[str], proposed_claims: list[dict], authorized_claim_ids: set[str]
+):
+    """Read-only fence for every row the legacy delta refresh can upsert."""
+    from vector_lake import governance_metrics
+
+    conn = get_connection()
+    changed_ids = old_claim_ids | {claim["claim_id"] for claim in proposed_claims}
+    related_ids = set(changed_ids)
+    memories = [
+        _memory_object_from_claim(governance_metrics.annotate_claim_validity(claim))
+        for claim in proposed_claims
+    ]
+    if changed_ids:
+        placeholders = ",".join("?" for _ in changed_ids)
+        memories.extend(
+            json.loads(row["data_json"])
+            for row in conn.execute(
+                f"SELECT data_json FROM operational_memory "
+                f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
+                tuple(sorted(changed_ids)),
+            )
+        )
+    impacted_keys = set()
+    for memory in memories:
+        related_ids.update(memory.get("contradicts_claim_ids", []))
+        if memory.get("memory_type") != "fact":
+            impacted_keys.add((memory.get("memory_type"), memory.get("memory_key")))
+    for memory_type, memory_key in sorted(impacted_keys):
+        related_ids.update(
+            row[0] for row in conn.execute(
+                "SELECT json_extract(data_json, '$.source_claim_id') "
+                "FROM operational_memory WHERE memory_type = ? "
+                "AND json_extract(data_json, '$.memory_key') = ?",
+                (memory_type, memory_key),
+            )
+        )
+    if related_ids - authorized_claim_ids:
+        raise ValueError("Operational memory dependency closure exceeds exact claim scope.")
+
+
 def _refresh_operational_memory_delta(
     old_claim_ids: set[str], proposed_claims: list[dict]
 ):
@@ -2598,7 +2638,9 @@ def rebuild_operational_memory() -> dict:
         ):
             store["items"][memory_id] = memory
     for claim in claims:
-        if classify_non_claim_text(str(claim.get("claim_text") or "")):
+        if classify_non_claim_text(
+            str(claim.get("claim_text") or ""), page_key=str(claim.get("source_page") or ""),
+        ):
             continue
         memory = _memory_object_from_claim(claim)
         store["items"][memory["memory_id"]] = memory
@@ -3288,6 +3330,8 @@ def operational_memory_search_index_status(
     *,
     connection: sqlite3.Connection | None = None,
     allow_integrity_scan: bool = True,
+    allow_durable_proof: bool = False,
+    allow_forced_attestation: bool = True,
 ) -> dict:
     """Inspect derived-index progress without creating schema or changing state."""
     configured = _operational_memory_search_index_enabled()
@@ -3404,14 +3448,18 @@ def operational_memory_search_index_status(
             integrity = verify_operational_memory_search_integrity(
                 conn,
                 allow_full_scan=allow_integrity_scan,
+                allow_durable_proof=allow_durable_proof,
+                allow_forced_attestation=allow_forced_attestation,
             )
             if integrity.get("status") != "ready":
                 warnings.append(
                     str(integrity.get("issue") or "operational_memory_search_integrity")
                 )
+    deferred = integrity is not None and integrity.get("status") == "deferred"
     stalled = bool(
         configured
         and warnings
+        and not deferred
         and progress_age_seconds is not None
         and progress_age_seconds > _MEMORY_SEARCH_PROGRESS_STALL_SECONDS
     )
@@ -3427,7 +3475,10 @@ def operational_memory_search_index_status(
         ),
         "available": True,
         "ready": ready,
-        "status": "ready" if ready else ("backfilling" if configured else "disabled"),
+        "status": (
+            "ready" if ready else "deferred" if deferred
+            else "backfilling" if configured else "disabled"
+        ),
         "warnings": warnings,
         "schema_version": schema_version,
         "backfill_cursor": cursor,
@@ -3917,7 +3968,7 @@ def _legacy_operational_memory_views(
         if allowed_types and memory_type not in allowed_types:
             continue
         if not include_polluted and classify_non_claim_text(
-            str(memory.get("text") or "")
+            str(memory.get("text") or ""), page_key=str(memory.get("source_page") or ""),
         ):
             continue
         relevance = _memory_relevance(memory, terms, matcher=matcher)
@@ -4055,7 +4106,7 @@ def search_operational_memory_views(
         for row in rows:
             memory = _decode_operational_memory_json(row["data_json"])
             if not include_polluted and classify_non_claim_text(
-                str(memory.get("text") or "")
+                str(memory.get("text") or ""), page_key=str(memory.get("source_page") or ""),
             ):
                 continue
             relevance = _memory_relevance(memory, terms, matcher=matcher)
@@ -4145,17 +4196,85 @@ def search_operational_memory(
     return history if include_history else current
 
 
+def _scoped_pollution_records(
+    source_claim_ids: list[str], *, connection=None,
+) -> tuple[dict, dict]:
+    """Load an exact bounded scope; reject missing, substantive or supported claims."""
+    if (
+        not isinstance(source_claim_ids, list)
+        or not 1 <= len(source_claim_ids) <= 256
+        or any(not isinstance(cid, str) or not cid or cid != cid.strip()
+               for cid in source_claim_ids)
+        or len(set(source_claim_ids)) != len(source_claim_ids)
+    ):
+        raise ValueError("Cleanup scope requires 1..256 distinct nonempty claim ids.")
+    placeholders = ",".join("?" for _ in source_claim_ids)
+    conn = connection if connection is not None else get_connection()
+    claims = {
+        row["claim_id"]: json.loads(row["data_json"])
+        for row in conn.execute(
+            f"SELECT claim_id, data_json FROM claims WHERE claim_id IN ({placeholders})",
+            source_claim_ids,
+        )
+    }
+    if set(claims) != set(source_claim_ids):
+        raise ValueError("Cleanup scope contains missing canonical claims.")
+    for claim in claims.values():
+        if (
+            not classify_non_claim_text(
+                str(claim.get("claim_text") or ""),
+                page_key=str(claim.get("source_page") or ""),
+            )
+            or claim.get("source_ids")
+            or claim.get("evidence_ids")
+        ):
+            raise ValueError("Cleanup scope contains substantive or linked claims.")
+    memories = {}
+    seen_claims = set()
+    for row in conn.execute(
+        "SELECT memory_id, data_json FROM operational_memory "
+        f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
+        source_claim_ids,
+    ):
+        memory = json.loads(row["data_json"])
+        cid = memory["source_claim_id"]
+        if str(memory.get("text") or "") != str(claims[cid].get("claim_text") or ""):
+            raise ValueError("Cleanup memory text no longer matches its canonical claim.")
+        memories[row["memory_id"]] = memory
+        seen_claims.add(cid)
+    if seen_claims != set(source_claim_ids):
+        raise ValueError("Cleanup scope contains claims without runtime memory records.")
+    return {"items": memories}, claims
+
+
 def remediate_operational_memory_pollution(
     dry_run: bool = True,
     limit: int = 0,
     sample_size: int = 20,
+    *,
+    source_claim_ids: list[str] | None = None,
+    confirmation: str = "",
+    _read_connection=None,
 ) -> dict:
-    """Preview or archive known infrastructure artifacts in operational memory."""
-    store = load_memory_objects()
+    """Preview or archive infrastructure prose; scoped writes require a fingerprint."""
+    scoped = source_claim_ids is not None
+    if _read_connection is not None and (not dry_run or not scoped):
+        raise ValueError("Backup connections are only valid for scoped read-only previews.")
+    if scoped and limit != 0:
+        raise ValueError("Scoped cleanup does not permit partial limits.")
+    scope_claims = {}
+    if scoped:
+        store, scope_claims = _scoped_pollution_records(
+            source_claim_ids, connection=_read_connection,
+        )
+    else:
+        store = load_memory_objects()
     candidates: list[tuple[dict, str]] = []
     reason_counts: dict[str, int] = {}
     for memory in store.get("items", {}).values():
-        reason = classify_non_claim_text(str(memory.get("text") or ""))
+        reason = classify_non_claim_text(
+            str(memory.get("text") or ""), page_key=str(memory.get("source_page") or ""),
+        )
         reasons = memory.get("validity_reasons") or []
         if not isinstance(reasons, list):
             reasons = [str(reasons)]
@@ -4179,11 +4298,29 @@ def remediate_operational_memory_pollution(
                 "memory_id": memory.get("memory_id"),
                 "source_page": memory.get("source_page"),
                 "reason": reason,
-                "text": " ".join(str(memory.get("text") or "").split())[:180],
+                **({"source_claim_id": memory.get("source_claim_id")} if scoped else {
+                    "text": " ".join(str(memory.get("text") or "").split())[:180],
+                }),
             }
             for memory, reason in selected[: max(0, sample_size)]
         ],
     }
+    if scoped:
+        payload = {
+            "contract": "scoped-template-retirement/v1",
+            "claims": scope_claims,
+            "memories": store["items"],
+            "candidates": [(m["memory_id"], reason) for m, reason in selected],
+        }
+        result["candidate_fingerprint"] = "sha256:" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        result["scope_claim_count"] = len(scope_claims)
+        result["confirmation_required"] = bool(selected)
+        if not dry_run and selected and not hmac.compare_digest(
+            str(confirmation), result["candidate_fingerprint"]
+        ):
+            raise ValueError("Scoped cleanup requires the current candidate fingerprint.")
     if dry_run or not selected:
         return result
 
@@ -4206,6 +4343,21 @@ def remediate_operational_memory_pollution(
                 "updated_at": now,
             }
         )
+        if scoped:
+            archived["template_retirement"] = {
+                "contract": "scoped-template-retirement/v1",
+                "fingerprint": result["candidate_fingerprint"],
+                "reason": reason,
+                "recorded_at": now,
+                "writer": "operator-confirmed:operational_memory_cleanup",
+                "prior_fields": {
+                    key: copy.deepcopy(memory[key])
+                    for key in (
+                        "status", "validity_state", "validity_reasons",
+                        "archived_at", "updated_at", "template_retirement",
+                    ) if key in memory
+                },
+            }
         updates.append(
             (
                 "Archived",
@@ -4215,6 +4367,14 @@ def remediate_operational_memory_pollution(
             )
         )
     with transaction():
+        if scoped:
+            locked = remediate_operational_memory_pollution(
+                dry_run=True, source_claim_ids=source_claim_ids, sample_size=0,
+            )
+            if not hmac.compare_digest(
+                result["candidate_fingerprint"], locked["candidate_fingerprint"]
+            ):
+                raise RuntimeError("Cleanup scope changed before archival; no rows updated.")
         get_connection().executemany(
             "UPDATE operational_memory SET status = ?, data_json = ?, updated_at = ? "
             "WHERE memory_id = ?",
@@ -4293,10 +4453,15 @@ def build_claim_graph_projection(
             for entity_id in claim.get("subject_entity_ids", [])
             if entity_id in entities
         ]
+        # Official snapshots need not have a Wiki page; URLs are not page locators.
         source_pages = [
             sources[source_id]["canonical_source_page"]
             for source_id in claim.get("source_ids", [])
             if source_id in sources
+            and not (
+                sources[source_id].get("source_type") == "official-snapshot"
+                and "canonical_source_page" not in sources[source_id]
+            )
         ]
         compact_text = _compact_claim_text(claim.get("claim_text", ""))
         nodes.append(
@@ -7770,9 +7935,7 @@ def plan_history_retention(
     proposed_ids["evidence_versions"] = evidence_versions
     metadata: list[dict] = []
     missing_rows = 0
-    invalid_business_time: dict[str, int] = {
-        table_name: 0 for table_name in _HISTORY_RETENTION_TABLES
-    }
+    invalid_business_time: dict[str, int] = dict.fromkeys(_HISTORY_RETENTION_TABLES, 0)
     for table_name in _HISTORY_RETENTION_TABLES:
         for key in proposed_ids.get(table_name, []):
             candidate = _history_candidate_metadata(conn, table_name, key)
@@ -8053,7 +8216,7 @@ def apply_history_retention_plan(
     ):
         raise RuntimeError("History retention active references drifted after preview")
 
-    deleted_counts = {table_name: 0 for table_name in _HISTORY_RETENTION_TABLES}
+    deleted_counts = dict.fromkeys(_HISTORY_RETENTION_TABLES, 0)
     payload_hashes: set[str] = set()
     guarded_rows: list[tuple[dict, dict]] = []
     for candidate in candidates:

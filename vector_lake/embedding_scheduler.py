@@ -467,33 +467,43 @@ class MinuteRateLimiter:
             now = time.time()
             cutoff = now - 60.0
             wait_seconds = 0.0
-            with db_store.transaction(max_wait_seconds=remaining_wait()):
-                remaining_wait()
-                conn = db_store.get_connection()
-                conn.execute(
-                    "DELETE FROM embedding_rate_reservations WHERE reserved_at <= ?",
-                    (cutoff,),
-                )
-                row = conn.execute(
-                    "SELECT COUNT(*) AS requests, COALESCE(SUM(token_count), 0) AS tokens, "
-                    "MIN(reserved_at) AS oldest FROM embedding_rate_reservations"
-                ).fetchone()
-                requests = int(row["requests"] or 0)
-                tokens = int(row["tokens"] or 0)
-                if (
-                    requests + 1 <= self.config.effective_rpm
-                    and tokens + request_tokens <= self.config.effective_tpm
-                ):
+            try:
+                with db_store.transaction(max_wait_seconds=remaining_wait()):
                     remaining_wait()
+                    conn = db_store.get_connection()
                     conn.execute(
-                        "INSERT INTO embedding_rate_reservations "
-                        "(reservation_id, reserved_at, token_count) VALUES (?, ?, ?)",
-                        (uuid.uuid4().hex, now, request_tokens),
+                        "DELETE FROM embedding_rate_reservations WHERE reserved_at <= ?",
+                        (cutoff,),
                     )
-                    remaining_wait()
-                    return
-                oldest = float(row["oldest"] or now)
-                wait_seconds = max(0.01, oldest + 60.0 - now + 0.05)
+                    row = conn.execute(
+                        "SELECT COUNT(*) AS requests, COALESCE(SUM(token_count), 0) AS tokens, "
+                        "MIN(reserved_at) AS oldest FROM embedding_rate_reservations"
+                    ).fetchone()
+                    requests = int(row["requests"] or 0)
+                    tokens = int(row["tokens"] or 0)
+                    if (
+                        requests + 1 <= self.config.effective_rpm
+                        and tokens + request_tokens <= self.config.effective_tpm
+                    ):
+                        remaining_wait()
+                        conn.execute(
+                            "INSERT INTO embedding_rate_reservations "
+                            "(reservation_id, reserved_at, token_count) VALUES (?, ?, ?)",
+                            (uuid.uuid4().hex, now, request_tokens),
+                        )
+                        remaining_wait()
+                        return
+                    oldest = float(row["oldest"] or now)
+                    wait_seconds = max(0.01, oldest + 60.0 - now + 0.05)
+            except EmbeddingRateLimitTimeout:
+                raise
+            except TimeoutError as exc:
+                if deadline is None:
+                    raise
+                raise EmbeddingRateLimitTimeout(
+                    "Embedding quota reservation timed out; interactive request "
+                    "fell back to lexical search."
+                ) from exc
             remaining = remaining_wait()
             if remaining is not None and wait_seconds > remaining:
                 raise EmbeddingRateLimitTimeout(

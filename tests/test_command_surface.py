@@ -135,6 +135,24 @@ def test_unsupported_claim_debt_is_preview_first_and_fingerprint_gated():
     assert callable(mcp_server.unsupported_claim_debt)
 
 
+def test_claim_provenance_repair_is_preview_first_and_fingerprint_gated():
+    from vector_lake.cli_app import build_parser
+
+    preview = build_parser().parse_args(["claim-provenance-repair"])
+    apply = build_parser().parse_args(
+        [
+            "claim-provenance-repair",
+            "--apply",
+            "--confirm-fingerprint",
+            "sha256:approved",
+        ]
+    )
+    assert preview.apply is False
+    assert apply.apply is True
+    assert apply.confirm_fingerprint == "sha256:approved"
+    assert callable(mcp_server.claim_provenance_repair)
+
+
 def test_backup_retention_is_preview_first_across_cli_and_mcp():
     from vector_lake.cli_app import build_parser
 

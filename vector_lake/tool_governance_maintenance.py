@@ -15,6 +15,7 @@ import re
 import shutil
 import sqlite3
 from collections import Counter, defaultdict
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -79,12 +80,53 @@ def operational_memory_search_index_maintenance(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def cleanup_operational_memory(dry_run: bool = True, limit: int = 0) -> str:
-    """Expose the bounded operational-memory cleanup with preview as the default."""
+def cleanup_operational_memory(
+    dry_run: bool = True,
+    limit: int = 0,
+    source_claim_ids: list[str] | None = None,
+    confirmation: str = "",
+) -> str:
+    """Archive exact reviewed templates with a checked backup and drift guard."""
+    if source_claim_ids is None:
+        result = governance_store.remediate_operational_memory_pollution(
+            dry_run=dry_run, limit=max(0, int(limit)),
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
     result = governance_store.remediate_operational_memory_pollution(
-        dry_run=dry_run,
-        limit=max(0, int(limit)),
+        dry_run=True, limit=limit, sample_size=0, source_claim_ids=source_claim_ids,
     )
+    if dry_run or not result["selected_count"]:
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    if not hmac.compare_digest(str(confirmation), result["candidate_fingerprint"]):
+        raise ValueError("Scoped cleanup requires the current candidate fingerprint.")
+    from vector_lake.tool_projection import create_maintenance_backup
+
+    backup = create_maintenance_backup("template_retirement")
+    manifest = json.loads((Path(backup) / "manifest.json").read_text(encoding="utf-8"))
+    if not (
+        manifest.get("complete") is True
+        and manifest.get("restorable_as_consistent_canonical_projection_snapshot") is True
+    ):
+        raise RuntimeError(f"Template retirement requires a consistent backup: {backup}")
+    backup_db = Path(backup) / "vector_lake.db"
+    if not backup_db.is_file():
+        raise RuntimeError("Template retirement backup database is missing.")
+    with closing(sqlite3.connect(backup_db.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        backup_plan = governance_store.remediate_operational_memory_pollution(
+            dry_run=True, sample_size=0, source_claim_ids=source_claim_ids,
+            _read_connection=conn,
+        )
+    if not hmac.compare_digest(
+        str(confirmation), backup_plan["candidate_fingerprint"],
+    ):
+        raise RuntimeError("Template retirement backup does not match the confirmed scope.")
+    result = governance_store.remediate_operational_memory_pollution(
+        dry_run=False, sample_size=0, source_claim_ids=source_claim_ids,
+        confirmation=confirmation,
+    )
+    result["backup"] = backup
+    result["backup_candidate_fingerprint"] = backup_plan["candidate_fingerprint"]
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

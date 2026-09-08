@@ -274,21 +274,30 @@ def test_outbox_materialization_does_not_hold_sqlite_write_transaction(
 ):
     db_store.init_db()
     db_store.enqueue_mutation(
-        "Concept_No-IO-Lock.md",
+        "Source_No-IO-Lock.md",
         "update",
-        payload_text="projection",
+        payload_text=_source_content(),
         validation_mode="schema",
     )
     observed = []
+    publications = []
+    original_materialize = mutation_coordinator.materialize_markdown_projection
+    original_publish = mutation_coordinator._publish_staged_projection
 
-    def materialize(*_args, **_kwargs):
+    def materialize(*args, **kwargs):
         observed.append(db_store.get_connection().in_transaction)
+        return original_materialize(*args, **kwargs)
+
+    def publish(staged):
+        publications.append(db_store.get_connection().in_transaction)
+        return original_publish(staged)
 
     monkeypatch.setattr(
         mutation_coordinator,
         "materialize_markdown_projection",
         materialize,
     )
+    monkeypatch.setattr(mutation_coordinator, "_publish_staged_projection", publish)
     monkeypatch.setattr(indexer, "index_projection_matches_canonical", lambda _items: False)
     monkeypatch.setattr(indexer, "update_index_items", lambda _items: None)
     monkeypatch.setattr(
@@ -300,6 +309,8 @@ def test_outbox_materialization_does_not_hold_sqlite_write_transaction(
     stats = process_mutation_outbox_batch(limit=1)
 
     assert observed == [False]
+    assert publications == [True]
+    assert (isolated_memory / "wiki/Source_No-IO-Lock.md").read_text(encoding="utf-8") == _source_content()
     assert stats == {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0}
 
 

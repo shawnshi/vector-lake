@@ -208,6 +208,12 @@ def build_evidence_packet(
     source_ids = list(dict.fromkeys([*source_ids, *evidence_source_ids]))
     source_records, missing_source_ids = _load_json_records("sources", "source_id", source_ids)
     assessments = list_claim_assessments(normalized_claim_id)
+    claim_version = claim_governance_version(claim)
+    current_assessments = [
+        assessment
+        for assessment in assessments
+        if assessment.get("claim_version") == claim_version
+    ]
 
     source_page = str(
         claim.get("source_page")
@@ -250,7 +256,9 @@ def build_evidence_packet(
         warnings.append("raw_source_locator_incomplete")
     if not lineage_safe:
         warnings.append("evidence_lineage_unverified")
-    if not assessments:
+    if len(current_assessments) < len(assessments):
+        warnings.append("claim_assessment_stale")
+    if not current_assessments:
         warnings.append("claim_unassessed")
 
     packet_body = {
@@ -276,7 +284,7 @@ def build_evidence_packet(
             "source_complete": not missing_source_ids and bool(source_ids),
             "source_integrity_complete": integrity_complete,
             "raw_locator_complete": raw_locator_complete,
-            "assessment_complete": bool(assessments),
+            "assessment_complete": bool(current_assessments),
             "lineage_safe": lineage_safe,
             "evidence_text_export": {
                 "included": bool(include_evidence_text),

@@ -1,13 +1,14 @@
 import json
 import sqlite3
+from contextlib import ExitStack, closing, nullcontext
 
 import pytest
 
 from vector_lake.tool_legacy_graph_audit import audit_legacy_graph_connection
 
 
-def _connection(*, reverse_insert_order: bool = False) -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
+def _connection(stack: ExitStack, *, reverse_insert_order: bool = False) -> sqlite3.Connection:
+    conn = stack.enter_context(closing(sqlite3.connect(":memory:")))
     conn.executescript(
         """
         CREATE TABLE wiki_nodes (
@@ -112,8 +113,30 @@ def _connection(*, reverse_insert_order: bool = False) -> sqlite3.Connection:
     return conn
 
 
-def test_nonempty_weighted_graph_is_never_treated_as_relation_graph_equivalent():
-    conn = _connection()
+@pytest.mark.parametrize("fail", [False, True])
+def test_connection_owner_closes_on_success_and_exception(fail):
+    expected = (
+        pytest.raises(AssertionError, match="injected assertion")
+        if fail else nullcontext()
+    )
+    with expected, ExitStack() as stack:
+        conn = _connection(stack)
+        if fail:
+            raise AssertionError("injected assertion")
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        conn.execute("SELECT 1")
+
+
+@pytest.fixture
+def connection_factory():
+    # Own only the handles allocated by this test's factory, even if setup fails.
+    with ExitStack() as stack:
+        yield lambda **kwargs: _connection(stack, **kwargs)
+
+
+def test_nonempty_weighted_graph_is_never_treated_as_relation_graph_equivalent(connection_factory):
+    conn = connection_factory()
     before_changes = conn.total_changes
     conn.execute("PRAGMA query_only=ON")
 
@@ -143,8 +166,8 @@ def test_nonempty_weighted_graph_is_never_treated_as_relation_graph_equivalent()
     assert conn.execute("SELECT COUNT(*) FROM wiki_nodes").fetchone()[0] == 2
 
 
-def test_empty_legacy_edge_table_can_be_ready_when_nodes_and_current_graph_are_sound():
-    conn = _connection()
+def test_empty_legacy_edge_table_can_be_ready_when_nodes_and_current_graph_are_sound(connection_factory):
+    conn = connection_factory()
     conn.execute("DELETE FROM wiki_edges")
     conn.commit()
 
@@ -156,9 +179,9 @@ def test_empty_legacy_edge_table_can_be_ready_when_nodes_and_current_graph_are_s
     assert report["deletion_ready"] is True
 
 
-def test_hashes_and_fingerprint_ignore_insert_order_row_factory_and_sample_limit():
-    left = _connection()
-    right = _connection(reverse_insert_order=True)
+def test_hashes_and_fingerprint_ignore_insert_order_row_factory_and_sample_limit(connection_factory):
+    left = connection_factory()
+    right = connection_factory(reverse_insert_order=True)
     right.row_factory = sqlite3.Row
 
     left_report = audit_legacy_graph_connection(left, sample_limit=0)
@@ -181,8 +204,8 @@ def test_hashes_and_fingerprint_ignore_insert_order_row_factory_and_sample_limit
     assert len(right_report["node_coverage"]["legacy_keys"]["sample"]) == 1
 
 
-def test_temp_table_shadow_cannot_hide_main_legacy_rows():
-    conn = _connection()
+def test_temp_table_shadow_cannot_hide_main_legacy_rows(connection_factory):
+    conn = connection_factory()
     conn.execute(
         "CREATE TEMP TABLE wiki_edges (source TEXT, target TEXT, weight REAL)"
     )
@@ -195,8 +218,8 @@ def test_temp_table_shadow_cannot_hide_main_legacy_rows():
     assert report["deletion_ready"] is False
 
 
-def test_external_consumer_finding_is_an_independent_hard_blocker():
-    conn = _connection()
+def test_external_consumer_finding_is_an_independent_hard_blocker(connection_factory):
+    conn = connection_factory()
     conn.execute("DELETE FROM wiki_edges")
     conn.commit()
 
@@ -222,8 +245,8 @@ def test_external_consumer_finding_is_an_independent_hard_blocker():
     assert report["deletion_ready"] is False
 
 
-def test_node_and_edge_gaps_fail_closed_with_bounded_diff_evidence():
-    conn = _connection()
+def test_node_and_edge_gaps_fail_closed_with_bounded_diff_evidence(connection_factory):
+    conn = connection_factory()
     conn.execute("DELETE FROM entities WHERE entity_id = 'entity_b'")
     conn.execute("DELETE FROM claim_graph_edges")
     conn.execute("DELETE FROM page_graph_edges")
@@ -243,8 +266,8 @@ def test_node_and_edge_gaps_fail_closed_with_bounded_diff_evidence():
     assert report["deletion_ready"] is False
 
 
-def test_payload_weight_and_dual_write_mismatches_are_semantic_blockers():
-    conn = _connection()
+def test_payload_weight_and_dual_write_mismatches_are_semantic_blockers(connection_factory):
+    conn = connection_factory()
     payload = json.loads(
         conn.execute(
             "SELECT data_json FROM entities WHERE entity_id = 'entity_a'"
@@ -278,8 +301,8 @@ def test_payload_weight_and_dual_write_mismatches_are_semantic_blockers():
     assert report["deletion_ready"] is False
 
 
-def test_missing_current_table_and_invalid_json_never_authorize_deletion():
-    conn = _connection()
+def test_missing_current_table_and_invalid_json_never_authorize_deletion(connection_factory):
+    conn = connection_factory()
     conn.execute("DROP TABLE claim_graph_nodes")
     conn.execute(
         "UPDATE wiki_nodes SET metadata_json = '{bad json' "
@@ -297,15 +320,15 @@ def test_missing_current_table_and_invalid_json_never_authorize_deletion():
 
 
 @pytest.mark.parametrize("sample_limit", [-1, 101])
-def test_sample_limit_is_bounded(sample_limit):
-    conn = _connection()
+def test_sample_limit_is_bounded(connection_factory, sample_limit):
+    conn = connection_factory()
 
     with pytest.raises(ValueError, match="between 0 and 100"):
         audit_legacy_graph_connection(conn, sample_limit=sample_limit)
 
 
-def test_sample_limit_rejects_non_integer_values():
-    conn = _connection()
+def test_sample_limit_rejects_non_integer_values(connection_factory):
+    conn = connection_factory()
 
     with pytest.raises(TypeError, match="must be an integer"):
         audit_legacy_graph_connection(conn, sample_limit=True)

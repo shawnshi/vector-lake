@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from vector_lake import db_store, indexer
 from vector_lake.durability import durability_profile
@@ -20,7 +22,6 @@ from vector_lake.wiki_utils import (
     get_wiki_dir,
     iter_markdown_files,
 )
-
 
 _CONTRACT_VERSION = "vector-lake-diagnostic-snapshot/v1"
 _PROJECTION_PATHS = (
@@ -51,7 +52,7 @@ def _sha256_json(payload: Any) -> str:
 def _path_identity(path: Path, *, relative_name: str) -> tuple[Any, ...]:
     try:
         stat = path.stat()
-    except OSError:
+    except FileNotFoundError:
         return (relative_name, "missing")
     return (
         relative_name,
@@ -65,15 +66,13 @@ def _path_identity(path: Path, *, relative_name: str) -> tuple[Any, ...]:
 
 def _capture_external_identity() -> dict[str, tuple[tuple[Any, ...], ...]]:
     wiki_dir = get_wiki_dir()
-    wiki_paths = tuple(sorted(iter_markdown_files(wiki_dir), key=lambda path: path.name))
-    wiki = tuple(
-        _path_identity(path, relative_name=path.name)
-        for path in wiki_paths
+    wiki_paths = tuple(
+        sorted(iter_markdown_files(wiki_dir), key=lambda path: path.name)
     )
+    wiki = tuple(_path_identity(path, relative_name=path.name) for path in wiki_paths)
     projection_paths = tuple(path_factory() for path_factory in _PROJECTION_PATHS)
     projection = tuple(
-        _path_identity(path, relative_name=path.name)
-        for path in projection_paths
+        _path_identity(path, relative_name=path.name) for path in projection_paths
     )
     return {"wiki": wiki, "projection": projection}
 
@@ -112,9 +111,7 @@ class DiagnosticSnapshot:
     generation_fingerprint: str
     source_fingerprint: str
     durability: dict[str, Any]
-    _external_identity: dict[str, tuple[tuple[Any, ...], ...]] = field(
-        repr=False
-    )
+    _external_identity: dict[str, tuple[tuple[Any, ...], ...]] = field(repr=False)
 
     def metadata(self) -> dict[str, Any]:
         """Return the stable, path-private public snapshot contract."""
@@ -141,12 +138,57 @@ class DiagnosticSnapshot:
         }
 
 
+def _trusted_snapshot_cause(exc: BaseException) -> BaseException | None:
+    cause = getattr(exc, "__cause__", None)
+    for _ in range(4):
+        if not isinstance(cause, db_store.ReadOnlySnapshotUnavailable):
+            return cause
+        next_cause = getattr(cause, "__cause__", None)
+        if next_cause is None or next_cause is cause:
+            return cause
+        cause = next_cause
+    return cause
+
+
 def _unavailable_code(exc: BaseException) -> str:
-    message = str(exc).casefold()
-    if any(token in message for token in ("locked", "busy", "timeout", "timed out")):
-        return "snapshot_timeout"
-    if "database_missing" in message:
-        return "database_missing"
+    cause = _trusted_snapshot_cause(exc)
+    if isinstance(cause, PermissionError):
+        return "snapshot_permission_denied"
+    if isinstance(cause, OSError):
+        if cause.errno in {errno.EACCES, errno.EPERM}:
+            return "snapshot_permission_denied"
+        if cause.errno == errno.EIO:
+            return "snapshot_io_error"
+        if cause.errno in {errno.ETIMEDOUT, errno.EBUSY}:
+            return "snapshot_timeout"
+    if isinstance(cause, sqlite3.OperationalError):
+        message = str(cause).casefold()
+        if any(
+            token in message for token in ("locked", "busy", "timeout", "timed out")
+        ):
+            return "snapshot_timeout"
+    if isinstance(exc, db_store.ReadOnlySnapshotUnavailable):
+        reason = str(exc)
+        if reason == "database_changed_during_read_only_snapshot":
+            return reason
+        if reason.startswith("database_missing"):
+            return "database_missing"
+        return "diagnostic_snapshot_unavailable"
+    if isinstance(exc, PermissionError):
+        return "snapshot_permission_denied"
+    if isinstance(exc, OSError):
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            return "snapshot_permission_denied"
+        if exc.errno == errno.EIO:
+            return "snapshot_io_error"
+        if exc.errno in {errno.ETIMEDOUT, errno.EBUSY}:
+            return "snapshot_timeout"
+    if isinstance(exc, sqlite3.OperationalError):
+        message = str(exc).casefold()
+        if any(
+            token in message for token in ("locked", "busy", "timeout", "timed out")
+        ):
+            return "snapshot_timeout"
     return "diagnostic_snapshot_unavailable"
 
 
@@ -173,17 +215,11 @@ def capture_diagnostic_snapshot(
             timeout=timeout,
         ) as connection:
             rows = connection.execute(
-                "SELECT surface, generation FROM runtime_generations "
-                "ORDER BY surface"
+                "SELECT surface, generation FROM runtime_generations ORDER BY surface"
             ).fetchall()
-            runtime_generations = {
-                str(row[0]): int(row[1])
-                for row in rows
-            }
+            runtime_generations = {str(row[0]): int(row[1]) for row in rows}
             if not runtime_generations:
-                raise DiagnosticSnapshotUnavailable(
-                    "diagnostic_snapshot_unavailable"
-                )
+                raise DiagnosticSnapshotUnavailable("diagnostic_snapshot_unavailable")
 
             index_data: dict[str, Any] = {"nodes": {}}
             projection_status = "unavailable"
@@ -228,8 +264,7 @@ def capture_diagnostic_snapshot(
             )
             wiki_dir = get_wiki_dir()
             wiki_paths = tuple(
-                wiki_dir / str(identity[0])
-                for identity in before["wiki"]
+                wiki_dir / str(identity[0]) for identity in before["wiki"]
             )
             snapshot = DiagnosticSnapshot(
                 connection=connection,

@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -248,9 +249,9 @@ def test_restore_round_trip_from_damaged_database_and_projection(isolated_memory
             "projection_pair_manifest.json",
         )
     }
-    with sqlite3.connect(
-        f"{database.as_uri()}?mode=ro&immutable=1", uri=True
-    ) as connection:
+    with closing(
+        sqlite3.connect(f"{database.as_uri()}?mode=ro&immutable=1", uri=True)
+    ) as connection, connection:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     assert not Path(str(database) + "-wal").exists()
     assert not Path(str(database) + "-shm").exists()
@@ -305,7 +306,9 @@ def test_restore_fingerprint_binds_wiki_identity_and_active_writer(
         )
 
     database = db_store.peek_db_path().resolve()
-    with sqlite3.connect(database, timeout=0, isolation_level=None) as writer:
+    with closing(
+        sqlite3.connect(database, timeout=0, isolation_level=None)
+    ) as writer, writer:
         writer.execute("BEGIN IMMEDIATE")
         blocked = restore_snapshot.preview_restore_snapshot(receipt)
         writer.execute("ROLLBACK")
@@ -476,6 +479,7 @@ def test_restore_resumes_after_hard_process_exit(
     child = """
 import os
 import sys
+from contextlib import closing
 from pathlib import Path
 from vector_lake import restore_snapshot
 

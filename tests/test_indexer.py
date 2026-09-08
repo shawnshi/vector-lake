@@ -873,9 +873,12 @@ def test_topology_writer_rebuilds_damaged_projection_sidecar(
     rebuilds = []
     real_rebuild = indexer.generate_index
 
-    def track_rebuild(skip_embeddings=True):
+    def track_rebuild(skip_embeddings=True, *, _before_publish=None):
         rebuilds.append(skip_embeddings)
-        return real_rebuild(skip_embeddings=skip_embeddings)
+        return real_rebuild(
+            skip_embeddings=skip_embeddings,
+            _before_publish=_before_publish,
+        )
 
     monkeypatch.setattr(indexer, "generate_index", track_rebuild)
 
@@ -927,7 +930,7 @@ def test_full_index_rebuild_uses_shared_projection_publish_lock(
     monkeypatch.setattr(
         indexer,
         "_generate_index_unlocked",
-        lambda skip_embeddings=True, *, invalidate_embedding_ids=(): "rebuilt",
+        lambda skip_embeddings=True, *, invalidate_embedding_ids=(), _before_publish=None: "rebuilt",
     )
 
     assert indexer.generate_index() == "rebuilt"

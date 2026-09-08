@@ -893,11 +893,79 @@ def _record_directory(
     }
 
 
+def _projection_recovery_protection(root: Path) -> list[dict[str, str]]:
+    """Pin validated recovery bundles until a separate completion/unpin contract."""
+    from vector_lake import tool_projection
+
+    protected = []
+    try:
+        with os.scandir(root) as entries:
+            for count, entry in enumerate(entries, 1):
+                if count > 10_000:
+                    raise RuntimeError("projection_recovery_backup_limit_exceeded")
+                path = root / entry.name
+                details = path.lstat()
+                if _is_link_or_reparse(path, details) or not stat.S_ISDIR(details.st_mode):
+                    continue  # Existing retention rules never remove these entries.
+                names = {child.name for child in path.iterdir()}
+                manifest = {}
+                if "manifest.json" in names:
+                    manifest = json.loads(_read_plain_file_bytes(
+                        path / "manifest.json", max_bytes=1024 * 1024,
+                    ))
+                    if not isinstance(manifest, dict):
+                        raise ValueError("backup_manifest_is_not_an_object")
+                receipt_name = tool_projection._PROJECTION_RECOVERY_ARTIFACT
+                recovery = receipt_name in names or receipt_name in manifest.get("copied", [])
+                database = path / "vector_lake.db"
+                if not recovery and "vector_lake.db" in names:
+                    details = database.lstat()
+                    if _is_link_or_reparse(database, details) or not stat.S_ISREG(details.st_mode):
+                        continue  # The candidate tree checks reject non-plain artifacts.
+                    # Detect stripped receipts without touching live runtime or creating WAL files.
+                    connection = sqlite3.connect(
+                        f"{database.resolve().as_uri()}?mode=ro&immutable=1", uri=True,
+                    )
+                    try:
+                        connection.execute("PRAGMA query_only=ON")
+                        if connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE name='projection_runtime_v9'"
+                        ).fetchone():
+                            row = connection.execute(
+                                "SELECT status FROM projection_runtime_v9 WHERE singleton=1"
+                            ).fetchone()
+                            if row is None:
+                                raise ValueError("projection_runtime_v9_missing")
+                            recovery = row[0] == "publish_pending"
+                    finally:
+                        connection.close()
+                if recovery:
+                    validated, _inventory = tool_projection.validate_maintenance_backup_v4(
+                        path / "manifest.json"
+                    )
+                    if tool_projection._validate_projection_recovery(path, validated) is None:
+                        raise ValueError("projection_recovery_evidence_missing")
+                    protected.append({
+                        "name": path.name,
+                        "manifest_sha256": validated["_manifest_sha256"],
+                        "reason": "projection_recovery_unverified_completion",
+                    })
+    except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise RuntimeError(f"projection_recovery_protection_failed:{exc}") from exc
+    return sorted(protected, key=lambda item: item["name"])
+
+
+def _revalidate_projection_recovery_protection(root: Path, plan: dict[str, Any]) -> None:
+    if _projection_recovery_protection(root) != plan["projection_recovery_protection"]:
+        raise RuntimeError("projection_recovery_protection_changed")
+
+
 def _fingerprint(
     candidates: list[dict[str, Any]],
     *,
     restorable_guard: dict[str, Any] | None = None,
     restorable_verification_failures: list[dict[str, Any]] | None = None,
+    projection_recovery_protection: list[dict[str, str]] | None = None,
 ) -> str:
     def normalized(item: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -917,6 +985,7 @@ def _fingerprint(
         }
 
     payload = {
+        "projection_recovery_protection": projection_recovery_protection or [],
         "candidates": [
             normalized(item)
             for item in sorted(candidates, key=lambda value: value["name"])
@@ -968,6 +1037,7 @@ def _empty_plan(
         "restorable_guard": None,
         "restorable_verification_failures": restorable_verification_failures,
         "protected": [],
+        "projection_recovery_protection": [],
         "ignored": [],
         "capacity": capacity,
         "capacity_after_candidate_reclaim": _capacity_after_reclaim(
@@ -1020,6 +1090,8 @@ def _scan_retention_plan(
     if not root.exists():
         return _empty_plan(root=root, options=options, root_state="absent")
     _directory_identity(root)
+    recovery_protection = _projection_recovery_protection(root)
+    recovery_names = {item["name"] for item in recovery_protection}
 
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -1049,6 +1121,9 @@ def _scan_retention_plan(
             continue
         if not stat.S_ISDIR(details.st_mode):
             ignored.append({"name": path.name, "reason": "not_directory"})
+            continue
+
+        if path.name in recovery_names:
             continue
 
         if _is_retention_tombstone(path.name):
@@ -1175,7 +1250,7 @@ def _scan_retention_plan(
 
     failed_by_name = {item["name"]: item for item in restorable_verification_failures}
     candidates: list[dict[str, Any]] = []
-    protected: list[dict[str, Any]] = []
+    protected: list[dict[str, Any]] = list(recovery_protection)
     for item in [*stages, *complete]:
         reasons = []
         is_complete_backup = item["type"] == "complete_backup"
@@ -1213,6 +1288,7 @@ def _scan_retention_plan(
         candidates,
         restorable_guard=restorable_guard,
         restorable_verification_failures=restorable_verification_failures,
+        projection_recovery_protection=recovery_protection,
     )
     return {
         "backup_root": str(root),
@@ -1229,6 +1305,7 @@ def _scan_retention_plan(
             key=lambda value: value["name"],
         ),
         "protected": sorted(protected, key=lambda value: value["name"]),
+        "projection_recovery_protection": recovery_protection,
         "ignored": ignored,
         "capacity": capacity,
         "capacity_after_candidate_reclaim": capacity_after_reclaim,
@@ -1376,6 +1453,7 @@ def _apply_retention_plan(plan: dict[str, Any]) -> dict[str, Any]:
     root = Path(plan["backup_root"])
     root_identity = _directory_identity(root)
     restorable_guard = plan.get("restorable_guard")
+    _revalidate_projection_recovery_protection(root, plan)
     for item in plan["candidates"]:
         if _directory_identity(root) != root_identity:
             raise RuntimeError("backup_root_identity_changed")
@@ -1407,6 +1485,7 @@ def _apply_retention_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 or (existing_tombstone and item["manifest_sha256"] is not None),
             )
             _revalidate_restorable_guard(root, restorable_guard)
+            _revalidate_projection_recovery_protection(root, plan)
             if not existing_tombstone:
                 source.rename(tombstone)
             manifest_sha256 = None
@@ -1441,6 +1520,7 @@ def _apply_retention_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 raise RuntimeError("renamed_backup_identity_changed")
             _revalidate_restorable_guard(root, restorable_guard)
             _verify_renamed_candidate_artifacts(tombstone, item)
+            _revalidate_projection_recovery_protection(root, plan)
             _remove_tree_no_follow(tombstone)
             deleted.append(item["name"])
         except _RestorableGuardVerificationError:

@@ -198,6 +198,88 @@ def _seed_auto_ingest_budget_reset(payload: dict) -> str:
     return job_id
 
 
+@pytest.mark.parametrize("log_case", [
+    "trusted_overrun", "invalid_usage", "trailing_event", "untrusted_prose",
+    "optional_string", "optional_negative", "optional_boolean", "optional_valid",
+])
+def test_generator_policy_failure_records_only_trusted_usage_in_receipt_and_budget(
+    isolated_memory, monkeypatch, log_case,
+):
+    from vector_lake.tool_auto_ingest import auto_ingest_budget_status
+
+    # Budget observation accepts historical reservations independently of the
+    # currently configured admission threshold (whose minimum is 16,384).
+    _write_config(isolated_memory)
+    job_id, claim = _claim_for_subagent()
+    events = [json.loads(line) for line in _tool_free_event_log().splitlines()]
+    usage = _completed_usage(input_tokens=8, output_tokens=3, reasoning_output_tokens=1)
+    events[-1]["usage"] = usage
+    if log_case == "invalid_usage":
+        events[-1]["usage"] = {**usage, "output_tokens": "3"}
+    elif log_case == "trailing_event":
+        events.append({"type": "turn.started"})
+    elif log_case.startswith("optional_"):
+        optional_values = {
+            "optional_string": "3",
+            "optional_negative": -1,
+            "optional_boolean": True,
+            "optional_valid": 3,
+        }
+        events[-1]["usage"] = {
+            **usage, "cache_write_input_tokens": optional_values[log_case],
+        }
+    events_path = isolated_memory / "events.jsonl"
+    events_path.write_text(_jsonl(*events), encoding="utf-8")
+
+    def generate(_runner, config, *_args):
+        if log_case == "untrusted_prose":
+            raise auto_ingest_worker.AutoIngestPolicyError("codex_usage_exceeded_reserved_tokens:12")
+        if log_case in {"optional_string", "optional_negative", "optional_boolean"}:
+            with pytest.raises(auto_ingest_worker.AutoIngestPolicyError) as exc_info:
+                auto_ingest_worker._validate_event_log(events_path, config)
+            assert type(exc_info.value) is auto_ingest_worker.AutoIngestPolicyError
+            assert str(exc_info.value) == "codex_event_usage_is_invalid:cache_write_input_tokens"
+            raise exc_info.value
+        auto_ingest_worker._validate_event_log(events_path, config)
+        raise AssertionError("over-reservation must fail closed")
+
+    monkeypatch.setattr(auto_ingest_worker, "_verified_raw_input", lambda *_a: "synthetic source")
+    monkeypatch.setattr(auto_ingest_worker, "render_strategy_directive", lambda: "synthetic purpose")
+    monkeypatch.setattr(auto_ingest_worker, "_run_codex_generator", generate)
+    # The synthetic 10-token reservation cannot hold the real prompt/schema.
+    # Isolate admission sizing, not event validation, job failure, or receipts.
+    monkeypatch.setattr(auto_ingest_worker, "_serialized_generator_inputs", lambda *_a: (b"", b""))
+    finalized = []
+    monkeypatch.setattr("vector_lake.tool_ingest.finalize_ingest_strict", lambda *_a: finalized.append(True))
+    now = datetime.now(timezone.utc)
+    outcome = auto_ingest_worker.AutoIngestController()._process_claimed_job(
+        claim, Path("C:/codex.exe"), _enabled_config(max_tokens_per_task=10),
+        auto_ingest_worker._empty_state(), threading.Event(), now,
+    )
+    assert outcome == "quarantined"
+    assert finalized == []
+    row = db_store.get_connection().execute("SELECT status, result_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    assert row["status"] == "failed"
+    assert not (isolated_memory / "wiki" / "Source_Test.md").exists()
+    paths = list(auto_ingest_worker._attempt_receipt_root().rglob("*.json"))
+    assert len(paths) == 1
+    receipt = json.loads(paths[0].read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "quarantined"
+    assert receipt["stage"] == "generation"
+    assert receipt["reserved_tokens"] == 10
+    budget = auto_ingest_budget_status(now=datetime.now(timezone.utc))
+    assert budget["hour"]["reserved_tokens"] == 10
+    if log_case in {"trusted_overrun", "optional_valid"}:
+        assert receipt["usage"] == usage
+        assert sum(receipt["usage"][key] for key in ("input_tokens", "output_tokens", "reasoning_output_tokens")) == 12
+        assert budget["actual_usage"]["complete"] is True
+        assert budget["actual_usage"]["totals"] == usage
+    else:
+        assert receipt["usage"] == {}
+        assert budget["actual_usage"]["complete"] is False
+        assert budget["actual_usage"]["totals"] == {}
+
+
 def test_auto_ingest_is_disabled_without_explicit_budget_config(isolated_memory):
     config = auto_ingest_worker.load_auto_ingest_config()
     assert config.enabled is False

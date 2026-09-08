@@ -1339,7 +1339,7 @@ def test_quick_doctor_marks_semantic_readiness_unchecked(
 
     report = json.loads(tool_doctor.quick_doctor_vector_lake())
 
-    assert observed == {"deep_projection_checks": False}
+    assert observed == {"deep_projection_checks": False, "bounded_memory_checks": True}
     assert report["mode"] == "quick"
     assert report["ok"] is True
     assert report["semantic_readiness"] == {
@@ -1352,6 +1352,7 @@ def test_quick_doctor_marks_semantic_readiness_unchecked(
 def test_all_known_mcp_rescan_entrypoints_are_heavy_task_gated():
     expected = {
         "doctor_vector_lake": ("scan", 900.0),
+        "finalize_exact_reviewed_ingest_outputs": ("projection", 900.0),
         "finalize_query_synthesis": ("projection", 900.0),
         "get_governance_debt": ("scan", 900.0),
         "lint_vector_lake": ("scan", 1800.0),
@@ -1459,6 +1460,78 @@ def test_terminal_ingest_recovery_apply_requires_manual_admin(monkeypatch):
     monkeypatch.delenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", raising=False)
     with pytest.raises(PermissionError, match="disabled by default"):
         mcp_server.recover_terminal_ingest_outputs(
+            "C:/approved/manifest.json",
+            dry_run=False,
+            confirmation="sha256:abc",
+        )
+
+
+def test_exact_reviewed_ingest_mcp_requires_exact_one_selection(monkeypatch):
+    manifest = {
+        "contract": "vector-lake-exact-reviewed-ingest-finalization/v1",
+        "selections": [{"job_id": "a" * 32}],
+    }
+    observed = {}
+    monkeypatch.setattr(
+        mcp_server,
+        "_read_payload",
+        lambda path: json.dumps(manifest),
+    )
+
+    def finalize(selections, *, dry_run, confirmation):
+        observed.update(
+            selections=selections,
+            dry_run=dry_run,
+            confirmation=confirmation,
+        )
+        return "ok"
+
+    monkeypatch.setattr(
+        mcp_server.tools,
+        "finalize_exact_reviewed_ingest_outputs",
+        finalize,
+    )
+    monkeypatch.setenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", "1")
+    assert (
+        mcp_server.finalize_exact_reviewed_ingest_outputs(
+            "C:/approved/manifest.json",
+            dry_run=False,
+            confirmation="sha256:abc",
+        )
+        == "ok"
+    )
+    assert observed == {
+        "selections": manifest["selections"],
+        "dry_run": False,
+        "confirmation": "sha256:abc",
+    }
+
+    bad_manifest = {**manifest, "selections": []}
+    monkeypatch.setattr(
+        mcp_server,
+        "_read_payload",
+        lambda path: json.dumps(bad_manifest),
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        mcp_server.finalize_exact_reviewed_ingest_outputs(
+            "C:/approved/manifest.json",
+            dry_run=True,
+        )
+
+
+def test_exact_reviewed_ingest_apply_requires_manual_admin(monkeypatch):
+    manifest = {
+        "contract": "vector-lake-exact-reviewed-ingest-finalization/v1",
+        "selections": [{"job_id": "a" * 32}],
+    }
+    monkeypatch.setattr(
+        mcp_server,
+        "_read_payload",
+        lambda path: json.dumps(manifest),
+    )
+    monkeypatch.delenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", raising=False)
+    with pytest.raises(PermissionError, match="disabled by default"):
+        mcp_server.finalize_exact_reviewed_ingest_outputs(
             "C:/approved/manifest.json",
             dry_run=False,
             confirmation="sha256:abc",

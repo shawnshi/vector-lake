@@ -967,6 +967,32 @@ def test_interactive_rate_reservation_fails_fast(isolated_memory):
         limiter.reserve(10, max_wait_seconds=0.01)
 
 
+@pytest.mark.parametrize("budget,error_type,mapped", [
+    (0.01, TimeoutError, True),
+    (None, TimeoutError, False),
+    (0.01, RuntimeError, False),
+    (0.01, embedding_scheduler.EmbeddingRateLimitTimeout, False),
+])
+def test_rate_reservation_preserves_transaction_error_contract(
+    budget, error_type, mapped, isolated_memory, monkeypatch,
+):
+    failure = error_type("synthetic transaction deadline or storage failure")
+    def fail_transaction(**_kwargs):
+        raise failure
+    monkeypatch.setattr(db_store, "transaction", fail_transaction)
+    limiter = embedding_scheduler.MinuteRateLimiter(
+        embedding_scheduler.EmbeddingRateConfig(rpm=10, tpm=100, utilization=1.0),
+        initialize_schema=False,
+    )
+    expected = embedding_scheduler.EmbeddingRateLimitTimeout if mapped else error_type
+    with pytest.raises(expected) as caught:
+        limiter.reserve(10, max_wait_seconds=budget)
+    if mapped:
+        assert caught.value.__cause__ is failure
+    else:
+        assert caught.value is failure
+
+
 def test_interactive_rate_reservation_can_skip_schema_bootstrap(
     isolated_memory,
     monkeypatch,

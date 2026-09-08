@@ -5121,6 +5121,481 @@ def test_reconcile_ingest_job_debt_deduplicates_current_raw_identity(
     assert superseded["idempotency_key"] is None
 
 
+def _exact_duplicate_fixture(isolated_memory, *, other_terminal_failures=0, label="exact-duplicate"):
+    raw_path = isolated_memory / "raw" / f"{label}.md"
+    raw_path.write_text(f"current exact revision {label}", encoding="utf-8")
+    current_hash = calculate_hash(str(raw_path))
+    failed_payload = _v4_ingest_payload(
+        str(raw_path),
+        current_hash,
+        f"Source_Exact-Legacy-{label}.md",
+        instructions="target instructions must stay private",
+    )
+    failed_job = db_store.enqueue_job("ingest", failed_payload)
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+            (failed_job,),
+        )
+    owner_payload = {
+        **failed_payload,
+        "canonical_name": f"Source_Exact-Current-Owner-{label}.md",
+        "instructions": "owner instructions must stay private",
+    }
+    owner_job = db_store.enqueue_job("ingest", owner_payload)
+    db_store.mark_job_awaiting_subagent(owner_job, "")
+
+    other_jobs = []
+    for index in range(other_terminal_failures):
+        other_raw = isolated_memory / "raw" / f"other-terminal-{index}.md"
+        other_raw.write_text(f"other terminal {index}", encoding="utf-8")
+        other_payload = _v4_ingest_payload(
+            str(other_raw),
+            calculate_hash(str(other_raw)),
+            f"Source_Other-Terminal-{index}.md",
+        )
+        other_job = db_store.enqueue_job("ingest", other_payload)
+        with db_store.transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'failed', retries = 3 WHERE job_id = ?",
+                (other_job,),
+            )
+        other_jobs.append(other_job)
+    return failed_job, owner_job, other_jobs, raw_path
+
+
+def _stored_job_row(job_id):
+    row = (
+        db_store.get_connection()
+        .execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
+        .fetchone()
+    )
+    return dict(row)
+
+
+def test_exact_reconcile_dry_run_scopes_one_duplicate_with_other_failures(
+    isolated_memory,
+):
+    failed_job, _owner_job, _other_jobs, _raw_path = _exact_duplicate_fixture(
+        isolated_memory,
+        other_terminal_failures=5,
+    )
+
+    preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            limit=0,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+    second_preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            limit=20,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+
+    assert preview["selected_jobs"] == 1
+    assert preview["available_jobs"] == 1
+    assert preview["counts"] == {"supersede_duplicate": 1}
+    assert preview["samples"] == [
+        {
+            "job_id": failed_job,
+            "action": "supersede_duplicate",
+            "reason": f"current raw revision is already owned by {preview['exact']['plan']['owner_job_id']}",
+        }
+    ]
+    assert preview["exact"]["contract"] == "vector-lake-ingest-debt-exact/v1"
+    assert preview["exact"]["fingerprint"].startswith("sha256:")
+    assert preview["exact"]["fingerprint"] == second_preview["exact"]["fingerprint"]
+    serialized_exact = json.dumps(preview["exact"], ensure_ascii=False)
+    assert "instructions must stay private" not in serialized_exact
+
+
+def test_exact_reconcile_apply_supersedes_only_target_duplicate(
+    isolated_memory,
+    monkeypatch,
+):
+    failed_job, owner_job, other_jobs, _raw_path = _exact_duplicate_fixture(
+        isolated_memory,
+        other_terminal_failures=5,
+    )
+    before_owner = _stored_job_row(owner_job)
+    before_others = {job_id: _stored_job_row(job_id) for job_id in other_jobs}
+    monkeypatch.setattr(
+        tool_projection,
+        "create_maintenance_backup",
+        lambda _label: str(isolated_memory / "exact-backup"),
+    )
+    preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+
+    applied = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            limit=0,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            confirmation=preview["exact"]["fingerprint"],
+        )
+    )
+
+    target = _stored_job_row(failed_job)
+    assert applied["selected_jobs"] == 1
+    assert applied["applied_counts"] == {"supersede_duplicate": 1}
+    assert applied["exact"]["mutation_count"] == 1
+    assert applied["concurrent_skips"] == []
+    assert target["status"] == "superseded"
+    assert target["idempotency_key"] is None
+    assert json.loads(target["result_json"])["owner_job_id"] == owner_job
+    assert _stored_job_row(owner_job) == before_owner
+    assert {job_id: _stored_job_row(job_id) for job_id in other_jobs} == before_others
+
+
+def test_exact_reconcile_apply_concurrent_owner_skip_is_conflict(
+    isolated_memory,
+    monkeypatch,
+):
+    failed_job, owner_job, _other_jobs, _raw_path = _exact_duplicate_fixture(
+        isolated_memory
+    )
+    preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+    backup_calls = []
+
+    def add_concurrent_owner(label):
+        backup_calls.append(label)
+        owner_payload = json.loads(_stored_job_row(owner_job)["payload"])
+        concurrent_payload = {
+            **owner_payload,
+            "canonical_name": "Source_Exact-Concurrent-Owner.md",
+        }
+        concurrent_owner = db_store.enqueue_job("ingest", concurrent_payload)
+        db_store.mark_job_awaiting_subagent(concurrent_owner, "")
+        return str(isolated_memory / "exact-concurrent-backup")
+
+    monkeypatch.setattr(tool_projection, "create_maintenance_backup", add_concurrent_owner)
+
+    with pytest.raises(tool_ingest.IngestBaselineConflict):
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            confirmation=preview["exact"]["fingerprint"],
+        )
+
+    target = _stored_job_row(failed_job)
+    assert backup_calls == ["ingest_job_debt"]
+    assert target["status"] == "failed"
+    assert target["retries"] == 3
+    assert target["idempotency_key"] is not None
+
+
+@pytest.mark.parametrize(
+    "race",
+    ["owner_error_msg", "target_task_type_created_at", "owner_missing"],
+)
+def test_exact_reconcile_apply_rejects_postbackup_row_guard_races(
+    isolated_memory,
+    monkeypatch,
+    race,
+):
+    failed_job, owner_job, other_jobs, _raw_path = _exact_duplicate_fixture(
+        isolated_memory,
+        other_terminal_failures=2,
+        label=race,
+    )
+    before_target = _stored_job_row(failed_job)
+    before_owner = _stored_job_row(owner_job)
+    before_others = {job_id: _stored_job_row(job_id) for job_id in other_jobs}
+    preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+    backup_calls = []
+
+    def mutate_after_confirmation(label):
+        backup_calls.append(label)
+        with db_store.transaction() as connection:
+            if race == "owner_error_msg":
+                connection.execute(
+                    "UPDATE jobs SET error_msg = 'post-backup owner guard drift' "
+                    "WHERE job_id = ?",
+                    (owner_job,),
+                )
+            elif race == "target_task_type_created_at":
+                connection.execute(
+                    "UPDATE jobs SET task_type = 'ingest-postbackup-drift', "
+                    "created_at = '2030-01-01T00:00:00+00:00' WHERE job_id = ?",
+                    (failed_job,),
+                )
+            elif race == "owner_missing":
+                connection.execute("DELETE FROM jobs WHERE job_id = ?", (owner_job,))
+            else:  # pragma: no cover - parametrization guard
+                raise AssertionError(race)
+        return str(isolated_memory / f"exact-{race}-backup")
+
+    monkeypatch.setattr(
+        tool_projection,
+        "create_maintenance_backup",
+        mutate_after_confirmation,
+    )
+
+    with pytest.raises(tool_ingest.IngestBaselineConflict, match="exact ingest debt"):
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            confirmation=preview["exact"]["fingerprint"],
+        )
+
+    target = _stored_job_row(failed_job)
+    assert backup_calls == ["ingest_job_debt"]
+    assert target["status"] == "failed"
+    assert target["retries"] == 3
+    assert target["idempotency_key"] == before_target["idempotency_key"]
+    assert target["result_json"] == before_target["result_json"]
+    if race == "target_task_type_created_at":
+        assert target["task_type"] == "ingest-postbackup-drift"
+        assert target["created_at"] == "2030-01-01T00:00:00+00:00"
+    else:
+        assert target == before_target
+    if race == "owner_error_msg":
+        owner = _stored_job_row(owner_job)
+        assert owner["error_msg"] == "post-backup owner guard drift"
+        assert {**owner, "error_msg": before_owner["error_msg"]} == before_owner
+    elif race == "owner_missing":
+        owner = (
+            db_store.get_connection()
+            .execute("SELECT * FROM jobs WHERE job_id = ?", (owner_job,))
+            .fetchone()
+        )
+        assert owner is None
+    else:
+        assert _stored_job_row(owner_job) == before_owner
+    assert {job_id: _stored_job_row(job_id) for job_id in other_jobs} == before_others
+
+
+def test_exact_reconcile_rejects_invalid_unknown_partial_and_mixed_arguments(
+    isolated_memory,
+):
+    failed_job, _owner_job, _other_jobs, _raw_path = _exact_duplicate_fixture(
+        isolated_memory
+    )
+
+    with pytest.raises(ValueError, match="job_id is invalid"):
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id="A" * 32,
+            expected_action="supersede_duplicate",
+        )
+    with pytest.raises(ValueError, match="Unknown or ineligible"):
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id="0" * 32,
+            expected_action="supersede_duplicate",
+        )
+    with pytest.raises(ValueError, match="required together"):
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            expected_action="supersede_duplicate",
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="requeue_current",
+        )
+    with pytest.raises(ValueError, match="cannot be mixed"):
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            _operator_retry_job_id=failed_job,
+            _expected_operator_retry_guard="guard",
+            _expected_operator_retry_revision="sha256:" + "0" * 64,
+        )
+    with pytest.raises(PermissionError, match="confirmation is required"):
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+
+
+def test_exact_reconcile_rejects_wrong_fingerprint_before_backup(
+    isolated_memory,
+    monkeypatch,
+):
+    failed_job, _owner_job, _other_jobs, _raw_path = _exact_duplicate_fixture(
+        isolated_memory
+    )
+    backup_calls = []
+    monkeypatch.setattr(
+        tool_projection,
+        "create_maintenance_backup",
+        lambda _label: backup_calls.append(_label) or "should-not-back-up",
+    )
+
+    with pytest.raises(PermissionError, match="confirmation mismatch"):
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            confirmation="sha256:" + "1" * 64,
+        )
+
+    assert backup_calls == []
+    assert _stored_job_row(failed_job)["status"] == "failed"
+
+
+def test_exact_reconcile_fingerprint_changes_on_raw_owner_or_target_drift(
+    isolated_memory,
+):
+    failed_job, owner_job, _other_jobs, raw_path = _exact_duplicate_fixture(
+        isolated_memory,
+        label="raw-drift",
+    )
+    preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+
+    raw_path.write_text("changed exact revision", encoding="utf-8")
+    with pytest.raises(tool_ingest.IngestBaselineConflict):
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            confirmation=preview["exact"]["fingerprint"],
+        )
+
+    failed_job, owner_job, _other_jobs, raw_path = _exact_duplicate_fixture(
+        isolated_memory,
+        label="owner-drift",
+    )
+    preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'cancelled', idempotency_key = NULL WHERE job_id = ?",
+            (owner_job,),
+        )
+    with pytest.raises(tool_ingest.IngestBaselineConflict):
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            confirmation=preview["exact"]["fingerprint"],
+        )
+
+    failed_job, _owner_job, _other_jobs, _raw_path = _exact_duplicate_fixture(
+        isolated_memory,
+        label="target-drift",
+    )
+    preview = json.loads(
+        reconcile_ingest_job_debt(
+            dry_run=True,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+        )
+    )
+    with db_store.transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET error_msg = 'changed target row' WHERE job_id = ?",
+            (failed_job,),
+        )
+    with pytest.raises(PermissionError, match="confirmation mismatch"):
+        reconcile_ingest_job_debt(
+            dry_run=False,
+            job_id=failed_job,
+            expected_action="supersede_duplicate",
+            confirmation=preview["exact"]["fingerprint"],
+        )
+
+
+def test_exact_reconcile_cross_surface_mcp_and_cli_forwarding(monkeypatch, capsys):
+    forwarded = []
+
+    def fake_reconcile(**kwargs):
+        forwarded.append(kwargs)
+        return json.dumps({"forwarded": kwargs}, sort_keys=True)
+
+    monkeypatch.setattr(mcp_server.tools, "reconcile_ingest_job_debt", fake_reconcile)
+    assert json.loads(
+        mcp_server.reconcile_ingest_tasks(
+            dry_run=False,
+            limit=3,
+            job_id="a" * 32,
+            expected_action="supersede_duplicate",
+            confirmation="sha256:abc",
+        )
+    )["forwarded"] == {
+        "dry_run": False,
+        "limit": 3,
+        "job_id": "a" * 32,
+        "expected_action": "supersede_duplicate",
+        "confirmation": "sha256:abc",
+    }
+
+    from vector_lake import cli_app
+
+    monkeypatch.setattr(cli_app, "_cli_heavy_task_policy", lambda _args: None)
+    monkeypatch.setattr(cli_app.tools, "reconcile_ingest_job_debt", fake_reconcile)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cli.py",
+            "ingest-tasks",
+            "--repair-debt",
+            "--apply",
+            "--limit",
+            "7",
+            "--job-id",
+            "b" * 32,
+            "--expected-action",
+            "supersede_duplicate",
+            "--confirm-fingerprint",
+            "sha256:def",
+        ],
+    )
+
+    assert cli_app.main() == 0
+
+    capsys.readouterr()
+    assert forwarded[-1] == {
+        "dry_run": False,
+        "limit": 7,
+        "job_id": "b" * 32,
+        "expected_action": "supersede_duplicate",
+        "confirmation": "sha256:def",
+    }
+
+
 def test_reconcile_failed_legacy_name_uses_current_revision_owner(
     isolated_memory,
     monkeypatch,
@@ -6728,6 +7203,777 @@ def test_ingest_candidate_manifest_is_not_parsed_from_untrusted_skeleton(
             "target_projection_hash": "a" * 64,
         }
     ]
+
+
+def _exact_review() -> dict:
+    return {
+        "review_id": "review-20260908-001",
+        "approved_at": "2026-09-08T03:00:00Z",
+        "approver": "authorized-operator",
+        "scope": "exact-ingest-finalization",
+        "reason": "Human reviewed this exact ingest result and raw fingerprint.",
+    }
+
+
+def _rejected_exact_output(job_id: str) -> dict:
+    return {
+        "schema_version": 1,
+        "job_id": job_id,
+        "purpose_scope": "excluded",
+        "purpose_evidence": "This raw item is outside the approved strategic purpose.",
+        "decision_confidence": 0.95,
+        "files": [],
+        "integration": {
+            "disposition": "rejected",
+            "reason": "Human-approved rejection for this exact source.",
+            "relations": [],
+        },
+    }
+
+
+def _standalone_exact_output(job_id: str, filename: str) -> dict:
+    return {
+        "schema_version": 1,
+        "job_id": job_id,
+        "purpose_scope": "edge",
+        "purpose_evidence": "This source should be preserved as standalone evidence.",
+        "decision_confidence": 0.95,
+        "files": [
+            {"filename": filename, "content": "# Standalone\n\nsource evidence"}
+        ],
+        "integration": {
+            "disposition": "standalone",
+            "reason": "No dispatched relation target is required for this source.",
+            "relations": [],
+        },
+    }
+
+
+def _exact_selection(job_id: str, payload: dict, output: dict, review: dict | None = None) -> dict:
+    return {
+        "job_id": job_id,
+        "filepath": str(payload["filepath"]),
+        "hash": str(payload["hash"]),
+        "canonical_name": str(payload["canonical_name"]),
+        "source_hash": str(payload.get("source_hash") or ""),
+        "source_projection_hash": str(payload.get("source_projection_hash") or ""),
+        "ingest_contract_version": int(payload["ingest_contract_version"]),
+        "integration_candidates_sha256": tool_ingest._canonical_json_sha256(
+            payload.get("integration_candidates") or []
+        ),
+        "review": review or _exact_review(),
+        "output": output,
+    }
+
+
+def test_exact_reviewed_ingest_plan_accepts_human_reviewed_rejection_without_auto_finalize(
+    isolated_memory,
+):
+    from vector_lake.auto_ingest_worker import (
+        AutoIngestConfig,
+        AutoIngestPolicyError,
+        _validate_generator_output,
+    )
+
+    raw_path = isolated_memory / "raw" / "reviewed-rejection.md"
+    raw_path.write_text("reviewed rejection", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_reviewed-rejection.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    output = _rejected_exact_output(job_id)
+    with pytest.raises(AutoIngestPolicyError, match="requires_human_review"):
+        _validate_generator_output(output, job_id, payload, AutoIngestConfig())
+
+    plan_json = tool_ingest.finalize_exact_reviewed_ingest_outputs(
+        [_exact_selection(job_id, payload, output)],
+        dry_run=True,
+    )
+    receipt = json.loads(plan_json)
+    assert receipt["ok"] is True
+    assert receipt["committed"] is False
+    item = receipt["plan"]["items"][0]
+    assert item["state"] == "finalizable"
+    assert item["disposition"] == "rejected"
+    assert "lease_token" not in plan_json
+    assert "task_packet_path" not in plan_json
+
+
+def test_exact_reviewed_ingest_claim_is_exact_atomic_and_restorable(isolated_memory):
+    raw_path = isolated_memory / "raw" / "exact-claim.md"
+    raw_path.write_text("exact claim", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_exact-claim.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    snapshot = db_store.inspect_exact_reviewed_ingest_candidate(job_id)
+    claims = db_store.claim_exact_reviewed_ingest_jobs(
+        [
+            {
+                "job_id": job_id,
+                "row_guard": snapshot["row_guard"],
+                "original_status": "awaiting_subagent",
+            }
+        ],
+        lease_seconds=300,
+    )
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim["status"] == "subagent_processing"
+    assert claim["lease_owner"].startswith("exact-reviewed-ingest:")
+    assert claim["lease_token"]
+
+    assert db_store.restore_exact_reviewed_ingest_claim(
+        claim,
+        reason="test rollback",
+    )
+    restored = db_store.get_connection().execute(
+        "SELECT status, retries, lease_owner, lease_token, lease_until, "
+        "lease_generation FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert dict(restored) == {
+        "status": "awaiting_subagent",
+        "retries": 0,
+        "lease_owner": None,
+        "lease_token": None,
+        "lease_until": None,
+        "lease_generation": 1,
+    }
+    with pytest.raises(RuntimeError, match="state changed"):
+        db_store.claim_exact_reviewed_ingest_jobs(
+            [
+                {
+                    "job_id": job_id,
+                    "row_guard": snapshot["row_guard"],
+                    "original_status": "awaiting_subagent",
+                }
+            ]
+        )
+
+
+def test_exact_reviewed_ingest_terminal_failed_supports_only_rejected_output(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "terminal-exact.md"
+    raw_path.write_text("terminal exact", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_terminal-exact.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    now = datetime.now(timezone.utc).isoformat()
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'failed', retries = 3, error_msg = ?, "
+            "completed_at = ?, updated_at = ? WHERE job_id = ?",
+            ("reviewed terminal rejection", now, now, job_id),
+        )
+
+    with pytest.raises(ValueError, match="only supports reviewed rejected output"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [
+                _exact_selection(
+                    job_id,
+                    payload,
+                    _standalone_exact_output(job_id, "Source_terminal-exact.md"),
+                )
+            ],
+            dry_run=True,
+        )
+    receipt = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [_exact_selection(job_id, payload, _rejected_exact_output(job_id))],
+            dry_run=True,
+        )
+    )
+    assert receipt["plan"]["items"][0]["original_status"] == "failed"
+
+
+def test_exact_reviewed_ingest_awaiting_admission_claims_only_selected_job(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_path = isolated_memory / "raw" / "awaiting-admission.md"
+    raw_path.write_text("awaiting admission", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_awaiting-admission.md",
+    )
+    other_raw = isolated_memory / "raw" / "unrelated-awaiting.md"
+    other_raw.write_text("unrelated awaiting", encoding="utf-8")
+    other_payload = _v4_ingest_payload(
+        str(other_raw),
+        calculate_hash(str(other_raw)),
+        "Source_unrelated-awaiting.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    other_job_id = db_store.enqueue_job("ingest", other_payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' "
+            "WHERE job_id IN (?, ?)",
+            (job_id, other_job_id),
+        )
+    other_before = dict(
+        db_store.get_connection()
+        .execute("SELECT * FROM jobs WHERE job_id = ?", (other_job_id,))
+        .fetchone()
+    )
+    monkeypatch.setattr(tool_ingest, "_projection_pair_settled_now", lambda: True)
+    selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
+    preview = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+    )
+    receipt = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [selection],
+            dry_run=False,
+            confirmation=preview["plan"]["fingerprint"],
+        )
+    )
+
+    assert receipt["ok"] is True
+    assert receipt["committed_job_ids"] == [job_id]
+    other_after = dict(
+        db_store.get_connection()
+        .execute("SELECT * FROM jobs WHERE job_id = ?", (other_job_id,))
+        .fetchone()
+    )
+    assert other_after == other_before
+
+
+def test_exact_reviewed_ingest_apply_records_reviewed_provenance_without_public_secret(
+    isolated_memory,
+    monkeypatch,
+):
+    raw_path = isolated_memory / "raw" / "apply-reviewed.md"
+    raw_path.write_text("apply reviewed", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_apply-reviewed.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
+    preview = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+    )
+    fingerprint = preview["plan"]["fingerprint"]
+
+    monkeypatch.setattr(tool_ingest, "_projection_pair_settled_now", lambda: False)
+
+    receipt_text = tool_ingest.finalize_exact_reviewed_ingest_outputs(
+        [selection],
+        dry_run=False,
+        confirmation=fingerprint,
+    )
+    receipt = json.loads(receipt_text)
+    assert receipt["committed"] is True
+    assert receipt["ok"] is False
+    assert receipt["state"] == "committed_projection_pending"
+    assert receipt["committed_job_ids"] == [job_id]
+    assert "lease_token" not in receipt_text
+    assert "exact-reviewed-ingest:" not in receipt_text
+    row = db_store.get_connection().execute(
+        "SELECT result_json FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    result = json.loads(row["result_json"])
+    assert result["reviewed_ingest"]["contract"] == (
+        "vector-lake-exact-reviewed-ingest-finalization/v1"
+    )
+    assert result["reviewed_ingest"]["selection_digest"] == receipt[
+        "selection_digests"
+    ][job_id]
+
+
+def test_exact_reviewed_ingest_rejects_active_foreign_lease(isolated_memory):
+    raw_path = isolated_memory / "raw" / "active-lease.md"
+    raw_path.write_text("active lease", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_active-lease.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent', "
+            "lease_owner = ?, lease_token = ?, lease_until = ? "
+            "WHERE job_id = ?",
+            (
+                "foreign-owner",
+                "secret-token",
+                (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+                job_id,
+            ),
+        )
+    with pytest.raises(ValueError, match="active lease"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [_exact_selection(job_id, payload, _rejected_exact_output(job_id))],
+            dry_run=True,
+        )
+
+
+def test_public_finalize_rejects_forged_reviewed_ingest_provenance(isolated_memory):
+    raw_path = isolated_memory / "raw" / "public-forgery.md"
+    raw_path.write_text("public caller forged reviewed provenance", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_public-forgery.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    claim = db_store.claim_subagent_jobs(limit=1, lease_seconds=300)[0]
+    processed_data = _claimed_processed_data(
+        payload,
+        job_id,
+        claim,
+        integration={
+            "disposition": "rejected",
+            "reason": "ordinary public caller forged reviewed ingest provenance",
+            "relations": [],
+        },
+        _reviewed_ingest_provenance={
+            "contract": "vector-lake-exact-reviewed-ingest-finalization/v1",
+            "selection_digest": "forged",
+        },
+    )
+
+    result = tool_ingest.finalize_ingest([], processed_data)
+
+    assert "reviewed ingest provenance is reserved" in result
+    row = db_store.get_connection().execute(
+        "SELECT status, result_json FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "subagent_processing"
+    assert row["result_json"] is None
+
+
+def test_reviewed_ingest_internal_context_bindings_are_enforced(isolated_memory):
+    raw_path = isolated_memory / "raw" / "bad-context.md"
+    raw_path.write_text("bad reviewed context", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_bad-context.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    claim = db_store.claim_subagent_jobs(limit=1, lease_seconds=300)[0]
+    processed_data = _claimed_processed_data(
+        payload,
+        job_id,
+        claim,
+        integration={
+            "disposition": "rejected",
+            "reason": "malformed internal reviewed context must be denied",
+            "relations": [],
+        },
+    )
+    context = tool_ingest._ReviewedIngestFinalizerContext(
+        job_id=job_id,
+        lease_owner="incorrect-owner",
+        lease_generation=int(claim["lease_generation"]),
+        raw_revision=str(payload["hash"]),
+        selection_digest="a" * 64,
+        review_sha256="b" * 64,
+        output_sha256="c" * 64,
+        provenance={
+            "contract": "vector-lake-exact-reviewed-ingest-finalization/v1",
+            "fingerprint": "sha256:" + "d" * 64,
+            "selection_digest": "a" * 64,
+            "review_sha256": "b" * 64,
+            "output_sha256": "c" * 64,
+        },
+    )
+
+    with pytest.raises(ValueError, match="lease owner mismatch"):
+        tool_ingest._finalize_ingest_impl(
+            [],
+            processed_data,
+            propagate_errors=True,
+            reviewed_ingest_context=context,
+        )
+    row = db_store.get_connection().execute(
+        "SELECT status, result_json FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "subagent_processing"
+    assert row["result_json"] is None
+
+
+def test_exact_reviewed_ingest_real_finalizer_persists_digest_and_replay_guard(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "real-finalizer.md"
+    raw_path.write_text("real reviewed finalizer", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_real-finalizer.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    output = _rejected_exact_output(job_id)
+    review = _exact_review()
+    selection = _exact_selection(job_id, payload, output, review)
+    preview = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+    )
+    receipt_text = tool_ingest.finalize_exact_reviewed_ingest_outputs(
+        [selection],
+        dry_run=False,
+        confirmation=preview["plan"]["fingerprint"],
+    )
+    receipt = json.loads(receipt_text)
+
+    assert receipt["committed"] is True
+    assert receipt["errors"] == []
+    assert "lease_token" not in receipt_text
+    assert "exact-reviewed-ingest:" not in receipt_text
+    row = db_store.get_connection().execute(
+        "SELECT result_json FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    result_json = json.loads(row["result_json"])
+    reviewed = result_json["reviewed_ingest"]
+    assert reviewed["selection_digest"] == receipt["selection_digests"][job_id]
+    assert reviewed["review_sha256"] == tool_ingest._canonical_json_sha256(review)
+    assert reviewed["output_sha256"] == tool_ingest._canonical_json_sha256(output)
+    assert "lease_token" not in row["result_json"]
+
+    replay_preview = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+    )
+    replay_receipt = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [selection],
+            dry_run=False,
+            confirmation=replay_preview["plan"]["fingerprint"],
+        )
+    )
+    assert replay_preview["plan"]["items"][0]["state"] == "already_finalized"
+    assert replay_receipt["already_finalized_job_ids"] == [job_id]
+    assert replay_receipt["selection_digests"][job_id] == reviewed["selection_digest"]
+
+    changed_review = {**review, "reason": "Human reviewed a changed attestation input."}
+    with pytest.raises(ValueError, match="selection does not match stored provenance"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [_exact_selection(job_id, payload, output, changed_review)],
+            dry_run=True,
+        )
+    changed_output = _rejected_exact_output(job_id)
+    changed_output["integration"]["reason"] = "Human-approved changed output denial."
+    with pytest.raises(ValueError, match="selection does not match stored provenance"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [_exact_selection(job_id, payload, changed_output, review)],
+            dry_run=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutator", "error"),
+    [
+        (lambda selection: selection.update({"hash": "sha256:" + "0" * 64}), "hash"),
+        (lambda selection: selection.update({"source_hash": "unexpected"}), "source_hash"),
+        (
+            lambda selection: selection.update(
+                {"integration_candidates_sha256": "0" * 64}
+            ),
+            "integration candidates digest mismatch",
+        ),
+        (
+            lambda selection: selection.update({"canonical_name": "Source_changed.md"}),
+            "canonical_name",
+        ),
+    ],
+)
+
+def test_exact_reviewed_ingest_plan_rejects_identity_mismatch(
+    isolated_memory,
+    mutator,
+    error,
+):
+    raw_path = isolated_memory / "raw" / "identity.md"
+    raw_path.write_text("identity reviewed", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_identity.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
+    mutator(selection)
+
+    with pytest.raises(ValueError, match=error):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+
+
+def test_exact_reviewed_ingest_plan_rejects_raw_drift_and_private_path(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "raw-drift.md"
+    raw_path.write_text("raw before review", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_raw-drift.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
+    raw_path.write_text("raw changed after review", encoding="utf-8")
+    with pytest.raises(tool_ingest.IngestBaselineConflict, match="Raw source changed"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+
+    private_path = isolated_memory / "raw" / "privacy" / "Diary" / "private.md"
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_text("private reviewed source", encoding="utf-8")
+    private_payload = _v4_ingest_payload(
+        str(private_path),
+        calculate_hash(str(private_path)),
+        "Source_private.md",
+    )
+    private_job_id = db_store.enqueue_job("ingest", private_payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (private_job_id,),
+        )
+    with pytest.raises(ValueError, match="private sources"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [
+                _exact_selection(
+                    private_job_id,
+                    private_payload,
+                    _rejected_exact_output(private_job_id),
+                )
+            ],
+            dry_run=True,
+        )
+
+
+def test_exact_reviewed_ingest_denies_when_auto_controller_enabled(
+    isolated_memory,
+    monkeypatch,
+):
+    from vector_lake import auto_ingest_worker
+
+    monkeypatch.setattr(
+        auto_ingest_worker,
+        "load_auto_ingest_config",
+        lambda: auto_ingest_worker.AutoIngestConfig(enabled=True),
+    )
+
+    with pytest.raises(RuntimeError, match="automatic ingest is enabled"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([{}], dry_run=True)
+
+
+def test_exact_reviewed_ingest_failed_retry_threshold_and_awaiting_admission(
+    isolated_memory,
+):
+    raw_path = isolated_memory / "raw" / "retry-threshold.md"
+    raw_path.write_text("retry threshold", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_retry-threshold.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'failed', retries = 2 WHERE job_id = ?",
+            (job_id,),
+        )
+    selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
+    with pytest.raises(ValueError, match="not eligible"):
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent', retries = 2 "
+            "WHERE job_id = ?",
+            (job_id,),
+        )
+    receipt = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+    )
+    assert receipt["plan"]["items"][0]["original_status"] == "awaiting_subagent"
+
+
+@pytest.mark.parametrize(("original_status", "retries"), [("awaiting_subagent", 2), ("failed", 3)])
+def test_exact_reviewed_ingest_cancellation_after_claim_restores_business_state(
+    isolated_memory,
+    monkeypatch,
+    original_status,
+    retries,
+):
+    status_slug = original_status.replace("_", "-")
+    raw_path = isolated_memory / "raw" / f"cancel-{status_slug}.md"
+    raw_path.write_text(f"cancel {original_status}", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        f"Source_cancel-{status_slug}.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = ?, retries = ? WHERE job_id = ?",
+            (original_status, retries, job_id),
+        )
+    before = dict(
+        db_store.get_connection()
+        .execute(
+            "SELECT status, retries, lease_generation FROM jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        .fetchone()
+    )
+    selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
+    preview = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+    )
+    operation = CancellationOperation(
+        tool_name="finalize_exact_reviewed_ingest_outputs",
+        lane="write",
+        deadline=None,
+    )
+    operation.mark_running()
+
+    def cancel_after_claim(files, processed_data, *, reviewed_ingest_context):
+        claimed = db_store.get_connection().execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        assert claimed["status"] == "subagent_processing"
+        operation.request_cancellation("client_cancelled", detached=True)
+        raise CooperativeCancellation(operation)
+
+    monkeypatch.setattr(
+        tool_ingest,
+        "_finalize_exact_reviewed_ingest_strict",
+        cancel_after_claim,
+    )
+
+    receipt = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [selection],
+            dry_run=False,
+            confirmation=preview["plan"]["fingerprint"],
+        )
+    )
+
+    assert receipt["committed"] is False
+    assert receipt["restored_job_ids"] == [job_id]
+    restored = db_store.get_connection().execute(
+        "SELECT status, retries, lease_owner, lease_token, lease_until, "
+        "lease_generation FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert restored["status"] == before["status"]
+    assert restored["retries"] == before["retries"]
+    assert restored["lease_owner"] is None
+    assert restored["lease_token"] is None
+    assert restored["lease_until"] is None
+    assert restored["lease_generation"] > before["lease_generation"]
+
+
+def test_exact_reviewed_ingest_after_claim_drift_is_restored(isolated_memory, monkeypatch):
+    raw_path = isolated_memory / "raw" / "after-claim-drift.md"
+    raw_path.write_text("after claim drift", encoding="utf-8")
+    payload = _v4_ingest_payload(
+        str(raw_path),
+        calculate_hash(str(raw_path)),
+        "Source_after-claim-drift.md",
+    )
+    job_id = db_store.enqueue_job("ingest", payload)
+    with db_store.transaction():
+        db_store.get_connection().execute(
+            "UPDATE jobs SET status = 'awaiting_subagent' WHERE job_id = ?",
+            (job_id,),
+        )
+    selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
+    preview = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
+    )
+    original_claim = db_store.claim_exact_reviewed_ingest_jobs
+
+    def claim_then_drift(candidates, *, lease_seconds=1800):
+        claims = original_claim(candidates, lease_seconds=lease_seconds)
+        with db_store.transaction():
+            db_store.get_connection().execute(
+                "UPDATE jobs SET error_msg = ? WHERE job_id = ?",
+                ("raced after exact reviewed claim", job_id),
+            )
+        return claims
+
+    monkeypatch.setattr(db_store, "claim_exact_reviewed_ingest_jobs", claim_then_drift)
+
+    receipt = json.loads(
+        tool_ingest.finalize_exact_reviewed_ingest_outputs(
+            [selection],
+            dry_run=False,
+            confirmation=preview["plan"]["fingerprint"],
+        )
+    )
+
+    assert receipt["committed"] is False
+    assert receipt["restored_job_ids"] == [job_id]
+    restored = db_store.get_connection().execute(
+        "SELECT status, error_msg, lease_owner, lease_token FROM jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert restored["status"] == "awaiting_subagent"
+    assert restored["error_msg"] in (None, "")
+    assert restored["lease_owner"] is None
+    assert restored["lease_token"] is None
 
 
 def test_terminal_ingest_recovery_claim_is_exact_atomic_and_restorable(

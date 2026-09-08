@@ -357,6 +357,26 @@ def test_maintenance_backup_is_queryable_and_has_manifest(isolated_memory):
     assert count == 1
 
 
+def test_maintenance_backup_creation_preserves_six_recent_valid_snapshots(isolated_memory):
+    db_store.init_db()
+    indexer.generate_index()
+    backups = [Path(create_maintenance_backup(f"recent_{number}")) for number in range(6)]
+
+    assert set(_backup_entries()) == set(backups)
+    for backup in backups:
+        manifest, inventory = tool_projection.validate_maintenance_backup_v4(
+            backup / "manifest.json"
+        )
+        assert manifest["manifest_version"] == 4
+        assert manifest["restorable_as_consistent_canonical_projection_snapshot"] is True
+        assert inventory is not None
+        created_at = datetime.fromisoformat(manifest["created_at"])
+        assert 0 <= (datetime.now(timezone.utc) - created_at).total_seconds() < 300
+
+    # The first receipt remains usable after the sixth snapshot is published.
+    tool_projection.validate_maintenance_backup_v4(backups[0] / "manifest.json")
+
+
 def test_maintenance_backup_streams_hash_and_fsyncs_files(
     isolated_memory,
     monkeypatch,

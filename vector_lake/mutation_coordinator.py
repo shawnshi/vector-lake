@@ -67,6 +67,8 @@ def _mutation_idempotency_key(mutation: dict, validation_mode: str) -> str:
 def resolve_wiki_mutation_path(
     filename: str,
     allow_existing_legacy_name: bool = False,
+    *,
+    allow_missing_legacy_delete: bool = False,
 ) -> Path:
     """Resolve a single wiki basename and reject every traversal form."""
     if not isinstance(filename, str) or not filename or filename != filename.strip():
@@ -91,7 +93,12 @@ def resolve_wiki_mutation_path(
     candidate = (wiki_root / filename).resolve()
     if candidate.parent != wiki_root:
         raise ValueError(f"Mutation path escapes wiki boundary: {filename}")
-    if not (allow_existing_legacy_name and candidate.exists()):
+    # Missing legacy names are permitted only for idempotent delete settlement.
+    # Creation/update callers retain the existing-file requirement by default.
+    if not (
+        allow_existing_legacy_name
+        and (candidate.exists() or allow_missing_legacy_delete)
+    ):
         validate_wiki_filename(filename)
     return candidate
 

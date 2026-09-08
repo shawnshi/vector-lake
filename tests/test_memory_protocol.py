@@ -73,6 +73,84 @@ def test_delta_is_timezone_strict_and_bounded(monkeypatch):
         memory_protocol.delta("2026-08-21T00:00:00")
 
 
+@pytest.mark.parametrize("lightweight", [False, True])
+@pytest.mark.parametrize("purpose_size", [0, 950, 1000, 1800])
+def test_context_reserves_complete_purpose_within_budget(
+    isolated_memory, monkeypatch, lightweight, purpose_size,
+):
+    from vector_lake import db_store, indexer, purpose_contract, tool_search
+
+    db_store.init_db()
+    indexer.generate_index()
+    monkeypatch.setattr(
+        purpose_contract, "render_strategy_directive", lambda: "p" * purpose_size,
+    )
+    monkeypatch.setattr(
+        tool_search.governance_store,
+        "search_operational_memory_views",
+        lambda *_args, **_kwargs: ([], []),
+    )
+    if purpose_size > 1000:
+        with pytest.raises(ValueError, match="strategic purpose"):
+            tool_search.assemble_context("audit", max_chars=1000, lightweight=lightweight)
+        return
+
+    result = tool_search.assemble_context("audit", max_chars=1000, lightweight=lightweight)
+
+    assert result["purpose"] == "p" * purpose_size
+    used = sum(len(result[key]) for key in (
+        "memory_packet", "wiki_context", "index_summary", "purpose",
+    ))
+    assert result["budget_used"] == used <= result["budget_max"] == 1000
+
+
+@pytest.mark.parametrize("lightweight", [False, True])
+def test_context_reports_missing_purpose_without_hiding_retrieval(
+    isolated_memory, lightweight,
+):
+    from vector_lake import db_store, indexer, tool_search
+
+    db_store.init_db()
+    indexer.generate_index()
+    assert not (isolated_memory / "purpose.md").exists()
+
+    result = tool_search.assemble_context("audit", max_chars=1000, lightweight=lightweight)
+
+    assert "[STRATEGIC PURPOSE STATUS: missing]" in result["purpose"]
+    assert "strategic alignment has not been checked" in result["purpose"]
+    assert result["budget_used"] <= result["budget_max"] == 1000
+
+
+@pytest.mark.parametrize("lightweight", [False, True])
+@pytest.mark.parametrize("failure", [PermissionError, ValueError])
+def test_context_does_not_mask_other_purpose_errors(monkeypatch, lightweight, failure):
+    from vector_lake import purpose_contract, tool_search
+
+    def unreadable_purpose():
+        raise purpose_contract.PurposeContractError("purpose invalid") from failure("probe")
+
+    monkeypatch.setattr(purpose_contract, "render_strategy_directive", unreadable_purpose)
+
+    with pytest.raises(purpose_contract.PurposeContractError, match="purpose invalid"):
+        tool_search.assemble_context("audit", max_chars=1000, lightweight=lightweight)
+
+
+@pytest.mark.parametrize("budget", [0, 1, 40, 100, 1000])
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_memory_packet_text_respects_even_small_budgets(monkeypatch, budget, unavailable):
+    from vector_lake import tool_search
+
+    def memories(*_args, **_kwargs):
+        if unavailable:
+            raise tool_search.governance_store.OperationalMemoryNotReady("index_unready")
+        return [], []
+
+    monkeypatch.setattr(tool_search.governance_store, "search_operational_memory_views", memories)
+    result = tool_search.build_memory_packet("audit", max_chars=budget)
+
+    assert len(result["packet"]) <= budget
+
+
 def _server_with_tools(names) -> FastMCP:
     server = FastMCP("surface-test")
     for name in names:
@@ -161,19 +239,21 @@ def test_memory_surface_is_exact_and_fail_closed(monkeypatch):
 def test_public_surface_counts_match_documented_contract():
     parser = cli_app.build_parser()
     subcommands = next(
-        action.choices
-        for action in parser._actions
-        if isinstance(getattr(action, "choices", None), dict)
+        choices
+        for choices in (
+            getattr(action, "choices", None) for action in parser._actions
+        )
+        if isinstance(choices, dict)
     )
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert len(mcp_server.mcp._tool_manager.list_tools()) == 67
+    assert len(mcp_server.mcp._tool_manager.list_tools()) == 68
     assert len(mcp_server._MEMORY_MCP_SURFACE_TOOLS) == 9
     assert len(mcp_server._READONLY_MCP_SURFACE_TOOLS) == 21
-    assert len(subcommands) == 40
+    assert len(subcommands) == 41
     assert (
-        "67 MCP tools (`full`) / 9 MCP tools (`memory`) / "
-        "21 MCP tools (`readonly`) / 40 CLI commands"
+        "68 MCP tools (`full`) / 9 MCP tools (`memory`) / "
+        "21 MCP tools (`readonly`) / 41 CLI commands"
     ) in readme
 
 

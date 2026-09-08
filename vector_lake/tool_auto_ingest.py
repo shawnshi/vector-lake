@@ -171,6 +171,8 @@ def _verified_receipt_usage(
     usage = payload.get("usage")
     if not isinstance(usage, dict):
         return {}, "invalid", [f"attempt_receipt_usage_invalid:{attempt_id}"]
+    if not usage:
+        return {}, "invalid", [f"attempt_receipt_usage_unknown:{attempt_id}"]
     normalized: dict[str, int] = {}
     for name, value in usage.items():
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:

@@ -232,25 +232,70 @@ def evaluate_rankings(
     }
 
 
-def _ranked_keys_from_xml(payload: str) -> list[str]:
+def _parse_search_result(payload: str) -> tuple[list[str], dict]:
+    """Consume the current public page-search envelope, not legacy bare XML."""
     try:
         root = ET.fromstring(str(payload or ""))
     except ET.ParseError as exc:
-        raise RetrievalBenchmarkError(
-            "search did not return a parseable EvidenceResults envelope"
-        ) from exc
-    if root.tag != "EvidenceResults":
-        raise RetrievalBenchmarkError(
-            f"unexpected search result root: {root.tag}"
-        )
+        raise RetrievalBenchmarkError("search returned malformed XML") from exc
+    if root.tag != "VectorLakeSearchResponse":
+        raise RetrievalBenchmarkError(f"unexpected search result root: {root.tag}")
+    if (
+        root.attrib
+        or len(root) != 2
+        or len(root.findall("SemanticReadinessEnvelope")) != 1
+        or len(root.findall("EvidenceResults")) != 1
+        or (root.text or "").strip()
+        or any((child.tail or "").strip() for child in root)
+    ):
+        raise RetrievalBenchmarkError("search requires unique page evidence and readiness envelopes")
+    readiness_node = root.findall("SemanticReadinessEnvelope")[0]
+    try:
+        readiness = json.loads(readiness_node.text or "")
+    except (ValueError, TypeError) as exc:
+        raise RetrievalBenchmarkError("search readiness metadata is malformed") from exc
+    if (
+        len(readiness_node)
+        or not isinstance(readiness, dict)
+        or readiness.get("contract_version") != "vector-lake-semantic-readiness-envelope/v1"
+        or readiness.get("status") not in {"ready", "not_ready", "degraded", "unknown"}
+        or readiness.get("results_are_not_accepted_facts") is not True
+    ):
+        raise RetrievalBenchmarkError("search readiness metadata contract is invalid")
+    evidence = root.findall("EvidenceResults")[0]
+    statuses = evidence.findall("SearchStatus")
+    if (
+        evidence.attrib
+        or len(statuses) != 1
+        or statuses[0].get("State") not in {"ok", "degraded"}
+        or len(statuses[0])
+        or (statuses[0].text or "").strip()
+        or (evidence.text or "").strip()
+        or any((child.tail or "").strip() for child in evidence)
+        or any(child.tag not in {"SearchStatus", "Evidence_Node", "NoEvidence"} for child in evidence)
+    ):
+        raise RetrievalBenchmarkError("search evidence status is unavailable or malformed")
+    nodes = evidence.findall("Evidence_Node")
+    empty_markers = evidence.findall("NoEvidence")
+    if (
+        len(empty_markers) > 1
+        or (empty_markers and nodes)
+        or any(len(node) or node.attrib or (node.text or "").strip() for node in empty_markers)
+    ):
+        raise RetrievalBenchmarkError("search evidence contains contradictory empty results")
     ranked = []
-    for node in root.findall("Evidence_Node"):
+    for node in nodes:
         source = str(node.attrib.get("Source") or "").strip()
         if source.endswith(".md"):
             source = source[:-3]
-        if source and source not in ranked:
+        if not source or len(node):
+            raise RetrievalBenchmarkError("search evidence source or content is malformed")
+        if source not in ranked:
             ranked.append(source)
-    return ranked
+    return ranked, {
+        "search_status": dict(statuses[0].attrib),
+        "semantic_readiness": readiness,
+    }
 
 
 @contextmanager
@@ -289,6 +334,7 @@ def run_retrieval_benchmark(
         search_fn = search_vector_lake
 
     rankings = {}
+    retrieval_metadata = {}
     with _embedding_policy(allow_remote_embeddings):
         for case in normalized["queries"]:
             result = search_fn(
@@ -300,13 +346,15 @@ def run_retrieval_benchmark(
                 include_history=case["include_history"],
                 mode="page",
             )
-            rankings[case["id"]] = _ranked_keys_from_xml(result)
+            rankings[case["id"]], retrieval_metadata[case["id"]] = _parse_search_result(result)
 
     report = evaluate_rankings(
         dataset,
         rankings,
         top_k_override=top_k,
     )
+    for case_report in report["queries"]:
+        case_report.update(retrieval_metadata[case_report["id"]])
     report["dataset_sha256"] = dataset_sha256
     report["retrieval_config"] = {
         "mode": "page",

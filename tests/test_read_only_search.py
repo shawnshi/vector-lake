@@ -42,5 +42,10 @@ def test_memory_tool_surfaces_projection_maintenance_state(isolated_memory):
     packet = tool_search.build_memory_packet("query")
 
     assert "database_missing" in direct
+    assert "python cli.py doctor" in direct
+    assert "No running maintenance worker has been verified" in direct
+    assert "converging automatically" not in packet["packet"]
+    assert "python cli.py doctor" in packet["packet"]
+    assert not db_store.peek_db_path().exists()
     assert "status='unavailable'" in packet["packet"]
     assert packet["warning_count"] == 1

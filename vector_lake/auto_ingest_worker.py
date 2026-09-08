@@ -225,6 +225,14 @@ class AutoIngestPolicyError(RuntimeError):
     """Raised when a job must be quarantined without another model attempt."""
 
 
+class _TrustedUsageReservationExceeded(AutoIngestPolicyError):
+    """Only a fully validated event log may carry usage into a failed receipt."""
+
+    def __init__(self, total_tokens: int, usage: dict[str, int]):
+        super().__init__(f"codex_usage_exceeded_reserved_tokens:{total_tokens}")
+        self.usage = dict(usage)
+
+
 class AutoIngestInfrastructureError(RuntimeError):
     """Raised when the host bridge failed without invalidating source content."""
 
@@ -2366,8 +2374,7 @@ def _validate_event_log(path: Path, config: AutoIngestConfig) -> dict[str, int]:
                         "codex_event_usage_shape_is_invalid"
                     )
                 parsed_usage = {}
-                for name in required_usage:
-                    value = raw_usage[name]
+                for name, value in raw_usage.items():
                     if (
                         isinstance(value, bool)
                         or not isinstance(value, int)
@@ -2376,7 +2383,8 @@ def _validate_event_log(path: Path, config: AutoIngestConfig) -> dict[str, int]:
                         raise AutoIngestPolicyError(
                             f"codex_event_usage_is_invalid:{name}"
                         )
-                    parsed_usage[name] = value
+                    if name in required_usage:
+                        parsed_usage[name] = value
                 usage = parsed_usage
                 seen_completed = True
     except UnicodeDecodeError as exc:
@@ -2393,9 +2401,7 @@ def _validate_event_log(path: Path, config: AutoIngestConfig) -> dict[str, int]:
         + usage["reasoning_output_tokens"]
     )
     if total_tokens > config.max_tokens_per_task:
-        raise AutoIngestPolicyError(
-            f"codex_usage_exceeded_reserved_tokens:{total_tokens}"
-        )
+        raise _TrustedUsageReservationExceeded(total_tokens, usage)
     return usage
 
 
@@ -2644,6 +2650,8 @@ def _validate_generator_output(
     job_id: str,
     processed_data: dict[str, Any],
     config: AutoIngestConfig,
+    *,
+    human_reviewed_rejected: bool = False,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     allowed_root = {
         "schema_version",
@@ -2716,7 +2724,7 @@ def _validate_generator_output(
             raise AutoIngestPolicyError("rejected_output_scope_or_files_invalid")
         if len(str(integration["reason"] or "").strip()) < 12:
             raise AutoIngestPolicyError("rejected_output_reason_too_short")
-        if not config.auto_finalize_rejected:
+        if not config.auto_finalize_rejected and not human_reviewed_rejected:
             raise AutoIngestPolicyError("rejected_output_requires_human_review")
     elif scope == "excluded":
         raise AutoIngestPolicyError("non_rejected_output_cannot_be_excluded")
@@ -3696,6 +3704,11 @@ class AutoIngestController:
                     failure_class="generator_policy",
                     receipt=receipt,
                     stage="generation",
+                    usage=(
+                        exc.usage
+                        if isinstance(exc, _TrustedUsageReservationExceeded)
+                        else None
+                    ),
                 )
             except Exception as exc:
                 return self._attempt_infrastructure_failure(

@@ -254,6 +254,36 @@ class TestOperationalMemory(unittest.TestCase):
             }
         )
 
+    def test_shared_page_facts_expose_distinct_stable_identities(self):
+        claims = {}
+        for suffix in ("alpha", "beta"):
+            claim_id = f"claim_identity_{suffix}"
+            claims[claim_id] = {
+                "claim_id": claim_id,
+                "claim_text": f"Identitymarker fact {suffix}.",
+                "claim_type": "assertion", "memory_type": "fact",
+                "memory_key": f"identity_{suffix}", "status": "Active",
+                "confidence": 0.9, "evidence_ids": [f"ev_{suffix}"],
+                "source_ids": ["src_shared"], "source_page": "Concept_Shared.md",
+                "updated_at": "2026-09-01T00:00:00+00:00",
+            }
+        self._replace_claims({"items": claims})
+        governance_store.rebuild_operational_memory()
+        rows = governance_store.search_operational_memory("Identitymarker")
+        self.assertEqual(len(rows), 2)
+        text = search_vector_lake("Identitymarker", mode="fact")
+        xml = ET.fromstring(search_vector_lake("Identitymarker", mode="fact", as_xml=True))
+        items = xml.findall("./MemoryResults/Memory_Item")
+        self.assertEqual(len(items), 2)
+        self.assertEqual({item.get("source_claim_id") for item in items}, set(claims))
+        self.assertEqual({item.get("memory_id") for item in items}, {row["memory_id"] for row in rows})
+        for item in items:
+            self.assertEqual(item.get("source_page"), "Concept_Shared.md")
+            self.assertEqual(item.get("Source"), "Concept_Shared.md")
+            self.assertIn(item.get("memory_id"), text)
+            self.assertIn(item.get("source_claim_id"), text)
+        self.assertIn("source_page: Concept_Shared.md", text)
+
     def _seed_claims(self):
         claims = governance_store.load_claims()
         claims["items"] = {

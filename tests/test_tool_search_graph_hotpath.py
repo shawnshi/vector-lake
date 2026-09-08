@@ -266,6 +266,7 @@ def test_assemble_context_reads_at_most_fifty_summary_nodes(
     assert nodes.yielded == 50
     assert context["index_summary"].count("\n") == 49
     assert "[concept] Concept 49" in context["index_summary"]
+    assert context["index_summary_truncated"] is None
 
 
 @pytest.mark.parametrize(
@@ -410,6 +411,11 @@ def test_graph_expansion_applies_same_eligibility_gate(
     )
     monkeypatch.setattr(tool_search, "_get_query_embedding", lambda *_args: [])
     monkeypatch.setattr(tool_search, "_expand_query_locally", lambda *_args: ["seed"])
+
+    for key, record in nodes.items():
+        (index_path.parent / f"{key}.md").write_text(
+            f"# {record['title']}", encoding="utf-8"
+        )
 
     result = tool_search.search_vector_lake(
         "seed",

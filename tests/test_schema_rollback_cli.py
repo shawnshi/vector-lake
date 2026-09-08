@@ -1256,12 +1256,14 @@ def test_schema_rollback_cli_is_preview_first_and_heavy_only_on_apply(
     assert cli_app._cli_heavy_task_policy(preview_args) is None
     assert cli_app._cli_heavy_task_policy(apply_args) == ("maintenance", 1800.0)
     command_choices = next(
-        action.choices
-        for action in cli_app.build_parser()._actions
-        if isinstance(getattr(action, "choices", None), dict)
-        and "schema-rollback" in action.choices
+        choices
+        for choices in (
+            getattr(action, "choices", None)
+            for action in cli_app.build_parser()._actions
+        )
+        if isinstance(choices, dict) and "schema-rollback" in choices
     )
-    assert len(command_choices) == 40
+    assert len(command_choices) == 41
 
     calls = []
     gate_calls = []

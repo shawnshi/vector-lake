@@ -6,6 +6,25 @@ import pytest
 from vector_lake import db_store, tool_search
 
 
+def test_memory_result_identity_escaping_bounds_and_absent_fields():
+    import xml.etree.ElementTree as ET
+
+    memory = {
+        "memory_id": 'memory_"<&', "source_claim_id": 'claim_"<&',
+        "source_page": 'Concept_"<&.md', "text": "<&" * 400,
+        "memory_score": 1.0,
+    }
+    root = ET.fromstring(tool_search._format_memory_result(memory, as_xml=True))
+    for field in ("memory_id", "source_claim_id", "source_page"):
+        assert root.get(field) == memory[field]
+        assert f"{field}: {memory[field]}" in tool_search._format_memory_result(memory)
+    assert len(root.text) == 420
+    assert root.get("Source") == memory["source_page"]
+    absent = ET.fromstring(tool_search._format_memory_result({"text": "no identities"}, as_xml=True))
+    assert all(field not in absent.attrib for field in ("memory_id", "source_claim_id", "source_page"))
+    assert absent.get("Source") == "operational_memory"
+
+
 def _snapshot(*, generation: str = "generation-1") -> dict:
     return {
         "projection_manifest": {"generation": generation},

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import queue
 import sqlite3
@@ -1198,6 +1199,100 @@ def test_raw_watchdog_gate_busy_defers_full_scan_without_failure_count(
 
     assert not holder.is_alive()
     assert calls == [(50, None, True)]
+
+
+@pytest.mark.parametrize("first_failure", [None, "preview_error", "exception"])
+def test_scheduled_history_retention_uses_real_read_only_preview(
+    isolated_memory, monkeypatch, caplog, first_failure,
+):
+    from vector_lake import storage_growth, tool_governance_maintenance, watchdog_app
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    old = "2020-01-01T00:00:00+00:00"
+    conn.executemany(
+        "INSERT INTO jobs (job_id, task_type, payload, status, created_at, "
+        "updated_at, available_at, completed_at) "
+        "VALUES (?, 'ingest', '{}', 'completed', ?, ?, ?, ?)",
+        [(f"retention-{number:04d}", old, old, old, old) for number in range(1002)],
+    )
+    conn.commit()
+    db_store.close_all_connections()
+    before = db_store.peek_db_path().read_bytes()
+    calls = []
+    results = []
+    statuses = []
+    real_maintenance = tool_governance_maintenance.history_retention_maintenance
+
+    def preview(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1 and first_failure == "exception":
+            raise OSError("injected retention read failure")
+        if len(calls) == 1 and first_failure == "preview_error":
+            # Exercise the API's actual error-as-data path, not a fabricated result.
+            with monkeypatch.context() as failure_patch:
+                failure_patch.setattr(
+                    db_store, "peek_db_path", lambda: isolated_memory / "absent.db",
+                )
+                return real_maintenance(**kwargs)
+        result = real_maintenance(**kwargs)
+        results.append(json.loads(result))
+        return result
+
+    class StopAfterThree:
+        waits = 0
+
+        @staticmethod
+        def is_set():
+            return False
+
+        def wait(self, _seconds):
+            self.waits += 1
+            return self.waits == 3
+
+    monkeypatch.setattr(
+        watchdog_app.time, "localtime",
+        lambda: time.struct_time((2026, 9, 6, 3, 0, 0, 6, 249, -1)),
+    )
+    monkeypatch.setattr(storage_growth, "record_storage_growth_sample", lambda: None)
+    monkeypatch.setattr(
+        watchdog_app, "maintain_operational_memory_search_for_watchdog",
+        lambda: {"deferred": False, "batches": 0},
+    )
+    monkeypatch.setattr(watchdog_app, "expire_stale_ingest_jobs_for_watchdog", lambda: 0)
+    monkeypatch.setattr(
+        tool_governance_maintenance, "history_retention_maintenance", preview,
+    )
+    monkeypatch.setattr(
+        watchdog_app, "write_status",
+        lambda state, _processed, _queue, message, error, **_kwargs: statuses.append(
+            (state, message, error)
+        ),
+    )
+    caplog.set_level("INFO", logger="watchdog_sync")
+
+    watchdog_app.scheduled_lint_loop(StopAfterThree())
+
+    assert len(calls) == (2 if first_failure else 1)
+    assert all(call["dry_run"] is True for call in calls)
+    assert all("confirmation" not in call and "plan_as_of" not in call for call in calls)
+    assert len(results) == 1
+    assert results[0]["dry_run"] is True and results[0]["applied"] is False
+    assert results[0]["selected_count_total"] > 0
+    assert db_store.peek_db_path().read_bytes() == before
+    assert db_store.get_connection().execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1002
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM history_retention_runs_v6"
+    ).fetchone()[0] == 0
+    assert any(
+        state == "idle" and "preview ready" in message and "operator approval required" in message
+        for state, message, error in statuses
+    )
+    assert "Daily history retention completed" not in caplog.text
+    if first_failure:
+        assert any(state == "error" and error for state, message, error in statuses)
+        assert "Daily history retention preview failed" in caplog.text
+    assert not (isolated_memory / "wiki" / ".meta" / ".history-retention.lock").exists()
 
 
 def test_scheduled_lint_retries_due_slot_after_gate_busy_past_minute(

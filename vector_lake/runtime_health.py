@@ -1491,6 +1491,7 @@ def assess_runtime_health(
     diagnostic_snapshot=None,
     *,
     bounded_write_checks: bool = False,
+    bounded_memory_checks: bool = False,
 ) -> dict[str, Any]:
     from vector_lake.diagnostic_snapshot import current_durability_status
     from vector_lake.wiki_utils import (
@@ -1624,7 +1625,15 @@ def assess_runtime_health(
     from vector_lake.governance_store import operational_memory_search_index_status
 
     try:
-        memory_search = operational_memory_search_index_status(connection=conn)
+        if bounded_memory_checks and not (deep_projection_checks or bounded_write_checks):
+            memory_search = operational_memory_search_index_status(
+                connection=conn,
+                allow_integrity_scan=False,
+                allow_durable_proof=True,
+                allow_forced_attestation=False,
+            )
+        else:
+            memory_search = operational_memory_search_index_status(connection=conn)
     except sqlite3.Error as exc:
         memory_search = {
             "configured": True,
@@ -1639,7 +1648,10 @@ def assess_runtime_health(
             "operational_memory_search_not_ready:"
             f"{memory_search.get('status') or 'unknown'}"
         )
-        if not memory_search.get("auto_maintenance_configured"):
+        if (
+            not memory_search.get("auto_maintenance_configured")
+            and memory_search.get("status") != "deferred"
+        ):
             issues.append("operational_memory_search_auto_maintenance_disabled")
         if memory_search.get("progress_stalled"):
             issues.append("operational_memory_search_progress_stalled")

@@ -8,17 +8,18 @@ silently mix FTS state, canonical generations, and filesystem roots.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import shutil
-from typing import Any, Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from vector_lake.durability import (
     durable_replace_file,
@@ -35,7 +36,6 @@ from vector_lake.search_projection_contract import (
     CANONICAL_PROJECTION_SURFACES,
     normalize_runtime_generations,
 )
-
 
 FORMAT_VERSION = 2
 LOCATOR_CONTRACT = "vector-lake-projection-locator"
@@ -81,9 +81,7 @@ _ROOT_DESCRIPTOR_FIELD_VARIANTS = {
         _ROOT_METADATA_FIELDS | _INDEX_ROOT_COMPONENTS,
         _ROOT_METADATA_FIELDS | (_INDEX_ROOT_COMPONENTS - {"errors_by_file"}),
     ),
-    "claim_graph": (
-        _ROOT_METADATA_FIELDS | _CLAIM_GRAPH_ROOT_COMPONENTS,
-    ),
+    "claim_graph": (_ROOT_METADATA_FIELDS | _CLAIM_GRAPH_ROOT_COMPONENTS,),
 }
 MAX_COMPONENT_ITEMS = 1_000_000
 MAX_CLOSURE_OBJECTS = DEFAULT_READ_OBJECT_LIMIT * 16
@@ -159,9 +157,7 @@ def locator_bytes(projection: str) -> bytes:
 
 def _write_durable_replace(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-    )
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     try:
         with temporary.open("xb") as handle:
             handle.write(payload)
@@ -396,19 +392,16 @@ def build_projection_roots(
     base = Path(base_dir)
     store = ProjectionStoreV2(base)
     nodes = {
-        str(key): dict(value)
-        for key, value in (index_data.get("nodes") or {}).items()
+        str(key): dict(value) for key, value in (index_data.get("nodes") or {}).items()
     }
     aliases = {
-        str(key): str(value)
-        for key, value in (index_data.get("aliases") or {}).items()
+        str(key): str(value) for key, value in (index_data.get("aliases") or {}).items()
     }
     aliases_by_node: dict[str, list[str]] = {}
     for alias, node_key in aliases.items():
         aliases_by_node.setdefault(node_key, []).append(alias)
     aliases_by_node = {
-        node_key: sorted(values)
-        for node_key, values in aliases_by_node.items()
+        node_key: sorted(values) for node_key, values in aliases_by_node.items()
     }
     edges, incidence = _edge_components(index_data.get("weighted_edges") or [])
     edge_candidates, candidate_incidence = _edge_components(
@@ -420,18 +413,14 @@ def build_projection_roots(
         nodes,
         aliases,
     )
-    categories = {
-        str(value): True for value in (index_data.get("categories") or [])
-    }
+    categories = {str(value): True for value in (index_data.get("categories") or [])}
     errors = {
         _error_key(item, ordinal): dict(item)
         for ordinal, item in enumerate(index_data.get("error_log") or [])
     }
     errors_by_file: dict[str, list[dict[str, Any]]] = {}
     for item in index_data.get("error_log") or []:
-        errors_by_file.setdefault(str(item.get("file") or ""), []).append(
-            dict(item)
-        )
+        errors_by_file.setdefault(str(item.get("file") or ""), []).append(dict(item))
     search_rows = {key: _search_row(key, node) for key, node in nodes.items()}
     handled = {
         "nodes",
@@ -442,9 +431,7 @@ def build_projection_roots(
         "projection_manifest",
         "_projection_edge_candidates",
     }
-    meta = {
-        str(key): value for key, value in index_data.items() if key not in handled
-    }
+    meta = {str(key): value for key, value in index_data.items() if key not in handled}
     component_values: dict[str, Mapping[str, Any]] = {
         "nodes": nodes,
         "aliases": aliases,
@@ -673,9 +660,7 @@ def _component_items(
 
 def _legacy_projection_manifest(sidecar: Mapping[str, Any]) -> dict[str, Any]:
     generations = _normalized_generations(sidecar.get("canonical_generation"))
-    token = hashlib.sha256(
-        _canonical_json(generations).encode("utf-8")
-    ).hexdigest()
+    token = hashlib.sha256(_canonical_json(generations).encode("utf-8")).hexdigest()
     return {
         "contract": "index-claim-graph-pair",
         "version": 1,
@@ -696,9 +681,7 @@ def materialize_index(
 ) -> dict[str, Any]:
     validated = validate_sidecar(dict(sidecar))
     store = ProjectionStoreV2(base_dir)
-    descriptor = _root_descriptor(
-        store, validated["index_root_sha256"], "index"
-    )
+    descriptor = _root_descriptor(store, validated["index_root_sha256"], "index")
     result = dict(_component_items(store, descriptor, "meta"))
     result["nodes"] = dict(_component_items(store, descriptor, "nodes"))
     result["aliases"] = dict(_component_items(store, descriptor, "aliases"))
@@ -773,7 +756,9 @@ def _path_identity(path: Path) -> tuple[int, int, int, int, int]:
     )
 
 
-def sidecar_identity(base_dir: str | os.PathLike[str]) -> tuple[int, int, int, int, int]:
+def sidecar_identity(
+    base_dir: str | os.PathLike[str],
+) -> tuple[int, int, int, int, int]:
     return _path_identity(Path(base_dir) / SIDECAR_FILENAME)
 
 
@@ -825,13 +810,9 @@ def read_committed_sidecar(
         raise ProjectionV2ContractError("sidecar_runtime_digest_mismatch")
     if sidecar != runtime_before.get("sidecar"):
         raise ProjectionV2ContractError("sidecar_runtime_payload_mismatch")
-    if sidecar["projection_generation"] != runtime_before.get(
-        "projection_generation"
-    ):
+    if sidecar["projection_generation"] != runtime_before.get("projection_generation"):
         raise ProjectionV2ContractError("sidecar_runtime_generation_mismatch")
-    if sidecar["canonical_generation"] != runtime_before.get(
-        "canonical_generation"
-    ):
+    if sidecar["canonical_generation"] != runtime_before.get("canonical_generation"):
         raise ProjectionV2ContractError("sidecar_runtime_canonical_mismatch")
     if require_current_generation and (
         sidecar["canonical_generation"] != _runtime_current_generations(conn)
@@ -947,7 +928,7 @@ def recover_pending_publish(
     *,
     connection: Any | None = None,
 ) -> bool:
-    """Finish an exact durable pending intent; never reconstruct intent."""
+    """Finish an exact current durable intent; obsolete intents require maintenance."""
     from vector_lake import db_store
 
     conn = connection or db_store.get_connection()
@@ -961,8 +942,10 @@ def recover_pending_publish(
         expected_digest, str(runtime.get("sidecar_sha256") or "")
     ):
         raise ProjectionV2ContractError("pending_sidecar_digest_mismatch")
-    if sidecar["canonical_generation"] != _runtime_current_generations(conn):
+    current_canonical = _runtime_current_generations(conn)
+    if sidecar["canonical_generation"] != current_canonical:
         raise ProjectionV2ContractError("pending_canonical_generation_stale")
+
     validate_root_closure(base_dir, sidecar)
     ensure_static_locators(base_dir)
     marker = Path(base_dir) / SIDECAR_FILENAME
@@ -976,6 +959,12 @@ def recover_pending_publish(
     if not marker_matches:
         _write_durable_replace(marker, canonical.encode("utf-8"))
     with db_store.transaction() as transaction_connection:
+        if sidecar["canonical_generation"] != _runtime_current_generations(
+            transaction_connection
+        ):
+            raise ProjectionV2ContractError(
+                "canonical_generation_changed_during_recovery"
+            )
         db_store.mark_projection_runtime_ready(
             transaction_connection,
             expected_projection_generation=sidecar["projection_generation"],
@@ -989,9 +978,7 @@ def publish_prepared_projection(
     prepared: PreparedProjectionV2,
     *,
     transaction_mutation: Callable[[Any, PreparedProjectionV2], Any] | None = None,
-    noop_transaction_mutation: Callable[
-        [Any, PreparedProjectionV2], Any
-    ] | None = None,
+    noop_transaction_mutation: Callable[[Any, PreparedProjectionV2], Any] | None = None,
     assert_canonical: Callable[[], None] | None = None,
 ) -> Any:
     """Publish objects -> DB pending -> sidecar -> DB ready in that order."""
@@ -1002,21 +989,16 @@ def publish_prepared_projection(
     state = db_store.get_projection_runtime_v9(conn)
     if (
         state.get("status") == "ready"
-        and state.get("projection_generation")
-        == prepared.projection_generation
+        and state.get("projection_generation") == prepared.projection_generation
     ):
         recorded = state.get("sidecar") or {}
         if (
-            recorded.get("index_root_sha256")
-            != prepared.index_root_sha256
+            recorded.get("index_root_sha256") != prepared.index_root_sha256
             or recorded.get("claim_graph_root_sha256")
             != prepared.claim_graph_root_sha256
-            or recorded.get("canonical_generation")
-            != prepared.canonical_generation
+            or recorded.get("canonical_generation") != prepared.canonical_generation
         ):
-            raise ProjectionV2ContractError(
-                "projection_generation_collision"
-            )
+            raise ProjectionV2ContractError("projection_generation_collision")
         try:
             committed, _identity, _runtime = read_committed_sidecar(
                 base_dir,
@@ -1029,23 +1011,18 @@ def publish_prepared_projection(
             validate_root_closure(base_dir, recorded)
             recorded_json = str(state.get("sidecar_json") or "")
             if recorded_json != _canonical_json(recorded):
-                raise ProjectionV2ContractError(
-                    "ready_sidecar_runtime_payload_invalid"
-                )
+                raise ProjectionV2ContractError("ready_sidecar_runtime_payload_invalid")
             if assert_canonical is not None:
                 assert_canonical()
             with db_store.transaction() as transaction_connection:
                 if assert_canonical is not None:
                     assert_canonical()
-                current = db_store.get_projection_runtime_v9(
-                    transaction_connection
-                )
+                current = db_store.get_projection_runtime_v9(transaction_connection)
                 if (
                     current.get("status") != "ready"
                     or current.get("projection_generation")
                     != prepared.projection_generation
-                    or current.get("sidecar_sha256")
-                    != state.get("sidecar_sha256")
+                    or current.get("sidecar_sha256") != state.get("sidecar_sha256")
                 ):
                     raise ProjectionV2ContractError(
                         "projection_runtime_changed_before_marker_repair"
@@ -1053,9 +1030,7 @@ def publish_prepared_projection(
                 db_store.cas_projection_runtime_publish_pending(
                     transaction_connection,
                     expected_status="ready",
-                    expected_projection_generation=(
-                        prepared.projection_generation
-                    ),
+                    expected_projection_generation=(prepared.projection_generation),
                     projection_generation=prepared.projection_generation,
                     canonical_generation=prepared.canonical_generation,
                     sidecar_json=recorded_json,
@@ -1068,9 +1043,7 @@ def publish_prepared_projection(
             with db_store.transaction() as transaction_connection:
                 db_store.mark_projection_runtime_ready(
                     transaction_connection,
-                    expected_projection_generation=(
-                        prepared.projection_generation
-                    ),
+                    expected_projection_generation=(prepared.projection_generation),
                     expected_sidecar_sha256=str(state["sidecar_sha256"]),
                 )
             committed, _identity, _runtime = read_committed_sidecar(
@@ -1078,16 +1051,12 @@ def publish_prepared_projection(
                 connection=conn,
             )
         if (
-            committed.get("index_root_sha256")
-            != prepared.index_root_sha256
+            committed.get("index_root_sha256") != prepared.index_root_sha256
             or committed.get("claim_graph_root_sha256")
             != prepared.claim_graph_root_sha256
-            or committed.get("canonical_generation")
-            != prepared.canonical_generation
+            or committed.get("canonical_generation") != prepared.canonical_generation
         ):
-            raise ProjectionV2ContractError(
-                "projection_generation_collision"
-            )
+            raise ProjectionV2ContractError("projection_generation_collision")
         transaction_result = None
         if noop_transaction_mutation is not None:
             if assert_canonical is not None:
@@ -1095,15 +1064,12 @@ def publish_prepared_projection(
             with db_store.transaction() as transaction_connection:
                 if assert_canonical is not None:
                     assert_canonical()
-                current = db_store.get_projection_runtime_v9(
-                    transaction_connection
-                )
+                current = db_store.get_projection_runtime_v9(transaction_connection)
                 if (
                     current.get("status") != "ready"
                     or current.get("projection_generation")
                     != prepared.projection_generation
-                    or current.get("sidecar_sha256")
-                    != state.get("sidecar_sha256")
+                    or current.get("sidecar_sha256") != state.get("sidecar_sha256")
                 ):
                     raise ProjectionV2ContractError(
                         "projection_runtime_changed_before_noop_mutation"
@@ -1121,9 +1087,7 @@ def publish_prepared_projection(
         if assert_canonical is not None:
             assert_canonical()
         if transaction_mutation is not None:
-            transaction_result = transaction_mutation(
-                transaction_connection, prepared
-            )
+            transaction_result = transaction_mutation(transaction_connection, prepared)
         db_store.cas_projection_runtime_publish_pending(
             transaction_connection,
             expected_status=str(state["status"]),
@@ -1135,9 +1099,7 @@ def publish_prepared_projection(
     ensure_static_locators(base_dir)
     marker = Path(base_dir) / SIDECAR_FILENAME
     _write_durable_replace(marker, prepared.sidecar_json.encode("utf-8"))
-    expected_digest = hashlib.sha256(
-        prepared.sidecar_json.encode("utf-8")
-    ).hexdigest()
+    expected_digest = hashlib.sha256(prepared.sidecar_json.encode("utf-8")).hexdigest()
     with db_store.transaction() as transaction_connection:
         db_store.mark_projection_runtime_ready(
             transaction_connection,
@@ -1154,9 +1116,7 @@ def load_component_roots(
 ) -> dict[str, Any]:
     validated = validate_sidecar(dict(sidecar))
     field = "index_root_sha256" if projection == "index" else "claim_graph_root_sha256"
-    return _root_descriptor(
-        ProjectionStoreV2(base_dir), validated[field], projection
-    )
+    return _root_descriptor(ProjectionStoreV2(base_dir), validated[field], projection)
 
 
 def _artifact_identity(path: Path) -> dict[str, Any]:
@@ -1251,9 +1211,7 @@ def schema_migration_projection_snapshot() -> dict[str, Any]:
         closure = validate_root_closure(base, sidecar)
         artifacts = [_artifact_record(path, base) for path in fixed]
         artifacts.extend(_artifact_record(path, base) for path in closure)
-        by_relative = {
-            str(item["relative_path"]): item for item in artifacts
-        }
+        by_relative = {str(item["relative_path"]): item for item in artifacts}
         artifacts = [by_relative[key] for key in sorted(by_relative)]
     except (OSError, UnicodeError, ProjectionV2ContractError, RuntimeError) as exc:
         issues.append(f"projection_v2_invalid:{exc}")
@@ -1348,16 +1306,14 @@ def schema_migration_projection_backup(
     if final.exists():
         raise RuntimeError("projection_backup_destination_exists")
     final.parent.mkdir(parents=True, exist_ok=True)
-    staging = final.with_name(
-        f".{final.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-    )
+    staging = final.with_name(f".{final.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     copied: list[dict[str, Any]] = []
     try:
         staging.mkdir()
         for item in snapshot.get("artifacts") or []:
-            if not isinstance(item, Mapping) or not item.get(
-                "source_identity", {}
-            ).get("exists"):
+            if not isinstance(item, Mapping) or not item.get("source_identity", {}).get(
+                "exists"
+            ):
                 continue
             relative = Path(str(item.get("relative_path") or ""))
             if relative.is_absolute() or ".." in relative.parts:
@@ -1372,10 +1328,9 @@ def schema_migration_projection_backup(
             shutil.copyfile(source, destination)
             sync_file(destination)
             observed_sha = _sha256_file(destination)
-            if (
-                observed_sha != item.get("sha256")
-                or int(destination.stat().st_size) != int(item.get("bytes") or -1)
-            ):
+            if observed_sha != item.get("sha256") or int(
+                destination.stat().st_size
+            ) != int(item.get("bytes") or -1):
                 raise RuntimeError(
                     f"projection_backup_copy_mismatch:{relative.as_posix()}"
                 )
@@ -1433,8 +1388,7 @@ def schema_migration_validate_projection_backup(
         or backup.get("generation") != source_snapshot.get("generation")
         or backup.get("canonical_generation")
         != source_snapshot.get("canonical_generation")
-        or backup.get("index_root_sha256")
-        != source_snapshot.get("index_root_sha256")
+        or backup.get("index_root_sha256") != source_snapshot.get("index_root_sha256")
         or backup.get("claim_graph_root_sha256")
         != source_snapshot.get("claim_graph_root_sha256")
     ):
@@ -1455,8 +1409,7 @@ def schema_migration_validate_projection_backup(
     expected = {
         str(item.get("relative_path")): item
         for item in source_snapshot.get("artifacts") or []
-        if isinstance(item, Mapping)
-        and item.get("source_identity", {}).get("exists")
+        if isinstance(item, Mapping) and item.get("source_identity", {}).get("exists")
     }
     observed = {
         str(item.get("relative_path")): item
@@ -1511,9 +1464,7 @@ def schema_rollback_stage_projection(plan: Mapping[str, Any]) -> dict[str, Any]:
             "status": "absent",
             "directory": None,
             "artifacts": [],
-            "content_binding": schema_migration_projection_content_binding(
-                snapshot
-            ),
+            "content_binding": schema_migration_projection_content_binding(snapshot),
         }
     live_base = get_wiki_dir().resolve()
     token = str(plan.get("fingerprint") or "rollback").removeprefix("sha256:")[:16]
@@ -1562,9 +1513,7 @@ def schema_rollback_stage_projection(plan: Mapping[str, Any]) -> dict[str, Any]:
             "status": status,
             "directory": str(staging),
             "artifacts": staged,
-            "content_binding": schema_migration_projection_content_binding(
-                snapshot
-            ),
+            "content_binding": schema_migration_projection_content_binding(snapshot),
         }
     except BaseException:
         if staging.exists():
@@ -1581,8 +1530,7 @@ def schema_rollback_publish_projection(
 
     if (
         not isinstance(staged, Mapping)
-        or staged.get("contract")
-        != "vector-lake-projection-rollback-stage/v2"
+        or staged.get("contract") != "vector-lake-projection-rollback-stage/v2"
         or staged.get("format_version") != FORMAT_VERSION
     ):
         raise RuntimeError("projection_v2_rollback_stage_contract_invalid")
@@ -1612,8 +1560,7 @@ def schema_rollback_publish_projection(
     expected_relatives = {
         str(item.get("relative_path"))
         for item in snapshot.get("artifacts") or []
-        if isinstance(item, Mapping)
-        and item.get("source_identity", {}).get("exists")
+        if isinstance(item, Mapping) and item.get("source_identity", {}).get("exists")
     }
     if set(artifacts) != expected_relatives:
         raise RuntimeError("projection_v2_rollback_stage_artifact_set_mismatch")
@@ -1632,15 +1579,12 @@ def schema_rollback_publish_projection(
         except ValueError as exc:
             raise RuntimeError("projection_v2_rollback_target_escape") from exc
         if target.is_symlink():
-            raise RuntimeError(
-                f"projection_v2_rollback_target_symlink:{relative_text}"
-            )
+            raise RuntimeError(f"projection_v2_rollback_target_symlink:{relative_text}")
         if target.is_file():
-            if (
-                int(target.stat().st_size) == int(item.get("bytes") or -1)
-                and hmac.compare_digest(
-                    _sha256_file(target), str(item.get("sha256") or "")
-                )
+            if int(target.stat().st_size) == int(
+                item.get("bytes") or -1
+            ) and hmac.compare_digest(
+                _sha256_file(target), str(item.get("sha256") or "")
             ):
                 source.unlink(missing_ok=True)
                 return
@@ -1658,8 +1602,7 @@ def schema_rollback_publish_projection(
     object_relatives = sorted(
         relative
         for relative in artifacts
-        if Path(relative).parts[:3]
-        == (".projection-store", "objects", "sha256")
+        if Path(relative).parts[:3] == (".projection-store", "objects", "sha256")
     )
     for relative in object_relatives:
         publish_relative(relative)

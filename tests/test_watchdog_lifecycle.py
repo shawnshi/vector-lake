@@ -304,6 +304,118 @@ def test_runtime_health_reports_unmigrated_schema_without_mutating_it(
     assert tables == {"entities"}
 
 
+@pytest.mark.parametrize("initialized", [False, True])
+def test_startup_projection_check_preserves_fresh_empty_runtime(
+    isolated_memory, initialized,
+):
+    from vector_lake import watchdog_app
+
+    if initialized:
+        db_store.init_db()
+        db_store.close_all_connections()
+    wiki_dir = isolated_memory / "wiki"
+    before = {str(path.relative_to(wiki_dir)): path.read_bytes()
+              for path in wiki_dir.rglob("*") if path.is_file()}
+
+    watchdog_app._check_projection_store_for_startup()
+
+    after = {str(path.relative_to(wiki_dir)): path.read_bytes()
+             for path in wiki_dir.rglob("*") if path.is_file()}
+    assert after == before
+    assert not (wiki_dir / ".projection-store").exists()
+
+
+def test_startup_projection_check_resolves_db_symlink_with_active_wal(
+    isolated_memory, monkeypatch,
+):
+    from vector_lake import indexer, watchdog_app
+    from vector_lake.projection_store_v2 import ProjectionStoreV2
+
+    db_store.init_db()
+    indexer.generate_index()
+    runtime = db_store.get_projection_runtime_v9()
+    assert runtime["status"] == "ready"
+    database = db_store.peek_db_path().resolve()
+    db_store.close_all_connections()
+    alias = database.with_name("alias.db")
+    alias.symlink_to(database)
+    assert alias.is_symlink() and alias.resolve() == database
+    monkeypatch.setenv("VECTOR_LAKE_DB_PATH", str(alias))
+    assert db_store.peek_db_path() == alias
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute("CREATE TABLE startup_wal_probe (value INTEGER)")
+        connection.execute("INSERT INTO startup_wal_probe VALUES (1)")
+        connection.commit()
+        wal = database.with_name(database.name + "-wal")
+        before_wal = wal.read_bytes()
+        assert len(before_wal) > 32
+        assert not alias.with_name(alias.name + "-wal").exists()
+
+        watchdog_app._check_projection_store_for_startup()
+
+        store = ProjectionStoreV2(isolated_memory / "wiki")
+        root = store.object_path(runtime["sidecar"]["index_root_sha256"])
+        root.rename(root.with_name(root.name + ".preserved"))
+        with pytest.raises(RuntimeError, match="projection_recovery_required"):
+            watchdog_app._check_projection_store_for_startup()
+        assert not root.exists()
+        assert wal.read_bytes() == before_wal
+        assert not alias.with_name(alias.name + "-wal").exists()
+        assert connection.execute("SELECT value FROM startup_wal_probe").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("missing", ["store", "objects", "root"])
+def test_watchdog_startup_requires_recovery_for_missing_durable_projection(
+    isolated_memory, monkeypatch, caplog, missing,
+):
+    from vector_lake import indexer, tool_projection, watchdog_app
+    from vector_lake.projection_store_v2 import ProjectionStoreV2
+
+    db_store.init_db()
+    indexer.generate_index()
+    runtime = db_store.get_projection_runtime_v9()
+    assert runtime["status"] == "ready"
+    wiki_dir = isolated_memory / "wiki"
+    store = ProjectionStoreV2(wiki_dir)
+    watchdog_app._check_projection_store_for_startup()
+    db_store.close_all_connections()
+    if missing == "store":
+        target = store.store_dir
+    elif missing == "objects":
+        target = store.objects_dir
+    else:
+        target = store.object_path(runtime["sidecar"]["index_root_sha256"])
+    target.rename(target.with_name(target.name + ".preserved"))
+    before = {str(path.relative_to(wiki_dir)): path.read_bytes()
+              for path in wiki_dir.rglob("*") if path.is_file()}
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("startup must neither repair nor start workers/observer")
+
+    monkeypatch.setattr(tool_projection, "rebuild_index_projection", forbidden)
+    monkeypatch.setattr(watchdog_app, "Observer", forbidden)
+    monkeypatch.setattr(watchdog_app.threading.Thread, "start", forbidden)
+
+    with pytest.raises(RuntimeError, match="projection_recovery_required"):
+        watchdog_app._start_watchdog_locked(threading.Event())
+
+    for relative, content in before.items():
+        assert (wiki_dir / relative).read_bytes() == content
+    assert not target.exists()
+    assert not (wiki_dir / ".meta" / "backups").exists()
+    status = json.loads(get_status_file().read_text(encoding="utf-8"))
+    assert status["components"]["watchdog"]["status"] == "halted"
+    assert "recovery required" in status["components"]["watchdog"]["current_action"]
+    assert "projection_recovery_required" in caplog.text
+    assert "self-healed" not in caplog.text
+
+
 def test_watchdog_detects_dead_worker_and_joins_remaining_workers(
     isolated_memory,
     monkeypatch,
@@ -435,7 +547,7 @@ def test_watchdog_restarts_transient_scheduler_failure(
         deadline = time.monotonic() + 2
         scheduler_status = {}
         while time.monotonic() < deadline:
-            status = json.loads(get_status_file().read_text(encoding="utf-8"))
+            status = _read_watchdog_status(get_status_file())
             scheduler_status = status["components"]["scheduler"]
             if scheduler_status["current_action"] == "Background worker restarted":
                 break

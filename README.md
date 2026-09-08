@@ -38,14 +38,14 @@ graph LR
 下表来自当前源码与插件清单。修改相关公开表面时必须同步更新，不能用历史版本标题替代运行契约。
 
 | Surface | Current contract |
-|---|---|
+| --- | --- |
 | Plugin package | `11.20.0+codex.20260829201234` |
 | Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
 | SQLite migration schema | `PRAGMA user_version = 9` |
 | Canonical governance schema | `8.0` |
 | Index projection | logical `PROJECTION_CONTRACT_VERSION = 1` / physical `format_version = 2` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 67 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 40 CLI commands / 19 Agent skills |
+| Public surfaces | 68 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 41 CLI commands / 19 Agent skills |
 
 通用 `init_db()` 遇到既有 v1–v8 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6、v7 或 v8 数据库，并按受控历史链最终
@@ -151,7 +151,7 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 1. **配置扫描范围**：检查 `config.json` 的 `target_directories`、`exclude_paths` 与 `supported_extensions`。非 embedding 文本推理不由插件调用外部模型 API；`GEMINI_API_KEY` 只用于 embedding。
 2. **扫描并入队**：执行 `python cli.py sync`。一次调用扫描配置范围、跳过已处理 revision，并最多持久化 50 个 ingest v5 job；它不会直接生成 subagent 任务包，也不承诺清空历史队列。
 3. **分发任务包**：运行 `python watchdog_sync.py`，或单独运行 `python -m vector_lake.ingest_worker`。worker 只领取当前 ingest v5 queued job，在隔离目录生成任务包，并把 job 转为 `awaiting_subagent`。
-4. **领取任务**：宿主使用 `python cli.py ingest-tasks --claim --limit 5` 或 MCP `claim_ingest_tasks` 领取。领取结果包含任务包以及 `lease_owner`、`lease_token`、`lease_generation`。
+4. **领取任务**：手动模式下，宿主使用 `python cli.py ingest-tasks --claim --limit 5` 或 MCP `claim_ingest_tasks` 领取。MCP 人工领取默认禁用，须由受信宿主显式设置 `VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN=1`；自动摄取启用时，CLI/MCP 人工领取均受 controller 独占限制，该变量不会绕过独占门。日常自动模式交由 automatic ingest host 领取，不要为领取任务而关闭安全检查。领取结果包含任务包以及 `lease_owner`、`lease_token`、`lease_generation`。
 5. **完成摄取**：宿主生成 Wiki payload 后调用 MCP `finalize_ingest`，提交 `files_written`、任务包中的 `processed_data` 和领取阶段的租约字段。成功后同一事务完成 job 并登记 `processed_files`。
 
 重复执行 `sync` 直到返回 `VECTOR_LAKE_RAW_FULL_SCAN_COMPLETE_V1` 且没有新 revision；这只证明当前 inventory 已扫描，不代表 queued、awaiting-subagent 或 failed 债务为零。还应执行 `python cli.py ingest-tasks` 与 `python cli.py ingest-tasks --repair-debt --limit 0` 核对队列。
@@ -169,7 +169,7 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 同时把 `enabled` 与 `allow_model_processing_raw_text` 设为 `true`；不要把示例文件本身当作
 已验证的运行配置。
 
-默认安全预算为每小时 100 项、滚动 24 小时 2000 项，单任务最多 81,920 tokens；对应的预留上限为每小时 8,192,000 tokens、滚动 24 小时 65,536,000 tokens（24 小时预留额度独立限制总量）。完成一次性启用与 raw-text 模型处理授权后，正常 `integrated` / `standalone` 任务固定以 Codex `-a never -s read-only` 自动运行和 finalize，不逐项再次请求确认；异常和策略拒绝仍按配置 fail-closed。以上均为成本与安全上限，不是吞吐 SLA，实际吞吐仍受单 worker、任务时长、heavy-task gate 和熔断器约束。启用或提高预算会启动独立 Codex 子进程并产生模型用量；变更后应使用一个真实的新 raw revision 做 canary，验证 `queued → awaiting_subagent → subagent_processing → finalized`、`processed_files` 当前哈希、outbox drain 与 Wiki/SQLite/index 三面一致。
+默认安全预算为每小时 100 项、滚动 24 小时 2000 项，单任务预留阈值最多 81,920 tokens；对应的预留上限为每小时 8,192,000 tokens、滚动 24 小时 65,536,000 tokens（24 小时预留额度独立限制总量）。完成一次性启用与 raw-text 模型处理授权后，正常 `integrated` / `standalone` 任务固定以 Codex `-a never -s read-only` 自动运行和 finalize，不逐项再次请求确认；异常和策略拒绝仍按配置 fail-closed。以上是本地准入与预留限制，不是提供方计费硬上限，也不是吞吐 SLA。生成结束后，可信事件日志中的实际用量超过预留阈值会拒绝发布，但已发生的模型用量仍计入失败 receipt 与预算观测；无效日志的用量保持未知，不按预留值冒充实际消耗。实际吞吐仍受单 worker、任务时长、heavy-task gate 和熔断器约束。启用或提高预算会启动独立 Codex 子进程并产生模型用量；变更后应使用一个真实的新 raw revision 做 canary，验证 `queued → awaiting_subagent → subagent_processing → finalized`、`processed_files` 当前哈希、outbox drain 与 Wiki/SQLite/index 三面一致。
 
 ### Ingest v5 task-packet contract
 
@@ -184,6 +184,8 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 `recover_terminal_ingest_outputs` 是仅供受控事故恢复的 full-surface MCP 工具，不改变普通 `claim_ingest_tasks` 的禁用边界。它只接受批准 sandbox 中、合同为 `vector-lake-terminal-ingest-output-recovery/v1` 的 manifest，并要求 1–3 个互异的终止 ingest job、历史 attempt/generation、验证事件摘要、当前待复核输出和显式 `operator_adjustment`。dry-run 会重新校验 raw revision、Source 基线、历史验证事件的精确 revision、完整 integration/final-purpose 合同，并返回内容绑定的确认指纹；apply 还要求可信宿主设置 `VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN=1` 和逐字匹配的指纹。
 
 成功提交会在 job recovery provenance 中保存 output/events/artifact/operator-adjustment 的 `selection_digest`。后续重放只有在该摘要完全一致时才可把 job 识别为 `already_recovered`；receipt 分别返回当前确认指纹和各 job 的实际恢复指纹。工具使用原子批量 lease、owner/token/generation fencing 和失败状态恢复；最后一项提交后仍执行有界 projection 收敛检查，若 canonical 已提交但 projection 未收敛，返回 `committed_projection_pending`，不得报告完整成功。
+
+`finalize_exact_reviewed_ingest_outputs` 是人工复核后的单条精确 finalization 入口。manifest 根合同必须是 `vector-lake-exact-reviewed-ingest-finalization/v1`，`selections` 长度必须恰好为 1，并绑定 job/raw/payload identity、integration candidates 摘要、输出摘要和 bounded review metadata；apply 仍要求 `VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN=1`、automatic controller 关闭、dry-run 指纹逐字确认，并由服务端自行 claim/finalize。lease owner/token 不属于公开 schema、plan 或 receipt；已提交重放只在 stored `reviewed_ingest.selection_digest` 完全一致时幂等。
 
 `retry_terminal_ingest_job` 只处理历史上被错误归类为 `generator_policy` 的顶层 Codex runner `error` 事件。该入口要求一个精确终止 job、当前 raw revision、无活动 lease、未处理 marker、内容绑定 dry-run 指纹及管理员 apply 门禁；apply 复用 ingest debt 的 CAS、Source/candidate 基线刷新和维护备份，不允许重试一般 input/output/model policy 失败。新版 runner 事件校验把顶层 `error` 视为基础设施失败，仍拒绝其输出，但交由有界基础设施重试和熔断器处理，而不再永久隔离为模型策略错误。
 
@@ -229,6 +231,8 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 - 同一 `memory_key` 的 `preference / decision / task_state`：`updated_at > authority_score > confidence_score`。
 - 失败侧标记为 `superseded`；无法裁决时保留 `conflicted`。
 
+`search --mode memory/fact` 的文本与 XML 命中保留实际存在的 `memory_id`、`source_claim_id`、`source_page`，原有 `Source` 来源提示不变；同页事实仍可区分稳定身份。CLI `search` 在后端不可用时返回非零退出码并提供诊断指引，不再声称未核验的维护 worker 正在自动恢复；正常零命中和仅有语义 `not_ready` 提示仍返回 `0`。默认 MCP 响应封装不变。
+
 `query` 会优先生成 Memory Packet，再按预算拼接相关 wiki 页面。Memory Packet 包含当前偏好、决策、任务状态、相关事实、冲突/陈旧告警和证据指针。启用 `VECTOR_LAKE_OPERATIONAL_MEMORY_FTS=1` 时，Watchdog 默认以有界批次自动推进派生索引；schema v6 以持久 proof 绑定 canonical 原始行、document mapping 和两套 FTS 物理索引，并按连接可见 revision 缓存稳定结果。缺行、多行、等计数 token 篡改、遗漏 pending、核验超限或查询竞态都会失败关闭并触发有界重放。索引未 ready 时只允许最多 5,000 条 source row 的降级窗口，超过即返回稳定的 not-ready/retry-after 契约，不再静默全表评分。旧式无界回退仅可通过显式高风险兼容开关启用。
 
 ### Agent-memory verbs 与薄客户端表面
@@ -239,7 +243,7 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 - `remember`：继续通过 sandboxed `payload_file` 和 Mutation Coordinator 受控写入。
 - `entity`：精确解析 key、canonical id、title 和 alias，并显式报告歧义。
 - `synthesize`：只组装 proposal-only dry-run 上下文，不提交 Synthesis 页面。
-- `context_pack`：在服务端字符预算内组装 Memory Packet 与页面上下文。
+- `context_pack`：在服务端字符预算内组装 Memory Packet 与页面上下文。完整 strategic purpose 先计入预算，剩余字符再分配给检索内容；预算不足以容纳 purpose 时显式报错，不截断策略约束。`purpose.md` 确实缺失时，在同一预算内返回 `STRATEGIC PURPOSE STATUS: missing` 提示，不声称已检查战略对齐；其他读取或解析错误仍直接报错。
 - `delta`：返回指定时间后的当前页面投影更新；不声称包含删除历史。
 
 直接 `forget` 不属于该契约。Vector Lake 的运行态记忆来自 canonical claims；Agent
@@ -250,13 +254,29 @@ Agent 可在独立 MCP 进程设置 `VECTOR_LAKE_MCP_SURFACE=memory`；默认 `f
 可用 verbs 中宣称 `remember`。
 
 所有直接 `search`（page / memory / fact）结果，以及 `recall`、`synthesize`、
-`context_pack` 响应，都会携带 `vector-lake-semantic-readiness-envelope/v1`。
+`context_pack` 响应和 `query` 的默认内存／受控任务上下文，都会携带
+`vector-lake-semantic-readiness-envelope/v1`。
 该 envelope 返回 `ready/status`、最多 8 条 issue 与 warning、有限债务摘要、捕获的
 canonical / governance / projection generation 与 fingerprint，并固定声明
 `results_are_not_accepted_facts=true`。`not_ready`、`degraded` 或无法证明代次时的
 `unknown` 都不会吞掉基础检索结果。运行时每次只核对轻量 generation token；同一
 token 最多复用 5 秒的完整语义评估，任何数据库、治理、投影或 readiness 策略 token
 变化都会立即失效，评估期间发生漂移则返回 `unknown`，不会伪报 `ready`。
+
+记忆摘要的 420 字符、轻量 Wiki 摘要的 1200 字符上限包含实际截断标记；
+恰好达到上限不算截断。Memory Packet 按完整条目计数，在同一字符预算内保留
+XML 闭合与转义。`query` / `context_pack` 透传已纳入数量、省略数量、
+文本截短数量及降级状态；`null` 表示未检索或无法证明完整性，不等于零省略。
+不存在或不可读的 Wiki 正文、空摘要仅保留发现状态，不计为已纳入上下文的页面。
+缺少可选正文不表示元数据检索后端故障；需要正文的上下文组装单独披露降级和省略。
+
+拓扑 audit 默认展示完整只读计划，包括稳定 ID、类型、受影响页面和说明。
+超过 50 项或无法容纳于 40000 字符预览时拒绝 preview/apply，不隐藏待执行项。
+精确确认指纹与写健康门不变；队列按稳定 `item_id` 幂等，不能因同标题丢掉不同建议。
+
+EvidencePacket 1.1 的 `assessment_complete` 仅表示当前 claim version 有评估，
+不表示 supported 或 accepted fact。历史与无版本评估仍保留在 `assessments` 中，
+但会标记 `claim_assessment_stale`；没有当前版本评估时同时标记 `claim_unassessed`。
 
 ## Storage Layout & Architecture
 
@@ -265,7 +285,7 @@ Vector Lake 使用 SQLite canonical 与可重建投影分离的架构。
 - **SQLite (Canonical Store)**：`vector_lake.db` 保存 entities、claims、evidence、sources、graph edges、governance state、jobs 与 outbox；同库的 `operational_memory` 是由 canonical claims 编译的事务性 Agent read model，不构成第二事实源。
 - **Markdown (Human-Audit Projection)**：`wiki/*.md` 是可审计发布面；`raw/` 保存由扫描器识别和按 revision 跟踪的输入材料。
 - **Derived Projections**：`index.json` 与 `claim_graph.json` 是 projection-v2 locators；其不可变组件位于 `.projection-store/objects/sha256/`。这些对象、FTS、`projection_pair_manifest.json`、Timeline 和 operational-memory packets 均可从 canonical 状态与受治理信源重建。小型 sidecar 是 locator/object 闭包的最后提交标记，绑定共同 generation、root digest、文件大小和 SHA-256；缺失、损坏或摘要不一致时读取链路失败关闭并要求重新同步。
-- **Commit Boundary**：canonical change set 与 outbox intent 在 SQLite 内原子提交；文件投影使用备份、原子替换和 fenced worker 恢复，但不宣称文件系统与 SQLite 之间存在分布式事务。
+- **Commit Boundary**：canonical change set 与 outbox intent 在 SQLite 内原子提交；文件投影使用备份、原子替换和 fenced worker 恢复，但不宣称文件系统与 SQLite 之间存在分布式事务。outbox 消费者在事务外验证并暂存内容，在短写事务内复核完整租约和最新意图后 CAS 发布；旧意图与并发人工编辑不能被覆盖。
 
 ```text
 MEMORY/
@@ -302,6 +322,12 @@ MEMORY/
 ```powershell
 python cli.py doctor
 ```
+
+quick doctor 不同步扫描整个 operational-memory 内容摘要；`integrity_verification_kind`
+明确区分 generation/revision 绑定的 `durable_proof` 与完整内容 attestation。
+证明缺失、失效或索引尚未补齐仍不能报告 ready。若 attestation interval 为 0，
+quick 返回 `deferred` 并要求 deep，不把未执行的检查误报为 backfill 停滞。
+直接内容篡改仍需 deep 检查；deep、写健康门和普通检索的既有强制核验行为不变。
 
 语义就绪度（与基础设施健康分开）：
 
@@ -477,6 +503,9 @@ python cli.py evidence-foundation-backfill --limit 100
 python cli.py evidence-foundation-backfill --apply --limit 100 --batch-size 25
 python cli.py unsupported-claim-debt
 python cli.py unsupported-claim-debt --apply --confirm-fingerprint "<preview fingerprint>"
+python cli.py claim-provenance-repair
+python cli.py claim-provenance-repair --source-map "C:/Users/shich/MEMORY/scratch/source-map.json"
+python cli.py claim-provenance-repair --source-map "C:/Users/shich/MEMORY/scratch/source-map.json" --apply --confirm-fingerprint "<preview fingerprint>"
 python cli.py timeline-rebuild
 python cli.py timeline-rebuild --apply
 python cli.py projection-rebuild-index
@@ -508,7 +537,72 @@ python cli.py restore-snapshot --maintenance-receipt "<absolute-backup-manifest.
 python cli.py restore-snapshot --maintenance-receipt "<absolute-backup-manifest.json>" --apply --confirm-fingerprint "sha256:<preview-fingerprint>" --confirm-no-writers
 ```
 
-除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥并绑定 fingerprint 与 `--confirm-no-writers`。`schema-rollback` 和 `restore-snapshot` 都拒绝裸备份，先保全当前 DB/projection/Wiki forward bundle，再按 completed receipt 原子恢复；中断后可从 pending receipt 幂等续跑。`projection-rebuild-index` 从 canonical 生成 v2 immutable roots、locator、FTS 与 sidecar，保留已有 `vec_embeddings`；`projection-object-gc` 只清理超过 retention、且不在 live/current/previous/pending/backup/restore roots 可达闭包中的对象，apply 必须提交同一预览 fingerprint。`embedding-backfill` 按 RPM/TPM 限额断点补齐向量并按 provider batch 单事务 CAS。`canonical-backfill`、`evidence-foundation-backfill`、`unsupported-claim-debt`、`history-retention`、`change-set-compaction`、`memory-cleanup`、`topology-queue-cleanup` 与 `orphan-source-classify` 均保持原有 preview、边界、游标或 fingerprint 门禁。
+除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥并绑定 fingerprint 与 `--confirm-no-writers`。`schema-rollback` 和 `restore-snapshot` 都拒绝裸备份，先保全当前 DB/projection/Wiki forward bundle，再按 completed receipt 原子恢复；中断后可从 pending receipt 幂等续跑。`projection-rebuild-index` 从 canonical 生成 v2 immutable roots、locator、FTS 与 sidecar，保留已有 `vec_embeddings`；`projection-object-gc` 只清理超过 retention、且不在 live/current/previous/pending/backup/restore roots 可达闭包中的对象，apply 必须提交同一预览 fingerprint。`embedding-backfill` 按 RPM/TPM 限额断点补齐向量并按 provider batch 单事务 CAS。`canonical-backfill`、`evidence-foundation-backfill`、`unsupported-claim-debt`、`claim-provenance-repair`、`history-retention`、`change-set-compaction`、`memory-cleanup`、`topology-queue-cleanup` 与 `orphan-source-classify` 均保持原有 preview、边界、游标或 fingerprint 门禁。`claim-provenance-repair` 只接受现有逐字证据、唯一 `Source_*` 原件映射，或位于 `MEMORY` 内且逐文件冻结 SHA-256、字节数和预期声明数的 `claim-provenance-source-map/v1`；映射既可绑定 `Source_*` 页面，也可绑定声明抽取运行中唯一的 `Source_*` 血缘引用，或正文中唯一的 `Source_*` 页面链接；多来源歧义仍拒绝修复。其余声明保持未修复并进入受治理研究路径。
+
+### Exact-claim official evidence (MCP / Python API)
+
+`claim_provenance_repair` adds optional `source_claim_ids` (1–256 unique,
+nonempty, whitespace-free IDs) and `official_evidence_map_path`. A supplied
+scope must be entirely eligible and repairable; no partial limit, implicit
+same-page expansion, or unselected equal-text/automatic closure is allowed.
+Apply rejects before any database mutation if old/new memory contradictions
+or same-key non-fact peers require IDs outside the authorized scope; conflict
+processing is never silently skipped or expanded beyond that scope.
+Omitting these arguments preserves legacy CLI/API behavior. Official maps
+require an explicit scope and cannot be mixed with legacy `source_map_path`.
+
+An operator prepares a `claim-official-evidence-map/v1` JSON file inside the
+effective MEMORY root, with `entries` covering **exactly** the selected IDs.
+Each entry contains `claim_id`, `expected_claim_version`,
+`expected_claim_sha256`, `review`, `snapshots`, and `review_receipt_sha256`.
+`review` requires `actor_id`, `method_version`, `purpose`, and timezone-qualified
+`reviewed_at`. Each snapshot requires:
+
+- `original_url` (absolute HTTPS, no credentials), `retrieved_at` (with timezone),
+  `raw_ref` under `raw/research/`, exact `byte_size` and lowercase `raw_sha256`;
+- `representation`: `original-http-body` or `verbatim-text-extraction`;
+- `quoted_excerpt`: an actual UTF-8 passage present byte-for-byte in the snapshot;
+- `metadata`: nonempty `validator`, `consent`, `classification`,
+  `retention_policy`, explicit `generation_parent_refs` list, `expires_at` and
+  `revoked_at` (null if absent). Extra metadata is retained; expired/revoked
+  snapshots are refused;
+- `semantic_review`: `supports_claim: true`, `original_source_verified: true`,
+  and a nonempty `rationale`. This is a human/operator attestation, **not** a
+  semantic inference from byte containment. Multiple primary snapshots per
+  claim are supported, e.g. a release index and a specification.
+
+Hashes use SHA-256 over UTF-8 JSON with `ensure_ascii=False`, `sort_keys=True`,
+`separators=(",", ":")`: `expected_claim_sha256` covers the complete current
+canonical claim object; `review_receipt_sha256` covers the entire entry except
+that receipt field. `expected_claim_version` is `claim_governance_version(claim)`.
+Receipts and their complete preimages are retained in extraction records.
+The receipt is a content binding, not a digital signature or identity proof.
+
+Preview with `dry_run=true`, the exact `source_claim_ids`, and the frozen map
+path. Review returned scope/counts and `candidate_fingerprint`; only a later
+explicit operator authorization may reuse the **same** arguments with
+`dry_run=false` and `confirmation=<fingerprint>`. Apply creates and validates a
+complete v4 maintenance backup, proves its DB/projection consistency and the
+same confirmed canonical/runtime basis, then rechecks claims and frozen bytes
+inside the write transaction before updates. The conservative state fence also
+invalidates previews on unrelated canonical/runtime changes. A missing or stale
+projection backup blocks apply; do not bypass that gate.
+
+Repair never fetches URLs, modifies Wiki/raw bytes or claim text, records an
+AcceptedFact, or promotes evidence tiers. A research summary or generated copy
+of claim wording is **not** an original document and must never be submitted as
+one. Official status and semantic support require actual operator source review;
+this offline tool cannot authenticate a URL or a dishonest attestation. Frozen
+files must remain immutable under operator control (SQLite does not lock the
+filesystem). Legacy reconstruction remains separate and is not upgraded into
+official evidence. Projection rebuilding, if needed after apply, is a separate
+preview/authorization step.
+
+MCP `operational_memory_cleanup` 可传入 `source_claim_ids`（1–256 个唯一声明 ID）进行精确模板归档；先以 `dry_run=true` 取得 `candidate_fingerprint`，再以相同范围和 `confirmation` 执行。此模式禁止部分 `limit`，要求一致性备份，并在写事务中重验声明与运行记忆快照；缺失、内容漂移、实质知识或已关联来源/证据的声明一律拒绝。它只归档运行记忆，不删除 Wiki、canonical 声明或历史，也不构成事实证实。新模板规则要求整段格式和所属页面身份同时匹配，普通正文及跨页面引用不会仅因包含自动生成字样而被过滤。
+
+维护快照创建只新增备份，绝不裁剪此前成功的快照；即使已有 5 份或更多，也必须另行授权 `backup-retention` 才能删除。watchdog 每日当地时间 03:00 的 `history-retention` 仅执行只读预览并报告需要操作员批准，不代填确认指纹，不自动删除；预览失败保留错误状态，仅成功预览才记为当天完成。
+
+watchdog 启动时只做有界投影存储检查，不自动重建对象。已有 durable v2 publication state 或 locator 而对象存储缺失时，启动以 `halted` / `projection_recovery_required` 拒绝继续；应保持 watchdog 停止，保全 DB、locator 与剩余对象，取得授权后从经验证的一致快照恢复，不绕过维护 preflight。全新且尚未创建投影的空运行目录仍可启动；此检查不替代 deep doctor 的完整对象校验。
 
 `backup-retention` 预览返回 fingerprint；apply 必须复用相同的 `keep-latest`、`min-age-days`、`stage-ttl-hours` 参数并提交该 fingerprint。默认保留最新 5 份完整备份、30 天内的完整备份和最新一份经实际校验可恢复的 canonical/projection 快照；私有 staging 与失败删除 tombstone 至少保留 24 小时。maintenance manifest v4 记录动态嵌套 artifact、逐文件 SHA-256/bytes、v2 roots 与完整对象闭包；执行前重扫 SQLite quick-check/schema/runtime generation 与 projection binding。旧 v3 backup 继续按内嵌 v1 pair contract 只读兼容。
 
@@ -535,7 +629,8 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_SUBAGENT_RUN_ID`：当前宿主运行标识；经清洗后决定 `brain/<run>/scratch/` 隔离目录。任务包路径不是 `config.json` 键。
 - `VECTOR_LAKE_INGEST_WORKER_RUN_ID`：ingest dispatcher 的 lease owner；未设置时使用主机名与 PID。`VECTOR_LAKE_INGEST_TASK_MAX_AGE_SECONDS` 控制 watchdog 回收 awaiting job 的阈值，默认 `86400` 秒。
 - `VECTOR_LAKE_PAYLOAD_ROOT`：显式覆盖 MCP `payload_file` 的批准根目录；未设置时只接受活动数据库同级的 `brain/<run>/scratch/`。Codex、Pi 与 Gemini 的其他 sandbox 必须由各自薄适配器显式映射，core 不猜宿主目录。
-- `VECTOR_LAKE_AGENT_SANDBOX_ROOTS`：以 `os.pathsep` 分隔的绝对 sandbox 根；只有这些根内的显式 graph 输出目录可写。未配置时 graph 仍可使用自身默认受控输出路径，但拒绝调用方指定任意目录。
+- `VECTOR_LAKE_AGENT_SANDBOX_ROOTS`：由宿主显式配置、以 `os.pathsep` 分隔的绝对 sandbox 根（Windows 为 `;`）；graph 的显式与默认输出均须位于这些根内。省略 `output_dir` 时选第一个根；未配置/空根列表、空输出目录、相对路径、`..`、symlink/reparse 路径均失败关闭，不推断目录或扩权。
+- `visualize_vector_lake` / `graph` 只导出已提交且通过当前 canonical generation 校验的投影快照，不 bootstrap、不重建；缺失、陈旧或损坏时须另行显式修复。MCP 保留 bounded heavy executor，但此唯一导出工具不占 canonical heavy gate，仍使用 projection publish lock。HTML 原子写入 sandbox，结果报告 as-of generation、节点数及 claim 投影默认上游 2500 节点截断边界。页面含本地摘要等数据，打开本身无外联；只有用户主动点击 CDN 加载按钮才加载外部渲染器，外部脚本可访问文件内全部图谱数据。浏览器启动失败不代表文件保存失败。
 - `VECTOR_LAKE_PAYLOAD_MAX_BYTES`：单个 MCP sandbox payload 上限，默认 `5 MiB`。
 - `VECTOR_LAKE_WIKI_BATCH_MAX_BYTES`：`write_wiki_batch` 全批 payload 的 UTF-8 字节上限，默认 `16 MiB`，无论配置如何都不能超过 `64 MiB`。
 - `VECTOR_LAKE_WIKI_BATCH_SCHEMA_MAINTENANCE_ALLOWLIST`：可信宿主提供的 JSON 文件名数组；未设置时 schema-maintenance 一律拒绝。manifest 请求必须是该精确清单的子集，且每项仍需绑定非空 canonical version 与 projection SHA-256；该能力不接受 `Source_*` 维护例外。
@@ -594,7 +689,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 ## Module Map
 
 | Path | Role |
-|---|---|
+| --- | --- |
 | `cli.py` | 根目录薄入口 |
 | `vector_lake/cli_app.py` | CLI 参数与命令路由 |
 | `vector_lake/tools.py` | Tool facade |
@@ -690,6 +785,8 @@ $env:PYTHONUTF8='1'; python cli.py projection-report --limit 5
 $env:PYTHONUTF8='1'; python cli.py evidence-packet "<claim_id>"
 $env:PYTHONUTF8='1'; python cli.py retrieval-benchmark "<dataset.json>"
 ```
+
+`retrieval-benchmark` 消费当前 `VectorLakeSearchResponse` 中唯一的页面 `EvidenceResults`，并保留每条查询的 `search_status` 与 `semantic_readiness`。不可用、错误、畸形或模式不符的响应属于执行错误，不作为零命中评分；正常零命中仍参与评分，语义 `not_ready` 本身不阻断可用检索。阈值通过返回 `0`，报告为 `fail` 返回 `2`，输入或执行错误返回 `1`。检索阈值通过不代表语义就绪或事实已被接受；模板和合成数据只能验证评估链路，不能证明真实业务收益。
 
 发布证据应记录每次运行的实际结果和实时收集的测试数量。`doctor` 健康不代表语义就绪；`readiness` 可以因治理积压、拓扑待刷新或断言有效性问题返回 `degraded` / `not_ready`。CLI 对健康/ready 返回 `0`，对已生成但失败或非 ready 的报告返回 `2`，未捕获异常返回 `1`，heavy-task 饱和返回 `75`；发布门仍应同时归档正文和退出码。
 

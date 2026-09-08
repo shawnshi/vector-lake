@@ -56,6 +56,27 @@ def _write_receipt(launch: dict, *, outcome: str, usage: dict[str, int]) -> None
     )
 
 
+@pytest.mark.parametrize("usage, complete", [({}, False), ({"input_tokens": 0, "output_tokens": 0}, True)])
+def test_budget_status_distinguishes_unknown_terminal_usage_from_observed_zero(
+    isolated_memory, usage, complete,
+):
+    now = datetime(2026, 8, 28, 12, tzinfo=timezone.utc)
+    launch = _launch(now - timedelta(minutes=1), 17, reserved=10)
+    _write_state([launch])
+    _write_receipt(launch, outcome="quarantined", usage=usage)
+
+    report = auto_ingest_budget_status(now=now)
+
+    assert report["hour"]["reserved_tokens"] == 10
+    assert report["actual_usage"]["complete"] is complete
+    assert report["actual_usage"]["totals"] == usage
+    assert report["complete"] is complete
+    assert report["status"] == ("ready" if complete else "degraded")
+    if not complete:
+        assert report["receipt_issue_counts"] == {"attempt_receipt_usage_unknown": 1}
+        assert report["actual_usage"]["receipt_states"]["invalid"] == 1
+
+
 def test_budget_status_reports_exact_100_and_2000_reservation_boundaries(
     isolated_memory,
 ):

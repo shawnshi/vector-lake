@@ -2092,6 +2092,7 @@ def _generate_index_unlocked(
     skip_embeddings: bool = True,
     *,
     invalidate_embedding_ids: Iterable[str] = (),
+    _before_publish=None,
 ):
     invalidate_embedding_ids = tuple(invalidate_embedding_ids)
     index_data = _empty_index_data()
@@ -2203,6 +2204,8 @@ def _generate_index_unlocked(
             expected_corpus_sha256=fts_corpus_sha256(search_upserts),
         )
 
+    if _before_publish is not None:
+        prepared = _before_publish(prepared)
     search_stats = publish_prepared_projection(
         get_wiki_dir(),
         prepared,
@@ -2240,6 +2243,7 @@ def generate_index(
     skip_embeddings: bool = True,
     *,
     invalidate_embedding_ids: Iterable[str] = (),
+    _before_publish=None,
 ):
     """Build and publish every index projection under the shared publish lock."""
     output_path = str(get_index_path())
@@ -2248,6 +2252,7 @@ def generate_index(
             return _generate_index_unlocked(
                 skip_embeddings=skip_embeddings,
                 invalidate_embedding_ids=invalidate_embedding_ids,
+                _before_publish=_before_publish,
             )
     except Timeout as exc:
         raise TimeoutError(f"Timeout while acquiring lock for {output_path}") from exc
@@ -2275,21 +2280,23 @@ def _projection_file_identity(path: str) -> tuple[int, ...]:
     )
 
 
-def _read_claim_graph_snapshot(path: str) -> dict:
+def _read_claim_graph_snapshot(path: str, *, connection=None) -> dict:
     """Read an atomically published graph without waiting on the writer lock."""
     if not os.path.exists(path):
         return {"nodes": [], "edges": []}
     if is_v2_locator(path, "claim_graph"):
         try:
-            return load_committed_claim_graph(Path(path).parent)
+            return load_committed_claim_graph(Path(path).parent, connection=connection)
         except ProjectionV2ContractError as exc:
             raise ProjectionSnapshotChanged(
                 f"Committed claim graph v2 is unavailable: {exc}"
             ) from exc
     try:
+        schema_connection = (
+            db_store.get_connection() if connection is None else connection
+        )
         schema_version = int(
-            db_store.get_connection().execute("PRAGMA user_version").fetchone()[0]
-            or 0
+            schema_connection.execute("PRAGMA user_version").fetchone()[0] or 0
         )
     except Exception as exc:
         raise ProjectionSnapshotChanged(
@@ -2333,7 +2340,10 @@ def claim_graph_projection_parity(*, connection=None) -> dict[str, int]:
             connection=connection,
         )
     )
-    observed = _read_claim_graph_snapshot(str(get_claim_graph_path()))
+    observed = _read_claim_graph_snapshot(
+        str(get_claim_graph_path()),
+        connection=connection,
+    )
 
     expected_nodes = _claim_graph_signatures(expected.get("nodes") or [])
     observed_nodes = _claim_graph_signatures(observed.get("nodes") or [])
@@ -3413,10 +3423,10 @@ def update_index_item(filename: str):
     return update_index_items([filename])
 
 
-def refresh_graph_topology_if_dirty() -> bool:
+def refresh_graph_topology_if_dirty(*, _before_publish=None) -> bool:
     output_path = str(get_index_path())
     if not os.path.exists(output_path):
-        generate_index()
+        generate_index(_before_publish=_before_publish)
         return True
 
     lock_path = output_path + ".lock"
@@ -3501,6 +3511,8 @@ def refresh_graph_topology_if_dirty() -> bool:
                                 ),
                             )
 
+                        if _before_publish is not None:
+                            prepared = _before_publish(prepared)
                         publish_prepared_projection(
                             get_wiki_dir(),
                             prepared,
@@ -3520,7 +3532,7 @@ def refresh_graph_topology_if_dirty() -> bool:
         return False
 
     if needs_full_rebuild:
-        generate_index()
+        generate_index(_before_publish=_before_publish)
         return True
     return refreshed
 

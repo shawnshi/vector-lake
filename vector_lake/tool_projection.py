@@ -6,14 +6,14 @@ canonical history.
 """
 
 from __future__ import annotations
-import hashlib
-import os
-import sqlite3
 
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import sqlite3
 import stat
 import time
 import uuid
@@ -24,22 +24,14 @@ from filelock import FileLock, Timeout
 
 from vector_lake import db_store, governance_store, indexer
 from vector_lake.backup_capacity import (
-    assert_legacy_projection_file_size,
     assert_backup_capacity,
+    assert_legacy_projection_file_size,
     estimate_maintenance_backup_bytes,
+    pending_projection_inventory,
     projection_v2_reachable_inventory,
 )
-from vector_lake.claim_extractor import extract_page_objects
 from vector_lake.cancellation import non_interruptible_phase
-from vector_lake.durability import sync_directory
-from vector_lake.projection_format_v2 import (
-    SIDECAR_CONTRACT,
-    is_v2_locator,
-    load_committed_index,
-    validate_root_closure,
-    validate_sidecar,
-)
-from vector_lake.projection_store_v2 import ProjectionStoreV2
+from vector_lake.claim_extractor import extract_page_objects
 from vector_lake.db_store import (
     backup_database,
     enqueue_mutation,
@@ -51,6 +43,7 @@ from vector_lake.db_store import (
     peek_db_path,
     transaction,
 )
+from vector_lake.durability import sync_directory
 from vector_lake.evidence_foundation import (
     build_extraction_run,
     evidence_independence,
@@ -63,8 +56,16 @@ from vector_lake.index_snapshot import (
     load_legacy_index_snapshot_for_migration,
 )
 from vector_lake.mutation_coordinator import materialize_markdown_projection
+from vector_lake.projection_format_v2 import (
+    SIDECAR_CONTRACT,
+    is_v2_locator,
+    load_committed_index,
+    materialize_index,
+    validate_root_closure,
+    validate_sidecar,
+)
+from vector_lake.projection_store_v2 import ProjectionStoreV2
 from vector_lake.schema_validator import VALID_H3_SLOTS, validate_schema
-from vector_lake.yaml_utils import dump_yaml
 from vector_lake.wiki_utils import (
     atomic_write_text,
     get_claim_graph_path,
@@ -79,7 +80,7 @@ from vector_lake.wiki_utils import (
     read_markdown_file,
     split_frontmatter,
 )
-
+from vector_lake.yaml_utils import dump_yaml
 
 EXCLUDED_WIKI_FILES = {
     "index.md",
@@ -92,10 +93,6 @@ EXCLUDED_WIKI_FILES = {
 log = logging.getLogger("vector-lake-projection")
 
 _MAINTENANCE_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
-# Best-effort housekeeping after each maintenance snapshot: keep the newest
-# N complete backups and prune older ones.
-_AUTO_RETAIN_KEEP_LATEST = 5
-
 _MAINTENANCE_MANIFEST_V4_KEYS = frozenset(
     {
         "manifest_version",
@@ -201,12 +198,81 @@ def _safe_backup_relative(value: object) -> str:
     if not name or "\\" in name:
         raise ValueError("backup_artifact_name_invalid")
     relative = Path(name)
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
         raise ValueError("backup_artifact_name_invalid")
     normalized = relative.as_posix()
     if normalized != name:
         raise ValueError("backup_artifact_name_not_canonical")
     return normalized
+
+
+_PROJECTION_RECOVERY_ARTIFACT = "projection_recovery.json"
+_PROJECTION_RECOVERY_CONTRACT = "vector-lake-pending-projection-recovery/v1"
+
+
+def _recovery_successor(updated_at: str) -> dict:
+    return {
+        "format_version": 2, "status": "rebuild_required",
+        "projection_generation": None, "canonical_generation": None,
+        "canonical_generation_json": None, "sidecar_sha256": None,
+        "sidecar": None, "sidecar_json": None, "previous_sidecar": None,
+        "previous_sidecar_json": None, "updated_at": updated_at,
+    }
+
+
+def _validate_projection_recovery(directory: Path, manifest: dict) -> dict | None:
+    """Validate fault evidence, not an ordinary restorable canonical snapshot."""
+    copied = set(manifest["copied"])
+    pending = pending_projection_inventory(
+        database_path=directory / "vector_lake.db", wiki_dir=directory,
+    )
+    if _PROJECTION_RECOVERY_ARTIFACT not in copied:
+        if pending is not None:
+            raise ValueError("maintenance_backup_pending_evidence_missing")
+        return None
+    path = directory / _PROJECTION_RECOVERY_ARTIFACT
+    if path.stat().st_size > _MAINTENANCE_MANIFEST_MAX_BYTES:
+        raise ValueError("projection_recovery_receipt_too_large")
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    keys = {
+        "contract", "operation", "reason", "database_sha256", "predecessor",
+        "successor", "canonical_generation", "marker_sha256", "object_artifacts",
+        "source_database", "source_wiki",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != keys or pending is None:
+        raise ValueError("projection_recovery_receipt_invalid")
+    generations, error = _read_backup_runtime_generations(directory / "vector_lake.db")
+    generations = {key: (generations or {}).get(key) for key in indexer.CANONICAL_PROJECTION_SURFACES}
+    successor = receipt.get("successor")
+    timestamp = successor.get("updated_at") if isinstance(successor, dict) else None
+    if not isinstance(timestamp, str) or not timestamp:
+        raise ValueError("projection_recovery_successor_invalid")
+    datetime.fromisoformat(timestamp)
+    reason = (
+        "pending_canonical_generation_stale"
+        if pending["runtime"]["canonical_generation"] != generations
+        else "pending_publish_interrupted"
+    )
+    expected_objects = sorted(_projection_gc_object_relative(p) for p in pending["paths"])
+    if (
+        receipt["contract"] != _PROJECTION_RECOVERY_CONTRACT
+        or receipt["operation"] != "projection-rebuild-index"
+        or receipt["reason"] != reason or error is not None
+        or receipt["database_sha256"] != manifest["artifact_sha256"].get("vector_lake.db")
+        or receipt["predecessor"] != pending["runtime"]
+        or successor != _recovery_successor(timestamp)
+        or receipt["canonical_generation"] != generations
+        or receipt["marker_sha256"] != manifest["artifact_sha256"].get("projection_pair_manifest.json")
+        or receipt["object_artifacts"] != expected_objects
+        or not set(expected_objects).issubset(copied)
+        or manifest["restorable_as_consistent_canonical_projection_snapshot"] is not False
+        or not all(isinstance(receipt[k], str) and Path(receipt[k]).is_absolute()
+                   for k in ("source_database", "source_wiki"))
+    ):
+        raise ValueError("projection_recovery_receipt_binding_mismatch")
+    return receipt
 
 
 def validate_maintenance_backup_v4(
@@ -233,8 +299,10 @@ def validate_maintenance_backup_v4(
     copied_raw = manifest.get("copied")
     hashes = manifest.get("artifact_sha256")
     sizes = manifest.get("artifact_bytes")
-    if not isinstance(copied_raw, list) or not isinstance(hashes, dict) or not isinstance(
-        sizes, dict
+    if (
+        not isinstance(copied_raw, list)
+        or not isinstance(hashes, dict)
+        or not isinstance(sizes, dict)
     ):
         raise ValueError("maintenance_backup_artifact_inventory_invalid")
     copied = [_safe_backup_relative(item) for item in copied_raw]
@@ -297,6 +365,11 @@ def validate_maintenance_backup_v4(
         ):
             raise ValueError(f"maintenance_backup_artifact_mismatch:{name}")
 
+    recovery = _validate_projection_recovery(directory, manifest)
+    recovery_artifacts = (
+        {_PROJECTION_RECOVERY_ARTIFACT, *recovery["object_artifacts"]}
+        if recovery is not None else set()
+    )
     projection_metadata = manifest.get("projection_v2")
     inventory = None
     if projection_format == 2:
@@ -321,19 +394,18 @@ def validate_maintenance_backup_v4(
             "projection_pair_manifest.json",
             *expected_objects,
         }
+        expected_artifacts.update(recovery_artifacts)
         if "vector_lake.db" in copied:
             expected_artifacts.add("vector_lake.db")
         recorded_objects = projection_metadata.get("object_artifacts")
         if (
             set(copied) != expected_artifacts
-            or
-            not isinstance(recorded_objects, list)
+            or not isinstance(recorded_objects, list)
             or set(recorded_objects) != expected_objects
             or len(recorded_objects) != len(expected_objects)
             or projection_metadata.get("format_version") != 2
             or projection_metadata.get("roots") != inventory["roots"]
-            or projection_metadata.get("sidecar_sha256")
-            != inventory["sidecar_sha256"]
+            or projection_metadata.get("sidecar_sha256") != inventory["sidecar_sha256"]
             or projection_metadata.get("object_count") != inventory["object_count"]
             or projection_metadata.get("reachable_object_bytes")
             != inventory["reachable_object_bytes"]
@@ -373,8 +445,7 @@ def validate_maintenance_backup_v4(
         if (
             sidecar_manifest != index_data.get(indexer.PROJECTION_MANIFEST_KEY)
             or generation != manifest.get("projection_generation")
-            or canonical_generation
-            != manifest.get("projection_canonical_generation")
+            or canonical_generation != manifest.get("projection_canonical_generation")
         ):
             raise ValueError("maintenance_backup_projection_v1_binding_mismatch")
         for artifact_path in (index_path, claim_graph_path):
@@ -389,10 +460,19 @@ def validate_maintenance_backup_v4(
                     f"{artifact_path.name}"
                 )
     elif projection_format is None and projection_metadata is None:
-        if set(copied).difference({"vector_lake.db"}):
+        if set(copied).difference({"vector_lake.db", *recovery_artifacts}):
             raise ValueError("maintenance_backup_unknown_or_missing_artifact")
     else:
         raise ValueError("maintenance_backup_projection_format_invalid")
+    if recovery is not None:
+        objects = {item["sha256"]: item for item in (inventory or {}).get("objects", [])}
+        for name in recovery["object_artifacts"]:
+            artifact = directory / name
+            objects[artifact.stem] = {
+                "sha256": artifact.stem, "path": str(artifact),
+                "bytes": manifest["artifact_bytes"][name],
+            }
+        inventory = {**(inventory or {}), "objects": list(objects.values())}
     return {
         **manifest,
         "_manifest_sha256": digest,
@@ -413,21 +493,18 @@ def _projection_gc_fingerprint(value: object) -> str:
 
 def _projection_gc_object_relative(path: Path) -> str:
     return (
-        Path(".projection-store")
-        / "objects"
-        / "sha256"
-        / path.parent.name
-        / path.name
+        Path(".projection-store") / "objects" / "sha256" / path.parent.name / path.name
     ).as_posix()
 
 
 def _projection_gc_protection() -> tuple[set[str], dict, list[str]]:
     protected: set[str] = set()
     issues: list[str] = []
+    maintenance_backups: list[dict] = []
     binding: dict[str, object] = {
         "live": None,
         "runtime_sidecars": [],
-        "maintenance_backups": [],
+        "maintenance_backups": maintenance_backups,
         "pending_receipts": [],
     }
     try:
@@ -474,7 +551,9 @@ def _projection_gc_protection() -> tuple[set[str], dict, list[str]]:
             )
             columns = {
                 str(row[1])
-                for row in connection.execute("PRAGMA table_info(projection_runtime_v9)")
+                for row in connection.execute(
+                    "PRAGMA table_info(projection_runtime_v9)"
+                )
             }
             if not {"status", "sidecar_json", "previous_sidecar_json"}.issubset(
                 columns
@@ -534,13 +613,20 @@ def _projection_gc_protection() -> tuple[set[str], dict, list[str]]:
             protected.update(
                 str(item["sha256"]) for item in backup_inventory["objects"]
             )
-        binding["maintenance_backups"].append(
+        maintenance_backups.append(
             {
                 "path": str(manifest_path),
                 "sha256": manifest["_manifest_sha256"],
                 "projection_generation": manifest.get("projection_generation"),
             }
         )
+
+    completion_binding, completion_issues = _projection_gc_completion_evidence(maintenance_backups)
+    # Keep the old binding for a proven-empty namespace, including pending GC
+    # receipts created before completion evidence became a protection fence.
+    if completion_binding or completion_issues:
+        binding["rebuild_completions"] = completion_binding
+    issues.extend(completion_issues)
 
     receipt_roots = (
         peek_meta_dir() / "restore-snapshot-receipts",
@@ -562,7 +648,9 @@ def _projection_gc_protection() -> tuple[set[str], dict, list[str]]:
                 digest, size = _sha256_plain_file(path)
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-                issues.append(f"pending_receipt_invalid:{path.name}:{type(exc).__name__}")
+                issues.append(
+                    f"pending_receipt_invalid:{path.name}:{type(exc).__name__}"
+                )
                 continue
             if not isinstance(payload, dict):
                 issues.append(f"pending_receipt_invalid:{path.name}")
@@ -580,7 +668,9 @@ def _projection_gc_protection() -> tuple[set[str], dict, list[str]]:
                 elif isinstance(value, str):
                     candidate = value.removeprefix("sha256:")
                     if _HEX_SHA256.fullmatch(candidate):
-                        object_path = ProjectionStoreV2(store_base).object_path(candidate)
+                        object_path = ProjectionStoreV2(store_base).object_path(
+                            candidate
+                        )
                         if object_path.exists():
                             protected.add(candidate)
 
@@ -604,7 +694,11 @@ def _projection_gc_plan(*, retention_days: int, limit: int) -> dict:
         or not 0 <= retention_days <= 3650
     ):
         raise ValueError("retention_days must be between 0 and 3650")
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _PROJECTION_GC_MAX_BATCH:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= _PROJECTION_GC_MAX_BATCH
+    ):
         raise ValueError(f"limit must be between 1 and {_PROJECTION_GC_MAX_BATCH}")
     protected, protection_binding, issues = _projection_gc_protection()
     if protection_binding.get("live") is None:
@@ -619,7 +713,9 @@ def _projection_gc_plan(*, retention_days: int, limit: int) -> dict:
     if root.exists():
         try:
             root_details = root.lstat()
-            if _is_reparse(root, root_details) or not stat.S_ISDIR(root_details.st_mode):
+            if _is_reparse(root, root_details) or not stat.S_ISDIR(
+                root_details.st_mode
+            ):
                 issues.append("projection_object_root_invalid")
             for current_root, directory_names, file_names in os.walk(
                 root, followlinks=False
@@ -630,9 +726,11 @@ def _projection_gc_plan(*, retention_days: int, limit: int) -> dict:
                     details = directory.lstat()
                     if _is_reparse(directory, details):
                         issues.append("projection_object_reparse_forbidden")
-                    if current == root and re.fullmatch(r"[0-9a-f]{2}", name) is None:
-                        issues.append(f"projection_object_unknown_directory:{name}")
-                    elif current != root:
+                    if (
+                        current == root
+                        and re.fullmatch(r"[0-9a-f]{2}", name) is None
+                        or current != root
+                    ):
                         issues.append(f"projection_object_unknown_directory:{name}")
                 for name in file_names:
                     scanned += 1
@@ -696,7 +794,10 @@ def _projection_gc_plan(*, retention_days: int, limit: int) -> dict:
 
 
 def _projection_gc_receipt_valid(payload: dict, *, status: str) -> bool:
-    if payload.get("contract") != _PROJECTION_GC_CONTRACT or payload.get("status") != status:
+    if (
+        payload.get("contract") != _PROJECTION_GC_CONTRACT
+        or payload.get("status") != status
+    ):
         return False
     fingerprint = payload.get("receipt_fingerprint")
     unsigned = dict(payload)
@@ -735,7 +836,9 @@ def projection_object_gc(
             "resumed": False,
         }
 
-    gc_lock = FileLock(str(receipt_root.parent / ".projection-object-gc.lock"), timeout=0)
+    gc_lock = FileLock(
+        str(receipt_root.parent / ".projection-object-gc.lock"), timeout=0
+    )
     projection_lock = FileLock(str(get_index_path()) + ".lock", timeout=0)
     try:
         gc_lock.acquire()
@@ -752,7 +855,9 @@ def projection_object_gc(
             if pending.get("plan_fingerprint") != confirmation:
                 raise RuntimeError("projection object GC pending fingerprint mismatch")
             _protected, current_binding, protection_issues = _projection_gc_protection()
-            if protection_issues or current_binding != pending.get("protection_binding"):
+            if protection_issues or current_binding != pending.get(
+                "protection_binding"
+            ):
                 raise RuntimeError("projection object GC protection binding changed")
             candidates = list(pending.get("candidates") or [])
             resumed = True
@@ -799,7 +904,9 @@ def projection_object_gc(
             for candidate in candidates:
                 digest = str(candidate.get("sha256") or "")
                 if digest in protected or _HEX_SHA256.fullmatch(digest) is None:
-                    raise RuntimeError("projection object GC candidate became protected")
+                    raise RuntimeError(
+                        "projection object GC candidate became protected"
+                    )
                 path = store.object_path(digest)
                 if not path.exists():
                     already_missing += 1
@@ -820,7 +927,11 @@ def projection_object_gc(
             for directory in sorted(touched_directories, key=str):
                 sync_directory(directory)
         completed = {
-            **{key: value for key, value in pending.items() if key != "receipt_fingerprint"},
+            **{
+                key: value
+                for key, value in pending.items()
+                if key != "receipt_fingerprint"
+            },
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "deleted_objects": deleted,
@@ -1065,9 +1176,7 @@ def _load_legacy_index_for_projection_rebuild(
             sidecar_identity = _legacy_projection_file_identity(sidecar_path)
             with sidecar_path.open("r", encoding="utf-8") as handle:
                 sidecar = json.load(handle)
-            sidecar_manifest, artifacts = indexer._validate_projection_sidecar(
-                sidecar
-            )
+            sidecar_manifest, artifacts = indexer._validate_projection_sidecar(sidecar)
             if sidecar_manifest != manifest:
                 raise RuntimeError("legacy_projection_sidecar_manifest_mismatch")
             for path in paths:
@@ -1110,17 +1219,35 @@ def _index_keys(
     allow_stale_generation: bool = False,
 ) -> set[str]:
     index_path = get_index_path()
-    if not index_path.exists():
-        return set()
-    if legacy_rebuild_capability is None:
-        data = (
-            load_committed_index(
-                index_path.parent,
-                require_current_generation=False,
-            )
-            if allow_stale_generation
-            else load_index_snapshot(index_path)
+    pending = pending_projection_inventory() if allow_stale_generation else None
+    if pending is not None:
+        # Diagnostic only: validate both intents, never turn read errors into emptiness.
+        runtime = pending["runtime"]
+        data = materialize_index(
+            index_path.parent, runtime["previous_sidecar"] or runtime["sidecar"]
         )
+    elif not index_path.exists():
+        return set()
+    elif legacy_rebuild_capability is None:
+        if allow_stale_generation:
+            connection = sqlite3.connect(
+                f"{peek_db_path().resolve().as_uri()}?mode=ro", uri=True
+            )
+            try:
+                connection.execute("PRAGMA query_only=ON")
+                runtime = db_store.get_projection_runtime_v9(connection)
+                if runtime["status"] == "rebuild_required":
+                    # A retired state is not a readable committed index. Its receipt
+                    # is checked by apply; preview reports no committed projection.
+                    return set()
+                data = load_committed_index(
+                    index_path.parent, connection=connection,
+                    require_current_generation=False,
+                )
+            finally:
+                connection.close()
+        else:
+            data = load_index_snapshot(index_path)
     else:
         data = _load_legacy_index_for_projection_rebuild(
             index_path,
@@ -1173,7 +1300,13 @@ def _copy_projection_pair_to_backup(
                 object_artifacts: list[str] = []
                 for item in v2_inventory["objects"]:
                     source = Path(item["path"])
-                    relative = Path(".projection-store") / "objects" / "sha256" / source.parent.name / source.name
+                    relative = (
+                        Path(".projection-store")
+                        / "objects"
+                        / "sha256"
+                        / source.parent.name
+                        / source.name
+                    )
                     target = backup_dir / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(source, target)
@@ -1232,9 +1365,9 @@ def _copy_projection_pair_to_backup(
             if sidecar_path.exists():
                 assert_legacy_projection_file_size(sidecar_path)
 
-            with open(index_path, "r", encoding="utf-8") as handle:
+            with open(index_path, encoding="utf-8") as handle:
                 index_data = json.load(handle)
-            with open(claim_graph_path, "r", encoding="utf-8") as handle:
+            with open(claim_graph_path, encoding="utf-8") as handle:
                 claim_graph_data = json.load(handle)
             generation = indexer.validate_projection_pair(index_data, claim_graph_data)
             manifest = index_data[indexer.PROJECTION_MANIFEST_KEY]
@@ -1254,9 +1387,7 @@ def _copy_projection_pair_to_backup(
                         "Projection sidecar is missing and the canonical binding "
                         "is unverifiable; run sync before backup."
                     )
-                current_generation = (
-                    indexer.canonical_runtime_generation_snapshot()
-                )
+                current_generation = indexer.canonical_runtime_generation_snapshot()
                 if (
                     canonical_generation.get("runtime_generations")
                     != current_generation
@@ -1278,10 +1409,10 @@ def _copy_projection_pair_to_backup(
                 # manifest/binding values are self-contained, so release both
                 # payloads before loading the (small) sidecar document.
                 del index_data, claim_graph_data
-                with open(sidecar_path, "r", encoding="utf-8") as handle:
+                with open(sidecar_path, encoding="utf-8") as handle:
                     sidecar_data = json.load(handle)
-            sidecar_manifest, sidecar_artifacts = (
-                indexer._validate_projection_sidecar(sidecar_data)
+            sidecar_manifest, sidecar_artifacts = indexer._validate_projection_sidecar(
+                sidecar_data
             )
             if sidecar_manifest != manifest:
                 raise indexer.ProjectionPairContractError(
@@ -1312,17 +1443,14 @@ def _copy_projection_pair_to_backup(
             copied.append(backup_sidecar_path.name)
             del sidecar_data
 
-            with open(backup_dir / index_path.name, "r", encoding="utf-8") as handle:
+            with open(backup_dir / index_path.name, encoding="utf-8") as handle:
                 assert_legacy_projection_file_size(backup_dir / index_path.name)
                 copied_index = json.load(handle)
             with open(
                 backup_dir / claim_graph_path.name,
-                "r",
                 encoding="utf-8",
             ) as handle:
-                assert_legacy_projection_file_size(
-                    backup_dir / claim_graph_path.name
-                )
+                assert_legacy_projection_file_size(backup_dir / claim_graph_path.name)
                 copied_claim_graph = json.load(handle)
             copied_generation = indexer.validate_projection_pair(
                 copied_index,
@@ -1377,6 +1505,10 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
         disk_anchor=backup_root,
     )
     backup_root.mkdir(parents=True, exist_ok=True)
+    with os.scandir(backup_root) as entries:
+        for count, _entry in enumerate(entries, 1):
+            if count >= 10_000:
+                raise RuntimeError("projection_recovery_backup_limit_exceeded")
     backup_name = f"{label}_{_utc_stamp()}"
     backup_dir = backup_root / backup_name
     stage_dir = backup_root / f".{backup_name}.{uuid.uuid4().hex}.tmp"
@@ -1399,12 +1531,56 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
             projection_v2,
         ) = _copy_projection_pair_to_backup(stage_dir)
         copied.extend(projection_files)
+        pending = pending_projection_inventory(
+            database_path=stage_dir / "vector_lake.db", wiki_dir=get_wiki_dir(),
+        )
+        if pending is not None:
+            object_artifacts = []
+            for source in pending["paths"]:
+                relative = _projection_gc_object_relative(source)
+                target = stage_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if relative not in copied:
+                    shutil.copyfile(source, target)
+                    copied.append(relative)
+                object_artifacts.append(relative)
+            generations = {
+                key: (database_generations or {}).get(key)
+                for key in indexer.CANONICAL_PROJECTION_SURFACES
+            }
+            receipt = {
+                "contract": _PROJECTION_RECOVERY_CONTRACT,
+                "operation": "projection-rebuild-index",
+                "reason": (
+                    "pending_canonical_generation_stale"
+                    if pending["runtime"]["canonical_generation"] != generations
+                    else "pending_publish_interrupted"
+                ),
+                "database_sha256": _sha256_plain_file(stage_dir / "vector_lake.db")[0],
+                "predecessor": pending["runtime"],
+                "successor": _recovery_successor(datetime.now(timezone.utc).isoformat()),
+                "canonical_generation": generations,
+                "marker_sha256": (
+                    _sha256_plain_file(stage_dir / "projection_pair_manifest.json")[0]
+                    if "projection_pair_manifest.json" in copied else None
+                ),
+                "object_artifacts": sorted(object_artifacts),
+                "source_database": str(peek_db_path().resolve()),
+                "source_wiki": str(get_wiki_dir().resolve()),
+            }
+            _write_manifest_and_sync(stage_dir / _PROJECTION_RECOVERY_ARTIFACT, receipt)
+            copied.append(_PROJECTION_RECOVERY_ARTIFACT)
+            current = pending_projection_inventory()
+            if current is None or current["runtime"] != pending["runtime"]:
+                raise RuntimeError("projection_recovery_backup_runtime_changed")
         copied = sorted(dict.fromkeys(copied))
         consistency = _canonical_projection_consistency(
             database_generations,
             database_generation_error,
             projection_canonical_generation,
         )
+        if pending is not None:
+            consistency = {**consistency, "status": "unverifiable", "reason": "pending-projection-fault-evidence-only"}
         artifact_sha256 = {
             name: _stream_sha256_and_sync(stage_dir / name) for name in sorted(copied)
         }
@@ -1423,7 +1599,9 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
             "projection_generation": projection_generation,
             "projection_canonical_generation": projection_canonical_generation,
             "projection_format": (
-                2 if projection_v2 is not None else (1 if projection_generation else None)
+                2
+                if projection_v2 is not None
+                else (1 if projection_generation else None)
             ),
             "projection_v2": projection_v2,
             "canonical_projection_consistency": consistency,
@@ -1443,53 +1621,10 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
         validate_maintenance_backup_v4(stage_dir / "manifest.json")
         stage_dir.replace(backup_dir)
         sync_directory(backup_root)
-        _auto_retain_backups(backup_root)
     except Exception:
         shutil.rmtree(stage_dir, ignore_errors=True)
         raise
     return str(backup_dir)
-
-
-def _auto_retain_backups(backup_root: Path) -> None:
-    """Bound backup growth after every maintenance snapshot.
-
-    Keeps the newest ``_AUTO_RETAIN_KEEP_LATEST`` complete backups and prunes
-    older ones.  The age-based guard in the retention scanner protects recent
-    snapshots, so this helper applies a hard keep-latest cap on top of it.
-    Every pruned directory is re-validated (complete manifest + restorable
-    snapshot) immediately before removal.  Best-effort: failures only log.
-    """
-    try:
-        from vector_lake.tool_backup_retention import (
-            _created_at_ns,
-            _read_complete_manifest,
-            _verify_restorable_backup_snapshot,
-        )
-
-        complete: list[tuple[str, int]] = []  # (name, created_at_ns)
-        for child in sorted(backup_root.iterdir(), key=lambda value: value.name):
-            if not child.is_dir() or child.name.startswith("."):
-                continue
-            manifest = _read_complete_manifest(child)
-            if manifest is None:
-                continue
-            created_ns = _created_at_ns(manifest[0]["created_at"])
-            if created_ns is None:
-                continue
-            complete.append((child.name, created_ns))
-        if len(complete) <= _AUTO_RETAIN_KEEP_LATEST:
-            return
-        complete.sort(key=lambda item: (item[1], item[0]), reverse=True)
-        for name, _created_ns in complete[_AUTO_RETAIN_KEEP_LATEST:]:
-            target = backup_root / name
-            manifest = _read_complete_manifest(target)
-            if manifest is None:
-                continue
-            _verify_restorable_backup_snapshot(target, manifest[0])
-            shutil.rmtree(target, ignore_errors=True)
-            log.info("Automatic retention pruned old backup: %s", name)
-    except Exception as exc:  # pragma: no cover - best-effort housekeeping
-        log.warning("Automatic backup retention failed: %s", exc)
 
 
 def projection_diff_report(limit: int = 20) -> str:
@@ -2195,13 +2330,423 @@ def _assert_projection_rebuild_root_snapshot(
     expected: dict[str, Path],
 ) -> None:
     observed = _projection_rebuild_root_snapshot()
-    if (
-        observed.get("database") != expected.get("database")
-        or get_db_path().resolve() != expected.get("database")
-    ):
+    if observed.get("database") != expected.get(
+        "database"
+    ) or get_db_path().resolve() != expected.get("database"):
         raise RuntimeError("projection_rebuild_database_path_changed")
     if observed != expected:
         raise RuntimeError("projection_rebuild_root_snapshot_changed")
+
+
+def _retire_pending_projection_from_backup(backup_dir: Path) -> bool:
+    """Consume a durable proof under publish lock + transactional full-state CAS."""
+    with FileLock(str(get_index_path()) + ".lock", timeout=15):
+        if not (backup_dir / _PROJECTION_RECOVERY_ARTIFACT).exists():
+            if pending_projection_inventory() is not None:
+                raise RuntimeError("projection_recovery_evidence_missing")
+            return False
+        manifest, _inventory = validate_maintenance_backup_v4(backup_dir / "manifest.json")
+        receipt = _validate_projection_recovery(backup_dir, manifest)
+        if receipt is None or receipt["reason"] != "pending_canonical_generation_stale":
+            return False
+        if (
+            receipt["source_database"] != str(peek_db_path().resolve())
+            or receipt["source_wiki"] != str(get_wiki_dir().resolve())
+        ):
+            raise RuntimeError("projection_recovery_source_changed")
+        with db_store.transaction() as connection:
+            runtime = db_store.get_projection_runtime_v9(connection)
+            if runtime == receipt["successor"]:
+                return True
+            if runtime != receipt["predecessor"]:
+                raise RuntimeError("projection_recovery_predecessor_changed")
+            if indexer.canonical_runtime_generation_snapshot(connection) != receipt["canonical_generation"]:
+                raise RuntimeError("canonical_generation_changed_during_retirement")
+            marker = get_projection_manifest_path()
+            try:
+                marker_digest = _sha256_plain_file(marker)[0]
+            except FileNotFoundError:
+                marker_digest = None
+            if marker_digest != receipt["marker_sha256"]:
+                raise RuntimeError("projection_recovery_marker_changed")
+            # Validate live closures too; a valid offline copy is not permission to
+            # hide live corruption or to manufacture readable empty projections.
+            pending = pending_projection_inventory()
+            if pending is None or pending["runtime"] != runtime:
+                raise RuntimeError("projection_recovery_live_intent_changed")
+            successor = db_store.retire_projection_runtime_pending(
+                connection, expected_runtime=receipt["predecessor"],
+                successor_updated_at=receipt["successor"]["updated_at"],
+            )
+            if successor != receipt["successor"]:
+                raise RuntimeError("projection_recovery_successor_mismatch")
+        return True
+
+
+_PROJECTION_COMPLETION_CONTRACT = "vector-lake-projection-rebuild-completion/v1"
+_PROJECTION_COMPLETION_MAX_BYTES = 64 * 1024
+
+
+def _completion_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _completion_binding(backup: Path) -> tuple[dict, dict]:
+    manifest, _inventory = validate_maintenance_backup_v4(backup / "manifest.json")
+    retirement = _validate_projection_recovery(backup, manifest)
+    if retirement is None or retirement["reason"] != "pending_canonical_generation_stale":
+        raise ValueError("projection_completion_retirement_required")
+    return {
+        "manifest_sha256": manifest["_manifest_sha256"],
+        "retirement_sha256": manifest["artifact_sha256"][_PROJECTION_RECOVERY_ARTIFACT],
+    }, retirement
+
+
+def _completion_namespace_paths() -> list[Path]:
+    root = peek_meta_dir() / "projection-rebuild-receipts"
+    try:
+        details = root.lstat()
+    except FileNotFoundError:
+        return []
+    if _is_reparse(root, details) or not stat.S_ISDIR(details.st_mode):
+        raise ValueError("projection_completion_namespace_invalid")
+    paths = []
+    with os.scandir(root) as entries:
+        for count, entry in enumerate(entries, 1):
+            if count > 30_000:
+                raise ValueError("projection_completion_namespace_limit")
+            path = Path(entry.path)
+            details = path.lstat()
+            if (re.fullmatch(r"[0-9a-f]{64}\.(rebuild|topology|completed)\.json", entry.name) is None
+                    or _is_reparse(path, details) or not stat.S_ISREG(details.st_mode)):
+                raise ValueError("projection_completion_namespace_unknown_entry")
+            paths.append(path)
+    return sorted(paths)
+
+
+def _completion_paths(binding: dict) -> dict[str, Path]:
+    operation = hashlib.sha256(_completion_json(binding)).hexdigest()
+    _completion_namespace_paths()
+    root = peek_meta_dir() / "projection-rebuild-receipts"
+    return {stage: root / f"{operation}.{stage}.json"
+            for stage in ("rebuild", "topology", "completed")}
+
+
+def _projection_gc_completion_evidence(backups: list[dict]) -> tuple[list[dict], list[str]]:
+    """Fence GC on bounded, validated evidence, not historical live objects."""
+    evidence: list[dict] = []
+    issues: list[str] = []
+    try:
+        paths = _completion_namespace_paths()
+        operations: dict[str, list[Path]] = {}
+        for path in paths:
+            operations.setdefault(path.name.split(".", 1)[0], []).append(path)
+        manifests = {item["sha256"]: Path(item["path"]) for item in backups}
+        for operation, operation_paths in sorted(operations.items()):
+            first = _read_completion_record(operation_paths[0])
+            binding = first.get("binding")
+            if (not isinstance(binding, dict)
+                    or operation != hashlib.sha256(_completion_json(binding)).hexdigest()):
+                raise ValueError("projection_completion_operation_mismatch")
+            manifest = manifests.get(str(binding.get("manifest_sha256")))
+            if manifest is None:
+                raise ValueError("projection_completion_backup_missing")
+            _binding, _retirement, stages, intents = _completion_intents(manifest.parent)
+            expected = {stages[intent["stage"]] for intent in intents}
+            completed = None
+            if stages["completed"] in operation_paths:
+                completed = validate_projection_rebuild_completion(manifest)
+                expected.add(stages["completed"])
+            if not intents or set(operation_paths) != expected:
+                raise ValueError("projection_completion_chain_missing")
+            evidence.append({
+                "operation": operation,
+                "intent_fingerprints": [intent["fingerprint"] for intent in intents],
+                "completed_fingerprint": completed["fingerprint"] if completed else None,
+            })
+            if completed is None:
+                issues.append("projection_completion_unfinished")
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        issues.append(f"projection_completion_evidence_invalid:{type(exc).__name__}:{exc}")
+    return evidence, list(dict.fromkeys(issues))
+
+
+def _read_completion_record(path: Path) -> dict:
+    details = path.lstat()
+    if _is_reparse(path, details) or not stat.S_ISREG(details.st_mode):
+        raise ValueError("projection_completion_not_plain_file")
+    if details.st_size > _PROJECTION_COMPLETION_MAX_BYTES:
+        raise ValueError("projection_completion_record_too_large")
+    with path.open("rb") as handle:
+        payload = handle.read(_PROJECTION_COMPLETION_MAX_BYTES + 1)
+    if len(payload) > _PROJECTION_COMPLETION_MAX_BYTES:
+        raise ValueError("projection_completion_record_too_large")
+    after = path.lstat()
+    if _is_reparse(path, after) or (after.st_size, after.st_mtime_ns) != (details.st_size, details.st_mtime_ns):
+        raise ValueError("projection_completion_record_changed")
+    value = json.loads(payload)
+    if not isinstance(value, dict) or payload != _completion_json(value):
+        raise ValueError("projection_completion_record_not_canonical")
+    fingerprint = value.get("fingerprint")
+    unsigned = {k: v for k, v in value.items() if k != "fingerprint"}
+    if fingerprint != hashlib.sha256(_completion_json(unsigned)).hexdigest():
+        raise ValueError("projection_completion_record_digest_mismatch")
+    return value
+
+
+def _write_completion_record(path: Path, unsigned: dict) -> dict:
+    value = {**unsigned, "fingerprint": hashlib.sha256(_completion_json(unsigned)).hexdigest()}
+    payload = _completion_json(value)
+    if len(payload) > _PROJECTION_COMPLETION_MAX_BYTES:
+        raise ValueError("projection_completion_record_too_large")
+    if path.exists():
+        if _read_completion_record(path) != value:
+            raise ValueError("projection_completion_immutable_record_conflict")
+        with path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with os.scandir(path.parent) as entries:
+            for count, _entry in enumerate(entries, 1):
+                if count >= 30_000:
+                    raise ValueError("projection_completion_namespace_limit")
+        # Exclusive creation never rewrites a previously approved record. A torn
+        # file fails closed on replay rather than authorizing a different intent.
+        with path.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    sync_directory(path.parent)
+    sync_directory(path.parent.parent)
+    return value
+
+
+def _completion_sidecar(value: object) -> dict:
+    sidecar = validate_sidecar(value)
+    if set(sidecar) != {"canonical_generation", "claim_graph_root_sha256", "contract",
+                        "counts", "format_version", "index_root_sha256",
+                        "projection_generation", "published_at_utc"}:
+        raise ValueError("projection_completion_sidecar_keys_invalid")
+    return sidecar
+
+
+def _completion_intents(backup: Path) -> tuple[dict, dict, dict, list[dict]]:
+    binding, retirement = _completion_binding(backup)
+    paths = _completion_paths(binding)
+    intents = []
+    for stage in ("rebuild", "topology"):
+        if not paths[stage].exists():
+            if stage == "rebuild" and paths["topology"].exists():
+                raise ValueError("projection_completion_chain_missing")
+            continue
+        value = _read_completion_record(paths[stage])
+        if (set(value) != {"contract", "binding", "stage", "predecessor", "sidecar", "fingerprint"}
+                or value["contract"] != _PROJECTION_COMPLETION_CONTRACT
+                or value["binding"] != binding or value["stage"] != stage):
+            raise ValueError("projection_completion_intent_binding_mismatch")
+        sidecar = _completion_sidecar(value["sidecar"])
+        if sidecar["canonical_generation"] != retirement["canonical_generation"]:
+            raise ValueError("projection_completion_canonical_drift")
+        expected = (retirement["successor"] if stage == "rebuild"
+                    else intents[0]["sidecar"])
+        if value["predecessor"] != expected:
+            raise ValueError("projection_completion_predecessor_mismatch")
+        intents.append(value)
+    return binding, retirement, paths, intents
+
+
+def validate_projection_rebuild_completion(backup_manifest: str | Path) -> dict:
+    """Read-only historical proof validation; NOT a proof of current readiness.
+
+    Does not consult live canonical state or require historical final objects to
+    survive future legitimate publication/GC. The writer verifies that closure
+    and convergence before recording this hash-bound observation.
+    """
+    if Path(backup_manifest).name != "manifest.json":
+        raise ValueError("projection_completion_manifest_name_invalid")
+    backup = Path(backup_manifest).parent
+    binding, _retirement, paths, intents = _completion_intents(backup)
+    if not intents:
+        raise ValueError("projection_completion_intent_missing")
+    value = _read_completion_record(paths["completed"])
+    if (set(value) != {"contract", "binding", "intent_fingerprints", "final_sidecar",
+                       "final_sidecar_sha256", "verification", "fingerprint"}
+            or value["contract"] != _PROJECTION_COMPLETION_CONTRACT
+            or value["binding"] != binding
+            or value["intent_fingerprints"] != [i["fingerprint"] for i in intents]
+            or value["final_sidecar"] != intents[-1]["sidecar"]
+            or value["final_sidecar_sha256"] != hashlib.sha256(
+                _completion_json(value["final_sidecar"])).hexdigest()
+            or value["verification"] != "ready-closure-canonical-fts-topology/v1"):
+        raise ValueError("projection_completion_binding_mismatch")
+    return {**value, "historically_valid": True, "proves_current_readiness": False}
+
+
+def _completion_matches_runtime(runtime: dict, sidecar: dict) -> bool:
+    return (runtime["sidecar"] == sidecar
+            and runtime["projection_generation"] == sidecar["projection_generation"]
+            and runtime["canonical_generation"] == sidecar["canonical_generation"]
+            and runtime["sidecar_sha256"] == hashlib.sha256(_completion_json(sidecar)).hexdigest())
+
+
+def _record_rebuild_completion(backup: Path, root_snapshot: dict) -> Path:
+    from vector_lake.projection_format_v2 import (
+        load_committed_pair,
+        read_committed_sidecar,
+    )
+
+    binding, _retirement, paths, intents = _completion_intents(backup)
+    if not intents:
+        raise ValueError("projection_completion_intent_missing")
+    with FileLock(str(get_index_path()) + ".lock", timeout=15):
+        with db_store.transaction() as connection:
+            _assert_projection_rebuild_root_snapshot(root_snapshot)
+            sidecar, identity, runtime = read_committed_sidecar(get_wiki_dir(), connection=connection)
+            if not _completion_matches_runtime(runtime, intents[-1]["sidecar"]):
+                raise ValueError("projection_completion_final_successor_mismatch")
+            validate_root_closure(get_wiki_dir(), sidecar)
+            index, _graph = load_committed_pair(get_wiki_dir(), connection=connection)
+            if indexer.is_graph_dirty(index):
+                raise ValueError("projection_completion_topology_dirty")
+            search_state = db_store.get_search_projection_state(connection)
+            if (search_state.get("projection_generation") != sidecar["projection_generation"]
+                    or search_state.get("canonical_generation") != sidecar["canonical_generation"]
+                    or db_store.verify_search_projection_integrity(connection).get("status") != "ready"):
+                raise ValueError("projection_completion_fts_unverified")
+            if set(index.get("nodes", {})) != _canonical_keys():
+                raise ValueError("projection_completion_canonical_keys_mismatch")
+            if read_committed_sidecar(get_wiki_dir(), connection=connection) != (sidecar, identity, runtime):
+                raise ValueError("projection_completion_changed_during_verification")
+            _assert_projection_rebuild_root_snapshot(root_snapshot)
+            _write_completion_record(paths["completed"], {
+                "contract": _PROJECTION_COMPLETION_CONTRACT, "binding": binding,
+                "intent_fingerprints": [i["fingerprint"] for i in intents],
+                "final_sidecar": sidecar, "final_sidecar_sha256": runtime["sidecar_sha256"],
+                "verification": "ready-closure-canonical-fts-topology/v1",
+            })
+    validate_projection_rebuild_completion(backup / "manifest.json")
+    return paths["completed"]
+
+
+def _rebuild_retired_projection(backup: Path, root_snapshot: dict) -> str:
+    from vector_lake.projection_format_v2 import (
+        prepare_projection_from_roots,
+        recover_pending_publish,
+    )
+
+    binding, retirement, paths, intents = _completion_intents(backup)
+    if (retirement["source_database"] != str(root_snapshot["database"])
+            or retirement["source_wiki"] != str(root_snapshot["wiki"])):
+        raise ValueError("projection_completion_source_changed")
+
+    def before_publish(stage):
+        def record(prepared):
+            _assert_projection_rebuild_root_snapshot(root_snapshot)
+            _binding, _retirement, _paths, chain = _completion_intents(backup)
+            runtime = db_store.get_projection_runtime_v9()
+            if stage == "rebuild":
+                if runtime != retirement["successor"]:
+                    raise ValueError("projection_completion_predecessor_changed")
+                predecessor = runtime
+            else:
+                if not chain or runtime["status"] != "ready" or not _completion_matches_runtime(runtime, chain[0]["sidecar"]):
+                    raise ValueError("projection_completion_topology_predecessor_changed")
+                predecessor = chain[0]["sidecar"]
+            if prepared.canonical_generation != retirement["canonical_generation"]:
+                raise ValueError("projection_completion_canonical_drift")
+            if paths[stage].exists():
+                recorded = _read_completion_record(paths[stage])["sidecar"]
+                # Rebuild metadata includes timestamps. Replay the original
+                # durable roots, not a freshly timestamped intent. The indexer's
+                # pending FTS mutation must still describe exactly those rows.
+                validate_root_closure(get_wiki_dir(), recorded)
+                recorded_index = materialize_index(get_wiki_dir(), recorded)
+                candidate_index = materialize_index(get_wiki_dir(), prepared.sidecar)
+                if indexer._search_projection_upserts(recorded_index) != indexer._search_projection_upserts(candidate_index):
+                    raise ValueError("projection_completion_reprepared_search_mismatch")
+                prepared = prepare_projection_from_roots(
+                    get_wiki_dir(), index_root_sha256=recorded["index_root_sha256"],
+                    claim_graph_root_sha256=recorded["claim_graph_root_sha256"],
+                    canonical_generation=recorded["canonical_generation"],
+                    counts=recorded["counts"], published_at_utc=recorded["published_at_utc"],
+                )
+            _write_completion_record(paths[stage], {
+                "contract": _PROJECTION_COMPLETION_CONTRACT, "binding": binding,
+                "stage": stage, "predecessor": predecessor, "sidecar": prepared.sidecar,
+            })
+            return prepared
+        return record
+
+    needs_rebuild = not intents
+    if intents:
+        with FileLock(str(get_index_path()) + ".lock", timeout=15):
+            runtime = db_store.get_projection_runtime_v9()
+            if runtime["status"] not in {"ready", "publish_pending"} or not _completion_matches_runtime(runtime, intents[-1]["sidecar"]):
+                if len(intents) == 1 and runtime == retirement["successor"]:
+                    needs_rebuild = True
+                elif (len(intents) == 2 and runtime["status"] == "ready"
+                      and _completion_matches_runtime(runtime, intents[0]["sidecar"])):
+                    pass  # Topology intent persisted before its DB publication.
+                else:
+                    raise ValueError("projection_completion_replay_successor_mismatch")
+            if runtime["status"] == "publish_pending":
+                recover_pending_publish(get_wiki_dir())
+    if needs_rebuild:
+        indexer.generate_index(_before_publish=before_publish("rebuild"))
+    _assert_projection_rebuild_root_snapshot(root_snapshot)
+    topology_refreshed = indexer.refresh_graph_topology_if_dirty(
+        _before_publish=before_publish("topology"))
+    try:
+        proof = _record_rebuild_completion(backup, root_snapshot)
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        raise RuntimeError(
+            f"committed-but-completion-unproven; backup={backup}; {exc}"
+        ) from exc
+    return (f"Rebuilt index projection at {get_index_path()}. "
+            f"completion_proof={proof}; topology_refreshed={topology_refreshed}; backup={backup}")
+
+
+def _projection_recovery_resume_backup() -> Path | None:
+    """Find the exact interrupted transition; no append-only retirement log."""
+    if not peek_db_path().is_file():
+        return None
+    connection = sqlite3.connect(f"{peek_db_path().resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN")
+        runtime = db_store.get_projection_runtime_v9(connection)
+        canonical_generation = indexer.canonical_runtime_generation_snapshot(connection)
+    finally:
+        connection.close()
+    root = peek_meta_dir() / "backups"
+    if not root.exists():
+        return None
+    matches = []
+    with os.scandir(root) as entries:
+        for count, entry in enumerate(entries, 1):
+            if count > 10_000:
+                raise RuntimeError("projection_recovery_backup_limit_exceeded")
+            directory = Path(entry.path)
+            if entry.name.startswith(".") or not (directory / _PROJECTION_RECOVERY_ARTIFACT).exists():
+                continue
+            manifest, _inventory = validate_maintenance_backup_v4(directory / "manifest.json")
+            receipt = _validate_projection_recovery(directory, manifest)
+            if receipt is not None and receipt["reason"] == "pending_canonical_generation_stale":
+                binding, _retirement, paths, intents = _completion_intents(directory)
+                if paths["completed"].exists():
+                    validate_projection_rebuild_completion(directory / "manifest.json")
+                    if (intents and _completion_matches_runtime(runtime, intents[-1]["sidecar"])
+                            and intents[-1]["sidecar"]["canonical_generation"] == canonical_generation):
+                        matches.append(directory)
+                elif intents or receipt["successor"] == runtime:
+                    # Unfinished operations must be resolved exactly, not bypassed
+                    # by manufacturing a new backup for an unrelated ready state.
+                    matches.append(directory)
+    if len(matches) > 1:
+        raise RuntimeError("projection_recovery_successor_ambiguous")
+    return matches[0] if matches else None
 
 
 def rebuild_index_projection(dry_run: bool = True) -> str:
@@ -2245,7 +2790,18 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
             allow_stale_generation=True,
         )
         _assert_projection_rebuild_root_snapshot(root_snapshot)
-        backup_dir = create_maintenance_backup("index_rebuild")
+        backup_dir = _projection_recovery_resume_backup()
+        if backup_dir is None:
+            backup_dir = Path(create_maintenance_backup("index_rebuild"))
+        _assert_projection_rebuild_root_snapshot(root_snapshot)
+        if (backup_dir / _PROJECTION_RECOVERY_ARTIFACT).exists():
+            manifest, _inventory = validate_maintenance_backup_v4(backup_dir / "manifest.json")
+            receipt = _validate_projection_recovery(backup_dir, manifest)
+            if receipt is not None and receipt["reason"] == "pending_canonical_generation_stale":
+                if db_store.get_projection_runtime_v9()["status"] == "publish_pending" and db_store.get_projection_runtime_v9() == receipt["predecessor"]:
+                    _retire_pending_projection_from_backup(backup_dir)
+                return _rebuild_retired_projection(backup_dir, root_snapshot)
+        _retire_pending_projection_from_backup(backup_dir)
         _assert_projection_rebuild_root_snapshot(root_snapshot)
         output = indexer.generate_index()
         _assert_projection_rebuild_root_snapshot(root_snapshot)
