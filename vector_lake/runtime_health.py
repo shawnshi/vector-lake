@@ -354,16 +354,82 @@ def _watchdog_component_health(
     components = status.get("components")
     component_map = components if isinstance(components, dict) else {}
     unhealthy_states = {"error", "halted", "stopped"}
-    required_components = {
-        item.strip()
-        for item in os.environ.get(
-            "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
-            "watchdog,outbox,ingest",
-        ).split(",")
-        if item.strip()
-    }
-    if auto_ingest_enabled:
-        required_components.add("auto_ingest")
+    profile_issues: list[str] = []
+    profile_name = "legacy_full"
+    profile = status.get("run_profile")
+    schema_version = status.get("schema_version")
+    legacy_status = profile is None and (
+        schema_version is None
+        or (type(schema_version) is int and 1 <= schema_version <= 3)
+    )
+    if legacy_status:
+        required_components = {
+            item.strip()
+            for item in os.environ.get(
+                "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+                "watchdog,outbox,ingest",
+            ).split(",")
+            if item.strip()
+        }
+        if auto_ingest_enabled:
+            required_components.add("auto_ingest")
+    else:
+        required_components = set()
+        if schema_version != 4:
+            profile_issues.append("watchdog_status_schema_incompatible")
+        if not isinstance(profile, dict) or profile.get("schema_version") != 1:
+            profile_issues.append("watchdog_run_profile_invalid")
+        else:
+            profile_name = str(profile.get("name") or "")
+            raw_inventory = profile.get("components")
+            inventory = (
+                tuple(str(item) for item in raw_inventory)
+                if isinstance(raw_inventory, list)
+                else ()
+            )
+            expected = tuple(str(item) for item in status.get("expected_components") or ())
+            allowed = {
+                "full": ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest"),
+                "maintenance": ("watchdog", "outbox"),
+            }
+            if profile_name not in allowed:
+                profile_issues.append("watchdog_run_profile_unknown")
+            elif inventory != allowed[profile_name] or expected != inventory:
+                profile_issues.append("watchdog_run_profile_inventory_mismatch")
+            else:
+                if set(component_map) != set(inventory):
+                    profile_issues.append("watchdog_run_profile_components_mismatch")
+                if profile_name == "maintenance":
+                    required_components = set(inventory)
+                else:
+                    required_components = {
+                        item.strip()
+                        for item in os.environ.get(
+                            "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
+                            "watchdog,outbox,ingest",
+                        ).split(",")
+                        if item.strip()
+                    }
+                    if auto_ingest_enabled:
+                        required_components.add("auto_ingest")
+
+    # Run-profile ownership is a v4 contract. Legacy workers did not all emit
+    # component owner fields; their existing top-level liveness gate is retained.
+    if not legacy_status:
+        owner_run = str(status.get("run_id") or "")
+        owner_pid = status.get("process_id")
+        if not owner_run:
+            profile_issues.append("watchdog_status_owner_run_invalid")
+        if not isinstance(owner_pid, int) or isinstance(owner_pid, bool) or owner_pid <= 0:
+            profile_issues.append("watchdog_status_owner_pid_invalid")
+        for name, raw_component in component_map.items():
+            if not isinstance(raw_component, dict):
+                profile_issues.append(f"watchdog_component_invalid:{name}")
+            elif (
+                str(raw_component.get("run_id") or "") != owner_run
+                or raw_component.get("process_id") != owner_pid
+            ):
+                profile_issues.append(f"watchdog_component_owner_mismatch:{name}")
 
     unhealthy_required: list[str] = []
     unhealthy_optional: list[str] = []
@@ -395,7 +461,14 @@ def _watchdog_component_health(
         if component_age is None or component_age > component_max_age:
             target = stale_required if is_required else stale_optional
             target.append(component_name)
-        if effective_status in unhealthy_states:
+        maintenance_operational_states = (
+            {"idle", "processing"} if component_name == "outbox" else {"idle"}
+        )
+        nonoperational_maintenance = (
+            profile_name == "maintenance"
+            and effective_status not in maintenance_operational_states
+        )
+        if effective_status in unhealthy_states or nonoperational_maintenance:
             target = unhealthy_required if is_required else unhealthy_optional
             target.append(component_name)
 
@@ -419,6 +492,8 @@ def _watchdog_component_health(
     )
     return {
         "component_map_present": bool(component_map),
+        "run_profile": profile_name,
+        "profile_issues": sorted(set(profile_issues)),
         "required_components": sorted(required_components),
         "component_ages_seconds": component_ages,
         "effective_statuses": effective_statuses,
@@ -429,9 +504,10 @@ def _watchdog_component_health(
         "stale_optional_components": sorted(stale_optional),
         "missing_components": missing_components,
         "missing_components_blocking": bool(
-            auto_ingest_enabled and "auto_ingest" in missing_components
+            (profile_name == "maintenance" and missing_components)
+            or (auto_ingest_enabled and "auto_ingest" in missing_components)
         ),
-        "aggregate_requires_block": aggregate_requires_block,
+        "aggregate_requires_block": aggregate_requires_block or bool(profile_issues),
     }
 
 
@@ -1935,6 +2011,9 @@ def assess_runtime_health(
             unhealthy_required_components = component_health[
                 "unhealthy_required_components"
             ]
+            detail["watchdog_run_profile"] = component_health["run_profile"]
+            for profile_issue in component_health["profile_issues"]:
+                issues.append(profile_issue)
             if component_health["component_map_present"]:
                 detail["watchdog_component_max_age_seconds"] = component_max_age
                 detail["watchdog_component_ages_seconds"] = component_health[

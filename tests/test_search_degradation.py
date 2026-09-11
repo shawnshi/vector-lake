@@ -1,7 +1,7 @@
 import io
 import json
 
-from vector_lake import tool_search
+from vector_lake import db_store, tool_search
 
 
 def _base_search_result(payload: str) -> str:
@@ -15,6 +15,8 @@ def _base_search_result(payload: str) -> str:
 
 
 def _install_index(isolated_memory, monkeypatch, nodes):
+    for key, node in nodes.items():
+        node.setdefault("raw_text", node.get("summary") or node.get("title") or key)
     index_data = {
         "nodes": nodes,
         "weighted_edges": [],
@@ -24,6 +26,30 @@ def _install_index(isolated_memory, monkeypatch, nodes):
     index_path.write_text(json.dumps(index_data), encoding="utf-8")
     monkeypatch.setattr(tool_search, "_load_search_index", lambda _path: index_data)
     monkeypatch.setattr(tool_search, "_get_query_embedding", lambda _query: [])
+    # These tests target hybrid backend degradation; exact fast-path behavior
+    # is exercised independently in test_exact_identity_search.py.
+    monkeypatch.setattr(tool_search, "_exact_fts_page_result", lambda *_args, **_kwargs: None)
+    signature = ("generation", 1, "digest", "canonical", 1)
+    monkeypatch.setattr(db_store, "get_connection", lambda: object())
+    monkeypatch.setattr(
+        db_store,
+        "verify_search_projection_integrity",
+        lambda _conn: {"status": "ready", "signature": signature},
+    )
+    monkeypatch.setattr(tool_search, "_search_projection_generation_issue", lambda _conn: None)
+    monkeypatch.setattr(
+        tool_search,
+        "_load_current_plaintext_rows",
+        lambda _conn, keys, _query, **_kwargs: {
+            key: {
+                "status": "available",
+                "snippet": nodes[key]["raw_text"],
+                "truncated": False,
+                "title": nodes[key].get("title", key),
+            }
+            for key in keys if key in nodes
+        },
+    )
     return index_data
 
 
@@ -270,6 +296,7 @@ def test_search_result_budget_and_phase_telemetry_are_enforced(
             "Concept_Alpha": {
                 "title": "Alpha",
                 "summary": "alpha",
+                "raw_text": "alpha " * 1_000,
                 "type": "concept",
                 "status": "active",
             }
@@ -312,6 +339,7 @@ def test_search_result_budget_is_enforced_in_utf8_bytes(
             "Concept_Alpha": {
                 "title": "Alpha",
                 "summary": "alpha",
+                "raw_text": "中" * 2_000,
                 "type": "concept",
                 "status": "active",
             }
@@ -374,6 +402,24 @@ def test_failed_search_records_projection_timing(isolated_memory, monkeypatch):
     status = tool_search.search_performance_status()
     assert "projection_snapshot" in status["last"]["backend_issues"]
     assert status["last"]["result_bytes"] == 0
+
+
+def test_page_plaintext_generation_guard_rejects_stale_projection(monkeypatch):
+    monkeypatch.setattr(
+        db_store,
+        "get_search_projection_state",
+        lambda _conn: {"canonical_generation": {"entities": 7}},
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "canonical_runtime_generation_snapshot",
+        lambda _conn: {"entities": 8},
+    )
+
+    assert (
+        tool_search._search_projection_generation_issue(object())
+        == "canonical_generation_stale"
+    )
 
 
 def test_search_bypasses_remote_embedding_when_fts_has_enough_candidates(

@@ -11,6 +11,7 @@ from unittest import mock
 import pytest
 
 from vector_lake import db_store, governance_store, wiki_utils
+from vector_lake.memory_search_normalization import BUILD_MARKER
 from vector_lake.tool_search import build_memory_packet, search_vector_lake
 
 
@@ -90,10 +91,10 @@ def test_claim_alias_xml_is_well_formed_and_machine_readable(monkeypatch):
 
 def _reference_memory_relevance(memory, terms):
     haystacks = {
-        "key": str(memory.get("memory_key", "")).lower(),
-        "text": str(memory.get("text", "")).lower(),
-        "page": str(memory.get("source_page", "")).lower(),
-        "type": str(memory.get("memory_type", "")).lower(),
+        "key": str(memory.get("memory_key", "")).casefold(),
+        "text": str(memory.get("text", "")).casefold(),
+        "page": str(memory.get("source_page", "")).casefold(),
+        "type": str(memory.get("memory_type", "")).casefold(),
     }
     score = 0.0
     for term in terms:
@@ -150,7 +151,7 @@ class TestOperationalMemoryExactMatcher(unittest.TestCase):
                 field: "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 96)))
                 for field in fields
             }
-            corpus = "".join(str(memory[field]).lower() for field in fields)
+            corpus = "".join(str(memory[field]).casefold() for field in fields)
             terms = []
             for _ in range(rng.randint(13, 64)):
                 if len(corpus) >= 3 and rng.random() < 0.75:
@@ -299,7 +300,8 @@ class TestOperationalMemory(unittest.TestCase):
                 "importance_score": 0.7,
                 "evidence_ids": ["ev_old"],
                 "source_ids": ["src_old"],
-                "source_page": "Entity_Runtime.md",
+                "source_page": "Concept_UserPreferences.md",
+                "operational_memory_provenance": True,
                 "updated_at": "2025-01-01T00:00:00+00:00",
                 "created_at": "2025-01-01T00:00:00+00:00",
                 "locator": {"heading": "Runtime"},
@@ -316,7 +318,8 @@ class TestOperationalMemory(unittest.TestCase):
                 "importance_score": 0.7,
                 "evidence_ids": ["ev_new"],
                 "source_ids": ["src_new"],
-                "source_page": "Entity_Runtime.md",
+                "source_page": "Concept_UserPreferences.md",
+                "operational_memory_provenance": True,
                 "updated_at": "2026-01-01T00:00:00+00:00",
                 "created_at": "2026-01-01T00:00:00+00:00",
                 "locator": {"heading": "Runtime"},
@@ -455,7 +458,7 @@ class TestOperationalMemory(unittest.TestCase):
         governance_store.apply_change_sets_batch(
             [
                 {
-                    "affected_pages": ["Entity_Runtime.md"],
+                    "affected_pages": ["Concept_UserPreferences.md"],
                     "proposed_entities": [],
                     "proposed_claims": [remaining],
                     "proposed_evidence": [],
@@ -2058,7 +2061,7 @@ def test_certification_gap_external_tamper_cannot_become_new_proof(
         "SELECT backfill_cursor, backfill_target, proof_status, proof_generation "
         "FROM operational_memory_search_state"
     ).fetchone()
-    assert tuple(state) == ("", "memory_3", "rebuild_required", None)
+    assert tuple(state) == ("", "memory_3", "rebuild_required", BUILD_MARKER)
     with pytest.raises(governance_store.OperationalMemoryNotReady) as error:
         governance_store.search_operational_memory("canonical", top_k=10)
     assert error.value.reason == "search_index_backfilling"
@@ -2110,7 +2113,7 @@ def test_complete_unready_rebuild_replays_before_certifying_existing_fts(
         "memory_3",
         "memory_3",
         "rebuild_required",
-        None,
+        BUILD_MARKER,
     )
 
     monkeypatch.setattr(
@@ -2133,7 +2136,7 @@ def test_complete_unready_rebuild_replays_before_certifying_existing_fts(
         "memory_1",
         "memory_3",
         "rebuild_required",
-        None,
+        BUILD_MARKER,
     )
     second = governance_store.maintain_operational_memory_search_index(2)
     assert second["ready"] is True
@@ -2523,6 +2526,100 @@ def test_default_runtime_profile_enables_operational_memory_fts():
 
     env = payload["profiles"]["default"]["env"]
     assert env["VECTOR_LAKE_OPERATIONAL_MEMORY_FTS"] == "1"
+
+
+def test_legacy_lowercase_ready_with_pending_forces_full_casefold_replay(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    record = {
+        "memory_id": "memory_strasse", "memory_type": "fact",
+        "memory_key": "Straße", "text": "Σς and Ｚ", "source_page": "页面𠀀",
+        "validity_state": "active", "memory_score": 0.8,
+    }
+    conn = _seed_isolated_search_memories([record])
+    assert governance_store.maintain_operational_memory_search_index(10)["ready"]
+    with db_store.transaction():
+        doc_id = conn.execute(
+            "SELECT doc_id FROM operational_memory_search_docs"
+        ).fetchone()[0]
+        conn.execute("DELETE FROM operational_memory_search_fts WHERE rowid = ?", (doc_id,))
+        conn.execute(
+            "INSERT INTO operational_memory_search_fts "
+            "(rowid,key_text,memory_text,page_text,type_text) VALUES (?,?,?,?,?)",
+            (doc_id, "straße", "σς and ｚ", "页面𠀀", "fact"),
+        )
+        observed = db_store.inspect_operational_memory_search_integrity(conn)
+        digests = tuple(observed[key] for key in (
+            "canonical_corpus_sha256", "docs_corpus_sha256",
+            "trigram_corpus_sha256", "short_corpus_sha256",
+        ))
+        old = db_store.hashlib.sha256()
+        for value in digests:
+            db_store._update_integrity_digest_value(old, value)
+        conn.execute(
+            "UPDATE operational_memory_search_state SET proof_status='ready', "
+            "proof_generation=?, canonical_corpus_sha256=?, docs_corpus_sha256=?, "
+            "trigram_corpus_sha256=?, short_corpus_sha256=?", (old.hexdigest(), *digests)
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO operational_memory_search_pending "
+            "(memory_id, operation) VALUES (?, 'upsert')", (record["memory_id"],)
+        )
+    # Pending work consumes the first one-row budget; certification must wait
+    # until the full prefix has been replayed under the new contract.
+    assert not governance_store.maintain_operational_memory_search_index(1)["ready"]
+    assert governance_store.maintain_operational_memory_search_index(1)["ready"]
+    # This is a contentless FTS table: stored field reads return NULL. Assert
+    # its actual MATCH surface instead of pretending it stores retrievable text.
+    assert conn.execute(
+        "SELECT rowid FROM operational_memory_search_fts "
+        "WHERE operational_memory_search_fts MATCH ?", ('key_text : "strasse"',)
+    ).fetchall()
+    assert governance_store.search_operational_memory("Σς", top_k=10)[0]["memory_id"] == record["memory_id"]
+    assert governance_store.search_operational_memory("STRASSE", top_k=10)[0][
+        "memory_id"
+    ] == record["memory_id"]
+    assert governance_store.search_operational_memory("z", top_k=10) == []
+
+
+def test_unicode_type_ready_fts_and_fallback_are_equivalent(isolated_memory, monkeypatch):
+    record = {"memory_id": "memory_unicode_type", "memory_type": "STRAẞE",
+              "memory_key": "key", "text": "text", "source_page": "page",
+              "validity_state": "active", "memory_score": 0.8}
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    conn = _seed_isolated_search_memories([record])
+    before = conn.execute("SELECT data_json FROM operational_memory").fetchone()[0]
+    assert governance_store.maintain_operational_memory_search_index(10)["ready"]
+    indexed = governance_store.search_operational_memory("STRASSE", top_k=10)
+    assert indexed[0]["memory_id"] == record["memory_id"]
+    assert governance_store.search_operational_memory_views("STRASSE", memory_types=["strasse"])[0]
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "0")
+    legacy = governance_store.search_operational_memory("STRASSE", top_k=10)
+    assert [x["memory_id"] for x in legacy] == [x["memory_id"] for x in indexed]
+    assert governance_store.search_operational_memory_views("STRASSE", memory_types=["strasse"])[0]
+    assert conn.execute("SELECT data_json FROM operational_memory").fetchone()[0] == before
+
+
+def test_legacy_partial_checkpoint_restarts_but_current_marker_resumes(
+    isolated_memory, monkeypatch
+):
+    monkeypatch.setenv("VECTOR_LAKE_OPERATIONAL_MEMORY_FTS", "1")
+    conn = _seed_isolated_search_memories(_integrity_test_records())
+    assert governance_store.maintain_operational_memory_search_index(100)["ready"]
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE operational_memory_search_state SET backfill_cursor='memory_1', "
+            "proof_status='rebuild_required', proof_generation=NULL"
+        )
+    first = governance_store.maintain_operational_memory_search_index(1)
+    assert first["backfill_cursor"] == "memory_0"
+    state = conn.execute(
+        "SELECT proof_generation FROM operational_memory_search_state"
+    ).fetchone()
+    assert state[0] == BUILD_MARKER
+    second = governance_store.maintain_operational_memory_search_index(1)
+    assert second["backfill_cursor"] == "memory_1"
 
 
 if __name__ == "__main__":

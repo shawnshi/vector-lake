@@ -2,6 +2,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from vector_lake.db_store import get_connection
+from vector_lake.timeline_semantics import parse_timeline_prefix, validate_timeline_date
 
 
 _STABLE_EVENT_PAYLOAD_FIELDS = (
@@ -31,25 +32,34 @@ def _stable_event_payload_signature(event) -> str:
 
 def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> dict:
     data = json.loads(row["data_json"])
+    description = str(row["claim_text"] or "")
+    prefix = parse_timeline_prefix(description)
     entities = data.get("subject_entity_ids") or []
     if isinstance(entities, str):
         entities = [entities]
     sources = data.get("source_ids") or []
     if isinstance(sources, str):
         sources = [sources]
+    # A structural prefix is closest to the event assertion and therefore beats
+    # page-level/default metadata. Explicit event_date then beats the broader
+    # temporal_anchor. updated_at is ingestion state, never occurrence time.
     event_date = (
-        data.get("temporal_anchor")
-        or data.get("event_date")
-        or data.get("updated_at")
+        validate_timeline_date(prefix.event_date)
+        or validate_timeline_date(data.get("event_date"))
+        or validate_timeline_date(data.get("temporal_anchor"))
         or "Unknown Date"
     )
-    description = row["claim_text"]
+    if prefix.event_date:
+        description = prefix.description
+    elif data.get("event_tag") and description.startswith(f"[{data['event_tag']}] "):
+        # Legacy extraction removed its coarse date while retaining the tag.
+        description = description[len(str(data["event_tag"])) + 3:]
     entity_id = entities[0] if entities else ""
     stable_raw = "\0".join([str(row["claim_id"]), str(event_date), str(description)])
     return {
         "id": hashlib.sha256(stable_raw.encode("utf-8")).hexdigest()[:24],
         "event_date": str(event_date),
-        "action": str(data.get("action") or data.get("event_tag") or data.get("claim_type") or "timeline-event"),
+        "action": str(prefix.event_tag or data.get("event_tag") or data.get("action") or "Unknown"),
         "sentiment": str(data.get("sentiment") or "neutral"),
         "description": description,
         "entity_id": entity_id,
@@ -306,7 +316,10 @@ def search_timeline_events(
                     " AND instr(lower(COALESCE(action, '')), lower(?)) > 0"
                 )
             params.append(filters["action"])
-        query += " ORDER BY event_date DESC, id ASC LIMIT ?"
+        query += (
+            " ORDER BY (event_date = 'Unknown Date') ASC, "
+            "event_date DESC, id ASC LIMIT ?"
+        )
         params.append(bounded_limit)
         return conn.execute(query, params).fetchall()
 

@@ -86,6 +86,7 @@ _MCP_HEAVY_TASKS = {
     "topology_queue_cleanup": ("maintenance", 900.0),
     "unsupported_claim_debt": ("maintenance", 900.0),
     "claim_provenance_repair": ("maintenance", 900.0),
+    "claim_placeholder_cleanup": ("maintenance", 900.0),
     "trigger_audit_graph": ("scan", 1800.0),
     "trigger_autonomous_research": ("ingest_scan", 1800.0),
     "visualize_vector_lake": ("scan", 900.0),
@@ -2277,6 +2278,25 @@ def claim_provenance_repair(
 
 
 @mcp.tool()
+def claim_placeholder_cleanup(
+    source_claim_ids: list[str],
+    dry_run: bool = True,
+    confirmation: str = "",
+) -> str:
+    """Preview or apply exact generated-placeholder claim cleanup."""
+    return json.dumps(
+        tools.cleanup_placeholder_claims(
+            source_claim_ids=source_claim_ids,
+            dry_run=dry_run,
+            confirmation=confirmation,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
 def record_claim_assessment(
     claim_id: str,
     assessment_type: str,
@@ -2847,9 +2867,51 @@ def visualize_vector_lake(output_dir: str | None = None) -> str:
         return f"Error: {exc}"
     return tools.visualize_vector_lake(str(authorized.parent))
 
+def _sanitized_wiki_write_diagnostic(exc: Exception, phase: str) -> dict[str, str]:
+    """Expose only fixed-vocabulary failure metadata, never exception content."""
+    import sqlite3
+    from vector_lake.defense_hook import DefenseHookException
+
+    allowed_types = {
+        FileNotFoundError: "FileNotFoundError", PermissionError: "PermissionError",
+        TimeoutError: "TimeoutError", OSError: "OSError",
+        sqlite3.OperationalError: "OperationalError", sqlite3.IntegrityError: "IntegrityError",
+        sqlite3.ProgrammingError: "ProgrammingError", sqlite3.DatabaseError: "DatabaseError",
+        DefenseHookException: "DefenseHookException", RuntimeError: "RuntimeError",
+        ValueError: "ValueError", TypeError: "TypeError", KeyError: "KeyError",
+        AssertionError: "AssertionError", Exception: "Exception",
+    }
+    exception_type = next(
+        (allowed_types[base] for base in type(exc).__mro__ if base in allowed_types),
+        "Exception",
+    )
+    safe_phase = "payload" if phase == "payload" else "mutation"
+    stages = {
+        ("vector_lake.runtime_health", "enforce_runtime_write_health"): "write_health",
+        ("vector_lake.mutation_coordinator", "_prepare_mutations"): "validation",
+        ("vector_lake.defense_hook", "verify_asset"): "validation",
+        ("vector_lake.governance_store", "prepare_change_set_from_content"): "preparation",
+        ("vector_lake.claim_extractor", "extract_page_objects"): "extraction",
+        ("vector_lake.governance_store", "apply_and_record_change_sets_batch"): "canonical_commit",
+        ("vector_lake.governance_store", "_apply_prepared_change_set"): "canonical_commit",
+    }
+    if safe_phase == "mutation":
+        trace = exc.__traceback__
+        for _ in range(32):
+            if trace is None:
+                break
+            module = trace.tb_frame.f_globals.get("__name__")
+            if isinstance(module, str):
+                safe_phase = stages.get((module, trace.tb_frame.f_code.co_name), safe_phase)
+            trace = trace.tb_next
+    return {"exception_type": exception_type, "phase": safe_phase}
+
+
 @mcp.tool()
 def write_wiki_page(filename: str, payload_file: str) -> str:
     """Write or update a Vector Lake wiki page safely.
+
+    Failure receipts may include fixed-vocabulary exception type and phase only.
     
     Args:
         filename: The filename (e.g. 'Concept_Example.md').
@@ -2864,9 +2926,11 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
         post_commit_warnings: list[str] | None = None,
         error_code: str | None = None,
         message: str,
+        diagnostic: dict[str, str] | None = None,
     ) -> str:
         return json.dumps(
             {
+                **({"diagnostic": diagnostic} if diagnostic is not None else {}),
                 "schema_version": 1,
                 "ok": ok,
                 "committed": committed,
@@ -2900,15 +2964,17 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
     try:
         content = _read_payload(payload_file)
     except Exception as exc:
+        diagnostic = _sanitized_wiki_write_diagnostic(exc, "payload")
         logging.warning(
             "write_wiki_page payload rejected: %s",
-            type(exc).__name__,
+            diagnostic["exception_type"],
         )
         return receipt(
             ok=False,
             committed=False,
             error_code="payload_rejected",
             message="Wiki payload could not be accepted.",
+            diagnostic=diagnostic,
         )
     from vector_lake.wiki_utils import SafeWriteError
     try:
@@ -2947,28 +3013,34 @@ def write_wiki_page(filename: str, payload_file: str) -> str:
             message=message,
         )
     except SafeWriteError as exc:
-        logging.warning("write_wiki_page rejected: %s", type(exc).__name__)
+        diagnostic = _sanitized_wiki_write_diagnostic(exc, "mutation")
+        logging.warning("write_wiki_page rejected: %s", diagnostic["exception_type"])
         return receipt(
             ok=False,
             committed=False,
             error_code="write_rejected",
             message="Wiki mutation was rejected.",
+            diagnostic=diagnostic,
         )
     except ValueError as exc:
-        logging.warning("write_wiki_page invalid request: %s", type(exc).__name__)
+        diagnostic = _sanitized_wiki_write_diagnostic(exc, "mutation")
+        logging.warning("write_wiki_page invalid request: %s", diagnostic["exception_type"])
         return receipt(
             ok=False,
             committed=False,
             error_code="invalid_request",
             message="Wiki mutation request is invalid.",
+            diagnostic=diagnostic,
         )
     except Exception as exc:
-        logging.warning("write_wiki_page failed: %s", type(exc).__name__)
+        diagnostic = _sanitized_wiki_write_diagnostic(exc, "mutation")
+        logging.warning("write_wiki_page failed: %s", diagnostic["exception_type"])
         return receipt(
             ok=False,
             committed=False,
             error_code="write_failed",
             message="Wiki mutation failed before commit.",
+            diagnostic=diagnostic,
         )
 
 @mcp.tool()

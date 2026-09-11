@@ -45,7 +45,7 @@ graph LR
 | Canonical governance schema | `8.0` |
 | Index projection | logical `PROJECTION_CONTRACT_VERSION = 1` / physical `format_version = 2` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 68 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 41 CLI commands / 19 Agent skills |
+| Public surfaces | 70 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 42 CLI commands / 19 Agent skills |
 
 通用 `init_db()` 遇到既有 v1–v8 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6、v7 或 v8 数据库，并按受控历史链最终
@@ -235,6 +235,18 @@ Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验�
 
 `query` 会优先生成 Memory Packet，再按预算拼接相关 wiki 页面。Memory Packet 包含当前偏好、决策、任务状态、相关事实、冲突/陈旧告警和证据指针。启用 `VECTOR_LAKE_OPERATIONAL_MEMORY_FTS=1` 时，Watchdog 默认以有界批次自动推进派生索引；schema v6 以持久 proof 绑定 canonical 原始行、document mapping 和两套 FTS 物理索引，并按连接可见 revision 缓存稳定结果。缺行、多行、等计数 token 篡改、遗漏 pending、核验超限或查询竞态都会失败关闭并触发有界重放。索引未 ready 时只允许最多 5,000 条 source row 的降级窗口，超过即返回稳定的 not-ready/retry-after 契约，不再静默全表评分。旧式无界回退仅可通过显式高风险兼容开关启用。
 
+操作型记忆分类不再由资料中的“方案、采用、状态、不要”等关键词触发。只有固定操作页、匹配的显式类型及 Operational Memory 来源标记共同成立，才识别为用户偏好、决策或任务；`authoring_origin` 本身不是授权凭据。Memory Packet 对最多 24 个选中 claim 作只读核对，并校验记录内容、页面和生命周期，仅通过 `effective_memory_type` 调整栏目，不改写既有存储 ID、类型或证据。存量类型迁移须单独预检；`fact` 仍是内容分类，不代表事实已被接受。
+
+运行记忆查询在既有有界候选池内优先比较查询字面词覆盖、页面/键证据及相关性，再用持久化 `memory_score` 和时间破同分，最终按稳定 ID 排序；不修改存储权重或生命周期。`retrieval_score` 表示主查询覆盖率（0–1），不是事实置信度，也不是全库最优召回保证。indexed/legacy 使用相同排序规则，但候选预选上限仍然存在。
+
+`trace_vector_lake` 对 `claim_...` 精确 ID 直接查询当前 canonical 主键，不依赖 FTS；不存在的 ID 不转为模糊命中，也不从身份历史中复活已删除记录。Trace 保留证据状态与 `Accepted Fact: False` 边界，读取不会初始化或回灌数据库。
+
+重提取时，仅在当前声明的文本、主体、页面与类型等边界不变，且当前官方审核绑定通过回执、原件、生命周期和所有权复核时保留该绑定。历史版本仅用来核验当前回执的旧快照，不恢复已丢失的关系；当前受治理旧绑定缺少可核验官方证明时，操作会明确阻塞而非静默清空。Source 页映射的空值保留还要求有效的当前所有者及一致的 artifact 绑定，同源冲突保留组会整体回滚。这些机制不代表事实获得业务批准。
+
+运行记忆全文检索统一采用 `casefold()` 规范化（不执行破坏性的 NFKC 字符变换），对查询、FTS 索引构建、类型过滤与回退排序保持一致。规范化仅作用于检索层，底层 SQLite 存储严格保留原始大小写与字符；搜索状态处于 schema version 7，使用确定性 proof digest 校验索引代际完整性。
+
+提取引擎严格分离历史来源身份键（用于生成向后兼容的稳定 `source_id`、`evidence_id` 与 `claim_id`）与真实物理路径（用于 `raw_ref`、artifact 内容哈希计算与 locator 定位）。治理写入层在变更入库前执行所有权预检，严禁同一 `artifact_id` 跨批次或跨页面覆盖已有 `source_id` 归属；多页批次支持同一所有者的互补元数据增量合并。
+
 ### Agent-memory verbs 与薄客户端表面
 
 `vector-lake-agent-memory/v1` 提供六个 Vector Lake 原生 verbs：
@@ -376,6 +388,16 @@ python cli.py ingest-tasks --cleanup-orphans --min-age-seconds 86400 --limit 100
 python watchdog_sync.py
 ```
 
+仅运行 owner 心跳与 durable outbox 投影维护（不启动文件监听、ingest、
+auto-ingest、定时扫描或自动全量 reconcile）：
+
+```powershell
+python watchdog_sync.py --maintenance
+```
+
+维护模式与默认模式使用同一 MEMORY singleton lock 和 `--stop` 协调关闭；状态文件
+记录并校验 run-fenced profile 与精确组件清单，未知或不一致 profile 会失败关闭。
+
 `watchdog_sync.py` 是独立进程，不会自动继承 MCP 子进程的环境。入口会在导入
 Vector Lake 运行时前，从同目录 `runtime_profiles.json` 加载默认 profile；调用方成对
 显式设置的 `VECTOR_LAKE_MEMORY_DIR` 与 `VECTOR_LAKE_META_DIR` 优先。只覆盖其中
@@ -506,6 +528,8 @@ python cli.py unsupported-claim-debt --apply --confirm-fingerprint "<preview fin
 python cli.py claim-provenance-repair
 python cli.py claim-provenance-repair --source-map "C:/Users/shich/MEMORY/scratch/source-map.json"
 python cli.py claim-provenance-repair --source-map "C:/Users/shich/MEMORY/scratch/source-map.json" --apply --confirm-fingerprint "<preview fingerprint>"
+python cli.py claim-placeholder-cleanup --claim-id "claim_123" --claim-id "claim_456"
+python cli.py claim-placeholder-cleanup --claim-id "claim_123" --claim-id "claim_456" --apply --confirm-fingerprint "sha256:<preview-fingerprint>"
 python cli.py timeline-rebuild
 python cli.py timeline-rebuild --apply
 python cli.py projection-rebuild-index
@@ -537,7 +561,7 @@ python cli.py restore-snapshot --maintenance-receipt "<absolute-backup-manifest.
 python cli.py restore-snapshot --maintenance-receipt "<absolute-backup-manifest.json>" --apply --confirm-fingerprint "sha256:<preview-fingerprint>" --confirm-no-writers
 ```
 
-除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥并绑定 fingerprint 与 `--confirm-no-writers`。`schema-rollback` 和 `restore-snapshot` 都拒绝裸备份，先保全当前 DB/projection/Wiki forward bundle，再按 completed receipt 原子恢复；中断后可从 pending receipt 幂等续跑。`projection-rebuild-index` 从 canonical 生成 v2 immutable roots、locator、FTS 与 sidecar，保留已有 `vec_embeddings`；`projection-object-gc` 只清理超过 retention、且不在 live/current/previous/pending/backup/restore roots 可达闭包中的对象，apply 必须提交同一预览 fingerprint。`embedding-backfill` 按 RPM/TPM 限额断点补齐向量并按 provider batch 单事务 CAS。`canonical-backfill`、`evidence-foundation-backfill`、`unsupported-claim-debt`、`claim-provenance-repair`、`history-retention`、`change-set-compaction`、`memory-cleanup`、`topology-queue-cleanup` 与 `orphan-source-classify` 均保持原有 preview、边界、游标或 fingerprint 门禁。`claim-provenance-repair` 只接受现有逐字证据、唯一 `Source_*` 原件映射，或位于 `MEMORY` 内且逐文件冻结 SHA-256、字节数和预期声明数的 `claim-provenance-source-map/v1`；映射既可绑定 `Source_*` 页面，也可绑定声明抽取运行中唯一的 `Source_*` 血缘引用，或正文中唯一的 `Source_*` 页面链接；多来源歧义仍拒绝修复。其余声明保持未修复并进入受治理研究路径。
+除只读报告外，维护入口默认 preview-first；只有显式 `--apply` 或 `--checkpoint-wal` 才写入。`schema-migrate` preview 不创建目录、lock、数据库或 SQLite sidecar；checkpoint 与 apply 互斥并绑定 fingerprint 与 `--confirm-no-writers`。`schema-rollback` 和 `restore-snapshot` 都拒绝裸备份，先保全当前 DB/projection/Wiki forward bundle，再按 completed receipt 原子恢复；中断后可从 pending receipt 幂等续跑。`projection-rebuild-index` 从 canonical 生成 v2 immutable roots、locator、FTS 与 sidecar，保留已有 `vec_embeddings`；`projection-object-gc` 只清理超过 retention、且不在 live/current/previous/pending/backup/restore roots 可达闭包中的对象，apply 必须提交同一预览 fingerprint。`embedding-backfill` 按 RPM/TPM 限额断点补齐向量并按 provider batch 单事务 CAS。`canonical-backfill`、`evidence-foundation-backfill`、`unsupported-claim-debt`、`claim-provenance-repair`、`claim-placeholder-cleanup`、`history-retention`、`change-set-compaction`、`memory-cleanup`、`topology-queue-cleanup` 与 `orphan-source-classify` 均保持原有 preview、边界、游标或 fingerprint 门禁。`claim-provenance-repair` 只接受现有逐字证据、唯一 `Source_*` 原件映射，或位于 `MEMORY` 内且逐文件冻结 SHA-256、字节数和预期声明数的 `claim-provenance-source-map/v1`；映射既可绑定 `Source_*` 页面，也可绑定声明抽取运行中唯一的 `Source_*` 血缘引用，或正文中唯一的 `Source_*` 页面链接；多来源歧义仍拒绝修复。其余声明保持未修复并进入受治理研究路径。
 
 ### Exact-claim official evidence (MCP / Python API)
 
@@ -599,6 +623,8 @@ official evidence. Projection rebuilding, if needed after apply, is a separate
 preview/authorization step.
 
 MCP `operational_memory_cleanup` 可传入 `source_claim_ids`（1–256 个唯一声明 ID）进行精确模板归档；先以 `dry_run=true` 取得 `candidate_fingerprint`，再以相同范围和 `confirmation` 执行。此模式禁止部分 `limit`，要求一致性备份，并在写事务中重验声明与运行记忆快照；缺失、内容漂移、实质知识或已关联来源/证据的声明一律拒绝。它只归档运行记忆，不删除 Wiki、canonical 声明或历史，也不构成事实证实。新模板规则要求整段格式和所属页面身份同时匹配，普通正文及跨页面引用不会仅因包含自动生成字样而被过滤。
+
+MCP `claim_placeholder_cleanup`（CLI 对应 `claim-placeholder-cleanup`）支持通过 `--claim-id` 传入 1–256 个唯一声明 ID 执行精确占位声明物理清理；先以 `dry_run=true` 校验全或无门禁并取得 `candidate_fingerprint`，再以同一指纹执行 apply。资格门禁要求声明均为 Active 且符合预设 stub 分类、无外链证据或来源、存在唯一归档事实记忆、历史前像在版本表中完备，且外部依赖闭包（反驳、替代、图边、活跃 job 等）全为空；写事务前校验 v4 维护备份与代际，事务内 CAS 校验后物理删除目标声明与记忆，结案对应治理缺口并保留历史版本与旁支声明。
 
 维护快照创建只新增备份，绝不裁剪此前成功的快照；即使已有 5 份或更多，也必须另行授权 `backup-retention` 才能删除。watchdog 每日当地时间 03:00 的 `history-retention` 仅执行只读预览并报告需要操作员批准，不代填确认指纹，不自动删除；预览失败保留错误状态，仅成功预览才记为当天完成。
 

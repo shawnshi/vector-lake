@@ -2571,6 +2571,9 @@ def get_connection() -> sqlite3.Connection:
                 factory=_GenerationTrackingConnection,
             )
         conn.row_factory = sqlite3.Row
+        from .memory_search_normalization import register_sqlite_functions
+
+        register_sqlite_functions(conn)
         conn.execute("PRAGMA recursive_triggers=ON")
         conn.execute("PRAGMA foreign_keys=ON")
         if not read_only:
@@ -8820,11 +8823,13 @@ def operational_memory_search_source_projection(payload: str) -> tuple[str, ...]
     memory = json.loads(payload)
     if not isinstance(memory, dict):
         raise ValueError("operational-memory payload must be a JSON object")
+    from .memory_search_normalization import casefold_text
+
     return (
-        str(memory.get("memory_key", "")).lower(),
-        str(memory.get("text", "")).lower(),
-        str(memory.get("source_page", "")).lower(),
-        str(memory.get("memory_type", "fact")).lower(),
+        casefold_text(memory.get("memory_key", "")),
+        casefold_text(memory.get("text", "")),
+        casefold_text(memory.get("source_page", "")),
+        casefold_text(memory.get("memory_type", "fact")),
     )
 
 
@@ -9056,7 +9061,10 @@ def _operational_memory_search_attestation_seconds() -> float:
 
 
 def _operational_memory_search_proof_generation(digests: tuple[str, ...]) -> str:
+    from .memory_search_normalization import NORMALIZATION_CONTRACT_DOMAIN
+
     digest = hashlib.sha256()
+    _update_integrity_digest_value(digest, NORMALIZATION_CONTRACT_DOMAIN)
     for value in digests:
         _update_integrity_digest_value(digest, value)
     return digest.hexdigest()
@@ -9258,14 +9266,16 @@ def mark_operational_memory_search_rebuild_required(
         raise RuntimeError(
             "Operational-memory search repair requires an active transaction"
         )
+    from .memory_search_normalization import BUILD_MARKER
+
     conn.execute(
         "UPDATE operational_memory_search_state SET backfill_cursor = '', "
         "backfill_target = (SELECT COALESCE(MAX(memory_id), '') "
         "FROM operational_memory), proof_status = 'rebuild_required', "
-        "proof_generation = NULL, canonical_corpus_sha256 = NULL, "
+        "proof_generation = ?, canonical_corpus_sha256 = NULL, "
         "docs_corpus_sha256 = NULL, trigram_corpus_sha256 = NULL, "
         "short_corpus_sha256 = NULL, updated_at = ? WHERE singleton = 1",
-        (datetime.now(timezone.utc).isoformat(),),
+        (BUILD_MARKER, datetime.now(timezone.utc).isoformat()),
     )
 
 
@@ -9277,13 +9287,29 @@ def invalidate_operational_memory_search_proof(
         raise RuntimeError(
             "Operational-memory search invalidation requires an active transaction"
         )
+    from .memory_search_normalization import BUILD_MARKER
+
+    state = conn.execute(
+        "SELECT proof_status, proof_generation FROM "
+        "operational_memory_search_state WHERE singleton = 1"
+    ).fetchone()
+    compatible = bool(
+        state is not None
+        and (
+            (str(state[0] or "") == "ready" and _operational_memory_search_state_proof(conn))
+            or (str(state[0] or "") != "ready" and str(state[1] or "") == BUILD_MARKER)
+        )
+    )
+    if not compatible:
+        mark_operational_memory_search_rebuild_required(conn)
+        return
     conn.execute(
         "UPDATE operational_memory_search_state SET "
-        "proof_status = 'rebuild_required', proof_generation = NULL, "
+        "proof_status = 'rebuild_required', proof_generation = ?, "
         "canonical_corpus_sha256 = NULL, docs_corpus_sha256 = NULL, "
         "trigram_corpus_sha256 = NULL, short_corpus_sha256 = NULL, "
         "updated_at = ? WHERE singleton = 1",
-        (datetime.now(timezone.utc).isoformat(),),
+        (BUILD_MARKER, datetime.now(timezone.utc).isoformat()),
     )
 
 
@@ -9295,8 +9321,10 @@ def certify_operational_memory_search_integrity(
         raise RuntimeError(
             "Operational-memory search certification requires an active transaction"
         )
+    from .memory_search_normalization import BUILD_MARKER
+
     state = conn.execute(
-        "SELECT backfill_cursor, backfill_target FROM "
+        "SELECT backfill_cursor, backfill_target, proof_status, proof_generation FROM "
         "operational_memory_search_state WHERE singleton = 1"
     ).fetchone()
     pending = int(
@@ -9304,7 +9332,32 @@ def certify_operational_memory_search_integrity(
             "SELECT COUNT(*) FROM operational_memory_search_pending"
         ).fetchone()[0]
     )
-    if state is None or str(state[0] or "") < str(state[1] or "") or pending:
+    checkpoint_current = bool(
+        state is not None
+        and (
+            str(state[3] or "") == BUILD_MARKER
+            or (
+                str(state[2] or "") == "ready"
+                and _operational_memory_search_state_proof(conn) is not None
+            )
+        )
+    )
+    # A truly empty projection has no normalization-dependent prefix. Initial
+    # schema setup may certify it without inventing a nonempty replay marker.
+    if not checkpoint_current and state is not None and not pending:
+        checkpoint_current = all(
+            conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None
+            for table in (
+                "operational_memory", "operational_memory_search_docs",
+                "operational_memory_search_fts", "operational_memory_search_short_fts",
+            )
+        )
+    if (
+        state is None
+        or str(state[0] or "") < str(state[1] or "")
+        or pending
+        or not checkpoint_current
+    ):
         raise RuntimeError("operational-memory search projection is incomplete")
     observed = inspect_operational_memory_search_integrity(conn)
     counts = (

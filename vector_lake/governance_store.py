@@ -21,6 +21,8 @@ try:
 except ImportError:  # pragma: no cover - minimal installations use stdlib JSON
     _orjson = None
 
+from vector_lake import db_store
+from vector_lake.memory_search_normalization import casefold_text
 from vector_lake.claim_extractor import classify_non_claim_text, extract_page_objects
 from vector_lake.db_store import (
     OperationalMemorySearchIntegrityLimitExceeded,
@@ -501,6 +503,24 @@ def _select_trace_claims_streaming(
     return [json.loads(data_json) for _, _, data_json in retained]
 
 
+def select_trace_claim_by_id(claim_id: str) -> list[dict]:
+    """Read one current canonical row by opaque primary key, without FTS."""
+    conn = require_current_schema_for_read("claims")
+    row = conn.execute(
+        "SELECT claim_id, data_json FROM claims WHERE claim_id = ?",
+        (claim_id,),
+    ).fetchone()
+    if row is None:
+        return []
+    try:
+        record = json.loads(row["data_json"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Invalid canonical claim metadata for exact trace lookup") from exc
+    if not isinstance(record, dict) or record.get("claim_id") != row["claim_id"]:
+        raise RuntimeError("Invalid canonical claim identity for exact trace lookup")
+    return [record]
+
+
 def select_trace_claims(
     tokens: list[str],
     relevant_pages: set[str],
@@ -548,11 +568,12 @@ def select_trace_claims(
 def load_trace_labels(
     entity_ids: set[str],
     source_ids: set[str],
-) -> tuple[dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict]]:
     """Load labels only for entities and sources referenced by selected claims."""
     conn = require_current_schema_for_read("entities", "sources")
     entity_names: dict[str, str] = {}
     source_pages: dict[str, str] = {}
+    source_traces: dict[str, dict] = {}
 
     ordered_entities = sorted(str(value) for value in entity_ids if value)
     for offset in range(0, len(ordered_entities), 500):
@@ -569,7 +590,14 @@ def load_trace_labels(
                 record.get("canonical_name") or row["canonical_name"] or ""
             )
 
+    from vector_lake.source_references import (
+        STRUCTURAL_SOURCE_PAGE,
+        normalize_explicit_source_page_ref,
+    )
+    from vector_lake.wiki_utils import normalize_raw_ref
+
     ordered_sources = sorted(str(value) for value in source_ids if value)
+    source_records: dict[str, dict] = {}
     for offset in range(0, len(ordered_sources), 500):
         batch = ordered_sources[offset : offset + 500]
         placeholders = ",".join("?" for _ in batch)
@@ -580,10 +608,114 @@ def load_trace_labels(
         ).fetchall()
         for row in rows:
             record = json.loads(row["data_json"])
-            source_pages[str(row["source_id"])] = str(
-                record.get("canonical_source_page") or ""
+            source_records[str(row["source_id"])] = record
+
+    candidate_keys: set[str] = set()
+    for source_id, record in source_records.items():
+        raw_ref = str(record.get("raw_ref") or "")
+        explicit_key = normalize_explicit_source_page_ref(raw_ref)
+        hinted_key = normalize_explicit_source_page_ref(
+            record.get("canonical_source_page") or ""
+        )
+        candidate = "" if explicit_key and hinted_key and explicit_key != hinted_key else (explicit_key or hinted_key)
+        if candidate and candidate != STRUCTURAL_SOURCE_PAGE:
+            candidate_keys.add(candidate)
+
+    source_entities: dict[str, dict] = {}
+    ordered_candidates = sorted(candidate_keys)
+    for offset in range(0, len(ordered_candidates), 500):
+        batch = ordered_candidates[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            "SELECT identities.page_key, entities.data_json "
+            "FROM entity_identities AS identities "
+            "JOIN entities ON entities.entity_id = identities.entity_id "
+            f"WHERE identities.page_key IN ({placeholders})",
+            tuple(batch),
+        ).fetchall()
+        for row in rows:
+            record = json.loads(row["data_json"])
+            if str(record.get("type") or record.get("entity_type") or "").casefold() == "source":
+                source_entities[str(row["page_key"])] = record
+
+    artifact_pairs: set[tuple[str, str]] = set()
+    for source_id, record in source_records.items():
+        artifact_id = str(record.get("artifact_id") or "")
+        if not artifact_id:
+            continue
+        row = conn.execute(
+            "SELECT 1 FROM source_artifacts WHERE artifact_id = ? AND source_id = ? LIMIT 1",
+            (artifact_id, source_id),
+        ).fetchone()
+        if row:
+            artifact_pairs.add((source_id, artifact_id))
+
+    for source_id in ordered_sources:
+        record = source_records.get(source_id)
+        if record is None:
+            source_traces[source_id] = {
+                "source_id": source_id,
+                "raw_ref": "",
+                "page": None,
+                "resolution": "unresolved",
+                "reason": "unknown_source",
+            }
+            continue
+        raw_ref = str(record.get("raw_ref") or "")
+        explicit_key = normalize_explicit_source_page_ref(raw_ref)
+        hinted_key = normalize_explicit_source_page_ref(record.get("canonical_source_page") or "")
+        conflicting_mapping = bool(explicit_key and hinted_key and explicit_key != hinted_key)
+        candidate = "" if conflicting_mapping else (explicit_key or hinted_key)
+        artifact_id = str(record.get("artifact_id") or "")
+        # Source IDs are producer-owned: official snapshots use a distinct
+        # identity scheme. Verify the stored binding, never rederive the ID.
+        identity_valid = record.get("source_id") == source_id
+        source_entity = source_entities.get(candidate)
+        declared_sources = source_entity.get("sources") if source_entity else None
+        if not isinstance(declared_sources, list):
+            declared_sources = None
+        normalized_raw_ref = normalize_raw_ref(raw_ref)
+        owns_raw_ref = bool(
+            normalized_raw_ref
+            and declared_sources
+            and any(
+                normalize_raw_ref(
+                    declared.get("raw_ref")
+                    if isinstance(declared, dict)
+                    else declared
+                )
+                == normalized_raw_ref
+                for declared in declared_sources
             )
-    return entity_names, source_pages
+        )
+        if conflicting_mapping:
+            resolution, reason, page = "unresolved", "ambiguous_mapping", None
+        elif candidate == STRUCTURAL_SOURCE_PAGE:
+            resolution, reason, page = "structural-placeholder", "structural_placeholder", None
+        elif not candidate:
+            resolution, reason, page = "unresolved", "no_canonical_mapping", None
+        elif source_entity is None:
+            resolution, reason, page = "unresolved", "missing_or_non_source_page", None
+        elif not explicit_key and not declared_sources:
+            resolution, reason, page = "unresolved", "missing_source_ownership_declaration", None
+        elif not explicit_key and not owns_raw_ref:
+            resolution, reason, page = "unresolved", "source_ownership_mismatch", None
+        elif not identity_valid:
+            resolution, reason, page = "unresolved", "source_identity_mismatch", None
+        elif (source_id, artifact_id) not in artifact_pairs:
+            resolution, reason, page = "unresolved", "missing_artifact", None
+        else:
+            resolution, reason, page = "resolved", "identity_bound_mapping", f"{candidate}.md"
+            source_pages[source_id] = page
+        source_traces[source_id] = {
+            "source_id": source_id,
+            "raw_ref": raw_ref,
+            "artifact_id": artifact_id or None,
+            "page": page,
+            "resolution": resolution,
+            "reason": reason,
+        }
+    return entity_names, source_pages, source_traces
 
 
 def load_alias_registry():
@@ -1232,29 +1364,307 @@ def _merge_reingested_source_records(
     conn,
     key_name: str,
     records: list[dict],
+    proposed_source_artifacts: list[dict] | None = None,
 ) -> list[dict]:
-    record_ids = sorted({str(record[key_name]) for record in records})
-    placeholders = ",".join("?" for _ in record_ids)
-    existing = {
-        str(row[key_name]): json.loads(row["data_json"] or "{}")
-        for row in conn.execute(
-            f"SELECT {key_name}, data_json FROM sources WHERE {key_name} IN ({placeholders})",
-            record_ids,
-        ).fetchall()
+    from vector_lake.source_references import normalize_explicit_source_page_ref
+    from vector_lake.wiki_utils import normalize_raw_ref
+
+    # executemany applies duplicate primary keys in input order.  Reject a
+    # same-source group unless every retention-relevant proposal is
+    # canonically equivalent, so retention cannot become last-write-wins.
+    grouped: dict[str, list[dict]] = {}
+    for record in records:
+        grouped.setdefault(str(record[key_name]), []).append(record)
+
+    inactive_states = {
+        "archived", "decayed", "deleted", "expired", "inactive", "retired", "revoked",
+        "superseded", "rejected", "withdrawn",
     }
-    return [
-        _merge_reingested_provenance_record(
-            existing[str(record[key_name])],
-            record,
-            preserve_ingested_at=True,
+
+    def group_signature(record: dict, current_hint: str) -> tuple:
+        integrity = str(record.get("integrity_status") or "").strip().casefold()
+        if integrity not in {"verified", "unverified", "failed", "invalid"}:
+            raise ValueError("Conflicting same-source retention proposals")
+
+        def lifecycle(container: dict) -> tuple:
+            status = str(container.get("status") or "active").strip().casefold()
+            state = str(container.get("lifecycle_state") or "active").strip().casefold()
+            if status not in inactive_states | {"active"} or state not in inactive_states | {"active"}:
+                raise ValueError("Conflicting same-source retention proposals")
+            return (
+                status,
+                state,
+                str(container.get("revoked_at") or ""),
+                *(str(container.get(field) or "") for field in (
+                    "expires_at", "expiry_at", "expiration_at"
+                )),
+            )
+
+        snapshot = record.get("official_snapshot")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        metadata = snapshot.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        explicit_hint = normalize_explicit_source_page_ref(
+            record.get("canonical_source_page") or ""
         )
-        if str(record[key_name]) in existing
-        else copy.deepcopy(record)
-        for record in records
-    ]
+        mapping_intent = explicit_hint or current_hint
+        algorithm = str(record.get("hash_algorithm") or "sha256").strip().casefold()
+        if algorithm != "sha256":
+            raise ValueError("Conflicting same-source retention proposals")
+        content_hash = record.get("content_hash")
+        canonical_group_hash = (
+            content_hash.casefold()
+            if isinstance(content_hash, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", content_hash) is not None
+            else ""
+        )
+        return (
+            normalize_raw_ref(record.get("raw_ref") or ""),
+            str(record.get("artifact_id") or ""),
+            canonical_group_hash,
+            algorithm,
+            integrity,
+            lifecycle(record),
+            lifecycle(snapshot),
+            lifecycle(metadata),
+            mapping_intent,
+        )
+
+    record_ids = {str(record[key_name]) for record in records}
+    existing: dict[str, dict] = {}
+    for row in _rows_for_ids(
+        conn,
+        select_prefix=f"SELECT {key_name}, data_json FROM sources WHERE {key_name} IN",
+        record_ids=record_ids,
+    ):
+        value = json.loads(row["data_json"] or "{}")
+        if not isinstance(value, dict):
+            raise RuntimeError("Invalid canonical source metadata")
+        existing[str(row[key_name])] = value
+
+    candidates: list[tuple[str, dict, dict, str, str]] = []
+    owner_pages: set[str] = set()
+    artifact_ids: set[str] = set()
+    for proposed in records:
+        source_id = str(proposed[key_name])
+        current = existing.get(source_id)
+        if current is None or proposed.get("canonical_source_page") not in (None, ""):
+            continue
+        current_hint = str(current.get("canonical_source_page") or "")
+        owner_page = normalize_explicit_source_page_ref(current_hint)
+        current_raw_ref = normalize_raw_ref(current.get("raw_ref") or "")
+        proposed_raw_ref = normalize_raw_ref(proposed.get("raw_ref") or "")
+        artifact_id = str(current.get("artifact_id") or "")
+        if (
+            not owner_page
+            or not current_raw_ref
+            or current_raw_ref != proposed_raw_ref
+            or current.get(key_name) != source_id
+            or proposed.get(key_name) != source_id
+            or not artifact_id
+            or str(proposed.get("artifact_id") or "") != artifact_id
+        ):
+            continue
+        explicit_ref = normalize_explicit_source_page_ref(proposed.get("raw_ref") or "")
+        if explicit_ref and explicit_ref != owner_page:
+            continue
+        candidates.append((source_id, current, proposed, owner_page, artifact_id))
+        owner_pages.add(owner_page)
+        artifact_ids.add(artifact_id)
+
+    owners: dict[str, dict] = {}
+    for row in _rows_for_ids(
+        conn,
+        select_prefix=(
+            "SELECT json_extract(data_json, '$.page_key') AS page_key, data_json "
+            "FROM entities WHERE json_extract(data_json, '$.page_key') IN"
+        ),
+        record_ids=owner_pages,
+    ):
+        value = json.loads(row["data_json"] or "{}")
+        if not isinstance(value, dict):
+            raise RuntimeError("Invalid canonical entity metadata")
+        owners[str(row["page_key"])] = value
+
+    artifacts: dict[str, dict] = {}
+    for row in _rows_for_ids(
+        conn,
+        select_prefix=(
+            "SELECT artifact_id, source_id, data_json FROM source_artifacts "
+            "WHERE artifact_id IN"
+        ),
+        record_ids=artifact_ids,
+    ):
+        value = json.loads(row["data_json"] or "{}")
+        if not isinstance(value, dict):
+            raise RuntimeError("Invalid source artifact metadata")
+        value = copy.deepcopy(value)
+        # The physical binding is authoritative evidence, not a default for
+        # missing or conflicting JSON identity fields.
+        if (
+            str(value.get("artifact_id") or "") != str(row["artifact_id"])
+            or str(value.get("source_id") or "") != str(row["source_id"])
+        ):
+            continue
+        artifacts[str(row["artifact_id"])] = value
+
+    proposed_artifacts: dict[str, dict] = {}
+    proposed_artifact_ids_by_source: dict[str, set[str]] = {}
+    conflicting_proposed_artifacts: set[str] = set()
+    for item in proposed_source_artifacts or []:
+        artifact_id = str(item.get("artifact_id") or "")
+        source_id = str(item.get("source_id") or "")
+        if not artifact_id:
+            continue
+        previous = proposed_artifacts.get(artifact_id)
+        if previous is not None and previous != item:
+            conflicting_proposed_artifacts.add(artifact_id)
+        proposed_artifacts[artifact_id] = item
+        if source_id:
+            proposed_artifact_ids_by_source.setdefault(source_id, set()).add(artifact_id)
+    now = datetime.now(timezone.utc)
+
+    def live(record: dict) -> bool:
+        for state_field in ("status", "lifecycle_state"):
+            state = str(record.get(state_field) or "active").casefold()
+            if state in inactive_states:
+                return False
+        if record.get("revoked_at") not in (None, ""):
+            return False
+
+        # Official snapshots have one known nested metadata envelope.  Keep
+        # this deliberately bounded rather than recursively trusting fields.
+        snapshots = [record]
+        official_snapshot = record.get("official_snapshot")
+        if isinstance(official_snapshot, dict):
+            snapshots.append(official_snapshot)
+            metadata = official_snapshot.get("metadata")
+            if isinstance(metadata, dict):
+                snapshots.append(metadata)
+        for snapshot in snapshots:
+            if snapshot.get("revoked_at") not in (None, ""):
+                return False
+            for field in ("expires_at", "expiry_at", "expiration_at"):
+                if field not in snapshot or snapshot.get(field) in (None, ""):
+                    continue
+                parsed = _parse_dt(snapshot[field])
+                if parsed is None or parsed <= now:
+                    return False
+        return True
+
+    def verified(record: dict) -> bool:
+        return str(record.get("integrity_status") or "").casefold() == "verified"
+
+    def canonical_hash(record: dict) -> str:
+        value = record.get("content_hash")
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+            return ""
+        return value.casefold()
+
+    def hash_proof_matches(*records: dict) -> bool:
+        hashes = [canonical_hash(record) for record in records]
+        if not all(hashes) or len(set(hashes)) != 1:
+            return False
+        algorithms = {
+            str(record.get("hash_algorithm")).strip().casefold()
+            for record in records
+            if record.get("hash_algorithm") not in (None, "")
+        }
+        return not algorithms or algorithms == {"sha256"}
+
+    retainable: set[int] = set()
+    for source_id, current, proposed, owner_page, artifact_id in candidates:
+        owner = owners.get(owner_page)
+        artifact = artifacts.get(artifact_id)
+        declarations = owner.get("sources") if owner else None
+        owns_raw_ref = isinstance(declarations, list) and any(
+            normalize_raw_ref(item.get("raw_ref") if isinstance(item, dict) else item)
+            == normalize_raw_ref(current.get("raw_ref") or "")
+            for item in declarations
+        )
+        if (
+            owner is None
+            or str(owner.get("type") or owner.get("entity_type") or "").casefold() != "source"
+            or str(owner.get("status") or "").casefold() != "active"
+            or not live(owner)
+            or not owns_raw_ref
+            or artifact is None
+            or str(artifact.get("artifact_id") or "") != artifact_id
+            or str(artifact.get("source_id") or "") != source_id
+            or not live(current)
+            or not live(proposed)
+            or not live(artifact)
+            or not verified(current)
+            or not verified(proposed)
+            or not verified(artifact)
+            or not hash_proof_matches(current, proposed, artifact)
+            or (
+                artifact.get("raw_ref") not in (None, "")
+                and normalize_raw_ref(artifact.get("raw_ref") or "")
+                != normalize_raw_ref(current.get("raw_ref") or "")
+            )
+        ):
+            continue
+        replacement = proposed_artifacts.get(artifact_id)
+        proposed_ids = proposed_artifact_ids_by_source.get(source_id, set())
+        if (
+            artifact_id in conflicting_proposed_artifacts
+            or (proposed_ids and proposed_ids != {artifact_id})
+        ):
+            continue
+        if replacement is not None and (
+            str(replacement.get("artifact_id") or "") != artifact_id
+            or str(replacement.get("source_id") or "") != source_id
+            or not live(replacement)
+            or not verified(replacement)
+            or not hash_proof_matches(current, proposed, artifact, replacement)
+            or (
+                replacement.get("raw_ref") not in (None, "")
+                and normalize_raw_ref(replacement.get("raw_ref") or "")
+                != normalize_raw_ref(current.get("raw_ref") or "")
+            )
+        ):
+            continue
+        retainable.add(id(proposed))
+
+    # Only the new preservation decision introduces a group-level constraint.
+    # Ordinary updates with no validated retention candidate keep their existing
+    # semantics; they must not be rejected by this narrowly scoped repair.
+    for source_id, group in grouped.items():
+        if len(group) < 2 or not any(id(record) in retainable for record in group):
+            continue
+        current_hint = normalize_explicit_source_page_ref(
+            existing[source_id].get("canonical_source_page") or ""
+        )
+        signatures = {group_signature(record, current_hint) for record in group}
+        if len(signatures) != 1:
+            raise ValueError("Conflicting same-source retention proposals")
+
+    merged_records = []
+    for record in records:
+        source_id = str(record[key_name])
+        current = existing.get(source_id)
+        if current is None:
+            merged_records.append(copy.deepcopy(record))
+            continue
+        merged = _merge_reingested_provenance_record(
+            current, record, preserve_ingested_at=True
+        )
+        if id(record) in retainable:
+            merged["canonical_source_page"] = copy.deepcopy(
+                current["canonical_source_page"]
+            )
+        merged_records.append(merged)
+    return merged_records
 
 
-def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict]):
+def _upsert_canonical_records(
+    table_name: str,
+    key_name: str,
+    records: list[dict],
+    *,
+    proposed_source_artifacts: list[dict] | None = None,
+):
     """Upsert only the records in one page-scoped canonical delta."""
     if not records:
         return
@@ -1315,7 +1725,12 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
         )
         return
     if table_name == "sources":
-        records = _merge_reingested_source_records(conn, key_name, records)
+        records = _merge_reingested_source_records(
+            conn,
+            key_name,
+            records,
+            proposed_source_artifacts=proposed_source_artifacts,
+        )
     conn.executemany(
         f"INSERT INTO {table_name} ({key_name}, data_json, updated_at) VALUES (?, ?, ?) "
         f"ON CONFLICT({key_name}) DO UPDATE SET "
@@ -1440,12 +1855,63 @@ def _append_version_records(
     return int(conn.total_changes - before_changes)
 
 
+_ARTIFACT_OWNERSHIP_CONFLICT = "Conflicting source artifact ownership"
+_ARTIFACT_RECORD_CONFLICT = "Invalid source artifact ownership record"
+
+
+def _preflight_source_artifact_ownership(conn, source_artifacts: list[dict]) -> None:
+    """Reject artifact ownership changes before any foundation mutation."""
+    incoming_owners: dict[str, str] = {}
+    for artifact in source_artifacts:
+        if not isinstance(artifact, dict):
+            raise ValueError(_ARTIFACT_RECORD_CONFLICT)
+        artifact_id = artifact.get("artifact_id")
+        source_id = artifact.get("source_id")
+        if any(not isinstance(value, str) or not value or any(ch.isspace() for ch in value)
+               for value in (artifact_id, source_id)):
+            raise ValueError(_ARTIFACT_RECORD_CONFLICT)
+        previous = incoming_owners.get(artifact_id)
+        if previous is not None and previous != source_id:
+            raise ValueError(_ARTIFACT_OWNERSHIP_CONFLICT)
+        incoming_owners[artifact_id] = source_id
+
+    ordered_ids = sorted(incoming_owners)
+    for offset in range(0, len(ordered_ids), 500):
+        batch = ordered_ids[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            "SELECT artifact_id, source_id, data_json FROM source_artifacts "
+            f"WHERE artifact_id IN ({placeholders})",
+            tuple(batch),
+        ):
+            artifact_id = row["artifact_id"]
+            physical_source_id = row["source_id"]
+            try:
+                stored = json.loads(row["data_json"] or "{}")
+            except (TypeError, ValueError):
+                raise ValueError(_ARTIFACT_RECORD_CONFLICT) from None
+            if not isinstance(stored, dict):
+                raise ValueError(_ARTIFACT_RECORD_CONFLICT)
+            json_artifact_id = stored.get("artifact_id")
+            json_source_id = stored.get("source_id")
+            if (
+                any(not isinstance(value, str) or not value or any(ch.isspace() for ch in value)
+                    for value in (artifact_id, physical_source_id, json_artifact_id, json_source_id))
+                or json_artifact_id != artifact_id
+                or json_source_id != physical_source_id
+            ):
+                raise ValueError(_ARTIFACT_RECORD_CONFLICT)
+            if incoming_owners[artifact_id] != physical_source_id:
+                raise ValueError(_ARTIFACT_OWNERSHIP_CONFLICT)
+
+
 def _upsert_foundation_records(
     entities: list[dict],
     source_artifacts: list[dict],
     extraction_runs: list[dict],
 ) -> None:
     conn = get_connection()
+    _preflight_source_artifact_ownership(conn, source_artifacts)
     now = _utc_now()
     for entity in entities:
         entity_id = str(entity.get("entity_id") or "")
@@ -1676,6 +2142,9 @@ def backfill_evidence_foundation_records(extracted: dict) -> dict:
         raise ValueError(
             "Evidence-foundation backfill requires one page and one extraction run."
         )
+    _preflight_source_artifact_ownership(
+        conn, list(extracted.get("source_artifacts") or [])
+    )
 
     record_specs = (
         (
@@ -1901,6 +2370,8 @@ def backfill_evidence_foundation_batch(extracted_pages: list[dict]) -> dict:
         all_artifacts.extend(list(extracted.get("source_artifacts") or []))
         all_runs.extend(runs)
 
+    _preflight_source_artifact_ownership(conn, all_artifacts)
+
     current_by_table: dict[str, dict[str, dict]] = {}
     for table_name, key_field, _payload_key in record_specs:
         record_ids = {
@@ -1992,10 +2463,14 @@ def backfill_evidence_foundation_batch(extracted_pages: list[dict]) -> dict:
             key_field,
             list(changed_by_table[table_name].values()),
         )
-    unique_artifacts = _dedupe_records(all_artifacts, "artifact_id")
+    unique_artifact_count = len({
+        str(record.get("artifact_id") or "")
+        for record in all_artifacts
+        if str(record.get("artifact_id") or "")
+    })
     _upsert_foundation_records(
         _dedupe_records(all_entities, "entity_id"),
-        unique_artifacts,
+        all_artifacts,
         _dedupe_records(all_runs, "run_id"),
     )
     _append_version_records(
@@ -2019,7 +2494,7 @@ def backfill_evidence_foundation_batch(extracted_pages: list[dict]) -> dict:
         "updated_claims": len(changed_by_table["claims"]),
         "updated_evidence": len(changed_by_table["evidence"]),
         "updated_sources": len(changed_by_table["sources"]),
-        "source_artifacts": len(unique_artifacts),
+        "source_artifacts": unique_artifact_count,
     }
 
 
@@ -2298,7 +2773,9 @@ def _unicode_search_runs(value: str) -> list[str]:
     """Return case-folded Unicode letter/number runs without script truncation."""
     runs: list[str] = []
     current: list[str] = []
-    for char in str(value or "").casefold():
+    from .memory_search_normalization import casefold_text
+
+    for char in casefold_text(value):
         category = unicodedata.category(char)
         if category.startswith(("L", "N")) or (current and category.startswith("M")):
             current.append(char)
@@ -2328,57 +2805,13 @@ def _query_terms(query: str) -> list[str]:
 
 
 def infer_memory_type(claim: dict) -> str:
-    explicit = str(claim.get("memory_type") or "").strip().lower().replace("-", "_")
-    if explicit in OPERATIONAL_MEMORY_TYPES:
+    from vector_lake.operational_memory_contract import (
+        is_governed_operational_claim,
+        normalized_memory_type,
+    )
+    explicit = normalized_memory_type(claim.get("memory_type"))
+    if is_governed_operational_claim(claim, explicit):
         return explicit
-
-    claim_type = str(claim.get("claim_type") or "").lower().replace("-", "_")
-    if claim_type in OPERATIONAL_MEMORY_TYPES:
-        return claim_type
-
-    text = f"{claim.get('claim_text', '')} {claim.get('source_page', '')}".lower()
-    if any(
-        token in text
-        for token in (
-            "preference",
-            "preferred",
-            "用户偏好",
-            "偏好",
-            "首选",
-            "不要",
-            "倾向",
-        )
-    ):
-        return "preference"
-    if any(
-        token in text
-        for token in (
-            "decision",
-            "decided",
-            "approved",
-            "决策",
-            "决定",
-            "方案",
-            "采用",
-            "选型",
-        )
-    ):
-        return "decision"
-    if any(
-        token in text
-        for token in (
-            "task",
-            "todo",
-            "pending",
-            "blocked",
-            "open item",
-            "待办",
-            "未完成",
-            "阻塞",
-            "状态",
-        )
-    ):
-        return "task_state"
     return "fact"
 
 
@@ -2504,9 +2937,50 @@ def _memory_object_from_claim(claim: dict) -> dict:
         "reinforcement_count": claim.get("reinforcement_count", len(evidence_ids)),
         "ttl_days": claim.get("ttl_days") or MEMORY_TTL_DAYS.get(memory_type, 365),
         "contradicts_claim_ids": list(claim.get("contradicts", [])),
+        "operational_memory_provenance": claim.get("operational_memory_provenance") is True,
+        "authoring_origin": claim.get("authoring_origin"),
     }
     memory.update(score_memory_object(memory))
     return memory
+
+
+def apply_effective_memory_routing(memories: list[dict]) -> list[dict]:
+    """Annotate selected results with a conservative, read-only routing type."""
+    from vector_lake.operational_memory_contract import effective_routing_type
+
+    selected_ids = list(dict.fromkeys(
+        str(item.get("source_claim_id") or "").strip()
+        for item in memories
+        if item.get("source_claim_id")
+    ))[:24]
+    claims_by_id = {}
+    if selected_ids:
+        conn = require_current_schema_for_read("claims")
+        placeholders = ",".join("?" for _ in selected_ids)
+        rows = conn.execute(
+            f"SELECT claim_id, data_json FROM claims WHERE claim_id IN ({placeholders})",
+            selected_ids,
+        ).fetchall()
+        for row in rows:
+            try:
+                record = json.loads(row[1])
+                if not isinstance(record, dict):
+                    raise ValueError("Canonical claim metadata must be an object")
+                claims_by_id[str(row[0])] = record
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "Invalid canonical claim metadata during operational memory routing"
+                ) from exc
+
+    routed = []
+    for item in memories:
+        result = dict(item)
+        claim_id = str(item.get("source_claim_id") or "")
+        result["effective_memory_type"] = effective_routing_type(
+            item, claims_by_id.get(claim_id)
+        )
+        routed.append(result)
+    return routed
 
 
 def _rank_memory_for_conflict(
@@ -2740,11 +3214,13 @@ def _memory_relevance(
 ) -> float:
     if not terms:
         return 0.0
+    from .memory_search_normalization import casefold_text
+
     haystacks = {
-        "key": str(memory.get("memory_key", "")).lower(),
-        "text": str(memory.get("text", "")).lower(),
-        "page": str(memory.get("source_page", "")).lower(),
-        "type": str(memory.get("memory_type", "")).lower(),
+        "key": casefold_text(memory.get("memory_key", "")),
+        "text": casefold_text(memory.get("text", "")),
+        "page": casefold_text(memory.get("source_page", "")),
+        "type": casefold_text(memory.get("memory_type", "")),
     }
     if matcher is not None:
         return (
@@ -2765,6 +3241,76 @@ def _memory_relevance(
         if term in haystacks["type"]:
             score += 1.0
     return score
+
+
+_MEMORY_QUERY_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "are", "can", "does", "for", "from", "how",
+        "in", "is", "of", "on", "or", "the", "to", "what", "when",
+        "where", "which", "who", "why", "with",
+    }
+)
+
+
+def _memory_query_profile(query: str, terms: list[str]) -> dict:
+    """Build bounded ranking signals from query literals, never guessed entities."""
+    runs = _unicode_search_runs(query)
+    quoted = []
+    for match in re.finditer(r"[\"']([^\"']+)[\"']", str(query or "")):
+        quoted.extend(_unicode_search_runs(match.group(1)))
+    quoted_set = set(quoted)
+    literal_terms = list(dict.fromkeys(
+        term for term in [*quoted, *runs]
+        if len(term) >= 2
+        and term not in _MEMORY_QUERY_STOPWORDS
+        and (
+            term in quoted_set
+            or not all(_is_cjk_ideograph(char) for char in term)
+        )
+    ))[:_MEMORY_QUERY_TERM_LIMIT]
+    meaningful_terms = list(dict.fromkeys(
+        term for term in terms
+        if len(term) >= 2 and term not in _MEMORY_QUERY_STOPWORDS
+    ))
+    return {
+        "literal_terms": literal_terms,
+        "meaningful_terms": meaningful_terms,
+    }
+
+
+def _memory_rank(memory: dict, terms: list[str], profile: dict, relevance: float) -> tuple:
+    """Return relevance-first rank plus a documented primary coverage score."""
+    from .memory_search_normalization import casefold_text
+
+    fields = {
+        "key": casefold_text(memory.get("memory_key", "")),
+        "text": casefold_text(memory.get("text", "")),
+        "page": casefold_text(memory.get("source_page", "")),
+        "type": str(memory.get("memory_type", "")).casefold(),
+    }
+    combined = " ".join(fields.values())
+    literals = profile["literal_terms"]
+    meaningful = profile["meaningful_terms"]
+    literal_hits = sum(term in combined for term in literals)
+    meaningful_hits = sum(term in combined for term in meaningful)
+    key_page_hits = sum(
+        term in fields["key"] or term in fields["page"] for term in meaningful
+    )
+    primary_hits = literal_hits if literals else meaningful_hits
+    primary_total = len(literals) if literals else len(meaningful)
+    if not primary_total:
+        primary_hits = sum(term in combined for term in terms)
+        primary_total = len(terms)
+    coverage = primary_hits / primary_total if primary_total else 0.0
+    stable_id = str(memory.get("memory_id") or "")
+    stable_id_rank = tuple(-ord(char) for char in stable_id) + (0,)
+    rank = (
+        bool(literal_hits), coverage, literal_hits, key_page_hits,
+        meaningful_hits, relevance,
+        float(memory.get("memory_score", 0) or 0),
+        _dt_rank(memory.get("updated_at")), stable_id_rank,
+    )
+    return rank, round(coverage, 6)
 
 
 _MEMORY_HIDDEN_STATES = frozenset({"archived", "expired", "superseded"})
@@ -2996,14 +3542,16 @@ def _upsert_memory_search_documents(
     decoded = []
     for memory_id, payload, updated_at in rows:
         memory = _decode_operational_memory_json(payload)
+        from .memory_search_normalization import casefold_text
+
         decoded.append(
             (
                 memory_id,
                 updated_at,
-                key_text := str(memory.get("memory_key", "")).lower(),
-                memory_text := str(memory.get("text", "")).lower(),
-                page_text := str(memory.get("source_page", "")).lower(),
-                type_text := str(memory.get("memory_type", "fact")).lower(),
+                key_text := casefold_text(memory.get("memory_key", "")),
+                memory_text := casefold_text(memory.get("text", "")),
+                page_text := casefold_text(memory.get("source_page", "")),
+                type_text := casefold_text(memory.get("memory_type", "fact")),
                 _memory_short_token_projection(
                     key_text,
                     memory_text,
@@ -3077,7 +3625,7 @@ def _advance_operational_memory_search_index(
     certification_data_version = None
     with transaction(max_wait_seconds=0.1):
         state = conn.execute(
-            "SELECT backfill_cursor, backfill_target, proof_status "
+            "SELECT backfill_cursor, backfill_target, proof_status, proof_generation "
             "FROM operational_memory_search_state WHERE singleton = 1"
         ).fetchone()
         if state is None:
@@ -3085,7 +3633,26 @@ def _advance_operational_memory_search_index(
         cursor = str(state[0] or "")
         target = str(state[1] or "")
         proof_status = str(state[2] or "")
+        proof_generation = str(state[3] or "")
         projection_changed = False
+
+        from .memory_search_normalization import BUILD_MARKER
+
+        current_checkpoint = bool(
+            (proof_status == "ready" and db_store._operational_memory_search_state_proof(conn))
+            or (proof_status != "ready" and proof_generation == BUILD_MARKER)
+        )
+        if not current_checkpoint:
+            mark_operational_memory_search_rebuild_required(conn)
+            cursor = ""
+            target = str(
+                conn.execute(
+                    "SELECT COALESCE(MAX(memory_id), '') FROM operational_memory"
+                ).fetchone()[0]
+                or ""
+            )
+            proof_status = "rebuild_required"
+            proof_generation = BUILD_MARKER
 
         pending_exists = (
             conn.execute(
@@ -3108,6 +3675,7 @@ def _advance_operational_memory_search_index(
                 or ""
             )
             proof_status = "rebuild_required"
+            proof_generation = BUILD_MARKER
         if batch_size and cursor >= target and not pending_exists:
             counts = _operational_memory_search_index_counts(conn)
             count_mismatch = _operational_memory_search_index_count_mismatch(
@@ -3248,8 +3816,13 @@ def _advance_operational_memory_search_index(
 
         conn.execute(
             "UPDATE operational_memory_search_state SET "
-            "backfill_cursor = ?, updated_at = ? WHERE singleton = 1",
-            (cursor, _utc_now()),
+            "backfill_cursor = ?, proof_generation = ?, updated_at = ? "
+            "WHERE singleton = 1",
+            (
+                cursor,
+                proof_generation if proof_status == "ready" else BUILD_MARKER,
+                _utc_now(),
+            ),
         )
         pending_after = (
             conn.execute(
@@ -3586,14 +4159,15 @@ def _memory_sql_term_filter(
     terms: list[str], alias: str = "om"
 ) -> tuple[str, list[str]]:
     search_text_sql = (
-        f"lower(COALESCE(json_extract({alias}.data_json, '$.memory_key'), '') || ' ' || "
+        f"COALESCE(json_extract({alias}.data_json, '$.memory_key'), '') || ' ' || "
         f"COALESCE(json_extract({alias}.data_json, '$.text'), '') || ' ' || "
         f"COALESCE(json_extract({alias}.data_json, '$.source_page'), '') || ' ' || "
-        f"COALESCE(json_extract({alias}.data_json, '$.memory_type'), ''))"
+        f"COALESCE(json_extract({alias}.data_json, '$.memory_type'), '')"
     )
+    encoded_terms = json.dumps(terms, ensure_ascii=False, separators=(",", ":"))
     return (
-        "(" + " OR ".join(f"instr({search_text_sql}, ?) > 0" for _ in terms) + ")",
-        list(terms),
+        f"casefold_any(({search_text_sql}), ?) = 1",
+        [encoded_terms],
     )
 
 
@@ -3611,9 +4185,11 @@ def _indexed_operational_memory_query(
     type_params: list[object] = []
     if allowed_types:
         placeholders = ", ".join("?" for _ in allowed_types)
-        type_sql = f" AND lower(COALESCE(om.memory_type, 'fact')) IN ({placeholders})"
+        type_sql = f" AND casefold_text(COALESCE(om.memory_type, 'fact')) IN ({placeholders})"
         type_params = sorted(allowed_types)
 
+    prefix_sql = " AND docs.memory_id <= ?" if cursor < target else ""
+    prefix_params = [cursor] if cursor < target else []
     candidate_queries: list[str] = []
     candidate_params: list[object] = []
     long_terms = [term for term in terms if len(term) >= 3]
@@ -3626,11 +4202,11 @@ def _indexed_operational_memory_query(
             "JOIN operational_memory_search_docs AS docs "
             "ON docs.doc_id = operational_memory_search_fts.rowid "
             "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
-            "WHERE operational_memory_search_fts MATCH ?" + type_sql + " "
+            "WHERE operational_memory_search_fts MATCH ?" + type_sql + prefix_sql + " "
             "ORDER BY bm25(operational_memory_search_fts) LIMIT ?)"
         )
         candidate_params.extend(
-            (_memory_fts_expression(long_terms), *type_params, candidate_limit)
+            (_memory_fts_expression(long_terms), *type_params, *prefix_params, candidate_limit)
         )
     if short_terms:
         candidate_queries.append(
@@ -3640,11 +4216,11 @@ def _indexed_operational_memory_query(
             "JOIN operational_memory_search_docs AS docs "
             "ON docs.doc_id = operational_memory_search_short_fts.rowid "
             "JOIN operational_memory AS om ON om.memory_id = docs.memory_id "
-            "WHERE operational_memory_search_short_fts MATCH ?" + type_sql + " "
+            "WHERE operational_memory_search_short_fts MATCH ?" + type_sql + prefix_sql + " "
             "ORDER BY bm25(operational_memory_search_short_fts) LIMIT ?)"
         )
         candidate_params.extend(
-            (_memory_fts_expression(short_terms), *type_params, candidate_limit)
+            (_memory_fts_expression(short_terms), *type_params, *prefix_params, candidate_limit)
         )
 
     residual_filter, residual_params = _memory_sql_term_filter(terms)
@@ -3758,7 +4334,8 @@ def _indexed_operational_memory_rows(
 
     try:
         state = conn.execute(
-            "SELECT backfill_cursor, backfill_target, schema_version "
+            "SELECT backfill_cursor, backfill_target, schema_version, "
+            "proof_status, proof_generation "
             "FROM operational_memory_search_state WHERE singleton = 1"
         ).fetchone()
         if state is None:
@@ -3775,6 +4352,23 @@ def _indexed_operational_memory_rows(
                 "using compatibility prefilter",
                 schema_version,
                 _MEMORY_SEARCH_INDEX_SCHEMA_VERSION,
+            )
+            return None
+        from .memory_search_normalization import BUILD_MARKER
+
+        proof_status = str(state[3] or "")
+        proof_generation = str(state[4] or "")
+        if proof_status == "ready":
+            checkpoint_current = bool(
+                db_store._operational_memory_search_state_proof(conn)
+            )
+        else:
+            checkpoint_current = proof_generation == BUILD_MARKER
+        if not checkpoint_current:
+            _raise_if_unbounded_operational_memory_fallback(
+                conn,
+                reason=("search_index_integrity_state" if proof_status == "ready"
+                        else "search_index_backfilling"),
             )
             return None
         include_pending = (
@@ -3901,7 +4495,7 @@ def _operational_memory_candidate_sql(
 ) -> tuple[str, list[object]]:
     """Build a streaming candidate query without hydrating the whole table."""
     search_text_sql = (
-        "lower(COALESCE(json_extract(data_json, '$.memory_key'), '') || ' ' || "
+        "casefold_text(COALESCE(json_extract(data_json, '$.memory_key'), '') || ' ' || "
         "COALESCE(json_extract(data_json, '$.text'), '') || ' ' || "
         "COALESCE(json_extract(data_json, '$.source_page'), '') || ' ' || "
         "COALESCE(json_extract(data_json, '$.memory_type'), ''))"
@@ -3922,7 +4516,7 @@ def _operational_memory_candidate_sql(
             filters.append(f"({exact_clause} OR ({supporting_clause}))")
     if allowed_types:
         placeholders = ", ".join("?" for _ in allowed_types)
-        filters.append(f"lower(COALESCE(memory_type, 'fact')) IN ({placeholders})")
+        filters.append(f"casefold_text(COALESCE(memory_type, 'fact')) IN ({placeholders})")
         params.extend(sorted(allowed_types))
 
     where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
@@ -3942,21 +4536,23 @@ def _legacy_operational_memory_views(
     conn = get_connection()
     terms = _bounded_memory_query_terms(query)
     matcher = _memory_term_matcher(terms)
+    profile = _memory_query_profile(query, terms)
     current_heap: list[tuple] = []
     history_heap: list[tuple] = []
 
     def push_ranked(
         heap: list[tuple],
         limit: int,
-        rank: tuple[float, float, float, int],
+        rank: tuple,
         memory: dict,
+        retrieval_score: float,
     ) -> None:
         if limit <= 0:
             return
-        entry = (*rank, memory)
+        entry = (rank, retrieval_score, memory)
         if len(heap) < limit:
             heapq.heappush(heap, entry)
-        elif rank > heap[0][:4]:
+        elif rank > heap[0][0]:
             heapq.heapreplace(heap, entry)
 
     sequence = 0
@@ -3964,7 +4560,7 @@ def _legacy_operational_memory_views(
         "SELECT data_json FROM operational_memory ORDER BY memory_id ASC"
     ):
         memory = _decode_operational_memory_json(row["data_json"])
-        memory_type = str(memory.get("memory_type", "fact")).lower()
+        memory_type = casefold_text(memory.get("memory_type", "fact"))
         if allowed_types and memory_type not in allowed_types:
             continue
         if not include_polluted and classify_non_claim_text(
@@ -3974,25 +4570,19 @@ def _legacy_operational_memory_views(
         relevance = _memory_relevance(memory, terms, matcher=matcher)
         if relevance <= 0 and terms:
             continue
-        memory_score = float(memory.get("memory_score", 0) or 0)
-        score = round(relevance + (memory_score * 5), 4)
-        rank = (
-            score,
-            memory_score,
-            _dt_rank(memory.get("updated_at")),
-            -sequence,
-        )
+        rank, retrieval_score = _memory_rank(memory, terms, profile, relevance)
         sequence += 1
-        push_ranked(history_heap, history_top_k, rank, memory)
+        push_ranked(history_heap, history_top_k, rank, memory, retrieval_score)
         state = str(memory.get("validity_state", "active")).lower()
         if state not in _MEMORY_HIDDEN_STATES:
-            push_ranked(current_heap, current_top_k, rank, memory)
+            push_ranked(current_heap, current_top_k, rank, memory, retrieval_score)
 
     def materialize(heap: list[tuple]) -> list[dict]:
         results: list[dict] = []
-        for score, _, _, _, memory in sorted(heap, reverse=True):
+        for _, retrieval_score, memory in sorted(heap, reverse=True):
             item = copy.deepcopy(memory)
-            item["retrieval_score"] = score
+            # Primary query coverage only; secondary signals resolve ordering.
+            item["retrieval_score"] = retrieval_score
             results.append(item)
         return results
 
@@ -4035,10 +4625,11 @@ def search_operational_memory_views(
     allowed_types = None
     if memory_types:
         allowed_types = {
-            str(item).strip().lower().replace("-", "_") for item in memory_types
+            casefold_text(item).strip().replace("-", "_") for item in memory_types
         }
     terms = _bounded_memory_query_terms(query)
     matcher = _memory_term_matcher(terms)
+    profile = _memory_query_profile(query, terms)
     candidate_limit = min(
         _operational_memory_degraded_row_limit(),
         max(128, (current_top_k + history_top_k) * 8),
@@ -4077,22 +4668,24 @@ def search_operational_memory_views(
     def push_ranked(
         heap: list[tuple],
         limit: int,
-        rank: tuple[float, float, float, int],
+        rank: tuple,
         memory: dict,
+        retrieval_score: float,
     ) -> None:
         if limit <= 0:
             return
-        entry = (*rank, memory)
+        entry = (rank, retrieval_score, memory)
         if len(heap) < limit:
             heapq.heappush(heap, entry)
-        elif rank > heap[0][:4]:
+        elif rank > heap[0][0]:
             heapq.heapreplace(heap, entry)
 
     def materialize(heap: list[tuple]) -> list[dict]:
         results: list[dict] = []
-        for score, _, _, _, memory in sorted(heap, reverse=True):
+        for _, retrieval_score, memory in sorted(heap, reverse=True):
             item = copy.deepcopy(memory)
-            item["retrieval_score"] = score
+            # This is primary query coverage, not a confidence score.
+            item["retrieval_score"] = retrieval_score
             results.append(item)
         return results
 
@@ -4112,19 +4705,12 @@ def search_operational_memory_views(
             relevance = _memory_relevance(memory, terms, matcher=matcher)
             if relevance <= 0 and terms:
                 continue
-            memory_score = float(memory.get("memory_score", 0) or 0)
-            score = round(relevance + (memory_score * 5), 4)
-            rank = (
-                score,
-                memory_score,
-                _dt_rank(memory.get("updated_at")),
-                -sequence,
-            )
+            rank, retrieval_score = _memory_rank(memory, terms, profile, relevance)
             sequence += 1
-            push_ranked(history_heap, history_top_k, rank, memory)
+            push_ranked(history_heap, history_top_k, rank, memory, retrieval_score)
             state = str(memory.get("validity_state", "active")).lower()
             if state not in _MEMORY_HIDDEN_STATES:
-                push_ranked(current_heap, current_top_k, rank, memory)
+                push_ranked(current_heap, current_top_k, rank, memory, retrieval_score)
         if indexed_signature is not None:
             integrity_after = verify_operational_memory_search_integrity(
                 conn,
@@ -6331,6 +6917,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     ]
 
     conn = get_connection()
+    _preflight_source_artifact_ownership(conn, proposed_source_artifacts)
     claim_owners, evidence_owners = _validate_canonical_id_ownership(
         conn,
         proposed_entities=proposed_entities,
@@ -6378,6 +6965,40 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
         old_evidence_records = [
             json.loads(row["data_json"]) for row in old_evidence_rows
         ]
+        # A re-extraction proposal is the base. Preserve only CURRENT, unchanged,
+        # operator-reviewed official bindings whose complete producer proof can be
+        # reverified now; fail closed before version append or page-scoped delete.
+        from vector_lake.provenance_retention import (
+            retain_current_reviewed_provenance,
+        )
+
+        proposed_claims, proposed_evidence = retain_current_reviewed_provenance(
+            conn,
+            old_claims=old_claim_records,
+            old_evidence=old_evidence_records,
+            proposed_claims=proposed_claims,
+            proposed_evidence=proposed_evidence,
+            proposed_sources=proposed_sources,
+            proposed_artifacts=proposed_source_artifacts,
+            proposed_runs=proposed_extraction_runs,
+            affected_page_keys=affected_page_keys,
+            family_resolver=lambda record: _record_family(
+                record, "claim_family_id", "claimfamily"
+            )[0],
+        )
+        claim_owners, evidence_owners = _validate_canonical_id_ownership(
+            conn,
+            proposed_entities=proposed_entities,
+            proposed_claims=proposed_claims,
+            proposed_evidence=proposed_evidence,
+            affected_page_keys=affected_page_keys,
+        )
+        _register_locator_id_ownership(
+            conn, owners=claim_owners, record_kind="claim"
+        )
+        _register_locator_id_ownership(
+            conn, owners=evidence_owners, record_kind="evidence"
+        )
         _append_version_records(
             "claim_versions",
             "claim_id",
@@ -6418,7 +7039,12 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
     _upsert_canonical_records("entities", "entity_id", proposed_entities)
     _upsert_canonical_records("claims", "claim_id", proposed_claims)
     _upsert_canonical_records("evidence", "evidence_id", proposed_evidence)
-    _upsert_canonical_records("sources", "source_id", proposed_sources)
+    _upsert_canonical_records(
+        "sources",
+        "source_id",
+        proposed_sources,
+        proposed_source_artifacts=proposed_source_artifacts,
+    )
     _upsert_foundation_records(
         proposed_entities,
         proposed_source_artifacts,

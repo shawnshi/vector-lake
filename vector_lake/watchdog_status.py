@@ -15,6 +15,8 @@ log = logging.getLogger("vector-lake-watchdog-status")
 _run_id = uuid.uuid4().hex
 _run_started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 _expected_components: tuple[str, ...] = ()
+_run_profile: str | None = None
+_run_status_path: Path | None = None
 _cached_status_path: Path | None = None
 _cached_status_identity: tuple[int, int, int, int] | None = None
 _cached_status_document: dict | None = None
@@ -148,8 +150,8 @@ def _status_document(
         components.values(),
         key=lambda item: priority.get(str(item.get("status", "idle")), 0),
     )
-    return {
-        "schema_version": 3,
+    document = {
+        "schema_version": 4 if _run_profile else 3,
         "run_id": _run_id,
         "process_id": os.getpid(),
         "started_at": _run_started_at,
@@ -162,6 +164,13 @@ def _status_document(
         "updated_at": now,
         "components": components,
     }
+    if _run_profile:
+        document["run_profile"] = {
+            "schema_version": 1,
+            "name": _run_profile,
+            "components": list(_expected_components),
+        }
+    return document
 
 
 def _publish_locked(status_file: Path, data: dict) -> bool:
@@ -254,18 +263,32 @@ def _existing_status_locked(status_file: Path) -> tuple[dict, bool]:
     return existing, True
 
 
-def begin_watchdog_run(expected_components: tuple[str, ...] | list[str]) -> str:
+def begin_watchdog_run(
+    expected_components: tuple[str, ...] | list[str],
+    *,
+    run_profile: str | None = None,
+) -> str:
     """Atomically fence prior status generations and publish the startup set.
 
     The singleton lock must already be held by the caller. Publishing the whole
     expected component inventory in one replace prevents a partially-started
     process from looking like a healthy continuation of an older PID.
     """
-    global _expected_components, _run_id, _run_started_at
+    global _expected_components, _run_id, _run_profile, _run_started_at, _run_status_path
 
     normalized = tuple(dict.fromkeys(str(item) for item in expected_components))
     if not normalized:
         raise ValueError("Watchdog expected_components cannot be empty")
+    if run_profile not in {None, "full", "maintenance"}:
+        raise ValueError("Watchdog run_profile must be full, maintenance, or omitted")
+    required_inventory = {
+        "full": ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest"),
+        "maintenance": ("watchdog", "outbox"),
+    }
+    if run_profile and normalized != required_inventory[run_profile]:
+        raise ValueError(
+            f"Watchdog {run_profile} profile requires exact component inventory"
+        )
     status_file = get_status_file()
     status_file.parent.mkdir(parents=True, exist_ok=True)
     with _status_lock:
@@ -297,6 +320,8 @@ def begin_watchdog_run(expected_components: tuple[str, ...] | list[str]) -> str:
         _run_id = uuid.uuid4().hex
         _run_started_at = _now_utc()
         _expected_components = normalized
+        _run_profile = run_profile
+        _run_status_path = status_file
         components = {
             component: _component_payload(
                 "starting",
@@ -331,10 +356,18 @@ def write_status(
     last_error: str = "",
     component: str = "watchdog",
 ) -> bool:
+    global _expected_components, _run_id, _run_profile, _run_started_at, _run_status_path
+
     status_file = get_status_file()
     status_file.parent.mkdir(parents=True, exist_ok=True)
 
     with _status_lock:
+        if _run_status_path != status_file:
+            _run_id = uuid.uuid4().hex
+            _run_started_at = _now_utc()
+            _expected_components = ()
+            _run_profile = None
+            _run_status_path = status_file
         if _expected_components and component not in _expected_components:
             log.error(
                 "Rejected unexpected watchdog component %s for run %s",

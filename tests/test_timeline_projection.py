@@ -87,7 +87,7 @@ def test_timeline_projection_tracks_add_update_and_type_conversion(isolated_memo
     assert conn.execute("SELECT description FROM timeline_events").fetchone()[0] == "Restored timeline value"
 
 
-def test_timeline_fallback_uses_payload_updated_at_not_storage_timestamp(isolated_memory):
+def test_timeline_does_not_relabel_payload_updated_at_as_event_date(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     claim = _claim("claim_payload_date", "Source_PayloadDate", "Payload dated event")
@@ -99,7 +99,7 @@ def test_timeline_fallback_uses_payload_updated_at_not_storage_timestamp(isolate
         "SELECT id, event_date FROM timeline_events WHERE description = ?",
         (claim["claim_text"],),
     ).fetchone()
-    assert original_event["event_date"] == "2026-06-02"
+    assert original_event["event_date"] == "Unknown Date"
 
     with db_store.transaction():
         conn.execute(
@@ -119,7 +119,7 @@ def test_timeline_fallback_uses_payload_updated_at_not_storage_timestamp(isolate
         (claim["claim_text"],),
     ).fetchone()
     assert rebuilt_event["id"] == original_event["id"]
-    assert rebuilt_event["event_date"] == "2026-06-02"
+    assert rebuilt_event["event_date"] == "Unknown Date"
     assert timeline_projection_parity()["missing"] == 0
     assert timeline_projection_parity()["extra"] == 0
 
@@ -147,8 +147,102 @@ def test_timeline_fallback_without_any_payload_date_is_stable(isolated_memory):
         (claim["claim_text"],),
     ).fetchone()
     assert event_after["id"] == event_before["id"]
+    assert event_after["event_date"] == "Unknown Date"
     assert timeline_projection_parity()["missing"] == 0
     assert timeline_projection_parity()["extra"] == 0
+
+
+def test_timeline_rejects_invalid_payload_dates_and_uses_valid_fallback(isolated_memory):
+    db_store.init_db()
+    claim = _claim("claim_invalid_date", "Source_InvalidDate", "Validated fallback event")
+    claim["event_date"] = {"year": 2026}
+    claim["temporal_anchor"] = "2026-Q2"
+    _apply_page("Source_InvalidDate", [claim])
+    row = db_store.get_connection().execute(
+        "SELECT event_date FROM timeline_events WHERE description = ?",
+        (claim["claim_text"],),
+    ).fetchone()
+    assert row["event_date"] == "2026-Q2"
+
+
+def test_timeline_invalid_payload_dates_become_unknown_but_timestamp_is_preserved(isolated_memory):
+    db_store.init_db()
+    invalid = _claim("claim_invalid_dates", "Source_InvalidDates", "Invalid dates")
+    invalid["event_date"] = True
+    invalid["temporal_anchor"] = "2026-02-30"
+    timestamped = _claim("claim_timestamp", "Source_Timestamp", "Timestamped event")
+    timestamped["event_date"] = "2026-09-09T12:30:00+00:00"
+    _apply_page("Source_InvalidDates", [invalid])
+    _apply_page("Source_Timestamp", [timestamped])
+    rows = db_store.get_connection().execute(
+        "SELECT description, event_date FROM timeline_events ORDER BY description"
+    ).fetchall()
+    assert [(row["description"], row["event_date"]) for row in rows] == [
+        ("Invalid dates", "Unknown Date"),
+        ("Timestamped event", "2026-09-09T12:30:00+00:00"),
+    ]
+
+
+def test_structural_prefix_repairs_date_action_and_description_on_rebuild(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    observation = _claim(
+        "claim_observation", "Source_Observation",
+        "[2026-08-24] [Observation] CMS changed [scope] only.",
+    )
+    observation["temporal_anchor"] = "2026-09-09"
+    observation["action"] = "page-default"
+    pivot = _claim(
+        "claim_pivot", "Source_Pivot",
+        "- [2024-02-29] [Pivot] Leap-day pivot.",
+    )
+    unknown_tag = _claim(
+        "claim_unknown_tag", "Source_UnknownTag",
+        "[2025-01-02] [Unexpected] Explicit unknown tag.",
+    )
+    _apply_page("Source_Observation", [observation])
+    _apply_page("Source_Pivot", [pivot])
+    _apply_page("Source_UnknownTag", [unknown_tag])
+
+    assert "CMS changed [scope] only." in search_timeline_events(action="Observation")
+    assert "Leap-day pivot." in search_timeline_events(action="Pivot")
+    assert "Explicit unknown tag." in search_timeline_events(action="Unexpected")
+    row = conn.execute(
+        "SELECT event_date, action, description FROM timeline_events "
+        "WHERE action = 'Observation'"
+    ).fetchone()
+    assert tuple(row) == ("2026-08-24", "Observation", "CMS changed [scope] only.")
+
+    before = [tuple(row) for row in conn.execute(
+        "SELECT id, event_date, action, description FROM timeline_events ORDER BY id"
+    ).fetchall()]
+    rebuild_timeline_events_from_claims(dry_run=False)
+    rebuild_timeline_events_from_claims(dry_run=False)
+    after = [tuple(row) for row in conn.execute(
+        "SELECT id, event_date, action, description FROM timeline_events ORDER BY id"
+    ).fetchall()]
+    assert after == before
+
+
+def test_unknown_dates_sort_after_dated_events_with_stable_id_tie_break(isolated_memory):
+    db_store.init_db()
+    for claim in (
+        _claim("claim_unknown_b", "Source_UnknownB", "Unknown B"),
+        _claim("claim_dated", "Source_Dated", "[2026-01-01] Dated"),
+        _claim("claim_unknown_a", "Source_UnknownA", "Unknown A"),
+    ):
+        if "[2026-01-01]" not in claim["claim_text"]:
+            claim["temporal_anchor"] = None
+            claim.pop("updated_at", None)
+        _apply_page(claim["locator"]["page_key"], [claim])
+
+    rows = db_store.get_connection().execute(
+        "SELECT id, event_date, description FROM timeline_events "
+        "ORDER BY (event_date = 'Unknown Date') ASC, event_date DESC, id ASC"
+    ).fetchall()
+    assert rows[0]["description"] == "Dated"
+    assert [row["event_date"] for row in rows[1:]] == ["Unknown Date", "Unknown Date"]
+    assert [row["id"] for row in rows[1:]] == sorted(row["id"] for row in rows[1:])
 
 
 def test_page_delete_only_removes_its_own_timeline_event(isolated_memory):

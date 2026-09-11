@@ -21,6 +21,83 @@ class TestClaimExtractor(unittest.TestCase):
         self.assertTrue(id_val.startswith("test_"))
         self.assertEqual(len(id_val.split("_")[1]), 24)
 
+    def test_full_date_timeline_metadata_preserves_claim_text_and_identity(self):
+        fm = {
+            "id": "concept_timeline",
+            "title": "Timeline Test",
+            "type": "concept",
+            "domain": "General",
+            "status": "Active",
+            "epistemic-status": "seed",
+            "categories": ["Uncategorized"],
+            "updated": "2026-09-09",
+            "temporal_anchor": "2026-09",
+            "sources": [],
+        }
+        text = "[2026-08-24] [Observation] CMS changed [scope] only."
+        result = extract_page_objects(
+            "Concept_Timeline.md",
+            fm,
+            f"## 1. 编译事实\n\nTimeline metadata fixture.\n\n"
+            f"## 2. 证据时间线\n\n{text}",
+        )
+        claim = next(item for item in result["claims"] if item["claim_type"] == "timeline-event")
+
+        self.assertEqual(claim["claim_text"], text)
+        self.assertEqual(claim["claim_id"], _stable_id("claim", f"Concept_Timeline:{text}"))
+        self.assertEqual(claim["event_date"], "2026-08-24")
+        self.assertEqual(claim["temporal_anchor"], "2026-08-24")
+        self.assertEqual(claim["event_tag"], "Observation")
+
+    def test_legacy_temporal_cleaning_preserves_canonical_text_and_identity(self):
+        fm = {
+            "id": "concept_legacy_timeline",
+            "title": "Legacy Timeline",
+            "type": "concept",
+            "domain": "General",
+            "status": "Active",
+            "epistemic-status": "seed",
+            "categories": ["Uncategorized"],
+            "updated": "2026-09-09",
+            "sources": ["raw/research/timeline-primary.md"],
+        }
+        cases = [
+            ("[2026] [Pivot] Legacy change.", "[Pivot] Legacy change.", "2026", "Pivot"),
+            ("[2026-09] [Pivot] Legacy change.", "[Pivot] Legacy change.", "2026-09", "Pivot"),
+            ("[2026-Q2] [Pivot] Legacy change.", "[Pivot] Legacy change.", "2026-Q2", "Pivot"),
+            ("[2026-H1] [Pivot] Legacy change.", "[Pivot] Legacy change.", "2026-H1", "Pivot"),
+            ("[2026] Legacy change.", "Legacy change.", "2026", None),
+            ("[2026-09] Legacy change.", "Legacy change.", "2026-09", None),
+            ("[2026-Q2] Legacy change.", "Legacy change.", "2026-Q2", None),
+            ("[2026-H1] Legacy change.", "Legacy change.", "2026-H1", None),
+            ("[2026-08-24] [Pivot] Legacy change.", "[2026-08-24] [Pivot] Legacy change.", "2026-08-24", "Pivot"),
+            ("[2026-08-24] Legacy change.", "[2026-08-24] Legacy change.", "2026-08-24", None),
+        ]
+        for raw, canonical, event_date, event_tag in cases:
+            with self.subTest(raw=raw):
+                # Baseline source-marker removal retains its preceding space;
+                # that space also participates in canonical identity.
+                canonical += " "
+                result = extract_page_objects(
+                    "Concept_Legacy_Timeline.md",
+                    fm,
+                    "## 1. 编译事实\n\nLegacy timeline fixture.\n\n"
+                    f"## 2. 证据时间线\n\n{raw} (Source: [[Source_Timeline_Inline]])",
+                )
+                claim = next(item for item in result["claims"] if item["claim_type"] == "timeline-event")
+                self.assertEqual(claim["claim_text"], canonical)
+                self.assertEqual(claim["claim_id"], _stable_id("claim", f"Concept_Legacy_Timeline:{canonical}"))
+                self.assertEqual(claim["event_date"], event_date)
+                self.assertEqual(claim["event_tag"], event_tag)
+                refs = ["raw/research/timeline-primary.md", "Source_Timeline_Inline"]
+                self.assertEqual(claim["inline_sources"], ["Source_Timeline_Inline"])
+                self.assertEqual(claim["source_ids"], [_stable_id("source", ref) for ref in refs])
+                self.assertEqual(
+                    set(claim["evidence_ids"]),
+                    {_stable_id("evidence", f"Concept_Legacy_Timeline:{ref}:{canonical}") for ref in refs},
+                )
+                self.assertEqual({source["raw_ref"] for source in result["sources"]}, set(refs))
+
     def test_extract_page_objects_basic(self):
         fm = {
             "title": "Test Concept",

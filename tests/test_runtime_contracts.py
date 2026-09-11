@@ -287,6 +287,69 @@ def test_write_wiki_page_failure_receipt_is_stable_and_sanitized(
     assert receipt["error_code"] == error_code
     assert "C:/private" not in raw_receipt
     assert "traceback sentinel" not in raw_receipt
+    assert receipt["diagnostic"] == {
+        "exception_type": "ValueError" if phase == "payload" else "RuntimeError",
+        "phase": phase,
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_type", "expected_code"),
+    [("payload", "RuntimeError", "payload_rejected"),
+     ("mutation", "RuntimeError", "write_failed"),
+     ("value", "ValueError", "invalid_request"),
+     ("safe", "Exception", "write_rejected")],
+)
+def test_write_wiki_page_diagnostic_sanitizes_custom_exception_name(
+    monkeypatch, caplog, case, expected_type, expected_code,
+):
+    from vector_lake.wiki_utils import SafeWriteError
+    secret = "PRIVATE_EXCEPTION_NAME_SENTINEL"
+    base = {"value": ValueError, "safe": SafeWriteError}.get(case, RuntimeError)
+    custom_error = type(secret, (base,), {})
+    monkeypatch.setattr(mcp_server, "_read_payload", lambda _path: "payload")
+    def fail(*_args, **_kwargs):
+        raise custom_error("C:/private/secret.md SQL secret_body")
+    if case == "payload":
+        monkeypatch.setattr(mcp_server, "_read_payload", fail)
+    else:
+        monkeypatch.setattr(mutation_coordinator, "execute_mutation_batch", fail)
+    raw = mcp_server.write_wiki_page("Source_Diagnostic.md", "C:/approved/scratch/x.md")
+    result = json.loads(raw)
+    assert result["diagnostic"] == {
+        "exception_type": expected_type, "phase": "payload" if case == "payload" else "mutation",
+    }
+    assert result["error_code"] == expected_code
+    for output in (raw, caplog.text):
+        assert secret not in output and "secret_body" not in output and "C:/private" not in output
+    records = [r for r in caplog.records if str(r.msg).startswith("write_wiki_page")]
+    assert len(records) == 1
+    assert records[0].args == (expected_type,)
+    assert result["committed"] is False
+
+
+def test_write_wiki_page_diagnostic_identifies_health_stage_without_issue_text(monkeypatch):
+    from vector_lake import runtime_health
+    monkeypatch.setattr(mcp_server, "_read_payload", lambda _path: "payload")
+    monkeypatch.delenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", raising=False)
+    monkeypatch.setattr(mutation_coordinator.db_store, "init_db", lambda: None)
+    monkeypatch.setattr(runtime_health, "assess_runtime_health", lambda **_kwargs: {"ok": False, "issues": ["PRIVATE_HEALTH_SENTINEL"]})
+    raw = mcp_server.write_wiki_page("Source_Diagnostic.md", "C:/approved/scratch/x.md")
+    result = json.loads(raw)
+    assert result["diagnostic"] == {"exception_type": "RuntimeError", "phase": "write_health"}
+    assert result["error_code"] == "write_failed"
+    assert "PRIVATE_HEALTH_SENTINEL" not in raw
+
+
+def test_write_wiki_page_diagnostic_validation_stage(isolated_memory):
+    from vector_lake.defense_hook import verify_asset
+    try:
+        verify_asset("invalid", "Source_Diagnostic.md", {}, isolated_memory / "wiki/index.json")
+    except Exception as exc:
+        diagnostic = mcp_server._sanitized_wiki_write_diagnostic(exc, "mutation")
+    else:
+        pytest.fail("invalid schema must raise")
+    assert diagnostic == {"exception_type": "DefenseHookException", "phase": "validation"}
 
 
 @pytest.mark.parametrize(

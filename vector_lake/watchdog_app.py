@@ -2726,6 +2726,80 @@ def index_worker_loop(stop_event: threading.Event | None = None):
     )
 
 
+def maintenance_outbox_worker_loop(stop_event: threading.Event | None = None):
+    """Drain only the durable mutation outbox for the maintenance profile."""
+    from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
+
+    stop_event = stop_event or threading.Event()
+    consecutive_failures = 0
+    max_failures = 5
+    write_status(
+        "idle", 0, 0, "Maintenance outbox consumer started", component="outbox"
+    )
+    while not stop_event.is_set():
+        try:
+            if consecutive_failures >= max_failures:
+                write_status(
+                    "halted", 0, 0, "Maintenance outbox consumer halted",
+                    "Max consecutive failures reached", component="outbox",
+                )
+                if stop_event.wait(60):
+                    break
+                consecutive_failures = 0
+                continue
+            from vector_lake import db_store
+
+            if not db_store.mutation_outbox_has_claimable():
+                write_status(
+                    "idle", 0, 0, "Maintenance outbox idle", component="outbox"
+                )
+                if stop_event.wait(1):
+                    break
+                continue
+            try:
+                with heavy_task(
+                    "projection", "watchdog-maintenance-outbox",
+                    origin="watchdog", wait_timeout_seconds=0, warn_after_seconds=900,
+                ):
+                    with global_task_lock:
+                        stats = process_mutation_outbox_batch(limit=50)
+            except HeavyTaskBusy:
+                write_status(
+                    "idle", 0, 0, "Maintenance outbox deferred by heavy-task gate",
+                    component="outbox",
+                )
+                if stop_event.wait(1):
+                    break
+                continue
+            consecutive_failures = 0
+            write_status(
+                "processing" if stats["claimed"] else "idle",
+                stats["completed"], 0, f"Maintenance outbox batch: {stats}",
+                component="outbox",
+            )
+            if stop_event.wait(
+                _outbox_batch_yield_seconds() if stats["completed"] else 1
+            ):
+                break
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            consecutive_failures += 1
+            write_status(
+                "error", 0, 0, "Maintenance outbox consumer exception",
+                str(exc), component="outbox",
+            )
+            if stop_event.wait(min(2**consecutive_failures, 60)):
+                break
+        finally:
+            from vector_lake.db_store import close_connection
+
+            close_connection()
+    write_status(
+        "stopped", 0, 0, "Maintenance outbox consumer stopped", component="outbox"
+    )
+
+
 def expire_stale_ingest_jobs_for_watchdog() -> int:
     """Run the bounded ingest expiry used by the hourly scheduler."""
     from vector_lake.db_store import expire_stale_subagent_jobs
@@ -3140,14 +3214,118 @@ def _check_projection_store_for_startup() -> None:
         )
 
 
-def _start_watchdog_locked(stop_event: threading.Event | None = None):
+def _run_maintenance_watchdog(stop_event: threading.Event) -> None:
+    """Run the fenced watchdog/outbox maintenance profile without ingress."""
+    worker_stop_event = threading.Event()
+    stop_request_path = watchdog_stop_request_path()
+    stop_request_path.unlink(missing_ok=True)
+    begin_watchdog_run(
+        ("watchdog", "outbox"),
+        run_profile="maintenance",
+    )
+    try:
+        _check_projection_store_for_startup()
+    except Exception as exc:
+        write_status(
+            "halted", 0, 0, "Watchdog startup projection check failed; recovery required",
+            str(exc), component="watchdog",
+        )
+        raise
+
+    def build_worker() -> threading.Thread:
+        return threading.Thread(
+            target=maintenance_outbox_worker_loop,
+            args=(worker_stop_event,),
+            daemon=True,
+            name="vector-lake-maintenance-outbox-worker",
+        )
+
+    worker = build_worker()
+    _register_background_threads({"outbox": worker})
+    restart_attempts = 0
+    restart_limit = _bounded_env_int(
+        "VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT", 2
+    )
+    failure_reason = ""
+    try:
+        worker.start()
+        write_status(
+            "idle", 0, 0, "Maintenance watchdog started", component="watchdog"
+        )
+        heartbeat_seconds = _bounded_env_float(
+            "VECTOR_LAKE_WATCHDOG_HEARTBEAT_SECONDS", 30.0,
+            minimum=1.0, maximum=120.0,
+        )
+        monitor_seconds = _bounded_env_float(
+            "VECTOR_LAKE_WATCHDOG_MONITOR_SECONDS", 1.0,
+            minimum=0.05, maximum=10.0,
+        )
+        last_heartbeat = 0.0
+        while not stop_event.wait(monitor_seconds):
+            if stop_request_path.exists():
+                stop_event.set()
+                break
+            if not worker.is_alive():
+                if restart_attempts >= restart_limit:
+                    failure_reason = (
+                        "required background worker unavailable after restart budget: outbox"
+                    )
+                    write_status(
+                        "halted", 0, 0, "Required background worker unavailable",
+                        failure_reason, component="outbox",
+                    )
+                    stop_event.set()
+                    break
+                restart_attempts += 1
+                worker = build_worker()
+                _register_background_threads({"outbox": worker})
+                worker.start()
+                write_status(
+                    "starting", 0, 0, "Background worker restarted",
+                    f"restart_attempt={restart_attempts}/{restart_limit}",
+                    component="outbox",
+                )
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_seconds:
+                write_status(
+                    "idle", 0, 0, "Maintenance watchdog heartbeat",
+                    component="watchdog",
+                )
+                last_heartbeat = now
+    finally:
+        stop_event.set()
+        worker_stop_event.set()
+        stop_request_path.unlink(missing_ok=True)
+        alive = _join_threads_bounded(
+            {"outbox": worker}, _shutdown_timeout_seconds()
+        )
+        shutdown_detail = failure_reason
+        if alive:
+            shutdown_detail = "; ".join(
+                item for item in (failure_reason, "worker_join_timeout:outbox") if item
+            )
+        write_status(
+            "halted" if shutdown_detail else "stopped", 0, 0,
+            "Watchdog shutdown incomplete" if shutdown_detail else "Watchdog stopped",
+            shutdown_detail, component="watchdog",
+        )
+
+
+def _start_watchdog_locked(
+    stop_event: threading.Event | None = None,
+    *,
+    maintenance: bool = False,
+):
     stop_event = stop_event or threading.Event()
+    if maintenance:
+        return _run_maintenance_watchdog(stop_event)
     worker_stop_event = threading.Event()
     auto_stop_event = threading.Event()
     stop_request_path = watchdog_stop_request_path()
     stop_request_path.unlink(missing_ok=True)
     begin_watchdog_run(
-        ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")
+        ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest"),
+        run_profile="full",
     )
     try:
         _check_projection_store_for_startup()
@@ -3756,7 +3934,11 @@ def _start_watchdog_locked(stop_event: threading.Event | None = None):
         )
 
 
-def start_watchdog(stop_event: threading.Event | None = None):
+def start_watchdog(
+    stop_event: threading.Event | None = None,
+    *,
+    maintenance: bool = False,
+):
     """Run exactly one watchdog instance for the active MEMORY root."""
     from filelock import FileLock, Timeout
     from vector_lake.wiki_utils import get_meta_dir
@@ -3769,7 +3951,10 @@ def start_watchdog(stop_event: threading.Event | None = None):
             "A Vector Lake watchdog instance is already running for this MEMORY root."
         ) from exc
     try:
-        return _start_watchdog_locked(stop_event=stop_event)
+        return _start_watchdog_locked(
+            stop_event=stop_event,
+            maintenance=maintenance,
+        )
     finally:
         instance_lock.release()
 

@@ -10,14 +10,16 @@ def _bootstrap_runtime_paths(config_path: Path | None = None) -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments not in ([], ["--stop"]):
-        raise SystemExit("usage: watchdog_sync.py [--stop]")
+    if arguments not in ([], ["--stop"], ["--maintenance"]):
+        raise SystemExit("usage: watchdog_sync.py [--stop | --maintenance]")
 
     _bootstrap_runtime_paths()
     from vector_lake.watchdog_app import request_watchdog_stop, start_watchdog
 
     if arguments == ["--stop"]:
         print(f"Watchdog stop requested: {request_watchdog_stop()}")
+    elif arguments == ["--maintenance"]:
+        start_watchdog(maintenance=True)
     else:
         start_watchdog()
     return 0

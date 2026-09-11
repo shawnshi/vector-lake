@@ -47,6 +47,7 @@ _CLI_HEAVY_TASKS = {
     "topology-queue-cleanup": ("maintenance", 900.0),
     "unsupported-claim-debt": ("maintenance", 900.0),
     "claim-provenance-repair": ("maintenance", 900.0),
+    "claim-placeholder-cleanup": ("maintenance", 900.0),
     "wiki-restore": ("maintenance", 900.0),
 }
 
@@ -785,6 +786,22 @@ Usage Examples:
         default="",
         help="Frozen claim-provenance-source-map/v1 JSON file inside MEMORY.",
     )
+    placeholder_cleanup_parser = subparsers.add_parser(
+        "claim-placeholder-cleanup",
+        help="[MAINTENANCE] Preview or remove an exact generated-placeholder scope.",
+    )
+    placeholder_cleanup_parser.add_argument(
+        "--claim-id", action="append", required=True,
+        help="Exact claim ID; repeat for each selected placeholder.",
+    )
+    placeholder_cleanup_parser.add_argument(
+        "--apply", action="store_true",
+        help="Apply the exact previewed scope. Defaults to dry-run.",
+    )
+    placeholder_cleanup_parser.add_argument(
+        "--confirm-fingerprint", default="",
+        help="Exact candidate fingerprint returned by the matching preview.",
+    )
 
     review_parser = subparsers.add_parser(
         "review",
@@ -1331,6 +1348,19 @@ def main() -> int:
                         runtime_only=True,
                         confirmation=getattr(args, "confirm_fingerprint", ""),
                         source_map_path=getattr(args, "source_map", ""),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "claim-placeholder-cleanup":
+            print(
+                json.dumps(
+                    tools.cleanup_placeholder_claims(
+                        source_claim_ids=getattr(args, "claim_id", []),
+                        dry_run=not getattr(args, "apply", False),
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
                     ),
                     ensure_ascii=False,
                     indent=2,

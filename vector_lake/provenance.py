@@ -18,16 +18,24 @@ def build_trace_for_query(
         raise ValueError("top_k must be non-negative")
     if top_k == 0:
         return {"query": query, "items": []}
-    tokens = _tokenize(query)
-
-    if relevant_pages is None:
-        from vector_lake.db_store import search_wiki
-
-        search_results = search_wiki(query, limit=10)
-        relevant_pages = {res["node_key"] for res in search_results}
+    normalized_query = str(query or "").strip()
+    exact_claim_id = normalized_query.startswith("claim_") and not any(
+        char.isspace() for char in normalized_query
+    )
+    if exact_claim_id:
+        claims = governance_store.select_trace_claim_by_id(normalized_query)
+        if not claims:
+            return {"query": query, "items": []}
     else:
-        relevant_pages = {str(page) for page in relevant_pages if str(page)}
-    claims = governance_store.select_trace_claims(tokens, relevant_pages, top_k)
+        tokens = _tokenize(query)
+        if relevant_pages is None:
+            from vector_lake.db_store import search_wiki
+
+            search_results = search_wiki(query, limit=10)
+            relevant_pages = {res["node_key"] for res in search_results}
+        else:
+            relevant_pages = {str(page) for page in relevant_pages if str(page)}
+        claims = governance_store.select_trace_claims(tokens, relevant_pages, top_k)
     entity_ids = {
         str(entity_id)
         for claim in claims
@@ -36,7 +44,7 @@ def build_trace_for_query(
     source_ids = {
         str(source_id) for claim in claims for source_id in claim.get("source_ids", [])
     }
-    entity_names, source_pages = governance_store.load_trace_labels(
+    entity_names, source_pages, source_traces = governance_store.load_trace_labels(
         entity_ids,
         source_ids,
     )
@@ -44,6 +52,7 @@ def build_trace_for_query(
     trace_items = []
     for claim in claims:
         annotated = governance_metrics.annotate_claim_validity(claim)
+        evidence_count = len(annotated.get("evidence_ids", []))
         trace_items.append(
             {
                 "claim_id": annotated["claim_id"],
@@ -58,11 +67,29 @@ def build_trace_for_query(
                     for source_id in annotated.get("source_ids", [])
                     if source_id in source_pages
                 ],
+                "sources": [
+                    {
+                        **source_traces.get(
+                            source_id,
+                            {
+                                "source_id": source_id,
+                                "raw_ref": "",
+                                "page": None,
+                                "resolution": "unresolved",
+                                "reason": "unknown_source",
+                            },
+                        ),
+                        "locator": annotated.get("locator", {}),
+                    }
+                    for source_id in annotated.get("source_ids", [])
+                ],
                 "confidence": annotated.get("confidence"),
                 "valid_to": annotated.get("valid_to"),
                 "review_after": annotated.get("review_after"),
                 "validity_state": annotated.get("validity_state"),
-                "evidence_count": len(annotated.get("evidence_ids", [])),
+                "evidence_count": evidence_count,
+                "acceptance_status": "not_assessed",
+                "accepted_fact": False,
                 "locator": annotated.get("locator", {}),
             }
         )
@@ -81,9 +108,17 @@ def format_trace(trace: dict) -> str:
             lines.append(f"  Entities: {', '.join(item['subject_entities'])}")
         if item["source_pages"]:
             lines.append(f"  Source Pages: {', '.join(item['source_pages'])}")
+        for source in item.get("sources", []):
+            if source.get("resolution") != "resolved":
+                lines.append(
+                    f"  Source: {source.get('source_id')} "
+                    f"[{source.get('resolution')}: {source.get('reason')}]"
+                )
         lines.append(f"  Confidence: {item.get('confidence')}")
         lines.append(f"  Validity: {item.get('validity_state')}")
         lines.append(f"  Evidence Count: {item.get('evidence_count')}")
+        lines.append(f"  Acceptance: {item.get('acceptance_status', 'not_assessed')}")
+        lines.append(f"  Accepted Fact: {item.get('accepted_fact', False)}")
         locator = item.get("locator") or {}
         if locator:
             lines.append(

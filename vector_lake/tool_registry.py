@@ -12,6 +12,7 @@ from threading import RLock
 _GROUPS: dict[str, tuple[str, ...]] = {
     "vector_lake.claim_assessment": ("record_claim_assessment",),
     "vector_lake.tool_claim_provenance": ("repair_claim_provenance",),
+    "vector_lake.tool_claim_cleanup": ("cleanup_placeholder_claims",),
     "vector_lake.tool_delete": ("delete_source",),
     "vector_lake.tool_doctor": (
         "doctor_vector_lake",

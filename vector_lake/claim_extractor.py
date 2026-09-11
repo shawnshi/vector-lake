@@ -12,8 +12,11 @@ from vector_lake.evidence_foundation import (
     source_locator_for,
     version_family_id,
 )
-from vector_lake.wiki_utils import normalize_sources
+from vector_lake.wiki_utils import normalize_raw_ref, normalize_sources
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
+from vector_lake.source_references import canonical_source_page_for_ref
+from vector_lake.timeline_semantics import parse_timeline_prefix
+from vector_lake.operational_memory_contract import is_operational_source_marker
 import logging
 
 log = logging.getLogger("vector-lake-claim-extractor")
@@ -221,7 +224,38 @@ def _validity_defaults(frontmatter: dict) -> dict:
         "importance_score": frontmatter.get("importance_score"),
         "reinforcement_count": frontmatter.get("reinforcement_count"),
         "ttl_days": frontmatter.get("ttl_days") or frontmatter.get("ttl"),
+        "authoring_origin": frontmatter.get("authoring_origin"),
     }
+
+
+_SOURCE_BINDING_CONFLICT = "conflicting source identity bindings"
+_SOURCE_CONFIG_CONFLICT = "conflicting source configuration bindings"
+
+
+def _bind_source_refs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep legacy identity while retaining one truthful physical reference."""
+    bindings: dict[str, tuple[str, str]] = {}
+    for identity_ref, physical_ref in pairs:
+        physical_key = normalize_raw_ref(physical_ref)
+        previous = bindings.get(identity_ref)
+        if previous and previous[0] != physical_key:
+            raise ValueError(_SOURCE_BINDING_CONFLICT)
+        if not previous:
+            bindings[identity_ref] = (physical_key, physical_ref)
+    return [(identity, physical) for identity, (_, physical) in bindings.items()]
+
+
+def _source_config(config: dict, physical_ref: str, identity_ref: str):
+    physical_present = physical_ref in config
+    legacy_present = identity_ref in config
+    if physical_present and legacy_present and physical_ref != identity_ref:
+        if config[physical_ref] != config[identity_ref]:
+            raise ValueError(_SOURCE_CONFIG_CONFLICT)
+    if physical_present:
+        return config[physical_ref]
+    if legacy_present:
+        return config[identity_ref]
+    return None
 
 
 def extract_page_objects(
@@ -240,7 +274,14 @@ def extract_page_objects(
     if isinstance(aliases, str):
         aliases = [aliases]
     aliases = [str(alias).strip() for alias in aliases if alias and str(alias).strip()]
-    sources = normalize_sources(frontmatter.get("sources") or [])
+    raw_frontmatter_sources = frontmatter.get("sources") or []
+    if isinstance(raw_frontmatter_sources, str):
+        raw_frontmatter_sources = [raw_frontmatter_sources]
+    raw_frontmatter_sources = [
+        str(value).strip() for value in raw_frontmatter_sources
+        if value and str(value).strip()
+    ]
+    sources = normalize_sources(raw_frontmatter_sources)
     summary = frontmatter.get("summary") or _body_summary(body)
     validity_defaults = _validity_defaults(frontmatter)
 
@@ -258,19 +299,17 @@ def extract_page_objects(
             "page_type": page_type,
         }
 
-    def _parse_temporal(text: str):
-        match = re.match(r"^\[(20\d\d(?:-[H|Q]\d|-[0-1]\d)?)\]\s*", text)
-        if match:
-            return match.group(1), text[match.end():]
-        return None, text
-
-    def _parse_inline_sources(raw_text: str):
+    def _parse_original_inline_sources(raw_text: str):
         found_sources = []
         for match in re.finditer(r"\(Source[s]?:\s*(.*?)\)", raw_text, flags=re.IGNORECASE):
             content = match.group(1)
             for m2 in re.finditer(r"\[\[(.*?)\]\]", content):
-                found_sources.append(m2.group(1).split("|")[0].strip().replace(".md", ""))
+                found_sources.append(m2.group(1).split("|")[0].strip())
         return found_sources
+
+    def _parse_inline_sources(raw_text: str):
+        # Retain the legacy lossy normalization for source/evidence identity.
+        return [value.replace(".md", "") for value in _parse_original_inline_sources(raw_text)]
 
     subject_entity_ids = []
     entity_records = []
@@ -350,34 +389,56 @@ def extract_page_objects(
             "text": summary,
         }]
 
-    inline_source_refs = []
+    inline_source_pairs = []
     for block in blocks:
-        inline_source_refs.extend(
-            _parse_inline_sources(block.get("raw_text", block.get("text", "")))
-        )
-    all_source_refs = list(dict.fromkeys([*sources, *inline_source_refs]))
+        raw_text = block.get("raw_text", block.get("text", ""))
+        originals = _parse_original_inline_sources(raw_text)
+        inline_source_pairs.extend((value.replace(".md", ""), value) for value in originals)
+    frontmatter_pairs = [
+        (normalize_sources([raw_ref])[0], raw_ref)
+        for raw_ref in raw_frontmatter_sources
+    ]
+    source_bindings = _bind_source_refs([*frontmatter_pairs, *inline_source_pairs])
+    physical_ref_by_identity = dict(source_bindings)
     source_metadata = frontmatter.get("source_artifacts") or {}
     if not isinstance(source_metadata, dict):
         source_metadata = {}
     artifact_by_source_id = {}
     source_id_by_ref = {}
     source_artifact_records = []
-    for raw_ref in all_source_refs:
-        source_id = _stable_id("source", raw_ref)
-        source_id_by_ref[raw_ref] = source_id
-        metadata = source_metadata.get(raw_ref) or {}
+    source_locators = frontmatter.get("source_locators") or {}
+    if not isinstance(source_locators, dict):
+        source_locators = {}
+    locator_frontmatter = dict(frontmatter)
+    locator_map = dict(source_locators)
+    metadata_by_physical_ref = {}
+    for identity_ref, physical_ref in source_bindings:
+        metadata_by_physical_ref[physical_ref] = _source_config(
+            source_metadata, physical_ref, identity_ref
+        )
+        locator = _source_config(source_locators, physical_ref, identity_ref)
+        if locator is not None:
+            locator_map[physical_ref] = locator
+    locator_frontmatter["source_locators"] = locator_map
+    for identity_ref, physical_ref in source_bindings:
+        source_id = _stable_id("source", identity_ref)
+        source_id_by_ref[identity_ref] = source_id
+        metadata = metadata_by_physical_ref[physical_ref] or {}
         if not isinstance(metadata, dict):
             metadata = {}
-        artifact = resolve_source_artifact(raw_ref, source_id=source_id, metadata=metadata)
+        artifact = resolve_source_artifact(physical_ref, source_id=source_id, metadata=metadata)
         artifact_by_source_id[source_id] = artifact
         source_artifact_records.append(artifact)
         source_records.append({
             "source_id": source_id,
             "artifact_id": artifact["artifact_id"],
-            "raw_ref": raw_ref,
-            "canonical_source_page": page_name if page_type == "source" else f"Source_{os.path.splitext(os.path.basename(raw_ref))[0]}.md",
-            "source_type": os.path.splitext(raw_ref)[1].lstrip(".").lower() or "md",
-            "title": title if page_type == "source" else os.path.basename(raw_ref),
+            "raw_ref": artifact["raw_ref"],
+            "canonical_source_page": canonical_source_page_for_ref(
+                physical_ref,
+                owning_page=page_name if page_type == "source" else "",
+            ),
+            "source_type": os.path.splitext(physical_ref)[1].lstrip(".").lower() or "md",
+            "title": title if page_type == "source" else os.path.basename(physical_ref),
             "ingested_at": now,
             "content_hash": artifact["content_hash"],
             "hash_algorithm": artifact["hash_algorithm"],
@@ -407,11 +468,26 @@ def extract_page_objects(
     )
 
     for block_index, block in enumerate(blocks, start=1):
-        block_temporal, cleaned_text = _parse_temporal(block["text"])
+        timeline_prefix = parse_timeline_prefix(block["text"])
+        block_temporal = timeline_prefix.event_date
+        # Preserve the established identity behavior for legacy coarse dates.
+        # Full dates were previously canonical text, so adding their metadata
+        # must not change claim_text or claim_id.
+        cleaned_text = block["text"]
+        if timeline_prefix.precision in {"year", "month", "quarter", "half"}:
+            # Baseline canonicalization removed only the coarse date.  Keep a
+            # following tag because it participates in stable claim identity.
+            cleaned_text = re.sub(
+                rf"^\[{re.escape(timeline_prefix.event_date)}\]\s*",
+                "",
+                cleaned_text,
+                count=1,
+            )
         final_temporal = block_temporal or validity_defaults.get("temporal_anchor")
 
         raw_text = block.get("raw_text", block["text"])
         inline_sources = _parse_inline_sources(raw_text)
+        original_inline_sources = _parse_original_inline_sources(raw_text)
 
         custom_claim_type = _claim_type_for_block(block["kind"])
         heading = block.get("heading") or title
@@ -423,6 +499,10 @@ def extract_page_objects(
             
         combined_sources = list(dict.fromkeys([*sources, *inline_sources]))
         combined_source_ids = [source_id_by_ref[raw_ref] for raw_ref in combined_sources]
+        operational_memory_provenance = any(
+            is_operational_source_marker(raw_ref)
+            for raw_ref in [*raw_frontmatter_sources, *original_inline_sources]
+        )
 
         evidence_ids = []
         for raw_ref, source_id in zip(combined_sources, combined_source_ids):
@@ -436,6 +516,7 @@ def extract_page_objects(
                 "block_index": block_index,
             }
             artifact = artifact_by_source_id[source_id]
+            physical_ref = physical_ref_by_identity[raw_ref]
             evidence_records.append({
                 "evidence_id": evidence_id,
                 "evidence_family_id": version_family_id(
@@ -452,8 +533,8 @@ def extract_page_objects(
                 "locator": projection_locator,
                 "projection_locator": projection_locator,
                 "source_locator": source_locator_for(
-                    frontmatter,
-                    raw_ref,
+                    locator_frontmatter,
+                    physical_ref,
                     artifact=artifact,
                 ),
                 "evidence_text": cleaned_text,
@@ -461,7 +542,7 @@ def extract_page_objects(
                 "created_at": now,
                 "extraction_run_id": extraction_run["run_id"],
                 **evidence_independence(
-                    raw_ref,
+                    physical_ref,
                     page_name,
                     artifact["generation_parent_refs"],
                 ),
@@ -498,9 +579,12 @@ def extract_page_objects(
             "locator": claim_locator,
             **validity_defaults,
             "temporal_anchor": final_temporal,
+            "event_date": block_temporal,
+            "event_tag": timeline_prefix.event_tag,
             "created_at": _jsonable(frontmatter.get("created", now)),
             "updated_at": _jsonable(frontmatter.get("updated", now)),
             "source_page": page_name,
+            "operational_memory_provenance": operational_memory_provenance,
         })
         claim_records.append(claim_record)
         if evidence_ids:
@@ -508,7 +592,16 @@ def extract_page_objects(
                 evidence_record["supports_claim_ids"].append(claim_id)
 
     if summary:
-        summary_temporal, cleaned_summary = _parse_temporal(summary)
+        summary_prefix = parse_timeline_prefix(summary)
+        summary_temporal = summary_prefix.event_date
+        cleaned_summary = summary
+        if summary_prefix.precision in {"year", "month", "quarter", "half"}:
+            cleaned_summary = re.sub(
+                rf"^\[{re.escape(summary_prefix.event_date)}\]\s*",
+                "",
+                cleaned_summary,
+                count=1,
+            )
         final_summary_temporal = summary_temporal or validity_defaults.get("temporal_anchor")
 
         summary_evidence_ids = []
@@ -517,6 +610,7 @@ def extract_page_objects(
             summary_evidence_ids.append(evidence_id)
             projection_locator = {"page_key": page_key, "heading": title, "block_index": 0}
             artifact = artifact_by_source_id[source_id]
+            physical_ref = physical_ref_by_identity[raw_ref]
             evidence_records.append({
                 "evidence_id": evidence_id,
                 "evidence_family_id": version_family_id(
@@ -529,8 +623,8 @@ def extract_page_objects(
                 "locator": projection_locator,
                 "projection_locator": projection_locator,
                 "source_locator": source_locator_for(
-                    frontmatter,
-                    raw_ref,
+                    locator_frontmatter,
+                    physical_ref,
                     artifact=artifact,
                 ),
                 "evidence_text": cleaned_summary,
@@ -538,7 +632,7 @@ def extract_page_objects(
                 "created_at": now,
                 "extraction_run_id": extraction_run["run_id"],
                 **evidence_independence(
-                    raw_ref,
+                    physical_ref,
                     page_name,
                     artifact["generation_parent_refs"],
                 ),
@@ -568,9 +662,14 @@ def extract_page_objects(
             "locator": summary_locator,
             **validity_defaults,
             "temporal_anchor": final_summary_temporal,
+            "event_date": summary_temporal,
+            "event_tag": summary_prefix.event_tag,
             "created_at": _jsonable(frontmatter.get("created", now)),
             "updated_at": _jsonable(frontmatter.get("updated", now)),
             "source_page": page_name,
+            "operational_memory_provenance": any(
+                is_operational_source_marker(raw_ref) for raw_ref in raw_frontmatter_sources
+            ),
         })
         if summary_evidence_ids:
             claim_records.append(summary_claim)

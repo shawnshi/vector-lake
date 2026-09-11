@@ -131,6 +131,14 @@ def test_lightweight_context_uses_bounded_sqlite_projection(
         lambda _conn, _query, _limit: [],
     )
     monkeypatch.setattr(
+        tool_search,
+        "_load_current_plaintext_rows",
+        lambda _conn, keys, _query, **_kwargs: {
+            key: {"status": "available", "snippet": "bounded evidence", "truncated": False, "title": "Seed"}
+            for key in keys
+        },
+    )
+    monkeypatch.setattr(
         db_store,
         "search_wiki",
         lambda _query, limit: [
@@ -194,6 +202,7 @@ def test_lightweight_question_without_fts_hits_skips_identity_scan(
         lambda _conn: None,
     )
     monkeypatch.setattr(db_store, "search_wiki", lambda _query, limit: [])
+    monkeypatch.setattr(tool_search, "_load_current_plaintext_rows", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         tool_search,
         "_sqlite_identity_rows",
@@ -410,6 +419,14 @@ def test_graph_expansion_applies_same_eligibility_gate(
         lambda *_args, **_kwargs: [{"node_key": "Seed", "rank": -1.0}],
     )
     monkeypatch.setattr(tool_search, "_get_query_embedding", lambda *_args: [])
+    monkeypatch.setattr(
+        tool_search,
+        "_load_current_plaintext_rows",
+        lambda _conn, keys, _query, **_kwargs: {
+            key: {"status": "available", "snippet": f"# {nodes[key]['title']}", "truncated": False}
+            for key in keys
+        },
+    )
     monkeypatch.setattr(tool_search, "_expand_query_locally", lambda *_args: ["seed"])
 
     for key, record in nodes.items():

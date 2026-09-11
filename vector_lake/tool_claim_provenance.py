@@ -650,16 +650,9 @@ _SOURCE_PAGE_FILENAME_RE = re.compile(
 
 
 def _normalize_source_page_ref(value: str) -> str:
-    source_ref = str(value or "").strip()
-    if source_ref.endswith(".md"):
-        source_ref = source_ref[:-3]
-    if (
-        not source_ref.startswith("Source_")
-        or any(char in source_ref for char in "/\\[]|#")
-        or any(char.isspace() for char in source_ref)
-    ):
-        return ""
-    return source_ref
+    from vector_lake.source_references import normalize_explicit_source_page_ref
+
+    return normalize_explicit_source_page_ref(value)
 
 
 def _inside_markdown_spans(spans: list[tuple[int, int]], offset: int) -> bool:

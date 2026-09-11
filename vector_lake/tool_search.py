@@ -1,5 +1,6 @@
 import logging
 import heapq
+import hashlib
 import json
 import math
 import os
@@ -139,6 +140,442 @@ _EXACT_IDENTITY_WEIGHTS = {
     "title": 116.0,
     "alias": 112.0,
 }
+
+_PLAINTEXT_RECORD_BYTE_LIMIT = 256 * 1024
+_PLAINTEXT_SCAN_CHAR_LIMIT = 64 * 1024
+_PAGE_SNIPPET_CHAR_LIMIT = 1_000
+_CONTEXT_SNIPPET_CHAR_LIMIT = 1_200
+_QUERY_PATTERN_LIMIT = 32
+_QUERY_PATTERN_CHAR_LIMIT = 256
+_INCOMPLETE_FOOTNOTE_MARKER = " [footnote incomplete]"
+_CITATION_CLOSURE_ATOM_LIMIT = 32
+_CITATION_CLOSURE_SCAN_LIMIT = 4_096
+_CITATION_CLOSURE_WHITESPACE_LIMIT = 32
+_HIDDEN_PLAINTEXT_STATES = {
+    "archived", "decayed", "deleted", "expired", "superseded",
+}
+_STRUCTURAL_PAGE_KEYS = {"concept_orphan-index"}
+
+
+def _incomplete_marker(limit: int) -> str:
+    if limit >= len(_INCOMPLETE_FOOTNOTE_MARKER) + 8:
+        return _INCOMPLETE_FOOTNOTE_MARKER
+    if limit >= len(" [incomplete]"):
+        return " [incomplete]"
+    if limit >= len("[!]"):
+        return "[!]"
+    return "!"[:max(0, limit)]
+
+
+def _safe_evidence_prefix(text: str, limit: int) -> str:
+    """Cut text without leaving half a footnote token or Source anchor."""
+    prefix = text[:max(0, limit)]
+    last_close = prefix.rfind("]")
+    last_ref = prefix.rfind("[^")
+    if last_ref > last_close:
+        prefix = prefix[:last_ref]
+    # Inspect enough of the original text to recognize a header cut mid-token.
+    # Use the same grammar as boundary expansion for both Source and Sources.
+    for anchor in re.finditer(r"\(Sources?:", text[:len(prefix) + 9], re.I):
+        if anchor.start() >= len(prefix):
+            break
+        closed_end, _ = _bounded_citation_closure(prefix, anchor.start())
+        if closed_end <= anchor.start():
+            prefix = prefix[:anchor.start()]
+            break
+    return prefix.rstrip()
+
+
+def _bounded_citation_closure(text: str, offset: int) -> tuple[int, bool]:
+    """Scan one bounded sequence of attached footnotes and Source anchors."""
+    origin = max(0, min(len(text), int(offset)))
+    scan_end = min(len(text), origin + _CITATION_CLOSURE_SCAN_LIMIT)
+    position = origin
+    accepted_end = origin
+    atoms = 0
+
+    def whitespace_end(start: int) -> tuple[int, bool]:
+        cursor = start
+        while cursor < scan_end and text[cursor].isspace():
+            cursor += 1
+            if cursor - start > _CITATION_CLOSURE_WHITESPACE_LIMIT:
+                return start, True
+        return cursor, False
+
+    def source_end(start: int) -> tuple[int | None, bool]:
+        header = re.match(r"\((?:Source|Sources):", text[start:], re.I)
+        if not header:
+            return None, False
+        cursor = start + len(header.group(0))
+        cursor, exhausted = whitespace_end(cursor)
+        if exhausted or not text.startswith("[[", cursor):
+            return None, True
+        close = text.find("]]", cursor + 2, scan_end)
+        if close < 0:
+            return None, True
+        cursor = close + 2
+        cursor, exhausted = whitespace_end(cursor)
+        if exhausted or cursor >= scan_end or text[cursor] != ")":
+            return None, True
+        return cursor + 1, False
+
+    while atoms < _CITATION_CLOSURE_ATOM_LIMIT:
+        atom_start, exhausted = whitespace_end(position)
+        if exhausted:
+            return accepted_end, True
+        separator_end = atom_start
+        if separator_end < scan_end and text[separator_end] in ",;":
+            separator_end += 1
+            separator_end, exhausted = whitespace_end(separator_end)
+            if exhausted:
+                return accepted_end, True
+
+        atom_end = None
+        malformed = False
+        footnote = re.match(r"\[\^[^\]\r\n]{1,256}\](?!:)", text[separator_end:scan_end])
+        if footnote:
+            atom_end = separator_end + len(footnote.group(0))
+        elif re.match(
+            r"\[\^[^\]\r\n]{1,256}\]:", text[separator_end:scan_end]
+        ):
+            return accepted_end, False
+        elif text.startswith("[^", separator_end):
+            malformed = True
+        else:
+            atom_end, malformed = source_end(separator_end)
+        if malformed:
+            return accepted_end, True
+        if atom_end is None:
+            return accepted_end, False
+        atoms += 1
+        accepted_end = atom_end
+        position = atom_end
+
+    probe, exhausted = whitespace_end(position)
+    if exhausted:
+        return accepted_end, True
+    if probe < scan_end and text[probe] in ",;":
+        probe += 1
+        probe, exhausted = whitespace_end(probe)
+    more = (
+        exhausted
+        or text.startswith("[^", probe)
+        or re.match(r"\((?:Source|Sources):", text[probe:], re.I) is not None
+    )
+    return accepted_end, bool(more)
+
+
+def _query_literal_patterns(query: str) -> list[re.Pattern]:
+    """Compile literal phrases/words; match offsets always belong to source text."""
+    normalized = str(query or "").strip()
+    values = [normalized]
+    values.extend(
+        term for term in re.findall(r"[\w\u3400-\u9fff]+", normalized)
+        if len(term) > 1 and term.casefold() not in STOP_WORDS
+    )
+    patterns = []
+    seen = set()
+    for value in values:
+        value = value[:_QUERY_PATTERN_CHAR_LIMIT]
+        folded = value.casefold()
+        if value and folded not in seen:
+            seen.add(folded)
+            patterns.append(re.compile(re.escape(value), re.IGNORECASE))
+            if len(patterns) >= _QUERY_PATTERN_LIMIT:
+                break
+    return patterns
+
+
+def _is_boilerplate_block(block: str) -> bool:
+    """Recognize standalone generated/navigation blocks, not quoted discussion."""
+    stripped = block.strip()
+    if not stripped or stripped.startswith((">", "“", '"', "```", "~~~", "`")):
+        return False
+    lowered = stripped.casefold()
+    return bool(
+        re.fullmatch(
+            r"<!--\s*(?:generated|navigation|cursor|metadata|chunking rule|"
+            r"provenance anchoring)(?:\s|:)[\s\S]*?-->",
+            stripped,
+            re.I,
+        )
+        or re.fullmatch(r"#{1,6}\s+(?:cursor|metadata|navigation|generated links)\s*", stripped, re.I)
+        or re.fullmatch(
+            r"\*?\[(?:system|assistant|developer) directive:\s*"
+            r"this section represents[^\]\r\n]*\]\*?",
+            stripped,
+            re.I,
+        )
+        or re.fullmatch(
+            r"(?:#{1,6}\s*)?(?:chunking rule|provenance anchoring)\s*"
+            r"(?::\s*(?:this (?:section|page|chunk)[^\r\n]*))?",
+            stripped,
+            re.I,
+        )
+        or re.fullmatch(
+            r"this (?:page|section|document) (?:is|was) (?:automatically |auto-)?"
+            r"generated (?:by|for) cursor[^\r\n]*",
+            stripped,
+            re.I,
+        )
+        or (lowered.startswith(("## navigation", "## generated links")) and "[[" in stripped)
+    )
+
+
+def _footnote_namespace(page_key: str) -> str:
+    """Return a compact page namespace derived from the complete UTF-8 key."""
+    digest = hashlib.sha256(str(page_key).encode("utf-8")).hexdigest()[:24]
+    return f"page-{digest}"
+
+
+def _namespace_footnotes(snippet: str, page_key: str) -> str:
+    """Make rendered footnote ids page-local without changing stored plaintext."""
+    namespace = _footnote_namespace(page_key)
+    return re.sub(
+        r"\[\^([^\]\r\n]{1,256})\]",
+        lambda match: f"[^{namespace}--{match.group(1)}]",
+        snippet,
+    )
+
+
+def _bounded_namespaced_snippet(
+    raw_text: str, query: str, page_key: str, limit: int,
+    *, identity_context: bool = False,
+) -> tuple[str, str, bool]:
+    """Select then namespace evidence while enforcing the post-render limit."""
+    limit = max(0, int(limit))
+    selection_limit = limit
+    result = ("", "hit_not_located", False)
+    original_snippet = ""
+    for _attempt in range(3):
+        if selection_limit <= 0:
+            break
+        snippet, status, clipped = _query_centered_snippet(
+            raw_text, query, limit=selection_limit,
+            identity_context=identity_context,
+        )
+        if snippet and not original_snippet:
+            original_snippet = snippet
+        rendered = _namespace_footnotes(snippet, page_key)
+        result = (rendered, status, clipped)
+        overflow = len(rendered) - limit
+        if overflow <= 0:
+            return result
+        selection_limit = max(0, selection_limit - overflow)
+
+    # A namespace-heavy reference group may be indivisible at this budget.
+    # Keep bounded query-bearing text and disclose the omitted closure.
+    marker = _incomplete_marker(limit)
+    # Retain the selected source wording, even when query terms are not
+    # contiguous. Reference closure is explicitly omitted, not left malformed.
+    meaningful = re.sub(
+        r"(?m)^\[\^[^\]\r\n]+\]:[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*",
+        "", original_snippet,
+    )
+    meaningful = re.sub(r"\[\^[^\]\r\n]+\]", "", meaningful).strip()
+    room = max(0, limit - len(marker))
+    bounded = _safe_evidence_prefix(meaningful, room) + marker
+    return bounded[:limit], "source_window_clipped", True
+
+
+def _query_centered_snippet(
+    raw_text: str,
+    query: str,
+    *,
+    limit: int,
+    identity_context: bool = False,
+) -> tuple[str, str, bool]:
+    """Return verbatim bounded evidence and an explicit completeness status."""
+    limit = max(0, int(limit))
+    if limit == 0:
+        return "", "source_window_clipped", bool(raw_text)
+    source = str(raw_text or "")
+    scan_clipped = len(source) > _PLAINTEXT_SCAN_CHAR_LIMIT
+    scanned = source[:_PLAINTEXT_SCAN_CHAR_LIMIT]
+    blocks = [
+        block for block in re.split(r"(?:\r?\n){2,}", scanned)
+        if not _is_boilerplate_block(block)
+    ]
+    cleaned = "\n\n".join(blocks)
+    patterns = _query_literal_patterns(query)
+    normalized_query = str(query or "").strip()
+    candidates = []
+    offset = 0
+    for position, block in enumerate(blocks):
+        block_matches = [pattern.search(block) for pattern in patterns]
+        hits = [match for match in block_matches if match is not None]
+        if hits:
+            exact = bool(normalized_query and re.search(
+                re.escape(normalized_query[:_QUERY_PATTERN_CHAR_LIMIT]), block, re.I,
+            ))
+            candidates.append((len(hits), exact, -position, offset, min(hits, key=lambda item: item.start())))
+        offset += len(block) + 2
+    if not candidates and identity_context:
+        offset = 0
+        for position, block in enumerate(blocks):
+            identity_match = re.search(r"(?m)^(?![ \t]*#{1,6}\s)[ \t]*\S+", block)
+            if identity_match:
+                candidates.append((0, False, -position, offset, identity_match))
+                break
+            offset += len(block) + 2
+    selected = max(candidates, default=None)
+    match = selected[-1] if selected else None
+    match_offset = selected[-2] if selected else 0
+    if match is None:
+        status = "hit_not_located_scan_clipped" if scan_clipped else "hit_not_located"
+        return "", status, scan_clipped
+
+    match = re.compile(re.escape(match.group(0)), re.IGNORECASE).search(
+        cleaned, match_offset + match.start(), match_offset + match.end(),
+    )
+    assert match is not None
+    center = (match.start() + match.end()) // 2
+    start = max(0, center - limit // 2)
+    end = min(len(cleaned), start + limit)
+    start = max(0, end - limit)
+    # Prefer paragraph/sentence boundaries without exceeding the hard cap.
+    left = max(cleaned.rfind("\n\n", start, match.start()),
+               cleaned.rfind("。", start, match.start()),
+               cleaned.rfind(". ", start, match.start()))
+    if left >= 0:
+        start = left + (2 if cleaned[left:left + 2] in {"\n\n", ". "} else 1)
+    paragraph_end = cleaned.find("\n\n", match.end(), end)
+    right_candidates = [value for value in (
+        cleaned.find("。", match.end(), end),
+        cleaned.find(". ", match.end(), end),
+    ) if value >= 0]
+    boundary_ref_incomplete = False
+    if paragraph_end >= 0:
+        end = paragraph_end
+    elif right_candidates:
+        end = min(right_candidates) + 1
+    # Apply one grammar at every selected paragraph, newline, sentence, or hard
+    # window boundary so mixed citation tails cannot be silently discarded.
+    closure_end, closure_incomplete = _bounded_citation_closure(cleaned, end)
+    if closure_end > end:
+        if closure_end <= start + limit:
+            end = closure_end
+        else:
+            boundary_ref_incomplete = True
+    if closure_incomplete:
+        boundary_ref_incomplete = True
+
+    bounded_prefix = cleaned[start:end]
+    safe_prefix = _safe_evidence_prefix(bounded_prefix, len(bounded_prefix))
+    if safe_prefix != bounded_prefix.rstrip():
+        boundary_ref_incomplete = True
+
+    snippet = safe_prefix.strip()
+    prefix_cut = start > 0
+    suffix_cut = end < len(cleaned) or scan_clipped
+    # Include a nearby referenced footnote definition when it fits; otherwise
+    # disclose that the reference is incomplete rather than silently cutting it.
+    refs = list(re.finditer(r"\[\^([^\]\r\n]+)\](?!:)", snippet))
+    missing_refs = ["boundary"] if boundary_ref_incomplete else []
+    for ref in refs:
+        label = ref.group(1)
+        if len(label) > 256:
+            missing_refs.append("oversized")
+            continue
+        definition = re.search(
+            rf"(?m)^\[\^{re.escape(label)}\]:[^\r\n]*(?:\r?\n(?:[ \t]+)[^\r\n]*)*",
+            cleaned,
+        )
+        if definition and definition.group(0) not in snippet:
+            addition = "\n\n" + definition.group(0)
+            if len(snippet) + len(addition) <= limit:
+                snippet += addition
+            else:
+                missing_refs.append(label)
+        elif definition is None:
+            missing_refs.append(label)
+    if missing_refs:
+        marker = _incomplete_marker(limit)
+        if len(snippet) + len(marker) <= limit:
+            snippet += marker
+        else:
+            snippet = _safe_evidence_prefix(
+                snippet, max(0, limit - len(marker)),
+            ) + marker
+    status = "available"
+    if prefix_cut or suffix_cut:
+        status = "source_window_clipped"
+    return snippet, status, prefix_cut or suffix_cut
+
+
+def _load_current_plaintext_rows(conn, page_keys, query: str, *, snippet_limit: int):
+    """Batch-load selected live entity bodies; the identity table is ledger only."""
+    keys = list(dict.fromkeys(str(key) for key in page_keys if str(key)))[:100]
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        "SELECT ident.page_key, ident.entity_id, e.canonical_name, "
+        "length(CAST(e.data_json AS BLOB)) AS record_bytes, "
+        "CASE WHEN length(CAST(e.data_json AS BLOB)) <= ? THEN e.data_json END AS data_json "
+        "FROM entity_identities AS ident JOIN entities AS e "
+        "ON e.entity_id = ident.entity_id "
+        f"WHERE ident.page_key IN ({placeholders})",
+        (_PLAINTEXT_RECORD_BYTE_LIMIT, *keys),
+    ).fetchall()
+    output = {}
+    for row in rows:
+        key = str(row["page_key"] or "")
+        if int(row["record_bytes"] or 0) > _PLAINTEXT_RECORD_BYTE_LIMIT:
+            output[key] = {"status": "oversized", "snippet": "", "truncated": True}
+            continue
+        try:
+            record = json.loads(row["data_json"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            output[key] = {"status": "corrupt", "snippet": "", "truncated": False}
+            continue
+        if not isinstance(record, dict):
+            output[key] = {"status": "corrupt", "snippet": "", "truncated": False}
+            continue
+        state = str(record.get("lifecycle_state") or record.get("status") or "active").casefold()
+        if state in _HIDDEN_PLAINTEXT_STATES:
+            output[key] = {"status": "not_current", "snippet": "", "truncated": False}
+            continue
+        raw_text = record.get("raw_text")
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            output[key] = {"status": "missing", "snippet": "", "truncated": False}
+            continue
+        normalized_query = _normalize_identity_label(query)
+        identity_labels = [
+            key,
+            record.get("title"),
+            record.get("canonical_name"),
+            row["canonical_name"],
+            *(record.get("aliases") or [] if isinstance(record.get("aliases"), list) else []),
+        ]
+        explicit_identity_match = bool(normalized_query) and any(
+            normalized_query == _normalize_identity_label(label)
+            for label in identity_labels if isinstance(label, str) and label
+        )
+        snippet, status, truncated = _bounded_namespaced_snippet(
+            raw_text, query, key, snippet_limit,
+            identity_context=explicit_identity_match,
+        )
+        output[key] = {
+            "status": status,
+            "snippet": snippet,
+            "truncated": truncated,
+            "title": str(record.get("title") or record.get("canonical_name") or row["canonical_name"] or key),
+            "explicit_identity_match": explicit_identity_match,
+        }
+    for key in keys:
+        output.setdefault(key, {"status": "missing", "snippet": "", "truncated": False})
+    return output
+
+
+def _is_structural_noise(node_key: str, query: str, exact_keys=()) -> bool:
+    normalized_key = str(node_key).casefold()
+    if normalized_key not in _STRUCTURAL_PAGE_KEYS:
+        return False
+    normalized_query = _normalize_identity_label(query)
+    return node_key not in exact_keys and normalized_query not in {
+        normalized_key, _normalize_identity_label(node_key.replace("_", " ")),
+    }
 
 
 def _query_embedding_int(name: str, default: int) -> int:
@@ -844,6 +1281,7 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
             current_top_k=24,
             history_top_k=12,
         )
+        memories = governance_store.apply_effective_memory_routing(memories)
     except governance_store.OperationalMemoryNotReady as exc:
         packet = (
             f"<MEMORY_PACKET status='unavailable' reason={quoteattr(exc.reason)} "
@@ -883,7 +1321,7 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     evidence_pointers = []
     for memory in memories:
         section = type_to_section.get(
-            memory.get("memory_type", "fact"), "Relevant Facts"
+            memory.get("effective_memory_type", "fact"), "Relevant Facts"
         )
         text, truncated = _bounded_excerpt(
             " ".join(str(memory.get("text", "")).split()), 420
@@ -1436,9 +1874,10 @@ def _sqlite_identity_rows(conn, query: str, limit: int) -> list[dict]:
         normalized[:-3] if normalized.casefold().endswith(".md") else normalized
     )
     rows = conn.execute(
-        "SELECT page_key, data_json FROM entity_identities WHERE "
-        "entity_id IN (?, ?) OR page_key IN (?, ?) "
-        "ORDER BY entity_id LIMIT ?",
+        "SELECT ident.page_key, e.data_json FROM entity_identities AS ident "
+        "JOIN entities AS e ON e.entity_id = ident.entity_id WHERE "
+        "ident.entity_id IN (?, ?) OR ident.page_key IN (?, ?) "
+        "ORDER BY ident.entity_id LIMIT ?",
         (normalized, page_query, normalized, page_query, int(limit)),
     ).fetchall()
     if not rows:
@@ -1522,68 +1961,52 @@ def _exact_fts_page_result(query: str, top_k: int, *, as_xml: bool) -> str | Non
     if not rows:
         return None
 
-    eligible = []
-    hidden_states = {"archived", "decayed", "deleted", "expired", "superseded"}
     page_keys = [str(row.get("node_key") or "") for row in rows]
-    placeholders = ",".join("?" for _ in page_keys)
     try:
-        identity_rows = conn.execute(
-            "SELECT page_key, data_json FROM entity_identities "
-            f"WHERE page_key IN ({placeholders})",
-            tuple(page_keys),
-        ).fetchall()
+        plaintext = _load_current_plaintext_rows(
+            conn, page_keys, query, snippet_limit=_PAGE_SNIPPET_CHAR_LIMIT,
+        )
     except sqlite3.Error:
-        return None
-    identities = {str(row["page_key"]): row for row in identity_rows}
-    for row in rows:
-        identity = identities.get(str(row.get("node_key") or ""))
-        if identity is None:
-            continue
-        try:
-            record = json.loads(identity["data_json"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if str(record.get("status") or "active").strip().lower() in hidden_states:
-            continue
-        eligible.append(row)
-
-    integrity_after = verify_search_projection_integrity(conn)
-    if _search_projection_generation_issue(conn) is not None:
-        raise SearchIndexError(
-            "The canonical generation changed during exact search; retry."
-        )
-    if _stable_fts_projection_signature(
-        integrity_after.get("signature")
-    ) != _stable_fts_projection_signature(signature):
-        raise SearchIndexError(
-            "The SQLite search projection changed during exact search; retry."
-        )
-    if not eligible:
         return None
 
     blocks = []
-    for index, row in enumerate(eligible[:top_k]):
-        title = str(row.get("title") or row.get("node_key") or "Untitled")
+    issues = []
+    for index, row in enumerate(rows[:top_k]):
         node_key = str(row.get("node_key") or "")
-        summary = " ".join(str(row.get("summary") or "").split())[:1600]
+        source = plaintext.get(node_key, {"status": "missing", "snippet": ""})
+        status = str(source["status"])
+        title = str(source.get("title") or node_key or "Untitled")
+        summary = str(source.get("snippet") or "")
+        if status != "available":
+            issues.append(f"plaintext_{status}")
         score = -float(row.get("rank") or 0.0)
         if as_xml:
             blocks.append(
                 f"<Evidence_Node ID={quoteattr(f'Wiki_{index}')} "
-                f"Source={quoteattr(node_key + '.md')}>\n"
+                f"Source={quoteattr(node_key + '.md')} ContentStatus={quoteattr(status)}>\n"
                 f"{escape(summary)}\n</Evidence_Node>\n"
             )
         else:
-            blocks.append(
-                f"- **{title}** (score: {score:.1f})\n  {summary} [{node_key}]...\n\n"
-            )
+            if summary:
+                blocks.append(f"- **{title}** (score: {score:.1f})\n  {summary} [{node_key}]...\n\n")
+            else:
+                blocks.append(f"- **{title}** (score: {score:.1f}; snippet: {status})\n\n")
+
+    # The proof covers candidate selection, current-body reads, and rendering.
+    integrity_after = verify_search_projection_integrity(conn)
+    if _search_projection_generation_issue(conn) is not None:
+        raise SearchIndexError("The canonical generation changed during exact search; retry.")
+    if _stable_fts_projection_signature(integrity_after.get("signature")) != _stable_fts_projection_signature(signature):
+        raise SearchIndexError("The SQLite search projection changed during exact search; retry.")
     if as_xml:
+        state = "degraded" if issues else "ok"
         return (
-            '<EvidenceResults>\n<SearchStatus State="ok" Backends=""/>\n'
+            f'<EvidenceResults>\n<SearchStatus State="{state}" Backends={quoteattr(",".join(sorted(set(issues))))}/>\n'
             + "".join(blocks)
             + "</EvidenceResults>"
         )
-    return "".join(blocks)
+    prefix = f"[Search degraded: {', '.join(sorted(set(issues)))}]\n" if issues else ""
+    return prefix + "".join(blocks)
 
 
 def search_vector_lake(
@@ -1924,9 +2347,13 @@ def search_vector_lake(
     # Phase 1: Expand candidate pool for reranking
     candidate_pool = []
     source_count = 0
+    structural_omitted = 0
     pool_size = max(40, top_k * 3)
     max_sources_pool = int(pool_size * 0.6)
     for score, node in scored:
+        if _is_structural_noise(node.get("_key", ""), query, exact_identity_keys):
+            structural_omitted += 1
+            continue
         node_type = node.get("type", "").lower()
         if node_type == "source":
             if (
@@ -1964,23 +2391,42 @@ def search_vector_lake(
         if len(final_scored) >= top_k:
             break
 
+    if structural_omitted:
+        backend_issues.append(f"structural_candidates_omitted:{structural_omitted}")
+
     result = ""
     result_char_limit = _search_result_char_limit()
     result_byte_limit = _search_result_byte_limit()
     result_bytes = 0
     phase_started = time.perf_counter()
+    selected_keys = [node["_key"] for _score, node in final_scored]
+    plaintext = {}
+    plaintext_signature = None
+    try:
+        from vector_lake.db_store import get_connection, verify_search_projection_integrity
+
+        plaintext_conn = get_connection()
+        integrity_before_plaintext = verify_search_projection_integrity(plaintext_conn)
+        plaintext_signature = integrity_before_plaintext.get("signature")
+        if integrity_before_plaintext.get("status") != "ready" or not isinstance(plaintext_signature, tuple):
+            backend_issues.append("plaintext_projection_unverified")
+            plaintext_signature = None
+        else:
+            if _search_projection_generation_issue(plaintext_conn) is not None:
+                raise SearchIndexError("The canonical generation changed before plaintext retrieval; retry.")
+            plaintext = _load_current_plaintext_rows(
+                plaintext_conn, selected_keys, query, snippet_limit=_PAGE_SNIPPET_CHAR_LIMIT,
+            )
+    except SearchIndexError:
+        raise
+    except Exception:
+        backend_issues.append("plaintext_read")
     for index, (score, node) in enumerate(final_scored):
-        filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
-        snippet = ""
-        snippet_status = "missing"
-        if os.path.exists(filepath):
-            try:
-                snippet = _read_search_snippet(filepath)
-                snippet_status = "available" if snippet.strip() else "empty"
-            except SearchIndexError:
-                backend_issues.append("wiki_snippet")
-                snippet = "[Snippet unavailable]"
-                snippet_status = "unavailable"
+        source = plaintext.get(node["_key"], {"status": "unavailable", "snippet": ""})
+        snippet = str(source.get("snippet") or "")
+        snippet_status = str(source.get("status") or "unavailable")
+        if snippet_status != "available":
+            backend_issues.append(f"plaintext_{snippet_status}")
         tension_edges = node.get("tension_edges", [])
         tension_info = ""
         if tension_edges:
@@ -1995,13 +2441,14 @@ def search_vector_lake(
                 f"Source={quoteattr(source_name)} ContentStatus={quoteattr(snippet_status)}>\n"
                 f"{escape(tension_info + snippet)}\n</Evidence_Node>\n"
             )
-        elif snippet_status != "available":
+        elif not snippet:
             # Keep the discovery result, but not the evidence-snippet shape
             # consumed by legacy context assembly. No unavailable body is read.
             title = " ".join(str(node.get("title", node["_key"])).split()).replace("*", r"\*")
             block = f"- **{title}** (score: {score:.1f}; snippet: {snippet_status})\n\n"
         else:
-            block = f"- **{node.get('title', node['_key'])}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
+            title = str(source.get("title") or node.get("title") or node["_key"])
+            block = f"- **{title}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
         block_bytes = len(block.encode("utf-8"))
         if (
             len(result) + len(block) > result_char_limit
@@ -2011,6 +2458,12 @@ def search_vector_lake(
             break
         result += block
         result_bytes += block_bytes
+    if plaintext_signature is not None:
+        integrity_after_plaintext = verify_search_projection_integrity(plaintext_conn)
+        if _search_projection_generation_issue(plaintext_conn) is not None:
+            raise SearchIndexError("The canonical generation changed during plaintext rendering; retry.")
+        if _stable_fts_projection_signature(integrity_after_plaintext.get("signature")) != _stable_fts_projection_signature(plaintext_signature):
+            raise SearchIndexError("The SQLite search projection changed during plaintext rendering; retry.")
     timings["materialize_ms"] = (time.perf_counter() - phase_started) * 1000.0
     issues = sorted(set(backend_issues))
     if as_xml:
@@ -2092,31 +2545,36 @@ def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
         search_rows.append(row)
         if len(search_rows) >= 15:
             break
-    integrity_after = verify_search_projection_integrity(conn)
-    generation_issue_after = _search_projection_generation_issue(conn)
-    if generation_issue_after is not None:
-        raise SearchIndexError(
-            "The canonical generation changed during context assembly "
-            f"({generation_issue_after}); retry."
-        )
-    if integrity_after.get("status") != "ready" or _stable_fts_projection_signature(
-        integrity_after.get("signature")
-    ) != _stable_fts_projection_signature(signature_before):
-        raise SearchIndexError(
-            "The SQLite search projection changed during context assembly; retry."
-        )
-
+    plaintext = _load_current_plaintext_rows(
+        conn,
+        [row.get("node_key") for row in search_rows],
+        query,
+        snippet_limit=_CONTEXT_SNIPPET_CHAR_LIMIT,
+    )
+    exact_keys = {
+        str(row.get("node_key") or "") for row in identity_rows
+        if row.get("node_key")
+    }
     wiki_context = ""
     page_count = 0
     truncated_count = 0
     retrieval_degraded = False
     included_keys = []
     for row in search_rows:
-        title = str(row.get("title") or row.get("node_key") or "Untitled")
         node_key = str(row.get("node_key") or "")
-        summary, truncated = _bounded_excerpt(
-            " ".join(str(row.get("summary") or "").split()), 1200
+        source = plaintext.get(node_key, {"status": "missing", "snippet": "", "truncated": False})
+        explicit_identity_match = (
+            node_key in exact_keys or bool(source.get("explicit_identity_match"))
         )
+        if _is_structural_noise(
+            node_key,
+            query,
+            {node_key} if explicit_identity_match else set(),
+        ):
+            continue
+        title = str(source.get("title") or node_key or "Untitled")
+        summary = str(source.get("snippet") or "")
+        truncated = bool(source.get("truncated"))
         if not summary:
             retrieval_degraded = True
             continue
@@ -2130,6 +2588,21 @@ def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
         page_count += 1
         truncated_count += truncated
         included_keys.append(node_key)
+
+    # Rendering is part of the protected read interval as well.
+    integrity_rendered = verify_search_projection_integrity(conn)
+    generation_issue_rendered = _search_projection_generation_issue(conn)
+    if generation_issue_rendered is not None:
+        raise SearchIndexError(
+            "The canonical generation changed during context rendering "
+            f"({generation_issue_rendered}); retry."
+        )
+    if integrity_rendered.get("status") != "ready" or _stable_fts_projection_signature(
+        integrity_rendered.get("signature")
+    ) != _stable_fts_projection_signature(signature_before):
+        raise SearchIndexError(
+            "The SQLite search projection changed during context rendering; retry."
+        )
 
     return {
         "memory_packet": memory_packet["packet"],

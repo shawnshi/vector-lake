@@ -80,12 +80,13 @@ def test_watchdog_run_generation_atomically_replaces_foreign_components(
     isolated_memory,
 ):
     expected = ("watchdog", "outbox", "scheduler", "ingest", "auto_ingest")
-    run_id = begin_watchdog_run(expected)
+    run_id = begin_watchdog_run(expected, run_profile="full")
     status_path = get_status_file()
     status = json.loads(status_path.read_text(encoding="utf-8"))
 
     assert run_id == current_watchdog_run_id() == status["run_id"]
-    assert status["schema_version"] == 3
+    assert status["schema_version"] == 4
+    assert status["run_profile"]["name"] == "full"
     assert status["process_id"] == os.getpid()
     assert status["expected_components"] == list(expected)
     assert set(status["components"]) == set(expected)
@@ -105,7 +106,9 @@ def test_watchdog_run_generation_atomically_replaces_foreign_components(
         "foreign-generation"
     )
 
-    replacement = begin_watchdog_run(("watchdog", "outbox"))
+    replacement = begin_watchdog_run(
+        ("watchdog", "outbox"), run_profile="maintenance"
+    )
     replaced = json.loads(status_path.read_text(encoding="utf-8"))
     assert replacement != run_id
     assert replaced["run_id"] == replacement
@@ -147,7 +150,9 @@ def test_watchdog_run_refuses_a_live_foreign_generation(
     monkeypatch.setattr(watchdog_status, "_process_is_alive", lambda _pid: True)
 
     with pytest.raises(RuntimeError, match="prior status owner is still alive"):
-        begin_watchdog_run(("watchdog", "auto_ingest"))
+        begin_watchdog_run(
+            ("watchdog", "outbox"), run_profile="maintenance"
+        )
 
     preserved = json.loads(status_path.read_text(encoding="utf-8"))
     assert preserved["run_id"] == "still-draining"

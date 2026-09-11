@@ -247,13 +247,37 @@ def test_public_surface_counts_match_documented_contract():
     )
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert len(mcp_server.mcp._tool_manager.list_tools()) == 68
+    # Freeze names as well as counts: the full surface exposes 70 tools, including the
+    # two guarded repair/recovery tools added after the earlier 67-tool surface.
+    expected_full = set("""
+        auto_ingest_budget_status auto_ingest_receipt_retention backup_retention
+        batch_replace_links bulk_reconciliation canonical_backfill canonical_reconcile_content
+        check_duplicate_entity claim_ingest_tasks claim_placeholder_cleanup claim_provenance_repair compact_change_set_history
+        context_pack delete_source delta doctor_vector_lake embedding_backfill entity
+        evidence_foundation_backfill expire_ingest_tasks export_evidence_packet
+        finalize_exact_reviewed_ingest_outputs finalize_ingest finalize_query_synthesis
+        gc_vector_lake get_governance_debt history_retention lint_vector_lake list_ingest_tasks
+        mcp_runtime_status memory_capabilities merge_suggestions_vector_lake
+        operational_memory_cleanup operational_memory_search_index orphan_source_classify
+        prepare_ingest_batch projection_rebuild_index projection_report propose_schema_mutation
+        query_logic_lake rebuild_timeline_events recall reconcile_ingest_tasks
+        reconcile_orphan_ingest_packets record_claim_assessment recover_failed_mutation_outbox
+        recover_terminal_ingest_outputs remember rename_entity resolve_governance_item
+        retry_terminal_ingest_job review_governance_list review_strategic_purpose search_timeline
+        search_vector_lake semantic_readiness semantic_readiness_campaign
+        sync_critical_decision_registry sync_vector_lake synthesize topology_queue_cleanup
+        trace_vector_lake trigger_audit_graph trigger_autonomous_research unsupported_claim_debt
+        update_operational_memory visualize_vector_lake wiki_restore write_wiki_batch write_wiki_page
+    """.split())
+    tools = mcp_server.mcp._tool_manager.list_tools()
+    assert {tool.name for tool in tools} == expected_full
+    assert len(tools) == 70
     assert len(mcp_server._MEMORY_MCP_SURFACE_TOOLS) == 9
     assert len(mcp_server._READONLY_MCP_SURFACE_TOOLS) == 21
-    assert len(subcommands) == 41
+    assert len(subcommands) == 42
     assert (
-        "68 MCP tools (`full`) / 9 MCP tools (`memory`) / "
-        "21 MCP tools (`readonly`) / 41 CLI commands"
+        "70 MCP tools (`full`) / 9 MCP tools (`memory`) / "
+        "21 MCP tools (`readonly`) / 42 CLI commands"
     ) in readme
 
 

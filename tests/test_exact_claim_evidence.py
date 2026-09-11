@@ -509,7 +509,11 @@ def test_new_memory_dependencies_guard_and_legacy_refresh(official_case, kind, m
         claim["authority_score"] = 1.0
     else:
         _set_runtime_peer(case, kind, peer)
+        # A preference must satisfy the governed source contract, not merely
+        # carry a legacy memory_type label.
         claim.update(memory_type="preference", memory_key="shared_test_key",
+                     source_page="Concept_UserPreferences.md",
+                     operational_memory_provenance=True,
                      updated_at="2099-01-01T00:00:00Z")
     before = _rows()
     with db_store.transaction(), pytest.raises(ValueError, match="memory.*scope"):

@@ -109,7 +109,9 @@ def test_exact_fts_fast_path_batches_entity_eligibility(monkeypatch):
                 [
                     {
                         "page_key": "Source_Alpha",
-                        "data_json": '{"status":"active"}',
+                        "data_json": '{"status":"active","raw_text":"Primary source."}',
+                        "record_bytes": 48,
+                        "canonical_name": "Alpha Source",
                     }
                 ]
             )
@@ -150,6 +152,7 @@ def test_exact_fts_fast_path_batches_entity_eligibility(monkeypatch):
     assert "Alpha Source" in result
     assert len(statements) == 1
     assert "FROM entity_identities" in statements[0][0]
+    assert "JOIN entities" in statements[0][0]
     assert "page_key IN" in statements[0][0]
 
 
@@ -225,6 +228,14 @@ def test_exact_source_identity_survives_top_one_source_budget(
     monkeypatch.setattr(tool_search, "get_index_path", lambda: index_path)
     monkeypatch.setattr(tool_search, "get_wiki_dir", lambda: wiki_dir)
     monkeypatch.setattr(tool_search, "_load_search_index", lambda _path: snapshot)
+    monkeypatch.setattr(
+        tool_search,
+        "_load_current_plaintext_rows",
+        lambda _conn, keys, _query, **_kwargs: {
+            key: {"status": "available", "snippet": "Alpha source body.", "truncated": False}
+            for key in keys
+        },
+    )
     monkeypatch.setattr(tool_search, "_get_fts_search_results", lambda *_a, **_k: [])
     monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "1")
     monkeypatch.setattr(
@@ -255,6 +266,14 @@ def test_nonexact_source_match_survives_top_one_source_budget(
     monkeypatch.setattr(tool_search, "get_index_path", lambda: index_path)
     monkeypatch.setattr(tool_search, "get_wiki_dir", lambda: wiki_dir)
     monkeypatch.setattr(tool_search, "_load_search_index", lambda _path: snapshot)
+    monkeypatch.setattr(
+        tool_search,
+        "_load_current_plaintext_rows",
+        lambda _conn, keys, _query, **_kwargs: {
+            key: {"status": "available", "snippet": "Alpha source body.", "truncated": False}
+            for key in keys
+        },
+    )
     monkeypatch.setattr(
         tool_search,
         "_fts_projection_probe",
