@@ -7,13 +7,18 @@ this seam is gated on a separately reviewed byte-equivalence corpus.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Protocol, TypeAlias
 
 
 NotApplicableGate: TypeAlias = tuple[Literal["not_applicable"], str]
 SafetyGate: TypeAlias = Callable[..., Any] | NotApplicableGate
-RunnerHandle: TypeAlias = Path
+
+@dataclass(frozen=True)
+class RunnerHandle:
+    """A probed resource paired with its immutable validated options."""
+
+    resource: Any
+    options: "RunnerOptions"
 
 
 @dataclass(frozen=True)
@@ -74,4 +79,3 @@ class RunnerAdapter(Protocol):
 
 class RunnerRegistrationError(ValueError):
     """A registry error whose message is restricted to fixed error codes."""
-

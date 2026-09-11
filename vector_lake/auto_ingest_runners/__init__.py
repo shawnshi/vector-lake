@@ -12,20 +12,21 @@ this reviewed data, which is deliberate friction.
 What the manifest check does and does not prove
 -----------------------------------------------
 ``_validate_contract`` proves that an adapter *declares* each gate against the
-reviewed manifest and names the reviewed enforcer and error code.  It rejects
-arbitrary callables, so an adapter cannot satisfy a gate with a no-op lambda.
-It does **not** prove that the named enforcer is actually called at runtime; that
-is established by the adapter's own behavioural tests and by review of the
-adapter.  Declarations are checked here; enforcement is checked there.
+reviewed manifest and that the declared name resolves to the reviewed
+module-level object wired into the gate.  It does **not** prove that the function
+enforces anything.  Enforcement for every applicable gate is established by
+behavioural tests plus review.  Declarations are checked here; behaviour there.
 """
 
 from __future__ import annotations
 
+import sys
 from types import MappingProxyType
 from typing import Mapping
 
 from .base import RunnerAdapter, RunnerRegistrationError, RunnerSafetyContract
 from .codex_exec import CODEX_EXEC_ADAPTER
+from .host_relay import HOST_RELAY_ADAPTER
 
 
 _APPLICABLE_GATES = (
@@ -38,8 +39,12 @@ _APPLICABLE_GATES = (
 )
 
 # Reviewed data.  Each entry is either
-#   ("applicable", <worker function name>, <fixed error code>) or
+#   ("applicable", <module-level callable name on the adapter's module>,
+#    <fixed error code>) or
 #   ("not_applicable", <non-empty reason>).
+# For an applicable gate the named callable must exist on the adapter's own module
+# and must be the exact object the gate is wired to; the registry verifies that
+# identity.  This proves wiring, not the callable's enforcement behaviour.
 _REVIEWED_MANIFESTS: Mapping[str, Mapping[str, tuple[str, str]]] = MappingProxyType(
     {
         "codex_exec": MappingProxyType(
@@ -75,7 +80,37 @@ _REVIEWED_MANIFESTS: Mapping[str, Mapping[str, tuple[str, str]]] = MappingProxyT
                     "codex_auth_identity_mismatch",
                 ),
             }
-        )
+        ),
+        "host_relay": MappingProxyType(
+            {
+                "binary_pin": (
+                    "not_applicable",
+                    "No executable is spawned because the relay protocol is data-only.",
+                ),
+                "version_pin": (
+                    "applicable",
+                    "_enforce_relay_protocol_version",
+                    "relay_protocol_version_unsupported",
+                ),
+                "dedicated_home": (
+                    "not_applicable",
+                    "The data-only relay has no runner home.",
+                ),
+                "instruction_surface_prohibited": (
+                    "not_applicable",
+                    "Compensating controls are the pinned spool root, data-only response, downstream purpose contract, and output validation.",
+                ),
+                "user_skills_prohibited": (
+                    "not_applicable",
+                    "The data-only relay has no skills tree.",
+                ),
+                "identity_pin": (
+                    "applicable",
+                    "_enforce_relay_response_binding",
+                    "relay_response_binding_mismatch",
+                ),
+            }
+        ),
     }
 )
 
@@ -114,12 +149,22 @@ def _validate_contract(
             or getattr(declared, "raises", None) != entry[2]
         ):
             raise RunnerRegistrationError(f"runner_gate_enforcer_mismatch:{gate}")
+        # The declared name must resolve to the exact module-level callable that the
+        # gate is wired to, on the adapter's own module.  Metadata alone would let a
+        # runner name a reviewed enforcer while wiring a different object.  The
+        # adapter module is used so this check never imports the worker module
+        # during the import cycle.  Behavioural tests plus review establish that
+        # the resolved object actually enforces the gate.
+        adapter_module = sys.modules.get(type(adapter).__module__)
+        resolved = getattr(adapter_module, entry[1], None) if adapter_module else None
+        if resolved is None or getattr(declared, "enforcer_impl", None) is not resolved:
+            raise RunnerRegistrationError(f"runner_gate_enforcer_unresolved:{gate}")
     if contract is None or contract.credential_actions != "forbidden":
         raise RunnerRegistrationError("runner_contract_credential_actions_invalid")
 
 
 _REGISTRY: Mapping[str, RunnerAdapter] = MappingProxyType(
-    {"codex_exec": CODEX_EXEC_ADAPTER}
+    {"codex_exec": CODEX_EXEC_ADAPTER, "host_relay": HOST_RELAY_ADAPTER}
 )
 
 # Import-time, fail-closed: a registry entry that does not match its reviewed
