@@ -903,10 +903,25 @@ def _reconcile_launch_ledger(state: dict[str, Any]) -> int:
 
 def _receipt_error_fields(error: BaseException | str | None) -> dict[str, str]:
     if error is None:
-        return {"error_type": "", "error_code": "", "error_fingerprint": ""}
+        return {
+            "error_type": "",
+            "error_code": "",
+            "error_fingerprint": "",
+            "error_subject": "",
+        }
     error_type = type(error).__name__ if isinstance(error, BaseException) else "Error"
     text = str(error)
-    raw_code = text.split(":", 1)[0] or error_type
+    head, separator, tail = text.partition(":")
+    error_subject = ""
+    if (
+        separator
+        and re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}\.md", head)
+        and tail.strip()
+    ):
+        error_subject = re.sub(r"[^A-Za-z0-9_.-]+", "_", head)[:120]
+        raw_code = tail.strip()
+    else:
+        raw_code = head or error_type
     error_code = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_code)[:120]
     fingerprint = hashlib.sha256(
         f"{error_type}\0{text}".encode("utf-8", errors="replace")
@@ -915,6 +930,7 @@ def _receipt_error_fields(error: BaseException | str | None) -> dict[str, str]:
         "error_type": error_type,
         "error_code": error_code,
         "error_fingerprint": fingerprint,
+        "error_subject": error_subject,
     }
 
 
@@ -3025,6 +3041,10 @@ def _record_ingest_stage_event_safe(
     try:
         error_fields = _receipt_error_fields(error)
         lease_generation = int(processed_data.get("lease_generation") or 0)
+        event_metadata = metadata
+        if error_fields["error_subject"]:
+            event_metadata = dict(metadata or {})
+            event_metadata.setdefault("error_subject", error_fields["error_subject"])
         db_store.record_ingest_stage_event(
             job_id=str(processed_data.get("job_id") or ""),
             revision=str(processed_data.get("hash") or ""),
@@ -3036,7 +3056,7 @@ def _record_ingest_stage_event_safe(
             ordinal=max(1, lease_generation),
             error_code=error_fields["error_code"],
             error_fingerprint=error_fields["error_fingerprint"],
-            metadata=metadata,
+            metadata=event_metadata,
         )
     except Exception as exc:
         log.warning(

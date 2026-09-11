@@ -1861,7 +1861,7 @@ _ARTIFACT_RECORD_CONFLICT = "Invalid source artifact ownership record"
 
 def _preflight_source_artifact_ownership(conn, source_artifacts: list[dict]) -> None:
     """Reject artifact ownership changes before any foundation mutation."""
-    incoming_owners: dict[str, str] = {}
+    incoming_owners: dict[str, list[tuple[str, str]]] = {}
     for artifact in source_artifacts:
         if not isinstance(artifact, dict):
             raise ValueError(_ARTIFACT_RECORD_CONFLICT)
@@ -1870,10 +1870,15 @@ def _preflight_source_artifact_ownership(conn, source_artifacts: list[dict]) -> 
         if any(not isinstance(value, str) or not value or any(ch.isspace() for ch in value)
                for value in (artifact_id, source_id)):
             raise ValueError(_ARTIFACT_RECORD_CONFLICT)
-        previous = incoming_owners.get(artifact_id)
-        if previous is not None and previous != source_id:
-            raise ValueError(_ARTIFACT_OWNERSHIP_CONFLICT)
-        incoming_owners[artifact_id] = source_id
+        if "raw_ref" in artifact and not isinstance(artifact["raw_ref"], str):
+            raise ValueError(_ARTIFACT_RECORD_CONFLICT)
+        raw_ref = str(artifact.get("raw_ref") or "")
+        for previous_source_id, previous_raw_ref in incoming_owners.get(artifact_id, []):
+            if previous_source_id != source_id and not (
+                raw_ref and previous_raw_ref and raw_ref != previous_raw_ref
+            ):
+                raise ValueError(_ARTIFACT_OWNERSHIP_CONFLICT)
+        incoming_owners.setdefault(artifact_id, []).append((source_id, raw_ref))
 
     ordered_ids = sorted(incoming_owners)
     for offset in range(0, len(ordered_ids), 500):
@@ -1901,8 +1906,16 @@ def _preflight_source_artifact_ownership(conn, source_artifacts: list[dict]) -> 
                 or json_source_id != physical_source_id
             ):
                 raise ValueError(_ARTIFACT_RECORD_CONFLICT)
-            if incoming_owners[artifact_id] != physical_source_id:
-                raise ValueError(_ARTIFACT_OWNERSHIP_CONFLICT)
+            stored_raw_ref = str(stored.get("raw_ref") or "")
+            for incoming_source_id, incoming_raw_ref in incoming_owners[artifact_id]:
+                same_owner = incoming_source_id == physical_source_id
+                distinct_refs = (
+                    incoming_raw_ref
+                    and stored_raw_ref
+                    and incoming_raw_ref != stored_raw_ref
+                )
+                if not same_owner and not distinct_refs:
+                    raise ValueError(_ARTIFACT_OWNERSHIP_CONFLICT)
 
 
 def _upsert_foundation_records(

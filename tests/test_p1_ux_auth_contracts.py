@@ -45,6 +45,7 @@ _EXPECTED_READONLY_DENIED_TOOLS = frozenset(
         "bulk_reconciliation",
         "canonical_backfill",
         "canonical_reconcile_content",
+        "claim_placeholder_cleanup",
         "claim_ingest_tasks",
         "claim_provenance_repair",
         "compact_change_set_history",

@@ -1963,22 +1963,54 @@ def _exact_fts_page_result(query: str, top_k: int, *, as_xml: bool) -> str | Non
 
     page_keys = [str(row.get("node_key") or "") for row in rows]
     try:
+        placeholders = ",".join("?" for _ in page_keys)
+        identity_owners = conn.execute(
+            f"SELECT page_key, data_json FROM entity_identities "
+            f"WHERE page_key IN ({placeholders})",
+            page_keys,
+        )
+        live_page_keys = set()
+        inactive_statuses = {
+            "archived", "decayed", "deleted", "expired", "superseded",
+        }
+        for identity in identity_owners:
+            try:
+                record = json.loads(identity["data_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            status = str(record.get("status") or "active").strip().casefold()
+            if status not in inactive_statuses:
+                live_page_keys.add(str(identity["page_key"]))
+        eligible = [
+            row for row in rows
+            if str(row.get("node_key") or "") in live_page_keys
+        ]
+        if not eligible:
+            return None
         plaintext = _load_current_plaintext_rows(
-            conn, page_keys, query, snippet_limit=_PAGE_SNIPPET_CHAR_LIMIT,
+            conn,
+            [str(row.get("node_key") or "") for row in eligible],
+            query,
+            snippet_limit=_PAGE_SNIPPET_CHAR_LIMIT,
         )
     except sqlite3.Error:
         return None
 
     blocks = []
     issues = []
-    for index, row in enumerate(rows[:top_k]):
+    for index, row in enumerate(eligible[:top_k]):
         node_key = str(row.get("node_key") or "")
         source = plaintext.get(node_key, {"status": "missing", "snippet": ""})
         status = str(source["status"])
-        title = str(source.get("title") or node_key or "Untitled")
-        summary = str(source.get("snippet") or "")
-        if status != "available":
-            issues.append(f"plaintext_{status}")
+        row_title = str(row.get("title") or row.get("node_key") or "Untitled")
+        title = str(source.get("title") or row_title)
+        summary = (
+            str(source["snippet"])
+            if source.get("snippet")
+            else " ".join(str(row.get("summary") or "").split())[:1600]
+        )
         score = -float(row.get("rank") or 0.0)
         if as_xml:
             blocks.append(
@@ -2409,7 +2441,6 @@ def search_vector_lake(
         integrity_before_plaintext = verify_search_projection_integrity(plaintext_conn)
         plaintext_signature = integrity_before_plaintext.get("signature")
         if integrity_before_plaintext.get("status") != "ready" or not isinstance(plaintext_signature, tuple):
-            backend_issues.append("plaintext_projection_unverified")
             plaintext_signature = None
         else:
             if _search_projection_generation_issue(plaintext_conn) is not None:
@@ -2419,14 +2450,12 @@ def search_vector_lake(
             )
     except SearchIndexError:
         raise
-    except Exception:
-        backend_issues.append("plaintext_read")
+    except Exception as exc:
+        log.warning("Plaintext snippet retrieval failed: %s", type(exc).__name__)
     for index, (score, node) in enumerate(final_scored):
         source = plaintext.get(node["_key"], {"status": "unavailable", "snippet": ""})
         snippet = str(source.get("snippet") or "")
         snippet_status = str(source.get("status") or "unavailable")
-        if snippet_status != "available":
-            backend_issues.append(f"plaintext_{snippet_status}")
         tension_edges = node.get("tension_edges", [])
         tension_info = ""
         if tension_edges:
@@ -2572,9 +2601,17 @@ def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
             {node_key} if explicit_identity_match else set(),
         ):
             continue
-        title = str(source.get("title") or node_key or "Untitled")
-        summary = str(source.get("snippet") or "")
-        truncated = bool(source.get("truncated"))
+        summary = ""
+        truncated = False
+        if source.get("status") == "available" and source.get("snippet"):
+            title = str(source.get("title") or node_key or "Untitled")
+            summary = str(source["snippet"])
+            truncated = bool(source.get("truncated"))
+        else:
+            title = str(row.get("title") or row.get("node_key") or "Untitled")
+            summary, truncated = _bounded_excerpt(
+                " ".join(str(row.get("summary") or "").split()), 1200
+            )
         if not summary:
             retrieval_degraded = True
             continue

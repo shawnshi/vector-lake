@@ -101,6 +101,9 @@ def test_exact_fts_fast_path_batches_entity_eligibility(monkeypatch):
         def fetchall(self):
             return self.rows
 
+        def __iter__(self):
+            return iter(self.rows)
+
     class Connection:
         @staticmethod
         def execute(statement, parameters):
@@ -150,10 +153,15 @@ def test_exact_fts_fast_path_batches_entity_eligibility(monkeypatch):
 
     assert result is not None
     assert "Alpha Source" in result
-    assert len(statements) == 1
+    # The exact fast path now issues two bounded statements: one
+    # ownership/liveness probe against the identity registry, then the
+    # canonical plaintext load. The registry is never the body source.
+    assert len(statements) == 2
     assert "FROM entity_identities" in statements[0][0]
-    assert "JOIN entities" in statements[0][0]
+    assert "JOIN entities" not in statements[0][0]
     assert "page_key IN" in statements[0][0]
+    assert "FROM entity_identities" in statements[1][0]
+    assert "JOIN entities" in statements[1][0]
 
 
 @pytest.mark.parametrize(
