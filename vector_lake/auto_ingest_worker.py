@@ -30,7 +30,11 @@ from typing import Any, Callable
 
 from vector_lake import db_store
 from vector_lake.auto_ingest_runners import get_runner_adapter
-from vector_lake.auto_ingest_runners.base import RunnerRegistrationError
+from vector_lake.auto_ingest_runners.base import (
+    GenerationRequest,
+    RunnerHandle,
+    RunnerRegistrationError,
+)
 from vector_lake.durability import durable_replace_file, sync_open_file
 from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
 from vector_lake.native_llm import peek_subagent_scratch_dir
@@ -3459,18 +3463,27 @@ class AutoIngestController:
     """Single-threaded controller; watchdog singleton supplies process-level exclusion."""
 
     def __init__(self) -> None:
-        self._runner: Path | None = None
+        self._runner: RunnerHandle | None = None
+        self._runner_name = ""
         self._runner_checked_at = 0.0
         self._sticky_error = ""
         self._pending_state: dict[str, Any] | None = None
 
-    def _get_runner(self, config: AutoIngestConfig) -> Path:
+    def _get_runner(self, config: AutoIngestConfig) -> RunnerHandle:
         now = time.monotonic()
         if (
             self._runner is None
+            or self._runner_name != config.runner
             or now - self._runner_checked_at >= _RUNNER_PROBE_TTL_SECONDS
         ):
-            self._runner = _probe_codex_runner(config)
+            try:
+                adapter = get_runner_adapter(config.runner)
+            except RunnerRegistrationError:
+                raise AutoIngestInfrastructureError(
+                    "auto_ingest_runner_registration_failed"
+                ) from None
+            self._runner = adapter.probe(adapter.validate_options(config))
+            self._runner_name = config.runner
             self._runner_checked_at = now
         return self._runner
 
@@ -3604,7 +3617,7 @@ class AutoIngestController:
     def _process_claimed_job(
         self,
         claim: dict[str, Any],
-        runner: Path,
+        runner: RunnerHandle,
         config: AutoIngestConfig,
         state: dict[str, Any],
         stop_event: threading.Event,
@@ -3724,12 +3737,24 @@ class AutoIngestController:
                     "model",
                     attempt_id=receipt.attempt_id,
                 ):
-                    output = _run_codex_generator(
-                        runner,
-                        config,
+                    try:
+                        adapter = get_runner_adapter(config.runner)
+                    except RunnerRegistrationError:
+                        raise AutoIngestInfrastructureError(
+                            "auto_ingest_runner_registration_failed"
+                        ) from None
+                    request = GenerationRequest(
                         job_id,
                         lease,
+                        receipt.attempt_id,
                         prompt,
+                        config.max_input_bytes,
+                        config.max_output_bytes,
+                        config.timeout_seconds,
+                    )
+                    output = adapter.generate(
+                        runner,
+                        request,
                         stop_event,
                         component_heartbeat.ensure_healthy,
                     )

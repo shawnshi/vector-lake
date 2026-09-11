@@ -102,6 +102,14 @@ def _write_config(memory_dir: Path, **overrides):
     )
 
 
+def _runner_handle(config):
+    """Build the probed runner handle the controller now passes around."""
+    adapter = auto_ingest_worker.get_runner_adapter(config.runner)
+    return auto_ingest_worker.RunnerHandle(
+        resource=Path("C:/codex.exe"), options=adapter.validate_options(config)
+    )
+
+
 def _valid_payload(filepath: str = "C:/raw/source.md"):
     return {
         "filepath": filepath,
@@ -252,8 +260,10 @@ def test_generator_policy_failure_records_only_trusted_usage_in_receipt_and_budg
     finalized = []
     monkeypatch.setattr("vector_lake.tool_ingest.finalize_ingest_strict", lambda *_a: finalized.append(True))
     now = datetime.now(timezone.utc)
+    config = _enabled_config(max_tokens_per_task=10)
+    # The runner argument is a RunnerHandle since the adapter seam was switched in.
     outcome = auto_ingest_worker.AutoIngestController()._process_claimed_job(
-        claim, Path("C:/codex.exe"), _enabled_config(max_tokens_per_task=10),
+        claim, _runner_handle(config), config,
         auto_ingest_worker._empty_state(), threading.Event(), now,
     )
     assert outcome == "quarantined"
@@ -387,10 +397,11 @@ def test_current_private_diary_claim_is_quarantined_before_raw_or_model_access(
         lambda *_args, **_kwargs: model_calls.append(True),
     )
 
+    config = _enabled_config()
     outcome = auto_ingest_worker.AutoIngestController()._process_claimed_job(
         claim,
-        Path("C:/codex.exe"),
-        _enabled_config(),
+        _runner_handle(config),
+        config,
         auto_ingest_worker._empty_state(),
         threading.Event(),
         datetime.now(timezone.utc),
