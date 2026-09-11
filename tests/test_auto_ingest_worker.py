@@ -511,7 +511,37 @@ def test_config_rejects_unimplemented_runner(isolated_memory):
 
     with pytest.raises(
         ValueError,
-        match="auto_ingest_config_invalid:runner_must_be_codex_exec",
+        match="auto_ingest_config_invalid:runner_is_unknown:fake_runner",
+    ):
+        auto_ingest_worker.load_auto_ingest_config()
+
+
+def test_codex_config_without_runner_options_preserves_values(isolated_memory):
+    _write_config(isolated_memory)
+
+    config = auto_ingest_worker.load_auto_ingest_config()
+
+    assert config.runner == "codex_exec"
+    assert config.runner_options is None
+    # The loader normalizes both paths through pathlib before storing them; that
+    # behaviour predates the runner seam, so the expectation is platform-correct
+    # rather than a literal echo of the config text.
+    assert config.codex_executable == str(Path("C:/codex.exe"))
+    assert config.runner_codex_home == str(Path("C:/vector-lake-auto-ingest"))
+    assert config.required_codex_version == "0.148.0"
+    assert config.model == "gpt-5.6-terra"
+    assert config.reasoning_effort == "medium"
+
+
+def test_codex_config_rejects_runner_options_owned_key(isolated_memory):
+    _write_config(isolated_memory, runner_options={"model": "another-model"})
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "auto_ingest_config_invalid:"
+            "runner_options_conflict_with_top_level_codex_options"
+        ),
     ):
         auto_ingest_worker.load_auto_ingest_config()
 

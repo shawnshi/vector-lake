@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from vector_lake import db_store
+from vector_lake.auto_ingest_runners import get_runner_adapter
+from vector_lake.auto_ingest_runners.base import RunnerRegistrationError
 from vector_lake.durability import durable_replace_file, sync_open_file
 from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
 from vector_lake.native_llm import peek_subagent_scratch_dir
@@ -250,6 +252,7 @@ class AutoIngestConfig:
     enabled: bool = False
     allow_model_processing_raw_text: bool = False
     runner: str = "codex_exec"
+    runner_options: dict[str, Any] | None = None
     codex_executable: str = ""
     runner_codex_home: str = ""
     required_codex_version: str = ""
@@ -364,8 +367,31 @@ def load_auto_ingest_config() -> AutoIngestConfig:
         )
 
     runner = str(raw.get("runner") or "")
-    if runner != "codex_exec":
-        raise ValueError("auto_ingest_config_invalid:runner_must_be_codex_exec")
+    try:
+        get_runner_adapter(runner)
+    except RunnerRegistrationError as exc:
+        raise ValueError(f"auto_ingest_config_invalid:{exc}") from None
+    runner_options = raw.get("runner_options")
+    if runner_options is not None and not isinstance(runner_options, dict):
+        raise ValueError("auto_ingest_config_invalid:runner_options_must_be_object")
+    codex_owned_keys = {
+        "codex_executable",
+        "runner_codex_home",
+        "required_codex_version",
+        "required_codex_sha256",
+        "required_system_skills_sha256",
+        "required_models_cache_sha256",
+        "required_auth_identity_sha256",
+        "model",
+        "reasoning_effort",
+    }
+    if runner == "codex_exec" and runner_options and (
+        codex_owned_keys & runner_options.keys()
+    ):
+        raise ValueError(
+            "auto_ingest_config_invalid:"
+            "runner_options_conflict_with_top_level_codex_options"
+        )
     codex_executable = str(raw.get("codex_executable") or "")
     executable_path = Path(codex_executable)
     if not executable_path.is_absolute():
@@ -420,6 +446,7 @@ def load_auto_ingest_config() -> AutoIngestConfig:
         enabled=True,
         allow_model_processing_raw_text=allow_model_processing_raw_text,
         runner=runner,
+        runner_options=dict(runner_options) if runner_options is not None else None,
         codex_executable=str(executable_path),
         runner_codex_home=str(runner_home_path),
         required_codex_version=required_version,
