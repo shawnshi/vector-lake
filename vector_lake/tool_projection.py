@@ -115,7 +115,23 @@ _MAINTENANCE_MANIFEST_V4_KEYS = frozenset(
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 _PROJECTION_GC_CONTRACT = "vector-lake-projection-object-gc/v1"
 _PROJECTION_GC_MAX_BATCH = 10_000
-_PROJECTION_GC_MAX_SCAN_FILES = 200_000
+# Operator-adjustable scan budget.  The object store grows with every published
+# projection generation, so a hard-coded cap silently disables
+# `projection_object_gc` once the store passes it: the scan reports
+# `projection_object_scan_limit_exceeded`, `can_apply` becomes False, and orphan
+# bytes accumulate with no sanctioned way to collect them.  Only orphan metadata
+# is retained in memory, so the default raises the budget to 1,000,000 files
+# while staying bounded and re-lowerable from the environment.
+def _projection_gc_scan_budget() -> int:
+    raw = os.environ.get("VECTOR_LAKE_PROJECTION_GC_MAX_SCAN_FILES", "1000000")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 1_000_000
+    return max(1_000, min(10_000_000, value))
+
+
+_PROJECTION_GC_MAX_SCAN_FILES = _projection_gc_scan_budget()
 _TEST_PROJECTION_GC_FAULT_HOOK = None
 _PROJECTION_REBUILD_LEGACY_CAPABILITY = object()
 
