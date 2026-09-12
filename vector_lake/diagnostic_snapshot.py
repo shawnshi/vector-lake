@@ -138,6 +138,29 @@ class DiagnosticSnapshot:
         }
 
 
+_READ_ONLY_SNAPSHOT_REASON_PREFIX = "database_read_only_snapshot_unavailable:"
+
+# Closed allowlist of structural sidecar failures whose reason token is safe to
+# surface.  Free-form messages can embed filesystem paths (see
+# tests/test_diagnostic_snapshot.py "...sanitizes_unknowns"), so anything outside
+# this list must keep degrading to the generic code.
+_SANITIZED_READ_ONLY_SNAPSHOT_REASONS = frozenset(
+    {
+        "database_has_uncheckpointed_wal",
+        "invalid_wal_frame",
+        "invalid_wal_frame_checksum",
+        "invalid_wal_frame_salt",
+        "invalid_wal_header",
+        "invalid_wal_header_checksum",
+        "invalid_wal_index",
+        "invalid_wal_index_checksum",
+        "invalid_wal_index_frame_checksum",
+        "invalid_wal_layout",
+        "missing_wal_index",
+    }
+)
+
+
 def _trusted_snapshot_cause(exc: BaseException) -> BaseException | None:
     cause = getattr(exc, "__cause__", None)
     for _ in range(4):
@@ -173,6 +196,10 @@ def _unavailable_code(exc: BaseException) -> str:
             return reason
         if reason.startswith("database_missing"):
             return "database_missing"
+        if reason.startswith(_READ_ONLY_SNAPSHOT_REASON_PREFIX):
+            token = reason[len(_READ_ONLY_SNAPSHOT_REASON_PREFIX):].split(":", 1)[0].strip()
+            if token in _SANITIZED_READ_ONLY_SNAPSHOT_REASONS:
+                return token
         return "diagnostic_snapshot_unavailable"
     if isinstance(exc, PermissionError):
         return "snapshot_permission_denied"

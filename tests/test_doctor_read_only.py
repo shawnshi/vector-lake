@@ -362,6 +362,105 @@ def test_read_only_transaction_snapshot_rejects_corrupt_committed_wal_frame(
     assert after == before
 
 
+def _clone_live_wal_targets(isolated_memory, name):
+    """Clone db+wal+shm so a mutated WAL can be validated without side effects."""
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    writer = db_store.get_connection()
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    with db_store.transaction():
+        writer.execute("CREATE TABLE wal_tail_probe (value INTEGER NOT NULL)")
+        writer.execute("INSERT INTO wal_tail_probe (value) VALUES (1)")
+    source_wal = Path(str(db_path) + "-wal")
+    source_shm = Path(str(db_path) + "-shm")
+    assert source_wal.stat().st_size > 32
+    clone_dir = isolated_memory / "scratch" / name
+    clone_dir.mkdir(parents=True)
+    clone_db = clone_dir / "vector_lake.db"
+    clone_wal = Path(str(clone_db) + "-wal")
+    clone_shm = Path(str(clone_db) + "-shm")
+    shutil.copyfile(db_path, clone_db)
+    shutil.copyfile(source_wal, clone_wal)
+    shutil.copyfile(source_shm, clone_shm)
+    return clone_db, clone_wal, clone_shm
+
+
+def _wal_frame_size(wal_path: Path) -> int:
+    header = wal_path.read_bytes()[:32]
+    page_size = int.from_bytes(header[8:12], "big")
+    return 24 + (65_536 if page_size == 1 else page_size)
+
+
+def test_validate_nonempty_wal_sidecars_tolerates_wal_truncated_mid_frame(
+    isolated_memory,
+):
+    """A WAL truncated to journal_size_limit may end mid-frame and stays valid.
+
+    Regression: a 64 MiB journal_size_limit left a non-frame-aligned WAL that the
+    read-only snapshot rejected as invalid_wal_layout, which disabled deep doctor
+    and the governance-debt snapshot for an otherwise healthy database.  The
+    committed frame count comes from the wal-index, so trailing bytes past the
+    last committed frame must be ignored rather than rejected.  This exercises the
+    validator directly: opening the file through a connection lets SQLite rewrite
+    the tail, which is the separate (and correct) wal_changed_before_snapshot_begin
+    fail-closed path.
+    """
+    clone_db, clone_wal, clone_shm = _clone_live_wal_targets(
+        isolated_memory, "wal-mid-frame"
+    )
+    frame_size = _wal_frame_size(clone_wal)
+    original_header = clone_wal.read_bytes()[:32]
+    with clone_wal.open("ab") as handle:
+        handle.write(b"\x00" * (frame_size // 2))
+    assert (clone_wal.stat().st_size - 32) % frame_size != 0
+
+    header, shm_headers = db_store._validate_nonempty_wal_sidecars(clone_db)
+    assert header == original_header
+    assert len(shm_headers) == 96
+
+
+def test_validate_nonempty_wal_sidecars_rejects_wal_shorter_than_committed_frames(
+    isolated_memory,
+):
+    """Relaxing the byte-alignment rule must not weaken frame-count validation."""
+    clone_db, clone_wal, _clone_shm = _clone_live_wal_targets(
+        isolated_memory, "wal-short"
+    )
+    clone_wal.write_bytes(clone_wal.read_bytes()[:32])
+
+    with pytest.raises(
+        db_store.ReadOnlySnapshotUnavailable,
+        match="invalid_wal_index",
+    ):
+        db_store._validate_nonempty_wal_sidecars(clone_db)
+
+
+def test_read_only_transaction_snapshot_still_rejects_rewritten_wal_tail(
+    isolated_memory,
+):
+    """The snapshot boundary still fails closed when the WAL moves under it."""
+    clone_db, clone_wal, clone_shm = _clone_live_wal_targets(
+        isolated_memory, "wal-rewrite"
+    )
+    frame_size = _wal_frame_size(clone_wal)
+    with clone_wal.open("ab") as handle:
+        handle.write(b"\x00" * (frame_size // 2))
+
+    before = {
+        path: _file_identity(path) for path in (clone_db, clone_wal, clone_shm)
+    }
+    with pytest.raises(
+        db_store.ReadOnlySnapshotUnavailable,
+        match="wal_changed_before_snapshot_begin",
+    ):
+        with db_store.read_only_transaction_snapshot(clone_db):
+            pass
+    after = {
+        path: _file_identity(path) for path in (clone_db, clone_wal, clone_shm)
+    }
+    assert after != before
+
+
 def test_doctor_uses_immutable_snapshot_for_closed_database(
     isolated_memory,
 ):

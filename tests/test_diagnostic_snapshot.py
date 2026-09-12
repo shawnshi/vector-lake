@@ -295,6 +295,23 @@ def test_path_identity_only_treats_missing_as_missing(monkeypatch, tmp_path):
             "database_missing",
         ),
         (
+            # Structural sidecar tokens survive sanitization so a live failure
+            # is diagnosable instead of collapsing into the generic code.
+            db_store.ReadOnlySnapshotUnavailable(
+                "database_read_only_snapshot_unavailable:invalid_wal_layout:"
+                "/secret/path.db-wal"
+            ),
+            "invalid_wal_layout",
+        ),
+        (
+            # Anything outside the closed allowlist must still degrade to the
+            # generic code and must not leak the embedded path.
+            db_store.ReadOnlySnapshotUnavailable(
+                "database_read_only_snapshot_unavailable:select * from secret"
+            ),
+            "diagnostic_snapshot_unavailable",
+        ),
+        (
             sqlite3.OperationalError("database is locked"),
             "snapshot_timeout",
         ),

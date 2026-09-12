@@ -2242,11 +2242,19 @@ def _validate_nonempty_wal_sidecars(path: Path) -> tuple[bytes, bytes]:
         or wal_page_size > 65_536
         or wal_page_size & (wal_page_size - 1)
         or wal_size < 32
-        or (wal_size - 32) % frame_size
     ):
         raise ReadOnlySnapshotUnavailable(
             f"database_read_only_snapshot_unavailable:invalid_wal_layout:{wal_path}"
         )
+    # A WAL truncated to `PRAGMA journal_size_limit` may end mid-frame, because
+    # that limit is applied as a byte length and need not be congruent to
+    # 32 mod frame_size.  SQLite derives the committed frame count from the
+    # wal-index, not from the file length, so trailing bytes past the last
+    # committed frame are valid and ignored.  Frame-level integrity is enforced
+    # below instead of here: the committed count must fit inside
+    # floor((wal_size - 32) / frame_size), and every committed frame is
+    # length-, salt- and rolling-checksum-verified, so a short or truncated
+    # final frame still fails closed.
     if not shm_path.is_file():
         raise ReadOnlySnapshotUnavailable(
             f"database_read_only_snapshot_unavailable:missing_wal_index:{shm_path}"
