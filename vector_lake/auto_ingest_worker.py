@@ -58,7 +58,7 @@ _STATE_NAME = ".auto_ingest_controller_state.json"
 _STATE_SCHEMA_VERSION = 1
 _MAX_TASKS_PER_HOUR = 100
 _MAX_TASKS_PER_24H = 2000
-_MAX_TOKENS_PER_TASK = 81920
+_MAX_TOKENS_PER_TASK = 131072
 # Default per-task budget is the operational default (not the safety ceiling).
 # Reservation defaults must stay within the hard ceilings enforced by
 # ``_require_int`` so a fresh (config-less) runtime is self-consistent.

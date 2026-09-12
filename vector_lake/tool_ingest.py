@@ -75,6 +75,51 @@ _TERMINAL_RETRY_CONTRACT = "vector-lake-terminal-ingest-retry/v1"
 _INGEST_DEBT_EXACT_CONTRACT = "vector-lake-ingest-debt-exact/v1"
 _INGEST_DEBT_EXACT_ACTIONS = {"supersede_duplicate"}
 _LEGACY_RETRYABLE_GENERATOR_REASON = "codex_event_log_type_is_not_allowed:error"
+# Marker written by ``_auto_source_page``; a finalized job whose canonical page still
+# carries it never received enrichment content and can be re-armed deliberately.
+_PROVENANCE_ONLY_SOURCE_MARKER = "该页面为摄入引擎自动生成的 provenance-only Source 记录"
+_BUDGET_UNFIT_ERROR_PREFIX = "serialized_prompt_and_schema_exceed_token_budget"
+
+
+def _provenance_only_finalized_job_ids(conn) -> list[str]:
+    """Return finalized ingest jobs whose canonical page is still a seed stub.
+
+    A provenance-only Source page means the enrichment generator never delivered
+    content (empty file list, dead runner, or an unfinished relay answer).  Those
+    jobs are otherwise terminal, so re-arming them is an explicit operator choice
+    rather than an automatic retry.
+    """
+    from vector_lake.wiki_utils import get_wiki_dir
+
+    wiki_dir = Path(get_wiki_dir())
+    selected: list[str] = []
+    for row in conn.execute(
+        "SELECT job_id, status, error_msg, payload FROM jobs "
+        "WHERE task_type = 'ingest' AND status IN ('finalized', 'failed')"
+    ):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(row["status"]) == "failed" and not str(
+            row["error_msg"] or ""
+        ).startswith(_BUDGET_UNFIT_ERROR_PREFIX):
+            # Only budget-unfit failures become retryable after the per-task
+            # budget is raised; every other terminal failure keeps its state.
+            continue
+        canonical_name = str(payload.get("canonical_name") or "")
+        if not canonical_name.casefold().endswith(".md"):
+            continue
+        candidate = wiki_dir / Path(canonical_name).name
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if _PROVENANCE_ONLY_SOURCE_MARKER in text:
+            selected.append(str(row["job_id"]))
+    return sorted(selected)
 
 
 def _raw_scan_checkpoint(label: str, position: int) -> None:
@@ -824,6 +869,12 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
 
     marker_matches = any(marker_matches_current(row) for row in rows)
     if action == "requeue_current":
+        if item.get("reopen_provenance_only"):
+            # Reopening a finalized provenance-only Source page is an explicit
+            # operator action.  The processed marker records that the raw bytes
+            # were ingested, not that the page ever received enrichment content,
+            # so it must not fence this requeue.
+            return ""
         return (
             "processed_files now proves the current raw revision"
             if marker_matches
@@ -1296,6 +1347,7 @@ def reconcile_ingest_job_debt(
     dry_run: bool = True,
     limit: int = 0,
     *,
+    reopen_provenance_only: bool = False,
     job_id: str = "",
     expected_action: str = "",
     confirmation: str = "",
@@ -1369,6 +1421,38 @@ def reconcile_ingest_job_debt(
         "AND json_extract(result_json, '$.state') = 'blocked' THEN 0 "
         "ELSE 1 END = 1"
     )
+    if reopen_provenance_only:
+        reopen_ids = _provenance_only_finalized_job_ids(conn)
+        if not reopen_ids:
+            conn.close()
+            return json.dumps(
+                {
+                    "dry_run": bool(dry_run),
+                    "selected_jobs": 0,
+                    "available_jobs": 0,
+                    "counts": {},
+                    "backup": "",
+                    "preview_error": "",
+                    "reopen_provenance_only": True,
+                    "reopen_candidates": 0,
+                    "cleanup": {
+                        "claimed": 0,
+                        "completed": 0,
+                        "failed": 0,
+                        "errors": [],
+                    },
+                    "concurrent_skips": [],
+                    "samples": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        placeholders = ", ".join("?" for _ in reopen_ids)
+        debt_predicate = (
+            "task_type = 'ingest' AND status IN ('finalized', 'failed') "
+            f"AND job_id IN ({placeholders})"
+        )
+        predicate_params = tuple(reopen_ids)
     operator_retry_job_id = str(_operator_retry_job_id or "").strip()
     operator_retry_arguments = (
         operator_retry_job_id,
@@ -1389,6 +1473,9 @@ def reconcile_ingest_job_debt(
     elif exact_job_id:
         filtered_predicate += " AND job_id = ?"
         predicate_params = (exact_job_id,)
+    if reopen_provenance_only:
+        # The reopen predicate carries one placeholder per candidate job id.
+        predicate_params = tuple(reopen_ids) + tuple(predicate_params)
     available_jobs = int(
         conn.execute(
             f"SELECT COUNT(*) FROM jobs WHERE {filtered_predicate}",
@@ -1561,7 +1648,7 @@ def reconcile_ingest_job_debt(
             )
         except RawRevisionFormatError:
             processed_matches_current = False
-        if processed_matches_current:
+        if processed_matches_current and not reopen_provenance_only:
             if operator_retry_job_id:
                 raise IngestBaselineConflict(
                     "terminal ingest retry revision became processed after confirmation"
@@ -1599,7 +1686,8 @@ def reconcile_ingest_job_debt(
             _job_is_non_retryable_policy_failure(record) and not operator_retry
         )
         needs_requeue = (
-            (record.get("status") == "failed" and not non_retryable_policy)
+            reopen_provenance_only
+            or (record.get("status") == "failed" and not non_retryable_policy)
             or payload_hash != current_hash
             or not contract_current
         )
@@ -1776,7 +1864,9 @@ def reconcile_ingest_job_debt(
             "job_id": record["job_id"],
             "action": "requeue_current",
             "reason": (
-                "operator-authorized legacy runner-error retry"
+                "finalized provenance-only Source page reopened for enrichment"
+                if reopen_provenance_only
+                else "operator-authorized legacy runner-error retry"
                 if operator_retry
                 else "terminal failure"
                 if record.get("status") == "failed"
@@ -1789,6 +1879,7 @@ def reconcile_ingest_job_debt(
             "processed_lookup_paths": processed_lookup_paths,
             "target_key": target_key,
             "created_at": str(record.get("created_at") or ""),
+            "reopen_provenance_only": reopen_provenance_only,
             "expected_state": expected_state,
         }
         requeue_groups.setdefault(str(target_key), []).append(candidate)
