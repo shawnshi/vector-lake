@@ -143,6 +143,15 @@ def _plain_regular_file_stat(path: Path) -> os.stat_result:
     return details
 
 
+# The maintenance-backup writer accepts a manifest up to 4 MiB
+# (tool_projection._MAINTENANCE_MANIFEST_MAX_BYTES).  Reading less here made the
+# corpus creatable-but-never-prunable once manifests grew past 1 MiB: every
+# retention call failed closed with backup_manifest_too_large, so backup volume
+# could only grow.  Keep the two limits in step; the read stays bounded to
+# max_bytes + 1 and keeps its stable-stat identity checks.
+_BACKUP_MANIFEST_READ_MAX_BYTES = 4 * 1024 * 1024
+
+
 def _read_plain_file_bytes(path: Path, *, max_bytes: int) -> bytes:
     before = _plain_regular_file_stat(path)
     if int(before.st_size) > max_bytes:
@@ -388,7 +397,9 @@ def _v4_declared_tree_is_exact(path: Path, manifest: dict[str, Any]) -> bool:
 def _read_complete_manifest(path: Path) -> tuple[dict[str, Any], str] | None:
     manifest_path = path / "manifest.json"
     try:
-        raw = _read_plain_file_bytes(manifest_path, max_bytes=1024 * 1024)
+        raw = _read_plain_file_bytes(
+            manifest_path, max_bytes=_BACKUP_MANIFEST_READ_MAX_BYTES
+        )
         manifest = json.loads(raw)
     except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
         return None
@@ -736,7 +747,7 @@ def _verify_restorable_backup_snapshot(
             sidecar = json.loads(
                 _read_plain_file_bytes(
                     path / sidecar_name,
-                    max_bytes=1024 * 1024,
+                    max_bytes=_BACKUP_MANIFEST_READ_MAX_BYTES,
                 )
             )
         except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError) as exc:
@@ -910,9 +921,12 @@ def _projection_recovery_protection(root: Path) -> list[dict[str, str]]:
                 names = {child.name for child in path.iterdir()}
                 manifest = {}
                 if "manifest.json" in names:
-                    manifest = json.loads(_read_plain_file_bytes(
-                        path / "manifest.json", max_bytes=1024 * 1024,
-                    ))
+                    manifest = json.loads(
+                        _read_plain_file_bytes(
+                            path / "manifest.json",
+                            max_bytes=_BACKUP_MANIFEST_READ_MAX_BYTES,
+                        )
+                    )
                     if not isinstance(manifest, dict):
                         raise ValueError("backup_manifest_is_not_an_object")
                 receipt_name = tool_projection._PROJECTION_RECOVERY_ARTIFACT
