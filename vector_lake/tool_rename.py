@@ -145,7 +145,15 @@ def rename_vector_lake_entity(
             f"and update links in {updated_files} file(s)."
         )
     try:
-        execute_mutation_batch(mutations)
+        execute_mutation_batch(
+            mutations,
+            # The destination page carries the already-reviewed content of the page
+            # being retired, so it is validated structurally rather than re-audited
+            # against the current evidence contract (see
+            # ``identity_only_filenames`` in mutation_coordinator).  The retire leg
+            # of the same batch keeps every delete gate.
+            identity_only_filenames=[normalized_new_name],
+        )
     except Exception as exc:
         return f"Error during atomic rename: {exc}"
     return f"Successfully renamed '{old_name}' to '{normalized_new_name}'. Updated links in {updated_files} files."

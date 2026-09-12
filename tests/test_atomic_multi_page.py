@@ -1,8 +1,10 @@
 import hashlib
+import json
 
 import pytest
 
 from vector_lake import db_store, indexer, mcp_server
+from vector_lake import governance_store, mutation_coordinator
 from vector_lake.projection_format_v2 import (
     build_projection_roots,
     publish_prepared_projection,
@@ -11,6 +13,189 @@ from vector_lake.schema_validator import SchemaViolationException, validate_sche
 from vector_lake.tool_rename import rename_vector_lake_entity
 from vector_lake.claim_extractor import _stable_id
 from vector_lake.wiki_utils import get_wiki_dir, split_frontmatter
+
+
+def _identity_page(name: str, title: str) -> str:
+    """A structurally valid page that deliberately lacks a legal evidence_tier."""
+    return (
+        "---\n"
+        f"id: {name}\n"
+        f"title: {title}\n"
+        "type: concept\n"
+        "domain: Medical_IT\n"
+        "status: Active\n"
+        "epistemic-status: seed\n"
+        "categories:\n- Uncategorized\n"
+        "updated: '2026-09-12'\n"
+        "sources: []\n"
+        "strategic_scope: core\n"
+        "---\n"
+        f"# {title}\n\n"
+        "## 1. 编译事实\n"
+        "*[System Directive: This section represents the LATEST consensus.]*\n\n"
+        "陈述。\n\n"
+        "### 物理机制 (Mechanism)\n"
+        "- 机制说明。\n\n"
+        "---\n\n"
+        "## 2. 证据时间线 (Timeline - EVENT STORE)\n"
+        "*[System Directive: This is the immutable event ledger.]*\n\n"
+        "- [2026-09-12] [Observation] 观察记录。\n"
+    )
+
+
+def test_entity_id_cannot_migrate_to_a_still_live_page(isolated_memory):
+    """The identity-transfer allowance must not let a live page's id be stolen.
+
+    An ``entity_id`` may move to a new page key only when the page that reserved
+    it is deleted by the same batch.  A surviving page keeps its id exclusively.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    now = "2026-09-13T00:00:00+00:00"
+    with db_store.transaction():
+        conn.execute(
+            "INSERT OR REPLACE INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) VALUES (?,?,?,?)",
+            (
+                "entity_live",
+                "Concept_Live",
+                json.dumps({"page_key": "Concept_Live"}),
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO entity_identities "
+            "(entity_id, page_key, canonical_name, identity_origin, data_json, "
+            "recorded_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                "entity_live",
+                "Concept_Live",
+                "Concept_Live",
+                "canonical_write",
+                "{}",
+                now,
+                now,
+            ),
+        )
+    proposed = [{"entity_id": "entity_live", "page_key": "Concept_Thief"}]
+
+    with pytest.raises(governance_store.CanonicalIdOwnershipError):
+        governance_store._validate_canonical_id_ownership(
+            conn,
+            proposed_entities=proposed,
+            proposed_claims=[],
+            proposed_evidence=[],
+            affected_page_keys={"Concept_Thief"},
+        )
+
+    # Retiring the page that reserved the id in the same batch makes it legal.
+    governance_store._validate_canonical_id_ownership(
+        conn,
+        proposed_entities=proposed,
+        proposed_claims=[],
+        proposed_evidence=[],
+        affected_page_keys={"Concept_Thief"},
+        retired_page_keys={"Concept_Live"},
+    )
+
+
+def test_identity_only_rename_skips_evidence_contract_but_keeps_structure(
+    isolated_memory,
+):
+    """A migration-era page without a legal evidence_tier can still be renamed.
+
+    Regression: `rename_vector_lake_entity` re-validated the destination page
+    against the full evidence contract, so pages created before that contract
+    could never be renamed even though their content was already reviewed.  The
+    destination is now validated structurally; content that breaks the structure
+    is still refused.
+    """
+    wiki_dir = get_wiki_dir()
+    legacy = wiki_dir / "Concept_Atrium Health.md"
+    legacy.write_text(_identity_page("atrium", "Atrium Health"), encoding="utf-8")
+
+    result = rename_vector_lake_entity(
+        "Concept_Atrium Health", "Concept_Atrium-Health", dry_run=False
+    )
+    assert result.startswith("Successfully renamed"), result
+    assert not legacy.exists()
+    assert (wiki_dir / "Concept_Atrium-Health.md").is_file()
+
+
+def test_identity_only_rejects_delete_and_existing_target(isolated_memory):
+    """The identity-only allowance must never overwrite or remove a live page."""
+    wiki_dir = get_wiki_dir()
+    legacy = wiki_dir / "Concept_Atrium Health.md"
+    legacy.write_text(_identity_page("atrium", "Atrium Health"), encoding="utf-8")
+    existing = wiki_dir / "Concept_Atrium-Health.md"
+    existing.write_text(_identity_page("atrium2", "Atrium Health 2"), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot be deletes"):
+        mutation_coordinator.validate_mutation_batch_metadata(
+            [
+                {
+                    "filename": "Concept_Atrium-Health.md",
+                    "is_delete": True,
+                    "expected_projection_hash": "",
+                }
+            ],
+            validation_mode="full",
+            identity_only_filenames=["Concept_Atrium-Health.md"],
+        )
+
+    with pytest.raises(ValueError, match="must not already exist"):
+        mutation_coordinator.validate_mutation_batch_metadata(
+            [
+                {
+                    "filename": "Concept_Atrium-Health.md",
+                    "content": _identity_page("atrium3", "Atrium Health 3"),
+                    "expected_projection_hash": "",
+                }
+            ],
+            validation_mode="full",
+            identity_only_filenames=["Concept_Atrium-Health.md"],
+        )
+
+
+def test_rename_retires_legacy_named_source_in_full_validation(isolated_memory):
+    """A migration-era name must be retirable without the schema-maintenance path.
+
+    Regression: `Concept_Atrium Health.md` (space) and `Concept_Epic_Systems.md`
+    (underscore in the core name) could neither be deleted nor renamed, because
+    the delete leg of the rename was validated against the current filename
+    contract while the schema-maintenance path forbids deletes.  Deletes now
+    carry the legacy-name allowance; updates keep the strict contract.
+    """
+    wiki_dir = get_wiki_dir()
+    legacy = wiki_dir / "Concept_Atrium Health.md"
+    legacy.write_text("---\ntitle: x\n---\nbody\n", encoding="utf-8")
+
+    metadata = mutation_coordinator.validate_mutation_batch_metadata(
+        [
+            {
+                "filename": "Concept_Atrium Health.md",
+                "is_delete": True,
+                "expected_projection_hash": hashlib.sha256(
+                    legacy.read_bytes()
+                ).hexdigest(),
+            }
+        ],
+        validation_mode="full",
+    )
+    assert metadata[0]["validation_mode"] == "full"
+    assert metadata[0]["filepath"].name == "Concept_Atrium Health.md"
+
+    with pytest.raises(ValueError, match="characters"):
+        mutation_coordinator.validate_mutation_batch_metadata(
+            [
+                {
+                    "filename": "Concept_Atrium Health.md",
+                    "content": "---\ntitle: x\n---\nbody\n",
+                    "expected_projection_hash": "",
+                }
+            ],
+            validation_mode="full",
+        )
 
 
 def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
@@ -22,7 +207,7 @@ def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
     (wiki_dir / "Concept_Ref.MD").write_text("ref [[Concept_Old]]", encoding="utf-8")
     captured = []
 
-    def fake_batch(mutations):
+    def fake_batch(mutations, **kwargs):
         captured.append(mutations)
         return True, "ok"
 
@@ -57,7 +242,7 @@ def test_batch_replace_links_commits_once(isolated_memory, monkeypatch):
     (wiki_dir / "Concept_B.MD").write_text("x [[Old]] y", encoding="utf-8")
     captured = []
 
-    def fake_batch(mutations):
+    def fake_batch(mutations, **kwargs):
         captured.append(mutations)
         return True, "ok"
 

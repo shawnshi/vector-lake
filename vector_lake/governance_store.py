@@ -6389,7 +6389,10 @@ def record_prepared_change_sets(change_sets: list[dict]) -> int:
     return added
 
 
-def apply_and_record_change_sets_batch(change_sets: list[dict]) -> list[dict]:
+def apply_and_record_change_sets_batch(
+    change_sets: list[dict],
+    retired_page_keys: set[str] | None = None,
+) -> list[dict]:
     """Persist pending deltas, apply them, and detach payloads in one transaction."""
     if not change_sets:
         return []
@@ -6449,7 +6452,9 @@ def apply_and_record_change_sets_batch(change_sets: list[dict]) -> list[dict]:
                 outcomes[idempotency_key] = manifest
 
         if active:
-            _apply_change_sets_batch_unchecked(active)
+            _apply_change_sets_batch_unchecked(
+                active, retired_page_keys=retired_page_keys
+            )
             published_at = _utc_now()
             for change_set in active:
                 terminal = _terminalize_change_set(
@@ -6800,8 +6805,23 @@ def _validate_canonical_id_ownership(
     proposed_claims: list[dict],
     proposed_evidence: list[dict],
     affected_page_keys: set[str],
+    retired_page_keys: set[str] | None = None,
 ) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
-    """Validate global-ID ownership before any page-scoped delete or upsert."""
+    """Validate global-ID ownership before any page-scoped delete or upsert.
+
+    ``retired_page_keys`` names the pages this batch deletes.  An ``entity_id``
+    may move to a new page key only when the page that previously reserved it is
+    itself being retired in the same batch (identity-only rename).  The unique
+    ownership invariant therefore still holds at batch end: a page that survives
+    the batch can never have its id claimed by another live page.
+    """
+    retired = {
+        normalized
+        for normalized in (
+            _normalized_owner_page(page) for page in (retired_page_keys or ())
+        )
+        if normalized
+    }
     entity_owners = _proposed_id_owners(
         proposed_entities,
         record_kind="entity",
@@ -6843,10 +6863,11 @@ def _validate_canonical_id_ownership(
                 record_id=entity_id,
             )
             if entity_owners[entity_id] != existing_owner:
-                raise CanonicalIdOwnershipError(
-                    f"Canonical entity_id {entity_id!r} is owned by page "
-                    f"{existing_owner[0]!r}, not {entity_owners[entity_id][0]!r}."
-                )
+                if existing_owner[0] not in retired:
+                    raise CanonicalIdOwnershipError(
+                        f"Canonical entity_id {entity_id!r} is owned by page "
+                        f"{existing_owner[0]!r}, not {entity_owners[entity_id][0]!r}."
+                    )
 
         for row in _rows_for_ids(
             conn,
@@ -6863,10 +6884,11 @@ def _validate_canonical_id_ownership(
                     "without page_key ownership."
                 )
             if entity_owners[entity_id][0] != identity_page:
-                raise CanonicalIdOwnershipError(
-                    f"Canonical entity_id {entity_id!r} is reserved by identity page "
-                    f"{identity_page!r}, not {entity_owners[entity_id][0]!r}."
-                )
+                if identity_page not in retired:
+                    raise CanonicalIdOwnershipError(
+                        f"Canonical entity_id {entity_id!r} is reserved by identity page "
+                        f"{identity_page!r}, not {entity_owners[entity_id][0]!r}."
+                    )
 
     _validate_locator_id_ownership(
         conn,
@@ -6881,7 +6903,10 @@ def _validate_canonical_id_ownership(
     return claim_owners, evidence_owners
 
 
-def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
+def _apply_change_sets_batch_unchecked(
+    change_sets: list[dict],
+    retired_page_keys: set[str] | None = None,
+) -> list[dict]:
     """Apply a page-scoped canonical delta inside an existing transaction."""
     if not change_sets:
         return []
@@ -6937,6 +6962,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
         proposed_claims=proposed_claims,
         proposed_evidence=proposed_evidence,
         affected_page_keys=affected_page_keys,
+        retired_page_keys=retired_page_keys,
     )
     _register_locator_id_ownership(
         conn,
@@ -7005,6 +7031,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             proposed_claims=proposed_claims,
             proposed_evidence=proposed_evidence,
             affected_page_keys=affected_page_keys,
+            retired_page_keys=retired_page_keys,
         )
         _register_locator_id_ownership(
             conn, owners=claim_owners, record_kind="claim"

@@ -113,7 +113,12 @@ def _prepare_staged_projection(
     """Validate and write a projection candidate without holding a DB lock."""
     filepath = resolve_wiki_mutation_path(
         filename,
-        allow_existing_legacy_name=validation_mode == "schema",
+        # Mirror validate_mutation_batch_metadata: a delete may retire a page whose
+        # existing name predates the current filename contract, because the delete
+        # moves the corpus toward conformance.  Updates keep the strict contract.
+        allow_existing_legacy_name=(
+            validation_mode == "schema" or mutation_type == "delete"
+        ),
     )
     if not isinstance(projection_base_hash, str):
         raise RuntimeError("Staged projection requires a committed projection baseline.")
@@ -234,7 +239,11 @@ def materialize_markdown_projection(
         )
     filepath = resolve_wiki_mutation_path(
         filename,
-        allow_existing_legacy_name=validation_mode == "schema",
+        # Same legacy-name allowance as the staging path: retiring a
+        # migration-era filename is a conformance move, not a creation.
+        allow_existing_legacy_name=(
+            validation_mode == "schema" or mutation_type == "delete"
+        ),
     )
     if mutation_type == "delete":
         if filepath.exists():
@@ -281,6 +290,7 @@ def validate_mutation_batch_metadata(
     mutations: Iterable[dict],
     validation_mode: str = "full",
     schema_maintenance_filenames: Iterable[str] | None = None,
+    identity_only_filenames: Iterable[str] | None = None,
 ) -> list[dict]:
     """Validate a complete mutation batch without reading or validating content."""
     if validation_mode not in {"full", "schema"}:
@@ -300,6 +310,21 @@ def validate_mutation_batch_metadata(
         for filename in maintenance_set
     ):
         raise ValueError("Schema maintenance filenames must be wiki basenames.")
+    identity_names = list(identity_only_filenames or ())
+    if len(identity_names) != len(set(identity_names)):
+        raise ValueError("Identity-only filenames must be unique.")
+    if any(
+        not isinstance(filename, str)
+        or not filename
+        or Path(filename).name != filename
+        for filename in identity_names
+    ):
+        raise ValueError("Identity-only filenames must be wiki basenames.")
+    identity_set = set(identity_names)
+    if identity_set & maintenance_set:
+        raise ValueError(
+            "Identity-only filenames cannot also be schema maintenance exceptions."
+        )
 
     metadata: list[dict] = []
     prepared_maintenance_names = set()
@@ -355,16 +380,51 @@ def validate_mutation_batch_metadata(
                 "expected_projection_hash must be empty or a 64-character SHA-256 hex digest."
             )
         item_validation_mode = (
+            # ``identity`` items reuse the already-supported bounded ``schema``
+            # validation (structure only, no evidence contract, no index-based
+            # tag/entity collision check) so the outbox and projection layers need
+            # no new mode.  Unlike a schema-maintenance exception they are not
+            # listed in ``maintenance_set``: they keep their own preconditions
+            # below and are not restricted to Source_ pages.
             "schema"
-            if validation_mode == "schema" or filename in maintenance_set
+            if validation_mode == "schema"
+            or filename in maintenance_set
+            or filename in identity_set
             else "full"
         )
         filepath = resolve_wiki_mutation_path(
             filename,
-            allow_existing_legacy_name=item_validation_mode == "schema",
+            # Deletes may target a page whose existing name predates the current
+            # filename contract (migration-era names such as `Concept_A B.md` or
+            # `Concept_A_B.md`).  Retiring or renaming such a page moves the
+            # corpus toward conformance, so the legacy-name allowance applies to
+            # deletes as well as to the bounded schema-maintenance path.  Updates
+            # keep the strict contract: the replacement page is still validated
+            # in full, and every other delete gate (projection hash, canonical
+            # cascade, backup) is unchanged.
+            allow_existing_legacy_name=(
+                item_validation_mode == "schema" or is_delete
+            ),
         )
         if projection_base_hash is not None:
             projection_base_hash = projection_base_hash.casefold()
+        if filename in identity_set:
+            # An identity-only write creates a NEW page while the caller retires
+            # the old one in the same batch (rename).  The replacement carries the
+            # already-reviewed content of its source, so it is validated
+            # structurally but is not re-audited against the current evidence
+            # contract, which migration-era pages cannot satisfy.  Deletes and
+            # pre-existing targets are refused so this can never overwrite or
+            # remove a live page, and the destination name is checked against the
+            # filename contract explicitly because the schema channel would
+            # otherwise skip that check.
+            if is_delete:
+                raise ValueError("Identity-only filenames cannot be deletes.")
+            if filepath.exists():
+                raise ValueError(
+                    "Identity-only target must not already exist: " + filename
+                )
+            validate_wiki_filename(filename)
         if filename in maintenance_set:
             if (
                 is_delete
@@ -407,12 +467,14 @@ def _prepare_mutations(
     mutations: Iterable[dict],
     validation_mode: str = "full",
     schema_maintenance_filenames: Iterable[str] | None = None,
+    identity_only_filenames: Iterable[str] | None = None,
 ) -> list[dict]:
     mutation_list = list(mutations)
     metadata = validate_mutation_batch_metadata(
         mutation_list,
         validation_mode=validation_mode,
         schema_maintenance_filenames=schema_maintenance_filenames,
+        identity_only_filenames=identity_only_filenames,
     )
     prepared = []
     for mutation, item in zip(mutation_list, metadata):
@@ -447,6 +509,7 @@ def execute_mutation_batch(
     transaction_callback: Callable[[list[int]], None] | None = None,
     precondition_callback: Callable[[], None] | None = None,
     schema_maintenance_filenames: Iterable[str] | None = None,
+    identity_only_filenames: Iterable[str] | None = None,
 ):
     """Commit canonical mutations atomically.
 
@@ -470,6 +533,7 @@ def execute_mutation_batch(
         mutation_list,
         validation_mode=validation_mode,
         schema_maintenance_filenames=schema_maintenance_filenames,
+        identity_only_filenames=identity_only_filenames,
     )
     db_store.init_db()
     outbox_ids = []
@@ -539,7 +603,18 @@ def execute_mutation_batch(
             if mutation["mutation_type"] == "delete":
                 node_key = _markdown_page_key(filename)
                 db_store.delete_node_cascade(node_key)
-        governance_store.apply_and_record_change_sets_batch(prepared_change_sets)
+        governance_store.apply_and_record_change_sets_batch(
+            prepared_change_sets,
+            # Pages deleted by this same batch: their ids may migrate to a new
+            # page key inside the batch (identity-only rename).  Derived from the
+            # deletes actually present in ``prepared`` so a live page's id can
+            # never be claimed by another live page.
+            retired_page_keys={
+                _markdown_page_key(mutation["filename"])
+                for mutation in prepared
+                if mutation["mutation_type"] == "delete"
+            },
+        )
 
         for mutation in prepared:
             filename = mutation["filename"]

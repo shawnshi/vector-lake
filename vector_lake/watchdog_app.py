@@ -1945,7 +1945,15 @@ def process_mutation_outbox_batch(
             validation_mode = row.get("validation_mode") or "full"
             target = resolve_wiki_mutation_path(
                 filename,
-                allow_existing_legacy_name=validation_mode == "schema",
+                # Mirror the mutation coordinator: a delete may retire a page whose
+                # existing name predates the current filename contract, because the
+                # delete moves the corpus toward conformance.  ``allow_existing_
+                # legacy_name`` gates the check; ``allow_missing_legacy_delete``
+                # only covers the already-materialized case.
+                allow_existing_legacy_name=(
+                    validation_mode == "schema"
+                    or row["mutation_type"] == "delete"
+                ),
                 allow_missing_legacy_delete=row["mutation_type"] == "delete",
             )
             payload_text = row.get("payload_text")
