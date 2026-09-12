@@ -66,6 +66,7 @@ _GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "vector_lake.tool_research": ("research_vector_lake",),
     "vector_lake.tool_purpose": ("review_strategic_purpose",),
+    "vector_lake.tool_wiki_delete": ("delete_wiki_batch",),
     "vector_lake.tool_governance_maintenance": (
         "classify_orphan_source_debt",
         "cleanup_operational_memory",

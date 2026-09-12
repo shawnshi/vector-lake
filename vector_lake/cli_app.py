@@ -49,6 +49,7 @@ _CLI_HEAVY_TASKS = {
     "claim-provenance-repair": ("maintenance", 900.0),
     "claim-placeholder-cleanup": ("maintenance", 900.0),
     "wiki-restore": ("maintenance", 900.0),
+    "wiki-delete": ("maintenance", 900.0),
 }
 
 
@@ -456,6 +457,26 @@ Usage Examples:
         type=int,
         default=10,
         help="Maximum number of canonical-only pages to restore.",
+    )
+
+    wiki_delete_parser = subparsers.add_parser(
+        "wiki-delete",
+        help="[MAINTENANCE] Delete exact Wiki pages with a fingerprinted batch.",
+    )
+    wiki_delete_parser.add_argument(
+        "--payload-file",
+        required=True,
+        help="Path to the JSON batch manifest (schema_version 1).",
+    )
+    wiki_delete_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Commit the deletions. Defaults to dry-run.",
+    )
+    wiki_delete_parser.add_argument(
+        "--confirm-fingerprint",
+        default="",
+        help="Exact fingerprint returned by the dry-run preview.",
     )
 
     memory_index_parser = subparsers.add_parser(
@@ -1167,6 +1188,19 @@ def main() -> int:
                     dry_run=not getattr(args, "apply", False),
                     limit=getattr(args, "limit", None),
                     include_existing=getattr(args, "include_existing", False),
+                )
+            )
+        elif args.command == "wiki-delete":
+            print(
+                json.dumps(
+                    tools.delete_wiki_batch(
+                        payload_file=getattr(args, "payload_file", ""),
+                        dry_run=not getattr(args, "apply", False),
+                        confirmation=getattr(args, "confirm_fingerprint", ""),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
                 )
             )
         elif args.command == "wiki-restore":
