@@ -82,6 +82,36 @@ def _bounded_env_float(
     return max(minimum, min(maximum, value))
 
 
+_MAINTENANCE_BACKUP_MODE_ENV = "VECTOR_LAKE_MAINTENANCE_BACKUP_MODE"
+_MAINTENANCE_BACKUP_FULL = "full"
+_MAINTENANCE_BACKUP_SKIP = "skip"
+
+
+def maintenance_backup_mode() -> str:
+    """Resolve the pre-modification maintenance-backup policy.
+
+    ``full`` (default) copies the whole canonical database and projection before
+    every maintenance mutation (~3.6 GB plus several minutes of exclusive
+    heavy-task time on the live corpus).  ``skip`` pauses that automatic copy.
+    It never reaches the operations that read the backup back as a verified input:
+    those call ``tool_projection.require_maintenance_backup`` and behave
+    identically under either mode.
+    """
+    value = str(
+        os.environ.get(_MAINTENANCE_BACKUP_MODE_ENV, _MAINTENANCE_BACKUP_FULL)
+    ).strip().lower()
+    if value not in {_MAINTENANCE_BACKUP_FULL, _MAINTENANCE_BACKUP_SKIP}:
+        raise RuntimeError(
+            f"{_MAINTENANCE_BACKUP_MODE_ENV} must be "
+            f"'{_MAINTENANCE_BACKUP_FULL}' or '{_MAINTENANCE_BACKUP_SKIP}'"
+        )
+    return value
+
+
+def maintenance_backup_skipped() -> bool:
+    return maintenance_backup_mode() == _MAINTENANCE_BACKUP_SKIP
+
+
 def backup_capacity_policy() -> dict:
     """Return the effective quota policy without mutating filesystem state.
 
@@ -117,6 +147,7 @@ def backup_capacity_policy() -> dict:
         ),
         "quota_mode": quota_mode if max_total_bytes > 0 else "report",
         "requested_quota_mode": quota_mode,
+        "maintenance_backup_mode": maintenance_backup_mode(),
     }
 
 

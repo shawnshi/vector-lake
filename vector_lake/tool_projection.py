@@ -25,6 +25,7 @@ from filelock import FileLock, Timeout
 from vector_lake import db_store, governance_store, indexer
 from vector_lake.backup_capacity import (
     assert_backup_capacity,
+    maintenance_backup_skipped,
     assert_legacy_projection_file_size,
     estimate_maintenance_backup_bytes,
     pending_projection_inventory,
@@ -1511,42 +1512,6 @@ def _copy_projection_pair_to_backup(
         ) from exc
 
 
-_MAINTENANCE_BACKUP_MODE_ENV = "VECTOR_LAKE_MAINTENANCE_BACKUP_MODE"
-_MAINTENANCE_BACKUP_FULL = "full"
-_MAINTENANCE_BACKUP_SKIP = "skip"
-
-
-def maintenance_backup_mode() -> str:
-    """Resolve the pre-modification maintenance-backup policy.
-
-    Every maintenance operation used to copy the whole canonical database and
-    projection before mutating (~3.6 GB and several minutes of exclusive
-    heavy-task time on the live corpus, repeatedly, with no switch to stop it).
-    ``skip`` pauses that automatic pre-modification copy.
-
-    It does **not** reach the operations whose correctness depends on reading the
-    backup back: claim-placeholder cleanup validates the manifest, generations and
-    restorable snapshot; template retirement requires a consistent backup; claim
-    provenance repair validates a scoped backup; index rebuild uses the backup
-    directory as its recovery bundle; and wiki restore uses it as the restore
-    source.  Those call ``require_maintenance_backup`` and behave exactly as
-    before under either mode, so pausing never silently degrades them.
-    """
-    value = str(
-        os.environ.get(_MAINTENANCE_BACKUP_MODE_ENV, _MAINTENANCE_BACKUP_FULL)
-    ).strip().lower()
-    if value not in {_MAINTENANCE_BACKUP_FULL, _MAINTENANCE_BACKUP_SKIP}:
-        raise RuntimeError(
-            f"{_MAINTENANCE_BACKUP_MODE_ENV} must be "
-            f"'{_MAINTENANCE_BACKUP_FULL}' or '{_MAINTENANCE_BACKUP_SKIP}'"
-        )
-    return value
-
-
-def maintenance_backup_skipped() -> bool:
-    return maintenance_backup_mode() == _MAINTENANCE_BACKUP_SKIP
-
-
 def create_maintenance_backup(label: str = "maintenance") -> str:
     """Publish a pre-modification backup, unless the policy pauses it.
 
@@ -1557,9 +1522,8 @@ def create_maintenance_backup(label: str = "maintenance") -> str:
     """
     if maintenance_backup_skipped():
         log.info(
-            "Maintenance backup paused by %s; skipped the pre-modification copy "
-            "for %s",
-            _MAINTENANCE_BACKUP_MODE_ENV,
+            "Maintenance backup paused by VECTOR_LAKE_MAINTENANCE_BACKUP_MODE; "
+            "skipped the pre-modification copy for %s",
             _validate_backup_label(label),
         )
         return ""

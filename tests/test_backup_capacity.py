@@ -331,15 +331,15 @@ def test_unconfigured_cap_does_not_claim_enforcement(tmp_path, monkeypatch):
 
 def test_maintenance_backup_mode_defaults_to_full_and_rejects_unknown(monkeypatch):
     monkeypatch.delenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", raising=False)
-    assert tool_projection.maintenance_backup_mode() == "full"
-    assert tool_projection.maintenance_backup_skipped() is False
+    assert backup_capacity.maintenance_backup_mode() == "full"
+    assert backup_capacity.maintenance_backup_skipped() is False
 
     monkeypatch.setenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", "SKIP")
-    assert tool_projection.maintenance_backup_skipped() is True
+    assert backup_capacity.maintenance_backup_skipped() is True
 
     monkeypatch.setenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", "paused")
     with pytest.raises(RuntimeError, match="VECTOR_LAKE_MAINTENANCE_BACKUP_MODE"):
-        tool_projection.maintenance_backup_mode()
+        backup_capacity.maintenance_backup_mode()
 
 
 def test_skip_mode_pauses_only_the_pre_modification_copy(isolated_memory, monkeypatch):
