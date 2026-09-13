@@ -13,6 +13,13 @@ from vector_lake.governance_metrics import claim_governance_version
 from vector_lake.provenance_retention import ReviewedProvenanceRetentionError
 from vector_lake import provenance_retention as retention
 
+# ``official_case`` is a cross-module pytest fixture: importing it is what makes the
+# name resolvable for the ``official_case`` parameters below, so every such
+# parameter shadows the import and ruff reports the import as unused/redefined.
+# Declaring it as an exported name records the intent without deleting a binding
+# that 19 tests depend on.
+__all__ = ["official_case"]
+
 
 def test_same_batch_source_revocation_cannot_preserve_binding(official_case):
     case = official_case

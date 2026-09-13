@@ -562,12 +562,59 @@ def test_default_budget_contract_matches_requested_safety_ceiling():
 
     assert config.max_tasks_per_hour == 100
     assert config.max_tasks_per_24h == 2000
-    assert config.max_tokens_per_task == 81920
-    assert config.max_reserved_tokens_per_hour == 100 * 81920
+    # Commit 74a0552 raised the per-task ceiling from 81920 to 131072 because the
+    # five largest queued sources were rejected before dispatch.  That raise was
+    # insufficient: the *derived* serialized budget is 98304 at 131072 while four
+    # sources measured 149860-165253.  The ceiling and the reservation defaults
+    # are one contract: the hour/24h reservations are derived from the ceiling and
+    # must stay inside the hard validation maxima.
+    assert config.max_tokens_per_task == 262144
+    # The hourly reservation maximum is a fixed hard cap (13107200), so it binds:
+    # one task now consumes at most 1/50 of it instead of 1/100.
+    assert config.max_reserved_tokens_per_hour == 13107200
+    assert config.max_reserved_tokens_per_hour == min(100 * 262144, 13107200)
     assert config.max_reserved_tokens_per_24h == 65536000
     assert auto_ingest_worker._STATE_MAX_LAUNCHES == 2000
-    assert auto_ingest_worker._MAX_TOKENS_PER_TASK == 81920
-    assert auto_ingest_worker._LEGACY_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH == 131072
+    assert auto_ingest_worker._MAX_TOKENS_PER_TASK == 262144
+    # The ledger acceptance ceiling must admit a row written at the ceiling, or
+    # the controller state becomes unreadable after the first launch.
+    assert auto_ingest_worker._LEGACY_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH == 262144
+
+
+def test_serialized_budget_admits_the_largest_known_source():
+    """The derived serialized budget must cover every measured oversized source.
+
+    ``_serialized_input_token_budget`` subtracts host overhead and generation
+    room from the ceiling.  Four queued sources were rejected with measured
+    serialized sizes 149860, 162555, 165253 (and one model-budget exhaustion), so
+    this test pins the arithmetic those rejections depend on: a future ceiling or
+    reserve change must not re-arm the same dead loop.
+    """
+    config = auto_ingest_worker.AutoIngestConfig()
+    budget = auto_ingest_worker._serialized_input_token_budget(config)
+
+    assert config.max_tokens_per_task == 262144
+    assert budget == 212992
+    for measured in (149860, 162555, 165253):
+        assert measured <= budget, measured
+    # Headroom, not a knife edge.
+    assert budget > 165253
+
+
+def test_runner_full_reservation_fallback_tracks_the_task_ceiling():
+    """The host_relay fallback reservation must not drift from the ceiling.
+
+    ``host_relay`` charges the whole reservation for external usage, so a stale
+    fallback would under-report spend for any config object that lacks
+    ``max_tokens_per_task``.  It cannot import the worker at module scope
+    (circular), so the equality is pinned here instead.
+    """
+    from vector_lake.auto_ingest_runners import host_relay
+
+    assert (
+        host_relay.DEFAULT_FULL_RESERVATION_TOKENS
+        == auto_ingest_worker._MAX_TOKENS_PER_TASK
+    )
 
 
 def test_enabled_config_accepts_requested_safety_ceiling(isolated_memory):
@@ -575,8 +622,8 @@ def test_enabled_config_accepts_requested_safety_ceiling(isolated_memory):
         isolated_memory,
         max_tasks_per_hour=100,
         max_tasks_per_24h=2000,
-        max_tokens_per_task=81920,
-        max_reserved_tokens_per_hour=100 * 81920,
+        max_tokens_per_task=262144,
+        max_reserved_tokens_per_hour=13107200,
         max_reserved_tokens_per_24h=65536000,
     )
 
@@ -584,8 +631,8 @@ def test_enabled_config_accepts_requested_safety_ceiling(isolated_memory):
 
     assert config.max_tasks_per_hour == 100
     assert config.max_tasks_per_24h == 2000
-    assert config.max_tokens_per_task == 81920
-    assert config.max_reserved_tokens_per_hour == 100 * 81920
+    assert config.max_tokens_per_task == 262144
+    assert config.max_reserved_tokens_per_hour == 13107200
     assert config.max_reserved_tokens_per_24h == 65536000
 
 
@@ -594,7 +641,7 @@ def test_enabled_config_accepts_requested_safety_ceiling(isolated_memory):
     (
         ("max_tasks_per_hour", 101),
         ("max_tasks_per_24h", 2001),
-        ("max_tokens_per_task", 81921),
+        ("max_tokens_per_task", 262145),
     ),
 )
 def test_enabled_config_rejects_task_budget_above_safety_ceiling(

@@ -83,18 +83,26 @@ def _bounded_env_float(
 
 
 def backup_capacity_policy() -> dict:
-    """Return the effective quota policy without mutating filesystem state."""
+    """Return the effective quota policy without mutating filesystem state.
+
+    ``quota_mode`` reports the *effective* mode.  ``enforce`` without a defined
+    ``max_total_bytes`` cannot block anything, so reporting it as ``enforce``
+    overstated the protection: the doctor surface showed ``quota_mode: enforce``
+    next to ``max_total_bytes: 0`` while backups grew unbounded (+7.6 GB/day
+    observed).  The requested value is preserved in ``requested_quota_mode``.
+    """
     raw_mode = str(os.environ.get("VECTOR_LAKE_BACKUP_QUOTA_MODE", "enforce"))
     quota_mode = raw_mode.strip().lower()
     if quota_mode not in {"enforce", "report"}:
         quota_mode = "enforce"
+    max_total_bytes = _bounded_env_int(
+        "VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES",
+        0,
+        minimum=0,
+        maximum=2**63 - 1,
+    )
     return {
-        "max_total_bytes": _bounded_env_int(
-            "VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES",
-            0,
-            minimum=0,
-            maximum=2**63 - 1,
-        ),
+        "max_total_bytes": max_total_bytes,
         "min_free_bytes": _bounded_env_int(
             "VECTOR_LAKE_BACKUP_MIN_FREE_BYTES",
             _DEFAULT_MIN_FREE_BYTES,
@@ -107,7 +115,8 @@ def backup_capacity_policy() -> dict:
             minimum=0.0,
             maximum=0.95,
         ),
-        "quota_mode": quota_mode,
+        "quota_mode": quota_mode if max_total_bytes > 0 else "report",
+        "requested_quota_mode": quota_mode,
     }
 
 

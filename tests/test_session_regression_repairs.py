@@ -107,7 +107,9 @@ def _exact_search(
     monkeypatch.setattr(tool_search, "_search_projection_generation_issue", lambda _conn: None)
     monkeypatch.setattr(tool_search, "_sqlite_identity_rows", lambda *_args: [])
     if plaintext_loader is None:
-        plaintext_loader = lambda *_args, **_kwargs: statuses
+
+        def plaintext_loader(*_args, **_kwargs):
+            return statuses
     monkeypatch.setattr(tool_search, "_load_current_plaintext_rows", plaintext_loader)
     return tool_search._exact_fts_page_result("needle", 5, as_xml=False)
 

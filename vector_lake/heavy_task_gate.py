@@ -54,7 +54,15 @@ class HeavyTaskStateError(RuntimeError):
 
 
 class HeavyTaskBusy(TimeoutError):
-    """Structured admission failure for a currently occupied heavy-task gate."""
+    """Structured admission failure for a currently occupied heavy-task gate.
+
+    ``retry_after_seconds`` is a bounded hint derived from the time this caller
+    actually spent waiting, so a client can schedule a retry instead of reading
+    transient admission backpressure as a parameter error.
+    """
+
+    _MIN_RETRY_AFTER_SECONDS = 1.0
+    _MAX_RETRY_AFTER_SECONDS = 300.0
 
     def __init__(
         self,
@@ -64,18 +72,26 @@ class HeavyTaskBusy(TimeoutError):
         origin: str,
         wait_timeout_seconds: float,
         gate_status: dict[str, Any],
+        waited_seconds: float = 0.0,
     ) -> None:
         self.task_class = task_class
         self.operation = operation
         self.origin = origin
         self.wait_timeout_seconds = wait_timeout_seconds
         self.gate_status = gate_status
+        self.waited_seconds = max(0.0, float(waited_seconds))
+        self.retry_after_seconds = max(
+            self._MIN_RETRY_AFTER_SECONDS,
+            min(self._MAX_RETRY_AFTER_SECONDS, self.waited_seconds),
+        )
         owner = gate_status.get("current") or {}
         owner_operation = owner.get("operation") or "unknown"
         super().__init__(
-            "Vector Lake heavy-task gate is busy; "
+            "Vector Lake heavy-task gate is busy "
+            "(transient admission backpressure, not a parameter error); "
             f"requested={operation!r}, owner={owner_operation!r}, "
-            f"wait_timeout_seconds={wait_timeout_seconds:g}"
+            f"wait_timeout_seconds={wait_timeout_seconds:g}, "
+            f"retry_after_seconds={self.retry_after_seconds:g}"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -83,6 +99,7 @@ class HeavyTaskBusy(TimeoutError):
 
         return {
             "error": "heavy_task_busy",
+            "retry_after_seconds": self.retry_after_seconds,
             "requested": {
                 "task_class": self.task_class,
                 "operation": self.operation,
@@ -303,6 +320,7 @@ class _HeavyTaskGate:
         operation: str,
         origin: str,
         wait_timeout_seconds: float,
+        waited_seconds: float = 0.0,
     ) -> HeavyTaskBusy:
         return HeavyTaskBusy(
             task_class=task_class,
@@ -310,6 +328,7 @@ class _HeavyTaskGate:
             origin=origin,
             wait_timeout_seconds=wait_timeout_seconds,
             gate_status=self.status(),
+            waited_seconds=waited_seconds,
         )
 
     def acquire(
@@ -336,6 +355,7 @@ class _HeavyTaskGate:
                 operation=operation,
                 origin=origin,
                 wait_timeout_seconds=wait_timeout_seconds,
+                waited_seconds=time.monotonic() - started_wait,
             )
 
         file_acquired = False
@@ -349,6 +369,7 @@ class _HeavyTaskGate:
                     operation=operation,
                     origin=origin,
                     wait_timeout_seconds=wait_timeout_seconds,
+                    waited_seconds=time.monotonic() - started_wait,
                 ) from exc
             file_acquired = True
 

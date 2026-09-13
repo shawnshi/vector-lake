@@ -462,3 +462,127 @@ def test_change_set_compaction_mcp_forwards_preview_and_explicit_apply(
             "confirmation": "sha256:abc",
         },
     ]
+
+
+def test_cli_repair_debt_forwards_reopen_provenance_only(monkeypatch, capsys):
+    """`--reopen-provenance-only` must reach the recovery tool.
+
+    The revive mode selects terminal jobs whose canonical page is still a
+    provenance-only seed, whether the job was finalized or failed.  It existed
+    since commit 74a0552 but had no CLI or MCP entry point, so the raw scan could
+    demand a reconcile that no caller could make effective.
+    """
+    from vector_lake import cli_app, tools
+
+    calls = []
+
+    def fake_reconcile(dry_run=True, limit=0, **kwargs):
+        calls.append({"dry_run": dry_run, "limit": limit, **kwargs})
+        return "{}"
+
+    monkeypatch.setattr(tools, "reconcile_ingest_job_debt", fake_reconcile)
+    monkeypatch.setattr(
+        cli_app,
+        "build_parser",
+        cli_app.build_parser,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cli.py",
+            "ingest-tasks",
+            "--repair-debt",
+            "--reopen-provenance-only",
+            "--apply",
+            "--limit",
+            "7",
+        ],
+    )
+
+    assert cli_app.main() == 0
+    capsys.readouterr()
+
+    assert len(calls) == 1
+    assert calls[0]["dry_run"] is False
+    assert calls[0]["limit"] == 7
+    assert calls[0]["reopen_provenance_only"] is True
+
+
+def test_cli_repair_debt_defaults_reopen_off(monkeypatch, capsys):
+    from vector_lake import cli_app, tools
+
+    calls = []
+    monkeypatch.setattr(
+        tools,
+        "reconcile_ingest_job_debt",
+        lambda dry_run=True, limit=0, **kwargs: calls.append(
+            {"dry_run": dry_run, "limit": limit, **kwargs}
+        )
+        or "{}",
+    )
+    monkeypatch.setattr(
+        "sys.argv", ["cli.py", "ingest-tasks", "--repair-debt"]
+    )
+
+    assert cli_app.main() == 0
+    capsys.readouterr()
+
+    assert calls == [
+        {
+            "dry_run": True,
+            "limit": 20,
+            "reopen_provenance_only": False,
+            "job_id": "",
+            "expected_action": "",
+            "confirmation": "",
+        }
+    ]
+
+
+def test_mcp_reopen_provenance_only_apply_requires_operator_capability(monkeypatch):
+    """Reviving terminal jobs spends model tokens, so apply stays gated."""
+    from vector_lake import mcp_server
+
+    forwarded = []
+
+    def fake_reconcile(dry_run=True, limit=0, **kwargs):
+        forwarded.append({"dry_run": dry_run, **kwargs})
+        return "{}"
+
+    monkeypatch.setattr(
+        mcp_server,
+        "tools",
+        type(
+            "Stub",
+            (),
+            {"reconcile_ingest_job_debt": staticmethod(fake_reconcile)},
+        ),
+    )
+    monkeypatch.delenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", raising=False)
+
+    # Preview stays available without the capability.
+    assert mcp_server.reconcile_ingest_tasks(
+        dry_run=True, reopen_provenance_only=True
+    ) == "{}"
+    assert forwarded[-1]["dry_run"] is True
+
+    with pytest.raises(PermissionError, match="ALLOW_MANUAL_INGEST_ADMIN"):
+        mcp_server.reconcile_ingest_tasks(
+            dry_run=False, reopen_provenance_only=True
+        )
+
+    monkeypatch.setenv("VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN", "1")
+    assert mcp_server.reconcile_ingest_tasks(
+        dry_run=False, reopen_provenance_only=True
+    ) == "{}"
+    assert forwarded[-1] == {
+        "dry_run": False,
+        "reopen_provenance_only": True,
+        "job_id": "",
+        "expected_action": "",
+        "confirmation": "",
+    }
+
+    # Without the flag the plain supersede path keeps its existing behaviour.
+    assert mcp_server.reconcile_ingest_tasks(dry_run=False) == "{}"

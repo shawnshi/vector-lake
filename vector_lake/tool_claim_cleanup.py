@@ -209,7 +209,8 @@ def _plan(source_claim_ids: list[str]) -> dict:
     if conn.execute(
         f"SELECT 1 FROM claim_graph_edges WHERE source_id IN ({marks}) OR target_id IN ({marks}) LIMIT 1",
         tuple(ids) + tuple(ids),
-    ).fetchone(): blockers.append("claim_graph_dependency")
+    ).fetchone():
+        blockers.append("claim_graph_dependency")
     if conn.execute(f"SELECT 1 FROM claim_assessments WHERE claim_id IN ({marks}) LIMIT 1", tuple(ids)).fetchone():
         blockers.append("claim_assessment_dependency")
     # Timeline is a flat schema, not a data_json envelope. Its stable event ID

@@ -60,6 +60,50 @@ def test_merge_public_defaults_remain_explicit_and_unchanged():
     assert tool_enqueue.default is True
 
 
+@pytest.mark.parametrize(
+    ("configured_wait", "expected_wait"),
+    [
+        (None, 5.0),
+        ("0", 0.0),
+        ("1.25", 1.25),
+        ("600", 60.0),
+        ("invalid", 5.0),
+        ("nan", 5.0),
+    ],
+)
+def test_mcp_heavy_task_admission_wait_is_bounded(
+    tmp_path,
+    monkeypatch,
+    configured_wait,
+    expected_wait,
+):
+    """The shared-gate admission wait absorbs routine holds and stays bounded.
+
+    Ordinary watchdog maintenance holds the gate for about 1-3s; an operator
+    projection-object GC holds it for minutes.  The old 0.5s default surfaced
+    every routine hold as a tool error yet could never span a GC run.
+    """
+    if configured_wait is None:
+        monkeypatch.delenv(
+            "VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS", configured_wait
+        )
+    server = mcp_server.ReloadAwareFastMCP(
+        "heavy-wait-bounds-test",
+        runtime_guard=mcp_server.MCPRuntimeGuard(
+            tmp_path,
+            check_interval_seconds=60,
+        ),
+    )
+    try:
+        assert server._heavy_task_wait == expected_wait
+    finally:
+        server.shutdown_blocking_executor(wait=True)
+
+
 @pytest.mark.parametrize("configured_workers", [None, "invalid"])
 def test_mcp_blocking_executor_uses_bounded_parallel_default(
     tmp_path,

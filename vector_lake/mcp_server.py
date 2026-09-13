@@ -46,6 +46,16 @@ _RUNTIME_REVISION_MAX_SCANNED_ENTRIES = 32768
 _MCP_CALL_DEADLINE_ARGUMENT = "_vector_lake_deadline_seconds"
 _MCP_CALL_DEADLINE_MAX_SECONDS = 3600.0
 
+# Default admission wait for the shared heavy-task gate.  Ordinary watchdog
+# maintenance holds it for about 1-3s, while an operator projection-object GC
+# holds it for minutes (197-208s observed).  The previous 0.5s default surfaced
+# every routine hold to the caller as a tool error yet could never span a GC run,
+# so it was the worst of both.  5s absorbs the routine hold and bounds the
+# pathological one; the clamp is wider so an operator can deliberately wait out a
+# window without editing code.
+_DEFAULT_MCP_HEAVY_TASK_WAIT_SECONDS = 5.0
+_MAX_MCP_HEAVY_TASK_WAIT_SECONDS = 60.0
+
 _MCP_HEAVY_TASKS = {
     "auto_ingest_budget_status": ("scan", 900.0),
     "auto_ingest_receipt_retention": ("maintenance", 900.0),
@@ -937,17 +947,22 @@ class ReloadAwareFastMCP(FastMCP):
             shutdown_timeout = 5.0
         try:
             heavy_task_wait = float(
-                os.environ.get("VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS", "0.5")
+                os.environ.get(
+                    "VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS",
+                    str(_DEFAULT_MCP_HEAVY_TASK_WAIT_SECONDS),
+                )
             )
         except (TypeError, ValueError):
-            heavy_task_wait = 0.5
+            heavy_task_wait = _DEFAULT_MCP_HEAVY_TASK_WAIT_SECONDS
         if not math.isfinite(heavy_task_wait):
-            heavy_task_wait = 0.5
+            heavy_task_wait = _DEFAULT_MCP_HEAVY_TASK_WAIT_SECONDS
         self._blocking_worker_count = worker_count
         self._blocking_queue_capacity = queue_capacity
         self._blocking_admission_timeout = max(0.0, min(5.0, admission_timeout))
         self._blocking_shutdown_timeout = max(0.1, min(30.0, shutdown_timeout))
-        self._heavy_task_wait = max(0.0, min(5.0, heavy_task_wait))
+        self._heavy_task_wait = max(
+            0.0, min(_MAX_MCP_HEAVY_TASK_WAIT_SECONDS, heavy_task_wait)
+        )
         self._blocking_slots = threading.BoundedSemaphore(worker_count + queue_capacity)
         self._blocking_inflight = 0
         self._blocking_executor = _DaemonThreadPoolExecutor(
@@ -2750,11 +2765,24 @@ def reconcile_ingest_tasks(
     job_id: str = "",
     expected_action: str = "",
     confirmation: str = "",
+    reopen_provenance_only: bool = False,
 ) -> str:
-    """Classify and safely recover abandoned or terminal ingest tasks."""
+    """Classify and safely recover abandoned or terminal ingest tasks.
+
+    ``reopen_provenance_only`` revives finalized jobs whose canonical page is
+    still a provenance-only seed and failed jobs rejected by the serialized
+    prompt+schema token budget.  Reviving spends model tokens, so applying it is
+    operator-gated exactly like the single-job terminal retry.
+    """
+    if reopen_provenance_only and not dry_run:
+        _require_explicit_capability(
+            _MANUAL_INGEST_ADMIN_ENV,
+            "ingest provenance-only reopen",
+        )
     return tools.reconcile_ingest_job_debt(
         dry_run=dry_run,
         limit=limit,
+        reopen_provenance_only=reopen_provenance_only,
         job_id=job_id,
         expected_action=expected_action,
         confirmation=confirmation,

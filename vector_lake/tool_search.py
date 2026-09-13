@@ -2134,7 +2134,11 @@ def search_vector_lake(
             backend_issues=backend_issues,
         )
 
-    wiki_dir = str(get_wiki_dir())
+    # Retained deliberately even though the binding is unread here: three tests in
+    # tests/test_exact_identity_search.py patch ``tool_search.get_wiki_dir`` as
+    # their only wiki-root isolation.  Removing this call silently turns those
+    # patches into no-ops, and those tests do not use the isolated_memory fixture.
+    wiki_dir = str(get_wiki_dir())  # noqa: F841
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
         if _raise_on_unavailable:

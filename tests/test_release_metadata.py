@@ -157,8 +157,10 @@ def test_auto_ingest_template_is_explicitly_disabled_and_unapproved():
     assert template["auto_finalize_rejected"] is False
     assert template["max_tasks_per_hour"] == 100
     assert template["max_tasks_per_24h"] == 2000
-    assert template["max_tokens_per_task"] == 81920
-    assert template["max_reserved_tokens_per_hour"] == 100 * 81920
+    assert template["max_tokens_per_task"] == 262144
+    # 13107200 is the fixed hourly hard cap, so the example config sits on it.
+    assert template["max_reserved_tokens_per_hour"] == 13107200
+    assert template["max_reserved_tokens_per_hour"] == min(100 * 262144, 13107200)
     assert template["max_reserved_tokens_per_24h"] == 65536000
     assert "absolute/path" in template["codex_executable"]
     for key in (

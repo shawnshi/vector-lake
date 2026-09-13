@@ -110,6 +110,24 @@ def _bounded_env_int(
     return max(minimum, min(maximum, value))
 
 
+def _watchdog_gate_wait_seconds() -> float:
+    """Bounded wait so watchdog maintenance is not starved by external heavy tasks.
+
+    Every watchdog admission used ``wait_timeout_seconds=0``, which can never win
+    the shared gate while an MCP tool or an operator projection-object GC holds
+    it.  Observed consequence in a single 2h47m window: 1,453 deferred
+    operational-memory index runs and 136 deferred raw full scans.  A short
+    bounded wait lets watchdog work take the gaps between external heavy tasks
+    while still yielding promptly.
+    """
+    return _bounded_env_float(
+        "VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS",
+        3.0,
+        minimum=0.0,
+        maximum=30.0,
+    )
+
+
 def _shutdown_timeout_seconds() -> float:
     return _bounded_env_float(
         "VECTOR_LAKE_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS",
@@ -1026,7 +1044,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
                 "ingest_scan",
                 "watchdog-raw-full-scan",
                 origin="watchdog",
-                wait_timeout_seconds=0,
+                wait_timeout_seconds=_watchdog_gate_wait_seconds(),
                 warn_after_seconds=1800,
             ):
                 return prepare_ingest_batch(**options)
@@ -2078,14 +2096,74 @@ def _legacy_projection_echo_reason(filename: str, projection_hash: str) -> str:
     return ""
 
 
+# Deterministic manual-edit failures used to be retried forever: the reconcile
+# plan is only acknowledged when a batch succeeds, so one poison page re-selected
+# the same batch indefinitely (observed: the same four pages failed 19 times each
+# while the full-Wiki reconciliation reported failed=4, cleared=False).  After
+# ``_LEGACY_PROJECTION_POISON_ATTEMPTS`` identical failures for one filename the
+# page is quarantined for the lifetime of the watchdog process: it leaves the plan
+# so the batch can advance, and a restart retries it (which is the desired
+# semantics after a code fix).  The quarantine is in-process by design; it is a
+# retry bound, not durable state.
+_LEGACY_PROJECTION_POISON_ATTEMPTS = 3
+_LEGACY_PROJECTION_POISON: dict[str, tuple[int, str]] = {}
+_LEGACY_PROJECTION_POISON_LOCK = threading.Lock()
+
+
+def _legacy_projection_quarantine_state(filename: str) -> tuple[int, str]:
+    with _LEGACY_PROJECTION_POISON_LOCK:
+        return _LEGACY_PROJECTION_POISON.get(filename, (0, ""))
+
+
+def _record_legacy_projection_failure(
+    filename: str, error_text: str
+) -> tuple[int, bool]:
+    """Count one identical failure; report the count and whether it is now quarantined."""
+
+    with _LEGACY_PROJECTION_POISON_LOCK:
+        attempts, _previous = _LEGACY_PROJECTION_POISON.get(filename, (0, ""))
+        attempts += 1
+        _LEGACY_PROJECTION_POISON[filename] = (attempts, error_text)
+        return attempts, attempts >= _LEGACY_PROJECTION_POISON_ATTEMPTS
+
+
+def reset_legacy_projection_quarantine() -> int:
+    """Clear the in-process deterministic-failure quarantine and return the count."""
+
+    with _LEGACY_PROJECTION_POISON_LOCK:
+        cleared = len(_LEGACY_PROJECTION_POISON)
+        _LEGACY_PROJECTION_POISON.clear()
+        return cleared
+
+
+def legacy_projection_quarantine_snapshot() -> dict[str, dict]:
+    """Return the quarantined pages with their last error, for operator status."""
+
+    with _LEGACY_PROJECTION_POISON_LOCK:
+        return {
+            filename: {"attempts": attempts, "last_error": error}
+            for filename, (attempts, error) in _LEGACY_PROJECTION_POISON.items()
+            if attempts >= _LEGACY_PROJECTION_POISON_ATTEMPTS
+        }
+
+
 def process_legacy_projection_batch(filenames) -> dict:
-    """Promote bounded manual Markdown edits into canonical state and durable outbox rows."""
+    """Promote bounded manual Markdown edits into canonical state and durable outbox rows.
+
+    Deterministic failures are retried at most ``_LEGACY_PROJECTION_POISON_ATTEMPTS``
+    times and then quarantined, so a poison page cannot hold the whole-Wiki
+    reconciliation open forever.
+    """
     from vector_lake.mutation_coordinator import execute_mutation_batch
     from vector_lake.wiki_utils import get_wiki_dir, normalize_semantic_text
 
-    stats = {"completed": 0, "failed": 0}
+    stats = {"completed": 0, "failed": 0, "quarantined": 0}
     wiki_dir = get_wiki_dir()
     for filename in dict.fromkeys(str(item) for item in filenames):
+        attempts, _ = _legacy_projection_quarantine_state(filename)
+        if attempts >= _LEGACY_PROJECTION_POISON_ATTEMPTS:
+            stats["quarantined"] += 1
+            continue
         target = wiki_dir / filename
         try:
             target_exists = target.exists()
@@ -2132,9 +2210,42 @@ def process_legacy_projection_batch(filenames) -> dict:
             stats["completed"] += 1
             log.debug("Ignored projection echo for %s: %s", filename, exc)
         except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            attempts, quarantined = _record_legacy_projection_failure(
+                filename,
+                error_text,
+            )
+            if quarantined:
+                # Leaves the plan so the batch can advance.  Logged once at the
+                # transition; subsequent selections are counted, not re-logged.
+                stats["quarantined"] += 1
+                log.error(
+                    "Quarantined manual edit for %s after %s identical failures; "
+                    "operator action required: %s",
+                    filename,
+                    attempts,
+                    error_text,
+                )
+                continue
             stats["failed"] += 1
-            log.error("Failed to process manual edit for %s: %s", filename, exc)
+            log.error(
+                "Failed to process manual edit for %s (attempt %s/%s): %s",
+                filename,
+                attempts,
+                _LEGACY_PROJECTION_POISON_ATTEMPTS,
+                exc,
+            )
     return stats
+
+
+def legacy_projection_quarantine_summary() -> str:
+    """One-line operator summary of quarantined manual edits, or an empty string."""
+
+    quarantined = legacy_projection_quarantine_snapshot()
+    if not quarantined:
+        return ""
+    pages = ", ".join(sorted(quarantined))
+    return f"{len(quarantined)} quarantined manual edit(s): {pages}"
 
 
 def process_legacy_projection_queue_batch(
@@ -2143,6 +2254,9 @@ def process_legacy_projection_queue_batch(
 ) -> dict:
     """Process ephemeral Wiki events and retain a durable retry on failure."""
     stats = process_legacy_projection_batch(filenames)
+    # Keep the returned contract stable even when the inner batch is replaced by a
+    # stub or an older caller shape.
+    stats.setdefault("quarantined", 0)
     if stats["failed"]:
         event_buffer.require_full_reconcile()
     return stats
@@ -2288,6 +2402,7 @@ def reconcile_wiki_overflow_once(
                 "selected": len(selected),
                 "completed": legacy_stats["completed"],
                 "failed": legacy_stats["failed"],
+                "quarantined": legacy_stats.get("quarantined", 0),
                 "remaining": remaining,
                 "scan_errors": [],
                 "generation_changed": (
@@ -2608,7 +2723,9 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                                 "scan_errors="
                                 f"{len(reconcile_stats['scan_errors'])}; "
                                 "generation_changed="
-                                f"{reconcile_stats['generation_changed']}"
+                                f"{reconcile_stats['generation_changed']}; "
+                                "quarantine="
+                                f"{legacy_projection_quarantine_summary() or 'none'}"
                             )
                         ),
                         component="outbox",
@@ -2819,6 +2936,73 @@ def expire_stale_ingest_jobs_for_watchdog() -> int:
     return expire_stale_subagent_jobs(max_age_seconds=max_age_seconds)
 
 
+# Full re-attestation of the derived operational-memory index is a whole-corpus
+# digest scan (~128,480 documents / ~3s on the live corpus, measured 0.91 gate
+# acquisitions per minute => ~4.6% duty on the shared heavy gate).
+#
+# The pre-gate probe must stay non-scanning, but it must also be able to answer
+# "ready".  ``allow_integrity_scan=False`` without ``allow_durable_proof=True``
+# makes ``verify_operational_memory_search_integrity`` return ``deferred`` whenever
+# the connection's integrity cache is cold, so for ~1 of every 60 seconds the probe
+# reported ``ready=False`` plus a spurious
+# ``operational_memory_search_attestation_required`` warning on a perfectly healthy
+# index, and the short-circuit could not fire.  That is the combination
+# ``runtime_health`` already avoids.  (Measured effect: the deep scan still runs,
+# inside the gate either way, once per attestation interval; the fix removes the
+# false negative and a forced gate acquisition, and it closes a latent ~12x
+# contention regression if ``VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS``
+# is ever 0, which would make the probe ``deferred`` on every iteration.)
+#
+# The interval defaults to the verifier's own attestation TTL
+# (``VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS``, 60s) so the default
+# tamper-detection latency is unchanged.  An equal-count tamper of the derived
+# index is only visible to a full scan, so this is a safety cadence: lower it for
+# tighter detection, or raise it (e.g. 900) to trade detection latency for gate
+# availability.  ``0`` disables the periodic scan; the durable proof and the
+# revision token still guard every retrieval.
+_OPERATIONAL_MEMORY_ATTESTATION_INTERVAL_SECONDS = 60.0
+_operational_memory_attestation_lock = threading.Lock()
+_operational_memory_attested_at: float | None = None
+
+
+def _operational_memory_attestation_interval_seconds() -> float:
+    return _bounded_env_float(
+        "VECTOR_LAKE_WATCHDOG_OPERATIONAL_MEMORY_ATTESTATION_SECONDS",
+        _OPERATIONAL_MEMORY_ATTESTATION_INTERVAL_SECONDS,
+        minimum=0.0,
+        maximum=86400.0,
+    )
+
+
+def _operational_memory_attestation_due() -> bool:
+    """True when the full digest attestation interval has elapsed.
+
+    The interval is process-local and resets on restart, so a restart always
+    re-attests once.  ``0`` disables the periodic scan entirely; the durable
+    proof still guards every retrieval.
+    """
+    interval = _operational_memory_attestation_interval_seconds()
+    if interval <= 0:
+        return False
+    with _operational_memory_attestation_lock:
+        if _operational_memory_attested_at is None:
+            return True
+        return (time.monotonic() - _operational_memory_attested_at) >= interval
+
+
+def mark_operational_memory_attested() -> None:
+    global _operational_memory_attested_at
+    with _operational_memory_attestation_lock:
+        _operational_memory_attested_at = time.monotonic()
+
+
+def reset_operational_memory_attestation_clock() -> None:
+    """Clear the attestation clock (tests and explicit operator resets)."""
+    global _operational_memory_attested_at
+    with _operational_memory_attestation_lock:
+        _operational_memory_attested_at = None
+
+
 def maintain_operational_memory_search_for_watchdog() -> dict:
     """Advance the derived memory index under bounded, non-blocking admission."""
     from vector_lake import governance_store
@@ -2838,21 +3022,31 @@ def maintain_operational_memory_search_for_watchdog() -> dict:
         "warnings": ["operational_memory_search_gate_busy"],
     }
     try:
+        # Non-scanning probe that must be able to report ready.  Without
+        # ``allow_durable_proof`` this call is ``deferred`` whenever the
+        # integrity cache is cold, which reports a healthy index as not-ready
+        # and forces the gate acquisition this probe exists to avoid.
         status = governance_store.operational_memory_search_index_status(
             allow_integrity_scan=False,
+            allow_durable_proof=True,
         )
-        if not status.get("auto_maintenance_configured") or status.get("ready"):
+        if not status.get("auto_maintenance_configured"):
             return {**status, "batches": 0, "deferred": False}
+        if status.get("ready") and not _operational_memory_attestation_due():
+            return {**status, "batches": 0, "deferred": False, "attested": False}
         with heavy_task(
             "scan",
             "watchdog-operational-memory-index",
             origin="watchdog",
-            wait_timeout_seconds=0,
+            wait_timeout_seconds=_watchdog_gate_wait_seconds(),
             warn_after_seconds=60,
         ):
+            # Full attestation: either the cheap probe reported a real gap, or the
+            # attestation interval elapsed.
             status = governance_store.operational_memory_search_index_status()
+            mark_operational_memory_attested()
             if status.get("ready"):
-                return {**status, "batches": 0, "deferred": False}
+                return {**status, "batches": 0, "deferred": False, "attested": True}
             result = governance_store.maintain_operational_memory_search_index_budget(
                 batch_size=min(
                     10_000,

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vector_lake.db_store import (
+    SchemaMaintenanceActive,
     claim_pending_jobs,
     enqueue_ingest_task_cleanup,
     get_connection,
@@ -244,6 +245,29 @@ def start_worker(stop_event: threading.Event | None = None):
                     component="ingest",
                 )
                 if stop_event.wait(5):
+                    break
+            except SchemaMaintenanceActive as exc:
+                # An operator schema migration holds the lock.  This is an expected
+                # transient state, not a worker failure: defer with the reported
+                # retry delay instead of logging an exception and flipping the
+                # component to error.
+                delay = min(
+                    60.0, max(1.0, float(getattr(exc, "retry_after_seconds", 0) or 0))
+                )
+                log.info(
+                    "Ingest dispatcher deferred: schema maintenance window active; "
+                    "retry in %ss.",
+                    delay,
+                )
+                write_status(
+                    "idle",
+                    0,
+                    0,
+                    f"Schema maintenance window active; retry in {delay:g}s",
+                    "",
+                    component="ingest",
+                )
+                if stop_event.wait(delay):
                     break
             except Exception as exc:
                 log.error("Worker exception: %s", exc)

@@ -9,7 +9,15 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from vector_lake import db_store, get_extension_root, governance_store
+# ``governance_store`` is re-exported deliberately: no code in this module reads it
+# (the write path re-imports it locally), but tests/test_runtime_contracts.py patches
+# ``tool_graph.governance_store.insert_governance_item_if_absent`` to prove the audit
+# preview never writes.  Dropping the import removes that handle.
+from vector_lake import (  # noqa: F401
+    db_store,
+    get_extension_root,
+    governance_store,
+)
 from vector_lake.cancellation import cancellation_checkpoint, non_interruptible_phase
 from vector_lake.indexer import (
     ProjectionPairContractError,

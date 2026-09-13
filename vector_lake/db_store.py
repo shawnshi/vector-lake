@@ -2164,6 +2164,20 @@ def schema_maintenance_lock(
         maintenance_lock.release()
 
 
+class SchemaMaintenanceActive(RuntimeError):
+    """Another process holds the schema-maintenance lock.
+
+    Expected transient state: a caller must defer and retry rather than treating
+    it as a worker failure.  ``retry_after_seconds`` mirrors the lock wait that
+    just expired so a caller can schedule the retry without guessing.  It stays a
+    ``RuntimeError`` subclass so existing handlers keep working.
+    """
+
+    def __init__(self, message: str, *, retry_after_seconds: float) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = float(retry_after_seconds)
+
+
 class ReadOnlySnapshotUnavailable(RuntimeError):
     """A byte-stable immutable SQLite snapshot cannot be opened safely."""
 
@@ -2888,8 +2902,9 @@ def init_db():
             )
             migration_guard.acquire()
         except FileLockTimeout as exc:
-            raise RuntimeError(
-                "Database schema migration maintenance window is active"
+            raise SchemaMaintenanceActive(
+                "Database schema migration maintenance window is active",
+                retry_after_seconds=_SCHEMA_MIGRATION_RUNTIME_LOCK_TIMEOUT_SECONDS,
             ) from exc
         try:
             _initialize_database_under_schema_lock(db_path)

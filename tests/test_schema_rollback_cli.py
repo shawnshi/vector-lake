@@ -1263,7 +1263,7 @@ def test_schema_rollback_cli_is_preview_first_and_heavy_only_on_apply(
         )
         if isinstance(choices, dict) and "schema-rollback" in choices
     )
-    assert len(command_choices) == 42
+    assert len(command_choices) == 43
 
     calls = []
     gate_calls = []

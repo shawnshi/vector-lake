@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from vector_lake import db_store, governance_store
+from vector_lake import watchdog_app
 from vector_lake.watchdog_app import (
     DiaryWatchdogHandler,
     RawWatchdogHandler,
@@ -83,8 +84,8 @@ def test_operational_memory_gate_busy_defers_before_full_attestation(monkeypatch
 
     status_calls = []
 
-    def quick_status(*, allow_integrity_scan=True):
-        status_calls.append(allow_integrity_scan)
+    def quick_status(*, allow_integrity_scan=True, allow_durable_proof=False):
+        status_calls.append((allow_integrity_scan, allow_durable_proof))
         if allow_integrity_scan:
             raise AssertionError("gate-busy path must not run a full attestation")
         return {
@@ -122,7 +123,10 @@ def test_operational_memory_gate_busy_defers_before_full_attestation(monkeypatch
     assert time.perf_counter() - started < 0.1
     assert result["deferred"] is True
     assert result["batches"] == 0
-    assert status_calls == [False]
+    # The pre-gate probe must be non-scanning *and* able to report ready, which
+    # requires the durable-proof allowance; without it the probe is "deferred" by
+    # construction and the gate is acquired on every loop iteration.
+    assert status_calls == [(False, True)]
 
 
 def test_ready_watchdog_cycles_reuse_revision_cache_and_detect_external_tamper(
@@ -218,6 +222,10 @@ def test_ready_watchdog_cycles_reuse_revision_cache_and_detect_external_tamper(
     watchdog_conn._operational_memory_search_integrity_cache[
         "attested_at_monotonic"
     ] -= 61
+    # The pre-gate probe trusts the durable proof, which cannot see an equal-count
+    # tamper; the deep attestation is now what discovers it.  Force that path the
+    # same way the watchdog does: expire the process-local attestation clock.
+    watchdog_app.reset_operational_memory_attestation_clock()
 
     repairing = maintain_operational_memory_search_for_watchdog()
     assert repairing["ready"] is False
@@ -1106,7 +1114,7 @@ def test_failed_manual_wiki_batch_sets_durable_reconcile_marker(
         ["Concept_Failed.md"],
     )
 
-    assert stats == {"completed": 0, "failed": 1}
+    assert stats == {"completed": 0, "failed": 1, "quarantined": 0}
     assert events.full_reconcile_required is True
     assert _wiki_reconcile_marker_path().exists()
 
@@ -1148,6 +1156,11 @@ def test_raw_watchdog_gate_busy_defers_full_scan_without_failure_count(
 ):
     from vector_lake import tool_ingest
     from vector_lake.heavy_task_gate import heavy_task
+
+    # Pin the admission wait to zero so this test keeps asserting the deferral
+    # contract immediately; the positive bounded default is covered by
+    # tests/test_watchdog_status_coalescing.py.
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS", "0")
 
     holder_acquired = threading.Event()
     holder_release = threading.Event()
@@ -1690,3 +1703,111 @@ def test_diary_watchdog_runs_one_trailing_sync_for_coalesced_events(
     assert handler.sync_process is processes[1]
     assert handler.sync_dirty is False
     processes[1].completed.set()
+
+
+def test_operational_memory_probe_short_circuits_without_taking_the_gate(monkeypatch):
+    """A healthy derived index must not acquire the shared gate every cycle.
+
+    Regression (P2-11): the pre-gate probe was
+    ``status(allow_integrity_scan=False)`` without ``allow_durable_proof=True``,
+    which makes the integrity verifier return ``deferred`` by construction.  The
+    short-circuit could therefore never fire, so the watchdog took the exclusive
+    heavy gate and paid a whole-corpus digest scan every 60s on an index that was
+    already ready.
+    """
+    from vector_lake import heavy_task_gate
+
+    calls = []
+    gates = []
+
+    def quick_status(**kwargs):
+        calls.append(kwargs)
+        return {
+            "configured": True,
+            "available": True,
+            "ready": True,
+            "auto_maintenance_configured": True,
+            "status": "ready",
+            "warnings": [],
+        }
+
+    class Lease:
+        def __enter__(self):
+            gates.append(1)
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        governance_store, "operational_memory_search_index_status", quick_status
+    )
+    monkeypatch.setattr(heavy_task_gate, "heavy_task", lambda *_a, **_k: Lease())
+    monkeypatch.setenv(
+        "VECTOR_LAKE_WATCHDOG_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "900"
+    )
+    watchdog_app.reset_operational_memory_attestation_clock()
+    watchdog_app.mark_operational_memory_attested()
+
+    steady = maintain_operational_memory_search_for_watchdog()
+
+    assert steady["ready"] is True
+    assert steady["deferred"] is False
+    assert steady["attested"] is False
+    assert gates == []
+    assert calls == [{"allow_integrity_scan": False, "allow_durable_proof": True}]
+
+    # Attestation due: exactly one deep scan inside the gate, then quiet again.
+    watchdog_app.reset_operational_memory_attestation_clock()
+    calls.clear()
+    due = maintain_operational_memory_search_for_watchdog()
+
+    assert due["attested"] is True
+    assert gates == [1]
+    assert calls == [{"allow_integrity_scan": False, "allow_durable_proof": True}, {}]
+
+    calls.clear()
+    quiet = maintain_operational_memory_search_for_watchdog()
+
+    assert quiet["attested"] is False
+    assert gates == [1]
+    assert calls == [{"allow_integrity_scan": False, "allow_durable_proof": True}]
+
+
+def test_operational_memory_attestation_interval_zero_disables_deep_scan(monkeypatch):
+    """``0`` must disable the periodic scan without breaking the durable path."""
+    from vector_lake import heavy_task_gate
+
+    gates = []
+
+    def quick_status(**_kwargs):
+        return {
+            "configured": True,
+            "available": True,
+            "ready": True,
+            "auto_maintenance_configured": True,
+            "status": "ready",
+            "warnings": [],
+        }
+
+    class Lease:
+        def __enter__(self):
+            gates.append(1)
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        governance_store, "operational_memory_search_index_status", quick_status
+    )
+    monkeypatch.setattr(heavy_task_gate, "heavy_task", lambda *_a, **_k: Lease())
+    monkeypatch.setenv(
+        "VECTOR_LAKE_WATCHDOG_OPERATIONAL_MEMORY_ATTESTATION_SECONDS", "0"
+    )
+    watchdog_app.reset_operational_memory_attestation_clock()
+
+    result = maintain_operational_memory_search_for_watchdog()
+
+    assert result["attested"] is False
+    assert gates == []

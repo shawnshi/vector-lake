@@ -1363,6 +1363,28 @@ def _publish_staged_projection_pair_guarded(
         _publish_staged_projection_pair(output_path, tmp_output, tmp_claim)
 
 
+def _log_projection_build_stats(prepared, *, context: str) -> None:
+    """Report the immutable-object cost of one projection build.
+
+    A publish used to allocate its whole ~2.8k-object tree with no telemetry at
+    all, which is why a 10-40x write amplification (EFF-01: positional identity
+    in ``_edge_key``/``_claim_item_key``) went unnoticed while the object store
+    reached 7.64 GB against a 96.2 MiB live closure.  ``new`` must be 0 for a
+    rebuild whose content did not change; a persistent non-zero value is the
+    signal that identity stopped being content-derived again.
+    """
+    log.info(
+        "Projection build (%s): new_objects=%d reused_objects=%d "
+        "new_bytes=%d reused_bytes=%d generation=%s",
+        context,
+        prepared.object_new_count,
+        prepared.object_reused_count,
+        prepared.object_new_bytes,
+        prepared.object_reused_bytes,
+        prepared.projection_generation,
+    )
+
+
 def _publish_projection_pair(
     output_path: str,
     index_data: dict,
@@ -1376,6 +1398,7 @@ def _publish_projection_pair(
         claim_graph_data,
         canonical_generation=expected_generation,
     )
+    _log_projection_build_stats(prepared, context="staged-pair")
     search_rows = _search_projection_upserts(index_data)
 
     def refresh_search_state(transaction_connection, candidate):
@@ -2191,6 +2214,7 @@ def _generate_index_unlocked(
         claim_graph_data,
         canonical_generation=canonical_before,
     )
+    _log_projection_build_stats(prepared, context="full-index-rebuild")
 
     def commit_search_projection(transaction_connection, candidate):
         return db_store.apply_search_projection_mutations(
@@ -3492,6 +3516,9 @@ def refresh_graph_topology_if_dirty(*, _before_publish=None) -> bool:
                             index_data,
                             claim_graph_data,
                             canonical_generation=canonical_before,
+                        )
+                        _log_projection_build_stats(
+                            prepared, context="topology-refresh"
                         )
 
                         def commit_topology(transaction_connection, candidate):

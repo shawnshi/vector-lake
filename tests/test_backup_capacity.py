@@ -288,3 +288,42 @@ def test_schema_migration_preflight_uses_target_volume_before_staging(
         backup_dir,
     )
     assert not backup_dir.exists()
+
+
+def test_unconfigured_cap_does_not_claim_enforcement(tmp_path, monkeypatch):
+    """An undefined cap cannot enforce anything, so it must not report enforce.
+
+    Observed on the live deployment: ``quota_mode: enforce`` was reported next to
+    ``max_total_bytes: 0`` while the backup store grew by ~7.6 GB/day with no
+    bound.  The effective mode is now ``report`` and the request is preserved.
+    """
+    roots = _roots(tmp_path)
+    monkeypatch.setattr(
+        backup_capacity.shutil,
+        "disk_usage",
+        lambda _path: DiskUsage(1_000, 100, 900),
+    )
+    monkeypatch.delenv("VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES", raising=False)
+    monkeypatch.delenv("VECTOR_LAKE_BACKUP_QUOTA_MODE", raising=False)
+    monkeypatch.setenv("VECTOR_LAKE_BACKUP_MIN_FREE_BYTES", "10")
+    monkeypatch.setenv("VECTOR_LAKE_BACKUP_MIN_FREE_RATIO", "0.1")
+
+    policy = backup_capacity.backup_capacity_policy()
+    assert policy["requested_quota_mode"] == "enforce"
+    assert policy["quota_mode"] == "report"
+    assert policy["max_total_bytes"] == 0
+
+    status = backup_capacity.backup_capacity_status(
+        estimated_new_bytes=0,
+        backup_roots=roots,
+        disk_anchor=tmp_path,
+    )
+    # Enforcement is not claimed, and enabling a real cap restores it.
+    assert status["quota_configured"] is False
+    assert status["allowed"] is True
+    assert "backup_max_total_bytes_unconfigured" in status["warnings"]
+
+    monkeypatch.setenv("VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES", "1000000")
+    enforced = backup_capacity.backup_capacity_policy()
+    assert enforced["quota_mode"] == "enforce"
+    assert enforced["requested_quota_mode"] == "enforce"

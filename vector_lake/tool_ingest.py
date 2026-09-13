@@ -75,19 +75,29 @@ _TERMINAL_RETRY_CONTRACT = "vector-lake-terminal-ingest-retry/v1"
 _INGEST_DEBT_EXACT_CONTRACT = "vector-lake-ingest-debt-exact/v1"
 _INGEST_DEBT_EXACT_ACTIONS = {"supersede_duplicate"}
 _LEGACY_RETRYABLE_GENERATOR_REASON = "codex_event_log_type_is_not_allowed:error"
-# Marker written by ``_auto_source_page``; a finalized job whose canonical page still
-# carries it never received enrichment content and can be re-armed deliberately.
+# Marker written by ``_auto_source_page``; a terminal job whose canonical page
+# still carries it never received enrichment content and can be re-armed
+# deliberately.  This page evidence is the only gate on reopen; the failure text
+# is not consulted (see ``_provenance_only_terminal_job_ids``).
 _PROVENANCE_ONLY_SOURCE_MARKER = "该页面为摄入引擎自动生成的 provenance-only Source 记录"
-_BUDGET_UNFIT_ERROR_PREFIX = "serialized_prompt_and_schema_exceed_token_budget"
 
 
-def _provenance_only_finalized_job_ids(conn) -> list[str]:
-    """Return finalized ingest jobs whose canonical page is still a seed stub.
+def _provenance_only_terminal_job_ids(conn) -> list[str]:
+    """Return terminal ingest jobs whose canonical page is still a seed stub.
 
     A provenance-only Source page means the enrichment generator never delivered
     content (empty file list, dead runner, or an unfinished relay answer).  Those
     jobs are otherwise terminal, so re-arming them is an explicit operator choice
     rather than an automatic retry.
+
+    Selection is gated on the *page evidence*, not on the failure text: a
+    ``finalized`` job and a ``failed`` job whose page is still a seed stub both
+    prove enrichment never landed, so both are recoverable.  The previous rule
+    additionally required a failed job's error to start with
+    ``serialized_prompt_and_schema_exceed_token_budget``, which left
+    ``intelligence_20260701_briefing`` unrecoverable by any entry point: its page
+    carried the seed marker but its error was ``model attempt budget exhausted``,
+    and the single-job terminal retry covers only the legacy generator error.
     """
     from vector_lake.wiki_utils import get_wiki_dir
 
@@ -102,12 +112,6 @@ def _provenance_only_finalized_job_ids(conn) -> list[str]:
         except (TypeError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
-            continue
-        if str(row["status"]) == "failed" and not str(
-            row["error_msg"] or ""
-        ).startswith(_BUDGET_UNFIT_ERROR_PREFIX):
-            # Only budget-unfit failures become retryable after the per-task
-            # budget is raised; every other terminal failure keeps its state.
             continue
         canonical_name = str(payload.get("canonical_name") or "")
         if not canonical_name.casefold().endswith(".md"):
@@ -870,10 +874,10 @@ def _ingest_debt_raw_precondition_failure(conn, item: dict) -> str:
     marker_matches = any(marker_matches_current(row) for row in rows)
     if action == "requeue_current":
         if item.get("reopen_provenance_only"):
-            # Reopening a finalized provenance-only Source page is an explicit
-            # operator action.  The processed marker records that the raw bytes
-            # were ingested, not that the page ever received enrichment content,
-            # so it must not fence this requeue.
+            # Reopening a provenance-only Source page is an explicit operator
+            # action.  The processed marker records that the raw bytes were
+            # ingested, not that the page ever received enrichment content, so it
+            # must not fence this requeue.
             return ""
         return (
             "processed_files now proves the current raw revision"
@@ -1422,7 +1426,7 @@ def reconcile_ingest_job_debt(
         "ELSE 1 END = 1"
     )
     if reopen_provenance_only:
-        reopen_ids = _provenance_only_finalized_job_ids(conn)
+        reopen_ids = _provenance_only_terminal_job_ids(conn)
         if not reopen_ids:
             conn.close()
             return json.dumps(
@@ -1864,7 +1868,7 @@ def reconcile_ingest_job_debt(
             "job_id": record["job_id"],
             "action": "requeue_current",
             "reason": (
-                "finalized provenance-only Source page reopened for enrichment"
+                "provenance-only Source page reopened for enrichment"
                 if reopen_provenance_only
                 else "operator-authorized legacy runner-error retry"
                 if operator_retry

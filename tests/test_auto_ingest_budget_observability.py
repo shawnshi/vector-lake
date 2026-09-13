@@ -98,7 +98,12 @@ def test_budget_status_reports_exact_100_and_2000_reservation_boundaries(
         "launches": 100,
         "launches_remaining": 0,
         "reserved_tokens": 3_276_800,
-        "reserved_tokens_remaining": 4_915_200,
+        # Hourly headroom is the enforced ceiling minus what the 100 launches in
+        # the window already reserved.  Derive the ceiling so raising the
+        # per-task budget cannot leave a stale subtraction literal behind.
+        "reserved_tokens_remaining": (
+            auto_ingest_worker._DEFAULT_MAX_RESERVED_TOKENS_PER_HOUR - 3_276_800
+        ),
         "next_release_at": (now + timedelta(minutes=30)).isoformat(),
     }
     assert report["rolling_24h"]["launches"] == 2000
@@ -120,7 +125,7 @@ def test_budget_status_rejects_task_token_limit_above_hard_ceiling(
         json.dumps(
             {
                 "schema_version": 1,
-                "max_tokens_per_task": 81921,
+                "max_tokens_per_task": 262145,
             }
         ),
         encoding="utf-8",

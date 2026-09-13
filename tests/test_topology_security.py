@@ -19,12 +19,25 @@ def _sanitize_url_function() -> str:
 
 
 def test_sanitize_url_allows_supported_locations_and_blocks_script_schemes():
+    """The sanitizer contract has two branches, and both are pinned here.
+
+    Absolute references go through the HTML URL parser and an explicit
+    ``http``/``https``/``file`` allowlist, so the parser — not a regex — decides
+    what the scheme is.  Relative references and bare fragments stay
+    document-local and are percent-encoded only.
+
+    ``HTTP://example.com/a`` resolves to ``http://example.com/a``: the parser
+    normalizes the scheme, and normalizing is what makes the control-character
+    bypasses below unreachable.  The older regex-plus-``encodeURI`` sanitizer
+    preserved the input case but allowed ``java\nscript:alert(1)`` because its
+    scheme regex cannot match across a newline.
+    """
     node = shutil.which("node")
     if not node:
         pytest.skip("Node.js is required to execute the topology URL sanitizer")
     cases = [
         {"value": "https://example.com/a b", "expected": "https://example.com/a%20b"},
-        {"value": "HTTP://example.com/a", "expected": "HTTP://example.com/a"},
+        {"value": "HTTP://example.com/a", "expected": "http://example.com/a"},
         {"value": "file:///C:/Vector Lake/Page.md", "expected": "file:///C:/Vector%20Lake/Page.md"},
         {"value": "/wiki/Page Name.md", "expected": "/wiki/Page%20Name.md"},
         {"value": "#node id", "expected": "#node%20id"},
@@ -35,6 +48,19 @@ def test_sanitize_url_allows_supported_locations_and_blocks_script_schemes():
         {"value": "vbscript:msgbox(1)", "expected": None},
         {"value": "", "expected": None},
         {"value": None, "expected": None},
+        # Control characters inside a scheme are stripped by HTML URL parsing, so
+        # they must be rejected by the parser path and by the relative path.
+        {"value": "java\nscript:alert(1)", "expected": None},
+        {"value": "\tjavascript:alert(1)", "expected": None},
+        {"value": "jav\tascript:alert(1)", "expected": None},
+        {"value": "java\u0000script:alert(1)", "expected": None},
+        {"value": "vbscript\n:msgbox(1)", "expected": None},
+        # A non-vbscript data payload with a legal scheme resolved is fine; the
+        # payload only matters when the scheme itself is not allowlisted.
+        {"value": "file:///C:/a.md?q=b", "expected": "file:///C:/a.md?q=b"},
+        # Protocol-relative references would resolve off-origin, so they are
+        # refused rather than treated as document-local paths.
+        {"value": "//evil.example/x", "expected": None},
     ]
     script = (
         _sanitize_url_function()

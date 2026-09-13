@@ -1585,11 +1585,17 @@ def test_init_refuses_active_schema_migration_window_without_creating_database(
 
     with FileLock(str(lock_path), timeout=0):
         with pytest.raises(
-            RuntimeError,
+            db_store.SchemaMaintenanceActive,
             match="schema migration maintenance window is active",
-        ):
+        ) as captured:
             db_store.init_db()
 
+    # Callers must be able to defer instead of treating this as a failure, so the
+    # exception stays catchable as RuntimeError and reports a retry delay.
+    assert isinstance(captured.value, RuntimeError)
+    assert captured.value.retry_after_seconds == (
+        db_store._SCHEMA_MIGRATION_RUNTIME_LOCK_TIMEOUT_SECONDS
+    )
     assert not path.exists()
 
 

@@ -9,6 +9,10 @@ Vector Lake 是一个面向医疗数字化研究的本地文件优先知识编�
 - `MEMORY/wiki/index.json` / `claim_graph.json`：projection v2 的小型 locator；实际页面、检索与拓扑组件存于 `MEMORY/wiki/.projection-store/objects/sha256/` 的不可变内容寻址对象中。
 - `MEMORY/wiki/.meta/vector_lake.db`：SQLite canonical 存储，保存实体、断言、证据、信源、图拓扑、变更集、治理队列、outbox 和 `operational_memory`。
 - `MEMORY/purpose.md`：版本化战略控制面。YAML 契约驱动摄取范围、证据等级、意图权重、SIR 复审和张力合成阈值；营销噪音与范围外资料不进入主图谱，但保留最小丢弃审计。`purpose_vectors.json` 仅保留为旧版回退，不再是权重主源。
+- `MEMORY/wiki/.git`：Wiki 目录自身的历史仓库。它**不由 Vector Lake 管理**：没有 retention、没有配额、没有工具入口，历史与 SQLite 版本表及投影对象存储重复。当前占用以 `git count-objects -vH` 为准，不属 canonical 契约。
+- `MEMORY/brain/`：宿主适配器的子代理暂存根（`VECTOR_LAKE_SUBAGENT_BRAIN_ROOT`，默认 `<active-db-dir>/brain/`）。它不属 canonical 契约，也不参与投影或检索。
+
+以下子系统当前**未启用且无数据**，保留仅为后续契约演进；引用它们的能力入口不得被当作可用能力：`critical_decision_registry`、`quality_evaluation_runs`、`schema_registry`。`claim_assessments` 表存在且有 Schema，但实库覆盖率接近零，`claim_assessment_coverage` 因此长期低于阈值；这属已披露缺口，不是回归。
 
 `MEMORY/wiki/.meta` 是默认 canonical 目录。若其中已经存在 canonical 数据但目录不可写，运行时会拒绝静默切换数据库；需要迁移位置时应显式设置 `VECTOR_LAKE_META_DIR`。仓库内 `data/v8_meta/` 只用于兼容既存 legacy fallback，或在默认 MEMORY 根没有 primary canonical 且 primary 无法写入时受控回退；`VECTOR_LAKE_ALLOW_META_FALLBACK=1` 可显式允许既存 primary 的回退。
 
@@ -45,7 +49,7 @@ graph LR
 | Canonical governance schema | `8.0` |
 | Index projection | logical `PROJECTION_CONTRACT_VERSION = 1` / physical `format_version = 2` |
 | EvidencePacket | `1.1` |
-| Public surfaces | 70 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 42 CLI commands / 19 Agent skills |
+| Public surfaces | 70 MCP tools (`full`) / 9 MCP tools (`memory`) / 21 MCP tools (`readonly`) / 43 CLI commands / 19 Agent skills |
 
 通用 `init_db()` 遇到既有 v1–v8 数据库会拒绝自动升级。CLI-only
 `schema-migrate` 接受契约完整的 v4、v5、v6、v7 或 v8 数据库，并按受控历史链最终
@@ -169,7 +173,7 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 同时把 `enabled` 与 `allow_model_processing_raw_text` 设为 `true`；不要把示例文件本身当作
 已验证的运行配置。
 
-默认安全预算为每小时 100 项、滚动 24 小时 2000 项，单任务预留阈值最多 81,920 tokens；对应的预留上限为每小时 8,192,000 tokens、滚动 24 小时 65,536,000 tokens（24 小时预留额度独立限制总量）。完成一次性启用与 raw-text 模型处理授权后，正常 `integrated` / `standalone` 任务固定以 Codex `-a never -s read-only` 自动运行和 finalize，不逐项再次请求确认；异常和策略拒绝仍按配置 fail-closed。以上是本地准入与预留限制，不是提供方计费硬上限，也不是吞吐 SLA。生成结束后，可信事件日志中的实际用量超过预留阈值会拒绝发布，但已发生的模型用量仍计入失败 receipt 与预算观测；无效日志的用量保持未知，不按预留值冒充实际消耗。实际吞吐仍受单 worker、任务时长、heavy-task gate 和熔断器约束。启用或提高预算会启动独立 Codex 子进程并产生模型用量；变更后应使用一个真实的新 raw revision 做 canary，验证 `queued → awaiting_subagent → subagent_processing → finalized`、`processed_files` 当前哈希、outbox drain 与 Wiki/SQLite/index 三面一致。
+默认安全预算为每小时 100 项、滚动 24 小时 2000 项，单任务上限 262,144 tokens（其中序列化 prompt+schema 实际预算为 `262144 - max(8192, min(16384, ceiling//3)) - max(4096, ceiling//8)` = 212,992）；对应的预留上限为每小时 13,107,200 tokens、滚动 24 小时 65,536,000 tokens（24 小时预留额度独立限制总量）。每小时 token 上限是固定硬顶，所以单任务上限提高后，每小时可预留的任务数从 100 降为最多 50；要恢复原任务吞吐需另行提高每小时 token 上限。完成一次性启用与 raw-text 模型处理授权后，正常 `integrated` / `standalone` 任务固定以 Codex `-a never -s read-only` 自动运行和 finalize，不逐项再次请求确认；异常和策略拒绝仍按配置 fail-closed。以上是本地准入与预留限制，不是提供方计费硬上限，也不是吞吐 SLA。生成结束后，可信事件日志中的实际用量超过预留阈值会拒绝发布，但已发生的模型用量仍计入失败 receipt 与预算观测；无效日志的用量保持未知，不按预留值冒充实际消耗。实际吞吐仍受单 worker、任务时长、heavy-task gate 和熔断器约束。启用或提高预算会启动独立 Codex 子进程并产生模型用量；变更后应使用一个真实的新 raw revision 做 canary，验证 `queued → awaiting_subagent → subagent_processing → finalized`、`processed_files` 当前哈希、outbox drain 与 Wiki/SQLite/index 三面一致。
 
 ### Ingest v5 task-packet contract
 
@@ -687,7 +691,9 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_MCP_SHUTDOWN_TIMEOUT_SECONDS`：transport 结束后的排空等待，默认 `5` 秒，限制为 `0.1` 至 `30` 秒；超时取消未开始项，已运行 daemon worker 可能在后台完成。
 - `VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT`：单个后台 worker 的进程生命周期内重启预算，默认 `2`、范围 `0..10`。
 - `VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS`：耗尽重启预算后必须拖停 watchdog 的组件；默认 `watchdog,outbox,ingest`，`auto_ingest` 始终保持 fail-closed。`scheduler` 默认非关键，可按运维要求显式加入。Runtime Health 与 Deep Doctor 共用同一分类器：可选 scheduler 隔离或陈旧只告警，显式列为必需后才阻断。
-- `VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS`：MCP 重任务等待共享跨进程门的时间，默认 `0.5` 秒，限制为 `0` 至 `5` 秒；超时返回结构化 `heavy_task_busy`。
+- `VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS`：MCP 重任务等待共享跨进程门的时间，默认 `5` 秒（原 `0.5` 秒），限制为 `0` 至 `60` 秒；超时返回结构化 `heavy_task_busy`，其中含 `retry_after_seconds`。默认值需覆盖 watchdog 日常维护的 1–3 秒占用；分钟级的 `projection-object-gc` 不应被默认值跨过，需要时才由操作员显式调大。
+- `VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS`：watchdog 重任务（operational-memory 派生索引、raw 全量扫描）等待共享门的时间，默认 `3` 秒，限制为 `0` 至 `30` 秒。置 `0` 会恢复“从不等待”，在外部重任务占用期间必然饥饿。
+- `VECTOR_LAKE_WATCHDOG_OPERATIONAL_MEMORY_ATTESTATION_SECONDS`：watchdog 对 operational-memory 派生索引做全量摘要重认证的间隔，默认 `60` 秒（与 `VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS` 同量级），限制为 `0` 至 `86400` 秒。实测：实库语料约 12.8 万文档、单次扫描约 3 秒、门禁acquire 频率 0.91 次/分，合计约占共享门 **4.6%**；调到 `900` 可把该占用降到约 0.3%，代价是“计数相等但内容被篡改”这类故障的发现延迟同步变长。置 `0` 关闭周期扫描（durable proof 与 revision token 仍守卫每次检索）。
 - `VECTOR_LAKE_MCP_TOOL_DEADLINE_SECONDS`：同步 MCP 调用的全局 deadline 上限；默认 `0` 表示不另设 deadline，合法范围为 `0..3600` 秒，非法值拒绝 server 启动。请求可用保留参数 `_vector_lake_deadline_seconds` 缩短但不能放宽该上限；排队取消不执行，已进入不可中断 publish 的操作返回可查询的 `cancellation_pending`，后台完成后记录 `completed_after_cancellation`。
 - `VECTOR_LAKE_SEMANTIC_CAMPAIGN_CURSOR_TTL_SECONDS`：只读 semantic campaign snapshot/cursor 的 sliding lease，默认 `120` 秒。相同 source/generation 的首屏并发 single-flight 复用；全局 accounted cache 上限 `384 MiB`，generation 或物理 source identity 改变会立即使旧 cursor stale。
 - `VECTOR_LAKE_DURABILITY_PROFILE`：只接受 `full`（默认）或 `best_effort`。`full` 对已确认的 Wiki、projection、backup 与 receipt 执行文件及父目录持久化屏障；非法值 fail-closed。`best_effort` 仅用于明确接受更弱断电 RPO 的受控环境。
@@ -697,7 +703,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_SEARCH_RESULT_MAX_BYTES`：页面搜索结果 UTF-8 字节预算，默认 `32768`；字符和字节预算同时生效。
 - `VECTOR_LAKE_DATABASE_WARNING_BYTES`：Doctor 数据库体积告警阈值，默认 `4 GiB`。
 - `VECTOR_LAKE_DATABASE_DAILY_GROWTH_WARNING_BYTES` / `VECTOR_LAKE_VERSION_DAILY_GROWTH_WARNING_ROWS`：Doctor 的每日数据库增量与 Claim/Evidence 版本行增量告警阈值，默认 `256 MiB` / `50000` 行。Watchdog 每个 UTC 日记录一次、保留 35 个样本，不自动删除历史。
-- `VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES`：maintenance 与 schema-migration 两个根的全局备份配额；默认 `0` 表示未配置并触发治理告警。`VECTOR_LAKE_BACKUP_MIN_FREE_BYTES` / `VECTOR_LAKE_BACKUP_MIN_FREE_RATIO` 默认 `10 GiB` / `0.10`；`VECTOR_LAKE_BACKUP_QUOTA_MODE` 只接受 `enforce`（默认）或 `report`。
+- `VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES`：maintenance 与 schema-migration 两个根的全局备份配额；默认 `0` 表示未配置并触发治理告警。未配置上限时 `quota_mode` 报为 `report`（请求值保留在 `requested_quota_mode`），因为未定义上限的 `enforce` 实际无法拦截任何写入。`VECTOR_LAKE_BACKUP_MIN_FREE_BYTES` / `VECTOR_LAKE_BACKUP_MIN_FREE_RATIO` 默认 `10 GiB` / `0.10`；`VECTOR_LAKE_BACKUP_QUOTA_MODE` 只接受 `enforce`（默认）或 `report`。
 - `VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS`：CLI 重任务等待同一门的时间，默认 `30` 秒，限制为 `0` 至 `300` 秒；超时退出码为 `75`。
 - `VECTOR_LAKE_TOPOLOGY_WORKER_TIMEOUT_SECONDS`：Louvain 拓扑隔离进程超时，默认 `60` 秒，限制为 `5` 至 `300` 秒；失败时回退到确定性的 connected-components。
 - `VECTOR_LAKE_WAL_AUTOCHECKPOINT_PAGES`：每个可写 SQLite 连接的自动回写阈值，默认 `1000` 页；它在事务提交后生效，不限制单个大事务的峰值。
@@ -820,6 +826,19 @@ $env:PYTHONUTF8='1'; python cli.py retrieval-benchmark "<dataset.json>"
 Doctor 对 SQLite/Wiki/投影内容使用只读路径。CLI 的重任务诊断入口仍会获取共享 heavy-task gate，因而可能更新 `.heavy-task-status.json` 并短暂持有 `.heavy-task.lock`；`VECTOR_LAKE_MCP_SURFACE=readonly` 则以专用有界 executor 承担 scan 准入，不获取该文件门，也不写 canonical meta。严格审计仍建议使用独立只读快照，以隔离其他进程的并发写入；普通 `full` / `memory` MCP 与 CLI 不承诺整个 meta 目录物理零写入。
 
 ## Notes
+
+### 能力入口对照（同一能力只有一处首选入口）
+
+| 能力 | 首选入口 | 不要使用 |
+|---|---|---|
+| 页面/断言检索 | MCP `search_vector_lake` | CLI `search`、skill `search` 仅用于离线或人工核对 |
+| 运行态记忆检索 | MCP `recall`（`mode=memory` / `mode=fact`） | `synthesize` / `context_pack` 是组合入口，不是检索入口 |
+| 精确标识解析 | MCP `entity` | 不要用检索来解析确定的 page key |
+| 基础设施与语义就绪 | MCP `doctor_vector_lake`（`quick`）/ `semantic_readiness` | `quick` 不取跨进程 heavy-task gate；`deep` 会取 |
+| 治理队列读 | MCP `review_governance_list`、`get_governance_debt` | 不要直接读 `governance_queue` 表 |
+| 投影漂移 | MCP `projection_report` | CLI `projection-report` 会持有共享 gate |
+
+CLI `--help` 与 MCP `tools/list` 是权威清单；上面只标注存在重叠的表面。
 
 - Windows 控制台建议设置 `PYTHONUTF8=1`，避免中文路径或中文输出触发编码问题。
 - 本仓库可能存在 live file lock；如果 `index.json` 或 `.meta` 文件正在被其他进程占用，先释放锁再重建。

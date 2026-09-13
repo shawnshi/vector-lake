@@ -176,13 +176,26 @@
             if (!url) return null;
             const strUrl = String(url).trim();
             if (!strUrl) return null;
-            try {
-                const parsed = new URL(strUrl);
+            // Reject a scheme-looking prefix with the HTML URL parser rather than
+            // with the allowlist regex alone.  Browsers strip embedded control
+            // characters ("java\nscript:alert(1)") before resolving, so a
+            // regex-only allowlist would pass a string that still executes.
+            if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(strUrl)) {
+                let parsed;
+                try {
+                    parsed = new URL(strUrl);
+                } catch {
+                    return null;
+                }
                 if (!['http:', 'https:', 'file:'].includes(parsed.protocol)) return null;
+                // Parsing normalizes the scheme and percent-encodes the path.
                 return parsed.href;
-            } catch {
-                return null;
             }
+            // Relative reference or bare fragment: keep it document-local.  Any
+            // colon is refused so this branch cannot re-introduce a scheme that
+            // the parser would have caught.
+            if (strUrl.startsWith('//') || strUrl.includes(':')) return null;
+            return encodeURI(strUrl);
         }
 
         const rawData = %%GRAPH_DATA%%;

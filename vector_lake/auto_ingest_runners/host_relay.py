@@ -27,7 +27,11 @@ FULL_RESERVATION_USAGE_KEYS = (
     "output_tokens",
     "reasoning_output_tokens",
 )
-DEFAULT_FULL_RESERVATION_TOKENS = 81920
+# Fallback only, for a config object that lacks ``max_tokens_per_task``.  It must
+# track ``auto_ingest_worker._MAX_TOKENS_PER_TASK`` (pinned by
+# tests/test_auto_ingest_worker.py) and cannot import it here because the worker
+# imports this adapter.
+DEFAULT_FULL_RESERVATION_TOKENS = 262144
 _OPTION_KEYS = frozenset({"spool_dir", "relay_protocol_version", "poll_seconds"})
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _FAILURE_CODE = re.compile(r"^[a-z0-9_]{1,64}$")

@@ -214,6 +214,16 @@ Usage Examples:
         help="Classify and recover abandoned ingest jobs.",
     )
     ingest_tasks_parser.add_argument(
+        "--reopen-provenance-only",
+        action="store_true",
+        help=(
+            "With --repair-debt: also revive finalized/failed jobs whose canonical "
+            "page is still a provenance-only seed, or whose failure was a "
+            "serialized-prompt token-budget rejection. Reviving spends model "
+            "tokens; preview first (omit --apply)."
+        ),
+    )
+    ingest_tasks_parser.add_argument(
         "--cleanup-orphans",
         action="store_true",
         help="Preview old unreferenced ingest task packets.",
@@ -1059,6 +1069,9 @@ def main() -> int:
                     tools.reconcile_ingest_job_debt(
                         dry_run=not getattr(args, "apply", False),
                         limit=getattr(args, "limit", 20),
+                        reopen_provenance_only=getattr(
+                            args, "reopen_provenance_only", False
+                        ),
                         job_id=getattr(args, "job_id", ""),
                         expected_action=getattr(args, "expected_action", ""),
                         confirmation=getattr(args, "confirm_fingerprint", ""),

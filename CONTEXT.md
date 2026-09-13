@@ -15,6 +15,9 @@ Current boundary:
 - Strategic intent: `MEMORY/purpose.md` (YAML contract parsed by `purpose_contract.py`)
 - Canonical governance store: `MEMORY/wiki/.meta/vector_lake.db` (SQLite)
 - Agent runtime read model: SQLite `operational_memory` table, compiled from canonical claims
+- `MEMORY/wiki/.git` is a Wiki-local history repository that Vector Lake does **not** own, prune or quota; it duplicates history already held by the SQLite version tables and the projection object store.
+- `MEMORY/brain/` is the host adapter's subagent staging root (`VECTOR_LAKE_SUBAGENT_BRAIN_ROOT`, default `<active-db-dir>/brain/`). It is outside the canonical contract.
+- `critical_decision_registry`, `quality_evaluation_runs` and `schema_registry` are provisioned but unpopulated; `claim_assessments` has a schema but near-zero live coverage. Do not treat their capability entrypoints as available capability.
 
 The durable architecture is:
 

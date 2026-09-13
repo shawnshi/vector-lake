@@ -23,7 +23,15 @@ def isolate_test_runtime(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_BRAIN_ROOT", raising=False)
     monkeypatch.delenv("VECTOR_LAKE_SUBAGENT_TASK_ROOT", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    # The deterministic manual-edit quarantine and the operational-memory
+    # attestation clock are in-process state, so they must not leak between tests.
+    from vector_lake import watchdog_app
+
+    watchdog_app.reset_legacy_projection_quarantine()
+    watchdog_app.reset_operational_memory_attestation_clock()
     yield memory_dir
+    watchdog_app.reset_legacy_projection_quarantine()
+    watchdog_app.reset_operational_memory_attestation_clock()
     db_store.close_all_connections()
     wiki_utils._META_DIR_CACHE = None
 

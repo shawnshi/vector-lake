@@ -357,7 +357,9 @@ def test_codex_contract_and_generate_forwarding(monkeypatch):
     handle = RunnerHandle(resource=Path("C:/codex.exe"), options=options)
     request = GenerationRequest("job-1", ("owner", "token", 2), "attempt", "p", 1, 2, 3)
     stop_event = object()
-    health_check = lambda: None
+
+    def health_check():
+        return None
 
     actual = adapter.generate(handle, request, stop_event, health_check)
 

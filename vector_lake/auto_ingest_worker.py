@@ -58,7 +58,18 @@ _STATE_NAME = ".auto_ingest_controller_state.json"
 _STATE_SCHEMA_VERSION = 1
 _MAX_TASKS_PER_HOUR = 100
 _MAX_TASKS_PER_24H = 2000
-_MAX_TOKENS_PER_TASK = 131072
+# The serialized prompt+schema budget is derived from the ceiling, not equal to it:
+#
+#   budget = ceiling - max(8192, min(16384, ceiling // 3))   # host overhead
+#                  - max(4096, ceiling // 8)                # generation room
+#
+# At 131072 that derived 98304, and four queued sources measured 149860-165253
+# serialized bytes, so the 74a0552 ceiling raise could not unblock them.  262144
+# derives 212992 (29% headroom over the largest measured source).  The hourly and
+# 24h reservation maxima are unchanged, so one task now consumes at most 1/50 of
+# the hourly reservation budget (was 1/100) and the hourly task ceiling is the
+# binding constraint.
+_MAX_TOKENS_PER_TASK = 262144
 # Default per-task budget is the operational default (not the safety ceiling).
 # Reservation defaults must stay within the hard ceilings enforced by
 # ``_require_int`` so a fresh (config-less) runtime is self-consistent.
@@ -72,10 +83,11 @@ _DEFAULT_MAX_RESERVED_TOKENS_PER_24H = min(
     65536000,
 )
 _STATE_MAX_LAUNCHES = _MAX_TASKS_PER_24H
-# Read-only compatibility ceiling for historical controller ledgers.  It must
-# never be used to authorize a new task; new work is capped by
-# ``_MAX_TOKENS_PER_TASK``.
-_LEGACY_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH = 131072
+# Read-only acceptance ceiling for controller ledger rows.  It must be >=
+# ``_MAX_TOKENS_PER_TASK``: a ledger written by this build records reservations at
+# that ceiling, so a lower bound here would make the controller state unreadable
+# after the first launch.  It never authorizes new work by itself.
+_LEGACY_STATE_MAX_RESERVED_TOKENS_PER_LAUNCH = 262144
 _STATE_MAX_CONSECUTIVE_INFRA_FAILURES = 10
 _ATTEMPT_RECEIPT_SCHEMA_VERSION = 1
 _ATTEMPT_RECEIPT_DIR_NAME = "auto_ingest_attempt_receipts"

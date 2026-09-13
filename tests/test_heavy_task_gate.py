@@ -466,3 +466,73 @@ def test_invalid_timeouts_fail_closed(field, value):
     kwargs[field] = value
     with pytest.raises(ValueError):
         heavy_task("scan", "invalid-timeout", **kwargs)
+
+
+def test_busy_reports_bounded_retry_after_seconds(tmp_path):
+    """Busy must advertise retry backpressure, not read as a caller error.
+
+    A caller that waits its full timeout is told to retry about that long, and the
+    hint is clamped so a pathological owner cannot produce an absurd delay.  The
+    gate re-enters on the owning thread, so contention must come from a second
+    thread.
+    """
+    meta_dir = tmp_path / "meta"
+    captured: list[HeavyTaskBusy] = []
+
+    with heavy_task(
+        "projection",
+        "gc-holder",
+        origin="pytest",
+        wait_timeout_seconds=0,
+        meta_dir=meta_dir,
+    ):
+        def contend() -> None:
+            try:
+                with heavy_task(
+                    "scan",
+                    "reader",
+                    origin="thread",
+                    wait_timeout_seconds=0.2,
+                    meta_dir=meta_dir,
+                ):
+                    captured.append(None)  # type: ignore[arg-type]
+            except HeavyTaskBusy as exc:
+                captured.append(exc)
+
+        thread = threading.Thread(target=contend, name="retry-hint-contender")
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert len(captured) == 1
+    busy = captured[0]
+    assert isinstance(busy, HeavyTaskBusy)
+    detail = busy.to_dict()
+    assert detail["error"] == "heavy_task_busy"
+    assert detail["retry_after_seconds"] == busy.retry_after_seconds
+    assert busy.waited_seconds >= 0.2
+    assert 1.0 <= busy.retry_after_seconds <= 300.0
+    assert "not a parameter error" in str(busy)
+    assert f"retry_after_seconds={busy.retry_after_seconds:g}" in str(busy)
+    assert detail["gate"]["current"]["operation"] == "gc-holder"
+
+    # The hint is derived from the wait, and is never below the floor even when
+    # the caller gave up immediately.
+    immediate = HeavyTaskBusy(
+        task_class="scan",
+        operation="reader",
+        origin="pytest",
+        wait_timeout_seconds=0.0,
+        gate_status={},
+        waited_seconds=0.0,
+    )
+    assert immediate.retry_after_seconds == 1.0
+    capped = HeavyTaskBusy(
+        task_class="scan",
+        operation="reader",
+        origin="pytest",
+        wait_timeout_seconds=0.0,
+        gate_status={},
+        waited_seconds=100000.0,
+    )
+    assert capped.retry_after_seconds == 300.0

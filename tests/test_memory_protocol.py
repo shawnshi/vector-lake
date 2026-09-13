@@ -274,10 +274,16 @@ def test_public_surface_counts_match_documented_contract():
     assert len(tools) == 70
     assert len(mcp_server._MEMORY_MCP_SURFACE_TOOLS) == 9
     assert len(mcp_server._READONLY_MCP_SURFACE_TOOLS) == 21
-    assert len(subcommands) == 42
+    assert len(subcommands) == 43
+    # Bind the documented Runtime Contract row to the measured code, not to a
+    # literal frozen at the last documentation pass.  Commit 74a0552 added the
+    # 43rd CLI command and raised the auto-ingest token ceiling without updating
+    # either the table or these assertions, which is how the drift shipped.
     assert (
-        "70 MCP tools (`full`) / 9 MCP tools (`memory`) / "
-        "21 MCP tools (`readonly`) / 42 CLI commands"
+        f"{len(tools)} MCP tools (`full`) / "
+        f"{len(mcp_server._MEMORY_MCP_SURFACE_TOOLS)} MCP tools (`memory`) / "
+        f"{len(mcp_server._READONLY_MCP_SURFACE_TOOLS)} MCP tools (`readonly`) / "
+        f"{len(subcommands)} CLI commands / 19 Agent skills"
     ) in readme
 
 

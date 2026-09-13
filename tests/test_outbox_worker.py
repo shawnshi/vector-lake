@@ -998,7 +998,7 @@ def test_watchdog_promotes_manual_projection_edit_to_canonical_and_outbox(
 
     stats = process_legacy_projection_batch(["Source_Test.md"])
 
-    assert stats == {"completed": 1, "failed": 0}
+    assert stats == {"completed": 1, "failed": 0, "quarantined": 0}
     assert db_store.get_connection().execute("SELECT COUNT(*) FROM change_sets").fetchone()[0] == before_change_sets + 1
     assert db_store.get_connection().execute(
         "SELECT data_json FROM entities WHERE json_extract(data_json, '$.id') = 'source_unrelated'"
@@ -1051,7 +1051,7 @@ def test_watchdog_does_not_promote_stale_projection_over_pending_canonical_inten
 
     stats = process_legacy_projection_batch(["Source_Test.md"])
 
-    assert stats == {"completed": 1, "failed": 0}
+    assert stats == {"completed": 1, "failed": 0, "quarantined": 0}
     assert pending["status"] == "pending"
     assert pending["payload_text"] == new_content
     assert pending["projection_base_hash"] == old_projection_hash
@@ -1095,7 +1095,7 @@ def test_watchdog_does_not_delete_pending_canonical_create_with_absent_projectio
 
     stats = process_legacy_projection_batch(["Source_Test.md"])
 
-    assert stats == {"completed": 1, "failed": 0}
+    assert stats == {"completed": 1, "failed": 0, "quarantined": 0}
     assert pending["status"] == "pending"
     assert pending["payload_text"] == content
     assert pending["projection_base_hash"] == ""
@@ -1143,7 +1143,7 @@ def test_watchdog_does_not_suppress_manual_edit_after_echo_snapshot(
 
     stats = process_legacy_projection_batch(["Source_Test.md"])
 
-    assert stats == {"completed": 0, "failed": 1}
+    assert stats == {"completed": 0, "failed": 1, "quarantined": 0}
     assert target.read_text(encoding="utf-8") == manual_content
     assert governance_store.canonical_page_versions({"Source_Test"})[
         "Source_Test"
@@ -1151,3 +1151,61 @@ def test_watchdog_does_not_suppress_manual_edit_after_echo_snapshot(
     assert db_store.get_connection().execute(
         "SELECT COUNT(*) FROM mutation_outbox"
     ).fetchone()[0] == outbox_count
+
+
+def test_deterministic_manual_edit_failures_quarantine_after_bounded_attempts(
+    isolated_memory,
+    monkeypatch,
+):
+    """A poison page must leave the reconcile plan instead of failing forever.
+
+    Observed: four pages failed 19 times each while the full-Wiki reconciliation
+    kept reporting failed=4, cleared=False, because the plan is only acknowledged
+    when a batch succeeds.  After ``_LEGACY_PROJECTION_POISON_ATTEMPTS`` identical
+    failures the filename is quarantined for the process lifetime, which lets the
+    batch advance; a restart retries it.
+    """
+    attempts = {"count": 0}
+
+    def fail_deterministically(*_args, **_kwargs):
+        attempts["count"] += 1
+        raise RuntimeError("Idempotency key is already owned by a different payload")
+
+    monkeypatch.setattr(
+        mutation_coordinator,
+        "execute_mutation_batch",
+        fail_deterministically,
+    )
+    watchdog_app.reset_legacy_projection_quarantine()
+
+    assert watchdog_app._LEGACY_PROJECTION_POISON_ATTEMPTS == 3
+    observed = [
+        process_legacy_projection_batch(["Concept_Poison.md"]) for _ in range(4)
+    ]
+
+    assert observed[0] == {"completed": 0, "failed": 1, "quarantined": 0}
+    assert observed[1] == {"completed": 0, "failed": 1, "quarantined": 0}
+    # The third attempt is the last one made, and quarantines the page.
+    assert observed[2] == {"completed": 0, "failed": 0, "quarantined": 1}
+    # The fourth selection is skipped, so the batch can be acknowledged.
+    assert observed[3] == {"completed": 0, "failed": 0, "quarantined": 1}
+    assert attempts["count"] == 3
+
+    snapshot = watchdog_app.legacy_projection_quarantine_snapshot()
+    assert set(snapshot) == {"Concept_Poison.md"}
+    assert snapshot["Concept_Poison.md"]["attempts"] == 3
+    assert "Idempotency key" in snapshot["Concept_Poison.md"]["last_error"]
+    assert "Concept_Poison.md" in watchdog_app.legacy_projection_quarantine_summary()
+
+    # An unrelated page is unaffected, and an explicit reset restores retries.
+    assert process_legacy_projection_batch(["Concept_Other.md"]) == {
+        "completed": 0,
+        "failed": 1,
+        "quarantined": 0,
+    }
+    assert watchdog_app.reset_legacy_projection_quarantine() == 2
+    assert process_legacy_projection_batch(["Concept_Poison.md"]) == {
+        "completed": 0,
+        "failed": 1,
+        "quarantined": 0,
+    }

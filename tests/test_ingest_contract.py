@@ -5557,6 +5557,7 @@ def test_exact_reconcile_cross_surface_mcp_and_cli_forwarding(monkeypatch, capsy
     )["forwarded"] == {
         "dry_run": False,
         "limit": 3,
+        "reopen_provenance_only": False,
         "job_id": "a" * 32,
         "expected_action": "supersede_duplicate",
         "confirmation": "sha256:abc",
@@ -5590,6 +5591,7 @@ def test_exact_reconcile_cross_surface_mcp_and_cli_forwarding(monkeypatch, capsy
     assert forwarded[-1] == {
         "dry_run": False,
         "limit": 7,
+        "reopen_provenance_only": False,
         "job_id": "b" * 32,
         "expected_action": "supersede_duplicate",
         "confirmation": "sha256:def",
@@ -8334,3 +8336,59 @@ def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeyp
             changed[0][mutate]["files_written"][0]["content"] = "changed"
         with pytest.raises(ValueError, match="does not match stored provenance"):
             tool_ingest._terminal_ingest_recovery_plan(changed)
+
+
+def test_provenance_only_reopen_is_gated_on_page_evidence_not_failure_text(
+    isolated_memory,
+):
+    """A failed job with a seed page is recoverable whatever its error says.
+
+    Regression: the selector additionally required a failed job's error to start
+    with ``serialized_prompt_and_schema_exceed_token_budget``, so
+    ``intelligence_20260701_briefing`` was unrecoverable by every entry point --
+    its page carried the seed marker, its error was ``model attempt budget
+    exhausted``, and the single-job terminal retry covers only the legacy
+    generator error.  The page marker alone proves enrichment never landed.
+    """
+    from vector_lake import db_store, tool_ingest
+    from vector_lake.wiki_utils import get_wiki_dir
+
+    db_store.init_db()
+    wiki_dir = get_wiki_dir()
+    marker = tool_ingest._PROVENANCE_ONLY_SOURCE_MARKER
+
+    def seed(job_id, status, error, page, page_is_seed):
+        (wiki_dir / page).write_text(
+            "seed body\n" + (marker if page_is_seed else "real enrichment body") + "\n",
+            encoding="utf-8",
+        )
+        db_store.get_connection().execute(
+            "INSERT OR REPLACE INTO jobs "
+            "(job_id, task_type, payload, status, retries, error_msg, "
+            " created_at, updated_at) "
+            "VALUES (?, 'ingest', ?, ?, 3, ?, "
+            " '2026-09-13T00:00:00+00:00', '2026-09-13T00:00:00+00:00')",
+            (job_id, json.dumps({"canonical_name": page}), status, error),
+        )
+    seed(
+        "a" * 32,
+        "failed",
+        "model attempt budget exhausted for this exact raw revision",
+        "Source_Model-Budget.md",
+        True,
+    )
+    seed("b" * 32, "failed", "anything else terminal", "Source_No-Seed.md", False)
+    seed("c" * 32, "finalized", "", "Source_Finalized-Seed.md", True)
+    seed(
+        "d" * 32,
+        "failed",
+        "serialized_prompt_and_schema_exceed_token_budget:165253>98304",
+        "Source_Budget-Unfit-Seed.md",
+        True,
+    )
+
+    selected = tool_ingest._provenance_only_terminal_job_ids(db_store.get_connection())
+
+    assert set(selected) == {"a" * 32, "c" * 32, "d" * 32}
+    # Selection is sorted and deterministic.
+    assert selected == sorted(selected)

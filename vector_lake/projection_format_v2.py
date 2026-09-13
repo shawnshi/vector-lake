@@ -229,24 +229,84 @@ def require_bounded_frontier(values: Iterable[Any]) -> tuple[Any, ...]:
     return tuple(result)
 
 
-def _edge_key(edge: Mapping[str, Any], ordinal: int = 0) -> str:
+def _edge_identity(edge: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the content-derived identity of an undirected edge.
+
+    ``pair`` normalizes endpoint order and ``signature`` hashes the edge content,
+    so the identity cannot depend on the caller's list position.  It must never
+    encode position: ``_edge_key`` used to embed an ``enumerate()`` ordinal, which
+    made the same logical edge hash differently whenever the caller's order
+    changed.  Measured against the live object store on 2026-09-13: of 211,848
+    distinct ``(pair, signature)`` edge identities, 155,757 (73.5%) were observed
+    with more than one ordinal, up to 73 vintages each.  Every such drift rewrote
+    the leaf and its whole ancestor path, so a publish cost a full ~2,777-object
+    tree rewrite instead of a bounded frontier.
+    """
     source = str(edge.get("source") or "")
     target = str(edge.get("target") or "")
     pair = "\x1f".join((min(source, target), max(source, target)))
     signature = hashlib.sha256(canonical_json_bytes(dict(edge))).hexdigest()
-    return f"{pair}\x1f{ordinal:08d}\x1f{signature}"
+    return pair, signature
 
 
-def _claim_item_key(item: Mapping[str, Any], ordinal: int) -> str:
+def _edge_key(edge: Mapping[str, Any], occurrence: int = 0) -> str:
+    """Key an edge by content identity plus its per-identity occurrence count.
+
+    ``occurrence`` only disambiguates *identical* edges, so it is content-
+    determined: adding or removing any other edge cannot renumber it.  The
+    ``%08d`` shape is unchanged so existing consumers that read the second field
+    keep working.
+    """
+    pair, signature = _edge_identity(edge)
+    return f"{pair}\x1f{occurrence:08d}\x1f{signature}"
+
+
+def _claim_item_key(item: Mapping[str, Any], occurrence: int = 0) -> str:
     identity = str(item.get("id") or item.get("claim_id") or "")
     digest = hashlib.sha256(canonical_json_bytes(dict(item))).hexdigest()
-    return f"{identity}\x1f{ordinal:08d}\x1f{digest}"
+    return f"{identity}\x1f{occurrence:08d}\x1f{digest}"
 
 
-def _error_key(item: Mapping[str, Any], ordinal: int) -> str:
+def _claim_item_identity(item: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        str(item.get("id") or item.get("claim_id") or ""),
+        hashlib.sha256(canonical_json_bytes(dict(item))).hexdigest(),
+    )
+
+
+def _error_key(item: Mapping[str, Any], occurrence: int = 0) -> str:
     filename = str(item.get("file") or "")
     digest = hashlib.sha256(canonical_json_bytes(dict(item))).hexdigest()
-    return f"{filename}\x1f{ordinal:08d}\x1f{digest}"
+    return f"{filename}\x1f{occurrence:08d}\x1f{digest}"
+
+
+def _error_identity(item: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        str(item.get("file") or ""),
+        hashlib.sha256(canonical_json_bytes(dict(item))).hexdigest(),
+    )
+
+
+def _content_keyed_items(
+    items: Iterable[Mapping[str, Any]],
+    key_for: Callable[[Mapping[str, Any], int], str],
+    identity_for: Callable[[Mapping[str, Any]], tuple[str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Map each item to a position-independent key.
+
+    Shared by the claim-node, claim-edge and error-log components, all of which
+    previously keyed on their ``enumerate()`` position.  91.0% of the 38,409 live
+    claim/error identities were observed with more than one ordinal, up to 52
+    vintages each.
+    """
+    occurrences: dict[tuple[str, str], int] = {}
+    values: dict[str, dict[str, Any]] = {}
+    for item in items:
+        identity = identity_for(item)
+        occurrence = occurrences.get(identity, 0)
+        occurrences[identity] = occurrence + 1
+        values[key_for(item, occurrence)] = dict(item)
+    return values
 
 
 def _search_row(node_key: str, node: Mapping[str, Any]) -> list[str]:
@@ -294,14 +354,25 @@ def _edge_components(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
     values: dict[str, dict[str, Any]] = {}
     incidence: dict[str, list[str]] = {}
-    for ordinal, edge in enumerate(edges):
-        normalized = dict(edge)
-        normalized["__ordinal__"] = ordinal
-        key = _edge_key(edge, ordinal)
-        values[key] = normalized
+    occurrences: dict[tuple[str, str], int] = {}
+    for edge in edges:
+        identity = _edge_identity(edge)
+        occurrence = occurrences.get(identity, 0)
+        occurrences[identity] = occurrence + 1
+        key = _edge_key(edge, occurrence)
+        # No positional field is stored.  ``__ordinal__`` used to be written here
+        # (the incremental path at indexer's edge retention already dropped it),
+        # so the two paths disagreed on value content and the same edge could
+        # never be reused across a full publish and an incremental one.
+        values[key] = dict(edge)
         for endpoint in {str(edge.get("source") or ""), str(edge.get("target") or "")}:
             if endpoint:
                 incidence.setdefault(endpoint, []).append(key)
+    # Canonical order: keys are content-derived, so sorting is input-order
+    # independent.  Appending in caller order made the incidence leaf change on
+    # every publish even when its key set was unchanged.
+    for keys in incidence.values():
+        keys.sort()
     return values, incidence
 
 
@@ -339,14 +410,16 @@ def build_claim_graph_root(
     ):
         raise ProjectionHeavyRebuildRequired()
     store = ProjectionStoreV2(base_dir)
-    claim_nodes = {
-        _claim_item_key(item, ordinal): dict(item)
-        for ordinal, item in enumerate(claim_nodes_raw)
-    }
-    claim_edges = {
-        _claim_item_key(item, ordinal): dict(item)
-        for ordinal, item in enumerate(claim_edges_raw)
-    }
+    claim_nodes = _content_keyed_items(
+        claim_nodes_raw,
+        _claim_item_key,
+        _claim_item_identity,
+    )
+    claim_edges = _content_keyed_items(
+        claim_edges_raw,
+        _claim_item_key,
+        _claim_item_identity,
+    )
     claim_meta = {
         str(key): value
         for key, value in claim_graph_data.items()
@@ -414,10 +487,11 @@ def build_projection_roots(
         aliases,
     )
     categories = {str(value): True for value in (index_data.get("categories") or [])}
-    errors = {
-        _error_key(item, ordinal): dict(item)
-        for ordinal, item in enumerate(index_data.get("error_log") or [])
-    }
+    errors = _content_keyed_items(
+        index_data.get("error_log") or [],
+        _error_key,
+        _error_identity,
+    )
     errors_by_file: dict[str, list[dict[str, Any]]] = {}
     for item in index_data.get("error_log") or []:
         errors_by_file.setdefault(str(item.get("file") or ""), []).append(dict(item))
@@ -688,13 +762,22 @@ def materialize_index(
     result["categories"] = sorted(
         key for key, _value in _component_items(store, descriptor, "categories")
     )
-    weighted_edges: list[tuple[int, dict[str, Any]]] = []
-    for _key, raw_edge in _component_items(store, descriptor, "edges"):
+    weighted_edges: list[tuple[tuple[float, str, str, str], dict[str, Any]]] = []
+    for key, raw_edge in _component_items(store, descriptor, "edges"):
         edge = dict(raw_edge)
-        ordinal = int(edge.pop("__ordinal__", len(weighted_edges)))
-        weighted_edges.append((ordinal, edge))
+        # Legacy objects still carry the retired positional field; never surface it.
+        edge.pop("__ordinal__", None)
+        try:
+            weight = float(edge.get("weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        # Canonical order instead of a stored position.  This is the same total
+        # order the pruner and the incremental retention path already use, and it
+        # cannot be perturbed by the caller's input order.
+        order = (-weight, str(edge.get("source")), str(edge.get("target")), key)
+        weighted_edges.append((order, edge))
     result["weighted_edges"] = [
-        edge for _ordinal, edge in sorted(weighted_edges, key=lambda item: item[0])
+        edge for _order, edge in sorted(weighted_edges, key=lambda item: item[0])
     ]
     if "errors_by_file" in descriptor:
         result["error_log"] = [
@@ -706,15 +789,14 @@ def materialize_index(
             for item in items
         ]
     else:
-        errors: list[tuple[int, dict[str, Any]]] = []
-        for key, raw_error in _component_items(store, descriptor, "error_log"):
-            try:
-                ordinal = int(key.rsplit("\x1f", 2)[-2])
-            except (IndexError, ValueError):
-                ordinal = len(errors)
-            errors.append((ordinal, dict(raw_error)))
+        # Ordered by content-derived key: the previous parsed ordinal is now an
+        # occurrence counter, which is not an ordering.
         result["error_log"] = [
-            item for _ordinal, item in sorted(errors, key=lambda pair: pair[0])
+            dict(value)
+            for _key, value in sorted(
+                _component_items(store, descriptor, "error_log"),
+                key=lambda pair: pair[0],
+            )
         ]
     result["projection_manifest"] = _legacy_projection_manifest(validated)
     return result
@@ -731,15 +813,15 @@ def materialize_claim_graph(
     )
     result = dict(_component_items(store, descriptor, "meta"))
     for name in ("nodes", "edges"):
-        ordered: list[tuple[int, dict[str, Any]]] = []
-        for key, value in _component_items(store, descriptor, name):
-            try:
-                ordinal = int(key.rsplit("\x1f", 2)[-2])
-            except (IndexError, ValueError):
-                ordinal = len(ordered)
-            ordered.append((ordinal, dict(value)))
+        # Ordered by content-derived key.  The previous parsed ordinal is now an
+        # occurrence counter and is not an ordering; sorting by key is total and
+        # input-order independent.
         result[name] = [
-            item for _ordinal, item in sorted(ordered, key=lambda pair: pair[0])
+            dict(value)
+            for _key, value in sorted(
+                _component_items(store, descriptor, name),
+                key=lambda pair: pair[0],
+            )
         ]
     result["projection_manifest"] = _legacy_projection_manifest(validated)
     return result
