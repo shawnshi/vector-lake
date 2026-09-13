@@ -15,6 +15,12 @@ from vector_lake.governance_metrics import claim_governance_version
 
 _REPAIR_CONTRACT = "claim-provenance-repair-plan-v1"
 _EVIDENCE_TYPE = "operator-reviewed-official-excerpt"
+# Only this planner strategy promises operator-reviewed official evidence; the
+# other evidence-preserving strategies (exact-existing-evidence, the
+# explicit-planned / frozen map strategies, unique-canonical-source-page) attach
+# whatever evidence the corpus already holds, so requiring the official type for
+# them would reject every marker the planner itself writes.
+_OFFICIAL_EVIDENCE_STRATEGY = "frozen-official-evidence-map"
 _MAX_ARTIFACTS = 64
 _MAX_FILE_BYTES = 16 * 1024 * 1024
 _MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -324,7 +330,18 @@ def retain_current_reviewed_provenance(
             raise ReviewedProvenanceRetentionError(
                 "Current governed repair references missing canonical reviewed evidence."
             )
-        if len(supported) != len(governed):
+        # The official-evidence requirement is scoped to the strategy that
+        # promised it.  Applying it to every strategy made 372 of 375 live
+        # markers unprovable - every claim the planner had repaired through a
+        # non-official strategy - which blocked writes to 66 pages and would
+        # recur on the next repair run.  The ``missing`` check above stays
+        # fail-closed for all strategies.
+        strategies = marker.get("strategies")
+        requires_official = bool(
+            isinstance(strategies, (list, tuple))
+            and _OFFICIAL_EVIDENCE_STRATEGY in strategies
+        )
+        if requires_official and len(supported) != len(governed):
             raise ReviewedProvenanceRetentionError(
                 "Current governed repair contains an unprovable evidence marker."
             )
