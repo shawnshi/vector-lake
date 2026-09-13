@@ -1496,9 +1496,9 @@ def repair_claim_provenance(
             f"{expected}"
         )
 
-    from vector_lake.tool_projection import create_maintenance_backup
+    from vector_lake.tool_projection import require_maintenance_backup
 
-    backup = create_maintenance_backup("claim_provenance_repair")
+    backup = require_maintenance_backup("claim_provenance_repair")
     repaired_at = _utc_now()
     with db_store.transaction():
         current_plan = build_claim_provenance_repair_plan(

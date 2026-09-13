@@ -704,6 +704,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_DATABASE_WARNING_BYTES`：Doctor 数据库体积告警阈值，默认 `4 GiB`。
 - `VECTOR_LAKE_DATABASE_DAILY_GROWTH_WARNING_BYTES` / `VECTOR_LAKE_VERSION_DAILY_GROWTH_WARNING_ROWS`：Doctor 的每日数据库增量与 Claim/Evidence 版本行增量告警阈值，默认 `256 MiB` / `50000` 行。Watchdog 每个 UTC 日记录一次、保留 35 个样本，不自动删除历史。
 - `VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES`：maintenance 与 schema-migration 两个根的全局备份配额；默认 `0` 表示未配置并触发治理告警。未配置上限时 `quota_mode` 报为 `report`（请求值保留在 `requested_quota_mode`），因为未定义上限的 `enforce` 实际无法拦截任何写入。`VECTOR_LAKE_BACKUP_MIN_FREE_BYTES` / `VECTOR_LAKE_BACKUP_MIN_FREE_RATIO` 默认 `10 GiB` / `0.10`；`VECTOR_LAKE_BACKUP_QUOTA_MODE` 只接受 `enforce`（默认）或 `report`。
+- `VECTOR_LAKE_MAINTENANCE_BACKUP_MODE`：修改前维护备份策略，只接受 `full`（默认）或 `skip`。每个维护操作默认会先复制整库与投影（实库约 3.6 GB 且独占 heavy-task gate 数分钟）；`skip` 暂停这份自动前置副本，**不**影响把备份当作已校验输入读回的操作——claim 占位清理、模板退役、claim 溯源修复、`index_rebuild`（恢复包载体）与 `wiki_restore`（恢复源）走 `require_maintenance_backup`，两种模式下行为完全一致，因此暂停不会让它们静默降级。该值在部署侧（进程环境）设置；测试套件会显式清除它，所以主机上暂停不会改变套件行为。
 - `VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS`：CLI 重任务等待同一门的时间，默认 `30` 秒，限制为 `0` 至 `300` 秒；超时退出码为 `75`。
 - `VECTOR_LAKE_TOPOLOGY_WORKER_TIMEOUT_SECONDS`：Louvain 拓扑隔离进程超时，默认 `60` 秒，限制为 `5` 至 `300` 秒；失败时回退到确定性的 connected-components。
 - `VECTOR_LAKE_WAL_AUTOCHECKPOINT_PAGES`：每个可写 SQLite 连接的自动回写阈值，默认 `1000` 页；它在事务提交后生效，不限制单个大事务的峰值。

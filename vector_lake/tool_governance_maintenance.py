@@ -99,9 +99,9 @@ def cleanup_operational_memory(
         return json.dumps(result, ensure_ascii=False, indent=2)
     if not hmac.compare_digest(str(confirmation), result["candidate_fingerprint"]):
         raise ValueError("Scoped cleanup requires the current candidate fingerprint.")
-    from vector_lake.tool_projection import create_maintenance_backup
+    from vector_lake.tool_projection import require_maintenance_backup
 
-    backup = create_maintenance_backup("template_retirement")
+    backup = require_maintenance_backup("template_retirement")
     manifest = json.loads((Path(backup) / "manifest.json").read_text(encoding="utf-8"))
     if not (
         manifest.get("complete") is True

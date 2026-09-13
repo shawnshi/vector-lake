@@ -1511,7 +1511,71 @@ def _copy_projection_pair_to_backup(
         ) from exc
 
 
+_MAINTENANCE_BACKUP_MODE_ENV = "VECTOR_LAKE_MAINTENANCE_BACKUP_MODE"
+_MAINTENANCE_BACKUP_FULL = "full"
+_MAINTENANCE_BACKUP_SKIP = "skip"
+
+
+def maintenance_backup_mode() -> str:
+    """Resolve the pre-modification maintenance-backup policy.
+
+    Every maintenance operation used to copy the whole canonical database and
+    projection before mutating (~3.6 GB and several minutes of exclusive
+    heavy-task time on the live corpus, repeatedly, with no switch to stop it).
+    ``skip`` pauses that automatic pre-modification copy.
+
+    It does **not** reach the operations whose correctness depends on reading the
+    backup back: claim-placeholder cleanup validates the manifest, generations and
+    restorable snapshot; template retirement requires a consistent backup; claim
+    provenance repair validates a scoped backup; index rebuild uses the backup
+    directory as its recovery bundle; and wiki restore uses it as the restore
+    source.  Those call ``require_maintenance_backup`` and behave exactly as
+    before under either mode, so pausing never silently degrades them.
+    """
+    value = str(
+        os.environ.get(_MAINTENANCE_BACKUP_MODE_ENV, _MAINTENANCE_BACKUP_FULL)
+    ).strip().lower()
+    if value not in {_MAINTENANCE_BACKUP_FULL, _MAINTENANCE_BACKUP_SKIP}:
+        raise RuntimeError(
+            f"{_MAINTENANCE_BACKUP_MODE_ENV} must be "
+            f"'{_MAINTENANCE_BACKUP_FULL}' or '{_MAINTENANCE_BACKUP_SKIP}'"
+        )
+    return value
+
+
+def maintenance_backup_skipped() -> bool:
+    return maintenance_backup_mode() == _MAINTENANCE_BACKUP_SKIP
+
+
 def create_maintenance_backup(label: str = "maintenance") -> str:
+    """Publish a pre-modification backup, unless the policy pauses it.
+
+    Returns the backup directory, or ``""`` when ``VECTOR_LAKE_MAINTENANCE_BACKUP_MODE``
+    is ``skip``.  Callers on this path only record the value, so ``""`` is a valid
+    no-copy result.  Callers that read the backup back must use
+    ``require_maintenance_backup`` instead.
+    """
+    if maintenance_backup_skipped():
+        log.info(
+            "Maintenance backup paused by %s; skipped the pre-modification copy "
+            "for %s",
+            _MAINTENANCE_BACKUP_MODE_ENV,
+            _validate_backup_label(label),
+        )
+        return ""
+    return _write_maintenance_backup(label)
+
+
+def require_maintenance_backup(label: str = "maintenance") -> str:
+    """Publish a backup that the calling operation will read back.
+
+    Never skipped: these backups are a verified input rather than a safety net, so
+    ``VECTOR_LAKE_MAINTENANCE_BACKUP_MODE=skip`` leaves their behaviour unchanged.
+    """
+    return _write_maintenance_backup(label)
+
+
+def _write_maintenance_backup(label: str = "maintenance") -> str:
     """Publish a complete SQLite/projection backup from a private staging directory."""
     label = _validate_backup_label(label)
     backup_root = get_meta_dir() / "backups"
@@ -2808,7 +2872,7 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
         _assert_projection_rebuild_root_snapshot(root_snapshot)
         backup_dir = _projection_recovery_resume_backup()
         if backup_dir is None:
-            backup_dir = Path(create_maintenance_backup("index_rebuild"))
+            backup_dir = Path(require_maintenance_backup("index_rebuild"))
         _assert_projection_rebuild_root_snapshot(root_snapshot)
         if (backup_dir / _PROJECTION_RECOVERY_ARTIFACT).exists():
             manifest, _inventory = validate_maintenance_backup_v4(backup_dir / "manifest.json")
@@ -2976,7 +3040,7 @@ def restore_missing_wiki_from_canonical(dry_run: bool = True, limit: int = 10) -
     if not page_keys:
         return "No canonical-only wiki pages to restore."
 
-    backup_dir = create_maintenance_backup("wiki_restore")
+    backup_dir = require_maintenance_backup("wiki_restore")
     restored = 0
     skipped: list[str] = []
     unsafe_versions: list[str] = []

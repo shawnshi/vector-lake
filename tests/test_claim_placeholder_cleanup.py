@@ -200,7 +200,7 @@ def test_unrelated_forensic_or_edited_projection_is_ineligible(isolated_memory, 
     before = _state_rows()
     preview = cleanup.cleanup_placeholder_claims(["claim_stub"])
     assert not preview["eligible"] and blocker in preview["blockers"]
-    monkeypatch.setattr(tool_projection, "create_maintenance_backup", lambda *_: pytest.fail("ineligible preview must not start backup"))
+    monkeypatch.setattr(tool_projection, "require_maintenance_backup", lambda *_: pytest.fail("ineligible preview must not start backup"))
     with pytest.raises(ValueError, match="ineligible"):
         cleanup.cleanup_placeholder_claims(["claim_stub"], dry_run=False, confirmation=preview["candidate_fingerprint"])
     assert _state_rows() == before
@@ -219,7 +219,7 @@ def test_derived_timeline_id_blocks_before_backup(isolated_memory, monkeypatch):
     preview = cleanup.cleanup_placeholder_claims(["claim_stub"])
     assert not preview["eligible"] and "timeline_dependency" in preview["blockers"]
     before = _state_rows()
-    monkeypatch.setattr(tool_projection, "create_maintenance_backup", lambda *_: pytest.fail("timeline dependency must block before backup"))
+    monkeypatch.setattr(tool_projection, "require_maintenance_backup", lambda *_: pytest.fail("timeline dependency must block before backup"))
     with pytest.raises(ValueError, match="ineligible"):
         cleanup.cleanup_placeholder_claims(["claim_stub"], dry_run=False, confirmation=preview["candidate_fingerprint"])
     assert _state_rows() == before
@@ -234,12 +234,12 @@ def _state_rows():
 
 
 def test_backup_generation_mismatch_does_not_delete(isolated_memory):
-    from vector_lake.tool_projection import create_maintenance_backup
+    from vector_lake.tool_projection import require_maintenance_backup
     db_store.init_db()
     _install_fixture()
     indexer.generate_index()
     preview = cleanup.cleanup_placeholder_claims(["claim_stub"])
-    backup = create_maintenance_backup("cleanup_test")
+    backup = require_maintenance_backup("cleanup_test")
     generations = dict(preview["runtime_generations"])
     generations["claims"] += 1
     before = _state_rows()

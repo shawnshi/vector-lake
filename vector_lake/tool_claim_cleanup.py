@@ -336,8 +336,8 @@ def cleanup_placeholder_claims(
     expected = plan["candidate_fingerprint"]
     if not confirmation or not hmac.compare_digest(str(confirmation), expected):
         raise ValueError(f"Placeholder cleanup requires the exact preview fingerprint: {expected}")
-    from vector_lake.tool_projection import create_maintenance_backup
-    backup_path = create_maintenance_backup("claim_placeholder_cleanup")
+    from vector_lake.tool_projection import require_maintenance_backup
+    backup_path = require_maintenance_backup("claim_placeholder_cleanup")
     backup = _validate_backup(backup_path, plan["runtime_generations"])
     now = datetime.now(timezone.utc).isoformat()
     with db_store.transaction() as conn:

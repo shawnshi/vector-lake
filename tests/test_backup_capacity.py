@@ -327,3 +327,46 @@ def test_unconfigured_cap_does_not_claim_enforcement(tmp_path, monkeypatch):
     enforced = backup_capacity.backup_capacity_policy()
     assert enforced["quota_mode"] == "enforce"
     assert enforced["requested_quota_mode"] == "enforce"
+
+
+def test_maintenance_backup_mode_defaults_to_full_and_rejects_unknown(monkeypatch):
+    monkeypatch.delenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", raising=False)
+    assert tool_projection.maintenance_backup_mode() == "full"
+    assert tool_projection.maintenance_backup_skipped() is False
+
+    monkeypatch.setenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", "SKIP")
+    assert tool_projection.maintenance_backup_skipped() is True
+
+    monkeypatch.setenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", "paused")
+    with pytest.raises(RuntimeError, match="VECTOR_LAKE_MAINTENANCE_BACKUP_MODE"):
+        tool_projection.maintenance_backup_mode()
+
+
+def test_skip_mode_pauses_only_the_pre_modification_copy(isolated_memory, monkeypatch):
+    """`skip` drops the automatic copy but never a verified-input backup.
+
+    Five operations read their backup back (claim-placeholder cleanup validates the
+    manifest/generations/restorable snapshot, template retirement requires a
+    consistent backup, claim provenance repair validates a scoped backup, index
+    rebuild carries its recovery bundle there, and wiki restore reads it as the
+    restore source).  Pausing must not silently degrade any of them.
+    """
+    db_store.init_db()
+    backup_root = isolated_memory / "wiki" / ".meta" / "backups"
+
+    monkeypatch.setenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", "skip")
+
+    assert tool_projection.create_maintenance_backup("pre_modification") == ""
+    created = sorted(p.name for p in backup_root.iterdir()) if backup_root.is_dir() else []
+    assert [name for name in created if not name.startswith(".")] == []
+
+    required = tool_projection.require_maintenance_backup("dependent_operation")
+    assert required
+    assert Path(required).name.startswith("dependent_operation_")
+    assert (Path(required) / "manifest.json").is_file()
+
+    monkeypatch.setenv("VECTOR_LAKE_MAINTENANCE_BACKUP_MODE", "full")
+    made = tool_projection.create_maintenance_backup("pre_modification")
+    assert made
+    assert Path(made).name.startswith("pre_modification_")
+    assert (Path(made) / "manifest.json").is_file()

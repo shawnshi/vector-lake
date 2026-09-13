@@ -182,7 +182,7 @@ def test_wrapper_requires_consistent_backup_before_write(isolated_memory, monkey
     (backup / "manifest.json").write_text(json.dumps({
         "complete": True, "restorable_as_consistent_canonical_projection_snapshot": False,
     }), encoding="utf-8")
-    monkeypatch.setattr("vector_lake.tool_projection.create_maintenance_backup", lambda _label: str(backup))
+    monkeypatch.setattr("vector_lake.tool_projection.require_maintenance_backup", lambda _label: str(backup))
     with pytest.raises(RuntimeError, match="consistent backup"):
         maintenance.cleanup_operational_memory(
             dry_run=False, source_claim_ids=["claim_Alpha"],
@@ -222,7 +222,7 @@ def test_backup_content_must_match_confirmed_candidates(isolated_memory, monkeyp
         db_store.get_connection().backup(conn)
         conn.execute("UPDATE operational_memory SET data_json = json_set(data_json, '$.changed', 1) WHERE memory_id = ?", ("memory_claim_Alpha",))
         conn.commit()
-    monkeypatch.setattr("vector_lake.tool_projection.create_maintenance_backup", lambda _label: str(backup))
+    monkeypatch.setattr("vector_lake.tool_projection.require_maintenance_backup", lambda _label: str(backup))
     with pytest.raises(RuntimeError, match="backup does not match"):
         maintenance.cleanup_operational_memory(
             dry_run=False, source_claim_ids=["claim_Alpha"],

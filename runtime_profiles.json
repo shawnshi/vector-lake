@@ -7,6 +7,7 @@
         "VECTOR_LAKE_META_DIR": "~/MEMORY/wiki/.meta",
         "VECTOR_LAKE_OPERATIONAL_MEMORY_FTS": "1",
         "VECTOR_LAKE_DURABILITY_PROFILE": "full",
+        "VECTOR_LAKE_MAINTENANCE_BACKUP_MODE": "skip",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1"
       }

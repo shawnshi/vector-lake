@@ -294,8 +294,8 @@ def test_transaction_time_race_causes_zero_repair_writes(official_case, monkeypa
                 assert conn.total_changes == changes_after_injection
 
     # Build the backup before patching transaction to isolate the race seam.
-    backup = tool_projection.create_maintenance_backup("race-test")
-    monkeypatch.setattr(tool_projection, "create_maintenance_backup", lambda _label: backup)
+    backup = tool_projection.require_maintenance_backup("race-test")
+    monkeypatch.setattr(tool_projection, "require_maintenance_backup", lambda _label: backup)
     monkeypatch.setattr(db_store, "transaction", racing_transaction)
     before = _rows()
     with pytest.raises(error_type, match=message) as rejection:
@@ -317,13 +317,13 @@ def test_scoped_apply_rejects_inconsistent_backup(official_case):
 
 def test_scoped_apply_rejects_stale_consistent_backup(official_case, monkeypatch):
     _publish()
-    backup = tool_projection.create_maintenance_backup("stale-test")
+    backup = tool_projection.require_maintenance_backup("stale-test")
     conn = db_store.get_connection()
     conn.execute("UPDATE operational_memory SET data_json=json_set(data_json, '$.note', 'new basis')")
     conn.commit()
     preview = _preview(official_case)
     before = _rows()
-    monkeypatch.setattr(tool_projection, "create_maintenance_backup", lambda _label: backup)
+    monkeypatch.setattr(tool_projection, "require_maintenance_backup", lambda _label: backup)
     with pytest.raises(ValueError, match="confirmed claim/memory basis"):
         _preview(official_case, dry_run=False, confirmation=preview["candidate_fingerprint"])
     assert _rows() == before
@@ -331,13 +331,13 @@ def test_scoped_apply_rejects_stale_consistent_backup(official_case, monkeypatch
 
 def test_scoped_apply_rejects_tampered_backup(official_case, monkeypatch):
     _publish()
-    backup = Path(tool_projection.create_maintenance_backup("tamper-test"))
+    backup = Path(tool_projection.require_maintenance_backup("tamper-test"))
     preview = _preview(official_case)
     manifest_path = backup / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["artifact_sha256"]["vector_lake.db"] = "0" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    monkeypatch.setattr(tool_projection, "create_maintenance_backup", lambda _label: str(backup))
+    monkeypatch.setattr(tool_projection, "require_maintenance_backup", lambda _label: str(backup))
     before = _rows()
     with pytest.raises(ValueError, match="artifact_mismatch"):
         _preview(official_case, dry_run=False, confirmation=preview["candidate_fingerprint"])

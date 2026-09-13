@@ -20,6 +20,12 @@ RUNTIME_PROFILE_ENV_KEYS = frozenset(
         *RUNTIME_PATH_KEYS,
         "VECTOR_LAKE_OPERATIONAL_MEMORY_FTS",
         "VECTOR_LAKE_DURABILITY_PROFILE",
+        # Pre-modification maintenance-backup policy.  It must be launchable from
+        # the profile because the MCP server is a stdio child of the host adapter:
+        # it inherits the host's environment block, which no longer changes when
+        # the operator updates an environment variable on the host.  Without this
+        # key the launcher cannot deliver the pause to MCP-initiated maintenance.
+        "VECTOR_LAKE_MAINTENANCE_BACKUP_MODE",
         "OPENBLAS_NUM_THREADS",
         "OMP_NUM_THREADS",
     }

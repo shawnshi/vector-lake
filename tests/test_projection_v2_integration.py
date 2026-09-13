@@ -666,7 +666,7 @@ def test_projection_rebuild_pending_rollback_dry_run_is_read_only_and_apply_stop
 
     monkeypatch.setattr(
         tool_projection,
-        "create_maintenance_backup",
+        "require_maintenance_backup",
         forbidden_call("backup"),
     )
     monkeypatch.setattr(tool_projection, "init_db", forbidden_call("init_db"))
@@ -733,7 +733,7 @@ def test_projection_rebuild_schema_lock_closes_post_guard_pending_race(
     )
     monkeypatch.setattr(
         tool_projection,
-        "create_maintenance_backup",
+        "require_maintenance_backup",
         lambda _label: calls.append("backup") or receipt_dir,
     )
 
@@ -783,7 +783,7 @@ def test_projection_rebuild_apply_preflight_runs_under_schema_lock(monkeypatch):
     monkeypatch.setattr(tool_projection, "_diff_sets", locked_diff)
     monkeypatch.setattr(
         tool_projection,
-        "create_maintenance_backup",
+        "require_maintenance_backup",
         lambda _label: receipt_dir,
     )
     monkeypatch.setattr(
@@ -820,7 +820,7 @@ def test_projection_rebuild_database_path_drift_stops_before_backup(monkeypatch)
     )
     monkeypatch.setattr(
         tool_projection,
-        "create_maintenance_backup",
+        "require_maintenance_backup",
         lambda _label: calls.append("backup"),
     )
 
@@ -868,7 +868,7 @@ def test_projection_rebuild_root_drift_stops_before_first_business_write(
     )
     monkeypatch.setattr(
         tool_projection,
-        "create_maintenance_backup",
+        "require_maintenance_backup",
         lambda _label: calls.append("backup"),
     )
     monkeypatch.setattr(
@@ -909,7 +909,7 @@ def test_projection_rebuild_migrates_v8_legacy_v1_to_v2(
 
     events = []
     backup_paths = []
-    real_backup = tool_projection.create_maintenance_backup
+    real_backup = tool_projection.require_maintenance_backup
     real_generate = indexer.generate_index
 
     def tracking_backup(label):
@@ -922,7 +922,7 @@ def test_projection_rebuild_migrates_v8_legacy_v1_to_v2(
         events.append("generate")
         return real_generate(*args, **kwargs)
 
-    monkeypatch.setattr(tool_projection, "create_maintenance_backup", tracking_backup)
+    monkeypatch.setattr(tool_projection, "require_maintenance_backup", tracking_backup)
     monkeypatch.setattr(indexer, "generate_index", tracking_generate)
     applied = tool_projection.rebuild_index_projection(dry_run=False)
     assert "Rebuilt index projection" in applied
