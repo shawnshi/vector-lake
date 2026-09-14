@@ -3,7 +3,8 @@
 - **状态**: 已批准执行（2026-09-14）。P0 已落地；P1 起为待执行
 - **决策记录**:
   - `2026-09-14` 作者确认 **P0 硬前置已解决**：既有 WIP 提交为 `61830d1`（迁移基线因此干净）。
-  - `2026-09-14` 作者**接受 P2 的跨库原子性代价**：规范写入与读模型发布不再共享同一 SQLite 事务，转为显式发布协议。P2 因此解除阻塞，但仍按"最小表先验证"顺序执行。
+  - `2026-09-14` 作者**接受 P2 的跨库原子性代价**：规范写入与读模型发布不再共享同一 SQLite 事务，转为显式发布协议。P2 因此解除阻塞，但仍按"最小表先验证"顺序执行。**该决策随后作废**——实测表明这个代价无法用"接受"消化（见下条）。
+  - `2026-09-14` **P2 已判定不可行并停止（未改活库）**：45 个生成触发器写 `runtime_generations`、`operational_memory` 上 9 个触发器、`_search_pending` 被 4 个触发器写入（SQLite 无跨库触发器）；`projection_runtime_v9`/`search_projection_state_v8` 是同事务读写的协调态；`embedding_metadata_v8` 受 generation CAS 保护而主库为 **WAL** ⇒ 跨库事务不原子。可移余量仅 ~30 行遥测（`embedding_runs` 29 + `embedding_rate_reservations` 1 + 两张空表），不值得引入第二库。已给出更便宜的替代方向（读侧独立版本轴，不抬 `user_version`），待决策。
   - `2026-09-14` **更正审计自身的一处误报**：原判 "`schema.md` `Schema V8.0` 与 `_SCHEMA_VERSION = 9` 漂移" **不成立**。二者是独立版本轴：`user_version` 是 SQLite 存储 schema，`Canonical governance schema 8.0` 是 `schema.md` 文档自身的版本（代码中不存在对应常量）。README 该表在两个轴上各自自洽。P0.1 范围据此收窄（见下）。
   - `2026-09-14` 作者**确认停机窗口**。实际执行时发现**该窗口对 P1 的完整性目标不再必要**（见 P1 机制变更），因此**未开启窗口、未触碰活库**。保留的、真正需要窗口的只有两项可选动作：`entities.ttl`/`decay_weight` 的 `DROP COLUMN`（破坏性 DDL），以及打开 `foreign_keys`（需先测代码路径）。
   - `2026-09-14` 作者确认 `skip` 是有意暂停的。据此判定：**`skip` 不阻塞 P1 与 P2**——P1 的触发器路线不改规范数据，P2 从不动规范库（可回滚点就是“旧表先不删”）。
@@ -152,7 +153,27 @@ python cli.py projection-rebuild-index
 
 ---
 
-### P2 — 读模型迁出规范库（无停机，按表增量）
+### P2 — 读模型迁出规范库（❌ 已判定**不可行**，已停）
+
+> **结论：P2 按原计划不可执行。** 不是成本问题，而是 SQLite 的机制限制。原文保留在下方以供审计对比。
+
+**实测证据（三项，均为硬约束）**
+
+| 约束 | 证据 |
+|---|---|
+| 触发器不能跳库写 | **45 个生成触发器**（`trg_*_generation_v3_*`，依附于 15 个规范面）都写 `runtime_generations`；`operational_memory` 上有 **9 个**触发器（3 生成 + 4 写 `_search_pending` + 2 个 P1 新增完整性触发器）；`operational_memory_search_pending` **被 4 个**触发器写入；`claim_graph_edges`/`page_graph_edges` 各带 3 个生成触发器。⇒ `runtime_generations`、`operational_memory`、`_search_*`、两张边表**均不可移**。 |
+| 协调态不能移 | `projection_runtime_v9` / `search_projection_state_v8` 是写入路径在**同一事务内**读写的发布状态（generation CAS），移出即失去原子性。它们不是可移的“读模型”，而是协调态。 |
+| WAL 下跨库事务不原子 | 实测 `PRAGMA journal_mode = wal`。SQLite 文档明确：主库为 WAL 时，涉及多个 attached 数据库的事务**不跨库原子**。而 `db_store.py:9717-9746` 在**同一事务内**先读 `runtime_generations` 比对（CAS）再写 `embedding_metadata_v8`/`vec_embeddings`。⇒ `embedding_metadata_v8` 也不可移。 |
+
+**真正可移的只剩** `embedding_runs`(29 行) / `embedding_rate_reservations`(1 行) / `schema_registry`(0 行) / `claim_graph_nodes`(0 行) —— 纯遥测与空表，约 30 行。**为一个 30 行的收益引入第二个 SQLite 库（第二套连接生命周期、schema 版本、备份/恢复、跨库发布协议）不划算。**
+
+**替代建议（更便宜，直击原动机）**：P2 的原动机是“读侧演进逼出规范库的 stop-the-world 迁移”。该动机不必用**换存储**解决，可以用**换版本轴**解决：在同一库内给读侧对象独立的版本注册（如 `read_model_schema_registry`），使读侧变更**不抬升 `user_version`**、不进入 `schema-migrate` 停机链。成本为一个注册表与一次清理，不新增失败模式。**待决策，未实施。**
+
+---
+
+## 以下为原文（已被上文推翻，保留用于审计对比）
+
+### P2（原计划）— 读模型迁出规范库（无停机，按表增量）
 
 **目标断言**：规范库 schema 版本不再被读侧需求驱动。
 
