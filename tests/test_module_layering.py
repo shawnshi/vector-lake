@@ -65,6 +65,11 @@ LAYERS: dict[str, set[str]] = {
         "raw_revision",
         "storage_growth",
         "decision_registry",
+        # Its own dependencies are projection_format_v2 and projection_store_v2
+        # (storage) plus wiki_utils (base), so its minimum legal layer is storage;
+        # being at derived put it above the storage modules that consume it
+        # (db_store, storage_growth). Every importer sits at storage or above.
+        "backup_capacity",
         # Pure implementation, no @mcp.tool() surface: it maintains the
         # timeline_events table from claim deltas and reports projection parity.
         # Its only dependencies are db_store (storage) and timeline_semantics
@@ -94,7 +99,6 @@ LAYERS: dict[str, set[str]] = {
         "indexer",
         "runtime_health",
         "governance_metrics",
-        "backup_capacity",
         "restore_snapshot",
         "diagnostic_snapshot",
         "topology_worker",
@@ -158,9 +162,7 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         # base -> orchestration
         ("wiki_utils", "mutation_coordinator"),
         # storage -> derived
-        ("db_store", "backup_capacity"),
         ("governance_store", "governance_metrics"),
-        ("storage_growth", "backup_capacity"),
         # storage -> domain
         ("db_store", "native_llm"),
         ("governance_store", "claim_extractor"),
