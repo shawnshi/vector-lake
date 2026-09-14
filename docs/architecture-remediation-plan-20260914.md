@@ -7,7 +7,14 @@
   - `2026-09-14` **更正审计自身的一处误报**：原判 "`schema.md` `Schema V8.0` 与 `_SCHEMA_VERSION = 9` 漂移" **不成立**。二者是独立版本轴：`user_version` 是 SQLite 存储 schema，`Canonical governance schema 8.0` 是 `schema.md` 文档自身的版本（代码中不存在对应常量）。README 该表在两个轴上各自自洽。P0.1 范围据此收窄（见下）。
   - `2026-09-14` 作者**确认停机窗口**。实际执行时发现**该窗口对 P1 的完整性目标不再必要**（见 P1 机制变更），因此**未开启窗口、未触碰活库**。保留的、真正需要窗口的只有两项可选动作：`entities.ttl`/`decay_weight` 的 `DROP COLUMN`（破坏性 DDL），以及打开 `foreign_keys`（需先测代码路径）。
   - `2026-09-14` 作者确认 `skip` 是有意暂停的。据此判定：**`skip` 不阻塞 P1 与 P2**——P1 的触发器路线不改规范数据，P2 从不动规范库（可回滚点就是“旧表先不删”）。
+  - `2026-09-14` **P0.4 已撤回 —— 审计的这条建议是错的**。我按计划实施了「漂移不再阻断写入」，结果 **5 个测试失败，其中 3 个是仓库有意编写、断言旧行为的测试**（`test_write_health_gate_blocks_projection_drift_after_index_exists`、`test_default_write_gate_detects_external_in_place_wiki_edit`、`test_full_write_gate_rejects_equal_key_wiki_content_drift`）。因此**先停下而非推翻它们**，回到原设计做了实测：
+    - `enforce_runtime_write_health` 对 `validation_mode == "schema"` **立即返回**（`runtime_health.py:3064-3069`）—— 而 watchdog 的修复路径（`watchdog_app.process_legacy_projection_batch`）正是以 `validation_mode="schema"` 调用 `execute_mutation_batch`（`watchdog_app.py:2243-2248`），`tool_rename` 同理。
+    - 因此**不存在死锁**，暂停是有界的：门阻断普通写入，而修复通道被显式豁免。这是有意的安全设计：外部对规范投影的就地编辑不能被下一次例程写入静默覆盖（那是数据丢失路径）。
+    - 实测证据：新增 `test_projection_drift_blocks_ordinary_writes_but_not_its_own_repair`，一次跑通完整回路——外部编辑 → 普通写入抛 "write gate blocked" → `process_legacy_projection_batch` 修复 `completed=1, failed=0, quarantined=0` → 重建索引后门**自行释放**。
+    - **保留的、次级且真实的缺陷**（未修，需单独决策）：单一 `validation_mode` 开关同时承担两件事——绕过安全门 **和** 放宽内容校验；用它逃门的路径（`tool_rename`、watchdog 修复）也一并放宽了内容审计。这是真实的耦合，但它是有意的，修复它属设计变更而非缺陷修复。
+    - 结论：原审计把「单一页漂移阻断全局写入」的严重度**高估**了。它的真实代价是未相关写入要等到对账完成（有界延迟），而非永久停摆。
   - `2026-09-14` **P1 已执行（触发器路线）**：建立 10 个触发器（5 张规范表 × INSERT/UPDATE），由 `init_db()` 在 bootstrap 路径幂等创建；无表重建、无数据拷贝、**未开停机窗口**。
+    - 注：本条时间上先于上一条 P0.4，但 P0.4 是事后补录，故排在前面；两者内容归属互不影响。
     - **执行中收窄的范围（与原计划不同，需审阅）**：**不实施值域 CHECK**。理由：`status`/`type`/`memory_type` 的受控词表由 Python 拥有，且已重复在 `schema_validator`、`tool_lint`、ingester 三处；在 DDL 里放第四份副本会把每次词表新增变成一次停机迁移——这恰好是审计发现的同一个反模式。仅实施结构性的 NOT NULL 部分。
     - 实测爆炸半径：全量套件 **14 失败 / 2971**，全部为测试夹具刻写的部分列行（`entities(entity_id, data_json)` 与一条缺 `status` 的 `operational_memory`），已修正 **17+1 处**。先验证了全部生产写入器都供给所需列（`governance_store.upsert_entity` 显式 8 列；`_save_table` 供给 `canonical_name`/`updated_at`；`_upsert_operational_memory_records` 供给 `status`），因此修正夹具而非弱化不变量。
     - 活库部署前在**库副本**上验证（fail-closed 变更不能只靠合成测试）：库副本 user_version 9、7,907 entities；`init_db()` 成功建立 10 个触发器；`upsert_entity` 与 `_upsert_operational_memory_records` 均成功；真 NULL 仍被拒。**未触碰活库**。
@@ -50,7 +57,7 @@
 | P0.1 | **契约文档漂移修复**（范围已更正）：`README.md:47` 的 `INGEST_CONTRACT_VERSION = 5` → `6`（源码 `tool_ingest.py:2649`）。同一常量在 README 正文还有 5 处陈旧引用（`:180` `:181` `:202` `:208` `:395` `:755` 的 "ingest v5"），一并改为 v6；其中 `:208` 关于\"较早契约版本活动任务在领取前受控重建\"的表述按代码事实重写（领取过滤器要求 `ingest_contract_version` 等于当前版本，见 `db_store.py:11056`）。**不含** `schema.md` 版本号——那是独立版本轴，非漂移 | 2 | `pytest tests/test_release_metadata.py` |
 | P0.2 | **把契约号纳入自动化门**：`tests/test_release_metadata.py` 新增 3 个测试——README Runtime Contract 表的契约号必须等于源码常量（ingest / `user_version` / projection / EvidencePacket）、公开表面计数必须等于活体定义（70/9/21 MCP、43 CLI、19 skills）、治理 schema 与 `user_version` 必须是可区分的两个轴且两份文档互洽。已做**反证验证**：注入漂移后测试确实失败 | 1 | 反证通过（见 §6） |
 | P0.3 | **图边对账（实测缺陷）**：`claim_graph_edges=10,293` vs `page_graph_edges=10,400`，only_page=133 / only_claim=26，其中 130 行**双端都存活**（非孤儿，不能盲删）。先用 `tool_legacy_graph_audit` 跑出权威判据，再生成幂等对账脚本走既有治理修复入口 | ≤3 | 两表集合差归零；`tool_legacy_graph_audit` 的 `current_relation_graph_dual_write_divergence` blocker 消失 |
-| P0.4 | **写闸门降级**：`runtime_health.py:2225-2240` 的 `write_projection_drift` 目前进 `issues` → `ok = not issues` → `enforce_runtime_write_health` 对**全体写入者**抛错。改为：按页隔离 + 触发 outbox 修复；只有规范数据损坏（`sqlite` integrity、generation 失配）才保留全局 fail-closed | ≤3 | 新增测试：注入单页漂移后，**该页**被隔离且**其他页**写入成功 |
+| P0.4 | **已撤回（见决策记录）**。原计划“把 `write_projection_drift` 降为非阻断”经实测证明是**错的**：它不是缺陷，而是有意为之且有测试保护的安全属性，同时其修复通道已被显式豁免，不存在死锁。改为新增一个同时钉住两半（门 + 豁免）的回归测试 | ≤1 | `test_projection_drift_blocks_ordinary_writes_but_not_its_own_repair` |
 
 **P0.3 的判据补充（实测，供决策）**：`only_page` 关系分布 `validates 78 / related_to 15 / instantiated-by 10 / evolved-from 8 / depends-on 6 / part-of 5`；样例 `Vendor_全国卫生标准技术委员会 → Institution_全国卫生标准技术委员会 (evolved-from)` 形态指向"改名/改类型后旧边残留"，但 130 行双端存活意味着**也存在合法新增未落另一表的方向**。因此判据不能是"删多的"，必须由 `governance_store` 的 change-set 作为权威回放。
 

@@ -2183,6 +2183,70 @@ def test_decision_scoped_readiness_rejects_unverified_registry_reference(
     assert "critical_decision_unverified:CD-MISSING" in readiness["issues"]
 
 
+def test_projection_drift_blocks_ordinary_writes_but_not_its_own_repair(
+    isolated_memory,
+):
+    """Pin both halves of the drift gate, because neither half is safe alone.
+
+    An external in-place edit to a canonical projection must not be silently
+    overwritten by the next routine write, so ordinary writes fail closed while
+    the drift stands. But the repair path must stay reachable, otherwise the
+    pause is permanent: it is exempt because it uses the ``schema``
+    bounded-repair channel (``enforce_runtime_write_health`` returns early for
+    that mode). This test guards against removing either the gate or the escape
+    hatch on its own -- a change that only relaxed the gate would let external
+    edits be destroyed, and a change that only removed the exemption would
+    deadlock reconciliation.
+    """
+    from vector_lake import runtime_health
+    from vector_lake.watchdog_app import (
+        process_legacy_projection_batch,
+        process_mutation_outbox_batch,
+    )
+
+    _write_purpose_contract(isolated_memory)
+    execute_mutation_plan(
+        "Source_Drift-Pin.md",
+        content=_source_content("source_drift_pin", "Drift Pin"),
+    )
+    assert process_mutation_outbox_batch()["completed"] == 1
+    indexer.generate_index()
+    assert assess_runtime_health()["ok"] is True
+
+    # An external edit to the canonical projection.
+    page = isolated_memory / "wiki" / "Source_Drift-Pin.md"
+    page.write_text(
+        page.read_text(encoding="utf-8").replace(
+            "Primary source content.",
+            "Externally edited projection content.",
+        ),
+        encoding="utf-8",
+    )
+
+    # Half one: routine writes fail closed while the drift stands.
+    health = assess_runtime_health(bounded_write_checks=True)
+    assert health["ok"] is False
+    assert any("projection_drift" in issue for issue in health["issues"])
+    with pytest.raises(RuntimeError, match="write gate blocked"):
+        execute_mutation_plan(
+            "Source_Drift-Blocked.md",
+            content=_source_content("source_drift_blocked", "Drift Blocked"),
+        )
+
+    # Half two: the bounded repair channel still reaches the page, so the pause
+    # is self-healing rather than a deadlock.
+    runtime_health._clear_health_caches_for_tests()
+    stats = process_legacy_projection_batch(["Source_Drift-Pin.md"])
+    assert stats["completed"] == 1
+    assert stats["failed"] == 0
+    assert stats["quarantined"] == 0
+
+    # And the gate releases once the drift is reconciled.
+    indexer.generate_index()
+    runtime_health._clear_health_caches_for_tests()
+    runtime_health.enforce_runtime_write_health()
+
+
 def test_doctor_labels_infrastructure_and_semantic_status_separately(
     isolated_memory, monkeypatch
 ):
