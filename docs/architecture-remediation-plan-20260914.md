@@ -5,6 +5,8 @@
   - `2026-09-14` 作者确认 **P0 硬前置已解决**：既有 WIP 提交为 `61830d1`（迁移基线因此干净）。
   - `2026-09-14` 作者**接受 P2 的跨库原子性代价**：规范写入与读模型发布不再共享同一 SQLite 事务，转为显式发布协议。P2 因此解除阻塞，但仍按"最小表先验证"顺序执行。
   - `2026-09-14` **更正审计自身的一处误报**：原判 "`schema.md` `Schema V8.0` 与 `_SCHEMA_VERSION = 9` 漂移" **不成立**。二者是独立版本轴：`user_version` 是 SQLite 存储 schema，`Canonical governance schema 8.0` 是 `schema.md` 文档自身的版本（代码中不存在对应常量）。README 该表在两个轴上各自自洽。P0.1 范围据此收窄（见下）。
+  - `2026-09-14` 作者**确认停机窗口**。实际执行时发现**该窗口对 P1 的完整性目标不再必要**（见 P1 机制变更），因此**未开启窗口、未触碰活库**。保留的、真正需要窗口的只有两项可选动作：`entities.ttl`/`decay_weight` 的 `DROP COLUMN`（破坏性 DDL），以及打开 `foreign_keys`（需先测代码路径）。
+  - `2026-09-14` 停机前盘点实测：写入者仅 `watchdog_sync.py`（PID 38968，心跳 8 秒前）；**不存在常驻 MCP server 进程**，它由宿主按需拉起——因此窗口期任何 MCP 工具调用（包括我自己）都会拉起一个写入者，这是窗口最大的隐性危险。`.meta` 实际为 **3.81 GiB / 76 文件**（`vector_lake.db` 3.6 GB + `embeddings.pkl` 271 MB）；先前 `du -sh .meta` 报 7.5 GB 是 git-bash 重复计数，已更正。**`backups/` 目录为空（0 项）但 mtime 为 18:57**——维护备份的实际落点与是否成功**未验证**，开窗之前必须查清。
 - **依据**: 2026-09-14 只读架构审计（未落盘为文档；本文件所有数字均为该次审计中在 `~/MEMORY/wiki/.meta/vector_lake.db` 与源码 AST 上的实测值，末尾附复现命令）
 - **基线**: 源码 `f08421b` + 工作树 35 个未提交改动
 - **版本目标**: 11.20.0 → 11.21.0
@@ -47,7 +49,29 @@
 
 ---
 
-### P1 — 一次性 schema v10 迁移窗口（完整性与权威归属）
+### P1 — 规范表不变量（机制已修订：**无需停机**）
+
+> **⚠ 机制变更（2026-09-14，基于实测）**：下文原定的"5 张表 12 步重建 + NOT NULL/CHECK"**已被更便宜的等价方案取代**。保留原文以便审计差异。
+
+**修订后的结论**：完整性目标（"DB 自身拒绝非法状态"）可以用 **`CREATE TRIGGER IF NOT EXISTS`** 达成，**无需表重建、无需数据拷贝、无需停机窗口**。
+
+实测依据：
+
+| 事实 | 证据 |
+|---|---|
+| 触发器能拒绝 NULL（INSERT 与 UPDATE 均生效） | 在临时库上实测：非法插入/更新均 `IntegrityError: claims_not_null_violation` |
+| 幂等可重放，适合放在 bootstrap 路径 | `CREATE TRIGGER IF NOT EXISTS` 重放无副作用，与 `db_store.py:8097` 等 `CREATE TABLE IF NOT EXISTS` 同一模式 |
+| **仓库已在用这个模式**维护最强的不变量 | `trg_canonical_identities_owner_conflict`、`trg_canonical_identities_append_only_update/delete`（`db_store.py:374-393`）、`trg_change_set_terminal_v6_immutable`（`:543`）、`trg_operational_memory_search_*`（`:7659-7696`） |
+| 新增触发器不会被 schema 契约拒绝 | 唯一的 glob 断言是 `name GLOB 'trg_*_generation_v*_*'`（`db_store.py:879-880`），只需用不撞该命名空间的触发器名 |
+| SQLite 3.50.4 / Python 3.13.12 | `DROP COLUMN` 支持（≥3.35）；**无 `ADD CONSTRAINT` 语法**⇒ NOT NULL 确实需重建，但触发器绕开了该限制 |
+
+**已知爆炸半径**：`tests/test_db_transactions.py` 约 8 处回滚夹具只写 `entities(entity_id, data_json)`，会因不变量而失败。经核对它们是**测试夹具而非生产路径镜像**（生产走 `governance_store.upsert_entity`，显式列出全部列，故活库实测 0 NULL）。属于有界、正当的测试更新。
+
+---
+
+## 以下为原文（已被上文取代，保留用于审计对比）
+
+### P1（原计划）— 一次性 schema v10 迁移窗口（完整性与权威归属）
 
 **目标断言**：规范库自身能拒绝非法状态；同一个事实在 `entities` 行内只有一个权威。
 
@@ -261,15 +285,14 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 ## 4. 排序理由（依赖图）
 
 ```
-[硬前置: 工作树干净]
+[硬前置: 工作树干净] ✅ 61830d1
         │
-      P0 止血 (P0.1/P0.2 独立; P0.3 需权威判据; P0.4 行为变更)
+      P0 止血 ✅ P0.1/P0.2 (fb47fd3)；P0.3/P0.4 未开始
         │
-      P1 v10 停机窗口 ── 必须单独、必须在 P2 之前？
-        │                否：P1 与 P2 无数据依赖，但 P2 会删表，
-        │                故 P1 先做完整性（一次窗口），P2 再删派生表
+      P1 规范表不变量 —— 机制修订为触发器，无停机
+        │                 （仅 DROP COLUMN / foreign_keys 仍需窗口，可选）
         │
-      P2 读模型迁出 (无停机，逐表)
+      P2 读模型迁出 (无停机，逐表) —— 决策已接受
         │
       P3 断环 ← 必须先于 P4.1
         │
@@ -289,7 +312,7 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 | 阶段 | 批次数 | 文件改动上限/批 | 是否需停机 | 风险 |
 |---|---|---|---|---|
 | P0 | 4 | ≤3 | 否 | 低（P0.4 为行为变更，中） |
-| P1 | 1 窗口 + 3–4 批 | 8 | **是**（一次性） | 中高（表重建） |
+| P1 | **0（原为 1 窗口）** | 8 | **否（机制修订后）** | 低（触发器）／中高（若坚持表重建） |
 | P2 | 4（每张表一批） | ≤10 | 否 | 高（跨库原子性），故最小表先验证 |
 | P3 | 7 | ≤10 | 否 | 中（P3.2/P3.3 低） |
 | P4 | 6–8 | ≤10 | 否 | 中 |
