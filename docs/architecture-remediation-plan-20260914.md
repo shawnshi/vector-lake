@@ -208,7 +208,12 @@ python cli.py projection-rebuild-index
 
 ---
 
-### P3 — 打破 37 模块强连通分量（38 条反向边 / 64 个符号）
+### P3 — 打破 37 模块强连通分量（✅ P3.1 已落地：契约已建立；数字已修正）
+
+> **⚠ 数字修正（2026-09-14）**：本节的“38 条边 / 64 个符号”是**错的**，实测为 **43 条边**，最大 SCC 为 **39**。错因：审计脚本把点号模块名**截断到顶层**，导致 `auto_ingest_worker → auto_ingest_runners.base` 等边不可见。建立契约时做了三次测量（38 → 39 → 43），最终版本的提取器会把导入**解析到真实模块**（而非符号或顶层前缀），它额外找到了：
+> `governance_store → governance_metrics`、`provenance → governance_metrics`、`provenance_retention → tool_claim_provenance`、`restore_snapshot → tool_projection`。
+> 另发现一个事实：所有现有反向边都是**函数内延迟导入**，因为任何顶层反向导入会立即产生 ImportError（实测）。
+> 契约已落地为 `tests/test_module_layering.py`（**未引入新依赖**，因本仓库 hash-lock 依赖，新增构建期依赖要重生成三个 lock 文件与 CI 安装，成本高于收益），含两个棘轮：允许清单必须缩小，最大 SCC 必须下降。反证已验证：注入延迟反向边后测试报 `('durability','mcp_server')`，移除后通过。
 
 **这是本计划工程量最集中的阶段，也是最可量化的。**
 
