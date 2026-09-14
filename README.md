@@ -44,7 +44,7 @@ graph LR
 | Surface | Current contract |
 | --- | --- |
 | Plugin package | `11.20.0+codex.20260829201234` |
-| Ingest payload | `INGEST_CONTRACT_VERSION = 5` |
+| Ingest payload | `INGEST_CONTRACT_VERSION = 6` |
 | SQLite migration schema | `PRAGMA user_version = 9` |
 | Canonical governance schema | `8.0` |
 | Index projection | logical `PROJECTION_CONTRACT_VERSION = 1` / physical `format_version = 2` |
@@ -177,8 +177,8 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 ## Quick Start
 
 1. **配置扫描范围**：检查 `config.json` 的 `target_directories`、`exclude_paths` 与 `supported_extensions`。非 embedding 文本推理不由插件调用外部模型 API；`GEMINI_API_KEY` 只用于 embedding。
-2. **扫描并入队**：执行 `python cli.py sync`。一次调用扫描配置范围、跳过已处理 revision，并最多持久化 50 个 ingest v5 job；它不会直接生成 subagent 任务包，也不承诺清空历史队列。
-3. **分发任务包**：运行 `python watchdog_sync.py`，或单独运行 `python -m vector_lake.ingest_worker`。worker 只领取当前 ingest v5 queued job，在隔离目录生成任务包，并把 job 转为 `awaiting_subagent`。
+2. **扫描并入队**：执行 `python cli.py sync`。一次调用扫描配置范围、跳过已处理 revision，并最多持久化 50 个 ingest v6 job；它不会直接生成 subagent 任务包，也不承诺清空历史队列。
+3. **分发任务包**：运行 `python watchdog_sync.py`，或单独运行 `python -m vector_lake.ingest_worker`。worker 只领取当前 ingest v6 queued job，在隔离目录生成任务包，并把 job 转为 `awaiting_subagent`。
 4. **领取任务**：手动模式下，宿主使用 `python cli.py ingest-tasks --claim --limit 5` 或 MCP `claim_ingest_tasks` 领取。MCP 人工领取默认禁用，须由受信宿主显式设置 `VECTOR_LAKE_ALLOW_MANUAL_INGEST_ADMIN=1`；自动摄取启用时，CLI/MCP 人工领取均受 controller 独占限制，该变量不会绕过独占门。日常自动模式交由 automatic ingest host 领取，不要为领取任务而关闭安全检查。领取结果包含任务包以及 `lease_owner`、`lease_token`、`lease_generation`。
 5. **完成摄取**：宿主生成 Wiki payload 后调用 MCP `finalize_ingest`，提交 `files_written`、任务包中的 `processed_data` 和领取阶段的租约字段。成功后同一事务完成 job 并登记 `processed_files`。
 
@@ -199,13 +199,13 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 
 默认安全预算为每小时 100 项、滚动 24 小时 2000 项，单任务上限 262,144 tokens（其中序列化 prompt+schema 实际预算为 `262144 - max(8192, min(16384, ceiling//3)) - max(4096, ceiling//8)` = 212,992）；对应的预留上限为每小时 13,107,200 tokens、滚动 24 小时 65,536,000 tokens（24 小时预留额度独立限制总量）。每小时 token 上限是固定硬顶，所以单任务上限提高后，每小时可预留的任务数从 100 降为最多 50；要恢复原任务吞吐需另行提高每小时 token 上限。完成一次性启用与 raw-text 模型处理授权后，正常 `integrated` / `standalone` 任务固定以 Codex `-a never -s read-only` 自动运行和 finalize，不逐项再次请求确认；异常和策略拒绝仍按配置 fail-closed。以上是本地准入与预留限制，不是提供方计费硬上限，也不是吞吐 SLA。生成结束后，可信事件日志中的实际用量超过预留阈值会拒绝发布，但已发生的模型用量仍计入失败 receipt 与预算观测；无效日志的用量保持未知，不按预留值冒充实际消耗。实际吞吐仍受单 worker、任务时长、heavy-task gate 和熔断器约束。启用或提高预算会启动独立 Codex 子进程并产生模型用量；变更后应使用一个真实的新 raw revision 做 canary，验证 `queued → awaiting_subagent → subagent_processing → finalized`、`processed_files` 当前哈希、outbox drain 与 Wiki/SQLite/index 三面一致。
 
-### Ingest v5 task-packet contract
+### Ingest v6 task-packet contract
 
 磁盘中的任务包顶层字段必须精确为 `task_id`、`task_type`、`created_at`、`runtime`、`cost_boundary`、`expected_output`、`metadata`、`prompt`。`metadata` 必须精确包含 `job_id`、`processed_data`、`finalize_tool`；其中 `processed_data` 必须绑定 durable job 的 `filepath`、`hash`、`canonical_name`、`source_hash`、`source_projection_hash`、`integration_candidates`、`ingest_contract_version`、`job_id`。
 
 领取阶段会同时校验任务包所在的 `<active-db-dir>/subagent_tasks/<run>/` 稳定状态目录、文件名与 `task_id`、runtime/cost boundary、预期输出、`finalize_ingest` 工具名、完整 prompt，以及以上字段与 SQLite durable payload 的逐项一致性。任务包与临时 `brain/<run>/scratch/` 都位于活动数据库同级目录，不写入版本化插件安装目录；可分别通过绝对路径环境变量 `VECTOR_LAKE_SUBAGENT_TASK_ROOT` 和 `VECTOR_LAKE_SUBAGENT_BRAIN_ROOT` 覆盖。缺失或被修改的受控任务包会在当前租约下重建；无法安全重建时领取失败并持久化原因。`finalize_ingest` 还会复核 raw revision、Source/target canonical 与 projection hash、候选清单、`integrated` / `standalone` / `rejected` 处置，以及 owner/token/generation fencing。
 
-Ingest v5 要求新生成的 `Source_*` 文件名直接通过严格命名校验：目录层级、空格和原始下划线统一收敛为连字符，完整 source identity 的哈希后缀保留，文件名总长不超过 120 字符。v4 活动任务会在领取前受控重建；若 raw、Source 或候选目标基线在分发后变化，finalize 不写入部分结果，而是失效旧 lease、把任务降级到重建路径，再生成新的 v5 packet。
+Ingest v6 要求新生成的 `Source_*` 文件名直接通过严格命名校验：目录层级、空格和原始下划线统一收敛为连字符，完整 source identity 的哈希后缀保留，文件名总长不超过 120 字符。领取过滤器只接受 `ingest_contract_version` 等于当前版本（`6`）的 job，因此较早契约版本（v4、v5）的活动任务会在领取前受控重建；若 raw、Source 或候选目标基线在分发后变化，finalize 不写入部分结果，而是失效旧 lease、把任务降级到重建路径，再生成新的 v6 packet。
 
 ### Terminal ingest output recovery
 
@@ -392,7 +392,7 @@ python cli.py evidence-packet "<claim_id>"
 python cli.py claim-assessment "<claim_id>" --assessment-type evidence_review --outcome supported --actor-id "reviewer:id" --method-version "review-v1" --reason "Reviewed current evidence" --expected-claim-version "<claim_version>"
 ```
 
-扫描 raw sources 并持久化一个有界 ingest v5 批次：
+扫描 raw sources 并持久化一个有界 ingest v6 批次：
 
 ```powershell
 python cli.py sync
@@ -752,7 +752,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `cli.py` | 根目录薄入口 |
 | `vector_lake/cli_app.py` | CLI 参数与命令路由 |
 | `vector_lake/tools.py` | Tool facade |
-| `vector_lake/tool_ingest.py` | ingest v5 扫描入队、任务包领取/修复、债务恢复与 lease-fenced finalization |
+| `vector_lake/tool_ingest.py` | ingest v6 扫描入队、任务包领取/修复、债务恢复与 lease-fenced finalization |
 | `vector_lake/ingest_worker.py` | queued job dispatcher；生成受控任务包并转入 `awaiting_subagent` |
 | `vector_lake/native_llm.py` | 当前环境 subagent 任务包、scratch 路径与 payload 隔离边界 |
 | `vector_lake/embedding_scheduler.py` | sqlite-vec 缺失向量的限速、断点和单写调度 |

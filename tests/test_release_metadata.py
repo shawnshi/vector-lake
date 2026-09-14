@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 
@@ -121,6 +122,115 @@ def test_release_metadata_runtime_profile_and_host_adapters_are_consistent():
     assert positioning in codex_manifest["interface"]["longDescription"].lower()
     assert positioning in gemini_manifest["description"].lower()
     assert positioning in agent_manifest["description"].lower()
+
+
+def _readme_contract_cell(label: str) -> str:
+    """Return the `Current contract` cell of one README Runtime Contract row."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"^\|\s*" + re.escape(label) + r"\s*\|\s*(.+?)\s*\|\s*$",
+        readme,
+        flags=re.MULTILINE,
+    )
+    assert match is not None, f"README Runtime Contract row missing: {label}"
+    return match.group(1)
+
+
+def _backticked_numbers(cell: str) -> list[str]:
+    """Numbers declared inside backticked spans, in reading order.
+
+    Handles both ``the `7` value`` and ``the `CONST = 7` value`` shapes.
+    """
+    return [
+        match.group(1)
+        for span in re.findall(r"`([^`]+)`", cell)
+        for match in [re.search(r"([0-9]+)\s*$", span)]
+        if match is not None
+    ]
+
+
+def test_readme_runtime_contract_numbers_match_their_source_constants():
+    """The Runtime Contract table is an operator's guide to stop-the-world
+    migrations. A stale number there is worse than a missing one, so every
+    value with a source constant must be derived rather than transcribed.
+    """
+    from vector_lake import db_store, indexer, projection_format_v2
+    from vector_lake import projection_store_v2, tool_evidence, tool_ingest
+
+    ingest = _readme_contract_cell("Ingest payload")
+    assert f"`INGEST_CONTRACT_VERSION = {tool_ingest.INGEST_CONTRACT_VERSION}`" == (
+        ingest
+    )
+
+    migration = _readme_contract_cell("SQLite migration schema")
+    assert f"`PRAGMA user_version = {db_store._SCHEMA_VERSION}`" == migration
+
+    projection = _readme_contract_cell("Index projection")
+    assert _backticked_numbers(projection) == [
+        str(indexer.PROJECTION_CONTRACT_VERSION),
+        str(projection_format_v2.FORMAT_VERSION),
+    ], projection
+    # The two projection stores declare the same physical format; if they ever
+    # disagree the README cannot be correct for both readers.
+    assert projection_store_v2.FORMAT_VERSION == projection_format_v2.FORMAT_VERSION
+
+    packet = _readme_contract_cell("EvidencePacket")
+    assert f"`{tool_evidence.EVIDENCE_PACKET_CONTRACT_VERSION}`" == packet
+
+
+def test_readme_public_surface_counts_match_the_live_surfaces():
+    """Surface counts are the cheapest thing in the table to let drift, and the
+    most misleading: an unavailable tool is indistinguishable from a missing
+    one to the reader. Count the live definitions instead of trusting the row.
+    """
+    from vector_lake import cli_app, mcp_server  # noqa: F401
+
+    server_source = (ROOT / "vector_lake" / "mcp_server.py").read_text(
+        encoding="utf-8"
+    )
+    cli_source = (ROOT / "vector_lake" / "cli_app.py").read_text(encoding="utf-8")
+    full_tools = server_source.count("@mcp.tool()")
+    memory_tools = len(mcp_server._MEMORY_MCP_SURFACE_TOOLS)
+    readonly_tools = len(mcp_server._READONLY_MCP_SURFACE_TOOLS)
+    cli_commands = len(re.findall(r"add_parser\(", cli_source))
+    skills = [
+        path
+        for path in (ROOT / "skills").iterdir()
+        if path.is_dir() and (path / "SKILL.md").is_file()
+    ]
+
+    # The row emphasises the surface names with backticks; fold them away so a
+    # pure naming choice cannot fail the count check.
+    cell = _readme_contract_cell("Public surfaces").replace("`", "")
+    for expected, name in (
+        (full_tools, "MCP tools (full)"),
+        (memory_tools, "MCP tools (memory)"),
+        (readonly_tools, "MCP tools (readonly)"),
+        (cli_commands, "CLI commands"),
+        (len(skills), "Agent skills"),
+    ):
+        assert f"{expected} {name}" in cell, f"{name}: README says {cell!r}"
+
+
+def test_governance_schema_version_is_a_separate_axis_from_user_version():
+    """`Canonical governance schema` is the version of schema.md itself, not of
+    the SQLite store. The two axes move independently, so neither must be
+    compared against the other -- but both documents must agree with each other.
+    """
+    from vector_lake import db_store
+
+    cell = _readme_contract_cell("Canonical governance schema")
+    governance_version = cell.strip().strip("`")
+    assert governance_version != str(db_store._SCHEMA_VERSION), (
+        "governance schema and SQLite user_version are independent axes; "
+        "if they are set to the same number the distinction has been lost"
+    )
+
+    schema_doc = (ROOT / "schema.md").read_text(encoding="utf-8")
+    header = schema_doc.splitlines()[0]
+    assert f"Schema V{governance_version}" in header, (
+        f"schema.md header {header!r} disagrees with the README row {cell!r}"
+    )
 
 
 def test_readonly_docs_do_not_claim_physical_zero_write():
