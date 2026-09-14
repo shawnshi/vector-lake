@@ -10071,6 +10071,16 @@ def delete_node_cascade(node_key: str):
             f"DELETE FROM claim_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
             [*related_ids, *related_ids],
         )
+        # page_graph_edges mirrors claim_graph_edges and readers UNION the two, so
+        # the same rows must go. Deleting a page used to remove its edges from
+        # claim_graph_edges only, which left the page's edges behind here and is
+        # exactly how the two tables drifted apart: the repository's own audit
+        # declares they must be semantically equal, and 122 rows in the live store
+        # were edges whose source page no longer existed.
+        conn.execute(
+            f"DELETE FROM page_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+            [*related_ids, *related_ids],
+        )
         from vector_lake.tool_timeline import sync_timeline_events_for_claim_delta
 
         sync_timeline_events_for_claim_delta(old_claim_rows, [])

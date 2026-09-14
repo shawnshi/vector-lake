@@ -184,6 +184,56 @@ def test_delete_cascade_locates_entity_by_page_key(isolated_memory):
     assert identity["lifecycle_state"] == "deleted"
 
 
+def test_delete_cascade_removes_edges_from_both_graph_tables(isolated_memory):
+    """claim_graph_edges and page_graph_edges mirror each other; both must clear.
+
+    Readers UNION the two tables and the repository's own audit declares them
+    semantically equal, but the cascade delete removed rows from
+    claim_graph_edges only. That asymmetry is what left 122 edges in the live
+    store whose source page no longer existed.
+    """
+    db_store.init_db()
+    governance_store.upsert_entity("entity_acme", _entity())
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO entity_identities "
+            "(entity_id, page_key, canonical_name, identity_origin, data_json, "
+            "recorded_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "entity_acme",
+                "Vendor_Acme",
+                "Acme Inc",
+                "explicit",
+                json.dumps({"entity_id": "entity_acme", "page_key": "Vendor_Acme"}),
+                "now",
+                "now",
+            ),
+        )
+        # One edge with the page as source and one with it as target. The live
+        # corpus keys edges by page key, which is part of ``related_ids``.
+        for source, target in (
+            ("Vendor_Acme", "Concept_X"),
+            ("Concept_Y", "Vendor_Acme"),
+        ):
+            for table in ("claim_graph_edges", "page_graph_edges"):
+                conn.execute(
+                    f"INSERT INTO {table} "
+                    "(source_id, target_id, relation, weight, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (source, target, "related_to", 1.0, "now"),
+                )
+
+    db_store.delete_node_cascade("Vendor_Acme")
+
+    for table in ("claim_graph_edges", "page_graph_edges"):
+        remaining = conn.execute(
+            f"SELECT count(*) FROM {table} "
+            "WHERE source_id = 'Vendor_Acme' OR target_id = 'Vendor_Acme'"
+        ).fetchone()[0]
+        assert remaining == 0, f"{table} kept {remaining} edge(s) after the cascade"
+
+
 def test_full_rebuild_keeps_same_name_entities_and_clears_stale_fts(isolated_memory, monkeypatch):
     db_store.init_db()
     first = _entity(title="Shared Display Name")

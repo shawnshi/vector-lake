@@ -13,6 +13,14 @@
     - 实测证据：新增 `test_projection_drift_blocks_ordinary_writes_but_not_its_own_repair`，一次跑通完整回路——外部编辑 → 普通写入抛 "write gate blocked" → `process_legacy_projection_batch` 修复 `completed=1, failed=0, quarantined=0` → 重建索引后门**自行释放**。
     - **保留的、次级且真实的缺陷**（未修，需单独决策）：单一 `validation_mode` 开关同时承担两件事——绕过安全门 **和** 放宽内容校验；用它逃门的路径（`tool_rename`、watchdog 修复）也一并放宽了内容审计。这是真实的耦合，但它是有意的，修复它属设计变更而非缺陷修复。
     - 结论：原审计把「单一页漂移阻断全局写入」的严重度**高估**了。它的真实代价是未相关写入要等到对账完成（有界延迟），而非永久停摆。
+  - `2026-09-14` **P0.3 已执行（图边双写对账）**。
+    - **又一个我自己的误判被纠正**：审计时我用 `entity_identities.page_key` 做“页面是否存活”的判据，得出“130 行双端都存活、非孤儿”的结论。**这是错的**：`entity_identities` 是**追加式身份注册表，有意保留已退休的 page_key**（12,416 个 key 对 7,907 个活页）。改用 `entities` 重算：`only_page=133` 中 **122 行的源实体已不存在**（真孤儿）。
+    - **权威判据（用证据推出，不是猜）**：`source_id` 始终是 page_key；`target_id` **不是** page_key，而是经 `alias_registry` 解析的名称/别名（如 `创业慧康` → `Vendor_创业慧康`）。若把“target 非存活”也当孤儿，会错删两表一致且能正常解析的 97 条边。最终判据：**边存活 ⇔ source_id 是 `entities` 中活的 page_key**；目标集合 = **10,304**。
+    - **根因修复（代码）**：`db_store.py:10071` 的 `delete_node_cascade` 只删 `claim_graph_edges` 不删其镜像 `page_graph_edges` —— 这就是 122 条孤儿的来源。已补上平行删除，并新增回归测试（已反证：移除修复后测试报“page_graph_edges 遗留 2 条边”）。
+    - **数据修复（活库）**：一次事务内删除 122 条孤儿、补齐 11+26 条缺失边；修后两表均 **10,304 且集合相等**；已幂等复跑验证（第二次 0 变更）。写入了可回滚的前置状态收据 `~/.meta/graph-edge-reconciliation-v1-receipt.json`。
+    - 验收：仓库自带审计 `audit_legacy_graph_connection` 的 `claim_page_relation_diff` 四项全为 **0**，`current_relation_graph_dual_write_divergence` 已从 blockers 中消失。
+    - **我造成的一个副作用（已修复，必须记下）**：我绕开治理路径直接写 SQL，而 `claim_graph_edges`/`page_graph_edges` 是**受运行时代次跟踪的表**，写入会抬高 generation，使得已发布的投影对变为 `canonical_generation_stale`（doctor 一度报 `projection_pair: invalid`、`ok: false`）。已用文档化入口 `cli.py projection-rebuild-index --apply` 重建并重新发布（新 generation `9b41c43d…`），恢复到 `projection_pair: committed_current`、`issues: []`。教训：这类表的写必须走代次感知路径，或修复后必须重建投影。
+    - 副作用之一的正面发现：重建过程创建了 `.meta/backups/index_rebuild_…` —— **证实 `maintenance_backup_mode=skip` 不影响 `require_maintenance_backup` 路径的备份**，与代码文档语义一致。
   - `2026-09-14` **P1 已执行（触发器路线）**：建立 10 个触发器（5 张规范表 × INSERT/UPDATE），由 `init_db()` 在 bootstrap 路径幂等创建；无表重建、无数据拷贝、**未开停机窗口**。
     - 注：本条时间上先于上一条 P0.4，但 P0.4 是事后补录，故排在前面；两者内容归属互不影响。
     - **执行中收窄的范围（与原计划不同，需审阅）**：**不实施值域 CHECK**。理由：`status`/`type`/`memory_type` 的受控词表由 Python 拥有，且已重复在 `schema_validator`、`tool_lint`、ingester 三处；在 DDL 里放第四份副本会把每次词表新增变成一次停机迁移——这恰好是审计发现的同一个反模式。仅实施结构性的 NOT NULL 部分。
