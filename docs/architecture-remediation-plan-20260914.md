@@ -327,6 +327,19 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 | 3a | `182b438` | 36 → 34 | `claim_governance_version` 下移 domain | 把导入改回旧位置，恰好复现该边 |
 | 4 | `2ea5792` | 34 → 29 | 修正 `memory_protocol` 误分类（agent facade） | 改回 base 后 5 条边全部重现 |
 | 5a | —— | —— | **已尝试并撤回** | 见下 |
+| 5 | `0a9e9eb` | 29 → 27 | `auto_ingest_runners.base`→base、`tools`→handler | 分别改回，两段边各自重现 |
+| 6 | `7a95549` | 27 → 24 | `timeline_semantics`→base、`tool_timeline`→storage | 改回后 3 条边重现；改回 `timeline_semantics` 反而**新增**一条 |
+| — | `d7dca7f` | —— | `tool_ingest` 的 12 符号只读侦察（见下） | —— |
+
+#### P3.2 侦察：`tool_timeline`（3 条边，已完成并清掉）
+
+与 `tool_ingest` **结论相反**。`tool_timeline`（332 行）两个被消费符号均**轻连带**：`sync_timeline_events_for_claim_delta` 连带 2、`timeline_projection_parity` 连带 4，合计 5 个不同名字。
+
+更关键：**它根本不是 handler**。全文无 `@mcp.tool()` 装饰器（timeline 的 MCP 面在 `mcp_server`），包内依赖只有 `db_store`(storage) 与 `timeline_semantics`；全部导入者（`db_store`/`governance_store`/`runtime_health`/`mcp_server`/`tool_claim_cleanup`）都在 storage 及以上。`tool_` 前缀只让它在**名字上**成了 handler。
+
+单改 `tool_timeline` 会**新增**一条违规：`timeline_semantics` 当时在 domain，而 storage→domain 是反向。`timeline_semantics` 包内依赖为 0（无依赖叶子），按批次 2/5 的规则属 base。两处改动因此**耦合、缺一不可**。
+
+**方法论收获**：判断“哪些边能靠搬迁清掉”必须逐符号算闭包；**指向同一模块不等于同因** —— `tool_ingest` 是未拆引擎（72 符号），`tool_timeline` 是命名错位（0 代码改动）。
 
 **分类纪律（批次 2/4 的依据）**：无包内依赖的模块不可能产生向上依赖 ⇒ 属于最底层；模块的层次必须不低于它自己的依赖。**不得为消除违规而将模块上移**，也不得用重分类掩盖真实倒挂。每处重分类都由该模块自身依赖图决定、一条命令可核。
 
