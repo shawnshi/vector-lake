@@ -297,6 +297,33 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 
 **为什么必须先于 P4**：现在拆分 `db_store`（13,059 行 / 271 顶层函数）会立刻产生新的环。断环是拆分的先决条件。
 
+#### P3.2 逐批执行日志
+
+| 批 | 提交 | 边数 | 内容 | 反证 |
+|---|---|---|---|---|
+| 1 | `1608524` | 44 → 43 | `version_family_id` 下移 base | 把导入改回旧位置，恰好复现该边 |
+| 2 | `b1414bf` | 43 → 36 | 修正 **7 处我自己的层次误分类** | 给降为 base 的模块注入向上导入，仍被报出 |
+| 3a | `182b438` | 36 → 34 | `claim_governance_version` 下移 domain | 把导入改回旧位置，恰好复现该边 |
+| 4 | `2ea5792` | 34 → 29 | 修正 `memory_protocol` 误分类（agent facade） | 改回 base 后 5 条边全部重现 |
+| 5a | —— | —— | **已尝试并撤回** | 见下 |
+
+**分类纪律（批次 2/4 的依据）**：无包内依赖的模块不可能产生向上依赖 ⇒ 属于最底层；模块的层次必须不低于它自己的依赖。**不得为消除违规而将模块上移**，也不得用重分类掩盖真实倒挂。每处重分类都由该模块自身依赖图决定、一条命令可核。
+
+**最大 SCC 在至今所有批次中始终为 39。** 反向边数与环大小是两个不同度量：移除一条不在所有环路径上的边，环依然完整；环只在最后一条闭环边被移除时成阶下降。
+
+#### P3.2 批次 5a — 已尝试并**撤回**（重要负结果）
+
+目标：剥离 `wiki_utils` 的向上依赖。两条在 `write_markdown_file`（调 `execute_mutation_plan`），一条在 `atomic_write_text`（内联调 `verify_asset`/`validate_schema`）。
+
+**先做完整侦察，结果看起来非常安全**：12 个调用点中**只有 1 个真正触发校验**（`mutation_coordinator.py:270` 传 `validation_mode`）；其余 4 个写 JSON，而 `.json` 后缀使 `_is_canonical_wiki_markdown_path` 直接返回 `False`，即校验从未运行。于是把校验搬到 `defense_hook.validate_canonical_markdown`，`atomic_write_text` 只做字节写入。
+
+**结果：`tests/test_mutation_coordinator.py` 14 个测试失败。** 它们测的是真实契约——“写入非法规范页必须拒绝且不替换目标”，含 `test_atomic_write_full_mode_fails_closed_when_validator_crashes`（校验器崩溃时 fail-closed）与依赖被我删除的 `pre_parsed_frontmatter` 参数的用例。已完全还原（29 边），工作树干净，43 测试绿。
+
+**为何撤回而非改测试**：
+- 这 14 个测试是**有价值的行为覆盖**，不是待追赶的陈旧断言。把调用点改到新位置，等于把覆盖从“写路径拒绝非法输入”换成“另一个函数会拒绝非法输入”，是实质弱化。
+- 另一种方案已尝试并**否决**：把校验器做成 `wiki_utils` 的可注册钩子。它看似解耦，实则只增加一层间接，并引入**新的失效模式**——未注册则校验静默消失；改为未注册即报错则所有规范写入在未导入校验域时全部 fail-closed。两者都比现有耦合更差。
+- 真实结论：`atomic_write_text` 的校验**本身就是“规范写入”关注点**，正确修法是把整个函数**上移**到高层，而不是把校验从它里面挖出来。这比一个批次更大（14 个测试 + 写路径），应单独设计与评审。
+
 ---
 
 ### P4 — 拆分 god module 与去浏览器化投影契约
