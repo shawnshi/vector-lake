@@ -282,3 +282,131 @@ This is a durable business claim.
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMaintenanceStubSuppression(unittest.TestCase):
+    """Stub notices must never be extractable as claims, in any known spelling."""
+
+    STUB_VARIANTS = {
+        "generated_stub": "This is an auto-generated stub page to prevent broken "
+        "links from [[Concept_X]].",
+        "generated_stub_truncated": "This is an auto-generated stub page to "
+        "prevent broken links.",
+        "generated_broken_link_stub": "Auto-generated stub to resolve broken link "
+        "from Concept_Index-Orphans.",
+        "bullet_timeline": "- [2026-06-01] [Observation] This is an "
+        "auto-generated stub page to prevent broken links from Product_Gemini.",
+        "tagged_date": "- [2026-01-01] [Observation] [concept] 2026-06-01: This is "
+        "an auto-generated stub page to prevent broken links from Concept_Agentic.",
+    }
+
+    def test_every_stub_spelling_is_classified(self):
+        from vector_lake.claim_extractor import (
+            classify_maintenance_only_text,
+            classify_non_claim_text,
+        )
+
+        for name, text in self.STUB_VARIANTS.items():
+            with self.subTest(variant=name):
+                reason = classify_non_claim_text(
+                    text, page_key="Concept_Test.md"
+                ) or classify_maintenance_only_text(text, page_key="Concept_Test.md")
+                self.assertIsNotNone(reason, f"{name} went unclassified")
+
+    def test_stub_blocks_never_reach_extraction(self):
+        from vector_lake.claim_extractor import _iter_blocks
+
+        body = "\n".join(self.STUB_VARIANTS.values())
+        body += "\n\nA real paragraph claim about hospital digital transformation.\n"
+        blocks = _iter_blocks(body, page_key="Concept_Test.md")
+
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("real paragraph claim", blocks[0]["text"])
+
+    def test_genuine_timeline_claims_survive(self):
+        from vector_lake.claim_extractor import _iter_blocks
+
+        body = (
+            "- [2026-06-02] [Observation] HIMSS 2026 会议确认医疗数字化正进入 "
+            "Agentic AI 落地肉搏战。\n"
+            "- Auto-generated stub to resolve broken link from Concept_X.\n"
+        )
+        blocks = _iter_blocks(body, page_key="Concept_Test.md")
+
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("HIMSS 2026", blocks[0]["text"])
+
+    def test_lint_treats_the_new_reasons_as_stub_debt(self):
+        from vector_lake.tool_lint import _GENERATED_STUB_REASONS
+
+        expected = {
+            "generated_stub",
+            "generated_stub_truncated",
+            "generated_broken_link_stub",
+            "generated_reshaped_stub",
+            "generated_entity_stub",
+        }
+        self.assertTrue(expected.issubset(_GENERATED_STUB_REASONS))
+
+
+class TestDuplicateBlockIdentity(unittest.TestCase):
+    """A repeated sentence must yield one claim, not two records for one id."""
+
+    FM = {
+        "title": "Test Concept",
+        "type": "concept",
+        "id": "concept_dupe",
+        "domain": "General",
+        "status": "Active",
+        "epistemic-status": "seed",
+        "categories": ["Uncategorized"],
+        "updated": "2026-07-13T00:00:00+00:00",
+        "aliases": [],
+        "sources": ["MEMORY/wiki/raw/Test.pdf"],
+    }
+
+    def test_repeated_bullet_yields_one_claim(self):
+        body = """## 1. 编译事实
+### 物理机制 (Mechanism)
+- [[Source_Repeated-Member]]
+### 演进关联 (Evolution)
+- [[Source_Repeated-Member]]
+## 2. 证据时间线
+"""
+        once = extract_page_objects("Concept_Dupe.md", dict(self.FM), body)
+        claim_ids = [record["claim_id"] for record in once["claims"]]
+        self.assertEqual(len(claim_ids), len(set(claim_ids)), "duplicate claim_id emitted")
+        bullets = [
+            record for record in once["claims"]
+            if record["claim_type"] == "bullet-claim"
+        ]
+        self.assertEqual(len(bullets), 1)
+
+    def test_distinct_sentences_still_both_extracted(self):
+        body = """## 1. 编译事实
+### 物理机制 (Mechanism)
+- [[Source_First-Member]]
+- [[Source_Second-Member]]
+## 2. 证据时间线
+"""
+        result = extract_page_objects("Concept_Dupe.md", dict(self.FM), body)
+        bullets = [
+            record for record in result["claims"]
+            if record["claim_type"] == "bullet-claim"
+        ]
+        self.assertEqual(len(bullets), 2)
+
+    def test_claim_identity_is_shared_by_guard_and_builder(self):
+        from vector_lake.claim_extractor import _claim_identity
+
+        first = _claim_identity(
+            page_key="P", cleaned_text="same", block_index=1, frontmatter={}
+        )
+        repeat = _claim_identity(
+            page_key="P", cleaned_text="same", block_index=7, frontmatter={}
+        )
+        other = _claim_identity(
+            page_key="P", cleaned_text="other", block_index=2, frontmatter={}
+        )
+        self.assertEqual(first, repeat)
+        self.assertNotEqual(first, other)

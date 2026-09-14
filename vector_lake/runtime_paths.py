@@ -26,6 +26,14 @@ RUNTIME_PROFILE_ENV_KEYS = frozenset(
         # the operator updates an environment variable on the host.  Without this
         # key the launcher cannot deliver the pause to MCP-initiated maintenance.
         "VECTOR_LAKE_MAINTENANCE_BACKUP_MODE",
+        # Backup retention quota.  Carried in the profile for the same reason as the
+        # mode above: the MCP server inherits the host's environment block, which
+        # does not change when the operator edits a host variable.  Without these
+        # keys ``max_total_bytes`` stayed 0, and a zero quota silently degrades
+        # ``quota_mode`` from ``enforce`` to ``report`` while backups grow
+        # unbounded.
+        "VECTOR_LAKE_BACKUP_QUOTA_MODE",
+        "VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES",
         "OPENBLAS_NUM_THREADS",
         "OMP_NUM_THREADS",
     }

@@ -119,6 +119,7 @@ def _prepare_staged_projection(
         allow_existing_legacy_name=(
             validation_mode == "schema" or mutation_type == "delete"
         ),
+        allow_missing_legacy_delete=mutation_type == "delete",
     )
     if not isinstance(projection_base_hash, str):
         raise RuntimeError("Staged projection requires a committed projection baseline.")
@@ -240,10 +241,14 @@ def materialize_markdown_projection(
     filepath = resolve_wiki_mutation_path(
         filename,
         # Same legacy-name allowance as the staging path: retiring a
-        # migration-era filename is a conformance move, not a creation.
+        # migration-era filename is a conformance move, not a creation.  The
+        # missing-file case is limited to deletes, which settle idempotently and
+        # are the only way to retire a canonical row whose page_key predates the
+        # filename contract.
         allow_existing_legacy_name=(
             validation_mode == "schema" or mutation_type == "delete"
         ),
+        allow_missing_legacy_delete=mutation_type == "delete",
     )
     if mutation_type == "delete":
         if filepath.exists():
@@ -402,9 +407,15 @@ def validate_mutation_batch_metadata(
             # keep the strict contract: the replacement page is still validated
             # in full, and every other delete gate (projection hash, canonical
             # cascade, backup) is unchanged.
+            # ``allow_missing_legacy_delete`` is what makes the case reachable at
+            # all: a canonical row with no Markdown file has nothing to delete on
+            # disk, so without it the retire leg was rejected here before the
+            # (also-correct) settlement path could run, and such a page could
+            # never converge.
             allow_existing_legacy_name=(
                 item_validation_mode == "schema" or is_delete
             ),
+            allow_missing_legacy_delete=is_delete,
         )
         if projection_base_hash is not None:
             projection_base_hash = projection_base_hash.casefold()

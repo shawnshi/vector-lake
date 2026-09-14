@@ -113,19 +113,12 @@ def _bounded_env_int(
 def _watchdog_gate_wait_seconds() -> float:
     """Bounded wait so watchdog maintenance is not starved by external heavy tasks.
 
-    Every watchdog admission used ``wait_timeout_seconds=0``, which can never win
-    the shared gate while an MCP tool or an operator projection-object GC holds
-    it.  Observed consequence in a single 2h47m window: 1,453 deferred
-    operational-memory index runs and 136 deferred raw full scans.  A short
-    bounded wait lets watchdog work take the gaps between external heavy tasks
-    while still yielding promptly.
+    Delegates to the shared helper in :mod:`vector_lake.heavy_task_gate` so every
+    background consumer uses one knob and one policy.
     """
-    return _bounded_env_float(
-        "VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS",
-        3.0,
-        minimum=0.0,
-        maximum=30.0,
-    )
+    from vector_lake.heavy_task_gate import background_gate_wait_seconds
+
+    return background_gate_wait_seconds()
 
 
 def _shutdown_timeout_seconds() -> float:
@@ -154,6 +147,21 @@ def _outbox_batch_yield_seconds() -> float:
     )
 
 
+def _wiki_reconcile_zero_progress_poll_seconds() -> float:
+    """Return the interruptible pause after a reconciliation round that repaired nothing.
+
+    A zero-progress round leaves ``successful_projection_batch`` false and
+    ``no_completed_work`` false, so without this term the consumer would spin
+    with no wait at all while the claim throttle is still in effect.
+    """
+    return _bounded_env_float(
+        "VECTOR_LAKE_WIKI_RECONCILE_ZERO_PROGRESS_POLL_SECONDS",
+        1.0,
+        minimum=0.05,
+        maximum=60.0,
+    )
+
+
 def _topology_refresh_deadline(
     *,
     now: float,
@@ -174,6 +182,28 @@ def _topology_refresh_deadline(
         maximum=3600.0,
     )
     return first_dirty, min(float(now) + debounce, first_dirty + max_staleness)
+
+
+def _topology_source_token() -> tuple[int, int] | None:
+    """Return a cheap identity token for the published projection pair.
+
+    ``index.json`` is a format-2 locator and does not change when a pair is
+    published, so it cannot be used as a freshness signal.  The projection
+    manifest is rewritten on every publish, and publishing is the only way
+    ``graph_state.dirty`` can be set.  Arming the topology staleness cap from
+    this token therefore keeps the cap self-enforcing without loading the
+    projection on every loop iteration.
+
+    ``None`` means the manifest is unreadable; callers must not arm from it, so
+    a companion-less or unavailable projection does not trigger rebuild storms.
+    """
+    from vector_lake.wiki_utils import get_projection_manifest_path
+
+    try:
+        stat = get_projection_manifest_path().stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
 
 
 def _raw_event_log_window_seconds() -> float:
@@ -2106,6 +2136,17 @@ def _legacy_projection_echo_reason(filename: str, projection_hash: str) -> str:
 # semantics after a code fix).  The quarantine is in-process by design; it is a
 # retry bound, not durable state.
 _LEGACY_PROJECTION_POISON_ATTEMPTS = 3
+
+# A full-Wiki reconciliation round that repairs nothing and reports no failure is
+# a stable disagreement between the drift scan and the repair path (for example a
+# page the repair path has quarantined).  The plan is re-derived from the same
+# scan on every round, so without a bound the loop re-claims the generation
+# immediately, re-scans the whole Wiki, and holds the shared heavy-task gate
+# indefinitely -- which starves bounded heavy callers such as the deep doctor.
+# After this many consecutive zero-progress rounds the loop stops claiming and
+# reports ``reconcile_blocked`` for operator action.  The durable marker is kept,
+# so nothing is hidden and a restart or code fix retries normally.
+_WIKI_RECONCILE_ZERO_PROGRESS_ROUNDS = 3
 _LEGACY_PROJECTION_POISON: dict[str, tuple[int, str]] = {}
 _LEGACY_PROJECTION_POISON_LOCK = threading.Lock()
 
@@ -2264,7 +2305,7 @@ def process_legacy_projection_queue_batch(
 
 def _collect_wiki_projection_drift(selected_limit: int) -> dict:
     """Collect a bounded candidate plan while counting all current drift."""
-    from vector_lake import governance_store
+    from vector_lake import db_store, governance_store
     from vector_lake.wiki_utils import get_wiki_dir, iter_markdown_files
 
     selected_limit = max(1, int(selected_limit))
@@ -2274,9 +2315,23 @@ def _collect_wiki_projection_drift(selected_limit: int) -> dict:
         for path in sorted(iter_markdown_files(wiki_dir), key=lambda item: item.name)
     }
     canonical_versions = governance_store.canonical_page_versions()
+    # ``canonical_page_versions`` normally initialises the store; callers that stub
+    # it would leave this read without a schema, so initialise explicitly to keep
+    # the plan scan independent of how the canonical versions were obtained.
+    db_store.init_db()
+    # Exclude pages whose Markdown matches their managed base version: those writes
+    # are still in flight in the durable outbox, so the doctor classifies them as
+    # pending reconciliation rather than drift.  Classifying them as repairable here
+    # made the watchdog rewrite pages the outbox was already writing -- and once a
+    # missing projection became retirable it could also retire them.
+    managed_base_versions = governance_store.managed_projection_base_versions(
+        db_store.get_connection(),
+        canonical_versions,
+    )
     candidates = []
     errors = []
     total_drift = 0
+    excluded_managed = 0
 
     for page_key in sorted(set(wiki_paths) | set(canonical_versions)):
         path = wiki_paths.get(page_key)
@@ -2302,6 +2357,15 @@ def _collect_wiki_projection_drift(selected_limit: int) -> dict:
 
         if not drifted:
             continue
+        if (
+            path is not None
+            and canonical_version is not None
+            and page_key in managed_base_versions
+            and observed_version == managed_base_versions[page_key]
+        ):
+            # Mid-reconciliation by the durable outbox, not drift to repair.
+            excluded_managed += 1
+            continue
         total_drift += 1
         if len(candidates) < selected_limit:
             candidates.append(filename)
@@ -2310,6 +2374,7 @@ def _collect_wiki_projection_drift(selected_limit: int) -> dict:
         "candidates": candidates,
         "errors": errors,
         "total_drift": total_drift,
+        "excluded_managed": excluded_managed,
     }
 
 
@@ -2492,7 +2557,13 @@ def reconcile_wiki_overflow_once(
         verification["candidates"],
         verification["total_drift"],
     )
-    event_buffer.allow_immediate_full_reconcile_retry()
+    # Only a round that actually repaired something may re-claim the generation
+    # immediately.  A verification round that repaired nothing and reported no
+    # failure would otherwise re-derive the plan from the same scan and spin
+    # without backoff, holding the shared heavy-task gate; the caller applies the
+    # normal retry throttle and a bounded zero-progress stop instead.
+    if legacy_stats["completed"]:
+        event_buffer.allow_immediate_full_reconcile_retry()
     return {
         "generation": expected_generation,
         "selected": len(selected),
@@ -2521,6 +2592,38 @@ def index_worker_loop(stop_event: threading.Event | None = None):
     )
     topology_dirty_since: float | None = None
     topology_refresh_due: float | None = None
+    topology_source_token: tuple[int, int] | None = None
+    reconcile_zero_progress_rounds = 0
+    reconcile_blocked = False
+    reconcile_blocked_detail = ""
+
+    def write_outbox_status(
+        state: str,
+        task_queue_size: int,
+        current_action: str,
+        last_error: str = "",
+    ) -> None:
+        """Publish outbox state without losing an outstanding blocked condition.
+
+        A transient cycle report (heavy-task deferral, topology refresh, legacy
+        batch, idle poll) must not overwrite a settled ``reconcile_blocked``
+        condition, otherwise the operator-visible state flaps with unrelated
+        activity.  Real failures keep their own state and are never rewritten.
+        """
+        if reconcile_blocked and state in {"idle", "processing"}:
+            state = "reconcile_blocked"
+            current_action = (
+                "Full Wiki reconciliation blocked; operator action required"
+            )
+            last_error = reconcile_blocked_detail or last_error
+        write_status(
+            state,
+            task_queue_size,
+            index_queue.qsize(),
+            current_action,
+            last_error,
+            component="outbox",
+        )
 
     write_status(
         "idle",
@@ -2561,6 +2664,20 @@ def index_worker_loop(stop_event: threading.Event | None = None):
 
             flag_path = get_outbox_signal_path()
             monotonic_now = time.monotonic()
+            current_topology_token = _topology_source_token()
+            if (
+                current_topology_token is not None
+                and current_topology_token != topology_source_token
+            ):
+                topology_source_token = current_topology_token
+                if topology_refresh_due is None:
+                    topology_dirty_since = None
+                topology_dirty_since, topology_refresh_due = (
+                    _topology_refresh_deadline(
+                        now=monotonic_now,
+                        dirty_since=topology_dirty_since,
+                    )
+                )
             topology_due = bool(
                 topology_refresh_due is not None
                 and monotonic_now >= topology_refresh_due
@@ -2573,17 +2690,18 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                 flag_path.exists()
                 or claimable_outbox
                 or not index_queue.empty()
-                or index_queue.full_reconcile_required
+                or (index_queue.full_reconcile_required and not reconcile_blocked)
                 or topology_due
             )
             if not work_pending:
-                write_status(
+                # While ``reconcile_blocked`` holds, the obligation alone is not a
+                # reason to take the shared heavy-task gate: the round would repair
+                # nothing.  Real work triggers above still admit the gate normally.
+                write_outbox_status(
                     "idle",
                     0,
-                    index_queue.qsize(),
                     "Outbox idle",
                     "",
-                    component="outbox",
                 )
                 if stop_event.wait(1):
                     break
@@ -2595,20 +2713,18 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                 "projection",
                 "watchdog-outbox-cycle",
                 origin="watchdog",
-                wait_timeout_seconds=0,
+                wait_timeout_seconds=_watchdog_gate_wait_seconds(),
                 warn_after_seconds=900,
             )
             try:
                 gate_lease.__enter__()
                 gate_entered = True
             except HeavyTaskBusy:
-                write_status(
+                write_outbox_status(
                     "idle",
                     0,
-                    index_queue.qsize(),
                     "Outbox deferred by heavy-task gate",
                     "Another memory-intensive operation is active",
-                    component="outbox",
                 )
                 if stop_event.wait(1):
                     break
@@ -2674,47 +2790,85 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                 successful_projection_batch = (
                     successful_projection_batch or legacy_completed
                 )
-                write_status(
+                write_outbox_status(
                     "error" if legacy_stats["failed"] else "idle",
                     legacy_stats["completed"],
-                    index_queue.qsize(),
                     f"Legacy projection batch completed: {legacy_stats}",
                     (
                         f"{legacy_stats['failed']} manual edit(s) failed"
                         if legacy_stats["failed"]
                         else ""
                     ),
-                    component="outbox",
                 )
 
             reconcile_stats = None
             if not pending_legacy and index_queue.empty():
-                generation = index_queue.claim_full_reconcile_marker(
-                    retry_interval_seconds=reconcile_retry_seconds,
-                )
-                if generation is not None:
-                    log.warning(
-                        "Reconciling Wiki overflow generation %s at capacity %s.",
-                        generation,
-                        index_queue.max_pending,
-                    )
-                    with global_task_lock:
-                        reconcile_stats = reconcile_wiki_overflow_once(
-                            index_queue,
-                            generation,
-                            batch_size=25,
-                        )
-                    cleared = reconcile_stats["cleared"]
+                if reconcile_blocked:
+                    # The durable marker is deliberately retained; only the
+                    # unbounded re-claim is stopped so the shared gate is free
+                    # for bounded callers and for operator recovery tooling.
                     write_status(
-                        "idle" if cleared else "error",
-                        reconcile_stats["completed"],
+                        "reconcile_blocked",
+                        0,
                         index_queue.qsize(),
-                        (
-                            "Full Wiki reconciliation completed"
-                            if cleared
-                            else "Full Wiki reconciliation pending"
-                        ),
-                        (
+                        "Full Wiki reconciliation blocked; operator action required",
+                        reconcile_blocked_detail,
+                        component="outbox",
+                    )
+                else:
+                    generation = index_queue.claim_full_reconcile_marker(
+                        retry_interval_seconds=reconcile_retry_seconds,
+                    )
+                    if generation is not None:
+                        log.warning(
+                            "Reconciling Wiki overflow generation %s at capacity %s.",
+                            generation,
+                            index_queue.max_pending,
+                        )
+                        with global_task_lock:
+                            reconcile_stats = reconcile_wiki_overflow_once(
+                                index_queue,
+                                generation,
+                                batch_size=25,
+                            )
+                        cleared = reconcile_stats["cleared"]
+                        reconcile_failed = bool(
+                            reconcile_stats["failed"]
+                            or reconcile_stats["scan_errors"]
+                        )
+                        if cleared:
+                            reconcile_zero_progress_rounds = 0
+                            reconcile_blocked = False
+                            reconcile_blocked_detail = ""
+                            reconcile_state = "idle"
+                            reconcile_action = "Full Wiki reconciliation completed"
+                        elif reconcile_failed:
+                            reconcile_zero_progress_rounds = 0
+                            reconcile_state = "error"
+                            reconcile_action = "Full Wiki reconciliation failed"
+                        elif reconcile_stats["completed"]:
+                            reconcile_zero_progress_rounds = 0
+                            reconcile_state = "processing"
+                            reconcile_action = "Full Wiki reconciliation pending"
+                        else:
+                            reconcile_zero_progress_rounds += 1
+                            if (
+                                reconcile_zero_progress_rounds
+                                >= _WIKI_RECONCILE_ZERO_PROGRESS_ROUNDS
+                            ):
+                                reconcile_blocked = True
+                            reconcile_state = (
+                                "reconcile_blocked"
+                                if reconcile_blocked
+                                else "processing"
+                            )
+                            reconcile_action = (
+                                "Full Wiki reconciliation blocked; operator "
+                                "action required"
+                                if reconcile_blocked
+                                else "Full Wiki reconciliation pending"
+                            )
+                        reconcile_detail = (
                             ""
                             if cleared
                             else (
@@ -2724,13 +2878,23 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                                 f"{len(reconcile_stats['scan_errors'])}; "
                                 "generation_changed="
                                 f"{reconcile_stats['generation_changed']}; "
+                                "zero_progress_rounds="
+                                f"{reconcile_zero_progress_rounds}; "
                                 "quarantine="
                                 f"{legacy_projection_quarantine_summary() or 'none'}"
                             )
-                        ),
-                        component="outbox",
-                    )
-                    log.info("Wiki overflow reconciliation: %s", reconcile_stats)
+                        )
+                        if reconcile_blocked:
+                            reconcile_blocked_detail = reconcile_detail
+                        write_status(
+                            reconcile_state,
+                            reconcile_stats["completed"],
+                            index_queue.qsize(),
+                            reconcile_action,
+                            reconcile_detail,
+                            component="outbox",
+                        )
+                        log.info("Wiki overflow reconciliation: %s", reconcile_stats)
 
             if reconcile_stats is not None:
                 reconcile_completed = bool(reconcile_stats.get("completed"))
@@ -2753,17 +2917,18 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                     refreshed = indexer.refresh_graph_topology_if_dirty()
                 topology_dirty_since = None
                 topology_refresh_due = None
-                write_status(
+                # A successful refresh publishes a new pair, so re-read the
+                # token to avoid re-arming from our own publish.
+                topology_source_token = _topology_source_token()
+                write_outbox_status(
                     "idle",
                     0,
-                    index_queue.qsize(),
                     (
                         "Graph topology refreshed after projection batches"
                         if refreshed
                         else "Graph topology already current"
                     ),
                     "",
-                    component="outbox",
                 )
 
             no_completed_work = (
@@ -2772,23 +2937,26 @@ def index_worker_loop(stop_event: threading.Event | None = None):
                 and not stats["claimed"]
             )
             if no_completed_work:
-                if index_queue.full_reconcile_required:
-                    write_status(
+                if reconcile_blocked:
+                    write_outbox_status(
+                        "reconcile_blocked",
+                        0,
+                        "Full Wiki reconciliation blocked; operator action required",
+                        reconcile_blocked_detail,
+                    )
+                elif index_queue.full_reconcile_required:
+                    write_outbox_status(
                         "idle",
                         0,
-                        index_queue.qsize(),
                         "Full Wiki reconciliation deferred",
                         f"retry interval={reconcile_retry_seconds}s",
-                        component="outbox",
                     )
                 else:
-                    write_status(
+                    write_outbox_status(
                         "idle",
                         0,
-                        index_queue.qsize(),
                         "Outbox idle",
                         "",
-                        component="outbox",
                     )
 
             consecutive_failures = 0
@@ -2834,6 +3002,11 @@ def index_worker_loop(stop_event: threading.Event | None = None):
             or (
                 _outbox_batch_yield_seconds()
                 if successful_projection_batch
+                else 0.0
+            )
+            or (
+                _wiki_reconcile_zero_progress_poll_seconds()
+                if reconcile_zero_progress_rounds
                 else 0.0
             )
             or (1.0 if no_completed_work else 0.0)
@@ -2884,7 +3057,9 @@ def maintenance_outbox_worker_loop(stop_event: threading.Event | None = None):
             try:
                 with heavy_task(
                     "projection", "watchdog-maintenance-outbox",
-                    origin="watchdog", wait_timeout_seconds=0, warn_after_seconds=900,
+                    origin="watchdog",
+                    wait_timeout_seconds=_watchdog_gate_wait_seconds(),
+                    warn_after_seconds=900,
                 ):
                     with global_task_lock:
                         stats = process_mutation_outbox_batch(limit=50)
@@ -3270,7 +3445,7 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                             "scan",
                             "watchdog-scheduled-lint",
                             origin="watchdog",
-                            wait_timeout_seconds=0,
+                            wait_timeout_seconds=_watchdog_gate_wait_seconds(),
                             warn_after_seconds=1800,
                         ):
                             with global_task_lock:

@@ -292,3 +292,126 @@ def test_schema_tag_collision_is_not_swallowed(tmp_path):
         validate_schema(
             frontmatter, "source body", "Source_Test.md", index_path=index_path
         )
+
+
+def test_rename_legalizes_a_canonical_page_whose_projection_is_missing(
+    isolated_memory,
+):
+    """A canonical-only page with a pre-contract name must be renameable.
+
+    The materialize path deliberately refuses to *create* a name that predates the
+    filename contract, so such a page previously had no converging repair at all:
+    the drift scan kept reporting it and the only available action was retirement.
+    """
+
+    def page_key_rows(page_key: str) -> list[tuple[str, str]]:
+        return [
+            (str(row[0]), str(row[1]))
+            for row in db_store.get_connection().execute(
+                "SELECT entity_id, data_json FROM entities "
+                "WHERE json_extract(data_json, '$.page_key') = ?",
+                (page_key,),
+            )
+        ]
+
+    db_store.init_db()
+    old_key = "Institution_Hospital_IT_Department"
+    new_key = "Institution_Hospital-IT-Department"
+    entity_id = "entity_legacy_identity"
+    governance_store.upsert_entity(
+        entity_id,
+        {
+            "entity_id": entity_id,
+            "id": "legacy_id",
+            "canonical_name": "Hospital IT Department",
+            "type": "institution",
+            "entity_type": "institution",
+            "status": "Active",
+            "domain": "General",
+            "categories": ["Uncategorized"],
+            "page_key": old_key,
+            "source_page": f"{old_key}.md",
+            "updated": "2026-07-12",
+            "updated_at": "2026-07-12",
+        },
+    )
+    wiki_dir = get_wiki_dir()
+    assert not (wiki_dir / f"{old_key}.md").exists()
+    assert len(page_key_rows(old_key)) == 1
+
+    result = rename_vector_lake_entity(old_key, new_key, dry_run=False)
+
+    assert result.startswith("Successfully renamed"), result
+    # The pre-contract page key is retired and only the legal one remains.
+    assert page_key_rows(old_key) == []
+    rows = page_key_rows(new_key)
+    assert len(rows) == 1
+    # Identity is carried forward, not re-minted from the new filename.
+    assert rows[0][0] == entity_id
+
+    target = wiki_dir / f"{new_key}.md"
+    assert target.exists()
+    assert (
+        governance_store.canonical_page_versions({new_key})[new_key]
+        == governance_store.canonical_page_version_from_content(
+            target.name,
+            target.read_text(encoding="utf-8"),
+        )
+    )
+
+
+def test_canonical_only_rename_uses_the_bounded_repair_channel(
+    isolated_memory,
+    monkeypatch,
+):
+    """The legalizing rename must not be blocked by the gate it is repairing.
+
+    The full write gate fails closed on ``write_projection_drift: missing_wiki=1``,
+    which is the exact condition a canonical-only page produces.  Requesting full
+    validation therefore deadlocks the repair, so the canonical-only path must use
+    the documented ``schema`` bounded-repair channel while the on-disk path keeps
+    full validation.
+    """
+    wiki_dir = get_wiki_dir()
+    (wiki_dir / "Concept_On-Disk.MD").write_text(
+        "---\ntitle: On Disk\naliases: []\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    db_store.init_db()
+    governance_store.upsert_entity(
+        "entity_canonical_only",
+        {
+            "entity_id": "entity_canonical_only",
+            "id": "canonical_only_id",
+            "canonical_name": "Canonical Only",
+            "type": "concept",
+            "entity_type": "concept",
+            "status": "Active",
+            "domain": "General",
+            "categories": ["Uncategorized"],
+            "page_key": "Concept_Canonical_Only",
+            "source_page": "Concept_Canonical_Only.md",
+            "updated": "2026-07-12",
+            "updated_at": "2026-07-12",
+        },
+    )
+    assert not (wiki_dir / "Concept_Canonical_Only.md").exists()
+
+    calls = []
+
+    def fake_batch(mutations, **kwargs):
+        calls.append(kwargs)
+        return True, "ok"
+
+    monkeypatch.setattr("vector_lake.tool_rename.execute_mutation_batch", fake_batch)
+
+    assert rename_vector_lake_entity(
+        "Concept_Canonical_Only", "Concept_Canonical-Only", dry_run=False
+    ).startswith("Successfully renamed")
+    assert rename_vector_lake_entity(
+        "Concept_On-Disk", "Concept_On-Disk-Renamed", dry_run=False
+    ).startswith("Successfully renamed")
+
+    assert [call.get("validation_mode") for call in calls] == ["schema", "full"]
+    # Neither leg may pair the bounded channel with a missing retire precondition.
+    assert calls[0]["identity_only_filenames"] == ["Concept_Canonical-Only.md"]

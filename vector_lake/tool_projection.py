@@ -2919,11 +2919,22 @@ def _canonical_entity_by_page_key(page_key: str) -> dict | None:
 
 
 def _iso_datetime(value: str | None) -> str:
+    """Return the stored timestamp shape for a projection frontmatter field.
+
+The projection is content-addressed: ``canonical_page_version_from_content``
+    re-extracts the frontmatter and hashes the resulting record, so whatever is
+    written here must read back as exactly the canonical stored value.
+
+    Coercing a bare ``YYYY-MM-DD`` into ``YYYY-MM-DDT00:00:00+00:00`` violated that
+    round trip for every bare-date row (7,522 live entities, the established
+    on-disk convention), so ``restore_missing_wiki_from_canonical`` always refused
+    with ``unsafe-version`` and a page whose Markdown projection was missing could
+    never be regenerated.  The stored shape is preserved verbatim; only a missing
+    value falls back to now.
+    """
     raw = str(value or "").strip()
     if not raw:
         return datetime.now(timezone.utc).isoformat()
-    if "T" not in raw and len(raw) == 10:
-        return f"{raw}T00:00:00+00:00"
     return raw
 
 

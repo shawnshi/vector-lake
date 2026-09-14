@@ -15,6 +15,10 @@ from pathlib import Path
 import pytest
 
 from vector_lake import auto_ingest_worker, db_store, ingest_worker
+from vector_lake.auto_ingest_runners.host_relay import (
+    HOST_RELAY_ADAPTER,
+    RELAY_PROTOCOL_VERSION,
+)
 from vector_lake.raw_revision import stable_raw_revision
 
 
@@ -524,6 +528,53 @@ def test_config_rejects_unimplemented_runner(isolated_memory):
         ValueError,
         match="auto_ingest_config_invalid:runner_is_unknown:fake_runner",
     ):
+        auto_ingest_worker.load_auto_ingest_config()
+
+
+def _write_relay_config_without_codex_fields(memory_dir: Path, **overrides):
+    (memory_dir / "relay").mkdir(exist_ok=True)
+    _write_config(memory_dir, runner="host_relay", runner_options={
+        "spool_dir": str((memory_dir / "relay").resolve()),
+        "relay_protocol_version": RELAY_PROTOCOL_VERSION,
+        "poll_seconds": 0.1,
+    })
+    path = memory_dir / "wiki" / ".meta" / "auto_ingest_config.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    for name in ("codex_executable", "runner_codex_home", "required_codex_version",
+                 "required_codex_sha256", "required_system_skills_sha256",
+                 "required_models_cache_sha256", "required_auth_identity_sha256",
+                 "model", "reasoning_effort"):
+        raw.pop(name)
+    raw.update(overrides)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+
+def test_host_relay_config_does_not_require_codex_settings(isolated_memory):
+    _write_relay_config_without_codex_fields(isolated_memory)
+    config = auto_ingest_worker.load_auto_ingest_config()
+    assert config.runner == "host_relay"
+    assert config.codex_executable == ""
+    assert config.runner_codex_home == ""
+    assert config.required_auth_identity_sha256 == ""
+    assert config.model == ""
+    assert config.runner_options["spool_dir"] == str((isolated_memory / "relay").resolve())
+    assert HOST_RELAY_ADAPTER.validate_options(config).config is config
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("allow_model_processing_raw_text", False, "allow_model_processing_raw_text_must_be_true"),
+    ("max_tasks_per_hour", 0, "max_tasks_per_hour"),
+    ("poll_seconds", 0, "poll_seconds"),
+])
+def test_host_relay_keeps_common_consent_and_budget_validation(isolated_memory, field, value, error):
+    _write_relay_config_without_codex_fields(isolated_memory, **{field: value})
+    with pytest.raises(ValueError, match=error):
+        auto_ingest_worker.load_auto_ingest_config()
+
+
+def test_codex_config_still_requires_codex_executable(isolated_memory):
+    _write_config(isolated_memory, codex_executable="")
+    with pytest.raises(ValueError, match="codex_executable_must_be_absolute"):
         auto_ingest_worker.load_auto_ingest_config()
 
 

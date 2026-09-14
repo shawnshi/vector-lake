@@ -1789,36 +1789,54 @@ def _read_search_snippet(
         raise SearchIndexError("Wiki frontmatter exceeds the bounded search limit.")
 
 
+_READINESS_UNSET = object()
+
+
 def _with_semantic_readiness(
     result: str,
     *,
     as_xml: bool,
     index_data: dict | None = None,
+    readiness: dict | None | object = _READINESS_UNSET,
 ) -> str:
-    """Attach non-blocking, generation-bound semantic readiness to retrieval."""
+    """Attach non-blocking, generation-bound semantic readiness to retrieval.
+
+    ``readiness`` determines who owns the envelope:
+
+    * ``_READINESS_UNSET`` (default): compute one for this call.
+    * ``None``: the caller already carries the envelope as a sibling response
+      field, so do not embed a second byte-identical copy in the retrieval
+      text. The envelope, not the retrieval body, is the authoritative copy.
+    * a mapping: reuse an envelope the caller already computed.
+    """
+    if readiness is None:
+        return result
     from vector_lake import runtime_health
 
-    try:
-        readiness = runtime_health.get_semantic_readiness_envelope(
-            index_data=index_data,
-            nonblocking=True,
-        )
-    except Exception as exc:
-        readiness = {
-            "contract_version": "vector-lake-semantic-readiness-envelope/v1",
-            "ready": False,
-            "status": "unknown",
-            "issues": [f"semantic_readiness_envelope_unavailable:{type(exc).__name__}"],
-            "warnings": [],
-            "issue_count": 1,
-            "warning_count": 0,
-            "issues_omitted": 0,
-            "warnings_omitted": 0,
-            "debt_summary": {},
-            "captured_generation": None,
-            "captured_fingerprint": None,
-            "results_are_not_accepted_facts": True,
-        }
+    if readiness is _READINESS_UNSET:
+        try:
+            readiness = runtime_health.get_semantic_readiness_envelope(
+                index_data=index_data,
+                nonblocking=True,
+            )
+        except Exception as exc:
+            readiness = {
+                "contract_version": "vector-lake-semantic-readiness-envelope/v1",
+                "ready": False,
+                "status": "unknown",
+                "issues": [
+                    f"semantic_readiness_envelope_unavailable:{type(exc).__name__}"
+                ],
+                "warnings": [],
+                "issue_count": 1,
+                "warning_count": 0,
+                "issues_omitted": 0,
+                "warnings_omitted": 0,
+                "debt_summary": {},
+                "captured_generation": None,
+                "captured_fingerprint": None,
+                "results_are_not_accepted_facts": True,
+            }
     encoded = json.dumps(
         readiness,
         ensure_ascii=False,
@@ -2052,6 +2070,7 @@ def search_vector_lake(
     filter_expr: str = None,
     *,
     _raise_on_unavailable: bool = False,
+    readiness: dict | None | object = _READINESS_UNSET,
 ):
     query = str(query or "").strip()
     if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
@@ -2072,6 +2091,7 @@ def search_vector_lake(
                 _raise_on_unavailable=_raise_on_unavailable,
             ),
             as_xml=as_xml,
+            readiness=readiness,
         )
     if normalized_mode == "fact":
         return _with_semantic_readiness(
@@ -2084,6 +2104,7 @@ def search_vector_lake(
                 _raise_on_unavailable=_raise_on_unavailable,
             ),
             as_xml=as_xml,
+            readiness=readiness,
         )
     if normalized_mode in {"claim", "claims"}:
         fact_result = format_operational_memory_results(
@@ -2101,6 +2122,7 @@ def search_vector_lake(
                 requested_mode=normalized_mode,
             ),
             as_xml=as_xml,
+            readiness=readiness,
         )
 
     search_started = time.perf_counter()
@@ -2113,6 +2135,7 @@ def search_vector_lake(
             value,
             as_xml=as_xml,
             index_data=readiness_index_data,
+            readiness=readiness,
         )
         timings["total_ms"] = (time.perf_counter() - search_started) * 1000.0
         encoded_size = len(value.encode("utf-8"))

@@ -7,11 +7,13 @@ import string
 from collections import Counter, defaultdict
 
 from vector_lake import governance_metrics
+from vector_lake.claim_extractor import classify_non_claim_text
 from vector_lake.merge_analysis import (
     FilenameCandidateStats,
     iter_filename_candidates,
     normalize_name,
 )
+from vector_lake.tool_ingest import PROVENANCE_ONLY_SOURCE_MARKER
 from vector_lake.wiki_utils import (
     SYSTEM_WHITELIST,
     get_wiki_dir,
@@ -26,6 +28,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vector-lake-tool-lint")
 
 _TEMPORAL_LINK = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_GENERATED_STUB_REASONS = frozenset(
+    {
+        "generated_stub",
+        "generated_stub_truncated",
+        "generated_broken_link_stub",
+        "generated_reshaped_stub",
+        "generated_entity_stub",
+    }
+)
+# Below this much non-maintenance prose, the page is a shell rather than an
+# enriched page carrying a stale stub line.
+_STUB_PAGE_CONTENT_FLOOR = 120
 
 
 class _BoundedIssueCollector:
@@ -172,6 +186,7 @@ def lint_vector_lake(auto_fix: bool = False):
             "duplicate_id", "alias_conflict", "broken_links", "orphan",
             "reviewed_orphan", "similarity", "decay", "semantic_gc",
             "governance", "managed_governance", "alignment",
+            "generated_stub", "provenance_only",
         ]
     }
     fixes_applied = 0
@@ -216,6 +231,41 @@ def lint_vector_lake(auto_fix: bool = False):
                 validate_schema(frontmatter, body, filename)
             except SchemaViolationException as exc:
                 issues["schema"].append(f"{filename}: {str(exc)}")
+
+        # Generated stubs and ingest-engine provenance-only Source records.
+        # Neither is a broken link (the target resolves) nor an orphan (many are
+        # heavily referenced), so without an explicit category the whole class
+        # stays invisible to routine linting. Reported from the first pass
+        # because ``_lint_record`` drops the body when auto_fix is off.
+        stub_reasons: Counter[str] = Counter()
+        content_chars = 0
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line or line[0] in "#>-" or line.startswith("<!--"):
+                continue
+            reason = classify_non_claim_text(line, page_key=filename)
+            if reason in _GENERATED_STUB_REASONS:
+                stub_reasons[reason] += 1
+                continue
+            if reason:
+                continue
+            content_chars += len(line)
+        if stub_reasons:
+            kinds = ", ".join(f"{key}x{count}" for key, count in sorted(stub_reasons.items()))
+            if content_chars < _STUB_PAGE_CONTENT_FLOOR:
+                issues["generated_stub"].append(
+                    f"{filename}: {kinds} - whole page is maintenance prose "
+                    f"({content_chars} chars of content)"
+                )
+            else:
+                issues["generated_stub"].append(
+                    f"{filename}: {kinds} - residual stub block inside "
+                    f"{content_chars} chars of content"
+                )
+        if PROVENANCE_ONLY_SOURCE_MARKER in body:
+            issues["provenance_only"].append(
+                f"{filename}: ingest-engine provenance-only Source record"
+            )
 
         parsed[filename] = _lint_record(
             frontmatter,
@@ -629,9 +679,19 @@ def lint_vector_lake(auto_fix: bool = False):
         "managed_governance": "12b. Managed Governance Debt",
         "alignment": "13. Alignment Drift",
         "schema": "14. Strict Schema Verification",
+        "generated_stub": "15. Generated Stub Pages",
+        "provenance_only": "16. Provenance-only Source Records",
     }
 
-    informational_checks = {"similarity", "reviewed_orphan", "managed_governance"}
+    informational_checks = {
+        "similarity",
+        "reviewed_orphan",
+        "managed_governance",
+        # Pre-existing quality debt, not evidence that the Wiki is broken: keep
+        # them visible without flipping the lint gate, like filename similarity.
+        "generated_stub",
+        "provenance_only",
+    }
     total_issues = sum(
         len(items)
         for key, items in issues.items()

@@ -80,6 +80,9 @@ _LEGACY_RETRYABLE_GENERATOR_REASON = "codex_event_log_type_is_not_allowed:error"
 # deliberately.  This page evidence is the only gate on reopen; the failure text
 # is not consulted (see ``_provenance_only_terminal_job_ids``).
 _PROVENANCE_ONLY_SOURCE_MARKER = "该页面为摄入引擎自动生成的 provenance-only Source 记录"
+# Public alias: lint and other read-only inspectors must not depend on a
+# private name to recognize this class.
+PROVENANCE_ONLY_SOURCE_MARKER = _PROVENANCE_ONLY_SOURCE_MARKER
 
 
 def _provenance_only_terminal_job_ids(conn) -> list[str]:

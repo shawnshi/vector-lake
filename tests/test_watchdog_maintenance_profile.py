@@ -96,6 +96,12 @@ def test_maintenance_outbox_defers_to_foreground_heavy_gate(isolated_memory, mon
     from vector_lake import db_store, watchdog_app
     from vector_lake.heavy_task_gate import heavy_task
 
+    # Pin the admission wait to zero so this test asserts the deferral contract
+    # immediately.  The bounded default lets a background consumer win a released
+    # gate, which is deliberate; a zero timeout is still honoured for operators who
+    # set it.
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS", "0")
+
     db_store.init_db()
     stop = threading.Event()
     processed = []

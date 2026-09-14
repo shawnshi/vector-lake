@@ -120,17 +120,22 @@ def recall(
     if normalized_mode not in {"page", "memory", "fact", "claim"}:
         raise ValueError("mode must be page, memory, fact, or claim")
     effective_mode = "fact" if normalized_mode == "claim" else normalized_mode
+    # One generation-bound envelope for the whole response. ``search_vector_lake``
+    # is told the caller owns it (``readiness=None``) so the retrieval body does
+    # not embed a second byte-identical copy of the same envelope.
+    readiness = get_semantic_readiness_envelope(nonblocking=True)
     response = {
         "contract_version": MEMORY_PROTOCOL_VERSION,
         "verb": "recall",
         "mode": effective_mode,
         "include_history": bool(include_history),
-        "semantic_readiness": get_semantic_readiness_envelope(nonblocking=True),
+        "semantic_readiness": readiness,
         "result": search_vector_lake(
             query,
             top_k=top_k,
             mode=normalized_mode,
             include_history=include_history,
+            readiness=None,
         ),
     }
     if normalized_mode == "claim":

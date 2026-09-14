@@ -240,6 +240,74 @@ def test_restore_refuses_lossy_canonical_metadata(isolated_memory):
     assert not restored.exists()
 
 
+def test_restore_accepts_a_bare_date_updated_value(isolated_memory):
+    """A bare ``YYYY-MM-DD`` must survive the canonical -> Markdown round trip.
+
+    The projection is content-addressed, so a regenerated page has to hash back to
+    the stored canonical record.  Coercing a bare date into a full timestamp in
+    ``_frontmatter_from_entity`` made every bare-date row unregenerable, so a
+    missing Markdown projection stayed permanently unrepairable and (on the live
+    corpus) held the whole-Wiki reconciliation open.
+    """
+    _purpose(isolated_memory)
+    page = _page("Bare Date Restore").replace(
+        "updated: 2026-07-13T00:00:00+00:00",
+        "updated: '2026-07-13'",
+    )
+    assert "updated: '2026-07-13'" in page
+    execute_mutation_plan("Concept_Bare-Date-Restore.md", content=page)
+    target = isolated_memory / "wiki" / "Concept_Bare-Date-Restore.md"
+    assert target.exists()
+
+    canonical_version = governance_store.canonical_page_versions(
+        {"Concept_Bare-Date-Restore"}
+    )["Concept_Bare-Date-Restore"]
+    stored = json.loads(
+        db_store.get_connection()
+        .execute(
+            "SELECT data_json FROM entities "
+            "WHERE json_extract(data_json, '$.page_key') = ?",
+            ("Concept_Bare-Date-Restore",),
+        )
+        .fetchone()[0]
+    )
+    # The stored shape is the bare date, so a regenerated page must keep it.
+    assert stored.get("updated") == "2026-07-13"
+    assert tool_projection._frontmatter_from_entity(stored)["updated"] == "2026-07-13"
+
+    target.unlink()
+    applied = restore_missing_wiki_from_canonical(dry_run=False, limit=5)
+
+    assert "Restored 1 missing wiki page" in applied
+    assert "unsafe-version" not in applied
+    assert target.exists()
+    assert (
+        governance_store.canonical_page_version_from_content(
+            target.name,
+            target.read_text(encoding="utf-8"),
+        )
+        == canonical_version
+    )
+
+
+def test_projection_frontmatter_keeps_the_stored_timestamp_shape():
+    base = {
+        "entity_id": "entity_shape",
+        "canonical_name": "Shape",
+        "type": "concept",
+        "page_key": "Concept_Shape",
+    }
+    for stored in (
+        "2026-07-12",
+        "2026-07-12T00:00:00+00:00",
+        "20260712",
+    ):
+        frontmatter = tool_projection._frontmatter_from_entity(
+            {**base, "updated": stored}
+        )
+        assert frontmatter["updated"] == stored
+
+
 def test_restore_is_projection_only_repeatable_and_watchdog_managed(isolated_memory):
     _purpose(isolated_memory)
     original = _page("Repeatable Restore")

@@ -9160,10 +9160,20 @@ def verify_operational_memory_search_integrity(
     """Verify relevant revisions immediately and bypass writes periodically.
 
     Retrieval may trust a stable durable proof without synchronously streaming
-    the entire derived corpus. Deep doctor and watchdog callers retain full
-    periodic attestation by leaving ``allow_durable_proof`` disabled. Bounded
-    quick diagnostics also disable ``allow_forced_attestation`` so an interval
-    of zero defers instead of forcing the normal retrieval fallback scan.
+    the entire derived corpus.  Caller policy, stated so the flag is not read as a
+    guarantee:
+
+    * ``allow_full_scan=False`` plus ``allow_durable_proof=True`` trusts the
+      persisted proof and reports ``verification_kind='durable_proof'`` having
+      inspected zero rows.  The bounded quick-doctor probe and the watchdog's
+      pre-gate probe use this deliberately, because a cold cache would otherwise
+      report a healthy index as ``deferred``.  The reported
+      ``integrity_attested_at`` / ``integrity_proof_age_seconds`` fields state how
+      old that proof is; ``durable_proof`` is not evidence of a fresh inspection.
+    * Raising ``allow_durable_proof`` (the default ``False``) keeps the full
+      periodic attestation, which is what the deep doctor path uses.
+    * ``allow_forced_attestation=False`` makes an interval of zero defer instead of
+      forcing the normal retrieval fallback scan.
     """
     try:
         revision_before = _operational_memory_search_revision_token(conn)

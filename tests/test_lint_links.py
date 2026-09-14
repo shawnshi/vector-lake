@@ -237,3 +237,90 @@ def test_lint_without_auto_fix_preserves_database_file_identity(
     after = durable_identity()
 
     assert after == before
+
+
+def _write_stub_fixture(wiki_dir, page_key, entity_type, body, index, sources="[]"):
+    (wiki_dir / f"{page_key}.md").write_text(
+        f"""---
+title: '{page_key}'
+type: {entity_type}
+domain: General
+status: Active
+epistemic-status: seed
+categories:
+- Uncategorized
+sources: {sources}
+id: 20260814_stub_{index:02d}
+updated: '2026-08-14'
+strategic_scope: core
+---
+{body}
+""",
+        encoding="utf-8",
+    )
+
+
+def test_lint_reports_generated_stub_and_provenance_only_pages(isolated_memory):
+    """Stub shells and residual stub blocks must be visible to routine lint."""
+    wiki_dir = isolated_memory / "wiki"
+    _write_stub_fixture(
+        wiki_dir,
+        "Concept_Rich-Carrier",
+        "concept",
+        "# Concept_Rich-Carrier\n\n"
+        + "Real clinical content sentence. " * 20
+        + "\n\n### 物理机制 (Mechanism)\n"
+        "This is an auto-generated stub page to prevent broken links from "
+        "[[Concept_Orphan-Index]].\n",
+        0,
+    )
+    _write_stub_fixture(
+        wiki_dir,
+        "Concept_Shell",
+        "concept",
+        "# Concept_Shell\n\nThis is an auto-generated stub page to prevent "
+        "broken links from [[Concept_Orphan-Index]].\n",
+        1,
+    )
+    _write_stub_fixture(
+        wiki_dir,
+        "Source_Provenance-Only",
+        "source",
+        "# Source_Provenance-Only\n\n## 来源范围\n"
+        "该页面为摄入引擎自动生成的 provenance-only Source 记录，源文件 `a.md`"
+        "（hash `sha256:aaa`）。\n",
+        2,
+        sources="['raw/stub/a.md']",
+    )
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "15. Generated Stub Pages: [INFO: 2]" in report
+    assert "16. Provenance-only Source Records: [INFO: 1]" in report
+    assert "Concept_Rich-Carrier.md: generated_stubx1 - residual stub block inside" in report
+    assert "Concept_Shell.md: generated_stubx1 - whole page is maintenance prose" in report
+    assert (
+        "Source_Provenance-Only.md: ingest-engine provenance-only Source record"
+        in report
+    )
+
+
+def test_stub_categories_stay_informational_and_do_not_flip_the_gate(isolated_memory):
+    """Pre-existing stub debt is reported without turning the lint gate red."""
+    wiki_dir = isolated_memory / "wiki"
+    _write_stub_fixture(
+        wiki_dir,
+        "Concept_Shell-Only",
+        "concept",
+        "# Concept_Shell-Only\n\nThis is an auto-generated stub page to prevent "
+        "broken links from [[Concept_Orphan-Index]].\n",
+        0,
+    )
+
+    report = lint_vector_lake(auto_fix=False)
+
+    # Informational, not [FAIL]: stub debt must not flip the lint gate. Other
+    # categories (naming, decay, semantic_gc) legitimately fire on this fixture.
+    assert "15. Generated Stub Pages: [INFO: 1]" in report
+    assert "16. Provenance-only Source Records: [PASS]" in report
+    assert "15. Generated Stub Pages: [FAIL" not in report

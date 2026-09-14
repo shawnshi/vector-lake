@@ -70,6 +70,15 @@ def test_watchdog_busy_gate_preserves_signal_and_does_not_claim(
 ):
     from vector_lake.heavy_task_gate import heavy_task
 
+    # Pin the admission wait to zero so this test keeps asserting the deferral
+    # contract immediately.  The bounded default -- which deliberately lets a
+    # background consumer win the gate once an external holder releases it -- is
+    # covered by test_watchdog_bounded_gate_wait_wins_after_holder_releases.
+    # Before the bounded wait existed, every background consumer deferred
+    # instantly, so this test's "never claims" outcome was the defect, not the
+    # contract.
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS", "0")
+
     db_store.init_db()
     while not index_queue.empty():
         index_queue.get_nowait()
@@ -100,7 +109,10 @@ def test_watchdog_busy_gate_preserves_signal_and_does_not_claim(
     monkeypatch.setattr(
         watchdog_app,
         "process_mutation_outbox_batch",
-        lambda **_kwargs: claimed.append("claimed"),
+        lambda **_kwargs: (
+            claimed.append("claimed")
+            or {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0}
+        ),
     )
     holder = threading.Thread(target=hold_gate, name="watchdog-gate-holder")
     worker = threading.Thread(
@@ -120,6 +132,73 @@ def test_watchdog_busy_gate_preserves_signal_and_does_not_claim(
         holder_release.set()
         worker.join(timeout=3)
         holder.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert not holder.is_alive()
+
+
+def test_watchdog_bounded_gate_wait_wins_after_holder_releases(
+    isolated_memory,
+    monkeypatch,
+):
+    """The bounded default must take a gate an external holder has released.
+
+    A zero admission timeout can never win the shared gate, which is how the
+    periodic outbox cycle ended up deferred indefinitely by any shorter holder.
+    """
+    from vector_lake.heavy_task_gate import heavy_task
+
+    db_store.init_db()
+    while not index_queue.empty():
+        index_queue.get_nowait()
+        index_queue.task_done()
+    wiki_utils.get_outbox_signal_path().write_text("1", encoding="utf-8")
+    monkeypatch.setenv("VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS", "8")
+
+    holder_acquired = threading.Event()
+    holder_release = threading.Event()
+    stop_event = threading.Event()
+    claimed: list[str] = []
+
+    def hold_gate():
+        with heavy_task(
+            "projection",
+            "external-holder",
+            origin="pytest",
+            wait_timeout_seconds=0,
+        ):
+            holder_acquired.set()
+            holder_release.wait(timeout=3)
+
+    monkeypatch.setattr(watchdog_app, "write_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        watchdog_app,
+        "process_mutation_outbox_batch",
+        lambda **_kwargs: (
+            claimed.append("claimed")
+            or {"claimed": 1, "completed": 1, "retrying": 0, "failed": 0}
+        ),
+    )
+
+    holder = threading.Thread(target=hold_gate, name="watchdog-gate-holder")
+    worker = threading.Thread(
+        target=watchdog_app.index_worker_loop,
+        args=(stop_event,),
+        name="watchdog-gate-contender",
+    )
+    holder.start()
+    assert holder_acquired.wait(timeout=2)
+    worker.start()
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not claimed:
+            time.sleep(0.05)
+        assert claimed, "a bounded wait must win the gate once the holder releases it"
+    finally:
+        stop_event.set()
+        holder_release.set()
+        worker.join(timeout=6)
+        holder.join(timeout=6)
 
     assert not worker.is_alive()
     assert not holder.is_alive()

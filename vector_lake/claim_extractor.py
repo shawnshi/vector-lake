@@ -37,6 +37,24 @@ _NON_CLAIM_ARTIFACTS = (
         ),
     ),
     (
+        # Same sentence with the "from X" target dropped. It still says nothing,
+        # so treating it as a claim publishes a maintenance notice as knowledge.
+        "generated_stub_truncated",
+        re.compile(
+            r"^this is an auto-generated stub page to prevent broken links\.?$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        # Alternate wording emitted by the link-repair pass; the third known
+        # spelling, and the one that produced dated Observation events.
+        "generated_broken_link_stub",
+        re.compile(
+            r"^auto-generated stub to resolve broken link from .+?\.?$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "generated_reshaped_stub",
         re.compile(
             r"^auto-generated stub for (?P<subject>[^.!?。！？]{1,160})\. "
@@ -143,13 +161,65 @@ def classify_non_claim_text(
     return None
 
 
+# Maintenance prefixes that can precede an otherwise whole-block stub notice: a
+# Timeline date/tag prefix, stray bracket tags, and a bare leading date+colon.
+_LEADING_TAG = re.compile(r"^\[[^\]\r\n]{1,40}\]\s*")
+_LEADING_DATE = re.compile(r"^(?:19|20)\d{2}(?:-\d{2}(?:-\d{2})?)?\s*[:：]\s*")
+
+
+def classify_maintenance_only_text(
+    raw_text: str, cleaned_text: str = "", *, page_key: str = "",
+) -> str | None:
+    """Classify maintenance prose that carries a Timeline/bullet prefix.
+
+    ``classify_non_claim_text`` anchors every pattern to the whole block, so a
+    stub notice pasted into a Task bullet (``- [2026-06-01] [Observation] ...``)
+    or tagged as ``[concept] 2026-06-01: ...`` never matched and was extracted as
+    a claim, producing synthetic Observation events. Stripping only leading
+    date/tag prefixes before matching keeps the anchored patterns authoritative.
+    """
+    text = str(cleaned_text or raw_text or "").strip()
+    if not text:
+        return None
+    direct = classify_non_claim_text(text, page_key=page_key)
+    if direct:
+        return direct
+    prefix = parse_timeline_prefix(text)
+    if prefix.event_date and prefix.description:
+        text = prefix.description.strip()
+    for _ in range(4):
+        stripped = _LEADING_TAG.sub("", text)
+        stripped = _LEADING_DATE.sub("", stripped)
+        if stripped == text:
+            break
+        text = stripped.strip()
+    if not text or text == str(cleaned_text or raw_text or "").strip():
+        return None
+    return classify_non_claim_text(text, page_key=page_key)
+
+
 def _is_non_claim_block(raw_text: str, cleaned_text: str, *, page_key: str = "") -> bool:
     raw = str(raw_text or "").strip()
     if classify_non_claim_text(raw, cleaned_text, page_key=page_key):
         return True
+    if classify_maintenance_only_text(raw, cleaned_text, page_key=page_key):
+        return True
     if re.match(r"^\[\^[^\]]+\]:", raw):
         return True
     return False
+
+
+def _claim_identity(
+    *, page_key: str, cleaned_text: str, block_index: int, frontmatter: dict,
+) -> str:
+    """Return the stable claim identity for one cleaned block.
+
+    Kept in one place so the dedupe guard and the record builder cannot drift:
+    ``claim_id`` depends on the page key plus the cleaned text only, while
+    ``claim_family_id`` also folds in heading and block index.
+    """
+    declared = frontmatter.get("claim_id") if block_index == 1 else None
+    return declared or _stable_id("claim", f"{page_key}:{cleaned_text}")
 
 
 def _iter_blocks(body: str, *, page_key: str = "") -> list[dict]:
@@ -467,6 +537,8 @@ def extract_page_objects(
         else None
     )
 
+    seen_claim_ids: set[str] = set()
+
     for block_index, block in enumerate(blocks, start=1):
         timeline_prefix = parse_timeline_prefix(block["text"])
         block_temporal = timeline_prefix.event_date
@@ -484,6 +556,20 @@ def extract_page_objects(
                 count=1,
             )
         final_temporal = block_temporal or validity_defaults.get("temporal_anchor")
+
+        claim_id = _claim_identity(
+            page_key=page_key,
+            cleaned_text=cleaned_text,
+            block_index=block_index,
+            frontmatter=frontmatter,
+        )
+        if claim_id in seen_claim_ids:
+            # One identity is one knowledge unit. A page that repeats the same
+            # sentence yields two blocks with one claim_id; emitting both put a
+            # conflicting duplicate in the change set and aborted the whole apply
+            # batch. First occurrence wins, and nothing is emitted for the repeat.
+            continue
+        seen_claim_ids.add(claim_id)
 
         raw_text = block.get("raw_text", block["text"])
         inline_sources = _parse_inline_sources(raw_text)
@@ -550,8 +636,6 @@ def extract_page_objects(
                 "contradicts_claim_ids": [],
             })
 
-        claim_id = frontmatter.get("claim_id") if block_index == 1 else None
-        claim_id = claim_id or _stable_id("claim", f"{page_key}:{cleaned_text}")
         from vector_lake.wiki_utils import enforce_claim_dict
         claim_locator = {
             "page_key": page_key,

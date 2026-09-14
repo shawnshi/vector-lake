@@ -1,4 +1,9 @@
+import pytest
+
 from vector_lake.merge_analysis import (
+    _MERGE_MIN_MEANINGFUL_CHARS,
+    _canonical_rank,
+    _meaningful_body_chars,
     FilenameCandidateStats,
     analyze_entities,
     filename_candidate_pairs,
@@ -977,3 +982,81 @@ def test_candidate_uses_evidence_score_not_confidence():
     assert results
     assert "evidence_score" in results[0]
     assert "confidence" not in results[0]
+
+
+def _rank_record(page_key: str, body: str, entity_id: str = "e1") -> dict:
+    return {
+        "entity": {"entity_id": entity_id, "categories": [], "topic_cluster": "General",
+                   "status": "Active"},
+        "effective_type": "concept",
+        "page_key": page_key,
+        "body": body,
+        "sources": [],
+    }
+
+
+def test_residual_stub_line_does_not_disqualify_a_substantial_page():
+    """A stale stub line must not cost a rich page the merge.
+
+    The old gate was a substring test, so any page containing the phrase
+    "auto-generated stub" scored 0 on ``non_stub_body`` and lost to a shorter
+    but clean duplicate.
+    """
+    rich = _rank_record(
+        "Concept_Rich",
+        "# Concept_Rich\n\n" + "Real clinical content sentence. " * 20
+        + "\n### 物理机制 (Mechanism)\n"
+        "This is an auto-generated stub page to prevent broken links from "
+        "[[Concept_Orphan-Index]].\n",
+    )
+    short_clean = _rank_record(
+        "Concept_Short", "# Concept_Short\n\nShort but clean note.\n", "e2"
+    )
+
+    assert _canonical_rank(rich) > _canonical_rank(short_clean)
+
+
+def test_pure_stub_page_still_loses_the_merge():
+    """Counting substance must keep true stub shells at zero."""
+    shell = _rank_record(
+        "Concept_Shell",
+        "# Concept_Shell\n\nThis is an auto-generated stub page to prevent "
+        "broken links from [[Concept_Orphan-Index]].\n",
+    )
+    assert _canonical_rank(shell)[4] == 0
+    assert _meaningful_body_chars(shell["body"]) < _MERGE_MIN_MEANINGFUL_CHARS
+
+
+def test_change_set_batch_collapses_identical_duplicate_records():
+    """A benign repeat must not abort the whole apply batch.
+
+    ``_apply_change_sets_batch_unchecked`` flattens one proposal list per change
+    set. Before this guard, two change sets carrying the same claim aborted the
+    batch inside ``retain_current_reviewed_provenance`` with
+    "duplicate claim_id" even though applying it twice is an upsert.
+    """
+    from vector_lake.governance_store import (
+        ChangeSetPayloadCorrupt,
+        _collapse_duplicate_records,
+    )
+
+    first = {"claim_id": "claim_a", "claim_text": "same"}
+    repeat = {"claim_id": "claim_a", "claim_text": "same"}
+    other = {"claim_id": "claim_b", "claim_text": "different"}
+
+    collapsed = _collapse_duplicate_records(
+        [first, repeat, other], "claim_id", "claim"
+    )
+    assert [record["claim_id"] for record in collapsed] == ["claim_a", "claim_b"]
+
+    # A genuine conflict is NOT swallowed here: it is left for the canonical
+    # ownership and provenance guards, which name the conflict far more precisely.
+    conflicting = _collapse_duplicate_records(
+        [first, {"claim_id": "claim_a", "claim_text": "conflict"}],
+        "claim_id",
+        "claim",
+    )
+    assert len(conflicting) == 2
+
+    with pytest.raises(ChangeSetPayloadCorrupt):
+        _collapse_duplicate_records([{"claim_text": "no id"}], "claim_id", "claim")

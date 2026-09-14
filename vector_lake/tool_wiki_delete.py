@@ -26,11 +26,13 @@ import hmac
 import json
 import shutil
 import unicodedata
+from collections import defaultdict
 
 from vector_lake.wiki_utils import (
     get_wiki_dir,
     iter_markdown_files,
     iter_wiki_link_matches,
+    split_frontmatter,
     validate_wiki_filename,
 )
 
@@ -105,22 +107,67 @@ def _batch_backlink_index(
     page_keys: set[str],
     excluded_names: set[str],
 ) -> dict[str, list[str]]:
-    """Return inbound Wiki links for the requested page keys in one Wiki pass."""
+    """Return inbound Wiki links for the requested page keys in one Wiki pass.
+
+    Link targets are resolved with the same exact -> normalized -> alias
+    resolution the lint graph uses, through the shared helpers rather than a
+    second implementation. Comparing the raw target string against page keys
+    (the previous behaviour) under-counted backlinks for every page referenced
+    through an alias or a normalized variant, so the delete gate could approve a
+    page and then break those links.
+
+    A page that cannot be read is treated as linking every requested key: an
+    unreadable projection is not evidence of absence.
+    """
+    from vector_lake.tool_lint import _register_link_target, _resolve_link_target
+
     excluded_identities = {name.casefold() for name in excluded_names}
-    backlinks: dict[str, list[str]] = {page_key: [] for page_key in page_keys}
+    exact_map: dict[str, str] = {}
+    # Must be a defaultdict: _register_link_target indexes it directly, exactly
+    # as the lint graph does.
+    normalized_map: dict[str, set[str]] = defaultdict(set)
+    contents: dict[str, str] = {}
+    unreadable: list[str] = []
     for path in iter_markdown_files(get_wiki_dir()):
-        if path.name.casefold() in excluded_identities:
-            continue
         try:
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
-            backlinks.setdefault("<unreadable>", []).append(path.name)
+            unreadable.append(path.name)
+            continue
+        contents[path.name] = content
+        node_key = _page_key(path.name)
+        _register_link_target(
+            exact_map, normalized_map, node_key, node_key, canonical=True
+        )
+        frontmatter, _body = split_frontmatter(content)
+        title = frontmatter.get("title")
+        if title:
+            _register_link_target(exact_map, normalized_map, str(title), node_key)
+        aliases = frontmatter.get("aliases")
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        if isinstance(aliases, list):
+            for alias in aliases:
+                _register_link_target(
+                    exact_map, normalized_map, str(alias).strip(), node_key
+                )
+
+    backlinks: dict[str, list[str]] = {page_key: [] for page_key in page_keys}
+    for name, content in contents.items():
+        # Skip links *from* the pages being deleted, but their own page key and
+        # aliases must stay registered above, otherwise links pointing at them
+        # would not resolve and the gate would see no backlinks at all.
+        if name.casefold() in excluded_identities:
             continue
         for match in iter_wiki_link_matches(content):
-            target = match.group(1).strip()
-            target_key = target[:-3] if target.casefold().endswith(".md") else target
-            if target_key in backlinks:
-                backlinks[target_key].append(path.name)
+            resolved = _resolve_link_target(
+                match.group(1).strip(), exact_map, normalized_map
+            )
+            if resolved in backlinks:
+                backlinks[resolved].append(name)
+    for name in unreadable:
+        for page_key in backlinks:
+            backlinks[page_key].append(name)
     return {key: sorted(set(value)) for key, value in backlinks.items() if value}
 
 

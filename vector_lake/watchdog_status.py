@@ -136,10 +136,17 @@ def _status_document(
     task_queue_size: int,
     index_queue_size: int,
 ) -> dict:
+    # ``reconcile_blocked`` is a settled, operator-gated condition rather than a
+    # worker failure: the process is healthy, but a data condition cannot be
+    # repaired automatically.  It is ranked between ``error`` and ``draining`` so
+    # it still dominates every operational state without being reported as a
+    # crash.  Diagnosis of the condition itself is emitted separately by
+    # ``runtime_health``.
     priority = {
         "halted": 6,
         "stopped": 5,
         "error": 4,
+        "reconcile_blocked": 3.5,
         "draining": 3,
         "processing": 2,
         "starting": 1,

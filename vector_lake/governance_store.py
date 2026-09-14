@@ -8,6 +8,7 @@ import math
 import os
 import re
 import sqlite3
+from pathlib import Path
 import time
 import unicodedata
 import uuid
@@ -1277,6 +1278,49 @@ def canonical_page_versions(
         page_key: _canonical_entity_records_version(page_records)
         for page_key, page_records in records_by_page.items()
     }
+
+
+def managed_projection_base_versions(
+    connection: sqlite3.Connection,
+    canonical_versions: dict[str, str],
+) -> dict[str, str]:
+    """Return ``page_key -> managed base version`` for writes still in flight.
+
+    A page whose Markdown matches its *managed base* version instead of the current
+    canonical version is mid-reconciliation, not drifted: its durable outbox row
+    already carries the payload that produced the canonical value.
+
+    This is the single implementation of that classification, shared by the
+    runtime-health projection model and the watchdog reconciliation scan.  When the
+    two disagreed, the watchdog classified such pages as repairable drift and tried
+    to rewrite them, competing with the outbox that was already writing them -- and
+    once a missing projection became retirable it could also delete them.
+    """
+    rows = connection.execute(
+        "SELECT filename, mutation_type, payload_text, base_version "
+        "FROM mutation_outbox WHERE status IN ('pending', 'processing') "
+        "ORDER BY id DESC"
+    ).fetchall()
+    base_versions: dict[str, str] = {}
+    for row in rows:
+        page_key = Path(str(row["filename"])).stem
+        if page_key in base_versions or page_key not in canonical_versions:
+            continue
+        if str(row["mutation_type"]) != "update" or row["payload_text"] is None:
+            continue
+        base_version = row["base_version"]
+        if base_version is None:
+            continue
+        try:
+            payload_version = canonical_page_version_from_content(
+                str(row["filename"]),
+                str(row["payload_text"]),
+            )
+        except Exception:
+            continue
+        if payload_version == canonical_versions.get(page_key):
+            base_versions[page_key] = str(base_version)
+    return base_versions
 
 
 def upsert_entity(entity_id: str, data: dict):
@@ -4042,6 +4086,22 @@ def operational_memory_search_index_status(
                     str(integrity.get("issue") or "operational_memory_search_integrity")
                 )
     deferred = integrity is not None and integrity.get("status") == "deferred"
+    # ``integrity_status: ready`` on its own cannot distinguish a proof attested
+    # seconds ago from one attested months ago, and a durable proof inspects zero
+    # rows by design.  Report the attestation instant and its age so the surface
+    # states how fresh the evidence is instead of implying an inspection that did
+    # not happen.
+    integrity_attested_at: str | None = None
+    integrity_proof_age_seconds: float | None = None
+    if integrity is not None:
+        if str(integrity.get("verification_kind") or "") == "full":
+            integrity_attested_at = datetime.now(timezone.utc).isoformat()
+            integrity_proof_age_seconds = 0.0
+        else:
+            integrity_attested_at = progress_updated_at or None
+            integrity_proof_age_seconds = _operational_memory_progress_age_seconds(
+                progress_updated_at
+            )
     stalled = bool(
         configured
         and warnings
@@ -4093,6 +4153,8 @@ def operational_memory_search_index_status(
             if integrity is not None
             else None
         ),
+        "integrity_attested_at": integrity_attested_at,
+        "integrity_proof_age_seconds": integrity_proof_age_seconds,
         "progress_updated_at": progress_updated_at or None,
         "progress_age_seconds": progress_age_seconds,
         "progress_stalled": stalled,
@@ -6903,6 +6965,50 @@ def _validate_canonical_id_ownership(
     return claim_owners, evidence_owners
 
 
+def _collapse_duplicate_records(records, key: str, label: str) -> list[dict]:
+    """Collapse byte-identical repeats of one primary key.
+
+    ``_apply_change_sets_batch_unchecked`` flattens one proposal list per change
+    set in the batch, so the same record can appear twice when two change sets
+    cover the same page. Writing it once is identical to writing it twice (the
+    canonical write upserts by primary key), and the repeat used to abort the
+    batch inside ``retain_current_reviewed_provenance`` with a bare
+    "duplicate claim_id".
+
+    A duplicate whose payloads *disagree* is deliberately left in place: it means
+    the batch contradicts itself, and the canonical ownership and provenance
+    guards downstream report that far more precisely than a flatten-time check
+    could. This helper only removes the harmless repeats.
+    """
+    if isinstance(records, dict):
+        records = list(records.values())
+    seen: dict[str, str] = {}
+    ordered: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ChangeSetPayloadCorrupt(
+                f"Change set proposes a {label} that is not a mapping."
+            )
+        value = str(record.get(key) or "")
+        if not value:
+            raise ChangeSetPayloadCorrupt(
+                f"Change set proposes a {label} without {key}."
+            )
+        try:
+            payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ChangeSetPayloadCorrupt(
+                f"Change set proposes an unserializable {label} {key}={value}: {exc}"
+            ) from exc
+        previous = seen.get(value)
+        if previous is None:
+            seen[value] = payload
+        elif previous == payload:
+            continue
+        ordered.append(record)
+    return ordered
+
+
 def _apply_change_sets_batch_unchecked(
     change_sets: list[dict],
     retired_page_keys: set[str] | None = None,
@@ -6926,15 +7032,27 @@ def _apply_change_sets_batch_unchecked(
         for page in change_set.get("affected_pages", [])
     }
     affected_page_keys = {_normalized_owner_page(page) for page in affected_pages}
-    proposed_entities = [
-        record for item in change_sets for record in item.get("proposed_entities", [])
-    ]
-    proposed_claims = [
-        record for item in change_sets for record in item.get("proposed_claims", [])
-    ]
-    proposed_evidence = [
-        record for item in change_sets for record in item.get("proposed_evidence", [])
-    ]
+    # A batch flattens one proposal list per change set. Two change sets in the
+    # same batch can legitimately carry the same record (the same page mutated
+    # twice, or the same claim proposed by an acknowledgement and a repair), and
+    # an identical repeat is harmless because the write is an upsert by primary
+    # key. Only a duplicate whose payloads disagree is a real corruption, so
+    # collapse identical repeats and keep failing closed on conflicts.
+    proposed_entities = _collapse_duplicate_records(
+        (record for item in change_sets for record in item.get("proposed_entities", [])),
+        "entity_id",
+        "entity",
+    )
+    proposed_claims = _collapse_duplicate_records(
+        (record for item in change_sets for record in item.get("proposed_claims", [])),
+        "claim_id",
+        "claim",
+    )
+    proposed_evidence = _collapse_duplicate_records(
+        (record for item in change_sets for record in item.get("proposed_evidence", [])),
+        "evidence_id",
+        "evidence",
+    )
     proposed_sources = [
         record
         for item in change_sets

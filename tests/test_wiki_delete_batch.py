@@ -336,3 +336,51 @@ def test_real_batch_deletes_canonical_page_and_its_claims(tmp_path, monkeypatch)
         ).fetchone()[0]
         == 0
     )
+
+
+def test_refuses_page_linked_only_through_an_alias(tmp_path, monkeypatch):
+    """An alias reference is a real backlink the delete gate must see.
+
+    ``_batch_backlink_index`` used to compare the raw link target against page
+    keys, so a page referenced only through an alias (or a normalized variant)
+    reported zero backlinks and was deleted, breaking those links.
+    """
+    monkeypatch.setattr(
+        "vector_lake.tool_projection.create_maintenance_backup",
+        lambda label="maintenance": str(tmp_path / label),
+    )
+    projection_hash = _write_page(
+        "Policy_Drg-Dip-2-0.md",
+        "---\n"
+        'id: "20260912_alias1"\n'
+        'title: "DRG/DIP 2.0"\n'
+        "aliases:\n"
+        "- Policy_Drg-Dip-2.0\n"
+        'type: "policy"\n'
+        'domain: "Medical_IT"\n'
+        'topic_cluster: "General"\n'
+        'status: "Active"\n'
+        'epistemic-status: "seed"\n'
+        "categories: [\"Uncategorized\"]\n"
+        'created: "2026-09-12"\n'
+        'updated: "2026-09-12"\n'
+        "sources: []\n"
+        'strategic_scope: "core"\n'
+        "---\n"
+        "# DRG/DIP 2.0\n\n## 1. 编译事实\n"
+        "### 管辖范围与适用对象 (Jurisdiction & Applicability)\n\n"
+        "## 2. 证据时间线\n",
+    )
+    # The referrer links the dotted alias, which is not the page key.
+    _write_page(
+        "System_Referrer.md",
+        "---\nid: s1\ntitle: Referrer\ntype: system\ndomain: Medical_IT\n"
+        "status: Active\nepistemic-status: seed\ncategories: [\"Uncategorized\"]\n"
+        "updated: '2026-09-12'\nsources: []\n---\n见 [[Policy_Drg-Dip-2.0]].\n",
+    )
+    manifest = _manifest(
+        tmp_path / "manifest-alias.json",
+        [_operations_for("Policy_Drg-Dip-2-0.md", projection_hash)],
+    )
+    with pytest.raises(ValueError, match="still linked"):
+        delete_wiki_batch(manifest, dry_run=True)

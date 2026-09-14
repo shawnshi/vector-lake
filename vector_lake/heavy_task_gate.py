@@ -53,6 +53,38 @@ class HeavyTaskStateError(RuntimeError):
     """The physical gate was acquired but its owner state could not be published."""
 
 
+_BACKGROUND_WAIT_ENV = "VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS"
+_BACKGROUND_WAIT_DEFAULT_SECONDS = 3.0
+_BACKGROUND_WAIT_MAX_SECONDS = 30.0
+
+
+def background_gate_wait_seconds() -> float:
+    """Return the bounded admission wait shared by every background consumer.
+
+    A background consumer that admits with ``wait_timeout_seconds=0`` can never
+    win the shared gate while an operator tool or another worker holds it, so its
+    work is deferred indefinitely instead of interleaving.  Observed consequence in
+    a single 2h47m window before this was centralised: 1,453 deferred
+    operational-memory index runs and 136 deferred raw full scans.
+
+    One shared knob keeps every periodic consumer consistent -- the earlier state
+    fixed two call sites and left four at zero, which is how the same defect kept
+    reappearing at the sites nobody had looked at yet.
+    """
+    raw = os.environ.get(_BACKGROUND_WAIT_ENV, "")
+    try:
+        value = (
+            float(raw)
+            if str(raw).strip() != ""
+            else _BACKGROUND_WAIT_DEFAULT_SECONDS
+        )
+    except (TypeError, ValueError):
+        value = _BACKGROUND_WAIT_DEFAULT_SECONDS
+    if not math.isfinite(value):
+        value = _BACKGROUND_WAIT_DEFAULT_SECONDS
+    return max(0.0, min(_BACKGROUND_WAIT_MAX_SECONDS, value))
+
+
 class HeavyTaskBusy(TimeoutError):
     """Structured admission failure for a currently occupied heavy-task gate.
 

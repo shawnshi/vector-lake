@@ -24,6 +24,7 @@ from vector_lake.runtime_health import (
     _watchdog_component_health,
     assess_runtime_health,
     assess_semantic_readiness,
+    get_semantic_readiness_assessment,
 )
 
 
@@ -73,6 +74,7 @@ def _doctor_watchdog_status(
     )
     unhealthy_required = health["unhealthy_required_components"]
     unhealthy_optional = health["unhealthy_optional_components"]
+    blocked_required = health["blocked_required_components"]
     stale_required = health["stale_required_components"]
     stale_optional = health["stale_optional_components"]
     paused_components = health["paused_components"]
@@ -86,6 +88,7 @@ def _doctor_watchdog_status(
     )
     degraded = bool(
         unhealthy_optional
+        or blocked_required
         or stale_optional
         or paused_components
         or health["missing_components"]
@@ -98,6 +101,7 @@ def _doctor_watchdog_status(
         f"{status.get('current_action', '')}; "
         f"age={age_seconds if age_seconds is not None else 'unknown'}s; "
         f"unhealthy={','.join(all_unhealthy) or 'none'}; "
+        f"blocked={','.join(blocked_required) or 'none'}; "
         f"optional_unhealthy={','.join(unhealthy_optional) or 'none'}; "
         f"stale={','.join(all_stale) or 'none'}; "
         f"optional_stale={','.join(stale_optional) or 'none'}; "
@@ -638,8 +642,17 @@ def _doctor_vector_lake(
 
 def semantic_readiness_vector_lake(decision_id: str | None = None) -> str:
     """Return the machine-readable semantic readiness report."""
+    normalized_decision_id = str(decision_id or "").strip()
+    # Decision-scoped assessment answers a different question and stays
+    # uncached. The global report is generation-bound and cached, so repeated
+    # doctor/CLI readiness calls no longer re-run the full aggregate scan.
+    assessment = (
+        assess_semantic_readiness(decision_id=normalized_decision_id)
+        if normalized_decision_id
+        else get_semantic_readiness_assessment()
+    )
     return json.dumps(
-        assess_semantic_readiness(decision_id=decision_id),
+        assessment,
         ensure_ascii=False,
         indent=2,
         sort_keys=True,

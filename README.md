@@ -105,6 +105,24 @@ change-set payload 原始上限提高到 8 MiB，同时保持压缩存储上限 
 收据；下一批版本游标只能取自成功 apply 后的收据。任何物理
 `VACUUM` 都必须在实际删除后重新测量 freelist，再于无写入者的独占维护窗口单独决策。
 
+### Wiki 对账、漂移与健康状态契约
+
+全量 Wiki 对账（overflow reconcile）是一个**有界、可停止、可解释**的循环，而不是“一直重试直到成功”：
+
+- **投影漂移的两种语义不得混用**。一个页面的 Markdown 与 canonical 版本不一致时，若其内容等于其 **managed base version**（即 mutation outbox 中仍然在飞的那条 update 所携带的 payload 版本），它是**待对账**而非可修复漂移。该分类只有一处实现：`governance_store.managed_projection_base_versions()`，Runtime Health 的投影模型与 watchdog 的对账扫描共用它。二者曾各自维护一套模型，导致 watchdog 去“修复” outbox 正在写的页面；在缺失投影变得可退休之后，它还可能把这些页面直接退休。
+- **零进展不会引发热循环**。一轮全量对账修复了 0 项且未报错时不会立即重claim（verification 分支只在真的有 `completed` 时才请求即时重试），并伴随 `VECTOR_LAKE_WIKI_RECONCILE_ZERO_PROGRESS_POLL_SECONDS` 暂停。连续 `_WIKI_RECONCILE_ZERO_PROGRESS_ROUNDS`（`3`）轮零进展后进入终态并**停止抢占共享门**。
+- **终态是 `reconcile_blocked`，不是 `error`**。它是“进程健康、但某项数据条件需要人工介入”，在 `watchdog_status.py` 的聚合优先级中介于 `error` 与 `draining` 之间，**不**属于 `unhealthy_states`，因此不再以 `watchdog_unhealthy:outbox` 这种工作进程崩溃的形象出现。但它仍是 issue，不是 warning：`runtime_health` 单独产出 `wiki_reconcile_blocked:<component>:<detail>`，`ok` 保持 `false` 直到真正收敛。durable marker（`wiki_reconcile_required.json`）在阻塞期间**保留**，不静默丢弃。
+- **阻塞态不占用共享门**。`work_pending` 对 `full_reconcile_required` 加 `and not reconcile_blocked`；真实工作触发条件（outbox 信号、可claim 行、队列、拓扑到期）仍正常准入。
+- **确定性不可修复页面有操作员回路**。同一页面经 `_LEGACY_PROJECTION_POISON_ATTEMPTS`（`3`）次相同失败后进入 in-process 隔离（文档字面语义：重启后重试，以便代码修复后生效）；隔离只让该条目退出**当批次**，因此**必须**同时从漂移扫描的候选集与 `total_drift` 中排除，否则计划会被同一扫描重建，marker 永不解除。
+- 只有唯一写入者会发布状态：`write_outbox_status()` 保证闸门让步、拓扑刷新、legacy 批次与空闲轮询这些**过程性**报告不会覆盖已确定的阻塞态，避免状态随无关活动抖动。
+
+健康与可观测字段：
+
+- `doctor_vector_lake` 的 detail 新增 `watchdog_blocked_components`，与 `watchdog_component_effective_statuses` 并列；watchdog 检查对阻塞态返回 degraded 而不是失败，原因由上述 issue 承载。
+- `operational_memory_search` 新增 `integrity_attested_at` 与 `integrity_proof_age_seconds`。`verification_kind='durable_proof'` 会**检视零行**（按设计信任已持久化的摘要 + revision token），单看 `integrity_status: ready` 无法分辨证明是在十秒前还是十个月前；这两个字段把新鲜度明确表达出来。探针策略：有界 quick 诊断与 watchdog 的 pre-gate 探针故意启用 `allow_durable_proof`（冷缓存下否则会把健康索引报成 `deferred`），deep doctor 保留完整周期重认证。
+- Wiki 对账扫描返回 `excluded_managed`，即被认定为“正在被 outbox 对账”而排除的页面数；它与 `total_drift`（可修复漂移）分列，不得合并成一个数。
+- 时间戳往返：投影 frontmatter 中的 `updated` **原样保留 canonical 存储形状**（裸 `YYYY-MM-DD` 就是裸日期）。投影是内容寻址的，重建内容必须回读得到同一版本哈希；把裸日期升格为完整时间戳会使每个裸日期行都无法重建，`restore_missing_wiki_from_canonical` 会以 `unsafe-version` 拒绝，该守卫必须保留。
+
 ## CBSS Integration Boundary
 
 Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candidate、溯源和检索上下文，不承载 CBSS 的业务执行状态机。
@@ -121,7 +139,7 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 
 ### 1. 核心受控类型 (Prefixes)
 
-文件名禁用空格与其他非规范符号，格式如 `Institution_北京协和医院.md`：
+文件名禁用空格与其他非规范符号，格式如 `Institution_北京协和医院.md`。严格校验只允许**类型前缀后恰好一个下划线**，其后的主体名与子名以连字符分隔：`(Type)_[MainName](-[SubName])*.md`，例如 `Institution_Hospital-IT-Department.md`。多下划线（`Institution_Hospital_IT_Department.md`）、内含点号、CJK 混排与空白的旧式名都会被 `validate_wiki_filename` 拒绝。
 
 - **`Institution_*`**：医疗机构、医院、医学院、科研院所及需求/监管侧机构。
 - **`Vendor_*`**：商业侧供应商、IT 企业、设备厂商。
@@ -132,6 +150,12 @@ Vector Lake 为可计算业务状态体系提供 Source、Evidence、Claim candi
 - **`Policy_*` / `Standard_*`**：政策法规、行业标准。
 - **`Source_*`**：对应 `raw/` 原始信源的一对一摘要节点。
 - **`Synthesis_*`**：跨来源合成、比较与调研长文。
+
+合法性边界（写入与退休不对称）：
+
+- **创建/更新**必须满足严格契约；`resolve_wiki_mutation_path` 的 legacy 名豁免只对**已存在**的文件生效，因此系统不会创建契约前的名字。
+- **退休（delete）允许**处理既存的契约前名字，包括其 Markdown 文件已缺失的情形（`allow_missing_legacy_delete`）——退休是朝合规方向的移动；该豁免同时接线在批量元数据校验、staged 投影与 outbox 结算三处，缺失的旧名页面因此可收敛，而不是永久阻塞。
+- **合法化**：canonical 行存在但 Markdown 投影缺失、且页面名早于当前契约时，可用 `rename_entity`（MCP）重命名为合法名。此路径从 canonical 重建源内容并**保留 `entity_id`**（提取器优先读取 frontmatter 的 `entity_id`，否则会按目的文件名重铸新身份），同一原子批次内完成 retire + create 并重写 `[[旧名]]` 引用。该批次走 `validation_mode='schema'` 有界修复通道，因为完整写入闸门恰好被“缺失投影”本身阻塞，否则闸门与修复互锁。
 
 ### 2. 文件结构设计
 
@@ -692,19 +716,20 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 - `VECTOR_LAKE_WATCHDOG_WORKER_RESTART_LIMIT`：单个后台 worker 的进程生命周期内重启预算，默认 `2`、范围 `0..10`。
 - `VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS`：耗尽重启预算后必须拖停 watchdog 的组件；默认 `watchdog,outbox,ingest`，`auto_ingest` 始终保持 fail-closed。`scheduler` 默认非关键，可按运维要求显式加入。Runtime Health 与 Deep Doctor 共用同一分类器：可选 scheduler 隔离或陈旧只告警，显式列为必需后才阻断。
 - `VECTOR_LAKE_MCP_HEAVY_TASK_WAIT_SECONDS`：MCP 重任务等待共享跨进程门的时间，默认 `5` 秒（原 `0.5` 秒），限制为 `0` 至 `60` 秒；超时返回结构化 `heavy_task_busy`，其中含 `retry_after_seconds`。默认值需覆盖 watchdog 日常维护的 1–3 秒占用；分钟级的 `projection-object-gc` 不应被默认值跨过，需要时才由操作员显式调大。
-- `VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS`：watchdog 重任务（operational-memory 派生索引、raw 全量扫描）等待共享门的时间，默认 `3` 秒，限制为 `0` 至 `30` 秒。置 `0` 会恢复“从不等待”，在外部重任务占用期间必然饥饿。
+- `VECTOR_LAKE_WATCHDOG_GATE_WAIT_SECONDS`：**所有后台 heavy-task 消费者**等待共享跨进程门的统一时间，默认 `3` 秒，限制为 `0` 至 `30` 秒。覆盖 outbox cycle、maintenance outbox、定时 lint 与 auto-ingest generation finalize 四处（历史上两处为 `0`、两处为 `3`，同一缺陷因此在不一致的调用点反复出现；现已收敛为 `heavy_task_gate.background_gate_wait_seconds()` 单点实现）。置 `0` 会恢复“从不等待”，在外部重任务占用期间必然饥饿，只应在测试或显式接受饥饿时使用。
 - `VECTOR_LAKE_WATCHDOG_OPERATIONAL_MEMORY_ATTESTATION_SECONDS`：watchdog 对 operational-memory 派生索引做全量摘要重认证的间隔，默认 `60` 秒（与 `VECTOR_LAKE_OPERATIONAL_MEMORY_ATTESTATION_SECONDS` 同量级），限制为 `0` 至 `86400` 秒。实测：实库语料约 12.8 万文档、单次扫描约 3 秒、门禁acquire 频率 0.91 次/分，合计约占共享门 **4.6%**；调到 `900` 可把该占用降到约 0.3%，代价是“计数相等但内容被篡改”这类故障的发现延迟同步变长。置 `0` 关闭周期扫描（durable proof 与 revision token 仍守卫每次检索）。
 - `VECTOR_LAKE_MCP_TOOL_DEADLINE_SECONDS`：同步 MCP 调用的全局 deadline 上限；默认 `0` 表示不另设 deadline，合法范围为 `0..3600` 秒，非法值拒绝 server 启动。请求可用保留参数 `_vector_lake_deadline_seconds` 缩短但不能放宽该上限；排队取消不执行，已进入不可中断 publish 的操作返回可查询的 `cancellation_pending`，后台完成后记录 `completed_after_cancellation`。
 - `VECTOR_LAKE_SEMANTIC_CAMPAIGN_CURSOR_TTL_SECONDS`：只读 semantic campaign snapshot/cursor 的 sliding lease，默认 `120` 秒。相同 source/generation 的首屏并发 single-flight 复用；全局 accounted cache 上限 `384 MiB`，generation 或物理 source identity 改变会立即使旧 cursor stale。
 - `VECTOR_LAKE_DURABILITY_PROFILE`：只接受 `full`（默认）或 `best_effort`。`full` 对已确认的 Wiki、projection、backup 与 receipt 执行文件及父目录持久化屏障；非法值 fail-closed。`best_effort` 仅用于明确接受更弱断电 RPO 的受控环境。
 - `VECTOR_LAKE_TOPOLOGY_REFRESH_DEBOUNCE_SECONDS`：outbox 投影批次后的图拓扑合并刷新等待，默认 `5` 秒。
-- `VECTOR_LAKE_TOPOLOGY_MAX_STALENESS_SECONDS`：连续投影期间允许图拓扑保持 dirty 的最长时间，默认 `300` 秒。
+- `VECTOR_LAKE_TOPOLOGY_MAX_STALENESS_SECONDS`：允许图拓扑保持 dirty 的最长时间，默认 `300` 秒。该上限由已发布投影对的 manifest 令牌（`(mtime_ns, size)`）布防，因此**即使投影批次没有产生进度也会自行强制刷新**；此前它只在“投影批次完成”时布防，于是当投影无进展时上限永远不会生效。`VECTOR_LAKE_TOPOLOGY_REFRESH_DEBOUNCE_SECONDS` 仍负责合并短时间内的连续发布会。
+- `VECTOR_LAKE_WIKI_RECONCILE_ZERO_PROGRESS_POLL_SECONDS`：一轮全量 Wiki 对账**修复了 0 项且未报错**后的可中断暂停，默认 `1` 秒，限制为 `0.05` 至 `60` 秒。没有该暂停时，零进展轮次既不满足“已成功批次”也不满足“无工作待办”，会以零等待空转，而 claim 节流仍在生效。
 - `VECTOR_LAKE_SEARCH_RESULT_MAX_CHARS`：页面搜索结果字符预算，默认 `24000`，与 `top_k` 独立。
 - `VECTOR_LAKE_SEARCH_RESULT_MAX_BYTES`：页面搜索结果 UTF-8 字节预算，默认 `32768`；字符和字节预算同时生效。
 - `VECTOR_LAKE_DATABASE_WARNING_BYTES`：Doctor 数据库体积告警阈值，默认 `4 GiB`。
 - `VECTOR_LAKE_DATABASE_DAILY_GROWTH_WARNING_BYTES` / `VECTOR_LAKE_VERSION_DAILY_GROWTH_WARNING_ROWS`：Doctor 的每日数据库增量与 Claim/Evidence 版本行增量告警阈值，默认 `256 MiB` / `50000` 行。Watchdog 每个 UTC 日记录一次、保留 35 个样本，不自动删除历史。
 - `VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES`：maintenance 与 schema-migration 两个根的全局备份配额；默认 `0` 表示未配置并触发治理告警。未配置上限时 `quota_mode` 报为 `report`（请求值保留在 `requested_quota_mode`），因为未定义上限的 `enforce` 实际无法拦截任何写入。`VECTOR_LAKE_BACKUP_MIN_FREE_BYTES` / `VECTOR_LAKE_BACKUP_MIN_FREE_RATIO` 默认 `10 GiB` / `0.10`；`VECTOR_LAKE_BACKUP_QUOTA_MODE` 只接受 `enforce`（默认）或 `report`。
-- `VECTOR_LAKE_MAINTENANCE_BACKUP_MODE`：修改前维护备份策略，只接受 `full`（默认）或 `skip`。每个维护操作默认会先复制整库与投影（实库约 3.6 GB 且独占 heavy-task gate 数分钟）；`skip` 暂停这份自动前置副本，**不**影响把备份当作已校验输入读回的操作——claim 占位清理、模板退役、claim 溯源修复、`index_rebuild`（恢复包载体）与 `wiki_restore`（恢复源）走 `require_maintenance_backup`，两种模式下行为完全一致，因此暂停不会让它们静默降级。该值在部署侧（进程环境）设置；测试套件会显式清除它，所以主机上暂停不会改变套件行为。
+- `VECTOR_LAKE_MAINTENANCE_BACKUP_MODE`：修改前维护备份策略，只接受 `full`（默认）或 `skip`。每个维护操作默认会先复制整库与投影（实库约 3.6 GB 且独占 heavy-task gate 数分钟）；`skip` 暂停这份自动前置副本，**不**影响把备份当作已校验输入读回的操作——claim 占位清理、模板退役、claim 溯源修复、`index_rebuild`（恢复包载体）与 `wiki_restore`（恢复源）走 `require_maintenance_backup`，两种模式下行为完全一致，因此暂停不会让它们静默降级。该值在部署侧（进程环境）设置，也可由 `runtime_profiles.json` 提供；**宿主环境变量优先**，profile 只填充缺失项（因此主机上设置 `skip` 会静默压过 profile 中的 `full`）。测试套件会显式清除它，所以主机上暂停不会改变套件行为。`VECTOR_LAKE_BACKUP_QUOTA_MODE` 与 `VECTOR_LAKE_BACKUP_MAX_TOTAL_BYTES` 同样可由 profile 启动（MCP server 是宿主适配器的 stdio 子进程，继承宿主的进程环境块，操作员事后修改主机变量不会影响它），两者都在 profile 环境键允许列表内；未列入允许列表的键会被 profile 校验 fail-closed 拒绝。
 - `VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS`：CLI 重任务等待同一门的时间，默认 `30` 秒，限制为 `0` 至 `300` 秒；超时退出码为 `75`。
 - `VECTOR_LAKE_TOPOLOGY_WORKER_TIMEOUT_SECONDS`：Louvain 拓扑隔离进程超时，默认 `60` 秒，限制为 `5` 至 `300` 秒；失败时回退到确定性的 connected-components。
 - `VECTOR_LAKE_WAL_AUTOCHECKPOINT_PAGES`：每个可写 SQLite 连接的自动回写阈值，默认 `1000` 页；它在事务提交后生效，不限制单个大事务的峰值。

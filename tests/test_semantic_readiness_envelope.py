@@ -502,3 +502,133 @@ def test_memory_protocol_read_verbs_expose_the_same_readiness(monkeypatch):
     )
 
     assert all(item["semantic_readiness"] == readiness for item in responses)
+
+
+def test_recall_computes_one_envelope_and_does_not_embed_a_duplicate(monkeypatch):
+    """The response envelope is authoritative; the retrieval body stays clean."""
+    envelope = {
+        "contract_version": "vector-lake-semantic-readiness-envelope/v1",
+        "ready": False,
+        "status": "not_ready",
+        "issues": ["coverage"],
+        "warnings": [],
+        "results_are_not_accepted_facts": True,
+    }
+    calls = {"envelope": 0}
+
+    def fake_envelope(**_kwargs):
+        calls["envelope"] += 1
+        return dict(envelope)
+
+    monkeypatch.setattr(
+        memory_protocol, "get_semantic_readiness_envelope", fake_envelope
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "format_operational_memory_results",
+        lambda *_args, **_kwargs: "BASE RETRIEVAL RESULT",
+    )
+
+    response = memory_protocol.recall("query", mode="memory")
+
+    assert calls["envelope"] == 1
+    assert response["semantic_readiness"] == envelope
+    assert response["result"] == "BASE RETRIEVAL RESULT"
+    assert "<SemanticReadinessEnvelope>" not in response["result"]
+
+
+def test_direct_search_still_embeds_the_envelope(monkeypatch):
+    """Removing the recall duplicate must not change the search surface."""
+    monkeypatch.setattr(
+        tool_search,
+        "format_operational_memory_results",
+        lambda *_args, **_kwargs: "BASE RETRIEVAL RESULT",
+    )
+
+    payload = tool_search.search_vector_lake("query", mode="memory")
+    envelope, result = _read_text_envelope(payload)
+
+    assert result == "BASE RETRIEVAL RESULT"
+    assert envelope["results_are_not_accepted_facts"] is True
+
+
+def test_readiness_report_reuses_generation_bound_assessment(monkeypatch):
+    """The doctor/CLI readiness surface must not re-run the full scan."""
+    from vector_lake import tool_doctor
+
+    runtime_health._clear_semantic_readiness_envelope_cache_for_tests()
+    monkeypatch.setattr(
+        runtime_health,
+        "_semantic_readiness_generation_binding",
+        lambda _index_data=None: _binding("stable"),
+    )
+    calls = {"assessment": 0}
+
+    def fake_assessment(**_kwargs):
+        calls["assessment"] += 1
+        return _assessment(status="not_ready", issues=["coverage"])
+
+    monkeypatch.setattr(runtime_health, "assess_semantic_readiness", fake_assessment)
+
+    first = json.loads(tool_doctor.semantic_readiness_vector_lake())
+    second = json.loads(tool_doctor.semantic_readiness_vector_lake())
+
+    assert calls["assessment"] == 1
+    assert first == second
+    assert first["status"] == "not_ready"
+    assert first["issues"] == ["coverage"]
+    assert first["detail"]["critical_pending_governance"] == 2
+    # Raw assessment shape is preserved; no envelope wrapping is introduced.
+    assert "captured_generation" not in first
+    assert "results_are_not_accepted_facts" not in first
+
+
+def test_readiness_report_is_not_cached_across_generation_drift(monkeypatch):
+    """A generation change during the assessment must not be cached as current."""
+    from vector_lake import tool_doctor
+
+    runtime_health._clear_semantic_readiness_envelope_cache_for_tests()
+    state = {"token": "one", "assessments": 0}
+    monkeypatch.setattr(
+        runtime_health,
+        "_semantic_readiness_generation_binding",
+        lambda _index_data=None: _binding(state["token"]),
+    )
+
+    def fake_assessment(**_kwargs):
+        state["assessments"] += 1
+        state["token"] = "two" if state["assessments"] == 1 else "three"
+        return _assessment(status="not_ready", issues=["coverage"])
+
+    monkeypatch.setattr(runtime_health, "assess_semantic_readiness", fake_assessment)
+
+    tool_doctor.semantic_readiness_vector_lake()
+    tool_doctor.semantic_readiness_vector_lake()
+
+    assert state["assessments"] == 2
+
+
+def test_decision_scoped_readiness_stays_uncached(monkeypatch):
+    """Decision-scoped assessment answers a different question; no cache reuse."""
+    from vector_lake import tool_doctor
+
+    runtime_health._clear_semantic_readiness_envelope_cache_for_tests()
+    calls = {"scoped": 0, "global": 0}
+
+    def fake_scoped(*, decision_id=None, **_kwargs):
+        calls["scoped"] += 1
+        return {"ready": False, "status": "not_ready", "issues": [str(decision_id)]}
+
+    def fake_global(**_kwargs):
+        calls["global"] += 1
+        return _assessment(status="ready", issues=[])
+
+    monkeypatch.setattr(tool_doctor, "assess_semantic_readiness", fake_scoped)
+    monkeypatch.setattr(runtime_health, "get_semantic_readiness_assessment", fake_global)
+
+    scoped = json.loads(tool_doctor.semantic_readiness_vector_lake("decision-1"))
+    tool_doctor.semantic_readiness_vector_lake("decision-2")
+
+    assert calls["scoped"] == 2
+    assert calls["global"] == 0
+    assert scoped["issues"] == ["decision-1"]

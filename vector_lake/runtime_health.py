@@ -58,6 +58,12 @@ _SEMANTIC_READINESS_ENVELOPE_CACHE: dict[str, Any] = {
     "checked_at": 0.0,
     "envelope": None,
 }
+_SEMANTIC_READINESS_ASSESSMENT_LOCK = threading.Lock()
+_SEMANTIC_READINESS_ASSESSMENT_CACHE: dict[str, Any] = {
+    "fingerprint": None,
+    "checked_at": 0.0,
+    "assessment": None,
+}
 _WIKI_VERSION_CACHE: dict[
     str,
     tuple[tuple[int, int, int, int, int], str | None, str | None],
@@ -354,6 +360,11 @@ def _watchdog_component_health(
     components = status.get("components")
     component_map = components if isinstance(components, dict) else {}
     unhealthy_states = {"error", "halted", "stopped"}
+    # Distinct from ``unhealthy_states``: the worker is alive and idle, but it has
+    # stopped automatic progress because a data condition needs operator action.
+    # These components are reported through ``blocked_*`` so the reason is
+    # explicit instead of being collapsed into a generic worker fault.
+    blocked_states = {"reconcile_blocked"}
     profile_issues: list[str] = []
     profile_name = "legacy_full"
     profile = status.get("run_profile")
@@ -433,6 +444,9 @@ def _watchdog_component_health(
 
     unhealthy_required: list[str] = []
     unhealthy_optional: list[str] = []
+    blocked_required: list[str] = []
+    blocked_optional: list[str] = []
+    blocked_component_details: dict[str, str] = {}
     stale_required: list[str] = []
     stale_optional: list[str] = []
     paused_components: dict[str, str] = {}
@@ -468,7 +482,13 @@ def _watchdog_component_health(
             profile_name == "maintenance"
             and effective_status not in maintenance_operational_states
         )
-        if effective_status in unhealthy_states or nonoperational_maintenance:
+        if effective_status in blocked_states:
+            blocked_target = blocked_required if is_required else blocked_optional
+            blocked_target.append(component_name)
+            blocked_component_details[component_name] = str(
+                component.get("last_error") or component.get("current_action") or ""
+            )
+        elif effective_status in unhealthy_states or nonoperational_maintenance:
             target = unhealthy_required if is_required else unhealthy_optional
             target.append(component_name)
 
@@ -500,6 +520,9 @@ def _watchdog_component_health(
         "paused_components": paused_components,
         "unhealthy_required_components": sorted(unhealthy_required),
         "unhealthy_optional_components": sorted(unhealthy_optional),
+        "blocked_required_components": sorted(blocked_required),
+        "blocked_optional_components": sorted(blocked_optional),
+        "blocked_component_details": blocked_component_details,
         "stale_required_components": sorted(stale_required),
         "stale_optional_components": sorted(stale_optional),
         "missing_components": missing_components,
@@ -1053,6 +1076,11 @@ def _clear_semantic_readiness_envelope_cache_for_tests() -> None:
             _SEMANTIC_READINESS_ENVELOPE_CACHE.update(
                 {"fingerprint": None, "checked_at": 0.0, "envelope": None}
             )
+    with _SEMANTIC_READINESS_ASSESSMENT_LOCK:
+        with _CACHE_LOCK:
+            _SEMANTIC_READINESS_ASSESSMENT_CACHE.update(
+                {"fingerprint": None, "checked_at": 0.0, "assessment": None}
+            )
 
 
 def _schedule_semantic_readiness_refresh(
@@ -1203,6 +1231,77 @@ def get_semantic_readiness_envelope(
                 }
             )
         return envelope
+
+
+def get_semantic_readiness_assessment(
+    *,
+    cache_ttl_seconds: float = _SEMANTIC_READINESS_CACHE_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Return the raw readiness assessment, bound to the runtime generation.
+
+    This is the uncached ``assess_semantic_readiness`` result shape, so callers
+    that report it verbatim keep their existing output contract. It exists
+    purely to stop doctor-facing surfaces from re-running the full aggregate
+    assessment on every request.
+
+    Governance, write-gate and campaign paths must keep calling
+    ``assess_semantic_readiness`` directly; their freshness semantics are
+    deliberately not shared with this cache.
+
+    A generation change detected during the assessment returns the fresh
+    assessment without caching it, mirroring the envelope fail-closed rule:
+    never publish a stale snapshot as current.
+    """
+    try:
+        ttl_seconds = min(60.0, max(0.0, float(cache_ttl_seconds)))
+    except (TypeError, ValueError):
+        ttl_seconds = _SEMANTIC_READINESS_CACHE_TTL_SECONDS
+
+    with _SEMANTIC_READINESS_ASSESSMENT_LOCK:
+        try:
+            before = _semantic_readiness_generation_binding(None)
+        except Exception:
+            before = None
+
+        if before is not None:
+            now = time.monotonic()
+            with _CACHE_LOCK:
+                cached = _SEMANTIC_READINESS_ASSESSMENT_CACHE.get("assessment")
+                cached_fingerprint = _SEMANTIC_READINESS_ASSESSMENT_CACHE.get(
+                    "fingerprint"
+                )
+                checked_at = float(
+                    _SEMANTIC_READINESS_ASSESSMENT_CACHE.get("checked_at") or 0.0
+                )
+            if (
+                cached is not None
+                and cached_fingerprint == before.get("fingerprint")
+                and now - checked_at <= ttl_seconds
+            ):
+                return copy.deepcopy(cached)
+
+        assessment = assess_semantic_readiness(index_data=None)
+        if not isinstance(assessment, dict):
+            raise TypeError("semantic readiness assessment is not a mapping")
+
+        if before is None:
+            return assessment
+        try:
+            after = _semantic_readiness_generation_binding(None)
+        except Exception:
+            after = None
+        if after is None or after.get("fingerprint") != before.get("fingerprint"):
+            return assessment
+
+        with _CACHE_LOCK:
+            _SEMANTIC_READINESS_ASSESSMENT_CACHE.update(
+                {
+                    "fingerprint": after.get("fingerprint"),
+                    "checked_at": time.monotonic(),
+                    "assessment": copy.deepcopy(assessment),
+                }
+            )
+        return assessment
 
 
 def _wiki_cache_key(path: Path) -> str:
@@ -2070,6 +2169,28 @@ def assess_runtime_health(
                         f"{component_name}:"
                         f"{component_health['effective_statuses'][component_name]}"
                     )
+                detail["watchdog_blocked_components"] = component_health[
+                    "blocked_required_components"
+                ]
+                for component_name in component_health[
+                    "blocked_required_components"
+                ]:
+                    # Kept as an issue on purpose: an operator-gated data
+                    # condition must not be silently downgraded to healthy just
+                    # because it is not a worker crash.
+                    issues.append(
+                        "wiki_reconcile_blocked:"
+                        f"{component_name}:"
+                        f"{component_health['blocked_component_details'].get(component_name, '')}"
+                    )
+                for component_name in component_health[
+                    "blocked_optional_components"
+                ]:
+                    warnings.append(
+                        "watchdog_component_blocked:"
+                        f"{component_name}:"
+                        f"{component_health['blocked_component_details'].get(component_name, '')}"
+                    )
                 missing_components = component_health["missing_components"]
                 if missing_components:
                     missing_message = "watchdog_components_missing:" + ",".join(
@@ -2333,10 +2454,6 @@ def assess_runtime_health(
             "FROM mutation_outbox WHERE status IN ('pending', 'processing') "
             "ORDER BY id DESC"
         ).fetchall()
-        active_projection_intents = {}
-        for row in active_projection_rows:
-            page_key = Path(str(row["filename"])).stem
-            active_projection_intents.setdefault(page_key, row)
 
         wiki_content_drift: list[str] = []
         unreadable_wiki: list[str] = []
@@ -2347,24 +2464,11 @@ def assess_runtime_health(
             )
             for page_key in shared_wiki_keys
         }
-        managed_base_versions = {}
-        for page_key, row in active_projection_intents.items():
-            if page_key not in canonical_versions:
-                continue
-            if str(row["mutation_type"]) != "update" or row["payload_text"] is None:
-                continue
-            base_version = row["base_version"]
-            if base_version is None:
-                continue
-            try:
-                payload_version = governance_store.canonical_page_version_from_content(
-                    str(row["filename"]),
-                    str(row["payload_text"]),
-                )
-            except Exception:
-                continue
-            if payload_version == canonical_versions.get(page_key):
-                managed_base_versions[page_key] = str(base_version)
+        # Shared with the watchdog reconciliation scan so the two cannot disagree
+        # about which pages are legitimately mid-reconciliation.
+        managed_base_versions = governance_store.managed_projection_base_versions(
+            conn, canonical_versions
+        )
         active_wiki_paths = {
             _wiki_cache_key(wiki_paths[page_key]) for page_key in shared_wiki_keys
         }

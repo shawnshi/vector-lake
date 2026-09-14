@@ -36,7 +36,11 @@ from vector_lake.auto_ingest_runners.base import (
     RunnerRegistrationError,
 )
 from vector_lake.durability import durable_replace_file, sync_open_file
-from vector_lake.heavy_task_gate import HeavyTaskBusy, heavy_task
+from vector_lake.heavy_task_gate import (
+    HeavyTaskBusy,
+    background_gate_wait_seconds,
+    heavy_task,
+)
 from vector_lake.native_llm import peek_subagent_scratch_dir
 from vector_lake.purpose_contract import render_strategy_directive
 from vector_lake.raw_revision import (
@@ -410,52 +414,52 @@ def load_auto_ingest_config() -> AutoIngestConfig:
         )
     codex_executable = str(raw.get("codex_executable") or "")
     executable_path = Path(codex_executable)
-    if not executable_path.is_absolute():
+    if runner == "codex_exec" and not executable_path.is_absolute():
         raise ValueError(
             "auto_ingest_config_invalid:codex_executable_must_be_absolute"
         )
     runner_codex_home = str(raw.get("runner_codex_home") or "")
     runner_home_path = Path(runner_codex_home)
-    if not runner_home_path.is_absolute():
+    if runner == "codex_exec" and not runner_home_path.is_absolute():
         raise ValueError(
             "auto_ingest_config_invalid:runner_codex_home_must_be_absolute"
         )
     required_version = str(raw.get("required_codex_version") or "")
-    if not re.fullmatch(r"\d+\.\d+\.\d+", required_version):
+    if runner == "codex_exec" and not re.fullmatch(r"\d+\.\d+\.\d+", required_version):
         raise ValueError(
             "auto_ingest_config_invalid:required_codex_version_must_be_semver"
         )
     required_codex_sha256 = str(raw.get("required_codex_sha256") or "").lower()
-    if not _SHA256_PATTERN.fullmatch(required_codex_sha256):
+    if runner == "codex_exec" and not _SHA256_PATTERN.fullmatch(required_codex_sha256):
         raise ValueError(
             "auto_ingest_config_invalid:required_codex_sha256_must_be_sha256"
         )
     required_system_skills_sha256 = str(
         raw.get("required_system_skills_sha256") or ""
     ).lower()
-    if not _SHA256_PATTERN.fullmatch(required_system_skills_sha256):
+    if runner == "codex_exec" and not _SHA256_PATTERN.fullmatch(required_system_skills_sha256):
         raise ValueError(
             "auto_ingest_config_invalid:required_system_skills_sha256_must_be_sha256"
         )
     required_models_cache_sha256 = str(
         raw.get("required_models_cache_sha256") or ""
     ).lower()
-    if not _SHA256_PATTERN.fullmatch(required_models_cache_sha256):
+    if runner == "codex_exec" and not _SHA256_PATTERN.fullmatch(required_models_cache_sha256):
         raise ValueError(
             "auto_ingest_config_invalid:required_models_cache_sha256_must_be_sha256"
         )
     required_auth_identity_sha256 = str(
         raw.get("required_auth_identity_sha256") or ""
     ).lower()
-    if not _SHA256_PATTERN.fullmatch(required_auth_identity_sha256):
+    if runner == "codex_exec" and not _SHA256_PATTERN.fullmatch(required_auth_identity_sha256):
         raise ValueError(
             "auto_ingest_config_invalid:required_auth_identity_sha256_must_be_sha256"
         )
     model = str(raw.get("model") or "")
-    if not _MODEL_PATTERN.fullmatch(model):
+    if runner == "codex_exec" and not _MODEL_PATTERN.fullmatch(model):
         raise ValueError("auto_ingest_config_invalid:model_is_not_a_safe_identifier")
     reasoning_effort = str(raw.get("reasoning_effort") or "")
-    if reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+    if runner == "codex_exec" and reasoning_effort not in {"low", "medium", "high", "xhigh"}:
         raise ValueError("auto_ingest_config_invalid:reasoning_effort_is_invalid")
 
     config = AutoIngestConfig(
@@ -463,8 +467,8 @@ def load_auto_ingest_config() -> AutoIngestConfig:
         allow_model_processing_raw_text=allow_model_processing_raw_text,
         runner=runner,
         runner_options=dict(runner_options) if runner_options is not None else None,
-        codex_executable=str(executable_path),
-        runner_codex_home=str(runner_home_path),
+        codex_executable=str(executable_path) if codex_executable else "",
+        runner_codex_home=str(runner_home_path) if runner_codex_home else "",
         required_codex_version=required_version,
         required_codex_sha256=required_codex_sha256,
         required_system_skills_sha256=required_system_skills_sha256,
@@ -4195,7 +4199,7 @@ class AutoIngestController:
                 "projection",
                 "auto-ingest-generation-finalize",
                 origin="watchdog",
-                wait_timeout_seconds=0,
+                wait_timeout_seconds=background_gate_wait_seconds(),
                 warn_after_seconds=float(config.timeout_seconds + 300),
             ):
                 claim = _claim_one(config)

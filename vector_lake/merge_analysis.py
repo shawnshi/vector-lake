@@ -13,7 +13,10 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, TypeVar
 
+from vector_lake.claim_extractor import classify_non_claim_text
 
+
+_MERGE_MIN_MEANINGFUL_CHARS = 80
 _TYPE_PREFIX = re.compile(
     r"^(concept|vendor|institution|product|person|event|policy|standard|source|synthesis|system)[_-]+",
     re.IGNORECASE,
@@ -520,6 +523,29 @@ def _plural_equivalent(left_norm: str, right_norm: str) -> bool:
     return left_norm != right_norm and singular(left_norm) == singular(right_norm)
 
 
+def _meaningful_body_chars(body: str, *, floor: int = _MERGE_MIN_MEANINGFUL_CHARS) -> int:
+    """Count body text that is not generated maintenance prose.
+
+    The previous gate was ``"auto-generated stub" not in body``: a single
+    residual stub line left inside an enriched page disqualified that page from
+    winning a merge, even when it carried far more content than its duplicate.
+    Counting substance instead of grepping for a marker removes that trap while
+    preserving the original 80-character floor. Exits as soon as the floor is
+    met so the extra pass stays bounded on long pages.
+    """
+    chars = 0
+    for raw_line in str(body or "").splitlines():
+        line = raw_line.strip()
+        if not line or line[0] in "#>-" or line.startswith("<!--"):
+            continue
+        if classify_non_claim_text(line):
+            continue
+        chars += len(line)
+        if chars >= floor:
+            return chars
+    return chars
+
+
 def _canonical_rank(record: dict) -> tuple:
     entity = record["entity"]
     entity_type = record["effective_type"]
@@ -538,7 +564,9 @@ def _canonical_rank(record: dict) -> tuple:
     status_score = 3 if status == "active" else 2 if status == "draft" else 0
     page_key_score = int(bool(record["page_key"]) and "/" not in record["page_key"] and "\\" not in record["page_key"])
     body = record["body"]
-    non_stub_body = int(bool(body) and "auto-generated stub" not in body and len(body) >= 80)
+    non_stub_body = int(
+        bool(body) and _meaningful_body_chars(body) >= _MERGE_MIN_MEANINGFUL_CHARS
+    )
     source_score = min(len(record["sources"]), 5)
     inbound_score = int(entity.get("inbound_count") or entity.get("inlinks") or 0)
     return (

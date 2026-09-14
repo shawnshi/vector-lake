@@ -409,6 +409,9 @@ def test_overflow_scan_finds_only_canonical_page_add_drift_and_delete(
         ],
         "errors": [],
         "total_drift": 3,
+        # Pages whose Markdown matches their managed base version are reported as
+        # mid-reconciliation rather than as repairable drift.
+        "excluded_managed": 0,
     }
 
 
@@ -1811,3 +1814,54 @@ def test_operational_memory_attestation_interval_zero_disables_deep_scan(monkeyp
 
     assert result["attested"] is False
     assert gates == []
+
+
+def test_overflow_scan_excludes_pages_with_an_in_flight_managed_write(
+    isolated_memory,
+    monkeypatch,
+):
+    """A page whose Markdown matches its managed base version is not repairable drift.
+
+    The runtime-health model classifies such pages as pending reconciliation; the
+    watchdog must use the same classification or it rewrites pages the durable
+    outbox is already writing (and, once a missing projection became retirable, it
+    could also delete them).
+    """
+    from vector_lake import db_store, governance_store
+
+    db_store.init_db()
+    wiki_dir = isolated_memory / "wiki"
+    (wiki_dir / "Concept_In-Flight.md").write_text("inflight body", encoding="utf-8")
+    (wiki_dir / "Concept_Real-Drift.md").write_text("drifted body", encoding="utf-8")
+
+    monkeypatch.setattr(
+        governance_store,
+        "canonical_page_versions",
+        lambda page_keys=None: {
+            "Concept_In-Flight": "canonical-new",
+            "Concept_Real-Drift": "canonical-real",
+        },
+    )
+
+    def content_version(_filename, content):
+        return {
+            "inflight body": "managed-base",
+            "drifted body": "unrelated",
+        }[content]
+
+    monkeypatch.setattr(
+        governance_store,
+        "canonical_page_version_from_content",
+        content_version,
+    )
+    monkeypatch.setattr(
+        governance_store,
+        "managed_projection_base_versions",
+        lambda _connection, _canonical: {"Concept_In-Flight": "managed-base"},
+    )
+
+    scan = _scan_wiki_reconcile_plan(limit=25)
+
+    assert scan["candidates"] == ["Concept_Real-Drift.md"]
+    assert scan["total_drift"] == 1
+    assert scan["excluded_managed"] == 1

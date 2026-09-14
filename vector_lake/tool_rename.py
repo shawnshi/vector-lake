@@ -17,6 +17,36 @@ from vector_lake.wiki_utils import (
 )
 
 
+def _canonical_entity_for_page_key(page_key: str) -> dict | None:
+    """Return one canonical entity record by page key, or ``None`` when absent.
+
+    Read failures are not converted into "does not exist": a database error must
+    surface rather than be reported as a missing entity.
+    """
+    from vector_lake.tool_projection import _canonical_entity_by_page_key
+
+    if not get_db_path().exists():
+        return None
+    return _canonical_entity_by_page_key(page_key)
+
+
+def _frontmatter_from_entity_for_rename(entity: dict) -> dict:
+    """Build projection frontmatter that carries the canonical identity forward.
+
+    ``_frontmatter_from_entity`` writes ``id`` only.  The extractor derives
+    ``entity_id`` from the frontmatter first and falls back to a page-key hash, so
+    the canonical ``entity_id`` must be carried explicitly or a rename would mint a
+    new identity for an existing page.
+    """
+    from vector_lake.tool_projection import _frontmatter_from_entity
+
+    frontmatter = _frontmatter_from_entity(entity)
+    entity_id = str(entity.get("entity_id") or "").strip()
+    if entity_id:
+        frontmatter["entity_id"] = entity_id
+    return frontmatter
+
+
 def rename_vector_lake_entity(
     old_name: str, new_name: str, dry_run: bool = True
 ) -> str:
@@ -36,11 +66,20 @@ def rename_vector_lake_entity(
     ]
     if len(matches) > 1:
         return f"Error: Old entity '{old_name}' is ambiguous."
+    canonical_source: dict | None = None
     if matches:
         old_path = matches[0]
         old_name = old_path.name
     elif not old_path.exists():
-        return f"Error: Old entity '{old_name}' does not exist."
+        # A canonical row can outlive its Markdown projection: the page name may
+        # predate the current filename contract, and the materialize path
+        # deliberately refuses to *create* such a name.  Rebuilding the source from
+        # canonical lets the same retire/create batch legalize the name instead of
+        # leaving the page permanently unrepairable.  It is the same single code
+        # path, not a second rename implementation.
+        canonical_source = _canonical_entity_for_page_key(old_name[:-3])
+        if not canonical_source:
+            return f"Error: Old entity '{old_name}' does not exist."
 
     normalized_new_name = normalize_entity_name(new_name[:-3]) + ".md"
     new_path = (wiki_dir / normalized_new_name).resolve()
@@ -49,10 +88,29 @@ def rename_vector_lake_entity(
     if new_path.exists():
         return f"Error: Target entity '{normalized_new_name}' already exists. Use merge instead."
 
-    old_bytes = old_path.read_bytes()
-    old_projection_hash = hashlib.sha256(old_bytes).hexdigest()
-    old_content = normalize_semantic_text(old_bytes.decode("utf-8"))
-    frontmatter, body = split_frontmatter(old_content)
+    if canonical_source is not None:
+        # No on-disk projection to hash, so the retire leg settles idempotently
+        # against the missing path (the delete gate permits that for exactly this
+        # case).  ``entity_id`` must be carried in the frontmatter because the
+        # extractor derives identity from it and would otherwise mint a new one
+        # from the destination filename.  This content is re-parsed immediately
+        # below and re-serialised with the destination key, so its intermediate
+        # formatting does not need to match any stored version -- the create leg
+        # becomes the new canonical baseline by construction.
+        old_projection_hash = ""
+        from vector_lake.tool_projection import _body_from_entity
+
+        frontmatter = _frontmatter_from_entity_for_rename(canonical_source)
+        synthesized = (
+            f"---\n{yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)}"
+            f"---\n{_body_from_entity(canonical_source, frontmatter)}"
+        )
+        frontmatter, body = split_frontmatter(synthesized)
+    else:
+        old_bytes = old_path.read_bytes()
+        old_projection_hash = hashlib.sha256(old_bytes).hexdigest()
+        old_content = normalize_semantic_text(old_bytes.decode("utf-8"))
+        frontmatter, body = split_frontmatter(old_content)
     preserved_entity_id = str(frontmatter.get("entity_id") or "").strip()
     if not preserved_entity_id and get_db_path().exists():
         try:
@@ -147,6 +205,18 @@ def rename_vector_lake_entity(
     try:
         execute_mutation_batch(
             mutations,
+            # The canonical-only case is a bounded repair of the projection itself.
+            # It must use the ``schema`` channel, because the full write gate is
+            # blocked by exactly the inconsistency being repaired
+            # (``write_projection_drift: missing_wiki=1``): the gate and the repair
+            # would otherwise deadlock, which is how such a page could never be
+            # legalized by anyone including an operator.  ``schema`` is the
+            # documented bounded-repair channel; the destination name is still
+            # checked against the filename contract explicitly, and the retire leg
+            # keeps every delete gate.
+            validation_mode=(
+                "schema" if canonical_source is not None else "full"
+            ),
             # The destination page carries the already-reviewed content of the page
             # being retired, so it is validated structurally rather than re-audited
             # against the current evidence contract (see
