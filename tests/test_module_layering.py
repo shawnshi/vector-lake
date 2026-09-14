@@ -116,19 +116,21 @@ def _layer_of(module: str) -> str | None:
     return None
 
 
-# Frozen on 2026-09-14: 43 intra-package edges violate the order above. Each entry
+# Frozen on 2026-09-14: 44 intra-package edges violate the order above. Each entry
 # is a P3 work item; delete the line when the edge is gone.
 #
-# This number is the third one measured. The audit said 38, then 39, and both were
-# wrong for the same reason: module names were truncated to their top level, which
-# hid auto_ingest_worker -> auto_ingest_runners.base and, once dotted names were
-# kept, four more edges (governance_store/provenance -> governance_metrics,
-# provenance_retention -> tool_claim_provenance, restore_snapshot ->
-# tool_projection). The lesson is in the gate itself: resolve imports to real
-# modules, never to symbol names or top-level prefixes.
+# This number is the fourth one measured. The audit said 38; each re-measurement
+# found the previous one blind to something, because the gate is only as good as
+# its import resolution:
+#   38 -> 39  dotted names were truncated to their top level, hiding
+#             auto_ingest_worker -> auto_ingest_runners.base
+#   39 -> 43  targets were not resolved to real modules, hiding four edges
+#   43 -> 44  relative imports (from .mod import x) were skipped entirely
+# The gate now resolves imports to real modules and handles relative form.
 ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
-        # storage -> domain (10): mostly pure helpers living one layer too high.
+        # storage -> domain (11)
+        ("db_store", "memory_search_normalization"),
         ("db_store", "native_llm"),
         ("db_store", "search_projection_contract"),
         ("governance_store", "claim_extractor"),
@@ -184,7 +186,7 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("wiki_utils", "mutation_coordinator"),
     }
 )
-assert len(ALLOWED_BACKWARD_EDGES) == 43, len(ALLOWED_BACKWARD_EDGES)
+assert len(ALLOWED_BACKWARD_EDGES) == 44, len(ALLOWED_BACKWARD_EDGES)
 
 # Frozen on 2026-09-14, re-measured once imports resolved to real modules.
 # Must fall as P3 batches land.
@@ -225,12 +227,25 @@ def _resolve_target(candidate: str, package: str, known: set[str]) -> str:
     return candidate
 
 
+def _relative_package(module: str, level: int) -> str:
+    """Package a relative import climbs to.
+
+    For a module ``p1...pn``, ``from .`` (level 1) means ``p1...p(n-1)`` and
+    ``from ..`` (level 2) means ``p1...p(n-2)``.
+    """
+    parts = module.split(".")
+    keep = parts[: len(parts) - level] if level <= len(parts) else []
+    return ".".join(keep)
+
+
 def _imports() -> dict[str, set[str]]:
     """Intra-package imports, including imports deferred inside function bodies.
 
     Targets are module names, not symbols, and stay fully qualified: truncating to
     the top-level package name would let ``auto_ingest_runners.base`` pass as
-    ``auto_ingest_runners`` and escape the declared order.
+    ``auto_ingest_runners`` and escape the declared order. Relative imports are
+    resolved too -- skipping them left the gate blind to
+    ``from .memory_search_normalization import casefold_text``.
     """
     known = _known_modules()
     graph: dict[str, set[str]] = {}
@@ -246,10 +261,16 @@ def _imports() -> dict[str, set[str]]:
             if isinstance(node, ast.ImportFrom):
                 # Do not shadow ``module``: it still holds this file's own name,
                 # which keys the graph.
-                imported_from = node.module or ""
-                if not imported_from.startswith("vector_lake"):
+                if node.level:
+                    package = _relative_package(module, node.level)
+                    if node.module:
+                        package = (
+                            f"{package}.{node.module}" if package else node.module
+                        )
+                elif (node.module or "").startswith("vector_lake"):
+                    package = (node.module or "").removeprefix("vector_lake").lstrip(".")
+                else:
                     continue
-                package = imported_from.removeprefix("vector_lake").lstrip(".")
                 if package:
                     targets.add(_resolve_target(package, "", known))
                 for alias in node.names:
