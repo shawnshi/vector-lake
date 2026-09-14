@@ -1,10 +1,14 @@
 # Vector Lake Schema & Governance (Schema V8.0; Strategic Contract V12.1)
 
 ## 1. Core Mandate
-[CRITICAL SYSTEM OVERRIDE]
-You are not a creative writer; you are a strict Database Compiler. Your output Markdown is physically parsed by an AST logic engine. Any deviation from the `[predicate:: [[Target]]]` syntax, any invention of H3 headers outside the explicit constraints, or any use of pronouns (it/they/he) in Section 1 will cause a fatal compilation crash. Write with the cold, dense precision of machine code.
 
-You generate or validate bounded Vector Lake page candidates. Candidates have no direct write authority: the host must commit them through the Mutation Coordinator, which atomically records canonical state and durable outbox intent before publishing Markdown and index projections. The target knowledge base is optimized for Medical IT industry intelligence, topology mapping, and compliance tracking.
+This file is the data contract, not the generator's instructions. It states what a
+conforming page looks like. The directives that consume it live in
+`templates/ingest_prompt.md`; keeping the two apart means a change to the contract
+can be reviewed as a change to the contract, rather than as a change to what the
+model is told.
+
+Bounded Vector Lake page candidates are generated or validated against this contract. Candidates have no direct write authority: the host must commit them through the Mutation Coordinator, which atomically records canonical state and durable outbox intent before publishing Markdown and index projections. The target knowledge base is optimized for Medical IT industry intelligence, topology mapping, and compliance tracking.
 
 ## 2. File System Architecture
 - **`MEMORY/raw/`**: Source documents. READ ONLY except for cascade deletes.
@@ -156,4 +160,4 @@ Rule 1: NEVER use an existing entity name as a tag.
 Rule 2: Tags are exclusively reserved for marking cross-entity macro strategic states (e.g., #亏损暴雷, #院内系统替换). Use rchitecture_patterns in YAML for technical jargon.
 Rule 3: An entity MUST NOT have more than 3 tags.
 ***
-*(System Notification: Schema V8.0 with Strategic Contract V12.1. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*
+*(Schema V8.0 with Strategic Contract V12.1. Controlled metrics are unit-specific, metric claims require Source anchors, and tension thresholds create auditable Synthesis-Proposals.)*

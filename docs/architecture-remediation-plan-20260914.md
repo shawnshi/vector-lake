@@ -21,6 +21,9 @@
     - 验证：ruff `E4,E7,E9,F` clean、`compileall` clean、pytest **2989 passed / 2 skipped / 320 subtests**（+18 为新增不变量测试）。
   - `2026-09-14` 停机前盘点实测（已修正先前误记）：`.meta` 实际为 **3.81 GiB / 76 文件**——先前 `du -sh .meta` 报 7.5 GB **不是** git-bash 重复计数（那是错误解释，已撤回），而是一次真实的瞬时占用：`.meta/backups/` 下 **2,782 个备份文件（3.9 GB）在 18:57 前后被按龄保留策略删除**，删除过程中的 18:56 读数 = 3.6 GB 库 + 3.9 GB 备份 = 7.5 GB，删除完成后的 19:00 读数 = 3.9 GB（仅库）。证据：`backups/` mtime `18:57` 且现为空；`storage_growth.json` 的 18:04 样本仍记 `backup_bytes 3,899,415,957 / 2,782 files`；`tool_backup_retention._apply_retention_plan` 具备 unlink 目录能力。
   - `2026-09-14` **备份状态需在开窗前人工确认（风险）**：`doctor_vector_lake(mode='quick')` 的**生效策略**为 `maintenance_backup_mode: "skip"`（非 `runtime_profiles.json` 声明的 `full`），且两个 backup root 均为 `0 文件 / 0 字节`——**当前系统没有任何备份**。缓解事实：`backup_capacity.maintenance_backup_mode()` 的文档字面语义说明 `skip` "never reaches the operations that read the backup back as a verified input: those call `tool_projection.require_maintenance_backup` and behave identically under either mode"，即**迁移自身的 pre-DDL 备份不受 `skip` 影响**。容量侧不阻塞：quota 12 GiB / `enforce`，磁盘空闲 3.05 TiB，要求保留 ≥ 409 GB，均满足。
+  - `2026-09-14` **P5 已执行（规范与指令分离）**。执行中发现实情比审计描述更具体：`[CRITICAL SYSTEM OVERRIDE]` 指令块在 `schema.md:4-5` 与 `templates/ingest_prompt.md:49-50` **近乎逐字重复**，而两者经 `{{schema_content}}` 与模板本体**同时注入同一条提示**——所以不只“规范兼写指令”，而是**同一条指令被注入两次**。
+    - 做法（保持语义中性，不减少注入内容）：指令仅保留在模板（其位置本就属于它）；模板补上 `outside the explicit constraints` 这半句，以保全原先仅在 `schema.md` 里存在的更严表述，确保无信息丢失；`schema.md` 的 `## 1. Core Mandate` 改为声明式，并说明本文件是数据契约而非生成器指令；`schema.md` 末段去掉了 `(System Notification: …)` 这种伪权威框构。
+    - 验证：新增 `test_injected_schema_contract_carries_no_generator_instructions`，并做**反证**——向 `schema.md` 重新注入 `[CRITICAL SYSTEM OVERRIDE]` 后测试确实失败，移除后通过。全量：pytest **2991 passed / 2 skipped / 320 subtests**。
 - **依据**: 2026-09-14 只读架构审计（未落盘为文档；本文件所有数字均为该次审计中在 `~/MEMORY/wiki/.meta/vector_lake.db` 与源码 AST 上的实测值，末尾附复现命令）
 - **基线**: 源码 `f08421b` + 工作树 35 个未提交改动
 - **版本目标**: 11.20.0 → 11.21.0
@@ -283,7 +286,7 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 
 ---
 
-### P5 — 规范与指令分离
+### P5 — 规范与指令分离（✅ 已执行）
 
 **问题（已验证）**：`tool_ingest.py:4280-4296` 把 `schema.md` + `SCHEMA_CATEGORIES.md` 读入，经 `tool_ingest.py:4320` `{{schema_content}}` 注入生成器提示；而 `schema.md:4` 的字面内容是 `[CRITICAL SYSTEM OVERRIDE]`。同一拼装体还包含 `{{index_summary}}`（模型自己写过的页面标题/摘要）与不可信 raw 文本，接收方持有 `finalize_ingest` 写权限。
 

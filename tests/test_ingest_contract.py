@@ -8392,3 +8392,34 @@ def test_provenance_only_reopen_is_gated_on_page_evidence_not_failure_text(
     assert set(selected) == {"a" * 32, "c" * 32, "d" * 32}
     # Selection is sorted and deterministic.
     assert selected == sorted(selected)
+
+
+def test_injected_schema_contract_carries_no_generator_instructions(isolated_memory):
+    """The data contract must not double as the generator's instructions.
+
+    ``schema.md`` is concatenated into the ingest prompt as ``{{schema_content}}``
+    and shipped to an agent that holds ``finalize_ingest`` write authority, in the
+    same context as untrusted raw text and as the model's own earlier page titles.
+    It used to open with ``[CRITICAL SYSTEM OVERRIDE]`` plus a near-verbatim copy
+    of the directive that ``templates/ingest_prompt.md`` already carries, so the
+    same instruction was injected twice and a document was carrying instruction
+    authority. Instruction prose belongs in the template only.
+    """
+    db_store.init_db()
+    context = tool_ingest._prepare_ingest_instruction_context()
+    spec = context.schema_content
+
+    for marker in (
+        "CRITICAL SYSTEM OVERRIDE",
+        "[CRITICAL",
+        "You are not a creative writer",
+        "System Notification",
+    ):
+        assert marker not in spec, f"{marker!r} leaked into the injected contract"
+
+    # The prompt is still a prompt: exactly one copy of the directive, and nothing
+    # was lost when the duplicate was removed from the contract.
+    template = context.prompt_template
+    assert template.count("[CRITICAL SYSTEM OVERRIDE]") == 1
+    assert "You are not a creative writer" in template
+    assert "outside the explicit constraints" in template
