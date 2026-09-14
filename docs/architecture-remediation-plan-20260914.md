@@ -6,7 +6,8 @@
   - `2026-09-14` 作者**接受 P2 的跨库原子性代价**：规范写入与读模型发布不再共享同一 SQLite 事务，转为显式发布协议。P2 因此解除阻塞，但仍按"最小表先验证"顺序执行。
   - `2026-09-14` **更正审计自身的一处误报**：原判 "`schema.md` `Schema V8.0` 与 `_SCHEMA_VERSION = 9` 漂移" **不成立**。二者是独立版本轴：`user_version` 是 SQLite 存储 schema，`Canonical governance schema 8.0` 是 `schema.md` 文档自身的版本（代码中不存在对应常量）。README 该表在两个轴上各自自洽。P0.1 范围据此收窄（见下）。
   - `2026-09-14` 作者**确认停机窗口**。实际执行时发现**该窗口对 P1 的完整性目标不再必要**（见 P1 机制变更），因此**未开启窗口、未触碰活库**。保留的、真正需要窗口的只有两项可选动作：`entities.ttl`/`decay_weight` 的 `DROP COLUMN`（破坏性 DDL），以及打开 `foreign_keys`（需先测代码路径）。
-  - `2026-09-14` 停机前盘点实测：写入者仅 `watchdog_sync.py`（PID 38968，心跳 8 秒前）；**不存在常驻 MCP server 进程**，它由宿主按需拉起——因此窗口期任何 MCP 工具调用（包括我自己）都会拉起一个写入者，这是窗口最大的隐性危险。`.meta` 实际为 **3.81 GiB / 76 文件**（`vector_lake.db` 3.6 GB + `embeddings.pkl` 271 MB）；先前 `du -sh .meta` 报 7.5 GB 是 git-bash 重复计数，已更正。**`backups/` 目录为空（0 项）但 mtime 为 18:57**——维护备份的实际落点与是否成功**未验证**，开窗之前必须查清。
+  - `2026-09-14` 停机前盘点实测（已修正先前误记）：`.meta` 实际为 **3.81 GiB / 76 文件**——先前 `du -sh .meta` 报 7.5 GB **不是** git-bash 重复计数（那是错误解释，已撤回），而是一次真实的瞬时占用：`.meta/backups/` 下 **2,782 个备份文件（3.9 GB）在 18:57 前后被按龄保留策略删除**，删除过程中的 18:56 读数 = 3.6 GB 库 + 3.9 GB 备份 = 7.5 GB，删除完成后的 19:00 读数 = 3.9 GB（仅库）。证据：`backups/` mtime `18:57` 且现为空；`storage_growth.json` 的 18:04 样本仍记 `backup_bytes 3,899,415,957 / 2,782 files`；`tool_backup_retention._apply_retention_plan` 具备 unlink 目录能力。
+  - `2026-09-14` **备份状态需在开窗前人工确认（风险）**：`doctor_vector_lake(mode='quick')` 的**生效策略**为 `maintenance_backup_mode: "skip"`（非 `runtime_profiles.json` 声明的 `full`），且两个 backup root 均为 `0 文件 / 0 字节`——**当前系统没有任何备份**。缓解事实：`backup_capacity.maintenance_backup_mode()` 的文档字面语义说明 `skip` "never reaches the operations that read the backup back as a verified input: those call `tool_projection.require_maintenance_backup` and behave identically under either mode"，即**迁移自身的 pre-DDL 备份不受 `skip` 影响**。容量侧不阻塞：quota 12 GiB / `enforce`，磁盘空闲 3.05 TiB，要求保留 ≥ 409 GB，均满足。
 - **依据**: 2026-09-14 只读架构审计（未落盘为文档；本文件所有数字均为该次审计中在 `~/MEMORY/wiki/.meta/vector_lake.db` 与源码 AST 上的实测值，末尾附复现命令）
 - **基线**: 源码 `f08421b` + 工作树 35 个未提交改动
 - **版本目标**: 11.20.0 → 11.21.0
@@ -366,6 +367,7 @@ python benchmarks/corpus_scale_benchmark.py --workspace . --nodes 10000 \
 | 规范库 schema 被读侧驱动的版本数 | v6,v7,v8,v9（**4 个**） | 0 |
 | 图投影截断可见性 | 2,500/321,520 无标记 | manifest 显式声明 |
 | 派生表驻留规范库 | 12 张 | 0 |
+| **投影对象库垃圾占比** | **已实测（修正原先的 UNVERIFIED）：扫描 6.28 GB 中可达仅 99.6 MB，孤儿 6.18 GB → 至少 98.4% 是垃圾**；且扫描本身在 200,000 文件处截断（`projection_object_file_limit_exceeded`，`scan_complete: false`），真实孤儿量更大 | 由 GC 回收（当前 `dry_run=True` 为默认） |
 | 契约文档与源码一致 | `INGEST_CONTRACT_VERSION` 表内 1 处 + 正文 5 处陈旧（`schema.md` 版本号经复核**不是**漂移） | 由测试强制一致 |
 
 **注意**：本计划**不改变** `mutation_outbox` 保留 27,643 条 completed（9 周）导致的库体积增长，也不改测试/源码 LOC 比（84,711 : 93,463）。两者都是独立问题，建议单独决策，不混入本计划以免扩大爆炸半径。
