@@ -29,6 +29,15 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "vector_lake"
 
 # Bottom-up. A module may only import from its own layer or from a layer below it.
+#
+# Placement rule applied here: a module with no intra-package imports cannot create
+# an upward dependency, so it belongs in the bottom layer; and a module's layer must
+# be at least as high as its own dependencies. ``memory_search_normalization``,
+# ``search_projection_contract``, ``source_references`` and
+# ``operational_memory_contract`` are dependency-free leaf contracts, and
+# ``decision_registry`` imports db_store, so it cannot sit below storage. Treating
+# these as domain modules made seven edges look like coupling when they were only my
+# map being wrong.
 LAYERS: dict[str, set[str]] = {
     "base": {
         "runtime_paths",
@@ -38,6 +47,10 @@ LAYERS: dict[str, set[str]] = {
         "cancellation",
         "memory_protocol",
         "tokenizer_runtime",
+        "memory_search_normalization",
+        "search_projection_contract",
+        "source_references",
+        "operational_memory_contract",
     },
     "storage": {
         "db_store",
@@ -46,6 +59,7 @@ LAYERS: dict[str, set[str]] = {
         "projection_format_v2",
         "raw_revision",
         "storage_growth",
+        "decision_registry",
     },
     "domain": {
         "schema_validator",
@@ -55,17 +69,12 @@ LAYERS: dict[str, set[str]] = {
         "semantic_merge",
         "merge_analysis",
         "timeline_semantics",
-        "source_references",
         "quality_registry",
-        "decision_registry",
         "evidence_foundation",
         "provenance",
         "provenance_retention",
-        "search_projection_contract",
-        "operational_memory_contract",
         "raw_scrub_contract",
         "skeleton_parser",
-        "memory_search_normalization",
         "index_snapshot",
         "defense_hook",
         "retrieval_benchmark",
@@ -127,18 +136,46 @@ def _layer_of(module: str) -> str | None:
 #   44 -> 43  P3.2 batch 1 moved version_family_id to the base layer
 ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
-        # storage -> domain (11)
-        ("db_store", "memory_search_normalization"),
+        # base -> derived
+        ("memory_protocol", "indexer"),
+        ("memory_protocol", "runtime_health"),
+        # base -> domain
+        ("wiki_utils", "defense_hook"),
+        ("wiki_utils", "schema_validator"),
+        # base -> handler
+        ("memory_protocol", "tool_memory"),
+        ("memory_protocol", "tool_query"),
+        ("memory_protocol", "tool_search"),
+        # base -> orchestration
+        ("wiki_utils", "mutation_coordinator"),
+        # storage -> derived
+        ("db_store", "backup_capacity"),
+        ("governance_store", "governance_metrics"),
+        ("storage_growth", "backup_capacity"),
+        # storage -> domain
         ("db_store", "native_llm"),
-        ("db_store", "search_projection_contract"),
         ("governance_store", "claim_extractor"),
-        ("governance_store", "decision_registry"),
-        ("governance_store", "memory_search_normalization"),
-        ("governance_store", "operational_memory_contract"),
         ("governance_store", "provenance_retention"),
-        ("governance_store", "source_references"),
-        ("projection_format_v2", "search_projection_contract"),
-        # orchestration -> handler (6)
+        # storage -> handler
+        ("db_store", "tool_ingest"),
+        ("db_store", "tool_timeline"),
+        ("governance_store", "tool_timeline"),
+        # domain -> derived
+        ("claim_assessment", "governance_metrics"),
+        ("provenance", "governance_metrics"),
+        ("provenance_retention", "governance_metrics"),
+        ("schema_validator", "indexer"),
+        # domain -> handler
+        ("provenance_retention", "tool_claim_provenance"),
+        ("retrieval_benchmark", "tool_search"),
+        # derived -> handler
+        ("restore_snapshot", "tool_projection"),
+        ("runtime_health", "tool_auto_ingest"),
+        ("runtime_health", "tool_gc"),
+        ("runtime_health", "tool_timeline"),
+        # derived -> orchestration
+        ("runtime_health", "watchdog_status"),
+        # orchestration -> handler
         ("auto_ingest_worker", "auto_ingest_runners.base"),
         ("auto_ingest_worker", "tool_ingest"),
         ("ingest_worker", "tool_ingest"),
@@ -146,44 +183,11 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("watchdog_app", "tool_governance_maintenance"),
         ("watchdog_app", "tool_ingest"),
         ("watchdog_app", "tool_lint"),
-        # storage -> handler (3)
-        ("db_store", "tool_ingest"),
-        ("db_store", "tool_timeline"),
-        ("governance_store", "tool_timeline"),
-        # domain -> derived (3)
-        ("claim_assessment", "governance_metrics"),
-        ("provenance_retention", "governance_metrics"),
-        ("schema_validator", "indexer"),
-        # derived -> handler (3)
-        ("runtime_health", "tool_auto_ingest"),
-        ("runtime_health", "tool_gc"),
-        ("runtime_health", "tool_timeline"),
-        # base -> handler (3)
-        ("memory_protocol", "tool_memory"),
-        ("memory_protocol", "tool_query"),
-        ("memory_protocol", "tool_search"),
-        # storage -> derived (2)
-        ("db_store", "backup_capacity"),
-        ("storage_growth", "backup_capacity"),
-        # base -> derived (2)
-        ("memory_protocol", "indexer"),
-        ("memory_protocol", "runtime_health"),
-        # base -> domain (2)
-        ("wiki_utils", "defense_hook"),
-        ("wiki_utils", "schema_validator"),
-        # found only after imports were resolved to real modules (storage -> derived)
-        ("governance_store", "governance_metrics"),
-        ("provenance", "governance_metrics"),
-        ("provenance_retention", "tool_claim_provenance"),
-        ("restore_snapshot", "tool_projection"),
-        # singletons
-        ("retrieval_benchmark", "tool_search"),
-        ("runtime_health", "watchdog_status"),
+        # handler -> surface
         ("tool_doctor", "mcp_server"),
-        ("wiki_utils", "mutation_coordinator"),
     }
 )
-assert len(ALLOWED_BACKWARD_EDGES) == 43, len(ALLOWED_BACKWARD_EDGES)
+assert len(ALLOWED_BACKWARD_EDGES) == 36, len(ALLOWED_BACKWARD_EDGES)
 
 # Frozen on 2026-09-14. Must fall as P3 batches land.
 #
