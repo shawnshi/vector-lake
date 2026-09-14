@@ -45,7 +45,6 @@ LAYERS: dict[str, set[str]] = {
         "yaml_utils",
         "durability",
         "cancellation",
-        "memory_protocol",
         "tokenizer_runtime",
         "memory_search_normalization",
         "search_projection_contract",
@@ -105,6 +104,10 @@ LAYERS: dict[str, set[str]] = {
 HANDLER_PREFIXES = ("tool_",)
 HANDLER_EXTRAS = {
     "governance_service",
+    # An agent-facing facade over the handler layer: it composes recall/remember/
+    # entity/synthesize from tool_search, tool_memory and tool_query, and only
+    # mcp_server imports it. It cannot sit in base while depending on handlers.
+    "memory_protocol",
     "auto_ingest_runners.base",
     "auto_ingest_runners.codex_exec",
     "auto_ingest_runners.host_relay",
@@ -136,16 +139,9 @@ def _layer_of(module: str) -> str | None:
 #   44 -> 43  P3.2 batch 1 moved version_family_id to the base layer
 ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
-        # base -> derived
-        ("memory_protocol", "indexer"),
-        ("memory_protocol", "runtime_health"),
         # base -> domain
         ("wiki_utils", "defense_hook"),
         ("wiki_utils", "schema_validator"),
-        # base -> handler
-        ("memory_protocol", "tool_memory"),
-        ("memory_protocol", "tool_query"),
-        ("memory_protocol", "tool_search"),
         # base -> orchestration
         ("wiki_utils", "mutation_coordinator"),
         # storage -> derived
