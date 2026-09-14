@@ -297,6 +297,27 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 
 **为什么必须先于 P4**：现在拆分 `db_store`（13,059 行 / 271 顶层函数）会立刻产生新的环。断环是拆分的先决条件。
 
+#### P3.2 侦察：`-> tool_*` 的 14 条边（只读，逐符号依赖闭包）
+
+对 `tool_ingest`（6861 行）中编排层导入的 12 个符号逐个算了**模块级依赖闭包**。结果把工作分成了两类，分界线很清楚：
+
+| 消费方 | 导入符号 | 是否存在不可搬的重符号 | 结论 |
+|---|---|---|---|
+| `db_store` | 1 | 无 | **可清**（清掉即 -1 边） |
+| `auto_ingest_worker` | 6 | `finalize_ingest_strict` 闭包 **46** 个 | **不可清** |
+| `ingest_worker` | 4 | `requeue_legacy_ingest_jobs` 闭包 **30** 个 | **不可清** |
+| `watchdog_app` | 6 | `prepare_ingest_batch` 闭包 **45** 个 | **不可清** |
+
+**自包含（0 连带）**：`INGEST_CONTRACT_VERSION`、`FULL_SCAN_COMPLETE_TOKEN`、`IngestFinalizationInfrastructureError`、`process_ingest_task_cleanup`、`is_private_diary_path`、`_load_ingest_config`。
+**轻连带（≤3）**：`get_ingest_target_directories`(→`_load_ingest_config`)、`_raw_full_scan_scrub_days`(→3 常量)、`_auto_source_page`(→3 私有助手)。
+**重连带**：`finalize_ingest_strict`、`prepare_ingest_batch`、`requeue_legacy_ingest_jobs` —— 这三者的闭包并集为 **72 个不同符号**。
+
+**关键结论**：那三个重符号不是“放错层的助手”，它们**就是 ingest 引擎本体**。要清掉三条编排层→`tool_ingest` 边，必须把 `tool_ingest` 拆成“引擎模块（下层）+ 薄适配器（handler）”，即 **P4.1 类工作，不是 P3.2 的批量修正**。因此：
+- **14 条 `-> tool_*` 边中只有 1 条（`db_store -> tool_ingest`）能靠有界符号搬迁清掉**；
+- 剩下 13 条（含 `-> tool_timeline` 的 3 条、`-> tool_search` 的 2 条、`-> tool_gc`/`tool_auto_ingest`/`tool_projection`/`tool_claim_provenance`/`tool_lint`/`tool_governance_maintenance`）**各自需要单独侦察**，不能假定它们与 `tool_ingest` 同因。
+
+这修正了我上一轮的预估：我曾建议“下一批先把被复用的实现从 `tool_*` 下沉”——对 `tool_ingest` 而言这个描述是**错的**，它不是几个助手住高了，而是一个未拆的引擎。
+
 #### P3.2 逐批执行日志
 
 | 批 | 提交 | 边数 | 内容 | 反证 |
