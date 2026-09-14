@@ -939,7 +939,8 @@ def test_equal_rank_results_use_stable_memory_id_after_physical_reorder(
         conn.execute("DELETE FROM operational_memory WHERE memory_id = 'memory-a'")
         conn.execute(
             "INSERT INTO operational_memory "
-            "(memory_id, memory_type, data_json, updated_at) VALUES (?, ?, ?, ?)",
+            "(memory_id, memory_type, status, data_json, updated_at) "
+            "VALUES (?, ?, 'Active', ?, ?)",
             tuple(stored),
         )
     conn.execute("VACUUM")

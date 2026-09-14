@@ -278,6 +278,79 @@ _RUNTIME_GENERATION_SCHEMA_OBJECTS_V3 = (
 )
 
 
+# Canonical row integrity. The five canonical tables are wide, nullable and
+# JSON-backed, and they carried no NOT NULL or CHECK at all: `entities` even had
+# two writers for the same fact (a `ttl`/`decay_weight` column pair alongside the
+# same keys inside `data_json`), with the columns left unpopulated on 7,900 of
+# 7,905 rows. Nothing in the database stopped a writer from storing a row that no
+# reader can use.
+#
+# Expressing NOT NULL as a real constraint would need a full twelve-step table
+# rebuild per table, because SQLite has no ADD CONSTRAINT and this corpus is
+# 3.6 GB / ~386k canonical rows. These triggers state the same invariant without
+# rebuilding anything, following the pattern already used for
+# trg_canonical_identities_* and trg_operational_memory_search_*.
+#
+# Value domains are deliberately not enforced here. The controlled vocabularies
+# behind `status`, `type` and `memory_type` are owned by Python and are already
+# duplicated across schema_validator, tool_lint and the ingester; a fourth copy in
+# DDL would turn every vocabulary addition into a stop-the-world migration.
+_CANONICAL_REQUIRED_COLUMNS_V1: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("claims", ("claim_text", "status", "data_json", "updated_at")),
+    ("entities", ("canonical_name", "data_json", "updated_at")),
+    ("evidence", ("data_json", "updated_at")),
+    ("sources", ("data_json", "updated_at")),
+    ("operational_memory", ("memory_type", "status", "data_json", "updated_at")),
+)
+
+
+def _canonical_required_columns_trigger_name(table: str, operation: str) -> str:
+    return f"trg_{table}_required_columns_v1_{operation}"
+
+
+def _canonical_required_columns_trigger_sql(table: str, operation: str) -> str:
+    """Reject a canonical row whose required columns are NULL.
+
+    ``INSERT OR REPLACE`` is a plain insert as far as triggers are concerned, so
+    this pair covers the create and the overwrite path with one statement each.
+    The trigger name avoids the ``trg_*_generation_v*_*`` namespace that
+    ``_runtime_generation_schema_issues`` asserts over.
+    """
+    required = dict(_CANONICAL_REQUIRED_COLUMNS_V1)[table]
+    predicate = " OR ".join(f"NEW.{column} IS NULL" for column in required)
+    # Bind the name first: a multi-line expression inside an f-string needs
+    # Python 3.12+, and this package still declares >=3.11 support.
+    trigger_name = _canonical_required_columns_trigger_name(table, operation)
+    return f"""
+    CREATE TRIGGER IF NOT EXISTS {trigger_name}
+    BEFORE {operation.upper()} ON {table}
+    FOR EACH ROW
+    WHEN {predicate}
+    BEGIN
+        SELECT RAISE(ABORT, 'canonical_required_column_null:{table}');
+    END
+    """
+
+
+_CANONICAL_INTEGRITY_TRIGGER_SCHEMA_V1: tuple[str, ...] = tuple(
+    _canonical_required_columns_trigger_sql(table, operation)
+    for table, _required in _CANONICAL_REQUIRED_COLUMNS_V1
+    for operation in ("insert", "update")
+)
+
+
+def _init_canonical_integrity_triggers(conn: sqlite3.Connection) -> None:
+    """Create the canonical NOT NULL triggers.
+
+    Additive and idempotent, so it is safe on the bootstrap path: it never
+    rewrites a table and never touches an existing row. Rollback is
+    ``DROP TRIGGER``, which is why this does not need a migration receipt or a
+    pre-DDL backup.
+    """
+    for statement in _CANONICAL_INTEGRITY_TRIGGER_SCHEMA_V1:
+        conn.execute(statement)
+
+
 _INGEST_TASK_CLEANUP_TABLE_SCHEMA_V4 = """
 CREATE TABLE IF NOT EXISTS ingest_task_cleanup (
     cleanup_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8086,6 +8159,7 @@ def _init_db_once(db_key: str):
         _add_column_if_missing(conn, "operational_memory", "status", "TEXT")
         _add_column_if_missing(conn, "operational_memory", "ttl", "REAL")
         _init_operational_memory_search_schema(conn)
+        _init_canonical_integrity_triggers(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claim_graph_nodes (
                 node_id TEXT PRIMARY KEY,

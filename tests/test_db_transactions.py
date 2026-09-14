@@ -166,7 +166,10 @@ def test_failed_deferred_commit_rolls_back_generation_and_clears_dirty_set(
                 "DEFERRABLE INITIALLY DEFERRED)"
             )
             conn.execute(
-                "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+                "INSERT INTO entities "
+                "(entity_id, canonical_name, data_json, updated_at) "
+                "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+                "'2026-01-01T00:00:00+00:00')",
                 ("failed_commit", '{"page_key":"Concept_Failed-Commit"}'),
             )
             conn.execute("INSERT INTO deferred_child (id, parent_id) VALUES (1, 999)")
@@ -233,7 +236,10 @@ def test_runtime_generation_tracks_same_size_entity_mutations(isolated_memory):
     with pytest.raises(RuntimeError, match="rollback generation"):
         with db_store.transaction():
             conn.execute(
-                "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+                "INSERT INTO entities "
+                "(entity_id, canonical_name, data_json, updated_at) "
+                "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+                "'2026-01-01T00:00:00+00:00')",
                 ("entity_rolled_back", '{"page_key":"Concept_Rollback"}'),
             )
             raise RuntimeError("rollback generation")
@@ -252,7 +258,10 @@ def test_bulk_write_bumps_runtime_generation_for_each_changed_row(isolated_memor
 
     with db_store.transaction():
         conn.executemany(
-            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             (
                 (f"entity_bulk_{index}", '{"page_key":"Concept_Bulk"}')
                 for index in range(250)
@@ -278,7 +287,10 @@ def test_partial_executemany_commit_still_bumps_runtime_generation(isolated_memo
 
     with pytest.raises(sqlite3.IntegrityError):
         conn.executemany(
-            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             [
                 ("entity_partial", '{"page_key":"Concept_Partial"}'),
                 ("entity_partial", '{"page_key":"Concept_Duplicate"}'),
@@ -314,13 +326,19 @@ def test_runtime_generation_tracks_cte_comments_and_qualified_tables(
     with db_store.transaction():
         conn.cursor().execute(
             "-- leading comment\n"
-            "INSERT INTO main.entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT INTO main.entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             ("entity_commented", '{"page_key":"Concept_Commented"}'),
         )
         conn.execute(
             "WITH payload(entity_id, data_json) AS (VALUES (?, ?)) "
-            "INSERT INTO main.entities (entity_id, data_json) "
-            "SELECT entity_id, data_json FROM payload",
+            "INSERT INTO main.entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "SELECT entity_id, "
+            "COALESCE(json_extract(data_json, '$.page_key'), entity_id), "
+            "data_json, '2026-01-01T00:00:00+00:00' FROM payload",
             ("entity_cte", '{"page_key":"Concept_CTE"}'),
         )
 
@@ -354,13 +372,17 @@ def test_runtime_generation_tracks_connection_and_cursor_executescript(
 
     before = generation()
     conn.executescript(
-        "INSERT INTO main.entities (entity_id, data_json) "
-        "VALUES ('entity_script_connection', '{\"page_key\":\"Concept_Script_A\"}');"
+        "INSERT INTO main.entities "
+        "(entity_id, canonical_name, data_json, updated_at) "
+        "VALUES ('entity_script_connection', 'Concept_Script_A', "
+        "'{\"page_key\":\"Concept_Script_A\"}', '2026-01-01T00:00:00+00:00');"
     )
     after_connection = generation()
     conn.cursor().executescript(
-        "INSERT INTO main.entities (entity_id, data_json) "
-        "VALUES ('entity_script_cursor', '{\"page_key\":\"Concept_Script_B\"}');"
+        "INSERT INTO main.entities "
+        "(entity_id, canonical_name, data_json, updated_at) "
+        "VALUES ('entity_script_cursor', 'Concept_Script_B', "
+        "'{\"page_key\":\"Concept_Script_B\"}', '2026-01-01T00:00:00+00:00');"
     )
     after_cursor = generation()
 
@@ -381,7 +403,10 @@ def test_nested_rollback_does_not_bump_runtime_generation(isolated_memory):
         with pytest.raises(RuntimeError, match="nested generation rollback"):
             with db_store.transaction():
                 conn.execute(
-                    "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+                    "INSERT INTO entities "
+                    "(entity_id, canonical_name, data_json, updated_at) "
+                    "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+                    "'2026-01-01T00:00:00+00:00')",
                     ("nested_generation", '{"page_key":"Concept_Nested"}'),
                 )
                 raise RuntimeError("nested generation rollback")
@@ -461,7 +486,10 @@ def test_external_sqlite_connection_advances_insert_update_delete_generations(
         raw.execute("PRAGMA recursive_triggers=OFF")
         before = generation(raw)
         raw.execute(
-            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             ("external_entity", '{"page_key":"Concept_External_A"}'),
         )
         raw.commit()
@@ -502,7 +530,10 @@ def test_external_sqlite_rollback_rolls_back_generation_trigger(isolated_memory)
     try:
         raw.execute("BEGIN IMMEDIATE")
         raw.execute(
-            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             ("external_rollback", '{"page_key":"Concept_Rollback"}'),
         )
         inside = int(
@@ -538,7 +569,10 @@ def test_external_replace_advances_generation_with_recursive_triggers_off(
     try:
         raw.execute("PRAGMA recursive_triggers=OFF")
         raw.execute(
-            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             ("external_replace", '{"page_key":"Concept_Replace_A"}'),
         )
         raw.commit()
@@ -548,7 +582,10 @@ def test_external_replace_advances_generation_with_recursive_triggers_off(
             ).fetchone()[0]
         )
         raw.execute(
-            "INSERT OR REPLACE INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             ("external_replace", '{"page_key":"Concept_Replace_B"}'),
         )
         raw.commit()
@@ -558,7 +595,10 @@ def test_external_replace_advances_generation_with_recursive_triggers_off(
             ).fetchone()[0]
         )
         raw.execute(
-            "REPLACE INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "REPLACE INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             ("external_replace", '{"page_key":"Concept_Replace_C"}'),
         )
         raw.commit()
@@ -583,7 +623,10 @@ def test_missing_generation_ledger_row_blocks_external_writes(
     path = db_store.get_db_path()
     with db_store.transaction() as conn:
         conn.execute(
-            "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+            "INSERT INTO entities "
+            "(entity_id, canonical_name, data_json, updated_at) "
+            "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+            "'2026-01-01T00:00:00+00:00')",
             ("ledger_guard", '{"page_key":"Concept_Ledger_A"}'),
         )
 
@@ -593,7 +636,10 @@ def test_missing_generation_ledger_row_blocks_external_writes(
         raw.commit()
         statements = {
             "insert": (
-                "INSERT INTO entities (entity_id, data_json) VALUES (?, ?)",
+                "INSERT INTO entities "
+                "(entity_id, canonical_name, data_json, updated_at) "
+                "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+                "'2026-01-01T00:00:00+00:00')",
                 ("ledger_guard_insert", '{"page_key":"Concept_Ledger_Insert"}'),
             ),
             "update": (
@@ -605,7 +651,10 @@ def test_missing_generation_ledger_row_blocks_external_writes(
                 ("ledger_guard",),
             ),
             "replace": (
-                "INSERT OR REPLACE INTO entities (entity_id, data_json) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO entities "
+                "(entity_id, canonical_name, data_json, updated_at) "
+                "VALUES (?1, COALESCE(json_extract(?2, '$.page_key'), ?1), ?2, "
+                "'2026-01-01T00:00:00+00:00')",
                 ("ledger_guard", '{"page_key":"Concept_Ledger_C"}'),
             ),
         }
