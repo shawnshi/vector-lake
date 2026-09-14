@@ -116,17 +116,15 @@ def _layer_of(module: str) -> str | None:
     return None
 
 
-# Frozen on 2026-09-14: 44 intra-package edges violate the order above. Each entry
+# Frozen on 2026-09-14: 43 intra-package edges violate the order above. Each entry
 # is a P3 work item; delete the line when the edge is gone.
 #
-# This number is the fourth one measured. The audit said 38; each re-measurement
-# found the previous one blind to something, because the gate is only as good as
-# its import resolution:
-#   38 -> 39  dotted names were truncated to their top level, hiding
-#             auto_ingest_worker -> auto_ingest_runners.base
-#   39 -> 43  targets were not resolved to real modules, hiding four edges
+# Started at 44. The gate is only as good as its import resolution, and every
+# correction came from making it stricter rather than reading code harder:
+#   38 -> 39  dotted module names were truncated to their top level
+#   39 -> 43  targets were not resolved to real modules
 #   43 -> 44  relative imports (from .mod import x) were skipped entirely
-# The gate now resolves imports to real modules and handles relative form.
+#   44 -> 43  P3.2 batch 1 moved version_family_id to the base layer
 ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
         # storage -> domain (11)
@@ -135,7 +133,6 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("db_store", "search_projection_contract"),
         ("governance_store", "claim_extractor"),
         ("governance_store", "decision_registry"),
-        ("governance_store", "evidence_foundation"),
         ("governance_store", "memory_search_normalization"),
         ("governance_store", "operational_memory_contract"),
         ("governance_store", "provenance_retention"),
@@ -186,10 +183,15 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("wiki_utils", "mutation_coordinator"),
     }
 )
-assert len(ALLOWED_BACKWARD_EDGES) == 44, len(ALLOWED_BACKWARD_EDGES)
+assert len(ALLOWED_BACKWARD_EDGES) == 43, len(ALLOWED_BACKWARD_EDGES)
 
-# Frozen on 2026-09-14, re-measured once imports resolved to real modules.
-# Must fall as P3 batches land.
+# Frozen on 2026-09-14. Must fall as P3 batches land.
+#
+# It did not fall for P3.2 batch 1, and that is expected rather than a bug: the
+# backward-edge count and the cycle size are different measures. Removing a
+# backward edge that is not on every path around a cycle leaves the cycle intact.
+# The cluster shrinks only when the last edge closing a loop is removed, so expect
+# this number to hold and then drop in steps.
 MAX_STRONGLY_CONNECTED_COMPONENT = 39
 
 

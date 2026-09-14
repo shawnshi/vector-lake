@@ -1,6 +1,7 @@
 import datetime
 import ctypes
 import hashlib
+import json
 import os
 import random
 import re
@@ -37,6 +38,34 @@ def normalize_semantic_text(content: str) -> str:
 
 def semantic_text_hash(content: str) -> str:
     return hashlib.sha256(normalize_semantic_text(content).encode("utf-8")).hexdigest()
+
+
+def stable_identity_digest(prefix: str, value: str) -> str:
+    """Short, prefixed, stable digest used to build version-family identifiers."""
+    return f"{prefix}_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
+
+
+def version_family_id(prefix: str, page_key: str, locator: dict) -> str:
+    """Identify the version family a page locator belongs to.
+
+    A generic identity-key primitive: it hashes the locator fields that decide
+    version lineage and nothing else. It lives in the base layer because both
+    storage and the evidence layer need it, and a storage module importing the
+    evidence layer to get it inverted the dependency order.
+    """
+    basis = json.dumps(
+        {
+            "page_key": page_key,
+            "heading": locator.get("heading"),
+            "block_index": locator.get("block_index"),
+            "source_id": locator.get("source_id"),
+            "kind": locator.get("kind"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return stable_identity_digest(prefix, basis)
 
 
 def _file_sha256(path: Path) -> str:

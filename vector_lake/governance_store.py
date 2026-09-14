@@ -39,7 +39,7 @@ from vector_lake.db_store import (
     transaction,
     verify_operational_memory_search_integrity,
 )
-from vector_lake.evidence_foundation import version_family_id
+from vector_lake.wiki_utils import version_family_id
 from vector_lake.wiki_utils import (
     get_meta_dir,
     get_wiki_dir,

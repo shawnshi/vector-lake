@@ -14,7 +14,12 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
-from vector_lake.wiki_utils import get_memory_dir, normalize_raw_ref
+from vector_lake.wiki_utils import (
+    get_memory_dir,
+    normalize_raw_ref,
+    stable_identity_digest,
+    version_family_id,  # noqa: F401 -- deliberate re-export, see note below
+)
 
 
 EXTRACTOR_NAME = "vector_lake.claim_extractor"
@@ -23,7 +28,8 @@ PARSER_NAME = "mistune-ast"
 
 
 def _digest(prefix: str, value: str) -> str:
-    return f"{prefix}_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
+    """Alias of the base-layer primitive; kept for the local call sites."""
+    return stable_identity_digest(prefix, value)
 
 
 def _candidate_source_path(raw_ref: str) -> Path | None:
@@ -194,17 +200,8 @@ def evidence_independence(raw_ref: str, page_name: str, parent_refs: list[str]) 
     }
 
 
-def version_family_id(prefix: str, page_key: str, locator: dict[str, Any]) -> str:
-    basis = json.dumps(
-        {
-            "page_key": page_key,
-            "heading": locator.get("heading"),
-            "block_index": locator.get("block_index"),
-            "source_id": locator.get("source_id"),
-            "kind": locator.get("kind"),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return _digest(prefix, basis)
+# ``version_family_id`` is deliberately re-exported from the base layer so that
+# existing importers (claim_extractor, tool_claim_provenance) keep working
+# unchanged. It is a generic identity-key builder with no evidence semantics, and
+# storage modules needed it, which meant a storage module importing the evidence
+# layer and inverting the dependency order.
