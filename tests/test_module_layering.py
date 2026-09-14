@@ -50,6 +50,10 @@ LAYERS: dict[str, set[str]] = {
         "search_projection_contract",
         "source_references",
         "operational_memory_contract",
+        # Zero intra-package imports: the runner protocol/contract types the worker
+        # implements and the adapters satisfy. A dependency-free leaf belongs at the
+        # bottom, and it was in the handler layer only because its package is.
+        "auto_ingest_runners.base",
     },
     "storage": {
         "db_store",
@@ -96,7 +100,6 @@ LAYERS: dict[str, set[str]] = {
         "auto_ingest_worker",
         "ingest_worker",
         "heavy_task_gate",
-        "tools",
     },
 }
 # Handlers and the CLI/MCP surface sit on top; they are derived from the filename
@@ -104,11 +107,14 @@ LAYERS: dict[str, set[str]] = {
 HANDLER_PREFIXES = ("tool_",)
 HANDLER_EXTRAS = {
     "governance_service",
+    # A 15-line backward-compatibility facade that lazily re-exports tool_registry,
+    # imported only by cli_app and mcp_server. It cannot sit below the handlers it
+    # re-exports.
+    "tools",
     # An agent-facing facade over the handler layer: it composes recall/remember/
     # entity/synthesize from tool_search, tool_memory and tool_query, and only
     # mcp_server imports it. It cannot sit in base while depending on handlers.
     "memory_protocol",
-    "auto_ingest_runners.base",
     "auto_ingest_runners.codex_exec",
     "auto_ingest_runners.host_relay",
 }
@@ -170,10 +176,8 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         # derived -> orchestration
         ("runtime_health", "watchdog_status"),
         # orchestration -> handler
-        ("auto_ingest_worker", "auto_ingest_runners.base"),
         ("auto_ingest_worker", "tool_ingest"),
         ("ingest_worker", "tool_ingest"),
-        ("tools", "tool_registry"),
         ("watchdog_app", "tool_governance_maintenance"),
         ("watchdog_app", "tool_ingest"),
         ("watchdog_app", "tool_lint"),
