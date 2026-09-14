@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vector_lake.wiki_utils import get_memory_dir
-from vector_lake.governance_metrics import claim_governance_version
+from vector_lake.evidence_foundation import claim_governance_version
 
 
 _REPAIR_CONTRACT = "claim-provenance-repair-plan-v1"

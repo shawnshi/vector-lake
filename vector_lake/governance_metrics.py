@@ -1,10 +1,12 @@
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-import hashlib
 import json
 import sqlite3
 
 from vector_lake import db_store, governance_store
+from vector_lake.evidence_foundation import (
+    claim_governance_version,  # noqa: F401 -- re-exported for the tool surfaces
+)
 from vector_lake.merge_analysis import (
     analyze_entities,
     build_wiki_backlink_index,
@@ -48,22 +50,9 @@ def _normalized_name(value: str) -> str:
     return normalize_name(value)
 
 
-def claim_governance_version(claim: dict) -> str:
-    stable = dict(claim)
-    for field in (
-        "validity_state",
-        "validity_reasons",
-        "claim_family_id",
-        "confidence_kind",
-        "calibrated_probability",
-        "assessment_status",
-        "extractor_name",
-        "extractor_version",
-        "extraction_run_id",
-    ):
-        stable.pop(field, None)
-    payload = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+# ``claim_governance_version`` is imported from the domain layer for re-export: the
+# tool surfaces import it from here, while domain modules now take it directly from
+# evidence_foundation, which is what removes the backward edge.
 
 
 def _infer_claim_validity_components(

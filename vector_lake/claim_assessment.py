@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from vector_lake.db_store import get_connection, init_db, transaction
-from vector_lake.governance_metrics import claim_governance_version
+from vector_lake.evidence_foundation import claim_governance_version
 
 ALLOWED_OUTCOMES = {
     "supported",

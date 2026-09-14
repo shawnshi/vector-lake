@@ -200,8 +200,27 @@ def evidence_independence(raw_ref: str, page_name: str, parent_refs: list[str]) 
     }
 
 
-# ``version_family_id`` is deliberately re-exported from the base layer so that
-# existing importers (claim_extractor, tool_claim_provenance) keep working
-# unchanged. It is a generic identity-key builder with no evidence semantics, and
-# storage modules needed it, which meant a storage module importing the evidence
-# layer and inverting the dependency order.
+def claim_governance_version(claim: dict) -> str:
+    """Digest of a claim's governed content, ignoring assessment-only fields.
+
+    This is a pure identity primitive used by both the domain and the derived
+    layers, so it lives here rather than in governance_metrics: a domain module
+    importing the metrics layer to get it inverted the dependency order.
+    """
+    stable = dict(claim)
+    for field in (
+        "validity_state",
+        "validity_reasons",
+        "claim_family_id",
+        "confidence_kind",
+        "calibrated_probability",
+        "assessment_status",
+        "extractor_name",
+        "extractor_version",
+        "extraction_run_id",
+    ):
+        stable.pop(field, None)
+    payload = json.dumps(
+        stable, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
