@@ -329,6 +329,27 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 | 5a | —— | —— | **已尝试并撤回** | 见下 |
 | 5 | `0a9e9eb` | 29 → 27 | `auto_ingest_runners.base`→base、`tools`→handler | 分别改回，两段边各自重现 |
 | 6 | `7a95549` | 27 → 24 | `timeline_semantics`→base、`tool_timeline`→storage | 改回后 3 条边重现；改回 `timeline_semantics` 反而**新增**一条 |
+| 7 | `a2e9e70` | 24 → 22 | `backup_capacity` derived→storage | 改回 derived 后两条边重现 |
+
+#### P3.2 侦察：`backup_capacity`（2 条边，已完成并清掉）
+
+闭包确实重：`assert_backup_capacity` 连带 **18**、`projection_v2_reachable_inventory` 连带 **7**。但**这是错的问题** —— 它的**自身依赖**只有 `projection_format_v2`、`projection_store_v2`（storage）与 `wiki_utils`（base），所以**最小合法层是 storage**；全部导入者（`db_store`/`storage_growth`/`restore_snapshot`/`runtime_health` + 4 个 handler）都在 storage 及以上。把它放在 derived 就把它抬到了消费它的 storage 模块之上 —— 两条边就这么多。
+
+与 `tool_ingest` 的区别：那个是**未拆引擎**（符号闭包 72），这个是**层次分配高于依赖所允**（零代码）。
+
+**未做且应分开看待**：`db_store` 在迁移中内联执行备份容量策略，按理应是**调用方**的职责。把该检查上提到迁移入口是真正的责任反转（消灭依赖而非重分类），属设计变更，不是本批。
+
+#### 剩余 22 条按**所需工作类型**分类（不是按层）
+
+| 类型 | 条数 | 例子 | 所需工作 |
+|---|---|---|---|
+| A. 未拆引擎 | 4 | 3× `→ tool_ingest`（编排层）+ `db_store → tool_ingest` | 模块拆分（P4.1 类）；其中 `db_store` 那条可单独靠 2 符号搬迁清掉 |
+| B. 真实责任反转 | ~6 | `governance_store → governance_metrics`、`runtime_health → tool_*`、`restore_snapshot → tool_projection` | 把实现下沉或反转调用；**每一条需单独侦察** |
+| C. 基座污染 | 3 | `wiki_utils → defense_hook`/`schema_validator`/`mutation_coordinator` | 函数**上移**（批次 5a 已证明“抽出校验”会弱化 14 个测试契约） |
+| D. 层次分配高于依赖所允 | ~2 | `governance_store/provenance → governance_metrics`（目标最小合法层是 domain） | 重分类可清 `provenance` 那条；`governance_store` 那条仍需 B 类修法 |
+| E. 处理器↔表面环 | 1 | `tool_doctor → mcp_server` | 把该诊断上移到表面，或改为注册式 |
+
+**判断纪律（已反复验证）**：指向同一模块 ≠ 同因；且“符号闭包重”本身不能判定不可清 —— 要看**模块自身依赖所允许的最低层**与**导入者所在层**。`tool_ingest` 与 `tool_timeline`/`backup_capacity` 的分歧就在于此。
 | — | `d7dca7f` | —— | `tool_ingest` 的 12 符号只读侦察（见下） | —— |
 
 #### P3.2 侦察：`tool_timeline`（3 条边，已完成并清掉）
