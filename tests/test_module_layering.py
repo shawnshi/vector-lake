@@ -58,6 +58,9 @@ LAYERS: dict[str, set[str]] = {
         "timeline_semantics",
         # Ingest root/config resolution, split out of tool_ingest so storage can use
         # it without importing a handler. Depends on wiki_utils (base) only.
+        # Depends only on wiki_utils, so base is legal; it also holds the shared
+        # provenance-repair identity so storage can use it without a handler.
+        "evidence_foundation",
         "ingest_paths",
         # Depends only on durability and wiki_utils, both base, and nothing below it
         # imports it. It publishes and reads the watchdog status file, which is
@@ -81,6 +84,10 @@ LAYERS: dict[str, set[str]] = {
         # watchdog can run it without importing a handler. Needs db_store and
         # governance_store, so storage is its minimum legal tier.
         "history_retention",
+        # Operates on canonical rows inside the write transaction, and after the
+        # blake2b identity helper moved to base its dependencies are all base, so
+        # storage is both legal and the tier that owns the decision.
+        "provenance_retention",
         "backup_capacity",
         # Pure implementation, no @mcp.tool() surface: it maintains the
         # timeline_events table from claim deltas and reports projection parity.
@@ -97,9 +104,7 @@ LAYERS: dict[str, set[str]] = {
         "semantic_merge",
         "merge_analysis",
         "quality_registry",
-        "evidence_foundation",
         "provenance",
-        "provenance_retention",
         "raw_scrub_contract",
         "skeleton_parser",
         "index_snapshot",
@@ -184,12 +189,10 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         # storage -> domain
         ("db_store", "native_llm"),
         ("governance_store", "claim_extractor"),
-        ("governance_store", "provenance_retention"),
         # domain -> derived
         ("provenance", "governance_metrics"),
         ("schema_validator", "indexer"),
         # domain -> handler
-        ("provenance_retention", "tool_claim_provenance"),
         ("retrieval_benchmark", "tool_search"),
         # derived -> handler
         ("restore_snapshot", "tool_projection"),
@@ -221,7 +224,7 @@ pass
 # module that imports wiki_utils joins it too. They are the C-class work that batch
 # 5a showed needs a function moved UP a layer rather than validation extracted,
 # against a 14-test contract surface.
-MAX_STRONGLY_CONNECTED_COMPONENT = 33
+MAX_STRONGLY_CONNECTED_COMPONENT = 13
 
 
 def _module_name(path: Path) -> str:

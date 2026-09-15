@@ -256,16 +256,17 @@ def test_producer_descriptor_tamper_rolls_back(official_case, field):
 
 
 def test_rekeyed_foreign_page_run_does_not_validate(official_case):
+    from vector_lake import evidence_foundation
     from vector_lake.evidence_foundation import build_extraction_run
-    from vector_lake import tool_claim_provenance as producer
+    from vector_lake.wiki_utils import stable_short_id
     case = official_case
     _repair(case)
     evidence = next(iter(governance_store.load_evidence()["items"].values()))
     conn = db_store.get_connection()
     old_id = evidence["extraction_run_id"]
     run = json.loads(conn.execute("SELECT data_json FROM extraction_runs WHERE run_id=?", (old_id,)).fetchone()[0])
-    base = build_extraction_run(page_key="Concept_Foreign", body=evidence["evidence_text"], artifact_ids=[evidence["artifact_id"]], frontmatter={}, extractor_name=producer._EXTRACTOR_NAME, extractor_version=producer._EXTRACTOR_VERSION)
-    new_id = producer._claim_stable_id("extractrun", base["run_id"] + run["review_receipt_sha256"] + evidence["official_review"]["claim_id"])
+    base = build_extraction_run(page_key="Concept_Foreign", body=evidence["evidence_text"], artifact_ids=[evidence["artifact_id"]], frontmatter={}, extractor_name=evidence_foundation.PROVENANCE_REPAIR_EXTRACTOR_NAME, extractor_version=evidence_foundation.PROVENANCE_REPAIR_EXTRACTOR_VERSION)
+    new_id = stable_short_id("extractrun", base["run_id"] + run["review_receipt_sha256"] + evidence["official_review"]["claim_id"])
     run.update(base)
     run["run_id"] = new_id
     conn.execute("UPDATE extraction_runs SET run_id=?, data_json=? WHERE run_id=?", (new_id, json.dumps(run), old_id))

@@ -9,8 +9,13 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vector_lake.wiki_utils import get_memory_dir
-from vector_lake.evidence_foundation import claim_governance_version
+from vector_lake.wiki_utils import get_memory_dir, stable_short_id
+from vector_lake.evidence_foundation import (
+    PROVENANCE_REPAIR_EXTRACTOR_NAME,
+    PROVENANCE_REPAIR_EXTRACTOR_VERSION,
+    claim_governance_version,
+    claim_page_key,
+)
 
 
 _REPAIR_CONTRACT = "claim-provenance-repair-plan-v1"
@@ -425,9 +430,8 @@ def retain_current_reviewed_provenance(
                     "Reviewed provenance cross-source artifact binding mismatch."
                 )
             receipt = _receipt(evidence, run, current)
-            from vector_lake import tool_claim_provenance as producer
-            if (run.get("extractor_name") != producer._EXTRACTOR_NAME or
-                    run.get("extractor_version") != producer._EXTRACTOR_VERSION):
+            if (run.get("extractor_name") != PROVENANCE_REPAIR_EXTRACTOR_NAME or
+                    run.get("extractor_version") != PROVENANCE_REPAIR_EXTRACTOR_VERSION):
                 raise ReviewedProvenanceRetentionError(
                     "Reviewed provenance producer identity mismatch."
                 )
@@ -462,7 +466,7 @@ def retain_current_reviewed_provenance(
                     "Reviewed provenance receipt snapshot mismatch."
                 )
             from vector_lake.evidence_foundation import build_extraction_run
-            reviewed_page = producer._claim_page_key(current)
+            reviewed_page = claim_page_key(current)
             if run.get("page_key") != reviewed_page:
                 raise ReviewedProvenanceRetentionError(
                     "Reviewed provenance producer page binding mismatch."
@@ -470,18 +474,18 @@ def retain_current_reviewed_provenance(
             base_run = build_extraction_run(
                 page_key=reviewed_page, body=evidence.get("evidence_text"),
                 artifact_ids=[artifact_id], frontmatter={},
-                extractor_name=producer._EXTRACTOR_NAME,
-                extractor_version=producer._EXTRACTOR_VERSION,
+                extractor_name=PROVENANCE_REPAIR_EXTRACTOR_NAME,
+                extractor_version=PROVENANCE_REPAIR_EXTRACTOR_VERSION,
             )
             if any(run.get(key) != value for key, value in base_run.items() if key != "run_id"):
                 raise ReviewedProvenanceRetentionError(
                     "Reviewed provenance producer descriptor mismatch."
                 )
-            expected_run = producer._claim_stable_id(
+            expected_run = stable_short_id(
                 "extractrun", base_run["run_id"] + receipt["review_receipt_sha256"]
                 + str(current.get("claim_id"))
             )
-            expected_evidence = producer._claim_stable_id(
+            expected_evidence = stable_short_id(
                 "evidence", "official:" + str(current.get("claim_id"))
                 + receipt["review_receipt_sha256"] + _sha(reconstructed)
             )

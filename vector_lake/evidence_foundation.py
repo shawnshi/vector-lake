@@ -27,6 +27,24 @@ EXTRACTOR_VERSION = "2.0"
 PARSER_NAME = "mistune-ast"
 
 
+# Provenance-repair identity, moved here from tool_claim_provenance so that storage
+# can verify reviewed provenance without importing a handler. They were private
+# there because they had one module-local user; across a layer boundary they get
+# public names.
+PROVENANCE_REPAIR_EXTRACTOR_NAME = "vector_lake.claim_provenance_repair"
+PROVENANCE_REPAIR_EXTRACTOR_VERSION = "1.0"
+
+
+def claim_page_key(claim: dict) -> str:
+    """Page key a claim belongs to, from its locator or source page."""
+    raw_locator = claim.get("locator")
+    locator = raw_locator if isinstance(raw_locator, dict) else {}
+    return str(
+        locator.get("page_key")
+        or Path(str(claim.get("source_page") or "")).stem
+    )
+
+
 def _digest(prefix: str, value: str) -> str:
     """Alias of the base-layer primitive; kept for the local call sites."""
     return stable_identity_digest(prefix, value)

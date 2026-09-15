@@ -1,4 +1,3 @@
-import hashlib
 import os
 import re
 from datetime import datetime, timezone
@@ -12,7 +11,7 @@ from vector_lake.evidence_foundation import (
     source_locator_for,
     version_family_id,
 )
-from vector_lake.wiki_utils import normalize_raw_ref, normalize_sources
+from vector_lake.wiki_utils import stable_short_id, normalize_raw_ref, normalize_sources
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 from vector_lake.source_references import canonical_source_page_for_ref
 from vector_lake.timeline_semantics import parse_timeline_prefix
@@ -91,8 +90,8 @@ def _utc_now() -> str:
 
 
 def _stable_id(prefix: str, value: str) -> str:
-    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=12).hexdigest()
-    return f"{prefix}_{digest}"
+    """Persisted identifier family; single implementation lives in the base layer."""
+    return stable_short_id(prefix, value)
 
 
 def _jsonable(value):

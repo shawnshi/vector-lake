@@ -41,6 +41,7 @@ from vector_lake.db_store import (
 )
 from vector_lake.wiki_utils import version_family_id
 from vector_lake.wiki_utils import (
+    stable_short_id,
     get_meta_dir,
     get_wiki_dir,
     iter_markdown_files,
@@ -2786,8 +2787,8 @@ def _compact_claim_text(text: str, limit: int = 240) -> str:
 
 
 def _stable_id(prefix: str, value: str) -> str:
-    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=12).hexdigest()
-    return f"{prefix}_{digest}"
+    """Persisted identifier family; the duplicate implementation was removed."""
+    return stable_short_id(prefix, value)
 
 
 def _coerce_float(

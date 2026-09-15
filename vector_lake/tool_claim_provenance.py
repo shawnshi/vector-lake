@@ -26,6 +26,9 @@ from pathlib import Path
 from vector_lake import db_store, governance_store
 from vector_lake.claim_extractor import _stable_id as _claim_stable_id
 from vector_lake.evidence_foundation import (
+    PROVENANCE_REPAIR_EXTRACTOR_NAME,
+    PROVENANCE_REPAIR_EXTRACTOR_VERSION,
+    claim_page_key,
     build_extraction_run,
     evidence_independence,
     resolve_source_artifact,
@@ -46,8 +49,6 @@ from vector_lake.wiki_utils import (
 
 _CONTRACT = "claim-provenance-repair-plan-v1"
 _SOURCE_MAP_CONTRACT = "claim-provenance-source-map/v1"
-_EXTRACTOR_NAME = "vector_lake.claim_provenance_repair"
-_EXTRACTOR_VERSION = "1.0"
 
 
 _OFFICIAL_MAP_CONTRACT = "claim-official-evidence-map/v1"
@@ -208,10 +209,10 @@ def _official_snapshot_record(snapshot: dict, claim: dict, review: dict, receipt
               "original_url": url, "retrieved_at": snapshot["retrieved_at"],
               "representation": snapshot["representation"], "official_snapshot": provenance}
     claim_id = claim["claim_id"]
-    page_key = _claim_page_key(claim)
+    page_key = claim_page_key(claim)
     run = build_extraction_run(
         page_key=page_key, body=excerpt, artifact_ids=[artifact["artifact_id"]],
-        frontmatter={}, extractor_name=_EXTRACTOR_NAME, extractor_version=_EXTRACTOR_VERSION,
+        frontmatter={}, extractor_name=PROVENANCE_REPAIR_EXTRACTOR_NAME, extractor_version=PROVENANCE_REPAIR_EXTRACTOR_VERSION,
     )
     run["review_receipt_sha256"] = receipt
     # Include receipt so separate reviews on the same page cannot overwrite runs.
@@ -299,7 +300,7 @@ def _build_official_evidence_plan(scope: list[str], map_path: str, *, runtime_on
                 raise ValueError("Conflicting official snapshot metadata for identical artifact bytes.")
         candidates.append({
             "claim_id": claim["claim_id"], "claim_version": claim_governance_version(claim),
-            "page_key": _claim_page_key(claim),
+            "page_key": claim_page_key(claim),
             "source_ids": sorted(record["source"]["source_id"] for record in records),
             "evidence_ids": sorted(record["evidence"]["evidence_id"] for record in records),
             "existing_evidence_ids": [], "source_page_record": None,
@@ -359,15 +360,6 @@ def _canonical_records(conn, table: str, id_field: str) -> dict[str, dict]:
             f"SELECT {id_field}, data_json FROM {table}"  # noqa: S608 - fixed callers
         )
     }
-
-
-def _claim_page_key(claim: dict) -> str:
-    raw_locator = claim.get("locator")
-    locator = raw_locator if isinstance(raw_locator, dict) else {}
-    return str(
-        locator.get("page_key")
-        or Path(str(claim.get("source_page") or "")).stem
-    )
 
 
 def _load_source_map(
@@ -896,7 +888,7 @@ def build_claim_provenance_repair_plan(
     claims_by_id = _scoped_unsupported_claims(conn, scope, runtime_only=runtime_only)
     unsupported_by_page: dict[str, int] = defaultdict(int)
     for claim in claims_by_id.values():
-        unsupported_by_page[_claim_page_key(claim)] += 1
+        unsupported_by_page[claim_page_key(claim)] += 1
     for page_key, mapping in {
         **source_map,
         **linked_page_source_map,
@@ -935,7 +927,7 @@ def build_claim_provenance_repair_plan(
     mapped_linked_page_counts: dict[str, int] = defaultdict(int)
     planned_source_evidence_by_text: dict[str, list[dict]] = defaultdict(list)
     for claim_id, claim in sorted(claims_by_id.items()):
-        page_key = _claim_page_key(claim)
+        page_key = claim_page_key(claim)
         page_mapping = source_map.get(page_key)
         linked_page_mapping = linked_page_source_map.get(page_key)
         lineage_ref = ""
@@ -1019,7 +1011,7 @@ def build_claim_provenance_repair_plan(
     candidates: list[dict] = []
     unresolved_claim_ids: list[str] = []
     for claim_id, claim in sorted(claims_by_id.items()):
-        page_key = _claim_page_key(claim)
+        page_key = claim_page_key(claim)
         claim_text = str(claim.get("claim_text") or "")
         exact_evidence = evidence_by_text.get(claim_text, [])
         planned_evidence = planned_source_evidence_by_text.get(claim_text, [])
@@ -1087,7 +1079,7 @@ def build_claim_provenance_repair_plan(
     ).hexdigest()
     candidate_pages = {item["page_key"] for item in candidates}
     unresolved_pages = {
-        _claim_page_key(claims_by_id[claim_id])
+        claim_page_key(claims_by_id[claim_id])
         for claim_id in unresolved_claim_ids
     }
     return {
@@ -1157,8 +1149,8 @@ def _source_page_evidence(
         body=body,
         artifact_ids=[str(artifact["artifact_id"])],
         frontmatter=frontmatter,
-        extractor_name=_EXTRACTOR_NAME,
-        extractor_version=_EXTRACTOR_VERSION,
+        extractor_name=PROVENANCE_REPAIR_EXTRACTOR_NAME,
+        extractor_version=PROVENANCE_REPAIR_EXTRACTOR_VERSION,
     )
     run["recorded_at"] = repaired_at
     locator = dict(claim.get("locator") or {})
@@ -1374,7 +1366,7 @@ def _apply_current_plan(plan: dict, *, fingerprint: str, repaired_at: str) -> di
 
     proposed_evidence = list(proposed_evidence_by_id.values())
     evidence_page_keys = {
-        _claim_page_key(record) for record in proposed_evidence
+        claim_page_key(record) for record in proposed_evidence
     }
     evidence_owners = governance_store._proposed_id_owners(
         proposed_evidence,

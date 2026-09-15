@@ -38,8 +38,26 @@ def semantic_text_hash(content: str) -> str:
 
 
 def stable_identity_digest(prefix: str, value: str) -> str:
-    """Short, prefixed, stable digest used to build version-family identifiers."""
+    """SHA-256 based short identifier (24 hex chars).
+
+    NOT interchangeable with ``stable_short_id``: both produce ``prefix_<24 hex>``
+    but from different hash functions, so swapping them silently rewrites every
+    stored identifier. This one is the version-family family; the BLAKE2b one below
+    is the persisted entity/claim/evidence id family.
+    """
     return f"{prefix}_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
+
+
+def stable_short_id(prefix: str, value: str) -> str:
+    """BLAKE2b-based short identifier (24 hex chars).
+
+    The single implementation of the persisted identifier family: entity_id,
+    claim/evidence ids, source ids, idempotency keys. It was duplicated verbatim in
+    claim_extractor and governance_store, which is why a storage module needing it
+    had to import the domain or the handler layer.
+    """
+    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=12).hexdigest()
+    return f"{prefix}_{digest}"
 
 
 def version_family_id(prefix: str, page_key: str, locator: dict) -> str:
