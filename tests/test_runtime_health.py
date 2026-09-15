@@ -1033,7 +1033,7 @@ def test_watchdog_rejects_second_instance_for_same_memory_root(isolated_memory):
 def test_raw_watchdog_uses_single_flight_path_scoped_ingest(
     isolated_memory, monkeypatch
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_engine
     from vector_lake.watchdog_app import RawWatchdogHandler
 
     first_path = isolated_memory / "raw" / "first.txt"
@@ -1061,7 +1061,7 @@ def test_raw_watchdog_uses_single_flight_path_scoped_ingest(
         def __init__(self, path):
             self.src_path = str(path)
 
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", prepare)
     handler = RawWatchdogHandler()
     try:
         handler.handle_event(Event(first_path))
@@ -1099,7 +1099,7 @@ def test_wiki_watchdog_decodes_bytes_moved_paths(monkeypatch):
 def test_raw_watchdog_moved_event_ingests_destination_path(
     isolated_memory, monkeypatch
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_engine
     from vector_lake.watchdog_app import RawWatchdogHandler
 
     source = isolated_memory / "raw" / "old.txt"
@@ -1116,7 +1116,7 @@ def test_raw_watchdog_moved_event_ingests_destination_path(
 
     from watchdog.events import FileMovedEvent
 
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", prepare)
     handler = RawWatchdogHandler()
     try:
         handler.on_moved(FileMovedEvent(str(source), str(destination)))
@@ -1130,7 +1130,7 @@ def test_raw_watchdog_moved_event_ingests_destination_path(
 def test_raw_watchdog_shutdown_drains_buffer_without_resubmitting_to_closed_executor(
     isolated_memory, monkeypatch
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_engine
     from vector_lake.watchdog_app import RawWatchdogHandler
 
     first_path = isolated_memory / "raw" / "first.txt"
@@ -1155,7 +1155,7 @@ def test_raw_watchdog_shutdown_drains_buffer_without_resubmitting_to_closed_exec
         def __init__(self, path):
             self.src_path = str(path)
 
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", prepare)
     handler = RawWatchdogHandler()
     handler.handle_event(Event(first_path))
     assert started.wait(timeout=2)

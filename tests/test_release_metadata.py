@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import json
 import re
 from pathlib import Path
@@ -155,10 +156,10 @@ def test_readme_runtime_contract_numbers_match_their_source_constants():
     value with a source constant must be derived rather than transcribed.
     """
     from vector_lake import db_store, indexer, projection_format_v2
-    from vector_lake import projection_store_v2, tool_evidence, tool_ingest
+    from vector_lake import projection_store_v2, tool_evidence
 
     ingest = _readme_contract_cell("Ingest payload")
-    assert f"`INGEST_CONTRACT_VERSION = {tool_ingest.INGEST_CONTRACT_VERSION}`" == (
+    assert f"`INGEST_CONTRACT_VERSION = {ingest_engine.INGEST_CONTRACT_VERSION}`" == (
         ingest
     )
 

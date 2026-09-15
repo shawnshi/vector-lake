@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import json
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def _payload(isolated_memory, *, canonical_name="Source_Local-First.md"):
         "source_observed_at": "2026-08-31T12:00:00+00:00",
         "attempt_id": "2" * 32,
         "integration_candidates": [],
-        "ingest_contract_version": tool_ingest.INGEST_CONTRACT_VERSION,
+        "ingest_contract_version": ingest_engine.INGEST_CONTRACT_VERSION,
         "instructions": "remote enrichment instructions",
     }
 
@@ -55,7 +56,7 @@ def test_v6_claim_admission_rejects_missing_or_invalid_correlation_fields(
         db_store.claim_subagent_jobs(
             limit=1,
             lease_owner="generator",
-            required_ingest_contract_version=tool_ingest.INGEST_CONTRACT_VERSION,
+            required_ingest_contract_version=ingest_engine.INGEST_CONTRACT_VERSION,
         )
         == []
     )
@@ -79,8 +80,8 @@ def test_auto_source_page_is_byte_deterministic(isolated_memory):
         "source_observed_at": "2026-08-31T12:00:00+00:00",
     }
 
-    first = tool_ingest._auto_source_page(payload)
-    second = tool_ingest._auto_source_page(payload)
+    first = ingest_engine._auto_source_page(payload)
+    second = ingest_engine._auto_source_page(payload)
 
     assert first == second
     assert "2026-08-31" in first["content"]
@@ -95,7 +96,7 @@ def test_local_source_publication_is_atomic_and_queues_enrichment(isolated_memor
     identity_key = db_store._job_idempotency_key("ingest", payload)
     assert identity_key
 
-    queued_payload, job_id = tool_ingest._publish_local_source_and_enqueue(
+    queued_payload, job_id = ingest_engine._publish_local_source_and_enqueue(
         payload,
         idempotency_key=identity_key,
         prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -180,7 +181,7 @@ def test_changed_raw_revision_updates_existing_source_seed(isolated_memory):
         isolated_memory,
         canonical_name="Source_Local-Revision.md",
     )
-    first_payload, first_job = tool_ingest._publish_local_source_and_enqueue(
+    first_payload, first_job = ingest_engine._publish_local_source_and_enqueue(
         first,
         idempotency_key=db_store._job_idempotency_key("ingest", first),
         prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -198,7 +199,7 @@ def test_changed_raw_revision_updates_existing_source_seed(isolated_memory):
     )
 
     queued_job = db_store.enqueue_job("ingest", second)
-    second_payload, second_job = tool_ingest._publish_local_source_and_enqueue(
+    second_payload, second_job = ingest_engine._publish_local_source_and_enqueue(
         second,
         idempotency_key=db_store._job_idempotency_key("ingest", second),
         prepare_started_at="2026-08-31T12:00:59+00:00",
@@ -242,7 +243,7 @@ def test_reused_source_rejects_terminal_quarantine_owner(isolated_memory):
         canonical_name="Source_Local-Quarantine.md",
     )
     identity_key = db_store._job_idempotency_key("ingest", payload)
-    queued_payload, job_id = tool_ingest._publish_local_source_and_enqueue(
+    queued_payload, job_id = ingest_engine._publish_local_source_and_enqueue(
         payload,
         idempotency_key=identity_key,
         prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -269,7 +270,7 @@ def test_reused_source_rejects_terminal_quarantine_owner(isolated_memory):
     ).fetchone()[0]
 
     with pytest.raises(RuntimeError, match="retained by a terminal job"):
-        tool_ingest._publish_local_source_and_enqueue(
+        ingest_engine._publish_local_source_and_enqueue(
             queued_payload,
             idempotency_key=identity_key,
             prepare_started_at="2026-08-31T12:01:00+00:00",
@@ -294,7 +295,7 @@ def test_reused_source_inherits_pending_projection_barrier(isolated_memory):
     )
     first_key = db_store._job_idempotency_key("ingest", first_payload)
     assert first_key
-    first_queued, _first_job = tool_ingest._publish_local_source_and_enqueue(
+    first_queued, _first_job = ingest_engine._publish_local_source_and_enqueue(
         first_payload,
         idempotency_key=first_key,
         prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -313,7 +314,7 @@ def test_reused_source_inherits_pending_projection_barrier(isolated_memory):
     )
     second_key = db_store._job_idempotency_key("ingest", second_payload)
     assert second_key and second_key != first_key
-    _second_queued, second_job = tool_ingest._publish_local_source_and_enqueue(
+    _second_queued, second_job = ingest_engine._publish_local_source_and_enqueue(
         second_payload,
         idempotency_key=second_key,
         prepare_started_at="2026-08-31T12:00:01+00:00",
@@ -362,7 +363,7 @@ def test_concurrent_duplicate_local_publication_has_one_durable_owner(
 
     def publish():
         barrier.wait(timeout=5)
-        return tool_ingest._publish_local_source_and_enqueue(
+        return ingest_engine._publish_local_source_and_enqueue(
             dict(payload),
             idempotency_key=identity_key,
             prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -423,7 +424,7 @@ def test_local_publication_rolls_back_when_enrichment_enqueue_fails(
     monkeypatch.setattr(db_store, "enqueue_job", fail_enqueue)
 
     with pytest.raises(RuntimeError, match="injected enqueue failure"):
-        tool_ingest._publish_local_source_and_enqueue(
+        ingest_engine._publish_local_source_and_enqueue(
             payload,
             idempotency_key=identity_key,
             prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -471,12 +472,12 @@ def test_complete_stage_trace_uses_one_attempt_id_without_raw_content(
         "source_observed_at": "2026-08-31T12:00:00+00:00",
         "attempt_id": "5" * 32,
         "integration_candidates": [],
-        "ingest_contract_version": tool_ingest.INGEST_CONTRACT_VERSION,
+        "ingest_contract_version": ingest_engine.INGEST_CONTRACT_VERSION,
         "instructions": "remote enrichment instructions",
     }
     identity_key = db_store._job_idempotency_key("ingest", payload)
     assert identity_key
-    _queued_payload, job_id = tool_ingest._publish_local_source_and_enqueue(
+    _queued_payload, job_id = ingest_engine._publish_local_source_and_enqueue(
         payload,
         idempotency_key=identity_key,
         prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -569,7 +570,7 @@ def test_superseded_source_projection_quarantines_then_reconciles_job(
     )
     identity_key = db_store._job_idempotency_key("ingest", payload)
     assert identity_key
-    queued_payload, job_id = tool_ingest._publish_local_source_and_enqueue(
+    queued_payload, job_id = ingest_engine._publish_local_source_and_enqueue(
         payload,
         idempotency_key=identity_key,
         prepare_started_at="2026-08-31T11:59:59+00:00",
@@ -657,7 +658,7 @@ def test_terminal_source_projection_failure_is_explicitly_quarantined(
     )
     identity_key = db_store._job_idempotency_key("ingest", payload)
     assert identity_key
-    _queued_payload, job_id = tool_ingest._publish_local_source_and_enqueue(
+    _queued_payload, job_id = ingest_engine._publish_local_source_and_enqueue(
         payload,
         idempotency_key=identity_key,
         prepare_started_at="2026-08-31T11:59:59+00:00",

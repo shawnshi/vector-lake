@@ -135,7 +135,7 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
         raw_ref = str(raw_path_obj).replace("\\", "/")
     raw_ref_identity = _source_ref_identity(raw_ref)
 
-    from vector_lake.tool_ingest import canonical_source_name
+    from vector_lake.ingest_engine import canonical_source_name
 
     expected_source_filename = canonical_source_name(
         str(raw_path_obj),

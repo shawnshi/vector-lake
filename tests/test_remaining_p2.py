@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import hashlib
 import json
 from pathlib import Path
@@ -5,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from vector_lake import db_store, governance_store, tool_ingest
-from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION
+from vector_lake.ingest_engine import (
+    INGEST_CONTRACT_VERSION,
+)
 
 
 def _current_payload(filepath: str, file_hash: str, *, candidates=None) -> dict:
@@ -210,7 +213,7 @@ def test_legacy_migration_covers_every_claimable_status_and_refreshes_raw_hash(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt current-contract instructions",
     )
@@ -254,7 +257,7 @@ def test_legacy_migration_covers_every_claimable_status_and_refreshes_raw_hash(
                 )
         jobs[job_id] = raw_path
 
-    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+    migrated = ingest_engine.requeue_legacy_ingest_jobs()
 
     assert migrated == len(statuses)
     rows = db_store.get_connection().execute(
@@ -280,7 +283,7 @@ def test_legacy_migration_terminalizes_bad_window_before_advancing_peer(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt current-contract instructions",
     )
@@ -323,7 +326,7 @@ def test_legacy_migration_terminalizes_bad_window_before_advancing_peer(
             (peer_id,),
         )
 
-    assert tool_ingest.requeue_legacy_ingest_jobs() == 0
+    assert ingest_engine.requeue_legacy_ingest_jobs() == 0
     assert (
         db_store.get_connection()
         .execute(
@@ -336,7 +339,7 @@ def test_legacy_migration_terminalizes_bad_window_before_advancing_peer(
         == 100
     )
 
-    assert tool_ingest.requeue_legacy_ingest_jobs() == 1
+    assert ingest_engine.requeue_legacy_ingest_jobs() == 1
     peer = (
         db_store.get_connection()
         .execute("SELECT status, payload FROM jobs WHERE job_id = ?", (peer_id,))
@@ -502,7 +505,7 @@ def test_integration_rejects_non_dispatched_or_tampered_candidate_tokens(
     ]
 
     with pytest.raises(ValueError, match=message):
-        tool_ingest._apply_integration_disposition(
+        ingest_engine._apply_integration_disposition(
             files,
             _integrated_processed_data(candidate, relation),
         )
@@ -520,7 +523,7 @@ def test_integration_accepts_exact_dispatched_candidate_tokens(monkeypatch):
         lambda _keys: {"Concept_Allowed": "v1"},
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_read_canonical_target_content",
         lambda *_args, **_kwargs: "# Target\n\n## 2. \u8bc1\u636e\u65f6\u95f4\u7ebf\n",
     )
@@ -532,7 +535,7 @@ def test_integration_accepts_exact_dispatched_candidate_tokens(monkeypatch):
     ]
 
     mutations, disposition, integration_targets = (
-        tool_ingest._apply_integration_disposition(
+        ingest_engine._apply_integration_disposition(
             files,
             _integrated_processed_data(candidate, candidate),
         )

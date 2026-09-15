@@ -1,9 +1,10 @@
+from vector_lake import ingest_engine
 import hashlib
 import json
 
 import pytest
 
-from vector_lake import db_store, governance_store, tool_ingest
+from vector_lake import db_store, governance_store
 from vector_lake.mutation_coordinator import execute_mutation_batch
 from vector_lake.schema_validator import SchemaViolationException, validate_schema
 
@@ -117,7 +118,7 @@ def test_source_link_closure_accepts_existing_and_same_batch_targets():
             ),
         },
     ]
-    prepared = tool_ingest._prepare_source_link_closure(files)
+    prepared = ingest_engine._prepare_source_link_closure(files)
     rows = _canonical_rows(
         {
             "Concept_Current": {
@@ -127,7 +128,7 @@ def test_source_link_closure_accepts_existing_and_same_batch_targets():
         }
     )
 
-    tool_ingest._assert_source_link_closure(prepared, rows)
+    ingest_engine._assert_source_link_closure(prepared, rows)
 
 
 def test_source_link_closure_rejects_missing_and_fuzzy_near_match():
@@ -141,7 +142,7 @@ def test_source_link_closure_rejects_missing_and_fuzzy_near_match():
             ),
         }
     ]
-    prepared = tool_ingest._prepare_source_link_closure(files)
+    prepared = ingest_engine._prepare_source_link_closure(files)
     rows = _canonical_rows(
         {
             "Concept_Ambient-Scribes": {
@@ -152,14 +153,14 @@ def test_source_link_closure_rejects_missing_and_fuzzy_near_match():
     )
 
     with pytest.raises(
-        tool_ingest.SourceLinkClosureError,
+        ingest_engine.SourceLinkClosureError,
         match=r"Source_Test\.md -> \[\[Concept_Ambient-Scribing\]\] \(missing\)",
     ):
-        tool_ingest._assert_source_link_closure(prepared, rows)
+        ingest_engine._assert_source_link_closure(prepared, rows)
 
 
 def test_source_link_closure_rejects_ambiguous_alias():
-    prepared = tool_ingest._prepare_source_link_closure(
+    prepared = ingest_engine._prepare_source_link_closure(
         [
             {
                 "filename": "Source_Test.md",
@@ -179,14 +180,14 @@ def test_source_link_closure_rejects_ambiguous_alias():
     )
 
     with pytest.raises(
-        tool_ingest.SourceLinkClosureError,
+        ingest_engine.SourceLinkClosureError,
         match="ambiguous: Concept_A, Concept_B",
     ):
-        tool_ingest._assert_source_link_closure(prepared, rows)
+        ingest_engine._assert_source_link_closure(prepared, rows)
 
 
 def test_source_link_closure_removes_replaced_page_old_aliases():
-    prepared = tool_ingest._prepare_source_link_closure(
+    prepared = ingest_engine._prepare_source_link_closure(
         [
             {
                 "filename": "Source_Test.md",
@@ -215,8 +216,8 @@ def test_source_link_closure_removes_replaced_page_old_aliases():
         }
     )
 
-    with pytest.raises(tool_ingest.SourceLinkClosureError, match="Retired Alias"):
-        tool_ingest._assert_source_link_closure(prepared, rows)
+    with pytest.raises(ingest_engine.SourceLinkClosureError, match="Retired Alias"):
+        ingest_engine._assert_source_link_closure(prepared, rows)
 
 
 def test_source_link_closure_ignores_code_temporal_and_non_source_content():
@@ -240,16 +241,16 @@ def test_source_link_closure_ignores_code_temporal_and_non_source_content():
             ),
         },
     ]
-    prepared = tool_ingest._prepare_source_link_closure(files)
+    prepared = ingest_engine._prepare_source_link_closure(files)
 
-    tool_ingest._assert_source_link_closure(prepared, [])
+    ingest_engine._assert_source_link_closure(prepared, [])
 
 
 def test_source_link_precondition_failure_has_no_mutation_side_effects(
     isolated_memory,
 ):
     content = _valid_source_content("[[Concept_Missing]]")
-    precondition = tool_ingest._prepare_source_link_precondition(
+    precondition = ingest_engine._prepare_source_link_precondition(
         [{"filename": "Source_Missing.md", "content": content}]
     )
     db_store.init_db()
@@ -257,7 +258,7 @@ def test_source_link_precondition_failure_has_no_mutation_side_effects(
     before_outbox = conn.execute("SELECT COUNT(*) FROM mutation_outbox").fetchone()[0]
     before_entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
 
-    with pytest.raises(tool_ingest.SourceLinkClosureError):
+    with pytest.raises(ingest_engine.SourceLinkClosureError):
         execute_mutation_batch(
             [{"filename": "Source_Missing.md", "content": content}],
             validation_mode="schema",
@@ -280,7 +281,7 @@ def test_source_link_precondition_accepts_same_batch_new_target(isolated_memory)
         {"filename": "Source_New.md", "content": source},
         {"filename": "Concept_New.md", "content": concept},
     ]
-    precondition = tool_ingest._prepare_source_link_precondition(files)
+    precondition = ingest_engine._prepare_source_link_precondition(files)
 
     execute_mutation_batch(
         files,
@@ -304,7 +305,7 @@ def test_source_link_precondition_observes_target_deleted_after_prepare(
         validation_mode="schema",
     )
     source_content = _valid_source_content("[[Concept_Target]]", entity_id="source_late")
-    precondition = tool_ingest._prepare_source_link_precondition(
+    precondition = ingest_engine._prepare_source_link_precondition(
         [{"filename": "Source_Late.md", "content": source_content}]
     )
     target_path = isolated_memory / "wiki" / "Concept_Target.md"
@@ -323,7 +324,7 @@ def test_source_link_precondition_observes_target_deleted_after_prepare(
     conn = db_store.get_connection()
     before_outbox = conn.execute("SELECT COUNT(*) FROM mutation_outbox").fetchone()[0]
 
-    with pytest.raises(tool_ingest.SourceLinkClosureError, match="Concept_Target"):
+    with pytest.raises(ingest_engine.SourceLinkClosureError, match="Concept_Target"):
         execute_mutation_batch(
             [{"filename": "Source_Late.md", "content": source_content}],
             validation_mode="schema",

@@ -982,14 +982,14 @@ class RawWatchdogHandler(FileSystemEventHandler):
 
     @staticmethod
     def _full_scan_complete(result) -> bool:
-        from vector_lake.tool_ingest import FULL_SCAN_COMPLETE_TOKEN
+        from vector_lake.ingest_engine import FULL_SCAN_COMPLETE_TOKEN
 
         lines = str(result or "").splitlines()
         return bool(lines) and lines[0].strip() == FULL_SCAN_COMPLETE_TOKEN
 
     @staticmethod
     def _scrub_period_days() -> int:
-        from vector_lake.tool_ingest import _raw_full_scan_scrub_days
+        from vector_lake.ingest_engine import _raw_full_scan_scrub_days
 
         return _raw_full_scan_scrub_days()
 
@@ -1060,7 +1060,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
             return True
 
     def _run_ingest(self, paths, overflow):
-        from vector_lake.tool_ingest import prepare_ingest_batch
+        from vector_lake.ingest_engine import prepare_ingest_batch
 
         options = {
             "batch_size": 50 if overflow else max(1, len(paths)),
@@ -1562,7 +1562,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
     def handle_event(self, event):
         if event.is_directory:
             return
-        from vector_lake.tool_ingest import is_private_diary_path
+        from vector_lake.ingest_engine import is_private_diary_path
 
         filepath = getattr(event, "dest_path", None) or event.src_path
         if is_private_diary_path(filepath):

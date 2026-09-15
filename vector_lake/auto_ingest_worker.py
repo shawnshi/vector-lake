@@ -2812,7 +2812,7 @@ def _validate_generator_output(
             # Model omitted the canonical Source page on a long input.  Auto-fill
             # a provenance-only page from the queued raw baseline; the finalizer
             # applies the same deterministic fallback.
-            from vector_lake.tool_ingest import _auto_source_page
+            from vector_lake.ingest_engine import _auto_source_page
 
             files.append(_auto_source_page(processed_data))
         elif canonical_count != 1:
@@ -2827,7 +2827,7 @@ def _verified_raw_input(
     config: AutoIngestConfig,
 ) -> str:
     from vector_lake.ingest_paths import get_ingest_target_directories
-    from vector_lake.tool_ingest import is_private_diary_path
+    from vector_lake.ingest_engine import is_private_diary_path
 
     try:
         raw_path = Path(str(processed_data.get("filepath") or ""))
@@ -2898,7 +2898,7 @@ def _lease_from_claim(claim: dict[str, Any]) -> tuple[str, str, int]:
 
 
 def _claim_one(config: AutoIngestConfig) -> dict[str, Any] | None:
-    from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION
+    from vector_lake.ingest_engine import INGEST_CONTRACT_VERSION
 
     tasks = db_store.claim_subagent_jobs(
         limit=1,
@@ -2953,7 +2953,7 @@ def _processed_data_from_claim(
 
 def _assert_not_private_source(processed_data: dict[str, Any]) -> None:
     """Reject reserved Diary payloads before any raw byte or prompt access."""
-    from vector_lake.tool_ingest import is_private_diary_path
+    from vector_lake.ingest_engine import is_private_diary_path
 
     raw_path = Path(str(processed_data.get("filepath") or ""))
     if not raw_path.is_absolute():
@@ -2964,7 +2964,7 @@ def _assert_not_private_source(processed_data: dict[str, Any]) -> None:
 
 def _quarantine_pending_private_sources(limit: int = 1000) -> int:
     """CAS-quarantine historical unowned Diary jobs before claim or model work."""
-    from vector_lake.tool_ingest import is_private_diary_path
+    from vector_lake.ingest_engine import is_private_diary_path
 
     if not db_store.peek_db_path().is_file():
         return 0
@@ -3844,7 +3844,7 @@ class AutoIngestController:
                 )
 
             try:
-                from vector_lake.tool_ingest import (
+                from vector_lake.ingest_engine import (
                     IngestFinalizationInfrastructureError,
                     finalize_ingest_strict,
                 )

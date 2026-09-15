@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import errno
 import json
 import os
@@ -1126,7 +1127,7 @@ def test_raw_watchdog_requeues_failed_batch_with_backoff(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_engine
 
     source = isolated_memory / "raw" / "retry.txt"
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -1141,7 +1142,7 @@ def test_raw_watchdog_requeues_failed_batch_with_backoff(
         completed.set()
         return "ok"
 
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", prepare)
     handler = RawWatchdogHandler(retry_base_seconds=0.01)
     try:
         handler.handle_event(SimpleNamespace(is_directory=False, src_path=str(source)))
@@ -1157,7 +1158,7 @@ def test_raw_watchdog_gate_busy_defers_full_scan_without_failure_count(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_engine
     from vector_lake.heavy_task_gate import heavy_task
 
     # Pin the admission wait to zero so this test keeps asserting the deferral
@@ -1183,9 +1184,9 @@ def test_raw_watchdog_gate_busy_defers_full_scan_without_failure_count(
     def prepare(*, batch_size, candidate_paths, _enqueue_all=False):
         calls.append((batch_size, candidate_paths, _enqueue_all))
         completed.set()
-        return f"{tool_ingest.FULL_SCAN_COMPLETE_TOKEN}\ncomplete"
+        return f"{ingest_engine.FULL_SCAN_COMPLETE_TOKEN}\ncomplete"
 
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", prepare)
     holder = threading.Thread(target=hold_gate, name="raw-gate-holder")
     holder.start()
     assert holder_acquired.wait(timeout=2)
@@ -1588,7 +1589,7 @@ def test_raw_watchdog_overflow_runs_one_complete_inventory(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_engine
 
     raw_dir = isolated_memory / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1613,11 +1614,11 @@ def test_raw_watchdog_overflow_runs_one_complete_inventory(
         assert _enqueue_all is True
         scan_complete.set()
         return (
-            f"{tool_ingest.FULL_SCAN_COMPLETE_TOKEN}\n"
+            f"{ingest_engine.FULL_SCAN_COMPLETE_TOKEN}\n"
             "Successfully enqueued recovery inventory."
         )
 
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", prepare)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", prepare)
     monkeypatch.setenv("VECTOR_LAKE_RAW_EVENT_BUFFER", "1")
     handler = RawWatchdogHandler(retry_base_seconds=0.01)
     try:

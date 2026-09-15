@@ -122,6 +122,11 @@ LAYERS: dict[str, set[str]] = {
         # It sits above domain (for validation) and above storage (for the commit),
         # which is exactly why wiki_utils could not keep those concerns.
         "canonical_write",
+        # The ingest engine, split out of tool_ingest so the orchestration layer can
+        # use it without importing a handler. Its heaviest cluster is closed under
+        # intra-module references and its maximum dependency layer is orchestration
+        # (mutation_coordinator), which is what makes this the right tier.
+        "ingest_engine",
     },
 }
 # Handlers and the CLI/MCP surface sit on top; they are derived from the filename
@@ -184,10 +189,7 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("runtime_health", "tool_auto_ingest"),
         ("runtime_health", "tool_gc"),
         # orchestration -> handler
-        ("auto_ingest_worker", "tool_ingest"),
-        ("ingest_worker", "tool_ingest"),
         ("watchdog_app", "tool_governance_maintenance"),
-        ("watchdog_app", "tool_ingest"),
         ("watchdog_app", "tool_lint"),
         # handler -> surface
         ("tool_doctor", "mcp_server"),
@@ -214,7 +216,7 @@ pass
 # module that imports wiki_utils joins it too. They are the C-class work that batch
 # 5a showed needs a function moved UP a layer rather than validation extracted,
 # against a 14-test contract surface.
-MAX_STRONGLY_CONNECTED_COMPONENT = 33
+MAX_STRONGLY_CONNECTED_COMPONENT = 34
 
 
 def _module_name(path: Path) -> str:

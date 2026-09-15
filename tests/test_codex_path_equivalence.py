@@ -177,7 +177,9 @@ def _canonical_transcript() -> bytes:
             _write_config(memory)
             _write_purpose_contract(memory)
             db_store.init_db()
-            from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION
+            from vector_lake.ingest_engine import (
+                INGEST_CONTRACT_VERSION,
+            )
 
             payload = {
                 "filepath": str(raw),

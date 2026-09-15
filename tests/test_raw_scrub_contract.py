@@ -65,7 +65,9 @@ def test_scrub_ledger_busy_is_due_after_persisted_backoff_and_restart(tmp_path):
 def test_long_lived_handler_runs_one_daily_cycle_and_restart_reuses_success(
     tmp_path,
 ):
-    from vector_lake.tool_ingest import FULL_SCAN_COMPLETE_TOKEN
+    from vector_lake.ingest_engine import (
+        FULL_SCAN_COMPLETE_TOKEN,
+    )
     from vector_lake.watchdog_app import RawWatchdogHandler
 
     clock = ManualUtcClock(datetime(2026, 8, 28, 2, 0, tzinfo=timezone.utc))

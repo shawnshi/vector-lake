@@ -93,7 +93,7 @@ def _persist_dispatch_packet_cleanup(job_id: str, task_path) -> bool:
 
 
 def process_jobs():
-    from vector_lake.tool_ingest import (
+    from vector_lake.ingest_engine import (
         INGEST_CONTRACT_VERSION,
         process_ingest_task_cleanup,
         requeue_legacy_ingest_jobs,

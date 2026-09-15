@@ -48,7 +48,9 @@ def _wake_at(handler, clock: ManualMonotonic, value: float) -> None:
 def _successful_result(overflow: bool) -> str:
     if not overflow:
         return "ok"
-    from vector_lake.tool_ingest import FULL_SCAN_COMPLETE_TOKEN
+    from vector_lake.ingest_engine import (
+        FULL_SCAN_COMPLETE_TOKEN,
+    )
 
     return f"{FULL_SCAN_COMPLETE_TOKEN}\ncomplete"
 

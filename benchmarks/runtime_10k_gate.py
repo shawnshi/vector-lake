@@ -39,6 +39,7 @@ from vector_lake import (  # noqa: E402
     db_store,
     index_snapshot,
     runtime_health,
+    ingest_engine,
     tool_ingest,
     tool_query,
     tool_search,
@@ -315,7 +316,7 @@ def _ingest_one(raw_path: Path) -> tuple[float, str, dict]:
     started = time.perf_counter()
     try:
         prepared = json.loads(
-            tool_ingest.prepare_ingest_batch(
+            ingest_engine.prepare_ingest_batch(
                 batch_size=1,
                 candidate_paths=[str(raw_path)],
             )
@@ -625,7 +626,7 @@ def run_gate(
                     encoding="utf-8",
                 )
                 drift_prepared = json.loads(
-                    tool_ingest.prepare_ingest_batch(
+                    ingest_engine.prepare_ingest_batch(
                         batch_size=1,
                         candidate_paths=[str(drift_raw)],
                     )

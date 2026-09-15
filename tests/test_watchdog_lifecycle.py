@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import json
 import os
 import sqlite3
@@ -25,7 +26,7 @@ def _install_lightweight_local_publication(monkeypatch, tool_ingest) -> None:
         job_id = db_store.enqueue_job("ingest", payload)
         return dict(payload), job_id
 
-    monkeypatch.setattr(tool_ingest, "_publish_local_source_and_enqueue", publish)
+    monkeypatch.setattr(ingest_engine, "_publish_local_source_and_enqueue", publish)
 
 
 def _write_test_purpose(memory_dir: Path) -> None:
@@ -812,7 +813,7 @@ def test_watchdog_schedules_all_collapsed_ingest_roots(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import ingest_paths, ingest_worker, tool_ingest, watchdog_app
+    from vector_lake import ingest_engine, ingest_paths, ingest_worker, watchdog_app
 
     stop_event = threading.Event()
     raw_dir = isolated_memory / "raw"
@@ -866,8 +867,9 @@ def test_watchdog_schedules_all_collapsed_ingest_roots(
     def cooperative_worker(event):
         event.wait(2)
 
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
     monkeypatch.setattr(watchdog_app, "RawWatchdogHandler", FakeRawHandler)
     monkeypatch.setattr(
@@ -877,7 +879,7 @@ def test_watchdog_schedules_all_collapsed_ingest_roots(
             "wiki": missing,
             "diary": missing,
             "raw": raw_dir,
-            "raw_targets": tool_ingest.get_ingest_target_directories(
+            "raw_targets": ingest_engine.get_ingest_target_directories(
                 collapse_nested=True
             ),
         },
@@ -900,7 +902,7 @@ def test_watchdog_hot_reconciles_removed_and_recreated_raw_roots(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import ingest_paths, ingest_worker, tool_ingest, watchdog_app
+    from vector_lake import ingest_engine, ingest_paths, ingest_worker, watchdog_app
 
     stop_event = threading.Event()
     raw_dir = isolated_memory / "raw"
@@ -986,8 +988,9 @@ def test_watchdog_hot_reconciles_removed_and_recreated_raw_roots(
     def cooperative_worker(event):
         event.wait(2)
 
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
     monkeypatch.setattr(watchdog_app, "RawWatchdogHandler", FakeRawHandler)
     monkeypatch.setattr(
@@ -997,7 +1000,7 @@ def test_watchdog_hot_reconciles_removed_and_recreated_raw_roots(
             "wiki": missing,
             "diary": missing,
             "raw": raw_dir,
-            "raw_targets": tool_ingest.get_ingest_target_directories(
+            "raw_targets": ingest_engine.get_ingest_target_directories(
                 collapse_nested=True
             ),
         },
@@ -1644,7 +1647,7 @@ def test_watchdog_hot_reconciles_parent_child_root_switch(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import ingest_paths, ingest_worker, tool_ingest, watchdog_app
+    from vector_lake import ingest_engine, ingest_paths, ingest_worker, watchdog_app
 
     stop_event = threading.Event()
     raw_dir = isolated_memory / "raw"
@@ -1720,8 +1723,9 @@ def test_watchdog_hot_reconciles_parent_child_root_switch(
     def cooperative_worker(event):
         event.wait(2)
 
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
     monkeypatch.setattr(watchdog_app, "RawWatchdogHandler", FakeRawHandler)
     monkeypatch.setattr(
@@ -1785,15 +1789,16 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated test ingest instructions",
     )
-    real_revision = tool_ingest.stable_raw_revision
-    real_walk = tool_ingest.os.walk
+    real_revision = ingest_engine.stable_raw_revision
+    real_walk = ingest_engine.os.walk
     hashed = []
     walked_roots = []
 
@@ -1806,16 +1811,16 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
         walked_roots.append(str(Path(root).resolve()))
         return real_walk(root, *args, **kwargs)
 
-    real_prepare = tool_ingest.prepare_ingest_batch
+    real_prepare = ingest_engine.prepare_ingest_batch
     calls = []
 
     def recording_prepare(*args, **kwargs):
         calls.append((args, dict(kwargs)))
         return real_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(tool_ingest, "stable_raw_revision", recording_revision)
-    monkeypatch.setattr(tool_ingest.os, "walk", recording_walk)
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", recording_prepare)
+    monkeypatch.setattr(ingest_engine, "stable_raw_revision", recording_revision)
+    monkeypatch.setattr(ingest_engine.os, "walk", recording_walk)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", recording_prepare)
     handler = RawWatchdogHandler()
     idle = False
     try:
@@ -1878,14 +1883,15 @@ def test_raw_full_scan_preserves_event_arriving_during_inventory(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated test ingest instructions",
     )
-    real_revision = tool_ingest.stable_raw_revision
+    real_revision = ingest_engine.stable_raw_revision
     inventory_hashed = threading.Event()
     release_inventory = threading.Event()
     hashed = []
@@ -1899,15 +1905,15 @@ def test_raw_full_scan_preserves_event_arriving_during_inventory(
                 raise TimeoutError("test did not release startup inventory")
         return result
 
-    real_prepare = tool_ingest.prepare_ingest_batch
+    real_prepare = ingest_engine.prepare_ingest_batch
     calls = []
 
     def recording_prepare(*args, **kwargs):
         calls.append((args, dict(kwargs)))
         return real_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(tool_ingest, "stable_raw_revision", pausing_revision)
-    monkeypatch.setattr(tool_ingest, "prepare_ingest_batch", recording_prepare)
+    monkeypatch.setattr(ingest_engine, "stable_raw_revision", pausing_revision)
+    monkeypatch.setattr(ingest_engine, "prepare_ingest_batch", recording_prepare)
     handler = RawWatchdogHandler()
     idle = False
     try:
@@ -1961,7 +1967,7 @@ def test_raw_watchdog_processes_quick_same_path_revision_and_supersedes_old_job(
     source = isolated_memory / "raw" / "quick-revision.txt"
     source.write_text("revision one", encoding="utf-8")
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated instructions",
     )

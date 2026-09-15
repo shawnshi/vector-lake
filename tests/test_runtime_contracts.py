@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import asyncio
 import gc
 import functools
@@ -3077,7 +3078,6 @@ def test_projection_consumers_fail_closed_on_uncommitted_index(isolated_memory):
         runtime_health,
         tool_doctor,
         tool_graph,
-        tool_ingest,
         tool_piea,
         tool_projection,
         tool_research,
@@ -3112,7 +3112,7 @@ def test_projection_consumers_fail_closed_on_uncommitted_index(isolated_memory):
     with pytest.raises(indexer.ProjectionPairContractError):
         tool_projection.embedding_backfill_projection(dry_run=True)
     with pytest.raises(indexer.ProjectionPairContractError):
-        tool_ingest._prepare_relevant_index_context()
+        ingest_engine._prepare_relevant_index_context()
 
     health = runtime_health.assess_runtime_health()
     assert health["ok"] is False

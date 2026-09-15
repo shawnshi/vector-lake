@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from vector_lake import (
+    ingest_engine,
     db_store,
     governance_store,
     ingest_paths,
@@ -37,17 +38,19 @@ from vector_lake.raw_revision import (
     stable_raw_revision,
 )
 from vector_lake.tool_ingest import (
+    claim_ingest_tasks,
+    calculate_hash,
+    list_ingest_tasks,
+    reconcile_ingest_job_debt,
+    reconcile_orphan_ingest_task_packets,
+)
+from vector_lake.ingest_engine import (
     INGEST_CONTRACT_VERSION,
     _read_canonical_target_content,
     _read_relevant_index_context,
     canonical_source_name,
-    claim_ingest_tasks,
-    calculate_hash,
-    list_ingest_tasks,
     prepare_ingest_batch,
     process_ingest_task_cleanup,
-    reconcile_ingest_job_debt,
-    reconcile_orphan_ingest_task_packets,
 )
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
 
@@ -82,7 +85,7 @@ def _v4_ingest_payload(
     except RawRevisionFormatError:
         raw_path = Path(filepath)
         if not raw_path.is_absolute():
-            raw_path = tool_ingest.get_raw_dir().parent / raw_path
+            raw_path = ingest_engine.get_raw_dir().parent / raw_path
         if not raw_path.exists():
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.write_text(f"test raw revision: {file_hash}", encoding="utf-8")
@@ -376,7 +379,7 @@ def test_raw_inventory_stops_at_next_bounded_checkpoint_before_enqueue(
     )
     operation.mark_running()
     scanned = []
-    original_revision = tool_ingest.stable_raw_revision
+    original_revision = ingest_engine.stable_raw_revision
 
     def stop_after_first_revision(*args, **kwargs):
         revision = original_revision(*args, **kwargs)
@@ -392,10 +395,10 @@ def test_raw_inventory_stops_at_next_bounded_checkpoint_before_enqueue(
                 )
         return revision
 
-    monkeypatch.setattr(tool_ingest, "stable_raw_revision", stop_after_first_revision)
-    monkeypatch.setattr(tool_ingest, "_RAW_SCAN_CHECKPOINT_ITEMS", 1, raising=False)
+    monkeypatch.setattr(ingest_engine, "stable_raw_revision", stop_after_first_revision)
+    monkeypatch.setattr(ingest_engine, "_RAW_SCAN_CHECKPOINT_ITEMS", 1, raising=False)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args, **_kwargs: "bounded instructions",
     )
@@ -454,7 +457,7 @@ def test_raw_enqueue_batch_is_non_interruptible_after_atomic_entry(
 
     monkeypatch.setattr(db_store, "enqueue_job", blocking_enqueue)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args, **_kwargs: "bounded instructions",
     )
@@ -534,9 +537,9 @@ def test_finalize_commit_is_non_interruptible_after_atomic_entry(
         },
     )
     monkeypatch.setenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", "1")
-    monkeypatch.setattr(tool_ingest, "load_purpose_contract", lambda: {})
+    monkeypatch.setattr(ingest_engine, "load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "validate_ingest_payload",
         lambda _files, _contract: [],
     )
@@ -562,7 +565,7 @@ def test_finalize_commit_is_non_interruptible_after_atomic_entry(
     def run_finalize():
         try:
             with bind_cancellation_operation(operation):
-                results.append(tool_ingest.finalize_ingest_strict([], processed_data))
+                results.append(ingest_engine.finalize_ingest_strict([], processed_data))
                 operation.mark_completed()
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
@@ -644,7 +647,7 @@ def test_new_source_names_survive_sanitization_and_extension_collisions(
     assert all(re.search(r"-[0-9a-f]{8}\.md$", name) for name in first)
     assert all("__" not in name for name in first)
     for name in first:
-        tool_ingest.validate_wiki_filename(name)
+        ingest_engine.validate_wiki_filename(name)
 
 
 def test_new_source_names_are_bounded_and_strictly_valid(
@@ -662,7 +665,7 @@ def test_new_source_names_are_bounded_and_strictly_valid(
     assert len(name) <= 120
     assert "__" not in name
     assert "\u3400" not in name
-    tool_ingest.validate_wiki_filename(name)
+    ingest_engine.validate_wiki_filename(name)
 
 
 def test_external_roots_with_same_basename_get_distinct_canonical_names(
@@ -690,10 +693,11 @@ def test_external_roots_with_same_basename_get_distinct_canonical_names(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated instructions",
     )
@@ -727,7 +731,7 @@ def test_durable_ingest_identity_lookup_is_candidate_scoped_and_chunked():
             return []
 
     keys = [f"key-{index:04d}" for index in range(805)]
-    existing = tool_ingest._existing_durable_ingest_keys(
+    existing = ingest_engine._existing_durable_ingest_keys(
         RecordingConnection(),
         keys,
     )
@@ -749,7 +753,7 @@ def test_prepare_ingest_uses_durable_job_identity_history_as_gate(
     second = prepare_ingest_batch(batch_size=1, candidate_paths=[str(raw_path)])
 
     assert json.loads(first)["filepath"] == str(raw_path.resolve())
-    assert second == tool_ingest.NO_NEW_REVISIONS_MESSAGE
+    assert second == ingest_engine.NO_NEW_REVISIONS_MESSAGE
     assert (
         db_store.get_connection()
         .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")
@@ -773,7 +777,7 @@ def test_prepare_ingest_honors_legacy_identity_without_job_key(
 
     second = prepare_ingest_batch(batch_size=1, candidate_paths=[str(raw_path)])
 
-    assert second == tool_ingest.NO_NEW_REVISIONS_MESSAGE
+    assert second == ingest_engine.NO_NEW_REVISIONS_MESSAGE
     assert (
         db_store.get_connection()
         .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")
@@ -853,7 +857,7 @@ def test_processed_durable_identity_remains_gate(
     second = prepare_ingest_batch(batch_size=1, candidate_paths=[str(raw_path)])
 
     assert json.loads(first)["filepath"] == str(raw_path.resolve())
-    assert second == tool_ingest.NO_NEW_REVISIONS_MESSAGE
+    assert second == ingest_engine.NO_NEW_REVISIONS_MESSAGE
     rows = (
         db_store.get_connection()
         .execute("SELECT job_id, idempotency_key FROM jobs WHERE task_type = 'ingest'")
@@ -1019,7 +1023,7 @@ def test_unchanged_path_event_refreshes_observed_file_metadata(
         candidate_paths=[str(raw_path)],
     )
 
-    assert result == tool_ingest.NO_NEW_REVISIONS_MESSAGE
+    assert result == ingest_engine.NO_NEW_REVISIONS_MESSAGE
     details = raw_path.stat()
     record = (
         db_store.get_connection()
@@ -1055,8 +1059,8 @@ def test_repeated_unchanged_scan_does_not_rewrite_observation(isolated_memory):
         candidate_paths=[str(raw_path)],
     )
 
-    assert first == tool_ingest.NO_NEW_REVISIONS_MESSAGE
-    assert second == tool_ingest.NO_NEW_REVISIONS_MESSAGE
+    assert first == ingest_engine.NO_NEW_REVISIONS_MESSAGE
+    assert second == ingest_engine.NO_NEW_REVISIONS_MESSAGE
     assert connection.total_changes == changes_after_first
 
 
@@ -1086,7 +1090,7 @@ def test_unchanged_scan_batches_changed_observations(
         return real_update(materialized)
 
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "update_processed_file_observations",
         record_batch,
     )
@@ -1096,7 +1100,7 @@ def test_unchanged_scan_batches_changed_observations(
         candidate_paths=[str(path) for path in raw_paths],
     )
 
-    assert result == tool_ingest.NO_NEW_REVISIONS_MESSAGE
+    assert result == ingest_engine.NO_NEW_REVISIONS_MESSAGE
     assert len(batches) == 1
     assert {item[0] for item in batches[0]} == {
         str(path.resolve()) for path in raw_paths
@@ -1119,7 +1123,7 @@ def test_private_diary_check_keeps_lexical_ancestry_after_resolution(
 
     monkeypatch.setattr(Path, "resolve", redirect_reserved_path)
 
-    assert tool_ingest.is_private_diary_path(lexical) is True
+    assert ingest_engine.is_private_diary_path(lexical) is True
 
 
 def test_full_scan_excludes_private_diary_path_case_insensitively(
@@ -1144,14 +1148,15 @@ def test_full_scan_excludes_private_diary_path_case_insensitively(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated instructions",
     )
-    real_walk = tool_ingest.os.walk
+    real_walk = ingest_engine.os.walk
     walked_roots = []
 
     def recording_walk(*args, **kwargs):
@@ -1159,7 +1164,7 @@ def test_full_scan_excludes_private_diary_path_case_insensitively(
             walked_roots.append(Path(root).resolve())
             yield root, dirs, files
 
-    monkeypatch.setattr(tool_ingest.os, "walk", recording_walk)
+    monkeypatch.setattr(ingest_engine.os, "walk", recording_walk)
 
     result = prepare_ingest_batch(batch_size=10, _enqueue_all=True)
     payloads = [
@@ -1169,7 +1174,7 @@ def test_full_scan_excludes_private_diary_path_case_insensitively(
         )
     ]
 
-    assert result.startswith(tool_ingest.FULL_SCAN_COMPLETE_TOKEN)
+    assert result.startswith(ingest_engine.FULL_SCAN_COMPLETE_TOKEN)
     assert [item["filepath"] for item in payloads] == [str(normal.resolve())]
     assert all(str(diary.resolve()) != item["filepath"] for item in payloads)
     assert diary.parent.resolve() not in walked_roots
@@ -1198,10 +1203,11 @@ def test_candidate_scan_matches_exclude_paths_by_casefolded_components(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated instructions",
     )
@@ -1234,17 +1240,18 @@ def test_full_scan_hashes_same_size_change_with_restored_mtime(
 
     config_root = isolated_memory / "extension-config"
     config_root.mkdir()
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated instructions",
     )
 
     first_result = prepare_ingest_batch(batch_size=1, _enqueue_all=True)
     original_stat = raw_path.stat()
-    assert first_result.startswith(tool_ingest.FULL_SCAN_COMPLETE_TOKEN)
+    assert first_result.startswith(ingest_engine.FULL_SCAN_COMPLETE_TOKEN)
     assert (
         db_store.get_connection()
         .execute("SELECT COUNT(*) FROM jobs WHERE task_type = 'ingest'")
@@ -1263,7 +1270,7 @@ def test_full_scan_hashes_same_size_change_with_restored_mtime(
     second_result = prepare_ingest_batch(batch_size=1, _enqueue_all=True)
 
     assert second_hash != first_hash
-    assert second_result.startswith(tool_ingest.FULL_SCAN_COMPLETE_TOKEN)
+    assert second_result.startswith(ingest_engine.FULL_SCAN_COMPLETE_TOKEN)
     row = (
         db_store.get_connection()
         .execute("SELECT payload FROM jobs WHERE task_type = 'ingest'")
@@ -1291,10 +1298,11 @@ def test_full_scan_fails_closed_when_hash_is_unavailable(
         json.dumps({"supported_extensions": [".txt"]}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "stable_raw_revision",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
     )
@@ -1329,8 +1337,9 @@ def test_ingest_rejects_malformed_or_mistyped_config(
     config_root = isolated_memory / "extension-config"
     config_root.mkdir()
     (config_root / "config.json").write_text(config_text, encoding="utf-8")
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
 
     with pytest.raises(RuntimeError, match=error_pattern):
         prepare_ingest_batch(batch_size=1, candidate_paths=[])
@@ -1353,8 +1362,9 @@ def test_full_scan_rejects_configured_target_that_is_not_a_directory(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
 
     with pytest.raises(RuntimeError, match="ingest_target_unavailable") as exc_info:
         prepare_ingest_batch(batch_size=1, _enqueue_all=True)
@@ -1374,7 +1384,7 @@ def test_prepare_ingest_builds_shared_instruction_context_once_per_batch(
         path.write_text(f"batch payload {index}", encoding="utf-8")
         paths.append(path)
 
-    real_prepare_context = tool_ingest._prepare_ingest_instruction_context
+    real_prepare_context = ingest_engine._prepare_ingest_instruction_context
     context_calls = []
 
     def recording_prepare_context():
@@ -1389,7 +1399,7 @@ def test_prepare_ingest_builds_shared_instruction_context_once_per_batch(
         return real_versions(page_keys)
 
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_prepare_ingest_instruction_context",
         recording_prepare_context,
     )
@@ -1430,7 +1440,7 @@ def test_prepare_ingest_isolates_one_file_failure_from_valid_peers(
             raise ValueError("source-specific preparation failure")
         return "valid instructions"
 
-    monkeypatch.setattr(tool_ingest, "_build_ingest_instructions", build)
+    monkeypatch.setattr(ingest_engine, "_build_ingest_instructions", build)
 
     with pytest.raises(
         RuntimeError,
@@ -2266,8 +2276,8 @@ def test_ingest_worker_creates_subagent_task_packet(isolated_memory):
     assert claimed_processed["lease_owner"] == claimed["lease_owner"]
     assert claimed_processed["lease_token"] == claimed["lease_token"]
     assert claimed_processed["lease_generation"] == claimed["lease_generation"]
-    assert tool_ingest._auto_source_page(claimed_processed) == (
-        tool_ingest._auto_source_page(payload)
+    assert ingest_engine._auto_source_page(claimed_processed) == (
+        ingest_engine._auto_source_page(payload)
     )
     import os
 
@@ -2340,7 +2350,7 @@ def test_v4_invalid_nested_source_name_migrates_to_v5(
     job_id = db_store.enqueue_job("ingest", payload)
     db_store.mark_job_awaiting_subagent(job_id, "")
 
-    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+    migrated = ingest_engine.requeue_legacy_ingest_jobs()
 
     row = (
         db_store.get_connection()
@@ -2356,7 +2366,7 @@ def test_v4_invalid_nested_source_name_migrates_to_v5(
     assert refreshed["ingest_contract_version"] == INGEST_CONTRACT_VERSION
     assert refreshed["canonical_name"] != payload["canonical_name"]
     assert "__" not in refreshed["canonical_name"]
-    tool_ingest.validate_wiki_filename(refreshed["canonical_name"])
+    ingest_engine.validate_wiki_filename(refreshed["canonical_name"])
 
 
 def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
@@ -2365,7 +2375,7 @@ def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
 ):
     _write_purpose_contract(isolated_memory)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt instructions",
     )
@@ -2431,7 +2441,7 @@ def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
     traced_sql = []
     connection = db_store.get_connection()
     connection.set_trace_callback(traced_sql.append)
-    first = tool_ingest.requeue_legacy_ingest_jobs()
+    first = ingest_engine.requeue_legacy_ingest_jobs()
     connection.set_trace_callback(None)
 
     assert first == 100
@@ -2474,7 +2484,7 @@ def test_legacy_requeue_filters_in_sql_and_checkpoints_at_one_hundred(
     assert "json_extract(payload, '$.ingest_contract_version')" in candidate_selects[0]
     assert "limit 100" in candidate_selects[0]
 
-    second = tool_ingest.requeue_legacy_ingest_jobs()
+    second = ingest_engine.requeue_legacy_ingest_jobs()
 
     assert second == 5
     assert all(
@@ -2499,7 +2509,7 @@ def test_legacy_requeue_isolates_projection_drift_and_advances_valid_peer(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt instructions",
     )
@@ -2520,7 +2530,7 @@ def test_legacy_requeue_isolates_projection_drift_and_advances_valid_peer(
         db_store.mark_job_awaiting_subagent(job_id, "")
         job_ids.append(job_id)
 
-    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+    migrated = ingest_engine.requeue_legacy_ingest_jobs()
     rows = {
         row["job_id"]: row
         for row in db_store.get_connection().execute(
@@ -2566,14 +2576,14 @@ def test_legacy_requeue_does_not_overwrite_concurrently_refreshed_payload(
             )
         return "stale rebuilt instructions"
 
-    monkeypatch.setattr(tool_ingest, "_build_ingest_instructions", refresh_payload)
+    monkeypatch.setattr(ingest_engine, "_build_ingest_instructions", refresh_payload)
     monkeypatch.setattr(
         governance_store,
         "canonical_page_versions",
         lambda _keys: {},
     )
 
-    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+    migrated = ingest_engine.requeue_legacy_ingest_jobs()
 
     row = (
         db_store.get_connection()
@@ -2724,9 +2734,9 @@ def test_manual_claim_does_not_overlap_an_existing_live_auto_claim(isolated_memo
 
 def test_finalize_ingest_rejects_mismatched_job_payload(isolated_memory, monkeypatch):
     db_store.init_db()
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/expected.md", "expected-hash", "Source_Expected.md"
@@ -2758,9 +2768,9 @@ def test_finalize_ingest_rejects_source_hash_not_bound_to_job_payload(
     isolated_memory, monkeypatch
 ):
     db_store.init_db()
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/source-version.md",
@@ -2841,9 +2851,9 @@ def test_finalize_ingest_rejects_contract_version_not_bound_to_job_payload(
     isolated_memory, monkeypatch
 ):
     db_store.init_db()
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/contract-version.md",
@@ -2866,9 +2876,9 @@ def test_finalize_ingest_rejects_contract_version_not_bound_to_job_payload(
 def test_finalize_ingest_marks_subagent_job_finalized(isolated_memory, monkeypatch):
     db_store.init_db()
     monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-finalize")
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/finalize.md", "finalize-hash", "Source_Finalize.md"
@@ -2914,9 +2924,9 @@ def test_legacy_md5_job_must_be_requeued_before_finalization(
     db_store.init_db()
     _write_purpose_contract(isolated_memory)
     monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-legacy-finalize")
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     raw_path = isolated_memory / "raw" / "legacy-finalize.md"
     raw_path.write_text("legacy canary bytes", encoding="utf-8")
@@ -2934,7 +2944,7 @@ def test_legacy_md5_job_must_be_requeued_before_finalization(
         required_ingest_contract_version=INGEST_CONTRACT_VERSION,
     )[0]
 
-    result = tool_ingest.finalize_ingest_strict(
+    result = ingest_engine.finalize_ingest_strict(
         [],
         _claimed_processed_data(
             payload,
@@ -2968,7 +2978,7 @@ def test_legacy_md5_job_must_be_requeued_before_finalization(
     )
     assert payload["hash"] == snapshot.legacy_md5
 
-    assert tool_ingest.requeue_legacy_ingest_jobs() == 1
+    assert ingest_engine.requeue_legacy_ingest_jobs() == 1
     refreshed = json.loads(
         db_store.get_connection()
         .execute(
@@ -2992,7 +3002,7 @@ def test_finalize_ingest_rejects_nested_filepath_without_reading_it(
 
     monkeypatch.setattr(Path, "read_text", forbidden_read)
     with pytest.raises(ValueError, match="filepath is not supported"):
-        tool_ingest._normalize_inline_files_written(
+        ingest_engine._normalize_inline_files_written(
             [{"filename": "Concept_Sentinel.md", "filepath": str(sentinel)}]
         )
     assert sentinel.exists()
@@ -3000,11 +3010,11 @@ def test_finalize_ingest_rejects_nested_filepath_without_reading_it(
 
 def test_finalize_ingest_rejects_oversize_inline_content():
     with pytest.raises(ValueError, match="per-file inline byte limit"):
-        tool_ingest._normalize_inline_files_written(
+        ingest_engine._normalize_inline_files_written(
             [
                 {
                     "filename": "Concept_Oversize.md",
-                    "content": "x" * (tool_ingest._MAX_FINALIZE_INLINE_FILE_BYTES + 1),
+                    "content": "x" * (ingest_engine._MAX_FINALIZE_INLINE_FILE_BYTES + 1),
                 }
             ]
         )
@@ -3016,9 +3026,9 @@ def test_cleanup_failure_after_durable_finalize_remains_success(
 ):
     db_store.init_db()
     monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-cleanup-warning")
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/finalize-cleanup-warning.md",
@@ -3035,8 +3045,8 @@ def test_cleanup_failure_after_durable_finalize_remains_success(
     def fail_cleanup(*args, **kwargs):
         raise sqlite3.OperationalError("injected cleanup claim failure")
 
-    monkeypatch.setattr(tool_ingest, "process_ingest_task_cleanup", fail_cleanup)
-    result = tool_ingest.finalize_ingest_strict(
+    monkeypatch.setattr(ingest_engine, "process_ingest_task_cleanup", fail_cleanup)
+    result = ingest_engine.finalize_ingest_strict(
         [],
         _claimed_processed_data(
             payload,
@@ -3083,9 +3093,9 @@ def test_empty_rejected_finalize_obeys_real_unhealthy_full_write_gate(
         "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
         "watchdog,outbox,scheduler,ingest",
     )
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/empty-gate-blocked.md",
@@ -3115,10 +3125,10 @@ def test_empty_rejected_finalize_obeys_real_unhealthy_full_write_gate(
     )
     result = mcp_server.tools.finalize_ingest([], processed_data)
     with pytest.raises(
-        tool_ingest.IngestFinalizationInfrastructureError,
+        ingest_engine.IngestFinalizationInfrastructureError,
         match="Vector Lake write gate blocked this mutation",
     ):
-        tool_ingest.finalize_ingest_strict([], processed_data)
+        ingest_engine.finalize_ingest_strict([], processed_data)
 
     after = dict(
         connection.execute(
@@ -3152,9 +3162,9 @@ def test_empty_rejected_finalize_callback_is_atomic_under_healthy_full_write_gat
         "VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS",
         "watchdog,outbox,scheduler,ingest",
     )
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/empty-gate-atomic.md",
@@ -3238,9 +3248,9 @@ def test_empty_rejected_finalize_callback_is_atomic_under_healthy_full_write_gat
 
 def test_finalize_ingest_requires_claimed_job(isolated_memory, monkeypatch):
     db_store.init_db()
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
 
     result = mcp_server.tools.finalize_ingest(
@@ -3257,9 +3267,9 @@ def test_stale_subagent_lease_cannot_finalize_after_reclaim(
     isolated_memory, monkeypatch
 ):
     db_store.init_db()
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload("raw/fenced.md", "fenced-hash", "Source_Fenced.md")
     job_id = db_store.enqueue_job("ingest", payload)
@@ -3297,7 +3307,7 @@ def test_final_cas_rolls_back_processed_marker_if_lease_changes_after_validation
     isolated_memory, monkeypatch
 ):
     db_store.init_db()
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     payload = _v4_ingest_payload("raw/race.md", "race-hash", "Source_Race.md")
     job_id = db_store.enqueue_job("ingest", payload)
     db_store.mark_job_awaiting_subagent(job_id, "")
@@ -3313,7 +3323,7 @@ def test_final_cas_rolls_back_processed_marker_if_lease_changes_after_validation
         return []
 
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload",
+        "vector_lake.ingest_engine.validate_ingest_payload",
         reclaim_during_payload_validation,
     )
     result = mcp_server.tools.finalize_ingest(
@@ -3489,9 +3499,9 @@ def test_finalize_ingest_rejects_missing_semantic_disposition(
     isolated_memory, monkeypatch
 ):
     db_store.init_db()
-    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.ingest_engine.load_purpose_contract", lambda: {})
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: []
+        "vector_lake.ingest_engine.validate_ingest_payload", lambda files, contract: []
     )
     payload = _v4_ingest_payload(
         "raw/no-disposition.md", "no-disposition", "Source_No-Disposition.md"
@@ -3569,7 +3579,7 @@ def test_finalize_ingest_rechecks_raw_revision_inside_canonical_commit(
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    real_apply = tool_ingest._apply_integration_disposition
+    real_apply = ingest_engine._apply_integration_disposition
 
     def mutate_raw_after_initial_check(files, processed_data):
         result = real_apply(files, processed_data)
@@ -3577,7 +3587,7 @@ def test_finalize_ingest_rechecks_raw_revision_inside_canonical_commit(
         return result
 
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_apply_integration_disposition",
         mutate_raw_after_initial_check,
     )
@@ -3638,7 +3648,7 @@ def test_finalize_rejected_ingest_rechecks_raw_revision_inside_transaction(
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    real_apply = tool_ingest._apply_integration_disposition
+    real_apply = ingest_engine._apply_integration_disposition
 
     def mutate_raw_after_initial_check(files, processed_data):
         result = real_apply(files, processed_data)
@@ -3646,7 +3656,7 @@ def test_finalize_rejected_ingest_rechecks_raw_revision_inside_transaction(
         return result
 
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_apply_integration_disposition",
         mutate_raw_after_initial_check,
     )
@@ -3750,7 +3760,7 @@ def test_standalone_ingest_skips_unscoped_existing_model_page(isolated_memory):
         "reason": "No approved existing target has a source-supported relation.",
     }
 
-    files, disposition, applied_targets = tool_ingest._apply_integration_disposition(
+    files, disposition, applied_targets = ingest_engine._apply_integration_disposition(
         [
             {
                 "filename": payload["canonical_name"],
@@ -4033,7 +4043,7 @@ def test_model_page_normalizer_repairs_incomplete_frontmatter_and_prefix(
     isolated_memory,
 ):
     _write_purpose_contract(isolated_memory)
-    files = tool_ingest._normalize_codex_output_pages(
+    files = ingest_engine._normalize_codex_output_pages(
         [
             {
                 "filename": "Ingest_Rural-Health-Update.md",
@@ -4051,7 +4061,7 @@ def test_model_page_normalizer_repairs_incomplete_frontmatter_and_prefix(
     )
 
     assert files[0]["filename"] == "Event_Rural-Health-Update.md"
-    frontmatter, body = tool_ingest.split_frontmatter(files[0]["content"])
+    frontmatter, body = ingest_engine.split_frontmatter(files[0]["content"])
     assert frontmatter["id"]
     assert frontmatter["type"] == "event"
     assert frontmatter["sources"] == ["Source_Test"]
@@ -5040,7 +5050,7 @@ def test_retry_terminal_ingest_job_races_fail_without_job_mutation(
     else:
         monkeypatch.setattr(tool_ingest, "reconcile_ingest_job_debt", inject_race)
     with pytest.raises(
-        tool_ingest.IngestBaselineConflict,
+        ingest_engine.IngestBaselineConflict,
         match="changed after confirmation|became processed|precondition changed",
     ):
         tool_ingest.retry_terminal_ingest_job(
@@ -5297,7 +5307,7 @@ def test_exact_reconcile_apply_concurrent_owner_skip_is_conflict(
 
     monkeypatch.setattr(tool_projection, "create_maintenance_backup", add_concurrent_owner)
 
-    with pytest.raises(tool_ingest.IngestBaselineConflict):
+    with pytest.raises(ingest_engine.IngestBaselineConflict):
         reconcile_ingest_job_debt(
             dry_run=False,
             job_id=failed_job,
@@ -5365,7 +5375,7 @@ def test_exact_reconcile_apply_rejects_postbackup_row_guard_races(
         mutate_after_confirmation,
     )
 
-    with pytest.raises(tool_ingest.IngestBaselineConflict, match="exact ingest debt"):
+    with pytest.raises(ingest_engine.IngestBaselineConflict, match="exact ingest debt"):
         reconcile_ingest_job_debt(
             dry_run=False,
             job_id=failed_job,
@@ -5489,7 +5499,7 @@ def test_exact_reconcile_fingerprint_changes_on_raw_owner_or_target_drift(
     )
 
     raw_path.write_text("changed exact revision", encoding="utf-8")
-    with pytest.raises(tool_ingest.IngestBaselineConflict):
+    with pytest.raises(ingest_engine.IngestBaselineConflict):
         reconcile_ingest_job_debt(
             dry_run=False,
             job_id=failed_job,
@@ -5513,7 +5523,7 @@ def test_exact_reconcile_fingerprint_changes_on_raw_owner_or_target_drift(
             "UPDATE jobs SET status = 'cancelled', idempotency_key = NULL WHERE job_id = ?",
             (owner_job,),
         )
-    with pytest.raises(tool_ingest.IngestBaselineConflict):
+    with pytest.raises(ingest_engine.IngestBaselineConflict):
         reconcile_ingest_job_debt(
             dry_run=False,
             job_id=failed_job,
@@ -5636,7 +5646,7 @@ def test_reconcile_failed_legacy_name_uses_current_revision_owner(
     db_store.mark_job_awaiting_subagent(owner_job, "")
     owner_key = db_store._job_idempotency_key("ingest", owner_payload)
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "canonical_source_name",
         lambda *_args, **_kwargs: "Source_Resolver-Drift-87654321.md",
     )
@@ -5838,7 +5848,7 @@ def test_reconcile_requeue_rechecks_revision_owner_set_at_apply(
         )
     planned_canonical = "Source_Planned-Requeue-Race.md"
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "canonical_source_name",
         lambda *_args, **_kwargs: planned_canonical,
     )
@@ -5848,12 +5858,12 @@ def test_reconcile_requeue_rechecks_revision_owner_set_at_apply(
         lambda _keys: {},
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_projection_hash_for_canonical_version",
         lambda *_args: "",
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt instructions",
     )
@@ -6250,10 +6260,13 @@ def test_reconcile_missing_canonical_reuses_one_identity_snapshot(
 
     config_root = isolated_memory / "extension-config"
     config_root.mkdir()
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     target_calls = []
     index_calls = []
+    # reconcile_ingest_job_debt lives in tool_ingest, so its call resolves this name
+    # in tool_ingest's globals; patch there, not in the engine.
     real_targets = tool_ingest.get_ingest_target_directories
     real_index = tool_ingest._source_identity_index_from_connection
 
@@ -7118,22 +7131,23 @@ def test_explicit_private_diary_root_is_never_walked(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
-    real_walk = tool_ingest.os.walk
+    monkeypatch.setattr(ingest_engine, "get_extension_root", lambda: config_root)
+    real_walk = ingest_engine.os.walk
     walked_roots = []
 
     def recording_walk(*args, **kwargs):
         walked_roots.append(Path(args[0]).resolve())
         return real_walk(*args, **kwargs)
 
-    monkeypatch.setattr(tool_ingest.os, "walk", recording_walk)
+    monkeypatch.setattr(ingest_engine.os, "walk", recording_walk)
 
     result = prepare_ingest_batch(batch_size=10, _enqueue_all=True)
 
     assert result == (
-        f"{tool_ingest.FULL_SCAN_COMPLETE_TOKEN}\n"
-        f"{tool_ingest.NO_NEW_REVISIONS_MESSAGE}"
+        f"{ingest_engine.FULL_SCAN_COMPLETE_TOKEN}\n"
+        f"{ingest_engine.NO_NEW_REVISIONS_MESSAGE}"
     )
     assert diary_root.resolve() not in walked_roots
 
@@ -7159,18 +7173,18 @@ def test_ingest_candidate_manifest_is_not_parsed_from_untrusted_skeleton(
         + "\n\nTask:"
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "parse_static_skeleton",
         lambda _filepath: malicious_skeleton,
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_projection_hash_for_canonical_version",
         lambda _filename, _version: "a" * 64,
     )
-    prepared = tool_ingest._PreparedIndexContext(
+    prepared = ingest_engine._PreparedIndexContext(
         candidates=(
-            tool_ingest._PreparedIndexCandidate(
+            ingest_engine._PreparedIndexCandidate(
                 key="Concept_Acme",
                 target_hash="canonical-acme-version",
                 node_type="concept",
@@ -7181,7 +7195,7 @@ def test_ingest_candidate_manifest_is_not_parsed_from_untrusted_skeleton(
             ),
         )
     )
-    context = tool_ingest._IngestInstructionContext(
+    context = ingest_engine._IngestInstructionContext(
         schema_content="schema",
         prompt_template=(
             "{{skeleton_block}}\n\n"
@@ -7199,7 +7213,7 @@ def test_ingest_candidate_manifest_is_not_parsed_from_untrusted_skeleton(
             return context
 
     manifest = []
-    instructions = tool_ingest._build_ingest_instructions(
+    instructions = ingest_engine._build_ingest_instructions(
         str(raw_path),
         "raw-hash",
         "Source_source.md",
@@ -7615,7 +7629,7 @@ def test_reviewed_ingest_internal_context_bindings_are_enforced(isolated_memory)
             "relations": [],
         },
     )
-    context = tool_ingest._ReviewedIngestFinalizerContext(
+    context = ingest_engine._ReviewedIngestFinalizerContext(
         job_id=job_id,
         lease_owner="incorrect-owner",
         lease_generation=int(claim["lease_generation"]),
@@ -7633,7 +7647,7 @@ def test_reviewed_ingest_internal_context_bindings_are_enforced(isolated_memory)
     )
 
     with pytest.raises(ValueError, match="lease owner mismatch"):
-        tool_ingest._finalize_ingest_impl(
+        ingest_engine._finalize_ingest_impl(
             [],
             processed_data,
             propagate_errors=True,
@@ -7781,7 +7795,7 @@ def test_exact_reviewed_ingest_plan_rejects_raw_drift_and_private_path(
         )
     selection = _exact_selection(job_id, payload, _rejected_exact_output(job_id))
     raw_path.write_text("raw changed after review", encoding="utf-8")
-    with pytest.raises(tool_ingest.IngestBaselineConflict, match="Raw source changed"):
+    with pytest.raises(ingest_engine.IngestBaselineConflict, match="Raw source changed"):
         tool_ingest.finalize_exact_reviewed_ingest_outputs([selection], dry_run=True)
 
     private_path = isolated_memory / "raw" / "privacy" / "Diary" / "private.md"
@@ -8167,9 +8181,9 @@ def test_terminal_recovery_prepare_pipeline_is_clock_independent(
         },
     }
     files = [{"filename": "Policy_clock-independent.md", "content": "# Clock"}]
-    contract = tool_ingest.load_purpose_contract()
+    contract = ingest_engine.load_purpose_contract()
 
-    first, first_disposition, first_targets = tool_ingest._prepare_final_ingest_files(
+    first, first_disposition, first_targets = ingest_engine._prepare_final_ingest_files(
         files,
         processed_data,
         contract,
@@ -8180,8 +8194,8 @@ def test_terminal_recovery_prepare_pipeline_is_clock_independent(
         def now(cls, tz=None):
             return cls(2031, 1, 2, tzinfo=tz or timezone.utc)
 
-    monkeypatch.setattr(tool_ingest, "datetime", FutureDateTime)
-    second, second_disposition, second_targets = tool_ingest._prepare_final_ingest_files(
+    monkeypatch.setattr(ingest_engine, "datetime", FutureDateTime)
+    second, second_disposition, second_targets = ingest_engine._prepare_final_ingest_files(
         files,
         processed_data,
         contract,
@@ -8203,14 +8217,14 @@ def test_terminal_recovery_relation_updates_use_stable_timestamp():
     content = "---\nupdated: 2026-09-01\n---\n# Target\n\n## 2. 证据时间线\n"
     timestamp = "2026-09-03T00:00:00Z"
 
-    first = tool_ingest._upsert_section_relation(
+    first = ingest_engine._upsert_section_relation(
         content,
         "## 2. 证据时间线",
         "<!-- vector-lake-relation:test -->",
         "- [2026-09-03] [Observation] bounded recovery relation",
         update_timestamp=timestamp,
     )
-    second = tool_ingest._upsert_section_relation(
+    second = ingest_engine._upsert_section_relation(
         content,
         "## 2. 证据时间线",
         "<!-- vector-lake-relation:test -->",
@@ -8293,6 +8307,17 @@ def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeyp
         lambda job_id, _attempt_id, _generation: snapshots[job_id],
     )
     monkeypatch.setattr(
+        ingest_engine,
+        "_stable_current_raw_revision",
+        lambda _path: SimpleNamespace(
+            canonical_revision="sha256:" + "f" * 64,
+            matches=lambda _revision: True,
+        ),
+    )
+    # The code under test, _terminal_ingest_recovery_plan, lives in tool_ingest, so it
+    # resolves these names in tool_ingest's globals; both modules are bound and both
+    # must be patched.
+    monkeypatch.setattr(
         tool_ingest,
         "_stable_current_raw_revision",
         lambda _path: SimpleNamespace(
@@ -8300,7 +8325,9 @@ def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeyp
             matches=lambda _revision: True,
         ),
     )
+    monkeypatch.setattr(ingest_engine, "is_private_diary_path", lambda _path: False)
     monkeypatch.setattr(tool_ingest, "is_private_diary_path", lambda _path: False)
+    monkeypatch.setattr(ingest_engine, "load_purpose_contract", lambda: object())
     monkeypatch.setattr(tool_ingest, "load_purpose_contract", lambda: object())
     monkeypatch.setattr(auto_ingest_worker, "load_auto_ingest_config", lambda: object())
     monkeypatch.setattr(
@@ -8309,9 +8336,19 @@ def test_terminal_ingest_recovery_plan_binds_already_recovered_selection(monkeyp
         lambda output, *_args: (output["files_written"], output["integration"]),
     )
     monkeypatch.setattr(
+        ingest_engine,
+        "_normalize_codex_output_pages",
+        lambda files, _contract, **_kwargs: files,
+    )
+    monkeypatch.setattr(
         tool_ingest,
         "_normalize_codex_output_pages",
         lambda files, _contract, **_kwargs: files,
+    )
+    monkeypatch.setattr(
+        ingest_engine,
+        "_validate_final_ingest_files",
+        lambda _files, _targets, _contract: None,
     )
     monkeypatch.setattr(
         tool_ingest,
@@ -8416,7 +8453,7 @@ def test_injected_schema_contract_carries_no_generator_instructions(isolated_mem
     authority. Instruction prose belongs in the template only.
     """
     db_store.init_db()
-    context = tool_ingest._prepare_ingest_instruction_context()
+    context = ingest_engine._prepare_ingest_instruction_context()
     spec = context.schema_content
 
     for marker in (

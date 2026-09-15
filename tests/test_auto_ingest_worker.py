@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import ctypes
 import hashlib
 import io
@@ -262,7 +263,7 @@ def test_generator_policy_failure_records_only_trusted_usage_in_receipt_and_budg
     # Isolate admission sizing, not event validation, job failure, or receipts.
     monkeypatch.setattr(auto_ingest_worker, "_serialized_generator_inputs", lambda *_a: (b"", b""))
     finalized = []
-    monkeypatch.setattr("vector_lake.tool_ingest.finalize_ingest_strict", lambda *_a: finalized.append(True))
+    monkeypatch.setattr("vector_lake.ingest_engine.finalize_ingest_strict", lambda *_a: finalized.append(True))
     now = datetime.now(timezone.utc)
     config = _enabled_config(max_tokens_per_task=10)
     # The runner argument is a RunnerHandle since the adapter seam was switched in.
@@ -1176,7 +1177,9 @@ def test_auto_ingest_dispatch_capacity_counts_handoff_and_processing(
     isolated_memory,
     active_status,
 ):
-    from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION
+    from vector_lake.ingest_engine import (
+        INGEST_CONTRACT_VERSION,
+    )
 
     _write_config(isolated_memory)
     payload = _valid_payload(str(isolated_memory / "raw" / "active.md"))
@@ -1194,7 +1197,9 @@ def test_auto_ingest_dispatch_capacity_counts_handoff_and_processing(
 def test_auto_ingest_dispatch_capacity_ignores_expired_dispatch_reservation(
     isolated_memory,
 ):
-    from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION
+    from vector_lake.ingest_engine import (
+        INGEST_CONTRACT_VERSION,
+    )
 
     _write_config(isolated_memory)
     payload = _valid_payload(str(isolated_memory / "raw" / "dispatch.md"))
@@ -1222,7 +1227,9 @@ def test_auto_ingest_dispatcher_hands_off_only_one_job_until_capacity_returns(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION
+    from vector_lake.ingest_engine import (
+        INGEST_CONTRACT_VERSION,
+    )
 
     _write_config(isolated_memory)
     first_payload = _valid_payload(str(isolated_memory / "raw" / "first.md"))
@@ -1915,7 +1922,6 @@ def test_controller_finalizes_using_only_trusted_claim_fields(
         },
     }
     finalized = {}
-    from vector_lake import tool_ingest
 
     class FakeClaimHandle:
         def __init__(self, _job_id, _lease):
@@ -1984,7 +1990,7 @@ def test_controller_finalizes_using_only_trusted_claim_fields(
         ),
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "finalize_ingest_strict",
         lambda files, data: (
             finalized.update({"files": files, "processed": data}) or "ok"
@@ -2015,7 +2021,7 @@ def test_durable_finalize_observability_failure_returns_warning_without_retry(
     monkeypatch,
     telemetry_failure,
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_engine
 
     _write_config(isolated_memory)
     job_id, claim = _claim_for_subagent()
@@ -2055,7 +2061,7 @@ def test_durable_finalize_observability_failure_returns_warning_without_retry(
         "_run_codex_generator",
         lambda *_args: generated,
     )
-    monkeypatch.setattr(tool_ingest, "finalize_ingest_strict", lambda *_args: "ok")
+    monkeypatch.setattr(ingest_engine, "finalize_ingest_strict", lambda *_args: "ok")
     monkeypatch.setattr(
         auto_ingest_worker,
         "_job_state",
@@ -2994,7 +3000,6 @@ def test_finalize_infrastructure_failures_are_retryable(
     monkeypatch,
     failure_stage,
 ):
-    from vector_lake import tool_ingest
 
     _write_config(isolated_memory)
     job_id, claim = _claim_for_subagent()
@@ -3043,17 +3048,17 @@ def test_finalize_infrastructure_failures_are_retryable(
     )
     if failure_stage == "strict_finalize":
         monkeypatch.setattr(
-            tool_ingest,
+            ingest_engine,
             "finalize_ingest_strict",
             lambda *_args: (_ for _ in ()).throw(
-                tool_ingest.IngestFinalizationInfrastructureError(
+                ingest_engine.IngestFinalizationInfrastructureError(
                     "injected strict finalize infrastructure failure"
                 )
             ),
         )
     else:
         monkeypatch.setattr(
-            tool_ingest,
+            ingest_engine,
             "finalize_ingest_strict",
             lambda *_args: finalized.append(True) or "unexpected",
         )
@@ -3159,7 +3164,7 @@ def test_runtime_component_heartbeat_failure_blocks_finalize_and_stops_thread(
     )
     monkeypatch.setattr(auto_ingest_worker, "_run_codex_generator", generator)
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.finalize_ingest_strict",
+        "vector_lake.ingest_engine.finalize_ingest_strict",
         lambda *_args: finalized.append(True) or "unexpected",
     )
 
@@ -3257,7 +3262,7 @@ def test_runtime_component_publish_failures_remain_retryable_infrastructure(
         lambda *_args: generated,
     )
     monkeypatch.setattr(
-        "vector_lake.tool_ingest.finalize_ingest_strict",
+        "vector_lake.ingest_engine.finalize_ingest_strict",
         lambda *_args: finalized.append(True) or "unexpected",
     )
     monkeypatch.setattr(
@@ -3373,7 +3378,7 @@ def test_runtime_component_heartbeat_continues_while_finalize_drains_on_stop(
         "_run_codex_generator",
         lambda *_args: generated,
     )
-    monkeypatch.setattr("vector_lake.tool_ingest.finalize_ingest_strict", finalize)
+    monkeypatch.setattr("vector_lake.ingest_engine.finalize_ingest_strict", finalize)
     monkeypatch.setattr(
         auto_ingest_worker,
         "_job_state",
@@ -3416,7 +3421,12 @@ def test_component_heartbeat_refreshes_stale_generation_before_finalize_gate(
 ):
     from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
     from vector_lake import runtime_health, watchdog_status
-    from vector_lake.tool_ingest import INGEST_CONTRACT_VERSION, calculate_hash
+    from vector_lake.tool_ingest import (
+        calculate_hash,
+    )
+    from vector_lake.ingest_engine import (
+        INGEST_CONTRACT_VERSION,
+    )
     from vector_lake.watchdog_status import write_status as publish_watchdog_status
 
     _write_config(isolated_memory, auto_finalize_rejected=False)

@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import hashlib
 import json
 import os
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_mutation_coordinator import _write_purpose_contract
-from vector_lake import db_store, raw_revision, tool_ingest
+from vector_lake import db_store, raw_revision
 
 
 @pytest.fixture(autouse=True)
@@ -16,9 +17,9 @@ def _install_ingest_purpose_contract(isolated_memory):
 
 
 def _configure_isolated_scan(monkeypatch) -> None:
-    monkeypatch.setattr(tool_ingest, "_load_ingest_config", lambda: {})
+    monkeypatch.setattr(ingest_engine, "_load_ingest_config", lambda: {})
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "isolated raw inventory instructions",
     )
@@ -67,11 +68,11 @@ def test_unchanged_full_inventory_reads_metadata_only(
     connection = db_store.get_connection()
     changes_before = connection.total_changes
 
-    result = tool_ingest.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
+    result = ingest_engine.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
 
     assert result == (
-        f"{tool_ingest.FULL_SCAN_COMPLETE_TOKEN}\n"
-        f"{tool_ingest.NO_NEW_REVISIONS_MESSAGE}"
+        f"{ingest_engine.FULL_SCAN_COMPLETE_TOKEN}\n"
+        f"{ingest_engine.NO_NEW_REVISIONS_MESSAGE}"
     )
     assert reads.get(str(raw_path.resolve()), 0) == 0
     assert connection.total_changes == changes_before
@@ -100,9 +101,9 @@ def test_full_inventory_metadata_change_reads_current_bytes(
     monkeypatch.setenv("VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS", "0")
     reads = _count_raw_bytes(monkeypatch)
 
-    result = tool_ingest.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
+    result = ingest_engine.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
 
-    assert result.startswith(tool_ingest.FULL_SCAN_COMPLETE_TOKEN)
+    assert result.startswith(ingest_engine.FULL_SCAN_COMPLETE_TOKEN)
     assert reads[str(raw_path.resolve())] == len(current_bytes)
     payload = json.loads(
         db_store.get_connection()
@@ -124,12 +125,12 @@ def test_explicit_candidate_always_reads_unchanged_file(
     monkeypatch.setenv("VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS", "0")
     reads = _count_raw_bytes(monkeypatch)
 
-    result = tool_ingest.prepare_ingest_batch(
+    result = ingest_engine.prepare_ingest_batch(
         batch_size=1,
         candidate_paths=[str(raw_path)],
     )
 
-    assert result == tool_ingest.NO_NEW_REVISIONS_MESSAGE
+    assert result == ingest_engine.NO_NEW_REVISIONS_MESSAGE
     assert reads[str(raw_path.resolve())] == len(raw_bytes)
 
 
@@ -153,9 +154,9 @@ def test_scrub_reads_and_detects_same_size_same_mtime_tamper(
     monkeypatch.setenv("VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS", "1")
     reads = _count_raw_bytes(monkeypatch)
 
-    result = tool_ingest.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
+    result = ingest_engine.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
 
-    assert result.startswith(tool_ingest.FULL_SCAN_COMPLETE_TOKEN)
+    assert result.startswith(ingest_engine.FULL_SCAN_COMPLETE_TOKEN)
     assert reads[str(raw_path.resolve())] == len(tampered_bytes)
     payload = json.loads(
         db_store.get_connection()
@@ -195,9 +196,9 @@ def test_legacy_md5_full_inventory_reads_once_and_enqueues_canonical_revision(
     monkeypatch.setenv("VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS", "0")
     reads = _count_raw_bytes(monkeypatch)
 
-    result = tool_ingest.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
+    result = ingest_engine.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
 
-    assert result.startswith(tool_ingest.FULL_SCAN_COMPLETE_TOKEN)
+    assert result.startswith(ingest_engine.FULL_SCAN_COMPLETE_TOKEN)
     assert reads[str(raw_path.resolve())] == len(raw_bytes)
     connection = db_store.get_connection()
     payload = json.loads(
@@ -221,16 +222,16 @@ def test_scrub_bucket_is_deterministic_once_per_period(monkeypatch):
     due_days = [
         day
         for day in range(start_day, start_day + 7)
-        if tool_ingest._raw_inventory_scrub_due(filepath, day_ordinal=day)
+        if ingest_engine._raw_inventory_scrub_due(filepath, day_ordinal=day)
     ]
 
     assert len(due_days) == 1
-    assert tool_ingest._raw_inventory_scrub_due(
+    assert ingest_engine._raw_inventory_scrub_due(
         filepath,
         day_ordinal=due_days[0],
     )
     monkeypatch.setenv("VECTOR_LAKE_RAW_FULL_SCAN_SCRUB_DAYS", "0")
-    assert not tool_ingest._raw_inventory_scrub_due(
+    assert not ingest_engine._raw_inventory_scrub_due(
         filepath,
         day_ordinal=due_days[0],
     )
@@ -262,7 +263,7 @@ def test_eight_day_fake_clock_detects_missed_same_stat_event_within_seven_days(
 
     for offset in range(8):
         with bind_raw_scrub_day(start_day + offset):
-            tool_ingest.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
+            ingest_engine.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
         row = db_store.get_connection().execute(
             "SELECT payload FROM jobs WHERE task_type = 'ingest' LIMIT 1"
         ).fetchone()

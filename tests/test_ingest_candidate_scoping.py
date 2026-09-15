@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import json
 from datetime import datetime, timezone
 
@@ -29,9 +30,9 @@ def test_candidate_lookup_chunks_paths_but_scans_source_json_once():
     paths = [f"C:/raw/candidate-{index:04d}.md" for index in range(805)]
     identities = [f"raw/candidate-{index:04d}.md" for index in range(805)]
 
-    assert tool_ingest._candidate_processed_files(connection, paths) == {}
-    assert tool_ingest._candidate_legacy_ingest_identities(connection, paths) == set()
-    assert tool_ingest._candidate_source_entities(connection, identities) == []
+    assert ingest_engine._candidate_processed_files(connection, paths) == {}
+    assert ingest_engine._candidate_legacy_ingest_identities(connection, paths) == set()
+    assert ingest_engine._candidate_source_entities(connection, identities) == []
 
     groups = {
         "processed": [
@@ -81,7 +82,7 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
     wiki_path = isolated_memory / "wiki" / "Source_Existing-Candidate.MD"
     _write_purpose_contract(isolated_memory)
     raw_stat = raw_path.stat()
-    source_page = tool_ingest._auto_source_page(
+    source_page = ingest_engine._auto_source_page(
         {
             "filepath": str(raw_path.resolve()),
             "hash": tool_ingest.calculate_hash(str(raw_path)),
@@ -122,7 +123,7 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
             (unrelated_job,),
         )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "scoped instructions",
     )
@@ -130,7 +131,7 @@ def test_candidate_prepare_queries_only_related_paths_and_source_identities(
     connection.set_trace_callback(traced_sql.append)
 
     result = json.loads(
-        tool_ingest.prepare_ingest_batch(
+        ingest_engine.prepare_ingest_batch(
             batch_size=1,
             candidate_paths=[str(raw_path)],
         )
@@ -179,16 +180,16 @@ def test_full_scan_keeps_existing_unscoped_inventory_queries(
     _write_purpose_contract(isolated_memory)
     db_store.init_db()
     connection = db_store.get_connection()
-    monkeypatch.setattr(tool_ingest, "_load_ingest_config", lambda: {})
+    monkeypatch.setattr(ingest_engine, "_load_ingest_config", lambda: {})
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "full scan instructions",
     )
     traced_sql = []
     connection.set_trace_callback(traced_sql.append)
 
-    tool_ingest.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
+    ingest_engine.prepare_ingest_batch(batch_size=1, _enqueue_all=True)
 
     connection.set_trace_callback(None)
     normalized_sql = [" ".join(statement.split()) for statement in traced_sql]

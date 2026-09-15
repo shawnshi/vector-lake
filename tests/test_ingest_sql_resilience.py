@@ -1,3 +1,4 @@
+from vector_lake import ingest_engine
 import hashlib
 import json
 import shutil
@@ -5,14 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from vector_lake import db_store, governance_store, tool_ingest
+from vector_lake import db_store, governance_store
 from vector_lake.raw_revision import is_supported_revision
 from vector_lake.tool_ingest import (
-    INGEST_CONTRACT_VERSION,
     calculate_hash,
     claim_ingest_tasks,
-    process_ingest_task_cleanup,
     reconcile_ingest_job_debt,
+)
+from vector_lake.ingest_engine import (
+    INGEST_CONTRACT_VERSION,
+    process_ingest_task_cleanup,
 )
 from tests.test_mutation_coordinator import _write_purpose_contract
 
@@ -97,7 +100,7 @@ def test_queued_legacy_ingest_with_null_retries_is_migrated(
             (job_id,),
         )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt v4 instructions",
     )
@@ -107,7 +110,7 @@ def test_queued_legacy_ingest_with_null_retries_is_migrated(
         lambda _keys: {},
     )
 
-    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+    migrated = ingest_engine.requeue_legacy_ingest_jobs()
 
     row = (
         db_store.get_connection()
@@ -211,12 +214,12 @@ def test_legacy_terminal_failure_releases_identity_for_replacement(
         raise RuntimeError("injected prompt rebuild failure")
 
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         fail_prompt_rebuild,
     )
 
-    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+    migrated = ingest_engine.requeue_legacy_ingest_jobs()
 
     row = (
         db_store.get_connection()
@@ -598,7 +601,7 @@ def test_historical_terminal_failed_identity_is_not_an_inventory_gate(
     raw_path = isolated_memory / "raw" / "historical-terminal.md"
     raw_path.write_text("historical terminal source", encoding="utf-8")
     first_result = json.loads(
-        tool_ingest.prepare_ingest_batch(
+        ingest_engine.prepare_ingest_batch(
             batch_size=1,
             candidate_paths=[str(raw_path)],
         )
@@ -615,12 +618,12 @@ def test_historical_terminal_failed_identity_is_not_an_inventory_gate(
             (first["job_id"],),
         )
 
-    durable_keys = tool_ingest._existing_durable_ingest_keys(
+    durable_keys = ingest_engine._existing_durable_ingest_keys(
         connection,
         [original_key],
     )
     second_result = json.loads(
-        tool_ingest.prepare_ingest_batch(
+        ingest_engine.prepare_ingest_batch(
             batch_size=1,
             candidate_paths=[str(raw_path)],
         )
@@ -1022,7 +1025,7 @@ def test_legacy_recovery_releases_terminal_owner_instead_of_superseding_candidat
         legacy_candidate=True,
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt legacy instructions",
     )
@@ -1032,7 +1035,7 @@ def test_legacy_recovery_releases_terminal_owner_instead_of_superseding_candidat
         lambda _keys: {},
     )
 
-    migrated = tool_ingest.requeue_legacy_ingest_jobs()
+    migrated = ingest_engine.requeue_legacy_ingest_jobs()
 
     assert migrated == 1
     _assert_terminal_owner_released_and_candidate_requeued(seed)
@@ -1047,7 +1050,7 @@ def test_debt_recovery_releases_terminal_owner_instead_of_superseding_candidate(
         legacy_candidate=False,
     )
     monkeypatch.setattr(
-        tool_ingest,
+        ingest_engine,
         "_build_ingest_instructions",
         lambda *_args: "rebuilt debt instructions",
     )
