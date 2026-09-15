@@ -65,6 +65,8 @@ def _configured_budget_policy() -> dict[str, Any]:
         ),
         "max_reserved_tokens_per_hour": (16384, 13107200),
         "max_reserved_tokens_per_24h": (16384, 65536000),
+        "max_consecutive_infra_failures": (1, 10),
+        "circuit_breaker_seconds": (60, 86400),
         "scratch_retention_days": (1, 90),
     }
     path = auto_ingest_worker._config_path()
@@ -259,6 +261,12 @@ def auto_ingest_budget_status(
                 "max_tokens_per_task",
                 "max_reserved_tokens_per_hour",
                 "max_reserved_tokens_per_24h",
+                # Published so a caller can compare the observed breaker state
+                # against its own threshold instead of re-reading the config.
+                # Without it, a tripped breaker with an expired cooldown window
+                # was indistinguishable from a healthy one.
+                "max_consecutive_infra_failures",
+                "circuit_breaker_seconds",
             )
         },
         "hour": {

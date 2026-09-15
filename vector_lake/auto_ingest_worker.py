@@ -860,6 +860,36 @@ def _record_success(state: dict[str, Any]) -> None:
     _save_state(state)
 
 
+def _reconcile_expired_circuit(state: dict[str, Any], now: datetime) -> bool:
+    """Close the breaker and clear its streak once the cooldown has elapsed.
+
+    ``_record_infrastructure_failure`` opens the breaker when the consecutive
+    failure count reaches ``max_consecutive_infra_failures`` and stamps
+    ``circuit_open_until``.  Nothing used to clear that stamp or the counter when
+    the window elapsed, so a ledger that had tripped once kept a count above the
+    configured threshold forever: the next single failure re-opened the breaker
+    for a full cooldown, and ``max_consecutive_infra_failures`` effectively
+    became 1.  The window expiry is the point at which the breaker is closed
+    again, so the streak has to be reset here for the threshold to mean what the
+    configuration says.  ``_record_success`` and
+    ``_record_non_infrastructure_outcome`` remain the in-flight resets.
+
+    Returns True when the ledger was rewritten.
+    """
+    circuit_until = _parse_utc(state.get("circuit_open_until"))
+    if circuit_until is None or circuit_until > now:
+        return False
+    next_state = {
+        **state,
+        "consecutive_infra_failures": 0,
+        "circuit_open_until": None,
+    }
+    _save_state(next_state)
+    state.clear()
+    state.update(next_state)
+    return True
+
+
 def _record_non_infrastructure_outcome(state: dict[str, Any]) -> None:
     """Break a consecutive infrastructure-failure chain on a typed policy result."""
     if not state.get("consecutive_infra_failures") and not state.get(
@@ -4084,16 +4114,35 @@ class AutoIngestController:
             "claim_handler_exited_without_outcome"
         )
 
+    def _reconcile_breaker_state(self) -> None:
+        """Close an expired auto-ingest breaker window if its cooldown has passed.
+
+        Lives on the worker class because both the disabled and the enabled tick
+        paths must apply it: the persisted streak is read by Runtime Health even
+        when the execution host is off.
+        """
+        try:
+            state = _load_state()
+            _reconcile_expired_circuit(state, _utc_now())
+        except AutoIngestInfrastructureError as exc:
+            self._sticky_error = str(exc)
+
     def tick(self, stop_event: threading.Event) -> str:
         config = load_auto_ingest_config()
         if not config.enabled:
             self._sticky_error = ""
+            # The launch bookkeeping below never runs while the host is disabled,
+            # so an expired breaker window would keep its streak above
+            # ``max_consecutive_infra_failures`` forever and the health surface
+            # (which reads the ledger regardless of enablement) would report a
+            # tripped breaker for a host that is not running at all.
+            self._reconcile_breaker_state()
             write_status(
                 "disabled",
                 0,
                 0,
                 "Automatic ingest host disabled",
-                "",
+                self._sticky_error,
                 component="auto_ingest",
             )
             return "disabled"
@@ -4135,6 +4184,19 @@ class AutoIngestController:
                 0,
                 0,
                 "Automatic ingest budget state unavailable",
+                str(exc),
+                component="auto_ingest",
+            )
+            return "state_unavailable"
+        try:
+            _reconcile_expired_circuit(state, now)
+        except AutoIngestInfrastructureError as exc:
+            self._sticky_error = str(exc)
+            write_status(
+                "paused",
+                0,
+                0,
+                "Automatic ingest breaker state unavailable",
                 str(exc),
                 component="auto_ingest",
             )

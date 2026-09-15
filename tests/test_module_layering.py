@@ -70,6 +70,9 @@ LAYERS: dict[str, set[str]] = {
         # infrastructure rather than orchestration; being in orchestration made
         # runtime_health's read of it look upward.
         "watchdog_status",
+        # Depends on wiki_utils only, so its minimum legal layer is base. It is
+        # process bootstrap (log destination), not a domain or storage module.
+        "runtime_logging",
     },
     "storage": {
         "db_store",

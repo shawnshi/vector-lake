@@ -182,6 +182,19 @@ def _entry_order(key: str) -> tuple[str, str]:
     return key_digest(key), key
 
 
+def projection_read_executor() -> ThreadPoolExecutor:
+    """One shared read pool for a multi-component projection materialization.
+
+    Six components used to build six pools per index load.  The pool's threads
+    are stateless with respect to the store, so a single pool serves all of them
+    without changing read validation.
+    """
+    return ThreadPoolExecutor(
+        max_workers=_BULK_READ_WORKERS,
+        thread_name_prefix="vector-lake-projection-read",
+    )
+
+
 class ProjectionStoreV2:
     """Persistent branch-16 hash trie backed by immutable JSON objects."""
 
@@ -319,39 +332,34 @@ class ProjectionStoreV2:
         *,
         limit: int,
         max_objects: int = DEFAULT_READ_OBJECT_LIMIT,
+        executor: ThreadPoolExecutor | None = None,
     ) -> tuple[tuple[str, Any], ...]:
-        """Materialize a complete trie with bounded parallel secure reads."""
+        """Materialize a complete trie with bounded parallel secure reads.
+
+        ``executor`` lets a caller that materializes several components share one
+        pool.  Each component used to build and tear down its own
+        ``ThreadPoolExecutor``; on Windows that thread churn was ~1.0 s of a
+        1.98 s live index load across six components, while a worker-count sweep
+        showed the parallel width does not change the read cost.  An injected
+        executor is owned by the caller and is never shut down here.
+        """
         self._validate_digest(root_digest)
         self._validate_read_bounds(limit, max_objects, MAX_ITER_LIMIT)
         reads = _ReadContext(
             max_objects=max_objects,
             defer_directory_rechecks=True,
         )
-        frontier: list[tuple[str, int, str]] = [(root_digest, 0, "")]
         leaf_blocks: list[tuple[str, list[list[Any]]]] = []
         try:
-            with ThreadPoolExecutor(
-                max_workers=_BULK_READ_WORKERS,
-                thread_name_prefix="vector-lake-projection-read",
-            ) as executor:
-                while frontier:
-                    self._prefetch_frontier(frontier, reads, executor)
-                    next_frontier: list[tuple[str, int, str]] = []
-                    for digest, depth, prefix in frontier:
-                        node, size = reads.raw_cache[digest]
-                        self._validate_node(node, size, depth, prefix)
-                        if node["kind"] == "leaf":
-                            leaf_blocks.append((prefix, node["entries"]))
-                            continue
-                        for slot, child in node["children"]:
-                            next_frontier.append(
-                                (
-                                    child,
-                                    depth + 1,
-                                    prefix + format(slot, "x"),
-                                )
-                            )
-                    frontier = next_frontier
+            if executor is None:
+                with projection_read_executor() as owned_executor:
+                    self._materialize_frontiers(
+                        owned_executor, root_digest, reads, leaf_blocks
+                    )
+            else:
+                self._materialize_frontiers(
+                    executor, root_digest, reads, leaf_blocks
+                )
 
             result: list[tuple[str, Any]] = []
             # A valid trie has no leaf prefix that is an ancestor of another.
@@ -364,6 +372,33 @@ class ProjectionStoreV2:
             return tuple(result)
         finally:
             self._verify_secure_read_directories(reads)
+
+    def _materialize_frontiers(
+        self,
+        executor: ThreadPoolExecutor,
+        root_digest: str,
+        reads: _ReadContext,
+        leaf_blocks: list[tuple[str, list[list[Any]]]],
+    ) -> None:
+        frontier: list[tuple[str, int, str]] = [(root_digest, 0, "")]
+        while frontier:
+            self._prefetch_frontier(frontier, reads, executor)
+            next_frontier: list[tuple[str, int, str]] = []
+            for digest, depth, prefix in frontier:
+                node, size = reads.raw_cache[digest]
+                self._validate_node(node, size, depth, prefix)
+                if node["kind"] == "leaf":
+                    leaf_blocks.append((prefix, node["entries"]))
+                    continue
+                for slot, child in node["children"]:
+                    next_frontier.append(
+                        (
+                            child,
+                            depth + 1,
+                            prefix + format(slot, "x"),
+                        )
+                    )
+            frontier = next_frontier
 
     def diff(
         self,
@@ -1182,4 +1217,5 @@ __all__ = [
     "ProjectionStoreV2",
     "canonical_json_bytes",
     "key_digest",
+    "projection_read_executor",
 ]

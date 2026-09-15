@@ -16,6 +16,7 @@ import re
 import secrets
 import shutil
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,7 @@ from vector_lake.projection_store_v2 import (
     DEFAULT_READ_OBJECT_LIMIT,
     ProjectionStoreV2,
     canonical_json_bytes,
+    projection_read_executor,
 )
 from vector_lake.search_projection_contract import (
     CANONICAL_PROJECTION_SURFACES,
@@ -721,6 +723,8 @@ def _component_items(
     store: ProjectionStoreV2,
     descriptor: Mapping[str, Any],
     name: str,
+    *,
+    executor: ThreadPoolExecutor | None = None,
 ) -> list[tuple[str, Any]]:
     root = _require_digest(descriptor.get(name), f"component_{name}")
     return list(
@@ -728,6 +732,7 @@ def _component_items(
             root,
             limit=MAX_COMPONENT_ITEMS,
             max_objects=MAX_CLOSURE_OBJECTS,
+            executor=executor,
         )
     )
 
@@ -756,14 +761,30 @@ def materialize_index(
     validated = validate_sidecar(dict(sidecar))
     store = ProjectionStoreV2(base_dir)
     descriptor = _root_descriptor(store, validated["index_root_sha256"], "index")
-    result = dict(_component_items(store, descriptor, "meta"))
-    result["nodes"] = dict(_component_items(store, descriptor, "nodes"))
-    result["aliases"] = dict(_component_items(store, descriptor, "aliases"))
+    # One read pool for every component.  Building a pool per component cost ~1.0 s
+    # of a 1.98 s live index load (Windows thread create/join) with no read-side
+    # benefit: a worker-count sweep from 1 to 16 left the read cost unchanged.
+    with projection_read_executor() as executor:
+        return _materialize_index_components(store, descriptor, validated, executor)
+
+
+def _materialize_index_components(
+    store: ProjectionStoreV2,
+    descriptor: Mapping[str, Any],
+    validated: Mapping[str, Any],
+    executor: ThreadPoolExecutor,
+) -> dict[str, Any]:
+    def component(name: str) -> list[tuple[str, Any]]:
+        return _component_items(store, descriptor, name, executor=executor)
+
+    result = dict(component("meta"))
+    result["nodes"] = dict(component("nodes"))
+    result["aliases"] = dict(component("aliases"))
     result["categories"] = sorted(
-        key for key, _value in _component_items(store, descriptor, "categories")
+        key for key, _value in component("categories")
     )
     weighted_edges: list[tuple[tuple[float, str, str, str], dict[str, Any]]] = []
-    for key, raw_edge in _component_items(store, descriptor, "edges"):
+    for key, raw_edge in component("edges"):
         edge = dict(raw_edge)
         # Legacy objects still carry the retired positional field; never surface it.
         edge.pop("__ordinal__", None)
@@ -783,7 +804,7 @@ def materialize_index(
         result["error_log"] = [
             dict(item)
             for _filename, items in sorted(
-                _component_items(store, descriptor, "errors_by_file"),
+                component("errors_by_file"),
                 key=lambda pair: pair[0],
             )
             for item in items
@@ -794,7 +815,7 @@ def materialize_index(
         result["error_log"] = [
             dict(value)
             for _key, value in sorted(
-                _component_items(store, descriptor, "error_log"),
+                component("error_log"),
                 key=lambda pair: pair[0],
             )
         ]
@@ -811,18 +832,19 @@ def materialize_claim_graph(
     descriptor = _root_descriptor(
         store, validated["claim_graph_root_sha256"], "claim_graph"
     )
-    result = dict(_component_items(store, descriptor, "meta"))
-    for name in ("nodes", "edges"):
-        # Ordered by content-derived key.  The previous parsed ordinal is now an
-        # occurrence counter and is not an ordering; sorting by key is total and
-        # input-order independent.
-        result[name] = [
-            dict(value)
-            for _key, value in sorted(
-                _component_items(store, descriptor, name),
-                key=lambda pair: pair[0],
-            )
-        ]
+    with projection_read_executor() as executor:
+        result = dict(_component_items(store, descriptor, "meta", executor=executor))
+        for name in ("nodes", "edges"):
+            # Ordered by content-derived key.  The previous parsed ordinal is now
+            # an occurrence counter and is not an ordering; sorting by key is
+            # total and input-order independent.
+            result[name] = [
+                dict(value)
+                for _key, value in sorted(
+                    _component_items(store, descriptor, name, executor=executor),
+                    key=lambda pair: pair[0],
+                )
+            ]
     result["projection_manifest"] = _legacy_projection_manifest(validated)
     return result
 

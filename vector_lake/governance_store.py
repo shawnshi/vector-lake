@@ -5343,6 +5343,78 @@ def _change_set_payload_digest(payload_bytes: bytes) -> str:
     return hashlib.sha256(payload_bytes).hexdigest()
 
 
+# Pure bookkeeping: these fields describe *when* an extractor run happened, not
+# what the delta contains.  ``proposed_extraction_runs[].recorded_at`` is stamped
+# with the wall clock, so a digest that includes it can never be reproduced for
+# unchanged page content (verified across processes: it is the only differing
+# leaf field).  An identity built on that digest can therefore never be
+# deduplicated, and a re-attempt of unchanged content is *guaranteed* to collide
+# with its own history -- which is how two sources were wedged on 2026-09-15.
+#
+# Anything that changes the *meaning* of the extraction stays identity-bearing:
+# ``run_id``, ``extractor_name``/``extractor_version``, ``model_name``/
+# ``model_version``, ``parser_name``/``parser_version``, ``prompt_version`` and
+# ``input_fingerprint`` all remain part of the identity.
+_CHANGE_SET_IDENTITY_VOLATILE_FIELDS: dict[str, tuple[str, ...]] = {
+    "proposed_extraction_runs": ("recorded_at",),
+}
+
+
+def _strip_change_set_identity_volatile(payload: dict) -> dict:
+    """Drop pure-bookkeeping fields from an already-canonical payload."""
+    normalized = dict(payload)
+    for section, fields in _CHANGE_SET_IDENTITY_VOLATILE_FIELDS.items():
+        records = normalized.get(section)
+        if not isinstance(records, list):
+            continue
+        normalized[section] = [
+            (
+                {key: value for key, value in record.items() if key not in fields}
+                if isinstance(record, dict)
+                else record
+            )
+            for record in records
+        ]
+    return normalized
+
+
+def _change_set_identity_digest(payload: dict) -> str:
+    """Digest of the semantic delta.
+
+    Strips the volatile bookkeeping itself so every caller -- the key derivation,
+    the guard and the manifest -- necessarily agrees.  Passing an already-stripped
+    payload is harmless.
+    """
+    return hashlib.sha256(
+        _canonical_json_bytes(_strip_change_set_identity_volatile(payload))
+    ).hexdigest()
+
+
+def _change_set_identity_digest_for(change_set: dict) -> str:
+    payload, _payload_bytes = _canonical_change_set_payload(change_set)
+    return _change_set_identity_digest(payload)
+
+
+def _change_set_idempotency_key(
+    origin: str,
+    *,
+    pages: list[str],
+    fingerprints: list[str],
+    identity_digest: str,
+) -> str:
+    """Identify one semantic delta for one origin and page set.
+
+    The identity digest participates, so the key is idempotent over exactly what
+    ``record_prepared_change_sets`` guards: a changed extraction yields a new key
+    (and a new, correctly deduplicated change set) instead of colliding with an
+    older record of the same content.
+    """
+    return _stable_id(
+        "changeset_idem",
+        "|".join([origin, *sorted(pages), *sorted(fingerprints), identity_digest]),
+    )
+
+
 def _normalized_change_set_status(value: object) -> str:
     status = str(value or "pending").strip().casefold()
     allowed = {"pending", *_CHANGE_SET_TERMINAL_STATUSES}
@@ -5461,6 +5533,7 @@ def _change_set_manifest(
             ).hexdigest(),
             "payload": {
                 "sha256": _change_set_payload_digest(payload_bytes),
+                "identity_sha256": _change_set_identity_digest(payload),
                 "codec": _CHANGE_SET_PAYLOAD_CODEC,
                 "raw_bytes": len(payload_bytes),
                 "stored_bytes": stored_bytes,
@@ -6029,6 +6102,7 @@ def _persist_prepared_change_set(
     if payload_bytes is None:
         _payload, payload_bytes = _canonical_change_set_payload(change_set)
     payload_sha256 = _change_set_payload_digest(payload_bytes)
+    identity_sha256 = _change_set_identity_digest_for(change_set)
     change_set_id = str(change_set.get("change_set_id") or "")
     idempotency_key = str(change_set.get("idempotency_key") or change_set_id)
     if not change_set_id or not idempotency_key:
@@ -6058,22 +6132,36 @@ def _persist_prepared_change_set(
                 f"Existing idempotency owner is malformed: {idempotency_key}"
             ) from exc
         existing_descriptor = existing_manifest.get("payload") or {}
-        existing_payload_sha256 = str(existing_descriptor.get("sha256") or "")
-        if not existing_payload_sha256 and existing_manifest.get(
-            "manifest_version"
-        ) in {
-            None,
-            1,
-        }:
-            _existing_payload, existing_bytes = _canonical_change_set_payload(
-                existing_manifest
-            )
-            existing_payload_sha256 = _change_set_payload_digest(existing_bytes)
-        if existing_payload_sha256 != payload_sha256:
-            raise ChangeSetIdempotencyConflict(
-                "Idempotency key is already owned by a different payload: "
-                f"{idempotency_key}"
-            )
+        # New manifests carry an identity digest over the semantic delta; legacy
+        # manifests only carry the raw payload digest, which is not reproducible
+        # for unchanged content.  Legacy rows keep the old, fail-closed
+        # comparison rather than being silently accepted.
+        existing_identity_sha256 = str(
+            existing_descriptor.get("identity_sha256") or ""
+        )
+        if existing_identity_sha256:
+            if existing_identity_sha256 != identity_sha256:
+                raise ChangeSetIdempotencyConflict(
+                    "Idempotency key is already owned by a different delta: "
+                    f"{idempotency_key}"
+                )
+        else:
+            existing_payload_sha256 = str(existing_descriptor.get("sha256") or "")
+            if not existing_payload_sha256 and existing_manifest.get(
+                "manifest_version"
+            ) in {
+                None,
+                1,
+            }:
+                _existing_payload, existing_bytes = _canonical_change_set_payload(
+                    existing_manifest
+                )
+                existing_payload_sha256 = _change_set_payload_digest(existing_bytes)
+            if existing_payload_sha256 != payload_sha256:
+                raise ChangeSetIdempotencyConflict(
+                    "Idempotency key is already owned by a different payload: "
+                    f"{idempotency_key}"
+                )
         existing_status = _normalized_change_set_status(existing["status"])
         manifest_status = _normalized_change_set_status(existing_manifest.get("status"))
         if manifest_status != existing_status:
@@ -6293,9 +6381,23 @@ def create_change_set(
         affected_ids.extend([record["claim_id"] for record in extracted["claims"]])
         page_summaries.append(extracted["page_key"])
 
-    idempotency_key = _stable_id(
-        "changeset_idem",
-        "|".join([origin, *sorted(page_summaries), *sorted(page_fingerprints)]),
+    identity_digest = _change_set_identity_digest_for(
+        {
+            "affected_pages": [os.path.basename(path) for path in page_paths],
+            "proposed_entities": proposed_entities,
+            "proposed_claims": proposed_claims,
+            "proposed_evidence": proposed_evidence,
+            "proposed_source_updates": proposed_source_updates,
+            "proposed_source_artifacts": proposed_source_artifacts,
+            "proposed_extraction_runs": proposed_extraction_runs,
+            "proposed_edges": proposed_edges,
+        }
+    )
+    idempotency_key = _change_set_idempotency_key(
+        origin,
+        pages=page_summaries,
+        fingerprints=page_fingerprints,
+        identity_digest=identity_digest,
     )
     if not force:
         duplicate = _load_change_set_by_idempotency_key(idempotency_key)
@@ -6383,12 +6485,27 @@ def prepare_change_set_from_content(
 
     page_key = extracted["page_key"]
     fingerprint = hashlib.sha1(content.encode("utf-8")).hexdigest()
-    idempotency_key = _stable_id(
-        "changeset_idem", "|".join([origin, page_key, fingerprint])
-    )
-
     proposed_entities = extracted.get("entities", [])
     proposed_claims = extracted.get("claims", [])
+    identity_digest = _change_set_identity_digest_for(
+        {
+            "affected_pages": [filename],
+            "proposed_entities": proposed_entities,
+            "proposed_claims": proposed_claims,
+            "proposed_evidence": extracted.get("evidence", []),
+            "proposed_source_updates": extracted.get("sources", []),
+            "proposed_source_artifacts": extracted.get("source_artifacts", []),
+            "proposed_extraction_runs": extracted.get("extraction_runs", []),
+            "proposed_edges": extracted.get("edges", []),
+        }
+    )
+    idempotency_key = _change_set_idempotency_key(
+        origin,
+        pages=[page_key],
+        fingerprints=[fingerprint],
+        identity_digest=identity_digest,
+    )
+
     return {
         "change_set_id": f"changeset_{uuid.uuid4().hex[:12]}",
         "idempotency_key": idempotency_key,
@@ -8039,36 +8156,60 @@ def _select_job_retention_candidates(
     return [str(row["job_id"]) for row in rows]
 
 
+_OUTBOX_RETENTION_SELECT_TEMPLATE = (
+    "WITH terminal AS ("
+    " SELECT id, completed_at AS retained_at"
+    " FROM mutation_outbox "
+    " WHERE status IN ({terminal})"
+    "), blocked AS ("
+    " SELECT DISTINCT superseded_by AS id"
+    " FROM mutation_outbox"
+    " WHERE superseded_by IS NOT NULL"
+    " AND COALESCE(status, '') NOT IN ({terminal})"
+    "), ranked AS ("
+    " SELECT id, retained_at,"
+    " ROW_NUMBER() OVER (ORDER BY retained_at DESC, id DESC) AS retain_rank"
+    " FROM terminal"
+    ") SELECT candidate.id FROM ranked AS candidate "
+    "LEFT JOIN blocked ON blocked.id = candidate.id "
+    "WHERE julianday(candidate.retained_at) IS NOT NULL "
+    "AND julianday(candidate.retained_at) < julianday(?) "
+    "AND candidate.retain_rank > ? "
+    "AND blocked.id IS NULL "
+    "ORDER BY candidate.retained_at ASC, candidate.id ASC LIMIT ?"
+)
+
+
+def _outbox_retention_select() -> str:
+    terminal = ",".join("?" for _ in _HISTORY_TERMINAL_OUTBOX_STATUSES)
+    return _OUTBOX_RETENTION_SELECT_TEMPLATE.format(terminal=terminal)
+
+
 def _select_outbox_retention_candidates(
     conn: sqlite3.Connection,
     cutoff: str,
     batch_size: int,
     keep_latest: int,
 ) -> list[int]:
-    terminal = ",".join("?" for _ in _HISTORY_TERMINAL_OUTBOX_STATUSES)
+    """Select expired terminal outbox rows that no live successor depends on.
+
+    The successor guard is materialized once instead of being written as a
+    correlated ``NOT EXISTS``.  There is no index on
+    ``mutation_outbox.superseded_by`` (only 108 of 27,761 rows set it), so the
+    correlated form re-scanned the whole table for every candidate row:
+    ``EXPLAIN QUERY PLAN`` reported ``CORRELATED SCALAR SUBQUERY`` immediately
+    followed by ``SCAN active``, and the live preview did not finish inside 30
+    minutes.  Because the join key is set-identical to the subquery
+    (``DISTINCT`` prevents row multiplication), the two forms select exactly
+    the same ids.
+    """
     rows = conn.execute(
-        "WITH terminal AS ("
-        " SELECT id, completed_at AS retained_at"
-        " FROM mutation_outbox "
-        f" WHERE status IN ({terminal})"
-        "), ranked AS ("
-        " SELECT id, retained_at,"
-        " ROW_NUMBER() OVER (ORDER BY retained_at DESC, id DESC) AS retain_rank"
-        " FROM terminal"
-        ") SELECT candidate.id FROM ranked AS candidate "
-        "WHERE julianday(candidate.retained_at) IS NOT NULL "
-        "AND julianday(candidate.retained_at) < julianday(?) "
-        "AND candidate.retain_rank > ? "
-        "AND NOT EXISTS ("
-        " SELECT 1 FROM mutation_outbox AS active "
-        " WHERE active.superseded_by = candidate.id "
-        f" AND COALESCE(active.status, '') NOT IN ({terminal})"
-        ") ORDER BY candidate.retained_at ASC, candidate.id ASC LIMIT ?",
+        _outbox_retention_select(),
         (
+            *_HISTORY_TERMINAL_OUTBOX_STATUSES,
             *_HISTORY_TERMINAL_OUTBOX_STATUSES,
             cutoff,
             keep_latest,
-            *_HISTORY_TERMINAL_OUTBOX_STATUSES,
             batch_size,
         ),
     ).fetchall()

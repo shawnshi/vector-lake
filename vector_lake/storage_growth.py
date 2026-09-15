@@ -19,7 +19,32 @@ from vector_lake.wiki_utils import atomic_write_text, get_wiki_dir, peek_meta_di
 _CONTRACT = "vector-lake-storage-growth-v1"
 _HISTORY_DAYS = 35
 _ROW_TABLES = ("claim_versions", "evidence_versions")
-_MAX_PROJECTION_OBJECT_FILES = 200_000
+# Bounded so the daily sample cannot walk an unbounded object store.  The
+# projection object GC scans the same directory under
+# ``VECTOR_LAKE_PROJECTION_GC_MAX_SCAN_FILES`` (default 1,000,000, same order of
+# magnitude as this default rather than the previous 200,000).  A hard 200,000
+# cap here stayed below the live store (228,636 files), so
+# ``projection_object_bytes`` and ``projection_orphan_bytes`` were silently
+# frozen below the real totals (under-reporting the orphan store by ~0.9 GB)
+# while ``projection_object_scan_complete`` reported False and nothing raised
+# it.  Raising the cap converts a cheap truncated walk into a full walk (~59 s
+# on the live store), and a store above the new cap still truncates -- but that
+# truncation is now reported.
+_MAX_PROJECTION_OBJECT_FILES_DEFAULT = 2_000_000
+_MAX_PROJECTION_OBJECT_FILES_CEILING = 50_000_000
+_STORAGE_OBJECT_SCAN_LIMIT_ENV = "VECTOR_LAKE_STORAGE_OBJECT_SCAN_MAX_FILES"
+
+
+def _max_projection_object_files() -> int:
+    raw = os.environ.get(
+        _STORAGE_OBJECT_SCAN_LIMIT_ENV,
+        str(_MAX_PROJECTION_OBJECT_FILES_DEFAULT),
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = _MAX_PROJECTION_OBJECT_FILES_DEFAULT
+    return max(1_000, min(_MAX_PROJECTION_OBJECT_FILES_CEILING, value))
 
 
 def _utc_now() -> datetime:
@@ -86,6 +111,7 @@ def _projection_object_bytes() -> dict[str, int | bool | str | None]:
             "projection_object_error": None,
         }
     object_root = get_wiki_dir() / ".projection-store" / "objects" / "sha256"
+    max_files = _max_projection_object_files()
     total = 0
     files = 0
     complete = True
@@ -108,7 +134,7 @@ def _projection_object_bytes() -> dict[str, int | bool | str | None]:
             directories[:] = retained
             for name in filenames:
                 files += 1
-                if files > _MAX_PROJECTION_OBJECT_FILES:
+                if files > max_files:
                     complete = False
                     error = "projection_object_file_limit_exceeded"
                     break
@@ -121,7 +147,7 @@ def _projection_object_bytes() -> dict[str, int | bool | str | None]:
                 except OSError as exc:
                     complete = False
                     error = f"projection_object_stat_failed:{type(exc).__name__}"
-            if files > _MAX_PROJECTION_OBJECT_FILES:
+            if files > max_files:
                 break
     reachable_bytes = int(reachable["reachable_object_bytes"])
     orphan_bytes = max(0, total - reachable_bytes)
@@ -130,7 +156,7 @@ def _projection_object_bytes() -> dict[str, int | bool | str | None]:
         "projection_reachable_bytes": reachable_bytes,
         "projection_object_bytes": total,
         "projection_orphan_bytes": orphan_bytes,
-        "projection_object_files": min(files, _MAX_PROJECTION_OBJECT_FILES),
+        "projection_object_files": min(files, max_files),
         "projection_object_scan_complete": complete,
         "projection_object_error": error,
     }

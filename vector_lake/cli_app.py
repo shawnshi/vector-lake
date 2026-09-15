@@ -1040,6 +1040,9 @@ def main() -> int:
     except RuntimeError as exc:
         print(f"CLI runtime authority error: {exc}", file=sys.stderr)
         return 1
+    from vector_lake.runtime_logging import configure_runtime_logging
+
+    configure_runtime_logging("cli")
     parser = build_parser()
     args = parser.parse_args()
 

@@ -98,11 +98,18 @@ def test_query_logic_lake_defaults_to_tool_free_in_memory_context(
     assert not scratch.exists()
 
 
-def test_dry_run_query_does_not_call_embedding_without_explicit_opt_in(
+def test_dry_run_query_does_not_call_embedding_when_the_provider_is_disabled(
     monkeypatch,
 ):
+    """A dry run stays local when the host has turned the provider off.
+
+    The previous name implied a dry-run-specific egress gate; there is none -- the
+    only thing that used to keep this local was the opt-in default, which is now
+    opt-out.  What this asserts is the real remaining guarantee: with an explicit
+    ``VECTOR_LAKE_QUERY_EMBEDDING=0`` the dry-run path makes no remote call.
+    """
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.delenv("VECTOR_LAKE_QUERY_EMBEDDING", raising=False)
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "0")
     calls = []
     monkeypatch.setattr(
         embedding_scheduler,

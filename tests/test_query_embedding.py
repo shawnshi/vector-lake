@@ -172,17 +172,24 @@ def test_direct_query_embedding_rejects_oversized_text_before_api(monkeypatch):
     assert calls == []
 
 
-def test_query_embedding_requires_explicit_opt_in_even_with_api_key(monkeypatch):
+def test_query_embedding_is_on_by_default_and_explicit_zero_disables(monkeypatch):
+    """The gate flipped from opt-in to opt-out; ``0`` is the fail-closed off switch."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.delenv("VECTOR_LAKE_QUERY_EMBEDDING", raising=False)
     calls = []
     monkeypatch.setattr(
         embedding_scheduler,
         "embed_texts",
         lambda *_args, **_kwargs: calls.append(1) or [[0.1]],
     )
-    _reset_query_embedding_state()
 
-    assert tool_search._get_query_embedding("default local-only query") == []
-    assert calls == []
-    assert tool_search._cached_query_embedding.cache_info().misses == 0
+    # Unset means enabled: the provider is reached.
+    monkeypatch.delenv("VECTOR_LAKE_QUERY_EMBEDDING", raising=False)
+    _reset_query_embedding_state()
+    assert tool_search._get_query_embedding("default query") == [0.1]
+    assert len(calls) == 1
+
+    # An explicit 0 keeps every query local, even with an API key present.
+    monkeypatch.setenv("VECTOR_LAKE_QUERY_EMBEDDING", "0")
+    _reset_query_embedding_state()
+    assert tool_search._get_query_embedding("local-only query") == []
+    assert len(calls) == 1

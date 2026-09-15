@@ -40,7 +40,6 @@ from vector_lake import (  # noqa: E402
     index_snapshot,
     runtime_health,
     ingest_engine,
-    tool_ingest,
     tool_query,
     tool_search,
     tool_timeline,

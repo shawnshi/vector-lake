@@ -744,8 +744,21 @@ def _exact_identity_scores(index_data: dict, query: str) -> dict[str, float]:
 
 
 def _query_embedding_enabled() -> bool:
-    """Return true only for the trusted host's explicit provider opt-in."""
-    return os.environ.get(_QUERY_EMBEDDING_OPT_IN_ENV) == "1"
+    """Return whether the remote query-embedding provider may be called.
+
+    **On by default.**  Unset means enabled; an explicit ``0`` (or any value
+    other than ``1``) disables it, so an operator still has a fail-closed way to
+    turn the provider off.  ``GEMINI_API_KEY`` remains a separate runtime
+    capability check, and ``_should_query_embedding`` still only reaches the
+    provider when lexical retrieval is weak, so ordinary searches keep their
+    local latency.
+
+    Measured on the live corpus with the index populated: a query that does
+    trigger the provider costs about **4,000 ms** (3,879 ms of it the remote
+    ``batchEmbedContents`` call) versus ~50 ms warm for the FTS-only path.  Set
+    the flag to ``0`` on a host that must never call the provider.
+    """
+    return os.environ.get(_QUERY_EMBEDDING_OPT_IN_ENV, "1").strip() == "1"
 
 
 def _should_query_embedding(*, fts_result_count: int, top_k: int) -> bool:

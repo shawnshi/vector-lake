@@ -1726,8 +1726,11 @@ class ReloadAwareFastMCP(FastMCP):
         with request_deadline_scope(deadline_seconds):
             return await super().call_tool(name, tool_arguments)
 
-# Global lock against stdout pollution
-logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', force=True)
+# Global lock against stdout pollution.  ``force=True`` used to replace every
+# handler an earlier import had installed, which discarded the launcher's
+# durable rotating log handler and made logging behaviour depend on import order.
+if not logging.getLogger().handlers:
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 from vector_lake import tool_memory  # noqa: E402
 from vector_lake import tools  # noqa: E402
 from vector_lake.governance_store import insert_governance_item_if_absent, _utc_now  # noqa: E402

@@ -1648,7 +1648,11 @@ def test_empty_health_timestamp_aggregates_use_outer_coalesce(
         for statement in traced_sql
         if "min(" in statement.casefold()
     ]
-    assert len(min_queries) == 4
+    # Every MIN() aggregate on the health surface must be wrapped in an outer
+    # COALESCE so an empty table yields '' rather than NULL.  The count is a pin,
+    # not the guard: the assertion below is what catches a new unwrapped MIN.
+    # 4 -> 5 when the expired-subagent-lease aggregate was added.
+    assert len(min_queries) == 5
     assert all("coalesce(min(" in statement for statement in min_queries)
     assert health["detail"]["ready_ingest_jobs"] == 0
     assert health["detail"]["awaiting_subagent_jobs"] == 0

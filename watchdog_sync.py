@@ -14,6 +14,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("usage: watchdog_sync.py [--stop | --maintenance]")
 
     _bootstrap_runtime_paths()
+
+    from vector_lake.runtime_logging import configure_runtime_logging
+
+    configure_runtime_logging("watchdog")
+
     from vector_lake.watchdog_app import request_watchdog_stop, start_watchdog
 
     if arguments == ["--stop"]:

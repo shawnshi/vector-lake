@@ -118,6 +118,10 @@ Conflict rules:
 | `skills/` | Host-loadable Agent workflows (e.g. research/review) |
 | `contracts/cbss/` | Evidence, authority-acceptance, business-event, decision-registry, and readiness contracts |
 
+`auto_ingest_config.json` defaults to `runner: "host_relay"`, whose consumer lives in the host, not in this package. `extensions/host-relay-consumer/` declares itself off by default and blocked by upstream `pi-subagents` contract gaps (no supported host session root -- still true in the installed 0.68.0 -- and no atomic launch binding); its own README forbids private helpers or configuration bypasses. The alternative `codex_exec` default is an explicit inert runner seam whose controller switch is deferred. Neither may be enabled, so `enabled: true` is not a supported configuration.
+
+The supported ingestion path is host-agnostic and needs neither: `cli.py ingest-tasks --claim` leases a task packet, a host subagent reads the packet's binding `prompt` plus the raw source, returns the `[{filename, content}]` array with exactly one `Source_*.md` page, and the result is submitted through `finalize_ingest`. Validate with `_validate_final_ingest_files` (not only `_prepare_final_ingest_files`) before submitting; a rejection does not consume a retry. Integrated publishes fail on a legacy target page whose `categories` is not a single-domain list -- publish standalone instead. See README for the full seven-step procedure and its caveats.
+
 `scripts/semantic_dedup_daemon.py` and `scripts/community_clustering_daemon.py`
 are deprecated, unsupported, and fail closed before DB, index, or governance
 access. A trusted operator may opt in only with

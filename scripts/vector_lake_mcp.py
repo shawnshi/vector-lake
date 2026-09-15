@@ -39,6 +39,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     bootstrap_runtime_paths(profile_path, caller="MCP launcher", profile=args.profile)
 
+    from vector_lake.runtime_logging import configure_runtime_logging
+
+    configure_runtime_logging("mcp")
+
     from vector_lake.mcp_server import main as run_mcp_server
 
     run_mcp_server()

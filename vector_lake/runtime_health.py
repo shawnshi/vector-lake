@@ -167,6 +167,12 @@ def _bounded_env_int(name: str, default: int, minimum: int) -> int:
     return max(minimum, value)
 
 
+# A deployment with no canonical corpus yet has nothing to protect, so an empty
+# backup root is only meaningful above this size.  Measured against the live
+# corpus (3.6 GiB) the floor is far below the unprotected data.
+_BACKUP_ABSENCE_MIN_DATABASE_BYTES_DEFAULT = 64 * 1024 * 1024
+
+
 def _auto_ingest_health_config(meta_dir: Path) -> tuple[bool, dict[str, Any], str]:
     path = meta_dir / "auto_ingest_config.json"
     if not path.exists():
@@ -187,6 +193,76 @@ def _auto_ingest_health_config(meta_dir: Path) -> tuple[bool, dict[str, Any], st
         if not consent:
             return False, payload, "model_raw_text_processing_not_authorized"
     return enabled, payload, ""
+
+
+def _relay_spool_health(
+    meta_dir: Path,
+    auto_ingest_config: dict[str, Any],
+    detail: dict[str, Any],
+    warnings: list[str],
+) -> None:
+    """Report relay request packets that no consumer has answered.
+
+    Pure repo-owned state: the producer writes packets under
+    ``<meta>/relay-spool/requests`` and polls ``responses``.  ``requests > 0``
+    with ``responses == 0`` means the lane is producing work nothing consumes --
+    precisely the condition that left automatic ingest dead for days while every
+    surface reported healthy (11 requests, 0 responses, oldest 2.8 days).
+
+    Advisory only.  It says nothing about whether a canonical write is safe, and
+    it must never enter the tier that drives ``health["ok"]``.
+    """
+    runner_options = auto_ingest_config.get("runner_options")
+    configured = ""
+    if isinstance(runner_options, dict):
+        configured = str(runner_options.get("spool_dir") or "")
+    spool = Path(configured) if configured else meta_dir / "relay-spool"
+    requests_dir = spool / "requests"
+    responses_dir = spool / "responses"
+    cap = _bounded_env_int("VECTOR_LAKE_RELAY_SPOOL_SCAN_LIMIT", 5_000, 1)
+
+    def _count(directory: Path) -> tuple[int, int, bool]:
+        if not directory.is_dir():
+            return 0, 0, True
+        count = 0
+        newest_mtime_ns = 0
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    count += 1
+                    if count > cap:
+                        return count, newest_mtime_ns, False
+                    try:
+                        newest_mtime_ns = max(
+                            newest_mtime_ns, int(entry.stat().st_mtime_ns)
+                        )
+                    except OSError:
+                        continue
+        except OSError:
+            return count, newest_mtime_ns, False
+        return count, newest_mtime_ns, True
+
+    requests, newest_request_ns, requests_complete = _count(requests_dir)
+    responses, _newest_response_ns, _responses_complete = _count(responses_dir)
+    detail["relay_spool"] = {
+        "path": str(spool),
+        "requests": requests,
+        "responses": responses,
+        "scan_complete": requests_complete,
+    }
+    if requests and not responses:
+        warnings.append(
+            f"relay_spool_unconsumed:requests={requests}:responses=0"
+        )
+        if newest_request_ns:
+            age = max(
+                0,
+                int(
+                    time.time()
+                    - newest_request_ns / 1_000_000_000
+                ),
+            )
+            detail["relay_spool"]["newest_request_age_seconds"] = age
 
 
 def _auto_ingest_attempt_receipt_summary(
@@ -1771,6 +1847,16 @@ def assess_runtime_health(
             "database_daily_growth_high:"
             f"{int(delta['database_bytes'])}>={database_growth_warning_bytes}"
         )
+    storage_latest = storage_growth.get("latest")
+    if isinstance(storage_latest, dict) and not bool(
+        storage_latest.get("projection_object_scan_complete", True)
+    ):
+        # A truncated scan freezes the reported object and orphan totals below
+        # the real values, so the growth trend silently under-reports.
+        warnings.append(
+            "projection_object_scan_incomplete:"
+            f"{storage_latest.get('projection_object_error') or 'unknown'}"
+        )
 
     from vector_lake.backup_capacity import backup_capacity_status
 
@@ -1795,6 +1881,32 @@ def assess_runtime_health(
         warnings.append(
             "backup_quota_unconfigured_high_database_ratio:"
             f"{backup_database_ratio:.4f}>=8.0000"
+        )
+    # An empty backup root is scored as a complete, healthy inventory, so a corpus
+    # with no recoverable copy reads exactly like one that was just backed up.
+    # Report the absence only where there is real data to protect and the
+    # pre-modification copy has not been deliberately paused.
+    backup_absence_floor = _bounded_env_int(
+        "VECTOR_LAKE_BACKUP_ABSENCE_MIN_DATABASE_BYTES",
+        _BACKUP_ABSENCE_MIN_DATABASE_BYTES_DEFAULT,
+        1,
+    )
+    backup_policy_mode = str(
+        backup_capacity["policy"].get("maintenance_backup_mode") or ""
+    )
+    if (
+        backup_capacity["inventory_complete"]
+        and backup_policy_mode not in {"", "skip"}
+        and int(backup_capacity["current_backup_bytes"] or 0) == 0
+        and database_bytes >= backup_absence_floor
+    ):
+        # Advisory only.  ``issues`` drives ``health["ok"]``, which
+        # ``enforce_runtime_write_health`` turns into a hard block on every
+        # ordinary mutation; an absent backup says nothing about whether a
+        # canonical write is safe, and gating on it would freeze the very ingest
+        # path an operator would use to recover.
+        warnings.append(
+            f"maintenance_backup_absent:current=0<database_bytes={database_bytes}"
         )
 
     from vector_lake.governance_store import operational_memory_search_index_status
@@ -1864,6 +1976,12 @@ def assess_runtime_health(
         _auto_ingest_health_config(meta_dir)
     )
     detail["auto_ingest_enabled"] = auto_ingest_enabled
+    _relay_spool_health(
+        meta_dir,
+        auto_ingest_config,
+        detail,
+        warnings,
+    )
     try:
         from vector_lake.tool_auto_ingest import auto_ingest_budget_status
 
@@ -1872,6 +1990,38 @@ def assess_runtime_health(
         )
     except Exception as exc:
         issues.append(f"auto_ingest_budget_status_failed:{type(exc).__name__}:{exc}")
+    budget_detail = detail.get("auto_ingest_budget")
+    if isinstance(budget_detail, dict):
+        for issue in budget_detail.get("issues") or []:
+            # The budget surface fails closed to ``status: blocked`` with no
+            # ``limits``/``circuit`` when the ledger is unreadable, so its own
+            # issues must reach health instead of being dropped with the
+            # breaker comparison.
+            warnings.append(f"auto_ingest_budget:{issue}")
+        circuit = budget_detail.get("circuit")
+        limit = (budget_detail.get("limits") or {}).get(
+            "max_consecutive_infra_failures"
+        )
+        failures = (
+            int((circuit or {}).get("consecutive_infra_failures") or 0)
+            if isinstance(circuit, dict)
+            else 0
+        )
+        # The breaker cooldown only says whether a new launch is blocked right
+        # now.  A streak at or above the threshold means the execution host has
+        # been failing every attempt, which is invisible while the cooldown
+        # window happens to be closed.  Advisory only: ``issues`` drives
+        # ``health["ok"]`` and therefore ``enforce_runtime_write_health``, and a
+        # failing auto-ingest runner does not make a canonical write unsafe.
+        # While the host is disabled the worker's own tick still clears an
+        # expired window (``_reconcile_breaker_state``).
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            if failures >= limit:
+                is_open = bool((circuit or {}).get("is_open"))
+                warnings.append(
+                    "auto_ingest_circuit_tripped:"
+                    f"failures={failures}>={limit}:open={is_open}"
+                )
     if auto_ingest_config_error:
         issues.append(f"auto_ingest_config_invalid:{auto_ingest_config_error}")
     elif not auto_ingest_enabled:
@@ -1924,7 +2074,7 @@ def assess_runtime_health(
         if pending_age > max_pending_age:
             issues.append(f"mutation_outbox_stalled:{pending_age}s")
 
-    from vector_lake.db_store import _ingest_result_is_auto_quarantine
+    from vector_lake.db_store import _ingest_result_is_quarantined
 
     terminal_rows = conn.execute(
         "SELECT task_type, result_json FROM jobs "
@@ -1935,7 +2085,7 @@ def assess_runtime_health(
         1
         for row in terminal_rows
         if str(row["task_type"] or "") == "ingest"
-        and _ingest_result_is_auto_quarantine(row["result_json"])
+        and _ingest_result_is_quarantined(row["result_json"])
     )
     blocking_terminal_jobs = terminal_jobs - auto_quarantined_jobs
     detail["terminal_failed_jobs"] = terminal_jobs
@@ -1949,6 +2099,33 @@ def assess_runtime_health(
         warnings.append(f"auto_ingest_quarantined_jobs:{auto_quarantined_jobs}")
     if blocking_terminal_jobs:
         issues.append(f"terminal_failed_jobs:{blocking_terminal_jobs}")
+
+    # A consumer that dies while holding a lease leaves the job in
+    # ``subagent_processing``.  ``expire_stale_subagent_jobs`` only scans
+    # ``awaiting_subagent`` and ``release_ingest_subagent_task_claim`` requires a
+    # *live* lease, so nothing reaps or reports it: one live job sat in this state
+    # for 38 hours with every surface healthy.  It is still claimable
+    # (``claim_subagent_jobs`` accepts an expired lease), so this is advisory --
+    # it must never enter the tier that drives ``health["ok"]``.
+    now_instant = datetime.now(timezone.utc).isoformat()
+    expired_lease_row = conn.execute(
+        "SELECT COUNT(*) AS count, COALESCE(MIN(lease_until), '') AS oldest "
+        "FROM jobs WHERE task_type = 'ingest' AND status = 'subagent_processing' "
+        "AND COALESCE(lease_until, '') <= ?",
+        (now_instant,),
+    ).fetchone()
+    expired_leases = int(expired_lease_row["count"] or 0)
+    detail["expired_subagent_leases"] = expired_leases
+    if expired_leases:
+        detail["expired_subagent_lease_recovery"] = {
+            "recovery": (
+                "claim_subagent_jobs() accepts an expired lease; re-lease and "
+                "release_ingest_subagent_task_claim() returns it to the queue "
+                "without spending a retry"
+            ),
+            "oldest_lease_until": str(expired_lease_row["oldest"] or ""),
+        }
+        warnings.append(f"subagent_lease_expired:{expired_leases}")
 
     auto_ingest_active_jobs = 0
     if auto_ingest_enabled:

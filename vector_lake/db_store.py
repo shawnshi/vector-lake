@@ -85,6 +85,21 @@ _WAL_AUTOCHECKPOINT_DEFAULT_PAGES = 1_000
 _WAL_AUTOCHECKPOINT_MAX_PAGES = 1_000_000
 _WAL_JOURNAL_SIZE_LIMIT_DEFAULT_BYTES = 64 * 1024 * 1024
 _WAL_JOURNAL_SIZE_LIMIT_MAX_BYTES = 16 * 1024 * 1024 * 1024
+# SQLite's default page cache is 2 MiB and ``mmap_size`` is 0.  The canonical
+# database is multiple GiB, so every whole-database pass (governance
+# aggregation, FTS corpus digest, quick_check) re-reads from the OS instead of
+# an application cache.  Measured on the live 3.6 GiB corpus, ``PRAGMA
+# quick_check`` drops from 62.6 s to 16.1 s with a 64 MiB cache.  256 MiB adds
+# little over 64 MiB.  This does not move first-search wall clock: that cost is
+# index materialisation, not pager traffic.
+_SQLITE_CACHE_KIB_DEFAULT = 65_536
+_SQLITE_CACHE_KIB_FLOOR = 2_000
+_SQLITE_CACHE_KIB_CEILING = 524_288
+# Kept off by default: SQLite documents that a memory-mapped file must not be
+# truncated by another process, and this deployment shares the database across
+# several host adapters.  Operators opt in per host.
+_SQLITE_MMAP_BYTES_DEFAULT = 0
+_SQLITE_MMAP_BYTES_CEILING = 256 * 1024 * 1024 * 1024
 _SEARCH_PROJECTION_INTEGRITY_MAX_ROWS_DEFAULT = 250_000
 _SEARCH_PROJECTION_INTEGRITY_MAX_ROWS_HARD = 2_000_000
 _SEARCH_PROJECTION_INTEGRITY_MAX_BYTES_DEFAULT = 512 * 1024 * 1024
@@ -2578,6 +2593,63 @@ def configured_wal_journal_size_limit_bytes() -> int:
     )
 
 
+def configured_sqlite_cache_kib() -> int:
+    return max(
+        _SQLITE_CACHE_KIB_FLOOR,
+        _configured_nonnegative_int(
+            "VECTOR_LAKE_SQLITE_CACHE_KIB",
+            _SQLITE_CACHE_KIB_DEFAULT,
+            _SQLITE_CACHE_KIB_CEILING,
+        ),
+    )
+
+
+def configured_sqlite_mmap_bytes() -> int:
+    return _configured_nonnegative_int(
+        "VECTOR_LAKE_SQLITE_MMAP_BYTES",
+        _SQLITE_MMAP_BYTES_DEFAULT,
+        _SQLITE_MMAP_BYTES_CEILING,
+    )
+
+
+def _configure_sqlite_pager(connection: sqlite3.Connection) -> None:
+    """Apply and verify the per-connection page-cache settings.
+
+    ``cache_size`` is set in KiB via the negative form so it is an absolute
+    budget rather than a page count, and it is verified because a silently
+    ignored PRAGMA would restore the default 2 MiB cache without any signal.
+    ``mmap_size`` is verified only when an operator requests it: a value of 0 is
+    the documented default and the honest answer on builds without mmap.  A
+    build-time cap (``SQLITE_MAX_MMAP_SIZE``) legitimately yields a smaller
+    positive value, so only a silent 0 is treated as failure.
+
+    ``cache_size`` is per connection, so the ceiling bounds the aggregate too:
+    the MCP server holds roughly five connections.
+    """
+    cache_kib = configured_sqlite_cache_kib()
+    connection.execute(f"PRAGMA cache_size = {-cache_kib}")
+    observed_cache = connection.execute("PRAGMA cache_size").fetchone()
+    if observed_cache is None or int(observed_cache[0]) != -cache_kib:
+        connection.close()
+        raise RuntimeError(
+            "SQLite page cache configuration was not applied: "
+            f"requested={-cache_kib}:observed="
+            f"{int(observed_cache[0]) if observed_cache is not None else 'missing'}"
+        )
+    mmap_bytes = configured_sqlite_mmap_bytes()
+    if mmap_bytes <= 0:
+        return
+    connection.execute(f"PRAGMA mmap_size = {mmap_bytes}")
+    observed_mmap = connection.execute("PRAGMA mmap_size").fetchone()
+    if observed_mmap is None or int(observed_mmap[0]) <= 0:
+        connection.close()
+        raise RuntimeError(
+            "SQLite mmap configuration was not applied: "
+            f"requested={mmap_bytes}:observed="
+            f"{int(observed_mmap[0]) if observed_mmap is not None else 'missing'}"
+        )
+
+
 def _configure_wal_retention(connection: sqlite3.Connection) -> None:
     autocheckpoint_pages = configured_wal_autocheckpoint_pages()
     journal_limit_bytes = configured_wal_journal_size_limit_bytes()
@@ -2669,6 +2741,7 @@ def get_connection() -> sqlite3.Connection:
         from .memory_search_normalization import register_sqlite_functions
 
         register_sqlite_functions(conn)
+        _configure_sqlite_pager(conn)
         conn.execute("PRAGMA recursive_triggers=ON")
         conn.execute("PRAGMA foreign_keys=ON")
         if not read_only:
@@ -10890,17 +10963,42 @@ def mark_file_processed(
         )
 
 
-def _ingest_result_is_auto_quarantine(result_json: object) -> bool:
-    """Identify controller quarantines without treating arbitrary failures as safe."""
+_INGEST_HANDOFF_EXPIRY_MAINTENANCE = "ingest_handoff_expiry"
+_INGEST_HANDOFF_EXPIRY_ERROR = "Subagent task packet expired before finalization"
+_INGEST_QUARANTINE_MAINTENANCE_CLASSES = frozenset(
+    {"auto_ingest_controller", _INGEST_HANDOFF_EXPIRY_MAINTENANCE}
+)
+
+
+def _ingest_result_is_quarantined(result_json: object) -> bool:
+    """Identify a deliberate quarantine without treating arbitrary failures as safe.
+
+    Two code paths quarantine an ingest job on purpose: the automatic ingest
+    controller (``auto_ingest_controller``) and the handoff-expiry sweep
+    (``ingest_handoff_expiry``).  The marker must match exactly, so an ordinary
+    failure still counts as blocking.
+
+    The expiry sweep used to write no ``result_json`` at all while incrementing
+    ``retries`` on every pass, so after three hourly sweeps a job that had simply
+    been waiting for a subagent that never ran became a permanent
+    ``terminal_failed_jobs`` entry.  Runtime Health excludes quarantined jobs
+    from that block, so the sweep's own failures were unrecoverable *and*
+    disabled every ordinary write, with no entry point able to clear them.
+    """
     try:
         result = json.loads(str(result_json or "{}"))
     except (TypeError, json.JSONDecodeError):
         return False
     return bool(
         isinstance(result, dict)
-        and result.get("maintenance") == "auto_ingest_controller"
+        and result.get("maintenance") in _INGEST_QUARANTINE_MAINTENANCE_CLASSES
         and result.get("state") == "quarantined"
     )
+
+
+# Backwards-compatible private alias: the controller path was the only caller when
+# this predicate was named for it.
+_ingest_result_is_auto_quarantine = _ingest_result_is_quarantined
 
 
 def _ingest_identity_owner_is_releasable(
@@ -10922,7 +11020,7 @@ def _ingest_identity_owner_is_releasable(
     if status in {"cancelled", "superseded"}:
         return True
     if status == "failed" and retries >= 3:
-        if _ingest_result_is_auto_quarantine(record.get("result_json")):
+        if _ingest_result_is_quarantined(record.get("result_json")):
             # A quarantine deliberately retains the exact revision identity. It
             # can be released only by the preview/CAS apply path in
             # reconcile_ingest_job_debt, never by an opportunistic enqueue.
@@ -12973,13 +13071,28 @@ def finalize_ingest_job(
 
 
 def expire_stale_subagent_jobs(max_age_seconds: int = 86400) -> int:
-    """Expire stale handoffs while durably retaining cleanup for their packets."""
+    """Expire stale handoffs while durably retaining cleanup for their packets.
+
+    The terminal row carries an exact quarantine marker so Runtime Health treats
+    it as reviewable debt instead of an unrecoverable block on every ordinary
+    write; see :func:`_ingest_result_is_quarantined`.
+    """
     init_db()
     conn = get_connection()
     cutoff = (
         datetime.now(timezone.utc) - timedelta(seconds=max(1, int(max_age_seconds)))
     ).isoformat()
     now_str = datetime.now(timezone.utc).isoformat()
+    result_json = json.dumps(
+        {
+            "maintenance": _INGEST_HANDOFF_EXPIRY_MAINTENANCE,
+            "state": "quarantined",
+            "failure_class": "subagent_packet_expired",
+            "error": _INGEST_HANDOFF_EXPIRY_ERROR,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     with transaction():
         rows = conn.execute(
             "SELECT job_id, task_packet_path FROM jobs "
@@ -12994,12 +13107,59 @@ def expire_stale_subagent_jobs(max_age_seconds: int = 86400) -> int:
         cursor = conn.execute(
             "UPDATE jobs SET status = 'failed', "
             "retries = COALESCE(retries, 0) + 1, "
-            "error_msg = 'Subagent task packet expired before finalization', updated_at = ?, "
-            "available_at = ?, lease_until = NULL, lease_owner = NULL, lease_token = NULL "
+            "error_msg = ?, result_json = ?, updated_at = ?, "
+            "available_at = ?, lease_until = NULL, lease_owner = NULL, "
+            "lease_token = NULL "
             "WHERE status = 'awaiting_subagent' AND updated_at < ?",
-            (now_str, now_str, cutoff),
+            (
+                _INGEST_HANDOFF_EXPIRY_ERROR,
+                result_json,
+                now_str,
+                now_str,
+                cutoff,
+            ),
         )
-        return int(cursor.rowcount or 0)
+        expired = int(cursor.rowcount or 0)
+        mark_unquarantined_expired_handoffs(conn, now_str=now_str)
+        return expired
+
+
+def mark_unquarantined_expired_handoffs(
+    conn: sqlite3.Connection,
+    *,
+    now_str: str,
+    limit: int = 1_000,
+) -> int:
+    """Back-fill the quarantine marker on rows an earlier sweep left bare.
+
+    Idempotent and narrowly scoped: only rows whose failure is exactly the
+    expiry message, that are already terminal, and whose ``result_json`` is still
+    NULL.  Nothing is fabricated -- the marker records the failure that is
+    already recorded in ``error_msg`` -- and it only ever writes where the field
+    was empty.
+    """
+    result_json = json.dumps(
+        {
+            "maintenance": _INGEST_HANDOFF_EXPIRY_MAINTENANCE,
+            "state": "quarantined",
+            "failure_class": "subagent_packet_expired",
+            "error": _INGEST_HANDOFF_EXPIRY_ERROR,
+            "backfilled_at": now_str,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    bounded = max(1, min(10_000, int(limit)))
+    cursor = conn.execute(
+        "UPDATE jobs SET result_json = ? WHERE job_id IN ("
+        "SELECT job_id FROM jobs WHERE task_type = 'ingest' "
+        "AND status = 'failed' AND COALESCE(retries, 0) >= 3 "
+        "AND result_json IS NULL AND error_msg = ? "
+        "ORDER BY job_id ASC LIMIT ?"
+        ")",
+        (result_json, _INGEST_HANDOFF_EXPIRY_ERROR, bounded),
+    )
+    return int(cursor.rowcount or 0)
 
 
 def update_job_status(
