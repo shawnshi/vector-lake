@@ -330,6 +330,21 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 | 5 | `0a9e9eb` | 29 → 27 | `auto_ingest_runners.base`→base、`tools`→handler | 分别改回，两段边各自重现 |
 | 6 | `7a95549` | 27 → 24 | `timeline_semantics`→base、`tool_timeline`→storage | 改回后 3 条边重现；改回 `timeline_semantics` 反而**新增**一条 |
 | 7 | `a2e9e70` | 24 → 22 | `backup_capacity` derived→storage | 改回 derived 后两条边重现 |
+| 8 | `0e15e07` | 22 → 21 | `watchdog_status` orchestration→base | 改回后该边重现；`native_llm` 同层安置被**否决** |
+| 9 | `2767fe1` | 21 → 20 | 新建 `ingest_paths`（base），拆出 ingest 根/配置解析 | 改回导入即复现；代价是 14 处 monkeypatch 目标需同步 |
+| **10** | `b1a2e7a` | **20 → 17** | **拆分规范写入路径出 `wiki_utils`** | 恢复 3 条延迟导入 → 3 条边全部重现，SCC 回到 41 |
+
+#### 最大 SCC 轨迹（本次唯一真正缩小环的批次）
+
+```
+39 ──────────── 批次1–8（边数在降，环不变）
+40 ── 批次9（新增节点落在既有环内）
+33 ── 批次10（wiki_utils 3 条向上边全部移除）  ← 减少 7 个模块
+```
+
+**批次 10 是唯一改变环的批次**，而且它必须**全做不可**：我先测了全部子集，只去掉 3 条中的 1 或 2 条，环**完全不变**（都是 40），只有 3 条全去才降到 32/33。反证：恢复那 3 条延迟导入，环回到 **41** —— 即这 3 条边值 **8 个模块**。
+
+**为何批次 5a 失败、批次 10 成功**：5a 试的是“从 `atomic_write_text` 里**抽出**校验”，失败是因为那 14 个测试断言的是“写路径拒绝非法输入且不替换目标” —— 这证明该函数**本身就是规范写入函数**，不是通用字节写入器。正确修法是**拆分**（校验+提交移到 orchestration 层），而非掏空它。
 
 #### P3.2 侦察：`backup_capacity`（2 条边，已完成并清掉）
 
