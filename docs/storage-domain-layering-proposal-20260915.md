@@ -170,13 +170,32 @@ governance_store → provenance_retention → tool_claim_provenance
 
 ### 5.1 批次
 
-| 阶段 | 内容 | 清边 | 规模 | 波及面 | **SCC** | 风险 |
-|---|---|---|---|---|---|---|
-| **P-A** | `retain_current_reviewed_provenance` 下移 storage | 2 | 275 行 | 小（写路径 1 + 测试） | **33→13** | 中：触及规范写事务，必须逐字节保持事务内语义 |
-| P-D1 | `classify_non_claim_text` 纯谓词下移 base | 0（为 D 铺路） | 小 | 小 | 33 | 低 |
-| P-C | `validate_schema` 改为注入 allowed-target 集 | 1 | 小 | **17 个调用点 / 10 模块** | 33→29 | 中：签名变化面广；必须保住 v9 fail-closed |
-| P-B | 5 个派生函数 + `build_trace_for_query` 上移 derived | 6 | 377 行 | **约 25 处引用** | **无变化** | **高**：`build_claim_graph_projection` 16 处引用 |
-| P-D2 | `canonical_page_version_from_content` 的抽取耦合 | 1 | 需设计 | 未知 | 无变化 | 需先定“规范页版本由谁定义” |
+| 阶段 | 内容 | 状态 | 清边 | **SCC** |
+|---|---|---|---|---|
+| **P-A** | `retain_current_reviewed_provenance` → storage（实为重分类） | ✅ `c10c98a` | 2 | **33→13** |
+| **P-D1** | `classify_non_claim_text` → 新 base `non_claim_text` | ✅ `8b6481b` | 0 | 13（无变化） |
+| **P-C** | `validate_schema` 改为注入可调用对象 | ✅ `8b6481b` | 1 | **13→8** |
+| P-B | 5 个派生函数 + `build_trace_for_query` 上移聚合模块 | 待做（你已确认方案） | 2 | 预计无变化 |
+| P-D2 | `canonical_page_version_from_content` 的抽取耦合 | ⚠️ **需重新决策**（见下） | 1 | — |
+
+#### P-C 的实测要点
+
+**先量再改，于是改动很小**：标签碰撞检查以可选参数 `index_path` 为条件，而 **16 个调用点中只有 2 个传它**（另有 6 个经由 `verify_asset`），其余根本不进那段代码。改为传回调后：
+- `schema_validator` **零向上依赖** ✓
+- 读取逻辑搬到 `indexer.committed_index_entities`，保留“committed reader + fail-closed”语义与惰性读取
+- **顺手堵掉一个我自己引入的漏洞**：那段代码外面包着会吞 `TypeError` 的 `except`，所以调用方若错传一个 `Path` 而非可调用对象，会**静默跳过校验**。现改为**非可调用即报错**，不静默。
+
+#### P-D2 需重新决策（我先前对它的描述不准确）
+
+`canonical_page_version_from_content` 有 **21 个外部调用点**（生产 11 处跨 5 个模块）。你已确认“接受页版本由调用方显式提供对象集”的**原则**，但落地后发现：那会把“由内容抽取对象”的负担平摊给 **21 个调用方**，而它们大多并不持有对象集，仍需 `extract_page_objects` ⇒ **耦合只是上移，并未消失**。
+
+因此 P-D2 存在三个选项，需你选：
+1. **维持现状**（`governance_store → claim_extractor` 保留为已知的 1 条边）；
+2. **在 `governance_store` 内部保留一个薄适配层**，把“内容→对象”作为**注入到 storage 的可调用对象**（形状同 P-C），这样 storage 不导入 domain，但需在组合根接线；
+3. **真正拆分**：把页版本的定义搬到 domain，由 storage 调用 domain —— 但这与“storage 不得依赖 domain”直接矛盾，除非把页版本计算归为**派生**。
+
+我倾向选项 2（与 P-C 同形，一致性最好），但它的第一个动作需先在组合根找到一个接线点，不在本提案范围内。
+
 
 **建议顺序**：**P-A → P-D1 → P-C → P-B → P-D2**。
 
