@@ -333,6 +333,22 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 | 8 | `0e15e07` | 22 → 21 | `watchdog_status` orchestration→base | 改回后该边重现；`native_llm` 同层安置被**否决** |
 | 9 | `2767fe1` | 21 → 20 | 新建 `ingest_paths`（base），拆出 ingest 根/配置解析 | 改回导入即复现；代价是 14 处 monkeypatch 目标需同步 |
 | **10** | `b1a2e7a` | **20 → 17** | **拆分规范写入路径出 `wiki_utils`** | 恢复 3 条延迟导入 → 3 条边全部重现，SCC 回到 41 |
+| **11** | `be97a76` | **17 → 14** | **拆分 ingest 引擎出 `tool_ingest`**（3389 行 / 81 个名字） | 全量套件 2995 绿；见下 |
+
+#### A 类：`tool_ingest` 引擎拆分（批次 11，已完成）
+
+**可行性先被证实，而且不是显而易见的**：
+- `tool_ingest` **确实**是真实反转（不同于 `tool_timeline`）：它依赖 `tool_projection`（handler）⇒ 最低合法层是 handler，而导入它的三个模块（`auto_ingest_worker`/`ingest_worker`/`watchdog_app`）在 orchestration ⇒ **区间为空**，必须拆分。
+- 引擎簇的最大依赖层是 **orchestration**（经 `mutation_coordinator`），且**不**需要 `tool_projection` ⇒ orchestration 就是它的正确层。
+- 簇在**模块内引用下封闭**（已显式校验，零泄漏）⇒ 搬迁是机械的。
+
+**两个生成器缺陷（均由验证发现，不由阅读发现）**：
+1. 首次用 `ast.Name` 算自由变量 —— 那会把局部变量也算进去，结果一团糟。改为：**拷贝全部模块级导入，再让 ruff F401 删未用项**（确定性，且本就在 CI 里）。
+2. 带装饰器的定义：`node.lineno` 指向 `def`/`class` 而**不是装饰器** ⇒ 用它的行区间会把你工 `@dataclass` 行孤零零留在原模块。现从 `decorator_list[0]` 起算。
+
+**大半工作量其实是测试夹具接线**，共四类形式，一个都不能漏：`from ... import` 块、`tool_ingest.X` 属性访问、`setattr(tool_ingest, "X")`（**单行与多行两种**）、以及两个模块都绑定同名时的 **companion patch**。涉及 15 个测试文件 + `benchmarks/runtime_10k_gate.py`（最初的 tests/scripts 扫描漏了它）。
+
+**这个重构里最阴的一个陷阱**：同一符号可能被两个模块绑定，并因“哪个模块的代码在调用”而解析到不同对象。`_terminal_ingest_recovery_plan` **留在了 tool_ingest**，所以它的辅助函数必须在 `tool_ingest` 上打补丁；只打 `ingest_engine` 会静默地让真实函数继续运行。
 
 #### 最大 SCC 轨迹（本次唯一真正缩小环的批次）
 
