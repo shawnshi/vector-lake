@@ -3376,7 +3376,7 @@ def scheduled_lint_loop(stop_event: threading.Event | None = None):
                 _close_db: Callable[[], None] | None = None
                 try:
                     from vector_lake.db_store import close_connection as _close_db
-                    from vector_lake.tool_governance_maintenance import (
+                    from vector_lake.history_retention import (
                         history_retention_maintenance,
                     )
 

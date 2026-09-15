@@ -7,7 +7,7 @@ import pytest
 from filelock import FileLock, Timeout
 
 from vector_lake import db_store, governance_store
-from vector_lake.tool_governance_maintenance import history_retention_maintenance
+from vector_lake.history_retention import history_retention_maintenance
 
 
 OLD = "2020-01-01T00:00:00+00:00"

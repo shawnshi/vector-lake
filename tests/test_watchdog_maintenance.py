@@ -1222,7 +1222,7 @@ def test_raw_watchdog_gate_busy_defers_full_scan_without_failure_count(
 def test_scheduled_history_retention_uses_real_read_only_preview(
     isolated_memory, monkeypatch, caplog, first_failure,
 ):
-    from vector_lake import storage_growth, tool_governance_maintenance, watchdog_app
+    from vector_lake import history_retention, storage_growth, watchdog_app
 
     db_store.init_db()
     conn = db_store.get_connection()
@@ -1239,7 +1239,7 @@ def test_scheduled_history_retention_uses_real_read_only_preview(
     calls = []
     results = []
     statuses = []
-    real_maintenance = tool_governance_maintenance.history_retention_maintenance
+    real_maintenance = history_retention.history_retention_maintenance
 
     def preview(**kwargs):
         calls.append(kwargs)
@@ -1278,7 +1278,7 @@ def test_scheduled_history_retention_uses_real_read_only_preview(
     )
     monkeypatch.setattr(watchdog_app, "expire_stale_ingest_jobs_for_watchdog", lambda: 0)
     monkeypatch.setattr(
-        tool_governance_maintenance, "history_retention_maintenance", preview,
+        history_retention, "history_retention_maintenance", preview,
     )
     monkeypatch.setattr(
         watchdog_app, "write_status",

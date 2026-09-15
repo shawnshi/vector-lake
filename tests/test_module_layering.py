@@ -77,6 +77,10 @@ LAYERS: dict[str, set[str]] = {
         # (storage) plus wiki_utils (base), so its minimum legal layer is storage;
         # being at derived put it above the storage modules that consume it
         # (db_store, storage_growth). Every importer sits at storage or above.
+        # Schema history retention, split out of tool_governance_maintenance so the
+        # watchdog can run it without importing a handler. Needs db_store and
+        # governance_store, so storage is its minimum legal tier.
+        "history_retention",
         "backup_capacity",
         # Pure implementation, no @mcp.tool() surface: it maintains the
         # timeline_events table from claim deltas and reports projection parity.
@@ -191,7 +195,6 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("restore_snapshot", "tool_projection"),
         ("runtime_health", "tool_auto_ingest"),
         # orchestration -> handler
-        ("watchdog_app", "tool_governance_maintenance"),
         ("watchdog_app", "tool_lint"),
         # handler -> surface
         ("tool_doctor", "mcp_server"),
