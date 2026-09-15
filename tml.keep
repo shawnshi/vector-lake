@@ -56,6 +56,11 @@ LAYERS: dict[str, set[str]] = {
         "auto_ingest_runners.base",
         # Zero intra-package imports: pure timeline prefix/date semantics.
         "timeline_semantics",
+        # Depends only on durability and wiki_utils, both base, and nothing below it
+        # imports it. It publishes and reads the watchdog status file, which is
+        # infrastructure rather than orchestration; being in orchestration made
+        # runtime_health's read of it look upward.
+        "watchdog_status",
     },
     "storage": {
         "db_store",
@@ -107,7 +112,6 @@ LAYERS: dict[str, set[str]] = {
     "orchestration": {
         "mutation_coordinator",
         "watchdog_app",
-        "watchdog_status",
         "auto_ingest_worker",
         "ingest_worker",
         "heavy_task_gate",
@@ -179,8 +183,6 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("restore_snapshot", "tool_projection"),
         ("runtime_health", "tool_auto_ingest"),
         ("runtime_health", "tool_gc"),
-        # derived -> orchestration
-        ("runtime_health", "watchdog_status"),
         # orchestration -> handler
         ("auto_ingest_worker", "tool_ingest"),
         ("ingest_worker", "tool_ingest"),
