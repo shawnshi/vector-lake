@@ -10960,7 +10960,7 @@ def _ingest_identity_owner_is_releasable(
     if not raw_path.is_absolute():
         raw_path = get_raw_dir().parent / raw_path
     try:
-        from vector_lake.tool_ingest import get_ingest_target_directories
+        from vector_lake.ingest_paths import get_ingest_target_directories
 
         snapshot = stable_raw_revision(
             raw_path,

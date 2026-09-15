@@ -2826,10 +2826,8 @@ def _verified_raw_input(
     processed_data: dict[str, Any],
     config: AutoIngestConfig,
 ) -> str:
-    from vector_lake.tool_ingest import (
-        get_ingest_target_directories,
-        is_private_diary_path,
-    )
+    from vector_lake.ingest_paths import get_ingest_target_directories
+    from vector_lake.tool_ingest import is_private_diary_path
 
     try:
         raw_path = Path(str(processed_data.get("filepath") or ""))
@@ -3049,7 +3047,7 @@ def _job_state(
     filepath: str,
     expected_hash: str,
 ) -> tuple[str, bool]:
-    from vector_lake.tool_ingest import get_ingest_target_directories
+    from vector_lake.ingest_paths import get_ingest_target_directories
 
     job = db_store.get_connection().execute(
         "SELECT status FROM jobs WHERE job_id = ?",

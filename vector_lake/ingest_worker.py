@@ -42,7 +42,7 @@ def _auto_ingest_dispatch_capacity_available() -> bool:
 
 
 def _ingest_finalization_proven(filepath: str, file_hash: str) -> bool:
-    from vector_lake.tool_ingest import get_ingest_target_directories
+    from vector_lake.ingest_paths import get_ingest_target_directories
 
     row = (
         get_connection()

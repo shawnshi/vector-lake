@@ -669,9 +669,9 @@ index_queue = WikiIndexEventBuffer(persist_reconcile_marker=True)
 
 def _raw_watch_configuration() -> tuple[list[Path], str]:
     """Return one validated ingest config snapshot for watch reconciliation."""
-    from vector_lake.tool_ingest import (
-        _load_ingest_config,
+    from vector_lake.ingest_paths import (
         get_ingest_target_directories,
+        load_ingest_config as _load_ingest_config,
     )
 
     config_snapshot = _load_ingest_config()
@@ -686,7 +686,7 @@ def _raw_watch_configuration() -> tuple[list[Path], str]:
 def _watch_directories(
     raw_targets: list[Path] | None = None,
 ) -> dict[str, Path | list[Path]]:
-    from vector_lake.tool_ingest import get_ingest_target_directories
+    from vector_lake.ingest_paths import get_ingest_target_directories
     from vector_lake.wiki_utils import get_raw_dir, get_wiki_dir
 
     raw_dir = get_raw_dir()

@@ -15,6 +15,7 @@ import pytest
 from vector_lake import (
     db_store,
     governance_store,
+    ingest_paths,
     indexer,
     mcp_server,
     mutation_coordinator,
@@ -690,6 +691,7 @@ def test_external_roots_with_same_basename_get_distinct_canonical_names(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
         tool_ingest,
         "_build_ingest_instructions",
@@ -1143,6 +1145,7 @@ def test_full_scan_excludes_private_diary_path_case_insensitively(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
         tool_ingest,
         "_build_ingest_instructions",
@@ -1196,6 +1199,7 @@ def test_candidate_scan_matches_exclude_paths_by_casefolded_components(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
         tool_ingest,
         "_build_ingest_instructions",
@@ -1231,6 +1235,7 @@ def test_full_scan_hashes_same_size_change_with_restored_mtime(
     config_root = isolated_memory / "extension-config"
     config_root.mkdir()
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
         tool_ingest,
         "_build_ingest_instructions",
@@ -1287,6 +1292,7 @@ def test_full_scan_fails_closed_when_hash_is_unavailable(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
         tool_ingest,
         "stable_raw_revision",
@@ -1324,6 +1330,7 @@ def test_ingest_rejects_malformed_or_mistyped_config(
     config_root.mkdir()
     (config_root / "config.json").write_text(config_text, encoding="utf-8")
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
 
     with pytest.raises(RuntimeError, match=error_pattern):
         prepare_ingest_batch(batch_size=1, candidate_paths=[])
@@ -1347,6 +1354,7 @@ def test_full_scan_rejects_configured_target_that_is_not_a_directory(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
 
     with pytest.raises(RuntimeError, match="ingest_target_unavailable") as exc_info:
         prepare_ingest_batch(batch_size=1, _enqueue_all=True)
@@ -6243,6 +6251,7 @@ def test_reconcile_missing_canonical_reuses_one_identity_snapshot(
     config_root = isolated_memory / "extension-config"
     config_root.mkdir()
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     target_calls = []
     index_calls = []
     real_targets = tool_ingest.get_ingest_target_directories
@@ -7110,6 +7119,7 @@ def test_explicit_private_diary_root_is_never_walked(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     real_walk = tool_ingest.os.walk
     walked_roots = []
 

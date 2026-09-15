@@ -812,7 +812,7 @@ def test_watchdog_schedules_all_collapsed_ingest_roots(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import ingest_worker, tool_ingest, watchdog_app
+    from vector_lake import ingest_paths, ingest_worker, tool_ingest, watchdog_app
 
     stop_event = threading.Event()
     raw_dir = isolated_memory / "raw"
@@ -867,6 +867,7 @@ def test_watchdog_schedules_all_collapsed_ingest_roots(
         event.wait(2)
 
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
     monkeypatch.setattr(watchdog_app, "RawWatchdogHandler", FakeRawHandler)
     monkeypatch.setattr(
@@ -899,7 +900,7 @@ def test_watchdog_hot_reconciles_removed_and_recreated_raw_roots(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import ingest_worker, tool_ingest, watchdog_app
+    from vector_lake import ingest_paths, ingest_worker, tool_ingest, watchdog_app
 
     stop_event = threading.Event()
     raw_dir = isolated_memory / "raw"
@@ -986,6 +987,7 @@ def test_watchdog_hot_reconciles_removed_and_recreated_raw_roots(
         event.wait(2)
 
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
     monkeypatch.setattr(watchdog_app, "RawWatchdogHandler", FakeRawHandler)
     monkeypatch.setattr(
@@ -1642,7 +1644,7 @@ def test_watchdog_hot_reconciles_parent_child_root_switch(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import ingest_worker, tool_ingest, watchdog_app
+    from vector_lake import ingest_paths, ingest_worker, tool_ingest, watchdog_app
 
     stop_event = threading.Event()
     raw_dir = isolated_memory / "raw"
@@ -1719,6 +1721,7 @@ def test_watchdog_hot_reconciles_parent_child_root_switch(
         event.wait(2)
 
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(watchdog_app, "Observer", FakeObserver)
     monkeypatch.setattr(watchdog_app, "RawWatchdogHandler", FakeRawHandler)
     monkeypatch.setattr(
@@ -1755,7 +1758,7 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_paths, tool_ingest
 
     _write_test_purpose(isolated_memory)
     _install_lightweight_local_publication(monkeypatch, tool_ingest)
@@ -1783,6 +1786,7 @@ def test_raw_startup_overflow_scans_and_hashes_inventory_once(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
         tool_ingest,
         "_build_ingest_instructions",
@@ -1850,7 +1854,7 @@ def test_raw_full_scan_preserves_event_arriving_during_inventory(
     isolated_memory,
     monkeypatch,
 ):
-    from vector_lake import tool_ingest
+    from vector_lake import ingest_paths, tool_ingest
 
     _write_test_purpose(isolated_memory)
     _install_lightweight_local_publication(monkeypatch, tool_ingest)
@@ -1875,6 +1879,7 @@ def test_raw_full_scan_preserves_event_arriving_during_inventory(
         encoding="utf-8",
     )
     monkeypatch.setattr(tool_ingest, "get_extension_root", lambda: config_root)
+    monkeypatch.setattr(ingest_paths, "get_extension_root", lambda: config_root)
     monkeypatch.setattr(
         tool_ingest,
         "_build_ingest_instructions",
