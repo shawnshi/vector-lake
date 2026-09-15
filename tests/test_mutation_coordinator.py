@@ -9,6 +9,7 @@ import yaml
 
 from vector_lake import db_store, governance_store, indexer
 from vector_lake.mutation_coordinator import execute_mutation_batch, execute_mutation_plan
+from vector_lake.canonical_write import write_canonical_markdown
 from vector_lake.wiki_utils import atomic_write_text
 
 
@@ -124,7 +125,7 @@ def test_atomic_write_full_mode_propagates_yaml_error_without_replacing_target(
     malformed = "---\nid: [unterminated\n---\nbody\n"
 
     with pytest.raises(yaml.YAMLError):
-        atomic_write_text(
+        write_canonical_markdown(
             target,
             malformed,
             pre_parsed_frontmatter=pre_parsed_frontmatter,
@@ -146,7 +147,7 @@ def test_atomic_write_rejects_unterminated_frontmatter_without_replacing_target(
     malformed = "---\nid: source_test\nbody without closing delimiter\n"
 
     with pytest.raises(yaml.YAMLError, match="Missing YAML frontmatter closing delimiter"):
-        atomic_write_text(
+        write_canonical_markdown(
             target,
             malformed,
             pre_parsed_frontmatter={"id": "source_test"},
@@ -201,7 +202,7 @@ def test_atomic_write_validates_case_alias_of_canonical_wiki_root(
     malformed = "---\nid: [unterminated\n---\nbody\n"
 
     with pytest.raises(yaml.YAMLError):
-        atomic_write_text(
+        write_canonical_markdown(
             alias_target,
             malformed,
             validation_mode=validation_mode,
@@ -233,7 +234,7 @@ def test_atomic_write_rejects_ambiguous_windows_path_aliases(
     malformed = "---\nid: [unterminated\n---\nbody\n"
 
     with pytest.raises(ValueError, match="Windows path|Windows alternate"):
-        atomic_write_text(
+        write_canonical_markdown(
             alias_target,
             malformed,
             validation_mode="schema",
@@ -259,7 +260,7 @@ def test_atomic_write_validates_wiki_file_symlink_without_following_target(
 
     malformed = "---\nid: [unterminated\n---\nbody\n"
     with pytest.raises(yaml.YAMLError):
-        atomic_write_text(
+        write_canonical_markdown(
             wiki_target,
             malformed,
             validation_mode="schema",
@@ -289,7 +290,7 @@ def test_atomic_write_full_mode_fails_closed_when_validator_crashes(
 
     monkeypatch.setattr(defense_hook, "verify_asset", fail_validation)
     with pytest.raises(RuntimeError, match="validator unavailable"):
-        atomic_write_text(target, replacement, validation_mode="full")
+        write_canonical_markdown(target, replacement, validation_mode="full")
 
     assert target.read_text(encoding="utf-8") == original
     assert not tuple(target.parent.glob(f"{target.name}.*.tmp"))
@@ -305,7 +306,7 @@ def test_atomic_write_rejects_mismatched_preparsed_frontmatter(
     target.write_text(original, encoding="utf-8")
 
     with pytest.raises(ValueError, match="does not match content"):
-        atomic_write_text(
+        write_canonical_markdown(
             target,
             original,
             pre_parsed_frontmatter={"id": "trusted"},

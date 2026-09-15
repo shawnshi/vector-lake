@@ -1,12 +1,9 @@
-import datetime
 import ctypes
 import hashlib
 import json
 import os
-import random
 import re
 import shutil
-import string
 import time
 import uuid
 import io
@@ -20,7 +17,7 @@ from vector_lake.durability import (
     durable_replace_file,
     sync_open_file,
 )
-from vector_lake.yaml_utils import load_yaml, dump_yaml
+from vector_lake.yaml_utils import load_yaml
 
 _META_DIR_CACHE = None
 
@@ -790,36 +787,31 @@ def _is_canonical_wiki_markdown_path(path: Path) -> bool:
         return False
 
 
+# Public name for higher layers that must decide whether a path is a canonical Wiki
+# page before validating it.
+is_canonical_wiki_markdown_path = _is_canonical_wiki_markdown_path
+
+# Same reason: the canonical write path must reject an ambiguous Windows alias
+# BEFORE it validates, which is the order the old inline copy used.
+reject_ambiguous_windows_path = _reject_ambiguous_windows_path
+
+
 def atomic_write_text(
     path: str | Path,
     content: str,
-    pre_parsed_frontmatter: dict | None = None,
-    validation_mode: str = "full",
     expected_current_hash: str | None = None,
 ):
+    """Atomically write text, with an optional compare-and-swap precondition.
+
+    Validation is deliberately NOT done here. It used to be, which put the schema and
+    purpose contracts in the base layer and made this base writer import two higher
+    layers. Canonical Markdown callers go through
+    ``canonical_write.write_canonical_markdown``, which validates first; every other
+    caller writes JSON receipts, for which validation never applied anyway because
+    the path check rejects anything that is not ``.md`` under the wiki root.
+    """
     path = Path(path)
     _reject_ambiguous_windows_path(path)
-    if validation_mode not in {"full", "schema"}:
-        raise ValueError(f"Unsupported validation_mode: {validation_mode}")
-    
-    # Validate canonical Wiki Markdown regardless of path spelling or casing.
-    if _is_canonical_wiki_markdown_path(path):
-        parsed_frontmatter, _ = split_frontmatter(content)
-        if (
-            pre_parsed_frontmatter is not None
-            and pre_parsed_frontmatter != parsed_frontmatter
-        ):
-            raise ValueError("Pre-parsed frontmatter does not match content")
-        frontmatter = parsed_frontmatter
-        if validation_mode == "full":
-            from vector_lake.defense_hook import verify_asset
-
-            verify_asset(content, path.name, frontmatter, get_index_path())
-        else:
-            from vector_lake.schema_validator import validate_schema
-
-            validate_schema(frontmatter, content, path.name)
-            
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -846,54 +838,6 @@ def ensure_parent_dir(path: str | Path):
 class SafeWriteError(Exception):
     pass
 
-def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_validation: bool = False):
-    path = Path(path)
-    # Check traversal
-    try:
-        if path.resolve().is_relative_to(get_wiki_dir().resolve()) is False and "MEMORY" not in str(path):
-            raise SafeWriteError(f"Path traversal blocked: {path}")
-    except Exception:
-        pass
-    if not skip_validation and path.exists():
-        try:
-            _, old_body, _ = read_markdown_file(path)
-            old_truth_count = _count_list_items(old_body, "编译事实") or _count_list_items(old_body, "Compiled Truth")
-            new_truth_count = _count_list_items(body, "编译事实") or _count_list_items(body, "Compiled Truth")
-            if new_truth_count < old_truth_count:
-                raise SafeWriteError(f"丢失了编译事实 (Compiled Truth)。旧文件有 {old_truth_count} 条，新文件只有 {new_truth_count} 条。请调用 read_resource 重新读取当前文件状态，并使用 Append 模式进行增量合并，而不是直接覆盖。")
-            old_timeline_count = _count_list_items(old_body, "证据时间线") or _count_list_items(old_body, "Evidence Timeline")
-            new_timeline_count = _count_list_items(body, "证据时间线") or _count_list_items(body, "Evidence Timeline")
-            if new_timeline_count < old_timeline_count:
-                raise SafeWriteError(f"丢失了证据时间线 (Evidence Timeline)。旧文件有 {old_timeline_count} 条记录，新文件只有 {new_timeline_count} 条记录。请调用 read_resource 重新读取当前文件状态，并使用 Append 模式进行增量合并，而不是直接覆盖。")
-        except SafeWriteError:
-            raise
-        except Exception:
-            pass
-
-    filename = path.name
-    if not skip_validation:
-        validate_wiki_filename(filename)
-    
-    if filename.startswith("Synthesis_STORM_") and not skip_validation:
-        required_headers = [
-            "## 1. Top 5 Key Findings",
-            "## 2. The Contradiction Map",
-            "## 3. Actionable Insights",
-            "## 4. Multi-Perspective Raw Scan",
-            "## 5. Peer Review"
-        ]
-        for header in required_headers:
-            if header not in body:
-                raise SafeWriteError(f"STORM Synthesis Structural Violation: The file {filename} is missing mandatory H2 section '{header}'. Please strictly follow the references/storm_report_template.md structure.")
-    yaml_block = dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    full_content = f"---\n{yaml_block}---\n{body.lstrip()}"
-    expected_path = (get_wiki_dir() / filename).resolve()
-    if path.resolve() != expected_path:
-        raise SafeWriteError(f"Path traversal blocked: {path}")
-    from vector_lake.mutation_coordinator import execute_mutation_plan
-    execute_mutation_plan(filename, content=full_content, is_delete=False)
-
-
 def backup_file(path: str | Path, suffix: str = ".bak") -> Path | None:
     source = Path(path)
     if not source.exists():
@@ -903,20 +847,7 @@ def backup_file(path: str | Path, suffix: str = ".bak") -> Path | None:
     return backup_path
 
 
-def sanitize_wiki_node(filepath: str | Path):
-    filepath = Path(filepath)
-    if not filepath.exists() or filepath.suffix.lower() != ".md":
-        return
-
-    frontmatter, body, _ = read_markdown_file(filepath)
-    today = datetime.datetime.now().strftime("%Y%m%d")
-    if not frontmatter.get("id"):
-        frontmatter["id"] = f"{today}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
-    frontmatter["updated"] = today
-    write_markdown_file(filepath, frontmatter, body, skip_validation=False)
-
-
-def _count_list_items(body: str, section_marker: str) -> int:
+def count_list_items(body: str, section_marker: str) -> int:
     count = 0
     in_section = False
     for line in io.StringIO(body):
@@ -929,10 +860,6 @@ def _count_list_items(body: str, section_marker: str) -> int:
         if in_section and (stripped.startswith("- ") or stripped.startswith("* ")):
             count += 1
     return count
-
-def safe_write_markdown(path: str | Path, content: str, skip_validation: bool = False):
-    frontmatter, body = split_frontmatter(content)
-    write_markdown_file(path, frontmatter, body, skip_validation=skip_validation)
 
 class TensionEdge(TypedDict):
     target: str

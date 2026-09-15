@@ -14,12 +14,12 @@ from vector_lake.merge_analysis import (
     normalize_name,
 )
 from vector_lake.tool_ingest import PROVENANCE_ONLY_SOURCE_MARKER
+from vector_lake.canonical_write import write_markdown_file
 from vector_lake.wiki_utils import (
     SYSTEM_WHITELIST,
     get_wiki_dir,
     iter_wiki_link_matches,
     read_markdown_file,
-    write_markdown_file,
 )
 from vector_lake.schema_validator import SchemaViolationException, VALID_STATUS, validate_schema
 

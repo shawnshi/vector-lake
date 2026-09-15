@@ -267,7 +267,9 @@ def materialize_markdown_projection(
         desired_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
         if current_hash == desired_hash:
             return filepath
-    atomic_write_text(
+    from vector_lake.canonical_write import write_canonical_markdown
+
+    write_canonical_markdown(
         filepath,
         payload_text,
         validation_mode=validation_mode,

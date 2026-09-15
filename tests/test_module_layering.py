@@ -118,6 +118,10 @@ LAYERS: dict[str, set[str]] = {
         "auto_ingest_worker",
         "ingest_worker",
         "heavy_task_gate",
+        # Canonical write path: validates canonical Markdown and commits mutations.
+        # It sits above domain (for validation) and above storage (for the commit),
+        # which is exactly why wiki_utils could not keep those concerns.
+        "canonical_write",
     },
 }
 # Handlers and the CLI/MCP surface sit on top; they are derived from the filename
@@ -163,11 +167,6 @@ def _layer_of(module: str) -> str | None:
 #   44 -> 43  P3.2 batch 1 moved version_family_id to the base layer
 ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
-        # base -> domain
-        ("wiki_utils", "defense_hook"),
-        ("wiki_utils", "schema_validator"),
-        # base -> orchestration
-        ("wiki_utils", "mutation_coordinator"),
         # storage -> derived
         ("governance_store", "governance_metrics"),
         # storage -> domain
@@ -215,7 +214,7 @@ pass
 # module that imports wiki_utils joins it too. They are the C-class work that batch
 # 5a showed needs a function moved UP a layer rather than validation extracted,
 # against a 14-test contract surface.
-MAX_STRONGLY_CONNECTED_COMPONENT = 40
+MAX_STRONGLY_CONNECTED_COMPONENT = 33
 
 
 def _module_name(path: Path) -> str:
