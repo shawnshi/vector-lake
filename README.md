@@ -747,12 +747,16 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 
 ## Module Map
 
+下表列出承担独立职责的模块，**不是完整清单**：`vector_lake/` 下仍有若干模块未列出，权威清单是源码树本身。新增或搬迁模块时请同步此处，否则读者会把不完整当成已覆盖。
+
 | Path | Role |
 | --- | --- |
 | `cli.py` | 根目录薄入口 |
 | `vector_lake/cli_app.py` | CLI 参数与命令路由 |
 | `vector_lake/tools.py` | Tool facade |
-| `vector_lake/tool_ingest.py` | ingest v6 扫描入队、任务包领取/修复、债务恢复与 lease-fenced finalization |
+| `vector_lake/ingest_engine.py` | ingest 引擎：配置、清单、指令构建、finalization 与 legacy requeue。依赖仅到 orchestration 层，因此编排层与 watchdog 可直接使用而不必导入 handler |
+| `vector_lake/ingest_paths.py` | ingest 源根与 `config.json` 解析（fail-closed 校验） |
+| `vector_lake/tool_ingest.py` | ingest 的 handler 入口：扫描入队、任务包领取/修复、债务恢复与 lease-fenced finalization；引擎实现已拆至 `ingest_engine.py` |
 | `vector_lake/ingest_worker.py` | queued job dispatcher；生成受控任务包并转入 `awaiting_subagent` |
 | `vector_lake/native_llm.py` | 当前环境 subagent 任务包、scratch 路径与 payload 隔离边界 |
 | `vector_lake/embedding_scheduler.py` | sqlite-vec 缺失向量的限速、断点和单写调度 |
@@ -763,6 +767,8 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `vector_lake/raw_revision.py` | no-follow 稳定 metadata/content revision 采样与兼容 digest |
 | `vector_lake/raw_scrub_contract.py` | 持久 daily scrub due/attempt/success ledger |
 | `vector_lake/claim_extractor.py` | Markdown page -> entity/claim/evidence/source |
+| `vector_lake/non_claim_text.py` | 识别维护性 prose（生成式 stub、模板残留）的纯谓词；零包内依赖，故存储层可直接使用而不导入 extractor |
+| `vector_lake/canonical_write.py` | 规范 Wiki 写入路径：先校验（schema/purpose 门）再交接原子写入；提交层级在 storage 之上，因此不复用 base writer |
 | `vector_lake/tool_memory.py` | 运行态记忆的受控写入入口 |
 | `vector_lake/memory_protocol.py` | 稳定 Agent-memory verbs、能力清单与有界 context/delta 适配器 |
 | `vector_lake/retrieval_benchmark.py` | 只读、数据集哈希绑定的 P@K/R@K/MRR/nDCG 检索评估器 |
@@ -781,10 +787,12 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `vector_lake/tool_legacy_graph_audit.py` | 以 caller-owned 只读连接对账旧 Wiki 图与 canonical/page/claim 关系；只输出删除阻断证据，不提供删除入口 |
 | `vector_lake/tool_storage_baseline.py` | 以 caller-owned 只读事务建立 FTS5/vec0 重建基线；重建就绪必须同时核验 sidecar/index/claim-graph 原始字节、嵌入 manifest、expected corpus，并在扫描前后复核 live canonical generation |
 | `vector_lake/storage_growth.py` | 每日一次、35 天有界的数据库、版本表与备份容量增长基线；仅采样和告警，不执行压缩或历史删除 |
-| `vector_lake/tool_governance_maintenance.py` | evidence foundation、history retention、memory index 与债务维护 |
+| `vector_lake/tool_governance_maintenance.py` | evidence foundation、memory index 与债务维护 |
+| `vector_lake/history_retention.py` | schema 历史保留的预览/应用：全局有界的批次、游标与持久收据；在规范写事务的同一层被调用 |
 | `vector_lake/tool_backup_retention.py` | 指纹确认、恢复点保护与两阶段备份保留 |
 | `vector_lake/backup_capacity.py` | 全局备份 inventory、配额/空闲空间遥测与创建前 fail-closed 门禁 |
 | `vector_lake/runtime_health.py` | 基础设施健康和语义就绪度的独立只读评估器 |
+| `vector_lake/gc_receipts.py` | GC recovery receipt 的校验与读取；供 `runtime_health` 报告，不需导入 handler |
 | `vector_lake/diagnostic_snapshot.py` | Doctor/health/readiness 共享 as-of snapshot 与 drift fence |
 | `vector_lake/cancellation.py` | cooperative deadline、atomic phase 与有界 operation registry |
 | `vector_lake/durability.py` | 跨平台文件/目录持久化屏障与 durability profile |
@@ -794,7 +802,7 @@ Doctor 明确告警而不伪装为已治理。配额默认 enforce；`report` �
 | `vector_lake/claim_assessment.py` | 追加式 ClaimAssessment；不产生 AcceptedFact |
 | `vector_lake/decision_registry.py` | 同步外部已验证 CriticalDecisionRegistry 并支持决策范围就绪度 |
 | `vector_lake/quality_registry.py` | 登记不可变 schema/dialect 版本与 golden dataset 评估结果 |
-| `vector_lake/mcp_server.py` | 67-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
+| `vector_lake/mcp_server.py` | 70-tool full / 9-tool memory / explicit readonly MCP 表面、源码 revision guard、payload sandbox 与 bounded blocking executor |
 | `vector_lake/watchdog_app.py` | trailing-edge 增量监听、队列调度、worker 有界重启/故障隔离、运行态记忆索引维护与定时自愈审计 |
 | `scripts/benchmark_multi_host_runtime.py` | 在隔离 MEMORY 上测量多 MCP + watchdog 的启动、RSS、soak 与 runtime-status P95 |
 | `vector_lake/watchdog_status.py` | Watchdog 状态遥测面板 (Status JSON) |
