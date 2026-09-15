@@ -8,7 +8,8 @@ import pytest
 
 from vector_lake import db_store, governance_store
 from vector_lake import tool_governance_maintenance as maintenance
-from vector_lake.claim_extractor import _iter_blocks, classify_non_claim_text
+from vector_lake.claim_extractor import _iter_blocks
+from vector_lake.non_claim_text import classify_non_claim_text
 
 
 @pytest.mark.parametrize("subject", ["Alpha", "Concept_Alpha", "Winning Health", "病案质控"])

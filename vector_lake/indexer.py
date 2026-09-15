@@ -1962,6 +1962,33 @@ def _calculate_weighted_edge_candidates(index_data: dict) -> list[dict]:
     )
 
 
+def committed_index_entities(
+    index_path: str | Path | None = None,
+):
+    """Return a callable yielding the set of titles and aliases in the index.
+
+    The read is deferred to the callable because callers only need it when a tag
+    collision check actually runs, and it must use the committed reader so a
+    stale or tampered v2 binding fails closed instead of validating an empty
+    legacy locator. This lived inside schema_validator, which made the validator
+    import this module; passing the callable keeps the dependency pointing down.
+    """
+    resolved = Path(index_path) if index_path is not None else get_index_path()
+
+    def entities() -> set[str]:
+        if not resolved.exists():
+            return set()
+        index_data = read_committed_index_snapshot(resolved)
+        found: set[str] = set()
+        for node_data in index_data.get("nodes", {}).values():
+            found.add(str(node_data.get("title", "")).lower())
+            for alias in node_data.get("aliases", []) or []:
+                found.add(str(alias).lower())
+        return found
+
+    return entities
+
+
 def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     """Calculate and retain the bounded pre-prune frontier for projection v2."""
     candidates = _calculate_weighted_edge_candidates(index_data)

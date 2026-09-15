@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from vector_lake import db_store
+from vector_lake import indexer, db_store
 from vector_lake.defense_hook import verify_asset
 from vector_lake.schema_validator import validate_schema
 from vector_lake.wiki_utils import (
@@ -140,7 +140,12 @@ def _prepare_staged_projection(
 
     frontmatter, _ = split_frontmatter(payload_text)
     if validation_mode == "full":
-        verify_asset(payload_text, filename, frontmatter, get_index_path())
+        verify_asset(
+            payload_text,
+            filename,
+            frontmatter,
+            indexer.committed_index_entities(get_index_path()),
+        )
     elif validation_mode == "schema":
         validate_schema(frontmatter, payload_text, filename)
     else:
@@ -497,7 +502,12 @@ def _prepare_mutations(
                 raise ValueError("Update mutations require full Markdown content.")
             frontmatter, _ = split_frontmatter(content)
             if item["validation_mode"] == "full":
-                verify_asset(content, item["filename"], frontmatter, get_index_path())
+                verify_asset(
+                    content,
+                    item["filename"],
+                    frontmatter,
+                    indexer.committed_index_entities(get_index_path()),
+                )
             else:
                 # Schema mode is a bounded legacy-maintenance path. Dynamic
                 # tag/entity collision checks belong to full writes because

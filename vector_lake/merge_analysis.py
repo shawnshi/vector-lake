@@ -13,7 +13,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, TypeVar
 
-from vector_lake.claim_extractor import classify_non_claim_text
+from vector_lake.non_claim_text import classify_non_claim_text
 
 
 _MERGE_MIN_MEANINGFUL_CHARS = 80

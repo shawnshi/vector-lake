@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vector_lake import db_store, governance_store
-from vector_lake.claim_extractor import classify_non_claim_text
+from vector_lake.non_claim_text import classify_non_claim_text
 
 _CONTRACT = "claim-placeholder-cleanup/v1"
 _ALLOWED_REASONS = {"generated_reshaped_stub", "generated_entity_stub"}

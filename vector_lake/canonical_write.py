@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vector_lake import defense_hook, schema_validator
+from vector_lake import defense_hook, indexer, schema_validator
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.yaml_utils import dump_yaml
 from vector_lake.wiki_utils import (
@@ -65,7 +65,10 @@ def validate_canonical_markdown(
         raise ValueError("Pre-parsed frontmatter does not match content")
     if validation_mode == "full":
         defense_hook.verify_asset(
-            content, target.name, parsed_frontmatter, get_index_path()
+            content,
+            target.name,
+            parsed_frontmatter,
+            indexer.committed_index_entities(get_index_path()),
         )
     else:
         schema_validator.validate_schema(parsed_frontmatter, content, target.name)

@@ -61,6 +61,9 @@ LAYERS: dict[str, set[str]] = {
         # Depends only on wiki_utils, so base is legal; it also holds the shared
         # provenance-repair identity so storage can use it without a handler.
         "evidence_foundation",
+        # Claim-text classification: zero package deps, so it cannot join a cycle,
+        # and storage needs it without importing the extractor.
+        "non_claim_text",
         "ingest_paths",
         # Depends only on durability and wiki_utils, both base, and nothing below it
         # imports it. It publishes and reads the watchdog status file, which is
@@ -191,7 +194,6 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("governance_store", "claim_extractor"),
         # domain -> derived
         ("provenance", "governance_metrics"),
-        ("schema_validator", "indexer"),
         # domain -> handler
         ("retrieval_benchmark", "tool_search"),
         # derived -> handler
@@ -224,7 +226,7 @@ pass
 # module that imports wiki_utils joins it too. They are the C-class work that batch
 # 5a showed needs a function moved UP a layer rather than validation extracted,
 # against a 14-test contract surface.
-MAX_STRONGLY_CONNECTED_COMPONENT = 13
+MAX_STRONGLY_CONNECTED_COMPONENT = 8
 
 
 def _module_name(path: Path) -> str:

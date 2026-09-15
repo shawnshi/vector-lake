@@ -301,10 +301,8 @@ class TestMaintenanceStubSuppression(unittest.TestCase):
     }
 
     def test_every_stub_spelling_is_classified(self):
-        from vector_lake.claim_extractor import (
-            classify_maintenance_only_text,
-            classify_non_claim_text,
-        )
+        from vector_lake.claim_extractor import classify_maintenance_only_text
+        from vector_lake.non_claim_text import classify_non_claim_text
 
         for name, text in self.STUB_VARIANTS.items():
             with self.subTest(variant=name):

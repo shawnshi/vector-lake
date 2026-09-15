@@ -1,7 +1,6 @@
 import re
 import json
 from datetime import datetime
-from pathlib import Path
 
 class SchemaViolationException(Exception):
     pass
@@ -47,7 +46,12 @@ CONTROLLED_METRICS = {
 
 INLINE_SOURCE_ANCHOR = re.compile(r"\(Source:\s*\[\[Source_[^\]]+\]\](?:[^)]*)\)")
 
-def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Path = None):
+def validate_schema(
+    frontmatter: dict,
+    body: str,
+    filename: str,
+    index_entities=None,
+):
     """
     Validates a Vector Lake Wiki node against the strict constraints of schema.md.
     Raises SchemaViolationException on any failure.
@@ -239,22 +243,20 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     # We shouldn't raise exception for (Source: [[Source_X]]).
     
     # Check tag collision if index is passed
-    if tags and index_path and index_path.exists():
+    # The tag-collision check needs the index's titles and aliases. The caller
+    # supplies them as a callable so this validator does not import the indexer,
+    # and so the read stays lazy and keeps the committed-reader fail-closed
+    # binding on the caller's side.
+    if tags and index_entities is not None:
+        if not callable(index_entities):
+            # Passing a Path here would raise TypeError inside the try below and be
+            # swallowed, silently disabling the check. Fail loudly instead.
+            raise TypeError(
+                "index_entities must be a callable returning the index entity set"
+            )
         try:
-            # Schema-v9 index.json is a static locator, not the projection
-            # payload.  Use the committed reader so a stale/tampered v2
-            # binding fails closed instead of silently validating the locator
-            # as an empty legacy index.
-            from vector_lake.indexer import read_committed_index_snapshot
+            entities_in_index = index_entities()
 
-            index_data = read_committed_index_snapshot(index_path)
-            
-            entities_in_index = set()
-            for node_id, node_data in index_data.get("nodes", {}).items():
-                entities_in_index.add(node_data.get("title", "").lower())
-                for alias in node_data.get("aliases", []):
-                    entities_in_index.add(alias.lower())
-                    
             for tag in tags:
                 if str(tag).lower() in entities_in_index:
                     raise SchemaViolationException(f"Tag Collision: [{tag}] is already an entity and cannot be used as a tag. Use semantic links instead.")

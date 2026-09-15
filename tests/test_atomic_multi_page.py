@@ -290,7 +290,10 @@ def test_schema_tag_collision_is_not_swallowed(tmp_path):
 
     with pytest.raises(SchemaViolationException, match="Tag Collision"):
         validate_schema(
-            frontmatter, "source body", "Source_Test.md", index_path=index_path
+            frontmatter,
+            "source body",
+            "Source_Test.md",
+            indexer.committed_index_entities(index_path),
         )
 
 

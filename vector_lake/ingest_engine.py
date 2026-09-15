@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 
 from typing import Callable, cast
 
-from vector_lake import get_extension_root
+from vector_lake import indexer, get_extension_root
 
 from vector_lake.cancellation import (
     CooperativeCancellation,
@@ -1202,7 +1202,7 @@ def _publish_local_source_and_enqueue(
         source_content,
         canonical_name,
         source_frontmatter,
-        get_index_path(),
+        indexer.committed_index_entities(get_index_path()),
     )
     desired_source_version = governance_store.canonical_page_version_from_content(
         canonical_name,
@@ -1990,11 +1990,21 @@ def _validate_final_ingest_files(
         content = str(item.get("content") or "")
         frontmatter, _body = split_frontmatter(content)
         if filename not in integration_target_names:
-            verify_asset(content, filename, frontmatter, get_index_path())
+            verify_asset(
+                content,
+                filename,
+                frontmatter,
+                indexer.committed_index_entities(get_index_path()),
+            )
             node_records.extend(validate_ingest_payload([item], contract))
             continue
         try:
-            verify_asset(content, filename, frontmatter, get_index_path())
+            verify_asset(
+                content,
+                filename,
+                frontmatter,
+                indexer.committed_index_entities(get_index_path()),
+            )
             continue
         except DefenseHookException:
             # Match mutation_coordinator's fenced schema-maintenance path:

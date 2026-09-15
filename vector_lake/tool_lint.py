@@ -7,7 +7,7 @@ import string
 from collections import Counter, defaultdict
 
 from vector_lake import governance_metrics
-from vector_lake.claim_extractor import classify_non_claim_text
+from vector_lake.non_claim_text import classify_non_claim_text
 from vector_lake.merge_analysis import (
     FilenameCandidateStats,
     iter_filename_candidates,

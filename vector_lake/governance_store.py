@@ -24,7 +24,8 @@ except ImportError:  # pragma: no cover - minimal installations use stdlib JSON
 
 from vector_lake import db_store
 from vector_lake.memory_search_normalization import casefold_text
-from vector_lake.claim_extractor import classify_non_claim_text, extract_page_objects
+from vector_lake.claim_extractor import extract_page_objects
+from vector_lake.non_claim_text import classify_non_claim_text
 from vector_lake.db_store import (
     OperationalMemorySearchIntegrityLimitExceeded,
     certify_operational_memory_search_integrity,
