@@ -1845,7 +1845,7 @@ def assess_runtime_health(
         )
 
     try:
-        from vector_lake.tool_gc import verify_gc_recovery_receipts
+        from vector_lake.gc_receipts import verify_gc_recovery_receipts
 
         gc_receipts = verify_gc_recovery_receipts(
             deep=deep_projection_checks or bounded_write_checks

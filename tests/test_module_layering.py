@@ -108,6 +108,9 @@ LAYERS: dict[str, set[str]] = {
         "runtime_health",
         "governance_metrics",
         "restore_snapshot",
+        # GC recovery-receipt verification, split out of tool_gc so runtime_health can
+        # report it without importing a handler.
+        "gc_receipts",
         "diagnostic_snapshot",
         "topology_worker",
         "embedding_scheduler",
@@ -187,7 +190,6 @@ ALLOWED_BACKWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         # derived -> handler
         ("restore_snapshot", "tool_projection"),
         ("runtime_health", "tool_auto_ingest"),
-        ("runtime_health", "tool_gc"),
         # orchestration -> handler
         ("watchdog_app", "tool_governance_maintenance"),
         ("watchdog_app", "tool_lint"),
@@ -216,7 +218,7 @@ pass
 # module that imports wiki_utils joins it too. They are the C-class work that batch
 # 5a showed needs a function moved UP a layer rather than validation extracted,
 # against a 14-test contract surface.
-MAX_STRONGLY_CONNECTED_COMPONENT = 34
+MAX_STRONGLY_CONNECTED_COMPONENT = 33
 
 
 def _module_name(path: Path) -> str:

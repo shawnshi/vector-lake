@@ -1,3 +1,4 @@
+from vector_lake import gc_receipts
 import hashlib
 import json
 import os
@@ -941,7 +942,7 @@ def test_gc_missing_backup_is_reported_by_receipt_and_write_health(isolated_memo
     backup_name = fingerprint.removeprefix("sha256:")[:16]
     shutil.rmtree(isolated_memory / "backup" / "gc" / backup_name)
 
-    verification = tool_gc.verify_gc_recovery_receipts(deep=True)
+    verification = gc_receipts.verify_gc_recovery_receipts(deep=True)
     assert any(
         issue.startswith("gc_receipt_invalid:")
         for issue in verification["issues"]
