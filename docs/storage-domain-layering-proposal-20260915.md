@@ -136,6 +136,13 @@ entities_in_index = { ... titles + aliases ... }
 
 ## 5. 分阶段方案
 
+> **✅ P-A 已执行（`c10c98a`）**：边 12 → 10，**SCC 33 → 13**（−20，与模拟完全一致）。
+> **但它不是原计划里的“275 行搬迁”——它是重分类。** 前置核查发现 `provenance_retention` **整个模块就是那一个簇**（27 个名字覆盖 577 行中的 16-577，簇外为空），所以只需把它的依赖降到目标层以下，然后重分类即可。两项使能改动：
+> 1. **持久标识符助手被重复实现**：`claim_extractor._stable_id` 与 `governance_store._stable_id` **逐字节相同**（BLAKE2b/12），现统一为 base 的 `wiki_utils.stable_short_id`，两处改为委托（零值变化）。
+> 2. **`evidence_foundation` 只依赖 wiki_utils ⇒ base 合法**，已重分类；并从 `tool_claim_provenance` 接管 provenance-repair 身份（`PROVENANCE_REPAIR_EXTRACTOR_NAME`/`_VERSION`/`claim_page_key`）。
+>
+> **本次避开的陷阱（值得单独记）**：batch 1 引入的 `wiki_utils.stable_identity_digest` **形状相同**（`prefix_` + 24 个 hex）**但用 SHA-256**，与 BLAKE2b 族**值不同**。若图省事复用它会**静默重写全部已持久化的** entity_id / evidence_id / source_id / 幂等键。两个函数现在都带 docstring 声明“**不可互换**”及各自属于哪个族。
+
 ### 5.0 先做了一次环影响模拟（读图，非执行）
 
 在写方案前，我在导入图上模拟了每个子问题“边消失”后的效果：
