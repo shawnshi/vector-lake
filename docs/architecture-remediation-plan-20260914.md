@@ -334,6 +334,37 @@ auto_ingest_worker / ingest_worker / watchdog_app -> tool_ingest
 | 9 | `2767fe1` | 21 → 20 | 新建 `ingest_paths`（base），拆出 ingest 根/配置解析 | 改回导入即复现；代价是 14 处 monkeypatch 目标需同步 |
 | **10** | `b1a2e7a` | **20 → 17** | **拆分规范写入路径出 `wiki_utils`** | 恢复 3 条延迟导入 → 3 条边全部重现，SCC 回到 41 |
 | **11** | `be97a76` | **17 → 14** | **拆分 ingest 引擎出 `tool_ingest`**（3389 行 / 81 个名字） | 全量套件 2995 绿；见下 |
+| 12 | `f2bffd6` | 14 → 13 | 拆 `verify_gc_recovery_receipts` → 新 derived `gc_receipts` | SCC 同时降 34 → 33 |
+| 13 | `bd58067` | 13 → 12 | 拆 `history_retention_maintenance` → 新 storage `history_retention` | 目标 registry 与 4 个消费方已重定向 |
+
+#### 剩余 12 条：为何无法再靠“搬家/重分类”解决
+
+我先把 14 条全部跑了区间测试 + 闭包规模，得到可决策的地图。但地图有**一个我自己的分析缺陷**，且在两个目标上都误导了我：
+
+> 推导“簇最低可放层”时按**导入语句**映射名字，于是 `from vector_lake import db_store` 记录的是**包名** `vector_lake`（无层次），而不是 `db_store` ⇒ **依赖被低估**。
+
+因此地图把 4 个候选项列为“可下沉”，实际**只有 2 个是真的**：
+
+| 候选 | 闭包 | 看似最低层 | 真实最低层 | 结论 |
+|---|---|---|---|---|
+| `verify_gc_recovery_receipts` | 8 | base | base（只用 wiki_utils） | ✅ 已拆（批 12） |
+| `history_retention_maintenance` | 5 | base | **storage**（用 db_store + governance_store） | ✅ 已拆（批 13） |
+| `auto_ingest_budget_status` | 9 | base | **orchestration**（调 `auto_ingest_worker._load_state`） | ❌ 真实反转 |
+| `lint_vector_lake` | 12 | base | **handler**（需 canonical_write / claim_extractor / merge_analysis / mutation_coordinator / schema_validator / tool_ingest / tool_rename） | ❌ 真实反转 |
+
+**地图还标了两个“可重分类”，两个都是陷阱**：`mcp_server`↔`tool_doctor` 与 `db_store`↔`native_llm` 都是**互相依赖**，改层只是**同层安置**，环不变（就是批次 8 否决过的那种做法）。⇒ **区间测试不够，必须同时看环。**
+
+因此剩下 12 条无一是“搬家/重分类”能解决的，全部需要**改调用方向**：
+
+| 边 | 需要的改动 |
+|---|---|
+| `governance_store → governance_metrics / provenance_retention / claim_extractor`（3） | 存储层不应调用指标/保留策略/提取器 —— 应上提到调用方 |
+| `provenance → governance_metrics`、`schema_validator → indexer` | 同上（域/校验层不应调用派生层） |
+| `db_store → native_llm` | 先把 `peek_db_path` 的**三处重复实现**收敛到 base，再搬 subagent 根函数 |
+| `runtime_health → tool_auto_ingest` | 预算状态需 orchestration 的 `_load_state`，故不能下移；应改由表面调用 |
+| `restore_snapshot → tool_projection`、`provenance_retention → tool_claim_provenance`、`retrieval_benchmark → tool_search` | 模块级导入，需逐条侦察 |
+| `watchdog_app → tool_lint` | 同上（`lint_vector_lake` 最低只能到 handler） |
+| `tool_doctor → mcp_server` | 把该诊断**上移**到表面 |
 
 #### A 类：`tool_ingest` 引擎拆分（批次 11，已完成）
 
