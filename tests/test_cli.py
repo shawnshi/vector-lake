@@ -1,151 +1,12 @@
 import unittest
-
-import pytest
-import threading
 from unittest.mock import patch
 
 from vector_lake import cli_app
 
-
-def test_cli_heavy_task_busy_returns_temporary_failure(
-    isolated_memory,
-    monkeypatch,
-    capsys,
-):
-    from vector_lake.heavy_task_gate import heavy_task
-
-    acquired = threading.Event()
-    release = threading.Event()
-
-    def hold_gate():
-        with heavy_task(
-            "scan",
-            "external-holder",
-            origin="pytest",
-            wait_timeout_seconds=0,
-        ):
-            acquired.set()
-            release.wait(timeout=2)
-
-    holder = threading.Thread(target=hold_gate, name="cli-gate-holder")
-    holder.start()
-    assert acquired.wait(timeout=2)
-    monkeypatch.setenv("VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS", "0.05")
-    try:
-        with (
-            patch("sys.argv", ["cli.py", "doctor"]),
-            patch.object(cli_app.tools, "doctor_vector_lake") as doctor,
-        ):
-            assert cli_app.main() == 75
-        doctor.assert_not_called()
-    finally:
-        release.set()
-        holder.join(timeout=2)
-
-    assert not holder.is_alive()
-    assert '"error": "heavy_task_busy"' in capsys.readouterr().err
-
-
-def test_projection_object_gc_is_preview_first_and_forwards_apply_fingerprint(
-    monkeypatch,
-):
-    from vector_lake import tool_projection
-
-    preview = cli_app.build_parser().parse_args(["projection-object-gc"])
-    assert preview.apply is False
-    assert preview.retention_days == 7
-    assert preview.limit == 1000
-    assert preview.confirm_fingerprint == ""
-
-    calls = []
-
-    def fake_gc(**kwargs):
-        calls.append(kwargs)
-        return {"ok": True}
-
-    monkeypatch.setattr(tool_projection, "projection_object_gc", fake_gc)
-    monkeypatch.setattr(cli_app, "_cli_heavy_task_policy", lambda _args: None)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "cli.py",
-            "projection-object-gc",
-            "--apply",
-            "--retention-days",
-            "14",
-            "--limit",
-            "25",
-            "--confirm-fingerprint",
-            "sha256:" + "a" * 64,
-        ],
-    )
-
-    assert cli_app.main() == 0
-    assert calls == [
-        {
-            "dry_run": False,
-            "retention_days": 14,
-            "limit": 25,
-            "confirmation": "sha256:" + "a" * 64,
-        }
-    ]
-
-@pytest.mark.parametrize("mode", ["memory", "fact", "claim", "page"])
-def test_search_cli_unavailable_backend_fails_without_creating_database(
-    isolated_memory, monkeypatch, capsys, mode,
-):
-    from vector_lake import db_store
-
-    monkeypatch.setattr(cli_app, "_configure_stdout", lambda: None)
-    monkeypatch.setattr("sys.argv", ["cli.py", "search", "query", "--mode", mode])
-    assert cli_app.main() == 1
-    captured = capsys.readouterr()
-    assert "doctor" in captured.err
-    assert ("index_missing" if mode == "page" else "database_missing") in captured.err
-    assert "converging automatically" not in captured.err
-    assert captured.out == ""
-    assert not db_store.peek_db_path().exists()
-
-
-@pytest.mark.parametrize("mode", ["memory", "fact", "claim"])
-@pytest.mark.parametrize("has_hit", [False, True])
-def test_search_cli_available_zero_hits_and_semantic_not_ready_succeed(
-    isolated_memory, monkeypatch, capsys, mode, has_hit,
-):
-    from vector_lake import db_store, governance_store, runtime_health
-
-    db_store.init_db()
-    if has_hit:
-        governance_store.apply_change_set({
-            "affected_pages": ["Concept_CLI.md"],
-            "proposed_entities": [], "proposed_evidence": [],
-            "proposed_source_updates": [], "proposed_edges": [],
-            "proposed_claims": [{
-                "claim_id": "claim_cli", "claim_text": "absentzzzz synthetic fact",
-                "claim_type": "assertion", "memory_type": "fact", "status": "active",
-                "source_page": "Concept_CLI.md", "locator": {"page_key": "Concept_CLI"},
-                "evidence_ids": ["ev_cli"], "confidence": 0.9,
-            }],
-        })
-        governance_store.rebuild_operational_memory()
-    monkeypatch.setattr(runtime_health, "get_semantic_readiness_envelope", lambda **_k: {
-        "contract_version": "vector-lake-semantic-readiness-envelope/v1",
-        "status": "not_ready", "ready": False,
-        "results_are_not_accepted_facts": True,
-    })
-    monkeypatch.setattr(cli_app, "_configure_stdout", lambda: None)
-    monkeypatch.setattr("sys.argv", ["cli.py", "search", "absentzzzz", "--mode", mode])
-    assert cli_app.main() == 0
-    captured = capsys.readouterr()
-    assert ("source_claim_id: claim_cli" if has_hit else "No operational memory matched") in captured.out
-    assert '"status":"not_ready"' in captured.out
-    assert captured.err == ""
-
-
 class TestCLI(unittest.TestCase):
     @patch('vector_lake.tools.doctor_vector_lake')
     def test_doctor_command(self, mock_doctor):
-        mock_doctor.return_value = "Infrastructure Summary: healthy"
+        mock_doctor.return_value = "Healthy"
         with patch('sys.argv', ['cli.py', 'doctor']):
             result = cli_app.main()
         self.assertEqual(result, 0)
@@ -165,26 +26,7 @@ class TestCLI(unittest.TestCase):
         with patch('sys.argv', ['cli.py', 'search', 'test_query', '--top_k', '3']):
             result = cli_app.main()
         self.assertEqual(result, 0)
-        mock_search.assert_called_once_with('test_query', 3, domain=None, cluster=None, include_history=False, mode='page', _raise_on_unavailable=True)
-
-    @patch('vector_lake.tools.search_vector_lake')
-    def test_search_command_accepts_formal_fact_mode(self, mock_search):
-        mock_search.return_value = "Fact Results"
-        with patch(
-            'sys.argv',
-            ['cli.py', 'search', 'test_query', '--mode', 'fact'],
-        ):
-            result = cli_app.main()
-        self.assertEqual(result, 0)
-        mock_search.assert_called_once_with(
-            'test_query',
-            5,
-            domain=None,
-            cluster=None,
-            include_history=False,
-            mode='fact',
-            _raise_on_unavailable=True,
-        )
+        mock_search.assert_called_once_with('test_query', 3, domain=None, cluster=None, include_history=False, mode='page')
 
     @patch('vector_lake.tools.prepare_query_context')
     def test_query_command(self, mock_query):

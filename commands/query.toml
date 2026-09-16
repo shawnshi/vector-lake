@@ -1,0 +1,11 @@
+description = "Deep reasoning over the Vector Lake with budget-controlled context."
+prompt = """
+Invoke the `query_logic_lake` MCP tool with the user's question as `query_str`.
+
+- Keep the default budget unless the user asks for more or less context.
+- Report the returned `wiki_context` pages by their `Source`/`Evidence_Node` ids so every claim stays traceable.
+- If the response contains a `[DEGRADED]` banner, say so explicitly: vector retrieval did not contribute and the result is BM25-only.
+- Do not invent facts that are absent from the returned context; state which parts are unanswered.
+
+User question: {{args}}
+"""

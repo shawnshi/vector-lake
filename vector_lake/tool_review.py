@@ -27,11 +27,11 @@ def _summarize_values(values, limit: int = 5) -> str:
 
 def _combined_pending_items() -> list[dict]:
     combined = []
-    for item in governance_store.reviewable_governance_items():
-        enriched = governance_store.normalize_governance_item(item)
+    for item in governance_store.pending_governance_items():
+        enriched = dict(item)
         enriched["queue_kind"] = "governance"
         combined.append(enriched)
-    combined.sort(key=governance_store.governance_priority_sort_key)
+    combined.sort(key=lambda item: item.get("created_at") or item.get("created") or "")
     return combined
 
 
@@ -56,13 +56,6 @@ def _format_combined_report(items: list[dict]) -> str:
         icon = type_icons.get(item.get("type"), "[*]")
         lines.append(f"  [{index}] {icon} **{item.get('title', 'Untitled')}** ({item.get('type', 'unknown')})")
         lines.append(f"      ID: {item.get('item_id', 'unknown')}")
-        lines.append(f"      Status: {item.get('status', 'pending')}")
-        lines.append(f"      Priority: {item.get('priority', 'P2')}")
-        if item.get("critical_decision_refs"):
-            lines.append(
-                "      Critical decisions: "
-                + _summarize_values(item["critical_decision_refs"], limit=5)
-            )
         lines.append(f"      Source: {item.get('source', 'unknown')}")
         if item.get("description"):
             lines.append(f"      {_truncate_text(item['description'])}")
@@ -76,24 +69,19 @@ def _format_combined_report(items: list[dict]) -> str:
 
 
 def _resolve_combined_item(identifier, resolution: str = "skip", change_manifest: dict = None):
-    from vector_lake import governance_service
-
-    if isinstance(identifier, str) and not identifier.isdigit():
-        return governance_service.resolve_governance_item(
-            identifier,
-            resolution,
-            change_manifest=change_manifest,
-        )
-
     pending = _combined_pending_items()
-    index = int(identifier)
-    if not 0 <= index < len(pending):
+    target = None
+    if isinstance(identifier, str) and not identifier.isdigit():
+        target = next((item for item in pending if item.get("item_id") == identifier), None)
+    else:
+        index = int(identifier)
+        if 0 <= index < len(pending):
+            target = pending[index]
+    if not target:
         return None
-    return governance_service.resolve_governance_item(
-        pending[index]["item_id"],
-        resolution,
-        change_manifest=change_manifest,
-    )
+
+    from vector_lake import governance_service
+    return governance_service.resolve_governance_item(target["item_id"], resolution, change_manifest=change_manifest)
 
 
 def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip", change_manifest: dict = None):
@@ -147,23 +135,7 @@ def review_vector_lake(action: str = "list", index="-1", resolution: str = "skip
         if not item:
             return f"Failed to resolve item '{index}'."
 
-        status = str(item.get("status") or "")
-        if status == "resolved":
-            result = f"Resolved item {item.get('item_id')} ('{item.get('title')}') → {resolution}."
-        elif status == "projection_pending":
-            result = (
-                f"Merge committed for item {item.get('item_id')} "
-                f"('{item.get('title')}'); projection recovery pending."
-            )
-            if item.get("last_projection_error"):
-                result += f"\nLast projection error: {item['last_projection_error']}"
-            if item.get("merge_outbox_statuses"):
-                result += f"\nOutbox statuses: {item['merge_outbox_statuses']}"
-        else:
-            return (
-                f"Item {item.get('item_id')} returned nonterminal status "
-                f"'{status or 'unknown'}'; no resolution was reported."
-            )
+        result = f"Resolved item {item.get('item_id')} ('{item.get('title')}') → {resolution}."
         if resolution == "create" and item.get("search_queries"):
             queries = " | ".join(item["search_queries"])
             result += "\n\n[SYSTEM DIRECTIVE]: Autonomous Deep Research Triggered.\n"

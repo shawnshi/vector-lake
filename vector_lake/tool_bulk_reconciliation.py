@@ -20,10 +20,8 @@ def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
         tgt = op.get("target_entity")
         if not src or not tgt:
             return "Error: Each operation must have source_entity and target_entity."
-        if src.casefold().endswith('.md'):
-            src = src[:-3]
-        if tgt.casefold().endswith('.md'):
-            tgt = tgt[:-3]
+        if src.endswith('.md'): src = src[:-3]
+        if tgt.endswith('.md'): tgt = tgt[:-3]
         
         src_path = (wiki_dir / f"{src}.md").resolve()
         tgt_path = (wiki_dir / f"{tgt}.md").resolve()
@@ -45,34 +43,40 @@ def bulk_reconcile(operations: list, dry_run: bool = True) -> str:
     if dry_run:
         return f"[DRY RUN] Validated {len(operations)} operations. No cycles detected. Would enqueue {len(operations)} merge tasks to the governance queue."
 
-    # Enqueue to governance queue
+    # Enqueue to governance queue under the shared queue lock so a concurrent
+    # writer's items are never dropped by this snapshot-and-save cycle.
     enqueued = 0
     now_str = datetime.now(timezone.utc).isoformat()
-    
-    for src, tgt in replace_map.items():
-        # Prevent duplicating items
-        item = {
-            "item_id": f"gov_{uuid.uuid4().hex[:12]}",
-            "type": "merge",
-            "title": f"Merge {src} into {tgt}",
-            "description": f"Bulk reconcile tool requested merge of {src} into {tgt}.",
-            "created_at": now_str,
-            "status": "pending",
-            "source": "bulk_reconcile",
-            "merge_source": src,
-            "merge_target": tgt,
-            "affected_pages": [f"{src}.md", f"{tgt}.md"],
-            "merge_candidate": {
-                "left_name": tgt,
-                "right_name": src,
-                "left_entity_id": f"entity_{tgt}",
-                "right_entity_id": f"entity_{src}"
+    with governance_store.governance_queue_session():
+        queue = governance_store.load_governance_queue()
+        for src, tgt in replace_map.items():
+            # Prevent duplicating items
+            if any(
+                item.get("merge_source") == src and item.get("merge_target") == tgt
+                for item in queue.get("items", [])
+            ):
+                continue
+
+            item = {
+                "item_id": f"gov_{uuid.uuid4().hex[:12]}",
+                "type": "merge",
+                "title": f"Merge {src} into {tgt}",
+                "description": f"Bulk reconcile tool requested merge of {src} into {tgt}.",
+                "created_at": now_str,
+                "status": "pending",
+                "source": "bulk_reconcile",
+                "affected_pages": [f"{src}.md", f"{tgt}.md"],
+                "merge_candidate": {
+                    "left_name": tgt,
+                    "right_name": src,
+                    "left_entity_id": f"entity_{tgt}",
+                    "right_entity_id": f"entity_{src}",
+                },
             }
-        }
-        if governance_store.insert_governance_item_if_absent(
-            item,
-            ("merge_source", "merge_target"),
-        ):
+            queue.setdefault("items", []).append(item)
             enqueued += 1
+
+        if enqueued > 0:
+            governance_store.save_governance_queue(queue)
 
     return f"Success: Enqueued {enqueued} merge suggestions to the governance queue. Awaiting Mentat review."

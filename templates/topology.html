@@ -1,10 +1,11 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>Vector Lake Topology</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: radial-gradient(circle at center, #111827 0%, #030712 100%); overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; color: #E5E7EB; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: radial-gradient(circle at center, #111827 0%, #030712 100%); overflow: hidden; font-family: 'Inter', sans-serif; color: #E5E7EB; }
         #3d-graph { width: 100%; height: 100%; position: absolute; inset: 0; z-index: 1; }
         #info-panel, .hud-box, #stats-panel {
             background: rgba(15, 23, 42, 0.4);
@@ -55,86 +56,52 @@
             display: flex; justify-content: center; gap: 24px; z-index: 10; flex-wrap: wrap; border-top: 1px solid #374151;
         }
         .stat-item { font-size: 0.84rem; color: #D1D5DB; font-weight: 500; text-transform: uppercase; }
-        button, input, summary, a { font: inherit; }
-        button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offset: 3px; }
-        button { color: #E5E7EB; background: #1F2937; border: 1px solid #4B5563; border-radius: 4px; cursor: pointer; }
-        button:disabled { color: #A0AAB5; background: #2A333D; border-color: #3D4853; cursor: default; }
-        summary { cursor: pointer; color: #D1D5DB; }
-        #info-summary, #summary-original { white-space: pre-wrap; overflow-wrap: anywhere; }
-        #info-title { padding-right: 20px; overflow-wrap: anywhere; }
-        #info-related li { margin-bottom: 8px; }
-        .node-select { text-align: left; padding: 4px 6px; }
-        .file-open { display: inline-block; margin-left: 8px; font-size: 0.8rem; }
-        .search-item { display: block; width: 100%; text-align: left; }
-        .muted { color: #9CA3AF; font-size: 0.8rem; }
-        #navigation-prompt { margin: 8px 0; }
         #loading {
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
             background: rgba(0,0,0,0.8); padding: 20px 40px; border-radius: 8px; color: #fff; z-index: 100;
         }
     </style>
+    <script src="https://unpkg.com/3d-force-graph"></script>
 </head>
 <body>
-    <div id="renderer-consent" style="position:fixed;inset:0;z-index:10000;background:#111827;padding:3em;overflow:auto">
-        <h2>Local graph export</h2>
-        <p>This file embeds local graph data, including summaries. Nothing is loaded from the network until you choose below.</p>
-        <p><strong>External scripts can access all graph data embedded in this file.</strong> Loading the renderer contacts unpkg.com and trusts its third-party code.</p>
-        <pre id="export-metadata" style="white-space:pre-wrap"></pre>
-        <button id="load-renderer" type="button">Load external CDN renderer and display graph</button>
-        <p id="renderer-status" role="status"></p>
-    </div>
     <div id="loading">Computing Topology...</div>
     <div id="3d-graph"></div>
 
     <div id="info-panel">
-        <button id="close-btn" type="button" aria-label="关闭详情">×</button>
-        <button id="btn-back" type="button" disabled>返回上一节点</button>
+        <div id="close-btn" onclick="document.getElementById('info-panel').classList.remove('visible'); selectedNode = null; if(typeof Graph !== 'undefined') Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());">×</div>
         <h2 id="info-title"></h2>
         <div id="info-meta"></div>
         <div class="info-section">
-            <strong>摘要 · 字段摘录</strong>
+            <strong>Summary</strong>
             <div id="info-summary"></div>
-            <button id="summary-more" type="button" hidden aria-expanded="false">展开摘录</button>
-            <details id="summary-original-details" hidden><summary>查看原始字段</summary><div id="summary-original"></div></details>
         </div>
-        <div class="info-section" id="related-section">
-            <strong>相关 Wiki · 图谱关联</strong>
-            <p class="muted">基于当前导出图谱</p>
-            <ul id="info-related"></ul>
-            <button id="related-more" type="button" hidden aria-expanded="false">显示更多</button>
-        </div>
-        <div id="navigation-prompt" role="status" hidden></div>
         <div class="info-section">
-            <strong>直接链接</strong>
+            <strong>Links</strong>
             <ul id="info-links"></ul>
         </div>
-        <details class="info-section" id="sources-details">
-            <summary>来源</summary>
+        <div class="info-section">
+            <strong>Sources</strong>
             <ul id="info-sources"></ul>
-        </details>
-        <details class="info-section" id="metrics-details">
-            <summary>技术指标</summary>
-            <div id="info-metrics"></div>
-        </details>
+        </div>
     </div>
 
     <div id="right-hud">
         <div class="hud-box">
-            <h4><label for="search-input">搜索</label></h4>
-            <input type="text" id="search-input" placeholder="搜索页面或 Claim…" autocomplete="off">
+            <h4>Search</h4>
+            <input type="text" id="search-input" placeholder="Search node or claim..." autocomplete="off">
             <div id="search-results"></div>
         </div>
 
         <div class="hud-box">
             <h4>Controls</h4>
-            <button id="btn-focus-mode" class="toggle-btn" aria-pressed="false">仅显示选中节点邻域</button>
-            <button id="btn-pause-physics" class="toggle-btn" aria-pressed="false">冻结布局</button>
+            <button id="btn-focus-mode" class="toggle-btn">Ego-Net Focus</button>
+            <button id="btn-pause-physics" class="toggle-btn">Pause Physics</button>
         </div>
 
         <div class="hud-box">
             <h4>View Mode</h4>
-            <button id="btn-page-view" class="toggle-btn active">页面视图</button>
-            <button id="btn-claim-view" class="toggle-btn">Claim 视图</button>
+            <button id="btn-page-view" class="toggle-btn active">Page View</button>
+            <button id="btn-claim-view" class="toggle-btn">Claim View</button>
         </div>
 
         <div class="hud-box">
@@ -172,71 +139,8 @@
                 .replace(/'/g, "&#039;");
         }
 
-        function sanitizeURL(url) {
-            if (!url) return null;
-            const strUrl = String(url).trim();
-            if (!strUrl) return null;
-            // Reject a scheme-looking prefix with the HTML URL parser rather than
-            // with the allowlist regex alone.  Browsers strip embedded control
-            // characters ("java\nscript:alert(1)") before resolving, so a
-            // regex-only allowlist would pass a string that still executes.
-            if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(strUrl)) {
-                let parsed;
-                try {
-                    parsed = new URL(strUrl);
-                } catch {
-                    return null;
-                }
-                if (!['http:', 'https:', 'file:'].includes(parsed.protocol)) return null;
-                // Parsing normalizes the scheme and percent-encodes the path.
-                return parsed.href;
-            }
-            // Relative reference or bare fragment: keep it document-local.  Any
-            // colon is refused so this branch cannot re-introduce a scheme that
-            // the parser would have caught.
-            if (strUrl.startsWith('//') || strUrl.includes(':')) return null;
-            return encodeURI(strUrl);
-        }
-
         const rawData = %%GRAPH_DATA%%;
-        const memoryBasePath = %%MEMORY_BASE_PATH%%;
-
-        function memoryFileURL(relativePath) {
-            // The base is already encoded by Path.as_uri(); encode only raw path components.
-            const encodedPath = String(relativePath).split('/').map(encodeURIComponent).join('/');
-            return `${memoryBasePath}${encodedPath}`;
-        }
-
-        function relatedWiki(graph, nodeId) {
-            const nodes = new Map(graph.nodes.map(node => [node.id, node]));
-            const strongest = new Map();
-            if (!nodes.has(nodeId)) return [];
-            graph.edges.forEach(edge => {
-                const source = typeof edge.source === 'object' ? edge.source.id : edge.source;
-                const target = typeof edge.target === 'object' ? edge.target.id : edge.target;
-                const id = source === nodeId ? target : target === nodeId ? source : null;
-                if (id === null || id === nodeId || !nodes.has(id) || !Number.isFinite(edge.weight)) return;
-                if (!strongest.has(id) || edge.weight > strongest.get(id)) strongest.set(id, edge.weight);
-            });
-            return Array.from(strongest, ([id, weight]) => ({ node: nodes.get(id), weight }))
-                .sort((a, b) => b.weight - a.weight || (a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0));
-        }
-
-        function summaryExcerpt(value) {
-            // Presentation only. Remove the schema's explicit directive wrapper, not arbitrary prose.
-            return String(value || '')
-                .replace(/\*?\[System Directive:[^\]]*\]\*?/gi, '')
-                .replace(/<!--\s*(?:System Directive|Template)[\s\S]*?-->/gi, '')
-                .replace(/^\s*#{1,6}\s+/gm, '')
-                .replace(/^\s*```[^\n]*$/gm, '')
-                .replace(/!?(?:\[([^\]]+)\])\([^\n)]*\)/g, '$1')
-                .replace(/\*\*([^\n]+?)\*\*/g, '$1')
-                .replace(/`([^`\n]+)`/g, '$1')
-                .replace(/\n{3,}/g, '\n\n')
-                .trim();
-        }
-
-        function initializeGraph() {
+        const memoryBasePath = "%%MEMORY_BASE_PATH%%";
 
         const PAGE_COLORS = {
             "Vendor": "#8B5CF6",
@@ -262,7 +166,7 @@
         const COMMUNITY_COLORS = ['#e6194b', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#d946ef', '#06b6d4', '#f43f5e', '#14b8a6', '#84cc16'];
 
         const graphs = {
-            page: rawData.pageGraph || { nodes: [], edges: [], community_labels: {} },
+            page: rawData.pageGraph || { nodes: rawData.nodes || [], edges: rawData.edges || [], community_labels: rawData.community_labels || {} },
             claim: rawData.claimGraph || { nodes: [], edges: [], community_labels: {} }
         };
         let activeGraphKey = 'page';
@@ -273,12 +177,6 @@
         let physicsPaused = false;
         let searchTokens = [];
         const activeGroups = new Set();
-        const navigationHistory = [];
-        const frozenPositions = new Map();
-        let loadedGraphKey = null;
-        let pendingFreeze = false;
-        // The renderer owns these live objects; visual changes must never replace them.
-        const liveGraphs = Object.fromEntries(Object.entries(graphs).map(([key, data]) => [key, toGraphData(data)]));
 
         const graphDiv = document.getElementById('3d-graph');
         const Graph = ForceGraph3D()(graphDiv);
@@ -288,7 +186,7 @@
         }
 
         function currentLinkColor(link) {
-            const focusNode = selectedNode;
+            const focusNode = hoverNode || selectedNode;
             if (focusNode) {
                 const s = link.source.id || link.source;
                 const t = link.target.id || link.target;
@@ -299,18 +197,13 @@
             return 'rgba(0,240,255,0.18)';
         }
 
-        function matchesSearch(node) {
-            const fields = [node.name, node.id, node.summary].map(value => String(value || '').toLowerCase());
-            return searchTokens.every(token => fields.some(value => value.includes(token)));
-        }
-
         function currentColor(node) {
-            // Sphere alpha is global in 3d-force-graph. Use opaque color/visibility accessors for emphasis.
-            if (!matchesSearch(node) || (selectedNode && selectedNode.id !== node.id && !isNeighbor(selectedNode, node))) {
-                return '#374151';
-            }
             if (activeGraphKey === 'page' && (node.alignment_score < 60 || node.status === 'contested' || node.status === 'misaligned')) {
                 return '#FF003C';
+            }
+            const focusNode = hoverNode || selectedNode;
+            if (focusNode && focusNode.id !== node.id && !isNeighbor(focusNode, node)) {
+                return 'rgba(55,65,81,0.2)';
             }
             if (activeGraphKey === 'claim') {
                 return CLAIM_STATE_COLORS[node.validity_state || 'unknown'] || CLAIM_STATE_COLORS.unknown;
@@ -323,7 +216,7 @@
         }
 
         function buildNeighbors(graphData) {
-            const map = Object.create(null);
+            const map = {};
             graphData.links.forEach(link => {
                 const s = link.source.id || link.source;
                 const t = link.target.id || link.target;
@@ -349,10 +242,9 @@
         }
 
         function toGraphData(data) {
-            const ids = new Set(data.nodes.map(node => node.id));
             return {
                 nodes: data.nodes.map(node => ({ ...node })),
-                links: data.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)).map(edge => ({ ...edge }))
+                links: data.edges.map(edge => ({ ...edge }))
             };
         }
 
@@ -362,18 +254,12 @@
             Array.from(new Set(currentGraph().nodes.map(node => node.group || 'Unknown'))).sort().forEach(group => {
                 const label = document.createElement('label');
                 label.className = 'filter-checkbox';
-                const input = document.createElement('input');
-                input.type = 'checkbox';
-                input.value = group;
-                input.checked = activeGroups.has(group);
-                label.appendChild(input);
-                const name = document.createElement('span');
-                name.textContent = group;
-                label.appendChild(name);
-                input.addEventListener('change', (event) => {
+                const checked = activeGroups.has(group) ? 'checked' : '';
+                label.innerHTML = `<input type="checkbox" value="${escapeHTML(group)}" ${checked}> ${escapeHTML(group)}`;
+                label.querySelector('input').addEventListener('change', (event) => {
                     if (event.target.checked) activeGroups.add(group);
                     else activeGroups.delete(group);
-                    refreshVisuals();
+                    renderGraph();
                 });
                 container.appendChild(label);
             });
@@ -410,7 +296,7 @@
             container.innerHTML = '';
             Object.entries(validityCounts).forEach(([state, count]) => {
                 const color = CLAIM_STATE_COLORS[state] || CLAIM_STATE_COLORS.unknown;
-                container.innerHTML += `<div class="metric-item"><div class="metric-color" style="background:${escapeHTML(color)}"></div>${escapeHTML(state)}: ${escapeHTML(count)}</div>`;
+                container.innerHTML += `<div class="metric-item"><div class="metric-color" style="background:${escapeHTML(color)}"></div>${escapeHTML(state)}: ${count}</div>`;
             });
             if (!container.innerHTML) {
                 container.innerHTML = '<div class="metric-item">No governance metrics.</div>';
@@ -421,13 +307,12 @@
             const stats = document.getElementById('stats-panel');
             const graph = currentGraph();
             stats.innerHTML = '';
-            const data = liveGraphs[activeGraphKey];
-            stats.innerHTML += `<div class="stat-item">${escapeHTML(activeGraphKey)} 节点（可见 / 总数）: ${data.nodes.filter(nodeVisibility).length} / ${graph.nodes.length}</div>`;
-            stats.innerHTML += `<div class="stat-item">边（可见 / 总数）: ${data.links.filter(linkVisibility).length} / ${graph.edges.length}</div>`;
+            stats.innerHTML += `<div class="stat-item">${escapeHTML(activeGraphKey)} nodes: ${graph.nodes.length}</div>`;
+            stats.innerHTML += `<div class="stat-item">${escapeHTML(activeGraphKey)} edges: ${graph.edges.length}</div>`;
             if (activeGraphKey === 'claim') {
                 const counts = rawData.governanceMetrics && rawData.governanceMetrics.validity_state_counts ? rawData.governanceMetrics.validity_state_counts : {};
                 Object.entries(counts).forEach(([state, count]) => {
-                    stats.innerHTML += `<div class="stat-item">${escapeHTML(state)}: ${escapeHTML(count)}</div>`;
+                    stats.innerHTML += `<div class="stat-item">${escapeHTML(state)}: ${count}</div>`;
                 });
             }
         }
@@ -440,13 +325,13 @@
                 results.innerHTML = '';
                 if (!val) {
                     searchTokens = [];
-                    refreshVisuals();
+                    Graph.nodeOpacity(Graph.nodeOpacity());
                     results.style.display = 'none';
                     return;
                 }
                 const tokens = val.split(/\s+/);
                 searchTokens = tokens;
-                refreshVisuals();
+                Graph.nodeOpacity(Graph.nodeOpacity());
                 
                 const scoredMatches = currentGraph().nodes.map(node => {
                     const name = (node.name || '').toLowerCase();
@@ -482,12 +367,11 @@
                 results.style.display = 'block';
                 matches.forEach(matchObj => {
                     const match = matchObj.node;
-                    const row = document.createElement('button');
-                    row.type = 'button';
+                    const row = document.createElement('div');
                     row.className = 'search-item';
                     const title = match.name || match.id;
                     const typeStr = match.raw_type ? `[${match.raw_type}] ` : (match.group ? `[${match.group}] ` : '');
-                    const degreeInfo = match.degree ? ` (直接链接度数: ${match.degree})` : '';
+                    const degreeInfo = match.degree ? ` (关联: ${match.degree})` : '';
                     row.textContent = `${typeStr}${title}${degreeInfo}`;
                     row.onclick = () => {
                         results.style.display = 'none';
@@ -499,7 +383,7 @@
         }
 
         function nodeVisibility(node) {
-            return activeGroups.has(node.group || 'Unknown') && (!focusMode || !selectedNode || selectedNode.id === node.id || isNeighbor(selectedNode, node));
+            return activeGroups.has(node.group || 'Unknown');
         }
 
         function resolveNode(idOrNode) {
@@ -511,201 +395,98 @@
             const s = resolveNode(link.source).group || 'Unknown';
             const t = resolveNode(link.target).group || 'Unknown';
             if (!activeGroups.has(s) || !activeGroups.has(t)) return false;
-            if (!nodeVisibility(resolveNode(link.source)) || !nodeVisibility(resolveNode(link.target))) return false;
-            const focusNode = selectedNode;
+            const focusNode = hoverNode || selectedNode;
             if (!focusNode) return true;
             const src = link.source.id || link.source;
             const tgt = link.target.id || link.target;
             return src === focusNode.id || tgt === focusNode.id;
         }
 
-        function clearSelection() {
-            selectedNode = null;
-            hoverNode = null;
-            navigationHistory.length = 0;
-            document.getElementById('btn-back').disabled = true;
-            ['info-title', 'info-meta', 'info-summary', 'info-related', 'info-links', 'info-sources', 'info-metrics', 'summary-original'].forEach(id => document.getElementById(id).replaceChildren());
-            ['related-more', 'summary-more', 'summary-original-details'].forEach(id => { document.getElementById(id).hidden = true; });
-            document.getElementById('navigation-prompt').hidden = true;
-            document.getElementById('info-panel').classList.remove('visible');
-            refreshVisuals();
-        }
-        document.getElementById('close-btn').onclick = clearSelection;
+        function renderGraph() {
+            const data = toGraphData(currentGraph());
+            neighbors = buildNeighbors(data);
+            Graph.graphData(data)
+                .nodeId('id')
+                .nodeLabel(node => `[${node.raw_type || node.group}] ${node.name || node.id} (关联: ${node.degree || 0})`)
+                .nodeVal(node => Math.max(2.5, Math.sqrt(node.degree || 1) * 3.8))
+                .nodeRelSize(7)
+                .nodeColor(currentColor)
+                .nodeVisibility(nodeVisibility)
+                .nodeOpacity(node => {
+                    const focusNode = hoverNode || selectedNode;
+                    if (searchTokens.length > 0) {
+                        const name = (node.name || '').toLowerCase();
+                        const id = (node.id || '').toLowerCase();
+                        const summary = (node.summary || '').toLowerCase();
+                        let match = true;
+                        for (const token of searchTokens) {
+                            if (!(name.includes(token) || id.includes(token) || summary.includes(token))) {
+                                match = false; break;
+                            }
+                        }
+                        if (!match) return 0.05;
+                    }
+                    if (focusNode && focusNode.id !== node.id && !isNeighbor(focusNode, node)) {
+                        return focusMode ? 0.02 : 0.25;
+                    }
+                    let decay = node.decay_weight;
+                    if (decay === undefined) decay = 1.0;
+                    return Math.max(0.65, decay);
+                })
+                .linkWidth(link => Math.max(0.8, (link.weight || 1) * 0.7))
+                .linkColor(currentLinkColor)
+                .linkVisibility(linkVisibility)
+                .linkDirectionalParticles(link => {
+                    if (physicsPaused) return 0;
+                    const focusNode = hoverNode || selectedNode;
+                    if (!focusNode) return currentGraph().nodes.length > 2000 ? 0 : 0.5;
+                    const src = link.source.id || link.source;
+                    const tgt = link.target.id || link.target;
+                    return (src === focusNode.id || tgt === focusNode.id) ? 3 : 0;
+                })
+                .linkDirectionalParticleSpeed(0.008)
+                .linkDirectionalParticleWidth(2.5)
+                .onNodeHover(node => {
+                    document.body.style.cursor = node ? 'pointer' : null;
+                    hoverNode = node;
+                    Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
+                })
+                .onNodeClick(node => selectNode(node.id))
+                 .onBackgroundClick(() => {
+                     selectedNode = null;
+                     document.getElementById('info-panel').classList.remove('visible');
+                     Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
+                 });
 
-        function refreshVisuals() {
-            Graph.nodeColor(currentColor).nodeVisibility(nodeVisibility).linkVisibility(linkVisibility).linkColor(currentLinkColor);
+            // Adjust Forces for 1500+ nodes
+            Graph.d3Force('charge').strength(-200);
+            Graph.d3Force('link').distance(120);
+            
+            if (activeGraphKey === 'page') {
+                const zForce = (alpha) => {
+                    currentGraph().nodes.forEach(node => {
+                        const targetZ = node.group === 'Synthesis' ? 400 : (node.group === 'Source' ? -400 : 0);
+                        node.vz += (targetZ - (node.z || 0)) * 0.1 * alpha;
+                    });
+                };
+                Graph.d3Force('z', zForce);
+            } else {
+                Graph.d3Force('z', null);
+            }
+
+            updateFilters();
+            renderLegend();
             renderStats();
         }
 
-        function setLayoutFrozen(frozen) {
-            // Official fix-dragged-nodes example and d3-force-3d: fx/fy/fz pin live simulation nodes.
-            // Do not pauseAnimation(): that also stops camera rendering and pointer interaction.
-            pendingFreeze = false;
-            if (frozen) {
-                liveGraphs[activeGraphKey].nodes.forEach(node => {
-                    // A newly activated view may not have had its first simulation tick yet.
-                    // Wait for real coordinates instead of pinning every uninitialized node at the origin.
-                    if (!['x', 'y', 'z'].every(axis => Number.isFinite(node[axis]))) {
-                        pendingFreeze = true;
-                        return;
-                    }
-                    if (!frozenPositions.has(node)) frozenPositions.set(node, [node.fx, node.fy, node.fz]);
-                    for (const axis of ['x', 'y', 'z']) {
-                        node['f' + axis] = node[axis];
-                        node['v' + axis] = 0;
-                    }
-                });
-            } else {
-                frozenPositions.forEach((positions, node) => {
-                    ['fx', 'fy', 'fz'].forEach((key, index) => {
-                        if (positions[index] === undefined) delete node[key];
-                        else node[key] = positions[index];
-                    });
-                });
-                frozenPositions.clear();
-            }
-            Graph.enableNodeDrag(!frozen);
-            if (!frozen) Graph.d3ReheatSimulation();
-        }
-
-        function renderGraph() {
-            if (loadedGraphKey !== activeGraphKey) {
-                const data = liveGraphs[activeGraphKey];
-                neighbors = buildNeighbors(data);
-                Graph.graphData(data);
-                loadedGraphKey = activeGraphKey;
-                if (physicsPaused) setLayoutFrozen(true);
-            }
-            refreshVisuals();
-            updateFilters();
-            renderLegend();
-        }
-
-        Graph.nodeId('id')
-            .nodeLabel(node => escapeHTML(`[${node.raw_type || node.group}] ${node.name || node.id} (直接链接度数: ${node.degree || 0})`))
-            .nodeVal(node => Math.max(2.5, Math.sqrt(node.degree || 1) * 3.8))
-            .nodeRelSize(7)
-            .nodeOpacity(0.85)
-            .linkWidth(link => Math.min(3, Math.max(0.8, (Number.isFinite(link.weight) ? link.weight : 1) * 0.7)))
-            // Current page weights and claim relations are undirected (their endpoints may be sorted).
-            // No directional animation unless a future export explicitly establishes direction.
-            .linkDirectionalParticles(0)
-            .onNodeHover(node => {
-                hoverNode = node;
-                document.body.style.cursor = hoverNode ? 'pointer' : null;
-                // The renderer owns the tooltip. Hover never replaces selected context.
-            })
-            .onNodeClick(node => selectNode(node.id))
-            .onEngineTick(() => { if (physicsPaused && pendingFreeze) setLayoutFrozen(true); })
-            .onBackgroundClick(clearSelection);
-        Graph.d3Force('charge').strength(-200);
-        Graph.d3Force('link').distance(120);
-        // Removed the ineffective z force: it mutated export copies, not simulation nodes,
-        // and treated category/group as ontology. Keep the standard 3D layout, not invented layers.
-
         function nodeHref(node) {
             if (activeGraphKey === 'claim') return null;
-            return memoryFileURL(`wiki/${node.id}.md`);
+            return `${memoryBasePath}wiki/${node.id}.md`;
         }
 
-        function renderSummary(value) {
-            const original = String(value || '');
-            const excerpt = summaryExcerpt(original);
-            const text = document.getElementById('info-summary');
-            const more = document.getElementById('summary-more');
-            const originalDetails = document.getElementById('summary-original-details');
-            let expanded = false;
-            const draw = () => {
-                text.textContent = excerpt ? (expanded || excerpt.length <= 280 ? excerpt : excerpt.slice(0, 280) + '…') : '暂无可展示摘录。';
-                more.hidden = excerpt.length <= 280;
-                more.textContent = expanded ? '收起摘录' : '展开摘录';
-                more.setAttribute('aria-expanded', String(expanded));
-            };
-            more.onclick = () => { expanded = !expanded; draw(); };
-            originalDetails.hidden = original === excerpt;
-            originalDetails.open = false;
-            document.getElementById('summary-original').textContent = original;
-            draw();
-        }
-
-        function renderRelated(node) {
-            const section = document.getElementById('related-section');
-            section.hidden = activeGraphKey !== 'page';
-            const list = document.getElementById('info-related');
-            const more = document.getElementById('related-more');
-            list.replaceChildren();
-            more.hidden = true;
-            if (section.hidden) return;
-            const related = relatedWiki(graphs.page, node.id);
-            let expanded = false;
-            const draw = () => {
-                list.replaceChildren();
-                related.slice(0, expanded ? related.length : 5).forEach(({ node: target }) => {
-                    const li = document.createElement('li');
-                    const button = document.createElement('button');
-                    button.type = 'button';
-                    button.className = 'node-select';
-                    button.textContent = target.name || target.id;
-                    button.onclick = () => selectNode(target.id);
-                    li.appendChild(button);
-                    const href = sanitizeURL(nodeHref(target));
-                    if (href) {
-                        const open = document.createElement('a');
-                        open.className = 'file-open';
-                        open.href = href;
-                        open.target = '_blank';
-                        open.rel = 'noopener noreferrer';
-                        open.textContent = '打开文件';
-                        open.setAttribute('aria-label', `打开文件：${target.name || target.id}`);
-                        li.appendChild(open);
-                    }
-                    list.appendChild(li);
-                });
-                if (!related.length) list.textContent = '当前导出图谱暂无关联 Wiki。';
-                more.hidden = related.length <= 5;
-                more.textContent = expanded ? '收起' : `显示更多（另 ${related.length - 5} 项）`;
-                more.setAttribute('aria-expanded', String(expanded));
-            };
-            more.onclick = () => { expanded = !expanded; draw(); };
-            draw();
-        }
-
-        function selectNode(nodeId, recordHistory = true, reveal = false) {
+        function selectNode(nodeId) {
             const node = currentGraph().nodes.find(item => item.id === nodeId);
             if (!node) return;
-            const prompt = document.getElementById('navigation-prompt');
-            if (!activeGroups.has(node.group || 'Unknown') && !reveal) {
-                prompt.replaceChildren();
-                prompt.hidden = false;
-                const message = document.createElement('p');
-                message.textContent = `“${node.name || node.id}”被分类筛选隐藏。是否显示该分类并导航？`;
-                const button = document.createElement('button');
-                button.type = 'button';
-                button.textContent = '显示该分类并导航';
-                button.onclick = () => selectNode(nodeId, recordHistory, true);
-                const cancel = document.createElement('button');
-                cancel.type = 'button';
-                cancel.textContent = '取消';
-                cancel.onclick = () => { prompt.hidden = true; };
-                prompt.appendChild(message);
-                prompt.appendChild(button);
-                prompt.appendChild(cancel);
-                document.getElementById('info-panel').classList.add('visible');
-                button.focus();
-                return;
-            }
-            if (reveal) {
-                activeGroups.add(node.group || 'Unknown');
-                updateFilters();
-            }
-            prompt.hidden = true;
-            if (recordHistory && selectedNode && selectedNode.id !== nodeId) navigationHistory.push(selectedNode.id);
-            if (!recordHistory) navigationHistory.pop();
-            document.getElementById('btn-back').disabled = navigationHistory.length === 0;
-            // Preserve the user's query text, but remove its visual emphasis on navigation.
-            searchTokens = [];
-            hoverNode = null;
-            document.getElementById('search-results').style.display = 'none';
             const liveNode = Graph.graphData().nodes.find(item => item.id === nodeId) || node;
             const distance = 150;
             const targetX = liveNode.x || 1;
@@ -715,49 +496,32 @@
             const ratio = 1 + distance / norm;
             
             const lookAtPos = { x: targetX, y: targetY, z: targetZ };
-            Graph.cameraPosition({ x: targetX * ratio, y: targetY * ratio, z: targetZ * ratio }, lookAtPos, 300);
+            Graph.cameraPosition({ x: targetX * ratio, y: targetY * ratio, z: targetZ * ratio }, lookAtPos, 1200);
 
             const href = nodeHref(node);
-            const safeHref = href ? sanitizeURL(href) : null;
-            const titleElement = document.getElementById('info-title');
-            const titleText = String(node.name || node.id || '');
-            titleElement.replaceChildren();
-            if (safeHref) {
-                const titleLink = document.createElement('a');
-                titleLink.href = safeHref;
-                titleLink.target = '_blank';
-                titleLink.rel = 'noopener noreferrer';
-                titleLink.textContent = titleText;
-                titleElement.appendChild(titleLink);
-            } else {
-                titleElement.textContent = titleText;
-            }
+            const safeName = escapeHTML(node.name || node.id);
+            const safeHref = href ? encodeURI(href) : null;
+            document.getElementById('info-title').innerHTML = safeHref ? `<a href="${safeHref}" target="_blank">${safeName}</a>` : safeName;
             selectedNode = node;
-            refreshVisuals();
+            Graph.nodeColor(currentColor).linkVisibility(linkVisibility).linkColor(currentLinkColor).nodeOpacity(Graph.nodeOpacity());
 
-            const meta = document.getElementById('info-meta');
-            meta.replaceChildren();
-            [node.raw_type || node.group || 'Unknown', node.validity_state,
-                node.updated ? `更新 ${String(node.updated).substring(0, 10)}` : null].filter(Boolean).forEach(value => {
-                const span = document.createElement('span');
-                span.textContent = value;
-                meta.appendChild(span);
-            });
-            const metrics = [
-                ['分类', node.group], ['直接链接度数', node.degree || 0], ['Claim 类型', node.claim_type],
-                ['置信字段', node.confidence], ['领域', node.domain], ['对齐字段', node.alignment_score], ['衰减字段', node.decay_weight]
-            ];
-            const metricsElement = document.getElementById('info-metrics');
-            metricsElement.replaceChildren();
-            metrics.filter(([, value]) => value !== undefined && value !== null && value !== '').forEach(([label, value]) => {
-                const row = document.createElement('div');
-                row.textContent = `${label}: ${value}`;
-                metricsElement.appendChild(row);
-            });
-            document.getElementById('metrics-details').open = false;
-            document.getElementById('sources-details').open = false;
-            renderSummary(node.summary);
-            renderRelated(node);
+            const meta = [];
+            meta.push(`<span><strong>Mode</strong> ${escapeHTML(activeGraphKey)}</span>`);
+            meta.push(`<span><strong>Category</strong> ${escapeHTML(node.group || 'Unknown')}</span>`);
+            meta.push(`<span><strong>Type</strong> ${escapeHTML(node.raw_type || 'Unknown')}</span>`);
+            meta.push(`<span><strong>Degree</strong> ${escapeHTML(node.degree || 0)}</span>`);
+            if (node.validity_state) meta.push(`<span><strong>Validity</strong> ${escapeHTML(node.validity_state)}</span>`);
+            if (node.claim_type) meta.push(`<span><strong>Claim</strong> ${escapeHTML(node.claim_type)}</span>`);
+            if (node.confidence !== undefined && node.confidence !== null) meta.push(`<span><strong>Conf</strong> ${escapeHTML(node.confidence)}</span>`);
+            if (node.domain) meta.push(`<span><strong>Domain</strong> ${escapeHTML(node.domain)}</span>`);
+            if (node.updated) {
+                const updatedStr = typeof node.updated === 'string' ? node.updated.substring(0, 10) : String(node.updated);
+                meta.push(`<span><strong>Updated</strong> ${escapeHTML(updatedStr)}</span>`);
+            }
+            if (node.alignment_score !== undefined) meta.push(`<span><strong>Align</strong> ${escapeHTML(node.alignment_score)}</span>`);
+            if (node.decay_weight !== undefined) meta.push(`<span><strong>Decay</strong> ${escapeHTML(node.decay_weight)}</span>`);
+            document.getElementById('info-meta').innerHTML = meta.join('');
+            document.getElementById('info-summary').innerText = node.summary || 'No summary available.';
 
             const links = document.getElementById('info-links');
             const sources = document.getElementById('info-sources');
@@ -769,65 +533,48 @@
                 const name = targetNode ? (targetNode.name || targetId) : targetId;
                 const group = targetNode ? (targetNode.group || 'Unknown') : 'Unknown';
                 const li = document.createElement('li');
-                const a = document.createElement('button');
-                a.type = 'button';
-                a.className = 'node-select';
-                a.disabled = !targetNode;
+                const a = document.createElement('a');
                 a.textContent = `[${group}] ${name}`;
                 a.onclick = () => selectNode(targetId);
                 li.appendChild(a);
                 links.appendChild(li);
             });
-            if (links.children.length === 0) links.innerHTML = '<li>暂无</li>';
+            if (links.children.length === 0) links.innerHTML = '<li>None</li>';
 
             (Array.isArray(node.sources) ? node.sources : []).forEach(source => {
-                const hrefValue = memoryFileURL(activeGraphKey === 'claim' ? `wiki/${source}` : source);
+                const hrefValue = activeGraphKey === 'claim' ? `${memoryBasePath}wiki/${source}` : `${memoryBasePath}${source}`;
                 const li = document.createElement('li');
-                const safeSourceHref = sanitizeURL(hrefValue);
-                if (safeSourceHref) {
-                    const a = document.createElement('a');
-                    a.href = safeSourceHref;
-                    a.target = '_blank';
-                    a.rel = 'noopener noreferrer';
-                    a.textContent = source;
-                    li.appendChild(a);
-                } else {
-                    const span = document.createElement('span');
-                    span.textContent = source;
-                    li.appendChild(span);
-                }
+                const a = document.createElement('a');
+                a.href = hrefValue;
+                a.target = '_blank';
+                a.textContent = source;
+                li.appendChild(a);
                 sources.appendChild(li);
             });
-            if (sources.children.length === 0) sources.innerHTML = '<li>暂无</li>';
+            if (sources.children.length === 0) sources.innerHTML = '<li>None</li>';
 
             document.getElementById('info-panel').classList.add('visible');
         }
 
-        function switchView(key) {
-            if (key === activeGraphKey) return;
-            clearSelection();
-            searchTokens = [];
-            document.getElementById('search-input').value = '';
-            document.getElementById('search-results').replaceChildren();
-            document.getElementById('search-results').style.display = 'none';
-            document.getElementById('related-section').hidden = key === 'claim';
-            document.getElementById('info-related').replaceChildren();
-            document.getElementById('btn-back').disabled = true;
-            document.body.style.cursor = null;
-            activeGraphKey = key;
+        document.getElementById('btn-page-view').onclick = () => {
+            activeGraphKey = 'page';
             colorMode = 'type';
             syncActiveGroups();
-            document.getElementById('btn-page-view').classList.toggle('active', key === 'page');
-            document.getElementById('btn-claim-view').classList.toggle('active', key === 'claim');
-            document.getElementById('btn-community').disabled = key === 'claim';
+            document.getElementById('btn-page-view').classList.add('active');
+            document.getElementById('btn-claim-view').classList.remove('active');
+            document.getElementById('btn-community').disabled = false;
+            renderGraph();
+        };
+        document.getElementById('btn-claim-view').onclick = () => {
+            activeGraphKey = 'claim';
+            colorMode = 'type';
+            syncActiveGroups();
+            document.getElementById('btn-claim-view').classList.add('active');
+            document.getElementById('btn-page-view').classList.remove('active');
+            document.getElementById('btn-community').disabled = true;
             document.getElementById('btn-community').classList.remove('active');
             document.getElementById('btn-type').classList.add('active');
             renderGraph();
-        }
-        document.getElementById('btn-page-view').onclick = () => switchView('page');
-        document.getElementById('btn-claim-view').onclick = () => switchView('claim');
-        document.getElementById('btn-back').onclick = () => {
-            if (navigationHistory.length) selectNode(navigationHistory[navigationHistory.length - 1], false);
         };
         document.getElementById('btn-type').onclick = () => {
             colorMode = 'type';
@@ -846,16 +593,17 @@
         document.getElementById('btn-focus-mode').onclick = () => {
             focusMode = !focusMode;
             document.getElementById('btn-focus-mode').classList.toggle('active', focusMode);
-            document.getElementById('btn-focus-mode').setAttribute('aria-pressed', String(focusMode));
-            refreshVisuals();
+            Graph.nodeOpacity(Graph.nodeOpacity());
         };
 
         document.getElementById('btn-pause-physics').onclick = () => {
             physicsPaused = !physicsPaused;
             document.getElementById('btn-pause-physics').classList.toggle('active', physicsPaused);
-            document.getElementById('btn-pause-physics').setAttribute('aria-pressed', String(physicsPaused));
-            document.getElementById('btn-pause-physics').textContent = physicsPaused ? '恢复布局' : '冻结布局';
-            setLayoutFrozen(physicsPaused);
+            if (physicsPaused) {
+                Graph.pauseAnimation();
+            } else {
+                Graph.resumeAnimation();
+            }
         };
 
         syncActiveGroups();
@@ -863,28 +611,6 @@
         renderSearch();
         renderGraph();
         setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 800);
-        }
-
-        document.getElementById('export-metadata').textContent = JSON.stringify(rawData.exportMetadata, null, 2);
-        document.getElementById('load-renderer').onclick = () => {
-            const button = document.getElementById('load-renderer');
-            button.disabled = true;
-            document.getElementById('renderer-status').textContent = 'Loading external renderer…';
-            const script = document.createElement('script');
-            script.src = 'https://unpkg.com/3d-force-graph';
-            script.onload = () => {
-                try {
-                    initializeGraph();
-                    document.getElementById('renderer-consent').style.display = 'none';
-                } catch (error) {
-                    document.getElementById('renderer-status').textContent = 'Renderer initialization failed. The local export remains saved.';
-                }
-            };
-            script.onerror = () => {
-                document.getElementById('renderer-status').textContent = 'External renderer could not load. The local export remains saved.';
-            };
-            document.head.appendChild(script);
-        };
     </script>
 </body>
 </html>

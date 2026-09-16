@@ -4,7 +4,14 @@ from filelock import FileLock
 
 from vector_lake.wiki_utils import get_wiki_dir, split_frontmatter
 from vector_lake.yaml_utils import dump_yaml
-from vector_lake.operational_memory_contract import MEMORY_TYPE_MAP
+
+
+MEMORY_TYPE_MAP = {
+    "preference": ("Concept_UserPreferences.md", "User Preferences"),
+    "decision": ("Concept_SystemDecisions.md", "System Decisions"),
+    "task_state": ("Concept_AgentTaskState.md", "Agent Task State"),
+    "fact": ("Concept_OperationalFacts.md", "Operational Facts"),
+}
 
 
 def _new_memory_page(memory_type: str, title: str, now_iso: str) -> str:
@@ -23,7 +30,6 @@ sources: [Operational_Memory]
 strategic_scope: core
 evidence_tier: derived
 topic_cluster: Operational_Memory
-authoring_origin: governed_operational_memory
 ---
 # {title}
 
@@ -66,7 +72,6 @@ def update_operational_memory(memory_type: str, content: str) -> str:
             frontmatter.setdefault("strategic_scope", "core")
             frontmatter.setdefault("evidence_tier", "derived")
             frontmatter.setdefault("topic_cluster", "Operational_Memory")
-            frontmatter["authoring_origin"] = "governed_operational_memory"
             if "### 物理机制 (Mechanism)" not in body:
                 body = body.replace(
                     "## 2. 证据时间线",

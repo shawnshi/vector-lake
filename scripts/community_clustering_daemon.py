@@ -1,37 +1,50 @@
-"""Deprecated community-clustering operator script, disabled by default."""
-
 import json
 import logging
 import os
 import uuid
 import glob
 from datetime import datetime, timezone
+from filelock import FileLock
+
+try:
+    import networkx as nx
+except ImportError:
+    nx = None
+
+try:
+    import igraph as ig
+    import leidenalg
+except ImportError:
+    ig = None
+    leidenalg = None
+
+# Leiden replaces Louvain.
+#
+# Louvain exposed a dendrogram with explicit levels; Leiden is parameterised by
+# resolution instead, so the two hierarchy levels are produced by two runs:
+# L0 (Global, coarse) at a low resolution and L1 (Micro, fine) at a high one.
+# Leiden is randomised, so a fixed seed keeps runs reproducible.
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+LEIDEN_L0_RESOLUTION = _env_float("VECTOR_LAKE_LEIDEN_L0_RESOLUTION", 1.0)
+LEIDEN_L1_RESOLUTION = _env_float("VECTOR_LAKE_LEIDEN_L1_RESOLUTION", 2.0)
+LEIDEN_SEED = int(_env_float("VECTOR_LAKE_LEIDEN_SEED", 42))
+
+# Ensure vector_lake is in path
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from vector_lake.wiki_utils import get_index_path, get_wiki_dir, get_meta_dir
+from vector_lake import governance_store
+from vector_lake.governance_store import load_governance_queue, save_governance_queue
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-clustering-daemon")
-
-_LEGACY_DAEMON_ENV = "VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS"
-_DISABLED_EXIT_CODE = 78
-
-
-def _legacy_daemon_enabled() -> bool:
-    return os.environ.get(_LEGACY_DAEMON_ENV) == "1"
-
-
-def _require_legacy_daemon() -> None:
-    if not _legacy_daemon_enabled():
-        raise PermissionError(
-            "Deprecated/unsupported community clustering daemon is disabled; set "
-            f"{_LEGACY_DAEMON_ENV}=1 only in a trusted operator process"
-        )
-
-
-def _enable_repo_imports() -> None:
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -42,6 +55,45 @@ def _mark_graph_clean(index_data: dict):
     index_data["graph_state"]["dirty"] = False
     index_data["graph_state"]["reason"] = "Community clustering applied"
     index_data["graph_state"]["updated_at"] = _utc_now()
+
+def _leiden_partition(nodes: list[str], edges: list[dict], resolution: float) -> dict:
+    """Leiden partition of the weighted page graph, keyed by node name.
+
+    Membership values are run-local integers; ``_stabilize_community_ids`` maps
+    them onto stable UUIDs by node overlap, so re-running with a different
+    partition does not orphan the community index pages.
+    """
+    graph = ig.Graph(directed=False)
+    graph.add_vertices(len(nodes))
+    graph.vs["name"] = list(nodes)
+    position = {name: index for index, name in enumerate(nodes)}
+
+    if not nodes:
+        return {}
+    pairs: list[tuple[int, int]] = []
+    weights: list[float] = []
+    for edge in edges:
+        source = edge.get("source")
+        target = edge.get("target")
+        if source not in position or target not in position or source == target:
+            continue
+        pairs.append((position[source], position[target]))
+        # Leiden modularity requires strictly positive weights.
+        weights.append(max(float(edge.get("weight") or 1.0), 1e-6))
+    if pairs:
+        graph.add_edges(pairs)
+        graph.es["weight"] = weights
+
+    partition = leidenalg.find_partition(
+        graph,
+        leidenalg.RBConfigurationVertexPartition,
+        weights="weight",
+        resolution_parameter=resolution,
+        seed=LEIDEN_SEED,
+    )
+    membership = partition.membership
+    return {nodes[index]: membership[index] for index in range(len(nodes))}
+
 
 def _stabilize_community_ids(new_partition, old_partition, old_uuids):
     new_comm_nodes = {}
@@ -77,24 +129,7 @@ def _stabilize_community_ids(new_partition, old_partition, old_uuids):
     final_partition = {n: stable_uuids[c] for n, c in new_partition.items()}
     return final_partition, diffs, stable_uuids
 
-def _unsafe_run_clustering():
-    _require_legacy_daemon()
-    _enable_repo_imports()
-    from filelock import FileLock
-
-    try:
-        import networkx as nx
-        from community import community_louvain
-    except ImportError:
-        nx = None
-        community_louvain = None
-
-    from vector_lake.governance_store import (
-        load_governance_queue,
-        save_governance_queue,
-    )
-    from vector_lake.wiki_utils import get_index_path, get_meta_dir, get_wiki_dir
-
+def run_clustering():
     index_file = get_index_path()
     if not index_file.exists():
         log.warning("Index file not found, skipping clustering.")
@@ -115,7 +150,7 @@ def _unsafe_run_clustering():
         index_data["community_labels"] = {}
         index_data["graph_insights"] = []
 
-        if not (nx and community_louvain and edges):
+        if not (nx and ig and leidenalg and edges):
             _mark_graph_clean(index_data)
             from vector_lake.wiki_utils import atomic_write_text
             atomic_write_text(index_file, json.dumps(index_data, ensure_ascii=False, indent=2))
@@ -136,17 +171,13 @@ def _unsafe_run_clustering():
                     node = index_data["nodes"][node_key]
                     node["centrality_score"] = round(pr_score, 4)
                     node["node_score"] = round(node.get("decay_weight", 1.0) * pr_score, 4)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Centrality scoring skipped for %s: %s", node_key, exc)
 
         try:
-            dendro = community_louvain.generate_dendrogram(G, weight="weight")
-            if len(dendro) >= 2:
-                raw_part_L1 = community_louvain.partition_at_level(dendro, 0) # Micro
-                raw_part_L0 = community_louvain.partition_at_level(dendro, len(dendro)-1) # Global
-            else:
-                raw_part_L1 = community_louvain.partition_at_level(dendro, 0)
-                raw_part_L0 = raw_part_L1
+            # Two Leiden runs replace the Louvain dendrogram levels.
+            raw_part_L1 = _leiden_partition(node_keys, edges, LEIDEN_L1_RESOLUTION)  # Micro
+            raw_part_L0 = _leiden_partition(node_keys, edges, LEIDEN_L0_RESOLUTION)  # Global
 
             snapshot_file = get_meta_dir() / "community_snapshot.json"
             old_part_L0 = {}
@@ -166,6 +197,9 @@ def _unsafe_run_clustering():
                 except Exception:
                     pass
 
+            if not raw_part_L0:
+                raw_part_L0 = raw_part_L1 or {}
+
             part_L0, diffs_L0, uuid_map_L0 = _stabilize_community_ids(raw_part_L0, old_part_L0, {})
             part_L1, diffs_L1, uuid_map_L1 = _stabilize_community_ids(raw_part_L1, old_part_L1, {})
 
@@ -180,8 +214,7 @@ def _unsafe_run_clustering():
                     community_nodes.setdefault(c_uuid, []).append(node)
 
                 for c_uuid, nodes in community_nodes.items():
-                    if len(nodes) < 3:
-                        continue
+                    if len(nodes) < 3: continue
                     sorted_nodes = sorted(nodes, key=lambda node: G.degree(node), reverse=True)
                     titles = [index_data["nodes"].get(n, {}).get("title", n) for n in sorted_nodes[:2]]
                     label = f"{level_name} Comm: {' / '.join(titles) if titles else 'Unknown'}"
@@ -220,28 +253,40 @@ def _unsafe_run_clustering():
 
                     if needs_llm:
                         try:
-                            queue = load_governance_queue()
-                            if not any(item.get("community_id") == c_uuid and item.get("status") == "pending" for item in queue.get("items", [])):
-                                queue["items"].append({
-                                    "item_id": f"gov_{uuid.uuid4().hex[:12]}",
-                                    "type": "community_naming",
-                                    "community_id": c_uuid,
-                                    "title": f"{level_name} Comm {c_uuid} Requires Synthesis",
-                                    "description": f"Diff ratio {diff_ratio:.2f}. Hubs: {' / '.join(titles)}.",
-                                    "created_at": _utc_now(),
-                                    "status": "pending",
-                                    "source": "indexer",
-                                    "affected_pages": [index_filename],
-                                    "hubs": titles
-                                })
-                                save_governance_queue(queue)
+                            # The queue is persisted by key-diff replacement, so the
+                            # whole read -> append -> save cycle must hold the shared
+                            # lock or a concurrent writer's item is silently dropped.
+                            with governance_store.governance_queue_session():
+                                queue = load_governance_queue()
+                                already_queued = any(
+                                    item.get("community_id") == c_uuid
+                                    and item.get("status") == "pending"
+                                    for item in queue.get("items", [])
+                                )
+                                if not already_queued:
+                                    queue["items"].append({
+                                        "item_id": f"gov_{uuid.uuid4().hex[:12]}",
+                                        "type": "community_naming",
+                                        "community_id": c_uuid,
+                                        "title": f"{level_name} Comm {c_uuid} Requires Synthesis",
+                                        "description": f"Diff ratio {diff_ratio:.2f}. Hubs: {' / '.join(titles)}.",
+                                        "created_at": _utc_now(),
+                                        "status": "pending",
+                                        "source": "indexer",
+                                        "affected_pages": [index_filename],
+                                        "hubs": titles
+                                    })
+                                    save_governance_queue(queue)
                         except Exception as e:
                             log.warning(f"Failed to queue naming for {c_uuid}: {e}")
 
                     content = f"""---
+id: {index_filename[:-3]}
 title: "{label}"
 type: system
 status: Active
+categories: [System]
+updated: {_utc_now()}
 community_id: {c_uuid}
 level: {level_name}
 aliases:
@@ -291,31 +336,5 @@ aliases:
                 
         log.info("V9 Heavy graph topology clustering complete.")
 
-
-def _run_legacy_clustering() -> None:
-    _unsafe_run_clustering()
-
-
-def main() -> int:
-    if not _legacy_daemon_enabled():
-        print(
-            "DEPRECATED/UNSUPPORTED community clustering daemon is disabled by "
-            f"default; set {_LEGACY_DAEMON_ENV}=1 only for isolated operator recovery.",
-            file=sys.stderr,
-        )
-        return _DISABLED_EXIT_CODE
-    print(
-        "DEPRECATED/UNSUPPORTED community clustering daemon override enabled; "
-        "never run it alongside watchdog_sync.py or vector_lake.watchdog_app.",
-        file=sys.stderr,
-    )
-    _run_legacy_clustering()
-    return 0
-
-
-def run_clustering() -> int:
-    """Compatibility entrypoint retaining the same fail-closed operator gate."""
-    return main()
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    run_clustering()

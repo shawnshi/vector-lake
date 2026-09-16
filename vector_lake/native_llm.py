@@ -1,10 +1,10 @@
 """Current-environment subagent handoff for text-generation work.
 
 Vector Lake may still use model APIs for embeddings in the indexer/search
-pipeline. Non-embedding text generation is not performed in-process. When a
-runtime path needs reasoning, it writes a bounded task packet. A host may
-execute that packet explicitly, or an operator may opt in to the separately
-budgeted, tool-isolated automatic controller.
+pipeline. Non-embedding text generation is intentionally not performed from
+library code because that silently creates external model cost. When a runtime
+path needs reasoning, it writes a bounded task packet that the host agent or a
+current-environment subagent can execute explicitly.
 """
 
 from __future__ import annotations
@@ -20,74 +20,7 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("vector-lake-native-llm")
-SUBAGENT_TASK_PACKET_FIELDS = frozenset(
-    {
-        "task_id",
-        "task_type",
-        "created_at",
-        "runtime",
-        "cost_boundary",
-        "expected_output",
-        "metadata",
-        "prompt",
-    }
-)
-SUBAGENT_TASK_RUNTIME = "current-environment-subagent"
-SUBAGENT_TASK_COST_BOUNDARY = (
-    "non-embedding generation requires explicit host enablement and bounded launch policy"
-)
 _DEFAULT_RUN_ID = f"runtime-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-
-
-def _safe_run_id() -> str:
-    run_id = os.environ.get("VECTOR_LAKE_SUBAGENT_RUN_ID", _DEFAULT_RUN_ID)
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "subagent-runtime"
-
-
-def _stable_runtime_root(env_name: str, default_name: str) -> Path:
-    configured = os.environ.get(env_name)
-    if configured:
-        candidate = Path(configured).expanduser()
-        if not candidate.is_absolute():
-            raise ValueError(f"{env_name} must be an absolute path")
-    else:
-        from vector_lake.db_store import peek_db_path
-
-        candidate = peek_db_path().resolve().parent / default_name
-    root = Path(os.path.abspath(os.fspath(candidate)))
-
-    from vector_lake import get_extension_root
-
-    extension_root = get_extension_root().resolve()
-    resolved_root = root.resolve()
-    if resolved_root == extension_root or resolved_root.is_relative_to(extension_root):
-        raise ValueError(
-            f"{env_name or default_name} must be outside the versioned extension root: "
-            f"{resolved_root}"
-        )
-    return root
-
-
-def peek_subagent_brain_root() -> Path:
-    """Return the version-independent ephemeral runtime root without creating it."""
-    return _stable_runtime_root("VECTOR_LAKE_SUBAGENT_BRAIN_ROOT", "brain")
-
-
-def get_subagent_brain_root() -> Path:
-    root = peek_subagent_brain_root()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def peek_subagent_task_root() -> Path:
-    """Return the version-independent durable task root without creating it."""
-    return _stable_runtime_root("VECTOR_LAKE_SUBAGENT_TASK_ROOT", "subagent_tasks")
-
-
-def get_subagent_task_root() -> Path:
-    root = peek_subagent_task_root()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 class NativeLLMUnavailable(RuntimeError):
@@ -103,33 +36,51 @@ class SubagentTaskRequired(NativeLLMUnavailable):
 
 
 def native_llm_ready() -> tuple[bool, str]:
-    return (
-        False,
-        "text generation is delegated to current-environment subagent task packets",
-    )
+    return False, "text generation is delegated to current-environment subagent task packets"
 
 
-def peek_subagent_scratch_dir() -> Path:
-    """Return the non-canonicalized scratch path so callers can inspect reparse ancestry."""
-    return peek_subagent_brain_root() / _safe_run_id() / "scratch"
+_STALE_RUNTIME_TTL_SECONDS = 7 * 24 * 3600
 
 
-def get_subagent_scratch_dir() -> Path:
-    """Return isolated ephemeral scratch outside the versioned extension tree."""
-    root = peek_subagent_scratch_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+def _prune_stale_runtime_dirs(brain_root: Path, keep: Path) -> None:
+    """Remove empty per-process scratch trees left behind by earlier runs.
 
+    Every process start created ``brain/runtime-<pid>-<uuid>`` and nothing ever
+    removed it, so the directory count grew without bound.  Only directories that
+    are empty of files and older than the TTL are removed; anything holding a
+    task packet is left alone.
+    """
+    import shutil
+    import time as _time
 
-def get_subagent_task_dir() -> Path:
-    """Return the durable per-run task directory beside the active database."""
-    root = get_subagent_task_root() / _safe_run_id()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    cutoff = _time.time() - _STALE_RUNTIME_TTL_SECONDS
+    try:
+        entries = list(brain_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.is_dir() or entry == keep or not entry.name.startswith("runtime-"):
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            if any(child.is_file() for child in entry.rglob("*")):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def _task_root() -> Path:
-    return get_subagent_task_dir()
+    from vector_lake import get_extension_root
+
+    run_id = os.environ.get("VECTOR_LAKE_SUBAGENT_RUN_ID", _DEFAULT_RUN_ID)
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "subagent-runtime"
+    brain_root = get_extension_root() / "brain"
+    root = brain_root / safe_run_id / "scratch" / "subagent_tasks"
+    root.mkdir(parents=True, exist_ok=True)
+    _prune_stale_runtime_dirs(brain_root, keep=brain_root / safe_run_id)
+    return root
 
 
 def create_subagent_task(
@@ -144,78 +95,28 @@ def create_subagent_task(
         "task_id": task_id,
         "task_type": task_type,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "runtime": SUBAGENT_TASK_RUNTIME,
-        "cost_boundary": SUBAGENT_TASK_COST_BOUNDARY,
+        "runtime": "current-environment-subagent",
+        "cost_boundary": "no non-embedding model API calls from Vector Lake runtime",
         "expected_output": expected_output,
         "metadata": metadata or {},
         "prompt": prompt,
     }
     tmp_path = task_path.with_suffix(".json.tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp_path, task_path)
     return task_path
 
 
-def resolve_subagent_task_path(task_path: str | Path) -> Path:
-    """Resolve only JSON packets inside the version-independent durable root."""
+def remove_subagent_task(task_path: str | Path) -> bool:
+    """Delete a completed task packet only when it is inside the isolated brain tree."""
+    from vector_lake import get_extension_root
+
     candidate = Path(task_path).resolve()
-    task_root = peek_subagent_task_root().resolve()
-    try:
-        relative = candidate.relative_to(task_root)
-    except ValueError as exc:
-        raise ValueError(
-            f"Task packet is outside the durable subagent task root: {candidate}"
-        ) from exc
-    if candidate.suffix.lower() != ".json" or len(relative.parts) != 2:
-        raise ValueError(
-            f"Task packet is outside the durable subagent task root: {candidate}"
-        )
-    return candidate
-
-
-def remove_subagent_task(
-    task_path: str | Path,
-    *,
-    expected_job_id: str | None = None,
-    expected_task_type: str | None = None,
-    expected_task_id: str | None = None,
-) -> bool:
-    """Delete one verified packet from an exact per-run subagent task directory."""
-    candidate = resolve_subagent_task_path(task_path)
-    if expected_task_id and candidate.stem != str(expected_task_id):
-        raise ValueError(
-            f"Task packet filename does not match expected task id: {candidate}"
-        )
+    task_root = (get_extension_root() / "brain").resolve()
+    if candidate.suffix.lower() != ".json" or not candidate.is_relative_to(task_root):
+        raise ValueError(f"Refusing to remove task packet outside isolated brain tree: {candidate}")
     if not candidate.exists():
         return False
-    try:
-        payload = json.loads(candidate.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Task packet is unreadable: {candidate}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"Task packet payload is not an object: {candidate}")
-    packet_task_id = str(payload.get("task_id") or "")
-    if not packet_task_id or packet_task_id != candidate.stem:
-        raise ValueError(
-            f"Task packet identity does not match its filename: {candidate}"
-        )
-    if expected_task_id and packet_task_id != str(expected_task_id):
-        raise ValueError(f"Task packet id does not match cleanup intent: {candidate}")
-    if expected_task_type and str(payload.get("task_type") or "") != str(
-        expected_task_type
-    ):
-        raise ValueError(f"Task packet type does not match cleanup intent: {candidate}")
-    if expected_job_id:
-        metadata = payload.get("metadata")
-        packet_job_id = (
-            str(metadata.get("job_id") or "") if isinstance(metadata, dict) else ""
-        )
-        if packet_job_id != str(expected_job_id):
-            raise ValueError(
-                f"Task packet job id does not match cleanup intent: {candidate}"
-            )
     candidate.unlink()
     return True
 
@@ -227,9 +128,7 @@ def generate_text(prompt: str, model: str | None = None) -> str:
         "plain text",
         {"model_ignored": model, "legacy_entrypoint": "generate_text"},
     )
-    raise SubagentTaskRequired(
-        task_path, "text generation requires host subagent execution"
-    )
+    raise SubagentTaskRequired(task_path, "text generation requires host subagent execution")
 
 
 async def async_generate_text(prompt: str, model: str | None = None) -> str:
@@ -259,9 +158,7 @@ def generate_json_array(prompt: str, model: str | None = None) -> list[Any]:
         "JSON array",
         {"model_ignored": model, "legacy_entrypoint": "generate_json_array"},
     )
-    raise SubagentTaskRequired(
-        task_path, "JSON array generation requires host subagent execution"
-    )
+    raise SubagentTaskRequired(task_path, "JSON array generation requires host subagent execution")
 
 
 def generate_json_object(prompt: str, model: str | None = None) -> dict[str, Any]:
@@ -271,6 +168,4 @@ def generate_json_object(prompt: str, model: str | None = None) -> dict[str, Any
         "JSON object",
         {"model_ignored": model, "legacy_entrypoint": "generate_json_object"},
     )
-    raise SubagentTaskRequired(
-        task_path, "JSON object generation requires host subagent execution"
-    )
+    raise SubagentTaskRequired(task_path, "JSON object generation requires host subagent execution")

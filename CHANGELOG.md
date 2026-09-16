@@ -1,217 +1,241 @@
-# Vector Lake 11.20.0
-
-## P2/P3 architecture remediation
-
-- Upgraded SQLite to schema v9 with an authoritative `projection_runtime_v9`
-  publish state. Controlled v4-v8 inputs migrate to v9, while rollback accepts
-  only the matching completed v8-to-v9 receipt and restores a verified v8
-  database/projection boundary.
-- Replaced full projection rewrites with content-addressed immutable projection
-  v2 objects and a sidecar commit pointer. Incremental page changes update only
-  affected HAMT paths and a bounded 512-node topology frontier; unchanged
-  generations are byte- and mtime-idempotent.
-- Allowed the explicit projection-rebuild migration command to read a retained
-  v1 pair only while schema v9 is pointer-free and `rebuild_required`. It
-  verifies the pair, sidecar, canonical generation and stable file identities;
-  ordinary readers remain fail-closed, and apply backs up before publication.
-  Legacy maintenance backup/restore accepts bounded files through 128 MiB with
-  actual-byte capacity preflight and exact hash validation; v2 object limits
-  remain unchanged.
-- Added maintenance-backup v4, transitive object-closure validation, generic
-  receipt-bound snapshot restore, and preview/fingerprint/apply projection-object
-  collection that protects live, pending, previous, backup and recovery roots.
-- Added a configurable durability profile. The default full profile applies
-  file and directory persistence barriers to acknowledged Wiki, projection,
-  backup and receipt publications; failure injection preserves an old-or-new
-  complete generation.
-- Made automatic-ingest budgets exactly observable and added bounded,
-  resumable attempt-receipt retention. The 100/hour, 2,000/24-hour and
-  32,768-token limits remain ceilings, and raw-text processing stays disabled
-  and unapproved by default.
-- Added a persistent raw-scrub ledger and daily due/retry scheduling so missed
-  filesystem events are rehashed within the configured period across restarts.
-- Batched embedding metadata/vector writes into one generation-CAS transaction
-  per provider batch, with all-or-nothing rollback and one progress update.
-- Reused generation-bound semantic campaign snapshots across first pages and
-  concurrent callers, with single-flight construction, sliding cursor leases
-  and a global accounted-byte cap.
-- Added cooperative cancellation/deadline state, observable detached atomic
-  completion, and checkpoints to semantic campaign scans, embedding batches and
-  raw-ingest inventory/enqueue/finalize boundaries.
-- Reduced runtime source-guard refreshes to bounded directory identity checks,
-  coalesced idle watchdog status publications, added worker-start retry, and
-  separated Operational Memory projection revision from unrelated database
-  commits while retaining periodic physical attestation.
-- Added a shared diagnostic snapshot for Doctor/health/readiness, a lightweight
-  semantic-readiness envelope on retrieval consumers, exact surface-aware memory
-  capabilities, and a formal `fact` mode with a deprecated `claim` alias.
-- Aligned Gemini/Codex command safety and environment parity. Read-only MCP scan
-  tools no longer acquire the canonical-meta file gate, while mutable tools and
-  ordinary CLI diagnostics retain their bounded control-plane telemetry.
-- Projection rebuild apply now shares the schema-maintenance lock with rollback,
-  rejects active or malformed rollback receipts before any backup or projection
-  write, and binds its database and projection roots across the guarded apply.
-  Receipt classification is bounded and self-contained; completed rollback
-  receipts remain terminal after later legitimate generation advances.
-- Pending rollback recovery now hashes the live database before acquiring the
-  Windows SQLite exclusive lock, then revalidates file identity, data version,
-  schema, generations and projection under lock. This avoids a Windows
-  `PermissionError` without weakening the no-writer compare-and-swap gate; CAS
-  failures also retain phase, errno and WinError diagnostics.
-- Split the bounded claim-graph node and edge ceilings so the canonical
-  2,500-node projection can retain its governed degree-limited edge set. The
-  edge surface remains fail-closed above 30,000 entries, and projection-v2
-  singleton leaves may exceed 256 KiB only within the existing 1 MiB object
-  ceiling; multi-entry leaves remain capped at 256 KiB. Root descriptors now
-  require their exact component key set before closure traversal, so surplus or
-  omitted components cannot hide behind a bounded descriptor read.
-- Added a fail-closed compatibility path for expired pre-budget auto-ingest
-  launch records that lack `reserved_tokens`: entries older than the complete
-  rolling 24-hour window are validated and pruned, while any such active entry
-  still blocks budget authorization instead of being assigned an inferred cost.
-
-# Vector Lake 11.19.1
-
-- Raised the default automatic-ingest safety ceiling to 100 tasks per hour and
-  2,000 tasks per rolling 24 hours while retaining the 32,768-token per-task
-  limit. Aggregate reservation ceilings now match those task ceilings at
-  3,276,800 and 65,536,000 tokens respectively, and the bounded launch ledger
-  accepts the full 2,000-entry window.
-- Kept automatic ingest disabled and raw-text model processing unapproved by
-  default. Budgeted normal tasks continue to use non-interactive, read-only
-  Codex execution; privacy, lease, circuit-breaker, and policy-failure gates are
-  unchanged.
-
-# Vector Lake 11.19.0
-
-## P1 architecture remediation
-
-- Added schema v8 embedding metadata and provider-return generation CAS so stale
-  provider responses cannot become current after a concurrent canonical update.
-  Persisted validity follows the node input hash/model/dimension/contract instead of
-  globally invalidating every vector on unrelated writes; bounded KNN expansion skips
-  nearer legacy or stale rows without false-empty results.
-- Added a completed-receipt-only v8-to-v7 schema rollback. Migration receipts now bind
-  the exact pre-v8 projection pair; rollback creates a verified forward v8 recovery
-  bundle, safely reuses verified complete or partial forward components after a
-  pre-receipt crash and rebuilds only missing components, rejects unconfirmed
-  post-migration writes, removes SQLite sidecars, and has fresh-process
-  Doctor/search/MCP acceptance against the frozen 11.18.3 runtime.
-- Bound the FTS projection to canonical generation, row count and corpus digest. Search
-  now bypasses incomplete FTS, uses a committed bounded lexical fallback, and exposes
-  shallow/deep health failures until a verified rebuild completes.
-- Split mutation-outbox poison attempts from transient generation, lease and SQLite
-  conflicts; deterministic payload failures still dead-letter, while transient races
-  remain retryable across process restarts.
-- Replaced unbounded operational-memory fallback with a source-row cap and stable
-  retry contract, and added bounded Watchdog maintenance that automatically converges
-  the derived FTS index. Search-index schema v6 now binds canonical rows, document
-  mappings, and both physical FTS surfaces to a durable proof; connection revision
-  caching keeps stable hot reads O(1), while equal-count tampering, lost pending work,
-  integrity-limit breaches, and certification races fail closed and trigger bounded
-  replay instead of returning a false-green empty result.
-- Reduced MCP runtime-revision overhead with a single-flight TTL/metadata/full-hash
-  guard, raised the bounded fast lane to 2 workers plus 4 queued calls, and added stable
-  retry metadata for saturation. Strict per-call hashing remains opt-in.
-- Added raw-inventory metadata fast paths, deterministic periodic content scrubbing and
-  true trailing-edge Watchdog event debounce with maximum staleness and overflow repair.
-- Added global backup inventory, quota/free-space telemetry and pre-staging capacity
-  gates for maintenance and schema-migration backups.
-- Added a generation-bound, read-only semantic-readiness campaign reporting exact
-  evidence, extraction, current-assessment, source-integrity and topology debt. Its
-  first snapshot now has hard row/JSON/graph/debt limits; cursor pages use a two-entry,
-  120-second source-bound LRU and never repeat the full database/graph scan.
-- Added a real read-only MCP surface; made merge suggestions preview-first; made failed
-  Doctor and non-ready Readiness CLI reports return non-zero status.
-- Aligned all plugin roots and skills with the enabled runtime, removed unsupported
-  direct queue/legacy janitor scripts, corrected command and sync semantics, removed
-  hidden-reasoning/fake-tool contracts, and made automatic raw-text model processing
-  require explicit configuration consent.
-- Declared the supported product boundary as a healthcare-digitalization, controlled
-  single-user expert workstation rather than a multi-tenant enterprise service.
-
-# Vector Lake 11.18.3
-
-- Enable the fail-closed automatic ingest host through an explicit, pinned
-  runtime policy while preserving bounded task and token budgets.
-- Report a disabled automatic ingest component explicitly and surface a Doctor
-  warning instead of presenting the autonomous closure path as merely idle.
-- Document the distinction between scan/enqueue sync and the automatic
-  claim/generate/finalize lifecycle.
-
-# Vector Lake 11.18.2
-
-- Accept the bounded historical `.gemini/MEMORY` to canonical `MEMORY`
-  storage-URI normalization during merge recovery only when raw identity and
-  all other preserved Source metadata remain unchanged.
-
-# Vector Lake 11.18.1
-
-- Complete projection rebuilds with a bounded topology refresh and verify the
-  published pair is current before reporting success.
-
 # Vector Lake 11.18.0
 
-- Added fingerprint-confirmed, runtime-scoped unsupported-claim debt registration with a complete recoverable backup and transaction-time candidate revalidation.
-- Added version-bound ClaimAssessment CLI and MCP surfaces so stale reviews cannot be attached to a changed claim.
-- Added verified whole-artifact raw locators when precise segment metadata is unavailable, while missing source bytes remain explicitly unresolved.
-- Extended evidence-foundation backfill to upgrade conservative unresolved or unverified placeholders without replacing reviewed locators.
-- Added canonical-only lineage and source-integrity repair without inventing missing Wiki projections or extraction runs.
-- Batched canonical prefetch and append-only Claim/Evidence version writes, reducing a 500-page repair transaction from minutes to seconds in the production-scale simulation.
+## 核心流程审计修复：两条主流程断路、两处静默数据丢失、隐私排除失效
+
+完整审计报告见 `AUDIT_2026-09-16.md`。共 17 项缺陷，本次修复 P0（5）与 P1（5），P2 做机械性清理。
+**根因是同一类 Python 语义缺陷 + 同一类守护网盲区**，因此除了修缺陷本身，也修了让缺陷通过的守护规则。
+
+### 1. `prepare_ingest_batch` 必然 `UnboundLocalError` —— 入库流水线长期整体失效
+
+函数体末尾的 `import json` 使 `json` 成为该函数**局部名**，其前的 `json.load()` 必然未绑定。两条并行后果：
+
+- 配置加载被 `except Exception: config = {}` 吞掉 → **`exclude_paths`（`stocks/` / `garmin/` / `personal-insights/`）被静默忽略，隐私排除目录照样进库**；
+- `json.dump()` 在 `except` 之外 → 只要存在待入库文件就抛 `UnboundLocalError`。
+
+修复：删除函数内 import；配置加载改为 `_load_scan_config()`（文件缺失=空配置，**不可读或非法 JSON 直接报错**，不再静默降级）；补 `init_db()`（全新知识库曾抛 `no such table: processed_files`）。
+
+顺带修复**冷启动断路**：`wiki/index.json` 不存在时 `_read_relevant_index_context` 直接抛错，而索引正是入库之后才产生的 → 空知识库永远无法完成首次入库。现区分两种情况：**无 wiki 页面 = 合法空上下文**（冷启动），**有页面但无索引 = 真实投影故障，仍报错**（否则会批量产生重复实体）。
+
+### 2. `create_change_set` 引用未定义名 —— canonical 引导路径全灭
+
+`existing_change_sets["items"].append(...)` 中的名字从未定义 → 每次调用 `NameError`，且发生在事务内 → 回滚。传播链：`ensure_canonical_store_populated()` → `migrate_existing_wiki(dry_run=False)` → `create_change_set()`，被 `graph`、`trace`、`governance_projection` 使用。**恰好在最需要它的场景（wiki 有页面、canonical 为空）不可用。**
+
+同时修掉三个同类问题：
+
+- `create_change_set(dry_run=True)` 此前**完全被忽略**，调用方拿到的是一次真实生效并落盘的变更集 → 现返回预览，不落盘（实测：dry-run 后 `change_sets` / `entities` 均为 0）；
+- `sync_pages_to_canonical` 用 `os.path.exists(path)` 判断“页面已删除”：传入**裸文件名**时永远为假 → **删掉 canonical 实体而 Markdown 仍在盘上**。现先按 wiki 目录解析相对路径；
+- `create_change_set` 中 4 个 `load_entities()/load_claims()/load_evidence()/load_sources()` 全表载入已无使用（SQLite 重构残留）→ 删除（每次调用省 4 次全表扫描）。
+
+### 3. 治理队列丢失更新：实测 4 线程 × 8 条丢失 24 条
+
+`_save_db_queue` 以“键差集替换”落盘，会 `DELETE` 调用方快照中不存在的所有键。任何未持锁的 `load → append → save` 都会删掉并发写入者在此窗口追加的条目。此前**部分**写入者取了 `governance_queue.lock`、部分没有，锁形同虚设。
+
+实测（修复前，4 线程 × 8 条）：
+
+```
+UNLOCKED writers: expected 32, persisted 8, lost 24
+```
+
+修复：新增 `governance_queue_session()` —— 单一缓存 `FileLock` 实例 + 线程内可重入，**整个 load → mutate → save 周期持锁**；全部写入者改道：`enqueue_governance_item(s)`、`create_merge_suggestions`、`create_change_set`、`create_change_set_from_content`、`publish_change_sets`、`governance_service.resolve_governance_item`、`mcp_server.propose_schema_mutation`、`tool_graph.audit`、`tool_bulk_reconciliation`、`scripts/community_clustering_daemon.py`、`scripts/semantic_dedup_daemon.py`。
+
+锁序统一为 **文件锁 → 数据库事务**，消除 `create_change_set`（事务内取文件锁）与 `propose_schema_mutation`（文件锁内取事务）之间的死锁条件。耗时较长的语义去重扫描不持锁，改为**在锁内重新读取最新快照后再合并**。
+
+### 4. `claim_graph_edges` 删除条件从未匹配 → 永久悬挂边
+
+原代码 `DELETE FROM claim_graph_edges WHERE source_id IN (page_keys)`：该表的键空间是 **claim_id**，用 page_key 过滤**永远匹配 0 行**；即便修正也只删 `source_id` 一侧。现按本次增量**实际触及的 claim_id**（旧 + 新）双端删除，再由 `save_graph_edges` 回填存活边。
+
+同时解除 `page_graph_edges` 的双写：该表是 indexer 的纯投影（`replace_page_graph_edges[_for_node]` 已双向替换），治理侧不再写它。
+
+### 5. `delete_source` 级联删除：前缀误匹配、无恢复点、`processed_files` 泄漏
+
+- `startswith("source_annual")` 会连 `Source_AnnualReport.md` 一起删 → 改为与 canonical 源页名**精确相等**；
+- `raw_basename in source` 子串匹配会命中 `raw/archive/AnnualReport.md` → 改为按 `normalize_raw_ref` 归一化后**精确比较**（或文件名相等）；
+- 删除 Markdown 前**先建恢复点** `backup/delete-source/<stamp>/`（对照 `tool_gc` 已有备份机制）；备份失败则整体中止、不做任何改动；
+- 删除原始源后清理 `processed_files` 行（此前同源重新加入会因 hash 相同被判定“已处理”，永不入库）。
+
+实测：删除 `raw/Annual.md` 时 `Source_AnnualReport.md` 保留、`Concept_Unrelated.md` 保留、`Source_Annual.md` 删除且已备份、`Concept_Multi.md` 移除引用、`processed_files` 1 → 0。
+
+### 6. 不可观测失败的修复
+
+| 缺陷 | 原状 | 现状 |
+|---|---|---|
+| `finalize_ingest` 异常吞噬 | 数据库/outbox/健康门故障与“载荷校验不通过”返回**同一种字符串**，工具调用上报成功 | 仅**调用方可修复的拒绝**（`ValueError` / `SafeWriteError` / `PurposeContractError` / `SchemaViolationException` / `DefenseHookException`）保留消息契约；**基础设施故障带堆栈抛出** |
+| outbox 唤醒信号 | 生产写 `<ext>/tmp/`、消费读 `%TEMP%/vector_lake_tmp/` → **永不一致的死信号** | 双方统一到 `<meta>/runtime/outbox_signal.lock`，实测信号被消费 |
+| 入库在途状态 | 放在系统临时目录（**跨知识库共享**）、以**内容 hash** 为键（同内容不同文件被静默丢弃）、**失败不释放**（源被阻塞 1 小时 TTL） | 移入 MEMORY 根 `<meta>/runtime/`、以**解析后的 filepath** 为键、原子写入、**入队失败即释放**（实测失败后重试可再次入队） |
+| 日记同步 | `Popen(stdout=DEVNULL, stderr=DEVNULL)`，失败**完全不可见** | 工作线程 `subprocess.run` + 超时；退出码/stderr 写入 `write_status(component="diary")`，成功时清回 `idle`（实测 exit=3 被记录） |
+| `assemble_context` | 用正则反向解析自己的格式化输出；`purpose` **无长度上限**，`budget_used` 可超 `budget_max` | 抽出 `_search_scored_pages()` 返回结构化结果，上下文直接消费；预算不变量 `budget_used <= budget_max` 在 200 与 20000 字符下均成立 |
+
+### 7. 回归守护网本身修复（让 F1 通过的那条规则）
+
+`tests/test_static_scope.py` 的 `_bound_in_scope` 把函数内**任意位置**的 import 记为**全函数可见**，因此**结构上看不见“绑定前引用”**——这正是 F1 的形态。新增 `use_before_local_import()`：对每个函数内 import 取**源码顺序中最早的绑定行**，任何更早的读取即判定为缺陷（嵌套函数/类/lambda 内的读取不计，因为它们可能晚于 import 执行）。对照实测：对修复前的 `tool_ingest.py` 报 3 处，修复后 0 处。
+
+### 8. 其它
+
+- 连接 PRAGMA 移入 `get_connection()`：`init_db` 按 db 路径记忆化，导致 `close_connection()` 之后的新连接（outbox 消费线程每轮回收连接）**静默失去 `foreign_keys` / `synchronous`**。当前全库无外键声明，属潜伏缺陷；实测已修（回收后 `fk=1 sync=1 journal=wal`）。
+- 删除 `wiki_utils` 中**重复定义**的 `SafeWriteError`，以及 `write_markdown_file` 里被自身 `except Exception: pass` 捕获、从未执行的死边界检查（真正生效的是末尾 `expected_path` 精确比较）。
+- `native_llm._task_root` 每进程创建 `brain/runtime-<pid>-<uuid>/` 且**无回收**（实测累积 50+ 个）：新增保守清理——**仅删除超过 7 天且不含任何文件**的 `runtime-*` 目录。
+- 仓库级 `ruff` 清理：未用 import / 重复定义 / 未用局部变量；`except Exception as e: pass` 改为带上下文的告警。
+
+### 9. 新增回归测试（+88 项）
+
+- `tests/test_static_scope.py`（+59）：绑定前引用检测，含“守护必须能在修复前的形态上失败”的自检。
+- `tests/test_governance_queue_concurrency.py`（4）：**确定性交错**证明未持锁保存会删掉对端条目；持锁并发 32 条零丢失；可重入。
+- `tests/test_canonical_change_sets.py`（7）：`create_change_set` 不再 `NameError`、`dry_run` 零落盘、引导只执行一次、裸文件名不作删除、真实删除仍生效、派生边双端删除。
+- `tests/test_runtime_coordination.py`（10）：信号路径一致、入库在途状态作用域与失败释放、同内容双源各自入队、级联删除精确匹配/恢复点/`processed_files` 清理、过期 runtime 目录清理。
+- `tests/test_context_assembly.py`（8）：上下文不再依赖格式化输出、预算不变量、检索降级可见、缺失索引上报。
+
+**回归基线：426 项测试全绿**（修复前 338 项）。`ruff check vector_lake scripts tests *.py --select F401,F811,F841,F821,F823,F541,E721` 全清。
 
 # Vector Lake 11.17.0
 
-- Added a repeatable local-only 12k+ corpus performance gate covering cold/warm index loads, serial and concurrent search, FTS fallback, exact-identity startup, throughput, errors, and RSS.
-- Made the generation-scoped exact-identity index single-flight so concurrent cold requests no longer repeat the full O(N) build and allocation.
-- Rate-limited repeated search-backend failure logs per backend while preserving degraded results and exposing the suppressed count in search telemetry.
-- Added deterministic exact recall for canonical keys, entity IDs, titles, and aliases ahead of fuzzy and vector ranking, including ambiguity-preserving alias results.
-- Added a read-only, versioned retrieval benchmark with dataset hashes and reproducible Precision, Recall, MRR, and nDCG metrics.
-- Added a stable Vector Lake-native Agent memory protocol plus an optional fail-closed eight-tool MCP surface; governed writes still flow through the existing operational-memory mutation contract.
-- Clarified that SQLite remains canonical, Markdown is a projection, and operational memory is a compiled Agent-facing read model rather than a second source of truth.
-- Removed search-reader dependence on the projection publisher lock while retaining sidecar, digest, identity, and canonical-generation validation.
-- Added an independent UTF-8 byte budget and failure-path timing telemetry for page search results.
-- Made query embeddings adaptive: strong FTS candidate sets bypass the remote provider, while sparse lexical recall retains hybrid vector search and operators can force always-vector behavior.
-- Removed schema DDL bootstrap from the interactive embedding hot path so its quota deadline remains bounded.
-- Added bounded daily storage-growth baselines for database/WAL bytes, Claim/Evidence version rows and payload bytes, and maintenance-backup bytes; Doctor now reports deltas and configurable growth warnings.
+## 依赖与算法变更：Leiden 取代 Louvain，新增 bm25s，抬高版本下限
 
-# Vector Lake 11.15.0
+### 1. `python-louvain` → `igraph>=0.11.0` + `leidenalg>=0.10.0`
 
-- Added independently durable orphan-GC receipts that bind the approved fingerprint to the verified backup manifest and mutation outbox IDs; Doctor now detects missing or incomplete recovery evidence.
-- Removed history-retention planning from orphan GC and rewrote active governance protection as one bounded queue scan, eliminating the correlated JSON scan from the GC hot path.
-- Split synchronous MCP execution into independent fast-read and heavy-task lanes, with per-lane admission, queue-wait, and execution metrics.
-- Added debounced post-projection topology refresh with a maximum staleness bound, target-side graph indexes, database-growth telemetry, and bounded search results with phase timings.
-- Hardened the standalone watchdog entrypoint so it loads paired runtime roots from `.mcp.json` before importing Vector Lake.
-- Made orphan-source debt explicitly P2 and added transactionally revalidated cleanup for removed or newly referenced sources, while protecting foreign, critical, and terminal governance records.
-- Upgraded ingest handoff to v5: generated `Source_*` names now satisfy the strict filename contract, legacy active jobs rebuild their canonical identity and task packet, and stale raw/Source/target baselines automatically invalidate the old lease and re-enter the rebuild path.
-- Added narrowly scoped mixed validation for ingest integration: new Source pages remain full-validated while updates to structurally valid legacy targets may use schema validation until purpose metadata is upgraded.
+- 社区检测改为 **Leiden**。Louvain 的 dendrogram 层级被 `resolution_parameter` 取代，因此两个层级由两次运行得出：L0(Global)=1.0、L1(Micro)=2.0（可用 `VECTOR_LAKE_LEIDEN_L0/L1_RESOLUTION` 调整）。
+- Leiden 是随机算法 → 新增固定种子 `VECTOR_LAKE_LEIDEN_SEED`（默认 42），否则每次聚类结果都不同，社区页会反复孤儿化。
+- `nx.pagerank` 仍负责 `centrality_score`/`node_score`，**排序语义未变**；`networkx` 因此保留。
+- 实际消费者只有 `scripts/community_clustering_daemon.py`；`vector_lake/indexer.py` 里早已失效的 `networkx`/`community` 导入属于死代码，已删除。
+- 两者均提供 `cp39/cp38-abi3` wheel，无需编译器。
+
+**顺带修复的既有缺陷**：`System_Community_*` 页面的 frontmatter 缺少 `id` / `categories` / `updated`，导致 `execute_mutation_batch` 必定抛 `DefenseHookException`——即聚类守护进程自 V11.10 统一突变协调器之后从未真正成功过（图永远保持 dirty）。已补齐模板并通过 `validate_schema` 实测。
+
+### 2. 新增 `bm25s>=0.2.0`：Phase-2 同池重排
+
+`tool_search._rerank_candidates_locally` 此前是空桩（永不重排）。现已用 bm25s 实现：
+
+- **候选集成员不变**，只改变池内顺序 → 召回不受影响。
+- 分词经项目自身的 `tokenizer`（bm25s 默认 `\w\w+` 无法切中文）。
+- 分数为池内 min-max 归一化（**非绝对相关度**）；`VECTOR_LAKE_RERANK_WEIGHT=0` 可完全恢复旧排序，异常时 fail-open 保持原顺序。
+- 保留 40% 上游权重是刻意设计：图扩展候选本就无词汇重叠，否则会被压到底部。
+
+**行为变化提醒**：检索结果的 `score` 显示由无界 BM25 量级变为 `[0,1]` 池内归一化值，格式化精度由 `.1f` 改为 `.3f`。
+
+### 3. 版本下限抬高（均已实际安装与验证）
+
+| 依赖 | 新下限 | 核验方式 |
+|---|---|---|
+| `filelock` | `>=3.15` | 已装 3.29.0，使用的 API 长期稳定 |
+| `networkx` | `>=3.2` | 已装 3.6.1 |
+| `PyYAML` | `>=6.0.1` | 已装 6.0.3 |
+| `google-genai` | `>=2.0.0` | **下载 2.0.0 wheel 核实**：`UserContent`/`Part.from_text`/`HttpOptions`/`EmbedContentConfig.output_dimensionality` 均存在 |
+| `sqlite-vec` | `>=0.1.3` | **隔离 venv 实跑 0.1.3**：`vec0(TEXT PRIMARY KEY, float[3072])` + `MATCH`+`ORDER BY`+`LIMIT` 全部通过 |
+| `mistune` | **`>=3.0.1`**（偏离字面值） | **二分实测**：3.0.0 的 `create_markdown(renderer='ast')` 抛 `TypeError: 'str' object is not callable`，3.0.1 起正常。写 `>=3.0` 会是一个虚假下限 |
+
+注：`igraph>=0.11.0` 的下限版本 0.11.0 并未发布（0.11.2 起才有 abi3 wheel），但作为约束合法，pip 会解析到最新版。
+
+### 4. `doctor` 新增 `Clustering Backend` 行
+
+显示实际生效的 `leidenalg`/`igraph` 版本，避免算法替换后无法确认运行时状态。
+
+### 5. 新增回归守护
+
+- `tests/test_clustering_leiden.py`（9 项）：群落恢复、分辨率单调性、种子可复现、空图/自环/缺权重健壮性、模板 schema 合规。
+- `tests/test_rerank_bm25s.py`（13 项）：成员不变、词汇相关项上升、权重 0 可复现旧序、bm25s 缺失/抛错 fail-open、分数区间、端到端渲染。
+- `tests/test_dependency_manifest.py`（23 项）：依赖下限、`python-louvain` 彻底移除（含运行时代码扫描）、`mistune>=3.0.1` 不得回退。
+
+回归基线：**338 项测试全绿**。
+
+# Vector Lake 11.16.0
+
+## 分词后端换为 `rjieba`（jieba-rs / Rust）
+
+- 新增必需依赖 **`rjieba>=0.2.1`**（jieba-rs 的官方 PyO3 绑定，作者同 messense，MIT）。它提供 `cp38-abi3` wheel，本机实测直接命中 wheel、**无需任何编译器**（与上轮被否决的 `jieba-fast` 根本不同）。
+- 后端链改为 **`rjieba` → `jieba`**（后者保留为纯 Python 回退，且是唯一提供 `add_word()` 的后端）；`VECTOR_LAKE_TOKENIZER=jieba|rjieba` 可强制，强制不可用时告警并回退。
+- 移除上一轮的 `jieba_fast` 后端及其可选依赖文件 `requirements-accel.txt`（已放弃）。
+
+### 版本真相（**未达到要求的 0.11**）
+
+- `rjieba 0.2.1` 的 `Cargo.toml` 钉定 **`jieba-rs = "0.9.0"`**，即实际生效的 crate 是 **0.9.x**，**不是 0.11**。
+- `jieba-rs 0.11.0` 于 2026-09-16 发布，但**没有任何已发布的 Python 绑定**；本机无 `cargo`/`rustc`/`maturin`，无法从 sdist 自建，且自建产物无 wheel、对他人不可复现。
+- 该事实以 `tokenizer.JIEBA_RS_PINNED = "0.9.x"` 硬编码记录，并由 `backend_version()` 与 `doctor` 直接输出：`rjieba 0.2.1 (jieba-rs 0.9.x)`。待绑定跟进后同步版本号即可。
+
+### 能力缺口（已量化，不静默）
+
+- `rjieba` **不暴露 `add_word()` / `load_userdict()`**，因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下无效。已改为一次性 WARNING 明确报告，而非假装成功。
+- 影响有限：索引与查询使用同一分词器，两侧切分一致，检索仍可命中，仅这些术语的精确短语形态不同。
+
+### 实测收益与语义差异
+
+| 指标 | 纯 Python `jieba` | `rjieba` |
+|---|---|---|
+| 3210 字符单页分词 | 4.39 ms | **0.39 ms（11.3×）** |
+| 200 字符 | 0.33 ms | 0.02 ms（15.0×） |
+| 9630 字符 | 13.51 ms | 1.82 ms（7.4×） |
+| N=5000 冷启动全量重建 | 101.1 s | **71.6 s** |
+| N=5000 warm / 单节点变更重建 | 0.70 s / 0.68 s | 0.49 s / 0.50 s |
+
+词元一致性：66 段项目文档真实中文语料中 **62/66 段逐词完全一致**，全局词表 **Jaccard 0.9957**；差异集中在拉丁/数字边界（`utf-8` vs `utf`+`8`、`2018-12` vs `2018`+`12`），中文词几乎一致。
+
+### 附带发现
+
+冷重建从 101.1 s 降到 71.6 s（30%），远低于分词本身的 11× —— 说明瓶颈已转移。对 warm 重建做 `cProfile`：`json.dump` 序列化 `index.json` + `claim_graph.json` 占 **~50%**，`load_entities`/`build_claim_graph_projection`/`fetchall` 合计约 20%，分词已不再是热点。
+
+# Vector Lake 11.15.0（已被 11.16.0 取代，保留为决策记录）
+
+> 本节记录的是**被否决**的 `jieba-fast` 方案及其证据，不是当前状态。当前后端见 11.16.0。
+
+## 分词后端改为可插拔（默认仍为 `jieba`）
+
+**未将 `jieba-fast` 写入必需依赖**，原因是它在当前约束下无法安全落地（逐条为实测/核验结果）：
+
+- PyPI 只发布 sdist（`jieba_fast-0.53`，上传于 2018-12-20），**0 个 wheel**，无任何平台预编译。
+- 安装需 C++ 工具链；本机无 `cl.exe` 也无 VS 安装目录，`pip install jieba-fast` 实测失败：`error: Microsoft Visual C++ 14.0 or greater is required`。
+- `setup.py` 仍为 `from distutils.core import setup`（`distutils` 已在 Python 3.12 从标准库移除）；其分类器只声明到 Python 3.7。
+- 模块名是 `jieba_fast` 而非 `jieba`（包内 `__version__ = '0.39'`），与项目钉定的 `jieba 0.42.1` 分词结果不同。
+- **若列为必需依赖**：无编译器的机器（绝大多数）安装即失败，而自带 MSVC 的 CI 反而通过——这是最危险的组合。
+
+交付的形态：
+
+- 新增 `vector_lake/tokenizer.py` 作为唯一分词入口：优先 `jieba_fast`，否则回退 `jieba`；`VECTOR_LAKE_TOKENIZER=jieba|jieba_fast` 可强制，强制后端不可用时**只告警并回退**，不会禁用分词。
+- 4 处直接 `import jieba` 全部改为经该入口（另有测试禁止再次直连）。
+- `requirements.txt` 改为钉定 `jieba>=0.42.1`；新增可选 `requirements-accel.txt`（仅在有编译器的机器安装）。
+- `doctor` 新增 `Tokenizer Backend` 行，显示实际生效的后端与版本。
+- **搜索索引的内容哈希纳入后端身份**：切换后端会触发重新分词，避免同一 FTS 索引里混用两套分词结果。
+
+热点定位（说明加速器的收益上限）：对 3210 字符正文做 `cProfile`，`get_DAG` + `calc`（即 `jieba-fast` 用 C 替换的 `_get_DAG_and_calc`）占总耗时的 **~65%**，HMM `viterbi` 只占 ~8%；纯 Python 基线实测 **5.1 ms/页**。
 
 # Vector Lake 11.14.0
 
-- Moved durable subagent task packets and ephemeral query scratch out of versioned plugin directories, and removed unrelated cross-connection writes from the canonical identity validation cache key.
-- Reconciled terminal ingest debt against the effective normalized raw revision, blocked ambiguous owner sets, and revalidated owner uniqueness inside the apply transaction.
-- Upgraded the SQLite migration contract to `PRAGMA user_version = 4`, adding a durable ingest task-packet cleanup ledger with schema and backup inspection coverage.
-- Hardened ingest contract v4 across `sync -> worker -> claim -> finalize`: legacy jobs are migrated or retired, candidate manifests are bound outside prompt text, task packets are path/shape/content checked and lease-repaired, and finalization revalidates raw, canonical, projection, disposition, and fencing state.
-- Added bounded MCP blocking execution with configurable workers, queue capacity, admission timeout, shutdown drain, runtime status, and fail-closed source-revision detection.
-- Added preview-first, fingerprint-confirmed backup retention with verified restore-point protection; orphan-page GC now requires an exact current candidate fingerprint before deletion.
-- Hardened raw candidate scoping, case-insensitive component exclusions, `privacy/Diary` traversal blocking, watcher subscription refresh, per-root retry backoff, and bounded ingest-debt progress.
-- Aligned README operator guidance with the current type/Synthesis schema, `/sync` surface, ingest v4 handoff, real environment keys, maintenance confirmation rules, module map, validation command, and Doctor/readiness output semantics.
-- Added read-only-preview ingest-job debt reconciliation with backups, lease-fenced CAS updates, replayable verified task-packet cleanup, missing-raw retirement, processed-job closure, current-hash requeue, and duplicate-current-identity supersession.
-- Replaced placeholder graph analysis with bounded topology computation, deterministic communities, a global degree cap, and dirty-graph retrieval isolation.
-- Added cascade tombstones for operational memory, Claim/Evidence versions, and entity identities when canonical pages are deleted.
-- Added preview-first cleanup for generated memory artifacts and obsolete indexer community-naming work, preserving mixed-content and decision-scoped records.
-- Decoupled change-set retention from orphan-page deletion, paired idempotency cleanup, hourly stale-ingest expiry, and observable watchdog-status failures.
-- Added global evidence-foundation coverage to semantic readiness and SHA-256-pinned CriticalDecisionRegistry import receipts.
-- Added verified SourceArtifact byte hashes, raw-source locators, deterministic ExtractionRun records, and explicit lineage/independence flags; missing sources now remain `unverified` instead of receiving placeholder hashes.
-- Added append-only Claim/Evidence version tables and an entity-identity registry; rename operations persist the old entity ID in frontmatter.
-- Added append-only ClaimAssessment, immutable schema/dialect registration, quality-evaluation runs, and EvidencePacket 1.1 export authorization for evidence text.
-- Critical-decision references now require an active registry record accepted by a caller-provided verifier before automatic P0 ranking, and semantic readiness can be evaluated for one mapped decision scope.
-- Corrected Timeline documentation: it is a governed, rebuildable knowledge projection, not a CBSS business Event Store.
-- Added a read-only CBSS `EvidencePacket` export over canonical Claim/Evidence/Source records; evidence text remains opt-in and bounded.
-- Split infrastructure health from semantic readiness so governance debt and claim validity are visible without changing the write gate.
-- Added explicit governance priority and `critical_decision_refs` ordering, including read-time normalization for legacy queue rows.
-- Added CBSS boundary contracts for claim acceptance, critical-decision registry, business events, and semantic readiness.
-- Reduced deep projection-check cost by deriving canonical versions from entity-only page extraction instead of rebuilding all claim and evidence records.
-- Removed stale authority-source, module-map, fixed-test-count, and fixed-runtime-count claims from operator documentation.
+本轮为审计驱动的缺陷修复，未引入新功能。回归基线：**156 项测试全绿**（原基线 110 项已过期，且修复前存在 1 项失败）。
+
+## 数据安全 (P0)
+- **GC 不再按文件时间删除数据**。`save_graph_edges` 曾把 claim 边原样复制进 `page_graph_edges`，而 GC 以 `page_key` 为键计算度数，导致所有页面度数恒为 0，退化为“按 mtime 删除”。现在 `page_graph_edges` 由图索引器独占写入（page-key 空间），孤儿判定改用 canonical 拓扑连通度（`links` / 共享来源 / claim 共现），并新增 50% 批量删除断路器与 `--force` 显式覆盖。
+- `gc` / `delete` 的 CLI 默认改为 dry-run，需 `--apply` 才落盘，与其余维护命令一致。
+- `change_sets` 清理前先轮转 JSONL 备份；备份失败则跳过删除。
+
+## 写入可用性 (P0)
+- **写健康门不再阻断自己的修复通道**。投影漂移、watchdog 心跳过期、outbox 未及时消费改判为“可修复降级”，只告警不阻断；仅硬故障（数据库不可用、outbox hard-failed 行、outbox 积压超过高水位）才阻断写入。
+- **人工编辑回路恢复**。`watchdog_app.index_worker_loop` 的 legacy 分支引用了四个未导入的名字（`transaction` / `sync_pages_to_canonical` / `_utc_now` / `get_connection`），任何手工编辑 `wiki/*.md` 都会抛 `NameError` 并静默丢失。该分支已收敛为统一走 `execute_mutation_plan`，失败时保留原文并记录原因。
+- `atomic_write_text` 不再吞掉非 `DefenseHookException` 的校验异常。
+- `watchdog_status` 写盘失败不再静默；`existing_embedding_ids` 不再把读取失败伪装成“全部缺失”。
+
+## 并发与一致性 (P0)
+- `generate_index` 现在持有与增量更新相同的 `index.json.lock`，不再静默覆盖并发写入（旧行为会丢弃这期间所有已标记完成的 outbox 变更）。
+- 全量重建不再把整段分词放进单个 `BEGIN IMMEDIATE`：改为逐节点短事务，并对内容哈希未变的节点跳过分词。5000 节点实测：冷重建 140s → 101s，无变更重建 140s → **0.70s**。
+- `refresh_graph_topology_if_dirty` 在释放索引锁与事务之后才触发全量重建。
+
+## 效率
+- `index.json` 不再重复保存正文（`raw_text`）：3000 节点实测 8786 KB → **2011 KB**。
+- 写健康门的目录扫描按目录时间戳缓存：3000 节点实测 287 ms → **29 ms**（常驻进程中）。
+- `upsert_search_index` 不再二次分词（此前每节点 jieba 运行两次）。
+- 移除死代码：`_VECTOR_CACHE`、`generate_index` 中未使用的 `load_entities`/`load_claims`、`search_vector_lake` 中未使用的全量节点拷贝。
+
+## 检索正确性
+- 图扩展与重排不再绕过调用方过滤条件（此前 `domain=` 会返回其他 domain 的页面）。
+- PPR 为非种子节点恢复 teleportation 质量，不再在两次迭代后退化为“与种子相邻”。
+- 向量不可用时 `search` 输出 `[DEGRADED]` 横幅，标明降级原因；不再静默返回 BM25-only 结果。
+- 嵌入单条文本增加 token 上限钳制（中文约 1 token/字符，原 15k 字符上限可能超出模型窗口）。
+
+## 中文语料
+- `_normalized_name` 不再把所有中文实体归一化为空串。修复前 10 个无关中文实体产出 45/45 假合并候选，现在为 0；真实重复仍可检出；全角/半角与空白变体归并。
+
+## 运维与可移植性
+- `wiki-restore` 经协调器原子写入，并在输出中提示后续所需的索引重建。
+- `config.json` 不再携带个人绝对路径；`target_directories` 留空即回落到 `<MEMORY>/raw`。
+- `watchdog_app` 的 Diary / raw 监听目录改用活动 MEMORY 根；`check_jobs.py`、`reset_jobs.py`、`scripts/launch_janitor_swarm.py` 去除硬编码路径与未定义名字（后者此前必然 `NameError`）。
+- 补齐 `commands/query.toml` 与 `commands/timeline.toml`；`requirements.lock.txt` 改为直接依赖的诚实钉版（原文件是含 `akshare`/`azure`/`bcrypt` 的环境快照）。
+- `doctor` 不再对 `GEMINI_API_KEY` / Subagent Text Runtime 恒报 OK，并区分硬故障与降级。
 
 # Vector Lake 11.13.0
 

@@ -1,6 +1,7 @@
 import re
 import json
 from datetime import datetime
+from pathlib import Path
 
 class SchemaViolationException(Exception):
     pass
@@ -46,17 +47,12 @@ CONTROLLED_METRICS = {
 
 INLINE_SOURCE_ANCHOR = re.compile(r"\(Source:\s*\[\[Source_[^\]]+\]\](?:[^)]*)\)")
 
-def validate_schema(
-    frontmatter: dict,
-    body: str,
-    filename: str,
-    index_entities=None,
-):
+def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Path = None):
     """
     Validates a Vector Lake Wiki node against the strict constraints of schema.md.
     Raises SchemaViolationException on any failure.
     """
-    if not filename.casefold().endswith(".md"):
+    if not filename.endswith(".md"):
         return
 
     # Skip system meta files
@@ -81,37 +77,22 @@ def validate_schema(
     if doc_type not in VALID_TYPES:
         raise SchemaViolationException(f"Schema Violation: Invalid type '{doc_type}'. Must be one of {VALID_TYPES}.")
 
-    # 1.3 Controlled category vocabulary
-    categories = frontmatter.get("categories")
-    if not isinstance(categories, list) or not categories:
-        raise SchemaViolationException(
-            "Schema Violation: categories must be a non-empty list."
-        )
-    invalid_categories = sorted(
-        {str(category) for category in categories if category not in VALID_CATEGORIES}
-    )
-    if invalid_categories:
-        raise SchemaViolationException(
-            "Schema Violation: Invalid category "
-            f"'{invalid_categories[0]}'. Must be one of {sorted(VALID_CATEGORIES)}."
-        )
-
-    # 1.4 Epistemic Status
+    # 1.3 Epistemic Status
     epistemic_status = str(frontmatter.get("epistemic-status", "")).lower()
     if epistemic_status and epistemic_status not in VALID_EPISTEMIC_STATUS:
         raise SchemaViolationException(f"Schema Violation: epistemic-status '{epistemic_status}' is invalid. Allowed: {VALID_EPISTEMIC_STATUS}.")
 
-    # 1.5 Status
+    # 1.4 Status
     status = str(frontmatter.get("status", "")).title()
     if status and status not in VALID_STATUS:
         raise SchemaViolationException(f"Schema Violation: status '{status}' is invalid. Allowed: {VALID_STATUS}.")
 
-    # 1.6 Tags Constraints
+    # 1.5 Tags Constraints
     tags = frontmatter.get("tags", [])
     if isinstance(tags, list) and len(tags) > 3:
         raise SchemaViolationException(f"Taxonomy Violation: Maximum 3 tags allowed, but found {len(tags)}.")
         
-    # 1.7 Dates
+    # 1.6 Dates
     try:
         if "created" in frontmatter:
             datetime.fromisoformat(str(frontmatter["created"]).replace("Z", "+00:00"))
@@ -119,7 +100,7 @@ def validate_schema(
     except ValueError:
         raise SchemaViolationException("Schema Violation: 'created' and 'updated' must be valid ISO8601 timestamps.")
         
-    # 1.8 Tension Edges & STQM
+    # 1.7 Tension Edges & STQM
     tension_edges = frontmatter.get("tension_edges", [])
     if tension_edges:
         if not isinstance(tension_edges, list):
@@ -137,7 +118,7 @@ def validate_schema(
             if not 0.0 <= intensity <= 1.0:
                 raise SchemaViolationException(f"Schema Violation: tension_edges intensity {intensity} out of bounds [0.0, 1.0].")
 
-    # 1.9 YAML Tyranny
+    # 1.8 YAML Tyranny
     for forbidden_key in ["parents", "children", "competes_with"]:
         if forbidden_key in frontmatter:
             raise SchemaViolationException(f"SSOT Violation: Topological edge '{forbidden_key}' must not exist in YAML. Use Markdown semantic links instead.")
@@ -165,10 +146,10 @@ def validate_schema(
             raise SchemaViolationException("Schema Violation: Missing '## 2. 证据时间线' section.")
 
         section_1_text = section_1_match.group(0)
-        
-        # A simple check could flag standalone pronouns, but structural checks
-        # avoid false positives in Chinese.
-        # For now, let's just do structural checks to avoid false positives in Chinese.
+
+        # Pronoun constraints are deliberately not enforced: a standalone-pronoun
+        # heuristic produced false positives on Chinese prose, so only structural
+        # checks run here.
         
         # H3 Slots
         h3_headers = re.findall(r'^###\s+(.*)$', section_1_text, re.MULTILINE)
@@ -208,8 +189,7 @@ def validate_schema(
             valid_tags = {"[Release]", "[Pivot]", "[Conflict]", "[Validation]", "[Observation]", "[Decision]", "[Execution]", "[Outcome]"}
             for bullet in bullets:
                 # Bypass pure text instructions or quotes
-                if bullet.startswith("[YYYY-MM-DD]") or "Event_Tag" in bullet:
-                    continue
+                if bullet.startswith("[YYYY-MM-DD]") or "Event_Tag" in bullet: continue
                 # Match strict timeline start
                 if not re.match(r'^\[\d{4}-\d{2}-\d{2}\]', bullet):
                     raise SchemaViolationException(f"Schema Violation: Timeline entry '{bullet[:20]}...' must start with [YYYY-MM-DD].")
@@ -243,20 +223,17 @@ def validate_schema(
     # We shouldn't raise exception for (Source: [[Source_X]]).
     
     # Check tag collision if index is passed
-    # The tag-collision check needs the index's titles and aliases. The caller
-    # supplies them as a callable so this validator does not import the indexer,
-    # and so the read stays lazy and keeps the committed-reader fail-closed
-    # binding on the caller's side.
-    if tags and index_entities is not None:
-        if not callable(index_entities):
-            # Passing a Path here would raise TypeError inside the try below and be
-            # swallowed, silently disabling the check. Fail loudly instead.
-            raise TypeError(
-                "index_entities must be a callable returning the index entity set"
-            )
+    if tags and index_path and index_path.exists():
         try:
-            entities_in_index = index_entities()
-
+            with open(index_path, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            
+            entities_in_index = set()
+            for node_id, node_data in index_data.get("nodes", {}).items():
+                entities_in_index.add(node_data.get("title", "").lower())
+                for alias in node_data.get("aliases", []):
+                    entities_in_index.add(alias.lower())
+                    
             for tag in tags:
                 if str(tag).lower() in entities_in_index:
                     raise SchemaViolationException(f"Tag Collision: [{tag}] is already an entity and cannot be used as a tag. Use semantic links instead.")

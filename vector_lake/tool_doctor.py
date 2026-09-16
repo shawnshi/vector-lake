@@ -1,5 +1,4 @@
-import importlib.util
-import sqlite3
+import importlib
 import os
 import sys
 import ast
@@ -7,30 +6,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vector_lake.wiki_utils import (
-    get_index_path,
-    get_memory_dir,
-    get_raw_dir,
-    get_wiki_dir,
-    iter_markdown_files,
-    peek_meta_dir,
-)
-from vector_lake.db_store import inspect_schema_migration_state, peek_db_path
-from vector_lake import db_store, get_extension_root
+from vector_lake.wiki_utils import get_index_path, get_memory_dir, get_raw_dir, get_wiki_dir, get_meta_dir
+from vector_lake.db_store import get_db_path, get_connection
+from vector_lake import get_extension_root
 from vector_lake.native_llm import native_llm_ready
-from vector_lake.runtime_health import (
-    _auto_ingest_health_config,
-    _open_runtime_database_read_only,
-    _watchdog_component_health,
-    assess_runtime_health,
-    assess_semantic_readiness,
-    get_semantic_readiness_assessment,
-)
-
-
-def _dependency_available(module_name: str) -> bool:
-    """Check installation without executing dependency import side effects."""
-    return importlib.util.find_spec(module_name) is not None
+from vector_lake.runtime_health import assess_runtime_health
 
 def _check_ast(module_path: Path) -> tuple[bool, str]:
     if not module_path.exists():
@@ -44,253 +24,9 @@ def _check_ast(module_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Error: {e}"
 
-
-def _doctor_watchdog_status(
-    status: dict,
-    *,
-    now_utc: datetime,
-    component_max_age: int,
-    auto_ingest_enabled: bool,
-) -> tuple[bool | None, str]:
-    """Render the shared required-versus-optional worker policy."""
-    updated_at = status.get("updated_at")
-    updated_dt = (
-        datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
-        if updated_at
-        else None
-    )
-    if updated_dt is not None and updated_dt.tzinfo is None:
-        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
-    age_seconds = (
-        max(0, int((now_utc - updated_dt).total_seconds()))
-        if updated_dt is not None
-        else None
-    )
-    health = _watchdog_component_health(
-        status,
-        now_utc=now_utc,
-        component_max_age=component_max_age,
-        auto_ingest_enabled=auto_ingest_enabled,
-    )
-    unhealthy_required = health["unhealthy_required_components"]
-    unhealthy_optional = health["unhealthy_optional_components"]
-    blocked_required = health["blocked_required_components"]
-    stale_required = health["stale_required_components"]
-    stale_optional = health["stale_optional_components"]
-    paused_components = health["paused_components"]
-    blocking = bool(
-        age_seconds is None
-        or age_seconds > 120
-        or health["aggregate_requires_block"]
-        or unhealthy_required
-        or stale_required
-        or health["missing_components_blocking"]
-    )
-    degraded = bool(
-        unhealthy_optional
-        or blocked_required
-        or stale_optional
-        or paused_components
-        or health["missing_components"]
-    )
-    result = False if blocking else (None if degraded else True)
-    all_unhealthy = sorted(unhealthy_required + unhealthy_optional)
-    all_stale = sorted(stale_required + stale_optional)
-    detail = (
-        f"[{status.get('status', 'unknown')}] "
-        f"{status.get('current_action', '')}; "
-        f"age={age_seconds if age_seconds is not None else 'unknown'}s; "
-        f"unhealthy={','.join(all_unhealthy) or 'none'}; "
-        f"blocked={','.join(blocked_required) or 'none'}; "
-        f"optional_unhealthy={','.join(unhealthy_optional) or 'none'}; "
-        f"stale={','.join(all_stale) or 'none'}; "
-        f"optional_stale={','.join(stale_optional) or 'none'}; "
-        f"paused={','.join(sorted(paused_components)) or 'none'}; "
-        f"missing={','.join(health['missing_components']) or 'none'}"
-    )
-    return result, detail
-
-
-def _read_database_state_from_connection(conn: sqlite3.Connection) -> dict:
-    """Read Doctor counters from a caller-owned query-only connection."""
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    canonical_keys = {
-        row["page_key"]
-        for row in conn.execute(
-            "SELECT json_extract(data_json, '$.page_key') AS page_key "
-            "FROM entities WHERE json_extract(data_json, '$.page_key') "
-            "IS NOT NULL"
-        )
-        if not str(row["page_key"]).startswith("System_")
-    }
-    outbox_counts = {
-        row["status"]: row["count"]
-        for row in conn.execute(
-            "SELECT status, COUNT(*) AS count FROM mutation_outbox "
-            "GROUP BY status"
-        )
-    }
-    terminal_jobs = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
-    ).fetchone()[0]
-    queued_jobs = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE status = 'queued'"
-    ).fetchone()[0]
-    awaiting_jobs = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'"
-    ).fetchone()[0]
-    return {
-        "canonical_keys": canonical_keys,
-        "outbox_counts": outbox_counts,
-        "terminal_jobs": terminal_jobs,
-        "queued_jobs": queued_jobs,
-        "awaiting_jobs": awaiting_jobs,
-    }
-
-
-def _read_database_state(db_path: Path) -> dict:
-    """Read Doctor counters without creating, migrating, or retaining a connection."""
-    with db_store.read_only_transaction_snapshot(db_path.resolve()) as conn:
-        return _read_database_state_from_connection(conn)
-
-
-def _schema_readiness_reasons(schema_state: dict) -> list[str]:
-    """Explain a non-ready schema even when a valid older ledger is migratable."""
-    reasons = [str(item) for item in (schema_state.get("issues") or []) if item]
-    user_version = schema_state.get("user_version")
-    supported_version = schema_state.get("supported_version")
-    if user_version is not None and supported_version is not None:
-        current = int(user_version)
-        supported = int(supported_version)
-        if current < supported:
-            reasons.append(f"database_schema_upgrade_required:{current}->{supported}")
-        elif current > supported:
-            reasons.append(f"database_schema_newer_than_runtime:{current}>{supported}")
-    if not schema_state.get("ready") and not reasons:
-        reasons.append(f"database_schema_not_ready:{schema_state.get('status', 'unknown')}")
-    return list(dict.fromkeys(reasons))
-
-
-def _diagnostic_snapshot_failure_report(reason: str) -> str:
-    from vector_lake.diagnostic_snapshot import current_durability_status
-
-    durability = current_durability_status()
-    durability_state = (
-        "OK"
-        if durability["profile"] == "full"
-        else ("WARN" if durability["profile"] == "best_effort" else "FAIL")
-    )
-    return "\n".join(
-        [
-            "=== Vector Lake Doctor ===",
-            f"[FAIL] Diagnostic Snapshot: {reason}",
-            f"[{durability_state}] Durability: profile={durability['profile']}",
-            "",
-            "Infrastructure Summary: issues detected",
-            "Semantic Readiness: not_ready",
-            f"Semantic issues: diagnostic_snapshot_failed:{reason}",
-            "Summary: infrastructure issues detected; semantic readiness not_ready",
-        ]
-    )
-
-
-def quick_doctor_vector_lake() -> str:
-    """Return bounded infrastructure health without deep projection comparison."""
-    health = assess_runtime_health(
-        deep_projection_checks=False,
-        bounded_memory_checks=True,
-    )
-    payload = {
-        "schema_version": 1,
-        "mode": "quick",
-        "ok": bool(health.get("ok")),
-        "paths": {
-            "memory": str(get_memory_dir()),
-            "raw": str(get_raw_dir()),
-            "wiki": str(get_wiki_dir()),
-            "meta": str(peek_meta_dir()),
-            "database": str(peek_db_path()),
-            "index": str(get_index_path()),
-        },
-        "infrastructure": health,
-        "semantic_readiness": {
-            "status": "not_checked",
-            "reason": "requires_deep_doctor",
-        },
-        "next_action": "Call doctor_vector_lake(mode='deep') for projection and semantic checks.",
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-
-
-def doctor_vector_lake(diagnostic_snapshot=None) -> str:
-    """Run deep Doctor against one shared diagnostic snapshot when available."""
-    if diagnostic_snapshot is not None:
-        return _doctor_vector_lake(diagnostic_snapshot=diagnostic_snapshot)
-
-    from vector_lake.diagnostic_snapshot import (
-        DiagnosticSnapshotChanged,
-        DiagnosticSnapshotUnavailable,
-        capture_diagnostic_snapshot,
-    )
-
-    try:
-        with capture_diagnostic_snapshot(timeout=5.0) as snapshot:
-            return _doctor_vector_lake(diagnostic_snapshot=snapshot)
-    except DiagnosticSnapshotChanged:
-        return _diagnostic_snapshot_failure_report("snapshot_changed")
-    except DiagnosticSnapshotUnavailable as exc:
-        reason = str(exc) or "diagnostic_snapshot_unavailable"
-        if reason != "database_missing":
-            return _diagnostic_snapshot_failure_report(reason)
-        return _doctor_vector_lake(snapshot_error=reason)
-
-
-def _doctor_vector_lake(
-    *,
-    diagnostic_snapshot=None,
-    snapshot_error: str | None = None,
-) -> str:
+def doctor_vector_lake() -> str:
     checks = []
-    semantic_readiness = {
-        "ready": False,
-        "status": "not_ready",
-        "issues": ["semantic_readiness_not_assessed"],
-        "warnings": [],
-        "detail": {},
-    }
-
-    if diagnostic_snapshot is not None:
-        snapshot_metadata = diagnostic_snapshot.metadata()
-        checks.append((
-            "Diagnostic Snapshot",
-            True,
-            (
-                f"captured_at={snapshot_metadata['captured_at']}; "
-                f"generation_fingerprint={snapshot_metadata['generation_fingerprint']}; "
-                f"source_fingerprint={snapshot_metadata['source_fingerprint']}"
-            ),
-        ))
-        durability = diagnostic_snapshot.durability
-    else:
-        from vector_lake.diagnostic_snapshot import current_durability_status
-
-        checks.append((
-            "Diagnostic Snapshot",
-            False,
-            snapshot_error or "diagnostic_snapshot_unavailable",
-        ))
-        durability = current_durability_status()
-    durability_ok = (
-        True
-        if durability["profile"] == "full"
-        else (None if durability["profile"] == "best_effort" else False)
-    )
-    checks.append((
-        "Durability",
-        durability_ok,
-        f"profile={durability['profile']}",
-    ))
+    warnings: list[str] = []
 
     # 1. Environment & Config
     python_ok = sys.version_info >= (3, 10)
@@ -298,13 +34,9 @@ def _doctor_vector_lake(
 
     has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
     checks.append((
-        "Gemini Embedding",
-        True if has_api_key else None,
-        (
-            "GEMINI_API_KEY is available"
-            if has_api_key
-            else "Unavailable: GEMINI_API_KEY is not inherited by this process"
-        ),
+        "GEMINI_API_KEY",
+        has_api_key,
+        "Set" if has_api_key else "Not set - vector/hybrid search degrades to BM25-only",
     ))
 
     # 2. Dependencies
@@ -314,112 +46,66 @@ def _doctor_vector_lake(
         "yaml": "PyYAML",
         "watchdog": "watchdog",
         "networkx": "networkx",
-        "community": "python-louvain",
+        "igraph": "igraph",
+        "leidenalg": "leidenalg",
+        "bm25s": "bm25s",
         "dotenv": "python-dotenv",
         "mcp": "mcp",
         "sqlite_vec": "sqlite-vec",
-        "rjieba": "rjieba",
+        "jieba": "jieba",
         "mistune": "mistune"
     }
     for module_name, package_name in dependencies.items():
         try:
-            if not _dependency_available(module_name):
-                raise ImportError(module_name)
-            checks.append(
-                (package_name, True, "discoverable; runtime import deferred")
-            )
+            importlib.import_module(module_name)
+            checks.append((package_name, True, "installed"))
         except ImportError:
             checks.append((package_name, False, "missing"))
-            
+
+    from vector_lake import tokenizer as _tokenizer
+
+    tokenizer_backend = _tokenizer.backend_name()
+    if tokenizer_backend == "unavailable":
+        checks.append((
+            "Tokenizer Backend",
+            False,
+            "no CJK tokenizer available; FTS pre-tokenization is disabled",
+        ))
+    else:
+        detail = _tokenizer.backend_version()
+        if not _tokenizer.supports_add_word():
+            detail += "; no add_word() on this backend (custom dictionary terms ignored)"
+        checks.append(("Tokenizer Backend", True, detail))
+
+    # Community detection: Leiden via igraph + leidenalg (was Louvain).
+    try:
+        import igraph as _ig
+        import leidenalg as _leiden
+
+        checks.append((
+            "Clustering Backend",
+            True,
+            f"leidenalg {getattr(_leiden, '__version__', '?')} (igraph {getattr(_ig, '__version__', '?')})",
+        ))
+    except ImportError as exc:
+        checks.append(("Clustering Backend", False, f"leidenalg/igraph missing: {exc}"))
+
     llm_ok, llm_detail = native_llm_ready()
-    checks.append(("Subagent Text Runtime", True if llm_ok else None, llm_detail))
+    if not llm_ok:
+        # Text generation is delegated to the host agent by design, so this is an
+        # expected operating mode rather than a failure.
+        warnings.append(f"Subagent Text Runtime: {llm_detail}")
+    else:
+        checks.append(("Subagent Text Runtime", True, llm_detail or "available"))
 
     # 3. Paths & Basic Files
-    meta_path = peek_meta_dir()
-    db_path = peek_db_path()
-    schema_state = (
-        db_store.inspect_schema_migration_connection(
-            diagnostic_snapshot.connection,
-            diagnostic_snapshot.db_path,
-        )
-        if diagnostic_snapshot is not None
-        else inspect_schema_migration_state(db_path)
-    )
-    schema_reasons = _schema_readiness_reasons(schema_state)
     for label, path in [("MEMORY", get_memory_dir()), ("Raw", get_raw_dir()), ("Wiki", get_wiki_dir())]:
         checks.append((label, path.exists(), str(path)))
 
     index_exists = get_index_path().exists()
     checks.append(("Index", index_exists, str(get_index_path()) if index_exists else "Lake is drying (Empty)"))
-    for label, path in [("Meta", meta_path), ("SQLite DB", db_path)]:
+    for label, path in [("Meta", get_meta_dir()), ("SQLite DB", get_db_path())]:
         checks.append((label, path.exists(), str(path)))
-    migration_detail = (
-        f"user_version={schema_state['user_version']}; "
-        f"supported={schema_state['supported_version']}; "
-        f"ledger_entries={len(schema_state['ledger'])}"
-    )
-    if schema_reasons:
-        migration_detail += "; " + "; ".join(schema_reasons)
-    checks.append((
-        "Schema Migrations",
-        bool(schema_state["ready"]),
-        migration_detail,
-    ))
-
-    committed_index_data = None
-    projection_connection = None
-    if index_exists and schema_state["ready"]:
-        if diagnostic_snapshot is not None:
-            committed_index_data = diagnostic_snapshot.index_data
-            projection_ok = (
-                diagnostic_snapshot.projection_status == "committed_current"
-            )
-            checks.append((
-                "Projection Pair",
-                projection_ok,
-                (
-                    "committed generation="
-                    + str(diagnostic_snapshot.projection_generation or "unknown")
-                    if projection_ok
-                    else "not committed/current: "
-                    + (
-                        diagnostic_snapshot.projection_error
-                        or "diagnostic_projection_unavailable"
-                    )
-                ),
-            ))
-            if not projection_ok:
-                committed_index_data = None
-        else:
-            try:
-                from vector_lake.indexer import read_committed_index_snapshot
-
-                projection_connection, _projection_db_path = (
-                    _open_runtime_database_read_only()
-                )
-                committed_index_data = read_committed_index_snapshot(
-                    get_index_path(),
-                    lock_timeout=1.0,
-                    connection=projection_connection,
-                    _acquire_lock=False,
-                )
-                projection_manifest = committed_index_data.get(
-                    "projection_manifest"
-                ) or {}
-                checks.append((
-                    "Projection Pair",
-                    True,
-                    "committed generation="
-                    + str(projection_manifest.get("generation") or "unknown"),
-                ))
-            except Exception as exc:
-                checks.append(("Projection Pair", False, f"not committed/current: {exc}"))
-            finally:
-                if projection_connection is not None:
-                    projection_connection.close()
-    else:
-        reason = "index missing" if not index_exists else "database schema not ready"
-        checks.append(("Projection Pair", False, reason))
 
     # 4. AST Compilation Checks
     ext_root = get_extension_root()
@@ -439,33 +125,31 @@ def _doctor_vector_lake(
         checks.append(("MCP Server", False, f"Startup Exception: {e}"))
 
     # 6. Watchdog Heartbeat
-    status_path = meta_path / ".watchdog_status.json"
+    status_path = get_meta_dir() / ".watchdog_status.json"
     if status_path.exists():
         try:
             with open(status_path, "r", encoding="utf-8") as f:
                 status = json.load(f)
-            try:
-                component_max_age = max(
-                    5,
-                    int(
-                        os.environ.get(
-                            "VECTOR_LAKE_WATCHDOG_COMPONENT_MAX_AGE_SECONDS",
-                            "120",
-                        )
-                    ),
-                )
-            except (TypeError, ValueError):
-                component_max_age = 120
-            auto_ingest_enabled, _auto_config, _auto_config_error = (
-                _auto_ingest_health_config(meta_path)
+            updated_at = status.get("updated_at")
+            age_seconds = None
+            if updated_at:
+                updated_dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+                if updated_dt.tzinfo is None:
+                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                age_seconds = max(0, int((datetime.now(timezone.utc) - updated_dt).total_seconds()))
+            unhealthy_components = [
+                name
+                for name, component in (status.get("components") or {}).items()
+                if str(component.get("status", "")).lower() in {"error", "halted"}
+            ]
+            heartbeat_ok = (
+                age_seconds is not None
+                and age_seconds <= 120
+                and str(status.get("status", "")).lower() not in {"error", "halted"}
+                and not unhealthy_components
             )
-            watchdog_ok, detail = _doctor_watchdog_status(
-                status,
-                now_utc=datetime.now(timezone.utc),
-                component_max_age=component_max_age,
-                auto_ingest_enabled=auto_ingest_enabled,
-            )
-            checks.append(("Watchdog Status", watchdog_ok, detail))
+            detail = f"[{status.get('status', 'unknown')}] {status.get('current_action', '')}; age={age_seconds if age_seconds is not None else 'unknown'}s"
+            checks.append(("Watchdog Status", heartbeat_ok, detail))
         except Exception as e:
             checks.append(("Watchdog Status", False, f"Parse error: {e}"))
     else:
@@ -473,38 +157,24 @@ def _doctor_vector_lake(
 
     # 7. State Projection Consistency
     try:
-        excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "synthesis_log.md"}
-        diagnostic_wiki_paths = (
-            diagnostic_snapshot.wiki_paths
-            if diagnostic_snapshot is not None
-            else iter_markdown_files(get_wiki_dir())
-        )
+        excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
         wiki_keys = {
-            path.stem
-            for path in diagnostic_wiki_paths
-            if path.name.casefold() not in excluded
-            and not path.name.casefold().startswith("system_")
+            path.stem for path in get_wiki_dir().glob("*.md")
+            if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
         }
-        if committed_index_data is None:
-            raise RuntimeError("projection pair is not committed and current")
-        index_data = committed_index_data
-        index_keys = {
-            key for key in index_data.get("nodes", {})
-            if not str(key).startswith("System_")
+        with open(get_index_path(), "r", encoding="utf-8") as f:
+            index_keys = {
+                key for key in json.load(f).get("nodes", {})
+                if not str(key).startswith("System_")
+            }
+        conn = get_connection()
+        canonical_keys = {
+            row["page_key"] for row in conn.execute(
+                "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
+                "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
+            )
+            if not str(row["page_key"]).startswith("System_")
         }
-        if not schema_state["ready"]:
-            raise RuntimeError(
-                "database schema is not ready: "
-                + "; ".join(schema_reasons)
-            )
-        db_state = (
-            _read_database_state_from_connection(
-                diagnostic_snapshot.connection
-            )
-            if diagnostic_snapshot is not None
-            else _read_database_state(db_path)
-        )
-        canonical_keys = db_state["canonical_keys"]
         missing_index = canonical_keys - index_keys
         extra_index = index_keys - canonical_keys
         missing_canonical = wiki_keys - canonical_keys
@@ -518,143 +188,57 @@ def _doctor_vector_lake(
             f"missing_canonical:{len(missing_canonical)} extra_canonical:{len(extra_canonical)}",
         ))
 
-        outbox_counts = db_state["outbox_counts"]
+        outbox_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute("SELECT status, COUNT(*) AS count FROM mutation_outbox GROUP BY status")
+        }
         outbox_ok = outbox_counts.get("failed", 0) == 0
         checks.append(("Mutation Outbox", outbox_ok, json.dumps(outbox_counts, ensure_ascii=False, sort_keys=True)))
 
-        terminal_jobs = db_state["terminal_jobs"]
-        queued_jobs = db_state["queued_jobs"]
-        awaiting_jobs = db_state["awaiting_jobs"]
+        terminal_jobs = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
+        ).fetchone()[0]
+        queued_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'queued'").fetchone()[0]
+        awaiting_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'awaiting_subagent'").fetchone()[0]
         checks.append((
             "Ingest Jobs",
             terminal_jobs == 0,
             f"queued:{queued_jobs} awaiting_subagent:{awaiting_jobs} terminal_failed:{terminal_jobs}",
         ))
 
-        health = assess_runtime_health(
-            deep_projection_checks=True,
-            diagnostic_snapshot=diagnostic_snapshot,
-        )
-        memory_search = health["detail"].get("operational_memory_search") or {}
-        memory_search_ok = (
-            True
-            if memory_search.get("ready")
-            else (
-                False
-                if memory_search.get("progress_stalled")
-                or (
-                    memory_search.get("configured")
-                    and not memory_search.get("auto_maintenance_configured")
-                )
-                else None
-            )
-        )
-        checks.append((
-            "Operational Memory Search",
-            memory_search_ok,
-            (
-                f"status={memory_search.get('status', 'unknown')}; "
-                f"indexed={memory_search.get('indexed_documents', 0)}/"
-                f"{memory_search.get('canonical_documents', 0)}; "
-                f"pending={memory_search.get('pending', 0)}; "
-                f"auto={bool(memory_search.get('auto_maintenance_configured'))}"
-            ),
-        ))
-        backup_capacity = health["detail"].get("backup_capacity") or {}
-        backup_policy = backup_capacity.get("policy") or {}
-        backup_capacity_ok = (
-            False
-            if not backup_capacity.get("allowed", False)
-            else (True if backup_capacity.get("quota_configured") else None)
-        )
-        checks.append((
-            "Backup Capacity",
-            backup_capacity_ok,
-            (
-                f"bytes={backup_capacity.get('current_backup_bytes', 0)}; "
-                f"free={backup_capacity.get('disk_free_bytes', 0)}; "
-                f"min_free={backup_capacity.get('minimum_free_required_bytes', 0)}; "
-                f"max_total={backup_policy.get('max_total_bytes', 0) or 'unconfigured'}; "
-                f"mode={backup_policy.get('quota_mode', 'unknown')}"
-            ),
-        ))
+        health = assess_runtime_health(deep_projection_checks=True)
         checks.append((
             "Write Gate",
-            health["ok"],
+            health["hard_ok"],
             (
                 "clean"
                 + (f"; warnings: {'; '.join(health['warnings'])}" if health["warnings"] else "")
-                if health["ok"]
+                if health["hard_ok"]
                 else "; ".join(health["issues"])
             ),
         ))
-        try:
-            semantic_readiness = assess_semantic_readiness(
-                index_data=index_data,
-                diagnostic_snapshot=diagnostic_snapshot,
-            )
-        except TypeError as exc:
-            if "diagnostic_snapshot" not in str(exc):
-                raise
-            semantic_readiness = assess_semantic_readiness(index_data=index_data)
+        degraded = health.get("degraded") or []
+        for item in degraded:
+            warnings.append(item)
     except Exception as e:
         checks.append(("State Consistency", False, f"Check failed: {e}"))
-        semantic_readiness = {
-            "ready": False,
-            "status": "not_ready",
-            "issues": [f"semantic_readiness_check_failed:{e}"],
-            "warnings": [],
-            "detail": {},
-        }
 
     lines = ["=== Vector Lake Doctor ==="]
     all_ok = True
-    has_warnings = False
     for label, ok, detail in checks:
-        if ok is None:
-            state = "WARN"
-            has_warnings = True
-        elif ok:
-            state = "OK"
-        else:
-            state = "FAIL"
-            all_ok = False
-        lines.append(f"[{state}] {label}: {detail}")
+        lines.append(f"[{'OK' if ok else 'FAIL'}] {label}: {detail}")
+        all_ok = all_ok and ok
     lines.append("")
-    infrastructure_status = (
-        "issues detected"
-        if not all_ok
-        else ("healthy with warnings" if has_warnings else "healthy")
-    )
-    lines.append(f"Infrastructure Summary: {infrastructure_status}")
-    lines.append(f"Semantic Readiness: {semantic_readiness['status']}")
-    if semantic_readiness["issues"]:
-        lines.append("Semantic issues: " + "; ".join(semantic_readiness["issues"]))
-    if semantic_readiness["warnings"]:
-        lines.append("Semantic warnings: " + "; ".join(semantic_readiness["warnings"]))
-    lines.append(
-        f"Summary: infrastructure {infrastructure_status}; "
-        f"semantic readiness {semantic_readiness['status']}"
-    )
+    if warnings:
+        lines.append(f"[WARN] Runtime degradation ({len(warnings)}): " + "; ".join(warnings))
+        lines.append("        These are self-healing or repairable and do not block writes.")
+        lines.append("")
+    if not all_ok:
+        lines.append("Summary: issues detected")
+    elif warnings:
+        lines.append("Summary: healthy with degradation")
+    else:
+        lines.append("Summary: healthy")
     lines.append(f"VECTOR_LAKE_MEMORY_DIR={os.environ.get('VECTOR_LAKE_MEMORY_DIR', '<default>')}")
     return "\n".join(lines)
-
-
-def semantic_readiness_vector_lake(decision_id: str | None = None) -> str:
-    """Return the machine-readable semantic readiness report."""
-    normalized_decision_id = str(decision_id or "").strip()
-    # Decision-scoped assessment answers a different question and stays
-    # uncached. The global report is generation-bound and cached, so repeated
-    # doctor/CLI readiness calls no longer re-run the full aggregate scan.
-    assessment = (
-        assess_semantic_readiness(decision_id=normalized_decision_id)
-        if normalized_decision_id
-        else get_semantic_readiness_assessment()
-    )
-    return json.dumps(
-        assessment,
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    )
 

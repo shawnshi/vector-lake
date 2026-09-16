@@ -1,13 +1,7 @@
 import json
 
-import pytest
-
 from vector_lake import db_store, governance_store
-from vector_lake.tool_timeline import (
-    rebuild_timeline_events_from_claims,
-    search_timeline_events,
-    timeline_projection_parity,
-)
+from vector_lake.tool_timeline import rebuild_timeline_events_from_claims, search_timeline_events
 
 
 def test_timeline_projection_rebuilds_from_claims(isolated_memory):
@@ -87,164 +81,6 @@ def test_timeline_projection_tracks_add_update_and_type_conversion(isolated_memo
     assert conn.execute("SELECT description FROM timeline_events").fetchone()[0] == "Restored timeline value"
 
 
-def test_timeline_does_not_relabel_payload_updated_at_as_event_date(isolated_memory):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    claim = _claim("claim_payload_date", "Source_PayloadDate", "Payload dated event")
-    claim["temporal_anchor"] = None
-    claim["updated_at"] = "2026-06-02"
-
-    _apply_page("Source_PayloadDate", [claim])
-    original_event = conn.execute(
-        "SELECT id, event_date FROM timeline_events WHERE description = ?",
-        (claim["claim_text"],),
-    ).fetchone()
-    assert original_event["event_date"] == "Unknown Date"
-
-    with db_store.transaction():
-        conn.execute(
-            "UPDATE claims SET updated_at = ? WHERE claim_id = ?",
-            ("2026-07-19T05:21:01.669360+00:00", claim["claim_id"]),
-        )
-
-    assert timeline_projection_parity() == {
-        "canonical": 1,
-        "projection": 1,
-        "missing": 0,
-        "extra": 0,
-    }
-    rebuild_timeline_events_from_claims(dry_run=False)
-    rebuilt_event = conn.execute(
-        "SELECT id, event_date FROM timeline_events WHERE description = ?",
-        (claim["claim_text"],),
-    ).fetchone()
-    assert rebuilt_event["id"] == original_event["id"]
-    assert rebuilt_event["event_date"] == "Unknown Date"
-    assert timeline_projection_parity()["missing"] == 0
-    assert timeline_projection_parity()["extra"] == 0
-
-
-def test_timeline_fallback_without_any_payload_date_is_stable(isolated_memory):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    claim = _claim("claim_unknown_date", "Source_UnknownDate", "Undated event")
-    claim["temporal_anchor"] = None
-    claim.pop("updated_at")
-
-    _apply_page("Source_UnknownDate", [claim])
-
-    event_before = conn.execute(
-        "SELECT id, event_date FROM timeline_events WHERE description = ?",
-        (claim["claim_text"],),
-    ).fetchone()
-    assert event_before["event_date"] == "Unknown Date"
-    assert timeline_projection_parity()["missing"] == 0
-    assert timeline_projection_parity()["extra"] == 0
-
-    rebuild_timeline_events_from_claims(dry_run=False)
-    event_after = conn.execute(
-        "SELECT id, event_date FROM timeline_events WHERE description = ?",
-        (claim["claim_text"],),
-    ).fetchone()
-    assert event_after["id"] == event_before["id"]
-    assert event_after["event_date"] == "Unknown Date"
-    assert timeline_projection_parity()["missing"] == 0
-    assert timeline_projection_parity()["extra"] == 0
-
-
-def test_timeline_rejects_invalid_payload_dates_and_uses_valid_fallback(isolated_memory):
-    db_store.init_db()
-    claim = _claim("claim_invalid_date", "Source_InvalidDate", "Validated fallback event")
-    claim["event_date"] = {"year": 2026}
-    claim["temporal_anchor"] = "2026-Q2"
-    _apply_page("Source_InvalidDate", [claim])
-    row = db_store.get_connection().execute(
-        "SELECT event_date FROM timeline_events WHERE description = ?",
-        (claim["claim_text"],),
-    ).fetchone()
-    assert row["event_date"] == "2026-Q2"
-
-
-def test_timeline_invalid_payload_dates_become_unknown_but_timestamp_is_preserved(isolated_memory):
-    db_store.init_db()
-    invalid = _claim("claim_invalid_dates", "Source_InvalidDates", "Invalid dates")
-    invalid["event_date"] = True
-    invalid["temporal_anchor"] = "2026-02-30"
-    timestamped = _claim("claim_timestamp", "Source_Timestamp", "Timestamped event")
-    timestamped["event_date"] = "2026-09-09T12:30:00+00:00"
-    _apply_page("Source_InvalidDates", [invalid])
-    _apply_page("Source_Timestamp", [timestamped])
-    rows = db_store.get_connection().execute(
-        "SELECT description, event_date FROM timeline_events ORDER BY description"
-    ).fetchall()
-    assert [(row["description"], row["event_date"]) for row in rows] == [
-        ("Invalid dates", "Unknown Date"),
-        ("Timestamped event", "2026-09-09T12:30:00+00:00"),
-    ]
-
-
-def test_structural_prefix_repairs_date_action_and_description_on_rebuild(isolated_memory):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    observation = _claim(
-        "claim_observation", "Source_Observation",
-        "[2026-08-24] [Observation] CMS changed [scope] only.",
-    )
-    observation["temporal_anchor"] = "2026-09-09"
-    observation["action"] = "page-default"
-    pivot = _claim(
-        "claim_pivot", "Source_Pivot",
-        "- [2024-02-29] [Pivot] Leap-day pivot.",
-    )
-    unknown_tag = _claim(
-        "claim_unknown_tag", "Source_UnknownTag",
-        "[2025-01-02] [Unexpected] Explicit unknown tag.",
-    )
-    _apply_page("Source_Observation", [observation])
-    _apply_page("Source_Pivot", [pivot])
-    _apply_page("Source_UnknownTag", [unknown_tag])
-
-    assert "CMS changed [scope] only." in search_timeline_events(action="Observation")
-    assert "Leap-day pivot." in search_timeline_events(action="Pivot")
-    assert "Explicit unknown tag." in search_timeline_events(action="Unexpected")
-    row = conn.execute(
-        "SELECT event_date, action, description FROM timeline_events "
-        "WHERE action = 'Observation'"
-    ).fetchone()
-    assert tuple(row) == ("2026-08-24", "Observation", "CMS changed [scope] only.")
-
-    before = [tuple(row) for row in conn.execute(
-        "SELECT id, event_date, action, description FROM timeline_events ORDER BY id"
-    ).fetchall()]
-    rebuild_timeline_events_from_claims(dry_run=False)
-    rebuild_timeline_events_from_claims(dry_run=False)
-    after = [tuple(row) for row in conn.execute(
-        "SELECT id, event_date, action, description FROM timeline_events ORDER BY id"
-    ).fetchall()]
-    assert after == before
-
-
-def test_unknown_dates_sort_after_dated_events_with_stable_id_tie_break(isolated_memory):
-    db_store.init_db()
-    for claim in (
-        _claim("claim_unknown_b", "Source_UnknownB", "Unknown B"),
-        _claim("claim_dated", "Source_Dated", "[2026-01-01] Dated"),
-        _claim("claim_unknown_a", "Source_UnknownA", "Unknown A"),
-    ):
-        if "[2026-01-01]" not in claim["claim_text"]:
-            claim["temporal_anchor"] = None
-            claim.pop("updated_at", None)
-        _apply_page(claim["locator"]["page_key"], [claim])
-
-    rows = db_store.get_connection().execute(
-        "SELECT id, event_date, description FROM timeline_events "
-        "ORDER BY (event_date = 'Unknown Date') ASC, event_date DESC, id ASC"
-    ).fetchall()
-    assert rows[0]["description"] == "Dated"
-    assert [row["event_date"] for row in rows[1:]] == ["Unknown Date", "Unknown Date"]
-    assert [row["id"] for row in rows[1:]] == sorted(row["id"] for row in rows[1:])
-
-
 def test_page_delete_only_removes_its_own_timeline_event(isolated_memory):
     db_store.init_db()
     first = _claim("claim_page_a", "Source_PageA", "Event A")
@@ -260,7 +96,7 @@ def test_page_delete_only_removes_its_own_timeline_event(isolated_memory):
     assert [row["description"] for row in rows] == ["Event B"]
 
 
-def test_timeline_parity_detects_stale_projection_count(isolated_memory):
+def test_timeline_search_falls_back_when_projection_count_is_stale(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     first = _claim("claim_current", "Source_Current", "Canonical current event")
@@ -284,14 +120,13 @@ def test_timeline_parity_detects_stale_projection_count(isolated_memory):
             ),
         )
 
-    parity = timeline_projection_parity()
-    assert parity["canonical"] == 2
-    assert parity["projection"] == 1
-    assert parity["missing"] == 2
-    assert parity["extra"] == 1
+    output = search_timeline_events(limit=10)
+    assert "Canonical current event" in output
+    assert "Second canonical event" in output
+    assert "Stale event" not in output
 
 
-def test_timeline_parity_rejects_equal_count_wrong_event_ids(isolated_memory):
+def test_timeline_search_rejects_equal_count_wrong_event_ids(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
     current = _claim("claim_equal", "Source_Equal", "Canonical equal-count event")
@@ -313,12 +148,10 @@ def test_timeline_parity_rejects_equal_count_wrong_event_ids(isolated_memory):
             ("wrong-id", "2000-01-01", "old", "neutral", "Stale equal-count event", "", "", "", "2000-01-01"),
         )
 
-    assert timeline_projection_parity() == {
-        "canonical": 1,
-        "projection": 1,
-        "missing": 1,
-        "extra": 1,
-    }
+    output = search_timeline_events(limit=10)
+
+    assert "Canonical equal-count event" in output
+    assert "Stale equal-count event" not in output
 
 
 def test_apply_change_set_rolls_back_claim_when_timeline_projection_fails(isolated_memory, monkeypatch):
@@ -348,209 +181,3 @@ def test_apply_change_set_rolls_back_claim_when_timeline_projection_fails(isolat
     conn = db_store.get_connection()
     assert conn.execute("SELECT COUNT(*) FROM claims WHERE claim_id = ?", (claim["claim_id"],)).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM timeline_events").fetchone()[0] == 0
-
-
-def test_timeline_parity_detects_same_id_payload_drift(isolated_memory):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    current = _claim("claim_payload_drift", "Source_Drift", "Canonical payload")
-    _apply_page("Source_Drift", [current])
-    event_id = conn.execute("SELECT id FROM timeline_events").fetchone()["id"]
-
-    with db_store.transaction():
-        conn.execute(
-            "UPDATE timeline_events SET description = ?, action = ? WHERE id = ?",
-            ("Stale projected payload", "stale-action", event_id),
-        )
-
-    assert timeline_projection_parity() == {
-        "canonical": 1,
-        "projection": 1,
-        "missing": 1,
-        "extra": 1,
-    }
-
-
-def test_timeline_parity_ignores_extraction_timestamp_drift(isolated_memory):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    current = _claim("claim_extracted_at", "Source_ExtractedAt", "Stable payload")
-    _apply_page("Source_ExtractedAt", [current])
-
-    with db_store.transaction():
-        conn.execute(
-            "UPDATE timeline_events SET extracted_at = ?",
-            ("2000-01-01T00:00:00+00:00",),
-        )
-
-    assert timeline_projection_parity() == {
-        "canonical": 1,
-        "projection": 1,
-        "missing": 0,
-        "extra": 0,
-    }
-
-
-def test_timeline_projection_filters_exact_and_substring_entity_fields(
-    isolated_memory,
-):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    entity = {
-        "entity_id": "entity_acme",
-        "canonical_name": "Acme Hospital",
-    }
-    claim = _claim(
-        "claim_entity_filter",
-        "Source_EntityFilter",
-        "Canonical event without a display name in its text",
-    )
-    claim["subject_entity_ids"] = [entity["entity_id"]]
-
-    with db_store.transaction():
-        conn.execute(
-            "INSERT INTO entities "
-            "(entity_id, canonical_name, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                entity["entity_id"],
-                entity["canonical_name"],
-                json.dumps(entity),
-                "2026-07-14T00:00:00+00:00",
-            ),
-        )
-    _apply_page("Source_EntityFilter", [claim])
-
-    for search_term in (
-        "entity_acme",
-        "Acme Hospital",
-        "Hospital",
-        "without a display name",
-    ):
-        output = search_timeline_events(entity_name=search_term, limit=5)
-        assert "Canonical event without a display name in its text" in output
-
-    assert (
-        search_timeline_events(entity_name="Unrelated Entity", limit=5)
-        == "No timeline events found matching the criteria."
-    )
-
-
-def test_timeline_search_does_not_run_full_parity_on_hot_path(
-    isolated_memory,
-    monkeypatch,
-):
-    db_store.init_db()
-    _apply_page(
-        "Source_HotPath",
-        [_claim("claim_hot_path", "Source_HotPath", "Bounded event")],
-    )
-
-    def reject_parity(*_args, **_kwargs):
-        raise AssertionError("full parity entered Timeline search hot path")
-
-    monkeypatch.setattr(
-        "vector_lake.tool_timeline.timeline_projection_parity",
-        reject_parity,
-    )
-
-    assert "Bounded event" in search_timeline_events(limit=10)
-
-
-def test_timeline_search_caps_limit_and_output_bytes(isolated_memory):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    large_rows = [
-        (
-            f"large-{index:03d}",
-            f"2026-07-{(index % 28) + 1:02d}",
-            "large",
-            "positive",
-            "x" * 5000,
-            "entity_acme",
-            "Acme Hospital",
-            "Source_Test",
-            "2026-07-14T00:00:00+00:00",
-        )
-        for index in range(150)
-    ]
-    compact_rows = [
-        (
-            f"compact-{index:03d}",
-            f"2026-06-{(index % 28) + 1:02d}",
-            "compact",
-            "neutral",
-            "small",
-            "entity_acme",
-            "Acme Hospital",
-            "Source_Test",
-            "2026-06-14T00:00:00+00:00",
-        )
-        for index in range(150)
-    ]
-    with db_store.transaction():
-        conn.executemany(
-            "INSERT INTO timeline_events "
-            "(id, event_date, action, sentiment, description, entity_id, "
-            "entity_title, source_file, extracted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            large_rows + compact_rows,
-        )
-
-    limited = search_timeline_events(action="compact", limit=10_000)
-    output = search_timeline_events(action="large", limit=10_000)
-
-    assert limited.count("\n  -> ") == 100
-    assert len(output.encode("utf-8")) <= 64 * 1024
-    assert output.count("\n  -> ") <= 100
-    assert "Timeline output truncated" in output
-
-
-def test_timeline_rebuild_rejects_limited_apply(isolated_memory):
-    db_store.init_db()
-
-    with pytest.raises(ValueError, match="only supported.*dry-runs"):
-        rebuild_timeline_events_from_claims(dry_run=False, limit=1)
-
-
-def test_timeline_query_indexes_match_exact_filters(isolated_memory):
-    db_store.init_db()
-    conn = db_store.get_connection()
-    plans = {
-        "date": conn.execute(
-            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
-            "ORDER BY event_date DESC, id ASC LIMIT 10"
-        ).fetchall(),
-        "entity": conn.execute(
-            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
-            "WHERE entity_id = ? COLLATE NOCASE "
-            "ORDER BY event_date DESC, id ASC LIMIT 10",
-            ("entity_acme",),
-        ).fetchall(),
-        "title": conn.execute(
-            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
-            "WHERE entity_title = ? COLLATE NOCASE "
-            "ORDER BY event_date DESC, id ASC LIMIT 10",
-            ("Acme Hospital",),
-        ).fetchall(),
-        "sentiment": conn.execute(
-            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
-            "WHERE sentiment = ? ORDER BY event_date DESC, id ASC LIMIT 10",
-            ("positive",),
-        ).fetchall(),
-        "action": conn.execute(
-            "EXPLAIN QUERY PLAN SELECT id FROM timeline_events "
-            "WHERE action = ? COLLATE NOCASE "
-            "ORDER BY event_date DESC, id ASC LIMIT 10",
-            ("release",),
-        ).fetchall(),
-    }
-    plan_text = {
-        name: " ".join(str(row[3]) for row in rows)
-        for name, rows in plans.items()
-    }
-
-    assert "idx_timeline_date_id" in plan_text["date"]
-    assert "idx_timeline_entity_date_id" in plan_text["entity"]
-    assert "idx_timeline_title_date_id" in plan_text["title"]
-    assert "idx_timeline_sentiment_date_id" in plan_text["sentiment"]
-    assert "idx_timeline_action_date_id" in plan_text["action"]

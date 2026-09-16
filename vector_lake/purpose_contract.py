@@ -45,8 +45,18 @@ def _parse_node_frontmatter(content: str, filename: str) -> dict[str, Any]:
 
 
 def validate_purpose_contract(contract: dict[str, Any]) -> dict[str, Any]:
-    if contract.get("purpose_version") != "12.1":
-        raise PurposeContractError("purpose contract requires purpose_version to be exactly '12.1'.")
+    version = str(contract.get("purpose_version") or "")
+    # Accept the whole 12.x contract family.  Pinning the minor version exactly
+    # made the package refuse to write at all against a knowledge base whose
+    # contract had moved to a newer 12.x, because the defense hook revalidates
+    # the contract on every page write.
+    parts = version.split(".")
+    if len(parts) != 2 or parts[0] != "12" or not parts[1].isdigit():
+        raise PurposeContractError(
+            "purpose contract requires purpose_version to be a '12.x' release, "
+            f"got {version!r}."
+        )
+    contract["purpose_version"] = version
 
     contract["intent_keywords"] = _as_string_list(contract.get("intent_keywords"), "intent_keywords")
     try:
@@ -92,13 +102,9 @@ def validate_purpose_contract(contract: dict[str, Any]) -> dict[str, Any]:
     policy = contract.get("synthesis_policy")
     if not isinstance(policy, dict):
         raise PurposeContractError("purpose contract requires a synthesis_policy object.")
-    raw_minimum_sources = policy.get("min_distinct_sources")
-    raw_minimum_intensity = policy.get("min_tension_intensity")
-    if raw_minimum_sources is None or raw_minimum_intensity is None:
-        raise PurposeContractError("synthesis_policy has invalid thresholds.")
     try:
-        minimum_sources = int(raw_minimum_sources)
-        minimum_intensity = float(raw_minimum_intensity)
+        minimum_sources = int(policy.get("min_distinct_sources"))
+        minimum_intensity = float(policy.get("min_tension_intensity"))
     except (TypeError, ValueError) as exc:
         raise PurposeContractError("synthesis_policy has invalid thresholds.") from exc
     if minimum_sources < 2 or not 0.0 <= minimum_intensity <= 1.0:
@@ -163,12 +169,11 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
     for item in items:
         if not isinstance(item, dict) or "filename" not in item:
             raise PurposeContractError("Each ingest item requires filename.")
-        if "filepath" in item:
-            raise PurposeContractError(
-                "Ingest filepath inputs are forbidden; provide bounded inline content."
-            )
-        if not isinstance(item.get("content"), str):
-            raise PurposeContractError("Each ingest item requires inline string content.")
+        if "filepath" in item and not item.get("content"):
+            with open(item["filepath"], "r", encoding="utf-8") as f:
+                item["content"] = f.read()
+        if "content" not in item:
+            raise PurposeContractError("Each ingest item requires content or filepath.")
         filename = Path(str(item["filename"])).name
         content = str(item["content"])
         frontmatter = _parse_node_frontmatter(content, filename)

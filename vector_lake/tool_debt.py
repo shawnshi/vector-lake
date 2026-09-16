@@ -2,25 +2,15 @@ from vector_lake import governance_metrics
 
 
 def debt_vector_lake(top: int = 20) -> str:
-    snapshot = governance_metrics.read_only_governance_debt_snapshot(limit=top)
-    metrics = snapshot["metrics"]
-    merge_report = snapshot["merge_candidate_report"]
-    merge_candidates = merge_report["suggestions"]
+    # ensure_canonical_store_populated() removed in SQLite refactor
+    metrics = governance_metrics.compute_debt_metrics()
+    merge_candidates = governance_metrics.find_merge_candidates(limit=top)
     lines = ["=== Vector Lake Debt Dashboard ==="]
-    lines.append(
-        "availability: " + ("available" if snapshot["available"] else "unavailable")
-    )
-    if not snapshot["available"]:
-        lines.append(f"unavailable_reason: {snapshot['unavailable_reason']}")
     for key, value in metrics.items():
         lines.append(f"{key}: {value}")
     lines.append("")
     lines.append("Top merge candidates:")
-    if not merge_report["available"]:
-        lines.append(
-            f"- unavailable: {merge_report['unavailable_reason']}"
-        )
-    elif not merge_candidates:
+    if not merge_candidates:
         lines.append("- none")
     else:
         for candidate in merge_candidates[:top]:

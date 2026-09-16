@@ -1,52 +1,19 @@
-import logging
-import heapq
-import hashlib
 import json
-import math
+import logging
 import os
 import re
-import sqlite3
-import threading
-import time
-import unicodedata
-from collections import OrderedDict
 from datetime import datetime, timezone
-from itertools import islice
 
 import functools
 import ast
 import operator
-from xml.sax.saxutils import escape, quoteattr
 
 from vector_lake import governance_store
-from vector_lake.index_snapshot import (
-    CompactGraphAdjacency,
-    get_compact_graph_adjacency,
-)
-from vector_lake.indexer import (
-    canonical_runtime_generation_snapshot,
-    read_committed_index_snapshot,
-)
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-search")
-
-
-class SearchIndexError(RuntimeError):
-    """The durable search projection exists but cannot be decoded safely."""
-
-
-class SearchBackendError(RuntimeError):
-    """A search backend failed; expose only the backend identity to callers."""
-
-    def __init__(self, backend: str):
-        self.backend = str(backend)
-        super().__init__(f"Search backend unavailable: {self.backend}")
-
 
 TOKEN_BUDGET = {
     "operational_memory": 0.30,
@@ -56,50 +23,12 @@ TOKEN_BUDGET = {
     "system_prompt": 0.15,
 }
 DEFAULT_MAX_CHARS = 200000
-CLAIM_MODE_DEPRECATION_WARNING = (
-    "mode='claim' is deprecated and is only a compatibility alias for "
-    "mode='fact'. Results are operational-memory facts, not canonical Claim "
-    "records; use export_evidence_packet with a claim_id for a canonical Claim."
-)
 
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 STOP_WORDS = {
-    "的",
-    "了",
-    "在",
-    "是",
-    "我",
-    "有",
-    "和",
-    "就",
-    "不",
-    "人",
-    "都",
-    "一",
-    "一个",
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "were",
-    "in",
-    "on",
-    "at",
-    "to",
-    "for",
-    "of",
-    "and",
-    "or",
-    "but",
-    "with",
-    "by",
-    "from",
-    "as",
-    "it",
-    "this",
-    "that",
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
+    "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for",
+    "of", "and", "or", "but", "with", "by", "from", "as", "it", "this", "that",
 }
 
 QUERY_EXPANSION_DICT = {
@@ -108,996 +37,103 @@ QUERY_EXPANSION_DICT = {
     "医疗AI": ["临床Agent", "大模型医疗落地", "电子病历 智能化"],
 }
 
+def _passes_filters(node: dict, domain: str | None, cluster: str | None, include_history: bool, filter_expr: str | None) -> bool:
+    """Single source of truth for the caller-visible result filters.
 
-_SEARCH_QUERY_CHAR_LIMIT = 16_384
-_SEARCH_TOP_K_LIMIT = 100
-_QUERY_EMBEDDING_OPT_IN_ENV = "VECTOR_LAKE_QUERY_EMBEDDING"
-
-_QUERY_EMBEDDING_STATE_LOCK = threading.Lock()
-_QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
-_QUERY_EMBEDDING_KEY_LOCKS = tuple(threading.Lock() for _ in range(16))
-_QUERY_EMBEDDING_CACHE_KEYS: OrderedDict[tuple[str, str, int, int], None] = (
-    OrderedDict()
-)
-_SEARCH_PERFORMANCE_LOCK = threading.Lock()
-_SEARCH_PERFORMANCE = {
-    "completed_calls": 0,
-    "last": {},
-    "max_total_ms": 0.0,
-}
-_SEARCH_BACKEND_LOG_LOCK = threading.Lock()
-_SEARCH_BACKEND_LOG_STATE: dict[str, dict[str, float | int]] = {}
-_SEARCH_BACKEND_LOG_INTERVAL_SECONDS = 30.0
-_IDENTITY_LOOKUP_LOCK = threading.Lock()
-_IDENTITY_LOOKUP_CACHE: dict[str, object] = {
-    "signature": "",
-    "lookup": {},
-}
-
-_EXACT_IDENTITY_WEIGHTS = {
-    "key": 120.0,
-    "id": 118.0,
-    "title": 116.0,
-    "alias": 112.0,
-}
-
-_PLAINTEXT_RECORD_BYTE_LIMIT = 256 * 1024
-_PLAINTEXT_SCAN_CHAR_LIMIT = 64 * 1024
-_PAGE_SNIPPET_CHAR_LIMIT = 1_000
-_CONTEXT_SNIPPET_CHAR_LIMIT = 1_200
-_QUERY_PATTERN_LIMIT = 32
-_QUERY_PATTERN_CHAR_LIMIT = 256
-_INCOMPLETE_FOOTNOTE_MARKER = " [footnote incomplete]"
-_CITATION_CLOSURE_ATOM_LIMIT = 32
-_CITATION_CLOSURE_SCAN_LIMIT = 4_096
-_CITATION_CLOSURE_WHITESPACE_LIMIT = 32
-_HIDDEN_PLAINTEXT_STATES = {
-    "archived", "decayed", "deleted", "expired", "superseded",
-}
-_STRUCTURAL_PAGE_KEYS = {"concept_orphan-index"}
-
-
-def _incomplete_marker(limit: int) -> str:
-    if limit >= len(_INCOMPLETE_FOOTNOTE_MARKER) + 8:
-        return _INCOMPLETE_FOOTNOTE_MARKER
-    if limit >= len(" [incomplete]"):
-        return " [incomplete]"
-    if limit >= len("[!]"):
-        return "[!]"
-    return "!"[:max(0, limit)]
-
-
-def _safe_evidence_prefix(text: str, limit: int) -> str:
-    """Cut text without leaving half a footnote token or Source anchor."""
-    prefix = text[:max(0, limit)]
-    last_close = prefix.rfind("]")
-    last_ref = prefix.rfind("[^")
-    if last_ref > last_close:
-        prefix = prefix[:last_ref]
-    # Inspect enough of the original text to recognize a header cut mid-token.
-    # Use the same grammar as boundary expansion for both Source and Sources.
-    for anchor in re.finditer(r"\(Sources?:", text[:len(prefix) + 9], re.I):
-        if anchor.start() >= len(prefix):
-            break
-        closed_end, _ = _bounded_citation_closure(prefix, anchor.start())
-        if closed_end <= anchor.start():
-            prefix = prefix[:anchor.start()]
-            break
-    return prefix.rstrip()
-
-
-def _bounded_citation_closure(text: str, offset: int) -> tuple[int, bool]:
-    """Scan one bounded sequence of attached footnotes and Source anchors."""
-    origin = max(0, min(len(text), int(offset)))
-    scan_end = min(len(text), origin + _CITATION_CLOSURE_SCAN_LIMIT)
-    position = origin
-    accepted_end = origin
-    atoms = 0
-
-    def whitespace_end(start: int) -> tuple[int, bool]:
-        cursor = start
-        while cursor < scan_end and text[cursor].isspace():
-            cursor += 1
-            if cursor - start > _CITATION_CLOSURE_WHITESPACE_LIMIT:
-                return start, True
-        return cursor, False
-
-    def source_end(start: int) -> tuple[int | None, bool]:
-        header = re.match(r"\((?:Source|Sources):", text[start:], re.I)
-        if not header:
-            return None, False
-        cursor = start + len(header.group(0))
-        cursor, exhausted = whitespace_end(cursor)
-        if exhausted or not text.startswith("[[", cursor):
-            return None, True
-        close = text.find("]]", cursor + 2, scan_end)
-        if close < 0:
-            return None, True
-        cursor = close + 2
-        cursor, exhausted = whitespace_end(cursor)
-        if exhausted or cursor >= scan_end or text[cursor] != ")":
-            return None, True
-        return cursor + 1, False
-
-    while atoms < _CITATION_CLOSURE_ATOM_LIMIT:
-        atom_start, exhausted = whitespace_end(position)
-        if exhausted:
-            return accepted_end, True
-        separator_end = atom_start
-        if separator_end < scan_end and text[separator_end] in ",;":
-            separator_end += 1
-            separator_end, exhausted = whitespace_end(separator_end)
-            if exhausted:
-                return accepted_end, True
-
-        atom_end = None
-        malformed = False
-        footnote = re.match(r"\[\^[^\]\r\n]{1,256}\](?!:)", text[separator_end:scan_end])
-        if footnote:
-            atom_end = separator_end + len(footnote.group(0))
-        elif re.match(
-            r"\[\^[^\]\r\n]{1,256}\]:", text[separator_end:scan_end]
-        ):
-            return accepted_end, False
-        elif text.startswith("[^", separator_end):
-            malformed = True
-        else:
-            atom_end, malformed = source_end(separator_end)
-        if malformed:
-            return accepted_end, True
-        if atom_end is None:
-            return accepted_end, False
-        atoms += 1
-        accepted_end = atom_end
-        position = atom_end
-
-    probe, exhausted = whitespace_end(position)
-    if exhausted:
-        return accepted_end, True
-    if probe < scan_end and text[probe] in ",;":
-        probe += 1
-        probe, exhausted = whitespace_end(probe)
-    more = (
-        exhausted
-        or text.startswith("[^", probe)
-        or re.match(r"\((?:Source|Sources):", text[probe:], re.I) is not None
-    )
-    return accepted_end, bool(more)
-
-
-def _query_literal_patterns(query: str) -> list[re.Pattern]:
-    """Compile literal phrases/words; match offsets always belong to source text."""
-    normalized = str(query or "").strip()
-    values = [normalized]
-    values.extend(
-        term for term in re.findall(r"[\w\u3400-\u9fff]+", normalized)
-        if len(term) > 1 and term.casefold() not in STOP_WORDS
-    )
-    patterns = []
-    seen = set()
-    for value in values:
-        value = value[:_QUERY_PATTERN_CHAR_LIMIT]
-        folded = value.casefold()
-        if value and folded not in seen:
-            seen.add(folded)
-            patterns.append(re.compile(re.escape(value), re.IGNORECASE))
-            if len(patterns) >= _QUERY_PATTERN_LIMIT:
-                break
-    return patterns
-
-
-def _is_boilerplate_block(block: str) -> bool:
-    """Recognize standalone generated/navigation blocks, not quoted discussion."""
-    stripped = block.strip()
-    if not stripped or stripped.startswith((">", "“", '"', "```", "~~~", "`")):
-        return False
-    lowered = stripped.casefold()
-    return bool(
-        re.fullmatch(
-            r"<!--\s*(?:generated|navigation|cursor|metadata|chunking rule|"
-            r"provenance anchoring)(?:\s|:)[\s\S]*?-->",
-            stripped,
-            re.I,
-        )
-        or re.fullmatch(r"#{1,6}\s+(?:cursor|metadata|navigation|generated links)\s*", stripped, re.I)
-        or re.fullmatch(
-            r"\*?\[(?:system|assistant|developer) directive:\s*"
-            r"this section represents[^\]\r\n]*\]\*?",
-            stripped,
-            re.I,
-        )
-        or re.fullmatch(
-            r"(?:#{1,6}\s*)?(?:chunking rule|provenance anchoring)\s*"
-            r"(?::\s*(?:this (?:section|page|chunk)[^\r\n]*))?",
-            stripped,
-            re.I,
-        )
-        or re.fullmatch(
-            r"this (?:page|section|document) (?:is|was) (?:automatically |auto-)?"
-            r"generated (?:by|for) cursor[^\r\n]*",
-            stripped,
-            re.I,
-        )
-        or (lowered.startswith(("## navigation", "## generated links")) and "[[" in stripped)
-    )
-
-
-def _footnote_namespace(page_key: str) -> str:
-    """Return a compact page namespace derived from the complete UTF-8 key."""
-    digest = hashlib.sha256(str(page_key).encode("utf-8")).hexdigest()[:24]
-    return f"page-{digest}"
-
-
-def _namespace_footnotes(snippet: str, page_key: str) -> str:
-    """Make rendered footnote ids page-local without changing stored plaintext."""
-    namespace = _footnote_namespace(page_key)
-    return re.sub(
-        r"\[\^([^\]\r\n]{1,256})\]",
-        lambda match: f"[^{namespace}--{match.group(1)}]",
-        snippet,
-    )
-
-
-def _bounded_namespaced_snippet(
-    raw_text: str, query: str, page_key: str, limit: int,
-    *, identity_context: bool = False,
-) -> tuple[str, str, bool]:
-    """Select then namespace evidence while enforcing the post-render limit."""
-    limit = max(0, int(limit))
-    selection_limit = limit
-    result = ("", "hit_not_located", False)
-    original_snippet = ""
-    for _attempt in range(3):
-        if selection_limit <= 0:
-            break
-        snippet, status, clipped = _query_centered_snippet(
-            raw_text, query, limit=selection_limit,
-            identity_context=identity_context,
-        )
-        if snippet and not original_snippet:
-            original_snippet = snippet
-        rendered = _namespace_footnotes(snippet, page_key)
-        result = (rendered, status, clipped)
-        overflow = len(rendered) - limit
-        if overflow <= 0:
-            return result
-        selection_limit = max(0, selection_limit - overflow)
-
-    # A namespace-heavy reference group may be indivisible at this budget.
-    # Keep bounded query-bearing text and disclose the omitted closure.
-    marker = _incomplete_marker(limit)
-    # Retain the selected source wording, even when query terms are not
-    # contiguous. Reference closure is explicitly omitted, not left malformed.
-    meaningful = re.sub(
-        r"(?m)^\[\^[^\]\r\n]+\]:[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*",
-        "", original_snippet,
-    )
-    meaningful = re.sub(r"\[\^[^\]\r\n]+\]", "", meaningful).strip()
-    room = max(0, limit - len(marker))
-    bounded = _safe_evidence_prefix(meaningful, room) + marker
-    return bounded[:limit], "source_window_clipped", True
-
-
-def _query_centered_snippet(
-    raw_text: str,
-    query: str,
-    *,
-    limit: int,
-    identity_context: bool = False,
-) -> tuple[str, str, bool]:
-    """Return verbatim bounded evidence and an explicit completeness status."""
-    limit = max(0, int(limit))
-    if limit == 0:
-        return "", "source_window_clipped", bool(raw_text)
-    source = str(raw_text or "")
-    scan_clipped = len(source) > _PLAINTEXT_SCAN_CHAR_LIMIT
-    scanned = source[:_PLAINTEXT_SCAN_CHAR_LIMIT]
-    blocks = [
-        block for block in re.split(r"(?:\r?\n){2,}", scanned)
-        if not _is_boilerplate_block(block)
-    ]
-    cleaned = "\n\n".join(blocks)
-    patterns = _query_literal_patterns(query)
-    normalized_query = str(query or "").strip()
-    candidates = []
-    offset = 0
-    for position, block in enumerate(blocks):
-        block_matches = [pattern.search(block) for pattern in patterns]
-        hits = [match for match in block_matches if match is not None]
-        if hits:
-            exact = bool(normalized_query and re.search(
-                re.escape(normalized_query[:_QUERY_PATTERN_CHAR_LIMIT]), block, re.I,
-            ))
-            candidates.append((len(hits), exact, -position, offset, min(hits, key=lambda item: item.start())))
-        offset += len(block) + 2
-    if not candidates and identity_context:
-        offset = 0
-        for position, block in enumerate(blocks):
-            identity_match = re.search(r"(?m)^(?![ \t]*#{1,6}\s)[ \t]*\S+", block)
-            if identity_match:
-                candidates.append((0, False, -position, offset, identity_match))
-                break
-            offset += len(block) + 2
-    selected = max(candidates, default=None)
-    match = selected[-1] if selected else None
-    match_offset = selected[-2] if selected else 0
-    if match is None:
-        status = "hit_not_located_scan_clipped" if scan_clipped else "hit_not_located"
-        return "", status, scan_clipped
-
-    match = re.compile(re.escape(match.group(0)), re.IGNORECASE).search(
-        cleaned, match_offset + match.start(), match_offset + match.end(),
-    )
-    assert match is not None
-    center = (match.start() + match.end()) // 2
-    start = max(0, center - limit // 2)
-    end = min(len(cleaned), start + limit)
-    start = max(0, end - limit)
-    # Prefer paragraph/sentence boundaries without exceeding the hard cap.
-    left = max(cleaned.rfind("\n\n", start, match.start()),
-               cleaned.rfind("。", start, match.start()),
-               cleaned.rfind(". ", start, match.start()))
-    if left >= 0:
-        start = left + (2 if cleaned[left:left + 2] in {"\n\n", ". "} else 1)
-    paragraph_end = cleaned.find("\n\n", match.end(), end)
-    right_candidates = [value for value in (
-        cleaned.find("。", match.end(), end),
-        cleaned.find(". ", match.end(), end),
-    ) if value >= 0]
-    boundary_ref_incomplete = False
-    if paragraph_end >= 0:
-        end = paragraph_end
-    elif right_candidates:
-        end = min(right_candidates) + 1
-    # Apply one grammar at every selected paragraph, newline, sentence, or hard
-    # window boundary so mixed citation tails cannot be silently discarded.
-    closure_end, closure_incomplete = _bounded_citation_closure(cleaned, end)
-    if closure_end > end:
-        if closure_end <= start + limit:
-            end = closure_end
-        else:
-            boundary_ref_incomplete = True
-    if closure_incomplete:
-        boundary_ref_incomplete = True
-
-    bounded_prefix = cleaned[start:end]
-    safe_prefix = _safe_evidence_prefix(bounded_prefix, len(bounded_prefix))
-    if safe_prefix != bounded_prefix.rstrip():
-        boundary_ref_incomplete = True
-
-    snippet = safe_prefix.strip()
-    prefix_cut = start > 0
-    suffix_cut = end < len(cleaned) or scan_clipped
-    # Include a nearby referenced footnote definition when it fits; otherwise
-    # disclose that the reference is incomplete rather than silently cutting it.
-    refs = list(re.finditer(r"\[\^([^\]\r\n]+)\](?!:)", snippet))
-    missing_refs = ["boundary"] if boundary_ref_incomplete else []
-    for ref in refs:
-        label = ref.group(1)
-        if len(label) > 256:
-            missing_refs.append("oversized")
-            continue
-        definition = re.search(
-            rf"(?m)^\[\^{re.escape(label)}\]:[^\r\n]*(?:\r?\n(?:[ \t]+)[^\r\n]*)*",
-            cleaned,
-        )
-        if definition and definition.group(0) not in snippet:
-            addition = "\n\n" + definition.group(0)
-            if len(snippet) + len(addition) <= limit:
-                snippet += addition
-            else:
-                missing_refs.append(label)
-        elif definition is None:
-            missing_refs.append(label)
-    if missing_refs:
-        marker = _incomplete_marker(limit)
-        if len(snippet) + len(marker) <= limit:
-            snippet += marker
-        else:
-            snippet = _safe_evidence_prefix(
-                snippet, max(0, limit - len(marker)),
-            ) + marker
-    status = "available"
-    if prefix_cut or suffix_cut:
-        status = "source_window_clipped"
-    return snippet, status, prefix_cut or suffix_cut
-
-
-def _load_current_plaintext_rows(conn, page_keys, query: str, *, snippet_limit: int):
-    """Batch-load selected live entity bodies; the identity table is ledger only."""
-    keys = list(dict.fromkeys(str(key) for key in page_keys if str(key)))[:100]
-    if not keys:
-        return {}
-    placeholders = ",".join("?" for _ in keys)
-    rows = conn.execute(
-        "SELECT ident.page_key, ident.entity_id, e.canonical_name, "
-        "length(CAST(e.data_json AS BLOB)) AS record_bytes, "
-        "CASE WHEN length(CAST(e.data_json AS BLOB)) <= ? THEN e.data_json END AS data_json "
-        "FROM entity_identities AS ident JOIN entities AS e "
-        "ON e.entity_id = ident.entity_id "
-        f"WHERE ident.page_key IN ({placeholders})",
-        (_PLAINTEXT_RECORD_BYTE_LIMIT, *keys),
-    ).fetchall()
-    output = {}
-    for row in rows:
-        key = str(row["page_key"] or "")
-        if int(row["record_bytes"] or 0) > _PLAINTEXT_RECORD_BYTE_LIMIT:
-            output[key] = {"status": "oversized", "snippet": "", "truncated": True}
-            continue
-        try:
-            record = json.loads(row["data_json"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            output[key] = {"status": "corrupt", "snippet": "", "truncated": False}
-            continue
-        if not isinstance(record, dict):
-            output[key] = {"status": "corrupt", "snippet": "", "truncated": False}
-            continue
-        state = str(record.get("lifecycle_state") or record.get("status") or "active").casefold()
-        if state in _HIDDEN_PLAINTEXT_STATES:
-            output[key] = {"status": "not_current", "snippet": "", "truncated": False}
-            continue
-        raw_text = record.get("raw_text")
-        if not isinstance(raw_text, str) or not raw_text.strip():
-            output[key] = {"status": "missing", "snippet": "", "truncated": False}
-            continue
-        normalized_query = _normalize_identity_label(query)
-        identity_labels = [
-            key,
-            record.get("title"),
-            record.get("canonical_name"),
-            row["canonical_name"],
-            *(record.get("aliases") or [] if isinstance(record.get("aliases"), list) else []),
-        ]
-        explicit_identity_match = bool(normalized_query) and any(
-            normalized_query == _normalize_identity_label(label)
-            for label in identity_labels if isinstance(label, str) and label
-        )
-        snippet, status, truncated = _bounded_namespaced_snippet(
-            raw_text, query, key, snippet_limit,
-            identity_context=explicit_identity_match,
-        )
-        output[key] = {
-            "status": status,
-            "snippet": snippet,
-            "truncated": truncated,
-            "title": str(record.get("title") or record.get("canonical_name") or row["canonical_name"] or key),
-            "explicit_identity_match": explicit_identity_match,
-        }
-    for key in keys:
-        output.setdefault(key, {"status": "missing", "snippet": "", "truncated": False})
-    return output
-
-
-def _is_structural_noise(node_key: str, query: str, exact_keys=()) -> bool:
-    normalized_key = str(node_key).casefold()
-    if normalized_key not in _STRUCTURAL_PAGE_KEYS:
-        return False
-    normalized_query = _normalize_identity_label(query)
-    return node_key not in exact_keys and normalized_query not in {
-        normalized_key, _normalize_identity_label(node_key.replace("_", " ")),
-    }
-
-
-def _query_embedding_int(name: str, default: int) -> int:
-    try:
-        return max(1, int(os.environ.get(name, default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _search_result_char_limit() -> int:
-    try:
-        value = int(os.environ.get("VECTOR_LAKE_SEARCH_RESULT_MAX_CHARS", "24000"))
-    except (TypeError, ValueError):
-        value = 24_000
-    return max(1_000, min(256_000, value))
-
-
-def _search_result_byte_limit() -> int:
-    try:
-        value = int(os.environ.get("VECTOR_LAKE_SEARCH_RESULT_MAX_BYTES", "32768"))
-    except (TypeError, ValueError):
-        value = 32_768
-    return max(4_096, min(1_048_576, value))
-
-
-def _record_search_performance(
-    timings: dict[str, float],
-    *,
-    result_chars: int,
-    result_bytes: int,
-    backend_issues: list[str],
-) -> None:
-    normalized = {
-        key: round(max(0.0, float(value)), 3) for key, value in timings.items()
-    }
-    normalized["result_chars"] = max(0, int(result_chars))
-    normalized["result_bytes"] = max(0, int(result_bytes))
-    normalized["backend_issues"] = sorted(set(backend_issues))
-    with _SEARCH_PERFORMANCE_LOCK:
-        _SEARCH_PERFORMANCE["completed_calls"] += 1
-        _SEARCH_PERFORMANCE["last"] = normalized
-        _SEARCH_PERFORMANCE["max_total_ms"] = round(
-            max(
-                float(_SEARCH_PERFORMANCE["max_total_ms"]),
-                float(normalized.get("total_ms") or 0.0),
-            ),
-            3,
-        )
-
-
-def search_performance_status() -> dict:
-    """Return query-text-free process-local search timing telemetry."""
-    with _SEARCH_BACKEND_LOG_LOCK:
-        suppressed = {
-            backend: int(state.get("suppressed", 0))
-            for backend, state in _SEARCH_BACKEND_LOG_STATE.items()
-            if int(state.get("suppressed", 0)) > 0
-        }
-    with _SEARCH_PERFORMANCE_LOCK:
-        status = {
-            "completed_calls": int(_SEARCH_PERFORMANCE["completed_calls"]),
-            "last": dict(_SEARCH_PERFORMANCE["last"]),
-            "max_total_ms": float(_SEARCH_PERFORMANCE["max_total_ms"]),
-            "result_char_limit": _search_result_char_limit(),
-            "result_byte_limit": _search_result_byte_limit(),
-        }
-    status["backend_log_suppressed"] = suppressed
-    return status
-
-
-def _log_search_backend_failure(backend: str) -> None:
-    """Rate-limit repeated backend failures without hiding degradation state."""
-    normalized = str(backend or "unknown").strip().lower() or "unknown"
-    now = time.monotonic()
-    with _SEARCH_BACKEND_LOG_LOCK:
-        state = _SEARCH_BACKEND_LOG_STATE.setdefault(
-            normalized,
-            {"last_logged": float("-inf"), "suppressed": 0},
-        )
-        elapsed = now - float(state["last_logged"])
-        if elapsed < _SEARCH_BACKEND_LOG_INTERVAL_SECONDS:
-            state["suppressed"] = int(state["suppressed"]) + 1
-            return
-        suppressed = int(state["suppressed"])
-        state["last_logged"] = now
-        state["suppressed"] = 0
-    suffix = f"; suppressed {suppressed} repeated failures" if suppressed else ""
-    log.error(
-        "Search backend %s failed; using bounded fallback%s",
-        normalized,
-        suffix,
-    )
-
-
-def _reset_search_backend_log_state() -> None:
-    with _SEARCH_BACKEND_LOG_LOCK:
-        _SEARCH_BACKEND_LOG_STATE.clear()
-
-
-def _normalize_identity_label(value: object) -> str:
-    """Normalize an identity label without turning fuzzy text into equality."""
-    text = unicodedata.normalize("NFKC", str(value or "")).strip()
-    if text.casefold().endswith(".md"):
-        text = text[:-3]
-    return " ".join(text.split()).casefold()
-
-
-def _identity_lookup(index_data: dict) -> dict[str, tuple[tuple[str, float], ...]]:
-    """Build one generation-scoped exact key/title/alias lookup.
-
-    The existing projection-level alias map stores one target per spelling and
-    can therefore hide an ambiguous alias.  This cache is rebuilt from nodes so
-    every exact claimant remains visible and the O(N) scan is paid once per
-    committed projection generation rather than once per query.
+    Graph expansion and reranking must not bypass these; previously only the
+    first scoring pass applied them, so ``domain=`` could return other domains.
     """
-    signature = json.dumps(
-        index_data.get("projection_manifest") or {},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    with _IDENTITY_LOOKUP_LOCK:
-        if _IDENTITY_LOOKUP_CACHE["signature"] == signature:
-            return _IDENTITY_LOOKUP_CACHE["lookup"]  # type: ignore[return-value]
-        # Build under the same lock as the generation check.  The work is O(N)
-        # and a concurrent cold start previously let every request repeat the
-        # full allocation before the first result reached the cache.
-        mutable: dict[str, dict[str, float]] = {}
-        for raw_key, raw_node in (index_data.get("nodes") or {}).items():
-            key = str(raw_key)
-            node = raw_node if isinstance(raw_node, dict) else {}
-            aliases = node.get("aliases") or []
-            if isinstance(aliases, str):
-                aliases = [aliases]
-            labels = [
-                (key, "key"),
-                (node.get("id"), "id"),
-                (node.get("title"), "title"),
-                *((alias, "alias") for alias in aliases),
-            ]
-            for label, kind in labels:
-                normalized = _normalize_identity_label(label)
-                if not normalized:
-                    continue
-                matches = mutable.setdefault(normalized, {})
-                matches[key] = max(
-                    matches.get(key, 0.0),
-                    _EXACT_IDENTITY_WEIGHTS[kind],
-                )
-
-        lookup = {
-            label: tuple(sorted(matches.items(), key=lambda item: (-item[1], item[0])))
-            for label, matches in mutable.items()
-        }
-        _IDENTITY_LOOKUP_CACHE["signature"] = signature
-        _IDENTITY_LOOKUP_CACHE["lookup"] = lookup
-        return lookup
-
-
-def _exact_identity_scores(index_data: dict, query: str) -> dict[str, float]:
-    normalized = _normalize_identity_label(query)
-    if not normalized:
-        return {}
-    return dict(_identity_lookup(index_data).get(normalized, ()))
-
-
-def _query_embedding_enabled() -> bool:
-    """Return whether the remote query-embedding provider may be called.
-
-    **On by default.**  Unset means enabled; an explicit ``0`` (or any value
-    other than ``1``) disables it, so an operator still has a fail-closed way to
-    turn the provider off.  ``GEMINI_API_KEY`` remains a separate runtime
-    capability check, and ``_should_query_embedding`` still only reaches the
-    provider when lexical retrieval is weak, so ordinary searches keep their
-    local latency.
-
-    Measured on the live corpus with the index populated: a query that does
-    trigger the provider costs about **4,000 ms** (3,879 ms of it the remote
-    ``batchEmbedContents`` call) versus ~50 ms warm for the FTS-only path.  Set
-    the flag to ``0`` on a host that must never call the provider.
-    """
-    return os.environ.get(_QUERY_EMBEDDING_OPT_IN_ENV, "1").strip() == "1"
-
-
-def _should_query_embedding(*, fts_result_count: int, top_k: int) -> bool:
-    if not _query_embedding_enabled():
+    if domain and str(node.get("domain") or "").lower() != domain.lower():
         return False
-    if os.environ.get("VECTOR_LAKE_QUERY_EMBEDDING_ALWAYS") == "1":
-        return True
-    minimum = _query_embedding_int(
-        "VECTOR_LAKE_QUERY_EMBEDDING_FTS_BYPASS_MIN_RESULTS",
-        5,
-    )
-    minimum = min(max(1, int(top_k)), minimum)
-    return max(0, int(fts_result_count)) < minimum
-
-
-@functools.lru_cache(maxsize=64)
-def _cached_query_embedding(
-    query: str,
-    model: str,
-    timeout_ms: int,
-    max_wait_ms: int,
-) -> tuple[float, ...]:
-    del model  # The model remains part of the cache key.
-    from vector_lake.embedding_scheduler import embed_texts
-
-    embeddings = embed_texts(
-        [query],
-        max_retries=0,
-        timeout_ms=timeout_ms,
-        max_wait_seconds=max_wait_ms / 1000.0,
-        initialize_schema=False,
-    )
-    return tuple(embeddings[0]) if embeddings else ()
-
-
-def _reset_query_embedding_state_for_tests() -> None:
-    global _QUERY_EMBEDDING_FAILURE_UNTIL
-    _cached_query_embedding.cache_clear()
-    with _QUERY_EMBEDDING_STATE_LOCK:
-        _QUERY_EMBEDDING_CACHE_KEYS.clear()
-        _QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
-
-
-def _get_query_embedding(query: str) -> list[float]:
-    global _QUERY_EMBEDDING_FAILURE_UNTIL
-    normalized_query = str(query or "").strip()
-    if len(normalized_query) > _SEARCH_QUERY_CHAR_LIMIT:
-        raise ValueError(f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters")
-    if (
-        not _query_embedding_enabled()
-        or not os.environ.get("GEMINI_API_KEY")
-        or not normalized_query
-    ):
-        return []
-
-    timeout_ms = _query_embedding_int(
-        "VECTOR_LAKE_QUERY_EMBEDDING_TIMEOUT_MS",
-        2_000,
-    )
-    max_wait_ms = _query_embedding_int(
-        "VECTOR_LAKE_QUERY_EMBEDDING_MAX_WAIT_MS",
-        250,
-    )
-    model = os.environ.get(
-        "VECTOR_LAKE_EMBEDDING_MODEL",
-        "gemini-embedding-2",
-    )
-    cache_key = (normalized_query, model, timeout_ms, max_wait_ms)
-    key_lock = _QUERY_EMBEDDING_KEY_LOCKS[
-        hash(cache_key) % len(_QUERY_EMBEDDING_KEY_LOCKS)
-    ]
-
-    with key_lock:
-        now = time.monotonic()
-        with _QUERY_EMBEDDING_STATE_LOCK:
-            cache_known = cache_key in _QUERY_EMBEDDING_CACHE_KEYS
-            if not cache_known and now < _QUERY_EMBEDDING_FAILURE_UNTIL:
-                return []
-
+    if cluster and str(node.get("topic_cluster") or "").lower() != cluster.lower():
+        return False
+    if not include_history and str(node.get("status") or "").lower() in ("deprecated", "archived"):
+        return False
+    if filter_expr:
         try:
-            vector = list(
-                _cached_query_embedding(
-                    normalized_query,
-                    model,
-                    timeout_ms,
-                    max_wait_ms,
-                )
-            )
-            with _QUERY_EMBEDDING_STATE_LOCK:
-                if not cache_known:
-                    _QUERY_EMBEDDING_FAILURE_UNTIL = 0.0
-                _QUERY_EMBEDDING_CACHE_KEYS[cache_key] = None
-                _QUERY_EMBEDDING_CACHE_KEYS.move_to_end(cache_key)
-                while len(_QUERY_EMBEDDING_CACHE_KEYS) > 64:
-                    _QUERY_EMBEDDING_CACHE_KEYS.popitem(last=False)
-            return vector
+            if not _safe_eval(filter_expr, node):
+                return False
         except Exception as exc:
-            cooldown = _query_embedding_int(
-                "VECTOR_LAKE_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS",
-                30,
-            )
-            with _QUERY_EMBEDDING_STATE_LOCK:
-                _QUERY_EMBEDDING_FAILURE_UNTIL = time.monotonic() + cooldown
-            log.warning(f"Failed to get query embedding: {exc}")
-            return []
+            log.warning("Filter expr evaluation failed for node %s: %s", node.get("_key"), exc)
+            return False
+    return True
 
 
-_VECTOR_CACHE = {"mtime": 0.0, "keys": [], "matrix": None}
-
-
-def _get_vector_search_results(
-    query_vector: list[float],
-    index_data: dict,
-    limit: int = 50,
-) -> dict[str, float]:
+def _get_query_embedding(query: str) -> tuple[list[float], str | None]:
+    """Query vector plus an explicit degradation reason when it is unavailable."""
+    if not os.environ.get("GEMINI_API_KEY"):
+        return [], "GEMINI_API_KEY is not set"
     try:
-        from vector_lake.db_store import (
-            get_vector_connection,
-            serialize_float32_vector,
-        )
+        from vector_lake.embedding_scheduler import embed_texts
 
-        conn = get_vector_connection()
-        from vector_lake.embedding_scheduler import load_embedding_rate_config
-        from vector_lake.search_projection_contract import (
-            EMBEDDING_INPUT_CONTRACT,
-            embedding_content_sha256,
-        )
+        embeddings = embed_texts([query])
+        if not embeddings:
+            return [], "embedding provider returned no vector"
+        return embeddings[0], None
+    except Exception as e:
+        log.warning(f"Failed to get query embedding: {e}")
+        return [], f"{type(e).__name__}: {e}"
 
-        config = load_embedding_rate_config()
-        requested_limit = max(1, int(limit))
-        if len(query_vector) != config.dimension:
-            return {}
-        query_norm = math.sqrt(
-            sum(float(value) * float(value) for value in query_vector)
-        )
-        if not math.isfinite(query_norm) or query_norm <= 0:
-            return {}
-        query_blob = serialize_float32_vector(
-            [float(value) / query_norm for value in query_vector]
-        )
-        owns_snapshot = not conn.in_transaction
-        if owns_snapshot:
-            conn.execute("BEGIN")
+
+def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tuple[dict[str, float], str | None]:
+    """Vector hits plus an explicit degradation reason when the query failed."""
+    try:
+        from vector_lake.db_store import get_connection
+        import sqlite_vec
+        conn = get_connection()
+        query_blob = sqlite_vec.serialize_float32(query_vector)
         # Using match because it's fast. It returns L2 distance.
         # Cosine similarity for normalized vectors: 1 - L2^2 / 2
-        # But sqlite-vec also has vec_distance_cosine which returns cosine distance.
-        # We can just use match and sort by distance.
-        try:
-            crowding = conn.execute(
-                "SELECT COUNT(*) AS total_count, "
-                "COALESCE(SUM(CASE WHEN meta.entity_id IS NOT NULL "
-                "AND meta.model = ? AND meta.dimension = ? "
-                "AND meta.input_contract = ? THEN 0 ELSE 1 END), 0) "
-                "AS metadata_invalid_count "
-                "FROM vec_embeddings AS vec "
-                "LEFT JOIN embedding_metadata_v8 AS meta "
-                "ON meta.entity_id = vec.entity_id",
-                (config.model, config.dimension, EMBEDDING_INPUT_CONTRACT),
-            ).fetchone()
-            total_count = int(crowding["total_count"] or 0)
-            metadata_invalid_count = int(crowding["metadata_invalid_count"] or 0)
-            if total_count <= metadata_invalid_count:
-                return {}
-
-            # vec0 applies ``k`` before JOIN predicates. Account for every
-            # legacy/wrong-contract row in this fixed-dimension vec0 table so
-            # those rows cannot crowd a valid neighbor out of a small KNN.
-            knn_k = min(total_count, requested_limit + metadata_invalid_count)
-            nodes = index_data.get("nodes") or {}
-            while True:
-                cursor = conn.execute(
-                    "SELECT vec.entity_id, vec.distance, meta.content_sha256 "
-                    "FROM vec_embeddings AS vec JOIN embedding_metadata_v8 AS meta "
-                    "ON meta.entity_id = vec.entity_id "
-                    "WHERE vec.embedding MATCH ? AND vec.k = ? AND meta.model = ? "
-                    "AND meta.dimension = ? AND meta.input_contract = ? "
-                    "ORDER BY vec.distance",
-                    (
-                        query_blob,
-                        knn_k,
-                        config.model,
-                        config.dimension,
-                        EMBEDDING_INPUT_CONTRACT,
-                    ),
-                )
-
-                results = {}
-                candidate_invalid_count = 0
-                similarity_exhausted = False
-                for row in cursor.fetchall():
-                    # distance is L2. convert to approx sim: 1 - L2^2 / 2
-                    dist = float(row["distance"])
-                    sim = 1.0 - (dist * dist) / 2.0
-                    if sim <= 0.5:
-                        similarity_exhausted = True
-                        break
-                    entity_id = str(row["entity_id"])
-                    node = nodes.get(entity_id)
-                    if node is None or str(
-                        row["content_sha256"]
-                    ) != embedding_content_sha256(
-                        node,
-                        max_chars=config.max_chars_per_item,
-                    ):
-                        candidate_invalid_count += 1
-                        continue
-                    results[entity_id] = sim
-                    if len(results) >= requested_limit:
-                        return results
-
-                if similarity_exhausted or knn_k >= total_count:
-                    return results
-
-                # Content-invalid/orphan candidates are visible only after the
-                # KNN prefix is read. Grow geometrically, but never beyond the
-                # same-dimension table cardinality, until ``limit`` valid rows
-                # are provably reachable or the table is exhausted.
-                knn_k = min(
-                    total_count,
-                    max(
-                        knn_k + 1,
-                        knn_k * 2,
-                        requested_limit
-                        + metadata_invalid_count
-                        + candidate_invalid_count,
-                    ),
-                )
-        finally:
-            if owns_snapshot and conn.in_transaction:
-                conn.rollback()
-    except Exception as exc:
-        log.warning("Failed to query vec_embeddings: %s", exc)
-        raise SearchBackendError("vector") from exc
-
-
-def _fts_projection_probe(index_data: dict) -> tuple[tuple | None, str | None]:
-    """Return one generation-bound FTS proof and any fail-closed issue."""
-    manifest_generation = str(
-        (index_data.get("projection_manifest") or {}).get("generation") or ""
-    )
-    # Unit-level callers may inject an in-memory index without a committed
-    # projection manifest. Real readers cannot reach this path because
-    # ``_load_search_index`` validates the sidecar contract first.
-    if not manifest_generation:
-        return ("unbound_in_memory_projection",), None
-    try:
-        from vector_lake.db_store import (
-            get_connection,
-            verify_search_projection_integrity,
+        cursor = conn.execute(
+            "SELECT entity_id, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (query_blob, limit)
         )
 
-        conn = get_connection()
-        integrity = verify_search_projection_integrity(conn)
-        signature = integrity.get("signature")
-        if integrity.get("status") != "ready" or not isinstance(signature, tuple):
-            return None, str(integrity.get("issue") or "fts_projection_integrity")
-        if str(signature[0]) != manifest_generation:
-            return None, "fts_projection_state"
-        return signature, None
-    except Exception:
-        return None, "fts_projection_integrity"
-
-
-def _fts_projection_signature(index_data: dict) -> tuple | None:
-    """Compatibility wrapper returning only the verified FTS proof."""
-    return _fts_projection_probe(index_data)[0]
-
-
-def _stable_fts_projection_signature(signature: tuple | None) -> tuple | None:
-    """Exclude connection revision noise after integrity has been re-proven."""
-    if signature is None or signature == ("unbound_in_memory_projection",):
-        return signature
-    return signature[:5]
-
+        results = {}
+        for row in cursor.fetchall():
+            # distance is L2. convert to approx sim: 1 - (dist^2)/2
+            dist = row["distance"]
+            sim = 1.0 - (dist * dist) / 2.0
+            if sim > 0.5:
+                results[row["entity_id"]] = sim
+        return results, None
+    except Exception as e:
+        log.warning(f"Failed to query vec_embeddings: {e}")
+        return {}, f"vec_embeddings query failed: {type(e).__name__}: {e}"
 
 def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
-    try:
-        from vector_lake.tokenizer_runtime import tokenize_for_fts
+    from vector_lake import tokenizer as _tokenizer
 
-        query_tok = tokenize_for_fts(query)
-    except ImportError:
-        query_tok = query if query else ""
-
+    query_tok = _tokenizer.tokenize_joined(query)
+        
     # Sanitize query_tok for FTS5 (remove special syntax characters)
     import re
-
-    query_tok = re.sub(r'["*^&|()\-:\[\]{}]', " ", query_tok)
+    query_tok = re.sub(r'["*^&|()\-:\[\]{}]', ' ', query_tok)
     # Ensure it's not empty or just spaces
     if not query_tok.strip():
         return []
-
+        
     try:
         from vector_lake.db_store import get_connection
-
         conn = get_connection()
-        cur = conn.execute(
-            """
+        cur = conn.execute("""
             SELECT node_key, title, summary, bm25(wiki_search_index) as rank 
             FROM wiki_search_index 
             WHERE wiki_search_index MATCH ? 
             ORDER BY rank LIMIT ?
-        """,
-            (query_tok, limit),
-        )
+        """, (query_tok, limit))
         return [dict(row) for row in cur.fetchall()]
-    except Exception as exc:
-        log.warning("Failed to query fts5: %s", exc)
-        raise SearchBackendError("fts5") from exc
-
+    except Exception as e:
+        log.warning(f"Failed to query fts5: {e}")
+        return []
 
 def _classify_intent(query: str) -> str:
-    temporal_keywords = {
-        "上周",
-        "去年",
-        "昨天",
-        "最近",
-        "历史",
-        "last week",
-        "yesterday",
-        "202",
-    }
-    entity_keywords = {
-        "是谁",
-        "哪里",
-        "谁在",
-        "who is",
-        "where is",
-        "公司",
-        "人员",
-        "关联",
-        "图谱",
-        "网络",
-    }
+    temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
+    entity_keywords = {"是谁", "哪里", "谁在", "who is", "where is", "公司", "人员", "关联", "图谱", "网络"}
     for kw in temporal_keywords:
-        if kw in query.lower():
-            return "temporal"
+        if kw in query.lower(): return "temporal"
     for kw in entity_keywords:
-        if kw in query.lower():
-            return "entity"
+        if kw in query.lower(): return "entity"
     return "general"
 
 
@@ -1109,15 +145,19 @@ def _expand_query_locally(query: str) -> list[str]:
             expanded_terms.update(expansions)
 
     tokens = set()
-    try:
-        from vector_lake.tokenizer_runtime import segment_text
-    except ImportError:
-        segment_text = None
+    from vector_lake import tokenizer as _tokenizer
+
+    backend_ready = _tokenizer.backend_name() != "unavailable"
+    if backend_ready:
+        for term in QUERY_EXPANSION_DICT.keys():
+            _tokenizer.add_word(term)
+        for expansions in QUERY_EXPANSION_DICT.values():
+            for exp in expansions:
+                _tokenizer.add_word(exp)
 
     for term in expanded_terms:
-        if segment_text and CJK_REGEX.search(term):
-            tokens.add(term.lower())
-            for word in segment_text(term):
+        if backend_ready and CJK_REGEX.search(term):
+            for word in _tokenizer.split(term):
                 word_lower = word.lower()
                 if word_lower not in STOP_WORDS and word_lower.strip():
                     tokens.add(word_lower)
@@ -1139,183 +179,44 @@ def _expand_query_locally(query: str) -> list[str]:
     return list(tokens)
 
 
-def _bounded_excerpt(text: str, limit: int) -> tuple[str, bool]:
-    limit = max(0, limit)
-    if len(text) <= limit:
-        return text, False
-    marker = "...[truncated]"[:limit]
-    return text[:limit - len(marker)] + marker, True
-
-
 def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) -> str:
     state = memory.get("validity_state", "active")
     memory_type = memory.get("memory_type", "fact")
     score = memory.get("retrieval_score", memory.get("memory_score", 0))
-    text, truncated = _bounded_excerpt(
-        " ".join(str(memory.get("text", "")).split()), 420
-    )
-    source = (
-        memory.get("source_page")
-        or memory.get("source_claim_id")
-        or "operational_memory"
-    )
-    identities = {
-        field: str(memory[field])
-        for field in ("memory_id", "source_claim_id", "source_page")
-        if memory.get(field)
-    }
+    text = " ".join(str(memory.get("text", "")).split())[:420]
+    source = memory.get("source_page") or memory.get("source_claim_id") or "operational_memory"
     if as_xml:
         attrs = (
-            f"ID={quoteattr(f'Memory_{index}')} Type={quoteattr(str(memory_type))} "
-            f"State={quoteattr(str(state))} Score={quoteattr(str(score))} "
-            f"Source={quoteattr(str(source))} Truncated={quoteattr(str(truncated).lower())}"
+            f"ID='Memory_{index}' Type='{memory_type}' State='{state}' "
+            f"Score='{score}' Source='{source}'"
         )
-        attrs += "".join(
-            f" {field}={quoteattr(value)}" for field, value in identities.items()
-        )
-        return f"<Memory_Item {attrs}>{escape(text)}</Memory_Item>\n"
-    identity_text = "".join(
-        f"  {field}: {value}\n" for field, value in identities.items()
-    )
+        return f"<Memory_Item {attrs}>{text}</Memory_Item>\n"
     return (
         f"- **{memory_type}:{memory.get('memory_key', memory.get('memory_id'))}** "
         f"(score: {score:.2f}, state: {state})\n"
         f"  {text}\n"
-        f"  Source: {source}\n"
-        f"{identity_text}\n"
+        f"  Source: {source}\n\n"
     )
 
 
-def _operational_memory_unavailable_guidance(reason: str) -> str:
-    return (
-        f"Operational memory unavailable ({reason}). "
-        "Run `python cli.py doctor` to diagnose; verify the configured memory/meta "
-        "paths and ask the operator to repair or rebuild the reported projection "
-        "before retrying. No running maintenance worker has been verified."
+def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool = False, include_history: bool = False, memory_types: list[str] | None = None) -> str:
+    memories = governance_store.search_operational_memory(
+        query,
+        top_k=top_k,
+        include_history=include_history,
+        memory_types=memory_types,
     )
-
-
-def format_operational_memory_results(
-    query: str,
-    top_k: int = 8,
-    as_xml: bool = False,
-    include_history: bool = False,
-    memory_types: list[str] | None = None,
-    *,
-    _raise_on_unavailable: bool = False,
-) -> str:
-    try:
-        memories = governance_store.search_operational_memory(
-            query,
-            top_k=top_k,
-            include_history=include_history,
-            memory_types=memory_types,
-        )
-    except governance_store.OperationalMemoryNotReady as exc:
-        if _raise_on_unavailable:
-            raise
-        if as_xml:
-            return (
-                "<MemoryResults State='unavailable' "
-                f"Reason={quoteattr(exc.reason)} "
-                f"RetryAfterSeconds={quoteattr(str(exc.retry_after_seconds))}/>"
-            )
-        return _operational_memory_unavailable_guidance(exc.reason)
-    if memory_types:
-        allowed_memory_types = {
-            str(memory_type).strip().lower() for memory_type in memory_types
-        }
-        memories = [
-            memory
-            for memory in memories
-            if str(memory.get("memory_type") or "fact").strip().lower()
-            in allowed_memory_types
-        ]
     if not memories:
-        return (
-            "<MemoryResults />"
-            if as_xml
-            else "No operational memory matched the query."
-        )
-    formatted = "".join(
-        _format_memory_result(memory, as_xml=as_xml, index=index)
-        for index, memory in enumerate(memories)
-    )
-    return f"<MemoryResults>\n{formatted}</MemoryResults>" if as_xml else formatted
-
-
-def _format_claim_mode_compatibility(
-    result: str,
-    *,
-    as_xml: bool,
-    requested_mode: str,
-) -> str:
-    if as_xml:
-        return (
-            "<SearchCompatibility RequestedMode="
-            f"{quoteattr(requested_mode)} EffectiveMode='fact' Deprecated='true' "
-            "ActualSemantics='operational_memory_fact_not_canonical_claim'>\n"
-            f"<Warning>{escape(CLAIM_MODE_DEPRECATION_WARNING)}</Warning>\n"
-            f"{result}\n"
-            "</SearchCompatibility>"
-        )
-    return (
-        f"DEPRECATION / ACTUAL SEMANTICS: {CLAIM_MODE_DEPRECATION_WARNING}\n\n{result}"
-    )
-
-
-_MEMORY_PACKET_TRUNCATION_SUFFIX = "\n...[memory packet truncated]\n</MEMORY_PACKET>"
-
-
-def _bounded_memory_packet_text(packet: str, max_chars: int) -> str:
-    if len(packet) <= max_chars:
-        return packet
-    room = max_chars - len(_MEMORY_PACKET_TRUNCATION_SUFFIX)
-    if room <= 0:
-        return ""
-    # Cut only at complete text lines, never inside the opening tag or an
-    # escaped XML entity. The closing element and disclosure are reserved.
-    boundary = packet.rfind("\n", 0, room + 1)
-    if boundary < 0:
-        return ""
-    return packet[:boundary] + _MEMORY_PACKET_TRUNCATION_SUFFIX
+        return "No operational memory matched the query."
+    return "".join(_format_memory_result(memory, as_xml=as_xml, index=index) for index, memory in enumerate(memories))
 
 
 def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
-    if max_chars <= 0:
-        return {
-            "packet": "", "memory_count": 0, "warning_count": 1,
-            "omitted_count": None, "budget_truncated": True,
-            "text_truncated_count": 0,
-        }
-    try:
-        memories, historical = governance_store.search_operational_memory_views(
-            query,
-            current_top_k=24,
-            history_top_k=12,
-        )
-        memories = governance_store.apply_effective_memory_routing(memories)
-    except governance_store.OperationalMemoryNotReady as exc:
-        packet = (
-            f"<MEMORY_PACKET status='unavailable' reason={quoteattr(exc.reason)} "
-            f"retry_after_seconds={quoteattr(str(exc.retry_after_seconds))}>\n"
-            f"{escape(_operational_memory_unavailable_guidance(exc.reason))}\n"
-            "</MEMORY_PACKET>"
-        )
-        return {
-            "packet": _bounded_memory_packet_text(packet, max_chars),
-            "memory_count": 0,
-            "warning_count": 1,
-            "omitted_count": None,
-            "budget_truncated": len(packet) > max_chars,
-            "text_truncated_count": 0,
-            "retry_after_seconds": exc.retry_after_seconds,
-        }
+    memories = governance_store.search_operational_memory(query, top_k=24, include_history=False)
+    historical = governance_store.search_operational_memory(query, top_k=12, include_history=True)
     stale_or_conflicted = [
-        item
-        for item in historical
-        if str(item.get("validity_state", "")).lower()
-        in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
+        item for item in historical
+        if str(item.get("validity_state", "")).lower() in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
     ][:6]
 
     sections = {
@@ -1333,19 +234,15 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
 
     evidence_pointers = []
     for memory in memories:
-        section = type_to_section.get(
-            memory.get("effective_memory_type", "fact"), "Relevant Facts"
-        )
-        text, truncated = _bounded_excerpt(
-            " ".join(str(memory.get("text", "")).split()), 420
-        )
+        section = type_to_section.get(memory.get("memory_type", "fact"), "Relevant Facts")
+        text = " ".join(str(memory.get("text", "")).split())
         line = (
             f"- [{memory.get('memory_score', 0):.2f}/{memory.get('validity_state', 'active')}] "
-            f"{text}"
+            f"{text[:420]}"
         )
         if memory.get("source_page"):
             line += f" ({memory['source_page']})"
-        sections[section].append((line, truncated))
+        sections[section].append(line)
         if memory.get("source_claim_id"):
             evidence_pointers.append(
                 f"- {memory.get('source_claim_id')} -> {memory.get('source_page', 'unknown')}"
@@ -1358,33 +255,17 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
         "Policy: Use this packet as the machine-facing runtime memory. If it conflicts with wiki prose, prefer active non-conflicted memory items and surface the conflict.",
         "",
     ]
-    memory_lines = set()
-    truncated_lines = set()
-    for title in (
-        "Current Preferences",
-        "Open Decisions",
-        "Task State",
-        "Relevant Facts",
-    ):
+    for title in ("Current Preferences", "Open Decisions", "Task State", "Relevant Facts"):
         lines.append(f"## {title}")
-        for line, truncated in sections[title]:
-            memory_lines.add(len(lines))
-            if truncated:
-                truncated_lines.add(len(lines))
-            lines.append(line)
-        if not sections[title]:
-            lines.append("- None matched.")
+        lines.extend(sections[title] or ["- None matched."])
         lines.append("")
 
     lines.append("## Conflicts / Stale Warnings")
     if stale_or_conflicted:
         for memory in stale_or_conflicted:
-            text, truncated = _bounded_excerpt(str(memory.get("text", "")), 260)
-            if truncated:
-                truncated_lines.add(len(lines))
             lines.append(
                 f"- [{memory.get('validity_state')}] {memory.get('memory_type')}:{memory.get('memory_key')} "
-                f"-> {text}"
+                f"-> {str(memory.get('text', ''))[:260]}"
             )
     else:
         lines.append("- None matched.")
@@ -1394,60 +275,100 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     lines.extend(evidence_pointers[:12] or ["- None matched."])
     lines.append("</MEMORY_PACKET>")
 
-    # This is an XML element containing Markdown text, not trusted markup.
-    lines[1:-1] = [escape(line) for line in lines[1:-1]]
-    full_packet = "\n".join(lines)
-    packet = _bounded_memory_packet_text(full_packet, max_chars)
-    budget_truncated = len(full_packet) > max_chars
-    prefix_chars = len(packet)
-    if budget_truncated:
-        prefix_chars = max(0, prefix_chars - len(_MEMORY_PACKET_TRUNCATION_SUFFIX))
-    included = text_truncated_count = end = 0
-    for index, line in enumerate(lines):
-        end += len(line) + bool(index)
-        if end > prefix_chars:
-            break
-        included += index in memory_lines
-        text_truncated_count += index in truncated_lines
+    packet = "\n".join(lines)
+    omitted = 0
+    if len(packet) > max_chars:
+        packet = packet[: max(0, max_chars - 80)].rstrip() + "\n...[memory packet truncated]\n</MEMORY_PACKET>"
+        omitted = max(0, len(memories) - 12)
     return {
         "packet": packet,
-        "memory_count": included,
+        "memory_count": len(memories),
         "warning_count": len(stale_or_conflicted),
-        "omitted_count": len(memories) - included,
-        "budget_truncated": budget_truncated,
-        "text_truncated_count": text_truncated_count,
+        "omitted_count": omitted,
     }
 
 
-def _rerank_candidates_locally(
-    query: str, candidates: list[tuple[float, dict]]
-) -> list[tuple[float, dict]]:
-    """Apply a deterministic semantic-text boost without an external model call."""
-    query_text = str(query or "").strip().casefold()
-    terms = {
-        str(term).strip().casefold()
-        for term in _expand_query_locally(query)
-        if str(term).strip()
-    }
-    reranked: list[tuple[float, int, dict]] = []
-    for position, (base_score, node) in enumerate(candidates):
-        key = str(node.get("_key") or "").casefold()
-        title = str(node.get("title") or "").casefold()
-        summary = str(node.get("summary") or "").casefold()
-        aliases = " ".join(map(str, node.get("aliases") or ())).casefold()
-        bonus = 0.0
-        if query_text and query_text in {key, title}:
-            bonus += 5.0
-        for term in terms:
-            if term in title or term in key:
-                bonus += 2.0
-            if term in aliases:
-                bonus += 1.0
-            if term in summary:
-                bonus += 0.5
-        reranked.append((float(base_score) + bonus, position, node))
-    reranked.sort(key=lambda item: (-item[0], item[1]))
-    return [(score, node) for score, _position, node in reranked]
+def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
+    """Phase 2: local reranking of the retrieved candidate pool with BM25.
+
+    Candidate *membership* is decided upstream by FTS5 + graph expansion, so
+    recall is unchanged; this only re-orders within that pool and replaces the
+    raw `-bm25` magnitudes that previously dominated the blend.
+
+    The lexical signal comes from ``bm25s`` over title + summary + aliases. The
+    page body is deliberately not read here: it would add per-candidate file IO
+    to every query, and ``index.json`` no longer carries it.
+
+    Scores are **pool-normalised**, not absolute: min-max within the pool means
+    the leading candidate always reports 1.0, and a pool with no lexical signal
+    at all reduces to a monotone rescaling of the upstream order. Ties at the
+    pool maximum stay tied.
+
+    ``VECTOR_LAKE_RERANK_WEIGHT`` (default 0.4) blends the two normalised score
+    sets; set it to 0 to reproduce the previous ordering exactly. The weight
+    keeps upstream influence on purpose so graph-expanded candidates, which have
+    no lexical overlap by construction, are not buried.
+    """
+    if len(candidates) < 2:
+        return candidates
+    try:
+        weight = float(os.environ.get("VECTOR_LAKE_RERANK_WEIGHT", "0.4"))
+    except ValueError:
+        weight = 0.4
+    weight = min(1.0, max(0.0, weight))
+    if weight <= 0.0:
+        return candidates
+
+    try:
+        import bm25s
+    except ImportError:
+        log.debug("bm25s is not installed; skipping local reranking.")
+        return candidates
+
+    from vector_lake import tokenizer as _tokenizer
+
+    def _document(node: dict) -> str:
+        aliases = node.get("aliases") or []
+        alias_text = " ".join(str(a) for a in aliases) if isinstance(aliases, list) else str(aliases)
+        return " ".join(
+            part for part in (str(node.get("title") or ""), str(node.get("summary") or ""), alias_text) if part
+        ).strip()
+
+    # Pre-tokenize with the project tokenizer, then let bm25s bind the tokens by
+    # splitting on whitespace only (its default \w\w+ pattern cannot segment CJK).
+    documents = [_tokenizer.tokenize_joined(_document(node)) for _, node in candidates]
+    query_tokens = _tokenizer.cut(query)
+    if not query_tokens or not any(documents):
+        return candidates
+
+    try:
+        corpus = bm25s.tokenize(documents, stopwords=[], token_pattern=r"(?u)\S+", show_progress=False)
+        retriever = bm25s.BM25()
+        retriever.index(corpus, show_progress=False)
+        lexical = [float(value) for value in retriever.get_scores(query_tokens)]
+    except Exception as exc:
+        # Fail open: a reranker fault must never drop results.
+        log.warning("Local reranking failed (%s: %s); keeping upstream order.", type(exc).__name__, exc)
+        return candidates
+
+    if len(lexical) != len(candidates):
+        log.warning("Local reranking returned %s scores for %s candidates; keeping upstream order.",
+                    len(lexical), len(candidates))
+        return candidates
+
+    def _normalise(values: list[float]) -> list[float]:
+        low, high = min(values), max(values)
+        if high - low <= 1e-12:
+            return [0.0] * len(values)
+        return [(value - low) / (high - low) for value in values]
+
+    upstream = _normalise([float(score) for score, _ in candidates])
+    lexical_norm = _normalise(lexical)
+    blended = [(1.0 - weight) * u + weight * b for u, b in zip(upstream, lexical_norm)]
+
+    # Stable: ties keep their upstream relative order.
+    order = sorted(range(len(candidates)), key=lambda index: (-blended[index], index))
+    return [(round(blended[index], 6), candidates[index][1]) for index in order]
 
 
 def _safe_eval(expr: str, context: dict) -> bool:
@@ -1495,13 +416,13 @@ def _safe_eval(expr: str, context: dict) -> bool:
         elif isinstance(node, ast.Call):
             # To support node.get('key') == 'value' or just get('key')
             # The context is actually `node`. So get() refers to node.get.
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "get":
+            if isinstance(node.func, ast.Attribute) and node.func.attr == 'get':
                 obj = _eval(node.func.value)
                 if isinstance(obj, dict) and node.args:
                     key = _eval(node.args[0])
                     default = _eval(node.args[1]) if len(node.args) > 1 else None
                     return obj.get(key, default)
-            elif isinstance(node.func, ast.Name) and node.func.id == "get":
+            elif isinstance(node.func, ast.Name) and node.func.id == 'get':
                 if node.args:
                     key = _eval(node.args[0])
                     default = _eval(node.args[1]) if len(node.args) > 1 else None
@@ -1509,953 +430,187 @@ def _safe_eval(expr: str, context: dict) -> bool:
         raise ValueError(f"Unsupported AST node: {type(node)}")
 
     try:
-        tree = ast.parse(expr, mode="eval")
+        tree = ast.parse(expr, mode='eval')
         return bool(_eval(tree.body))
     except Exception as e:
         log.warning(f"Failed to safe_eval expression '{expr}': {e}")
         return False
 
+_INDEX_CACHE = {
+    "mtime": 0.0,
+    "data": None
+}
 
-def _load_search_index(index_path: str | os.PathLike) -> dict:
-    """Load a current committed snapshot without waiting on the publisher lock.
-
-    The projection sidecar is published last. ``read_committed_index_snapshot``
-    verifies the sidecar, both artifact digests and their identities before and
-    after decoding, so a concurrent atomic publisher is detected without making
-    every search queue behind a potentially long rebuild lock.
-    """
-    last_error = None
-    for attempt in range(3):
-        try:
-            return read_committed_index_snapshot(index_path, _acquire_lock=False)
-        except Exception as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(0.05)
-    assert last_error is not None
-    raise last_error
-
-
-def resolve_exact_entities(
+def _search_scored_pages(
     query: str,
-    *,
-    limit: int = 10,
-    domain: str | None = None,
-    cluster: str | None = None,
-    include_history: bool = False,
-) -> list[dict]:
-    """Resolve exact page keys, ids, titles, and aliases from one committed index."""
-    query = str(query or "").strip()
-    if not query:
-        return []
-    if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
-        raise ValueError(
-            f"identity query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters"
-        )
-    try:
-        limit = max(1, min(_SEARCH_TOP_K_LIMIT, int(limit)))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("limit must be an integer") from exc
-    index_path = str(get_index_path())
-    if not os.path.exists(index_path):
-        return []
-    index_data = _load_search_index(index_path)
-    resolved = []
-    for key, score in sorted(
-        _exact_identity_scores(index_data, query).items(),
-        key=lambda item: (-item[1], item[0]),
-    ):
-        raw_node = (index_data.get("nodes") or {}).get(key)
-        if not isinstance(raw_node, dict):
-            continue
-        node = {"_key": key, **raw_node}
-        if not _search_node_is_eligible(
-            node,
-            domain=domain,
-            cluster=cluster,
-            include_history=include_history,
-            filter_expr=None,
-        ):
-            continue
-        aliases = node.get("aliases") or []
-        if isinstance(aliases, str):
-            aliases = [aliases]
-        resolved.append(
-            {
-                "key": key,
-                "score": score,
-                "id": node.get("id"),
-                "title": node.get("title") or key,
-                "aliases": list(aliases),
-                "type": node.get("type"),
-                "status": node.get("status"),
-                "summary": node.get("summary") or "",
-                "updated_at": node.get("updated_at") or node.get("updated") or "",
-            }
-        )
-        if len(resolved) >= limit:
-            break
-    return resolved
-
-
-def _graph_expansion_scores(
-    seed_keys: set[str],
-    weighted_edges: list[dict],
-    *,
-    hops: int = 2,
-    alpha: float = 0.85,
-    adjacency: CompactGraphAdjacency | None = None,
-) -> dict[str, float]:
-    """Run the bounded-hop walk without materializing whole-graph adjacency."""
-    ppr_scores = {key: 1.0 for key in seed_keys}
-    for _ in range(hops):
-        active_adjacency: dict[str, list[tuple[str, float]]] | None = None
-        if adjacency is None:
-            active_keys = set(ppr_scores)
-            active_adjacency = {}
-            for edge in weighted_edges:
-                source = edge["source"]
-                target = edge["target"]
-                weight = edge.get("weight", 1.0)
-                if source in active_keys:
-                    active_adjacency.setdefault(source, []).append((target, weight))
-                if target in active_keys:
-                    active_adjacency.setdefault(target, []).append((source, weight))
-
-        next_scores = {
-            key: (1 - alpha) if key in seed_keys else 0.0 for key in ppr_scores
-        }
-        for node, current_score in ppr_scores.items():
-            if adjacency is not None:
-                total_weight = adjacency.total_weight(node)
-                if not math.isfinite(total_weight) or total_weight <= 0:
-                    continue
-                for neighbor, weight in adjacency.iter_weighted_neighbors(node):
-                    next_scores[neighbor] = next_scores.get(
-                        neighbor, 0.0
-                    ) + alpha * current_score * (weight / total_weight)
-            else:
-                assert active_adjacency is not None
-                neighbors = active_adjacency.get(node, ())
-                if not neighbors:
-                    continue
-                total_weight = sum(weight for _, weight in neighbors)
-                if not math.isfinite(total_weight) or total_weight <= 0:
-                    continue
-                for neighbor, weight in neighbors:
-                    next_scores[neighbor] = next_scores.get(
-                        neighbor, 0.0
-                    ) + alpha * current_score * (weight / total_weight)
-        ppr_scores = next_scores
-    return ppr_scores
-
-
-def _search_node_is_eligible(
-    node: dict,
-    *,
-    domain: str | None,
-    cluster: str | None,
-    include_history: bool,
-    filter_expr: str | None,
-) -> bool:
-    """Apply the same metadata eligibility gate to every search candidate."""
-    if domain and str(node.get("domain") or "").casefold() != str(domain).casefold():
-        return False
-    if (
-        cluster
-        and str(node.get("topic_cluster") or "").casefold() != str(cluster).casefold()
-    ):
-        return False
-    if not include_history and str(node.get("status") or "").casefold() in {
-        "deprecated",
-        "archived",
-    }:
-        return False
-    if filter_expr:
-        try:
-            if not _safe_eval(filter_expr, node):
-                return False
-        except Exception as exc:
-            log.warning(
-                "Filter expr evaluation failed for node %s: %s",
-                node.get("_key", "<unknown>"),
-                exc,
-            )
-            return False
-    return True
-
-
-def _eligible_exact_identity_scores(
-    index_data: dict,
-    query: str,
-    *,
-    domain: str | None,
-    cluster: str | None,
-    include_history: bool,
-    filter_expr: str | None,
-) -> dict[str, float]:
-    eligible = {}
-    nodes = index_data.get("nodes") or {}
-    for key, score in _exact_identity_scores(index_data, query).items():
-        raw_node = nodes.get(key)
-        if not isinstance(raw_node, dict):
-            continue
-        node = {"_key": key, **raw_node}
-        if _search_node_is_eligible(
-            node,
-            domain=domain,
-            cluster=cluster,
-            include_history=include_history,
-            filter_expr=filter_expr,
-        ):
-            eligible[key] = score
-    return eligible
-
-
-def _lexical_fallback_node_limit() -> int:
-    try:
-        configured = int(
-            os.environ.get("VECTOR_LAKE_LEXICAL_FALLBACK_MAX_NODES", "20000")
-        )
-    except (TypeError, ValueError):
-        configured = 20_000
-    return max(1, min(100_000, configured))
-
-
-def _lexical_fallback_scores(
-    index_data: dict,
-    terms,
-    *,
-    limit: int,
-) -> dict[str, float]:
-    """Provide a bounded deterministic fallback only when FTS is unavailable."""
-    normalized_terms = {
-        str(term).strip().casefold() for term in terms if str(term).strip()
-    }
-    if not normalized_terms:
-        return {}
-
-    def scored_nodes():
-        nodes = index_data.get("nodes", {})
-        for key, node in islice(nodes.items(), _lexical_fallback_node_limit()):
-            fields = (
-                (str(key)[:1024].casefold(), 4.0),
-                (str(node.get("title") or "")[:4096].casefold(), 4.0),
-                (str(node.get("summary") or "")[:4096].casefold(), 2.0),
-                (str(node.get("raw_text") or "")[:4096].casefold(), 1.0),
-                (
-                    " ".join(map(str, node.get("aliases") or ()))[:4096].casefold(),
-                    1.0,
-                ),
-            )
-            score = sum(
-                weight
-                for term in normalized_terms
-                for value, weight in fields
-                if term in value
-            )
-            if score > 0:
-                yield (score, str(key))
-
-    selected = heapq.nsmallest(
-        max(1, int(limit)),
-        scored_nodes(),
-        key=lambda item: (-item[0], item[1]),
-    )
-    return {key: score for score, key in selected}
-
-
-def _merge_fallback_scores(
-    hybrid_scores: dict[str, float],
-    fallback_scores: dict[str, float],
-) -> None:
-    """Add degraded fallback candidates without reducing stronger scores."""
-    for key, score in fallback_scores.items():
-        hybrid_scores[key] = max(hybrid_scores.get(key, score), score)
-
-
-def _read_search_snippet(
-    path: str | os.PathLike,
-    *,
-    max_chars: int = 2_500,
-    max_frontmatter_chars: int = 65_536,
-) -> str:
-    """Read a bounded body snippet without materializing the whole Markdown file."""
-    if max_chars <= 0:
-        return ""
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        first_line = handle.readline(8_193)
-        if not first_line.lstrip("\ufeff").startswith("---"):
-            return (first_line + handle.read(max_chars))[:max_chars]
-        if len(first_line) > 8_192 and not first_line.endswith(("\n", "\r")):
-            raise SearchIndexError("Wiki frontmatter contains an oversized line.")
-        consumed = len(first_line)
-        while consumed <= max_frontmatter_chars:
-            line = handle.readline(8_193)
-            if not line:
-                return ""
-            if len(line) > 8_192 and not line.endswith(("\n", "\r")):
-                raise SearchIndexError("Wiki frontmatter contains an oversized line.")
-            consumed += len(line)
-            if line.strip() == "---":
-                return handle.read(max_chars)
-        raise SearchIndexError("Wiki frontmatter exceeds the bounded search limit.")
-
-
-_READINESS_UNSET = object()
-
-
-def _with_semantic_readiness(
-    result: str,
-    *,
-    as_xml: bool,
-    index_data: dict | None = None,
-    readiness: dict | None | object = _READINESS_UNSET,
-) -> str:
-    """Attach non-blocking, generation-bound semantic readiness to retrieval.
-
-    ``readiness`` determines who owns the envelope:
-
-    * ``_READINESS_UNSET`` (default): compute one for this call.
-    * ``None``: the caller already carries the envelope as a sibling response
-      field, so do not embed a second byte-identical copy in the retrieval
-      text. The envelope, not the retrieval body, is the authoritative copy.
-    * a mapping: reuse an envelope the caller already computed.
-    """
-    if readiness is None:
-        return result
-    from vector_lake import runtime_health
-
-    if readiness is _READINESS_UNSET:
-        try:
-            readiness = runtime_health.get_semantic_readiness_envelope(
-                index_data=index_data,
-                nonblocking=True,
-            )
-        except Exception as exc:
-            readiness = {
-                "contract_version": "vector-lake-semantic-readiness-envelope/v1",
-                "ready": False,
-                "status": "unknown",
-                "issues": [
-                    f"semantic_readiness_envelope_unavailable:{type(exc).__name__}"
-                ],
-                "warnings": [],
-                "issue_count": 1,
-                "warning_count": 0,
-                "issues_omitted": 0,
-                "warnings_omitted": 0,
-                "debt_summary": {},
-                "captured_generation": None,
-                "captured_fingerprint": None,
-                "results_are_not_accepted_facts": True,
-            }
-    encoded = json.dumps(
-        readiness,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    if as_xml:
-        body = result if str(result).lstrip().startswith("<") else escape(str(result))
-        return (
-            "<VectorLakeSearchResponse>\n"
-            f"<SemanticReadinessEnvelope>{escape(encoded)}</SemanticReadinessEnvelope>\n"
-            f"{body}\n"
-            "</VectorLakeSearchResponse>"
-        )
-    return (
-        "<SemanticReadinessEnvelope>\n"
-        f"{encoded}\n"
-        "</SemanticReadinessEnvelope>\n"
-        f"{result}"
-    )
-
-
-def _search_projection_generation_issue(conn) -> str | None:
-    from vector_lake.db_store import get_search_projection_state
-
-    state = get_search_projection_state(conn)
-    expected = state.get("canonical_generation")
-    if not isinstance(expected, dict):
-        return "canonical_generation_missing"
-    try:
-        current = canonical_runtime_generation_snapshot(conn)
-    except Exception:
-        return "canonical_generation_unreadable"
-    if expected != current:
-        return "canonical_generation_stale"
-    return None
-
-
-def _looks_like_exact_identity(query: str) -> bool:
-    normalized = str(query or "").strip()
-    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{2,}(?:\.md)?", normalized))
-
-
-def _sqlite_identity_rows(conn, query: str, limit: int) -> list[dict]:
-    """Resolve exact indexed ids and page keys from bounded canonical rows.
-
-    Names and aliases are already part of the verified FTS projection. Keeping
-    them out of this helper prevents a no-hit request from scanning every
-    entity JSON document through ``lower()`` or ``json_each``.
-    """
-    normalized = str(query or "").strip()
-    page_query = (
-        normalized[:-3] if normalized.casefold().endswith(".md") else normalized
-    )
-    rows = conn.execute(
-        "SELECT ident.page_key, e.data_json FROM entity_identities AS ident "
-        "JOIN entities AS e ON e.entity_id = ident.entity_id WHERE "
-        "ident.entity_id IN (?, ?) OR ident.page_key IN (?, ?) "
-        "ORDER BY ident.entity_id LIMIT ?",
-        (normalized, page_query, normalized, page_query, int(limit)),
-    ).fetchall()
-    if not rows:
-        rows = conn.execute(
-            "SELECT page_key, data_json FROM canonical_identities WHERE "
-            "(record_kind = 'claim' AND record_id IN (?, ?)) OR "
-            "(record_kind = 'evidence' AND record_id IN (?, ?)) OR "
-            "page_key IN (?, ?) ORDER BY record_kind, record_id LIMIT ?",
-            (
-                normalized,
-                page_query,
-                normalized,
-                page_query,
-                normalized,
-                page_query,
-                int(limit),
-            ),
-        ).fetchall()
-    results = []
-    hidden_states = {"archived", "decayed", "deleted", "expired", "superseded"}
-    for row in rows:
-        try:
-            record = json.loads(row["data_json"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if str(record.get("status") or "active").strip().lower() in hidden_states:
-            continue
-        page_key = str(row["page_key"] or record.get("page_key") or "")
-        results.append(
-            {
-                "node_key": page_key,
-                "title": str(
-                    record.get("canonical_name")
-                    or record.get("title")
-                    or page_key
-                    or "Untitled"
-                ),
-                "summary": str(record.get("summary") or ""),
-                "rank": -1000.0,
-            }
-        )
-    return results
-
-
-def _exact_fts_page_result(query: str, top_k: int, *, as_xml: bool) -> str | None:
-    """Return high-precision current-page hits without materializing graph state."""
-    from vector_lake.db_store import (
-        get_connection,
-        search_wiki,
-        verify_search_projection_integrity,
-    )
-
-    try:
-        conn = get_connection()
-        if _search_projection_generation_issue(conn) is not None:
-            return None
-        integrity_before = verify_search_projection_integrity(conn)
-        signature = integrity_before.get("signature")
-        if integrity_before.get("status") != "ready" or not isinstance(
-            signature, tuple
-        ):
-            return None
-        fts_rows = search_wiki(query, limit=top_k)
-        identity_rows = (
-            _sqlite_identity_rows(conn, query, top_k)
-            if not fts_rows or _looks_like_exact_identity(query)
-            else []
-        )
-    except (RuntimeError, sqlite3.Error):
-        return None
-    rows = []
-    seen_keys = set()
-    for row in [*identity_rows, *fts_rows]:
-        node_key = str(row.get("node_key") or "")
-        if not node_key or node_key in seen_keys:
-            continue
-        seen_keys.add(node_key)
-        rows.append(row)
-        if len(rows) >= top_k:
-            break
-    if not rows:
-        return None
-
-    page_keys = [str(row.get("node_key") or "") for row in rows]
-    try:
-        placeholders = ",".join("?" for _ in page_keys)
-        identity_owners = conn.execute(
-            f"SELECT page_key, data_json FROM entity_identities "
-            f"WHERE page_key IN ({placeholders})",
-            page_keys,
-        )
-        live_page_keys = set()
-        inactive_statuses = {
-            "archived", "decayed", "deleted", "expired", "superseded",
-        }
-        for identity in identity_owners:
-            try:
-                record = json.loads(identity["data_json"])
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(record, dict):
-                continue
-            status = str(record.get("status") or "active").strip().casefold()
-            if status not in inactive_statuses:
-                live_page_keys.add(str(identity["page_key"]))
-        eligible = [
-            row for row in rows
-            if str(row.get("node_key") or "") in live_page_keys
-        ]
-        if not eligible:
-            return None
-        plaintext = _load_current_plaintext_rows(
-            conn,
-            [str(row.get("node_key") or "") for row in eligible],
-            query,
-            snippet_limit=_PAGE_SNIPPET_CHAR_LIMIT,
-        )
-    except sqlite3.Error:
-        return None
-
-    blocks = []
-    issues = []
-    for index, row in enumerate(eligible[:top_k]):
-        node_key = str(row.get("node_key") or "")
-        source = plaintext.get(node_key, {"status": "missing", "snippet": ""})
-        status = str(source["status"])
-        row_title = str(row.get("title") or row.get("node_key") or "Untitled")
-        title = str(source.get("title") or row_title)
-        summary = (
-            str(source["snippet"])
-            if source.get("snippet")
-            else " ".join(str(row.get("summary") or "").split())[:1600]
-        )
-        score = -float(row.get("rank") or 0.0)
-        if as_xml:
-            blocks.append(
-                f"<Evidence_Node ID={quoteattr(f'Wiki_{index}')} "
-                f"Source={quoteattr(node_key + '.md')} ContentStatus={quoteattr(status)}>\n"
-                f"{escape(summary)}\n</Evidence_Node>\n"
-            )
-        else:
-            if summary:
-                blocks.append(f"- **{title}** (score: {score:.1f})\n  {summary} [{node_key}]...\n\n")
-            else:
-                blocks.append(f"- **{title}** (score: {score:.1f}; snippet: {status})\n\n")
-
-    # The proof covers candidate selection, current-body reads, and rendering.
-    integrity_after = verify_search_projection_integrity(conn)
-    if _search_projection_generation_issue(conn) is not None:
-        raise SearchIndexError("The canonical generation changed during exact search; retry.")
-    if _stable_fts_projection_signature(integrity_after.get("signature")) != _stable_fts_projection_signature(signature):
-        raise SearchIndexError("The SQLite search projection changed during exact search; retry.")
-    if as_xml:
-        state = "degraded" if issues else "ok"
-        return (
-            f'<EvidenceResults>\n<SearchStatus State="{state}" Backends={quoteattr(",".join(sorted(set(issues))))}/>\n'
-            + "".join(blocks)
-            + "</EvidenceResults>"
-        )
-    prefix = f"[Search degraded: {', '.join(sorted(set(issues)))}]\n" if issues else ""
-    return prefix + "".join(blocks)
-
-
-def search_vector_lake(
-    query: str,
-    top_k: int = 5,
-    as_xml: bool = False,
+    top_k: int,
     domain: str = None,
     cluster: str = None,
     include_history: bool = False,
-    mode: str = "page",
     filter_expr: str = None,
-    *,
-    _raise_on_unavailable: bool = False,
-    readiness: dict | None | object = _READINESS_UNSET,
 ):
-    query = str(query or "").strip()
-    if len(query) > _SEARCH_QUERY_CHAR_LIMIT:
-        raise ValueError(f"search query exceeds {_SEARCH_QUERY_CHAR_LIMIT} characters")
-    try:
-        top_k = int(top_k)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("top_k must be an integer") from exc
-    top_k = max(1, min(_SEARCH_TOP_K_LIMIT, top_k))
-    normalized_mode = str(mode or "page").strip().lower()
-    if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
-        return _with_semantic_readiness(
-            format_operational_memory_results(
-                query,
-                top_k=top_k,
-                as_xml=as_xml,
-                include_history=include_history,
-                _raise_on_unavailable=_raise_on_unavailable,
-            ),
-            as_xml=as_xml,
-            readiness=readiness,
-        )
-    if normalized_mode == "fact":
-        return _with_semantic_readiness(
-            format_operational_memory_results(
-                query,
-                top_k=top_k,
-                as_xml=as_xml,
-                include_history=include_history,
-                memory_types=["fact"],
-                _raise_on_unavailable=_raise_on_unavailable,
-            ),
-            as_xml=as_xml,
-            readiness=readiness,
-        )
-    if normalized_mode in {"claim", "claims"}:
-        fact_result = format_operational_memory_results(
-            query,
-            top_k=top_k,
-            as_xml=as_xml,
-            include_history=include_history,
-            memory_types=["fact"],
-            _raise_on_unavailable=_raise_on_unavailable,
-        )
-        return _with_semantic_readiness(
-            _format_claim_mode_compatibility(
-                fact_result,
-                as_xml=as_xml,
-                requested_mode=normalized_mode,
-            ),
-            as_xml=as_xml,
-            readiness=readiness,
-        )
+    """Ranked pages plus retrieval notes.
 
-    search_started = time.perf_counter()
-    timings: dict[str, float] = {}
-    backend_issues: list[str] = []
-    readiness_index_data = None
-
-    def finish(value: str) -> str:
-        value = _with_semantic_readiness(
-            value,
-            as_xml=as_xml,
-            index_data=readiness_index_data,
-            readiness=readiness,
-        )
-        timings["total_ms"] = (time.perf_counter() - search_started) * 1000.0
-        encoded_size = len(value.encode("utf-8"))
-        _record_search_performance(
-            timings,
-            result_chars=len(value),
-            result_bytes=encoded_size,
-            backend_issues=backend_issues,
-        )
-        return value
-
-    def fail(issue: str) -> None:
-        backend_issues.append(issue)
-        timings["total_ms"] = (time.perf_counter() - search_started) * 1000.0
-        _record_search_performance(
-            timings,
-            result_chars=0,
-            result_bytes=0,
-            backend_issues=backend_issues,
-        )
-
-    # Retained deliberately even though the binding is unread here: three tests in
-    # tests/test_exact_identity_search.py patch ``tool_search.get_wiki_dir`` as
-    # their only wiki-root isolation.  Removing this call silently turns those
-    # patches into no-ops, and those tests do not use the isolated_memory fixture.
-    wiki_dir = str(get_wiki_dir())  # noqa: F841
+    Split out of ``search_vector_lake`` so callers that need the pages can use
+    them directly.  ``assemble_context`` used to re-parse the human-readable
+    string with a regex, which silently produced an empty wiki context whenever
+    the formatting changed or a title contained the delimiter.
+    """
     index_path = str(get_index_path())
     if not os.path.exists(index_path):
-        if _raise_on_unavailable:
-            raise SearchIndexError(
-                "Search unavailable (index_missing). Run `python cli.py doctor` "
-                "to diagnose the configured paths and projection before retrying."
-            )
-        return finish(
-            "Lake is drying. No index.json found, please ingest sources first."
-        )
-    if (
-        domain is None
-        and cluster is None
-        and not include_history
-        and filter_expr is None
-        and _looks_like_exact_identity(query)
-    ):
-        phase_started = time.perf_counter()
-        exact_result = _exact_fts_page_result(query, top_k, as_xml=as_xml)
-        timings["exact_fts_fast_path_ms"] = (
-            time.perf_counter() - phase_started
-        ) * 1000.0
-        if exact_result is not None:
-            return finish(exact_result)
-    phase_started = time.perf_counter()
-    try:
-        index_data = _load_search_index(index_path)
-    except Exception as exc:
-        log.error(f"Failed to read index.json: {exc}")
-        timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
-        fail("projection_snapshot")
-        raise SearchIndexError(
-            "The knowledge base index could not be read safely."
-        ) from exc
-    readiness_index_data = index_data
-    timings["index_load_ms"] = (time.perf_counter() - phase_started) * 1000.0
+        return [], [], "Lake is drying. No index.json found, please ingest sources first."
 
-    # ⚡ Bolt: Removed unused O(N) list comprehension of all index nodes to eliminate unnecessary memory allocation and CPU overhead in the search hot path.
+    try:
+        current_mtime = os.path.getmtime(index_path)
+        if _INDEX_CACHE["mtime"] != current_mtime or _INDEX_CACHE["data"] is None:
+            import time
+            for attempt in range(3):
+                try:
+                    with open(index_path, "r", encoding="utf-8") as handle:
+                        _INDEX_CACHE["data"] = json.load(handle)
+                        _INDEX_CACHE["mtime"] = current_mtime
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise e
+                    time.sleep(0.2)
+        index_data = _INDEX_CACHE["data"]
+    except Exception as e:
+        log.error(f"Failed to read index.json: {e}")
+        return [], [], "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
+
     intent = _classify_intent(query)
-    phase_started = time.perf_counter()
-    exact_identity_scores = _eligible_exact_identity_scores(
-        index_data,
-        query,
-        domain=domain,
-        cluster=cluster,
-        include_history=include_history,
-        filter_expr=filter_expr,
-    )
-    exact_identity_keys = set(exact_identity_scores)
-    timings["exact_identity_ms"] = (time.perf_counter() - phase_started) * 1000.0
-    timings["exact_identity_hits"] = float(len(exact_identity_scores))
-    phase_started = time.perf_counter()
     tokens = _expand_query_locally(query)
-    timings["tokenize_ms"] = (time.perf_counter() - phase_started) * 1000.0
-    if not tokens and not exact_identity_scores:
-        return finish("No valid search tokens.")
+    if not tokens:
+        return [], [], "No valid search tokens."
 
     scored = []
-
+    
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
-    hybrid_scores = dict(exact_identity_scores)
-    fts_result_count = 0
-
+    hybrid_scores = {}
+    
     # 1. FTS5 Search
-    phase_started = time.perf_counter()
-    fts_signature, fts_integrity_issue = _fts_projection_probe(index_data)
     try:
-        if fts_signature is None:
-            raise SearchBackendError(fts_integrity_issue or "fts_projection_integrity")
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
         fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
-        fts_result_count = len(fts_results)
         for row in fts_results:
-            key = row["node_key"]
-            raw_score = row.get("rank")
+            key = row['node_key']
+            raw_score = row.get('rank')
             if raw_score is None:
-                raw_score = row.get("score", 0)
+                raw_score = row.get('score', 0)
             fts_score = raw_score * -1.0  # SQLite BM25 is negative
             hybrid_scores[key] = hybrid_scores.get(key, 0.0) + fts_score
-    except Exception as exc:
-        backend = exc.backend if isinstance(exc, SearchBackendError) else "fts5"
-        backend_issues.append(backend)
-        _log_search_backend_failure(backend)
-        _merge_fallback_scores(
-            hybrid_scores,
-            _lexical_fallback_scores(
-                index_data,
-                [query, *tokens],
-                limit=top_k * 5,
-            ),
-        )
-    timings["fts_ms"] = (time.perf_counter() - phase_started) * 1000.0
+    except Exception as e:
+        log.error(f"FTS5 Search failed: {e}")
 
     # 2. Vector Search (Hybrid blending)
-    phase_started = time.perf_counter()
-    embedding_requested = not exact_identity_scores and _should_query_embedding(
-        fts_result_count=fts_result_count,
-        top_k=top_k,
-    )
-    query_vector = _get_query_embedding(query) if embedding_requested else []
-    timings["embedding_ms"] = (time.perf_counter() - phase_started) * 1000.0
-    timings["embedding_bypassed_by_fts"] = 0.0 if embedding_requested else 1.0
-    if (
-        not query_vector
-        and embedding_requested
-        and _query_embedding_enabled()
-        and os.environ.get("GEMINI_API_KEY")
-    ):
-        backend_issues.append("query_embedding")
+    vector_notes = []
+    query_vector, embedding_error = _get_query_embedding(query)
     if query_vector:
-        phase_started = time.perf_counter()
-        try:
-            vector_results = _get_vector_search_results(
-                query_vector,
-                index_data,
-                limit=top_k * 5,
+        vector_results, vector_error = _get_vector_search_results(query_vector, limit=top_k * 5)
+        if vector_error:
+            vector_notes.append(vector_error)
+        elif not vector_results:
+            vector_notes.append(
+                "no stored vectors matched; run `embedding-backfill --apply` to (re)build the vector projection"
             )
-            for key, sim in vector_results.items():
-                vec_score = (sim**2) * 15.0
-                hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
-        except SearchBackendError as exc:
-            backend_issues.append(exc.backend)
-        timings["vector_ms"] = (time.perf_counter() - phase_started) * 1000.0
+        for key, sim in vector_results.items():
+            # scale similarity so it competes/blends with BM25.
+            vec_score = (sim ** 2) * 15.0
+            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
     else:
-        timings["vector_ms"] = 0.0
-
-    # FTS/vec rows are committed before their matching projection files are
-    # published.  Revalidate after those SQLite reads so results from a newer
-    # database generation are never blended with the older index snapshot.
-    phase_started = time.perf_counter()
-    try:
-        current_index_data = _load_search_index(index_path)
-    except Exception as exc:
-        timings["generation_check_ms"] = (time.perf_counter() - phase_started) * 1000.0
-        fail("projection_generation_check")
-        raise SearchIndexError(
-            "The knowledge base projection changed during search; retry after sync."
-        ) from exc
-    if current_index_data.get("projection_manifest") != index_data.get(
-        "projection_manifest"
-    ):
-        index_data = current_index_data
-        readiness_index_data = current_index_data
-        hybrid_scores = _lexical_fallback_scores(
-            index_data,
-            [query, *tokens],
-            limit=top_k * 5,
-        )
-        exact_identity_scores = _eligible_exact_identity_scores(
-            index_data,
-            query,
-            domain=domain,
-            cluster=cluster,
-            include_history=include_history,
-            filter_expr=filter_expr,
-        )
-        exact_identity_keys = set(exact_identity_scores)
-        for key, score in exact_identity_scores.items():
-            hybrid_scores[key] = max(hybrid_scores.get(key, 0.0), score)
-        backend_issues.append("projection_generation_changed")
-    elif fts_signature is not None:
-        current_fts_signature, current_fts_issue = _fts_projection_probe(index_data)
-        if _stable_fts_projection_signature(
-            current_fts_signature
-        ) != _stable_fts_projection_signature(fts_signature):
-            hybrid_scores = _lexical_fallback_scores(
-                index_data,
-                [query, *tokens],
-                limit=top_k * 5,
-            )
-            for key, score in exact_identity_scores.items():
-                hybrid_scores[key] = max(hybrid_scores.get(key, 0.0), score)
-            backend_issues.append(current_fts_issue or "fts_projection_state_changed")
-    timings["generation_check_ms"] = (time.perf_counter() - phase_started) * 1000.0
+        vector_notes.append(embedding_error or "query embedding unavailable")
 
     for key, score in hybrid_scores.items():
-        if key in index_data.get("nodes", {}):
-            node = {"_key": key, **index_data["nodes"][key]}
-            if not _search_node_is_eligible(
-                node,
-                domain=domain,
-                cluster=cluster,
-                include_history=include_history,
-                filter_expr=filter_expr,
-            ):
+        if key in index_data.get('nodes', {}):
+            node = {'_key': key, **index_data['nodes'][key]}
+            if not _passes_filters(node, domain, cluster, include_history, filter_expr):
                 continue
-
-            if (
-                not include_history
-                and node.get("status", "").lower() == "decayed"
-                and intent != "temporal"
-            ):
+            if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
                 score *= 0.2
             scored.append((score, node))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
     # P2-1: Dynamic Graph Expansion via Multi-hop PPR (Personalized PageRank)
-    phase_started = time.perf_counter()
     top_keys = {node["_key"] for _, node in scored[:5]}
-    graph_ready = (index_data.get("graph_state") or {}).get("dirty") is False
-    if top_keys and graph_ready and index_data.get("weighted_edges"):
-        adjacency = get_compact_graph_adjacency(index_data)
-        ppr_scores = _graph_expansion_scores(
-            top_keys,
-            index_data["weighted_edges"],
-            adjacency=adjacency,
-        )
+    if top_keys and index_data.get("weighted_edges"):
+        # Build adjacency list
+        adj = {}
+        for edge in index_data["weighted_edges"]:
+            s, t, w = edge["source"], edge["target"], edge.get("weight", 1.0)
+            adj.setdefault(s, []).append((t, w))
+            adj.setdefault(t, []).append((s, w))
+            
+        # PPR parameters.  Non-seed nodes must still receive teleportation mass,
+        # otherwise the walk collapses to "adjacent to a seed" after two steps.
+        seed_keys = set(top_keys)
+        alpha = 0.85
+        restart_mass = (1 - alpha) / len(top_keys)
+        ppr_scores = {k: 1.0 / len(top_keys) for k in seed_keys}
+
+        for _ in range(2):
+            next_scores = {k: restart_mass if k in seed_keys else 0.0 for k in adj}
+            for node, current_score in ppr_scores.items():
+                neighbors = adj.get(node, [])
+                if neighbors:
+                    total_weight = sum(w for _, w in neighbors)
+                    if total_weight <= 0:
+                        continue
+                    for neighbor, w in neighbors:
+                        next_scores[neighbor] = next_scores.get(neighbor, 0.0) + alpha * current_score * (w / total_weight)
+            ppr_scores = next_scores
 
         existing_keys = {node["_key"] for _, node in scored}
         expansion_limit = 12 if intent == "entity" else 5
-
+        
         sorted_expansions = sorted(
-            [(k, v) for k, v in ppr_scores.items() if k not in existing_keys],
-            key=lambda x: x[1],
-            reverse=True,
+            [(k, v) for k, v in ppr_scores.items() if k not in existing_keys], 
+            key=lambda x: x[1], 
+            reverse=True
         )
-
-        expansion_count = 0
-        for expanded_key, ppr_weight in sorted_expansions:
-            if expansion_count >= expansion_limit:
-                break
+        
+        for expanded_key, ppr_weight in sorted_expansions[:expansion_limit]:
             expanded_node = index_data["nodes"].get(expanded_key)
-            if expanded_node:
-                candidate = {"_key": expanded_key, **expanded_node}
-                if not _search_node_is_eligible(
-                    candidate,
-                    domain=domain,
-                    cluster=cluster,
-                    include_history=include_history,
-                    filter_expr=filter_expr,
-                ):
-                    continue
-                # Scale PPR weight to match BM25 range approximately
-                scored.append((ppr_weight * 15.0, candidate))
-                expansion_count += 1
-    timings["graph_ms"] = (time.perf_counter() - phase_started) * 1000.0
+            if expanded_node is None:
+                continue
+            # Graph expansion is an additional candidate source, not an exemption
+            # from the caller's filters.
+            if not _passes_filters(expanded_node, domain, cluster, include_history, filter_expr):
+                continue
+            scored.append((ppr_weight * 15.0, {"_key": expanded_key, **expanded_node}))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
     # Phase 1: Expand candidate pool for reranking
     candidate_pool = []
     source_count = 0
-    structural_omitted = 0
     pool_size = max(40, top_k * 3)
     max_sources_pool = int(pool_size * 0.6)
     for score, node in scored:
-        if _is_structural_noise(node.get("_key", ""), query, exact_identity_keys):
-            structural_omitted += 1
-            continue
         node_type = node.get("type", "").lower()
         if node_type == "source":
-            if (
-                source_count < max_sources_pool
-                or node.get("_key") in exact_identity_keys
-            ):
+            if source_count < max_sources_pool:
                 candidate_pool.append((score, node))
                 source_count += 1
         else:
             candidate_pool.append((score, node))
         if len(candidate_pool) >= pool_size:
             break
-
+            
     # Phase 2: Local deterministic ranking. Text-model reranking is delegated
     # to the host agent when explicitly requested, not performed by runtime code.
-    phase_started = time.perf_counter()
     reranked = _rerank_candidates_locally(query, candidate_pool)
-    timings["rerank_ms"] = (time.perf_counter() - phase_started) * 1000.0
 
     # Phase 3: Final top_k extraction
     final_scored = []
     source_count = 0
-    max_sources_final = max(1, int(top_k * 0.6))
+    max_sources_final = int(top_k * 0.6)
     for score, node in reranked:
         node_type = node.get("type", "").lower()
         if node_type == "source":
-            if (
-                source_count < max_sources_final
-                or node.get("_key") in exact_identity_keys
-            ):
+            if source_count < max_sources_final:
                 final_scored.append((score, node))
                 source_count += 1
         else:
@@ -2463,356 +618,144 @@ def search_vector_lake(
         if len(final_scored) >= top_k:
             break
 
-    if structural_omitted:
-        backend_issues.append(f"structural_candidates_omitted:{structural_omitted}")
+    return final_scored, vector_notes, None
+
+
+def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain: str = None, cluster: str = None, include_history: bool = False, mode: str = "page", filter_expr: str = None):
+    normalized_mode = str(mode or "page").lower()
+    if normalized_mode in {"memory", "operational-memory", "operational_memory"}:
+        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history)
+    if normalized_mode in {"claim", "claims"}:
+        return format_operational_memory_results(query, top_k=top_k, as_xml=as_xml, include_history=include_history, memory_types=["fact"])
+
+    wiki_dir = str(get_wiki_dir())
+    final_scored, vector_notes, error = _search_scored_pages(
+        query,
+        top_k=top_k,
+        domain=domain,
+        cluster=cluster,
+        include_history=include_history,
+        filter_expr=filter_expr,
+    )
+    if error:
+        return error
 
     result = ""
-    result_char_limit = _search_result_char_limit()
-    result_byte_limit = _search_result_byte_limit()
-    result_bytes = 0
-    phase_started = time.perf_counter()
-    selected_keys = [node["_key"] for _score, node in final_scored]
-    plaintext = {}
-    plaintext_signature = None
-    try:
-        from vector_lake.db_store import get_connection, verify_search_projection_integrity
-
-        plaintext_conn = get_connection()
-        integrity_before_plaintext = verify_search_projection_integrity(plaintext_conn)
-        plaintext_signature = integrity_before_plaintext.get("signature")
-        if integrity_before_plaintext.get("status") != "ready" or not isinstance(plaintext_signature, tuple):
-            plaintext_signature = None
-        else:
-            if _search_projection_generation_issue(plaintext_conn) is not None:
-                raise SearchIndexError("The canonical generation changed before plaintext retrieval; retry.")
-            plaintext = _load_current_plaintext_rows(
-                plaintext_conn, selected_keys, query, snippet_limit=_PAGE_SNIPPET_CHAR_LIMIT,
-            )
-    except SearchIndexError:
-        raise
-    except Exception as exc:
-        log.warning("Plaintext snippet retrieval failed: %s", type(exc).__name__)
+    if vector_notes:
+        result += "[DEGRADED] Vector retrieval did not contribute: " + "; ".join(vector_notes) + "\n\n"
+    if not final_scored:
+        return result + "No matching pages."
     for index, (score, node) in enumerate(final_scored):
-        source = plaintext.get(node["_key"], {"status": "unavailable", "snippet": ""})
-        snippet = str(source.get("snippet") or "")
-        snippet_status = str(source.get("status") or "unavailable")
+        filepath = os.path.join(wiki_dir, f"{node['_key']}.md")
+        snippet = ""
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read()
+            snippet = re.sub(r"^---.*?---\s*", "", content, flags=re.DOTALL)[:2500]  # V11.2: Expanded chunk limit
+            
         tension_edges = node.get("tension_edges", [])
         tension_info = ""
         if tension_edges:
             tension_info = "  [Tension Edges]:\n"
             for te in tension_edges:
                 tension_info += f"    -> {te.get('target')} (Polarity: {te.get('polarity')}, Intensity: {te.get('intensity')}): {te.get('context')}\n"
-
+                
         if as_xml:
-            source_name = f"{node['_key']}.md"
-            block = (
-                f"<Evidence_Node ID={quoteattr(f'Wiki_{index}')} "
-                f"Source={quoteattr(source_name)} ContentStatus={quoteattr(snippet_status)}>\n"
-                f"{escape(tension_info + snippet)}\n</Evidence_Node>\n"
-            )
-        elif not snippet:
-            # Keep the discovery result, but not the evidence-snippet shape
-            # consumed by legacy context assembly. No unavailable body is read.
-            title = " ".join(str(node.get("title", node["_key"])).split()).replace("*", r"\*")
-            block = f"- **{title}** (score: {score:.1f}; snippet: {snippet_status})\n\n"
+            result += f"<Evidence_Node ID='Wiki_{index}' Source='{node['_key']}.md'>\n{tension_info}{snippet}\n</Evidence_Node>\n"
         else:
-            title = str(source.get("title") or node.get("title") or node["_key"])
-            block = f"- **{title}** (score: {score:.1f})\n{tension_info}  {snippet}...\n\n"
-        block_bytes = len(block.encode("utf-8"))
-        if (
-            len(result) + len(block) > result_char_limit
-            or result_bytes + block_bytes > result_byte_limit
-        ):
-            backend_issues.append("result_budget")
-            break
-        result += block
-        result_bytes += block_bytes
-    if plaintext_signature is not None:
-        integrity_after_plaintext = verify_search_projection_integrity(plaintext_conn)
-        if _search_projection_generation_issue(plaintext_conn) is not None:
-            raise SearchIndexError("The canonical generation changed during plaintext rendering; retry.")
-        if _stable_fts_projection_signature(integrity_after_plaintext.get("signature")) != _stable_fts_projection_signature(plaintext_signature):
-            raise SearchIndexError("The SQLite search projection changed during plaintext rendering; retry.")
-    timings["materialize_ms"] = (time.perf_counter() - phase_started) * 1000.0
-    issues = sorted(set(backend_issues))
-    if as_xml:
-        state = "degraded" if issues else "ok"
-        status = (
-            f"<SearchStatus State={quoteattr(state)} "
-            f"Backends={quoteattr(','.join(issues))}/>\n"
-        )
-        body = result or "<NoEvidence/>\n"
-        return finish(f"<EvidenceResults>\n{status}{body}</EvidenceResults>")
-    if not result:
-        result = "No matching evidence found.\n"
-    if issues:
-        return finish(f"[Search degraded: {', '.join(issues)}]\n{result}")
-    return finish(result)
+            result += f"- **{node.get('title', node['_key'])}** (score: {score:.3f})\n{tension_info}  {snippet}...\n\n"
+    return result
 
 
-def _context_purpose(max_chars: int) -> str:
-    from vector_lake.purpose_contract import PurposeContractError, render_strategy_directive
+def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """Assemble a budget-bounded reasoning context for a query.
 
-    try:
-        purpose = render_strategy_directive()
-    except PurposeContractError as exc:
-        if not isinstance(exc.__cause__, FileNotFoundError):
-            raise
-        purpose = (
-            "[STRATEGIC PURPOSE STATUS: missing]\n"
-            "purpose.md is absent; strategic alignment has not been checked."
-        )
-    if len(purpose) > max_chars:
-        raise ValueError(
-            f"max_chars must be at least {len(purpose)} to preserve the strategic purpose"
-        )
-    return purpose
+    Pages come from ``_search_scored_pages`` directly.  This function previously
+    re-parsed the formatted search string with a regex, which produced an empty
+    wiki context whenever the formatting drifted.  The returned budget is now
+    enforced: ``budget_used <= budget_max`` always holds.
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
 
+    index_budget = int(max_chars * TOKEN_BUDGET["index_summary"])
 
-def _assemble_sqlite_context(query: str, max_chars: int) -> dict:
-    """Build bounded request context without materializing the full graph index."""
-    purpose = _context_purpose(max_chars)
-    retrieval_budget = max_chars - len(purpose)
-    memory_packet = build_memory_packet(query, max_chars=int(retrieval_budget * 0.50))
-    wiki_budget = max(0, retrieval_budget - len(memory_packet["packet"]))
-
-    from vector_lake.db_store import (
-        get_connection,
-        search_wiki,
-        verify_search_projection_integrity,
-    )
-
-    conn = get_connection()
-    generation_issue_before = _search_projection_generation_issue(conn)
-    if generation_issue_before is not None:
-        raise SearchIndexError(
-            "The canonical generation is not aligned with the SQLite search "
-            f"projection ({generation_issue_before})."
-        )
-    integrity_before = verify_search_projection_integrity(conn)
-    signature_before = integrity_before.get("signature")
-    if integrity_before.get("status") != "ready" or not isinstance(
-        signature_before, tuple
-    ):
-        raise SearchIndexError(
-            "The SQLite search projection could not be verified before context "
-            "assembly."
-        )
-    fts_rows = search_wiki(query, limit=15)
-    identity_rows = (
-        _sqlite_identity_rows(conn, query, 15)
-        if _looks_like_exact_identity(query)
-        else []
-    )
-    search_rows = []
-    seen_keys = set()
-    for row in [*identity_rows, *fts_rows]:
-        node_key = str(row.get("node_key") or "")
-        if not node_key or node_key in seen_keys:
-            continue
-        seen_keys.add(node_key)
-        search_rows.append(row)
-        if len(search_rows) >= 15:
-            break
-    plaintext = _load_current_plaintext_rows(
-        conn,
-        [row.get("node_key") for row in search_rows],
-        query,
-        snippet_limit=_CONTEXT_SNIPPET_CHAR_LIMIT,
-    )
-    exact_keys = {
-        str(row.get("node_key") or "") for row in identity_rows
-        if row.get("node_key")
-    }
-    wiki_context = ""
-    page_count = 0
-    truncated_count = 0
-    retrieval_degraded = False
-    included_keys = []
-    for row in search_rows:
-        node_key = str(row.get("node_key") or "")
-        source = plaintext.get(node_key, {"status": "missing", "snippet": "", "truncated": False})
-        explicit_identity_match = (
-            node_key in exact_keys or bool(source.get("explicit_identity_match"))
-        )
-        if _is_structural_noise(
-            node_key,
-            query,
-            {node_key} if explicit_identity_match else set(),
-        ):
-            continue
-        summary = ""
-        truncated = False
-        if source.get("status") == "available" and source.get("snippet"):
-            title = str(source.get("title") or node_key or "Untitled")
-            summary = str(source["snippet"])
-            truncated = bool(source.get("truncated"))
-        else:
-            title = str(row.get("title") or row.get("node_key") or "Untitled")
-            summary, truncated = _bounded_excerpt(
-                " ".join(str(row.get("summary") or "").split()), 1200
-            )
-        if not summary:
-            retrieval_degraded = True
-            continue
-        rank = float(row.get("rank") or 0.0)
-        block = (
-            f"- **{title}** (rank: {rank:.4f}, source: {node_key}.md)\n  {summary}\n\n"
-        )
-        if len(wiki_context) + len(block) > wiki_budget:
-            break
-        wiki_context += block
-        page_count += 1
-        truncated_count += truncated
-        included_keys.append(node_key)
-
-    # Rendering is part of the protected read interval as well.
-    integrity_rendered = verify_search_projection_integrity(conn)
-    generation_issue_rendered = _search_projection_generation_issue(conn)
-    if generation_issue_rendered is not None:
-        raise SearchIndexError(
-            "The canonical generation changed during context rendering "
-            f"({generation_issue_rendered}); retry."
-        )
-    if integrity_rendered.get("status") != "ready" or _stable_fts_projection_signature(
-        integrity_rendered.get("signature")
-    ) != _stable_fts_projection_signature(signature_before):
-        raise SearchIndexError(
-            "The SQLite search projection changed during context rendering; retry."
-        )
-
-    return {
-        "memory_packet": memory_packet["packet"],
-        "memory_count": memory_packet["memory_count"],
-        "memory_warning_count": memory_packet["warning_count"],
-        "memory_omitted_count": memory_packet["omitted_count"],
-        "memory_packet_truncated": memory_packet.get("budget_truncated", False),
-        "memory_text_truncated_count": memory_packet.get("text_truncated_count", 0),
-        "wiki_context": wiki_context,
-        "wiki_page_count": page_count,
-        "wiki_omitted_count": len(search_rows) - page_count,
-        "wiki_text_truncated_count": truncated_count,
-        "wiki_retrieval_degraded": retrieval_degraded,
-        "_retrieved_page_keys": included_keys,
-        "index_summary": "",
-        "index_summary_truncated": False,
-        "purpose": purpose,
-        "budget_used": len(memory_packet["packet"]) + len(wiki_context) + len(purpose),
-        "budget_max": max_chars,
-    }
-
-
-def assemble_context(
-    query: str,
-    max_chars: int = DEFAULT_MAX_CHARS,
-    *,
-    lightweight: bool = False,
-) -> dict:
-    if lightweight:
-        return _assemble_sqlite_context(query, max_chars)
-
-    purpose = _context_purpose(max_chars)
-    retrieval_budget = max_chars - len(purpose)
-    index_budget = int(retrieval_budget * TOKEN_BUDGET["index_summary"])
-
-    # Reserve the complete strategic purpose before sharing the retrieval budget.
-    memory_packet = build_memory_packet(query, max_chars=int(retrieval_budget * 0.50))
+    # P2-2: Dynamic Sliding Window for Budget
+    # Allow memory to burst up to 50% if there are critical alerts
+    memory_packet = build_memory_packet(query, max_chars=int(max_chars * 0.50))
     actual_memory_used = len(memory_packet["packet"])
-    wiki_budget = retrieval_budget - actual_memory_used - index_budget
 
-    index_path = str(get_index_path())
-    index_existed_before_search = os.path.exists(index_path)
-    search_index_data = None
-    if index_existed_before_search:
-        try:
-            search_index_data = _load_search_index(index_path)
-        except Exception as exc:
-            raise SearchIndexError(
-                "The knowledge base projection could not be verified before "
-                "context assembly."
-            ) from exc
+    purpose = ""
+    try:
+        from vector_lake.purpose_contract import render_strategy_directive
 
-    search_results = search_vector_lake(query, top_k=15, as_xml=False)
-    retrieval_text = search_results.split("</SemanticReadinessEnvelope>\n", 1)[-1]
-    unavailable_count = len(re.findall(
-        r"^- \*\*[^\n]+?\*\* \(score: [^;\n)]+; snippet: (?:missing|empty|unavailable)\)\n",
-        retrieval_text, re.MULTILINE,
-    ))
-    first_line = retrieval_text.partition("\n")[0]
-    note = first_line if first_line.startswith("[Search degraded:") else ""
-    if unavailable_count and not note:
-        note = "[Search degraded: wiki_snippet_unavailable]"
-    retrieval_degraded = bool(note)
-    wiki_context = ""
-    if note and len(note) + 2 <= wiki_budget:
-        wiki_context = note + "\n\n"
+        purpose = render_strategy_directive()
+    except Exception as exc:
+        log.warning("Strategy directive unavailable for context assembly: %s", exc)
+    purpose_budget = int(max_chars * TOKEN_BUDGET["system_prompt"])
+
+    # Wiki dynamically eats the remaining budget.
+    wiki_budget = max(0, max_chars - actual_memory_used - index_budget - purpose_budget)
+
+    scored_pages, vector_notes, retrieval_error = _search_scored_pages(query, top_k=15)
+
+    wiki_dir = str(get_wiki_dir())
+    wiki_blocks: list[str] = []
+    wiki_used = 0
     page_count = 0
-    matches = list(re.finditer(
-        r"\*\*([^\n]+?)\*\*(?![^\n]*; snippet: (?:missing|empty|unavailable)\))[^\n]*\n\s+(.*?)\.\.\.\n",
-        retrieval_text, re.DOTALL,
-    ))
-    for match in matches:
-        page_content = match.group(0)
-        if len(wiki_context) + len(page_content) > wiki_budget:
+    for score, node in scored_pages:
+        key = node["_key"]
+        filepath = os.path.join(wiki_dir, f"{key}.md")
+        snippet = ""
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+                snippet = re.sub(r"^---.*?---\s*", "", handle.read(), flags=re.DOTALL)[:2500]
+        except OSError:
+            snippet = ""
+        block = f"- **{node.get('title', key)}** (score: {score:.3f})\n  {snippet}\n\n"
+        if wiki_used + len(block) > wiki_budget:
             break
-        wiki_context += page_content
+        wiki_blocks.append(block)
+        wiki_used += len(block)
         page_count += 1
+    wiki_context = "".join(wiki_blocks)
 
     index_summary = ""
-    index_summary_truncated = False
-    if index_existed_before_search:
-        try:
-            index_data = _load_search_index(index_path)
-        except Exception as exc:
-            raise SearchIndexError(
-                "The knowledge base projection changed during context assembly; "
-                "retry after sync."
-            ) from exc
-        if index_data.get("projection_manifest") != search_index_data.get(
-            "projection_manifest"
-        ):
-            raise SearchIndexError(
-                "The knowledge base projection generation changed during context "
-                "assembly; retry."
-            )
-        lines = []
-        nodes = index_data.get("nodes", {})
-        for key, node in islice(nodes.items(), 50):
-            lines.append(f"[{node.get('type', '?')}] {node.get('title', key)}")
-        full_summary = "\n".join(lines)
-        index_summary = full_summary[:index_budget]
-        index_summary_truncated = len(full_summary) > index_budget
-        if not index_summary_truncated:
-            if isinstance(nodes, dict):
-                index_summary_truncated = len(nodes) > len(lines)
-            elif len(lines) == 50:
-                # A lazy view need not expose a count. Do not read a 51st node
-                # just to turn unknown completeness into a boolean.
-                index_summary_truncated = None
-    elif os.path.exists(index_path):
-        raise SearchIndexError(
-            "The knowledge base projection appeared during context assembly; retry."
-        )
+    index_path = str(get_index_path())
+    if os.path.exists(index_path):
+        import time
 
+        for attempt in range(3):
+            try:
+                with open(index_path, "r", encoding="utf-8") as handle:
+                    index_data = json.load(handle)
+                lines = [
+                    f"[{node.get('type', '?')}] {node.get('title', key)}"
+                    for key, node in list(index_data.get("nodes", {}).items())[:50]
+                ]
+                index_summary = "\n".join(lines)[:index_budget]
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    index_summary = "[Index read failed]"
+                    log.error("Index summary unavailable: %s", exc)
+                time.sleep(0.2)
+
+    # ``purpose`` is the last claimant on the budget and must not overflow it.
+    remaining = max_chars - (len(memory_packet["packet"]) + len(wiki_context) + len(index_summary))
+    purpose = purpose[:max(0, min(purpose_budget, remaining))]
+
+    budget_used = len(memory_packet["packet"]) + len(wiki_context) + len(index_summary) + len(purpose)
     return {
         "memory_packet": memory_packet["packet"],
         "memory_count": memory_packet["memory_count"],
         "memory_warning_count": memory_packet["warning_count"],
         "memory_omitted_count": memory_packet["omitted_count"],
-        "memory_packet_truncated": memory_packet.get("budget_truncated", False),
-        "memory_text_truncated_count": memory_packet.get("text_truncated_count", 0),
         "wiki_context": wiki_context,
         "wiki_page_count": page_count,
-        "wiki_omitted_count": len(matches) - page_count + unavailable_count,
-        # This path consumes pre-rendered search snippets, not full source text.
-        "wiki_text_truncated_count": None,
-        "wiki_retrieval_degraded": retrieval_degraded,
         "index_summary": index_summary,
-        "index_summary_truncated": index_summary_truncated,
         "purpose": purpose,
-        "budget_used": len(memory_packet["packet"])
-        + len(wiki_context)
-        + len(index_summary)
-        + len(purpose),
+        "retrieval_notes": list(vector_notes or []) + ([retrieval_error] if retrieval_error else []),
+        "budget_used": budget_used,
         "budget_max": max_chars,
     }

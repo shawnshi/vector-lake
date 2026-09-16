@@ -3,13 +3,13 @@
     "vector-lake-mcp": {
       "command": "python",
       "args": [
-        "scripts/vector_lake_mcp.py",
-        "--profile",
-        "default",
-        "--surface",
-        "full"
+        "-m",
+        "vector_lake.mcp_server"
       ],
-      "cwd": "."
+      "cwd": ".",
+      "env": {
+        "PYTHONPATH": "."
+      }
     }
   }
 }

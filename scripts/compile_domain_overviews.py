@@ -150,14 +150,11 @@ def compile_overviews():
             content.append("\n</details>")
 
         try:
-            from vector_lake.canonical_write import safe_write_markdown
+            from vector_lake.wiki_utils import safe_write_markdown
             safe_write_markdown(overview_path, "\n".join(content))
             log.info(f"Compiled {overview_filename} with {len(top_nodes)} top nodes and {len(tail_nodes)} tail nodes.")
         except Exception as e:
             log.error(f"Failed to write {overview_filename}: {e}")
 
 if __name__ == "__main__":
-    from vector_lake.runtime_paths import bootstrap_runtime_paths
-
-    bootstrap_runtime_paths(caller="Domain overview compiler")
     compile_overviews()

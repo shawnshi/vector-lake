@@ -1,0 +1,11 @@
+description = "Search the strategic timeline event store."
+prompt = """
+Invoke the `search_timeline` MCP tool and answer from its events only.
+
+- Map the user's request onto `entity_name`, `sentiment`, `action` and `limit`.
+- Always show each event's date and action tag; never reorder events chronologically without saying so.
+- If the tool returns no events, say the timeline has no matching entries rather than guessing.
+- Treat events still marked `provisional` as unverified.
+
+User request: {{args}}
+"""

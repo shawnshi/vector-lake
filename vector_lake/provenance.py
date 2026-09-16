@@ -8,91 +8,47 @@ def _tokenize(query: str) -> list[str]:
     return [token.lower() for token in re.split(r"\W+", query or "") if token.strip()]
 
 
-def build_trace_for_query(
-    query: str,
-    top_k: int = 5,
-    *,
-    relevant_pages: set[str] | None = None,
-) -> dict:
-    if top_k < 0:
-        raise ValueError("top_k must be non-negative")
-    if top_k == 0:
-        return {"query": query, "items": []}
-    normalized_query = str(query or "").strip()
-    exact_claim_id = normalized_query.startswith("claim_") and not any(
-        char.isspace() for char in normalized_query
-    )
-    if exact_claim_id:
-        claims = governance_store.select_trace_claim_by_id(normalized_query)
-        if not claims:
-            return {"query": query, "items": []}
-    else:
-        tokens = _tokenize(query)
-        if relevant_pages is None:
-            from vector_lake.db_store import search_wiki
+def build_trace_for_query(query: str, top_k: int = 5) -> dict:
+    tokens = _tokenize(query)
+    
+    # 1. Use FTS5 to find relevant source pages instead of O(N) full claim scan
+    from vector_lake.db_store import search_wiki
+    search_results = search_wiki(query, limit=10)
+    relevant_pages = {res["node_key"] for res in search_results}
+    
+    claims = governance_store.load_claims()["items"].values()
+    entities = governance_store.load_entities()["items"]
+    sources = governance_store.load_sources()["items"]
 
-            search_results = search_wiki(query, limit=10)
-            relevant_pages = {res["node_key"] for res in search_results}
-        else:
-            relevant_pages = {str(page) for page in relevant_pages if str(page)}
-        claims = governance_store.select_trace_claims(tokens, relevant_pages, top_k)
-    entity_ids = {
-        str(entity_id)
-        for claim in claims
-        for entity_id in claim.get("subject_entity_ids", [])
-    }
-    source_ids = {
-        str(source_id) for claim in claims for source_id in claim.get("source_ids", [])
-    }
-    entity_names, source_pages, source_traces = governance_store.load_trace_labels(
-        entity_ids,
-        source_ids,
-    )
+    matches = []
+    for claim in claims:
+        # Boost score if the claim comes from a top FTS match
+        source_page = claim.get('source_page', '')
+        base_score = 5 if source_page in relevant_pages else 0
+        
+        haystack = f"{claim.get('claim_text', '')} {source_page}".lower()
+        match_score = sum(1 for token in tokens if token in haystack)
+        score = base_score + match_score
+        
+        if score > 0:
+            matches.append((score, claim))
+    matches.sort(key=lambda item: item[0], reverse=True)
 
     trace_items = []
-    for claim in claims:
+    for _, claim in matches[:top_k]:
         annotated = governance_metrics.annotate_claim_validity(claim)
-        evidence_count = len(annotated.get("evidence_ids", []))
-        trace_items.append(
-            {
-                "claim_id": annotated["claim_id"],
-                "claim_text": annotated.get("claim_text", ""),
-                "subject_entities": [
-                    entity_names[entity_id]
-                    for entity_id in annotated.get("subject_entity_ids", [])
-                    if entity_id in entity_names
-                ],
-                "source_pages": [
-                    source_pages[source_id]
-                    for source_id in annotated.get("source_ids", [])
-                    if source_id in source_pages
-                ],
-                "sources": [
-                    {
-                        **source_traces.get(
-                            source_id,
-                            {
-                                "source_id": source_id,
-                                "raw_ref": "",
-                                "page": None,
-                                "resolution": "unresolved",
-                                "reason": "unknown_source",
-                            },
-                        ),
-                        "locator": annotated.get("locator", {}),
-                    }
-                    for source_id in annotated.get("source_ids", [])
-                ],
-                "confidence": annotated.get("confidence"),
-                "valid_to": annotated.get("valid_to"),
-                "review_after": annotated.get("review_after"),
-                "validity_state": annotated.get("validity_state"),
-                "evidence_count": evidence_count,
-                "acceptance_status": "not_assessed",
-                "accepted_fact": False,
-                "locator": annotated.get("locator", {}),
-            }
-        )
+        trace_items.append({
+            "claim_id": annotated["claim_id"],
+            "claim_text": annotated.get("claim_text", ""),
+            "subject_entities": [entities[entity_id]["canonical_name"] for entity_id in annotated.get("subject_entity_ids", []) if entity_id in entities],
+            "source_pages": [sources[source_id]["canonical_source_page"] for source_id in annotated.get("source_ids", []) if source_id in sources],
+            "confidence": annotated.get("confidence"),
+            "valid_to": annotated.get("valid_to"),
+            "review_after": annotated.get("review_after"),
+            "validity_state": annotated.get("validity_state"),
+            "evidence_count": len(annotated.get("evidence_ids", [])),
+            "locator": annotated.get("locator", {}),
+        })
 
     return {"query": query, "items": trace_items}
 
@@ -108,23 +64,14 @@ def format_trace(trace: dict) -> str:
             lines.append(f"  Entities: {', '.join(item['subject_entities'])}")
         if item["source_pages"]:
             lines.append(f"  Source Pages: {', '.join(item['source_pages'])}")
-        for source in item.get("sources", []):
-            if source.get("resolution") != "resolved":
-                lines.append(
-                    f"  Source: {source.get('source_id')} "
-                    f"[{source.get('resolution')}: {source.get('reason')}]"
-                )
         lines.append(f"  Confidence: {item.get('confidence')}")
         lines.append(f"  Validity: {item.get('validity_state')}")
         lines.append(f"  Evidence Count: {item.get('evidence_count')}")
-        lines.append(f"  Acceptance: {item.get('acceptance_status', 'not_assessed')}")
-        lines.append(f"  Accepted Fact: {item.get('accepted_fact', False)}")
         locator = item.get("locator") or {}
         if locator:
-            lines.append(
-                f"  Locator: {locator.get('page_key', '')}#{locator.get('heading', '')}:{locator.get('block_index', '')}"
-            )
+            lines.append(f"  Locator: {locator.get('page_key', '')}#{locator.get('heading', '')}:{locator.get('block_index', '')}")
         if item.get("review_after"):
             lines.append(f"  Review After: {item['review_after']}")
         lines.append("")
     return "\n".join(lines).strip()
+

@@ -1,9 +1,6 @@
 import argparse
 import io
-import json
-import math
 import os
-from pathlib import Path
 import sys
 
 try:
@@ -12,150 +9,19 @@ except ImportError:
     dotenv = None
 
 from vector_lake import tools
-from vector_lake.runtime_paths import bootstrap_runtime_paths
-
-
-_CLI_HEAVY_TASKS = {
-    "auto-ingest-receipt-retention": ("maintenance", 900.0),
-    "audit-graph": ("scan", 1800.0),
-    "backup-retention": ("maintenance", 900.0),
-    "canonical-backfill": ("maintenance", 900.0),
-    "change-set-compaction": ("maintenance", 1800.0),
-    "debt": ("scan", 900.0),
-    "delete": ("maintenance", 900.0),
-    "doctor": ("scan", 900.0),
-    "embedding-backfill": ("embedding", 3600.0),
-    "evidence-foundation-backfill": ("maintenance", 1800.0),
-    "gc": ("maintenance", 1800.0),
-    "graph": ("scan", 900.0),
-    "history-retention": ("maintenance", 1800.0),
-    "lint": ("scan", 1800.0),
-    "memory-cleanup": ("maintenance", 900.0),
-    "memory-search-index": ("maintenance", 1800.0),
-    "merge-suggestions": ("scan", 1800.0),
-    "orphan-source-classify": ("scan", 900.0),
-    "projection-rebuild-index": ("projection", 1800.0),
-    "projection-object-gc": ("maintenance", 1800.0),
-    "projection-report": ("scan", 900.0),
-    "retrieval-benchmark": ("scan", 900.0),
-    "research": ("ingest_scan", 1800.0),
-    "restore-snapshot": ("maintenance", 1800.0),
-    "schema-migrate": ("maintenance", 1800.0),
-    "schema-rollback": ("maintenance", 1800.0),
-    "sync": ("ingest_scan", 1800.0),
-    "timeline-rebuild": ("projection", 900.0),
-    "topology-queue-cleanup": ("maintenance", 900.0),
-    "unsupported-claim-debt": ("maintenance", 900.0),
-    "claim-provenance-repair": ("maintenance", 900.0),
-    "claim-placeholder-cleanup": ("maintenance", 900.0),
-    "wiki-restore": ("maintenance", 900.0),
-    "wiki-delete": ("maintenance", 900.0),
-}
-
-
-def _cli_heavy_task_policy(args) -> tuple[str, float] | None:
-    if args.command == "ingest-tasks":
-        if any(
-            bool(getattr(args, field, False))
-            for field in (
-                "repair_debt",
-                "cleanup_orphans",
-                "expire_stale",
-            )
-        ):
-            return "maintenance", 900.0
-        return None
-    if args.command == "schema-migrate":
-        if not (
-            getattr(args, "apply", False)
-            or getattr(args, "checkpoint_wal", False)
-        ):
-            return None
-    if args.command in {"restore-snapshot", "schema-rollback"} and not getattr(
-        args, "apply", False
-    ):
-        return None
-    return _CLI_HEAVY_TASKS.get(args.command)
-
-
-def _cli_heavy_task_wait_seconds() -> float:
-    try:
-        value = float(
-            os.environ.get("VECTOR_LAKE_CLI_HEAVY_TASK_WAIT_SECONDS", "30")
-        )
-    except (TypeError, ValueError):
-        value = 30.0
-    if not math.isfinite(value):
-        value = 30.0
-    return max(0.0, min(300.0, value))
 
 
 def _configure_stdout():
     if sys.stdout.encoding != "utf-8":
-        sys.stdout = io.TextIOWrapper(
-            sys.stdout.buffer, encoding="utf-8", errors="replace"
-        )
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 
 def _load_env():
-    configured = os.environ.get("VECTOR_LAKE_ENV_FILE", "").strip()
-    if not configured or dotenv is None:
+    if dotenv is None:
         return
-    env_path = Path(configured).expanduser()
-    if not env_path.is_absolute():
-        raise RuntimeError("VECTOR_LAKE_ENV_FILE must be an absolute path")
-    if not env_path.is_file():
-        raise RuntimeError(f"VECTOR_LAKE_ENV_FILE does not exist: {env_path}")
-    dotenv.load_dotenv(env_path)
-
-
-def _nonnegative_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("expected an integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("expected zero or a positive integer")
-    return parsed
-
-
-def _positive_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("expected an integer") from exc
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("expected a positive integer")
-    return parsed
-
-
-def _doctor_exit_code(report: str) -> int:
-    lines = [line.strip() for line in str(report).splitlines()]
-    if any(line.startswith("[FAIL]") for line in lines):
-        return 2
-    prefix = "Infrastructure Summary:"
-    summary_lines = [line for line in lines if line.startswith(prefix)]
-    if len(summary_lines) != 1:
-        raise ValueError("doctor report must contain one Infrastructure Summary")
-    status = summary_lines[0][len(prefix):].strip().lower()
-    if status in {"healthy", "healthy with warnings"}:
-        return 0
-    if status == "issues detected":
-        return 2
-    raise ValueError(f"unrecognized doctor infrastructure status: {status!r}")
-
-
-def _readiness_exit_code(report: str) -> int:
-    payload = json.loads(report)
-    if not isinstance(payload, dict):
-        raise ValueError("readiness report must be a JSON object")
-    status = str(payload.get("status") or "").strip().lower()
-    ready = payload.get("ready")
-    if status == "ready" and ready is True:
-        return 0
-    if status in {"degraded", "not_ready"} and ready is False:
-        return 2
-    raise ValueError("readiness report has an inconsistent status contract")
+    env_path = os.path.join(os.path.expanduser("~"), ".gemini", ".env")
+    if os.path.exists(env_path):
+        dotenv.load_dotenv(env_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -170,1362 +36,180 @@ Usage Examples:
   python cli.py review
   python cli.py review resolve 0
   python cli.py review resolve review_ab12cd34ef56
-  python cli.py delete "/path/to/raw/file.pdf" --dry-run
+  python cli.py delete "/path/to/raw/file.pdf"            # dry-run by default
+  python cli.py delete "/path/to/raw/file.pdf" --apply     # perform the delete
   python cli.py doctor
-  python cli.py evidence-packet "claim_id"
 """,
     )
 
-    subparsers = parser.add_subparsers(
-        dest="command", required=True, help="Available wiki operations"
-    )
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available wiki operations")
 
-    subparsers.add_parser(
-        "sync",
-        help="[INGEST] Generates MCP ingestion instructions for Native Subagents.",
-    )
-    ingest_tasks_parser = subparsers.add_parser(
-        "ingest-tasks", help="[INGEST] List or expire subagent ingest tasks."
-    )
-    ingest_tasks_parser.add_argument(
-        "--limit",
-        type=_nonnegative_int,
-        default=20,
-        help="Maximum number of jobs to list.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--awaiting-only",
-        action="store_true",
-        help="Hide queued jobs and show only awaiting-subagent jobs.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--expire-stale",
-        action="store_true",
-        help="Expire stale awaiting-subagent jobs instead of listing.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--claim",
-        action="store_true",
-        help="Lease awaiting task packets to this host runtime.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--repair-debt",
-        action="store_true",
-        help="Classify and recover abandoned ingest jobs.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--reopen-provenance-only",
-        action="store_true",
-        help=(
-            "With --repair-debt: also revive finalized/failed jobs whose canonical "
-            "page is still a provenance-only seed, or whose failure was a "
-            "serialized-prompt token-budget rejection. Reviving spends model "
-            "tokens; preview first (omit --apply)."
-        ),
-    )
-    ingest_tasks_parser.add_argument(
-        "--cleanup-orphans",
-        action="store_true",
-        help="Preview old unreferenced ingest task packets.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply the selected repair or cleanup operation.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--job-id",
-        default="",
-        help="Exact 32-hex ingest job id for --repair-debt duplicate retirement.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--expected-action",
-        default="",
-        help="Expected exact repair action; currently only supersede_duplicate.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Preview fingerprint required to apply an exact --repair-debt operation.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--max-age-seconds",
-        type=int,
-        default=86400,
-        help="Age threshold for --expire-stale.",
-    )
-    budget_status_parser = subparsers.add_parser(
-        "auto-ingest-budget-status",
-        help="[READ] Report rolling automatic-ingest task and token budgets.",
-    )
-    budget_status_parser.add_argument(
-        "--reservations-only",
-        action="store_true",
-        help="Skip per-attempt receipt reads and report exact reservations only.",
-    )
-    receipt_retention_parser = subparsers.add_parser(
-        "auto-ingest-receipt-retention",
-        help="[MAINTENANCE] Preview or delete expired terminal attempt receipts.",
-    )
-    receipt_retention_parser.add_argument("--apply", action="store_true")
-    receipt_retention_parser.add_argument("--confirm-fingerprint", default="")
-    receipt_retention_parser.add_argument("--plan-as-of", default="")
-    receipt_retention_parser.add_argument("--limit", type=_positive_int, default=256)
-    ingest_tasks_parser.add_argument(
-        "--min-age-seconds",
-        type=_nonnegative_int,
-        default=86400,
-        help="Minimum age for --cleanup-orphans.",
-    )
-    ingest_tasks_parser.add_argument(
-        "--lease-seconds", type=int, default=3600, help="Lease duration for --claim."
-    )
+    subparsers.add_parser("sync", help="[INGEST] Generates MCP ingestion instructions for Native Subagents.")
+    ingest_tasks_parser = subparsers.add_parser("ingest-tasks", help="[INGEST] List or expire subagent ingest tasks.")
+    ingest_tasks_parser.add_argument("--limit", type=int, default=20, help="Maximum number of jobs to list.")
+    ingest_tasks_parser.add_argument("--awaiting-only", action="store_true", help="Hide queued jobs and show only awaiting-subagent jobs.")
+    ingest_tasks_parser.add_argument("--expire-stale", action="store_true", help="Expire stale awaiting-subagent jobs instead of listing.")
+    ingest_tasks_parser.add_argument("--claim", action="store_true", help="Lease awaiting task packets to this host runtime.")
+    ingest_tasks_parser.add_argument("--max-age-seconds", type=int, default=86400, help="Age threshold for --expire-stale.")
+    ingest_tasks_parser.add_argument("--lease-seconds", type=int, default=3600, help="Lease duration for --claim.")
 
-    lint_parser = subparsers.add_parser(
-        "lint", help="[LINT] Run self-healing audit on the Wiki nodes."
-    )
-    lint_parser.add_argument(
-        "--auto-fix",
-        action="store_true",
-        help="Automatically fix issues such as decaying notes.",
-    )
+    lint_parser = subparsers.add_parser("lint", help="[LINT] Run self-healing audit on the Wiki nodes.")
+    lint_parser.add_argument("--auto-fix", action="store_true", help="Automatically fix issues such as decaying notes.")
 
-    search_parser = subparsers.add_parser(
-        "search", help="[SEARCH] CJK-aware search with graph expansion."
-    )
+    search_parser = subparsers.add_parser("search", help="[SEARCH] CJK-aware search with graph expansion.")
     search_parser.add_argument("query", help="Semantic query string.")
-    search_parser.add_argument(
-        "--top_k", type=int, default=5, help="Number of results (default: 5)."
-    )
-    search_parser.add_argument(
-        "--domain", type=str, default=None, help="Filter by domain namespace."
-    )
-    search_parser.add_argument(
-        "--cluster", type=str, default=None, help="Filter by topic cluster."
-    )
-    search_parser.add_argument(
-        "--include-history",
-        action="store_true",
-        help="Bypass temporal invalidation to search deprecated facts.",
-    )
-    search_parser.add_argument(
-        "--mode",
-        choices=["page", "memory", "fact", "claim"],
-        default="page",
-        help=(
-            "Search pages, all operational memory, or fact-only operational "
-            "memory; claim is a deprecated alias for fact."
-        ),
-    )
+    search_parser.add_argument("--top_k", type=int, default=5, help="Number of results (default: 5).")
+    search_parser.add_argument("--domain", type=str, default=None, help="Filter by domain namespace.")
+    search_parser.add_argument("--cluster", type=str, default=None, help="Filter by topic cluster.")
+    search_parser.add_argument("--include-history", action="store_true", help="Bypass temporal invalidation to search deprecated facts.")
+    search_parser.add_argument("--mode", choices=["page", "memory", "claim"], default="page", help="Search page index, operational memory, or fact claims.")
 
-    benchmark_parser = subparsers.add_parser(
-        "retrieval-benchmark",
-        help="[EVAL] Run a deterministic, read-only retrieval benchmark.",
-    )
-    benchmark_parser.add_argument(
-        "dataset",
-        help="Path to a vector-lake-retrieval-benchmark/v1 JSON dataset.",
-    )
-    benchmark_parser.add_argument(
-        "--top-k",
-        type=_positive_int,
-        default=None,
-        help="Override dataset top_k for this run (maximum: 100).",
-    )
-    benchmark_parser.add_argument(
-        "--allow-remote-embeddings",
-        action="store_true",
-        help=(
-            "Allow the configured query embedding provider. The default is "
-            "local deterministic retrieval only."
-        ),
-    )
-
-    query_parser = subparsers.add_parser(
-        "query", help="[QUERY] Deep reasoning with budget-controlled context."
-    )
+    query_parser = subparsers.add_parser("query", help="[QUERY] Deep reasoning with budget-controlled context.")
     query_parser.add_argument("query_str", help="The topic or command for reasoning.")
-    query_mode = query_parser.add_mutually_exclusive_group()
-    query_mode.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview only (the default; retained for compatibility).",
-    )
-    query_mode.add_argument(
-        "--apply",
-        action="store_true",
-        help="Explicitly prepare a persisted query-synthesis job.",
-    )
+    query_parser.add_argument("--dry-run", action="store_true", help="Output Markdown to stdout only without persisting to disk.")
 
-    subparsers.add_parser(
-        "graph",
-        help="[GRAPH] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.",
-    )
-    timeline_rebuild_parser = subparsers.add_parser(
-        "timeline-rebuild",
-        help="[TIMELINE] Rebuild timeline_events from timeline-event claims.",
-    )
-    timeline_rebuild_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Persist the rebuilt projection. Defaults to dry-run.",
-    )
-    timeline_rebuild_parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional maximum number of claims to project.",
-    )
+    subparsers.add_parser("graph", help="[GRAPH] Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.")
+    timeline_rebuild_parser = subparsers.add_parser("timeline-rebuild", help="[TIMELINE] Rebuild timeline_events from timeline-event claims.")
+    timeline_rebuild_parser.add_argument("--apply", action="store_true", help="Persist the rebuilt projection. Defaults to dry-run.")
+    timeline_rebuild_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of claims to project.")
 
-    projection_report_parser = subparsers.add_parser(
-        "projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift."
-    )
-    projection_report_parser.add_argument(
-        "--limit", type=int, default=20, help="Sample size per drift bucket."
-    )
+    projection_report_parser = subparsers.add_parser("projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift.")
+    projection_report_parser.add_argument("--limit", type=int, default=20, help="Sample size per drift bucket.")
 
-    canonical_backfill_parser = subparsers.add_parser(
-        "canonical-backfill",
-        help="[MAINTENANCE] Backfill missing canonical rows from Wiki pages.",
-    )
-    canonical_backfill_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Persist the backfill. Defaults to dry-run.",
-    )
-    canonical_backfill_parser.add_argument(
-        "--limit",
-        type=int,
-        default=50,
-        help="Maximum number of missing pages to process.",
-    )
+    canonical_backfill_parser = subparsers.add_parser("canonical-backfill", help="[MAINTENANCE] Backfill missing canonical rows from Wiki pages.")
+    canonical_backfill_parser.add_argument("--apply", action="store_true", help="Persist the backfill. Defaults to dry-run.")
+    canonical_backfill_parser.add_argument("--limit", type=int, default=50, help="Maximum number of missing pages to process.")
 
-    foundation_backfill_parser = subparsers.add_parser(
-        "evidence-foundation-backfill",
-        help="[MAINTENANCE] Backfill missing evidence-foundation metadata without replacing canonical content.",
-    )
-    foundation_backfill_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Persist the backfill. Defaults to dry-run.",
-    )
-    foundation_backfill_parser.add_argument(
-        "--limit",
-        type=int,
-        default=500,
-        help="Maximum page revisions per run; zero means all.",
-    )
-    foundation_backfill_parser.add_argument(
-        "--batch-size", type=int, default=100, help="Atomic page count per transaction."
-    )
-    foundation_backfill_parser.add_argument(
-        "--backup-reference",
-        default="",
-        help="Existing verified SQLite backup to reuse.",
-    )
+    index_rebuild_parser = subparsers.add_parser("projection-rebuild-index", help="[MAINTENANCE] Rebuild index projection from canonical SQLite.")
+    index_rebuild_parser.add_argument("--apply", action="store_true", help="Persist rebuilt index projection. Defaults to dry-run.")
 
-    index_rebuild_parser = subparsers.add_parser(
-        "projection-rebuild-index",
-        help="[MAINTENANCE] Rebuild index projection from canonical SQLite.",
-    )
-    index_rebuild_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Persist rebuilt index projection. Defaults to dry-run.",
-    )
+    embedding_backfill_parser = subparsers.add_parser("embedding-backfill", help="[MAINTENANCE] Backfill missing vector embeddings under rate limits.")
+    embedding_backfill_parser.add_argument("--apply", action="store_true", help="Persist embeddings. Defaults to dry-run.")
+    embedding_backfill_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of nodes to embed.")
+    embedding_backfill_parser.add_argument("--include-existing", action="store_true", help="Re-embed nodes that already have vectors.")
 
-    embedding_backfill_parser = subparsers.add_parser(
-        "embedding-backfill",
-        help="[MAINTENANCE] Backfill missing vector embeddings under rate limits.",
-    )
-    embedding_backfill_parser.add_argument(
-        "--apply", action="store_true", help="Persist embeddings. Defaults to dry-run."
-    )
-    embedding_backfill_parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional maximum number of nodes to embed.",
-    )
-    embedding_backfill_parser.add_argument(
-        "--include-existing",
-        action="store_true",
-        help="Re-embed nodes that already have vectors.",
-    )
+    wiki_restore_parser = subparsers.add_parser("wiki-restore", help="[MAINTENANCE] Restore missing Wiki pages from canonical metadata.")
+    wiki_restore_parser.add_argument("--apply", action="store_true", help="Persist restored Markdown pages. Defaults to dry-run.")
+    wiki_restore_parser.add_argument("--limit", type=int, default=10, help="Maximum number of canonical-only pages to restore.")
 
-    wiki_restore_parser = subparsers.add_parser(
-        "wiki-restore",
-        help="[MAINTENANCE] Restore missing Wiki pages from canonical metadata.",
-    )
-    wiki_restore_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Persist restored Markdown pages. Defaults to dry-run.",
-    )
-    wiki_restore_parser.add_argument(
-        "--limit",
-        type=int,
-        default=10,
-        help="Maximum number of canonical-only pages to restore.",
-    )
+    review_parser = subparsers.add_parser("review", help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.")
+    review_parser.add_argument("action", nargs="?", default="list", choices=["list", "resolve", "ground"], help="Action: 'list' (default), 'resolve', or 'ground'.")
+    review_parser.add_argument("index", nargs="?", default="-1", help="Index or item_id of review item to resolve (for 'resolve' action).")
+    review_parser.add_argument("--resolution", type=str, default="skip", help="Resolution type: 'skip', 'create', 'merge', 'acknowledge' (default: skip).")
 
-    wiki_delete_parser = subparsers.add_parser(
-        "wiki-delete",
-        help="[MAINTENANCE] Delete exact Wiki pages with a fingerprinted batch.",
-    )
-    wiki_delete_parser.add_argument(
-        "--payload-file",
-        required=True,
-        help="Path to the JSON batch manifest (schema_version 1).",
-    )
-    wiki_delete_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Commit the deletions. Defaults to dry-run.",
-    )
-    wiki_delete_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact fingerprint returned by the dry-run preview.",
-    )
+    subparsers.add_parser("audit-graph", help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.")
+    subparsers.add_parser("doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout.")
 
-    memory_index_parser = subparsers.add_parser(
-        "memory-search-index",
-        help="[MAINTENANCE] Report or explicitly advance the optional operational-memory FTS index.",
-    )
-    memory_index_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Advance one bounded index batch. Defaults to read-only status.",
-    )
-    memory_index_parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=256,
-        help="Maximum documents to synchronize when --apply is used (max: 10000).",
-    )
+    research_parser = subparsers.add_parser("research", help="[RESEARCH] Autonomously scan graph gaps and governance queue to formulate web research directives.")
+    research_parser.add_argument("--dry-run", action="store_true", help="Preview the research queries without the SYSTEM DIRECTIVE execution hook.")
 
-    memory_cleanup_parser = subparsers.add_parser(
-        "memory-cleanup",
-        help="[MAINTENANCE] Preview or archive generated template artifacts in operational memory.",
-    )
-    memory_cleanup_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Archive detected artifacts. Defaults to dry-run.",
-    )
-    memory_cleanup_parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="Maximum rows to archive; zero means all candidates.",
-    )
-    history_retention_parser = subparsers.add_parser(
-        "history-retention",
-        help="[MAINTENANCE] Preview or explicitly apply bounded history retention.",
-    )
-    history_retention_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Delete the selected history batch. Defaults to read-only preview.",
-    )
-    history_retention_parser.add_argument(
-        "--ttl-days",
-        type=_positive_int,
-        default=30,
-        help="Minimum history age in days.",
-    )
-    history_retention_parser.add_argument(
-        "--batch-size",
-        type=_positive_int,
-        default=500,
-        help="Maximum rows selected globally (max: 500).",
-    )
-    history_retention_parser.add_argument(
-        "--max-delete-bytes",
-        type=_positive_int,
-        default=128 * 1024 * 1024,
-        help="Maximum logical bytes selected globally.",
-    )
-    history_retention_parser.add_argument(
-        "--keep-change-sets",
-        type=_nonnegative_int,
-        default=1000,
-        help="Always retain at least this many newest change sets.",
-    )
-    history_retention_parser.add_argument(
-        "--keep-terminal-jobs",
-        type=_nonnegative_int,
-        default=1000,
-        help="Always retain at least this many newest terminal jobs.",
-    )
-    history_retention_parser.add_argument(
-        "--keep-terminal-outbox",
-        type=_nonnegative_int,
-        default=1000,
-        help="Always retain at least this many newest terminal outbox rows.",
-    )
-    history_retention_parser.add_argument(
-        "--keep-versions-per-family",
-        type=_positive_int,
-        default=2,
-        help="Always retain the newest versions in each claim/evidence family.",
-    )
-    history_retention_parser.add_argument(
-        "--claim-version-cursor",
-        default="",
-        help="Receipt-issued claim-version keyset cursor for the next batch.",
-    )
-    history_retention_parser.add_argument(
-        "--evidence-version-cursor",
-        default="",
-        help="Receipt-issued evidence-version keyset cursor for the next batch.",
-    )
-    history_retention_parser.add_argument(
-        "--version-cursor-receipt",
-        default="",
-        help="Fingerprint of the successful receipt that issued both cursors.",
-    )
-    history_retention_parser.add_argument(
-        "--plan-as-of",
-        default="",
-        help="Fixed timezone-aware preview instant required for apply.",
-    )
-    history_retention_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact sha256 fingerprint returned by the matching preview.",
-    )
-    change_set_compaction_parser = subparsers.add_parser(
-        "change-set-compaction",
-        help="[MAINTENANCE] Preview or apply bounded legacy change-set compaction.",
-    )
-    change_set_compaction_parser.add_argument("--apply", action="store_true")
-    change_set_compaction_parser.add_argument(
-        "--max-rows", type=_positive_int, default=100
-    )
-    change_set_compaction_parser.add_argument(
-        "--max-input-bytes", type=_positive_int, default=64 * 1024 * 1024
-    )
-    change_set_compaction_parser.add_argument(
-        "--cursor",
-        default="",
-        help="safe_next_cursor returned by the prior successful apply.",
-    )
-    change_set_compaction_parser.add_argument(
-        "--confirm-fingerprint", default=""
-    )
-    backup_retention_parser = subparsers.add_parser(
-        "backup-retention",
-        help="[MAINTENANCE] Preview or explicitly apply backup retention.",
-    )
-    backup_retention_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Delete only candidates matching --confirm-fingerprint. Defaults to preview.",
-    )
-    backup_retention_parser.add_argument(
-        "--keep-latest",
-        type=_positive_int,
-        default=5,
-        help="Retain this many newest backups, plus the newest restorable backup.",
-    )
-    backup_retention_parser.add_argument(
-        "--min-age-days",
-        type=_positive_int,
-        default=30,
-        help="Minimum complete-backup age in days.",
-    )
-    backup_retention_parser.add_argument(
-        "--stage-ttl-hours",
-        type=_positive_int,
-        default=24,
-        help="Minimum private staging age in hours.",
-    )
-    backup_retention_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact fingerprint from a current preview; required with --apply.",
-    )
-    projection_object_gc_parser = subparsers.add_parser(
-        "projection-object-gc",
-        help=(
-            "[MAINTENANCE] Preview or collect unreachable immutable "
-            "projection-v2 objects."
-        ),
-    )
-    projection_object_gc_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Delete only candidates bound to --confirm-fingerprint. Defaults to preview.",
-    )
-    projection_object_gc_parser.add_argument(
-        "--retention-days",
-        type=_positive_int,
-        default=7,
-        help="Minimum orphan-object age in days.",
-    )
-    projection_object_gc_parser.add_argument(
-        "--limit",
-        type=_positive_int,
-        default=1000,
-        help="Maximum objects to collect in one receipt-bound batch.",
-    )
-    projection_object_gc_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact fingerprint from the current preview; required with --apply.",
-    )
-    schema_migrate_parser = subparsers.add_parser(
-        "schema-migrate",
-        help=(
-            "[MAINTENANCE] Preview or apply the controlled SQLite "
-            "v4/v5/v6/v7/v8 to v9 migration."
-        ),
-    )
-    schema_migrate_action = schema_migrate_parser.add_mutually_exclusive_group()
-    schema_migrate_action.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply the exact previewed plan. Defaults to a physically read-only preview.",
-    )
-    schema_migrate_action.add_argument(
-        "--checkpoint-wal",
-        action="store_true",
-        help="Checkpoint and truncate the exact previewed WAL without running migration DDL.",
-    )
-    schema_migrate_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact sha256 fingerprint returned by the matching preview.",
-    )
-    schema_migrate_parser.add_argument(
-        "--confirm-no-writers",
-        action="store_true",
-        help="Assert that MCP, watchdog, and every other database writer are stopped.",
-    )
-    schema_rollback_parser = subparsers.add_parser(
-        "schema-rollback",
-        help=(
-            "[MAINTENANCE] Preview or apply a completed-receipt-bound "
-            "SQLite v9 to v8 rollback."
-        ),
-    )
-    schema_rollback_parser.add_argument(
-        "--migration-receipt",
-        required=True,
-        help="Absolute path to the authoritative completed v8-to-v9 migration receipt.",
-    )
-    schema_rollback_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply the exact previewed rollback. Defaults to physical read-only preview.",
-    )
-    schema_rollback_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact sha256 fingerprint returned by the matching rollback preview.",
-    )
-    schema_rollback_parser.add_argument(
-        "--confirm-no-writers",
-        action="store_true",
-        help="Assert that MCP, watchdog, and every other database writer are stopped.",
-    )
-    schema_rollback_parser.add_argument(
-        "--confirm-data-rewind",
-        action="store_true",
-        help="Explicitly accept loss of writes committed after the migration receipt.",
-    )
-    restore_snapshot_parser = subparsers.add_parser(
-        "restore-snapshot",
-        help=(
-            "[MAINTENANCE] Preview or apply a completed maintenance-backup "
-            "receipt-bound full recovery."
-        ),
-    )
-    restore_snapshot_parser.add_argument(
-        "--maintenance-receipt",
-        required=True,
-        help="Absolute path to an authoritative completed backup manifest.json.",
-    )
-    restore_snapshot_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply the exact previewed restore. Defaults to read-only preview.",
-    )
-    restore_snapshot_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact sha256 fingerprint returned by the matching restore preview.",
-    )
-    restore_snapshot_parser.add_argument(
-        "--confirm-no-writers",
-        action="store_true",
-        help="Assert that MCP, watchdog, and every other database writer are stopped.",
-    )
-    topology_cleanup_parser = subparsers.add_parser(
-        "topology-queue-cleanup",
-        help="[MAINTENANCE] Preview or retire legacy indexer-generated community naming items.",
-    )
-    topology_cleanup_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Retire matching legacy items. Defaults to dry-run.",
-    )
-    orphan_source_parser = subparsers.add_parser(
-        "orphan-source-classify",
-        help="[MAINTENANCE] Classify unreferenced canonical sources and register non-destructive debt.",
-    )
-    orphan_source_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Register classified debt. Defaults to dry-run.",
-    )
-    unsupported_debt_parser = subparsers.add_parser(
-        "unsupported-claim-debt",
-        help="[MAINTENANCE] Preview or register runtime unsupported claims as governed evidence debt.",
-    )
-    unsupported_debt_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply the exact previewed candidate set. Defaults to dry-run.",
-    )
-    unsupported_debt_parser.add_argument(
-        "--review-days", type=int, default=30, help="Governance review window."
-    )
-    unsupported_debt_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact candidate fingerprint returned by the matching preview.",
-    )
-    provenance_repair_parser = subparsers.add_parser(
-        "claim-provenance-repair",
-        help="[MAINTENANCE] Preview or repair exact source-backed unsupported claims.",
-    )
-    provenance_repair_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply the exact previewed candidate set. Defaults to dry-run.",
-    )
-    provenance_repair_parser.add_argument(
-        "--confirm-fingerprint",
-        default="",
-        help="Exact candidate fingerprint returned by the matching preview.",
-    )
-    provenance_repair_parser.add_argument(
-        "--source-map",
-        default="",
-        help="Frozen claim-provenance-source-map/v1 JSON file inside MEMORY.",
-    )
-    placeholder_cleanup_parser = subparsers.add_parser(
-        "claim-placeholder-cleanup",
-        help="[MAINTENANCE] Preview or remove an exact generated-placeholder scope.",
-    )
-    placeholder_cleanup_parser.add_argument(
-        "--claim-id", action="append", required=True,
-        help="Exact claim ID; repeat for each selected placeholder.",
-    )
-    placeholder_cleanup_parser.add_argument(
-        "--apply", action="store_true",
-        help="Apply the exact previewed scope. Defaults to dry-run.",
-    )
-    placeholder_cleanup_parser.add_argument(
-        "--confirm-fingerprint", default="",
-        help="Exact candidate fingerprint returned by the matching preview.",
-    )
 
-    review_parser = subparsers.add_parser(
-        "review",
-        help="[REVIEW] Inspect and resolve the unified legacy/governance review surface.",
-    )
-    review_parser.add_argument(
-        "action",
-        nargs="?",
-        default="list",
-        choices=["list", "resolve", "ground"],
-        help="Action: 'list' (default), 'resolve', or 'ground'.",
-    )
-    review_parser.add_argument(
-        "index",
-        nargs="?",
-        default="-1",
-        help="Index or item_id of review item to resolve (for 'resolve' action).",
-    )
-    review_parser.add_argument(
-        "--resolution",
-        type=str,
-        default="skip",
-        help="Resolution type: 'skip', 'create', 'merge', 'acknowledge' (default: skip).",
-    )
+    debt_parser = subparsers.add_parser("debt", help="[DEBT] Show governance debt metrics.")
+    debt_parser.add_argument("--top", type=int, default=20, help="Top debt window size.")
 
-    subparsers.add_parser(
-        "audit-graph",
-        help="[AUDIT-GRAPH] Synthesize graph topology insights into the unified review surface.",
-    )
-    subparsers.add_parser(
-        "doctor", help="[DOCTOR] Validate runtime dependencies and filesystem layout."
-    )
-    readiness_parser = subparsers.add_parser(
-        "readiness",
-        help="[READINESS] Report semantic readiness separately from runtime health.",
-    )
-    readiness_parser.add_argument(
-        "--decision-id",
-        default=None,
-        help="Evaluate only a verified CriticalDecisionRegistry scope.",
-    )
-
-    research_parser = subparsers.add_parser(
-        "research",
-        help="[RESEARCH] Autonomously scan graph gaps and governance queue to formulate web research directives.",
-    )
-    research_mode = research_parser.add_mutually_exclusive_group()
-    research_mode.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview only (the default; retained for compatibility).",
-    )
-    research_mode.add_argument(
-        "--apply",
-        action="store_true",
-        help="Explicitly emit the authorized external-research action plan.",
-    )
-
-    debt_parser = subparsers.add_parser(
-        "debt", help="[DEBT] Show governance debt metrics."
-    )
-    debt_parser.add_argument(
-        "--top", type=int, default=20, help="Top debt window size."
-    )
-
-    trace_parser = subparsers.add_parser(
-        "trace", help="[TRACE] Show provenance trace for a query or identifier."
-    )
+    trace_parser = subparsers.add_parser("trace", help="[TRACE] Show provenance trace for a query or identifier.")
     trace_parser.add_argument("query_or_id", help="Query text or object identifier.")
 
-    evidence_parser = subparsers.add_parser(
-        "evidence-packet",
-        help="[EVIDENCE] Export a read-only CBSS EvidencePacket for one canonical claim.",
-    )
-    evidence_parser.add_argument("claim_id", help="Canonical claim identifier.")
-    evidence_parser.add_argument(
-        "--include-text",
-        action="store_true",
-        help="Include bounded evidence text. The default exports hashes and locators only.",
-    )
-    evidence_parser.add_argument(
-        "--max-text-chars",
-        type=int,
-        default=2000,
-        help="Per-evidence text limit when --include-text is used (default: 2000, max: 10000).",
-    )
-    evidence_parser.add_argument(
-        "--actor-id",
-        default="",
-        help="Required operator identifier when --include-text is used.",
-    )
-    evidence_parser.add_argument(
-        "--purpose",
-        default="",
-        help="Required bounded export purpose when --include-text is used.",
-    )
-    assessment_parser = subparsers.add_parser(
-        "claim-assessment",
-        help="[EVIDENCE] Append a version-bound review assessment to one claim.",
-    )
-    assessment_parser.add_argument("claim_id", help="Canonical claim identifier.")
-    assessment_parser.add_argument(
-        "--assessment-type", required=True, help="Review method category."
-    )
-    assessment_parser.add_argument(
-        "--outcome",
-        required=True,
-        choices=(
-            "supported",
-            "unsupported",
-            "contradicted",
-            "inconclusive",
-            "needs_review",
-        ),
-    )
-    assessment_parser.add_argument("--actor-id", required=True)
-    assessment_parser.add_argument("--method-version", required=True)
-    assessment_parser.add_argument("--reason", required=True)
-    assessment_parser.add_argument(
-        "--expected-claim-version",
-        required=True,
-        help="Version from the reviewed EvidencePacket; rejects stale assessments.",
-    )
-    assessment_parser.add_argument(
-        "--details-json", default="{}", help="Optional JSON object with review details."
-    )
+    merge_parser = subparsers.add_parser("merge-suggestions", help="[MERGE] Detect and enqueue candidate entity merges.")
+    merge_parser.add_argument("--limit", type=int, default=20, help="Maximum number of merge candidates to surface.")
+    merge_parser.add_argument("--preview", action="store_true", help="Do not enqueue governance items; only preview candidates.")
 
-    merge_parser = subparsers.add_parser(
-        "merge-suggestions",
-        help="[MERGE] Preview candidate entity merges; enqueue only with --apply.",
-    )
-    merge_parser.add_argument(
-        "--limit",
-        type=int,
-        default=20,
-        help="Maximum number of merge candidates to surface.",
-    )
-    merge_mode = merge_parser.add_mutually_exclusive_group()
-    merge_mode.add_argument(
-        "--apply",
-        action="store_true",
-        help="Enqueue eligible merge candidates for governance review.",
-    )
-    merge_mode.add_argument(
-        "--preview",
-        action="store_true",
-        help="Compatibility alias for the default zero-write preview mode.",
-    )
+    delete_parser = subparsers.add_parser("delete", help="[DELETE] Cascade-delete a raw source and all related wiki pages.")
+    delete_parser.add_argument("raw_path", help="Path to the raw source file to remove.")
+    delete_parser.add_argument("--apply", action="store_true", help="Persist the cascade delete. Defaults to dry-run.")
 
-    delete_parser = subparsers.add_parser(
-        "delete",
-        help="[DELETE] Cascade-delete a raw source and all related wiki pages.",
-    )
-    delete_parser.add_argument(
-        "raw_path", help="Path to the raw source file to remove."
-    )
-    delete_mode = delete_parser.add_mutually_exclusive_group()
-    delete_mode.add_argument(
-        "--apply",
-        action="store_true",
-        help="Execute the deletion. Defaults to dry-run.",
-    )
-    delete_mode.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview what would be deleted without making changes.",
-    )
-
-    gc_parser = subparsers.add_parser(
-        "gc", help="[GC] Automatically prune isolated/orphan entities."
-    )
-    gc_parser.add_argument(
-        "--days",
-        type=_positive_int,
-        default=30,
-        help="Prune entities older than this many days (default: 30; minimum: 1).",
-    )
-    gc_parser.add_argument(
-        "--confirm-orphans",
-        default=None,
-        help="Delete only the orphan candidate set matching this dry-run fingerprint. Requires --apply.",
-    )
-    gc_mode = gc_parser.add_mutually_exclusive_group()
-    gc_mode.add_argument(
-        "--apply",
-        action="store_true",
-        help="Execute garbage collection. Defaults to dry-run.",
-    )
-    gc_mode.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview what would be deleted without making changes.",
-    )
+    gc_parser = subparsers.add_parser("gc", help="[GC] Automatically prune isolated/orphan entities.")
+    gc_parser.add_argument("--days", type=int, default=30, help="Prune entities older than this many days (default: 30).")
+    gc_parser.add_argument("--apply", action="store_true", help="Persist the prune. Defaults to dry-run.")
+    gc_parser.add_argument("--force", action="store_true", help="Bypass the 50%% mass-deletion safety threshold.")
     return parser
 
 
 def main() -> int:
     _configure_stdout()
-    try:
-        # Resolve storage authority before an explicitly selected dotenv is loaded.
-        # python-dotenv defaults to override=False, so the bound pair remains
-        # authoritative while unrelated credentials can still be imported.
-        bootstrap_runtime_paths(caller="CLI")
-        _load_env()
-    except RuntimeError as exc:
-        print(f"CLI runtime authority error: {exc}", file=sys.stderr)
-        return 1
-    from vector_lake.runtime_logging import configure_runtime_logging
-
-    configure_runtime_logging("cli")
+    _load_env()
     parser = build_parser()
     args = parser.parse_args()
 
-    lease = None
-    lease_entered = False
-    lease_failure = None
     try:
-        policy = _cli_heavy_task_policy(args)
-        if policy is not None:
-            from vector_lake.heavy_task_gate import heavy_task
-
-            task_class, warn_after_seconds = policy
-            lease = heavy_task(
-                task_class,
-                args.command,
-                origin="cli",
-                wait_timeout_seconds=_cli_heavy_task_wait_seconds(),
-                warn_after_seconds=warn_after_seconds,
-            )
-            lease.__enter__()
-            lease_entered = True
         if args.command == "sync":
             print(tools.sync_vector_lake())
         elif args.command == "ingest-tasks":
-            if getattr(args, "repair_debt", False):
-                print(
-                    tools.reconcile_ingest_job_debt(
-                        dry_run=not getattr(args, "apply", False),
-                        limit=getattr(args, "limit", 20),
-                        reopen_provenance_only=getattr(
-                            args, "reopen_provenance_only", False
-                        ),
-                        job_id=getattr(args, "job_id", ""),
-                        expected_action=getattr(args, "expected_action", ""),
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                    )
-                )
-            elif getattr(args, "cleanup_orphans", False):
-                print(
-                    tools.reconcile_orphan_ingest_task_packets(
-                        dry_run=not getattr(args, "apply", False),
-                        min_age_seconds=getattr(args, "min_age_seconds", 86400),
-                        limit=getattr(args, "limit", 20),
-                    )
-                )
-            elif getattr(args, "expire_stale", False):
-                print(
-                    tools.expire_ingest_tasks(getattr(args, "max_age_seconds", 86400))
-                )
+            if getattr(args, "expire_stale", False):
+                print(tools.expire_ingest_tasks(getattr(args, "max_age_seconds", 86400)))
             elif getattr(args, "claim", False):
-                print(
-                    tools.claim_ingest_tasks(
-                        limit=getattr(args, "limit", 20),
-                        lease_seconds=getattr(args, "lease_seconds", 3600),
-                    )
-                )
+                print(tools.claim_ingest_tasks(
+                    limit=getattr(args, "limit", 20),
+                    lease_seconds=getattr(args, "lease_seconds", 3600),
+                ))
             else:
-                print(
-                    tools.list_ingest_tasks(
-                        limit=getattr(args, "limit", 20),
-                        include_queued=not getattr(args, "awaiting_only", False),
-                    )
-                )
+                print(tools.list_ingest_tasks(
+                    limit=getattr(args, "limit", 20),
+                    include_queued=not getattr(args, "awaiting_only", False),
+                ))
         elif args.command == "search":
-            print(
-                tools.search_vector_lake(
-                    args.query,
-                    args.top_k,
-                    domain=getattr(args, "domain", None),
-                    cluster=getattr(args, "cluster", None),
-                    include_history=getattr(args, "include_history", False),
-                    mode=getattr(args, "mode", "page"),
-                    _raise_on_unavailable=True,
-                )
-            )
-        elif args.command == "retrieval-benchmark":
-            from vector_lake.retrieval_benchmark import run_retrieval_benchmark
-
-            report = run_retrieval_benchmark(
-                args.dataset,
-                top_k_override=getattr(args, "top_k", None),
-                allow_remote_embeddings=getattr(args, "allow_remote_embeddings", False),
-            )
-            print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
-            return 0 if report["status"] == "pass" else 2
+            print(tools.search_vector_lake(
+                args.query,
+                args.top_k,
+                domain=getattr(args, "domain", None),
+                cluster=getattr(args, "cluster", None),
+                include_history=getattr(args, "include_history", False),
+                mode=getattr(args, "mode", "page"),
+            ))
         elif args.command == "lint":
             print(tools.lint_vector_lake(getattr(args, "auto_fix", False)))
         elif args.command == "query":
-            print(
-                tools.prepare_query_context(
-                    args.query_str, not getattr(args, "apply", False)
-                )
-            )
-        elif args.command == "auto-ingest-budget-status":
-            print(
-                json.dumps(
-                    tools.auto_ingest_budget_status(
-                        include_actual_usage=not getattr(
-                            args, "reservations_only", False
-                        )
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "auto-ingest-receipt-retention":
-            print(
-                json.dumps(
-                    tools.auto_ingest_attempt_receipt_retention(
-                        apply=getattr(args, "apply", False),
-                        confirm_fingerprint=getattr(
-                            args, "confirm_fingerprint", ""
-                        ),
-                        plan_as_of=getattr(args, "plan_as_of", ""),
-                        limit=getattr(args, "limit", 256),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
+            print(tools.prepare_query_context(args.query_str, getattr(args, "dry_run", False)))
         elif args.command == "graph":
             print(tools.visualize_vector_lake())
         elif args.command == "timeline-rebuild":
-            print(
-                tools.rebuild_timeline_events_from_claims(
-                    dry_run=not getattr(args, "apply", False),
-                    limit=getattr(args, "limit", None),
-                )
-            )
+            print(tools.rebuild_timeline_events_from_claims(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", None),
+            ))
         elif args.command == "projection-report":
             print(tools.projection_diff_report(limit=getattr(args, "limit", 20)))
         elif args.command == "canonical-backfill":
-            print(
-                tools.canonical_backfill_missing_wiki(
-                    dry_run=not getattr(args, "apply", False),
-                    limit=getattr(args, "limit", 50),
-                )
-            )
-        elif args.command == "evidence-foundation-backfill":
-            print(
-                tools.evidence_foundation_backfill(
-                    dry_run=not getattr(args, "apply", False),
-                    limit=getattr(args, "limit", 500),
-                    batch_size=getattr(args, "batch_size", 100),
-                    backup_reference=getattr(args, "backup_reference", ""),
-                )
-            )
+            print(tools.canonical_backfill_missing_wiki(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", 50),
+            ))
         elif args.command == "projection-rebuild-index":
-            print(
-                tools.rebuild_index_projection(
-                    dry_run=not getattr(args, "apply", False)
-                )
-            )
+            print(tools.rebuild_index_projection(dry_run=not getattr(args, "apply", False)))
         elif args.command == "embedding-backfill":
-            print(
-                tools.embedding_backfill_projection(
-                    dry_run=not getattr(args, "apply", False),
-                    limit=getattr(args, "limit", None),
-                    include_existing=getattr(args, "include_existing", False),
-                )
-            )
-        elif args.command == "wiki-delete":
-            print(
-                json.dumps(
-                    tools.delete_wiki_batch(
-                        payload_file=getattr(args, "payload_file", ""),
-                        dry_run=not getattr(args, "apply", False),
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
+            print(tools.embedding_backfill_projection(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", None),
+                include_existing=getattr(args, "include_existing", False),
+            ))
         elif args.command == "wiki-restore":
-            print(
-                tools.restore_missing_wiki_from_canonical(
-                    dry_run=not getattr(args, "apply", False),
-                    limit=getattr(args, "limit", 10),
-                )
-            )
-        elif args.command == "memory-search-index":
-            print(
-                tools.operational_memory_search_index_maintenance(
-                    dry_run=not getattr(args, "apply", False),
-                    batch_size=getattr(args, "batch_size", 256),
-                )
-            )
-        elif args.command == "memory-cleanup":
-            print(
-                tools.cleanup_operational_memory(
-                    dry_run=not getattr(args, "apply", False),
-                    limit=getattr(args, "limit", 0),
-                )
-            )
-        elif args.command == "history-retention":
-            print(
-                tools.history_retention_maintenance(
-                    dry_run=not getattr(args, "apply", False),
-                    ttl_days=getattr(args, "ttl_days", 30),
-                    batch_size=getattr(args, "batch_size", 500),
-                    max_delete_bytes=getattr(
-                        args, "max_delete_bytes", 128 * 1024 * 1024
-                    ),
-                    keep_change_sets=getattr(args, "keep_change_sets", 1000),
-                    keep_terminal_jobs=getattr(args, "keep_terminal_jobs", 1000),
-                    keep_terminal_outbox=getattr(args, "keep_terminal_outbox", 1000),
-                    keep_versions_per_family=getattr(
-                        args, "keep_versions_per_family", 2
-                    ),
-                    claim_version_cursor=getattr(
-                        args, "claim_version_cursor", ""
-                    ),
-                    evidence_version_cursor=getattr(
-                        args, "evidence_version_cursor", ""
-                    ),
-                    version_cursor_receipt=getattr(
-                        args, "version_cursor_receipt", ""
-                    ),
-                    plan_as_of=getattr(args, "plan_as_of", ""),
-                    confirmation=getattr(args, "confirm_fingerprint", ""),
-                )
-            )
-        elif args.command == "change-set-compaction":
-            print(
-                tools.compact_change_set_history(
-                    dry_run=not getattr(args, "apply", False),
-                    max_rows=getattr(args, "max_rows", 100),
-                    max_input_bytes=getattr(
-                        args, "max_input_bytes", 64 * 1024 * 1024
-                    ),
-                    cursor=getattr(args, "cursor", ""),
-                    confirmation=getattr(args, "confirm_fingerprint", ""),
-                )
-            )
-        elif args.command == "backup-retention":
-            print(
-                tools.backup_retention_maintenance(
-                    dry_run=not getattr(args, "apply", False),
-                    keep_latest=getattr(args, "keep_latest", 5),
-                    min_age_days=getattr(args, "min_age_days", 30),
-                    stage_ttl_hours=getattr(args, "stage_ttl_hours", 24),
-                    confirmation=getattr(args, "confirm_fingerprint", ""),
-                )
-            )
-        elif args.command == "projection-object-gc":
-            from vector_lake.tool_projection import projection_object_gc
-
-            print(
-                json.dumps(
-                    projection_object_gc(
-                        dry_run=not getattr(args, "apply", False),
-                        retention_days=getattr(args, "retention_days", 7),
-                        limit=getattr(args, "limit", 1000),
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "schema-migrate":
-            from vector_lake import db_store
-
-            print(
-                json.dumps(
-                    db_store.schema_migration_maintenance(
-                        apply=getattr(args, "apply", False),
-                        checkpoint_wal=getattr(args, "checkpoint_wal", False),
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                        confirm_no_writers=getattr(
-                            args, "confirm_no_writers", False
-                        ),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "topology-queue-cleanup":
-            print(
-                tools.retire_legacy_topology_queue(
-                    dry_run=not getattr(args, "apply", False)
-                )
-            )
-        elif args.command == "orphan-source-classify":
-            print(
-                json.dumps(
-                    tools.classify_orphan_source_debt(
-                        dry_run=not getattr(args, "apply", False)
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
+            print(tools.restore_missing_wiki_from_canonical(
+                dry_run=not getattr(args, "apply", False),
+                limit=getattr(args, "limit", 10),
+            ))
         elif args.command == "review":
-            print(
-                tools.review_vector_lake(
-                    action=args.action,
-                    index=args.index,
-                    resolution=getattr(args, "resolution", "skip"),
-                )
-            )
+            print(tools.review_vector_lake(action=args.action, index=args.index, resolution=getattr(args, "resolution", "skip")))
         elif args.command == "audit-graph":
             print(tools.audit_graph())
         elif args.command == "doctor":
-            report = tools.doctor_vector_lake()
-            print(report)
-            return _doctor_exit_code(report)
-        elif args.command == "readiness":
-            report = tools.semantic_readiness_vector_lake(
-                getattr(args, "decision_id", None)
-            )
-            print(report)
-            return _readiness_exit_code(report)
+            print(tools.doctor_vector_lake())
         elif args.command == "research":
-            print(tools.research_vector_lake(not getattr(args, "apply", False)))
+            print(tools.research_vector_lake(getattr(args, "dry_run", False)))
         elif args.command == "debt":
             print(tools.debt_vector_lake(getattr(args, "top", 20)))
         elif args.command == "trace":
             print(tools.trace_vector_lake(args.query_or_id))
-        elif args.command == "evidence-packet":
-            print(
-                tools.export_evidence_packet(
-                    args.claim_id,
-                    include_evidence_text=getattr(args, "include_text", False),
-                    max_evidence_text_chars=getattr(args, "max_text_chars", 2000),
-                    actor_id=getattr(args, "actor_id", ""),
-                    purpose=getattr(args, "purpose", ""),
-                )
-            )
-        elif args.command == "unsupported-claim-debt":
-            print(
-                json.dumps(
-                    tools.register_unsupported_claim_debt(
-                        dry_run=not getattr(args, "apply", False),
-                        review_days=getattr(args, "review_days", 30),
-                        runtime_only=True,
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "claim-provenance-repair":
-            print(
-                json.dumps(
-                    tools.repair_claim_provenance(
-                        dry_run=not getattr(args, "apply", False),
-                        runtime_only=True,
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                        source_map_path=getattr(args, "source_map", ""),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "claim-placeholder-cleanup":
-            print(
-                json.dumps(
-                    tools.cleanup_placeholder_claims(
-                        source_claim_ids=getattr(args, "claim_id", []),
-                        dry_run=not getattr(args, "apply", False),
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "claim-assessment":
-            details = json.loads(getattr(args, "details_json", "{}"))
-            if not isinstance(details, dict):
-                raise ValueError("--details-json must decode to a JSON object")
-            print(
-                json.dumps(
-                    tools.record_claim_assessment(
-                        args.claim_id,
-                        assessment_type=args.assessment_type,
-                        outcome=args.outcome,
-                        actor_id=args.actor_id,
-                        method_version=args.method_version,
-                        reason=args.reason,
-                        details=details,
-                        expected_claim_version=args.expected_claim_version,
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
         elif args.command == "merge-suggestions":
-            print(
-                tools.merge_suggestions_vector_lake(
-                    limit=getattr(args, "limit", 20),
-                    enqueue=getattr(args, "apply", False),
-                )
-            )
-        elif args.command == "schema-rollback":
-            from vector_lake import db_store
-
-            print(
-                json.dumps(
-                    db_store.schema_rollback_maintenance(
-                        migration_receipt=args.migration_receipt,
-                        apply=getattr(args, "apply", False),
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                        confirm_no_writers=getattr(
-                            args, "confirm_no_writers", False
-                        ),
-                        confirm_data_rewind=getattr(
-                            args, "confirm_data_rewind", False
-                        ),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "restore-snapshot":
-            from vector_lake.restore_snapshot import restore_snapshot_maintenance
-
-            print(
-                json.dumps(
-                    restore_snapshot_maintenance(
-                        maintenance_receipt=args.maintenance_receipt,
-                        apply=getattr(args, "apply", False),
-                        confirmation=getattr(args, "confirm_fingerprint", ""),
-                        confirm_no_writers=getattr(
-                            args, "confirm_no_writers", False
-                        ),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
+            print(tools.merge_suggestions_vector_lake(limit=getattr(args, "limit", 20), enqueue=not getattr(args, "preview", False)))
         elif args.command == "delete":
-            print(
-                tools.delete_source(
-                    args.raw_path, dry_run=not getattr(args, "apply", False)
-                )
-            )
+            print(tools.delete_source(args.raw_path, dry_run=not getattr(args, "apply", False)))
         elif args.command == "gc":
-            gc_kwargs = {
-                "days": getattr(args, "days", 30),
-                "dry_run": not getattr(args, "apply", False),
-            }
-            orphan_confirmation = getattr(args, "confirm_orphans", None)
-            if orphan_confirmation is not None:
-                gc_kwargs["orphan_confirmation"] = orphan_confirmation
-            print(tools.gc_vector_lake(**gc_kwargs))
+            print(tools.gc_vector_lake(
+                days=getattr(args, "days", 30),
+                dry_run=not getattr(args, "apply", False),
+                force=getattr(args, "force", False),
+            ))
     except Exception as exc:
-        lease_failure = exc
-        from vector_lake.heavy_task_gate import HeavyTaskBusy
-        from vector_lake.governance_store import OperationalMemoryNotReady
-
-        if isinstance(exc, OperationalMemoryNotReady):
-            from vector_lake.tool_search import _operational_memory_unavailable_guidance
-
-            print(_operational_memory_unavailable_guidance(exc.reason), file=sys.stderr)
-            return 1
-        if isinstance(exc, HeavyTaskBusy):
-            print(
-                json.dumps(exc.to_dict(), ensure_ascii=False, sort_keys=True),
-                file=sys.stderr,
-            )
-            return 75
         print(f"Error executing command '{args.command}': {exc}", file=sys.stderr)
         return 1
-    finally:
-        if lease_entered and lease is not None:
-            lease.__exit__(
-                type(lease_failure) if lease_failure is not None else None,
-                lease_failure,
-                (
-                    lease_failure.__traceback__
-                    if lease_failure is not None
-                    else None
-                ),
-            )
     return 0

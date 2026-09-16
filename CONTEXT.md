@@ -2,42 +2,26 @@
 
 ## 1. Active Position
 
-Vector Lake is a local knowledge compiler with an inspectable Markdown publication surface and a SQLite canonical runtime. It should not be treated as a classic vector database, a stateless RAG service, or a CBSS business execution runtime.
-
-The supported deployment is a controlled Windows, single-user, expert-operated healthcare-digitalization research workbench. One host-neutral MCP runtime is connected through separate Codex, Pi/Agent Plugins, and Gemini adapters. It is not an enterprise multi-tenant service or an unattended GA system. Concurrency claims below refer only to bounded workers inside one trusted local runtime.
+Vector Lake is a Markdown-first knowledge compiler with a file-backed governance runtime. It should not be treated as a classic vector database or a stateless RAG service.
 
 Current boundary:
 
 - Human-facing memory: `MEMORY/wiki/*.md`
-- Page runtime index locator: `MEMORY/wiki/index.json`
-- Claim topology locator: `MEMORY/wiki/claim_graph.json`
-- Immutable projection objects: `MEMORY/wiki/.projection-store/objects/sha256/`
+- Page runtime index: `MEMORY/wiki/index.json`
+- Claim topology: `MEMORY/wiki/claim_graph.json`
 - Strategic intent: `MEMORY/purpose.md` (YAML contract parsed by `purpose_contract.py`)
 - Canonical governance store: `MEMORY/wiki/.meta/vector_lake.db` (SQLite)
-- Agent runtime read model: SQLite `operational_memory` table, compiled from canonical claims
-- `MEMORY/wiki/.git` is a Wiki-local history repository that Vector Lake does **not** own, prune or quota; it duplicates history already held by the SQLite version tables and the projection object store.
-- `MEMORY/brain/` is the host adapter's subagent staging root (`VECTOR_LAKE_SUBAGENT_BRAIN_ROOT`, default `<active-db-dir>/brain/`). It is outside the canonical contract.
-- `critical_decision_registry`, `quality_evaluation_runs` and `schema_registry` are provisioned but unpopulated; `claim_assessments` has a schema but near-zero live coverage. Do not treat their capability entrypoints as available capability.
+- Agent runtime memory: `operational_memory.json`
 
 The durable architecture is:
 
 ```text
-host adapter -> scripts/vector_lake_mcp.py -> runtime profile -> MCP core
-raw source -> page-scoped coordinator -> SQLite canonical + fenced outbox -> Markdown + projection-v2 roots/locators
-SQLite canonical -> operational memory -> Memory Packet -> query context
+raw source -> Markdown wiki -> canonical claims/evidence -> operational memory -> Memory Packet -> query context
 ```
-
-The launcher anchors imports and `runtime_profiles.json` to its own plugin root, not the caller's current directory or `PYTHONPATH`. Process path overrides must set `VECTOR_LAKE_MEMORY_DIR` and `VECTOR_LAKE_META_DIR` together, and both profile and override roots must resolve to absolute paths after `~` expansion. Core code does not infer Codex, Gemini, or Pi sandbox and dotenv locations; those belong to the host adapter.
-
-CBSS boundary:
-
-- Vector Lake owns Source, Evidence, Claim candidates, provenance, knowledge projections, and retrieval context.
-- CBSS owns authority acceptance, AcceptedFact lifecycle, Aggregate state, Command, executable Policy, Decision, ActionRequest, ExecutionResult, business Event Ledger, compensation, and System-of-Record reconciliation.
-- `contracts/cbss/` defines the transfer boundary. Vector Lake Timeline and `memory_type=decision` are not CBSS business records.
 
 ## 2. Runtime Model
 
-Markdown remains the inspectable publication layer. SQLite is the transactional canonical layer. New operational memory enters through the coordinator and preserves its Markdown evidence timeline so projections can be rebuilt without applying synthesized restore text back into canonical state.
+Markdown remains the sovereign, inspectable publication layer. Agent memory is compiled, scored, and selectively injected. **(V7.2+ Mandate: All new operational memory MUST be persisted directly into Markdown Wiki nodes via the Dual-Schema layout, specifically under the `## 2. 证据时间线 (Evidence Timeline)` section to prevent index-rebuild data loss.)**
 
 Operational memory types:
 
@@ -73,167 +57,187 @@ Conflict rules:
 | `vector_lake/tool_ingest.py` | Raw-source scan and Subagent instructions generation |
 | `vector_lake/indexer.py` | Page index, weighted edges, claim graph refresh, pure-Python BM25 inverted index |
 | `vector_lake/claim_extractor.py` | Page-to-entity/claim/evidence/source extraction |
-| `vector_lake/tool_memory.py` | Governed operational-memory observation persistence via MCP |
-| `vector_lake/memory_protocol.py` | Stable Agent-memory verbs and bounded thin-client adapters |
-| `vector_lake/retrieval_benchmark.py` | Read-only, dataset-hash-bound retrieval evaluation |
+| `vector_lake/tool_memory.py` | Wiki-as-Database operational memory persistence via MCP |
 | `vector_lake/governance_store.py` | Canonical store, change sets, operational memory, conflict resolver |
-| `vector_lake/governance_metrics.py` | Debt, health metrics, and merge-candidate report orchestration |
-| `vector_lake/merge_analysis.py` | Unicode-safe duplicate recall, evidence scoring, four-state decisions, component grouping, and merge preflight |
-| `vector_lake/tokenizer_runtime.py` | Shared rjieba boundary for consistent index and query tokenization |
-| `vector_lake/tool_search.py` | Exact identity + local query expansion + BM25 + Graph Traversal, Memory Packet assembly |
+| `vector_lake/governance_metrics.py` | Debt and health metrics |
+| `vector_lake/tool_search.py` | Hybrid search (local query expansion + BM25 + Graph Traversal), Memory Packet assembly |
 | `vector_lake/tool_query.py` | Query synthesis with Memory Packet first |
 | `vector_lake/tool_research.py` | Autonomous deep research and graph insight processing |
 | `vector_lake/purpose_contract.py` | Purpose parsing, ingestion admission, SIR review, and synthesis proposal thresholds |
 | `vector_lake/tool_review.py` | Unified review surface |
-| `vector_lake/tool_doctor.py` | Infrastructure checks and separate semantic-readiness report |
-| `vector_lake/runtime_health.py` | Read-only infrastructure-health and semantic-readiness evaluators |
-| `vector_lake/diagnostic_snapshot.py` | Shared as-of snapshot and cross-surface drift fence |
-| `vector_lake/tool_evidence.py` | Read-only EvidencePacket export by claim ID |
-| `vector_lake/evidence_foundation.py` | SourceArtifact integrity, raw locators, extraction runs, and lineage flags |
-| `vector_lake/claim_assessment.py` | Append-only claim assessments without AcceptedFact promotion |
-| `vector_lake/decision_registry.py` | Verified external decision registry adapter and scoped readiness |
-| `vector_lake/quality_registry.py` | Immutable schema versions and quality-evaluation ledger |
-| `scripts/vector_lake_mcp.py` | Host-neutral, profile-aware stdio MCP launcher |
-| `vector_lake/runtime_paths.py` | Validated runtime-profile and path bootstrap |
+| `vector_lake/tool_doctor.py` | Runtime layout and dependency checks |
 | `vector_lake/mcp_server.py` | Standard Model Context Protocol (MCP) server entrypoint |
 | `vector_lake/watchdog_app.py` | Real-time ingest watcher, background job orchestration, scheduled auto-lint |
 | `vector_lake/watchdog_status.py` | Status JSON telemetry broadcaster for the daemon |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
+| `vector_lake/db.py` | Legacy DB utils |
 | `vector_lake/db_store.py` | SQLite connection pooling, schema initialization, and WAL settings |
-| `vector_lake/projection_store_v2.py` | Immutable content-addressed HAMT object store |
-| `vector_lake/projection_format_v2.py` | Root/locator/sidecar publication, materialization, and recovery delegates |
-| `vector_lake/restore_snapshot.py` | Receipt-bound database/projection/Wiki recovery |
-| `vector_lake/cancellation.py` | Cooperative deadlines and observable atomic completion |
-| `vector_lake/durability.py` | File/directory durability profiles and persistence barriers |
-| `vector_lake/mutation_coordinator.py` | Canonical transaction and fenced projection-outbox boundary |
 | `vector_lake/defense_hook.py` | Pre-flight constraints and guardrails |
 | `vector_lake/skeleton_parser.py` | Parsers for structural validation |
 | `vector_lake/provenance.py` | Tracing entities to raw sources |
 | `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
 | `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
 | `vector_lake/yaml_utils.py` | YAML helpers |
-| `scripts/benchmark_multi_host_runtime.py` | Isolated multi-MCP/watchdog startup, RSS, soak, and runtime-status gate |
-| `scripts/community_clustering_daemon.py` | Deprecated/unsupported legacy Louvain operator script; disabled by default and never scheduled by watchdog |
+| `scripts/community_clustering_daemon.py` | Optional operator-invoked Louvain analysis; not scheduled by watchdog |
 | `schema.md` | Wiki and runtime memory contract |
-| `skills/` | Host-loadable Agent workflows (e.g. research/review) |
-| `contracts/cbss/` | Evidence, authority-acceptance, business-event, decision-registry, and readiness contracts |
-
-`auto_ingest_config.json` defaults to `runner: "host_relay"`, whose consumer lives in the host, not in this package. `extensions/host-relay-consumer/` declares itself off by default and blocked by upstream `pi-subagents` contract gaps (no supported host session root -- still true in the installed 0.68.0 -- and no atomic launch binding); its own README forbids private helpers or configuration bypasses. The alternative `codex_exec` default is an explicit inert runner seam whose controller switch is deferred. Neither may be enabled, so `enabled: true` is not a supported configuration.
-
-The supported ingestion path is host-agnostic and needs neither: `cli.py ingest-tasks --claim` leases a task packet, a host subagent reads the packet's binding `prompt` plus the raw source, returns the `[{filename, content}]` array with exactly one `Source_*.md` page, and the result is submitted through `finalize_ingest`. Validate with `_validate_final_ingest_files` (not only `_prepare_final_ingest_files`) before submitting; a rejection does not consume a retry. Integrated publishes fail on a legacy target page whose `categories` is not a single-domain list -- publish standalone instead. See README for the full seven-step procedure and its caveats.
-
-`scripts/semantic_dedup_daemon.py` and `scripts/community_clustering_daemon.py`
-are deprecated, unsupported, and fail closed before DB, index, or governance
-access. A trusted operator may opt in only with
-`VECTOR_LAKE_ENABLE_LEGACY_UNSAFE_DAEMONS=1` during isolated recovery; neither
-script may run concurrently with `watchdog_sync.py` or
-`vector_lake.watchdog_app.py`. Supported paths are watchdog/indexer topology
-maintenance plus the preview-first `projection-rebuild-index`,
-`embedding-backfill`, and `topology-queue-cleanup` CLI commands.
+| `commands/` | Macro-level workflows (e.g. research/review) for Agents |
+| `agents/` | Ingestor and synthesizer contracts |
 
 ## 4. CLI Contract & MCP Interface
 
 **Note (v8.3+)**: Agents interact with the system entirely through the `vector_lake/mcp_server.py` MCP tools (e.g. `search_vector_lake`, `sync_vector_lake`).
 
-**Host workflow surface**: the current release packages 19 skills under `skills/`; Codex may invoke them with `$vector-lake:<name>`, Agent Plugins clients may load the same directory, and every host may call MCP tools directly. The former Gemini `commands/*.toml` slash-command layer remains deleted.
+**Command surfaces**: Gemini CLI loads compatibility prompts from `commands/*.toml` and exposes them with `/`. Codex does not load plugin-defined slash commands; invoke the corresponding plugin skills with `$vector-lake:<name>` or ask the agent to call the MCP tool directly.
 
-**Thin adapters**: Codex uses `.codex-plugin/plugin.json` plus `.codex-plugin/mcp.json`; Pi/Agent Plugins 1.0 uses root `plugin.json` plus `mcp.json`; the Gemini thin adapter uses `gemini-extension.json`. All three target the same launcher/profile/surface contract. The Gemini CLI is unavailable on the current validation host, so Gemini manifest and raw stdio checks are evidence for the adapter contract, not a real Gemini-host smoke claim.
+Gemini CLI compatibility commands:
+- `/vl_sync`: Distributed Subagent pipeline for graph sync and raw file ingestion
+- `/search`: Semantic query
+- `/query`: Deep logic reasoning
+- `/review`: Check governance queue
+- `/resolve`: Resolve pending items
+- `/audit`: Synthesize topology and audit
+- `/debt`: View governance debt metrics
+- `/lint`: Self-healing audit of nodes
+- `/research`: Autonomous web research directive
+- `/graph`: Generate interactive 3D HTML topology
+- `/doctor`: Validate runtime dependencies and health
+- `/gc`: Garbage collect orphaned entities
+- `/delete`: Cascade-delete sources and sever graph edges
+- `/trace`: Audit provenance traces
+- `/merge`: Surface candidate entity merges
+- `/timeline`: SQL query against historical timeline_events (via MCP)
+- `review_strategic_purpose(as_of="")`: emits due `SIR-Review-Proposal` records without mutating the Wiki.
 
-Server-runtime revision covers loaded Python, runtime profiles, contracts, templates, and restart-sensitive root assets. Host-adapter revision separately covers skills, host manifests, context, and launcher. Adapter drift may require host reload but must not mark the running MCP server stale.
-
-The MCP surface remains the host-neutral contract. Important direct tools include:
-- `sync_vector_lake`: scan configured raw sources and enqueue a bounded ingest batch; it does not generate or finalize Wiki pages.
-- `review_strategic_purpose(as_of="")`: emit due `SIR-Review-Proposal` records without mutating the Wiki.
-- `semantic_readiness(decision_id="")`: report global semantic debt or, with a verified registry ID, only evidence and governance mapped to that decision; it does not change write-gate behavior.
-- `export_evidence_packet(claim_id, include_evidence_text=False, max_evidence_text_chars=2000)`: export a claim candidate and its provenance without accepting it as fact.
-- `sync_critical_decision_registry(payload_file, expected_sha256, actor_id)`: import only a sandboxed registry snapshot pinned by an operator-supplied SHA-256 digest and record the import receipt.
-- `operational_memory_cleanup(dry_run=True, limit=0)` and `topology_queue_cleanup(dry_run=True)`: preview-first remediation surfaces for generated runtime artifacts and obsolete indexer naming work.
+Codex equivalents include `$vector-lake:query` and `$vector-lake:timeline`.
 
 The following CLI commands remain the ground truth operating surface for *human operators*:
 
 ```powershell
 python cli.py doctor
-python cli.py readiness
-python cli.py evidence-packet "<claim_id>"
 python cli.py sync
 python cli.py search "query" --top_k 5
 python cli.py search "query" --mode memory --top_k 5
-python cli.py search "query" --mode fact --top_k 5
-python cli.py retrieval-benchmark "dataset.json"
-python cli.py query "question" [--dry-run|--apply]
+python cli.py search "query" --mode claim --top_k 5
+python cli.py query "question" [--dry-run]
 python cli.py review
 python cli.py audit-graph
-python cli.py research [--dry-run|--apply]
+python cli.py research [--dry-run]
 python cli.py debt --top 20
 python cli.py trace "<query-or-id>"
 python cli.py merge-suggestions --limit 20
 python cli.py graph
 python cli.py gc --days 30 --dry-run
 python cli.py delete "<raw-source-path>" --dry-run
-python cli.py memory-cleanup
-python cli.py topology-queue-cleanup
-python cli.py schema-migrate
-python cli.py schema-rollback --migration-receipt "<absolute-completed-receipt>"
-python cli.py restore-snapshot --maintenance-receipt "<absolute-backup-manifest.json>"
-python cli.py projection-object-gc --retention-days 7 --limit 1000
 ```
-
-The current database contract is schema v9. Physical projection format v2 uses
-small locators plus a sidecar commit pointer over immutable content-addressed
-objects; its materialized logical payload remains projection contract v1.
-`schema-rollback` accepts only an authoritative completed v8-to-v9 receipt.
-`restore-snapshot` and `projection-object-gc` are preview/fingerprint/apply
-maintenance surfaces and are intentionally CLI-only.
-
-`search --mode fact` returns only `memory_type=fact` operational-memory rows.
-Legacy `--mode claim` is a deprecated compatibility alias for `fact`, not a
-canonical Claim query, and must surface that actual semantic to callers. Use
-`evidence-packet` when a canonical Claim candidate and its provenance are needed.
-
-Direct page/memory/fact search and the `recall`, `synthesize`, and `context_pack`
-memory verbs expose `vector-lake-semantic-readiness-envelope/v1`. The envelope
-contains bounded issues, warnings, and debt; the captured canonical, governance,
-and projection generation/fingerprint; and
-`results_are_not_accepted_facts=true`. A `not_ready`, `degraded`, or `unknown`
-envelope is advisory and never suppresses the base retrieval result. The hot path
-checks a lightweight generation token on every call and reuses a full assessment
-for at most five seconds while that token remains stable. Any token change
-invalidates immediately; an unverified binding or mid-assessment drift reports
-`unknown` rather than a false `ready`.
 
 For Windows validation, prefer:
 
 ```powershell
-$env:PYTHONIOENCODING='utf-8'; python -m pytest -q -p no:cacheprovider
-$env:PYTHONIOENCODING='utf-8'; python -m compileall -q vector_lake tests scripts
-$env:PYTHONIOENCODING='utf-8'; python scripts/benchmark_multi_host_runtime.py --duration-seconds 300
+$env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v
+$env:PYTHONUTF8='1'; python -m compileall vector_lake tests
 ```
 
 ## 5. Current Validation Baseline
 
-The checked baseline is produced by the current CI commands rather than a fixed test or data count. Run the full pytest suite with warnings promoted to errors, `pip check`, `git diff --check`, read-only lint, and deep doctor before release. Runtime data counts are diagnostic snapshots and must not be copied into this contract as permanent expectations.
+Last verified: 2026-07-08 (V11.5 Refactoring).
+
+- Unit tests: `Ran 8 tests ... OK`
+- Compile: `python -m compileall vector_lake tests` OK
+- Doctor: healthy
+- `search --mode memory`: smoke OK
+- Debt snapshot:
+  - `operational_memory_count: 13755`
+  - `superseded_memory_count: 510`
+  - `conflicted_memory_count: 0`
+  - `memory_type_counts: {'fact': 11881, 'decision': 1393, 'task_state': 384, 'preference': 97}`
 
 ## 6. Operating Rules
 
 1. Preserve the split: Markdown is for humans; `.meta` is canonical state; `operational_memory` is for Agents.
-2. Keep `schema.md`, `README.md`, `skills/`, and `contracts/` aligned when the runtime surface changes.
+2. Keep `schema.md`, `README.md`, `commands/`, and `agents/` aligned when the runtime surface changes.
 3. Do not hand-edit derived runtime files unless the task is explicitly data repair. Prefer rebuild paths.
-4. Use preview first for delete, gc, retention, restore, schema change, and any operation that removes or replaces assets.
-5. Treat lock contention as environmental state, not proof that a code patch failed. Note that `daemon_watchdog` and `sync` operations are protected by cross-process `filelock` to prevent meta and index corruption.
+4. Use dry-run first for delete, gc, and any operation that removes assets.
+5. Treat lock contention as environmental state, not proof that a code patch failed. Note that `daemon-watchdog` and `sync` operations are protected by cross-process `filelock` to prevent meta and index corruption.
 6. Use `PYTHONUTF8=1` when scripts may print Chinese paths.
 7. Never silently include unrelated dirty files in a publish or commit scope.
-8. Keep infrastructure health and semantic readiness separate: the first protects mutations and projections; the second reports evidence/governance fitness to consumers.
-9. Governance decision relevance must use explicit `critical_decision_refs`; never infer it from title or description text.
-10. Do not use Vector Lake Timeline, `Policy_*` pages, or operational-memory decisions as CBSS Event, executable Policy, or Decision records.
-11. `VECTOR_LAKE_MCP_SURFACE=memory` is an exact 9-tool thin surface that includes the governed `remember` mutation and read-only automatic-ingest budget status. `VECTOR_LAKE_MCP_SURFACE=readonly` is an exact 21-tool physical-read surface backed by SQLite `mode=ro` and `query_only`; its scan-class heavy tools remain bounded by the dedicated executor but bypass the canonical-meta file gate. It is not an operating-system ACL, so snapshot/generation drift still fails closed and independent read-only snapshots remain preferable for forensic audits. CLI diagnostics and the other MCP surfaces may still publish heavy-task lock/status telemetry.
-12. Watchdog workers use a bounded restart budget. Outbox, ingest, and automatic-ingest exhaustion remain fail-closed; scheduler exhaustion is isolated as an optional-component warning unless the operator adds it to `VECTOR_LAKE_WATCHDOG_REQUIRED_COMPONENTS`.
-13. The multi-host capacity decision is evidence-bound to `docs/multi-host-runtime-report.md`. Independent stdio remains the target until a reproducible benchmark breaches an approved gate; do not add shared transport preemptively.
 
 ## 7. System Capabilities & Architecture Defenses
-The Vector Lake system uses bounded single-host concurrency for ingestion and graph maintenance, with several defensive mechanisms:
-- **Two-Track Watchdog**: Raw changes are path-scoped and coalesced through one worker; Wiki changes enter a bounded legacy queue and are promoted through the coordinator.
-- **Write Health Gate**: Ordinary mutations run deep key-and-content parity checks across Wiki, index, and canonical state. Drift on settled projections blocks writes. An active outbox row is treated as managed recovery only when its payload version exactly matches canonical state. Bounded repairs can use schema mode or an explicit operator override. Semantic readiness is read-only and does not alter this gate.
-- **Fenced Outbox**: Claims carry owner, token, and generation. Same-page newer intents supersede older active rows without deleting history, and workers revalidate before materializing Markdown and before indexing.
-- **Row-Level Governance Queue**: Enqueue, deduplication, publish, and resolve update only their target rows; unrelated concurrent items are preserved.
-- **Incremental Projection Store**: The Indexer updates immutable HAMT paths for changed page/search/topology components and a bounded 512-node candidate frontier, then atomically advances the sidecar/DB publish state. Single-page writes no longer rewrite the full projection; unchanged generations are byte- and mtime-idempotent.
-- **Scheduled Read-Only Lint**: At 10:00 and 23:00 the watchdog refreshes dirty graph topology and runs `lint_vector_lake(auto_fix=False)`. It does not checkpoint the SQLite WAL; WAL truncation remains a fingerprint-bound explicit maintenance action, and destructive repair remains an explicit operator action.
+The Vector Lake system is designed for high-concurrency ingestion and graph maintenance with several defensive mechanisms:
+- **Two-Track Watchdog**: Monitors raw sources for incremental ingestion by creating host-subagent task packets and monitors wiki nodes for O(1) index updates. It hooks `on_deleted` and `on_moved` events to reflect Semantic GC operations and prevent ghost nodes.
+- **Write Health Gate**: Ordinary mutations are blocked when watchdog heartbeat, mutation outbox, or Wiki/index/SQLite projection consistency is unhealthy. Bounded repairs can use schema mode or an explicit operator override. Runtime health checks are read-only when the SQLite file already exists, so doctor/write-gate checks do not take a schema-migration write lock during watchdog batches.
+- **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
+- **Scheduled Read-Only Lint**: At 10:00 and 23:00 the watchdog refreshes dirty graph topology, runs `lint_vector_lake(auto_fix=False)`, and checkpoints the SQLite WAL. Destructive repair remains an explicit operator action.
+
+The following CLI commands remain the ground truth operating surface for *human operators*:
+
+```powershell
+python cli.py doctor
+python cli.py sync
+python cli.py search "query" --top_k 5
+python cli.py search "query" --mode memory --top_k 5
+python cli.py search "query" --mode claim --top_k 5
+python cli.py query "question" [--dry-run]
+python cli.py review
+python cli.py audit-graph
+python cli.py research [--dry-run]
+python cli.py debt --top 20
+python cli.py trace "<query-or-id>"
+python cli.py merge-suggestions --limit 20
+python cli.py graph
+python cli.py gc --days 30 --dry-run
+python cli.py delete "<raw-source-path>" --dry-run
+```
+
+For Windows validation, prefer:
+
+```powershell
+$env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v
+$env:PYTHONUTF8='1'; python -m compileall vector_lake tests
+```
+
+## 5. Current Validation Baseline
+
+Last verified: 2026-07-08 (V11.5 Refactoring).
+
+- Unit tests: `Ran 8 tests ... OK`
+- Compile: `python -m compileall vector_lake tests` OK
+- Doctor: healthy
+- `search --mode memory`: smoke OK
+- Debt snapshot:
+  - `operational_memory_count: 13755`
+  - `superseded_memory_count: 510`
+  - `conflicted_memory_count: 0`
+  - `memory_type_counts: {'fact': 11881, 'decision': 1393, 'task_state': 384, 'preference': 97}`
+
+## 6. Operating Rules
+
+1. Preserve the split: Markdown is for humans; `.meta` is canonical state; `operational_memory` is for Agents.
+2. Keep `schema.md`, `README.md`, `commands/`, and `agents/` aligned when the runtime surface changes.
+3. Do not hand-edit derived runtime files unless the task is explicitly data repair. Prefer rebuild paths.
+4. Use dry-run first for delete, gc, and any operation that removes assets.
+5. Treat lock contention as environmental state, not proof that a code patch failed. Note that `daemon-watchdog` and `sync` operations are protected by cross-process `filelock` to prevent meta and index corruption.
+6. Use `PYTHONUTF8=1` when scripts may print Chinese paths.
+7. Never silently include unrelated dirty files in a publish or commit scope.
+
+## 7. System Capabilities & Architecture Defenses
+The Vector Lake system is designed for high-concurrency ingestion and graph maintenance with several defensive mechanisms:
+- **Two-Track Watchdog**: Monitors raw sources for incremental ingestion by creating host-subagent task packets and monitors wiki nodes for O(1) index updates. It hooks `on_deleted` and `on_moved` events to reflect Semantic GC operations and prevent ghost nodes.
+- **Write Health Gate**: Ordinary mutations are blocked when watchdog heartbeat, mutation outbox, or Wiki/index/SQLite projection consistency is unhealthy. Bounded repairs can use schema mode or an explicit operator override. Runtime health checks are read-only when the SQLite file already exists, so doctor/write-gate checks do not take a schema-migration write lock during watchdog batches.
+- **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
+- **Scheduled Read-Only Lint**: At 10:00 and 23:00 the watchdog refreshes dirty graph topology, runs `lint_vector_lake(auto_fix=False)`, and checkpoints the SQLite WAL. It does not merge, archive, or rewrite Wiki pages.
+- **Explicit Auxiliary Jobs**: Research, timeline rebuild, semantic deduplication, overview compilation, and community clustering are operator-invoked workflows. The watchdog does not silently launch those scripts.
+- **Strategic Intent Engine (V12.0)**: Parses `MEMORY/purpose.md` as the primary source for intent keywords and weighting. The same contract is injected into ingestion, retrieval, and research; it validates `strategic_scope` and `evidence_tier` during ingest, exposes SIR review proposals, and creates de-duplicated `Synthesis-Proposal` queue items only after the configured independent-source and tension thresholds are met.
+- **Strict Two-Step CoT Ingestion (V9.0)**: Forces ingestion subagents to output an intermediate `analysis_buffer.json` (parsing tensions, consensus, unknowns) before writing Markdown, eliminating extraction omissions.
+- **Strict 7-Type Enforcement (V9.1)**: The PIEA interceptor actively strips nested/invalid prefixes (e.g., `Concept_Synthesis_` or `Entity_`) and forces LLM agents to save files using exact, canonical 7-type filenames (`vendor`, `product`, `person`, `event`, `concept`, `synthesis`, `source`). All backend algorithms are strictly aligned to this matrix.
+- **Cross-Type PIEA Deduplication (V9.1)**: `tool_piea.py` no longer segregates similarity checks by type. If an agent proposes `Vendor_Accenture` when `Concept_Accenture` already exists, it triggers a hard block and forces a timeline append, eradicating "Same Name, Multi-Type" pollution.
+- **Error Resilience**: Utilizes a global `global_task_lock` for thread safety and halts on consecutive failures to prevent cascading storms. The watchdog writes an immediate startup status and periodic heartbeat to `MEMORY/wiki/.meta/.watchdog_status.json`; subprocess errors are emitted to the same status surface.
+- **AST-Based Parsing (V11.5)**: Replaced brittle Regex and string splitting with `mistune` Abstract Syntax Tree (AST) parsing, making extraction immune to Markdown stylistic variations or Markdown linting format changes.
+- **Native Vector Engine (V11.5)**: Integrated `sqlite-vec` extension for FTS5 + Vector hybrid search. Eliminated the `embeddings.pkl` O(N) memory bottleneck, offloading similarity calculation directly into the SQLite C-backend.
+- **Rate-Aware Embedding Scheduler**: Gemini embeddings are a resumable projection. All processes reserve requests and tokens through one SQLite rolling window, validate response cardinality and 3072-dimensional vectors, use an explicit HTTP timeout, and record resumable batch progress. Index rebuild and incremental index maintenance never invoke the embedding API.
+- **O(V+E) Graph Indexing (V11.5)**: Eliminated catastrophic O(N²) CPU deadlocks during node overlapping frequency calculations by utilizing an inverted-index map. 
+- **Chinese Tokenization (V11.5)**: Implemented offline `jieba` pre-tokenization pipeline before SQLite `MATCH` execution, fixing the precision drop caused by `porter unicode61` character splitting.
+- **Subagent Text Runtime Boundary (V11.13)**: Search expansion and reranking are deterministic; ingest creates current-environment subagent task packets; semantic dedupe no longer calls a text arbiter. `google-genai` remains only for embedding paths when `GEMINI_API_KEY` is configured.
+- **Canonical Transaction Boundary**: SQLite canonical changes and durable outbox intent commit together. Markdown, FTS, `index.json`, and `claim_graph.json` are recoverable projections written after commit.
+- **Pure Canonical Architecture & Outbox (V11.11)**: Mutation entrypoints converge on `mutation_coordinator`; the outbox is polled even when the wake-up signal is missing, claims rows with leases, retries transient failures, and records terminal errors. Full and incremental index paths read SQLite entities and identify nodes by `page_key`.
+- **Fenced Subagent Completion**: Ingest claims issue owner/token/generation credentials. Finalization validates them before work and repeats a compare-and-set inside the canonical transaction, so expired workers cannot commit late results.
+- **Timeline Projection Parity**: Claim deltas update Timeline rows in the same transaction. Queries verify stable event-ID parity and fall back to canonical claims whenever the projection is incomplete; deep Doctor checks report exact missing/extra counts.

@@ -6,7 +6,6 @@ import re
 from collections import Counter
 from filelock import FileLock
 from vector_lake import get_extension_root
-from vector_lake.indexer import read_committed_index_snapshot
 from vector_lake.wiki_utils import get_index_path, normalize_memory_key
 
 log = logging.getLogger("vector-lake-piea")
@@ -48,13 +47,7 @@ def strip_name(name: str) -> str:
     return name.lower()
 
 
-def check_duplicate_entity(
-    candidate_title: str,
-    candidate_type: str,
-    candidate_summary: str = "",
-    *,
-    register_pending: bool = True,
-) -> str:
+def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_summary: str = "") -> str:
     """PIEA Hook: Check if an entity or concept already exists in the graph using hard normalization and cosine similarity.
     
     Args:
@@ -67,43 +60,27 @@ def check_duplicate_entity(
     
     # 2. Normalize candidate_type (extract core type if nested, e.g., "concept_synthesis" -> "synthesis")
     candidate_type = candidate_type.strip().lower()
-    if "synthesis" in candidate_type:
-        candidate_type = "synthesis"
-    elif "person" in candidate_type:
-        candidate_type = "person"
-    elif "event" in candidate_type:
-        candidate_type = "event"
-    elif "vendor" in candidate_type:
-        candidate_type = "vendor"
-    elif "institution" in candidate_type:
-        candidate_type = "institution"
-    elif "product" in candidate_type:
-        candidate_type = "product"
-    elif "concept" in candidate_type:
-        candidate_type = "concept"
+    if "synthesis" in candidate_type: candidate_type = "synthesis"
+    elif "person" in candidate_type: candidate_type = "person"
+    elif "event" in candidate_type: candidate_type = "event"
+    elif "vendor" in candidate_type: candidate_type = "vendor"
+    elif "institution" in candidate_type: candidate_type = "institution"
+    elif "product" in candidate_type: candidate_type = "product"
+    elif "concept" in candidate_type: candidate_type = "concept"
     
     if candidate_type not in ("vendor", "institution", "product", "person", "event", "concept", "synthesis"):
         return json.dumps({"is_duplicate": False, "reason": f"Type '{candidate_type}' does not require deduplication check."})
 
     index_path = get_index_path()
     if not index_path.exists():
-        return json.dumps({
-            "status": "not_ready",
-            "is_duplicate": None,
-            "error": "projection_not_committed",
-            "reason": "No committed index exists; run sync before deduplication.",
-        })
+        return json.dumps({"is_duplicate": False, "reason": "No index exists yet."})
 
     try:
-        index_data = read_committed_index_snapshot(index_path)
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
     except Exception as e:
         log.warning(f"Could not load index for PIEA check: {e}")
-        return json.dumps({
-            "status": "not_ready",
-            "is_duplicate": None,
-            "error": "projection_not_committed",
-            "reason": "Committed projection could not be verified; run sync.",
-        })
+        return json.dumps({"is_duplicate": False, "reason": "Could not read index."})
 
     CONFIG_PATH = get_extension_root() / "config.json"
     threshold = 0.92
@@ -171,24 +148,6 @@ def check_duplicate_entity(
                 "match_type": "cosine_similarity_cross_type" if existing_type != candidate_type else "cosine_similarity",
                 "instruction": instruction
             })
-
-    if not register_pending:
-        from vector_lake.wiki_utils import normalize_entity_name
-
-        new_key = normalize_entity_name(
-            f"{candidate_type.capitalize()}_{candidate_title}"
-        )
-        return json.dumps(
-            {
-                "is_duplicate": False,
-                "pending_registry_checked": False,
-                "pending_registered": False,
-                "instruction": (
-                    "No committed duplicate found. Read-only preview cannot reserve "
-                    f"a pending name; proposed filename: {new_key}.md"
-                ),
-            }
-        )
 
     # --- NEW CONCURRENCY LOGIC (Pending Entities Registry) ---
     tmp_dir = get_extension_root() / "tmp"
