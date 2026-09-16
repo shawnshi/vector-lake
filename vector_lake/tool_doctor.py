@@ -50,7 +50,7 @@ def doctor_vector_lake() -> str:
         "leidenalg": "leidenalg",
         "bm25s": "bm25s",
         "dotenv": "python-dotenv",
-        "mcp": "mcp",
+        "fastmcp": "fastmcp",
         "sqlite_vec": "sqlite-vec",
         "jieba": "jieba",
         "mistune": "mistune"

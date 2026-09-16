@@ -1,3 +1,15 @@
+# Unreleased
+
+## MCP 服务端依赖换为 `fastmcp>=4.0.0`
+
+`vector_lake/mcp_server.py` 直接导入 `fastmcp.FastMCP`，移除 `mcp.server.MCPServer` / `mcp.server.fastmcp` 双路径回退。
+
+- 同步工具清单兜底改写 fastmcp 4 的 `local_provider._components`：`_tool_manager` 在 4.x 已不存在，旧兜底会静默返回空列表；`list_tools()` 仍只有协程形态，原有“无事件循环时 `asyncio.run`”的路径不变。
+- `requirements.txt`：`mcp>=2.1.0` → `fastmcp>=4.0.0`；`requirements.lock.txt` 改钉 `fastmcp==4.0.4`。MCP Python SDK（`mcp` 2.2.0）由 `fastmcp-slim[client,server]` 传递解析，不再作为直接依赖声明。
+- 传递依赖净增 27 个发行包（fastmcp-slim、cyclopts、griffelib、joserfc、authlib、keyring、py-key-value-aio 等）。解析后逐版本查 OSV 均为 0 记录；fastmcp 许可 Apache-2.0，仓库 PrefectHQ/fastmcp。
+- 启动期外部调用归零：fastmcp 默认会在启动时请求 pypi.org 查版本并打印 banner，现固定 `FASTMCP_CHECK_FOR_UPDATES=off` 且 `mcp.run(show_banner=False)`——stdio 通道的 stdout 承载 JSON-RPC，不能有横幅噪声。
+- 验证：`registered_tool_names()` 仍返回 36 个工具；`python -m vector_lake.mcp_server` 经 stdio 实测握手列出 36 个工具并成功执行 `get_governance_debt`；全量 pytest 通过。
+
 # Vector Lake 11.18.0
 
 ## 核心流程审计修复：两条主流程断路、两处静默数据丢失、隐私排除失效

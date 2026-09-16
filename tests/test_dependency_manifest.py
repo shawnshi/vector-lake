@@ -34,7 +34,7 @@ def _specifier(name: str) -> str | None:
 @pytest.mark.parametrize(
     "name",
     ["filelock", "networkx", "python-dotenv", "igraph", "leidenalg", "PyYAML",
-     "watchdog", "google-genai", "mcp", "sqlite-vec", "mistune", "bm25s"],
+     "watchdog", "google-genai", "fastmcp", "sqlite-vec", "mistune", "bm25s"],
 )
 def test_required_dependency_is_declared(name):
     assert _specifier(name) is not None, f"{name} missing from requirements.txt"
@@ -77,19 +77,26 @@ def test_declared_floor_matches_the_requested_minimum(name, minimum):
     assert f">={minimum}" in line.replace(" ", ""), f"{name} floor drifted: {line}"
 
 
-def test_mcp_floor_is_on_the_2x_line():
-    """The runtime imports MCPServer, which only exists from mcp 2.x.
+def test_fastmcp_floor_is_on_the_4x_line():
+    """The runtime imports ``fastmcp.FastMCP``; the SDK import path is gone.
 
-    The former floor (``mcp>=1.0.0``) let a clean install resolve to 2.x while
-    the code still imported the removed ``mcp.server.fastmcp`` module: that is
-    exactly how CI went red on a fresh checkout, so the floor is load-bearing.
+    The reversal this guards: the tree used to import ``mcp.server.MCPServer``
+    (mcp 2.x) with a 1.x ``mcp.server.fastmcp`` fallback, so a floor that let a
+    clean install resolve elsewhere emptied the tool surface.  fastmcp 4 also
+    dropped ``_tool_manager``, which is why the floor is 4.0 and not 3.x.
     """
-    line = _specifier("mcp")
+    line = _specifier("fastmcp")
     assert line is not None
-    assert line.replace(" ", "") in {"mcp>=2.1.0", "mcp>=2.1"}, (
-        f"mcp floor must track the MCPServer API: {line}"
+    assert line.replace(" ", "") in {"fastmcp>=4.0.0", "fastmcp>=4.0"}, (
+        f"fastmcp floor must track the 4.x FastMCP API: {line}"
     )
-    assert "fastmcp" not in line.lower()
+    assert _specifier("mcp") is None, (
+        "mcp is resolved transitively by fastmcp-slim; declaring it directly "
+        "reintroduces the 2.x SDK import this project moved away from"
+    )
+    source = (ROOT / "vector_lake" / "mcp_server.py").read_text(encoding="utf-8")
+    assert "from fastmcp import FastMCP" in source
+    assert "mcp.server" not in source, "the removed SDK import path came back"
 
 
 def test_mistune_floor_is_above_the_broken_3_0_0():

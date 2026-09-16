@@ -1,29 +1,33 @@
 import inspect
+import os
 import sys
 import logging
 
-try:  # mcp 2.x: FastMCP was renamed to MCPServer
-    from mcp.server import MCPServer as _Server
-    SERVER_API = "MCPServer"
-except ImportError:  # mcp 1.x fallback, kept so a 1.x host keeps serving
-    from mcp.server.fastmcp import FastMCP as _Server
-    SERVER_API = "FastMCP"
+# A stdio MCP server must not do startup network I/O: fastmcp's default version
+# check calls pypi.org on every host start.  This has to be set before fastmcp is
+# imported (its settings are read at import time) and stays overridable from the
+# environment.
+os.environ.setdefault("FASTMCP_CHECK_FOR_UPDATES", "off")
+
+from fastmcp import FastMCP
+
+SERVER_API = "FastMCP"
 
 # Global lock against stdout pollution
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', force=True)
 from vector_lake import tools, tool_memory
 from vector_lake.tool_timeline import search_timeline_events
 
-mcp = _Server("vector-lake")
+mcp = FastMCP("vector-lake")
 
 
 def registered_tool_names(server=None) -> list[str]:
     """Names of the tools registered on ``server`` (defaults to this module's).
 
-    mcp 2.x exposes ``list_tools()`` only as a coroutine, while the doctor and the
-    test suite need the surface from synchronous code.  Prefer the public API and
+    fastmcp exposes ``list_tools()`` only as a coroutine, while the doctor and the
+    test suite need the surface from synchronous code.  Prefer the public API,
     discarding the coroutine when an event loop is already running; fall back to
-    the tool manager mapping so a health check can never crash here.
+    the local provider's component registry so a health check cannot crash here.
     """
     server = server if server is not None else mcp
     lister = getattr(server, "list_tools", None)
@@ -54,10 +58,16 @@ def registered_tool_names(server=None) -> list[str]:
             listed = []
         if listed:
             return [str(getattr(tool, "name", tool)) for tool in listed]
-    manager = getattr(server, "_tool_manager", None)
-    registered = getattr(manager, "_tools", None) if manager is not None else None
-    if isinstance(registered, dict):
-        return [str(name) for name in registered]
+    provider = getattr(server, "local_provider", None)
+    components = getattr(provider, "_components", None) if provider is not None else None
+    if isinstance(components, dict):
+        registered = [
+            str(key).split(":", 1)[1].rsplit("@", 1)[0]
+            for key in components
+            if str(key).startswith("tool:")
+        ]
+        if registered:
+            return registered
     return []
 
 
@@ -530,4 +540,5 @@ def bulk_reconciliation(payload_file: str, dry_run: bool = True) -> str:
     return bulk_reconcile(operations, dry_run)
 
 if __name__ == "__main__":
-    mcp.run()
+    # stdout carries the JSON-RPC stream; no banner, no version check.
+    mcp.run(show_banner=False)
