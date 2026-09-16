@@ -10,6 +10,191 @@
 - 启动期外部调用归零：fastmcp 默认会在启动时请求 pypi.org 查版本并打印 banner，现固定 `FASTMCP_CHECK_FOR_UPDATES=off` 且 `mcp.run(show_banner=False)`——stdio 通道的 stdout 承载 JSON-RPC，不能有横幅噪声。
 - 验证：`registered_tool_names()` 仍返回 36 个工具；`python -m vector_lake.mcp_server` 经 stdio 实测握手列出 36 个工具并成功执行 `get_governance_debt`；全量 pytest 通过。
 
+# Vector Lake 11.20.2
+
+## 删除丢失子系统的残留数据 + VACUUM（操作方选项 A）
+
+### 已验证备份
+
+三个恢复点，**均以只读方式打开核验**（`file:...?mode=ro` + `integrity_check` + 回读行数），并核查了已删集的每一行：
+
+| 备份 | 大小 | 表数 | 内容 |
+|---|---|---|---|
+| `backups/vector_lake_1789575103.db.bak` | 3 622 MB | 81 | 删失效检索投影之前（尚无 gram/页投影，符合预期） |
+| `backups/vector_lake_1789596868.db.bak` | 3 887 MB | 73 | generation 机制清理之前（gram 414 914 / 页节点 7 178 已存在） |
+| `backups/vector_lake_1789597629.db.bak` | 3 451 MB | 58 | **丢失子系统数据清理之前，18 张表的 1 346 635 行全部可恢复** |
+
+三者 `integrity_check` 均为 `ok`，且都包含 `operational_memory 142 117 / claims 120 339 / evidence 139 339 / entities 8 489 / timeline_events 9 286`。
+
+> 核查过程中一次 `ls | head` 与一次 `os.listdir` 都返回空目录，触发了误报的数据丢失警报；改用 `ls -1 | wc -l`、`du`、`find` 以及逐个打开文件后确认备份始终存在。**空列表不能作为不存在的证据** —— 上表的只读打开才是正向核验。
+
+### 删除的对象
+
+**18 张表 / 1 346 635 行**，创建方与读取方均随丢失版本一起消失：`evidence_versions`(494 879)、`claim_versions`(432 439)、`canonical_identities`(302 705)、`wiki_edges`(29 706)、`extraction_runs`(24 181)、`change_set_lifecycle_v6`(22 883)、`entity_identities`(12 425)、`wiki_nodes`(9 003)、`embedding_metadata_v8`(7 169)、`ingest_stage_events`(4 370)、`source_artifacts`(3 210)、`ingest_task_cleanup`(2 537)、`merge_journal`(489)、`history_retention_runs_v6`(303)、`ingest_outbox_links`(282)、`claim_assessments`(43)、`schema_migrations`(9)、`api_users`(2)，以及**仅服务于这些表的 4 个守卫触发器**。
+
+表 73→40、触发器 65→16。**所有保留表行数逐一比对未变**，`integrity_check` ok，`foreign_key_check` 干净。删除前对每个对象断言：代码无引用、无活动触发器/视图交叉引用。
+
+### 一次差点出事的拦截
+
+首次枚举把 `vec_embeddings_chunks` / `_info` / `_rowids` / `_vector_chunks00` 也列为候选 —— 名字过滤器排除了 FTS 影子后缀（`_data`/`_idx`/`_docsize`/`_config`/`_content`），却没排除 sqlite-vec 的。这四个是**活动虚拟表 `vec_embeddings` 的影子表**，删掉会直接摧毁向量投影（7 169 条 embedding）并把混合检索静默降级为纯词法。过滤器已改为排除所有活动虚拟表的影子命名空间，`vec_embeddings*` 与 `wiki_search_index*` 完好且已按行数验证。
+
+### `VACUUM`
+
+两轮：**3 887 MB → 3 451 MB**（freelist 353 MB → 0，68 s）、**3 451 MB → 1 524 MB**（freelist 1 928 MB → 0，42 s）。每轮后 `integrity_check` ok、`foreign_key_check` 干净、行数未变。
+
+整个会话下来存储 **3 622 MB → 1 524 MB（−58%）**，而且是*新增*了 n-gram 索引（97 MB postings）与页投影（~12 MB）之后。
+
+### 验证
+
+- `pytest tests -q` → **487 passed**；`ruff` 错误数与改动前一致（65 条全为既有）。
+- 线上不变量：gram 索引 ready/usable、页投影 7178/30140、memory 投影 142117/142117 drift 0/0、timeline parity 9286/9286；重新执行 `init_db` 后表/触发器仍为 40/16（确认不会重建已删对象）。
+- 清理后读路径：`assemble_context` 1.38 s、`search[page]` 0.215 s、`search[memory]` 0.486 s、`operational_memory_search` 0.427 s、`timeline` 0.057 s，与清理前同噪声水平。
+
+# Vector Lake 11.20.1
+
+## 数据库维护：删除无创建方无读取方的对象 + VACUUM
+
+### 已验证备份
+
+- `backups/vector_lake_1789575103.db.bak`（3 622 MB）——删失效检索投影之前，`integrity_check ok`
+- `backups/vector_lake_1789596868.db.bak`（3 887 MB）——generation 机制清理与 `VACUUM` 之前，`integrity_check ok`，并从备份回读行数
+
+### 删除的对象
+
+在删除前对**代码文件**（.py/.sql/.toml/.json/.cfg/.ini，143 个文件）逐一做名字扫描，并对线上 `sqlite_master` 做触发器/视图交叉引用，确认无创建方、无读取方、无任何活动对象引用：
+
+- **45 个** `trg_*_generation_v3_*` 触发器（15 张表 × insert/update/delete）——它们只 `UPDATE runtime_generations`，而后者无人读取；
+- `runtime_generations`（15 行）与 `projection_runtime_v9`（1 行）——后者没有任何触发器、也没有任何代码引用；
+- **13 张空表**：`api_rate_limits`、`change_set_payload_refs`、`change_set_payloads`、`critical_decision_registry`、`embedding_jobs`、`embedding_rate_events`、`entity_redirects`、`lost_and_found`、`mutation_intents`、`projection_outbox`、`quality_evaluation_runs`、`schema_registry`、`wiki_embeddings`（均 0 行，删除零数据损失）。
+
+表 73→58、触发器 65→20。**所有保留表的行数逐一比对未变**，`integrity_check` ok，`foreign_key_check` 干净。
+
+删除脚本对每个对象断言前置条件（代码无引用、表为空、无活动触发器引用），不满足即中止；文档（含本次报告）提及不算创建方或读取方。
+
+**保留的 20 个触发器**：10 个 `required_columns_v1` 完整性守卫、4 个旧版遗留守卫（`canonical_identities` 的 append-only/owner-conflict、change-set 终态不可变），以及本次新增的 6 个。守卫**故意保留**——它们在执行契约，而不是无人读取的记账；删掉会静默削弱写路径。
+
+### `VACUUM`
+
+**3 887 MB → 3 451 MB（−436 MB）**，freelist 353 MB → 0，`integrity_check` ok，`foreign_key_check` 干净，行数全部未变，耗时 68 s。
+
+### 未删除：丢失子系统的数据（需单独决策）
+
+代码侧名字扫描同时发现 **约 131 万行、25 张表现在既无创建方也无读取方** —— 属于那个模块已丢失的版本：`evidence_versions`(494 879)、`claim_versions`(432 439)、`canonical_identities`(302 705)、`wiki_edges`(29 706)、`extraction_runs`(24 181)、`change_set_lifecycle_v6`(22 883)、`change_set_idempotency`(21 992)、`entity_identities`(12 425)、`wiki_nodes`(9 003)、`embedding_metadata_v8`(7 169)、`ingest_stage_events`(4 370)、`source_artifacts`(3 210)、`ingest_task_cleanup`(2 537)、`merge_journal`(489)、`history_retention_runs_v6`(303)、`ingest_outbox_links`(282)、`claim_assessments`(43)、`schema_migrations`(9)、`api_users`(2) 等。
+
+这些是**历史与审计制品，不是记账噪音**：`claim_versions`/`evidence_versions` 是追加型版本账本，`canonical_identities` 是身份/别名账本，`wiki_nodes`/`wiki_edges` 是更早的页投影。它们当前无人读取，但也是那个丢失版本留下的**唯一记录**，且受 `append_only` 守卫保护；`ARCH_2026-09-17.md`（操作方自己的评审）把丢子系统列为项目最大架构风险且“没有干净解法”。基于名字扫描启发式销毁 131 万行属于**目标决策而非维护步骤**，因此**未执行**，需要按组明确 go/no-go。
+
+### 附带修正
+
+`compact_memory_gram_overlay()` 现在接受 `limit_grams=None` 表示整批清空（分块进行，上限 `COMPACT_MAX_GRAMS`），修掉了 MCP `compact_memory_gram_index` 调用会 `TypeError` 的缺陷。
+
+### 验证
+
+- `pytest tests -q` → **487 passed**；`ruff` 无新增问题。
+- 维护后重跑基准：`assemble_context` 1.128 s、`search[page]` 0.192 s、`search[memory]` 0.468 s、`timeline` 0.056 s、`operational_memory_search` 0.424 s。
+- 线上不变量：gram 索引 ready/usable、page 投影 7178/30140、memory 投影 142117/142117 drift 0/0、timeline parity 9286/9286。
+- 入库写路径（40 行的页）：写入 **1.1–1.4 ms/页**；下一次读取的自愈（物化 + 有界压缩）**12–18 ms/页**。
+
+# Vector Lake 11.20.0
+
+## 三项后续：ngram 倒排索引、删除失效投影、index.json 投影为邻接表
+
+详细测量与证据见 `PERF_2026-09-16.md`。三项均先打样测量再实现，不是拍脑袋选的方案。
+
+### 1. `memory_gram_index`：精确 n-gram 倒排索引
+
+剩余最差路径是 `_query_terms` 把一个中文查询展开成**每个单字 + 每个相邻 bigram**，使 SQL 打分变成 `O(行数 × 词项数)`。先做了两个打样：
+
+| 方案 | 长查询延迟 | 排序 |
+|---|---|---|
+| FTS5 + bm25（列权重 4/3/1/1） | 240–300 ms | **改变**：旧 top-12 召回仅 3/12–12/12 |
+| 精确 n-gram postings | 0.10–0.58 s | **与全表扫描完全一致** |
+
+FTS5 方案是因为**改变排序**被否决，不是因为慢。n-gram 方案实测最长现实查询只触及 **223 253 条 posting**，纯 Python 累加 0.12 s——不需要 numpy，也不需要自定义压缩依赖。97 MB postings 取代了本来需要 ~450 MB 的 25.4 M 行 SQL 记录。
+
+结构：`operational_memory_gram(gram, postings)` 存打包的 little-endian `uint32` 数组（`(doc_delta << 4) | field_mask`）；`operational_memory_gram_overlay` 用普通 B-tree 行承载新增写入，使单个文档的更新是 `DELETE WHERE doc = ?` 加一次插入；`operational_memory_gram_dirty` 标记“基础 postings 不可信”的文档，**跳过**它们的 base 条目——这正是"不存旧状态也能精确合并"的关键，同时也自然退役了被删除的文档。
+
+线上验证：**11 组查询 × 4 组过滤组合全部与 `legacy` 全表扫描逐条 id 一致**，0.098–0.583 s vs 4.66–6.09 s。
+
+构建过程中发现并已写入代码注释的两个 SQLite 行为：嵌套在上层 upsert 中的触发器里用 `OR IGNORE`/`OR REPLACE` 会报 UNIQUE 而不是消解冲突（改用显式 `NOT EXISTS` 守卫）；因此触发器定义必须 `DROP` 后重建，只加 `IF NOT EXISTS` 会让升级后的库永久保留旧定义。
+
+### 2. 删除失效检索投影
+
+先做**已验证备份**（`backups/vector_lake_1789575103.db.bak`，3 622 MB，`integrity_check ok`，并从备份里回读行数），再删除 `operational_memory_search_docs/_fts/_short_fts/_pending/_state/_revision` 与 `search_projection_state_v8`，以及仍在维护它们的 10 个 `trg_operational_memory_search_*` 触发器。表 81→66、触发器 72→62，释放 49 547 页（193 MB）回 freelist；`integrity_check` 与 `foreign_key_check` 均干净；`operational_memory`(142 117)、`claims`(120 339)、`timeline_events`(9 286) 均未变。
+
+### 3. `page_index_projection`：index.json 投影为节点表 + 邻接表
+
+读路径原本每个进程解析整份 18 MB 文件，而且**每次查询**都重建 30 140 条边的邻接字典。`tracemalloc` 实测：解析后常驻 **42.2 MiB**、峰值 **137.4 MiB**；投影邻接仅常驻 **9.7 MiB**。现在节点按 key 取（每次查询几十行），7 178 个节点的字典不再整体存在于内存；`assemble_context` 的 50 行摘要是 50 行 SQL。
+
+`index.json` 仍是主权制品：`page_index_state(index_mtime, index_size)` 用一次 `stat` 就发现带外改写，投影自行修复。`page_index_edges` 带显式 `sequence` 列，因为两步 personalized PageRank 对顺序敏感；节点字典、边顺序与最终邻接均已与改动前的内存内构建在线上语料逐项核对一致（7 178 节点、30 140 边）。
+
+### 验证
+
+- `pytest tests -q` → **487 passed**（476 原有 + 11 新增 `tests/test_memory_gram_index.py` / `tests/test_page_index_projection.py`）。
+- `ruff check vector_lake` 错误总数与改动前一致（65 条均为既有 E402/E701）。
+- 线上不变量：memory 投影 142117/142117、drift 0/0；timeline parity 9286/9286；`integrity_check` ok。
+- 新增运维面：`python cli.py gram-index [--apply|--compact]`、MCP `memory_gram_index_status` / `rebuild_memory_gram_index` / `compact_memory_gram_index`。
+
+### 未完成
+
+- **另一套失效机制仍在，超出本次授权范围**：20 张表上的 60 个 `trg_*_generation_v3_*` 触发器与 `projection_runtime_v9` 在本仓库**既无创建方也无读取方**（已 grep 验证），`runtime_generations` 同样无人引用；它们仍在每次写入时维护一个无人消费的 generation 注册表。删除属破坏性操作，需单独决策。
+- 数据库 3 887 MB，其中 **352 MB 在 freelist**（重建暂存表留下的空间）。`VACUUM` 可回收，但需要数分钟排他锁，留给运维决定。
+
+# Vector Lake 11.19.0
+
+## 读路径性能：search / query / timeline 在 8 488 页语料上从 14.3 s 降到 1.9 s
+
+完整测量与证据见 `PERF_2026-09-16.md`。全部改动都是实测定位到的瓶颈，不是预防性重构。
+
+实测语料：8 488 个 wiki 页、142 117 条 `operational_memory`、120 339 条 claim、9 286 条 timeline 事件、`index.json` 18.0 MB、`vector_lake.db` 3.8 GB。
+
+| 路径 | 改前 (p50) | 改后 (p50) | 倍数 |
+|---|---|---|---|
+| `query` → `assemble_context` | 14.25 s | **1.91 s** | 7.5× |
+| `build_memory_packet` | 10.50 s | **1.67 s** | 6.3× |
+| `search_operational_memory` | 5.00 s | **0.72 s** | 7.0× |
+| `search`（page 模式） | 2.53 s | **0.22 s** | 11.5× |
+| `search`（memory 模式） | 5.72 s | **0.77 s** | 7.4× |
+| `timeline` | 0.75 s | **0.05 s** | 15.4× |
+
+### 1. `operational_memory_index` 检索投影（主要收益）
+
+`search_operational_memory` 原本是**全表 Python 扫描**：`SELECT *` 后对 142 117 行逐行 `json.loads`（cProfile：加载 4.5 s、评分 0.9 s），而 `build_memory_packet` 为了同时取“活跃视图”和“含历史视图”**把它跑了两遍**。
+
+修复分两步：
+
+- `search_memory_packet_views` 用一次加载喂两个视图；`assemble_context` 与 `_search_scored_pages` 共用 `_load_index_cached`，不再为 50 行摘要二次解析 18 MB 的 `index.json`；
+- 新增 `operational_memory_index` 投影表（`db_store`），由 `AFTER INSERT/UPDATE/DELETE` 触发器**在数据库层**维护，因此任何写入方（包括 `governance_store` 之外的代码）都无法绕过。检索改为 SQL 侧精确评分（`_memory_relevance` 的逐字重述：相关性为 0 的行才被丢弃，与 Python 评分器一致），SQL 取窗口后**仍用原 Python 评分器重排**，并按 `source_rowid` 复原 `SELECT *` 的自然序作为末位 tie-break。
+
+`VECTOR_LAKE_MEMORY_SEARCH=legacy` 可强制回到旧全表扫描；它既是差分测试的 oracle，也是运维逃生口。`tests/test_operational_memory_index.py` 对 10 组查询/过滤组合断言两条路径**逐条 id 完全一致**。
+
+自愈：`PRAGMA data_version` + `Connection.total_changes` 门控决定是否运行行数对账（未变动时约 20 µs，而非两次 `COUNT(*)` 扫描），投影被删或落后会在下一次查询前修好。
+
+### 2. Timeline：修掉一个长期报错，并把校验成本降到常数级
+
+- **回归修复**：canonical 回退路径引用 `claims.entity_id`，而该列**不存在** → 任何带 `entity_name`/`sentiment`/`action` 的 timeline 查询都返回 `Error executing timeline query: no such column: entity_id`。改为对 `data_json.subject_entity_ids` 过滤，并补齐实体标题映射。
+- **实测发现投影已漂移**（`missing=9 284 / extra=9 284`），意味着索引路径长期不可达、每次都走坏掉的回退。已执行 `rebuild_timeline_events_from_claims`，parity 归零。
+- `timeline_projection_parity` 每次查询都要全扫 claim 并逐条 SHA-256（0.79 s / 0.80 s）。新增 `idx_claims_claim_type` 表达式索引，并按“库路径 + claim 指纹 + 投影 id 极值”做记忆化；任何写入方（含其他进程）都会改变指纹。
+- 投影的 `event_date` 此前对 6 573 / 9 286 条事件取了**入库时间**：事件日期其实写在 claim 文本的 `[YYYY-MM-DD]` 前缀里。`claim_event_date` 现在按 anchor → 文本前缀 → `updated_at` 取日期，`ORDER BY event_date DESC` 才有意义。
+- 投影漂移时输出 `[DEGRADED]` 前缀说明来源，降级结果不再被误认为权威结果。
+
+### 3. 查询向量：客户端复用 + 有界缓存
+
+`embed_texts` 每次请求都 `genai.Client(...)`（本机实测 1.7–6.9 s），占了查询向量 2.4 s 延迟中的约 1.7 s。改为进程内复用一个客户端，缓存以**工厂函数身份**为键，因此 monkeypatch 重绑 `_create_client` 依然生效。查询向量另加 256 项 LRU（按 float32 存，约 3 MB 上限），只缓存成功结果。
+
+### 4. 验证
+
+- `pytest tests -q` → **450 passed**（429 原有 + 21 新增）。
+- `ruff check` 在改动文件上与改动前错误数一致（4 条全部为既有 E402/E701）。
+- 差分等价：索引后端与 legacy 全表扫描在 `top_k`、`include_history`、`memory_types`、空查询等组合下返回**完全相同**的 id 序列。
+- 复现脚本与逐项证据：`benchmarks/bench_hot_paths.py`、`PERF_2026-09-16.md`。
+
+### 5. 未完成 / 遗留
+
+- **长 CJK 查询仍非秒级**：`_query_terms` 会展开全部单字与相邻 bigram，30 字查询产生约 59 个词项、约 2.0–2.5 s 的 `instr()` 工作（旧路径 6.97 s，改善 2.8×）。进一步提速需要 n-gram 倒排索引或 FTS5/trigram 投影，两者都会改变检索语义，因此保留为待决策项而非静默混用。
+- **失效投影仍在被维护**：`operational_memory_search_docs`（128 615 行）/ `..._fts` / `..._short_fts` / `..._pending`（积压 13 788 行）/ `..._state` / `search_projection_state_v8` 在本仓库中**既无创建方也无读取方**（已 grep 验证），消费端随本地树成为主线而丢失；但它们**不是惰性数据**：线上库仍装着 `trg_operational_memory_search_insert/update/delete` 与 `..._revision` 触发器，因此每次 `operational_memory` 写入仍会往 `..._pending` 入队、并为一个无人读取的投影递增 revision。实测占用：FTS 数据块 ≈162 MB（`..._fts_data` 97.8 MB + `..._short_fts_data` 64.3 MB）加影子表行。删除表与触发器属破坏性操作，需明确授权与已验证备份后另行执行。
+- **写路径成本**：新触发器使 `operational_memory` 每行写入增加约 **118 µs**（20 000 行插入：无该触发器 0.24 s，有 2.61 s）。增量入库只重写变更 claim 的 memory 及其直接冲突对端（每页数十行），折合约 10–15 ms/页；可见代价是全量 `rebuild_operational_memory` 在 142 k 行语料上慢约 17 s。若日后成为瓶颈，可改用 pending 队列入队式触发器把成本移出写路径。
+- `index.json`（18 MB）仍整体解析；10 万页规模需要改为投影邻接表。
+
 # Vector Lake 11.18.0
 
 ## 核心流程审计修复：两条主流程断路、两处静默数据丢失、隐私排除失效

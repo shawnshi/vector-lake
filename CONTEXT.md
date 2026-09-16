@@ -58,7 +58,7 @@ Conflict rules:
 | `vector_lake/indexer.py` | Page index, weighted edges, claim graph refresh, pure-Python BM25 inverted index |
 | `vector_lake/claim_extractor.py` | Page-to-entity/claim/evidence/source extraction |
 | `vector_lake/tool_memory.py` | Wiki-as-Database operational memory persistence via MCP |
-| `vector_lake/governance_store.py` | Canonical store, change sets, operational memory, conflict resolver |
+| `vector_lake/governance_store.py` | Canonical store, change sets, operational memory, conflict resolver; indexed operational-memory retrieval (`score_memory_items`, `search_operational_memory`, `search_memory_packet_views`) |
 | `vector_lake/governance_metrics.py` | Debt and health metrics |
 | `vector_lake/tool_search.py` | Hybrid search (local query expansion + BM25 + Graph Traversal), Memory Packet assembly |
 | `vector_lake/tool_query.py` | Query synthesis with Memory Packet first |
@@ -71,13 +71,16 @@ Conflict rules:
 | `vector_lake/watchdog_status.py` | Status JSON telemetry broadcaster for the daemon |
 | `vector_lake/wiki_utils.py` | Path resolution, frontmatter, atomic writes, backups |
 | `vector_lake/db.py` | Legacy DB utils |
-| `vector_lake/db_store.py` | SQLite connection pooling, schema initialization, and WAL settings |
+| `vector_lake/db_store.py` | SQLite connection pooling, schema initialization, WAL settings, and the trigger-maintained `operational_memory_index` / `operational_memory_gram*` / `page_index_*` read projections |
 | `vector_lake/defense_hook.py` | Pre-flight constraints and guardrails |
 | `vector_lake/skeleton_parser.py` | Parsers for structural validation |
 | `vector_lake/provenance.py` | Tracing entities to raw sources |
 | `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
 | `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
 | `vector_lake/yaml_utils.py` | YAML helpers |
+| `vector_lake/memory_gram_index.py` | Exact n-gram inverted index over operational memory (base postings + overlay + dirty set) that makes `search_operational_memory` sub-second without changing its ranking |
+| `vector_lake/page_index_projection.py` | SQLite projection of `index.json` (node table + ordered edge table + process-wide adjacency cache) so read paths never parse the whole file |
+| `benchmarks/bench_hot_paths.py` | Reproducible p50/p95 latency harness for the `search` / `query` / `timeline` read paths |
 | `scripts/community_clustering_daemon.py` | Optional operator-invoked Louvain analysis; not scheduled by watchdog |
 | `schema.md` | Wiki and runtime memory contract |
 | `commands/` | Macro-level workflows (e.g. research/review) for Agents |
