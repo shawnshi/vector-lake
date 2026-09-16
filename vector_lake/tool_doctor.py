@@ -116,10 +116,9 @@ def doctor_vector_lake() -> str:
 
     # 5. MCP Discovery / Import check
     try:
-        from vector_lake.mcp_server import mcp
-        manager = getattr(mcp, "_tool_manager", None)
-        registered = getattr(manager, "_tools", {}) if manager is not None else {}
-        tools_count = len(registered) if registered is not None else 0
+        from vector_lake.mcp_server import mcp, registered_tool_names
+
+        tools_count = len(registered_tool_names(mcp))
         checks.append(("MCP Server", tools_count > 0, f"Import OK, {tools_count} tools exposed"))
     except Exception as e:
         checks.append(("MCP Server", False, f"Startup Exception: {e}"))

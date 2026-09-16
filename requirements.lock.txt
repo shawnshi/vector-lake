@@ -21,7 +21,12 @@
 # * rjieba wheel used: rjieba-0.2.1-cp38-abi3-win_amd64.whl, carrying jieba-rs
 #   0.9.x.  Update this pin and tokenizer.JIEBA_RS_PINNED together when a
 #   binding for jieba-rs 0.11 is published.
+# * mcp must stay >=2.1: mcp_server.py targets mcp.server.MCPServer. 2.1.0 was
+#   verified by a clean `pip install -r requirements.txt` plus a full suite run
+#   on Windows/CPython 3.13; 1.x hosts keep working via the FastMCP fallback.
 # * mistune must stay >=3.0.1 (3.0.0 breaks renderer='ast').
+# * mcp is on the 2.x line: mcp_server.py prefers `mcp.server.MCPServer` and
+#   only falls back to the 1.x `fastmcp` name, which 2.x stubs out with a raise.
 # * igraph/leidenalg install from cp39/cp38-abi3 wheels; no compiler needed.
 
 filelock==3.29.0
@@ -32,7 +37,7 @@ leidenalg==0.12.0
 PyYAML==6.0.3
 watchdog==6.0.0
 google-genai==2.7.0
-mcp==1.27.2
+mcp==2.2.0
 sqlite-vec==0.1.9
 rjieba==0.2.1
 jieba==0.42.1

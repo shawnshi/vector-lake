@@ -21,7 +21,12 @@ leidenalg>=0.10.0
 PyYAML>=6.0.1
 watchdog>=4.0
 google-genai>=2.0.0
-mcp>=1.0.0
+# mcp 2.x is the target line: mcp_server.py imports `mcp.server.MCPServer`. The
+# 2.x import is attempted first and the 1.x name `mcp.server.fastmcp.FastMCP` is
+# kept only as a fallback so an existing 1.x host keeps serving. A floor of
+# `mcp>=1.0.0` let a clean install resolve to 2.x while the code still imported
+# only the removed 1.x module, which is how CI went red on a fresh checkout.
+mcp>=2.1.0
 sqlite-vec>=0.1.3
 rjieba>=0.2.1
 jieba>=0.42.1

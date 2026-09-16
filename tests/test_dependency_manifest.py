@@ -77,6 +77,21 @@ def test_declared_floor_matches_the_requested_minimum(name, minimum):
     assert f">={minimum}" in line.replace(" ", ""), f"{name} floor drifted: {line}"
 
 
+def test_mcp_floor_is_on_the_2x_line():
+    """The runtime imports MCPServer, which only exists from mcp 2.x.
+
+    The former floor (``mcp>=1.0.0``) let a clean install resolve to 2.x while
+    the code still imported the removed ``mcp.server.fastmcp`` module: that is
+    exactly how CI went red on a fresh checkout, so the floor is load-bearing.
+    """
+    line = _specifier("mcp")
+    assert line is not None
+    assert line.replace(" ", "") in {"mcp>=2.1.0", "mcp>=2.1"}, (
+        f"mcp floor must track the MCPServer API: {line}"
+    )
+    assert "fastmcp" not in line.lower()
+
+
 def test_mistune_floor_is_above_the_broken_3_0_0():
     """3.0.0 fails at import time for the renderer this project uses."""
     line = _specifier("mistune")
