@@ -278,7 +278,7 @@ python cli.py wiki-restore --apply --limit 10
 
 ## Config
 
-`config.json` 与环境变量共同控制运行范围和模型调用：
+`config.json` 与环境变量共同控制运行范围和模型调用。该文件是机器相关配置，**不入 git**：克隆后执行 `cp config.example.json config.json` 再按本机填写。文件缺失时使用代码内置默认值（含默认排除列表 `exclude_paths`），不会退化为“无排除”。
 
 - `target_directories`：raw source 扫描路径。
 - `exclude_paths`：排除目录。

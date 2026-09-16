@@ -112,6 +112,43 @@ def _configured_memory_dir() -> Path | None:
     return resolved
 
 
+# Shipped defaults for the per-machine ``config.json``.  That file is untracked
+# (see ``config.example.json``), so a fresh checkout has no config at all; if the
+# defaults lived only in the file, a missing config would silently empty
+# ``exclude_paths`` and re-ingest privacy-excluded raw sources.
+DEFAULT_EXCLUDE_PATHS = ("stocks/", "garmin/", "personal-insights/")
+DEFAULT_SUPPORTED_EXTENSIONS = (".md", ".txt")
+
+
+def load_config() -> dict:
+    """Extension config merged over the shipped defaults.
+
+    A missing ``config.json`` is a supported state.  An unreadable or malformed
+    file raises, because ignoring it would drop the exclusion list.
+    """
+    import json
+
+    config = {
+        "target_directories": [],
+        "exclude_paths": list(DEFAULT_EXCLUDE_PATHS),
+        "supported_extensions": list(DEFAULT_SUPPORTED_EXTENSIONS),
+    }
+    config_path = get_extension_root() / "config.json"
+    if not config_path.exists():
+        return config
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Vector Lake config '{config_path}' is unreadable ({type(exc).__name__}: {exc}); "
+            "refusing to run with an unknown exclusion list."
+        ) from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Vector Lake config '{config_path}' must contain a JSON object.")
+    config.update(raw)
+    return config
+
+
 def reset_memory_dir_cache() -> None:
     """Drop the cached config-derived MEMORY root (tests and config reloads)."""
     global _META_DIR_CACHE

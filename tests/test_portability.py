@@ -27,18 +27,22 @@ SOURCES = sorted(
 PERSONAL_PATH = re.compile(r"(?:[A-Za-z]:[\\/]Users[\\/](?!<)[^\\/\"']+|/home/[^/\"']+|/Users/[^/\"']+)")
 
 
-def _config_paths_outside_allowlist() -> list[str]:
-    """Absolute personal paths in config.json, excluding the allowed keys."""
+def _config_documents() -> list[tuple[str, dict]]:
+    """Tracked config documents present in this checkout.
+
+    ``config.json`` is a per-machine file that is no longer tracked, so a fresh
+    clone only has the ``config.example.json`` template.  Whatever is present
+    (normally both) is what must stay portable.
+    """
     import json
 
-    config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-    return sorted(
-        key
-        for key, value in config.items()
-        if key not in MACHINE_SPECIFIC_KEYS
-        and isinstance(value, str)
-        and PERSONAL_PATH.search(value)
-    )
+    documents: list[tuple[str, dict]] = []
+    for name in ("config.json", "config.example.json"):
+        path = ROOT / name
+        if path.exists():
+            documents.append((name, json.loads(path.read_text(encoding="utf-8"))))
+    assert documents, "expected at least config.example.json to be present"
+    return documents
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
@@ -53,17 +57,33 @@ def test_no_machine_specific_absolute_paths(path: Path):
 
 
 def test_only_memory_dir_may_hold_a_machine_specific_path():
-    offenders = _config_paths_outside_allowlist()
+    offenders = sorted(
+        f"{name}:{key}"
+        for name, config in _config_documents()
+        for key, value in config.items()
+        if key not in MACHINE_SPECIFIC_KEYS
+        and isinstance(value, str)
+        and PERSONAL_PATH.search(value)
+    )
     assert not offenders, (
-        f"config.json keys {offenders} contain a personal absolute path; "
+        f"config keys {offenders} contain a personal absolute path; "
         f"only {sorted(MACHINE_SPECIFIC_KEYS)} may be machine-specific"
     )
 
 
-def test_config_target_directories_is_empty_by_default():
-    import json
+def test_missing_config_keeps_the_shipped_exclusions(tmp_path, monkeypatch):
+    """A checkout without config.json must not lose the privacy exclusions."""
+    from vector_lake import wiki_utils
 
-    config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-    assert config.get("target_directories") == [], (
-        "ship an empty list so the default resolves to <MEMORY>/raw instead of one user's path"
+    monkeypatch.setattr(wiki_utils, "get_extension_root", lambda: tmp_path)
+    config = wiki_utils.load_config()
+    assert config["exclude_paths"] == list(wiki_utils.DEFAULT_EXCLUDE_PATHS)
+    assert config["supported_extensions"] == list(wiki_utils.DEFAULT_SUPPORTED_EXTENSIONS)
+
+
+def test_config_target_directories_is_empty_by_default():
+    offenders = [name for name, config in _config_documents() if config.get("target_directories") != []]
+    assert not offenders, (
+        f"{offenders} must ship an empty list so the default resolves to <MEMORY>/raw "
+        "instead of one user's path"
     )

@@ -17,3 +17,5 @@ scratch/
 .codex/
 tests_tmp/
 .env
+# Per-machine config (see config.example.json); must never reach a public repo.
+config.json

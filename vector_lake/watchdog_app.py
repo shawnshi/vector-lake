@@ -4,15 +4,15 @@ import queue
 import threading
 import time
 from pathlib import Path
-import json
 from vector_lake import get_extension_root
+from vector_lake.wiki_utils import DEFAULT_EXCLUDE_PATHS, load_config
 
-# Load config
+# Config: shipped defaults merged with the optional per-machine ``config.json``.
+# Opening that file at import time used to make a checkout without it
+# unimportable, and a defaulted empty list used to drop every exclusion.
 CONFIG_PATH = get_extension_root() / "config.json"
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    config = json.load(f)
-
-EXCLUDE_PATHS = config.get("exclude_paths", [])
+config = load_config()
+EXCLUDE_PATHS = config.get("exclude_paths", list(DEFAULT_EXCLUDE_PATHS))
 
 try:
     from watchdog.events import FileSystemEventHandler

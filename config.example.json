@@ -1,4 +1,5 @@
 {
+  "memory_dir": "",
   "target_directories": [],
   "exclude_paths": [
     "stocks/",

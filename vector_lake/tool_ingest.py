@@ -15,6 +15,7 @@ from vector_lake.wiki_utils import (
     get_raw_dir,
     get_wiki_dir,
     get_index_path,
+    load_config,
     validate_wiki_filename,
 )
 from vector_lake.purpose_contract import (
@@ -642,23 +643,12 @@ def _load_scan_config() -> dict:
 
     This used to swallow every failure into ``{}``, which quietly disabled
     ``exclude_paths`` and therefore re-ingested privacy-excluded raw sources.
-    A missing file is a legitimate empty config; an unreadable or malformed one
-    is not.
+    ``config.json`` is per-machine and untracked, so a missing file is a
+    supported state -- but it must still yield the shipped defaults rather than
+    an empty exclusion list.  An unreadable or malformed file stays a hard
+    error (see ``wiki_utils.load_config``).
     """
-    config_path = get_extension_root() / "config.json"
-    if not config_path.exists():
-        return {}
-    try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            config = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"Vector Lake config '{config_path}' is unreadable ({type(exc).__name__}: {exc}); "
-            "refusing to scan raw sources with an unknown exclusion list."
-        ) from exc
-    if not isinstance(config, dict):
-        raise RuntimeError(f"Vector Lake config '{config_path}' must contain a JSON object.")
-    return config
+    return load_config()
 
 
 def prepare_ingest_batch(batch_size: int = 5) -> str:
