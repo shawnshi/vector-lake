@@ -1,7 +1,26 @@
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from vector_lake.db_store import get_connection
+
+# The ingest pipeline prefixes every extracted timeline claim with its event
+# date, e.g. ``[2026-05-02] [Observation] ...``.  On the live corpus 6573 of
+# 9286 timeline claims carry the date only here (974 have a temporal anchor and
+# 1739 have neither), so without this the projection reported the *ingestion*
+# timestamp as the event date and ``ORDER BY event_date DESC`` was meaningless.
+_TEXT_EVENT_DATE = re.compile(r"^\s*\[(\d{4}-\d{2}-\d{2})\]")
+
+
+def claim_event_date(row, data: dict) -> str:
+    """Canonical event date: temporal anchor, else the text prefix, else updated_at."""
+    for candidate in (data.get("temporal_anchor"), data.get("event_date")):
+        if candidate:
+            return str(candidate)
+    match = _TEXT_EVENT_DATE.match(str(row["claim_text"] or ""))
+    if match:
+        return match.group(1)
+    return str(row["updated_at"] or "Unknown Date")
 
 
 def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> dict:
@@ -12,7 +31,7 @@ def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> d
     sources = data.get("source_ids") or []
     if isinstance(sources, str):
         sources = [sources]
-    event_date = data.get("temporal_anchor") or data.get("event_date") or row["updated_at"] or "Unknown Date"
+    event_date = claim_event_date(row, data)
     description = row["claim_text"]
     entity_id = entities[0] if entities else ""
     stable_raw = "\0".join([str(row["claim_id"]), str(event_date), str(description)])
@@ -42,6 +61,44 @@ def _entity_title_map(entity_ids: set[str]) -> dict[str, str]:
         tuple(sorted(entity_ids)),
     ).fetchall()
     return {str(row["entity_id"]): str(row["canonical_name"] or row["entity_id"]) for row in rows}
+
+
+def _claim_subject_ids(data: dict) -> list[str]:
+    subjects = data.get("subject_entity_ids") or []
+    if isinstance(subjects, str):
+        subjects = [subjects]
+    return [str(item) for item in subjects]
+
+
+# ``timeline_projection_parity`` is a full recomputation of the canonical event
+# id set, so it is memoised against a cheap fingerprint of the rows it depends on:
+#   * the database identity, so two isolated corpora can never share an entry;
+#   * the count / newest ``updated_at`` / highest rowid of the timeline claims;
+#   * the count and id extremes of the projection, which catch an out-of-band
+#     write to ``timeline_events`` that bypasses the claim delta.
+# Anything that can change the id sets moves one of those numbers, including
+# writes made by another process, so the cache cannot silently go stale.
+_PARITY_CACHE: dict = {"fingerprint": None, "result": None}
+
+
+def _timeline_claims_fingerprint(conn=None) -> str:
+    conn = conn or get_connection()
+    count, newest, highest = conn.execute(
+        "SELECT COUNT(*), COALESCE(MAX(updated_at), ''), COALESCE(MAX(rowid), 0) "
+        "FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
+    ).fetchone()
+    projected, lowest_id, highest_id = conn.execute(
+        "SELECT COUNT(*), COALESCE(MIN(id), ''), COALESCE(MAX(id), '') FROM timeline_events"
+    ).fetchone()
+    from vector_lake.db_store import get_db_path
+
+    return f"{get_db_path()}|{count}:{newest}:{highest}|{projected}:{lowest_id}:{highest_id}"
+
+
+def invalidate_timeline_parity_cache() -> None:
+    """Drop the memoised parity proof after this process rewrites the projection."""
+    _PARITY_CACHE["fingerprint"] = None
+    _PARITY_CACHE["result"] = None
 
 
 def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: list[dict]) -> dict:
@@ -80,24 +137,35 @@ def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: 
             "VALUES (:id, :event_date, :action, :sentiment, :description, :entity_id, :entity_title, :source_file, :extracted_at)",
             new_events,
         )
+    invalidate_timeline_parity_cache()
     return {"deleted": len(old_event_ids), "upserted": len(new_events)}
 
 
 def timeline_projection_parity() -> dict:
-    """Compare the exact stable event IDs in canonical claims and the SQL projection."""
+    """Compare the exact stable event IDs in canonical claims and the SQL projection.
+
+    Memoised against :func:`_timeline_claims_fingerprint`; the recomputation is a
+    SHA-256 over every timeline claim and used to run on every timeline query.
+    """
     conn = get_connection()
+    fingerprint = _timeline_claims_fingerprint(conn)
+    if _PARITY_CACHE["fingerprint"] == fingerprint and _PARITY_CACHE["result"] is not None:
+        return dict(_PARITY_CACHE["result"])
     claim_rows = conn.execute(
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
         "WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
     ).fetchall()
     expected_ids = {_event_from_claim_row(row)["id"] for row in claim_rows}
     actual_ids = {str(row["id"]) for row in conn.execute("SELECT id FROM timeline_events")}
-    return {
+    result = {
         "canonical": len(expected_ids),
         "projection": len(actual_ids),
         "missing": len(expected_ids - actual_ids),
         "extra": len(actual_ids - expected_ids),
     }
+    _PARITY_CACHE["fingerprint"] = fingerprint
+    _PARITY_CACHE["result"] = dict(result)
+    return result
 
 
 def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None = None) -> str:
@@ -115,11 +183,7 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
     rows = conn.execute(query, params).fetchall()
     entity_ids = set()
     for row in rows:
-        data = json.loads(row["data_json"])
-        subjects = data.get("subject_entity_ids") or []
-        if isinstance(subjects, str):
-            subjects = [subjects]
-        entity_ids.update(str(item) for item in subjects)
+        entity_ids.update(_claim_subject_ids(json.loads(row["data_json"])))
     entity_titles = _entity_title_map(entity_ids)
     events = [_event_from_claim_row(row, entity_titles=entity_titles) for row in rows]
     if dry_run:
@@ -135,6 +199,7 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
             "VALUES (:id, :event_date, :action, :sentiment, :description, :entity_id, :entity_title, :source_file, :extracted_at)",
             events,
         )
+    invalidate_timeline_parity_cache()
     return f"Rebuilt {len(events)} timeline_events row(s) from timeline-event claims."
 
 def search_timeline_events(entity_name: str = None, sentiment: str = None, action: str = None, limit: int = 10) -> str:
@@ -171,11 +236,25 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
             for r in rows
         )
 
+    # The projection is stale: answer from canonical claims and say so, so a
+    # degraded result is never mistaken for an authoritative one.
+    drift_note = ""
+    if parity["projection"]:
+        drift_note = (
+            f"[DEGRADED] timeline_events projection is out of parity with canonical claims "
+            f"(missing={parity['missing']}, extra={parity['extra']}); answering from canonical claims. "
+            f"Run rebuild_timeline_events(dry_run=False) to restore the indexed path.\n\n"
+        )
+
     query = "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
     params = []
     
     if entity_name:
-        query += " AND (entity_id LIKE ? OR claim_text LIKE ?)"
+        # ``claims`` has no ``entity_id`` column; the subjects live inside
+        # ``data_json``.  The previous predicate referenced ``entity_id`` and
+        # raised "no such column" on every filtered query, so the canonical
+        # fallback could never return a result.
+        query += " AND (claim_text LIKE ? OR json_extract(data_json, '$.subject_entity_ids') LIKE ?)"
         params.extend([f"%{entity_name}%", f"%{entity_name}%"])
     if sentiment:
         query += " AND COALESCE(json_extract(data_json, '$.sentiment'), 'neutral') = ?"
@@ -195,13 +274,25 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
         
     if not rows:
         return "No timeline events found matching the criteria."
-        
-    results = []
+
+    subject_ids: set[str] = set()
+    decoded_events = []
     for r in rows:
         data = json.loads(r["data_json"])
-        date = data.get("temporal_anchor") or "Unknown Date"
-        entities = ", ".join(data.get("subject_entity_ids", []))
+        subjects = _claim_subject_ids(data)
+        subject_ids.update(subjects)
+        decoded_events.append((data, subjects, r))
+    entity_titles = _entity_title_map(subject_ids)
+
+    results = []
+    for data, subjects, r in decoded_events:
+        date = claim_event_date(r, data)
+        entities = ", ".join(entity_titles.get(item, item) for item in subjects)
         source = ", ".join(data.get("source_ids", []))
-        results.append(f"[{date}] <{entities}>\n  -> {r['claim_text']}\n  Source: {source}")
-        
-    return "\n\n".join(results)
+        action = data.get("action") or data.get("event_tag") or data.get("claim_type") or "timeline-event"
+        results.append(
+            f"[{date}] <{entities}>\n  -> {r['claim_text']}\n"
+            f"  Action: {action} | Source: {source}"
+        )
+
+    return drift_note + "\n\n".join(results)

@@ -73,6 +73,13 @@ Usage Examples:
     timeline_rebuild_parser.add_argument("--apply", action="store_true", help="Persist the rebuilt projection. Defaults to dry-run.")
     timeline_rebuild_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of claims to project.")
 
+    gram_index_parser = subparsers.add_parser(
+        "gram-index",
+        help="[SEARCH] Report or rebuild the exact n-gram index used by operational-memory search.",
+    )
+    gram_index_parser.add_argument("--apply", action="store_true", help="Run the bulk rebuild. Defaults to dry-run.")
+    gram_index_parser.add_argument("--compact", action="store_true", help="Merge the overlay into the base and prune retired documents.")
+
     projection_report_parser = subparsers.add_parser("projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift.")
     projection_report_parser.add_argument("--limit", type=int, default=20, help="Sample size per drift bucket.")
 
@@ -167,6 +174,15 @@ def main() -> int:
                 dry_run=not getattr(args, "apply", False),
                 limit=getattr(args, "limit", None),
             ))
+        elif args.command == "gram-index":
+            print(tools.memory_gram_index_report())
+            if getattr(args, "compact", False):
+                print(tools.compact_memory_gram_overlay())
+                print(tools.prune_retired_gram_docs())
+            if getattr(args, "apply", False):
+                print(tools.rebuild_memory_gram_index(dry_run=False))
+            elif not getattr(args, "compact", False):
+                print(tools.rebuild_memory_gram_index(dry_run=True))
         elif args.command == "projection-report":
             print(tools.projection_diff_report(limit=getattr(args, "limit", 20)))
         elif args.command == "canonical-backfill":

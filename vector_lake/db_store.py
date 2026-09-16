@@ -1,8 +1,10 @@
 import hashlib
 import json
 import logging
+import random
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from vector_lake.wiki_utils import get_meta_dir
@@ -78,37 +80,454 @@ def close_connection():
 
 from contextlib import contextmanager
 
+# --- write-lock budget -------------------------------------------------------
+#
+# ``connect(timeout=...)`` *is* the SQLite busy timeout, so every
+# ``BEGIN IMMEDIATE`` attempt already blocks inside SQLite for up to
+# ``DB_BUSY_TIMEOUT_MS`` before it raises ``database is locked``.  The previous
+# loop then retried 60 times with a 0.5-1.5 s sleep on top, so one
+# ``transaction()`` could park for roughly half an hour while the process looked
+# hung: nothing wrote ``.watchdog_status.json`` during the wait, ``runtime_health``
+# then reported ``watchdog_stale``, and every writer queued behind it
+# (``enqueue_mutation``, ``claim_mutation_outbox``, ingest, GC, timeline rebuild).
+#
+# The budget below is a hard ceiling on total waiting.  ``PRAGMA busy_timeout``
+# is re-armed to the remaining budget before each attempt so the ceiling is real
+# rather than nominal, and restored to the default once the lock is taken so
+# later one-off statements keep the full patience.
+DB_BUSY_TIMEOUT_MS = 30_000
+BEGIN_LOCK_BUDGET_SECONDS = 90.0
+BEGIN_LOCK_MAX_ATTEMPTS = 8
+
+
+class DatabaseLockTimeout(RuntimeError):
+    """The write lock could not be taken inside ``BEGIN_LOCK_BUDGET_SECONDS``.
+
+    Distinct from ``sqlite3.OperationalError`` so callers that already catch
+    SQLite errors for a genuinely unusable database do not silently absorb a
+    contention timeout, which is a retryable condition with a different remedy.
+    """
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def _arm_busy_timeout(conn: sqlite3.Connection, remaining_seconds: float) -> None:
+    """Point ``PRAGMA busy_timeout`` at the remaining lock budget."""
+    budget_ms = max(1, int(min(remaining_seconds, DB_BUSY_TIMEOUT_MS / 1000.0) * 1000))
+    try:
+        conn.execute(f"PRAGMA busy_timeout={budget_ms:d}")
+    except sqlite3.OperationalError as exc:
+        log.warning("Could not arm busy_timeout=%s: %s", budget_ms, exc)
+
+
+def _acquire_write_lock(conn: sqlite3.Connection) -> None:
+    """Take the write lock, or raise :class:`DatabaseLockTimeout` inside the budget."""
+    deadline = time.monotonic() + BEGIN_LOCK_BUDGET_SECONDS
+    last_error: sqlite3.OperationalError | None = None
+    attempts = 0
+    acquired = False
+    while attempts < BEGIN_LOCK_MAX_ATTEMPTS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        _arm_busy_timeout(conn, remaining)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            acquired = True
+            break
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_error(exc):
+                raise
+            last_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Jittered exponential backoff, never past the remaining budget.
+            time.sleep(min(remaining, 0.1 * (2 ** (attempts - 1)) * (0.5 + random.random())))
+    # Whatever happened, hand the connection back its default patience.
+    _arm_busy_timeout(conn, DB_BUSY_TIMEOUT_MS / 1000.0)
+    if not acquired:
+        raise DatabaseLockTimeout(
+            f"Could not acquire the Vector Lake write lock within "
+            f"{BEGIN_LOCK_BUDGET_SECONDS:.0f}s ({attempts} attempt(s)); "
+            f"another writer is holding it. Last error: {last_error}"
+        ) from last_error
+
+
 @contextmanager
 def transaction():
     conn = get_connection()
-    in_tx = getattr(_LOCAL, 'in_transaction', False)
-    if in_tx:
+    if getattr(_LOCAL, "in_transaction", False):
         yield conn
-    else:
-        max_retries = 60
-        for attempt in range(max_retries):
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                break
-            except sqlite3.OperationalError as e:
-                if "database is locked" in str(e) and attempt < max_retries - 1:
-                    import time
-                    import random
-                    time.sleep(0.5 + random.random())
-                    continue
-                raise
-        _LOCAL.in_transaction = True
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            _LOCAL.in_transaction = False
+        return
 
-_INIT_DB_DONE = False
-_INIT_LOCK = threading.Lock()
+    _acquire_write_lock(conn)
+    _LOCAL.in_transaction = True
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        # A failed ``commit()`` used to escape without a rollback, leaving the
+        # connection inside an open transaction; the next ``BEGIN IMMEDIATE`` on
+        # it then raised "cannot start a transaction within a transaction",
+        # which reads as a schema bug rather than a stuck lock.
+        try:
+            conn.rollback()
+        except sqlite3.Error as rollback_error:
+            log.error("Rollback failed, connection state is unknown: %s", rollback_error)
+        raise
+    finally:
+        _LOCAL.in_transaction = False
+
+# --- operational memory search projection -----------------------------------
+#
+# ``search_operational_memory`` used to decode every row of ``operational_memory``
+# (142k rows / ~170 MB of JSON on the live corpus) and score them in Python for
+# every query, twice per Memory Packet.  The projection below carries the fields
+# the scorer actually reads as plain columns, maintained by triggers so every
+# writer -- including ones outside this module -- keeps it in step.
+#
+# Coercion contract (must stay in step with ``governance_store``):
+#   memory_type    : lower(COALESCE(json.memory_type, 'fact'))
+#   validity_state : lower(COALESCE(json.validity_state, 'active'))
+#   memory_score   : CAST(json.memory_score AS REAL) or 0.0
+#   updated_rank   : unixepoch(json.updated_at,'subsec') or 0.0 -- millisecond
+#                    precision, while the Python oracle uses microsecond floats,
+#                    so rows written inside the same millisecond may tie here
+#                    and rank apart in Python.  The differential test in
+#                    tests/test_operational_memory_index.py pins this down.
+#   *_blob         : lower() of the corresponding JSON field, '' when absent
+
+_OM_INDEX_VALUE_COLUMNS = (
+    "memory_type",
+    "validity_state",
+    "memory_score",
+    "updated_rank",
+    "key_blob",
+    "text_blob",
+    "page_blob",
+    "source_updated_at",
+)
+
+_OM_INDEX_COLUMNS = ("memory_id",) + _OM_INDEX_VALUE_COLUMNS + ("source_rowid",)
+
+
+def _om_index_value_expr(source: str) -> str:
+    """Newline-joined projection value expressions bound to ``source`` (``NEW``/``src``)."""
+    return (
+        f"            lower(COALESCE(json_extract({source}.data_json, '$.memory_type'), 'fact')),\n"
+        f"            lower(COALESCE(json_extract({source}.data_json, '$.validity_state'), 'active')),\n"
+        f"            COALESCE(CAST(json_extract({source}.data_json, '$.memory_score') AS REAL), 0.0),\n"
+        f"            COALESCE(unixepoch(NULLIF(json_extract({source}.data_json, '$.updated_at'), ''), 'subsec'), 0.0),\n"
+        f"            lower(COALESCE(json_extract({source}.data_json, '$.memory_key'), '')),\n"
+        f"            lower(COALESCE(json_extract({source}.data_json, '$.text'), '')),\n"
+        f"            lower(COALESCE(json_extract({source}.data_json, '$.source_page'), '')),\n"
+        f"            COALESCE(json_extract({source}.data_json, '$.updated_at'), ''),\n"
+        f"            {source}.rowid"
+    )
+
+
+def _create_operational_memory_index(conn: sqlite3.Connection) -> None:
+    """Create the search projection and its maintenance triggers."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operational_memory_index (
+            memory_id TEXT PRIMARY KEY,
+            memory_type TEXT NOT NULL,
+            validity_state TEXT NOT NULL,
+            memory_score REAL NOT NULL,
+            updated_rank REAL NOT NULL,
+            key_blob TEXT NOT NULL,
+            text_blob TEXT NOT NULL,
+            page_blob TEXT NOT NULL,
+            source_updated_at TEXT NOT NULL DEFAULT '',
+            source_rowid INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    # ``source_rowid`` reproduces the store's natural ``SELECT *`` order, which is
+    # the final tie-break of the Python scorer.  Adding the column to a database
+    # that predates it invalidates every existing row, so the rename succeeds and
+    # forces one rebuild.
+    try:
+        conn.execute(
+            "ALTER TABLE operational_memory_index "
+            "ADD COLUMN source_rowid INTEGER NOT NULL DEFAULT 0"
+        )
+        stale_format = True
+    except sqlite3.OperationalError:
+        stale_format = False
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_om_index_type_state "
+        "ON operational_memory_index (memory_type, validity_state)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_om_index_type ON operational_memory_index (memory_type)"
+    )
+    columns = ", ".join(_OM_INDEX_COLUMNS)
+    upsert = ", ".join(
+        f"{column} = excluded.{column}" for column in _OM_INDEX_COLUMNS if column != "memory_id"
+    )
+    for trigger, event in (
+        ("trg_om_index_insert", "AFTER INSERT"),
+        ("trg_om_index_update", "AFTER UPDATE"),
+    ):
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {trigger}
+            {event} ON operational_memory
+            BEGIN
+                INSERT INTO operational_memory_index ({columns})
+                VALUES (
+                    NEW.memory_id,
+{_om_index_value_expr('NEW')}
+                )
+                ON CONFLICT(memory_id) DO UPDATE SET {upsert};
+            END
+            """
+        )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_om_index_delete
+        AFTER DELETE ON operational_memory
+        BEGIN
+            DELETE FROM operational_memory_index WHERE memory_id = OLD.memory_id;
+        END
+        """
+    )
+    _create_memory_gram_tables(conn)
+    _create_page_index_tables(conn)
+    ensure_operational_memory_index(conn, force=stale_format)
+
+
+def _create_page_index_tables(conn: sqlite3.Connection) -> None:
+    """Schema for the ``index.json`` projection in ``vector_lake.page_index_projection``.
+
+    Only nodes need a new table: ``page_graph_edges`` already mirrors
+    ``index.json``'s ``weighted_edges`` byte-for-byte (verified on the live
+    corpus, same weights and same order), so the adjacency is read from there.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS page_index_nodes (
+            node_key TEXT PRIMARY KEY,
+            node_id TEXT,
+            title TEXT,
+            type TEXT,
+            status TEXT,
+            domain TEXT,
+            topic_cluster TEXT,
+            node_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_page_index_nodes_domain ON page_index_nodes (domain)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_page_index_nodes_cluster ON page_index_nodes (topic_cluster)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS page_index_edges (
+            sequence INTEGER PRIMARY KEY,
+            source_key TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            weight REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_page_index_edges_source ON page_index_edges (source_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_page_index_edges_target ON page_index_edges (target_key)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS page_index_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            index_mtime REAL NOT NULL DEFAULT 0,
+            index_size INTEGER NOT NULL DEFAULT 0,
+            node_count INTEGER NOT NULL DEFAULT 0,
+            edge_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
+        )
+        """
+    )
+
+
+def _create_memory_gram_tables(conn: sqlite3.Connection) -> None:
+    """Schema for the exact n-gram index in ``vector_lake.memory_gram_index``.
+
+    The dirty queue is filled by triggers on the projection, so every writer of
+    ``operational_memory`` -- including ones outside this module -- marks its own
+    documents stale.  Nothing here computes grams: that needs Python, and the
+    materialisation is a bounded maintenance step instead (see the module docstring).
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operational_memory_gram (
+            gram TEXT PRIMARY KEY,
+            postings BLOB NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operational_memory_gram_overlay (
+            gram TEXT NOT NULL,
+            doc INTEGER NOT NULL,
+            mask INTEGER NOT NULL,
+            PRIMARY KEY (gram, doc)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_om_gram_overlay_doc "
+        "ON operational_memory_gram_overlay (doc)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operational_memory_gram_dirty (
+            doc INTEGER PRIMARY KEY
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operational_memory_gram_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            format_version INTEGER NOT NULL DEFAULT 1,
+            doc_count INTEGER NOT NULL DEFAULT 0,
+            gram_count INTEGER NOT NULL DEFAULT 0,
+            postings_count INTEGER NOT NULL DEFAULT 0,
+            base_docs INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
+        )
+        """
+    )
+    for trigger, event, doc in (
+        ("trg_om_gram_dirty_insert", "AFTER INSERT", "NEW.rowid"),
+        ("trg_om_gram_dirty_update", "AFTER UPDATE", "NEW.rowid"),
+        ("trg_om_gram_dirty_delete", "AFTER DELETE", "OLD.rowid"),
+    ):
+        # ``INSERT OR IGNORE``/``OR REPLACE`` are rejected here: this trigger runs
+        # nested inside the projection's own upsert, and SQLite raises the UNIQUE
+        # violation instead of applying the nested conflict resolution (verified
+        # with a minimal repro).  An explicit NOT EXISTS guard cannot conflict.
+        #
+        # Dropped rather than guarded with IF NOT EXISTS because a trigger body is
+        # code, and an upgraded database would otherwise keep the previous, buggy
+        # body forever.
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.execute(
+            f"""
+            CREATE TRIGGER {trigger}
+            {event} ON operational_memory_index
+            BEGIN
+                INSERT INTO operational_memory_gram_dirty (doc)
+                SELECT {doc} WHERE NOT EXISTS (
+                    SELECT 1 FROM operational_memory_gram_dirty WHERE doc = {doc}
+                );
+            END
+            """
+        )
+
+
+def ensure_operational_memory_index(
+    conn: sqlite3.Connection | None = None, force: bool = False
+) -> dict:
+    """Reconcile ``operational_memory_index`` with ``operational_memory``.
+
+    ``force`` re-derives every row (content-drift check); the default only fills
+    gaps, which is the cheap path taken on first use and after an out-of-band
+    schema upgrade.  Returns row counts so callers can report the work done.
+    """
+    conn = conn or get_connection()
+    result = {
+        "canonical": conn.execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0],
+        "projected": conn.execute("SELECT COUNT(*) FROM operational_memory_index").fetchone()[0],
+        "deleted": 0,
+        "rebuilt": 0,
+    }
+    if not force and result["canonical"] == result["projected"]:
+        return result
+
+    columns = ", ".join(_OM_INDEX_COLUMNS)
+    if force:
+        result["deleted"] = conn.execute("DELETE FROM operational_memory_index").rowcount
+        gap_clause = ""
+    else:
+        result["deleted"] = conn.execute(
+            "DELETE FROM operational_memory_index "
+            "WHERE memory_id NOT IN (SELECT memory_id FROM operational_memory)"
+        ).rowcount
+        gap_clause = (
+            "WHERE src.memory_id NOT IN (SELECT memory_id FROM operational_memory_index)"
+        )
+    result["rebuilt"] = conn.execute(
+        f"""
+        INSERT OR REPLACE INTO operational_memory_index ({columns})
+        SELECT src.memory_id,
+{_om_index_value_expr('src')}
+        FROM operational_memory AS src
+        {gap_clause}
+        """
+    ).rowcount
+    result["projected"] = conn.execute(
+        "SELECT COUNT(*) FROM operational_memory_index"
+    ).fetchone()[0]
+    return result
+
+
+def operational_memory_index_drift(conn: sqlite3.Connection | None = None) -> dict:
+    """Report projection rows that are missing or stale relative to the source."""
+    conn = conn or get_connection()
+    missing, stale = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN idx.memory_id IS NULL THEN 1 ELSE 0 END),
+            SUM(CASE WHEN idx.memory_id IS NOT NULL
+                      AND idx.source_updated_at <> COALESCE(json_extract(src.data_json, '$.updated_at'), '')
+                     THEN 1 ELSE 0 END)
+        FROM operational_memory AS src
+        LEFT JOIN operational_memory_index AS idx ON idx.memory_id = src.memory_id
+        """
+    ).fetchone()
+    return {"missing": int(missing or 0), "stale": int(stale or 0)}
+
+
+# Reconciling the projection with the store needs two ``COUNT(*)`` index scans
+# (~11 ms on the live 142k-row corpus), which is too much to pay on every query.
+# ``PRAGMA data_version`` moves when another connection commits and
+# ``Connection.total_changes`` moves for this connection's own writes, so an
+# untouched database is cleared by two constant-time reads instead.
+_OM_INDEX_GUARD: dict = {"fingerprint": None}
+
+
+def operational_memory_index_fingerprint(conn: sqlite3.Connection | None = None) -> tuple:
+    conn = conn or get_connection()
+    return (
+        str(get_db_path()),
+        conn.execute("PRAGMA data_version").fetchone()[0],
+        conn.total_changes,
+    )
+
+
+def ensure_operational_memory_index_cheap(conn: sqlite3.Connection | None = None) -> dict | None:
+    """Reconcile only when a write could have invalidated the projection.
+
+    Returns the reconciliation result, or ``None`` when the guard short-circuited.
+    """
+    conn = conn or get_connection()
+    if _OM_INDEX_GUARD["fingerprint"] == operational_memory_index_fingerprint(conn):
+        return None
+    result = ensure_operational_memory_index(conn)
+    _OM_INDEX_GUARD["fingerprint"] = operational_memory_index_fingerprint(conn)
+    return result
 
 def init_db():
     db_path = get_db_path()
@@ -284,6 +703,7 @@ def _init_db_once(db_key: str):
             conn.execute("ALTER TABLE operational_memory ADD COLUMN ttl REAL")
         except sqlite3.OperationalError:
             pass
+        _create_operational_memory_index(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claim_graph_nodes (
                 node_id TEXT PRIMARY KEY,
@@ -395,10 +815,28 @@ def _init_db_once(db_key: str):
             "CREATE INDEX IF NOT EXISTS idx_jobs_ready "
             "ON jobs(status, available_at, lease_until, created_at)"
         )
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
-            "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
-        )
+        # Same defence-in-depth trade as idx_mutation_outbox_idempotency above:
+        # a database written by a release that predates this index can already
+        # hold duplicate keys, and failing here would make init_db() - and
+        # therefore every command in a fresh process - unusable.
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
+                "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+            )
+        except sqlite3.IntegrityError:
+            duplicate_groups = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT idempotency_key FROM jobs "
+                "WHERE idempotency_key IS NOT NULL "
+                "GROUP BY idempotency_key HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+            log.error(
+                "Skipping idx_jobs_idempotency: jobs already holds %s duplicated "
+                "idempotency_key group(s) written by an earlier release. "
+                "Idempotency is still enforced by the SELECT in enqueue_job(); "
+                "clean the duplicates to reclaim the index.",
+                duplicate_groups,
+            )
         
         # Add expression-based indexes for performance
         try:
@@ -411,6 +849,10 @@ def _init_db_once(db_key: str):
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_status ON operational_memory (json_extract(data_json, '$.status'))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_source_claim ON operational_memory (json_extract(data_json, '$.source_claim_id'))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_key ON operational_memory (memory_type, json_extract(data_json, '$.memory_key'))")
+            # ``timeline_projection_parity`` runs on every timeline query and used
+            # to full-scan ``claims`` because the claim_type predicate had no
+            # index.  The expression text must match the query verbatim.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_claim_type ON claims (json_extract(data_json, '$.claim_type'))")
         except sqlite3.OperationalError as e:
             # Older SQLite versions might not support expression indexes
             import logging

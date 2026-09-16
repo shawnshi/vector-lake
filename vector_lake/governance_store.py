@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
@@ -14,7 +15,12 @@ from pathlib import Path
 from filelock import FileLock
 
 from vector_lake.claim_extractor import extract_page_objects
-from vector_lake.db_store import get_connection, init_db, transaction
+from vector_lake.db_store import (
+    ensure_operational_memory_index_cheap,
+    get_connection,
+    init_db,
+    transaction,
+)
 from vector_lake.wiki_utils import (
     get_meta_dir,
     get_wiki_dir,
@@ -1041,39 +1047,66 @@ def _memory_relevance(memory: dict, terms: list[str]) -> float:
     return score
 
 
-def search_operational_memory(
-    query: str,
-    top_k: int = 12,
-    memory_types: list[str] | None = None,
-    include_history: bool = False,
-) -> list[dict]:
+HIDDEN_MEMORY_STATES = frozenset({"archived", "expired", "superseded"})
+
+
+def _memory_score_value(value) -> float:
+    """Coerce a stored ``memory_score`` to a sortable float.
+
+    ``None`` must not reach the sort key: the previous inline
+    ``memory.get("memory_score", 0)`` returns ``None`` for an explicitly null
+    field and then raised ``TypeError`` inside ``list.sort``.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_memory_types(memory_types: list[str] | None) -> set[str] | None:
+    if not memory_types:
+        return None
+    return {str(item).strip().lower().replace("-", "_") for item in memory_types}
+
+
+def _load_memory_items() -> list[dict]:
+    """Load the operational-memory store, rebuilding it when it is empty."""
     store = load_memory_objects()
     if not store.get("items") and load_claims().get("items"):
         store = rebuild_operational_memory()
+    return list(store.get("items", {}).values())
 
-    allowed_types = None
-    if memory_types:
-        allowed_types = {str(item).strip().lower().replace("-", "_") for item in memory_types}
 
-    terms = _query_terms(query)
+def score_memory_items(
+    memories,
+    terms: list[str],
+    top_k: int,
+    allowed_types: set[str] | None = None,
+    include_history: bool = False,
+) -> list[dict]:
+    """Rank an already-loaded memory collection by relevance, then memory score.
+
+    Split out of :func:`search_operational_memory` so a caller that needs both
+    the active and the history-inclusive view (the Memory Packet) scores one
+    loaded collection twice instead of loading the whole store twice.
+    """
     ranked = []
-    hidden_states = {"archived", "expired", "superseded"}
-    for memory in store.get("items", {}).values():
+    for memory in memories:
         memory_type = str(memory.get("memory_type", "fact")).lower()
         if allowed_types and memory_type not in allowed_types:
             continue
         state = str(memory.get("validity_state", "active")).lower()
-        if not include_history and state in hidden_states:
+        if not include_history and state in HIDDEN_MEMORY_STATES:
             continue
         relevance = _memory_relevance(memory, terms)
         if relevance <= 0 and terms:
             continue
-        score = relevance + (float(memory.get("memory_score", 0) or 0) * 5)
+        score = relevance + (_memory_score_value(memory.get("memory_score")) * 5)
         # ⚡ Bolt: Store the score values as sort keys with a reference to the un-copied memory object.
         # This delays expensive deepcopies until *after* top_k elements are selected.
         ranked.append((
             round(score, 4),
-            memory.get("memory_score", 0),
+            _memory_score_value(memory.get("memory_score")),
             _dt_rank(memory.get("updated_at")),
             memory
         ))
@@ -1090,6 +1123,316 @@ def search_operational_memory(
         results.append(item)
 
     return results
+
+
+MEMORY_SEARCH_BACKEND_ENV = "VECTOR_LAKE_MEMORY_SEARCH"
+MEMORY_SEARCH_RESULT_WINDOW = 4
+MEMORY_SEARCH_BACKENDS = ("gram", "index", "legacy")
+
+
+def _memory_search_backend() -> str:
+    """``gram`` (default) uses the n-gram index, ``index`` the projected scan.
+
+    ``legacy`` forces the original full-table JSON scan; it is the differential
+    oracle the other two backends are tested against, and an operator escape hatch.
+    """
+    backend = str(os.environ.get(MEMORY_SEARCH_BACKEND_ENV, "gram") or "gram").strip().lower()
+    return backend if backend in MEMORY_SEARCH_BACKENDS else "gram"
+
+
+def _gram_memory_candidates(
+    terms: list[str],
+    allowed_types: set[str] | None,
+    include_history: bool,
+    window: int,
+) -> list[str] | None:
+    """Exact relevance from the n-gram index, ordered by the documented key.
+
+    Returns ``None`` when the index cannot answer (not built, or a backlog large
+    enough that draining it inside a read would not be bounded).
+    """
+    from vector_lake import memory_gram_index
+
+    if not memory_gram_index.ensure_memory_gram_index():
+        return None
+    conn = get_connection()
+    if not terms:
+        # No terms means "everything, ordered by memory score" for the legacy
+        # scorer; skipping the index is both correct and far cheaper.
+        sql = (
+            "SELECT memory_id FROM operational_memory_index"
+        )
+        params: list = []
+        where = []
+        if allowed_types:
+            where.append("memory_type IN (%s)" % ",".join("?" for _ in allowed_types))
+            params.extend(sorted(allowed_types))
+        if not include_history:
+            where.append("validity_state NOT IN (%s)" % ",".join("?" for _ in HIDDEN_MEMORY_STATES))
+            params.extend(sorted(HIDDEN_MEMORY_STATES))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += (
+            " ORDER BY ROUND(5 * memory_score, 4) DESC, memory_score DESC,"
+            " updated_rank DESC, source_rowid ASC"
+            f" LIMIT {int(window)}"
+        )
+        return [str(row[0]) for row in conn.execute(sql, params)]
+
+    relevance = memory_gram_index.accumulate_relevance(
+        terms, skip_docs=memory_gram_index.skip_doc_set(conn)
+    )
+    if not relevance:
+        return []
+
+    # ``memory_type`` contributes one point per term that is a substring of the
+    # type name; that is a per-type constant rather than a per-document lookup.
+    type_weights: dict[str, int] = {}
+    for memory_type in _distinct_memory_types():
+        weight = sum(1 for term in terms if term and term in memory_type)
+        if weight:
+            type_weights[memory_type] = weight
+
+    rows: list[tuple] = []
+    ordered = sorted(relevance.items())
+    for start in range(0, len(ordered), 4000):
+        chunk = ordered[start : start + 4000]
+        by_doc = dict(chunk)
+        placeholders = ",".join("?" for _ in chunk)
+        params: list = [doc for doc, _ in chunk]
+        sql = (
+            "SELECT rowid, memory_id, memory_type, memory_score, updated_rank, source_rowid "
+            f"FROM operational_memory_index WHERE rowid IN ({placeholders})"
+        )
+        if allowed_types:
+            sql += " AND memory_type IN (%s)" % ",".join("?" for _ in allowed_types)
+            params.extend(sorted(allowed_types))
+        if not include_history:
+            sql += " AND validity_state NOT IN (%s)" % ",".join("?" for _ in HIDDEN_MEMORY_STATES)
+            params.extend(sorted(HIDDEN_MEMORY_STATES))
+        for row in get_connection().execute(sql, params):
+            doc = int(row["rowid"])
+            memory_score = _memory_score_value(row["memory_score"])
+            total = by_doc[doc] + type_weights.get(str(row["memory_type"]), 0)
+            rows.append((
+                round(total + memory_score * 5, 4),
+                memory_score,
+                float(row["updated_rank"] or 0.0),
+                int(row["source_rowid"] or 0),
+                str(row["memory_id"]),
+            ))
+    # ``score`` / ``memory_score`` / ``updated_rank`` descending with ``source_rowid``
+    # *ascending*: the legacy stable sort keeps the store's natural order for full
+    # ties, and ``reverse=True`` over the whole tuple would invert that last key.
+    rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+    return [row[4] for row in rows[:window]]
+
+
+def _distinct_memory_types() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            str(row[0])
+            for row in get_connection().execute(
+                "SELECT DISTINCT memory_type FROM operational_memory_index"
+            )
+        )
+    )
+
+
+def _indexed_memory_candidates(
+    terms: list[str],
+    allowed_types: set[str] | None,
+    include_history: bool,
+    limit: int,
+) -> list[str]:
+    """Top ``limit`` memory ids by the projected relevance score.
+
+    The predicate is an exact restatement of :func:`_memory_relevance` over the
+    columns maintained by ``operational_memory_index``: a row is excluded only
+    when its relevance would be 0, which the Python scorer drops as well.  The
+    per-term contribution of ``memory_type`` is hoisted into a single ``CASE``
+    because the type is one of a handful of literals, which removes one
+    ``instr()`` per row per term -- the dominant cost of a plain scan.
+    """
+    conn = get_connection()
+    params: list = []
+
+    def bound(value) -> str:
+        params.append(value)
+        return f"?{len(params)}"
+
+    relevance_parts = []
+    candidate_parts = []
+    for term in terms:
+        key_param = bound(term)
+        text_param = bound(term)
+        page_param = bound(term)
+        relevance_parts.append(
+            f"4 * (instr(key_blob, {key_param}) > 0)"
+            f" + 3 * (instr(text_blob, {text_param}) > 0)"
+            f" + (instr(page_blob, {page_param}) > 0)"
+        )
+        candidate_parts.append(
+            f"(instr(key_blob, {key_param}) > 0"
+            f" OR instr(text_blob, {text_param}) > 0"
+            f" OR instr(page_blob, {page_param}) > 0)"
+        )
+
+    type_weight_cases = []
+    type_hits = []
+    for memory_type in _distinct_memory_types():
+        weight = sum(1 for term in terms if term and term in memory_type)
+        if not weight:
+            continue
+        type_hits.append(memory_type)
+        type_weight_cases.append(f"WHEN {bound(memory_type)} THEN {bound(float(weight))}")
+    if type_weight_cases:
+        relevance_parts.append(f"(CASE memory_type {' '.join(type_weight_cases)} ELSE 0 END)")
+        candidate_parts.append(
+            "memory_type IN (%s)" % ", ".join(bound(item) for item in type_hits)
+        )
+    relevance = " + ".join(relevance_parts) if relevance_parts else "0"
+
+    where = []
+    if allowed_types:
+        where.append("memory_type IN (%s)" % ", ".join(bound(item) for item in sorted(allowed_types)))
+    if not include_history:
+        where.append(
+            "validity_state NOT IN (%s)"
+            % ", ".join(bound(item) for item in sorted(HIDDEN_MEMORY_STATES))
+        )
+    if candidate_parts:
+        where.append("(" + " OR ".join(candidate_parts) + ")")
+
+    sql = (
+        f"SELECT memory_id, ({relevance}) AS relevance FROM operational_memory_index"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += (
+        " ORDER BY ROUND(relevance + 5 * memory_score, 4) DESC,"
+        " memory_score DESC, updated_rank DESC, source_rowid ASC"
+        f" LIMIT {int(limit)}"
+    )
+    return [str(row["memory_id"]) for row in conn.execute(sql, params)]
+
+
+def _memory_payloads(memory_ids: list[str]) -> list[dict]:
+    """Decode only the payloads the exact scorer still needs to see.
+
+    Rows are returned in ``memory_ids`` order: the downstream scorer is a stable
+    sort, so for a tie group the retained order is exactly the one the SQL
+    pre-selection chose.  Returning the rows in plan order instead would silently
+    reshuffle ties relative to the full-scan oracle.
+    """
+    if not memory_ids:
+        return []
+    conn = get_connection()
+    by_id: dict[str, dict] = {}
+    for start in range(0, len(memory_ids), 400):
+        chunk = memory_ids[start : start + 400]
+        placeholders = ", ".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT memory_id, data_json FROM operational_memory WHERE memory_id IN ({placeholders})",
+            chunk,
+        ):
+            by_id[str(row["memory_id"])] = json.loads(row["data_json"])
+    return [by_id[memory_id] for memory_id in memory_ids if memory_id in by_id]
+
+
+def search_operational_memory(
+    query: str,
+    top_k: int = 12,
+    memory_types: list[str] | None = None,
+    include_history: bool = False,
+) -> list[dict]:
+    allowed_types = _normalize_memory_types(memory_types)
+    terms = _query_terms(query)
+    backend = _memory_search_backend()
+
+    if backend == "legacy":
+        return score_memory_items(
+            _load_memory_items(), terms, top_k,
+            allowed_types=allowed_types, include_history=include_history,
+        )
+
+    # Creating the projection, its triggers and the initial backfill is memoised
+    # per database path inside db_store.  The reconciliation that follows is
+    # short-circuited by a data_version/total_changes guard, so in steady state
+    # the self-healing check costs two constant-time reads -- and it lives inside
+    # the guard because a projection that has been dropped outright must degrade
+    # to the full scan rather than raise from the repair attempt.
+    window = max(top_k * MEMORY_SEARCH_RESULT_WINDOW, top_k + 16)
+    try:
+        initialize_meta_store()
+        ensure_operational_memory_index_cheap()
+        if backend == "gram":
+            memory_ids = _gram_memory_candidates(terms, allowed_types, include_history, window)
+            if memory_ids is not None:
+                if not memory_ids:
+                    return []
+                return score_memory_items(
+                    _memory_payloads(memory_ids), terms, top_k,
+                    allowed_types=allowed_types, include_history=include_history,
+                )
+            log.info(
+                "Memory gram index is not usable; answering from the projected scan "
+                "(run rebuild_memory_gram_index to restore the indexed path)."
+            )
+        memory_ids = _indexed_memory_candidates(terms, allowed_types, include_history, window)
+    except sqlite3.Error as exc:
+        log.warning(
+            "Operational memory index unavailable (%s: %s); falling back to the full scan.",
+            type(exc).__name__, exc,
+        )
+        return score_memory_items(
+            _load_memory_items(), terms, top_k,
+            allowed_types=allowed_types, include_history=include_history,
+        )
+
+    if not memory_ids:
+        # An empty result is legitimate (nothing matched).  An empty memory store
+        # with canonical claims present is not: that is the bootstrap case the
+        # legacy path repaired by rebuilding memory from claims.
+        if not get_connection().execute("SELECT COUNT(*) FROM operational_memory").fetchone()[0]:
+            refreshed = rebuild_operational_memory() if load_claims().get("items") else None
+            if refreshed and refreshed.get("items"):
+                return score_memory_items(
+                    list(refreshed["items"].values()), terms, top_k,
+                    allowed_types=allowed_types, include_history=include_history,
+                )
+        return []
+
+    # Re-score the SQL window with the oracle so the returned ordering is the one
+    # the previous implementation produced, not SQL's rounding of it.
+    return score_memory_items(
+        _memory_payloads(memory_ids), terms, top_k,
+        allowed_types=allowed_types, include_history=include_history,
+    )
+
+
+def search_memory_packet_views(
+    query: str,
+    active_top_k: int = 24,
+    history_top_k: int = 12,
+) -> tuple[list[dict], list[dict]]:
+    """Return ``(active, history_inclusive)`` slices for the Memory Packet.
+
+    Irrespective of backend this is two retrievals, but they share the loaded
+    collection (``legacy``) or the projected scan (``index``) instead of
+    decoding the whole ``operational_memory`` table twice per query.
+    """
+    terms = _query_terms(query)
+    if _memory_search_backend() == "legacy":
+        memories = _load_memory_items()
+        return (
+            score_memory_items(memories, terms, active_top_k, include_history=False),
+            score_memory_items(memories, terms, history_top_k, include_history=True),
+        )
+    return (
+        search_operational_memory(query, top_k=active_top_k, include_history=False),
+        search_operational_memory(query, top_k=history_top_k, include_history=True),
+    )
 
 
 def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:

@@ -181,3 +181,143 @@ def test_apply_change_set_rolls_back_claim_when_timeline_projection_fails(isolat
     conn = db_store.get_connection()
     assert conn.execute("SELECT COUNT(*) FROM claims WHERE claim_id = ?", (claim["claim_id"],)).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM timeline_events").fetchone()[0] == 0
+
+
+def _insert_timeline_claim(conn, claim_id: str, text: str, payload: dict, updated_at: str) -> None:
+    with db_store.transaction():
+        conn.execute(
+            "INSERT OR REPLACE INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim_id, text, "active", json.dumps(payload), updated_at),
+        )
+
+
+def test_filtered_search_works_on_the_canonical_fallback(isolated_memory):
+    """The fallback must not reference ``claims.entity_id``, which does not exist.
+
+    ``timeline_events`` is left deliberately stale so the projection branch is
+    skipped, which is the only state in which the canonical fallback runs.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    payload = {
+        "claim_type": "timeline-event",
+        "subject_entity_ids": ["Vendor_Fallback"],
+        "source_ids": ["Source_Fallback"],
+        "action": "Release",
+        "sentiment": "positive",
+    }
+    _insert_timeline_claim(
+        conn,
+        "claim_fallback",
+        "[2026-05-02] [Release] Vendor_Fallback shipped.",
+        payload,
+        "2026-07-14T00:00:00+00:00",
+    )
+
+    # Leave the projection non-empty but wrong so the drift note is exercised too.
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO timeline_events "
+            "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("stale-row", "2000-01-01", "old", "neutral", "Stale", "", "", "", "2000-01-01"),
+        )
+
+    output = search_timeline_events(entity_name="Vendor_Fallback", limit=5)
+
+    assert "no such column" not in output
+    assert "Vendor_Fallback shipped." in output
+    assert output.startswith("[DEGRADED]")
+
+    sentiment_miss = search_timeline_events(sentiment="negative", limit=5)
+    assert "Vendor_Fallback shipped." not in sentiment_miss
+    assert "no such column" not in sentiment_miss
+
+
+def test_event_date_comes_from_the_claim_text_prefix(isolated_memory):
+    """Timeline claims carry their event date as a ``[YYYY-MM-DD]`` text prefix."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _insert_timeline_claim(
+        conn,
+        "claim_prefix",
+        "[2026-03-01] [Observation] Event with a text date.",
+        {
+            "claim_type": "timeline-event",
+            "subject_entity_ids": ["Concept_Prefix"],
+            "source_ids": ["Source_Prefix"],
+        },
+        "2026-07-14T00:00:00+00:00",
+    )
+    assert "Rebuilt 1 timeline_events" in rebuild_timeline_events_from_claims(dry_run=False)
+
+    row = conn.execute("SELECT event_date FROM timeline_events").fetchone()
+
+    assert row["event_date"] == "2026-03-01", row["event_date"]
+
+
+def test_parity_cache_follows_claim_writes(isolated_memory):
+    from vector_lake import tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _insert_timeline_claim(
+        conn,
+        "claim_cached",
+        "[2026-04-04] [Release] Cached event.",
+        {
+            "claim_type": "timeline-event",
+            "subject_entity_ids": ["Concept_Cache"],
+            "source_ids": ["Source_Cache"],
+        },
+        "2026-07-14T00:00:00+00:00",
+    )
+    rebuild_timeline_events_from_claims(dry_run=False)
+    assert tool_timeline.timeline_projection_parity()["missing"] == 0
+
+    # A new canonical claim must invalidate the memoised proof.
+    _insert_timeline_claim(
+        conn,
+        "claim_cached_2",
+        "[2026-04-05] [Release] Second cached event.",
+        {
+            "claim_type": "timeline-event",
+            "subject_entity_ids": ["Concept_Cache"],
+            "source_ids": ["Source_Cache"],
+        },
+        "2026-07-15T00:00:00+00:00",
+    )
+
+    assert tool_timeline.timeline_projection_parity()["missing"] == 1
+
+
+def test_parity_cache_follows_out_of_band_projection_writes(isolated_memory):
+    from vector_lake import tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _insert_timeline_claim(
+        conn,
+        "claim_oob",
+        "[2026-04-06] [Release] Out of band event.",
+        {
+            "claim_type": "timeline-event",
+            "subject_entity_ids": ["Concept_Oob"],
+            "source_ids": ["Source_Oob"],
+        },
+        "2026-07-14T00:00:00+00:00",
+    )
+    rebuild_timeline_events_from_claims(dry_run=False)
+    assert tool_timeline.timeline_projection_parity()["missing"] == 0
+
+    with db_store.transaction():
+        conn.execute("DELETE FROM timeline_events")
+        conn.execute(
+            "INSERT INTO timeline_events "
+            "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("zzz-wrong", "2000-01-01", "old", "neutral", "Wrong", "", "", "", "2000-01-01"),
+        )
+
+    assert tool_timeline.timeline_projection_parity()["extra"] == 1

@@ -1,7 +1,9 @@
-import json
 import logging
 import os
 import re
+import threading
+from array import array
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 import functools
@@ -59,16 +61,46 @@ def _passes_filters(node: dict, domain: str | None, cluster: str | None, include
     return True
 
 
+# A query embedding costs one provider round trip and the embedding is a pure
+# function of the query text, so repeats (the common case for an agent that
+# re-asks with a stable phrasing) can be served locally.  Bounded and LRU so a
+# long-lived server cannot grow without limit; vectors are stored as float32
+# because that is what the vector projection consumes anyway.
+QUERY_EMBEDDING_CACHE_SIZE = 256
+_QUERY_EMBEDDING_CACHE: "OrderedDict[str, array]" = OrderedDict()
+_QUERY_EMBEDDING_CACHE_LOCK = threading.Lock()
+
+
+def _cached_query_embedding(query: str):
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        cached = _QUERY_EMBEDDING_CACHE.get(query)
+        if cached is not None:
+            _QUERY_EMBEDDING_CACHE.move_to_end(query)
+        return cached
+
+
+def _store_query_embedding(query: str, values) -> None:
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        _QUERY_EMBEDDING_CACHE[query] = array("f", values)
+        _QUERY_EMBEDDING_CACHE.move_to_end(query)
+        while len(_QUERY_EMBEDDING_CACHE) > QUERY_EMBEDDING_CACHE_SIZE:
+            _QUERY_EMBEDDING_CACHE.popitem(last=False)
+
+
 def _get_query_embedding(query: str) -> tuple[list[float], str | None]:
     """Query vector plus an explicit degradation reason when it is unavailable."""
     if not os.environ.get("GEMINI_API_KEY"):
         return [], "GEMINI_API_KEY is not set"
+    cached = _cached_query_embedding(query)
+    if cached is not None:
+        return list(cached), None
     try:
         from vector_lake.embedding_scheduler import embed_texts
 
         embeddings = embed_texts([query])
         if not embeddings:
             return [], "embedding provider returned no vector"
+        _store_query_embedding(query, embeddings[0])
         return embeddings[0], None
     except Exception as e:
         log.warning(f"Failed to get query embedding: {e}")
@@ -212,8 +244,7 @@ def format_operational_memory_results(query: str, top_k: int = 8, as_xml: bool =
 
 
 def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
-    memories = governance_store.search_operational_memory(query, top_k=24, include_history=False)
-    historical = governance_store.search_operational_memory(query, top_k=12, include_history=True)
+    memories, historical = governance_store.search_memory_packet_views(query)
     stale_or_conflicted = [
         item for item in historical
         if str(item.get("validity_state", "")).lower() in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
@@ -436,10 +467,6 @@ def _safe_eval(expr: str, context: dict) -> bool:
         log.warning(f"Failed to safe_eval expression '{expr}': {e}")
         return False
 
-_INDEX_CACHE = {
-    "mtime": 0.0,
-    "data": None
-}
 
 def _search_scored_pages(
     query: str,
@@ -455,26 +482,16 @@ def _search_scored_pages(
     them directly.  ``assemble_context`` used to re-parse the human-readable
     string with a regex, which silently produced an empty wiki context whenever
     the formatting changed or a title contained the delimiter.
+
+    Nodes and the personalised-PageRank adjacency come from the SQLite projection
+    (``page_index_projection``) instead of a full ``index.json`` parse per process
+    and a full 30 140-edge dict rebuild per query.
     """
-    index_path = str(get_index_path())
-    if not os.path.exists(index_path):
-        return [], [], "Lake is drying. No index.json found, please ingest sources first."
+    from vector_lake import page_index_projection
 
     try:
-        current_mtime = os.path.getmtime(index_path)
-        if _INDEX_CACHE["mtime"] != current_mtime or _INDEX_CACHE["data"] is None:
-            import time
-            for attempt in range(3):
-                try:
-                    with open(index_path, "r", encoding="utf-8") as handle:
-                        _INDEX_CACHE["data"] = json.load(handle)
-                        _INDEX_CACHE["mtime"] = current_mtime
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise e
-                    time.sleep(0.2)
-        index_data = _INDEX_CACHE["data"]
+        if not page_index_projection.ensure_page_index_projection():
+            return [], [], "Lake is drying. No index.json found, please ingest sources first."
     except Exception as e:
         log.error(f"Failed to read index.json: {e}")
         return [], [], "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
@@ -522,27 +539,27 @@ def _search_scored_pages(
     else:
         vector_notes.append(embedding_error or "query embedding unavailable")
 
+    # Only the keys the hybrid stage actually produced are materialised, so the
+    # 7 178-node dict never has to exist in memory.
+    nodes = page_index_projection.nodes_by_key(list(hybrid_scores))
+
     for key, score in hybrid_scores.items():
-        if key in index_data.get('nodes', {}):
-            node = {'_key': key, **index_data['nodes'][key]}
-            if not _passes_filters(node, domain, cluster, include_history, filter_expr):
-                continue
-            if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
-                score *= 0.2
-            scored.append((score, node))
+        node = nodes.get(key)
+        if node is None:
+            continue
+        node = {"_key": key, **node}
+        if not _passes_filters(node, domain, cluster, include_history, filter_expr):
+            continue
+        if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
+            score *= 0.2
+        scored.append((score, node))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
     # P2-1: Dynamic Graph Expansion via Multi-hop PPR (Personalized PageRank)
     top_keys = {node["_key"] for _, node in scored[:5]}
-    if top_keys and index_data.get("weighted_edges"):
-        # Build adjacency list
-        adj = {}
-        for edge in index_data["weighted_edges"]:
-            s, t, w = edge["source"], edge["target"], edge.get("weight", 1.0)
-            adj.setdefault(s, []).append((t, w))
-            adj.setdefault(t, []).append((s, w))
-            
+    adj = page_index_projection.adjacency() if top_keys else None
+    if top_keys and adj:
         # PPR parameters.  Non-seed nodes must still receive teleportation mass,
         # otherwise the walk collapses to "adjacent to a seed" after two steps.
         seed_keys = set(top_keys)
@@ -570,9 +587,11 @@ def _search_scored_pages(
             key=lambda x: x[1], 
             reverse=True
         )
+        expansion_keys = [key for key, _ in sorted_expansions[:expansion_limit]]
+        expanded_nodes = page_index_projection.nodes_by_key(expansion_keys)
         
         for expanded_key, ppr_weight in sorted_expansions[:expansion_limit]:
-            expanded_node = index_data["nodes"].get(expanded_key)
+            expanded_node = expanded_nodes.get(expanded_key)
             if expanded_node is None:
                 continue
             # Graph expansion is an additional candidate source, not an exemption
@@ -721,25 +740,15 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     wiki_context = "".join(wiki_blocks)
 
     index_summary = ""
-    index_path = str(get_index_path())
-    if os.path.exists(index_path):
-        import time
+    if os.path.exists(str(get_index_path())):
+        try:
+            from vector_lake import page_index_projection
 
-        for attempt in range(3):
-            try:
-                with open(index_path, "r", encoding="utf-8") as handle:
-                    index_data = json.load(handle)
-                lines = [
-                    f"[{node.get('type', '?')}] {node.get('title', key)}"
-                    for key, node in list(index_data.get("nodes", {}).items())[:50]
-                ]
-                index_summary = "\n".join(lines)[:index_budget]
-                break
-            except Exception as exc:
-                if attempt == 2:
-                    index_summary = "[Index read failed]"
-                    log.error("Index summary unavailable: %s", exc)
-                time.sleep(0.2)
+            page_index_projection.ensure_page_index_projection()
+            index_summary = "\n".join(page_index_projection.node_summary_lines(50))[:index_budget]
+        except Exception as exc:
+            index_summary = "[Index read failed]"
+            log.error("Index summary unavailable: %s", exc)
 
     # ``purpose`` is the last claimant on the budget and must not overflow it.
     remaining = max_chars - (len(memory_packet["packet"]) + len(wiki_context) + len(index_summary))

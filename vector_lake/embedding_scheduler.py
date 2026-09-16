@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -253,6 +254,41 @@ def _create_client():
     return genai.Client(http_options=types.HttpOptions(timeout=timeout_ms))
 
 
+# ``_create_client()`` measured 1.7-6.9 s per call on the operator machine (the
+# ``google.genai`` import plus auth/transport setup), and it was invoked for
+# every embedding request -- including the single-vector query embedding on the
+# search hot path, where it dominated the 2.4 s retrieve latency.  One client per
+# process is enough; ``httpx`` underneath it is safe for concurrent use.
+#
+# The cache is keyed on the identity of the resolved factory so that rebinding
+# ``_create_client`` (tests, alternate transports) takes effect instead of being
+# silently served a stale client.
+_CLIENT_CACHE: tuple | None = None
+_CLIENT_CACHE_LOCK = threading.Lock()
+
+
+def _shared_client():
+    global _CLIENT_CACHE
+    factory = _create_client
+    cached = _CLIENT_CACHE
+    if cached is not None and cached[0] is factory:
+        return cached[1]
+    with _CLIENT_CACHE_LOCK:
+        cached = _CLIENT_CACHE
+        if cached is not None and cached[0] is factory:
+            return cached[1]
+        client = factory()
+        _CLIENT_CACHE = (factory, client)
+        return client
+
+
+def reset_client_cache() -> None:
+    """Drop the reused embedding client (credential rotation, transport swap)."""
+    global _CLIENT_CACHE
+    with _CLIENT_CACHE_LOCK:
+        _CLIENT_CACHE = None
+
+
 def _validated_response_values(response: Any, expected_count: int, dimension: int) -> list[list[float]]:
     embeddings = list(getattr(response, "embeddings", []) or [])
     if len(embeddings) != expected_count:
@@ -303,7 +339,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     normalized = [str(text)[:config.max_chars_per_item] for text in texts]
     tokens = sum(estimate_embedding_tokens(text) for text in normalized)
     return _request_embeddings(
-        _create_client(),
+        _shared_client(),
         normalized,
         tokens,
         config,
@@ -362,7 +398,7 @@ def embedding_backfill(
     last_error = ""
     consecutive_failures = 0
     try:
-        client = _create_client()
+        client = _shared_client()
         limiter = MinuteRateLimiter(config)
         for batch in batches:
             contents = [item["text"] for item in batch]

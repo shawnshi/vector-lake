@@ -97,6 +97,28 @@ def rebuild_timeline_events(dry_run: bool = True, limit: int = 0) -> str:
     )
 
 @mcp.tool()
+def memory_gram_index_status() -> str:
+    """Report the exact n-gram index used by operational-memory search.
+
+    The index answers ``search_operational_memory`` in ~0.1-0.5 s instead of the
+    O(rows x terms) scan.  When it reports ``usable=False`` the search silently
+    falls back to the slower exact scan; run the rebuild to restore the fast path.
+    """
+    return tools.memory_gram_index_report()
+
+@mcp.tool()
+def rebuild_memory_gram_index(dry_run: bool = True) -> str:
+    """Bulk-rebuild the operational-memory n-gram index (minutes on a large corpus)."""
+    return tools.rebuild_memory_gram_index(dry_run=dry_run)
+
+@mcp.tool()
+def compact_memory_gram_index() -> str:
+    """Merge the n-gram overlay into the base index and prune deleted documents."""
+    merged = tools.compact_memory_gram_overlay(limit_grams=None)
+    retired = tools.prune_retired_gram_docs()
+    return f"compacted {merged}; pruned {retired}"
+
+@mcp.tool()
 def projection_report(limit: int = 20) -> str:
     """Report drift between Wiki pages, SQLite canonical entities, and index.json."""
     return tools.projection_diff_report(limit=limit)

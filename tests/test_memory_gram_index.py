@@ -1,0 +1,208 @@
+"""Differential and maintenance tests for the exact n-gram memory index.
+
+The index is only allowed to be a *performance* change, so the central assertion
+is that its result is identical to the ``legacy`` full-table scan -- including
+the order of tie groups, which is where a naive rewrite silently drifts.
+"""
+
+import json
+
+import pytest
+
+from vector_lake import db_store, governance_store, memory_gram_index
+
+
+def _put(conn, memory_id: str, text: str, memory_type: str = "fact", score: float = 0.6,
+         state: str = "active", page: str | None = None) -> None:
+    payload = {
+        "memory_id": memory_id,
+        "memory_type": memory_type,
+        "memory_key": memory_id,
+        "text": text,
+        "source_page": page if page is not None else f"Concept_{memory_id}.md",
+        "validity_state": state,
+        "memory_score": score,
+        "updated_at": "2026-07-14T00:00:00+00:00",
+    }
+    with db_store.transaction():
+        conn.execute(
+            "INSERT OR REPLACE INTO operational_memory "
+            "(memory_id, memory_type, score, status, ttl, data_json, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (memory_id, memory_type, score, "Active", 365.0,
+             json.dumps(payload, ensure_ascii=False), payload["updated_at"]),
+        )
+
+
+SEED = [
+    ("mem_a", "信创 HIS 集成平台 选型结论", "decision", 0.9),
+    ("mem_b", "医院 电子病历六级 评级 目标", "task_state", 0.7),
+    ("mem_c", "preferred deployment target is Kubernetes", "preference", 0.8),
+    ("mem_d", "DRG 医保支付 合规 运营", "fact", 0.6),
+    ("mem_e", "DRG 结算 清单 质控", "fact", 0.6),
+    ("mem_f", "DRG 病案 首页 上传", "fact", 0.6),
+    ("mem_g", "信创 HIS 旧结论", "decision", 0.5),
+    ("mem_h", "互联互通 五乙 智慧服务 分级 评估", "fact", 0.55),
+    ("mem_i", "unrelated payload", "fact", 0.4),
+    ("mem_j", "公立医院 高质量发展 评价 指标", "fact", 0.65),
+]
+
+
+@pytest.fixture
+def seeded(isolated_memory):
+    db_store.init_db()
+    conn = db_store.get_connection()
+    for memory_id, text, memory_type, score in SEED:
+        _put(conn, memory_id, text, memory_type, score)
+    assert memory_gram_index.ensure_memory_gram_index() is True
+    return isolated_memory
+
+
+def _ids(backend: str, query: str, **kwargs):
+    import os
+
+    os.environ["VECTOR_LAKE_MEMORY_SEARCH"] = backend
+    return [m["memory_id"] for m in governance_store.search_operational_memory(query, **kwargs)]
+
+
+@pytest.mark.parametrize(
+    "query,kwargs",
+    [
+        ("信创 医院 HIS 集成平台", {"top_k": 8}),
+        ("DRG 医保支付", {"top_k": 3}),
+        ("DRG", {"top_k": 8}),
+        ("deployment target", {"top_k": 5}),
+        ("电子病历六级", {"top_k": 5}),
+        ("互联互通 五乙", {"top_k": 5}),
+        ("公立医院高质量发展", {"top_k": 5}),
+        ("unrelated", {"top_k": 5}),
+        ("", {"top_k": 6}),
+        ("信创", {"top_k": 8, "include_history": True}),
+        ("HIS", {"top_k": 8, "memory_types": ["decision"]}),
+        ("DRG", {"top_k": 8, "memory_types": ["fact"]}),
+        ("信创", {"top_k": 8, "memory_types": ["preference"], "include_history": True}),
+        ("医院", {"top_k": 4}),
+    ],
+)
+def test_gram_backend_is_identical_to_the_full_scan(seeded, query, kwargs):
+    assert _ids("gram", query, **kwargs) == _ids("legacy", query, **kwargs)
+
+
+def test_gram_relevance_matches_the_sql_scorer(seeded):
+    conn = db_store.get_connection()
+    for query in ("信创 医院", "DRG", "互联互通 五乙 智慧服务", "x", "HIS 集成平台"):
+        terms = governance_store._query_terms(query)
+        indexed = memory_gram_index.accumulate_relevance(
+            terms, skip_docs=memory_gram_index.skip_doc_set(conn)
+        )
+        reference: dict[int, int] = {}
+        for row in conn.execute(
+            "SELECT rowid, key_blob, text_blob, page_blob, memory_type FROM operational_memory_index"
+        ):
+            relevance = sum(
+                4 * (term in row["key_blob"])
+                + 3 * (term in row["text_blob"])
+                + (term in row["page_blob"])
+                + (term in row["memory_type"])
+                for term in terms
+            )
+            if relevance:
+                reference[int(row["rowid"])] = relevance
+        assert indexed == reference, query
+
+
+def test_text_updates_propagate_through_the_overlay(seeded):
+    conn = db_store.get_connection()
+    _put(conn, "mem_a", "医院 电子病历六级 目标")
+
+    assert memory_gram_index.pending_doc_count() == 1
+    assert _ids("gram", "电子病历 医院", top_k=5) == _ids("legacy", "电子病历 医院", top_k=5)
+    # The read above already drained the queue through its self-heal step.
+    assert memory_gram_index.pending_doc_count() == 0
+    memory_gram_index.flush_memory_gram_dirty()
+    assert _ids("gram", "信创 集成平台", top_k=5) == _ids("legacy", "信创 集成平台", top_k=5)
+
+
+def test_deleted_documents_are_skipped_until_pruned(seeded):
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DELETE FROM operational_memory WHERE memory_id = 'mem_d'")
+
+    assert memory_gram_index.retired_doc_count() == 1
+    assert _ids("gram", "DRG 医保支付 合规", top_k=6) == _ids("legacy", "DRG 医保支付 合规", top_k=6)
+
+    memory_gram_index.flush_memory_gram_dirty(limit_docs=100)
+    assert _ids("gram", "DRG", top_k=6) == _ids("legacy", "DRG", top_k=6)
+
+    assert memory_gram_index.prune_retired_gram_docs()["retired"] == 1
+    assert memory_gram_index.pending_doc_count() == 0
+    assert _ids("gram", "DRG", top_k=6) == _ids("legacy", "DRG", top_k=6)
+
+
+def test_inserted_documents_join_the_index(seeded):
+    conn = db_store.get_connection()
+    _put(conn, "mem_new", "跨机构 影像 云 平台 选型")
+
+    assert _ids("gram", "影像 云 平台", top_k=4) == _ids("legacy", "影像 云 平台", top_k=4)
+
+
+def test_compaction_preserves_results(seeded):
+    conn = db_store.get_connection()
+    for memory_id, text, memory_type, score in SEED[:4]:
+        _put(conn, memory_id, text.replace("DRG", "DIP"), memory_type, score)
+    memory_gram_index.flush_memory_gram_dirty(limit_docs=100)
+    assert memory_gram_index.overlay_row_count() > 0
+
+    result = memory_gram_index.compact_memory_gram_overlay(limit_grams=10_000)
+
+    assert result["grams"] > 0
+    assert memory_gram_index.overlay_row_count() == 0
+    assert _ids("gram", "DIP", top_k=5) == _ids("legacy", "DIP", top_k=5)
+    assert _ids("gram", "医院 HIS", top_k=5) == _ids("legacy", "医院 HIS", top_k=5)
+
+
+def test_rebuild_reports_and_restores_the_base(seeded):
+    dry = memory_gram_index.rebuild_memory_gram_index(dry_run=True)
+    assert "Would rebuild" in dry
+
+    with db_store.transaction():
+        db_store.get_connection().execute("DELETE FROM operational_memory_gram")
+
+    assert memory_gram_index.gram_index_state()["ready"] is False
+    assert memory_gram_index.gram_index_usable() is False
+    # A short corpus is rebuilt automatically on first use.
+    assert memory_gram_index.ensure_memory_gram_index() is True
+    assert _ids("gram", "信创 医院", top_k=5) == _ids("legacy", "信创 医院", top_k=5)
+
+
+def test_backend_falls_back_when_the_index_tables_are_missing(seeded):
+    with db_store.transaction():
+        db_store.get_connection().execute("DROP TABLE operational_memory_gram")
+
+    assert _ids("gram", "DRG", top_k=4) == _ids("legacy", "DRG", top_k=4)
+
+
+def test_composite_terms_need_real_adjacency(seeded):
+    conn = db_store.get_connection()
+    # Every bigram of "医院电子" exists somewhere, but no document contains the run,
+    # so the composite term must contribute nothing.  The query as a whole still
+    # matches on the single-character terms, and must match the oracle exactly.
+    terms = governance_store._query_terms("医院电子")
+    indexed = memory_gram_index.accumulate_relevance(
+        terms, skip_docs=memory_gram_index.skip_doc_set(conn)
+    )
+    composite_only = memory_gram_index.accumulate_relevance(
+        ["医院电子"], skip_docs=memory_gram_index.skip_doc_set(conn)
+    )
+
+    assert composite_only == {}
+    assert indexed
+    assert _ids("gram", "医院电子", top_k=5) == _ids("legacy", "医院电子", top_k=5)
+
+
+def test_index_report_is_operator_readable(seeded, monkeypatch):
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_SEARCH", "gram")
+    report = memory_gram_index.memory_gram_index_report()
+
+    assert "ready=True" in report
+    assert "usable=True" in report
+    assert "backend=gram" in report

@@ -13,6 +13,12 @@ from vector_lake.tool_search import assemble_context, search_vector_lake
 from vector_lake.tool_sync import sync_vector_lake
 from vector_lake.tool_trace import trace_vector_lake
 from vector_lake.tool_timeline import rebuild_timeline_events_from_claims
+from vector_lake.memory_gram_index import (
+    compact_memory_gram_overlay,
+    memory_gram_index_report,
+    prune_retired_gram_docs,
+    rebuild_memory_gram_index,
+)
 from vector_lake.tool_projection import (
     canonical_backfill_missing_wiki,
     embedding_backfill_projection,
@@ -50,6 +56,10 @@ __all__ = [
     "review_vector_lake",
     "review_strategic_purpose",
     "rebuild_timeline_events_from_claims",
+    "rebuild_memory_gram_index",
+    "compact_memory_gram_overlay",
+    "prune_retired_gram_docs",
+    "memory_gram_index_report",
     "search_vector_lake",
     "sync_vector_lake",
     "trace_vector_lake",

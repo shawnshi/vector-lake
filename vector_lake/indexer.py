@@ -278,6 +278,15 @@ def _write_index(output_path: str, index_data: dict):
     if removed:
         log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
     _write_json_payload(output_path, index_data)
+    # Keep the SQLite read projection in step with the file it projects.  Done here
+    # rather than only lazily on read, because the ingest path rewrites index.json
+    # once per page and a lazy rebuild would then cost a full parse per search.
+    try:
+        from vector_lake import page_index_projection
+
+        page_index_projection.refresh_page_index_projection(index_data)
+    except Exception as exc:  # noqa: BLE001 - the file stays sovereign; reads self-heal
+        log.warning("Page index projection refresh failed: %s: %s", type(exc).__name__, exc)
 
 
 def _write_claim_graph(output_path: str, claim_graph_data: dict):
@@ -1200,10 +1209,7 @@ def refresh_graph_topology_if_dirty() -> bool:
                         needs_full_rebuild = True
                     elif is_graph_dirty(index_data):
                         _apply_graph_topology(index_data)
-                        temp_path = output_path + ".tmp"
-                        with open(temp_path, "w", encoding="utf-8") as handle:
-                            json.dump(index_data, handle, ensure_ascii=False, separators=(",", ":"))
-                        _replace_with_retry(temp_path, output_path)
+                        _write_index(output_path, index_data)
                         log.info("Graph topology partially refreshed and saved.")
                         changed = True
     except Timeout:
