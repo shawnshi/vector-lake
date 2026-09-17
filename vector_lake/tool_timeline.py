@@ -12,15 +12,38 @@ from vector_lake.db_store import get_connection
 _TEXT_EVENT_DATE = re.compile(r"^\s*\[(\d{4}-\d{2}-\d{2})\]")
 
 
-def claim_event_date(row, data: dict) -> str:
-    """Canonical event date: temporal anchor, else the text prefix, else updated_at."""
+def _stable_event_date(row, data: dict):
+    """The event date from a source that an unrelated rewrite cannot move.
+
+    A temporal anchor or a dated text prefix is part of the claim's content;
+    ``updated_at`` is not, so it is never allowed here.
+    """
     for candidate in (data.get("temporal_anchor"), data.get("event_date")):
         if candidate:
             return str(candidate)
     match = _TEXT_EVENT_DATE.match(str(row["claim_text"] or ""))
-    if match:
-        return match.group(1)
-    return str(row["updated_at"] or "Unknown Date")
+    return match.group(1) if match else None
+
+
+def claim_event_date(row, data: dict) -> str:
+    """Canonical event date for display: stable source, else the text prefix, else updated_at."""
+    stable = _stable_event_date(row, data)
+    return stable if stable is not None else str(row["updated_at"] or "Unknown Date")
+
+
+def identity_event_date(row, data: dict) -> str:
+    """The date component allowed into the content-addressed event id.
+
+    Only :func:`_stable_event_date` qualifies.  The id used to be
+    ``sha256(claim_id, event_date, text)`` with ``event_date`` taken from
+    :func:`claim_event_date`, i.e. from ``updated_at`` for the 2444 of 9996 live
+    timeline claims that carry no anchor and no dated text.  Every rewrite of such
+    a claim therefore minted a new id, and unless the delta sync was handed the
+    exact previous row the old ``timeline_events`` row was orphaned for good.
+
+    Displaying the fallback is fine; identifying a row by it is not.
+    """
+    return _stable_event_date(row, data) or ""
 
 
 def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> dict:
@@ -34,7 +57,8 @@ def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> d
     event_date = claim_event_date(row, data)
     description = row["claim_text"]
     entity_id = entities[0] if entities else ""
-    stable_raw = "\0".join([str(row["claim_id"]), str(event_date), str(description)])
+    # Identity uses only immutable inputs; ``event_date`` above is presentation.
+    stable_raw = "\0".join([str(row["claim_id"]), identity_event_date(row, data), str(description)])
     return {
         "id": hashlib.sha256(stable_raw.encode("utf-8")).hexdigest()[:24],
         "event_date": str(event_date),

@@ -381,6 +381,66 @@ def test_timeline_repair_closes_drift_and_leaves_correct_rows_untouched(isolated
     ).fetchone()["extracted_at"] == extracted_before
 
 
+def test_event_identity_ignores_updated_at_for_a_date_less_claim(isolated_memory):
+    """Regression gate: an ``updated_at`` change must not move a claim's event id.
+
+    The id used to be derived from ``claim_event_date``, which falls back to
+    ``updated_at`` when a claim carries no anchor and no dated text.  Every rewrite
+    of such a claim therefore minted a new id and orphaned the previous
+    ``timeline_events`` row unless the delta sync was handed the exact previous
+    row -- the drift class that kept regenerating on the live corpus (7 pairs on
+    ``Concept_OperationalFacts`` were the last specimen).
+    """
+    from vector_lake import tool_timeline as tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    payload = {
+        "claim_type": "timeline-event",
+        "subject_entity_ids": ["Concept_Ops"],
+        "source_ids": ["Source_Ops"],
+    }
+    text = "战略价值：多模态医疗推理可通过中间层的状态缓存实现连续推演。"
+    _insert_timeline_claim(conn, "claim_dateless", text, dict(payload), "2026-06-01T00:00:00+00:00")
+    rebuild_timeline_events_from_claims(dry_run=False)
+    assert tool_timeline.timeline_projection_parity()["missing"] == 0
+    before = conn.execute("SELECT id FROM timeline_events").fetchone()["id"]
+
+    # The same claim written again with a fresh timestamp, and the delta sync is
+    # deliberately NOT called -- the id must not have moved, so nothing is orphaned.
+    _insert_timeline_claim(conn, "claim_dateless", text, dict(payload), "2026-09-17T04:33:42+00:00")
+
+    parity = tool_timeline.timeline_projection_parity()
+    assert parity["missing"] == 0, parity
+    assert parity["extra"] == 0, parity
+    assert conn.execute("SELECT id FROM timeline_events").fetchone()["id"] == before
+
+
+def test_event_identity_still_follows_the_claim_content(isolated_memory):
+    """Content addressing stays meaningful: changed text is still a new identity."""
+    from vector_lake import tool_timeline as tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    payload = {
+        "claim_type": "timeline-event",
+        "subject_entity_ids": ["Concept_Ops"],
+        "source_ids": ["Source_Ops"],
+    }
+    _insert_timeline_claim(conn, "claim_dated", "[2026-04-07] [Release] Original.", dict(payload), "2026-06-01T00:00:00+00:00")
+    first = conn.execute(
+        "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE claim_id = 'claim_dated'"
+    ).fetchone()
+    first_id = tool_timeline._event_from_claim_row(first)["id"]
+
+    _insert_timeline_claim(conn, "claim_dated", "[2026-04-07] [Release] Rewritten.", dict(payload), "2026-06-01T00:00:00+00:00")
+    second = conn.execute(
+        "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE claim_id = 'claim_dated'"
+    ).fetchone()
+
+    assert tool_timeline._event_from_claim_row(second)["id"] != first_id
+
+
 def test_timeline_repair_is_a_noop_when_parity_is_clean(isolated_memory):
     from vector_lake import tool_timeline
 
