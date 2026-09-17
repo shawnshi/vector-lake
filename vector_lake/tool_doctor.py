@@ -6,8 +6,15 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vector_lake.wiki_utils import get_index_path, get_memory_dir, get_raw_dir, get_wiki_dir, get_meta_dir
-from vector_lake.db_store import get_db_path, get_connection
+from vector_lake.wiki_utils import (
+    get_index_path,
+    get_memory_dir,
+    get_raw_dir,
+    get_wiki_dir,
+    get_meta_dir,
+    wiki_page_keys,
+)
+from vector_lake.db_store import get_db_path, get_connection, idempotency_index_state
 from vector_lake import get_extension_root
 from vector_lake.native_llm import native_llm_ready
 from vector_lake.runtime_health import assess_runtime_health
@@ -107,6 +114,29 @@ def doctor_vector_lake() -> str:
     for label, path in [("Meta", get_meta_dir()), ("SQLite DB", get_db_path())]:
         checks.append((label, path.exists(), str(path)))
 
+    # 3b. Backup footprint against the retention bound.
+    try:
+        from vector_lake.backup_retention import plan_backup_retention
+
+        plan = plan_backup_retention(get_meta_dir() / "backups")
+        detail = (
+            f"{plan['entry_count']} entr(ies), {plan['total_bytes'] / 1024 ** 3:.2f} GiB total; "
+            f"bound keep<={plan['keep_count']} and <= {plan['max_bytes'] / 1024 ** 3:.1f} GiB"
+        )
+        if plan["remove"]:
+            detail += (
+                f"; {len(plan['remove'])} prunable ({plan['removable_bytes'] / 1024 ** 3:.2f} GiB)"
+            )
+            warnings.append(
+                f"backup_footprint_over_bound:{plan['total_bytes'] / 1024 ** 3:.2f}GiB "
+                f"({len(plan['remove'])} entr(ies) prunable by prune_backups)"
+            )
+        if plan["unrecognized"]:
+            detail += f"; unrecognized (never pruned): {', '.join(plan['unrecognized'][:3])}"
+        checks.append(("Backups", not plan["remove"], detail))
+    except Exception as e:
+        checks.append(("Backups", False, f"Check failed: {e}"))
+
     # 4. AST Compilation Checks
     ext_root = get_extension_root()
     for mod in ["mcp_server.py", "watchdog_app.py", "tool_ingest.py"]:
@@ -157,10 +187,7 @@ def doctor_vector_lake() -> str:
     # 7. State Projection Consistency
     try:
         excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
-        wiki_keys = {
-            path.stem for path in get_wiki_dir().glob("*.md")
-            if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
-        }
+        wiki_keys = wiki_page_keys(get_wiki_dir(), excluded)
         with open(get_index_path(), "r", encoding="utf-8") as f:
             index_keys = {
                 key for key in json.load(f).get("nodes", {})
@@ -186,7 +213,15 @@ def doctor_vector_lake() -> str:
             f"missing_index:{len(missing_index)} extra_index:{len(extra_index)} "
             f"missing_canonical:{len(missing_canonical)} extra_canonical:{len(extra_canonical)}",
         ))
+    except Exception as e:
+        checks.append(("State Consistency", False, f"Check failed: {e}"))
 
+    # 7b. Database state.  Kept in its own block because the file projection above
+    # can be missing or half-written (a drying lake, a rebuild in flight), and a
+    # single shared ``try`` used to hide the whole SQLite surface -- outbox, jobs
+    # and the write gate -- behind one missing ``index.json``.
+    try:
+        conn = get_connection()
         outbox_counts = {
             row["status"]: row["count"]
             for row in conn.execute("SELECT status, COUNT(*) AS count FROM mutation_outbox GROUP BY status")
@@ -220,7 +255,33 @@ def doctor_vector_lake() -> str:
         for item in degraded:
             warnings.append(item)
     except Exception as e:
-        checks.append(("State Consistency", False, f"Check failed: {e}"))
+        checks.append(("Database State", False, f"Check failed: {e}"))
+
+    # 7c. The uniqueness guarantee these tables actually end up with.
+    # ``full`` = a key may never repeat.  ``active`` = the table already held
+    # duplicate history, so uniqueness is enforced over non-terminal rows only
+    # (the population a concurrent enqueue can collide in).  ``absent`` means only
+    # the BEGIN IMMEDIATE write lock is left.
+    try:
+        idempotency = idempotency_index_state()
+        absent = [table for table, state in idempotency.items() if state["uniqueness"] == "absent"]
+        checks.append((
+            "Idempotency Index",
+            not absent,
+            ", ".join(
+                f"{table}={state['uniqueness']}(dups={state['duplicate_groups']})"
+                for table, state in sorted(idempotency.items())
+            ),
+        ))
+        for table, state in sorted(idempotency.items()):
+            if state["uniqueness"] != "full":
+                warnings.append(
+                    f"idempotency_index_degraded:{table}={state['uniqueness']} "
+                    f"({state['duplicate_groups']} duplicate group(s); "
+                    f"repair_idempotency_keys('{table}') reclaims the full index)"
+                )
+    except Exception as e:
+        checks.append(("Idempotency Index", False, f"Check failed: {e}"))
 
     lines = ["=== Vector Lake Doctor ==="]
     all_ok = True

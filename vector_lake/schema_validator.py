@@ -19,6 +19,11 @@ VALID_H3_SLOTS = {
 
 VALID_TYPES = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
 
+# Conditional slot: required on Section 1 exactly when the frontmatter declares
+# ``tension_edges``.  Exported so the merge path can reproduce the same allow-list
+# instead of duplicating the literal.
+TENSION_H3_SLOT = "### 认知张力与未决争议 (Controversies & Tensions)"
+
 VALID_CATEGORIES = {
     "Uncategorized",
     "Artificial_Intelligence",
@@ -181,15 +186,15 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
         h3_headers = re.findall(r'^###\s+(.*)$', section_1_text, re.MULTILINE)
         allowed_slots = list(VALID_H3_SLOTS.get(doc_type, []))
         if tension_edges:
-            allowed_slots.append("### 认知张力与未决争议 (Controversies & Tensions)")
+            allowed_slots.append(TENSION_H3_SLOT)
             
         for header in h3_headers:
             header_cleaned = f"### {header.strip()}"
             if header_cleaned not in allowed_slots:
                 raise SchemaViolationException(f"Schema Violation: Invalid H3 header '{header_cleaned}' for type '{doc_type}'. Allowed slots: {allowed_slots}.")
         
-        if tension_edges and "### 认知张力与未决争议 (Controversies & Tensions)" not in section_1_text:
-            raise SchemaViolationException("Schema Violation: 'tension_edges' defined in YAML but missing '### 认知张力与未决争议 (Controversies & Tensions)' slot.")
+        if tension_edges and TENSION_H3_SLOT not in section_1_text:
+            raise SchemaViolationException(f"Schema Violation: 'tension_edges' defined in YAML but missing '{TENSION_H3_SLOT}' slot.")
 
         # Metric Constraint
         metric_matches = re.findall(r'\{Metric:\s*([^\}]+)\}', section_1_text)

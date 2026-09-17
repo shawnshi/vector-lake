@@ -5,6 +5,7 @@ import random
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from vector_lake.wiki_utils import get_meta_dir
@@ -78,8 +79,6 @@ def close_connection():
         _LOCAL.conn = None
     _LOCAL.in_transaction = False
 
-from contextlib import contextmanager
-
 # --- write-lock budget -------------------------------------------------------
 #
 # ``connect(timeout=...)`` *is* the SQLite busy timeout, so every
@@ -96,7 +95,16 @@ from contextlib import contextmanager
 # rather than nominal, and restored to the default once the lock is taken so
 # later one-off statements keep the full patience.
 DB_BUSY_TIMEOUT_MS = 30_000
-BEGIN_LOCK_BUDGET_SECONDS = 90.0
+
+# The MCP client that drives these tools abandons a call at 60 s (the SDK's
+# ``DEFAULT_REQUEST_TIMEOUT_MSEC``); the pi adapter passes no per-server override.
+# A writer that parks past that point cannot report anything useful -- the caller
+# is already gone while the server still holds the request -- so lock contention
+# has to surface as a bounded, actionable error well inside the client's patience.
+# Keep the two numbers coupled in one place: raising this above
+# ``MCP_CALL_TIMEOUT_SECONDS`` silently reintroduces unreportable waits.
+MCP_CALL_TIMEOUT_SECONDS = 60.0
+BEGIN_LOCK_BUDGET_SECONDS = 20.0
 BEGIN_LOCK_MAX_ATTEMPTS = 8
 
 
@@ -123,9 +131,55 @@ def _arm_busy_timeout(conn: sqlite3.Connection, remaining_seconds: float) -> Non
         log.warning("Could not arm busy_timeout=%s: %s", budget_ms, exc)
 
 
+def _record_lock_contention(attempts: int, budget_seconds: float, waited_seconds: float, outcome: str) -> None:
+    """Persist write-lock contention so a wedge leaves evidence behind.
+
+    SQLite cannot report which connection holds the write lock, so a stalled holder used
+    to be indistinguishable from an idle system: every writer silently timed out and the
+    only durable trace was a transient stderr line (measured: a held lock wedged all wiki
+    writes for hours and needed hand-forensics to attribute).  This writes a bounded
+    marker that ``runtime_health`` surfaces, including the caller's function name.
+    """
+    try:
+        import inspect
+
+        from vector_lake.wiki_utils import get_meta_dir
+
+        runtime_dir = get_meta_dir() / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        marker_path = runtime_dir / "write_lock_contention.json"
+        try:
+            payload = json.loads(marker_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                payload = {}
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        caller = "unknown"
+        for frame in inspect.stack()[2:]:
+            if frame.function not in {"_record_lock_contention", "_acquire_write_lock", "transaction"}:
+                caller = frame.function
+                break
+        entry = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "outcome": outcome,
+            "attempts": int(attempts),
+            "budget_seconds": round(float(budget_seconds), 1),
+            "waited_seconds": round(float(waited_seconds), 1),
+            "caller": caller,
+        }
+        payload["last"] = entry
+        history = list(payload.get("history") or [])
+        history.append(entry)
+        payload["history"] = history[-20:]
+        marker_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - telemetry must never break a write
+        log.warning("Could not record write-lock contention: %s", exc)
+
+
 def _acquire_write_lock(conn: sqlite3.Connection) -> None:
     """Take the write lock, or raise :class:`DatabaseLockTimeout` inside the budget."""
-    deadline = time.monotonic() + BEGIN_LOCK_BUDGET_SECONDS
+    started = time.monotonic()
+    deadline = started + BEGIN_LOCK_BUDGET_SECONDS
     last_error: sqlite3.OperationalError | None = None
     attempts = 0
     acquired = False
@@ -150,6 +204,17 @@ def _acquire_write_lock(conn: sqlite3.Connection) -> None:
             time.sleep(min(remaining, 0.1 * (2 ** (attempts - 1)) * (0.5 + random.random())))
     # Whatever happened, hand the connection back its default patience.
     _arm_busy_timeout(conn, DB_BUSY_TIMEOUT_MS / 1000.0)
+    waited = time.monotonic() - started
+    if acquired:
+        if attempts > 1:
+            _record_lock_contention(attempts, BEGIN_LOCK_BUDGET_SECONDS, waited, "acquired-after-retry")
+        return
+    _record_lock_contention(attempts, BEGIN_LOCK_BUDGET_SECONDS, waited, "timed-out")
+    log.error(
+        "Could not acquire the Vector Lake write lock within %.0fs (%d attempt(s)); "
+        "another writer is holding it. Last error: %s",
+        BEGIN_LOCK_BUDGET_SECONDS, attempts, last_error,
+    )
     if not acquired:
         raise DatabaseLockTimeout(
             f"Could not acquire the Vector Lake write lock within "
@@ -301,15 +366,34 @@ def _create_operational_memory_index(conn: sqlite3.Connection) -> None:
     )
     _create_memory_gram_tables(conn)
     _create_page_index_tables(conn)
+    # ``CREATE TABLE IF NOT EXISTS`` leaves an existing table alone, so a column
+    # added after a schema's first release needs its own tolerated ALTER, exactly
+    # as ``operational_memory_index.source_rowid`` does.  ``_table_columns``
+    # answers the same question on the read path without a write lock.
+    try:
+        conn.execute("ALTER TABLE page_index_state ADD COLUMN edge_digest TEXT")
+    except sqlite3.OperationalError:
+        pass
     ensure_operational_memory_index(conn, force=stale_format)
 
 
 def _create_page_index_tables(conn: sqlite3.Connection) -> None:
     """Schema for the ``index.json`` projection in ``vector_lake.page_index_projection``.
 
-    Only nodes need a new table: ``page_graph_edges`` already mirrors
-    ``index.json``'s ``weighted_edges`` byte-for-byte (verified on the live
-    corpus, same weights and same order), so the adjacency is read from there.
+    ``page_index_edges`` is not a restatement of ``page_graph_edges``, and the two
+    cannot be substituted for each other:
+
+    * ``page_graph_edges`` is keyed ``(source_id, target_id, relation)``, so it
+      collapses duplicate pairs and assigns no order;
+    * ``page_index_edges`` keeps the multiset together with its ``sequence``.
+
+    Measured on the live corpus the cardinalities differ accordingly -- 1 293 189
+    rows against 1 607 843 -- so the earlier note here, that the two mirror one
+    another "byte-for-byte ... same order", holds only as a set of distinct pairs
+    at maximum weight.  The reader is ``page_index_projection.adjacency``, and it
+    needs the ordered multiset because the two-step personalised PageRank walk is
+    order-sensitive for zero-mass candidates.  Collapsing this table into
+    ``page_graph_edges`` would silently change ranking, not just storage.
     """
     conn.execute(
         """
@@ -353,7 +437,8 @@ def _create_page_index_tables(conn: sqlite3.Connection) -> None:
             index_size INTEGER NOT NULL DEFAULT 0,
             node_count INTEGER NOT NULL DEFAULT 0,
             edge_count INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT
+            updated_at TEXT,
+            edge_digest TEXT
         )
         """
     )
@@ -529,6 +614,239 @@ def ensure_operational_memory_index_cheap(conn: sqlite3.Connection | None = None
     _OM_INDEX_GUARD["fingerprint"] = operational_memory_index_fingerprint(conn)
     return result
 
+# --- idempotency index recovery ---------------------------------------------
+#
+# ``enqueue_mutation`` and ``enqueue_job`` both SELECT by ``idempotency_key`` and
+# then INSERT, inside one ``BEGIN IMMEDIATE``.  The write lock is what actually
+# serialises them; the unique index is defence-in-depth on top of it, and it is
+# the only thing that still holds if a caller forgets the lock.
+#
+# A database written by an earlier release can already hold duplicate keys.
+# Aborting ``init_db`` on such a database would make every command unusable, so
+# the full index is skipped -- but skipping it used to be the end of the story,
+# which left these tables with *no* uniqueness at all.  The partial index below
+# restores exactly the guarantee a concurrent enqueue can violate, and it does so
+# without deleting any history.
+#
+# The predicate is written as "not a terminal state" rather than a list of active
+# states, so a status added later is protected by default instead of silently
+# falling outside the index.
+_TERMINAL_IDEMPOTENCY_STATES = ("completed", "finalized", "cancelled", "superseded")
+_ACTIVE_IDEMPOTENCY_PREDICATE = (
+    "idempotency_key IS NOT NULL AND COALESCE(status, '') NOT IN ("
+    + ", ".join(f"'{state}'" for state in _TERMINAL_IDEMPOTENCY_STATES)
+    + ")"
+)
+
+# table -> (unique index name, primary-key column).  The primary key differs per
+# table: ``mutation_outbox`` uses ``id``, ``jobs`` uses ``job_id``.  The repair has
+# to know which, because "the canonical row is the lowest one" is expressed against
+# it and hardcoding ``id`` made the ``jobs`` repair fail with "no such column: id".
+IDEMPOTENCY_TABLES: tuple[str, ...] = ("mutation_outbox", "jobs")
+_IDEMPOTENCY_INDEXES: dict[str, tuple[str, str]] = {
+    "mutation_outbox": ("idx_mutation_outbox_idempotency", "id"),
+    "jobs": ("idx_jobs_idempotency", "job_id"),
+}
+
+
+def _duplicate_idempotency_groups(conn: sqlite3.Connection, table: str) -> int:
+    return int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT idempotency_key FROM {table} "
+            f"WHERE idempotency_key IS NOT NULL "
+            f"GROUP BY idempotency_key HAVING COUNT(*) > 1)"
+        ).fetchone()[0]
+    )
+
+
+def _ensure_idempotency_index(
+    conn: sqlite3.Connection, table: str, index_name: str
+) -> str:
+    """Create the strongest idempotency index the current data allows.
+
+    Returns ``full`` (every key unique forever), ``active`` (unique among
+    in-flight rows only, because the table already holds duplicate history) or
+    ``absent`` (uniqueness is solely the surrounding write lock).
+    """
+    try:
+        conn.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} "
+            f"ON {table}(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        return "full"
+    except sqlite3.IntegrityError:
+        pass
+
+    duplicates = _duplicate_idempotency_groups(conn, table)
+    try:
+        conn.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name}_active "
+            f"ON {table}(idempotency_key) WHERE {_ACTIVE_IDEMPOTENCY_PREDICATE}"
+        )
+    except sqlite3.IntegrityError:
+        log.error(
+            "%s holds %s duplicated idempotency_key group(s), and at least one duplicate "
+            "is still in a non-terminal status, so no unique index could be created. "
+            "Concurrent enqueues are protected only by the BEGIN IMMEDIATE write lock. "
+            "Resolve the in-flight duplicates, then re-run init_db().",
+            table,
+            duplicates,
+        )
+        return "absent"
+
+    log.warning(
+        "%s holds %s duplicated idempotency_key group(s) written by an earlier release, "
+        "so the full unique index cannot be created. Created %s_active over non-terminal "
+        "rows instead, which is the population a concurrent enqueue can collide in. "
+        "Call repair_idempotency_keys(%r, dry_run=False) to clear the redundant keys and "
+        "reclaim the full index.",
+        table,
+        duplicates,
+        index_name,
+        table,
+    )
+    return "active"
+
+
+def idempotency_index_state() -> dict[str, dict]:
+    """Report the uniqueness level actually in force for each idempotency table."""
+    init_db()
+    conn = get_connection()
+    existing = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+    }
+    state: dict[str, dict] = {}
+    for table, (index_name, _primary_key) in _IDEMPOTENCY_INDEXES.items():
+        if index_name in existing:
+            uniqueness = "full"
+        elif f"{index_name}_active" in existing:
+            uniqueness = "active"
+        else:
+            uniqueness = "absent"
+        state[table] = {
+            "uniqueness": uniqueness,
+            "duplicate_groups": _duplicate_idempotency_groups(conn, table),
+        }
+    return state
+
+
+def repair_idempotency_keys(table: str, dry_run: bool = True) -> dict:
+    """Clear the *redundant* idempotency keys so the full unique index is available.
+
+    The canonical row for a key is the one ``enqueue_mutation`` / ``enqueue_job``
+    already returns for it: the lowest ``id``.  Every other row keeps its status,
+    timestamps, error text and ``superseded_by`` link -- only the duplicate key is
+    cleared, which is what makes the rows collide in the first place.  No audit
+    history is deleted, and ``dry_run`` (the default) reports the exact ids first.
+    """
+    if table not in _IDEMPOTENCY_INDEXES:
+        raise ValueError(f"Unsupported idempotency table: {table}")
+    index_name, primary_key = _IDEMPOTENCY_INDEXES[table]
+    init_db()
+    conn = get_connection()
+    with transaction():
+        rows = conn.execute(
+            f"SELECT {primary_key} FROM {table} "
+            f"WHERE idempotency_key IS NOT NULL AND {primary_key} NOT IN ("
+            f"SELECT MIN({primary_key}) FROM {table} WHERE idempotency_key IS NOT NULL "
+            f"GROUP BY idempotency_key)"
+        ).fetchall()
+        # The primary key is not always an integer: ``mutation_outbox`` uses an
+        # INTEGER ``id`` while ``jobs`` uses a hex ``job_id``, so the values are
+        # carried through untyped rather than coerced.
+        redundant_keys = [row[primary_key] for row in rows]
+        result = {
+            "table": table,
+            "dry_run": bool(dry_run),
+            "redundant_rows": len(redundant_keys),
+            "redundant_keys": redundant_keys,
+            "duplicate_groups_before": _duplicate_idempotency_groups(conn, table),
+            "uniqueness_before": idempotency_index_state()[table]["uniqueness"],
+        }
+        if dry_run or not redundant_keys:
+            result["uniqueness_after"] = result["uniqueness_before"]
+            return result
+        conn.executemany(
+            f"UPDATE {table} SET idempotency_key = NULL WHERE {primary_key} = ?",
+            [(row_id,) for row_id in redundant_keys],
+        )
+        result["uniqueness_after"] = _ensure_idempotency_index(conn, table, index_name)
+        result["duplicate_groups_after"] = _duplicate_idempotency_groups(conn, table)
+        return result
+
+
+# Objects that prove ``_init_db_once`` ran to completion.  Its DDL is one
+# transaction, so a partial schema cannot exist: either the whole tail is there
+# or nothing was committed.  The list deliberately mixes early and late objects
+# so a database created by an older, narrower version still takes the full path.
+_SCHEMA_SENTINELS: tuple[str, ...] = (
+    "entities",
+    "claims",
+    "operational_memory",
+    "operational_memory_index",
+    "wiki_search_index",
+    "page_index_nodes",
+    "page_index_edges",
+    "page_index_state",
+    "operational_memory_gram_overlay",
+)
+
+
+def _schema_is_complete(db_path: Path) -> bool:
+    """Read-only probe: every sentinel object already exists.
+
+    Opens a bare connection and reads ``sqlite_master`` only.  No PRAGMAs are
+    applied and no statement is issued that could take the write lock, so this is
+    safe to call on the read path while another process is writing.  The caller
+    uses it to skip the DDL transaction that would otherwise make every read wait
+    behind the writer holding ``BEGIN IMMEDIATE``.
+    """
+    if not db_path.exists():
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1.0)
+        present = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+        }
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+    return set(_SCHEMA_SENTINELS).issubset(present)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names of ``table``; empty when the table does not exist."""
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return set()
+
+
+def _om_index_format_is_stale(conn: sqlite3.Connection) -> bool:
+    """Read-only equivalent of ``_init_db_once``'s ``ALTER TABLE`` format probe.
+
+    That probe learned whether ``source_rowid`` was missing by attempting the
+    ALTER, which requires the write lock.  ``PRAGMA table_info`` answers the same
+    question without it, so the staleness decision can be made before deciding
+    whether the write transaction is needed at all.  A missing table reports
+    stale, which sends the caller down the full initialisation path.
+    """
+    return "source_rowid" not in _table_columns(conn, "operational_memory_index")
+
+
+def _page_index_state_format_is_stale(conn: sqlite3.Connection) -> bool:
+    """Whether ``page_index_state`` still lacks the edge digest column."""
+    return "edge_digest" not in _table_columns(conn, "page_index_state")
+
+
 def init_db():
     db_path = get_db_path()
     db_key = str(db_path.resolve())
@@ -536,6 +854,17 @@ def init_db():
         return
     with _INIT_LOCK:
         if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
+            return
+        if (
+            _schema_is_complete(db_path)
+            and not _om_index_format_is_stale(get_connection())
+            and not _page_index_state_format_is_stale(get_connection())
+        ):
+            # The DDL would be a no-op, and running it would block every reader
+            # behind the writer's lock.  Keep the cheap gap-fill so a writer that
+            # bypassed the triggers still gets reconciled, then memoise.
+            _INITIALIZED_DB_PATHS.add(db_key)
+            ensure_operational_memory_index(get_connection())
             return
         _INITIALIZED_DB_PATHS.discard(db_key)
         _init_db_once(db_key)
@@ -645,25 +974,9 @@ def _init_db_once(db_key: str):
         # performed by enqueue_mutation().  A database written by an earlier
         # release can already hold duplicate keys, and failing here would make
         # init_db() - and therefore every command - unusable on that database.
-        # Skip the index instead of aborting, and say exactly why.
-        try:
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_mutation_outbox_idempotency "
-                "ON mutation_outbox(idempotency_key) WHERE idempotency_key IS NOT NULL"
-            )
-        except sqlite3.IntegrityError:
-            duplicate_groups = conn.execute(
-                "SELECT COUNT(*) FROM (SELECT idempotency_key FROM mutation_outbox "
-                "WHERE idempotency_key IS NOT NULL "
-                "GROUP BY idempotency_key HAVING COUNT(*) > 1)"
-            ).fetchone()[0]
-            log.warning(
-                "Skipping idx_mutation_outbox_idempotency: mutation_outbox already holds "
-                "%s duplicated idempotency_key group(s) written by an earlier release. "
-                "Idempotency is still enforced by the SELECT in enqueue_mutation(); "
-                "see the unique-index note in the changelog to reclaim it.",
-                duplicate_groups,
-            )
+        # ``_ensure_idempotency_index`` degrades to a partial index over the
+        # non-terminal rows rather than giving up the guarantee entirely.
+        _ensure_idempotency_index(conn, "mutation_outbox", "idx_mutation_outbox_idempotency")
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS wiki_search_index USING fts5(
                 node_key, title, summary, text,
@@ -819,24 +1132,7 @@ def _init_db_once(db_key: str):
         # a database written by a release that predates this index can already
         # hold duplicate keys, and failing here would make init_db() - and
         # therefore every command in a fresh process - unusable.
-        try:
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency "
-                "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
-            )
-        except sqlite3.IntegrityError:
-            duplicate_groups = conn.execute(
-                "SELECT COUNT(*) FROM (SELECT idempotency_key FROM jobs "
-                "WHERE idempotency_key IS NOT NULL "
-                "GROUP BY idempotency_key HAVING COUNT(*) > 1)"
-            ).fetchone()[0]
-            log.error(
-                "Skipping idx_jobs_idempotency: jobs already holds %s duplicated "
-                "idempotency_key group(s) written by an earlier release. "
-                "Idempotency is still enforced by the SELECT in enqueue_job(); "
-                "clean the duplicates to reclaim the index.",
-                duplicate_groups,
-            )
+        _ensure_idempotency_index(conn, "jobs", "idx_jobs_idempotency")
         
         # Add expression-based indexes for performance
         try:

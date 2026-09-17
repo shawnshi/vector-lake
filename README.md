@@ -18,7 +18,8 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 | 约束 | 事实 | 规避 |
 |---|---|---|
-| 必须常驻守护进程 | outbox 消费、增量索引、定时 lint 均在 `watchdog_sync.py` 内。MCP-only 模式没有消费者，写入会持续堆积 | 生产环境常驻守护进程；仅做只读检索时才可省略 |
+| 必须常驻守护进程与摄取 Runner | outbox 消费、增量索引、定时 lint 均在 `watchdog_sync.py` 内；摄取任务包的**模型调用**在宿主侧 `scripts/ingest_runner.py`（默认 shadow，只报告不写页面），由 `scripts/ingest_runner_service.py` 负责重启。MCP-only 模式没有消费者，写入会持续堆积；只跑 watchdog 时任务包会停在 `awaiting_subagent` | 生产环境常驻 `watchdog_sync.py` 与 `ingest_runner_service.py`；仅做只读检索时才可省略 |
+| Runner 健康默认只告警 | `runner_absent` / `runner_stalled` / `runner_failing` 默认进 `warnings`，不翻转 `ok`；“从未跑过”与“跑挂了”由 `.meta/runtime/runner_supervisor.json` 区分 | 需要把 Runner 缺失升级为硬门时设 `VECTOR_LAKE_RUNNER_STRICT=1` |
 | 编译依赖 LLM 宿主 | `cli.py sync` 只产出 subagent 任务包，不自行编译；`native_llm.generate_text` 恒抛 `SubagentTaskRequired` | 在具备 subagent 能力的宿主内运行摄取流程 |
 | 向量检索需要显式回填 | 任何页面写入都会使该节点向量失效；无自动重嵌 | 定期 `python cli.py embedding-backfill --apply`；需 `GEMINI_API_KEY`（无 key 时 `search` 输出 `[DEGRADED]` 横幅） |
 | GC 的孤儿判据是拓扑度数 ≤ 1 | 度数来自 canonical 的 `links` / 共享来源 / claim 共现；**不是**可视化边集 | 先 `python cli.py gc` 做 dry-run，它会在同一调用中打印每个页面的实际度数。单次删除超过候选页 50% 时会自动中止，需 `--force` 才继续 |
@@ -83,13 +84,13 @@ graph LR
 
 ## Quick Start
 
-> **运行前提**：Vector Lake 不是自包含的编译器。原始信源到 Wiki 页面的“编译”由 LLM 宿主（subagent）执行，`cli.py sync` 只负责生成任务包。因此实际运行需要同时满足：**① 单机 ② 常驻 `python watchdog_sync.py` ③ 具备 subagent 能力的宿主**。只启动 MCP server 而不启动守护进程时，写入会在 5 分钟后进入 outbox 积压告警状态。
+> **运行前提**：Vector Lake 不是自包含的编译器。原始信源到 Wiki 页面的“编译”由 LLM 宿主（subagent）执行，`cli.py sync` 只负责生成任务包。因此实际运行需要同时满足：**① 单机 ② 常驻 `python watchdog_sync.py` ③ 常驻摄取 Runner（`scripts/ingest_runner_service.py`）④ 具备 subagent 能力的宿主**。只启动 MCP server 而不启动守护进程时，写入会在 5 分钟后进入 outbox 积压告警状态。
 
 1. **环境配置**：`config.json` 的 `target_directories` 留空即表示使用当前 `MEMORY/raw/`（多机可移植）；也可显式填写绝对路径。`supported_extensions` 配置允许扫描的后缀。非 embedding 文本推理不由插件直接调用外部 API；需要推理的后台任务会生成当前环境 subagent 任务包。`GEMINI_API_KEY` 只影响 embedding 与混合检索的向量分支。
 2. **生成编译任务**：执行 `python cli.py sync` 得到原始信源的 subagent 摄取任务包，由宿主执行并回填。也可由 `watchdog_sync.py` 在检测到 raw 变更时自动生成。
 3. **后台监听与自治管理**：运行 `python watchdog_sync.py` 启动守护进程（它会接管 outbox 消费、增量索引与定时 lint）。即使不使用增量监听，只要发生写入就需要它来消费 outbox。它搭载的核心基建与防御系统：
    - **双轨看门狗 (Two-Track Watchdog)**：除增量文件外还捕获 `on_deleted` / `on_moved`，因此重命名或删除页面不会在图谱里留下幽灵节点。
-   - **写入健康门 (Write Health Gate)**：写入只在**硬故障**下被阻断（数据库不可用、outbox 存在 hard-failed 行、积压超过 `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`）。投影漂移、心跳过期、outbox 未及时消费属于**可修复降级**，只记录告警并继续写入——阻断它们会同时阻断唯一的修复通道。
+   - **写入健康门 (Write Health Gate)**：写入只在**硬故障**下被阻断（数据库不可用、存在 hard-failed 的 `mutation_outbox` 行）。outbox 积压超过 `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`、投影漂移、心跳过期、终态失败作业、时间线 parity 漂移都属于**可修复降级**，只记录告警并继续写入——阻断它们会同时阻断唯一的修复通道。需要严格模式的运维方可分别用 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING` / `VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING` / `VECTOR_LAKE_TIMELINE_PARITY_BLOCKING` 把这些降级提升为阻断。
    - **I/O 批处理防抖 (I/O Debouncing)**：同批次修改合并为一次 `index.json` 写盘；`index.json` 不再冗余保存正文，投影写入使用短事务，全量重建不再冻结数据库。
    - **两步思维链摄入 (Payload-Based MCP)**：Agent 先输出分析缓冲（Tension / Consensus / Unknowns），长文本经 `payload_file` 落盘后入湖，规避 CLI 传参截断与 JSON 解析失败。
    - **语义张力量化模型 (STQM)**：图谱原生支持 `tension_edges`，把争议与矛盾结构化为冲突边，Query 时可直接展示领域盲区。
@@ -107,9 +108,10 @@ graph LR
 ### 日常运行入口
 
 1. **常驻守护**：`python watchdog_sync.py`（outbox 消费、增量索引、定时 lint 与 WAL checkpoint 都在这里；只跑 MCP server 会让写入持续积压）。
-2. **检索**：`python cli.py search "<keyword>"`，或 `python cli.py query "<question>"` 走预算受控的上下文组装。
-3. **摄取队列**：`python cli.py ingest-tasks` 查看 queued / awaiting_subagent 作业；宿主 subagent 完成后经 `finalize_ingest` 入湖。
-4. **周期治理**：`python cli.py review` 处理冲突与候选队列，`python cli.py doctor` 检查运行健康度。
+2. **常驻摄取 Runner**：`python scripts/ingest_runner_service.py --limit 1 --interval 180 --model-cmd "python scripts/ingest_model_pi_subagents.py"`。Runner 认领任务包、在子进程里调用宿主模型，再经 `finalize_ingest` 提交；不加 `--no-shadow` 时只报告 `needs-model`，不写页面。
+3. **检索**：`python cli.py search "<keyword>"`，或 `python cli.py query "<question>"` 走预算受控的上下文组装。
+4. **摄取队列**：`python cli.py ingest-tasks` 查看 queued / awaiting_subagent 作业；宿主 subagent 完成后经 `finalize_ingest` 入湖。
+5. **周期治理**：`python cli.py review` 处理冲突与候选队列，`python cli.py doctor` 检查运行健康度。
 
 历史版本的逐项特性说明不再在本文件维护；版本变更请查 `CHANGELOG.md`，运行契约以本节与上方“已知限制”表为准。
 
@@ -150,29 +152,31 @@ Vector Lake adopts a hybrid CQRS-like architecture with O(1) incremental native 
 
 - **Markdown (Source of Truth)**: `wiki/*.md` and `raw/*.md`.
 - **Database (Read Model & Fast Mutations)**: `vector_lake.db` containing unified SQLite entities, claims, graph edges, and operational memory.
-- **Concurrency & Atomicity**: 多页变更经 `MutationCoordinator` 在单个 `BEGIN IMMEDIATE` 事务内提交 canonical 状态与 `mutation_outbox` 意图，再materialize Markdown 投影；事务失败整体回滚，投影失败由 outbox 重试。**Wiki 页面本身没有自动 `*.bak` 备份**——删除类命令（`gc` / `delete`）会先写恢复点目录（`backup/gc/`、`backup/delete-source/`），其余写入依赖 canonical 状态重建。
+- **Concurrency & Atomicity**: 多页变更经 `MutationCoordinator` 在单个 `BEGIN IMMEDIATE` 事务内提交 canonical 状态与 `mutation_outbox` 意图，再materialize Markdown 投影；事务失败整体回滚，投影失败由 outbox 重试。**Wiki 页面本身没有自动 `*.bak` 备份**——删除类命令（`gc` / `delete`）会先写恢复点目录（`backup/gc/`、`backup/delete-source/`），其余写入依赖 canonical 状态重建。数据库副本写在 `.meta/backups/`（`vector_lake_<ts>.db.bak` 及 `-wal` / `-shm` sidecar），其总量由 `backup-retention` 约束。
 
 ```text
 MEMORY/
   purpose.md          <-- Versioned Strategic Purpose Contract & Epistemic Stance
   raw/
+  backup/
+    gc/               <-- Recovery points written before gc deletes a page
+    delete-source/    <-- Recovery points written before a cascade delete
   wiki/
     *.md
     index.json
     .meta/
       purpose_vectors.json <-- Optional legacy fallback for intent weights
       vector_lake.db       <-- Unified SQLite Store (Entities, Claims, Graph, Timeline, Operational Memory)
+      backups/             <-- Bounded SQLite copies (.db.bak + -wal / -shm sidecars)
+      runtime/             <-- Runner / supervisor / lock-contention status JSON
+      subagent_tasks/      <-- Native-subagent task packets
 ```
 
 ## Commands
 
 > **Note**: Vector Lake 现已全面接入 MCP (Model Context Protocol)。大语言模型 Agent 将直接通过 `vector_lake/mcp_server.py` 调用底层 Tool 接口，不再需要通过终端模拟。
 > 
-> **Slash Commands**: 本仓库**不随附**任何 slash command 兼容层。原 `commands/*.toml`（两个文件、无任何代码读取）已在 host-convention 批次中移除。所有能力通过 MCP 工具面调用；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
->
-> 已随附：
-> - `/query`：深度逻辑推理与查询（映射 `query_logic_lake`）
-> - `/timeline`：搜索与提取战略时间线事件（映射 `search_timeline`）
+> **Slash Commands**: 本仓库**不随附**任何 slash command 兼容层，`commands/` 目录已不存在。所有能力通过 MCP 工具面调用；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
 >
 > 仅可通过 MCP 工具或 CLI 调用（无 slash command 层）：
 > - `sync_vector_lake`：自动调度 Ingestor 子智能体执行图谱知识的异步增量同步
@@ -268,13 +272,29 @@ python cli.py projection-report --limit 20
 python cli.py canonical-backfill --limit 100
 python cli.py canonical-backfill --apply --limit 100
 python cli.py timeline-rebuild --apply
+python cli.py timeline-repair
+python cli.py timeline-repair --apply
 python cli.py projection-rebuild-index --apply
 python cli.py embedding-backfill --limit 200
 python cli.py embedding-backfill --apply --limit 200
 python cli.py wiki-restore --apply --limit 10
+python cli.py gram-index
+python cli.py gram-index --apply --compact
 ```
 
-这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影。
+备份保留与幂等性键维护：
+
+```powershell
+python cli.py backup-retention
+python cli.py backup-retention --keep 2 --max-bytes 6442450944 --apply
+python cli.py idempotency-status
+python cli.py repair-idempotency --table mutation_outbox
+python cli.py repair-idempotency --table mutation_outbox --apply
+```
+
+这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影；`timeline-repair` 就地补齐 `timeline_events` 的 parity 漂移，不重建整表；`gram-index` 报告或重建运行态记忆检索用的精确 n-gram 倒排，`--compact` 把 overlay 合并回 base 并清理退役文档。
+
+`backup-retention` 约束 `.meta/backups`（SQLite 副本目录，与 `MEMORY/backup/` 下的页面恢复点无关）：默认保留最新 3 份副本，其余受 12 GiB 预算约束，**最新一份无论是否超预算都不会被删**；`idempotency-status` 报告各幂等表当前达到的唯一性等级，`repair-idempotency` 清除冗余幂等键以便建成完整唯一索引——它两种模式下都不删除业务行。
 
 ## Config
 
@@ -293,7 +313,14 @@ python cli.py wiki-restore --apply --limit 10
 - `VECTOR_LAKE_EMBEDDING_MAX_BATCH_ITEMS` / `VECTOR_LAKE_EMBEDDING_MAX_BATCH_TOKENS`：单批条数与 token 上限，默认 `100` / `200000`。
 - `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
 - `VECTOR_LAKE_TOKENIZER`：强制分词后端，取 `jieba` 或 `rjieba`；不设置则自动优先 `rjieba`。指定的后端不可用时只会告警并回退，不会禁用分词。
-- `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`：outbox 待处理行数的硬门限，默认 `2000`。超过后写入会被阻断（这是硬故障，与心跳/漂移类降级告警不同）。
+- `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`：outbox 待处理行数阈值，默认 `2000`。**超出后默认只计为降级告警，不阻断写入**（阻断积压等于掉断唯一的自愈路径）；设 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING=1` 才升级为阻断。
+- `VECTOR_LAKE_OUTBOX_FAILURE_NONBLOCKING=1`：把 `mutation_outbox_failed` 从硬故障降为降级告警。默认关闭，因为失败行会阻塞 canonical 写入；打开等于用可用性换安全性。
+- `VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING=1` / `VECTOR_LAKE_TIMELINE_PARITY_BLOCKING=1`：把终态失败作业与时间线 parity 漂移从降级升级为阻断写入的诊断用闸门，默认关闭。
+- `VECTOR_LAKE_BACKUP_KEEP` / `VECTOR_LAKE_BACKUP_MAX_BYTES`：`backup-retention` 的默认保留份数（`3`）与字节预算（`12 GiB`）。
+- `VECTOR_LAKE_RUNNER_EXPECTED=0`：不再把缺失的摄取 Runner 报为告警；用于不需要摄取的主机。
+- `VECTOR_LAKE_RUNNER_STALE_SECONDS`：Runner / 监督器心跳过期阈值，默认 `2400` 秒。
+- `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 相关告警提升为降级。默认只告警，不影响 `ok`。
+- `VECTOR_LAKE_RUNNER_MODEL_CMD`：Runner 的模型接缝命令，等价于 `--model-cmd`。相关脚本另读 `VECTOR_LAKE_RUNNER_PI_BIN`、`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT`、`VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`、`VECTOR_LAKE_RUNNER_COOLDOWN`。
 - `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。
 - `VECTOR_LAKE_LEIDEN_L1_RESOLUTION` / `VECTOR_LAKE_LEIDEN_L0_RESOLUTION`：Leiden 的 Micro / Global 分辨率，默认 `2.0` / `1.0`。分辨率越高社区越小。
 - `VECTOR_LAKE_LEIDEN_SEED`：Leiden 随机种子，默认 `42`。**必须固定**才能保证社区划分可复现。
@@ -360,6 +387,8 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 
 ## Module Map
 
+`vector_lake/` 内是运行时本体：它自行调用嵌入模型，但**不发起任何非嵌入的模型调用**（任务包的 `cost_boundary`）；文本生成一律交给宿主，因此摄取 Runner 放在 `scripts/` 而非包内。
+
 入口与核心管线：
 
 | Path | Role |
@@ -385,6 +414,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `vector_lake/defense_hook.py` | 写入前防御钩子（schema + purpose 契约统一入口） |
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |
 | `vector_lake/yaml_utils.py` | YAML 存取封装 |
+| `vector_lake/backup_retention.py` | `.meta/backups` 的扫描、边界解析与剪枝（最新一份永不删除） |
 
 索引、检索与记忆：
 
@@ -409,6 +439,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `vector_lake/tool_review.py` / `tool_merge.py` / `semantic_merge.py` / `tool_piea.py` / `tool_bulk_reconciliation.py` | 队列评审、合并建议与合并执行、跨类型查重、批量对账 |
 | `vector_lake/tool_lint.py` / `tool_gc.py` / `tool_delete.py` / `tool_rename.py` / `tool_debt.py` / `tool_doctor.py` | 自愈审计、孤儿 GC、级联删除、重命名、债务与体检 |
 | `vector_lake/tool_projection.py` / `tool_timeline.py` / `tool_trace.py` / `tool_graph.py` | 投影对账与重建、时间线重建与检索、溯源、图谱可视化 |
+| `vector_lake/tool_maintenance.py` | 备份保留与幂等索引维护面（`backup-retention` / `idempotency-status` / `repair-idempotency`） |
 | `vector_lake/provenance.py` / `skeleton_parser.py` | 溯源追踪、结构骨架解析 |
 
 仓库资产：
@@ -418,7 +449,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `schema.md` / `SCHEMA_CATEGORIES.md` | Wiki 与运行态记忆契约、受控分类表 |
 | `skills/` | 面向宿主的技能定义（每个能力一份 `SKILL.md`） |
 | `templates/` | 摄取 / 查询提示词模板与拓扑可视化 HTML |
-| `scripts/` | 独立维护脚本（社区聚类、语义去重、域总览、janitor 分片、purpose 校验） |
+| `scripts/` | 独立维护脚本（社区聚类、语义去重、域总览、janitor 分片、purpose 校验），以及宿主侧摄取 Runner：`ingest_runner.py` + 常驻监督器 `ingest_runner_service.py` + 模型接缝 `ingest_model_pi_subagents.py` |
 | `tests/` | pytest 回归套件 |
 
 ## Validation
@@ -431,12 +462,12 @@ $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
 
-本轮（2026-09-16）实测结果：
+本轮（2026-09-17）实测结果：
 
-- `python -m pytest -p no:cacheprovider -q` → **426 passed**（重新运行于隔离 MEMORY 根）。
+- `python -m pytest -p no:cacheprovider -q` → **689 passed**（在仓库工作副本中运行，另在排除 `.git` / `config.json` / `brain` / `tmp` 的副本上复现，结果一致）。
 - `python -m compileall -q vector_lake tests` → OK。
-- `python cli.py doctor` → `State Consistency: Wiki:N JSON:N SQLite:N` 三者一致，`Write Gate: clean`；未运行守护进程时 `Watchdog Status` 会报告缺失状态文件。
-- 端到端：raw 源 → `sync` → `ingest-tasks` → `finalize_ingest` → outbox 消费 → 索引 → `search` / `query` 全链路在该隔离根上跑通。
+- `python cli.py doctor` → `State Consistency: Wiki:7125 JSON:7125 SQLite:7125`（missing/extra 均为 0），`Write Gate: clean`，`Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)`，`Backups: 3 entries, 10.70 GiB`（keep≤3 / ≤12.0 GiB）；`Summary: healthy with degradation`（唯一降级项是设计内的 subagent 文本运行时委托）。
+- 端到端：raw 源 → `sync` → `ingest-tasks` → `finalize_ingest` → outbox 消费 → 索引 → `search` / `query` 全链路在隔离根上跑通。
 
 **本文件不记录语料规模类数字**（节点数、边数、memory 条数）。这类数值取决于运行实例，无法从仓库复现，容易在版本迭代后变成误导性基线；需要时以目标实例上的 `doctor` / `debt` / `projection-report` 实测输出为准。
 

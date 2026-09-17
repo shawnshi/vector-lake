@@ -90,6 +90,10 @@ def create_subagent_task(
     metadata: dict[str, Any] | None = None,
 ) -> Path:
     task_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    # Packets belong to the isolated brain tree: ``remove_subagent_task`` refuses anything
+    # outside it, and finalize_ingest deletes the packet once the job closes.  Durability
+    # across restarts comes from the pruner skipping directories that still hold files,
+    # plus the job payload recording this absolute path.
     task_path = _task_root() / f"{task_id}.json"
     payload = {
         "task_id": task_id,
@@ -102,7 +106,13 @@ def create_subagent_task(
         "prompt": prompt,
     }
     tmp_path = task_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # The task packet is read back by a separate process, so the bytes have to be
+    # on stable storage before the rename makes it visible.
+    from vector_lake.wiki_utils import flush_durable
+
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+        flush_durable(handle)
     os.replace(tmp_path, task_path)
     return task_path
 

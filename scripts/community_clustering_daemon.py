@@ -72,12 +72,16 @@ def superseded_community_artifacts(names, written) -> list[str]:
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _mark_graph_clean(index_data: dict):
-    if "graph_state" not in index_data:
-        index_data["graph_state"] = {}
-    index_data["graph_state"]["dirty"] = False
-    index_data["graph_state"]["reason"] = "Community clustering applied"
-    index_data["graph_state"]["updated_at"] = _utc_now()
+def _mark_graph_clean(index_data: dict, clustered: bool = True):
+    graph_state = index_data.setdefault("graph_state", {})
+    graph_state["dirty"] = False
+    graph_state["clustering_stale"] = not clustered
+    graph_state["reason"] = (
+        "Community clustering applied"
+        if clustered
+        else "Community clustering skipped (no weighted edges or leidenalg/igraph unavailable)"
+    )
+    graph_state["updated_at"] = _utc_now()
 
 def _leiden_partition(nodes: list[str], edges: list[dict], resolution: float) -> dict:
     """Leiden partition of the weighted page graph, keyed by node name.
@@ -118,39 +122,156 @@ def _leiden_partition(nodes: list[str], edges: list[dict], resolution: float) ->
     return {nodes[index]: membership[index] for index in range(len(nodes))}
 
 
-def _stabilize_community_ids(new_partition, old_partition, old_uuids):
+def _yaml_scalar(value: str) -> str:
+    r"""A double-quoted YAML scalar safe for arbitrary text.
+
+    ``json.dumps`` output is valid YAML (YAML 1.2 is a JSON superset) and
+    escapes backslashes and quotes, which hand interpolation did not.  One hub
+    title containing a backslash (``paper-\Delta-mem``, a LaTeX fragment) made
+    ``load_yaml`` raise ``found unknown escape character`` on the generated
+    page, and because ``_prepare_mutations`` validates the whole batch before
+    committing anything, that single title aborted the entire run.
+    """
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _stabilize_community_ids(new_partition, old_partition, old_uuids=None):
+    """Map run-local community ids onto stable UUIDs by node overlap.
+
+    Each old UUID can be claimed **once**.  The previous version took every new
+    community's best-overlap old UUID without recording that it had been taken,
+    so several new communities could land on the same id: the returned mapping
+    was then not a partition (a synthetic 5-community split collapsed onto 3
+    ids, silently merging two of them), and ``process_level`` wrote two
+    different clusters to the same ``System_Community_<level>_<id>.md``, where
+    the second write replaced the first.
+
+    Claims are resolved in descending overlap order with a deterministic
+    tie-break, so the assignment does not depend on dict iteration order.
+    """
     new_comm_nodes = {}
-    for n, c in new_partition.items():
-        new_comm_nodes.setdefault(c, []).append(n)
-        
-    stable_uuids = {}
-    diffs = {}
-    
+    for node, community in new_partition.items():
+        new_comm_nodes.setdefault(community, []).append(node)
+
+    reserved = {str(value) for value in old_partition.values()}
+    candidates = []
     for new_cid, nodes in new_comm_nodes.items():
         overlap_counts = {}
-        for n in nodes:
-            old_u = old_partition.get(n)
+        for node in nodes:
+            old_u = old_partition.get(node)
             if old_u:
                 overlap_counts[old_u] = overlap_counts.get(old_u, 0) + 1
-                
         if overlap_counts:
-            best_old_u = max(overlap_counts.items(), key=lambda x: x[1])[0]
-            old_nodes_in_u = [n for n, u in old_partition.items() if u == best_old_u]
-            overlap = overlap_counts[best_old_u]
-            added = len(nodes) - overlap
-            removed = len(old_nodes_in_u) - overlap
-            total_old = len(old_nodes_in_u) if old_nodes_in_u else 1
-            diff_ratio = (added + removed) / total_old
-            
-            stable_uuids[new_cid] = best_old_u
-            diffs[best_old_u] = {"ratio": diff_ratio, "added": [n for n in nodes if old_partition.get(n) != best_old_u]}
+            best_old_u, overlap = max(
+                overlap_counts.items(), key=lambda item: (item[1], str(item[0]))
+            )
         else:
-            new_u = uuid.uuid4().hex[:8]
-            stable_uuids[new_cid] = new_u
-            diffs[new_u] = {"ratio": 1.0, "added": nodes}
-            
+            best_old_u, overlap = None, 0
+        candidates.append((overlap, str(new_cid), new_cid, nodes, best_old_u))
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+
+    claimed = set()
+    stable_uuids = {}
+    diffs = {}
+    for overlap, _order, new_cid, nodes, best_old_u in candidates:
+        if best_old_u is not None and best_old_u not in claimed:
+            stable_uuid = best_old_u
+        else:
+            # The old owner is gone, or a larger-overlap community took it.
+            # Mint a fresh id instead of sharing one.
+            stable_uuid = uuid.uuid4().hex[:8]
+            while stable_uuid in claimed or stable_uuid in reserved:
+                stable_uuid = uuid.uuid4().hex[:8]
+            best_old_u = None
+        claimed.add(stable_uuid)
+        stable_uuids[new_cid] = stable_uuid
+
+        added = [n for n in nodes if old_partition.get(n) != best_old_u]
+        if best_old_u is None:
+            diff_ratio = 1.0
+        else:
+            old_nodes_in_u = [n for n, u in old_partition.items() if u == best_old_u]
+            total_old = len(old_nodes_in_u) or 1
+            removed = len(old_nodes_in_u) - overlap
+            diff_ratio = (len(added) + removed) / total_old
+        diffs[stable_uuid] = {"ratio": diff_ratio, "added": added}
+
     final_partition = {n: stable_uuids[c] for n, c in new_partition.items()}
     return final_partition, diffs, stable_uuids
+
+def _build_graph_insights(nodes, edges, communities, isolated_limit=20, sparse_limit=20):
+    """Deterministic topology insights for the review queue and the research scout.
+
+    ``graph_insights`` was reset to ``[]`` on every clustering run and never
+    written back after the Louvain migration, so ``tool_graph.audit_graph``
+    always answered "No graph insights found" and ``tool_research`` never
+    emitted a single graph-gap query.  Only the two types the consumers read
+    are produced: ``isolated_node`` (matched on ``insight['node']``) and
+    ``sparse_community`` (matched on ``insight['nodes']``).
+
+    Both loops are capped because ``audit_graph`` enqueues every insight as a
+    governance item; an uncapped pass over a graph with hundreds of isolated
+    pages would flood the queue.
+    """
+    degree = {}
+    for edge in edges:
+        source = edge.get("source")
+        target = edge.get("target")
+        if not source or not target:
+            continue
+        degree[source] = degree.get(source, 0) + 1
+        degree[target] = degree.get(target, 0) + 1
+
+    insights = []
+    for key in sorted(key for key in nodes if degree.get(key, 0) == 0)[:isolated_limit]:
+        insights.append({
+            "type": "isolated_node",
+            "node": key,
+            "nodes": [key],
+            "description": (
+                f"{key} has no weighted edge to any other page and is unreachable "
+                "from the rest of the topology."
+            ),
+        })
+
+    members_by_community = {}
+    node_set = set(nodes)
+    for key, community in communities.items():
+        if key in node_set:
+            members_by_community.setdefault(str(community), []).append(key)
+
+    community_of = {key: str(community) for key, community in communities.items()}
+    internal_edges = {}
+    for edge in edges:
+        source_community = community_of.get(edge.get("source"))
+        if source_community is not None and source_community == community_of.get(edge.get("target")):
+            internal_edges[source_community] = internal_edges.get(source_community, 0) + 1
+
+    sparse = []
+    for community, members in members_by_community.items():
+        if len(members) < 3:
+            continue
+        # Mean internal degree below 1: the community is a label without a
+        # topology behind it, so the links that would justify it are missing.
+        if internal_edges.get(community, 0) * 2 < len(members):
+            sparse.append((community, sorted(members)))
+
+    for community, members in sorted(sparse)[:sparse_limit]:
+        insights.append({
+            "type": "sparse_community",
+            "node": members[0],
+            "nodes": members,
+            "community_id": community,
+            "description": (
+                f"Community {community} has {len(members)} members but only "
+                f"{internal_edges.get(community, 0)} internal edge(s); the "
+                "linkage that would justify grouping them is missing."
+            ),
+        })
+
+    return insights
+
 
 def run_clustering():
     index_file = get_index_path()
@@ -174,7 +295,7 @@ def run_clustering():
         index_data["graph_insights"] = []
 
         if not (nx and ig and leidenalg and edges):
-            _mark_graph_clean(index_data)
+            _mark_graph_clean(index_data, clustered=False)
             from vector_lake.wiki_utils import atomic_write_text
             atomic_write_text(index_file, json.dumps(index_data, ensure_ascii=False, indent=2))
             return
@@ -236,16 +357,26 @@ def run_clustering():
                 for node, c_uuid in final_partition.items():
                     community_nodes.setdefault(c_uuid, []).append(node)
 
+                labels = {}
+                written = set()
                 for c_uuid, nodes in community_nodes.items():
                     if len(nodes) < 3: continue
                     sorted_nodes = sorted(nodes, key=lambda node: G.degree(node), reverse=True)
                     titles = [index_data["nodes"].get(n, {}).get("title", n) for n in sorted_nodes[:2]]
                     label = f"{level_name} Comm: {' / '.join(titles) if titles else 'Unknown'}"
-                    
-                    diff_ratio = diffs_info.get(c_uuid, {}).get("ratio", 1.0)
-                    added_nodes = diffs_info.get(c_uuid, {}).get("added", [])
 
                     index_filename = f"System_Community_{level_name}_{c_uuid}.md"
+                    if index_filename in written:
+                        # Unreachable while _stabilize_community_ids keeps one id
+                        # per community; refuse to let a second cluster silently
+                        # overwrite the first if that ever regresses.
+                        log.error(f"Community id collision kept out of the write set: {index_filename}")
+                        continue
+                    written.add(index_filename)
+                    labels[c_uuid] = label
+
+                    diff_ratio = diffs_info.get(c_uuid, {}).get("ratio", 1.0)
+                    added_nodes = diffs_info.get(c_uuid, {}).get("added", [])
                     index_filepath = wiki_dir / index_filename
                     
                     hubs_markdown = "\n".join([f"- [[{node}]]" for node in sorted_nodes[:5]])
@@ -305,7 +436,7 @@ def run_clustering():
 
                     content = f"""---
 id: {index_filename[:-3]}
-title: "{label}"
+title: {_yaml_scalar(label)}
 type: system
 status: Active
 categories: [System]
@@ -313,7 +444,7 @@ updated: {_utc_now()}
 community_id: {c_uuid}
 level: {level_name}
 aliases:
-- "{label}"
+- {_yaml_scalar(label)}
 ---
 # {label}
 
@@ -332,9 +463,16 @@ aliases:
 {unassimilated}
 """
                     wiki_mutations.append({"filename": index_filename, "content": content})
+                return labels
 
-            process_level("L0", part_L0, diffs_L0)
+            labels_L0 = process_level("L0", part_L0, diffs_L0)
             process_level("L1", part_L1, diffs_L1)
+
+            # ``communities`` is the L0 partition, so the L0 labels are the ones
+            # the graph dashboard can resolve.  With no producer here the UI fell
+            # back to printing the raw community UUID.
+            index_data["community_labels"] = labels_L0
+            index_data["graph_insights"] = _build_graph_insights(node_keys, edges, part_L0)
 
             # Retire community indexes left by an earlier naming generation.
             #

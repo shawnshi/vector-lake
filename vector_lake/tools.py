@@ -31,6 +31,12 @@ from vector_lake.tool_projection import (
 )
 from vector_lake.tool_research import research_vector_lake
 from vector_lake.tool_purpose import review_strategic_purpose
+from vector_lake.tool_maintenance import (
+    IDEMPOTENCY_TABLES,
+    backup_retention_report,
+    idempotency_index_report,
+    repair_idempotency_keys,
+)
 
 
 __all__ = [
@@ -64,6 +70,10 @@ __all__ = [
     "compact_memory_gram_overlay",
     "prune_retired_gram_docs",
     "memory_gram_index_report",
+    "IDEMPOTENCY_TABLES",
+    "backup_retention_report",
+    "idempotency_index_report",
+    "repair_idempotency_keys",
     "search_vector_lake",
     "sync_vector_lake",
     "trace_vector_lake",

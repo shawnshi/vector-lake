@@ -7,6 +7,8 @@ bootstrap, ``migrate_existing_wiki(dry_run=False)`` and
 a knowledge base with wiki pages but an empty canonical store.
 """
 
+import json
+
 import pytest
 
 from vector_lake import db_store, governance_store
@@ -155,3 +157,54 @@ def test_change_set_apply_deletes_both_edge_directions(isolated_memory, monkeypa
         "SELECT COUNT(*) FROM claim_graph_edges WHERE target_id = ?", (peer_claim,)
     ).fetchone()[0]
     assert dangling == 0, "a claim edge survived the removal of its target claim"
+
+
+def test_page_rewrite_survives_claim_ids_beyond_the_sql_variable_ceiling(isolated_memory, monkeypatch):
+    """A bulk rewrite touches every claim of every affected page.
+
+    ``IN (?,?,...)`` binds one SQL variable per id (SQLite caps them at 32,766 on
+    this build) and the ``claim_graph_edges`` statement binds each id twice, so a
+    page carrying more than 16,383 claims aborted the whole transaction with
+    "too many SQL variables".  That is not hypothetical: the community index
+    rewrite carries ~14k claims and it killed an entire clustering run.  The
+    lookup now takes one JSON parameter (``json_each``), so the ceiling is gone.
+    """
+    monkeypatch.setenv("VECTOR_LAKE_DISABLE_WRITE_HEALTH_GATE", "1")
+    _write_purpose_contract(isolated_memory)
+    db_store.init_db()
+    page = isolated_memory / "wiki" / "Concept_Bulk.md"
+    page.write_text(_concept("Concept_Bulk"), encoding="utf-8")
+
+    conn = db_store.get_connection()
+    claim_ids = [f"claim_bulk{index:05d}" for index in range(17000)]
+    with db_store.transaction():
+        conn.executemany(
+            "INSERT OR REPLACE INTO claims (claim_id, claim_text, status, data_json, updated_at) "
+            "VALUES (?, ?, 'Active', ?, ?)",
+            [
+                (
+                    claim_id,
+                    f"bulk {claim_id}",
+                    json.dumps(
+                        {
+                            "claim_id": claim_id,
+                            "claim_text": f"bulk {claim_id}",
+                            "locator": {"page_key": "Concept_Bulk"},
+                        }
+                    ),
+                    "2026-01-01",
+                )
+                for claim_id in claim_ids
+            ],
+        )
+    assert 2 * len(claim_ids) > 32766, "precondition: the placeholder form would exceed the ceiling"
+
+    governance_store.apply_change_sets_batch(
+        [governance_store.create_change_set([str(page)], origin="probe", auto_approve=True)]
+    )
+
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM claims WHERE claim_id IN (SELECT value FROM json_each(?))",
+        (json.dumps(claim_ids),),
+    ).fetchone()[0]
+    assert remaining == 0, "the superseded claims must be retired by the rewrite"

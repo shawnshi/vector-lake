@@ -1,10 +1,13 @@
+import json
 import logging
 import os
 import queue
 import threading
 import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from vector_lake import get_extension_root
+from vector_lake.watchdog_status import reset_components, write_status
 from vector_lake.wiki_utils import DEFAULT_EXCLUDE_PATHS, load_config
 
 # Config: shipped defaults merged with the optional per-machine ``config.json``.
@@ -145,10 +148,14 @@ class RawWatchdogHandler(FileSystemEventHandler):
         except Exception as e:
             log.error(f"Failed to trigger sync_vector_lake: {e}")
 
-    def on_created(self, event): self.handle_event(event)
-    def on_modified(self, event): self.handle_event(event)
-    def on_moved(self, event): self.handle_event(event)
-from vector_lake.watchdog_status import reset_components, write_status
+    def on_created(self, event):
+        self.handle_event(event)
+
+    def on_modified(self, event):
+        self.handle_event(event)
+
+    def on_moved(self, event):
+        self.handle_event(event)
 
 
 def process_mutation_outbox_batch(
@@ -256,6 +263,55 @@ def canonicalise_manual_edits(filenames) -> tuple[int, list[tuple[str, str]]]:
     return handled, failures
 
 
+# The outbox consumer is the single writer for the read projection.  A rebuild is
+# expensive, and the loop ticks every second, so a stale projection is retried at
+# this interval rather than at loop frequency.
+PROJECTION_HEAL_INTERVAL_SECONDS = 15.0
+_last_projection_heal = 0.0
+
+
+def heal_page_index_projection(force: bool = False) -> dict:
+    """Single-writer repair of the SQLite read projection.
+
+    The reader-side rebuild was removed: a reader that found the projection behind
+    used to take the write lock and rebuild it, so every query competed with
+    whoever was writing, and the loser returned no answer at all.  Readers now
+    fall back to ``index.json`` (see ``page_index_projection.read_catalog``);
+    this is the only place the projection is brought back in step out of band,
+    and it runs in the process that already owns the index.
+    """
+    global _last_projection_heal
+    from vector_lake import page_index_projection
+
+    if not force:
+        if (
+            page_index_projection.projection_is_current()
+            and page_index_projection.projection_stale() is None
+        ):
+            return {"healed": False, "reason": "current"}
+        now = time.monotonic()
+        if (now - _last_projection_heal) < PROJECTION_HEAL_INTERVAL_SECONDS:
+            return {"healed": False, "reason": "throttled"}
+        _last_projection_heal = now
+
+    report = page_index_projection.heal_projection_if_stale()
+    if report.get("healed"):
+        log.info("Page index projection rebuilt from index.json: %s", report)
+    elif report.get("reason") not in {"current"}:
+        # Expected while another writer holds the lock; the next cycle retries.
+        log.warning("Page index projection heal deferred: %s", report)
+    if report.get("healed") or report.get("marker"):
+        write_status(
+            "idle",
+            0,
+            index_queue.qsize(),
+            f"Projection: {report.get('reason')}",
+            "" if report.get("healed") else str(report.get("reason")),
+            component="projection",
+        )
+    return report
+
+
 def index_worker_loop():
     log.info("Outbox Consumer Thread started.")
     consecutive_failures = 0
@@ -294,6 +350,9 @@ def index_worker_loop():
                     component="outbox",
                 )
                 log.info(f"Outbox batch completed: {stats}")
+
+            # The projection is this process's responsibility, never a reader's.
+            heal_page_index_projection()
 
             # Manual filesystem edits are bounded so they cannot starve durable outbox work.
             pending_legacy = set()
@@ -347,48 +406,132 @@ def index_worker_loop():
             close_connection()
 
 
+# Hours of the day at which the autonomous lint (and the only periodic
+# ``wal_checkpoint(TRUNCATE)``) is due.
+SCHEDULED_LINT_HOURS = (10, 23)
+
+
+def scheduled_lint_occurrence(now) -> str:
+    """The most recent scheduled instant at or before ``now``, as ``YYYY-MM-DD-HH``.
+
+    The loop used to fire only when ``tm_min == 0``, sampled every 30 s, so a
+    restart, a slow tick or a long ingest over that minute skipped the day's lint
+    entirely -- and with it the only periodic WAL truncation.  Keying on the most
+    recent occurrence lets the loop catch up instead, and running at most once per
+    occurrence means a week of downtime still triggers exactly one run.
+    """
+    hours = sorted(SCHEDULED_LINT_HOURS)
+    due_hours = [hour for hour in hours if hour <= now.tm_hour]
+    if due_hours:
+        return f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}-{due_hours[-1]:02d}"
+    previous = date(now.tm_year, now.tm_mon, now.tm_mday) - timedelta(days=1)
+    return f"{previous.year:04d}-{previous.month:02d}-{previous.day:02d}-{hours[-1]:02d}"
+
+
+def _scheduled_lint_state_path() -> Path:
+    from vector_lake.wiki_utils import get_meta_dir
+
+    return get_meta_dir() / ".scheduled_lint_state.json"
+
+
+def _load_last_scheduled_lint() -> str:
+    """Last successfully completed occurrence, or ``""`` when unknown.
+
+    Persisted rather than in-memory: an unpersisted marker would make every
+    watchdog restart trigger an immediate full lint.
+    """
+    try:
+        data = json.loads(_scheduled_lint_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("last_occurrence") or "") if isinstance(data, dict) else ""
+
+
+def _save_last_scheduled_lint(occurrence: str) -> None:
+    path = _scheduled_lint_state_path()
+    payload = {
+        "last_occurrence": occurrence,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(path.name + ".tmp")
+        from vector_lake.wiki_utils import flush_durable
+
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            flush_durable(handle)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        # Worst case the next restart re-runs one lint, which is idempotent.
+        log.warning(f"Could not persist the scheduled-lint marker: {exc}")
+
+
 def scheduled_lint_loop():
     log.info("Scheduled Lint Worker Thread started.")
-    last_run_date_hour = ""
+    if not os.environ.get("VECTOR_LAKE_IGNORE_SCHEDULED_LINT_STATE"):
+        last_occurrence = _load_last_scheduled_lint()
+    else:
+        # Operator escape hatch for a deliberate forced re-run.
+        last_occurrence = ""
 
     while True:
         try:
             # DB connection opens only inside actual work blocks now
             now = time.localtime()
-            
-            # Run at 10:00 and 23:00
-            if now.tm_hour in (10, 23) and now.tm_min == 0:
-                current_date_hour = f"{now.tm_year}-{now.tm_mon}-{now.tm_mday}-{now.tm_hour}"
-                if current_date_hour != last_run_date_hour:
-                    write_status("processing", 0, index_queue.qsize(), "Running Scheduled Auto-Lint", "", component="scheduler")
-                    log.info("Triggering Scheduled Autonomous Auto-Lint...")
-                    
-                    from vector_lake.tool_lint import lint_vector_lake
-                    from vector_lake import indexer
-                    with global_task_lock:
-                        if indexer.refresh_graph_topology_if_dirty():
-                            log.info("Graph topology refreshed during scheduled lint.")
-                        lint_vector_lake(auto_fix=False)
-                        
-                        # Truncate WAL to prevent unbounded growth
-                        from vector_lake.db_store import get_connection
-                        try:
-                            conn = get_connection()
-                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                            log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
-                        except Exception as e:
-                            log.error(f"Failed to truncate WAL: {e}")
-                    
-                    log.info("Scheduled Autonomous Auto-Lint completed.")
-                    last_run_date_hour = current_date_hour
-                    write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "", component="scheduler")
-            
-            # If we just ran at hour 10 or 23, sleep 60 seconds to push past min 0
-            if now.tm_hour in (10, 23) and now.tm_min == 0:
-                time.sleep(60)
-            else:
-                time.sleep(30)
-                
+            due = scheduled_lint_occurrence(now)
+
+            if due != last_occurrence:
+                write_status("processing", 0, index_queue.qsize(), "Running Scheduled Auto-Lint", "", component="scheduler")
+                log.info(f"Triggering Scheduled Autonomous Auto-Lint for occurrence {due}...")
+
+                from vector_lake.tool_lint import lint_vector_lake
+                from vector_lake import indexer
+                with global_task_lock:
+                    if indexer.refresh_graph_topology_if_dirty():
+                        log.info("Graph topology refreshed during scheduled lint.")
+                    lint_vector_lake(auto_fix=False)
+
+                    # Truncate WAL to prevent unbounded growth
+                    from vector_lake.db_store import get_connection
+                    try:
+                        conn = get_connection()
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
+                    except Exception as e:
+                        log.error(f"Failed to truncate WAL: {e}")
+
+                    # Backups are written by the repair, projection and ingest
+                    # paths and nothing ever removed them, so the tree grows
+                    # without bound.  Housekeeping belongs here, next to the other
+                    # scheduled maintenance; the bound never drops below the newest
+                    # copy (see vector_lake.backup_retention).
+                    try:
+                        from vector_lake.backup_retention import prune_backups
+                        from vector_lake.wiki_utils import get_meta_dir
+
+                        retention = prune_backups(get_meta_dir() / "backups", dry_run=False)
+                        if retention["deleted"]:
+                            log.info(
+                                "Backup retention removed %s entr(ies), %s bytes; %s kept.",
+                                len(retention["deleted"]),
+                                retention["removable_bytes"],
+                                len(retention["keep"]),
+                            )
+                        for failure in retention["failures"]:
+                            log.warning(f"Backup retention left {failure}")
+                    except Exception as e:
+                        log.error(f"Backup retention failed: {e}")
+
+                log.info("Scheduled Autonomous Auto-Lint completed.")
+                # Only a completed occurrence is recorded, so a failure is retried
+                # on the next tick instead of being silently skipped.
+                last_occurrence = due
+                _save_last_scheduled_lint(due)
+                write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "", component="scheduler")
+
+            time.sleep(30)
+
         except Exception as exc:
             log.error(f"Scheduled lint worker error: {exc}")
             write_status("error", 0, index_queue.qsize(), "Scheduled lint exception", str(exc), component="scheduler")

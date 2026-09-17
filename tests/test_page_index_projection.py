@@ -162,3 +162,84 @@ def test_missing_index_is_reported_as_drying(isolated_memory):
     result = search_vector_lake("anything", top_k=3)
 
     assert "drying" in result.lower()
+
+
+# --- incremental edge projection -------------------------------------------
+#
+# The state stamp is ``(mtime, size)``, so any ``index.json`` rewrite used to
+# re-project every edge row under the write lock even when the topology was
+# untouched.  These pin the content check that lets the rewrite be skipped.
+
+
+def _reindex_payload(wiki_dir) -> dict:
+    return json.loads((wiki_dir / "index.json").read_text(encoding="utf-8"))
+
+
+def test_unchanged_edges_skip_the_edge_rewrite(indexed_memory):
+    wiki_dir = indexed_memory / "wiki"
+    payload = _reindex_payload(wiki_dir)
+
+    result = page_index_projection.refresh_page_index_projection(payload)
+
+    assert result["edges_rewritten"] is False
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0] == 4
+    assert page_index_projection.projection_state()["edge_count"] == 4
+
+
+def test_changed_edge_weight_forces_the_rewrite(indexed_memory):
+    wiki_dir = indexed_memory / "wiki"
+    payload = _reindex_payload(wiki_dir)
+    payload["weighted_edges"][0]["weight"] = 99.0
+
+    result = page_index_projection.refresh_page_index_projection(payload)
+
+    assert result["edges_rewritten"] is True
+    conn = db_store.get_connection()
+    row = conn.execute("SELECT weight FROM page_index_edges WHERE sequence = 0").fetchone()
+    assert float(row[0]) == 99.0
+
+
+def test_edge_count_change_is_detected_without_hashing(indexed_memory):
+    wiki_dir = indexed_memory / "wiki"
+    payload = _reindex_payload(wiki_dir)
+    payload["weighted_edges"] = payload["weighted_edges"][:3]
+
+    result = page_index_projection.refresh_page_index_projection(payload)
+
+    assert result["edges_rewritten"] is True
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0] == 3
+
+
+def test_recorded_digest_matches_the_projected_edges(indexed_memory):
+    wiki_dir = indexed_memory / "wiki"
+    payload = _reindex_payload(wiki_dir)
+
+    page_index_projection.refresh_page_index_projection(payload)
+
+    state = page_index_projection.projection_state()
+    assert state["edge_digest"] == page_index_projection._weighted_edges_digest(payload)
+
+
+def test_skipped_rewrite_leaves_the_adjacency_consistent(indexed_memory):
+    wiki_dir = indexed_memory / "wiki"
+    payload = _reindex_payload(wiki_dir)
+    before = page_index_projection.adjacency()
+
+    page_index_projection.refresh_page_index_projection(payload)
+
+    assert page_index_projection.adjacency() == before
+
+
+def test_refresh_without_an_edge_key_keeps_the_projection(indexed_memory):
+    """A payload that never claims edges must not erase them."""
+    wiki_dir = indexed_memory / "wiki"
+    payload = _reindex_payload(wiki_dir)
+    payload.pop("weighted_edges")
+
+    result = page_index_projection.refresh_page_index_projection(payload)
+
+    assert result["edges_rewritten"] is False
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0] == 4

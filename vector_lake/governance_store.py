@@ -328,6 +328,30 @@ def load_alias_registry():
     return store
 
 
+def get_alias(key: str) -> str | None:
+    """Return one alias target without loading the complete registry."""
+    initialize_meta_store()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT value FROM alias_registry WHERE key = ?",
+            (key,),
+        )
+        .fetchone()
+    )
+    return row["value"] if row else None
+
+
+def upsert_alias(key: str, value: str) -> None:
+    """Persist one alias mapping and participate in any surrounding transaction."""
+    now = _utc_now()
+    with transaction():
+        get_connection().execute(
+            "INSERT OR REPLACE INTO alias_registry (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, now),
+        )
+
+
 def load_memory_objects():
     return _load_db_map("operational_memory", "memory_id")
 
@@ -607,6 +631,22 @@ def _upsert_operational_memory_records(records: list[dict]):
     )
 
 
+def _json_id_list(ids) -> str:
+    """A sorted JSON array for ``json_each``-based membership tests.
+
+    ``IN (?,?,...)`` costs one SQL variable per id and SQLite caps them at
+    32,766 (measured on this build), while a bulk change-set batch touches every
+    claim of every affected page -- 14,055 of them for one rewrite of the
+    community index pages -- and the ``claim_graph_edges`` statement below binds
+    each id twice.  That exceeded the ceiling with
+    ``sqlite3.OperationalError: too many SQL variables``, and because the whole
+    batch runs in one transaction it aborted the entire run.  A single JSON
+    parameter has no such limit.  ``sorted`` keeps the previous deterministic
+    parameter order.
+    """
+    return json.dumps(sorted(ids), ensure_ascii=False)
+
+
 def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: list[dict]):
     """Rebuild memory only for changed claims and their direct conflict peers."""
     from vector_lake import governance_metrics
@@ -616,19 +656,18 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
     changed_claim_ids = old_claim_ids | proposed_claim_ids
     old_memories = []
     if changed_claim_ids:
-        placeholders = ",".join("?" for _ in changed_claim_ids)
         old_memories = [
             json.loads(row["data_json"])
             for row in conn.execute(
-                f"SELECT data_json FROM operational_memory "
-                f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
-                tuple(sorted(changed_claim_ids)),
+                "SELECT data_json FROM operational_memory "
+                "WHERE json_extract(data_json, '$.source_claim_id') IN (SELECT value FROM json_each(?))",
+                (_json_id_list(changed_claim_ids),),
             ).fetchall()
         ]
         conn.execute(
-            f"DELETE FROM operational_memory "
-            f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
-            tuple(sorted(changed_claim_ids)),
+            "DELETE FROM operational_memory "
+            "WHERE json_extract(data_json, '$.source_claim_id') IN (SELECT value FROM json_each(?))",
+            (_json_id_list(changed_claim_ids),),
         )
 
     new_memories = [
@@ -646,12 +685,11 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
 
     peer_rows = []
     if related_claim_ids:
-        placeholders = ",".join("?" for _ in related_claim_ids)
         peer_rows.extend(
             conn.execute(
-                f"SELECT data_json FROM operational_memory "
-                f"WHERE json_extract(data_json, '$.source_claim_id') IN ({placeholders})",
-                tuple(sorted(related_claim_ids)),
+                "SELECT data_json FROM operational_memory "
+                "WHERE json_extract(data_json, '$.source_claim_id') IN (SELECT value FROM json_each(?))",
+                (_json_id_list(related_claim_ids),),
             ).fetchall()
         )
     for memory_type, memory_key in sorted(impacted_keys):
@@ -1567,12 +1605,27 @@ def build_claim_graph_projection(limit_nodes: int | None = None) -> dict:
     }
 
 
-def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
+def create_merge_suggestions(limit: int = 20, enqueue: bool = True, include_hazardous: bool = False) -> dict:
+    """Queue detected duplicate pairs for human resolution.
+
+    Candidates flagged in ``hazards`` (a shared name claimed by three or more
+    distinct entities) are not enqueued by default: resolving one means deciding
+    which of three or more live nodes keeps the name, which is not a choice the
+    detector can make.  Those candidates stay visible in ``find_merge_candidates``
+    and in the returned payload, and can be enqueued with ``include_hazardous``.
+    """
     from vector_lake import governance_metrics
 
     suggestions = governance_metrics.find_merge_candidates(limit=limit)
+    hazardous = [s for s in suggestions if s.get("hazards")]
+    enqueueable = suggestions if include_hazardous else [s for s in suggestions if not s.get("hazards")]
     if not enqueue:
-        return {"created": 0, "suggestions": suggestions}
+        return {
+            "created": 0,
+            "suggestions": enqueueable,
+            "skipped_hazardous": len(suggestions) - len(enqueueable),
+            "hazardous_pairs": [s["pair_key"] for s in hazardous],
+        }
 
     created = 0
     with governance_queue_session():
@@ -1582,7 +1635,7 @@ def create_merge_suggestions(limit: int = 20, enqueue: bool = True) -> dict:
             for item in queue["items"]
             if item.get("type") == "merge"
         }
-        for suggestion in suggestions:
+        for suggestion in enqueueable:
             if suggestion["pair_key"] in existing_pairs:
                 continue
             queue["items"].append({
@@ -1877,11 +1930,15 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             old_claim_ids | {record["claim_id"] for record in proposed_claims if record.get("claim_id")}
         )
         if touched_claim_ids:
-            edge_placeholders = ",".join("?" for _ in touched_claim_ids)
+            # One JSON parameter instead of two placeholder lists: see
+            # ``_json_id_list`` for why the placeholder form cannot hold a bulk
+            # batch's claim set.
+            touched_claim_json = _json_id_list(touched_claim_ids)
             conn.execute(
-                f"DELETE FROM claim_graph_edges WHERE source_id IN ({edge_placeholders}) "
-                f"OR target_id IN ({edge_placeholders})",
-                [*touched_claim_ids, *touched_claim_ids],
+                "DELETE FROM claim_graph_edges "
+                "WHERE source_id IN (SELECT value FROM json_each(?)) "
+                "OR target_id IN (SELECT value FROM json_each(?))",
+                (touched_claim_json, touched_claim_json),
             )
         conn.execute(
             f"DELETE FROM entities WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",

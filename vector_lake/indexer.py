@@ -14,7 +14,15 @@ from vector_lake import governance_metrics
 from vector_lake import governance_store
 from vector_lake import db_store
 from vector_lake import tokenizer as _tokenizer
-from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_wiki_dir, read_markdown_file, VALID_PREFIXES
+from vector_lake.wiki_utils import (
+    get_claim_graph_path,
+    get_index_path,
+    get_wiki_dir,
+    read_markdown_file,
+    flush_durable,
+    fsync_directory,
+    VALID_PREFIXES,
+)
 
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
@@ -43,6 +51,11 @@ RELEVANCE_WEIGHTS = {
     "common_neighbor": 1.5,
     "type_affinity": 1.0,
 }
+
+# Degree bound for the page-space edge set.  A full rebuild has always applied
+# it; the incremental path did not, which is how the live index grew to 1.6M
+# edges (mean degree 487, max 4118) against a documented limit of 15.
+MAX_EDGES_PER_NODE = 15
 
 # index.json.lock is shared with the outbox consumer's partial updates.
 INDEX_LOCK_TIMEOUT_SECONDS = 120
@@ -101,6 +114,7 @@ def _empty_index_data() -> dict:
         "graph_insights": [],
         "graph_state": {
             "dirty": False,
+            "clustering_stale": False,
             "reason": "",
             "updated_at": None,
         },
@@ -252,10 +266,12 @@ def _write_json_payload(output_path: str, data: dict):
     temp_path = output_path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+        flush_durable(handle)
     import time
     for attempt in range(5):
         try:
             os.replace(temp_path, output_path)
+            fsync_directory(os.path.dirname(output_path) or ".")
             return
         except PermissionError as e:
             if attempt < 4:
@@ -271,6 +287,36 @@ def _write_json_payload(output_path: str, data: dict):
 def _write_json_stage(stage_path: str, data: dict):
     with open(stage_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+        flush_durable(handle)
+
+
+def _refresh_page_projection(index_data: dict) -> None:
+    """Bring the read projection in step with the ``index.json`` just written.
+
+    Done by the writer, not lazily on read: the ingest path rewrites
+    ``index.json`` once per page, so a lazy rebuild would cost a full parse per
+    search, and readers no longer rebuild at all (see
+    ``page_index_projection.read_catalog``).
+
+    A failure is recorded rather than raised: the file is already published and
+    stays sovereign, readers fall back to it, and ``heal_projection_if_stale`` --
+    the outbox consumer's job -- retries under the write lock it can afford.
+    """
+    from vector_lake import page_index_projection
+
+    try:
+        page_index_projection.refresh_page_index_projection(index_data)
+        page_index_projection.clear_projection_stale()
+    except Exception as exc:  # noqa: BLE001 - the file stays sovereign; reads self-heal
+        # Do not swallow this silently: the next reader inherits the rebuild, and
+        # under contention that rebuild is exactly what it cannot get.  Recording
+        # the failure lets the reader name the cause instead of reporting a bare
+        # lock timeout, and leaves an operator-visible trace of who lost the race.
+        log.warning("Page index projection refresh failed: %s: %s", type(exc).__name__, exc)
+        try:
+            page_index_projection.mark_projection_stale(f"{type(exc).__name__}: {exc}")
+        except Exception as marker_exc:  # noqa: BLE001 - the marker is best-effort
+            log.warning("Could not record projection staleness: %s", marker_exc)
 
 
 def _write_index(output_path: str, index_data: dict):
@@ -278,15 +324,7 @@ def _write_index(output_path: str, index_data: dict):
     if removed:
         log.info(f"Stripped legacy embedded payloads before writing index: {', '.join(removed)}")
     _write_json_payload(output_path, index_data)
-    # Keep the SQLite read projection in step with the file it projects.  Done here
-    # rather than only lazily on read, because the ingest path rewrites index.json
-    # once per page and a lazy rebuild would then cost a full parse per search.
-    try:
-        from vector_lake import page_index_projection
-
-        page_index_projection.refresh_page_index_projection(index_data)
-    except Exception as exc:  # noqa: BLE001 - the file stays sovereign; reads self-heal
-        log.warning("Page index projection refresh failed: %s: %s", type(exc).__name__, exc)
+    _refresh_page_projection(index_data)
 
 
 def _write_claim_graph(output_path: str, claim_graph_data: dict):
@@ -294,8 +332,16 @@ def _write_claim_graph(output_path: str, claim_graph_data: dict):
 
 
 def _mark_graph_dirty(index_data: dict, reason: str):
+    """Records that both the edge set and the community assignment are stale.
+
+    A node/edge change invalidates the Leiden partition too, so the two flags
+    are set together and cleared by different owners: ``dirty`` by the
+    topology refresh in this module, ``clustering_stale`` by the clustering
+    daemon.
+    """
     graph_state = index_data.setdefault("graph_state", {})
     graph_state["dirty"] = True
+    graph_state["clustering_stale"] = True
     graph_state["reason"] = reason
     graph_state["updated_at"] = _utc_now()
 
@@ -303,6 +349,7 @@ def _mark_graph_dirty(index_data: dict, reason: str):
 def _mark_graph_clean(index_data: dict):
     graph_state = index_data.setdefault("graph_state", {})
     graph_state["dirty"] = False
+    graph_state["clustering_stale"] = False
     graph_state["reason"] = ""
     graph_state["updated_at"] = _utc_now()
 
@@ -311,6 +358,22 @@ def is_graph_dirty(index_data: dict | None) -> bool:
     if not index_data:
         return True
     graph_state = (index_data.get("graph_state") or {})
+    return bool(graph_state.get("dirty"))
+
+
+def is_clustering_stale(index_data: dict | None) -> bool:
+    """True when ``communities`` predates the current node/edge set.
+
+    Readers that render community membership (the graph tool, the naming
+    queue) must not present a stale partition as current.  Legacy payloads
+    written before the flags were separated have no ``clustering_stale`` key;
+    they fall back to ``dirty``, which was the only staleness signal then.
+    """
+    if not index_data:
+        return True
+    graph_state = index_data.get("graph_state") or {}
+    if "clustering_stale" in graph_state:
+        return bool(graph_state["clustering_stale"])
     return bool(graph_state.get("dirty"))
 
 
@@ -611,6 +674,61 @@ def calculate_relevance(node_a: dict, node_b: dict, all_nodes: dict,
     return round(score, 3)
 
 
+def dedupe_and_prune_edges(
+    edges: list[dict],
+    max_edges_per_node: int = MAX_EDGES_PER_NODE,
+) -> list[dict]:
+    """Normalise, deduplicate and degree-bound a page-space edge set.
+
+    Enforces the two invariants every consumer assumes -- the SQLite
+    ``page_graph_edges`` projection (primary key ``source_id, target_id``),
+    the renderer, and the clustering daemon that reads ``weighted_edges``:
+
+    1. exactly one row per unordered ``(source, target)`` pair, stored as
+       ``min``/``max`` so a pair written by two code paths cannot appear twice;
+    2. no node above ``max_edges_per_node`` incident edges.
+
+    Both invariants were previously maintained only on the full-rebuild path.
+    ``update_index_items`` appended every qualifying edge for the touched node
+    and re-added that node's rows from the projection without re-applying
+    either rule, so the published set drifted to 1.6M edges for 7,125 nodes
+    (mean degree 487.7, max 4,118, 314,660 duplicate pairs) while the
+    projection it feeds held 1,293,183 deduplicated rows -- the file and its
+    own projection disagreed.
+
+    Kept as a single function so the two paths cannot drift apart again; it
+    is deterministic (weight descending, then key ascending) so a rebuild and
+    an incremental update converge on the same set.
+    """
+    best: dict[tuple[str, str], float] = {}
+    for edge in edges:
+        source = edge.get("source")
+        target = edge.get("target")
+        if not source or not target or source == target:
+            continue
+        key = (source, target) if source <= target else (target, source)
+        weight = float(edge.get("weight") or 1.0)
+        if weight > best.get(key, float("-inf")):
+            best[key] = weight
+
+    ordered = sorted(
+        ((source, target, weight) for (source, target), weight in best.items()),
+        key=lambda item: (-item[2], item[0], item[1]),
+    )
+
+    counts: dict[str, int] = {}
+    pruned: list[dict] = []
+    for source, target, weight in ordered:
+        if counts.get(source, 0) >= max_edges_per_node:
+            continue
+        if counts.get(target, 0) >= max_edges_per_node:
+            continue
+        counts[source] = counts.get(source, 0) + 1
+        counts[target] = counts.get(target, 0) + 1
+        pruned.append({"source": source, "target": target, "weight": weight})
+    return pruned
+
+
 def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     nodes_dict = index_data["nodes"]
     node_keys = list(nodes_dict.keys())
@@ -794,31 +912,25 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     # Page-space edges are derived from canonical links/source overlap only.
     # `claim_graph_edges` lives in a different key space and `page_graph_edges`
     # is this function's own output projection, so neither is merged in here.
-
-    edges.sort(key=lambda edge: edge["weight"], reverse=True)
-
-    # --- Top-K Edge Pruning to prevent Force Collapse ---
-    MAX_EDGES_PER_NODE = 15
-    node_edge_counts = {k: 0 for k in node_keys}
-    pruned_edges = []
-    
-    for edge in edges:
-        src = edge["source"]
-        tgt = edge["target"]
-        if node_edge_counts.get(src, 0) < MAX_EDGES_PER_NODE and node_edge_counts.get(tgt, 0) < MAX_EDGES_PER_NODE:
-            pruned_edges.append(edge)
-            node_edge_counts[src] += 1
-            node_edge_counts[tgt] += 1
-
-    return pruned_edges
+    return dedupe_and_prune_edges(edges)
 
 
 def _apply_graph_topology(index_data: dict):
-    if "graph_state" not in index_data:
-        index_data["graph_state"] = {}
-    index_data["graph_state"]["dirty"] = True
-    index_data["graph_state"]["reason"] = "Index generated, awaiting async clustering"
-    index_data["graph_state"]["updated_at"] = _utc_now()
+    """Marks the edge topology as current and the community assignment as stale.
+
+    This runs after ``weighted_edges`` is (re)computed, so ``dirty`` is
+    cleared here -- previously this function set ``dirty = True`` again, so the
+    flag could never be cleared, ``refresh_graph_topology_if_dirty`` reported
+    work on every pass, and the centrality placeholders below were the only
+    scores ever written (live index: 4,645 nodes at ``centrality_score = 1.0``,
+    2,478 with no key at all).  Clustering is a separate, operator-invoked step
+    and stays marked stale until the daemon runs.
+    """
+    graph_state = index_data.setdefault("graph_state", {})
+    graph_state["dirty"] = False
+    graph_state["clustering_stale"] = True
+    graph_state["reason"] = "Edge topology current; community clustering pending"
+    graph_state["updated_at"] = _utc_now()
     
     # Initialize basic node scores so BM25 doesn't crash
     node_keys = list(index_data["nodes"].keys())
@@ -912,6 +1024,13 @@ def _generate_index_locked(skip_embeddings: bool = True):
             raise FileNotFoundError(f"Missing staged projection file before publish: {staged_path}")
     os.replace(tmp_claim, claim_graph_path)
     os.replace(tmp_output, output_path)
+    fsync_directory(os.path.dirname(output_path) or ".")
+
+    # The published file is now the source of truth this projection mirrors, so
+    # the writer that published it also refreshes it.  Without this, a full
+    # rebuild left the projection stale until some reader rebuilt it -- which is
+    # precisely the coupling that made every query compete for the write lock.
+    _refresh_page_projection(index_data)
 
     log.info(
         f"Generated index.json with {len(index_data['nodes'])} nodes | "
@@ -1141,6 +1260,14 @@ def update_index_items(filenames: list[str]):
                                     node_data.pop("_key", None)
     
                     _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
+                    # Re-apply the shared cap and pair-level dedup after the batch.
+                    # The loop above appends every qualifying edge for the touched
+                    # node, and the projection re-add above is not deduplicated
+                    # against those appended rows, so without this the published
+                    # set drifts away from weighted_edges' documented contract.
+                    index_data["weighted_edges"] = dedupe_and_prune_edges(
+                        index_data.get("weighted_edges") or []
+                    )
                     index_data["categories"] = list((index_data.get("categories") or []))
                     # Do not recompute heavy debt metrics on partial update
                     index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
@@ -1223,9 +1350,17 @@ def refresh_graph_topology_if_dirty() -> bool:
 
 
 def _replace_with_retry(temp_path: str, output_path: str) -> None:
+    # The staged file is synced before the swap so a caller cannot publish a torn
+    # projection by forgetting to flush its own handle.
+    try:
+        with open(temp_path, "rb") as staged:
+            os.fsync(staged.fileno())
+    except OSError as exc:
+        log.warning(f"Could not fsync staged {temp_path}: {exc}")
     for attempt in range(5):
         try:
             os.replace(temp_path, output_path)
+            fsync_directory(os.path.dirname(output_path) or ".")
             return
         except PermissionError as exc:
             if attempt < 4:

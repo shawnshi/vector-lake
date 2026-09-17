@@ -1,3 +1,5 @@
+import pytest
+
 from vector_lake import db_store, indexer
 from types import SimpleNamespace
 
@@ -239,3 +241,172 @@ def test_start_embedding_run_marks_crashed_run_abandoned(isolated_memory, monkey
         for row in conn.execute("SELECT run_id, status FROM embedding_runs")
     }
     assert rows == {"stale-run": "abandoned", "new-run": "running"}
+
+
+# --- caller-supplied budget -------------------------------------------------
+#
+# A quota error used to sleep a flat 60 s per retry, which exceeds the MCP
+# client's 60 s call ceiling on its own.  These pin the deadline check that turns
+# an unaffordable wait into an explicit, immediate failure.
+
+
+class _StubLimiter:
+    def __init__(self, wait_seconds=0.0):
+        self.wait_seconds = wait_seconds
+        self.calls = 0
+        self.deadlines = []
+        self.durable = []
+
+    def reserve(self, request_tokens, deadline=None, durable=True):
+        self.calls += 1
+        self.deadlines.append(deadline)
+        self.durable.append(durable)
+        if self.wait_seconds:
+            raise embedding_scheduler.EmbeddingBudgetExceeded(
+                f"rate-limit window would hold this request for {self.wait_seconds}s"
+            )
+
+
+class _QuotaClient:
+    """Raises the provider's quota error on every call."""
+
+    def __init__(self):
+        self.models = SimpleNamespace(embed_content=self._embed)
+        self.calls = 0
+
+    def _embed(self, **_kwargs):
+        self.calls += 1
+        raise RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")
+
+
+def test_quota_retry_inside_a_budget_fails_fast(monkeypatch):
+    slept = []
+    monkeypatch.setattr(embedding_scheduler.time, "sleep", lambda seconds: slept.append(seconds))
+    client = _QuotaClient()
+
+    with pytest.raises(embedding_scheduler.EmbeddingBudgetExceeded) as caught:
+        embedding_scheduler._request_embeddings(
+            client,
+            ["梅奥"],
+            10,
+            embedding_scheduler.load_embedding_rate_config(),
+            _StubLimiter(),
+            budget_seconds=1.0,
+        )
+
+    assert slept == []  # the 60 s quota sleep was refused, not taken
+    assert client.calls >= 1
+    assert "budget remains" in str(caught.value)
+
+
+def test_quota_retry_will_wait_when_no_budget_was_given(monkeypatch):
+    """Batch callers (backfill) must keep the patient behaviour."""
+    slept = []
+    monkeypatch.setattr(embedding_scheduler.time, "sleep", lambda seconds: slept.append(seconds))
+    config = embedding_scheduler.load_embedding_rate_config()
+
+    with pytest.raises(RuntimeError, match="RESOURCE_EXHAUSTED"):
+        embedding_scheduler._request_embeddings(
+            _QuotaClient(), ["梅奥"], 10, config, _StubLimiter(), budget_seconds=None
+        )
+
+    assert slept == [60.0] * config.max_retries
+
+
+def test_rate_limiter_refuses_an_unaffordable_window_wait(isolated_memory, monkeypatch):
+    """A full rolling window must not be waited out past the caller's deadline."""
+    db_store.init_db()
+    monkeypatch.setattr(
+        embedding_scheduler.time, "sleep", lambda seconds: pytest.fail("slept past the budget")
+    )
+    config = embedding_scheduler.load_embedding_rate_config()
+    limiter = embedding_scheduler.MinuteRateLimiter(config)
+    now = embedding_scheduler.time.time()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        for index in range(config.effective_rpm):
+            conn.execute(
+                "INSERT INTO embedding_rate_reservations (reservation_id, reserved_at, token_count) "
+                "VALUES (?, ?, ?)",
+                (f"res_{index}", now, 1),
+            )
+
+    with pytest.raises(embedding_scheduler.EmbeddingBudgetExceeded):
+        limiter.reserve(1, deadline=embedding_scheduler.time.monotonic())
+
+
+def test_rate_limiter_still_blocks_without_a_deadline(isolated_memory, monkeypatch):
+    """No deadline means the limiter waits, as the batch paths require."""
+    db_store.init_db()
+    slept = []
+    config = embedding_scheduler.load_embedding_rate_config()
+    limiter = embedding_scheduler.MinuteRateLimiter(config)
+    now = embedding_scheduler.time.time()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        for index in range(config.effective_rpm):
+            conn.execute(
+                "INSERT INTO embedding_rate_reservations (reservation_id, reserved_at, token_count) "
+                "VALUES (?, ?, ?)",
+                (f"res_{index}", now, 1),
+            )
+
+    def _stop_after_one_wait(seconds):
+        slept.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(embedding_scheduler.time, "sleep", _stop_after_one_wait)
+    with pytest.raises(KeyboardInterrupt):
+        limiter.reserve(1)
+    assert slept and slept[0] > 59.0
+
+
+def test_interactive_reservation_does_not_take_the_write_lock(isolated_memory, monkeypatch):
+    """A query embedding must not put the write lock back on the read path."""
+    db_store.init_db()
+    config = embedding_scheduler.load_embedding_rate_config()
+    limiter = embedding_scheduler.MinuteRateLimiter(config)
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("an interactive reservation attempted the write lock")
+
+    monkeypatch.setattr(db_store, "_acquire_write_lock", _forbidden)
+
+    limiter.reserve(10, durable=False)  # must not raise
+
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM embedding_rate_reservations").fetchone()[0] == 0
+
+
+def test_batch_reservation_still_records_durably(isolated_memory):
+    db_store.init_db()
+    config = embedding_scheduler.load_embedding_rate_config()
+    limiter = embedding_scheduler.MinuteRateLimiter(config)
+
+    limiter.reserve(10)
+    limiter.reserve(10, durable=False)
+
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM embedding_rate_reservations").fetchone()[0] == 1
+
+
+def test_interactive_reservation_still_refuses_a_saturated_window(isolated_memory, monkeypatch):
+    """Read-only does not mean unguarded: a full durable window still degrades."""
+    db_store.init_db()
+    config = embedding_scheduler.load_embedding_rate_config()
+    limiter = embedding_scheduler.MinuteRateLimiter(config)
+    now = embedding_scheduler.time.time()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        for index in range(config.effective_rpm):
+            conn.execute(
+                "INSERT INTO embedding_rate_reservations (reservation_id, reserved_at, token_count) "
+                "VALUES (?, ?, ?)",
+                (f"res_{index}", now, 1),
+            )
+    monkeypatch.setattr(
+        embedding_scheduler.time, "sleep", lambda seconds: pytest.fail("slept past the budget")
+    )
+
+    with pytest.raises(embedding_scheduler.EmbeddingBudgetExceeded):
+        limiter.reserve(1, deadline=embedding_scheduler.time.monotonic(), durable=False)

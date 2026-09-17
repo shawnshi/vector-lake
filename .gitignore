@@ -17,5 +17,7 @@ scratch/
 .codex/
 tests_tmp/
 .env
+# Runtime PID / lock files written by resident processes.
+*.pid
 # Per-machine config (see config.example.json); must never reach a public repo.
 config.json

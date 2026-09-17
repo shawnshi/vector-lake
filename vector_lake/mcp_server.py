@@ -119,6 +119,49 @@ def compact_memory_gram_index() -> str:
     return f"compacted {merged}; pruned {retired}"
 
 @mcp.tool()
+def backup_retention_report(keep: int = 0, max_bytes: int = 0, dry_run: bool = True) -> str:
+    """Report the .meta/backups footprint against its retention bound.
+
+    Backup files are written by the repair, projection and ingest paths and nothing
+    used to remove them, so the tree grows without bound (a full copy per backup of
+    a multi-GB database).  This reports what lies outside the bound; ``dry_run=False``
+    removes exactly those entries.
+
+    Args:
+        keep: Newest copies to retain. 0 uses the configured default (3).
+        max_bytes: Byte budget for the older copies. 0 uses the configured default (12 GiB).
+        dry_run: When True (the default) nothing is removed. The newest copy is
+            always retained, and anything unrecognised is never pruned.
+    """
+    return tools.backup_retention_report(keep=keep, max_bytes=max_bytes, dry_run=dry_run)
+
+@mcp.tool()
+def idempotency_index_status() -> str:
+    """Report the uniqueness guarantee each idempotency table actually has.
+
+    ``full`` means an idempotency key can never repeat.  ``active`` means the table
+    already held duplicate history written by an earlier release, so uniqueness is
+    enforced over non-terminal rows only -- the population a concurrent enqueue can
+    collide in.  ``absent`` means only the write lock protects enqueue.
+    """
+    return tools.idempotency_index_report()
+
+@mcp.tool()
+def repair_idempotency_keys(table: str = "mutation_outbox", dry_run: bool = True) -> str:
+    """Clear the redundant idempotency keys so the full unique index can be created.
+
+    Use this after ``idempotency_index_status`` reports ``active`` or ``absent``.
+    Only the duplicate *key* is cleared: the row, its status, timestamps, error text
+    and superseded_by link are all kept, so no audit history is lost.  Each key stays
+    on its canonical (lowest id) row -- the one enqueue already returns for it.
+
+    Args:
+        table: 'mutation_outbox' or 'jobs'.
+        dry_run: When True (the default) no row is changed.
+    """
+    return tools.repair_idempotency_keys(table=table, dry_run=dry_run)
+
+@mcp.tool()
 def projection_report(limit: int = 20) -> str:
     """Report drift between Wiki pages, SQLite canonical entities, and index.json."""
     return tools.projection_diff_report(limit=limit)
@@ -446,7 +489,8 @@ def visualize_vector_lake(output_dir: str = None) -> str:
     writes exactly one file (``vector_lake_graph.html``) into it, so the gate
     only requires a directory under a known host home.  Compare
     ``_read_payload``, which additionally requires the ``<root>/<project>/scratch``
-    shape because it reads arbitrary caller-named content.
+    shape because it reads arbitrary caller-named content.  When ``output_dir``
+    is omitted the file goes to the lake's own ``<MEMORY>/scratch`` tree.
     """
     if output_dir:
         from vector_lake import host_env

@@ -68,4 +68,6 @@ def test_genuine_duplicate_is_still_detected(isolated_memory):
     candidates = find_merge_candidates(limit=100)
 
     assert len(candidates) == 1
-    assert "北京协和医院" in candidates[0]["left_name"] + candidates[0]["right_name"]
+    # ``left_name``/``right_name`` now carry the on-disk page key; the CJK title
+    # stays available on the display fields.
+    assert "北京协和医院" in candidates[0]["left_canonical_name"] + candidates[0]["right_canonical_name"]

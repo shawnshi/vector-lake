@@ -26,6 +26,12 @@ TOKEN_BUDGET = {
 }
 DEFAULT_MAX_CHARS = 200000
 
+# A query embedding runs inside an MCP tool call, so it must not outlive the
+# caller's patience.  A healthy provider round trip measured 9.6 s cold and ~0.5 s
+# warm on this host; a quota-retry loop used to sleep a flat 60 s per attempt.
+# The budget is generous against the healthy path and hard against the loop.
+QUERY_EMBEDDING_BUDGET_SECONDS = 20.0
+
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 STOP_WORDS = {
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
@@ -97,7 +103,11 @@ def _get_query_embedding(query: str) -> tuple[list[float], str | None]:
     try:
         from vector_lake.embedding_scheduler import embed_texts
 
-        embeddings = embed_texts([query])
+        embeddings = embed_texts(
+            [query],
+            budget_seconds=QUERY_EMBEDDING_BUDGET_SECONDS,
+            durable_reservation=False,
+        )
         if not embeddings:
             return [], "embedding provider returned no vector"
         _store_query_embedding(query, embeddings[0])
@@ -475,6 +485,8 @@ def _search_scored_pages(
     cluster: str = None,
     include_history: bool = False,
     filter_expr: str = None,
+    catalog=None,
+    projection_note: str | None = None,
 ):
     """Ranked pages plus retrieval notes.
 
@@ -489,11 +501,20 @@ def _search_scored_pages(
     """
     from vector_lake import page_index_projection
 
-    try:
-        if not page_index_projection.ensure_page_index_projection():
+    # Read-only source selection.  A reader never repairs the projection: the
+    # rebuild needs the write lock, and a reader that lost that race used to give
+    # up entirely (a 60 s MCP timeout with no answer).  ``index.json`` is the
+    # sovereign artifact, so when the projection is behind the file answers
+    # instead -- the note records that the answer did not come from the
+    # projection, and the outbox consumer rebuilds it out of band.
+    #
+    # ``catalog`` is injectable so a caller that already resolved it for this
+    # request (``assemble_context``) does not parse the file a second time.
+    if catalog is None:
+        catalog, projection_note = page_index_projection.read_catalog()
+    if catalog is None:
+        if page_index_projection.index_file_stamp() is None:
             return [], [], "Lake is drying. No index.json found, please ingest sources first."
-    except Exception as e:
-        log.error(f"Failed to read index.json: {e}")
         return [], [], "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
 
     intent = _classify_intent(query)
@@ -541,7 +562,7 @@ def _search_scored_pages(
 
     # Only the keys the hybrid stage actually produced are materialised, so the
     # 7 178-node dict never has to exist in memory.
-    nodes = page_index_projection.nodes_by_key(list(hybrid_scores))
+    nodes = catalog.nodes_by_key(list(hybrid_scores))
 
     for key, score in hybrid_scores.items():
         node = nodes.get(key)
@@ -558,7 +579,7 @@ def _search_scored_pages(
 
     # P2-1: Dynamic Graph Expansion via Multi-hop PPR (Personalized PageRank)
     top_keys = {node["_key"] for _, node in scored[:5]}
-    adj = page_index_projection.adjacency() if top_keys else None
+    adj = catalog.adjacency() if top_keys else None
     if top_keys and adj:
         # PPR parameters.  Non-seed nodes must still receive teleportation mass,
         # otherwise the walk collapses to "adjacent to a seed" after two steps.
@@ -588,7 +609,7 @@ def _search_scored_pages(
             reverse=True
         )
         expansion_keys = [key for key, _ in sorted_expansions[:expansion_limit]]
-        expanded_nodes = page_index_projection.nodes_by_key(expansion_keys)
+        expanded_nodes = catalog.nodes_by_key(expansion_keys)
         
         for expanded_key, ppr_weight in sorted_expansions[:expansion_limit]:
             expanded_node = expanded_nodes.get(expanded_key)
@@ -637,6 +658,8 @@ def _search_scored_pages(
         if len(final_scored) >= top_k:
             break
 
+    if projection_note:
+        vector_notes.append(projection_note)
     return final_scored, vector_notes, None
 
 
@@ -661,7 +684,7 @@ def search_vector_lake(query: str, top_k: int = 5, as_xml: bool = False, domain:
 
     result = ""
     if vector_notes:
-        result += "[DEGRADED] Vector retrieval did not contribute: " + "; ".join(vector_notes) + "\n\n"
+        result += "[DEGRADED] Retrieval notes: " + "; ".join(vector_notes) + "\n\n"
     if not final_scored:
         return result + "No matching pages."
     for index, (score, node) in enumerate(final_scored):
@@ -716,7 +739,14 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     # Wiki dynamically eats the remaining budget.
     wiki_budget = max(0, max_chars - actual_memory_used - index_budget - purpose_budget)
 
-    scored_pages, vector_notes, retrieval_error = _search_scored_pages(query, top_k=15)
+    from vector_lake import page_index_projection
+
+    # Resolved once and handed to the scoring pass, so one request parses
+    # index.json at most once even when the projection is behind.
+    catalog, projection_note = page_index_projection.read_catalog()
+    scored_pages, vector_notes, retrieval_error = _search_scored_pages(
+        query, top_k=15, catalog=catalog, projection_note=projection_note
+    )
 
     wiki_dir = str(get_wiki_dir())
     wiki_blocks: list[str] = []
@@ -742,10 +772,12 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     index_summary = ""
     if os.path.exists(str(get_index_path())):
         try:
-            from vector_lake import page_index_projection
-
-            page_index_projection.ensure_page_index_projection()
-            index_summary = "\n".join(page_index_projection.node_summary_lines(50))[:index_budget]
+            if catalog is None:
+                index_summary = "[Index read failed]"
+            else:
+                index_summary = "\n".join(catalog.node_summary_lines(50))[:index_budget]
+                if projection_note:
+                    vector_notes = list(vector_notes or []) + [projection_note]
         except Exception as exc:
             index_summary = "[Index read failed]"
             log.error("Index summary unavailable: %s", exc)

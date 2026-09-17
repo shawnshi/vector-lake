@@ -85,6 +85,93 @@ def annotate_claim_validity(claim: dict, now=None) -> dict:
     return annotated
 
 
+def establishment_key(created, identity) -> tuple:
+    """Ordering for survivor selection: oldest first, nodes without a date last.
+
+    Shared by the merge-candidate generator (entity rows) and the lint auto-merge
+    (page frontmatter), so the same duplicate pair resolves to the same survivor
+    whichever path handles it.
+    """
+    return (str(created or "") or "\uffff", str(identity or ""))
+
+
+def _establishment_key(entity: dict) -> tuple:
+    return establishment_key(entity.get("created_at"), entity.get("entity_id"))
+
+
+def _resolvable_name(entity: dict, canonical_name: str) -> str:
+    """On-disk identifier the merge resolver can turn into a wiki page.
+
+    ``governance_service.resolve_governance_item`` resolves the two sides as
+    ``<prefix><name>.md`` / ``<name>.md``, so what it needs is the page key.
+    ``canonical_name`` is unusable for that: it keeps the raw title
+    (``Source_intelligence_20260302_briefing``, ``Google (谷歌)``,
+    ``Mayo Clinic Platform``) while the file is named from the normalized key.
+    """
+    page_key = str(entity.get("page_key") or "").strip()
+    return page_key or str(canonical_name or entity.get("entity_id") or "").strip()
+
+
+def _names_of(entity: dict) -> set:
+    """Every name an entity answers to: its canonical name plus its aliases."""
+    names = {str(entity.get("canonical_name", "") or "")}
+    names.update(str(alias) for alias in (entity.get("aliases") or []))
+    return {name for name in names if name}
+
+
+def _name_owner_index(entities) -> dict:
+    """name -> {entity id}, so ownership counts entities rather than slots."""
+    owners: dict = {}
+    for entity in entities:
+        for name in _names_of(entity):
+            owners.setdefault(name, set()).add(str(entity.get("entity_id") or ""))
+    return owners
+
+
+def _merge_hazards(name_owners: dict, shared_names) -> list:
+    """Names whose ownership is ambiguous across the graph.
+
+    A shared name claimed by three or more distinct entities cannot decide which
+    page survives: merging any one pair would silently reassign a name another
+    live node still owns.  Such candidates stay visible in the preview surface but
+    are not enqueued by default (see ``governance_store.create_merge_suggestions``)
+    and are refused at resolution time unless explicitly forced (see
+    ``governance_service.resolve_governance_item``).
+    """
+    hazards = []
+    for name in sorted(name for name in shared_names if name):
+        owners = name_owners.get(str(name), set())
+        if len(owners) >= 3:
+            hazards.append(f"ambiguous-name:{name} claimed by {len(owners)} distinct entities")
+    return hazards
+
+
+def ambiguous_name_hazards(page_keys) -> list:
+    """Ambiguous shared names for two wiki pages identified by page key.
+
+    Used as the entry guard in ``governance_service.resolve_governance_item`` so
+    that every resolution path is checked - including callers that build their own
+    ``merge_candidate``, such as ``bulk_reconciliation``, which never calls
+    ``find_merge_candidates``.
+    """
+    keys = [str(key) for key in page_keys if key]
+    if len(keys) < 2:
+        return []
+    entities = list(
+        governance_store.query_entities({"status!=": "Merged", "type!=": "system"})["items"].values()
+    )
+    by_key: dict = {}
+    for entity in entities:
+        key = str(entity.get("page_key") or "")
+        if key in keys and key not in by_key:
+            by_key[key] = entity
+    resolved = list(by_key.values())
+    if len(resolved) < 2:
+        return []
+    shared = _names_of(resolved[0]) & _names_of(resolved[1])
+    return _merge_hazards(_name_owner_index(entities), shared)
+
+
 def find_merge_candidates(limit: int = 20) -> list[dict]:
     entities = list(governance_store.query_entities({"status!=": "Merged", "type!=": "system"})["items"].values())
     candidates = []
@@ -104,6 +191,11 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
         topic_cluster = e.get("topic_cluster")
         canonical_name = e.get("canonical_name", e["entity_id"])
         valid_entities.append((e, names, norms, tokens, domain, topic_cluster, canonical_name))
+
+    # Names claimed by a *distinct* entity, for the ambiguity guard.  Counting
+    # slots instead of entities would over-count, because one entity may both
+    # carry a name as its canonical name and repeat it in its aliases.
+    name_owners = _name_owner_index(entity for entity, *_ in valid_entities)
 
     # ⚡ Bolt: Build inverted indices to pre-filter candidate pairs.
     # A candidate pair requires a minimum score of 3. Since token overlap gives +1
@@ -164,16 +256,31 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
         if score < 3:
             continue
 
+        domain = left_domain or right_domain or "General"
+        hazards = _merge_hazards(name_owners, left_names & right_names)
+
+        # Survivor = the older node.  Pairing comes out of set-iteration order, so
+        # without this the surviving page key would be an arbitrary coin flip
+        # rather than a property of the data.  Recorded as a reason so a reviewer
+        # can audit the choice.
+        if _establishment_key(right) < _establishment_key(left):
+            left, right = right, left
+            left_canon_name, right_canon_name = right_canon_name, left_canon_name
+        reasons.append("direction:older-entity-survives")
+
         pair_key = "::".join(sorted([left["entity_id"], right["entity_id"]]))
         candidates.append({
             "pair_key": pair_key,
             "score": score,
             "left_entity_id": left["entity_id"],
-            "left_name": left_canon_name,
+            "left_name": _resolvable_name(left, left_canon_name),
+            "left_canonical_name": left_canon_name,
             "right_entity_id": right["entity_id"],
-            "right_name": right_canon_name,
+            "right_name": _resolvable_name(right, right_canon_name),
+            "right_canonical_name": right_canon_name,
             "reasons": reasons,
-            "domain": left_domain or right_domain or "General",
+            "domain": domain,
+            "hazards": hazards,
         })
 
     candidates.sort(key=lambda item: (-item["score"], item["pair_key"]))

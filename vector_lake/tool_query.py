@@ -1,9 +1,11 @@
 import datetime
+import hashlib
 import logging
 import os
 import re
+import time
 
-from vector_lake import provenance
+from vector_lake import get_extension_root, provenance
 from vector_lake.tool_search import assemble_context
 from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, normalize_entity_name
 
@@ -31,10 +33,6 @@ def _node_core(name: str) -> str:
             return name[len(prefix):]
     return name
 
-
-import time
-import hashlib
-from vector_lake import get_extension_root
 
 def prepare_query_context(query_str: str, dry_run: bool = False):
     wiki_dir = str(get_wiki_dir())

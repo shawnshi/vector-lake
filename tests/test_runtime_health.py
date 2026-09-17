@@ -224,3 +224,39 @@ def test_subagent_backlog_is_visible_without_blocking_by_default(isolated_memory
 
     assert health["ok"] is True
     assert any("subagent_backlog" in warning for warning in health["warnings"])
+
+
+def test_a_stale_page_index_projection_is_reported_without_blocking(isolated_memory):
+    """The health surface must show a projection a writer failed to refresh.
+
+    Readers fall back to ``index.json``, so a dropped eager refresh would
+    otherwise be invisible: the only symptom would be slower queries.
+    """
+    from vector_lake.wiki_utils import get_index_path
+
+    _write_purpose_contract(isolated_memory)
+    execute_mutation_plan("Source_Healthy.md", content=_source_content("source_healthy", "Healthy Source"))
+    indexer.generate_index()
+
+    # The writer that publishes index.json also refreshes the projection, so a
+    # quiet lake must be clean.
+    assert assess_runtime_health()["ok"] is True
+
+    # Now simulate the writer losing the race: the file moves on, the projection
+    # does not, and the failure is recorded in the marker.
+    path = get_index_path()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["nodes"]["Concept_Late"] = {
+        "title": "Late",
+        "type": "concept",
+        "domain": "General",
+        "status": "Active",
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    health = assess_runtime_health()
+
+    assert health["hard_ok"] is True  # repairable, and never blocks a write
+    assert any("page_index_projection_behind" in item for item in health["degraded"])
+    assert health["detail"]["page_index_projection"]["current"] is False
+    assert health["detail"]["page_index_projection"]["index_stamp"]

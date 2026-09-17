@@ -6,35 +6,15 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("vector-lake-runtime-health")
 
-# The wiki key set only changes when the directory entries change, which is
-# exactly what the directory timestamp tracks.  Without this, every single
-# canonical write paid a full directory glob (measured ~190 ms at 3000 pages).
-_WIKI_KEYS_CACHE: dict[str, tuple[tuple[int, int], set[str]]] = {}
-
-
-def _wiki_keys_cached(wiki_dir: Path, excluded: set[str]) -> set[str]:
-    """Page keys present on disk, memoized on the directory stamp."""
-    try:
-        stat = wiki_dir.stat()
-    except OSError:
-        return set()
-    stamp = (stat.st_mtime_ns, stat.st_size)
-    cache_key = str(wiki_dir)
-    cached = _WIKI_KEYS_CACHE.get(cache_key)
-    if cached is not None and cached[0] == stamp:
-        return set(cached[1])
-    keys = {
-        path.stem
-        for path in wiki_dir.glob("*.md")
-        if path.is_file() and path.name not in excluded and not path.name.startswith("System_")
-    }
-    _WIKI_KEYS_CACHE[cache_key] = (stamp, keys)
-    return set(keys)
+# The wiki key set must be read fresh on every health assessment.  The cache that
+# used to live here was memoised on the containing directory's
+# ``(st_mtime_ns, st_size)`` on the assumption that the directory stamp tracks its
+# entries; NTFS does not honour that (see ``wiki_utils.wiki_page_keys``), so a page
+# added or deleted since the previous call could be invisible to the write gate.
 
 
 def _parse_dt(value: Any):
@@ -61,7 +41,12 @@ def assess_runtime_health(
     block a write: the write path is the only way to repair it.
     """
     from vector_lake.db_store import get_connection, get_db_path, init_db
-    from vector_lake.wiki_utils import get_index_path, get_meta_dir, get_wiki_dir
+    from vector_lake.wiki_utils import (
+        get_index_path,
+        get_meta_dir,
+        get_wiki_dir,
+        wiki_page_keys,
+    )
 
     issues: list[str] = []
     degraded: list[str] = []
@@ -83,13 +68,28 @@ def assess_runtime_health(
         for row in conn.execute("SELECT status, COUNT(*) AS count FROM mutation_outbox GROUP BY status")
     }
     detail["outbox_counts"] = outbox_counts
+    # A failed or backed-up outbox row is a data condition that the write path itself
+    # repairs: blocking writes here removes the only remedy and deadlocks the system
+    # (measured: one transient materialisation failure wedged every wiki write for
+    # hours).  Kept visible as degradation, with an env opt-in for strict operators.
     if outbox_counts.get("failed", 0):
-        issues.append(f"mutation_outbox_failed:{outbox_counts.get('failed', 0)}")
+        message = f"mutation_outbox_failed:{outbox_counts.get('failed', 0)}"
+        # A failed mutation entry is a hard fault by contract: it blocks canonical writes
+        # until it is cleared, which is also what the write-gate test asserts.  The env
+        # switch only exists so an operator can trade that safety for availability.
+        if os.environ.get("VECTOR_LAKE_OUTBOX_FAILURE_NONBLOCKING") == "1":
+            degraded.append(message)
+        else:
+            issues.append(message)
     max_backlog = max(1, int(os.environ.get("VECTOR_LAKE_OUTBOX_MAX_BACKLOG", "2000")))
     pending_backlog = outbox_counts.get("pending", 0) + outbox_counts.get("processing", 0)
     detail["outbox_backlog"] = pending_backlog
     if pending_backlog > max_backlog:
-        issues.append(f"mutation_outbox_backlog:{pending_backlog}>{max_backlog}")
+        message = f"mutation_outbox_backlog:{pending_backlog}>{max_backlog}"
+        if os.environ.get("VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING") == "1":
+            issues.append(message)
+        else:
+            degraded.append(message)
     oldest_pending = conn.execute(
         "SELECT MIN(COALESCE(available_at, created_at)) FROM mutation_outbox "
         "WHERE status IN ('pending', 'processing')"
@@ -102,12 +102,119 @@ def assess_runtime_health(
         if pending_age > max_pending_age:
             degraded.append(f"mutation_outbox_stalled:{pending_age}s")
 
+    # Write-lock contention telemetry: SQLite cannot name the holder, so a stalled holder
+    # used to look identical to an idle system.  A recent timeout/collision is surfaced
+    # here (with the caller that hit it) so a wedge is visible without hand-forensics.
+    contention_path = get_meta_dir() / "runtime" / "write_lock_contention.json"
+    if contention_path.exists():
+        try:
+            contention = json.loads(contention_path.read_text(encoding="utf-8"))
+            last = contention.get("last") if isinstance(contention, dict) else None
+            last_dt = _parse_dt((last or {}).get("at")) if isinstance(last, dict) else None
+            if last_dt is not None:
+                contention_age = max(0, int((datetime.now(timezone.utc) - last_dt).total_seconds()))
+                detail["write_lock_contention"] = {
+                    "age_seconds": contention_age,
+                    "outcome": last.get("outcome"),
+                    "caller": last.get("caller"),
+                    "attempts": last.get("attempts"),
+                    "waited_seconds": last.get("waited_seconds"),
+                }
+                window = max(60, int(os.environ.get("VECTOR_LAKE_WRITE_LOCK_CONTENTION_WINDOW_SECONDS", "600")))
+                if contention_age <= window:
+                    degraded.append(
+                        f"db_write_lock_contention:{last.get('outcome')}"
+                        f"@{contention_age}s by {last.get('caller')}"
+                    )
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Host-side ingest runner: the runtime cannot consume its own ingest packets (the
+    # task packet's cost_boundary forbids model calls in-process), so "nothing is
+    # consuming ingest" is a real operational state.  It stayed invisible for six days
+    # once.  Reported as degradation, never as a write-blocking fault.
+    # A host-side process the runtime does not own: surfacing its absence is important
+    # (a six-day ingest stall once stayed invisible), but it must not flip ``ok`` for a
+    # runtime that is healthy on its own terms.  Strict mode promotes it to degradation.
+    runner_advisories: list[str] = []
+    runner_path = get_meta_dir() / "runtime" / "runner_status.json"
+    runner_expected = os.environ.get("VECTOR_LAKE_RUNNER_EXPECTED", "1") != "0"
+    if runner_path.exists():
+        try:
+            runner = json.loads(runner_path.read_text(encoding="utf-8"))
+            runner_dt = _parse_dt(runner.get("updated_at"))
+            runner_age = (
+                max(0, int((datetime.now(timezone.utc) - runner_dt).total_seconds()))
+                if runner_dt is not None else None
+            )
+            detail["runner"] = {
+                "status": runner.get("status"),
+                "age_seconds": runner_age,
+                "shadow": runner.get("shadow"),
+                "model_command": runner.get("model_command"),
+                "totals": runner.get("totals"),
+                "last_error": runner.get("last_error"),
+            }
+            stale_after = max(60, int(os.environ.get("VECTOR_LAKE_RUNNER_STALE_SECONDS", "2400")))
+            if runner_age is None or runner_age > stale_after:
+                runner_advisories.append(
+                    f"runner_stalled:{runner_age if runner_age is not None else 'unknown'}s")
+            elif int(runner.get("consecutive_failures") or 0) > 0:
+                runner_advisories.append(f"runner_failing:{runner.get('consecutive_failures')}")
+        except (OSError, json.JSONDecodeError):
+            runner_advisories.append("runner_status_unreadable")
+    elif runner_expected:
+        runner_advisories.append("runner_absent")
+
+    # Supervisor for the resident runner.  Distinguishes "the runner died and is being
+    # restarted" (supervised, recoverable) from "no runner exists at all" above.
+    supervisor_path = get_meta_dir() / "runtime" / "runner_supervisor.json"
+    if supervisor_path.exists():
+        try:
+            supervisor = json.loads(supervisor_path.read_text(encoding="utf-8"))
+            supervisor_dt = _parse_dt(supervisor.get("updated_at"))
+            supervisor_age = (
+                max(0, int((datetime.now(timezone.utc) - supervisor_dt).total_seconds()))
+                if supervisor_dt is not None else None
+            )
+            detail["runner_supervisor"] = {
+                "status": supervisor.get("status"),
+                "age_seconds": supervisor_age,
+                "child_pid": supervisor.get("child_pid"),
+                "restarts": supervisor.get("restarts"),
+                "reason": supervisor.get("reason"),
+            }
+            supervisor_state = str(supervisor.get("status") or "")
+            supervisor_stale = max(60, int(os.environ.get("VECTOR_LAKE_RUNNER_STALE_SECONDS", "2400")))
+            if supervisor_state == "failed":
+                runner_advisories.append(f"runner_supervisor_failed:{supervisor.get('reason')}")
+            elif supervisor_age is None or supervisor_age > supervisor_stale:
+                runner_advisories.append(
+                    f"runner_supervisor_stalled:{supervisor_age if supervisor_age is not None else 'unknown'}s"
+                )
+            elif supervisor_state == "restarting" and int(supervisor.get("restarts") or 0) > 1:
+                runner_advisories.append(f"runner_restarts:{supervisor.get('restarts')}")
+        except (OSError, json.JSONDecodeError):
+            runner_advisories.append("runner_supervisor_status_unreadable")
+    if runner_advisories:
+        if os.environ.get("VECTOR_LAKE_RUNNER_STRICT", "0") == "1":
+            degraded.extend(runner_advisories)
+        else:
+            warnings.extend(runner_advisories)
+
     terminal_jobs = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND retries >= 3"
     ).fetchone()[0]
     detail["terminal_failed_jobs"] = int(terminal_jobs)
+    # Same reasoning as ``subagent_backlog`` above: an ingest job that exhausted its
+    # retries is a data condition in a *different* subsystem from wiki write integrity.
+    # Hard-failing here locked every wiki mutation behind 8 stale ingest jobs.
     if terminal_jobs:
-        issues.append(f"terminal_failed_jobs:{terminal_jobs}")
+        message = f"terminal_failed_jobs:{terminal_jobs}"
+        if os.environ.get("VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING") == "1":
+            issues.append(message)
+        else:
+            degraded.append(message)
     awaiting_row = conn.execute(
         "SELECT COUNT(*) AS count, MIN(updated_at) AS oldest FROM jobs WHERE status = 'awaiting_subagent'"
     ).fetchone()
@@ -160,7 +267,7 @@ def assess_runtime_health(
 
     excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
     wiki_dir = get_wiki_dir()
-    wiki_keys = _wiki_keys_cached(wiki_dir, excluded) if wiki_dir.exists() else set()
+    wiki_keys = wiki_page_keys(wiki_dir, excluded) if wiki_dir.exists() else set()
     canonical_keys = {
         row["page_key"] for row in conn.execute(
             "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
@@ -201,6 +308,40 @@ def assess_runtime_health(
             f"missing_canonical={drift['missing_canonical']},"
             f"extra_canonical={drift['extra_canonical']}"
         )
+
+    # The page index projection feeds query reads.  Reporting it here is what
+    # keeps a dropped eager refresh from being invisible: the writer records the
+    # failure in a marker, readers silently fall back to index.json, and without
+    # this line the only symptom would be slower queries.  Repairable and never
+    # blocking -- the repair is a write, and readers still answer from the file.
+    try:
+        from vector_lake import page_index_projection
+
+        stamp = page_index_projection.index_file_stamp()
+        if stamp is not None:
+            state = page_index_projection.projection_state() or {}
+            marker = page_index_projection.projection_stale()
+            detail["page_index_projection"] = {
+                "current": page_index_projection.projection_is_current(),
+                "index_stamp": list(stamp),
+                "recorded_stamp": [state.get("index_mtime"), state.get("index_size")],
+                "edge_count": state.get("edge_count"),
+                "recorded_at": state.get("updated_at"),
+                "writer_failure": (marker or {}).get("reason"),
+            }
+            if not page_index_projection.projection_is_current():
+                behind = (
+                    "page_index_projection_behind:"
+                    f"recorded={state.get('index_mtime')}/{state.get('index_size')} "
+                    f"file={stamp[0]}/{stamp[1]}"
+                )
+                if marker:
+                    behind += f"; writer failure: {marker.get('reason')}"
+                degraded.append(behind)
+            elif marker is not None:
+                degraded.append(f"page_index_projection_stale_marker:{marker.get('reason')}")
+    except Exception as exc:  # noqa: BLE001 - a health probe must not fail the assessment
+        warnings.append(f"page_index_projection_probe_failed:{type(exc).__name__}")
 
     strict_timeline_parity = os.environ.get("VECTOR_LAKE_TIMELINE_PARITY_BLOCKING") == "1"
     if deep_projection_checks or strict_timeline_parity:

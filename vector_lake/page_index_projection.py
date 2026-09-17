@@ -35,12 +35,16 @@ This module projects what the read paths consume into SQLite:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import sqlite3
 import threading
 
 from vector_lake.db_store import get_connection, init_db, transaction
 from vector_lake.wiki_utils import get_index_path
+from vector_lake.wiki_utils import get_meta_dir
 
 log = logging.getLogger("vector-lake-page-index")
 
@@ -54,12 +58,85 @@ def index_file_stamp() -> tuple[float, int] | None:
     return (stat.st_mtime, stat.st_size)
 
 
+# --- writer-reported staleness ----------------------------------------------
+#
+# ``indexer._write_index`` refreshes this projection right after it rewrites
+# ``index.json``.  When that refresh loses the write lock, the failure used to be
+# swallowed as a log line, so the next reader silently paid for the rebuild -- and
+# was the only party who could report it.  The marker records the failure where
+# the reader can see it: it travels with the database, is written with an atomic
+# replace, and never blocks, because the situation it describes is precisely the
+# one where the database is unavailable to us.
+
+STALE_MARKER_NAME = "page_index_projection.stale.json"
+
+
+def stale_marker_path():
+    return get_meta_dir() / STALE_MARKER_NAME
+
+
+def projection_stale() -> dict | None:
+    """The last writer-reported refresh failure, or ``None`` when there is none."""
+    path = stale_marker_path()
+    try:
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def mark_projection_stale(reason: str) -> None:
+    """Record that a writer could not refresh the projection.  Never raises."""
+    path = stale_marker_path()
+    payload = {"reason": str(reason)[:500], "at": _utc_now()}
+    stamp = index_file_stamp()
+    if stamp is not None:
+        payload["index_stamp"] = [stamp[0], stamp[1]]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as exc:
+        log.warning("Could not record projection staleness at %s: %s", path, exc)
+
+
+def clear_projection_stale() -> None:
+    """Drop the marker once the projection is known to be in step again."""
+    path = stale_marker_path()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("Could not clear projection staleness at %s: %s", path, exc)
+
+
 def projection_state() -> dict | None:
+    """The recorded stamp row, or ``None`` when the projection is absent.
+
+    Tolerates a missing ``page_index_state`` table: readers run before
+    ``init_db`` can be shown to be necessary, and a fresh database has no
+    projection yet.  Treating that as "not current" sends the caller down the
+    rebuild path; raising here would turn a cold lake into a hard error.
+    """
     conn = get_connection()
-    row = conn.execute(
-        "SELECT index_mtime, index_size, node_count, edge_count, updated_at "
-        "FROM page_index_state WHERE singleton = 1"
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT index_mtime, index_size, node_count, edge_count, updated_at, edge_digest "
+            "FROM page_index_state WHERE singleton = 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # A database last initialised by an older build has no digest column yet;
+        # it arrives with the next ``init_db``.  Until then the refresh path falls
+        # back to rewriting edges, which is the behaviour that build had.
+        try:
+            row = conn.execute(
+                "SELECT index_mtime, index_size, node_count, edge_count, updated_at "
+                "FROM page_index_state WHERE singleton = 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
     return dict(row) if row is not None else None
 
 
@@ -93,6 +170,59 @@ def _node_insert() -> str:
         "(node_key, node_id, title, type, status, domain, topic_cluster, node_json) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
+
+
+def _weighted_edges_digest(index_data: dict) -> str | None:
+    """Content digest of ``weighted_edges``; ``None`` when the key is absent.
+
+    The stamp on ``page_index_state`` is ``(mtime, size)``, which changes on every
+    ``index.json`` rewrite -- including the many rewrites that leave the topology
+    untouched (a page edit with no link change, a governance pass, a decay tick).
+    Without a content check every one of those rewrites re-projected all 1.6 M
+    edge rows while holding the write lock.
+
+    ``json.dumps`` then one hash, rather than a Python loop over the edges: on the
+    live corpus this measures 1.58 s (1.36 s dump + 0.22 s blake2b) against a
+    measured 2.92 s for the bare DELETE+INSERT on an empty database, and the
+    rewrite additionally holds ``BEGIN IMMEDIATE`` while updating two indexes on a
+    2.3 GB database.  The cost moved off the lock and the locked work is skipped.
+
+    The digest is over the edge order too, so it can only ever answer "identical",
+    never "equivalent": the PageRank walk depends on that order.
+    """
+    if "weighted_edges" not in index_data:
+        return None
+    edges = index_data.get("weighted_edges") or []
+    blob = json.dumps(edges, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.blake2b(blob, digest_size=16).hexdigest()
+
+
+def _edge_digest_supported(conn) -> bool:
+    """Whether ``page_index_state`` carries the digest column yet.
+
+    Probed per call rather than assumed: ``refresh_page_index_projection`` is also
+    reached from the indexer's write path, and a database last initialised by an
+    older build has not run the ``ALTER`` that adds the column.
+    """
+    try:
+        return "edge_digest" in {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(page_index_state)")
+        }
+    except sqlite3.Error:
+        return False
+
+
+def _stored_edge_state(conn):
+    """``(edge_count, edge_digest)`` as recorded, or ``None`` when unknown."""
+    if not _edge_digest_supported(conn):
+        return None
+    try:
+        row = conn.execute(
+            "SELECT edge_count, edge_digest FROM page_index_state WHERE singleton = 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return (row[0], row[1]) if row is not None else None
 
 
 def refresh_page_index_projection(index_data: dict, node_keys=None) -> dict:
@@ -137,12 +267,27 @@ def refresh_page_index_projection(index_data: dict, node_keys=None) -> dict:
         written = len(rows)
 
     stamp = index_file_stamp()
-    if "weighted_edges" in index_data:
+    edge_changed = True
+    for_edge_digest: str | None = None
+    if "weighted_edges" not in index_data:
+        edge_changed = False
+    else:
+        edges = index_data.get("weighted_edges") or []
+        stored = _stored_edge_state(conn)
+        # Only pay for the digest when an identical row count makes "unchanged"
+        # possible; a different count is proof of change on its own.
+        if stored is not None and stored[1] and int(stored[0] or 0) == len(edges):
+            for_edge_digest = _weighted_edges_digest(index_data)
+            edge_changed = for_edge_digest != stored[1]
+
+    if edge_changed and "weighted_edges" in index_data:
         edge_rows = [
             (position, str(edge.get("source") or ""), str(edge.get("target") or ""),
              float(edge.get("weight", 1.0) or 0.0))
             for position, edge in enumerate(index_data.get("weighted_edges") or [])
         ]
+        if for_edge_digest is None:
+            for_edge_digest = _weighted_edges_digest(index_data)
         with transaction():
             conn.execute("DELETE FROM page_index_edges")
             if edge_rows:
@@ -152,24 +297,41 @@ def refresh_page_index_projection(index_data: dict, node_keys=None) -> dict:
                     edge_rows,
                 )
     if stamp is not None:
+        digest_supported = _edge_digest_supported(conn)
+        columns = (
+            "(singleton, index_mtime, index_size, node_count, edge_count, updated_at, edge_digest) "
+            if digest_supported
+            else "(singleton, index_mtime, index_size, node_count, edge_count, updated_at) "
+        )
+        placeholders = "VALUES (1, ?, ?, ?, ?, ?, ?)" if digest_supported else "VALUES (1, ?, ?, ?, ?, ?)"
+        digest_update = (
+            "edge_digest = excluded.edge_digest, " if digest_supported else ""
+        )
+        values = [
+            stamp[0], stamp[1],
+            conn.execute("SELECT COUNT(*) FROM page_index_nodes").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0],
+            _utc_now(),
+        ]
+        if digest_supported:
+            # Recorded only here, after the edge rows are committed: a digest that
+            # claimed freshness for rows that were never written would let every
+            # later reader skip the repair.
+            values.append(for_edge_digest if for_edge_digest is not None else _weighted_edges_digest(index_data))
         with transaction():
             conn.execute(
                 "INSERT INTO page_index_state "
-                "(singleton, index_mtime, index_size, node_count, edge_count, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(singleton) DO UPDATE SET "
+                + columns
+                + placeholders
+                + " ON CONFLICT(singleton) DO UPDATE SET "
                 "index_mtime = excluded.index_mtime, index_size = excluded.index_size, "
                 "node_count = excluded.node_count, edge_count = excluded.edge_count, "
-                "updated_at = excluded.updated_at",
-                (
-                    stamp[0], stamp[1],
-                    conn.execute("SELECT COUNT(*) FROM page_index_nodes").fetchone()[0],
-                    conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0],
-                    _utc_now(),
-                ),
+                + digest_update
+                + "updated_at = excluded.updated_at",
+                tuple(values),
             )
     _invalidate_adjacency()
-    return {"nodes_written": written, "partial": partial_keys is not None}
+    return {"nodes_written": written, "partial": partial_keys is not None, "edges_rewritten": edge_changed}
 
 
 def ensure_page_index_projection() -> bool:
@@ -177,7 +339,16 @@ def ensure_page_index_projection() -> bool:
 
     Returns False when there is no index at all, which callers report as the
     cold-start "lake is drying" state.
+
+    **Writer-side only.**  This takes the write lock, so a reader that called it
+    made every query queue behind whichever writer held the lock -- and a reader
+    that lost that race returned no answer at all.  Readers use
+    :func:`read_catalog` instead, which never writes and falls back to
+    ``index.json`` itself when the projection is behind.  The repair below is the
+    outbox consumer's job (:func:`heal_projection_if_stale`).
     """
+    if projection_is_current():
+        return True
     init_db()
     if projection_is_current():
         return True
@@ -192,11 +363,193 @@ def ensure_page_index_projection() -> bool:
         log.error("Failed to read index.json: %s", exc)
         raise
     refresh_page_index_projection(index_data)
+    clear_projection_stale()
     log.info(
         "Rebuilt the page index projection from %s (%s nodes).",
         path.name, len(index_data.get("nodes") or {}),
     )
     return True
+
+
+def heal_projection_if_stale() -> dict:
+    """Single-writer repair entry point: bring the projection back in step.
+
+    Called by the outbox consumer, never by a reader.  Kept separate from
+    :func:`ensure_page_index_projection` so the intent is explicit at the call
+    site and so the write-lock cost lands on the one process that already owns
+    the index instead of on whoever happens to query next.
+
+    Returns a small report rather than raising: a contended heal is a normal
+    outcome that the next cycle retries.
+    """
+    from vector_lake.db_store import DatabaseLockTimeout
+
+    marker = projection_stale()
+    if projection_is_current():
+        if marker is not None:
+            clear_projection_stale()
+        return {"healed": False, "reason": "current"}
+    if index_file_stamp() is None:
+        return {"healed": False, "reason": "no index.json"}
+    try:
+        rebuilt = ensure_page_index_projection()
+    except DatabaseLockTimeout as exc:
+        return {"healed": False, "reason": f"write lock unavailable: {exc}", "marker": bool(marker)}
+    except Exception as exc:  # noqa: BLE001 - the writer reports and retries next cycle
+        return {"healed": False, "reason": f"{type(exc).__name__}: {exc}", "marker": bool(marker)}
+    return {"healed": bool(rebuilt), "reason": "rebuilt", "marker": bool(marker)}
+
+
+def _load_index_json() -> dict | None:
+    """Parse ``index.json``; ``None`` when it is missing or unreadable."""
+    path = get_index_path()
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as exc:
+        log.error("Failed to read index.json: %s", exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class _SqliteCatalog:
+    """Node and edge accessors over the SQLite projection."""
+
+    source = "projection"
+
+    def nodes_by_key(self, keys) -> dict[str, dict]:
+        return nodes_by_key(keys)
+
+    def adjacency(self) -> dict[str, list[tuple[str, float]]]:
+        return adjacency()
+
+    def node_summary_lines(self, limit: int = 50) -> list[str]:
+        return node_summary_lines(limit)
+
+
+class _FileCatalog:
+    """Node and edge accessors built from ``index.json`` itself.
+
+    The file is the sovereign artifact, so it can always answer a read: a reader
+    that finds the projection behind does not have to take the write lock to
+    rebuild it in order to return results that the file already contains -- and
+    contains more up to date.
+
+    Built per request and dropped with it.  The module docstring's objection to
+    parsing the whole file stands (169 MB / ~1.9 s on the live corpus), but the
+    alternative for a stale projection was no answer at all, and caching the
+    object graph in a long-lived server is the cost this projection exists to
+    avoid.  The edge walk is lazy: queries whose top hits produce no seeds never
+    pay for it.
+    """
+
+    source = "index.json"
+
+    def __init__(self, index_data: dict):
+        nodes = index_data.get("nodes") or {}
+        self._nodes = {str(key): node for key, node in nodes.items()}
+        self._weighted_edges = index_data.get("weighted_edges")
+        self._adjacency: dict[str, list[tuple[str, float]]] | None = None
+
+    def nodes_by_key(self, keys) -> dict[str, dict]:
+        ordered = [str(key) for key in keys]
+        return {key: self._nodes[key] for key in ordered if key in self._nodes}
+
+    def adjacency(self) -> dict[str, list[tuple[str, float]]]:
+        if self._adjacency is None:
+            table: dict[str, list[tuple[str, float]]] = {}
+            for edge in self._weighted_edges or []:
+                source = str(edge.get("source") or "")
+                target = str(edge.get("target") or "")
+                weight = float(edge.get("weight", 1.0) or 0.0)
+                table.setdefault(source, []).append((target, weight))
+                table.setdefault(target, []).append((source, weight))
+            self._adjacency = table
+        return self._adjacency
+
+    def node_summary_lines(self, limit: int = 50) -> list[str]:
+        return [
+            f"[{self._nodes[key].get('type') or '?'}] {self._nodes[key].get('title') or key}"
+            for key in sorted(self._nodes)[: int(limit)]
+        ]
+
+
+def _fallback_note() -> str:
+    note = (
+        "page index projection is behind index.json; node and edge reads fell back to "
+        "index.json itself (results are current; the outbox consumer rebuilds the projection)"
+    )
+    marker = projection_stale()
+    if marker is not None:
+        note += f"; last writer-reported refresh failure: {marker.get('reason')}"
+    return note
+
+
+# One cached fallback catalog, keyed by the ``index.json`` stamp.
+#
+# A stale projection makes every read parse the whole file (169 MB / 1.9 s on the
+# live corpus, plus a 1.6 M-edge adjacency when seeds exist).  The stamp is
+# exactly the granularity at which that parse stops being valid, so caching on it
+# is enough to make a stale window cheap for repeated queries.  Deliberately a
+# single entry rather than an LRU: the module's objection to holding the parsed
+# object graph in a long-lived process stands, so the cache is bounded to one and
+# dropped the moment the projection can answer again.
+_CATALOG_CACHE: dict[str, object] = {"key": None, "catalog": None}
+_CATALOG_LOCK = threading.Lock()
+
+
+def _catalog_cache_key():
+    path = get_index_path()
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path), stat.st_mtime, stat.st_size)
+
+
+def reset_catalog_cache() -> None:
+    """Drop the cached fallback catalog (tests, and explicit memory release)."""
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE["key"] = None
+        _CATALOG_CACHE["catalog"] = None
+
+
+def read_catalog():
+    """Read-only node/edge source for a query, plus a note when it is a fallback.
+
+    Never writes and never takes the write lock.  ``(None, note)`` means there was
+    nothing to read at all, which callers report as the cold-start state.
+
+    The fallback catalog is cached on the index stamp, so a request that repeats
+    during a stale window does not re-parse the file.
+    """
+    if projection_is_current():
+        # The projection can answer again: release the fallback object graph.
+        # Checked lock-free first so the steady state (the common case) does not
+        # take the cache lock on every query.
+        if _CATALOG_CACHE["catalog"] is not None:
+            reset_catalog_cache()
+        return _SqliteCatalog(), None
+
+    key = _catalog_cache_key()
+    if key is None:
+        return None, "no index.json to read"
+    with _CATALOG_LOCK:
+        if _CATALOG_CACHE["key"] == key and _CATALOG_CACHE["catalog"] is not None:
+            return _CATALOG_CACHE["catalog"], _fallback_note()
+
+    index_data = _load_index_json()
+    if index_data is None:
+        return None, "no index.json to read"
+    catalog = _FileCatalog(index_data)
+    with _CATALOG_LOCK:
+        # Stored as a key/catalog pair so a racing rebuild can never pair a
+        # catalog with the wrong stamp; the loser simply rebuilds next time.
+        _CATALOG_CACHE["key"] = key
+        _CATALOG_CACHE["catalog"] = catalog
+    return catalog, _fallback_note()
 
 
 def nodes_by_key(keys) -> dict[str, dict]:

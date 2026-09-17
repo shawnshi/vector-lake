@@ -1,5 +1,63 @@
 # Unreleased
 
+## 聚类守护进程两个致命阻塞修复（修复前该脚本无法在活库上跑完一轮）
+
+`scripts/community_clustering_daemon.py` 不被 watchdog 调度（`CONTEXT.md:84` 明确写 "not scheduled"），因此它的批量路径长期无人执行、从未暴露过下面两个缺陷。它们各自都能让整轮运行在写入前一条边也不落盘的情况下终止。
+
+- **YAML 标量未转义（阻断一）**：社区索引页的 frontmatter 由 f-string 手写 `title: "{label}"`，而 label 由两个成员标题拼接，标题里只要有一个反斜杠就炸：活库 7,123 个标题中恰好有一个（`paper-\Delta-mem`，LaTeX 片段），生成页在 `load_yaml` 抛 `ScannerError: found unknown escape character`。由于 `_prepare_mutations` 在提交前校验整批，**单个标题就终止了整轮运行**（实测：21:11:24 启动，21:16:38 失败，exit 1；仓库未发生任何变更——index.json 哈希与备份一致、577 个社区页原封不动）。新增 `_yaml_scalar()` 用 `json.dumps` 输出合法的 YAML 双引号标量（YAML 1.2 是 JSON 超集，反斜杠与引号均被转义），title 与 aliases 均改用它。验证：反斜杠 / 双引号 / 中文三类 label 均能 frontmatter 往返完全一致并通过 `schema_validator`。
+- **SQL 变量上限（阻断二）**：`_apply_change_sets_batch_unchecked` 用 `IN (?,?,...)` 按 id 展开占位符，而 SQLite 上限为 32,766（本机 3.50.4 实测），`claim_graph_edges` 那条语句又把每个 id 绑定两次；批量重写社区索引页触及的 claim id 达 14,055 个（`claims` 表中 `locator.page_key LIKE 'System_Community%'` 的实数），远超 16,383 的半数上限，抛 `sqlite3.OperationalError: too many SQL variables` 并因整批同属一个事务而全部回滚（实测第二轮：21:18:30 启动，21:20:02 失败）。新增 `_json_id_list()`，把 4 条语句改为 `IN (SELECT value FROM json_each(?))`：无论 id 多少都只占 1 个参数，并保持 `sorted()` 的确定性参数序。验证：17,000 个 id 下旧写法复现 `too many SQL variables`、新写法通过（参数 2 个）；新增 `tests/test_canonical_change_sets.py::test_page_rewrite_survives_claim_ids_beyond_the_sql_variable_ceiling`（预置 17,000 条 claim 后重写页面，断言无异常且旧 claim 被退休）。
+- **运行前置：先让边集收敛**。首轮失败时 `weighted_edges` 仍是修复前的 1,607,841 条，守护进程的 `nx.Graph` + `nx.pagerank` 在 160 万条边上耗时约 5 分钟（失败耗时主要是这一段）。先执行一次增量更新（`indexer.update_index_items(["Vendor_Google.md"])`，16 秒）把活库边集按新的共享剪枝收敛到 29,815 条（最大度 15、0 重复），守护进程随即只需 2 分 04 秒完成。
+- 验证（活库，已授权执行）：exit 0，`V9 Heavy graph topology clustering complete.`。社区索引页 577 → 568（537 个原址重写、31 个新建、40 个退休、5 个手写命名页全部保留）；`communities` 7,178（含 65 个陈旧键）→ 7,123（恰好等于节点数）、897 个稳定 ID、0 冲突；`community_labels` 0 → 265（每个 label 都有对应的 L0 页面）；`graph_insights` 0 → 20（全为 `isolated_node`，与稀疏社区在活图上不触发一致）；`graph_state.clustering_stale` → false。消费端实测复活：`tool_research.research_vector_lake(dry_run=True)` 由原先永远返回 “No research required” 变为产出 15 条研究指令，其中包含由 `isolated_node` 派生的图谱缺口查询。回滚点：`MEMORY/backups/graph-precluster-20260917-211106/`（index.json 166 MB + 577 个社区页 + community_snapshot.json + 聚类前状态四元的 JSON 快照）。
+- 残留：写入 `index.json` 用的是 `atomic_write_text(..., indent=2)`，绕过了 `_write_index`，因此页面索引投影会短暂落后（运行中出现 `projection_drift:missing_index=1`，下一次 `_write_index` 已自愈）；守护进程全程持锁，运行期间出现 `db_write_lock_contention:timed-out@99s`；运行中的 watchdog 进程仍持有旧代码，本轮结束后它写入的 `graph_state` 只有 `dirty:true`（未设置 `clustering_stale`），需重启该进程后新旧语义才一致。
+
+## 图谱输出路径默认改为 `<MEMORY>/scratch`
+
+- `tool_graph._graph_output_path` 的首选位置原为 `<memory_dir>` 的**上一级** `tmp/`，即不传 `output_dir` 时会把生成的仪表盘写进宿主家目录布局（备选是 `<extension_root>/data/tmp`），与 `skills/graph` 自述的“禁止向全局路径盲写”相矛盾。现改为 `<memory_dir>/scratch/vector_lake_graph.html`，与技能对显式 `output_dir` 要求的隔离区一致；extension-root 备选仅保留为 scratch 不可写时的降级路径。
+- `skills/graph/SKILL.md` 同步：`output_dir` 改为可选（默认即 `<MEMORY>/scratch`），阻断点改为针对“显式传入且超出获批沙盒”的情况；技能版本 11.1.0 → 11.1.1。
+- 验证：新增 `tests/test_graph_algo_contract.py::test_default_output_path_is_the_memory_scratch_tree` 与 `::test_default_output_path_never_escapes_the_memory_root`（断言产物落在 memory 根之内、不再落在其上一级）；活图无参调用 `visualize_vector_lake()` 实测返回 `C:\Users\shich\MEMORY\scratch\vector_lake_graph.html`（10,868,401 字节，重写），`C:/Users/shich/tmp` 与 `vector-lake/data/tmp` 均未创建。
+
+## 图谱可视化四层算法的六个不变量修复（P0-P2）
+
+活图实测的六个断裂点：边集违反自身剪枝上限、社区视图全量渲染失效、社区 ID 稳定化把划分退化成合并、斥力只覆盖 45.8% 节点、连通保底承诺不成立、载荷把节点数组序列化两遍。逐项修复如下。
+
+- **边集不变量下沉为共享函数（P0）**：新增 `indexer.dedupe_and_prune_edges(edges, max_edges_per_node=MAX_EDGES_PER_NODE)`，同时保证“每个无向对只出现一次（min/max 归一）”与“没有节点超过 15 条边”。此前两条规则只在全量重建路径生效，`update_index_items` 的增量路径对触及节点追加全部合格边、又从 `page_graph_edges` 投影回捞一次、且从不重剪——活图因此涨到 1,607,843 条边 / 7,125 节点（平均度 487.7，最大 4,118，314,660 条重复对），而它自己的 SQLite 投影（主键 `source_id,target_id,relation`）只有 1,293,183 行，**索引文件与其投影互相矛盾**。修复后同一份活数据：29,815 条边、最大度 15、0 超限、0 重复，且对逆序输入结果逐字一致、对已剪结果幂等。
+- **社区视图恢复（P0）**：`communities` 的值是 8 位 hex 字符串，前端 `COMMUNITY_COLORS[cid % length]` 实算 `'6fd2edf4' % 10 === NaN`，`COMMUNITY_COLORS[NaN]` 为 `undefined`，`ctx.fillStyle = undefined` 被 Canvas 静默忽略——实测 2,000/2,000 节点颜色索引无效，社区模式整图同色。改为 `communityColorIndex(token)`（字符串稳定哈希）并对未分配节点使用独立灰色。活图 7,111 个带社区的节点全部得到合法索引并分布在 10 个色桶（499/746/1227/1164/985/311/678/479/530/492）。
+- **社区 ID 稳定化不再合并簇（P0）**：`_stabilize_community_ids` 改为按重叠量降序认领、旧 UUID 一旦被认领即排除，认领冲突时铸新 ID（并避开全部保留 ID）。此前只取“最大重叠旧 UUID”而不标记已占用，合成用例 5 个新社区被压成 3 个 ID，输出不再是划分，`process_level` 还会把两簇写进同一个 `System_Community_<level>_<id>.md`，后者覆盖前者。活图 L0：897 个 Leiden 社区 → 897 个稳定 ID、0 冲突；L1：930 → 930、0 冲突；用自身快照重跑两轮结果逐字相同（这是社区索引页不被孤立的前提）。另在 `process_level` 加入同一文件名二次写入的拒绝守卫，把静默覆盖变成一条 error 日志。
+- **斥力改为空间哈希（P1）**：原实现外层步长 `max(1, N/200)`、内层只扫 `[i+1, i+16)`，在 7,125 节点下实测 3,264/7,125（45.8%）节点参与过斥力，**3,859 个节点全程零斥力**（只能被链路吸引拖走，必然压成同心重叠），且是否参与取决于数组下标。改为按斥力半径（100px）分桶、每个节点只访问 4 个半平面邻格，覆盖 100.0% 节点。JS 实测（node 25，同规模、同螺旋初值）：2.20 ms/迭代、63,508 次配对评估，旧方案 0.06 ms/迭代、3,060 次评估；同时给 `alpha` 加衰减（起点 0.3、每步 0.985、下界 0.001）——此前 alpha 恒为 0.08 且 `isSimulating` 永不复位，布局永不收敛。
+- **连通保底改为覆盖优先（P1）**：`_extract_backbone_edges` 由“权重降序 + 有未覆盖端点即选”改为“配对覆盖 → 补齐孤立节点 → 按权重填满配额”，并先按无向对去重（重复行不得消耗配额）。原实现在 5,000 边预算下用 5,000 条边只覆盖 6,216 个节点、留下 909 个孤儿，`max backbone degree` 达 232——所谓骨架其实是毛刺；docstring 声称“保证每个连通节点保留其最强边”与行为不符，已改为准确表述（保证被表示，不保证是它最强的那条）。修复后同一数据：覆盖 6,594 个节点、孤儿 529，而这 529 恰好是**真实无边孤立节点数**（529），最大 backbone 度降到 21。
+- **载荷去重与真度（P1/P2）**：`_build_graph_payload` 不再在顶层重复 `nodes`/`edges`/`community_labels`（此前与 `pageGraph` 同内容，实测 HTML 里 `"node_kind": "page"` 出现 14,248 次 = 2 × 7,124，把含页面摘要的节点对象写了两遍）。实测 HTML 由 15,217,470 字符 / 19,377,941 字节降到 8,717,708 字符 / 10,868,401 字节（-43%），页节点对象恰好序列化一次。
+- **`degree` 改为真实无向度（P2）**：原实现按 `links` 逐条自增（含悬空与未解析），入边仅在别名解析成功时计入，实测 6,365/7,123 节点（89%）与真实度数不符，最极端的 `Institution_浙大一院` 报 3 而实为 791。改为从去重后的 `weighted_edges` 计算，实测不一致 0/7,123（同一节点现在报 775）。
+- **死管道复活（P2）**：`graph_insights` 自 Louvain 迁移后只有初始化、没有生产者，`tool_graph.audit_graph` 永远回答 “No graph insights found”，`tool_research` 的图谱缺口扫描永远空转；`community_labels` 同样只被赋 `{}`，UI 因此显示裸 hex。daemon 现按消费者契约产出 `isolated_node` / `sparse_community`（各限 20 条，避免淹没治理队列），并写入 L0 标签。同时修正 `audit_graph` 的队列标题——原标题不含节点名，按标题去重会把同类型的所有洞察压成一条。
+- **脏标记与陈旧度可见（P2）**：`_apply_graph_topology` 原本把 `dirty` 又置回 `True`，导致该标记永不清除、`refresh_graph_topology_if_dirty` 每次都报“有变更”，且 `centrality_score` 只写过占位值（实测 4,645 节点为 1.0、2,478 节点无此键）。现拆分为 `dirty`（边拓扑，由本模块清除）与 `clustering_stale`（社区划分，由 daemon 清除，跳过聚类时保持为真），旧载荷无该键时回退到 `dirty`。`tool_graph` 在 meta 中新增 `communities_stale` / `community_labels_available` / `read_consistency` / `orphan_page_nodes`，模板新增陈旧告警徽标，工具返回值在社区过期或降级读时显式告警。
+- **锁超时与降级显性化（P2）**：`visualize_vector_lake` 对 169 MB 的 `index.json` 只等 5 秒锁，实测**每次调用都超时**并静默落入无锁读；改为 20 秒（可传参），并在载荷 `meta.read_consistency` 与返回串中标记降级。修复后同一活数据在锁内完成（`read_consistency: locked`）。
+- **前端杂项（P2）**：`PALETTE` 补 `Institution` / `Policy` / `Standard` / `Claim` / `System`（前三者是 `VALID_PREFIXES` 中的一等类型，实测 187/7,123 节点此前落到灰色 Unknown）；`onlyRisk` 改走共享 `isRiskyNode()`——原判据 `alignment_score >= 80` 因实测全部为 100.0 而恒真、且把大写 `status === 'Contested'` 与小写字面量比较、又对无该字段的 claim 节点求值，四种情形下都不可能过滤；删除从未被读取的 `timeFilterRatio` 死变量。
+- 验证：新增 `tests/test_graph_algo_contract.py`（18 例，覆盖去重/封顶/确定性/幂等、骨架覆盖率与关系分级、社区 ID 唯一性与稳定性、载荷去重与真度、陈旧度回退、洞察契约与上限）；全量 pytest 676 例通过；另有 4 例失败属于本次改动之外的既有问题——`test_ingest_contract.py` 两例源于工作区未提交的 `native_llm._stable_task_root()` 把 ingest 包移到 `MEMORY/wiki/.meta/subagent_tasks/` 后触发 `remove_task_packet` 的 brain-tree 守卫，`test_runtime_health.py` 一例源于未提交的 `runtime_health.py` 把 `mutation_outbox_failed` 从 `issues` 降为条件门控，`test_portability.py[ingest_runner.py]` 源于本次会话期间新出现的未跟踪文件 `scripts/ingest_runner.py` 内硬编码 `C:/Users/shich/MEMORY`；活图验证使用 `MEMORY/scratch/accept_graph_fixes.py`（只读，7,123 节点重放全部指标）与 `MEMORY/scratch/measure_repulsion.js`（node 25 实测新旧斥力开销），`node --check` 校验生成 HTML 的内联脚本语法通过。
+- 未验证：未对活 `MEMORY` 运行聚类 daemon（其写入未被本次授权覆盖），因此活图 `community_labels` 仍为空、`clustering_stale` 仍为真——工具现在会显式告警而非静默展示过期划分；`weighted_edges` 的收敛要在下一次批次更新或全量重建时才落到磁盘。
+
+## lint 自动合并改走共享合并器 + 治理项与其效果同事务提交
+
+- `tool_lint` 的相似度自动合并分支改为调用 `semantic_merge.merge_markdown_content`，并复用 `governance_metrics.establishment_key` 的「最老者幸存」方向规则。此前它自做朴素拼接（同一个 schema 缺陷，被吞并页的编译事实条目会落到 `## 2. 证据时间线` 之后），且方向按 `updated` **最新者**保留——与生成器规则相反，同一重复对在两条路径上会朝相反方向合并。**该分支当前是死代码**（外层 `if False: # auto_fix disabled for similarity merge by Mentat`），本次只保证一旦重新打开行为正确；是否直接删除该分支另议。
+- `governance_service.resolve_governance_item` 把队列锁提到数据库事务之前（维持 file-lock → DB transaction 的锁序），并将队列项状态更新放进 mutation 的 `canonical_callback`，与 canonical 变更同事务提交。此前两者分属不同事务：客户端或进程在 canonical 已提交、队列项未标记的窗口内死亡，会留下「已合并但仍 pending」的条目，而副页已删，重跑永远无法成功。
+- 验证：`tests/test_merge_resolution_guard.py` 新增两例——队列写入必须发生在 mutation 事务内；提交回调内部抛错时正文、副页与队列项三者一并回滚。
+- 数据修复（非代码）：活图 `alias_registry` 中 `Google Cloud -> entity_90ce1b512589e8544687e3b6` 一行丢失，已用 `governance_store.upsert_alias` 按该实体自身的 `canonical_name` 定向恢复。**删除原因未查明**：已排除 `save_alias_registry`/`rebuild_alias_registry`（无调用方）、当日针对该页的 change set（无）、以及合并路径（隔离环境复现保留该行）；曾提假设“受影响页提取为空时只剩别名行被清”——被 `_apply_change_sets_batch_unchecked` 的 page-scoped `DELETE FROM entities` 证伪（该路径连实体行一起删，无可恢复对象），相应改动已撤回。
+
+## 合并器分节处理 + 歧义名判定下沉到解析入口
+
+- `semantic_merge.merge_markdown_content` 由「整体拼接右页正文」改为**分节合并**：两侧正文被分配进同一个 Section 1 与同一个 Section 2，H3 区块按标题合并去重，时间线条目并集去重。旧拼接必然触发 `schema_validator` 的事件账本校验——它把 `## 2. 证据时间线` 一直扫到文件末尾，于是被吞并页的编译事实条目被读成非法时间线条目。活图 361 对真实页面实测：旧拼接 209 对不合法，新合并 0 对不合法。
+- Section 1 的 H3 白名单按**幸存页**类型收敛：对幸存页类型非法的槽位降级为粗体标签而不丢事实。`TENSION_H3_SLOT` 改为随 `tension_edges` 条件加入，并提为 `schema_validator.TENSION_H3_SLOT` 单一常量由校验器与合并器共用，避免字面量漂移。这一条来自实测：首版分节合并把携带 `tension_edges` 的页面弄坏——它降级了校验器仍然索要的那个槽位。
+- 歧义名守卫下沉到 `governance_service.resolve_governance_item` 入口：合并前按两侧 page key 计算 `ambiguous_name_hazards`，命中即拒绝且保持队列项 `pending`；`change_manifest: {"allow_ambiguous_names": true}` 显式放行。此前守卫只在生成器入队路径生效，`bulk_reconciliation` 自建 `merge_candidate`、从不调用生成器，可直接绕过。
+- `governance_metrics` 抽出 `_names_of` / `_name_owner_index` / `ambiguous_name_hazards`，生成器与解析入口共用同一判定。
+- 验证：全量 pytest 618 例通过；`MEMORY/scratch/accept-merger.py`（361 对真实页面，只读，旧 209 不合法 → 新 0 不合法）；`MEMORY/scratch/accept-generator.py`（生成器三项指标）。
+
+## 合并候选生成器的三处契约缺陷修复
+
+- `left_name` / `right_name` 改为输出磁盘上的 page key。此前输出 `canonical_name`，而 `resolve_governance_item` 按 `<prefix><name>.md` / `<name>.md` 解析页面；活图实测 361 条候选中 266 条（441 个名称位）解析不到任何文件，等于永远无法合并。原始标题保留在新字段 `left_canonical_name` / `right_canonical_name` 供展示。实测 441 → 0。
+- 幸存方改为确定性选择：`created_at` 更早的一方保留（缺失者排最后，再以 `entity_id` 兜底）。此前方向来自候选配对的集合遍历顺序，即随机；现已写入 `reasons`（`direction:older-entity-survives`）可审计。两次独立运行结果逐对一致，违反“最老者幸存”的候选为 0。
+- 新增 `hazards`：共享名被 ≥3 个不同实体声明时不入队。此类配对无法由检测器决定保留哪个节点（活图实测 9 条，涉及「四层壳模型」「Agent Skill 标准结构」「电子病历系统功能应用水平分级评价」）。候选项仍出现在预览面与 `find_merge_candidates` 中，可用 `create_merge_suggestions(..., include_hazardous=True)` 强制入队。
+- 明确未采用「名称超集」启发式：探针显示它会把 `AI Factory`、`Intelligence Hub Briefing [2026-08-09]` 等大量真实重复误判（`ai`、`memory`、`factory` 这类单词名污染了名称空间），故不落地。
+- `merge-suggestions` 预览新增 `skipped_hazardous` 计数与逐条 `HAZARDS:` 标注。
+- 验证：新增 `tests/test_merge_candidate_contract.py`（4 例）；全量 pytest 610 例通过。
+
 ## MCP 服务端依赖换为 `fastmcp>=4.0.0`
 
 `vector_lake/mcp_server.py` 直接导入 `fastmcp.FastMCP`，移除 `mcp.server.MCPServer` / `mcp.server.fastmcp` 双路径回退。

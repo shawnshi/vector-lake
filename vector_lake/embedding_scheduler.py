@@ -195,7 +195,24 @@ class MinuteRateLimiter:
     def __init__(self, config: EmbeddingRateConfig):
         self.config = config
 
-    def reserve(self, request_tokens: int):
+    def reserve(self, request_tokens: int, deadline: float | None = None, durable: bool = True):
+        """Claim a slot in the rolling window.
+
+        ``deadline`` is a ``time.monotonic()`` instant.  Without one the limiter
+        waits as long as the window requires, which is right for batch backfills;
+        with one, an unaffordable wait raises :class:`EmbeddingBudgetExceeded`
+        rather than sleeping past the caller's own deadline.
+
+        ``durable=False`` makes the check read-only, for requests that run on a
+        read path.  A durable reservation needs ``BEGIN IMMEDIATE``, so recording
+        every query embedding put the write lock back on a path that was just
+        cleaned of it -- a query would queue behind whatever ingest was writing.
+        The cost is that interactive requests are not counted, so the window can be
+        exceeded by however many of them land inside it.  That is a deliberate
+        trade at the observed scale (a handful of queries per minute against
+        ``rpm`` 3000), and the provider's own 429 is now bounded by the caller's
+        budget instead of a flat 60 s sleep.
+        """
         request_tokens = max(1, int(request_tokens))
         if request_tokens > self.config.effective_tpm:
             raise ValueError(
@@ -206,15 +223,37 @@ class MinuteRateLimiter:
             now = time.time()
             cutoff = now - 60.0
             wait_seconds = 0.0
-            with db_store.transaction():
-                conn = db_store.get_connection()
-                conn.execute(
-                    "DELETE FROM embedding_rate_reservations WHERE reserved_at <= ?",
-                    (cutoff,),
-                )
+            conn = db_store.get_connection()
+            if durable:
+                with db_store.transaction():
+                    conn.execute(
+                        "DELETE FROM embedding_rate_reservations WHERE reserved_at <= ?",
+                        (cutoff,),
+                    )
+                    row = conn.execute(
+                        "SELECT COUNT(*) AS requests, COALESCE(SUM(token_count), 0) AS tokens, "
+                        "MIN(reserved_at) AS oldest FROM embedding_rate_reservations"
+                    ).fetchone()
+                    requests = int(row["requests"] or 0)
+                    tokens = int(row["tokens"] or 0)
+                    if (
+                        requests + 1 <= self.config.effective_rpm
+                        and tokens + request_tokens <= self.config.effective_tpm
+                    ):
+                        conn.execute(
+                            "INSERT INTO embedding_rate_reservations "
+                            "(reservation_id, reserved_at, token_count) VALUES (?, ?, ?)",
+                            (uuid.uuid4().hex, now, request_tokens),
+                        )
+                        return
+                    oldest = float(row["oldest"] or now)
+                    wait_seconds = max(0.01, oldest + 60.0 - now + 0.05)
+            else:
                 row = conn.execute(
                     "SELECT COUNT(*) AS requests, COALESCE(SUM(token_count), 0) AS tokens, "
-                    "MIN(reserved_at) AS oldest FROM embedding_rate_reservations"
+                    "MIN(reserved_at) AS oldest FROM embedding_rate_reservations "
+                    "WHERE reserved_at > ?",
+                    (cutoff,),
                 ).fetchone()
                 requests = int(row["requests"] or 0)
                 tokens = int(row["tokens"] or 0)
@@ -222,19 +261,30 @@ class MinuteRateLimiter:
                     requests + 1 <= self.config.effective_rpm
                     and tokens + request_tokens <= self.config.effective_tpm
                 ):
-                    conn.execute(
-                        "INSERT INTO embedding_rate_reservations "
-                        "(reservation_id, reserved_at, token_count) VALUES (?, ?, ?)",
-                        (uuid.uuid4().hex, now, request_tokens),
-                    )
                     return
                 oldest = float(row["oldest"] or now)
                 wait_seconds = max(0.01, oldest + 60.0 - now + 0.05)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if wait_seconds > remaining:
+                    raise EmbeddingBudgetExceeded(
+                        f"rate-limit window would hold this request for {wait_seconds:.1f}s "
+                        f"but only {max(0.0, remaining):.1f}s of the caller's budget remains"
+                    )
             time.sleep(wait_seconds)
 
 
 class EmbeddingResponseError(RuntimeError):
     """Raised when the provider response cannot be safely mapped to inputs."""
+
+
+class EmbeddingBudgetExceeded(RuntimeError):
+    """The caller's deadline left no room for the wait this request needs.
+
+    Distinct from a provider error: nothing was sent, or the retry the provider
+    asked for was refused.  Callers that hold a deadline of their own (the query
+    path runs inside an MCP tool call) degrade on this instead of parking.
+    """
 
 
 def _provider_contents(contents: list[str]) -> list[Any]:
@@ -312,27 +362,60 @@ def _request_embeddings(
     request_tokens: int,
     config: EmbeddingRateConfig,
     limiter: MinuteRateLimiter,
+    budget_seconds: float | None = None,
+    durable_reservation: bool = True,
 ) -> list[list[float]]:
+    """Embed ``contents``, optionally inside a caller-supplied time budget.
+
+    A quota error used to sleep a flat 60 s per retry, which on its own exceeds
+    the MCP client's 60 s call ceiling: the server would keep working on a request
+    whose caller had already given up, and the caller saw a timeout instead of the
+    real cause.  With ``budget_seconds`` the deadline is checked before every
+    sleep, so an unaffordable wait surfaces as :class:`EmbeddingBudgetExceeded`
+    and the search degrades with ``vector_notes`` explaining why.
+    """
     last_error: Exception | None = None
+    deadline = None if budget_seconds is None else time.monotonic() + float(budget_seconds)
     provider_contents = _provider_contents(contents)
     for attempt in range(config.max_retries + 1):
         try:
-            limiter.reserve(request_tokens)
+            limiter.reserve(request_tokens, deadline=deadline, durable=durable_reservation)
             response = client.models.embed_content(model=config.model, contents=provider_contents)
             return _validated_response_values(response, len(contents), config.dimension)
+        except EmbeddingBudgetExceeded:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt >= config.max_retries:
                 break
             message = str(exc)
             is_quota = "429" in message or "RESOURCE_EXHAUSTED" in message or "quota" in message.lower()
-            time.sleep(60.0 if is_quota else min(60.0, 2.0 ** attempt))
+            delay = 60.0 if is_quota else min(60.0, 2.0 ** attempt)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if delay > remaining:
+                    raise EmbeddingBudgetExceeded(
+                        f"retry after {type(exc).__name__} needs {delay:.0f}s but only "
+                        f"{max(0.0, remaining):.1f}s of the caller's budget remains: {message[:200]}"
+                    ) from exc
+            time.sleep(delay)
     assert last_error is not None
     raise last_error
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Shared validated embedding entrypoint for small runtime requests."""
+def embed_texts(
+    texts: list[str],
+    budget_seconds: float | None = None,
+    durable_reservation: bool = True,
+) -> list[list[float]]:
+    """Shared validated embedding entrypoint for small runtime requests.
+
+    ``budget_seconds`` bounds the total wait (rate-limit window plus retries).
+    Omit it for batch work such as backfill, where waiting is the correct answer.
+
+    ``durable_reservation=False`` keeps the request off the write lock, for
+    callers on a read path; see :meth:`MinuteRateLimiter.reserve`.
+    """
     if not texts or not os.environ.get("GEMINI_API_KEY"):
         return []
     config = load_embedding_rate_config()
@@ -344,6 +427,8 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         tokens,
         config,
         MinuteRateLimiter(config),
+        budget_seconds=budget_seconds,
+        durable_reservation=durable_reservation,
     )
 
 

@@ -133,6 +133,26 @@ Usage Examples:
     gc_parser.add_argument("--days", type=int, default=30, help="Prune entities older than this many days (default: 30).")
     gc_parser.add_argument("--apply", action="store_true", help="Persist the prune. Defaults to dry-run.")
     gc_parser.add_argument("--force", action="store_true", help="Bypass the 50%% mass-deletion safety threshold.")
+
+    backup_parser = subparsers.add_parser(
+        "backup-retention",
+        help="[MAINTENANCE] Report or enforce the bound on .meta/backups.",
+    )
+    backup_parser.add_argument("--keep", type=int, default=0, help="Newest copies to retain (0 = configured default).")
+    backup_parser.add_argument("--max-bytes", type=int, default=0, help="Byte budget for the older copies (0 = configured default).")
+    backup_parser.add_argument("--apply", action="store_true", help="Remove the entries past the bound. Defaults to dry-run; the newest copy is always kept.")
+
+    subparsers.add_parser(
+        "idempotency-status",
+        help="[MAINTENANCE] Report the uniqueness guarantee each idempotency table has.",
+    )
+
+    repair_parser = subparsers.add_parser(
+        "repair-idempotency",
+        help="[MAINTENANCE] Clear redundant idempotency keys so the full unique index can be created.",
+    )
+    repair_parser.add_argument("--table", choices=list(tools.IDEMPOTENCY_TABLES), default="mutation_outbox", help="Table to repair (default: mutation_outbox).")
+    repair_parser.add_argument("--apply", action="store_true", help="Clear the redundant keys. Defaults to dry-run; no row is deleted either way.")
     return parser
 
 
@@ -232,6 +252,19 @@ def main() -> int:
                 days=getattr(args, "days", 30),
                 dry_run=not getattr(args, "apply", False),
                 force=getattr(args, "force", False),
+            ))
+        elif args.command == "backup-retention":
+            print(tools.backup_retention_report(
+                keep=getattr(args, "keep", 0),
+                max_bytes=getattr(args, "max_bytes", 0),
+                dry_run=not getattr(args, "apply", False),
+            ))
+        elif args.command == "idempotency-status":
+            print(tools.idempotency_index_report())
+        elif args.command == "repair-idempotency":
+            print(tools.repair_idempotency_keys(
+                table=getattr(args, "table", "mutation_outbox"),
+                dry_run=not getattr(args, "apply", False),
             ))
     except Exception as exc:
         print(f"Error executing command '{args.command}': {exc}", file=sys.stderr)

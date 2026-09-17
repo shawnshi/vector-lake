@@ -7,12 +7,17 @@ import string
 from collections import defaultdict
 from difflib import SequenceMatcher
 
+import yaml
+
 from vector_lake import governance_metrics
 from vector_lake import governance_store
+from vector_lake.governance_metrics import establishment_key
+from vector_lake.semantic_merge import merge_markdown_content
 from vector_lake.wiki_utils import (
     VALID_PREFIXES,
     get_wiki_dir,
     read_markdown_file,
+    split_frontmatter,
     write_markdown_file,
 )
 from vector_lake.schema_validator import (
@@ -42,6 +47,14 @@ def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str):
         write_markdown_file(filepath, frontmatter, body, skip_validation=False)
     except Exception as e:
         log.warning(f"Failed to write fixed frontmatter to {filepath}: {e}")
+
+
+def _render_page(frontmatter: dict, body: str) -> str:
+    """Rebuild the text ``merge_markdown_content`` consumes from a parsed page."""
+    rendered = yaml.safe_dump(
+        frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False
+    )
+    return f"---\n{rendered}---\n{body}"
 
 def _generate_id():
     today = datetime.datetime.now().strftime("%Y%m%d")
@@ -325,10 +338,10 @@ def lint_vector_lake(auto_fix: bool = False):
                     
                     fm_a = parsed[file_a]["fm"]
                     fm_b = parsed[file_b]["fm"]
-                    date_a = fm_a.get("updated", "")
-                    date_b = fm_b.get("updated", "")
+                    primary_order = establishment_key(fm_a.get("created"), fm_a.get("id") or key_a)
+                    secondary_order = establishment_key(fm_b.get("created"), fm_b.get("id") or key_b)
                     
-                    if date_b > date_a:
+                    if secondary_order < primary_order:
                         primary, secondary = file_b, file_a
                         s_key = key_a
                     else:
@@ -338,23 +351,20 @@ def lint_vector_lake(auto_fix: bool = False):
                     p_data = parsed[primary]
                     s_data = parsed[secondary]
                     
-                    # Append Body
-                    new_body = p_data["body"] + f"\n\n---\n## Auto-Merged from {s_key}\n\n" + s_data["body"]
-                    p_data["body"] = new_body
-                    
-                    # Append Alias
-                    p_aliases = p_data["fm"].get("aliases", [])
-                    if isinstance(p_aliases, str): p_aliases = [p_aliases]
-                    if s_key not in p_aliases: p_aliases.append(s_key)
-                    s_aliases = s_data["fm"].get("aliases", [])
-                    if isinstance(s_aliases, str): s_aliases = [s_aliases]
-                    for alias in s_aliases:
-                        if alias not in p_aliases: p_aliases.append(alias)
-                    p_data["fm"]["aliases"] = p_aliases
-                    p_data["fm"]["updated"] = datetime.datetime.now().strftime("%Y-%m-%d")
-                    
+                    # Body, aliases and the survivor's frontmatter come from the
+                    # shared section-aware merger: a naive concatenation put the
+                    # consumed page's compiled-truth bullets after
+                    # `## 2. 证据时间线`, where the schema validator reads them as
+                    # malformed timeline entries.
+                    merged_content = merge_markdown_content(
+                        _render_page(p_data["fm"], p_data["body"]),
+                        _render_page(s_data["fm"], s_data["body"]),
+                    )
+                    merged_fm, merged_body = split_frontmatter(merged_content)
+                    merged_fm["updated"] = datetime.datetime.now().strftime("%Y-%m-%d")
+
                     # Write Primary
-                    _write_fixed_frontmatter(p_data["path"], p_data["fm"], p_data["body"])
+                    _write_fixed_frontmatter(p_data["path"], merged_fm, merged_body)
                     
                     # Delete Secondary
                     try:

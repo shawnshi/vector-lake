@@ -1,6 +1,6 @@
 ---
 name: graph
-version: 11.1.0
+version: 11.1.1
 tier: action-allowed
 description: 'Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.'
 triggers: "Visualize graph, show topology, render vector lake, 3d network graph"
@@ -25,8 +25,8 @@ triggers: "Visualize graph, show topology, render vector lake, 3d network graph"
 
 <execution_workflow>
   <workflow>
-    [Step 1: Invocation] Prepare parameters for graph generation. Get your current conversation's absolute `scratch/` directory path.
-    [Step 2: Rendering] Call the `visualize_vector_lake` tool via the MCP server. You MUST pass `output_dir="<your-absolute-scratch-path>"` so the HTML file is built inside your sandbox isolation zone.
+    [Step 1: Invocation] Prepare parameters for graph generation. The default output path is already the lake's own `<MEMORY>/scratch` isolation zone, so no path is required; only resolve your current conversation's absolute `scratch/` path when the artifact must land in that specific sandbox.
+    [Step 2: Rendering] Call the `visualize_vector_lake` tool via the MCP server. `output_dir` is optional and defaults to `<MEMORY>/scratch`. Pass `output_dir="<your-absolute-scratch-path>"` to place the HTML file in a different sandbox isolation zone.
     [Step 3: Verification] Confirm the HTML artifact is successfully generated and provide the user with the absolute path.
   </workflow>
 
@@ -37,7 +37,7 @@ triggers: "Visualize graph, show topology, render vector lake, 3d network graph"
   </tool_dispatch>
 
   <checkpoint_rules>
-    [FABLE 5 CHECKPOINT] 必须在此定义强制阻断点，要求人类 Approve：如果目标输出路径超出了 `scratch/` 隔离沙盒，必须挂起任务并请求人类授权。
+    [FABLE 5 CHECKPOINT] 必须在此定义强制阻断点，要求人类 Approve：如果显式传入的 `output_dir` 超出了获批的沙盒隔离区（默认路径 `<MEMORY>/scratch` 视为已获批），必须挂起任务并请求人类授权。
   </checkpoint_rules>
 </execution_workflow>
 

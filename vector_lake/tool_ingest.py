@@ -12,10 +12,12 @@ from vector_lake.db_store import mark_file_processed
 from vector_lake import governance_store
 from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
+    flush_durable,
     get_raw_dir,
     get_wiki_dir,
     get_index_path,
     load_config,
+    read_frontmatter_only,
     validate_wiki_filename,
 )
 from vector_lake.purpose_contract import (
@@ -68,7 +70,18 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
             try:
                 task_packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                task_packet = {"error": f"Unreadable task packet: {exc}"}
+                # An unreadable packet is unusable work.  Retiring it here (rather than
+                # handing it back on every claim) stops it consuming a batch slot forever;
+                # with the write gate no longer hard-failing on job health, the terminal
+                # state stays visible without blocking wiki writes.
+                from vector_lake.db_store import update_job_status
+
+                update_job_status(
+                    row.get("job_id"),
+                    "failed",
+                    f"Unreadable task packet ({packet_path}): {exc}",
+                )
+                continue
         if isinstance(task_packet, dict) and "error" not in task_packet:
             metadata = task_packet.setdefault("metadata", {})
             processed = metadata.setdefault("processed_data", {})
@@ -99,8 +112,120 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     return f"Expired {expired} awaiting-subagent ingest job(s)."
 
 def canonical_source_name(raw_path: str) -> str:
+    """The Source page name a task packet mandates for this raw file.
+
+    Normalised, because the packet's name must satisfy ``validate_wiki_filename`` or the
+    task can never be finalised: an arXiv-style stem (``2608.19880v1``) contains dots,
+    which the strict ``[Type]_[MainName]-[SubName]`` rule rejects, and ``finalize_ingest``
+    refuses the write.  Those papers sat un-ingested for exactly this reason.
+    """
     basename = Path(raw_path).stem
-    return f"Source_{basename}.md"
+    safe = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", basename).strip("-")
+    return f"Source_{safe or 'unnamed'}.md"
+
+
+_NAME_KEY = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+
+
+def _name_key(value: str) -> str:
+    """Alphanumeric-only comparison key, so ``a_b`` matches ``a-b``."""
+    return _NAME_KEY.sub("", str(value)).lower()
+
+
+def _raw_key(raw_path: str) -> str:
+    """Comparison key for a raw source: its stem, alphanumerics only."""
+    return _name_key(Path(str(raw_path)).stem)
+
+
+def _declared_raw_keys() -> set:
+    """Stems of every raw source that some wiki page declares in its ``sources:``.
+
+    This is the authoritative "already ingested" signal, and it is path-form tolerant
+    once normalised (``a_b`` == ``a-b``, spaces and punctuation dropped).  Matching on
+    published Source *page names* cannot work for short stems (``AI.md``, ``品牌.md``):
+    the page is named ``Source_<dir>-<stem>-<hash8>``, so a short stem never lands at
+    the start and substring matching over-matches unrelated pages.
+
+    Built from frontmatter only (one cheap head-read per page) and only when the caller
+    actually needs it, so an idle scan pays nothing.
+    """
+    wiki_dir = get_wiki_dir()
+    if not wiki_dir.exists():
+        return set()
+    keys = set()
+    for entry in os.scandir(wiki_dir):
+        if not entry.is_file() or not entry.name.endswith(".md"):
+            continue
+        try:
+            frontmatter = read_frontmatter_only(entry.path)
+        except Exception:
+            continue
+        for source in frontmatter.get("sources") or []:
+            text = str(source).replace("\\", "/")
+            if "raw/" not in text:
+                continue
+            key = _raw_key(text)
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _published_source_keys() -> list:
+    """Normalised names of every existing ``Source_*`` page.
+
+    Fallback signal for pages that declare no ``sources:`` path at all.  Used together
+    with :func:`_declared_raw_keys` - the skip decision is their *union*, because for
+    duplicate prevention an over-eager skip only delays an ingest while an under-eager
+    one writes a second copy of a page that already exists.
+    """
+    wiki_dir = get_wiki_dir()
+    if not wiki_dir.exists():
+        return []
+    return [
+        _name_key(name[:-3])
+        for name in os.listdir(wiki_dir)
+        if name.startswith("Source_") and name.endswith(".md")
+    ]
+
+
+def _already_published(filepath: str, name_keys: list, declared_keys: set, min_key_len: int = 4) -> bool:
+    """True when this raw source is already published, by either signal.
+
+    A raw file that has been published must not be prepared again: the
+    ``processed_files`` row is written on the finalize path, so a source ingested while
+    the ingest pipeline was stalled has a page but no row, and the ledger check below
+    therefore keeps treating it as new - the queue refilled with such files indefinitely.
+    Short stems are only matched by prefix against page names (a stem like ``AI`` would
+    otherwise match unrelated pages) but are matched exactly against declared sources,
+    which is why the declaration signal is needed in the union.
+    """
+    key = _raw_key(filepath)
+    if not key:
+        return False
+    if key in declared_keys:
+        return True
+    if len(key) < min_key_len:
+        return any(page.startswith(key) for page in name_keys)
+    return any(key in page for page in name_keys)
+
+def raw_publication_index() -> dict:
+    """Public: both signals used to decide whether a raw source is already published.
+
+    Returns ``{"name_keys": [...], "declared_keys": set()}`` so a caller can build the
+    index once and reuse it across a batch.  ``prepare_ingest_batch`` and the host-side
+    ingest runner must share this single implementation - when they did not, their
+    verdicts drifted (a name-only predicate called 88 raw files un-ingested where the
+    union calls 73, and would have re-ingested 15 that were already published).
+    """
+    return {"name_keys": _published_source_keys(), "declared_keys": _declared_raw_keys()}
+
+
+def raw_is_published(filepath: str, index: dict | None = None) -> bool:
+    """Public: is this raw source already published?  Union of both signals."""
+    if index is None:
+        index = raw_publication_index()
+    return _already_published(filepath, index["name_keys"], index["declared_keys"])
+
 
 def calculate_hash(filepath: str) -> str:
     hasher = hashlib.md5()
@@ -597,6 +722,7 @@ def _write_ingest_in_flight_unlocked(data: dict) -> None:
     tmp_path = processing_file.with_name(processing_file.name + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
+        flush_durable(handle)
     os.replace(tmp_path, processing_file)
 
 
@@ -689,6 +815,7 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     
     in_flight = _load_ingest_in_flight()
     pending_files = []
+    publication_index = None  # built lazily: one frontmatter scan per call, only when needed
 
     for filepath in files_to_process:
         try:
@@ -711,6 +838,14 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 if file_hash == processed[filepath]["hash"]:
                     continue
             else:
+                # No ledger row.  Normally that means a genuinely new file - but a source
+                # already published under a different raw path (or ingested on a path that
+                # never recorded a row) would only be duplicated by preparing it again.
+                if publication_index is None:
+                    publication_index = raw_publication_index()
+                if raw_is_published(filepath, publication_index):
+                    log.info("Skipping raw source already published: %s", filepath)
+                    continue
                 file_hash = calculate_hash(filepath)
 
             if file_hash:

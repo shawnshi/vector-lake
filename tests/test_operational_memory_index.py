@@ -196,7 +196,7 @@ def test_query_embedding_cache_is_bounded_and_serves_repeats(monkeypatch):
     tool_search._QUERY_EMBEDDING_CACHE.clear()
     calls = []
 
-    def fake_embed(texts):
+    def fake_embed(texts, budget_seconds=None, durable_reservation=True):
         calls.append(list(texts))
         return [[0.25] * 4 for _ in texts]
 
@@ -223,7 +223,7 @@ def test_query_embedding_failure_is_not_cached(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(
         "vector_lake.embedding_scheduler.embed_texts",
-        lambda _texts: [],
+        lambda _texts, budget_seconds=None, durable_reservation=True: [],
     )
 
     vector, reason = tool_search._get_query_embedding("transient failure")

@@ -1,4 +1,5 @@
 import datetime
+import io
 import logging
 import os
 import random
@@ -7,13 +8,13 @@ import shutil
 import string
 import uuid
 from pathlib import Path
+from typing import List, TypedDict
 
 import yaml
 from vector_lake import get_extension_root, host_env
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 
-import io
 _META_DIR_CACHE = None
 _CONFIG_CACHE: dict = {}
 log = logging.getLogger("vector-lake-wiki")
@@ -295,6 +296,80 @@ def read_frontmatter_only(path: str | Path, errors: str = "replace") -> dict:
         return {}
 
 
+def wiki_page_keys(
+    wiki_dir: str | Path | None = None, excluded: set[str] | None = None
+) -> set[str]:
+    """Page keys present on disk: ``.md`` filenames without the extension.
+
+    ``os.scandir`` rather than ``glob`` + ``is_file``: on the live 8 488-page wiki
+    this is ~31 ms instead of ~506 ms for an identical key set.
+
+    Callers must **not** memoise this on the directory's ``(st_mtime_ns, st_size)``.
+    ``runtime_health`` did, on the assumption that the directory stamp tracks its
+    entries.  NTFS does not honour that assumption: on this host, creating a file
+    in a directory left the stamp byte-identical, and 300 rapid creates produced
+    only 42 distinct stamps.  A cache keyed on it therefore handed the canonical
+    write gate a stale key set and silently dropped the projection-drift signal for
+    a page that had just been added.  A 31 ms scan is the price of the gate telling
+    the truth.
+    """
+    directory = Path(wiki_dir) if wiki_dir is not None else get_wiki_dir()
+    skip = SYSTEM_WHITELIST if excluded is None else excluded
+    if not directory.exists():
+        return set()
+    keys: set[str] = set()
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                name = entry.name
+                if not name.endswith(".md") or name in skip or name.startswith("System_"):
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                keys.add(name[: -len(".md")])
+    except OSError:
+        return set()
+    return keys
+
+
+def flush_durable(handle) -> None:
+    """Flush an open writable handle and force its bytes to stable storage.
+
+    ``os.replace`` is atomic with respect to *readers*, but it only swaps a
+    directory entry.  Without an ``fsync`` the replacement inode's data may still
+    sit in the page cache when the swap happens, so a crash or power loss can
+    leave a zero-length or torn canonical file while the previous content is
+    already unlinked.  ``write_markdown_file`` already guards *logical* loss of
+    compiled truth; this guards the physical write.
+    """
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def fsync_directory(directory: str | Path) -> None:
+    """Force a completed rename into the directory entry itself.
+
+    POSIX only: Windows cannot open a directory for ``fsync``, and its rename
+    durability is handled by the filesystem journal instead.  A failure here is
+    never fatal -- the data file is already synced.
+    """
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def atomic_write_text(
     path: str | Path,
     content: str,
@@ -328,7 +403,9 @@ def atomic_write_text(
     temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     with open(temp_path, "w", encoding="utf-8") as handle:
         handle.write(content)
+        flush_durable(handle)
     os.replace(temp_path, path)
+    fsync_directory(path.parent)
 
 def ensure_parent_dir(path: str | Path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -418,7 +495,6 @@ def safe_write_markdown(path: str | Path, content: str, skip_validation: bool = 
     frontmatter, body = split_frontmatter(content)
     write_markdown_file(path, frontmatter, body, skip_validation=skip_validation)
 
-from typing import TypedDict, List
 
 class TensionEdge(TypedDict):
     target: str
