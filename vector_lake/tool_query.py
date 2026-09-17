@@ -7,17 +7,31 @@ import time
 
 from vector_lake import get_extension_root, provenance
 from vector_lake.tool_search import assemble_context
+from vector_lake.node_vocabulary import (
+    GENERATED_NODE_TYPES,
+    strip_prefix,
+    type_for_node_id,
+)
 from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, normalize_entity_name
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-query")
 
-# Type prefixes a wiki filename may start with (``wiki_utils.VALID_PREFIXES``).
-_NODE_PREFIXES = (
-    "Concept_", "Vendor_", "Institution_", "Product_", "Person_",
-    "Event_", "Policy_", "Standard_", "Source_", "Synthesis_",
-)
+# This file used to keep its own copy of the prefix list, and a second, inline copy of
+# the same list further down.  Both omitted ``System_`` while the comment claimed to
+# mirror ``wiki_utils.VALID_PREFIXES``, so the two places that read the list disagreed
+# with the three that did not.  The vocabulary now has one owner.
+#
+# What that omission actually changed, precisely: ``_node_core`` stripped every prefix
+# except ``System_``, and the stub creator labelled every ``System_*`` target
+# ``concept`` -- which ``validate_schema`` then rejected, because a ``System_*.md``
+# filename may not carry the type ``concept``.  So ``System_*`` targets silently
+# produced no stub at all.  Note the limit of the stem fix: link targets are
+# normalised (underscores become hyphens, ``normalize_entity_name``) while the
+# existing-page keys are raw filenames, so a target containing ``_`` still does not
+# match a ``System_*`` file.  That asymmetry affects every prefix equally and is not
+# what this change alters.
 
 
 def _node_core(name: str) -> str:
@@ -28,10 +42,17 @@ def _node_core(name: str) -> str:
     stub creator invented a second node, ``Concept_Epic-Systems``, for an entity
     that was already in the graph.  Four such pairs existed in the live wiki.
     """
-    for prefix in _NODE_PREFIXES:
-        if name.startswith(prefix):
-            return name[len(prefix):]
-    return name
+    return strip_prefix(name)
+
+
+def _node_type(target: str) -> str:
+    """The type a stub for ``target`` must declare.
+
+    An untyped link target gets ``concept``; a typed one gets its own type.  Callers
+    that write a page must check :data:`GENERATED_NODE_TYPES` first (see
+    :func:`_generate_stubs_for_broken_links`).
+    """
+    return type_for_node_id(target) or "concept"
 
 
 def prepare_query_context(query_str: str, dry_run: bool = False):
@@ -214,7 +235,20 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     stubs = 0
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     for target in broken_targets:
-        node_type = target.split("_")[0].lower() if target.startswith(("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_")) else "concept"
+        # A generated artifact is not a graph node.  Writing one would satisfy the
+        # link for the linter while ``indexer`` skips the page, so the gap would
+        # disappear from lint without ever appearing in the graph; and the live wiki
+        # holds 798 ``System_*`` pages precisely because they are generated.  Before
+        # the vocabulary fix this case produced no page either, but only as a side
+        # effect of ``validate_schema`` rejecting the mistyped stub.
+        if type_for_node_id(target) in GENERATED_NODE_TYPES:
+            log.info(
+                "Not creating a stub for '%s': %s pages are generated artifacts, not graph nodes.",
+                target,
+                type_for_node_id(target),
+            )
+            continue
+        node_type = _node_type(target)
         frontmatter = {
             "id": target,
             "title": target.replace("_", " "),

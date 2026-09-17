@@ -410,6 +410,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `vector_lake/mutation_coordinator.py` | 统一突变编排：canonical 事务 + 持久化 outbox + 投影 materialize |
 | `vector_lake/runtime_health.py` | 运行时健康评估与写入门（硬故障阻断 / 可修复降级放行） |
 | `vector_lake/wiki_utils.py` | 路径解析、frontmatter、原子写入与位置辅助（runtime/outbox 信号目录等） |
+| `vector_lake/node_vocabulary.py` | 节点类型词表的唯一来源（类型 ⇄ 前缀、严格文件名模式），零 import 的叶片模块 |
 | `vector_lake/schema_validator.py` | frontmatter 与正文结构的 schema 校验 |
 | `vector_lake/defense_hook.py` | 写入前防御钩子（schema + purpose 契约统一入口） |
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |

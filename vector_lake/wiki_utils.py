@@ -12,6 +12,7 @@ from typing import List, TypedDict
 
 import yaml
 from vector_lake import get_extension_root, host_env
+from vector_lake.node_vocabulary import NODE_PREFIXES, NODE_TYPE_ALTERNATION
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 
@@ -20,7 +21,10 @@ _CONFIG_CACHE: dict = {}
 log = logging.getLogger("vector-lake-wiki")
 
 SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
-VALID_PREFIXES = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
+# Derived from ``node_vocabulary`` rather than spelled out here: three hand-written
+# copies of this list had already drifted (one was missing ``System_``).  The value
+# and its order are unchanged.
+VALID_PREFIXES = NODE_PREFIXES
 INVALID_CHARS_REGEX = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s]+')
 
 def normalize_memory_key(key: str) -> str:
@@ -66,7 +70,11 @@ def validate_wiki_filename(filename: str):
     if INVALID_CHARS_REGEX.search(filename):
         raise ValueError(f"Invalid characters: '{filename}' contains forbidden characters (e.g., brackets, slashes, spaces).")
         
-    if not re.match(r'^(Concept|Vendor|Institution|Product|Person|Event|Policy|Standard|Source|Synthesis)_[a-zA-Z0-9\u4e00-\u9fa5]+(-[a-zA-Z0-9\u4e00-\u9fa5]+)*\.md$', filename):
+    if not re.match(
+        rf'^(?:{NODE_TYPE_ALTERNATION})_[a-zA-Z0-9\u4e00-\u9fa5]+'
+        r'(-[a-zA-Z0-9\u4e00-\u9fa5]+)*\.md$',
+        filename,
+    ):
         raise ValueError(f"Strict Naming Violation: '{filename}' must match pattern [Type]_[MainName]-[SubName].md")
         
     core_name = filename.split("_", 1)[1][:-3] if "_" in filename else filename[:-3]

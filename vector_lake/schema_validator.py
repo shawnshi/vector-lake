@@ -3,6 +3,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from vector_lake.node_vocabulary import NODE_TYPE_SET
+
 class SchemaViolationException(Exception):
     pass
 
@@ -17,7 +19,7 @@ VALID_H3_SLOTS = {
     "standard": ["### 管辖范围与适用对象 (Jurisdiction & Applicability)", "### 核心约束与合规要求 (Compliance Mandates)", "### 奖惩机制与市场影响 (Incentives & Penalties)", "### 演进与废除条件 (Lifecycle)"]
 }
 
-VALID_TYPES = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
+VALID_TYPES = NODE_TYPE_SET
 
 # Conditional slot: required on Section 1 exactly when the frontmatter declares
 # ``tension_edges``.  Exported so the merge path can reproduce the same allow-list
