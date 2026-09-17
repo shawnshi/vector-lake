@@ -1,5 +1,57 @@
 # Unreleased
 
+## `lint --auto-fix` 的存根类型错误，使这些“修复”从未真正落盘
+
+`lint_vector_lake(auto_fix=True)`（可经 `cli.py lint --auto-fix` 与 MCP 工具触达）为破链创建存根时，
+文件名按目标自带的前缀命名，而 frontmatter 里的 `type` **硬编码为 `concept`**：
+
+```python
+stub_filename = f"Concept_{target}.md" if not target.startswith(valid_prefixes) else f"{target}.md"
+...
+"type": "concept",
+```
+
+而写入走 `execute_mutation_plan` → `validate_schema`，后者会校验文件名前缀与 `type` 是否一致。实测：
+链接 `[[Vendor_Missing-Thing]]` 产生 `Vendor_Missing-Thing.md` + `type: concept`，被拒：
+
+```
+Schema Violation: Filename prefix 'Vendor' does not match frontmatter type 'concept'.
+```
+
+异常被 `except Exception` 捕获后只写一行 `log.warning`（`tool_lint.py:55`，`fixes_applied` 不增加）。
+所以真实后果**不是“写出了一个非法页面”**，而是：**页面从未被创建、破链仍然破着、而 lint 报告里对此
+一字未提** —— 看起来像是“修过了、只是没什么可修”。
+
+修复：文件名前缀与 `type` 是同一个决定，两者都从上一批建立的词表所有者推导（`node_vocabulary`），
+并让正文的 H3 插槽跟随类型（`### 物理机制` 是 concept 的插槽，用在 Vendor 页上同样是错的）。同时
+与 `tool_query` 的存根创建保持一致：拒绝生成物类型（`System_*`），因为 `indexer` 会跳过这类页面，
+写出来只会让这条检查通过而图里永远没有该节点，把缺口藏起来。
+
+### 实测边界（一并钉住，不留含糊）
+
+| 目标 | 类型 | 插槽 | `validate_schema` |
+|---|---|---|---|
+| `Vendor_Missing-Thing` | `vendor` | `### 组织架构与商业模式` | 通过 |
+| `Standard_Missing-Thing` | `standard` | 该类型的首个插槽 | 通过 |
+| `Source_Missing-Thing` | `source` | 无声明插槽 → 回退到通用行 | 通过 |
+| `Bare-Thing` | `concept` | `### 物理机制` | 通过 |
+| `System_Missing-Thing` | — | — | 按设计**不写**（生成物命名空间）|
+| `Synthesis_Missing-Thing` | — | — | **仍不写**（见下）|
+
+`Synthesis_*` 依旧不被生成，但原因与本批无关：`schema_validator` 要求 Synthesis 页必须带
+`## 核心合成论点 (Core Synthesized Claims)` 与 `## 支撑拓扑 (Supporting Topology)`，而通用存根正文
+不产出这两节。修复前它先被类型不匹配挡住，修复后改由这条规则挡住 —— 两种情况下都没有页面。
+该限制已写成测试固定下来（避免将来有人让它“悄悄开始”产出非法 Synthesis 页），并在代码注释里注明。
+
+`tests/test_lint_stub_type.py` 新增 6 例；**修复前其中 2 例失败**（断言 `stub.exists()` 为真而实际为假），
+修复后全绿。全量 pytest **733 passed**。
+
+### 仍未处理（记录在案）
+
+`tool_lint` 与 `tool_query` 各自维护着一个存根创建器：前者直接写文件、吃 `auto_fix` 开关；后者走
+`execute_mutation_plan` 并产出 `strategic_scope` 等字段。本批只修了前者的类型与插槽错误，**没有**把
+两者合并 —— 合并会改变 lint 的写入路径与 `fixes_applied` 语义，属于独立批次。
+
 ## 节点类型词表收敛为单一来源，并修掉它的副本已产生的 `System_` 缺陷
 
 同一份词表在**五处**以手写形式存在，各不相同：
