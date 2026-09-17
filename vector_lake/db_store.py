@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from vector_lake.wiki_utils import get_meta_dir
@@ -827,21 +828,43 @@ _SCHEMA_SENTINELS: tuple[str, ...] = (
 # the first run.  Recreating them is pure DDL and no row data is at risk in
 # either direction -- the two tables hold zero rows and the dropped column is
 # NULL everywhere.
-_LEGACY_SCHEMA_PRUNES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "2026-09-17-prune-orphaned-legacy-schema",
-        (
-            "DROP TABLE IF EXISTS ingest_jobs",
-            "DROP INDEX IF EXISTS idx_jobs_retention_v6",
-            "DROP INDEX IF EXISTS idx_mutation_outbox_retention_v6",
-            "DROP INDEX IF EXISTS idx_mutation_outbox_idempotency_lookup",
-            "DROP TABLE IF EXISTS claim_graph_nodes",
-        ),
-    ),
-    (
-        "2026-09-17-drop-change-sets-change-id",
-        ("ALTER TABLE change_sets DROP COLUMN change_id",),
-    ),
+def _prune_orphaned_legacy_schema(conn: sqlite3.Connection) -> None:
+    """Drop the objects a removed release created but never dropped."""
+    for statement in (
+        "DROP TABLE IF EXISTS ingest_jobs",
+        "DROP INDEX IF EXISTS idx_jobs_retention_v6",
+        "DROP INDEX IF EXISTS idx_mutation_outbox_retention_v6",
+        "DROP INDEX IF EXISTS idx_mutation_outbox_idempotency_lookup",
+        "DROP TABLE IF EXISTS claim_graph_nodes",
+    ):
+        conn.execute(statement)
+
+
+def _prune_change_sets_change_id(conn: sqlite3.Connection) -> None:
+    """Drop ``change_sets.change_id`` while a pre-prune database still has it.
+
+    Guarded by a read-only probe, deliberately not by catching
+    ``OperationalError``.  A ``DROP COLUMN`` that fails because the column is
+    referenced by an index, trigger or view reports
+    ``error in index ... after drop column: no such column: ...`` -- a substring
+    test for ``no such column`` swallows exactly that and then records the
+    migration as applied while the column is still there.  With the probe there
+    is nothing to tolerate: the statement is issued only when the column exists,
+    so any failure from it is real and must propagate.
+    """
+    if "change_id" not in _table_columns(conn, "change_sets"):
+        return
+    conn.execute("ALTER TABLE change_sets DROP COLUMN change_id")
+
+
+# Each migration is a name plus ordered steps.  Steps are callables rather than
+# SQL strings so a step can make a decision (probe a column) instead of relying
+# on an error message to tell "already done" apart from "failed".
+_LEGACY_SCHEMA_PRUNES: tuple[
+    tuple[str, tuple[Callable[[sqlite3.Connection], None], ...]], ...
+] = (
+    ("2026-09-17-prune-orphaned-legacy-schema", (_prune_orphaned_legacy_schema,)),
+    ("2026-09-17-drop-change-sets-change-id", (_prune_change_sets_change_id,)),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """
@@ -851,58 +874,61 @@ _SCHEMA_MIGRATIONS_DDL = """
     )
 """
 
-# Only one outcome is tolerated: ``ALTER TABLE ... DROP COLUMN`` on a column that
-# is already gone, which is the normal state of a database created by this tree
-# (no release here adds ``change_id``, so only a pre-prune database has it).
-# ``DROP TABLE/INDEX IF EXISTS`` never raises for a missing object, so a "no such
-# table" error there means something else is wrong and must propagate.  An older
-# SQLite without ``DROP COLUMN`` raises a syntax error, which is deliberately not
-# tolerated either -- ``_init_db_once`` defers the whole prune instead of
-# recording a half-done migration.
-_TOLERATED_PRUNE_ERRORS = ("no such column",)
+
+def _ledger_exists(conn: sqlite3.Connection) -> bool:
+    """Read-only: is the prune ledger table there at all?"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        is not None
+    )
 
 
-def _legacy_prunes_applied(conn: sqlite3.Connection) -> bool:
-    """Read-only: every prune is recorded in the ledger.
+def _recorded_prunes(conn: sqlite3.Connection) -> set[str]:
+    """Read-only: the migration names in the ledger.
 
-    False when the ledger table is absent, which is the state of every database
-    written before the first prune ran.  Safe on the read path: reads
-    ``schema_migrations`` only, takes no write lock.
+    Empty when the ledger table does not exist, which is the state of every
+    database written before the first prune ran.  Takes no write lock, so it is
+    safe to call before deciding whether a transaction is needed at all.
+
+    Table absence is probed through ``sqlite_master`` rather than caught as an
+    error.  Swallowing the read and returning "empty" would turn any transient
+    failure -- a lock, a schema change in flight -- into "nothing has been
+    applied yet", and the caller would then re-run finished migrations and
+    overwrite the ledger timestamps with new ones.
     """
-    try:
-        recorded = {str(row[0]) for row in conn.execute("SELECT name FROM schema_migrations")}
-    except sqlite3.Error:
-        return False
-    return all(name in recorded for name, _ in _LEGACY_SCHEMA_PRUNES)
+    if not _ledger_exists(conn):
+        return set()
+    return {str(row[0]) for row in conn.execute("SELECT name FROM schema_migrations")}
 
 
 def apply_legacy_schema_prunes() -> list[str]:
     """Drop schema left behind by removed releases.  Idempotent and recorded.
 
-    Owns its transaction, so it is safe both standalone and nested inside
-    ``_init_db_once``'s DDL transaction.  Returns the migration names this call
-    actually applied.  A migration whose statements did not all succeed is left
-    unrecorded, so the next ``init_db()`` retries it instead of silently
-    reporting success.
+    Reads the ledger before deciding anything, so a converged database costs one
+    SELECT and takes no write lock at all.  Each migration owns its own
+    transaction, so an earlier success survives a later failure.  A migration is
+    recorded only after every one of its steps succeeded, so a failure leaves it
+    pending for the next attempt instead of reporting success.
+
+    Returns the migration names this call actually applied.
     """
+    conn = get_connection()
+    pending = [
+        (name, steps)
+        for name, steps in _LEGACY_SCHEMA_PRUNES
+        if name not in _recorded_prunes(conn)
+    ]
     completed: list[str] = []
-    with transaction():
-        conn = get_connection()
-        conn.execute(_SCHEMA_MIGRATIONS_DDL)
-        recorded = {
-            str(row[0]) for row in conn.execute("SELECT name FROM schema_migrations")
-        }
-        for name, statements in _LEGACY_SCHEMA_PRUNES:
-            if name in recorded:
+    for name, steps in pending:
+        with transaction():
+            conn = get_connection()
+            conn.execute(_SCHEMA_MIGRATIONS_DDL)
+            if name in _recorded_prunes(conn):
                 continue
-            for statement in statements:
-                try:
-                    conn.execute(statement)
-                except sqlite3.OperationalError as exc:
-                    message = str(exc).lower()
-                    if any(phrase in message for phrase in _TOLERATED_PRUNE_ERRORS):
-                        continue
-                    raise
+            for step in steps:
+                step(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations (name, applied_at) VALUES (?, ?)",
                 (name, datetime.now(timezone.utc).isoformat()),
@@ -917,30 +943,51 @@ def legacy_schema_prune_names() -> tuple[str, ...]:
 
 
 def applied_schema_prunes(conn: sqlite3.Connection | None = None) -> dict[str, str]:
-    """The prune ledger, for the doctor surface.  Empty when never applied."""
+    """The prune ledger, for the doctor surface.  Empty when never applied.
+
+    Deliberately does not call ``init_db()``: this is a diagnostic, and a
+    diagnostic that can write is not a diagnostic.
+    """
     if conn is None:
-        init_db()
         conn = get_connection()
-    try:
-        rows = conn.execute("SELECT name, applied_at FROM schema_migrations").fetchall()
-    except sqlite3.OperationalError:
+    if not _ledger_exists(conn):
         return {}
+    rows = conn.execute("SELECT name, applied_at FROM schema_migrations").fetchall()
     return {row["name"]: row["applied_at"] for row in rows}
 
 
+def _apply_prunes_best_effort() -> None:
+    """Run the prunes without making them a precondition for using the database.
+
+    ``init_db()`` never needed the write lock when the schema was already
+    complete, and every command goes through it.  A read-only snapshot, or a
+    database whose writer is busy elsewhere, must stay usable: an un-applied
+    cleanup degrades to a warning, and ``doctor`` reports the schema as not
+    converged.  ``DatabaseLockTimeout`` is deliberately not caught -- it is
+    raised only after this module's own lock budget, and its class docstring
+    records that callers must not absorb it.
+    """
+    try:
+        apply_legacy_schema_prunes()
+    except sqlite3.OperationalError as exc:
+        log.warning("Legacy schema prune deferred, schema not converged: %s", exc)
+
+
 def _schema_is_complete(db_path: Path) -> bool:
-    """Read-only probe: every sentinel object exists and every prune is recorded.
+    """Read-only probe: every sentinel object already exists.
 
-    Opens a bare connection and reads ``sqlite_master`` and
-    ``schema_migrations`` only.  No PRAGMAs are applied and no statement is
-    issued that could take the write lock, so this is safe to call on the read
-    path while another process is writing.  The caller uses it to skip the DDL
-    transaction that would otherwise make every read wait behind the writer
-    holding ``BEGIN IMMEDIATE``.
+    Opens a bare connection and reads ``sqlite_master`` only.  No PRAGMAs are
+    applied and no statement is issued that could take the write lock, so this is
+    safe to call on the read path while another process is writing.  The caller
+    uses it to skip the DDL transaction that would otherwise make every read wait
+    behind the writer holding ``BEGIN IMMEDIATE``.
 
-    The ledger is part of the contract on purpose: without it a database whose
-    sentinels are all present would take the fast path forever and never run
-    the prunes.
+    The prune ledger is deliberately *not* part of this contract.  Requiring it
+    here would make ``init_db()`` fail outright on a read-only snapshot of a
+    pre-prune database, when all that is missing is a cleanup.  The prunes are
+    run separately by ``_apply_prunes_best_effort``, which is how a database
+    whose sentinels were already present still converges on its next
+    ``init_db()`` instead of never.
     """
     if not db_path.exists():
         return False
@@ -951,7 +998,6 @@ def _schema_is_complete(db_path: Path) -> bool:
             str(row[0])
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
         }
-        prunes_applied = _legacy_prunes_applied(conn)
     except sqlite3.Error:
         return False
     finally:
@@ -960,7 +1006,7 @@ def _schema_is_complete(db_path: Path) -> bool:
                 conn.close()
             except sqlite3.Error:
                 pass
-    return set(_SCHEMA_SENTINELS).issubset(present) and prunes_applied
+    return set(_SCHEMA_SENTINELS).issubset(present)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1006,9 +1052,11 @@ def init_db():
             # bypassed the triggers still gets reconciled, then memoise.
             _INITIALIZED_DB_PATHS.add(db_key)
             ensure_operational_memory_index(get_connection())
+            _apply_prunes_best_effort()
             return
         _INITIALIZED_DB_PATHS.discard(db_key)
         _init_db_once(db_key)
+        _apply_prunes_best_effort()
 
 
 def _init_db_once(db_key: str):
@@ -1287,14 +1335,6 @@ def _init_db_once(db_key: str):
             # Older SQLite versions might not support expression indexes
             import logging
             logging.getLogger("vector-lake-db").warning(f"Could not create JSON expression indexes: {e}")
-    try:
-        apply_legacy_schema_prunes()
-    except sqlite3.OperationalError as exc:
-        # A read-only database, or another process holding the write lock while
-        # it initialises, must not make every command unusable.  The ledger is
-        # NOT written on failure, so the next init retries.  This degrades to
-        # "not pruned yet"; it never reports the prune as done.
-        log.warning("Legacy schema prune deferred: %s", exc)
     _INITIALIZED_DB_PATHS.add(db_key)
 
 

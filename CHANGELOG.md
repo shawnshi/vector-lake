@@ -18,10 +18,26 @@ retention 机制。但被删代码已经用 `CREATE ... IF NOT EXISTS` 把对象
 - `change_sets.change_id` 列：26 774 行全为 NULL，且字符串 `change_id` 在仓库任何 Python 文件中
   0 次出现。
 
-处置：新增一次性 prune 机制（`db_store._LEGACY_SCHEMA_PRUNES` + `schema_migrations` 台账）。
-台账是 schema 契约的一部分——`_schema_is_complete` 现在要求「哨兵对象齐备 **且** 每个 prune 已记账」，
-否则活库会永远走 `init_db()` 的快路径、prune 永不执行。prune 自持事务，单独调用与嵌在
-`_init_db_once` 事务内都安全；失败时**不写台账**并降级为下次重试，不会把半成品记成已完成。
+处置：新增一次性 prune 机制（`db_store._LEGACY_SCHEMA_PRUNES` + `schema_migrations` 台账）。每条迁移
+是一个名字 + 有序步骤，步骤是**可调用对象**而非 SQL 字符串，因而可以自己做判断（探测列是否存在），
+而不是靠异常文案区分「已完成」与「失败」。
+
+- prune 先只读台账，已收敛的库只发生一次 SELECT、**完全不取写锁**；只有存在待处理迁移时才开事务。
+- 每条迁移自持事务，前面的成功不会被后面的失败回滚。
+- 迁移只在全部步骤成功后记账，失败则保持待处理、下次重试。
+- prune **不是** `_schema_is_complete` 的条件。曾经把它写成条件，结果会让「prune 之前做的只读快照」
+  上 `init_db()` 直接失败（而它缺的只是一次清理）；现在由 `init_db()` 两个分支末尾的
+  `_apply_prunes_best_effort()` 承担，失败只告警并把 schema 标为未收敛（`doctor` 会报 FAIL），
+  库仍可用于读取。
+- 表缺失通过 `sqlite_master` 探测，而不是 catch 后返回空集：把任何瞬时读失败当成「还没应用过」
+  会导致重跑已完成迁移并**覆盖 `applied_at`**，台账就不再是「迁移实际何时执行」的记录。
+
+**独立复核（builtin `reviewer`，未参与生成）发现并已修复一个真缺陷**：原先靠
+`"no such column" in message` 容忍失败。实测 SQLite 对「列被索引引用而无法删除」报的是
+`error in index ... after drop column: no such column: ...`——**包含**该子串，于是真实失败被当作已完成，
+列还在而台账声称已删。改为 `PRAGMA table_info` 探测后再决定是否发 ALTER，不留任何容忍项。
+同时按复核意见收紧了三点：每条迁移独立事务、失败不得被读错误伪装成「空台账」、
+`applied_schema_prunes()` 不再调用 `init_db()`（诊断不应写库）。
 
 - 与 prune 同时删除的死代码：`db_store.page_graph_degree_map`（全仓 0 调用点，且是
   `page_graph_edges` 1 293 200 行的唯一全表读取者）。
@@ -34,7 +50,8 @@ retention 机制。但被删代码已经用 `CREATE ... IF NOT EXISTS` 把对象
 `Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)` 全部保持。
 **回滚演练**：按记录的恢复点重建全部 7 个对象 + `change_id` 列（实测全部成功恢复），清空台账后重跑
 `doctor`，7 个对象再次全部消失、台账再次记满 2 条 —— 恢复路径与再收敛都已实测，不只是文档。
-新增 `tests/test_legacy_schema_prune.py`（7 例）；全量 pytest **696 passed**。
+新增 `tests/test_legacy_schema_prune.py`（11 例，含复核 P1 的索引列回归与「读失败不得伪装成空台账」）；
+全量 pytest **700 passed**。
 
 ## 删除一个对无界边投影的全表读取函数
 
