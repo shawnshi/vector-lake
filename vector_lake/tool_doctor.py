@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 from vector_lake.wiki_utils import (
     get_index_path,
     get_memory_dir,
@@ -195,8 +196,7 @@ def doctor_vector_lake() -> str:
 
     # 7. State Projection Consistency
     try:
-        excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
-        wiki_keys = wiki_page_keys(get_wiki_dir(), excluded)
+        wiki_keys = wiki_page_keys(get_wiki_dir(), NON_NODE_WIKI_FILES)
         with open(get_index_path(), "r", encoding="utf-8") as f:
             index_keys = {
                 key for key in json.load(f).get("nodes", {})

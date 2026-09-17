@@ -19,9 +19,36 @@ comment claimed to mirror ``wiki_utils.VALID_PREFIXES``. The consequence was not
 cosmetic: a link to an existing ``System_Community_*`` page did not match that page
 by stem, and a stub invented for a ``System_*`` target was typed ``concept``.
 
+``NON_NODE_WIKI_FILES`` is here for the same reason and covers the other half of
+the question.  A node type answers "what kind of node is this file?"; this set
+answers "is this file a node at all?".  It had been spelled out six times, and the
+sites did not agree on what to do with a name that is missing from it, so an
+answer that is not written down in one place is an answer that drifts.
+
 This module has no imports, so every layer can depend on it without creating a
 cycle or dragging in the wiki filesystem helpers.
 """
+
+#: Wiki files that are not knowledge nodes: they are index and report artifacts the
+#: wiki generates about itself, so they are skipped by the page projection, the graph
+#: indexer and the schema validator alike.  ``wiki_utils.SYSTEM_WHITELIST`` is this
+#: same object.
+#:
+#: ``System_*`` files are the *other* way to be a non-node, and deliberately are not
+#: listed here: they are matched by prefix, and ``GENERATED_NODE_TYPES`` already
+#: records that their type is generated.
+#:
+#: Not to be confused with the ``{index.md, log.md, overview.md}`` lists a number of
+#: call sites pass when choosing which files to *read or delete*.  That is a narrower
+#: question with its own answer, and it is not this set.
+NON_NODE_WIKI_FILES: frozenset[str] = frozenset({
+    "index.md",
+    "log.md",
+    "overview.md",
+    "orphan_pages.md",
+    "wiki_link_stats.md",
+    "Synthesis_log.md",
+})
 
 #: Canonical order.  ``wiki_utils.VALID_PREFIXES`` is derived from it, so the
 #: order of this tuple is part of that public tuple's value.

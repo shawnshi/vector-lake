@@ -24,6 +24,7 @@ from vector_lake.wiki_utils import (
     VALID_PREFIXES,
 )
 
+from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
 # Community detection moved to Leiden (igraph + leidenalg) and lives in
@@ -1048,7 +1049,7 @@ def update_index_items(filenames: list[str]):
     # Filter valid files
     valid_filenames = []
     for filename in filenames:
-        if not filename.endswith(".md") or filename in ("index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md") or filename.startswith("System_"):
+        if not filename.endswith(".md") or filename in NON_NODE_WIKI_FILES or filename.startswith("System_"):
             continue
         valid_filenames.append(filename)
         

@@ -15,12 +15,10 @@ from pathlib import Path
 from vector_lake import indexer
 from vector_lake.claim_extractor import extract_page_objects
 from vector_lake.db_store import backup_database, get_connection, get_db_path, init_db
+from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 from vector_lake.schema_validator import VALID_H3_SLOTS
 from vector_lake.yaml_utils import dump_yaml
 from vector_lake.wiki_utils import get_claim_graph_path, get_index_path, get_meta_dir, get_wiki_dir, read_markdown_file
-
-
-EXCLUDED_WIKI_FILES = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
 
 
 def _utc_stamp() -> str:
@@ -34,7 +32,7 @@ def _wiki_keys() -> set[str]:
     return {
         path.stem
         for path in wiki_dir.glob("*.md")
-        if path.is_file() and path.name not in EXCLUDED_WIKI_FILES and not path.name.startswith("System_")
+        if path.is_file() and path.name not in NON_NODE_WIKI_FILES and not path.name.startswith("System_")
     }
 
 

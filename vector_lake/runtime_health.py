@@ -8,6 +8,8 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
+
 log = logging.getLogger("vector-lake-runtime-health")
 
 # The wiki key set must be read fresh on every health assessment.  The cache that
@@ -265,9 +267,8 @@ def assess_runtime_health(
     else:
         warnings.append("watchdog_status_missing")
 
-    excluded = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
     wiki_dir = get_wiki_dir()
-    wiki_keys = wiki_page_keys(wiki_dir, excluded) if wiki_dir.exists() else set()
+    wiki_keys = wiki_page_keys(wiki_dir, NON_NODE_WIKI_FILES) if wiki_dir.exists() else set()
     canonical_keys = {
         row["page_key"] for row in conn.execute(
             "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "

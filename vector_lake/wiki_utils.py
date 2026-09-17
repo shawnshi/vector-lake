@@ -12,7 +12,7 @@ from typing import List, TypedDict
 
 import yaml
 from vector_lake import get_extension_root, host_env
-from vector_lake.node_vocabulary import NODE_PREFIXES, NODE_TYPE_ALTERNATION
+from vector_lake.node_vocabulary import NODE_PREFIXES, NODE_TYPE_ALTERNATION, NON_NODE_WIKI_FILES
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 
@@ -20,7 +20,7 @@ _META_DIR_CACHE = None
 _CONFIG_CACHE: dict = {}
 log = logging.getLogger("vector-lake-wiki")
 
-SYSTEM_WHITELIST = {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}
+SYSTEM_WHITELIST = NON_NODE_WIKI_FILES
 # Derived from ``node_vocabulary`` rather than spelled out here: three hand-written
 # copies of this list had already drifted (one was missing ``System_``).  The value
 # and its order are unchanged.

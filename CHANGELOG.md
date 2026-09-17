@@ -1,5 +1,45 @@
 # Unreleased
 
+## 「这个文件到底是不是节点」的答案，原先写在六个地方
+
+`{index.md, log.md, overview.md, orphan_pages.md, wiki_link_stats.md, Synthesis_log.md}`
+—— 这套「不是知识节点的 wiki 文件」清单原先散落在 **6 处**，且形态各异：内联字面量、裸元组、
+模块常量。六处取值当时一致，所以没有任何可见故障；重复真正买到的东西是：下一次修改会落在当时凑巧
+被打开的那一份里。
+
+其中两处连「承载信息」都算不上：`runtime_health` 与 `tool_doctor` 各自把本地副本传给
+`wiki_page_keys`，而该函数的默认参数**本来就正好是这套集合** —— 它们做的事是用一份副本替换默认值。
+
+现在归一到零 import 叶片模块 `node_vocabulary.NON_NODE_WIKI_FILES`（`frozenset`），
+`wiki_utils.SYSTEM_WHITELIST` 变成**同一个对象**而非同值副本（批5 已用过这个模式）。取值与判定
+行为逐项复验不变：`identity: True`、集合相等、`validate_schema` 对六个文件名照旧跳过。
+
+### 与另一套「三文件清单」的区别，以及为什么没有一并合并
+
+另外还有 **7 处**持有更窄的 `{index.md, log.md, overview.md}`（`governance_store` ×2、
+`tool_delete`、`tool_ingest`、`tool_lint`、`tool_rename`、`watchdog_app`），`indexer:1138` 甚至只有
+两元素（缺 `overview.md`）。**这不是同一套集合**：它回答的是「哪些文件可以直接读/删」，与「是不是
+节点」是两个问题，因此本批**没有**动它们，只在所有者注释里点名区分。
+
+`tool_lint.skip_files` 也保持三元素不动，理由与直觉相反：它在 `:81` 过滤的是**要 lint 哪些文件**，
+若改用六元素集合，这些文件会被移出待检清单、其 key 不再进入 `all_keys`，于是指向它们的链接**反而
+会被判成破链**、`--auto-fix` 还会为它们造出存根。lint 需要同时具备两套集合（一套决定检查范围、一套
+决定链接解析），今天它把两者压成一个列表 —— 这是独立缺陷，记录在案，未在本批改动。
+
+### 新增 `tests/test_non_node_wiki_files.py`（11 例）
+
+守卫用 AST 统计**字符串常量**里出现的成员数，而不是扫文本，因此单引号藏不住副本、
+「元组 + 字面量」也不会被重复计数（这一点强于批5 的文本扫描守卫）。阈值设为 **4**：三元素清单
+（7 处）合法通过，四成员及以上的重声明触发失败。
+
+阈值自证：`test_the_guard_fires_on_a_redeclared_set` 用合成源码证明守卫能失败，
+`test_the_guard_tolerates_the_narrower_three_file_list` 证明三元素清单不被误伤；另外做了真实树验证
+—— 把 `tool_doctor` 的那份副本手工还原后，守卫报出
+`{'tool_doctor.py': [...六个成员...]}` 并给出修复指引。边界（看不见变量拼装的集合，也看不见
+`vector_lake/*.py` 之外的成员清单）写在模块 docstring 里。
+
+全量 pytest **747 passed**。
+
 ## 审计的「5 个 import 环」经实测不成立：0 个加载期环
 
 审计把 `wiki_utils`（fan-in 30）周围的 5 条路径记为「层反转/环」，并据此建议重排分层。用 AST

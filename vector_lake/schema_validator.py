@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from vector_lake.node_vocabulary import NODE_TYPE_SET
+from vector_lake.node_vocabulary import NODE_TYPE_SET, NON_NODE_WIKI_FILES
 
 class SchemaViolationException(Exception):
     pass
@@ -93,7 +93,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
         return
 
     # Skip system meta files
-    if filename in {"index.md", "log.md", "overview.md", "orphan_pages.md", "wiki_link_stats.md", "Synthesis_log.md"}:
+    if filename in NON_NODE_WIKI_FILES:
         return
 
     # --- 1. FRONTMATTER VALIDATION ---
