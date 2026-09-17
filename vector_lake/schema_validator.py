@@ -34,6 +34,13 @@ VALID_CATEGORIES = {
 VALID_STATUS = {"Active", "Draft", "Superseded", "Deprecated", "Archived", "Contested"}
 VALID_EPISTEMIC_STATUS = {"seed", "sprouting", "evergreen"}
 
+# ``SCHEMA_CATEGORIES.md`` scopes the category ontology to "entities, concepts, and
+# synthesis logic nodes".  Derived system artifacts (the clustering daemon's
+# ``System_Community_*`` indexes) are none of those, and the daemon marks them with
+# ``categories: [System]``.  This set is the only place a ``System_*`` page may use
+# a category outside ``VALID_CATEGORIES``.
+SYSTEM_ARTIFACT_CATEGORIES = frozenset({"System"})
+
 # The single source for "which frontmatter keys must be present".  ``tool_lint``
 # used to keep its own shorter list with no system-file exemption, so the linter
 # and the write gate disagreed about the same page.

@@ -17,6 +17,7 @@ from vector_lake.wiki_utils import (
 )
 from vector_lake.schema_validator import (
     REQUIRED_FIELDS,
+    SYSTEM_ARTIFACT_CATEGORIES,
     VALID_CATEGORIES,
     VALID_EPISTEMIC_STATUS,
     VALID_STATUS,
@@ -267,9 +268,15 @@ def lint_vector_lake(auto_fix: bool = False):
         categories = frontmatter.get("categories", [])
         if isinstance(categories, str): categories = [categories]
         if isinstance(categories, list):
+            # ``SCHEMA_CATEGORIES.md`` covers entities, concepts and synthesis nodes.
+            # A derived system artifact is none of those, so its own marker category
+            # is allowed -- and only there.
+            system_artifact = filename.startswith("System_")
             new_cats = []
             for category in categories:
-                if category not in valid_categories:
+                if category not in valid_categories and not (
+                    system_artifact and category in SYSTEM_ARTIFACT_CATEGORIES
+                ):
                     issues["category"].append(f"{filename}: Invalid category '{category}'")
                     if auto_fix:
                         changed = True

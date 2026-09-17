@@ -83,6 +83,40 @@ def test_status_matching_stays_case_insensitive(isolated_memory):
     assert "Invalid epistemic-status" not in report
 
 
+def test_system_artifacts_may_carry_their_own_category(isolated_memory):
+    """``SCHEMA_CATEGORIES.md`` scopes the ontology to knowledge nodes.
+
+    Derived system artifacts are not entities, concepts or synthesis nodes, so the
+    daemon's own ``System`` marker is allowed -- and only on a ``System_*`` page.
+    """
+    wiki = get_wiki_dir()
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "System_Community_L0_deadbeef.md").write_text(
+        "---\n"
+        "id: gov_deadbeef\n"
+        "title: Community index\n"
+        "type: system\n"
+        "status: Active\n"
+        "categories: [System]\n"
+        "updated: 2026-09-16\n"
+        "---\n\n- [[Concept_Alpha]]\n",
+        encoding="utf-8",
+    )
+    report = lint_vector_lake(auto_fix=False)
+    assert "Invalid category" not in report, report
+
+    # The same category on a knowledge node is still rejected.
+    _page(
+        "Concept_System-Category.md",
+        type_="concept",
+        status="Active",
+        epistemic="seed",
+        category="System",
+    )
+    report = lint_vector_lake(auto_fix=False)
+    assert "Invalid category 'System'" in report, report
+
+
 def test_missing_required_fields_is_the_single_source():
     """The linter and the write gate must agree on which keys a page needs."""
     system = {
