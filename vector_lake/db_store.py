@@ -1580,6 +1580,58 @@ def replace_page_graph_edges_for_node(node_key: str, edges: list[dict]) -> int:
     return len(rows)
 
 
+def page_graph_edges_mirror_drift(max_examples: int = 3) -> dict[str, object]:
+    """Whether ``page_graph_edges`` still mirrors the published edge projection.
+
+    The table is documented as "a pure projection of ``index.json``
+    ``weighted_edges``", and ``page_index_edges`` is the read projection of that
+    same set.  Both are supposed to hold the same pairs, so the contract is
+    checkable entirely inside SQLite.  Measured on the live corpus before this
+    check existed: 1 293 200 rows against 29 837 published, i.e. 1 263 363 rows
+    (97.7 %) that the published file does not contain.  They were written before
+    the degree cap existed and survive because the incremental writer rewrites
+    only the nodes an update touches.
+
+    Deliberately not a degree bound.  The published set itself reaches degree 17
+    on 10 nodes, so ``MAX_EDGES_PER_NODE`` is not the bound the artifact actually
+    satisfies; mirroring the published set is.  Counting is not used for the
+    verdict either: ``LIMIT`` probes answer "is there a violation" in milliseconds
+    even at 1.29M rows, where an exact ``EXCEPT`` count took 30s -- too slow for
+    a check an operator runs interactively.
+
+    Read-only.  ``difference`` is exact only when one side is clean; when rows are
+    both extra and missing only the net difference is knowable without the count.
+    """
+    conn = get_connection()
+    projection_rows = int(conn.execute("SELECT COUNT(*) FROM page_graph_edges").fetchone()[0])
+    published_rows = int(conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0])
+    extra_examples = [
+        (str(row[0]), str(row[1]))
+        for row in conn.execute(
+            "SELECT g.source_id, g.target_id FROM page_graph_edges g"
+            " LEFT JOIN page_index_edges p"
+            " ON p.source_key = g.source_id AND p.target_key = g.target_id"
+            " WHERE p.sequence IS NULL LIMIT ?",
+            (max_examples,),
+        )
+    ]
+    missing_example = conn.execute(
+        "SELECT p.source_key, p.target_key FROM page_index_edges p"
+        " LEFT JOIN page_graph_edges g"
+        " ON g.source_id = p.source_key AND g.target_id = p.target_key"
+        " WHERE g.source_id IS NULL LIMIT 1"
+    ).fetchone()
+    return {
+        "projection_rows": projection_rows,
+        "published_rows": published_rows,
+        "difference": projection_rows - published_rows,
+        "extra_examples": extra_examples,
+        "extra": bool(extra_examples),
+        "missing": missing_example is not None,
+        "missing_example": None if missing_example is None else tuple(missing_example),
+    }
+
+
 def enqueue_mutation(
     filename: str,
     mutation_type: str,

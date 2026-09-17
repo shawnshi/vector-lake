@@ -16,6 +16,7 @@ from vector_lake.wiki_utils import (
 )
 from vector_lake.db_store import (
     applied_schema_prunes,
+    page_graph_edges_mirror_drift,
     get_db_path,
     get_connection,
     idempotency_index_state,
@@ -288,6 +289,32 @@ def doctor_vector_lake() -> str:
                 )
     except Exception as e:
         checks.append(("Idempotency Index", False, f"Check failed: {e}"))
+
+    # ``page_graph_edges`` is a projection of the published ``weighted_edges``, and
+    # ``page_index_edges`` is the read projection of the same set.  Nothing
+    # re-derives the former on its own -- its writer only rewrites the nodes an
+    # update touches -- so drift is invisible until something compares the two.
+    try:
+        drift = page_graph_edges_mirror_drift()
+        clean = not drift["extra"] and not drift["missing"]
+        detail = f"mirrors the published {drift['published_rows']} edge(s)"
+        if not clean:
+            parts = [
+                f"projection={drift['projection_rows']}",
+                f"published={drift['published_rows']}",
+                f"difference={drift['difference']}",
+            ]
+            if drift["extra_examples"]:
+                shown = ", ".join(f"{a}->{b}" for a, b in drift["extra_examples"])
+                parts.append(f"not published, e.g. {shown}")
+            if drift["missing_example"]:
+                parts.append(f"missing from the projection, e.g. {drift['missing_example'][0]}")
+            detail = "; ".join(parts)
+        checks.append(("Page Edge Projection", clean, detail))
+        if not clean:
+            warnings.append("page_edge_projection_drift")
+    except Exception as e:
+        checks.append(("Page Edge Projection", False, f"Check failed: {e}"))
 
     # Legacy schema residue is invisible from inside the tree: an object that no
     # release creates, reads or writes still sits in every database that a past

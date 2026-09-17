@@ -1,5 +1,56 @@
 # Unreleased
 
+## 修复 `page_graph_edges` 与已发布边集不再一致（97.7% 的行是残留）
+
+审计实测：`page_graph_edges` 有 **1 293 200** 行，而实际发布的 `index.json["weighted_edges"]`
+只有 **29 837** 条 —— **1 263 363 行（97.7%）是发布集里不存在的**。原因不是逻辑错误，而是
+“常量收紧后旧数据不会重算”：
+
+- 全量重建路径用封顶后的集整体替换该表（`replace_page_graph_edges`），但增量路径
+  （`replace_page_graph_edges_for_node`）**只重写本次改动涉及的节点**；
+- 因此每个“此后再未被改动过”的节点都永久保留封顶前的行。活库最大节点度数为 **2 174**。
+
+两张表本来就该一致：`page_index_edges` 是同一份 `weighted_edges` 的读取投影。于是这个契约
+完全可以只在库内校验，不需要解析 `index.json`：
+
+- `db_store.page_graph_edges_mirror_drift()`（只读）用两个 `LEFT JOIN ... LIMIT` 探针回答
+  “是否已经偏离”，并用行数差给出规模与样例。刻意**不**用精确 `EXCEPT` 计数：实测在 1.29M 行时
+  需要 **30.7 s**，对 `doctor` 来说不可接受；探针在同规模下是 **0.00 s / 0.16 s**。
+- `doctor` 新增 `Page Edge Projection` 检查，偏离时计 FAIL + `page_edge_projection_drift` 告警，
+  并直接给出一个不在发布集里的边样例。
+
+**该检查不是度数上限检查。** 已发布的 `weighted_edges` 自身就有 **10 个节点度数为 16–17**，
+超过 `MAX_EDGES_PER_NODE = 15`（`_apply_graph_topology` 并不加边，所以这与它无关），
+即“≤15”从来不是这份产物真正满足的界限；真正满足的界限是“镜像已发布集”。
+
+活库一次性修复用全量重建本来就调用的那句：
+`db_store.replace_page_graph_edges(index.json["weighted_edges"])`。实测：
+
+- 行数 1 293 200 → **29 837**，漂移 `(extra, missing) = (False, False)`；
+- `PRAGMA quick_check = ok`；`doctor` → `[OK] Page Edge Projection: mirrors the published 29837 edge(s)`；
+- 状态一致性 Wiki:7125 JSON:7125 SQLite:7125 不变，`page_index_edges` 与 `index.json` 未被改写；
+- freelist 60 640 → **154 200 页（约 383 MB 可回收）**。**未执行 VACUUM**（2.13 GiB 的整库重写，
+  工具与耗时均超出本批次范围），因此文件大小不变，空间在 freelist 中。
+
+新增 `tests/test_page_edge_projection_mirror.py`（7 例）；全量 pytest **707 passed**。
+
+### 本批**未**做的事，以及原因
+
+审计建议里与本条同时提出的 “切断 `page_graph_edges` 投影回灌上游”（D1）**已实现又撤回**，
+因为独立复核发现并实测确认它会静默丢边：
+
+`update_index_items` 用**原始**链接字符串做预筛，而全量重建 `_calculate_weighted_edges` 先用
+`alias_map` 把链接解析成 page key。因此“用别名写的链接”只在重建路径上成边，增量路径看不见它 ——
+过去靠读回投影把这类边“托住”。实测已发布边集中：
+
+- 按原始链接预筛，**116 条**边无法通过（会被丢）；
+- 只修别名解析后仍剩 **63 条**（其余差异来自 `TYPE_AFFINITY` 不对称与共同邻居度数用的旧值）；
+- 因此**无法用有限改动让增量路径等价于重建路径**，撤回是正确处置，而非绕过。
+
+结论：只要读回仍在，该表就有读取者，不能删；而按上面的一次性重投影，读回变成“读回自己刚
+发布的那 15 条以内边”，行为可证不变。D1 需要先把增量路径的推导对齐到重建路径（即 `update_index_items`
+的预筛与 `calculate_relevance` 入参都要先过别名解析，且以 `min`/`max` 规范方向取 affinity），
+否则不应改；这次尝试的完整改动已撤回，未提交。
 ## 删除树内无法创建也无法清理的 schema 残留
 
 2026-09-16 的 `526df6a`（"Local tree becomes the authoritative main line"）删除了 `db_store.py` +
