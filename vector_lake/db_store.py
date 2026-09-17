@@ -1399,25 +1399,6 @@ def replace_page_graph_edges_for_node(node_key: str, edges: list[dict]) -> int:
     return len(rows)
 
 
-def page_graph_degree_map(page_keys: set[str]) -> dict[str, int]:
-    """Undirected degree per page_key in the visualization edge projection.
-
-    NOTE: this is the *weighted/pruned* graph used for rendering, not a
-    connectivity oracle.  Orphan detection must use canonical topology
-    (see ``tool_gc._topological_degrees``).
-    """
-    init_db()
-    conn = get_connection()
-    degrees = {key: 0 for key in page_keys}
-    for row in conn.execute("SELECT source_id, target_id FROM page_graph_edges"):
-        source, target = row["source_id"], row["target_id"]
-        if source in degrees:
-            degrees[source] += 1
-        if target in degrees:
-            degrees[target] += 1
-    return degrees
-
-
 def enqueue_mutation(
     filename: str,
     mutation_type: str,
