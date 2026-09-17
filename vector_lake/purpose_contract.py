@@ -180,8 +180,16 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
         strategic_scope = str(frontmatter.get("strategic_scope", "")).strip().lower()
         if strategic_scope not in ALLOWED_SCOPES:
             raise PurposeContractError(f"{filename}: strategic_scope must be one of {sorted(ALLOWED_SCOPES)}.")
+        # ``render_strategy_directive`` scopes this requirement to *new* nodes
+        # ("Every new node must declare ...").  Full validation also runs when an
+        # existing page is re-saved, and 6311 of the 7178 live pages predate the
+        # evidence_tier vocabulary, so an absent field is treated as legacy rather
+        # than as a contradiction with the purpose contract.  A *present* value
+        # outside the contract vocabulary is still a hard error -- that is a real
+        # conflict with purpose.md, and ``validation_mode="schema"`` remains the
+        # escape hatch for bounded legacy maintenance.
         evidence_tier = str(frontmatter.get("evidence_tier", "")).strip()
-        if evidence_tier not in permitted_tiers:
+        if evidence_tier and evidence_tier not in permitted_tiers:
             raise PurposeContractError(f"{filename}: evidence_tier must be one of {sorted(permitted_tiers)}.")
             
         aliases = frontmatter.get("aliases")

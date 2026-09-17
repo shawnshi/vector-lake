@@ -9,8 +9,27 @@ from difflib import SequenceMatcher
 
 from vector_lake import governance_metrics
 from vector_lake import governance_store
-from vector_lake.wiki_utils import get_wiki_dir, read_markdown_file, write_markdown_file
-from vector_lake.schema_validator import validate_schema, SchemaViolationException
+from vector_lake.wiki_utils import (
+    VALID_PREFIXES,
+    get_wiki_dir,
+    read_markdown_file,
+    write_markdown_file,
+)
+from vector_lake.schema_validator import (
+    REQUIRED_FIELDS,
+    VALID_CATEGORIES,
+    VALID_EPISTEMIC_STATUS,
+    VALID_STATUS,
+    VALID_TYPES,
+    missing_required_fields,
+    validate_schema,
+    SchemaViolationException,
+)
+
+
+# ``VALID_STATUS`` is capitalised while the check below lowercases the page value,
+# so the comparison view is normalised once here instead of restating the set.
+_LOWERCASE_STATUS = {status.lower() for status in VALID_STATUS}
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -33,17 +52,17 @@ def lint_vector_lake(auto_fix: bool = False):
         return "Wiki directory not found."
 
     skip_files = {"index.md", "log.md", "overview.md"}
-    valid_types = {"vendor", "institution", "product", "person", "event", "concept", "policy", "standard", "source", "synthesis", "system"}
-    valid_status = {"active", "draft", "superseded", "deprecated"}
-    valid_epistemic = {"seed", "sprouting", "evergreen"}
-    valid_categories = {
-        "Uncategorized", "Artificial_Intelligence", "Healthcare_IT",
-        "Strategy_and_Business", "System_Architecture",
-        "Philosophy_and_Cognitive", "Biomedicine",
-        "Policy_and_Governance", "Entities_and_Actors",
-    }
-    valid_prefixes = ("Concept_", "Vendor_", "Institution_", "Product_", "Person_", "Event_", "Policy_", "Standard_", "Source_", "Synthesis_", "System_")
-    required_fields = ["title", "type", "domain", "status", "epistemic-status", "categories"]
+    # Every vocabulary is imported from its single owner.  The local copies that
+    # used to live here had already drifted: ``valid_status`` was missing
+    # ``archived`` and ``contested``, so every page using those two legal statuses
+    # was reported as an invalid status even though schema_validator accepts them.
+    # tests/test_lint_vocabularies.py fails if a copy reappears.
+    valid_types = VALID_TYPES
+    valid_status = _LOWERCASE_STATUS
+    valid_epistemic = VALID_EPISTEMIC_STATUS
+    valid_categories = VALID_CATEGORIES
+    valid_prefixes = VALID_PREFIXES
+    required_fields = list(REQUIRED_FIELDS)
 
     files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]
     issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment"]}
@@ -206,7 +225,7 @@ def lint_vector_lake(auto_fix: bool = False):
         frontmatter = data["fm"]
         changed = False
 
-        missing = [field for field in required_fields if not frontmatter.get(field)]
+        missing = missing_required_fields(frontmatter, filename)
         if missing:
             issues["frontmatter"].append(f"{filename}: Missing fields: {', '.join(missing)}")
             if auto_fix:

@@ -34,6 +34,29 @@ VALID_CATEGORIES = {
 VALID_STATUS = {"Active", "Draft", "Superseded", "Deprecated", "Archived", "Contested"}
 VALID_EPISTEMIC_STATUS = {"seed", "sprouting", "evergreen"}
 
+# The single source for "which frontmatter keys must be present".  ``tool_lint``
+# used to keep its own shorter list with no system-file exemption, so the linter
+# and the write gate disagreed about the same page.
+REQUIRED_FIELDS = (
+    "id", "title", "type", "domain", "status",
+    "epistemic-status", "categories", "updated", "sources",
+)
+# Derived system artifacts (community indexes and the like) carry no domain, no
+# epistemic status and no sources by design, so those keys are not required on a
+# ``System_*`` page.
+SYSTEM_FILE_EXEMPT_FIELDS = frozenset({"domain", "epistemic-status", "sources"})
+
+
+def missing_required_fields(frontmatter: dict, filename: str) -> list[str]:
+    """Required frontmatter keys absent from ``frontmatter``, in contract order.
+
+    Callers raise on ``missing[0]`` so the reported field matches the order the
+    contract lists them in.  Key *presence* is what counts: ``sources: []`` is a
+    present, satisfiable value, not a missing field.
+    """
+    exempt = SYSTEM_FILE_EXEMPT_FIELDS if str(filename).startswith("System_") else frozenset()
+    return [field for field in REQUIRED_FIELDS if field not in frontmatter and field not in exempt]
+
 # Metric keys double as a physical unit contract.  Keep legacy keys readable,
 # but use the unambiguous keys below for all newly compiled SIR evidence.
 CONTROLLED_METRICS = {
@@ -65,13 +88,9 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
 
     # 1.1 Required Fields
     # strategic_scope and evidence_tier are highly recommended but we allow legacy files without them
-    required_fields = ["id", "title", "type", "domain", "status", "epistemic-status", "categories", "updated", "sources"]
-    for field in required_fields:
-        if field not in frontmatter:
-            # For system files, we can be more lenient
-            if filename.startswith("System_") and field in ["domain", "epistemic-status", "sources"]:
-                continue
-            raise SchemaViolationException(f"Schema Violation: Missing required frontmatter field '{field}'.")
+    missing = missing_required_fields(frontmatter, filename)
+    if missing:
+        raise SchemaViolationException(f"Schema Violation: Missing required frontmatter field '{missing[0]}'.")
     # 1.2 Type Validation
     doc_type = frontmatter.get("type", "").lower()
     if doc_type not in VALID_TYPES:

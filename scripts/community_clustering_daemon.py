@@ -1,8 +1,8 @@
 import json
 import logging
 import os
+import re
 import uuid
-import glob
 from datetime import datetime, timezone
 from filelock import FileLock
 
@@ -45,6 +45,29 @@ from vector_lake.governance_store import load_governance_queue, save_governance_
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-clustering-daemon")
+
+# A community index written by a clustering run: ``System_Community[-_]L<level>[-_]<uuid8|digits>``.
+# Hand-named indexes (``...-L0-Eroom-s-Law.md``), operator-acknowledged stubs
+# (``System_Community-L0.md``) and any other spelling deliberately do not match.
+COMMUNITY_ARTIFACT_PATTERN = re.compile(
+    r"^System_Community[_-]L\d+[_-](?:[0-9a-f]{8}|\d+)\.md$"
+)
+
+
+def superseded_community_artifacts(names, written) -> list[str]:
+    """Names of machine-generated community indexes from an earlier generation.
+
+    ``written`` is the set of filenames the current run produced; those are never
+    returned.  Everything else that matches the machine pattern is retired, so a
+    naming-generation change cannot strand the previous generation's pages --
+    which is exactly what happened when the glob was ``System_Community_[0-9]*.md``
+    (an underscore plus a digit, matching none of the 1078 live artifacts).
+    """
+    keep = set(written)
+    return sorted(
+        name for name in names
+        if name not in keep and COMMUNITY_ARTIFACT_PATTERN.match(name)
+    )
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -313,12 +336,20 @@ aliases:
             process_level("L0", part_L0, diffs_L0)
             process_level("L1", part_L1, diffs_L1)
 
-            # Clean up old legacy flat files safely
-            legacy_files = glob.glob(str(wiki_dir / "System_Community_[0-9]*.md"))
-            for old_file in legacy_files:
-                wiki_mutations.append(
-                    {"filename": os.path.basename(old_file), "is_delete": True}
-                )
+            # Retire community indexes left by an earlier naming generation.
+            #
+            # This used to glob ``System_Community_[0-9]*.md``, which requires an
+            # underscore followed by a digit.  Every artifact in the live wiki is
+            # named ``System_Community[-_]L<level>...``, so the glob matched
+            # nothing and 506 pages from the previous generation survived
+            # indefinitely -- together with ~41k canonical rows (claims, evidence)
+            # keyed to them.  Match the machine pattern explicitly instead, and
+            # never delete a page this run just wrote.
+            names = [path.name for path in wiki_dir.glob("System_Community*.md")]
+            for name in superseded_community_artifacts(
+                names, {mutation["filename"] for mutation in wiki_mutations}
+            ):
+                wiki_mutations.append({"filename": name, "is_delete": True})
 
             if wiki_mutations:
                 from vector_lake.mutation_coordinator import execute_mutation_batch

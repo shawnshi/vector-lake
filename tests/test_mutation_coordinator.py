@@ -324,24 +324,42 @@ def test_record_prepared_change_sets_does_not_load_full_history(isolated_memory,
 
 def test_schema_validation_mode_allows_bounded_legacy_maintenance(isolated_memory):
     _write_purpose_contract(isolated_memory)
+    # An absent ``evidence_tier`` marks a page written before the vocabulary
+    # existed.  The contract scopes the requirement to *new* nodes, so full
+    # validation lets a legacy page through.
     legacy_content = _named_source_content("source_legacy", "Legacy Source").replace(
         "evidence_tier: primary\n",
         "",
     )
 
-    with pytest.raises(Exception, match="evidence_tier"):
-        execute_mutation_plan("Source_Legacy.md", content=legacy_content)
-
     ok, message = execute_mutation_batch(
         [{"filename": "Source_Legacy.md", "content": legacy_content}],
-        validation_mode="schema",
     )
 
     assert ok is True
     assert "committed" in message.lower()
     assert (isolated_memory / "wiki" / "Source_Legacy.md").exists()
+
+    # A *present* value outside the vocabulary is a real conflict with purpose.md,
+    # and ``schema`` mode is its escape hatch.
+    wrong_tier = _named_source_content("source_wrong", "Wrong Tier").replace(
+        "evidence_tier: primary\n",
+        "evidence_tier: bogus\n",
+    )
+
+    with pytest.raises(Exception, match="evidence_tier"):
+        execute_mutation_plan("Source_Wrong.md", content=wrong_tier)
+
+    ok, message = execute_mutation_batch(
+        [{"filename": "Source_Wrong.md", "content": wrong_tier}],
+        validation_mode="schema",
+    )
+
+    assert ok is True
+    assert "committed" in message.lower()
+    assert (isolated_memory / "wiki" / "Source_Wrong.md").exists()
     row = db_store.get_connection().execute(
-        "SELECT validation_mode FROM mutation_outbox WHERE filename = 'Source_Legacy.md'"
+        "SELECT validation_mode FROM mutation_outbox WHERE filename = 'Source_Wrong.md'"
     ).fetchone()
     assert row["validation_mode"] == "schema"
 
