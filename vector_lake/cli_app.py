@@ -71,6 +71,11 @@ Usage Examples:
     timeline_rebuild_parser = subparsers.add_parser("timeline-rebuild", help="[TIMELINE] Rebuild timeline_events from timeline-event claims.")
     timeline_rebuild_parser.add_argument("--apply", action="store_true", help="Persist the rebuilt projection. Defaults to dry-run.")
     timeline_rebuild_parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of claims to project.")
+    timeline_repair_parser = subparsers.add_parser(
+        "timeline-repair",
+        help="[TIMELINE] Close timeline_events parity drift in place instead of rebuilding the whole table.",
+    )
+    timeline_repair_parser.add_argument("--apply", action="store_true", help="Persist the repair. Defaults to dry-run.")
 
     gram_index_parser = subparsers.add_parser(
         "gram-index",
@@ -172,6 +177,10 @@ def main() -> int:
             print(tools.rebuild_timeline_events_from_claims(
                 dry_run=not getattr(args, "apply", False),
                 limit=getattr(args, "limit", None),
+            ))
+        elif args.command == "timeline-repair":
+            print(tools.repair_timeline_projection(
+                dry_run=not getattr(args, "apply", False),
             ))
         elif args.command == "gram-index":
             print(tools.memory_gram_index_report())

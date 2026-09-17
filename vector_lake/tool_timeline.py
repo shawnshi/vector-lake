@@ -202,6 +202,67 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
     invalidate_timeline_parity_cache()
     return f"Rebuilt {len(events)} timeline_events row(s) from timeline-event claims."
 
+
+def repair_timeline_projection(dry_run: bool = True) -> str:
+    """Close the parity gap in place: drop orphan ids, project the missing ones.
+
+    The event id is content-addressed -- ``sha256(claim_id, event_date, text)`` --
+    on purpose, so that a row rewritten out of band with the same row count is
+    detectable (``test_timeline_search_rejects_equal_count_wrong_event_ids``).
+    ``event_date`` falls back to ``claim.updated_at`` when a claim carries no
+    temporal anchor and no dated text, which is the case for roughly a quarter of
+    the corpus, so a claim edit can legitimately move its id.
+
+    ``sync_timeline_events_for_claim_delta`` deletes the id derived from the row
+    content it is handed, so a delta that is not handed the *exact* previous row
+    leaves an orphan that no later delta can ever match again.  Parity drift is
+    therefore monotonic until the whole table is rebuilt.
+
+    This removes only the orphan ids and inserts only the ids the claims now
+    derive, so the projection converges without replacing ``timeline_events``.
+    """
+    conn = get_connection()
+    claim_rows = conn.execute(
+        "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
+        "WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
+    ).fetchall()
+    entity_ids: set[str] = set()
+    for row in claim_rows:
+        entity_ids.update(_claim_subject_ids(json.loads(row["data_json"])))
+    entity_titles = _entity_title_map(entity_ids)
+    expected = {}
+    for row in claim_rows:
+        event = _event_from_claim_row(row, entity_titles=entity_titles)
+        expected[event["id"]] = event
+    actual = {str(row["id"]) for row in conn.execute("SELECT id FROM timeline_events")}
+    orphan_ids = sorted(actual - set(expected))
+    missing_ids = sorted(set(expected) - actual)
+    if dry_run:
+        return (
+            "[DRY RUN] Would delete "
+            f"{len(orphan_ids)} orphan row(s) and insert {len(missing_ids)} missing row(s)."
+        )
+
+    from vector_lake.db_store import transaction
+
+    with transaction():
+        if orphan_ids:
+            conn.executemany(
+                "DELETE FROM timeline_events WHERE id = ?", [(i,) for i in orphan_ids]
+            )
+        if missing_ids:
+            conn.executemany(
+                "INSERT OR REPLACE INTO timeline_events "
+                "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
+                "VALUES (:id, :event_date, :action, :sentiment, :description, :entity_id, :entity_title, :source_file, :extracted_at)",
+                [expected[i] for i in missing_ids],
+            )
+    invalidate_timeline_parity_cache()
+    return (
+        f"Repaired timeline_events: deleted {len(orphan_ids)} orphan row(s), "
+        f"inserted {len(missing_ids)} missing row(s)."
+    )
+
 def search_timeline_events(entity_name: str = None, sentiment: str = None, action: str = None, limit: int = 10) -> str:
     """Query the timeline_events projection; fall back to timeline-event claims if the projection is empty."""
     conn = get_connection()

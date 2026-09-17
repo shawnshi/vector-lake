@@ -321,3 +321,85 @@ def test_parity_cache_follows_out_of_band_projection_writes(isolated_memory):
         )
 
     assert tool_timeline.timeline_projection_parity()["extra"] == 1
+
+
+def test_timeline_repair_closes_drift_and_leaves_correct_rows_untouched(isolated_memory):
+    """Repair converges the projection without replacing the whole table.
+
+    Only orphan ids are deleted and only missing ids inserted, so a row that was
+    already correct keeps its ``extracted_at`` -- which is how this test proves a
+    full-table rewrite did not happen.
+    """
+    from vector_lake import tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    payload = {
+        "claim_type": "timeline-event",
+        "subject_entity_ids": ["Concept_Repair"],
+        "source_ids": ["Source_Repair"],
+    }
+    _insert_timeline_claim(conn, "claim_repair_a", "[2026-04-07] [Release] First event.", dict(payload), "2026-07-14T00:00:00+00:00")
+    _insert_timeline_claim(conn, "claim_repair_b", "[2026-04-08] [Release] Second event.", dict(payload), "2026-07-14T00:00:00+00:00")
+    rebuild_timeline_events_from_claims(dry_run=False)
+    assert tool_timeline.timeline_projection_parity()["missing"] == 0
+
+    survivor = conn.execute(
+        "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE claim_id = 'claim_repair_b'"
+    ).fetchone()
+    survivor_id = tool_timeline._event_from_claim_row(survivor)["id"]
+    extracted_before = conn.execute(
+        "SELECT extracted_at FROM timeline_events WHERE id = ?", (survivor_id,)
+    ).fetchone()["extracted_at"]
+
+    # Drift of both kinds: an out-of-band orphan row, and a claim whose content
+    # moved (its id is content-addressed, so the old id becomes an orphan too).
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO timeline_events "
+            "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("orphan-id", "2000-01-01", "old", "neutral", "Orphan", "", "", "", "2000-01-01"),
+        )
+    _insert_timeline_claim(conn, "claim_repair_a", "[2026-04-09] [Release] First event moved.", dict(payload), "2026-07-16T00:00:00+00:00")
+
+    drift = tool_timeline.timeline_projection_parity()
+    assert drift["missing"] == 1, drift
+    assert drift["extra"] == 2, drift
+
+    assert "[DRY RUN]" in tool_timeline.repair_timeline_projection(dry_run=True)
+    assert tool_timeline.timeline_projection_parity() == drift
+
+    message = tool_timeline.repair_timeline_projection(dry_run=False)
+    assert "deleted 2" in message and "inserted 1" in message, message
+
+    after = tool_timeline.timeline_projection_parity()
+    assert after["missing"] == 0, after
+    assert after["extra"] == 0, after
+    assert conn.execute(
+        "SELECT extracted_at FROM timeline_events WHERE id = ?", (survivor_id,)
+    ).fetchone()["extracted_at"] == extracted_before
+
+
+def test_timeline_repair_is_a_noop_when_parity_is_clean(isolated_memory):
+    from vector_lake import tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _insert_timeline_claim(
+        conn,
+        "claim_clean",
+        "[2026-04-10] [Release] Clean event.",
+        {
+            "claim_type": "timeline-event",
+            "subject_entity_ids": ["Concept_Clean"],
+            "source_ids": ["Source_Clean"],
+        },
+        "2026-07-14T00:00:00+00:00",
+    )
+    rebuild_timeline_events_from_claims(dry_run=False)
+
+    message = tool_timeline.repair_timeline_projection(dry_run=False)
+
+    assert "deleted 0" in message and "inserted 0" in message, message
+    assert tool_timeline.timeline_projection_parity()["missing"] == 0
