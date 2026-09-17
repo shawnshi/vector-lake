@@ -209,6 +209,25 @@ def retired_doc_count(conn=None) -> int:
     return pending_doc_count(conn) - live_dirty_doc_count(conn)
 
 
+def dirty_breakdown(conn=None) -> tuple[int, int, int]:
+    """``(total, live, retired)`` for the queue, read in a single statement.
+
+    Three separate ``COUNT`` calls can disagree: they are separate reads, and
+    another connection draining the queue between them makes ``retired`` come out
+    negative.  Deriving all three from one snapshot cannot.
+    """
+    conn = conn or get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*), "
+        "COALESCE(SUM(EXISTS ("
+        "SELECT 1 FROM operational_memory_index AS i WHERE i.rowid = d.doc"
+        ")), 0) "
+        "FROM operational_memory_gram_dirty AS d"
+    ).fetchone()
+    total, live = int(row[0]), int(row[1])
+    return total, live, total - live
+
+
 def skip_doc_set(conn=None) -> set[int]:
     """Documents whose base postings are stale (edited since the base, or deleted)."""
     conn = conn or get_connection()
@@ -333,13 +352,28 @@ def flush_memory_gram_dirty(limit_docs: int = DEFAULT_FLUSH_DOCS) -> dict:
     re-inserted from its current projection row.  Documents that no longer exist
     stay dirty on purpose: the query skips base postings for dirty documents, so
     staying dirty is what retires a deleted document's postings.
+
+    Retired markers are therefore not *selectable* here, even though they stay
+    queued.  The queue is keyed by document rowid and drained in that order, and a
+    deleted document keeps whatever rowid it had -- the smallest ones belong to the
+    oldest documents, which are exactly the ones that have since been deleted.  So
+    selecting the batch with ``LIMIT`` alone let a head of retired markers consume
+    the entire batch on every call, the flush cleared nothing, and the backlog
+    could never drain: measured on the live lake, the first 400 queued documents
+    were 0 live and the first 10 000 were 19 live.
     """
     conn = get_connection()
-    docs = [row[0] for row in conn.execute(
-        "SELECT doc FROM operational_memory_gram_dirty LIMIT ?", (int(limit_docs),)
-    )]
+    docs = [
+        row[0]
+        for row in conn.execute(
+            "SELECT doc FROM operational_memory_gram_dirty AS d "
+            "WHERE EXISTS (SELECT 1 FROM operational_memory_index AS i WHERE i.rowid = d.doc) "
+            "LIMIT ?",
+            (int(limit_docs),),
+        )
+    ]
     if not docs:
-        return {"flushed": 0, "overlay_rows": 0, "retired": 0, "remaining": 0}
+        return {"flushed": 0, "overlay_rows": 0, "remaining": pending_doc_count(conn)}
     placeholders = ",".join("?" for _ in docs)
     inserted = 0
     with transaction():
@@ -382,7 +416,6 @@ def flush_memory_gram_dirty(limit_docs: int = DEFAULT_FLUSH_DOCS) -> dict:
     return {
         "flushed": len(live),
         "overlay_rows": inserted,
-        "retired": len(docs) - len(live),
         "remaining": pending_doc_count(conn),
     }
 
@@ -538,6 +571,20 @@ def ensure_memory_gram_index() -> bool:
     A stale-but-small backlog is drained incrementally; a large one needs an
     explicit :func:`rebuild_memory_gram_index`, so the caller keeps using the
     exact scan meanwhile rather than paying minutes inside a read.
+
+    "A large one needs an explicit rebuild" is taken literally, because a partial
+    drain past the cap is not free and does not converge:
+
+    * it cannot reach usability in one call, so the batch is spent and the caller
+      falls back to the exact scan anyway;
+    * it publishes the overlay for a document while that document's *stale base*
+      postings -- grams it no longer contains -- stay in the base.  Nothing
+      rewrites those until :func:`compact_memory_gram_overlay` reaches that gram,
+      and until then the read path sees base-plus-overlay for a document that is no
+      longer dirty, so :func:`skip_doc_set` no longer suppresses it;
+    * once the live backlog reaches zero the queue can still hold nothing but
+      retired markers, and the batch query then has to walk all of them to prove it
+      has nothing to do -- on every read.
     """
     conn = get_connection()
     try:
@@ -547,10 +594,16 @@ def ensure_memory_gram_index() -> bool:
             if _projection_doc_count(conn) <= AUTO_REBUILD_MAX_DOCS:
                 rebuild_memory_gram_index()
             return gram_index_usable()
-        if pending_doc_count(conn):
+        live_backlog = live_dirty_doc_count(conn)
+        if live_backlog == 0:
+            # Nothing serviceable is queued.  Retired markers are not work: they stay
+            # queued so the query keeps skipping their base postings until
+            # :func:`prune_retired_gram_docs` rewrites them away.
+            pass
+        elif live_backlog <= AUTO_REBUILD_MAX_DOCS:
             flush_memory_gram_dirty()
-            if live_dirty_doc_count(conn) > AUTO_REBUILD_MAX_DOCS:
-                return False
+        else:
+            return False
         if overlay_row_count(conn):
             compact_memory_gram_overlay()
         return gram_index_usable()

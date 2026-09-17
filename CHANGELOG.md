@@ -1,5 +1,113 @@
 # Unreleased
 
+## 修复 n-gram 脏队列被“已删文档标记”死锁，并让不可用的索引可见
+
+审计把 `operational_memory_gram_dirty` 的 111,564 行当成墓碑泄漏。**这个判断是错的**，实测
+推翻了它：其中 56,920 行标记的是已删文档，而它们**是承重的**，不是垃圾 ——
+
+> 查询路径用 `skip_doc_set()` 跳过所有脏文档的基础倒排，所以“保持脏”正是已删文档的基础倒排
+> 在 `prune_retired_gram_docs()` 重写掉它们之前不被检索出来的机制。（`memory_gram_index.py`
+> 自己的函数 docstring 就写着这句话：“Documents that no longer exist stay dirty on purpose”。）
+
+然而在查证过程中发现了一个**真正的缺陷**，比原判断严重：
+
+`flush_memory_gram_dirty()` 用 `SELECT doc FROM operational_memory_gram_dirty LIMIT 400` 取批次。
+该表以文档 rowid 为主键、按 rowid 顺序消费，而**已删文档的标记永远不会离开队列**；老文档的
+rowid 最小，被删掉的恰恰就是它们。于是队列开头全是永远不会消失的标记，把它们当成待办
+取走后，一次 flush 什么都清不掉。活库实测：
+
+| 队列头部（按 rowid） | 仍然存在的文档 |
+|---|---|
+| 前 400 行 | **0** |
+| 前 2 000 行 | 8 |
+| 前 10 000 行 | 19 |
+
+最小的“存活且脏”文档 rowid 是 **38 506** —— 也就是说前 400 行**全部**是已删文档的标记。
+
+（注：这张表看起来与“最小存活 rowid = 38 506”矛盾，实际不矛盾 —— 脏表不是稠密的：
+111 564 行散布在 doc 值 82–203 599 之间，`doc <= 10 000` 只有 **130 行**，因此 `ORDER BY doc
+LIMIT 10000` 的窗口上界是 56 342，已经越过 38 506。）
+
+后果不只是“不领情”（索引不前进），而是：**每一次记忆检索都在读路径上付一次写事务，并且
+永远零进展**。`ensure_memory_gram_index()` 在 backlog 超限时仍然调 flush（与它自己的 docstring
+“一个很大的 backlog 需要显式 rebuild，调用方在此期间继续用精确扫描”相矛盾），而 flush 拿
+到的 400 行全是已删文档 —— 它 `DELETE` 了 overlay、回查了 400 个 rowid、写了
+`operational_memory_gram_state`，然后返回 `flushed: 0`。
+
+修复分两处：
+
+1. 批次只选**仍然存在**的文档（`WHERE EXISTS (SELECT 1 FROM operational_memory_index ...)`）。
+   已删标记继续留在队列里维持跳过语义，只是不再占据批次。实测选行成本 0.2 ms → **11.5 ms**。
+2. `ensure_memory_gram_index()` 按它自己 docstring 的字面意思执行：**不再**在 backlog 超过 cap 时
+   做部分排空。超过 cap 的部分排空既无法在一次调用内达到可用、又会白白耗掉批次，还会（见下）
+   让读路径看到“基础倒排 + overlay”的叠加。于是读路径不再自行收敛：超限时它只如实返回
+   `usable=False`，出路由运维动作承担。
+
+顺带：去掉 `flush_memory_gram_dirty()` 返回值里已经恒为 0 的 `retired` 键（全仓确认无消费方）；
+空批次分支返回真实的 `remaining`（原先硬编码 0，无法区分“队列空”和“队列里只有已删标记”）。
+新增 `dirty_breakdown()` 用**单条**语句同时取 total/live/retired —— 原先 doctor 用两次独立读相减，
+另一个连接在两次读之间排空队列就会把 retired 算成负数。
+
+### 独立复核提出的一个既有缺陷：已刷出文档的陈旧基础倒排会泄到候选集里
+
+复核（只读 reviewer）指出：flush 把存活文档移出脏集，而**唯一**能中和该文档陈旧基础倒排的机制
+就是它自己在脏集里（`_accumulate` 的 `if doc in skip: continue`）。刷出后：
+
+- 该文档不再被 `skip_doc_set()` 抑制；
+- 基础倒排里它**已经不再包含**的那些 gram 仍然存在；
+- 唯一会重写基础倒排的是 `_compact_gram_chunk`，而它只遍历 `SELECT DISTINCT gram FROM
+  operational_memory_gram_overlay` —— 只覆盖该文档**仍然拥有**的 gram，丢掉的那些永不被触碰。
+
+**实测确认（FACT）**：在 10 文档隔离库上，把 `mem_a` 从“信创 HIS 集成平台 选型结论”改成
+“医院 电子病历六级 目标”（丢掉 信创/集成平台），自愈之后
+`accumulate_relevance(_query_terms("信创 集成平台"))` 返回 **`{1: 30}`**，而按当前 payload
+逐字计算的精确参考是 **`{}`**。
+
+**关键定性：这不是本批引入的**。把 `memory_gram_index.py` revert 到修复前跑同一个探针，结果
+**逐字相同**（`{1: 30}` vs `{}`）。它是既有设计缺陷，只是在活库上原本被“排空永不前进”掩盖住。
+本批的两处修复都不会恶化它（修复 2 使读路径在超限时不再刷出，反而缩小了触发面），但也没有修好它。
+影响面：候选窗口污染（`window = max(top_k*4, top_k+16)`），返回的文档由重新打分兜底（
+`governance_store` 会按当前 payload 重算），因此不会返回错误内容，而是在候选被虚高挤爆时
+可能丢掉本该入选的文档。修复方向需要设计决策（丢掉 gram 写 mask-0 墓碑、或仅在 rebuild 后
+供应索引），已记录为待办。
+
+### 新暴露出来的状态：一个 101.7 MB、永远不被读取的索引
+
+活库实测：`gram_count = 414 914`、`postings` 共 **101 721 484 B**、`ready=True`，但
+`live_backlog = 54 644 > AUTO_REBUILD_MAX_DOCS = 2 000`，于是 `gram_index_usable()` 恒为 False，
+**每一次记忆检索都回退到全表精确扫描**。这个索引被持续物化、持续维护，却从不被读取，
+而此前没有任何运维面能看出来（`doctor` 不报，检索结果也完全正确）。
+
+`doctor` 新增 `Memory Gram Index` 检查（信息行 + 不可用时加 `memory_gram_index_unusable` 告警，
+**不**计 FAIL：回退到精确扫描是正确的降级，不是故障）。当前活库输出：
+
+```
+[OK] Memory Gram Index: usable=False ready=True grams=414914 queued=111564 live_backlog=54644 retired=56920 cap=2000
+```
+
+复核同时指出：该检查原先只对 `gram_index_state()` 做了容错，而 `dirty_breakdown()` 在表不存在时
+仍会抛 `sqlite3.OperationalError` 落入 `except` → `ok=False` → `cli.py doctor` 直接报 FAIL。
+早于 11.20.0 写入的库就是这种情况，而“没有索引”本来就是受支持的降级状态（同文件的
+`gram_index_usable` 与既有测试都这么认为）。现已两个探测分别降级，并加了覆盖此路径的测试。
+
+出路由运维动作承担（本批未执行）：`gram-index --apply` 做一次全量 rebuild
+（“minutes on a large corpus”）。56 920 条已删标记由 `gram-index --compact`
+（`prune_retired_gram_docs`，全量重写 base，秒级）清除。
+
+`tests/test_memory_gram_index.py` 新增 7 例，并逐个在**修复前**的代码上跑过以确认各自到底测什么：
+
+| 测试 | 修复前 | 性质 |
+|---|---|---|
+| `..._retired_marker_cannot_consume_the_whole_batch` | **FAIL**（`assert 0 == 1`） | 真实回归测试 |
+| `..._read_path_does_not_drain_a_backlog_beyond_the_cap` | FAIL | 新行为 |
+| `..._queue_breakdown_is_one_consistent_snapshot` | FAIL | 新函数 |
+| `..._doctor_reports_a_usable_gram_index` | FAIL | 新检查 |
+| `..._doctor_flags_an_unusable_gram_index` | FAIL | 新检查 |
+| `..._doctor_treats_a_missing_gram_index_as_degradation` | FAIL | 新检查 |
+| `..._queue_of_only_retired_markers_reports_no_progress` | **PASS** | 只覆盖新的空批次分支，**不是**回归测试 |
+
+全量 pytest **714 passed**。
+
 ## 修复 `page_graph_edges` 与已发布边集不再一致（97.7% 的行是残留）
 
 审计实测：`page_graph_edges` 有 **1 293 200** 行，而实际发布的 `index.json["weighted_edges"]`

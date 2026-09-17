@@ -1,5 +1,6 @@
 import importlib
 import os
+import sqlite3
 import sys
 import ast
 import json
@@ -23,6 +24,7 @@ from vector_lake.db_store import (
     legacy_schema_prune_names,
 )
 from vector_lake import get_extension_root
+from vector_lake import memory_gram_index
 from vector_lake.native_llm import native_llm_ready
 from vector_lake.runtime_health import assess_runtime_health
 
@@ -338,6 +340,44 @@ def doctor_vector_lake() -> str:
             warnings.append(f"schema_prune_pending:{name}")
     except Exception as e:
         checks.append(("Schema Migrations", False, f"Check failed: {e}"))
+
+    # The exact n-gram index only serves reads while its backlog is small enough
+    # to drain on the read path.  Past that cap the index is still materialised and
+    # maintained but never read, and nothing fails: search falls back to the full
+    # scan and returns the same answer.  Report the two numbers that decide whether
+    # the indexed path is live, so a 100 MB index that is never consulted is
+    # visible instead of merely inferable.
+    #
+    # A database written before the index existed has no ``gram_state`` at all.
+    # That is a supported degradation -- the same one ``gram_index_usable`` reports
+    # -- not a doctor failure, so a missing table lands in the warning path too.
+    try:
+        conn = get_connection()
+        try:
+            gram_state = memory_gram_index.gram_index_state()
+            gram_ready = bool(gram_state["ready"])
+            gram_count = int(gram_state["gram_count"] or 0)
+        except sqlite3.OperationalError:
+            gram_ready, gram_count = False, 0
+        try:
+            total, live_backlog, retired = memory_gram_index.dirty_breakdown(conn)
+        except sqlite3.OperationalError:
+            total = live_backlog = retired = 0
+        usable = gram_ready and live_backlog <= memory_gram_index.AUTO_REBUILD_MAX_DOCS
+        checks.append((
+            "Memory Gram Index",
+            True,
+            f"usable={usable} ready={gram_ready} grams={gram_count} "
+            f"queued={total} live_backlog={live_backlog} retired={retired} "
+            f"cap={memory_gram_index.AUTO_REBUILD_MAX_DOCS}",
+        ))
+        if not usable:
+            warnings.append(
+                f"memory_gram_index_unusable:live_backlog={live_backlog} retired={retired} "
+                "(rebuild_memory_gram_index restores the indexed path)"
+            )
+    except Exception as e:
+        checks.append(("Memory Gram Index", False, f"Check failed: {e}"))
 
     lines = ["=== Vector Lake Doctor ==="]
     all_ok = True

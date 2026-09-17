@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from vector_lake import db_store, governance_store, memory_gram_index
+from vector_lake import db_store, governance_store, memory_gram_index, tool_doctor
 
 
 def _put(conn, memory_id: str, text: str, memory_type: str = "fact", score: float = 0.6,
@@ -206,3 +206,120 @@ def test_index_report_is_operator_readable(seeded, monkeypatch):
     assert "ready=True" in report
     assert "usable=True" in report
     assert "backend=gram" in report
+
+
+def test_a_retired_marker_cannot_consume_the_whole_batch(seeded):
+    """A deleted document must not be able to head-of-line block the drain.
+
+    The queue is keyed by rowid and drained in that order, and the oldest
+    documents are the ones that get deleted, so their markers sit at the front.
+    Selecting the batch with ``LIMIT`` alone spent it entirely on markers that can
+    never leave the queue: measured on the live lake, the first 400 queued
+    documents were 0 live and the first 10 000 were 19 live, so the flush cleared
+    nothing on every call and the backlog could never drain.
+    """
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DELETE FROM operational_memory WHERE memory_id = 'mem_a'")
+    _put(conn, "mem_new", "跨机构 影像 云 平台 选型")
+
+    assert memory_gram_index.retired_doc_count() == 1
+    assert memory_gram_index.pending_doc_count() == 2
+
+    result = memory_gram_index.flush_memory_gram_dirty(limit_docs=1)
+
+    assert result["flushed"] == 1
+    assert memory_gram_index.pending_doc_count() == 1
+    # The retired marker is still queued on purpose: staying dirty is what keeps
+    # the deleted document's base postings skipped until they are pruned.
+    assert memory_gram_index.retired_doc_count() == 1
+
+
+def test_a_queue_of_only_retired_markers_reports_no_progress(seeded):
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DELETE FROM operational_memory WHERE memory_id = 'mem_a'")
+    assert memory_gram_index.pending_doc_count() == 1
+
+    result = memory_gram_index.flush_memory_gram_dirty(limit_docs=50)
+
+    assert result["flushed"] == 0
+    assert result["overlay_rows"] == 0
+    # The count is reported, not assumed to be zero, so a caller can tell an empty
+    # queue from one that only holds retired markers.
+    assert result["remaining"] == 1
+
+
+def test_doctor_reports_a_usable_gram_index(seeded):
+    report = tool_doctor.doctor_vector_lake()
+
+    assert "[OK] Memory Gram Index:" in report
+    assert "usable=True" in report
+    assert "memory_gram_index_unusable" not in report
+
+
+def test_doctor_flags_an_unusable_gram_index(seeded):
+    conn = db_store.get_connection()
+    for index in range(memory_gram_index.AUTO_REBUILD_MAX_DOCS + 1):
+        _put(conn, f"bulk_{index}", f"bulk payload {index}")
+    assert memory_gram_index.live_dirty_doc_count(conn) > memory_gram_index.AUTO_REBUILD_MAX_DOCS
+
+    report = tool_doctor.doctor_vector_lake()
+
+    assert "[OK] Memory Gram Index:" in report
+    assert "usable=False" in report
+    assert "memory_gram_index_unusable" in report
+
+
+def test_the_read_path_does_not_drain_a_backlog_beyond_the_cap(seeded):
+    """Past the cap a partial drain cannot reach usability, so it is not attempted.
+
+    Draining anyway spends the batch, then falls back to the exact scan regardless,
+    and it publishes the overlay for documents whose stale base postings are still
+    in the base.  A rebuild is the documented way out of this state.
+    """
+    conn = db_store.get_connection()
+    for index in range(memory_gram_index.AUTO_REBUILD_MAX_DOCS + 1):
+        _put(conn, f"bulk_{index}", f"bulk payload {index}")
+    backlog = memory_gram_index.live_dirty_doc_count(conn)
+    assert backlog > memory_gram_index.AUTO_REBUILD_MAX_DOCS
+
+    assert memory_gram_index.ensure_memory_gram_index() is False
+
+    # Nothing was drained: the batch would have been wasted anyway.
+    assert memory_gram_index.live_dirty_doc_count(conn) == backlog
+
+
+def test_the_queue_breakdown_is_one_consistent_snapshot(seeded):
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DELETE FROM operational_memory WHERE memory_id = 'mem_a'")
+    _put(conn, "mem_new", "跨机构 影像 云 平台 选型")
+
+    total, live, retired = memory_gram_index.dirty_breakdown(conn)
+
+    assert (total, live, retired) == (2, 1, 1)
+    assert total == memory_gram_index.pending_doc_count(conn)
+    assert live == memory_gram_index.live_dirty_doc_count(conn)
+    assert retired == memory_gram_index.retired_doc_count(conn)
+    assert retired >= 0
+
+
+def test_doctor_treats_a_missing_gram_index_as_degradation(isolated_memory):
+    """A database written before the index existed must not report a doctor FAIL."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        for table in (
+            "operational_memory_gram",
+            "operational_memory_gram_overlay",
+            "operational_memory_gram_dirty",
+            "operational_memory_gram_state",
+        ):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+    report = tool_doctor.doctor_vector_lake()
+
+    assert "[FAIL] Memory Gram Index" not in report
+    assert "[OK] Memory Gram Index:" in report
+    assert "memory_gram_index_unusable" in report
