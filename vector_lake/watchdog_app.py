@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from vector_lake import get_extension_root, host_env
+from vector_lake import get_extension_root
 from vector_lake.wiki_utils import DEFAULT_EXCLUDE_PATHS, load_config
 
 # Config: shipped defaults merged with the optional per-machine ``config.json``.
@@ -86,117 +86,28 @@ class WikiIndexHandler(FileSystemEventHandler):
         self.queue_path(event.dest_path)
 
 
-def _run_diary_sync(sync_script: str, filename: str) -> None:
-    """Run the diary sync and surface its outcome.
-
-    The previous implementation used ``Popen`` with stdout/stderr discarded, so a
-    failed sync was completely invisible: no job row, no exit code, no retry and
-    no status anywhere.  Running it on a worker thread keeps the observer loop
-    responsive while making the outcome observable.
-    """
-    import subprocess
-    import sys
-
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    try:
-        completed = subprocess.run(
-            [sys.executable, sync_script],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=int(os.environ.get("VECTOR_LAKE_DIARY_SYNC_TIMEOUT_SECONDS", "600")),
-        )
-    except Exception as exc:
-        log.error("Diary sync for %s could not be started: %s", filename, exc)
-        write_status(
-            "error",
-            0,
-            index_queue.qsize(),
-            f"Diary sync failed to start for {filename}",
-            f"{type(exc).__name__}: {exc}",
-            component="diary",
-        )
-        return
-
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()[-1500:]
-        log.error("Diary sync for %s exited with %s: %s", filename, completed.returncode, detail)
-        write_status(
-            "error",
-            0,
-            index_queue.qsize(),
-            f"Diary sync failed for {filename}",
-            f"exit={completed.returncode}: {detail}",
-            component="diary",
-        )
-        return
-
-    log.info("Diary sync for %s completed.", filename)
-    write_status(
-        "idle",
-        0,
-        index_queue.qsize(),
-        f"Diary sync completed for {filename}",
-        "",
-        component="diary",
-    )
-
-
-class DiaryWatchdogHandler(FileSystemEventHandler):
-    def __init__(self):
-        self.last_triggered = {}
-        self.lock = threading.Lock()
-
-    def handle_event(self, event):
-        if event.is_directory:
-            return
-        filepath = event.src_path
-        filename = os.path.basename(filepath)
-        if not filename.endswith(".md"):
-            return
-
-        now = time.time()
-        with self.lock:
-            if len(self.last_triggered) > 2000:
-                self.last_triggered.clear()
-            
-            if filepath in self.last_triggered and (now - self.last_triggered[filepath]) < DEBOUNCE_SECONDS:
-                return
-            self.last_triggered[filepath] = now
-
-        log.info(f"Diary modified: {filename}. Running diary sync in a worker thread.")
-        sync_script = os.environ.get("VECTOR_LAKE_DIARY_SYNC_SCRIPT") or str(
-            host_env.legacy_diary_sync_script()
-        )
-        if not os.path.exists(sync_script):
-            log.error(
-                "Diary sync script is missing: %s. Set VECTOR_LAKE_DIARY_SYNC_SCRIPT to the "
-                "real path; the diary change for %s was NOT processed.",
-                sync_script,
-                filename,
-            )
-            write_status(
-                "error",
-                0,
-                index_queue.qsize(),
-                f"Diary sync script missing for {filename}",
-                str(sync_script),
-                component="diary",
-            )
-            return
-        threading.Thread(
-            target=_run_diary_sync,
-            args=(str(sync_script), filename),
-            name="vector-lake-diary-sync",
-            daemon=True,
-        ).start()
-
-    def on_created(self, event): self.handle_event(event)
-    def on_modified(self, event): self.handle_event(event)
+# The diary watcher used to run an external ``sync_focus.py`` on every change under
+# ``raw/privacy/Diary``.  That integration was the Gemini-era personal-insights
+# pipeline; it is deprecated and the script no longer exists on this host, so the
+# component could only ever write ``error`` into the watchdog status and pin the
+# whole daemon to ``error``.  It is removed rather than re-pointed.
+#
+# Diary files stay out of the graph: ``RawWatchdogHandler`` still skips
+# ``raw/privacy/Diary``, so a diary edit is now a no-op for the lake instead of a
+# failed external call.  Ingesting private diary text into the wiki would be a
+# privacy decision, not a cleanup.
 
 
 class RawWatchdogHandler(FileSystemEventHandler):
+    """Trigger ingestion for raw sources, except private diary text.
+
+    ``raw/privacy/Diary`` is skipped outright.  It used to be excluded so the
+    separate diary watcher could handle it; that watcher ran a deprecated external
+    sync script and is gone, so the exclusion now means the stronger thing: diary
+    text is never ingested into the lake.  Feeding private diary content into the
+    wiki is a privacy decision, not a side effect of removing a component.
+    """
+
     def __init__(self):
         self.last_triggered = {}
         self.lock = threading.Lock()
@@ -205,8 +116,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
         if event.is_directory:
             return
         filepath = event.src_path
-        
-        # Prevent Double-Trigger: Exclude privacy/Diary (handled by DiaryWatchdogHandler)
+
         if "privacy" in filepath and "Diary" in filepath:
             return
             
@@ -238,7 +148,7 @@ class RawWatchdogHandler(FileSystemEventHandler):
     def on_created(self, event): self.handle_event(event)
     def on_modified(self, event): self.handle_event(event)
     def on_moved(self, event): self.handle_event(event)
-from vector_lake.watchdog_status import write_status
+from vector_lake.watchdog_status import reset_components, write_status
 
 
 def process_mutation_outbox_batch(
@@ -486,6 +396,11 @@ def scheduled_lint_loop():
 
 
 def _start_watchdog_locked():
+    # A fresh process owns a fresh component set.  Without this, a component that a
+    # previous run reported on -- but that no longer runs -- keeps its last status
+    # forever, and because the aggregate takes the worst status, one stale "error"
+    # pins the whole daemon to error.
+    reset_components()
     threading.Thread(target=index_worker_loop, daemon=True).start()
     threading.Thread(target=scheduled_lint_loop, daemon=True).start()
     
@@ -505,11 +420,6 @@ def _start_watchdog_locked():
     from vector_lake.wiki_utils import get_memory_dir
 
     memory_dir = get_memory_dir()
-    diary_dir = str(memory_dir / "raw" / "privacy" / "Diary")
-    if os.path.exists(diary_dir):
-        diary_handler = DiaryWatchdogHandler()
-        observer.schedule(diary_handler, diary_dir, recursive=False)
-        log.info(f"Diary monitor active on directory: {diary_dir}")
 
     raw_dir = str(memory_dir / "raw")
     if os.path.exists(raw_dir):

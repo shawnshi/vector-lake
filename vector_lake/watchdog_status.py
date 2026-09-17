@@ -13,6 +13,49 @@ _status_lock = threading.Lock()
 def get_status_file() -> Path:
     return get_meta_dir() / ".watchdog_status.json"
 
+
+def reset_components() -> None:
+    """Drop every recorded component, keeping only the file's shared fields.
+
+    ``write_status`` can only merge a component in, never retire one, and the
+    aggregate status is the worst of the recorded components.  A component that a
+    later release no longer runs would therefore pin the daemon to its last status
+    (an ``error``) forever.  A fresh process owns a fresh component set, so it
+    starts from an empty one.
+    """
+    status_file = get_status_file()
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = status_file.with_name(f".watchdog_status_{uuid.uuid4().hex}.tmp")
+    with _status_lock:
+        existing: dict = {}
+        if status_file.exists():
+            try:
+                existing = json.loads(status_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        data = {
+            "status": "idle",
+            "task_queue_size": int(existing.get("task_queue_size") or 0),
+            "index_queue_size": int(existing.get("index_queue_size") or 0),
+            "current_action": "Watchdog starting",
+            "last_error": "",
+            "updated_at": now,
+            "components": {},
+        }
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(status_file)
+        except Exception as exc:
+            log.error("Could not reset the watchdog status file: %s: %s", type(exc).__name__, exc)
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
+
 def write_status(
     state: str,
     task_queue_size: int,

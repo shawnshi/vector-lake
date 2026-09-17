@@ -24,8 +24,6 @@ HOST_HOME_DIRS: tuple[str, ...] = ("~/.gemini", "~/.codex")
 LEGACY_ENV_FILE = "~/.gemini/.env"
 # Historical MEMORY root; the last fallback in ``wiki_utils.get_memory_dir()``.
 LEGACY_MEMORY_ROOT = "~/.gemini/MEMORY"
-# Diary watcher default sync hook (override: ``VECTOR_LAKE_DIARY_SYNC_SCRIPT``).
-LEGACY_DIARY_SYNC_SCRIPT = "~/.gemini/scripts/sync_focus.py"
 # Sandbox the Codex host writes ingest/orchestration payloads into.
 CODEX_BRAIN_ROOT = "~/.codex/brain"
 
@@ -51,11 +49,6 @@ def legacy_env_file() -> Path:
 def legacy_memory_root() -> Path:
     """Last-resort MEMORY root when neither the env var nor config.json is set."""
     return _resolve(LEGACY_MEMORY_ROOT)
-
-
-def legacy_diary_sync_script() -> Path:
-    """Default diary-sync hook invoked by the watchdog."""
-    return _resolve(LEGACY_DIARY_SYNC_SCRIPT)
 
 
 def codex_brain_root() -> Path:
