@@ -168,7 +168,7 @@ MEMORY/
 
 > **Note**: Vector Lake 现已全面接入 MCP (Model Context Protocol)。大语言模型 Agent 将直接通过 `vector_lake/mcp_server.py` 调用底层 Tool 接口，不再需要通过终端模拟。
 > 
-> **Gemini CLI Slash Commands**: 当前仓库实际随附的 slash command 兼容层只有两个文件：`commands/query.toml` 与 `commands/timeline.toml`。其余能力请直接调用对应 MCP 工具。Codex 不加载插件自定义 slash command；在 Codex 中使用 `$vector-lake:query`、`$vector-lake:timeline` 等同名技能，或直接要求调用对应 MCP 工具。
+> **Slash Commands**: 本仓库**不随附**任何 slash command 兼容层。原 `commands/*.toml`（两个文件、无任何代码读取）已在 host-convention 批次中移除。所有能力通过 MCP 工具面调用；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
 >
 > 已随附：
 > - `/query`：深度逻辑推理与查询（映射 `query_logic_lake`）
@@ -417,7 +417,6 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 |---|---|
 | `schema.md` / `SCHEMA_CATEGORIES.md` | Wiki 与运行态记忆契约、受控分类表 |
 | `skills/` | 面向宿主的技能定义（每个能力一份 `SKILL.md`） |
-| `commands/` | `commands/query.toml`、`commands/timeline.toml`（其余能力请直接调用 MCP 工具） |
 | `templates/` | 摄取 / 查询提示词模板与拓扑可视化 HTML |
 | `scripts/` | 独立维护脚本（社区聚类、语义去重、域总览、janitor 分片、purpose 校验） |
 | `tests/` | pytest 回归套件 |

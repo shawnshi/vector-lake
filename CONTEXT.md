@@ -83,35 +83,32 @@ Conflict rules:
 | `benchmarks/bench_hot_paths.py` | Reproducible p50/p95 latency harness for the `search` / `query` / `timeline` read paths |
 | `scripts/community_clustering_daemon.py` | Optional operator-invoked Louvain analysis; not scheduled by watchdog |
 | `schema.md` | Wiki and runtime memory contract |
-| `commands/` | Macro-level workflows (e.g. research/review) for Agents |
 | `agents/` | Ingestor and synthesizer contracts |
 
 ## 4. CLI Contract & MCP Interface
 
 **Note (v8.3+)**: Agents interact with the system entirely through the `vector_lake/mcp_server.py` MCP tools (e.g. `search_vector_lake`, `sync_vector_lake`).
 
-**Command surfaces**: Gemini CLI loads compatibility prompts from `commands/*.toml` and exposes them with `/`. Codex does not load plugin-defined slash commands; invoke the corresponding plugin skills with `$vector-lake:<name>` or ask the agent to call the MCP tool directly.
+**Command surfaces**: there is no bundled slash-command compatibility layer. `commands/`
+was removed in the host-convention batch — it held two `commands/*.toml` files that no code
+read. Hosts reach every capability through the MCP tool surface, and hosts that package
+skills additionally use `$vector-lake:<name>` (for example `$vector-lake:query`,
+`$vector-lake:timeline`). `tests/test_command_surface.py` fails if a `commands/` directory
+reappears before the documentation is updated.
 
-Gemini CLI compatibility commands:
-- `/vl_sync`: Distributed Subagent pipeline for graph sync and raw file ingestion
-- `/search`: Semantic query
-- `/query`: Deep logic reasoning
-- `/review`: Check governance queue
-- `/resolve`: Resolve pending items
-- `/audit`: Synthesize topology and audit
-- `/debt`: View governance debt metrics
-- `/lint`: Self-healing audit of nodes
-- `/research`: Autonomous web research directive
-- `/graph`: Generate interactive 3D HTML topology
-- `/doctor`: Validate runtime dependencies and health
-- `/gc`: Garbage collect orphaned entities
-- `/delete`: Cascade-delete sources and sever graph edges
-- `/trace`: Audit provenance traces
-- `/merge`: Surface candidate entity merges
-- `/timeline`: SQL query against historical timeline_events (via MCP)
-- `review_strategic_purpose(as_of="")`: emits due `SIR-Review-Proposal` records without mutating the Wiki.
+### 4.1 Host-runtime conventions
 
-Codex equivalents include `$vector-lake:query` and `$vector-lake:timeline`.
+Host conventions are data, not literals: `vector_lake/host_env.py` owns the `~/.gemini`
+and `~/.codex` fallbacks (env file, MEMORY root, diary hook, payload sandbox roots) and
+`tests/test_portability.py` fails if any other module reintroduces one.
+
+| Variable | Effect |
+|---|---|
+| `VECTOR_LAKE_MEMORY_DIR` | MEMORY root; highest precedence, above `config.json` |
+| `VECTOR_LAKE_PAYLOAD_ROOT` | **Extends** the built-in payload sandboxes; it no longer replaces them. A configured root is trusted as named, while the built-in `brain/` roots still require the `<root>/<project>/scratch/...` shape. A value resolving to a filesystem anchor (`C:\`, `/`) is refused with `host_env.PayloadRootError` |
+| `VECTOR_LAKE_PAYLOAD_MAX_BYTES` | Payload size ceiling, default 5 MiB |
+| `VECTOR_LAKE_DIARY_SYNC_SCRIPT` | Overrides `host_env.legacy_diary_sync_script()` |
+| `VECTOR_LAKE_SUBAGENT_RUN_ID` | Namespaces generated subagent task packets |
 
 The following CLI commands remain the ground truth operating surface for *human operators*:
 
@@ -157,65 +154,7 @@ Last verified: 2026-07-08 (V11.5 Refactoring).
 ## 6. Operating Rules
 
 1. Preserve the split: Markdown is for humans; `.meta` is canonical state; `operational_memory` is for Agents.
-2. Keep `schema.md`, `README.md`, `commands/`, and `agents/` aligned when the runtime surface changes.
-3. Do not hand-edit derived runtime files unless the task is explicitly data repair. Prefer rebuild paths.
-4. Use dry-run first for delete, gc, and any operation that removes assets.
-5. Treat lock contention as environmental state, not proof that a code patch failed. Note that `daemon-watchdog` and `sync` operations are protected by cross-process `filelock` to prevent meta and index corruption.
-6. Use `PYTHONUTF8=1` when scripts may print Chinese paths.
-7. Never silently include unrelated dirty files in a publish or commit scope.
-
-## 7. System Capabilities & Architecture Defenses
-The Vector Lake system is designed for high-concurrency ingestion and graph maintenance with several defensive mechanisms:
-- **Two-Track Watchdog**: Monitors raw sources for incremental ingestion by creating host-subagent task packets and monitors wiki nodes for O(1) index updates. It hooks `on_deleted` and `on_moved` events to reflect Semantic GC operations and prevent ghost nodes.
-- **Write Health Gate**: Ordinary mutations are blocked when watchdog heartbeat, mutation outbox, or Wiki/index/SQLite projection consistency is unhealthy. Bounded repairs can use schema mode or an explicit operator override. Runtime health checks are read-only when the SQLite file already exists, so doctor/write-gate checks do not take a schema-migration write lock during watchdog batches.
-- **I/O Debouncing**: The Indexer buffers multiple O(1) memory mutations (BM25 updates, edge recalculations) across batched file events and flushes them in a single write operation to `index.json`. This eliminates O(N) disk thrashing during heavy wiki modifications.
-- **Scheduled Read-Only Lint**: At 10:00 and 23:00 the watchdog refreshes dirty graph topology, runs `lint_vector_lake(auto_fix=False)`, and checkpoints the SQLite WAL. Destructive repair remains an explicit operator action.
-
-The following CLI commands remain the ground truth operating surface for *human operators*:
-
-```powershell
-python cli.py doctor
-python cli.py sync
-python cli.py search "query" --top_k 5
-python cli.py search "query" --mode memory --top_k 5
-python cli.py search "query" --mode claim --top_k 5
-python cli.py query "question" [--dry-run]
-python cli.py review
-python cli.py audit-graph
-python cli.py research [--dry-run]
-python cli.py debt --top 20
-python cli.py trace "<query-or-id>"
-python cli.py merge-suggestions --limit 20
-python cli.py graph
-python cli.py gc --days 30 --dry-run
-python cli.py delete "<raw-source-path>" --dry-run
-```
-
-For Windows validation, prefer:
-
-```powershell
-$env:PYTHONUTF8='1'; python -m unittest discover -s tests -p 'test_*.py' -v
-$env:PYTHONUTF8='1'; python -m compileall vector_lake tests
-```
-
-## 5. Current Validation Baseline
-
-Last verified: 2026-07-08 (V11.5 Refactoring).
-
-- Unit tests: `Ran 8 tests ... OK`
-- Compile: `python -m compileall vector_lake tests` OK
-- Doctor: healthy
-- `search --mode memory`: smoke OK
-- Debt snapshot:
-  - `operational_memory_count: 13755`
-  - `superseded_memory_count: 510`
-  - `conflicted_memory_count: 0`
-  - `memory_type_counts: {'fact': 11881, 'decision': 1393, 'task_state': 384, 'preference': 97}`
-
-## 6. Operating Rules
-
-1. Preserve the split: Markdown is for humans; `.meta` is canonical state; `operational_memory` is for Agents.
-2. Keep `schema.md`, `README.md`, `commands/`, and `agents/` aligned when the runtime surface changes.
+2. Keep `schema.md`, `README.md`, and `agents/` aligned when the runtime surface changes.
 3. Do not hand-edit derived runtime files unless the task is explicitly data repair. Prefer rebuild paths.
 4. Use dry-run first for delete, gc, and any operation that removes assets.
 5. Treat lock contention as environmental state, not proof that a code patch failed. Note that `daemon-watchdog` and `sync` operations are protected by cross-process `filelock` to prevent meta and index corruption.

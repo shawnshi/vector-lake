@@ -1,6 +1,5 @@
 import argparse
 import io
-import os
 import sys
 
 try:
@@ -8,7 +7,7 @@ try:
 except ImportError:
     dotenv = None
 
-from vector_lake import tools
+from vector_lake import host_env, tools
 
 
 def _configure_stdout():
@@ -19,9 +18,9 @@ def _configure_stdout():
 def _load_env():
     if dotenv is None:
         return
-    env_path = os.path.join(os.path.expanduser("~"), ".gemini", ".env")
-    if os.path.exists(env_path):
-        dotenv.load_dotenv(env_path)
+    env_path = host_env.legacy_env_file()
+    if env_path.exists():
+        dotenv.load_dotenv(str(env_path))
 
 
 def build_parser() -> argparse.ArgumentParser:

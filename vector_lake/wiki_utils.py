@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 import yaml
-from vector_lake import get_extension_root
+from vector_lake import get_extension_root, host_env
 from vector_lake.yaml_utils import load_yaml, dump_yaml
 
 
@@ -82,7 +82,7 @@ def get_memory_dir() -> Path:
     Resolution order:
       1. ``VECTOR_LAKE_MEMORY_DIR`` (used by tests and isolated runs),
       2. ``memory_dir`` in the repository ``config.json`` (per-machine setting),
-      3. ``~/.gemini/MEMORY`` (historical default).
+      3. ``host_env.legacy_memory_root()`` (historical default).
     """
     override = os.environ.get("VECTOR_LAKE_MEMORY_DIR")
     if override:
@@ -90,7 +90,7 @@ def get_memory_dir() -> Path:
     configured = _configured_memory_dir()
     if configured is not None:
         return configured
-    return (Path(os.path.expanduser("~")) / ".gemini" / "MEMORY").resolve()
+    return host_env.legacy_memory_root()
 
 
 def _configured_memory_dir() -> Path | None:

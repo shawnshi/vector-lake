@@ -158,34 +158,43 @@ def search_vector_lake(query: str, top_k: int = 5, mode: str = "page") -> str:
     """
     return tools.search_vector_lake(query, top_k, mode=mode)
 
+def _payload_path_allowed(abs_path) -> bool:
+    """Sandbox predicate for agent payload files.
+
+    Roots are additive: ``VECTOR_LAKE_PAYLOAD_ROOT`` *extends* the built-in
+    sandboxes instead of replacing them, so an operator override can no longer
+    silently revoke the repository-local ``brain/`` sandbox.
+
+    The built-in roots still require the ``<root>/<project>/scratch/...`` shape
+    because they are shared with every other host process.  An explicitly
+    configured root is trusted as-is: the operator named that exact directory,
+    and ``host_env.payload_root_from_env()`` already rejects a filesystem anchor.
+    """
+    from vector_lake import host_env
+
+    configured_root = host_env.payload_root_from_env()
+    if configured_root is not None and abs_path.is_relative_to(configured_root):
+        return True
+    for root in host_env.payload_sandbox_roots():
+        if not abs_path.is_relative_to(root):
+            continue
+        relative_parts = abs_path.relative_to(root).parts
+        if len(relative_parts) >= 3 and relative_parts[1].lower() == "scratch":
+            return True
+    return False
+
+
 def _read_payload(payload_file: str) -> str:
     if not payload_file:
         return ""
     import os
     from pathlib import Path
-    from vector_lake import get_extension_root
 
     abs_path = Path(payload_file).resolve()
-    configured_root = os.environ.get("VECTOR_LAKE_PAYLOAD_ROOT")
-    if configured_root:
-        allowed = abs_path.is_relative_to(Path(configured_root).expanduser().resolve())
-    else:
-        allowed = False
-        brain_roots = [
-            (get_extension_root() / "brain").resolve(),
-            Path(os.path.expanduser("~/.codex/brain")).resolve(),
-        ]
-        for root in brain_roots:
-            if not abs_path.is_relative_to(root):
-                continue
-            relative_parts = abs_path.relative_to(root).parts
-            if len(relative_parts) >= 3 and relative_parts[1].lower() == "scratch":
-                allowed = True
-                break
-    if not allowed:
+    if not _payload_path_allowed(abs_path):
         raise ValueError(f"[Security Error] Payload file must be within an approved agent sandbox: {payload_file}")
     if not abs_path.exists() or not abs_path.is_file():
-        raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Please use write_to_file to create it first.")
+        raise ValueError(f"[Sandbox Error] Payload file not found: {payload_file}. Create it inside an approved sandbox first.")
     max_bytes = max(1, int(os.environ.get("VECTOR_LAKE_PAYLOAD_MAX_BYTES", str(5 * 1024 * 1024))))
     if abs_path.stat().st_size > max_bytes:
         raise ValueError(f"[Sandbox Error] Payload file exceeds {max_bytes} bytes: {payload_file}")
@@ -431,14 +440,19 @@ def check_duplicate_entity(candidate_title: str, candidate_type: str, candidate_
 
 @mcp.tool()
 def visualize_vector_lake(output_dir: str = None) -> str:
-    """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard."""
+    """Visualize the LLM-Wiki topology as an interactive 3D HTML dashboard.
+
+    ``output_dir`` is an *output* directory, not an input sandbox: this call
+    writes exactly one file (``vector_lake_graph.html``) into it, so the gate
+    only requires a directory under a known host home.  Compare
+    ``_read_payload``, which additionally requires the ``<root>/<project>/scratch``
+    shape because it reads arbitrary caller-named content.
+    """
     if output_dir:
-        from pathlib import Path
-        import os
-        abs_dir = Path(output_dir).resolve()
-        allowed_roots = [Path(os.path.expanduser("~/.gemini")).resolve(), Path(os.path.expanduser("~/.codex")).resolve()]
-        if not any(abs_dir.is_relative_to(root) for root in allowed_roots):
-            return "Error: Write operations must be contained within an approved agent sandbox."
+        from vector_lake import host_env
+
+        if not host_env.is_within_host_home(output_dir):
+            return "Error: Output directory must be inside an approved agent sandbox."
     return tools.visualize_vector_lake(output_dir)
 
 @mcp.tool()

@@ -87,3 +87,42 @@ def test_config_target_directories_is_empty_by_default():
         f"{offenders} must ship an empty list so the default resolves to <MEMORY>/raw "
         "instead of one user's path"
     )
+
+
+HOST_HOME_LITERAL = re.compile(r"\.gemini|\.codex")
+
+
+def test_host_home_literals_live_in_one_module():
+    """Host conventions are data in ``host_env``, not literals across modules.
+
+    Before the extraction, ``~/.gemini`` appeared in three modules and
+    ``~/.codex`` in two, with no single place to add a third host.
+    """
+    offenders = [
+        f"{path.name}:{lineno}: {line.strip()}"
+        for path in sorted((ROOT / "vector_lake").glob("*.py"))
+        if path.name != "host_env.py"
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if HOST_HOME_LITERAL.search(line)
+    ]
+    assert not offenders, f"host home literals escaped host_env.py: {offenders}"
+
+
+def test_memory_dir_falls_back_to_the_legacy_host_root(monkeypatch):
+    """Precedence: VECTOR_LAKE_MEMORY_DIR > config.json > host_env fallback."""
+    from vector_lake import host_env, wiki_utils
+
+    monkeypatch.delenv("VECTOR_LAKE_MEMORY_DIR", raising=False)
+    # Neutralise the per-machine config.json so the third fallback is reachable.
+    monkeypatch.setattr(wiki_utils, "_CONFIG_CACHE", {"memory_dir": None})
+
+    assert wiki_utils.get_memory_dir() == host_env.legacy_memory_root()
+
+
+def test_memory_dir_env_beats_the_configured_value(monkeypatch, tmp_path):
+    from vector_lake import wiki_utils
+
+    monkeypatch.setattr(wiki_utils, "_CONFIG_CACHE", {"memory_dir": tmp_path.parent})
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_DIR", str(tmp_path))
+
+    assert wiki_utils.get_memory_dir() == tmp_path.resolve()

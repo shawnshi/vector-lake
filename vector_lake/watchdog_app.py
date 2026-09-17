@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from vector_lake import get_extension_root
+from vector_lake import get_extension_root, host_env
 from vector_lake.wiki_utils import DEFAULT_EXCLUDE_PATHS, load_config
 
 # Config: shipped defaults merged with the optional per-machine ``config.json``.
@@ -166,8 +166,8 @@ class DiaryWatchdogHandler(FileSystemEventHandler):
             self.last_triggered[filepath] = now
 
         log.info(f"Diary modified: {filename}. Running diary sync in a worker thread.")
-        sync_script = os.environ.get("VECTOR_LAKE_DIARY_SYNC_SCRIPT") or os.path.expanduser(
-            "~/.gemini/scripts/sync_focus.py"
+        sync_script = os.environ.get("VECTOR_LAKE_DIARY_SYNC_SCRIPT") or str(
+            host_env.legacy_diary_sync_script()
         )
         if not os.path.exists(sync_script):
             log.error(
