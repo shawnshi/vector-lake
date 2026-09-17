@@ -1,5 +1,49 @@
 # Unreleased
 
+## 删除树内无法创建也无法清理的 schema 残留
+
+2026-09-16 的 `526df6a`（"Local tree becomes the authoritative main line"）删除了 `db_store.py` +
+`governance_store.py` 共 23 856 行和 `tests/test_retention_v6.py`（2 232 行），其中包括整套 v6
+retention 机制。但被删代码已经用 `CREATE ... IF NOT EXISTS` 把对象写进了活库，而没人发过一条
+`DROP` —— 于是这些对象在库里存续至今，树内既看不见也清不掉：
+
+- `ingest_jobs` 表 + `idx_ingest_jobs_job_id` + `idx_ingest_jobs_status`：全仓**零条 SQL 引用**该表。
+  `ingest_jobs` 这个词只出现在 `requeue_legacy_ingest_jobs` 这个函数名里，而该函数查的是 `jobs`。
+- `idx_jobs_retention_v6` / `idx_mutation_outbox_retention_v6`：为已经不存在的 retention DELETE 建的
+  索引。**清理逻辑消失而索引留下**，这就是 `mutation_outbox`（32 280 行全终态，最老 2026-07-12）与
+  `jobs` 此后无界增长的直接原因。
+- `idx_mutation_outbox_idempotency_lookup`：`_ensure_idempotency_index` 只创建 `{name}` 与
+  `{name}_active`，从不创建 `_lookup`。
+- `claim_graph_nodes` 表：0 行。树内创建它、在 canonical 级联里 DELETE 它，但从不 INSERT、从不读取。
+- `change_sets.change_id` 列：26 774 行全为 NULL，且字符串 `change_id` 在仓库任何 Python 文件中
+  0 次出现。
+
+处置：新增一次性 prune 机制（`db_store._LEGACY_SCHEMA_PRUNES` + `schema_migrations` 台账）。
+台账是 schema 契约的一部分——`_schema_is_complete` 现在要求「哨兵对象齐备 **且** 每个 prune 已记账」，
+否则活库会永远走 `init_db()` 的快路径、prune 永不执行。prune 自持事务，单独调用与嵌在
+`_init_db_once` 事务内都安全；失败时**不写台账**并降级为下次重试，不会把半成品记成已完成。
+
+- 与 prune 同时删除的死代码：`db_store.page_graph_degree_map`（全仓 0 调用点，且是
+  `page_graph_edges` 1 293 200 行的唯一全表读取者）。
+- `governance_store.ALLOWED_TABLES` 移除 `claim_graph_nodes`。
+- `doctor` 新增 `Schema Migrations` 检查（未收敛时计 FAIL + `schema_prune_pending:` 告警）。
+
+验证（活库 `C:/Users/shich/MEMORY`，2.29 GB）：对象数 130 → 123；`PRAGMA quick_check` = `ok`；
+`change_sets` 26 774 行无损；`operational_memory` 146 679 行无损；
+`State Consistency: Wiki:7125 JSON:7125 SQLite:7125`、`Write Gate: clean`、
+`Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)` 全部保持。
+**回滚演练**：按记录的恢复点重建全部 7 个对象 + `change_id` 列（实测全部成功恢复），清空台账后重跑
+`doctor`，7 个对象再次全部消失、台账再次记满 2 条 —— 恢复路径与再收敛都已实测，不只是文档。
+新增 `tests/test_legacy_schema_prune.py`（7 例）；全量 pytest **696 passed**。
+
+## 删除一个对无界边投影的全表读取函数
+
+`db_store.page_graph_degree_map` 在全仓（runtime / tests / docs / skills / templates）0 调用点，
+其 docstring 自己已指向别处（"Orphan detection must use canonical topology"），即被取代后没有被删。
+它是唯一会全表扫描 `page_graph_edges`（1 293 200 行）的函数；删除后该表只剩 1 个读者
+（`indexer.py:1206` 的增量回读），也就是让它能回灌自己上游的那条读写闭环。
+全量 pytest 689 passed（无变化）。
+
 ## 聚类守护进程两个致命阻塞修复（修复前该脚本无法在活库上跑完一轮）
 
 `scripts/community_clustering_daemon.py` 不被 watchdog 调度（`CONTEXT.md:84` 明确写 "not scheduled"），因此它的批量路径长期无人执行、从未暴露过下面两个缺陷。它们各自都能让整轮运行在写入前一条边也不落盘的情况下终止。

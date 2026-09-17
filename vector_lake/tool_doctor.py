@@ -14,7 +14,13 @@ from vector_lake.wiki_utils import (
     get_meta_dir,
     wiki_page_keys,
 )
-from vector_lake.db_store import get_db_path, get_connection, idempotency_index_state
+from vector_lake.db_store import (
+    applied_schema_prunes,
+    get_db_path,
+    get_connection,
+    idempotency_index_state,
+    legacy_schema_prune_names,
+)
 from vector_lake import get_extension_root
 from vector_lake.native_llm import native_llm_ready
 from vector_lake.runtime_health import assess_runtime_health
@@ -282,6 +288,29 @@ def doctor_vector_lake() -> str:
                 )
     except Exception as e:
         checks.append(("Idempotency Index", False, f"Check failed: {e}"))
+
+    # Legacy schema residue is invisible from inside the tree: an object that no
+    # release creates, reads or writes still sits in every database that a past
+    # release wrote it into.  ``init_db()`` drops the recorded set; this check is
+    # how an operator can see whether that actually happened.
+    try:
+        applied_prunes = applied_schema_prunes()
+        pending_prunes = [
+            name for name in legacy_schema_prune_names() if name not in applied_prunes
+        ]
+        checks.append((
+            "Schema Migrations",
+            not pending_prunes,
+            (
+                f"{len(applied_prunes)} prune(s) applied"
+                if not pending_prunes
+                else "pending: " + ", ".join(pending_prunes)
+            ),
+        ))
+        for name in pending_prunes:
+            warnings.append(f"schema_prune_pending:{name}")
+    except Exception as e:
+        checks.append(("Schema Migrations", False, f"Check failed: {e}"))
 
     lines = ["=== Vector Lake Doctor ==="]
     all_ok = True

@@ -160,7 +160,7 @@ def _default_queue_store() -> dict:
 ALLOWED_TABLES = {
     "entities", "claims", "evidence", "sources", "change_sets",
     "governance_queue", "wiki_search_index", "alias_registry",
-    "operational_memory", "claim_graph_nodes", "claim_graph_edges", "page_graph_edges",
+    "operational_memory", "claim_graph_edges", "page_graph_edges",
     "timeline_events", "processed_files", "mutation_outbox"
 }
 
