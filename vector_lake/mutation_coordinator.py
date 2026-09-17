@@ -50,7 +50,9 @@ def materialize_markdown_projection(
     """Idempotently materialize the Markdown projection for one outbox row."""
     filepath = resolve_wiki_mutation_path(
         filename,
-        allow_existing_legacy_name=validation_mode == "schema",
+        # Same reasoning as ``_prepare_mutations``: a delete removes an existing name
+        # and cannot introduce a malformed one.
+        allow_existing_legacy_name=validation_mode == "schema" or mutation_type == "delete",
     )
     if mutation_type == "delete":
         if filepath.exists():
@@ -96,7 +98,11 @@ def _prepare_mutations(
             raise ValueError("expected_version must be a string when supplied.")
         filepath = resolve_wiki_mutation_path(
             filename,
-            allow_existing_legacy_name=validation_mode == "schema",
+            # Deleting a page never *creates* a name, so an existing legacy filename
+            # must not block the removal.  Without this a page whose name violates
+            # the pattern could never be renamed: `rename_vector_lake_entity` starts
+            # by deleting the old name, and the validator rejected that same name.
+            allow_existing_legacy_name=validation_mode == "schema" or is_delete,
         )
         if filename in seen_filenames:
             raise ValueError(f"A mutation batch cannot contain duplicate filenames: {filename}")
