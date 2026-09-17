@@ -11,6 +11,26 @@ from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, normalize_e
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-query")
 
+# Type prefixes a wiki filename may start with (``wiki_utils.VALID_PREFIXES``).
+_NODE_PREFIXES = (
+    "Concept_", "Vendor_", "Institution_", "Product_", "Person_",
+    "Event_", "Policy_", "Standard_", "Source_", "Synthesis_",
+)
+
+
+def _node_core(name: str) -> str:
+    """The page name without its type prefix.
+
+    The existence check below used to be prefix-exact, so a link to ``[[Epic
+    Systems]]`` did not match the existing ``Vendor_Epic-Systems`` page and the
+    stub creator invented a second node, ``Concept_Epic-Systems``, for an entity
+    that was already in the graph.  Four such pairs existed in the live wiki.
+    """
+    for prefix in _NODE_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
 
 import time
 import hashlib
@@ -129,9 +149,26 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
     return "Query finalization completed with no valid wiki files synced."
 
 
+def _covering_page(target, existing_files, normalized_existing, existing_cores):
+    """The page that already covers ``target``, or ``None`` when nothing does.
+
+    A match is either the target itself (exact or normalised) or the page carrying
+    the same core name under a different type prefix.
+    """
+    if not target:
+        return None
+    if target in normalized_existing or target in existing_files:
+        return target
+    return existing_cores.get(_node_core(target))
+
+
 def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     existing_files = {name.replace(".md", "") for name in os.listdir(wiki_dir) if name.endswith(".md")}
     normalized_existing = {normalize_entity_name(f) for f in existing_files}
+    # A name already present under *any* type prefix.  ``Vendor_Epic-Systems``
+    # covers ``Epic-Systems``; creating ``Concept_Epic-Systems`` next to it would
+    # fork one entity into two nodes.
+    existing_cores = {_node_core(f): f for f in existing_files}
     broken_targets = set()
 
     for filename in files_to_scan:
@@ -149,13 +186,29 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
         for match in re.finditer(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]", content):
             raw_target = match.group(1).strip().replace(".md", "")
             target = normalize_entity_name(raw_target)
-            if target and target not in normalized_existing and target not in existing_files:
-                broken_targets.add(target)
+            covering = _covering_page(target, existing_files, normalized_existing, existing_cores)
+            if covering:
+                if covering != target:
+                    log.warning(
+                        "Not creating %s.md: %s already covers that name; fix the link instead.",
+                        target,
+                        covering,
+                    )
+                continue
+            broken_targets.add(target)
         for match in re.finditer(r"\[[^\[\]]+?::\s*\[\[([^\]]+?)\]\]\]", content):
             raw_target = match.group(1).strip().split("|")[0].strip().replace(".md", "")
             target = normalize_entity_name(raw_target)
-            if target and target not in normalized_existing and target not in existing_files:
-                broken_targets.add(target)
+            covering = _covering_page(target, existing_files, normalized_existing, existing_cores)
+            if covering:
+                if covering != target:
+                    log.warning(
+                        "Not creating %s.md: %s already covers that name; fix the link instead.",
+                        target,
+                        covering,
+                    )
+                continue
+            broken_targets.add(target)
 
     if not broken_targets:
         return 0
