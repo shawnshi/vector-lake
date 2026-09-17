@@ -35,6 +35,25 @@ def _collapse_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+# Reader-facing markers written by the page-shaping tools (``tool_query``, the
+# lint stub builder).  They are emitted *inside* the compiled-truth and timeline
+# sections, so the heading rule below turns them into claims even though they
+# record nothing.
+SYSTEM_DIRECTIVE_MARKER = "[System Directive:"
+
+
+def _is_system_directive(text) -> bool:
+    """True for a block that only carries a reader instruction.
+
+    A directive is not a claim, but it sits under a ``证据时间线``/``编译事实``
+    heading.  Its text is rewritten on every reshape (it embeds a ``Last Reshaped``
+    date), and because the timeline projection id is content-addressed, each
+    reshape moved the id and orphaned the previous ``timeline_events`` row -- the
+    one defect that kept regenerating timeline-projection drift.
+    """
+    return SYSTEM_DIRECTIVE_MARKER in str(text or "")
+
+
 def _body_summary(body: str, limit: int = 320) -> str:
     return _collapse_text(body)[:limit]
 
@@ -253,6 +272,8 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         }]
 
     for block_index, block in enumerate(blocks, start=1):
+        if _is_system_directive(block["text"]) or _is_system_directive(block.get("raw_text")):
+            continue
         block_temporal, cleaned_text = _parse_temporal(block["text"])
         final_temporal = block_temporal or validity_defaults.get("temporal_anchor")
 

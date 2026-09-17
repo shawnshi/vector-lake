@@ -64,6 +64,47 @@ This is a paragraph claim.
         # Check that edges are extracted correctly (empty in this case)
         self.assertEqual(len(result["edges"]), 0)
 
+    def test_system_directive_blocks_are_not_claims(self):
+        """A reader instruction is not a claim, even under a claim-heavy heading.
+
+        ``tool_query`` and the lint stub builder write ``[System Directive: ...]``
+        inside the compiled-truth and timeline sections.  The heading rule turned
+        them into claims, and because the timeline projection id is
+        content-addressed and the directive is rewritten on every reshape, each
+        reshape orphaned the previous ``timeline_events`` row.
+        """
+        fm = {
+            "title": "Test Directive",
+            "type": "concept",
+            "id": "concept_directive",
+            "domain": "General",
+            "status": "Active",
+            "epistemic-status": "seed",
+            "categories": ["Testing"],
+            "updated": "2026-09-17T00:00:00+00:00",
+            "sources": [],
+        }
+        body = """## 1. 编译事实
+*[System Directive: This section represents the LATEST consensus.]*
+
+A real compiled-truth sentence.
+
+## 2. 证据时间线
+*[System Directive: This is the immutable event ledger.]*
+
+- [2026-09-17] [Observation] A real event.
+"""
+        result = extract_page_objects("Concept_Directive.md", fm, body)
+
+        texts = [c["claim_text"] for c in result["claims"]]
+        self.assertFalse([t for t in texts if "System Directive" in t], texts)
+        self.assertIn("A real compiled-truth sentence.", texts)
+        self.assertIn("[2026-09-17] [Observation] A real event.", texts)
+
+        timeline = [c for c in result["claims"] if c.get("claim_type") == "timeline-event"]
+        self.assertEqual(len(timeline), 1)
+        self.assertIn("A real event.", timeline[0]["claim_text"])
+
     def test_extract_page_objects_edges(self):
         fm = {
             "id": "2024_0002",
