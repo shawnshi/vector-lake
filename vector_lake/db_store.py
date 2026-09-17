@@ -1514,6 +1514,10 @@ def delete_node_cascade(node_key: str):
             f"DELETE FROM claim_graph_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
             [*related_ids, *related_ids],
         )
+        # Deferred on purpose, and load-order-bearing: ``tool_timeline`` imports this
+        # module at module scope.  The deferred binding is also what lets
+        # ``tests/test_timeline_projection.py`` inject a projection failure by patching
+        # ``tool_timeline``'s name.  See ``tests/test_import_layering.py``.
         from vector_lake.tool_timeline import sync_timeline_events_for_claim_delta
 
         sync_timeline_events_for_claim_delta(old_claim_rows, [])

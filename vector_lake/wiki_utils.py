@@ -459,6 +459,10 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_val
     expected_path = (get_wiki_dir() / filename).resolve()
     if path.resolve() != expected_path:
         raise SafeWriteError(f"Path traversal blocked: {path}")
+    # Deferred on purpose, and load-order-bearing: ``mutation_coordinator`` imports this
+    # module at module scope, so hoisting this import to the top makes the package
+    # unimportable (a five-module cycle through ``defense_hook``/``purpose_contract``).
+    # See ``tests/test_import_layering.py``.
     from vector_lake.mutation_coordinator import execute_mutation_plan
     execute_mutation_plan(filename, content=full_content, is_delete=False)
 

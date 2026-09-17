@@ -1,5 +1,49 @@
 # Unreleased
 
+## 审计的「5 个 import 环」经实测不成立：0 个加载期环
+
+审计把 `wiki_utils`（fan-in 30）周围的 5 条路径记为「层反转/环」，并据此建议重排分层。用 AST
+区分**模块级**与**函数级**导入后重算，结论相反：**模块加载期没有任何环**。
+
+那 5 条都是把两类边合并后跑 SCC 得到的结果 —— 属于**概念上的层反转**，不是导入缺陷。包之所以一直
+可加载，正是因为所有「向上」的边都延迟到了函数作用域。真正的双向对只有 **2 对**：
+
+| 出边 | 延迟导入位置 | 反向为何成立 |
+|---|---|---|
+| `wiki_utils` → `mutation_coordinator` | `write_markdown_file` | coordinator 在模块级导入 `wiki_utils` |
+| `db_store` → `tool_timeline` | `delete_node_cascade` | `tool_timeline` 在模块级导入 `db_store` |
+
+量化验证：把 `wiki_utils` 那条延迟导入提到模块级，包立刻不可导入 —— 形成 5 模块 SCC
+（`db_store → defense_hook → mutation_coordinator → purpose_contract → wiki_utils`），
+解释器报 `cannot import name ... from partially initialized module`。**也就是说这条延迟导入是承重的，
+不是可以顺手「清理」的坏味道。**
+
+两对都不是意外，且 `db_store` 那一对还额外承重：`tests/test_timeline_projection.py` 依赖调用方在调用
+时刻解析 `tool_timeline` 的绑定，才能打进 `sync_timeline_events_for_claim_delta` 模拟投影失败、断言
+规范事务回滚。把函数挪到下层会**静默取消这个故障注入点**。
+
+### 新增 `tests/test_import_layering.py`（3 例），并如实标注它的价值边界
+
+它会自动发现这类问题，但**不是因为**它拦住了环：环一旦出现，`tests/conftest.py` 导入包即失败，整个套件
+在**收集阶段**就报错，根本轮不到这个测试。它的真实价值更窄：
+
+- 只读文件、不导入包，所以能在**包完全无法导入**的状态下运行（用 `importlib` 在故意破坏的树上实测过）；
+- 它指出形成环的**具体模块集合**，而不是丢下一串 partially-initialized-module 的链条。
+
+第一点和第三点分别对应 `test_there_is_no_module_level_import_cycle` 与
+`test_only_the_two_documented_pairs_are_deferred_and_upward`；第二点是
+`test_the_cycle_checker_detects_a_synthetic_cycle`，用于保证检查器自身可失败。边界（只扫
+`vector_lake/*.py`；看不见 `importlib` 动态导入）写在模块 docstring 里。
+
+### 未做，以及为什么
+
+**不重排分层。** 30 个导入者的底座模块、零个可测量的缺陷、而唯一的替代方案（把写入闸门的所有权
+上移）会改变 `write_markdown_file` 的契约 —— 这是独立批次的规模，不是本轮的范围。两处延迟导入已就地
+加注释说明它们是承重的、以及原因，`wiki_utils` 那条的真实收敛方向（低层只提供 `atomic_write_text`
+原语，写入闸门由上层包裹）记录在案。
+
+全量 pytest **736 passed**。
+
 ## `lint --auto-fix` 的存根类型错误，使这些“修复”从未真正落盘
 
 `lint_vector_lake(auto_fix=True)`（可经 `cli.py lint --auto-fix` 与 MCP 工具触达）为破链创建存根时，
