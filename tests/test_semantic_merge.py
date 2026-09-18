@@ -151,3 +151,137 @@ def test_section_aware_merge_stays_pure():
 
     assert left == left_before
     assert right == right_before
+
+
+# --- Evidence metadata is a union, not an inheritance -------------------------
+#
+# Every case below is a regression on one behaviour of the old merge: it inherited
+# the survivor's frontmatter apart from ``aliases`` and dropped the left body's
+# pre-``## 1.`` prefix.  Both deleted evidence while the merge reported success.
+
+
+def _metadata_page(
+    entity_id,
+    title,
+    *,
+    sources="[]",
+    tags="[]",
+    categories=None,
+    extra_frontmatter="",
+    updated="2026-01-02",
+    h1=None,
+):
+    category_block = categories or ["System_Architecture"]
+    rendered_categories = "\n".join(f"- {value}" for value in category_block)
+    return f"""---
+id: {entity_id}
+title: {title}
+type: vendor
+domain: Medical_IT
+topic_cluster: General
+status: Active
+epistemic-status: seed
+ttl: 1095
+categories:
+{rendered_categories}
+tags: {tags}
+created: '2026-01-01'
+updated: '{updated}'
+sources: {sources}
+aliases: []
+{extra_frontmatter}---
+{h1 or ''}## 1. 编译事实 (Compiled Truth - READ MODEL)
+
+{title} 是主体。 (Last Reshaped: 2026-01-01)
+
+### 核心护城河 (Moat)
+
+- {title} 拥有护城河。 (Source: [[Source_S]])
+
+---
+
+## 2. 证据时间线 (Timeline - EVENT STORE)
+
+- [2026-01-01] [Release] {title} 发布。 (Source: [[Source_S]])
+"""
+
+
+def test_merge_unions_evidence_metadata_and_keeps_survivor_identity():
+    left = _metadata_page("vendor_a", "Vendor_A", sources="[raw/left.md]", tags="['#left']",
+                          categories=["System_Architecture"])
+    right = _metadata_page("vendor_b", "Vendor_B", sources="[raw/right.md]", tags="['#right']",
+                           categories=["Healthcare_IT"],
+                           extra_frontmatter="evidence_tier: commercial-commitment\n")
+
+    merged = merge_markdown_content(left, right)
+    frontmatter, body = split_frontmatter(merged)
+
+    # Identity stays the survivor's: copying the consumed page's id or title would
+    # re-label this page as the thing that was merged into it.
+    assert frontmatter["id"] == "vendor_a"
+    assert frontmatter["title"] == "Vendor_A"
+    assert frontmatter["created"] == "2026-01-01"
+
+    # The consumed page's evidence metadata survives the deletion of its file.
+    assert frontmatter["sources"] == ["raw/left.md", "raw/right.md"]
+    assert frontmatter["tags"] == ["#left", "#right"]
+    assert frontmatter["categories"] == ["System_Architecture", "Healthcare_IT"]
+    assert frontmatter["evidence_tier"] == "commercial-commitment"
+
+    validate_schema(frontmatter, body, "Vendor_A.md")
+
+
+def test_merge_keeps_the_survivor_h1():
+    left = _metadata_page("vendor_a", "Vendor_A", h1="# [[Vendor_A|Vendor_A]]\n")
+    right = _metadata_page("vendor_b", "Vendor_B", h1="# [[Vendor_B|Vendor_B]]\n")
+
+    _, body = split_frontmatter(merge_markdown_content(left, right))
+
+    # The prefix used to be sliced off with the leading heading, so the merged page
+    # lost a title line both inputs carried.
+    assert body.startswith("# [[Vendor_A|Vendor_A]]")
+    assert body.count("# [[Vendor_A|Vendor_A]]") == 1
+    assert "Vendor_B|Vendor_B" not in body
+    assert body.count("## 1. 编译事实") == 1
+
+
+def test_merge_tag_union_respects_the_taxonomy_limit(caplog):
+    import logging
+
+    from vector_lake.schema_validator import MAX_TAGS
+
+    left = _metadata_page("vendor_a", "Vendor_A", tags="['#a', '#b', '#c']")
+    right = _metadata_page("vendor_b", "Vendor_B", tags="['#d']")
+
+    with caplog.at_level(logging.WARNING, logger="vector-lake-semantic-merge"):
+        merged = merge_markdown_content(left, right)
+    frontmatter, body = split_frontmatter(merged)
+
+    # Truncated to the bound the write gate enforces, survivor's tags first...
+    assert frontmatter["tags"] == ["#a", "#b", "#c"]
+    assert len(frontmatter["tags"]) == MAX_TAGS
+    # ...and the drop is disclosed rather than silent.
+    assert any("#d" in record.getMessage() for record in caplog.records)
+    validate_schema(frontmatter, body, "Vendor_A.md")
+
+
+def test_merge_does_not_move_updated_backwards():
+    left = _metadata_page("vendor_a", "Vendor_A", updated="2026-09-12")
+    right = _metadata_page("vendor_b", "Vendor_B", updated="2026-09-07T08:40:25.890500+00:00")
+    # The store holds both a bare date and a full timestamp; a lexical max over the raw
+    # strings would let the longer form of an earlier day win.
+    assert split_frontmatter(merge_markdown_content(left, right))[0]["updated"] == "2026-09-12"
+
+
+def test_same_day_updated_keeps_the_survivor_stamp():
+    # The comparison is on the date part, so a same-day pairing is a tie and a tie
+    # keeps the survivor's own stamp: a merge is not a reason to re-time a page.
+    left = _metadata_page("vendor_a", "Vendor_A", updated="2026-09-12")
+    newer_right = _metadata_page("vendor_b", "Vendor_B", updated="2026-09-12T06:00:00+00:00")
+    assert split_frontmatter(merge_markdown_content(left, newer_right))[0]["updated"] == "2026-09-12"
+
+    later_right = _metadata_page("vendor_b", "Vendor_B", updated="2026-09-13T06:00:00+00:00")
+    assert (
+        split_frontmatter(merge_markdown_content(left, later_right))[0]["updated"]
+        == "2026-09-13T06:00:00+00:00"
+    )

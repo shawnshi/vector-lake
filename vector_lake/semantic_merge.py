@@ -10,13 +10,46 @@ if the consumed page had first been overwritten with a bullet-free placeholder.
 Merging now distributes both bodies into exactly one Section 1 and one Section 2,
 so the concatenation itself is schema-conformant.  The function stays pure: it
 never touches either input string.
+
+Frontmatter is a union, not an inheritance: the survivor keeps its identity
+(``id``, ``title``, ``created``) and its own values, and the consumed page's
+evidence metadata is *added*.  Inheriting the survivor's frontmatter verbatim --
+what this function used to do, apart from aliases -- deleted the consumed page's
+``sources``, ``tags`` and ``categories`` along with its file, which is silent
+evidence loss in a provenance-first store.  Two rules bound the union:
+
+* additive fields (``aliases``, ``sources``, ``tags``, ``categories``) keep the
+  survivor's order and then append what the consumed page adds;
+* ``tags`` is capped at ``schema_validator.MAX_TAGS`` with the survivor's tags
+  preferred, because the write gate rejects an over-long list anyway; the drop is
+  logged rather than performed silently.
+
+Everything else the consumed page declares and the survivor does not is copied
+across (``evidence_tier``, ``tension_edges``, ...), so a field cannot disappear
+just because the survivor never used it.
 """
+import logging
 import re
 
 import yaml
 
 from vector_lake.wiki_utils import split_frontmatter
-from vector_lake.schema_validator import TENSION_H3_SLOT, VALID_H3_SLOTS
+from vector_lake.schema_validator import (
+    MAX_TAGS,
+    TENSION_H3_SLOT,
+    VALID_H3_SLOTS,
+)
+
+log = logging.getLogger("vector-lake-semantic-merge")
+
+# Values that accumulate across a merge instead of being replaced.  Dropping any of
+# these is the defect described in the module docstring.
+_ADDITIVE_FIELDS = ("aliases", "sources", "tags", "categories")
+
+# Fields that describe *which entity this page is*.  They are never inherited from
+# the consumed page: `id` and `title` would re-label the survivor as the thing that
+# was merged into it, and a copied `created` would rewrite its history.
+_IDENTITY_FIELDS = frozenset({"id", "title", "created"})
 
 _SECTION_1 = re.compile(r"^##\s*1\.\s*编译事实.*$", re.MULTILINE)
 _SECTION_2 = re.compile(r"^##\s*2\.\s*证据时间线.*$", re.MULTILINE)
@@ -33,10 +66,13 @@ def _as_list(value) -> list:
 
 
 def _split_sections(body: str):
-    """Split a body into (heading1, section1, heading2, section2).
+    """Split a body into ``(prefix, heading1, section1, heading2, section2)``.
 
-    Returns ``None`` when the body is not dual-schema, which keeps the pre-existing
-    single-block behaviour for pages that carry no profile sections.
+    ``prefix`` is whatever precedes the first ``## 1.`` heading -- in practice the
+    page H1.  It used to be dropped here, so a merged page lost the title line its
+    two inputs both carried.  Returns ``None`` when the body is not dual-schema,
+    which keeps the pre-existing single-block behaviour for pages that carry no
+    profile sections.
     """
     heading_1 = _SECTION_1.search(body)
     heading_2 = _SECTION_2.search(body)
@@ -46,7 +82,13 @@ def _split_sections(body: str):
     # A stray separator inside Section 1 would make the validator stop reading
     # Section 1 early; the merged page emits exactly one, before Section 2.
     section_1 = _SEPARATOR.sub("", section_1)
-    return heading_1.group(0).strip(), section_1, heading_2.group(0).strip(), body[heading_2.end():]
+    return (
+        body[:heading_1.start()].strip(),
+        heading_1.group(0).strip(),
+        section_1,
+        heading_2.group(0).strip(),
+        body[heading_2.end():],
+    )
 
 
 def _split_h3_blocks(text: str):
@@ -131,6 +173,78 @@ def _merge_section_2(left_text: str, right_text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _newer_stamp(left_value, right_value):
+    """The later of two ``updated`` stamps, compared on their date part.
+
+    Deliberately not ``max()`` over the raw strings: the store holds both
+    ``'2026-09-12'`` and ``'2026-09-07T08:40:25.890500+00:00'``, and a merge must not
+    move the survivor's timestamp backwards just because the consumed page wrote a
+    longer form of an earlier day.
+    """
+    left_stamp, right_stamp = str(left_value or ""), str(right_value or "")
+    if not left_stamp:
+        return right_value
+    if not right_stamp:
+        return left_value
+    return right_value if right_stamp[:10] > left_stamp[:10] else left_value
+
+
+def _union_frontmatter(left_frontmatter: dict, right_frontmatter: dict) -> dict:
+    """Fold the consumed page's frontmatter into the survivor's, in place.
+
+    The survivor's values win wherever the two disagree, except for ``updated``,
+    which must not go backwards.  See the module docstring for why inheritance alone
+    is evidence loss.
+    """
+    right_title = str(right_frontmatter.get("title") or "").strip()
+
+    # The consumed page's title is one more name for the same entity, so it joins the
+    # alias set -- this is also what keeps inbound ``[[Old_Page_Name]]`` links
+    # resolvable after the consumed file is deleted.
+    additive = {
+        "aliases": _as_list(right_frontmatter.get("aliases")) + ([right_title] if right_title else []),
+    }
+    for field in _ADDITIVE_FIELDS:
+        if field == "aliases":
+            continue
+        additive[field] = _as_list(right_frontmatter.get(field))
+
+    for field, right_values in additive.items():
+        merged = _as_list(left_frontmatter.get(field))
+        for value in right_values:
+            if value and value not in merged:
+                merged.append(value)
+        if merged:
+            left_frontmatter[field] = merged
+
+    tags = left_frontmatter.get("tags")
+    if isinstance(tags, list) and len(tags) > MAX_TAGS:
+        # The write gate rejects the page above the cap, so the union has to be cut
+        # here.  The survivor's tags are kept first: they are the ones its own
+        # sources were curated against.  Logged, because a silent truncation is the
+        # same class of defect as the silent drop this function was fixing.
+        dropped = tags[MAX_TAGS:]
+        left_frontmatter["tags"] = tags[:MAX_TAGS]
+        log.warning(
+            "Merge tag union exceeds MAX_TAGS=%s; dropped %s",
+            MAX_TAGS,
+            ", ".join(str(tag) for tag in dropped),
+        )
+
+    if "updated" in right_frontmatter:
+        left_frontmatter["updated"] = _newer_stamp(
+            left_frontmatter.get("updated"), right_frontmatter.get("updated")
+        )
+
+    for field, value in right_frontmatter.items():
+        if field in _IDENTITY_FIELDS or field in _ADDITIVE_FIELDS or field == "updated":
+            continue
+        if field not in left_frontmatter and value not in (None, "", [], {}):
+            left_frontmatter[field] = value
+
+    return left_frontmatter
+
+
 def merge_markdown_content(left_content: str, right_content: str) -> str:
     """Return a merged left page without mutating either source file."""
     left_frontmatter, left_body = split_frontmatter(left_content)
@@ -140,15 +254,8 @@ def merge_markdown_content(left_content: str, right_content: str) -> str:
     if not right_frontmatter:
         raise ValueError("The merge source has no valid YAML frontmatter.")
 
-    left_aliases = _as_list(left_frontmatter.get("aliases"))
-    right_aliases = _as_list(right_frontmatter.get("aliases"))
     right_title = str(right_frontmatter.get("title") or "").strip()
-    if right_title:
-        right_aliases.append(right_title)
-    for alias in right_aliases:
-        if alias and alias not in left_aliases:
-            left_aliases.append(alias)
-    left_frontmatter["aliases"] = left_aliases
+    _union_frontmatter(left_frontmatter, right_frontmatter)
 
     rendered_frontmatter = yaml.safe_dump(
         left_frontmatter,
@@ -161,10 +268,11 @@ def merge_markdown_content(left_content: str, right_content: str) -> str:
     if left_sections is None:
         merged_body = f"{left_body.strip()}\n\n## Merged from {source_label}\n{right_body.strip()}"
     else:
-        heading_1, section_1, heading_2, section_2 = left_sections
+        prefix, heading_1, section_1, heading_2, section_2 = left_sections
         right_sections = _split_sections(right_body)
-        right_section_1, right_section_2 = (right_sections[1], right_sections[3]) if right_sections else (right_body, "")
-        merged_body = "\n\n".join([
+        right_section_1, right_section_2 = (right_sections[2], right_sections[4]) if right_sections else (right_body, "")
+        merged_body = "\n\n".join(part for part in [
+            prefix,
             heading_1,
             _merge_section_1(section_1, right_section_1, _allowed_h3_slots(left_frontmatter)),
             "---",
@@ -172,7 +280,7 @@ def merge_markdown_content(left_content: str, right_content: str) -> str:
             _merge_section_2(section_2, right_section_2),
             f"## Merged from {source_label}",
             f"本页由 {source_label} 合并而来；其编译事实与时间线条目已并入上文对应分节。",
-        ])
+        ] if part)
     return (
         f"---\n{rendered_frontmatter}---\n"
         f"{merged_body.strip()}\n"

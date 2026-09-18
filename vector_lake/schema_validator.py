@@ -26,6 +26,10 @@ VALID_TYPES = NODE_TYPE_SET
 # instead of duplicating the literal.
 TENSION_H3_SLOT = "### 认知张力与未决争议 (Controversies & Tensions)"
 
+# The taxonomy cap on ``tags``.  Exported for the same reason as the slot above: the
+# merge path has to respect the bound, and a second literal would let the two drift.
+MAX_TAGS = 3
+
 VALID_CATEGORIES = {
     "Uncategorized",
     "Artificial_Intelligence",
@@ -122,8 +126,8 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
 
     # 1.5 Tags Constraints
     tags = frontmatter.get("tags", [])
-    if isinstance(tags, list) and len(tags) > 3:
-        raise SchemaViolationException(f"Taxonomy Violation: Maximum 3 tags allowed, but found {len(tags)}.")
+    if isinstance(tags, list) and len(tags) > MAX_TAGS:
+        raise SchemaViolationException(f"Taxonomy Violation: Maximum {MAX_TAGS} tags allowed, but found {len(tags)}.")
         
     # 1.6 Dates
     try:
