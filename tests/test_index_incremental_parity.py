@@ -1,19 +1,18 @@
 """The incremental update must derive the same edges a full rebuild does.
 
-These two paths used different resolution rules, and the difference is what the read-back in
-``update_index_items`` exists to paper over: it copies a node's existing ``page_graph_edges`` rows
-forward, because the incremental path could not re-derive the edges that alias resolution had
-produced.  This batch moved both paths onto one rule (``vector_lake.link_resolution``), so the
-question is now answerable: with the same inputs, do they agree?
+These two paths used different resolution rules, and the difference was what the read-back in
+``update_index_items`` papered over: it copied a node's existing ``page_graph_edges`` rows forward,
+because the incremental path could not re-derive the edges alias resolution had produced.  Both paths
+now use one rule (``vector_lake.link_resolution``) for links *and* triple targets, and score a pair in
+the same orientation -- so the read-back is gone and ``page_graph_edges`` is a projection again.
 
-If they do, the read-back is redundant for these shapes and can be removed -- which is what
-``page_graph_edges`` needs to become a pure projection of the published index again.  These tests
-are the evidence for that step, and they also pin the resolution rules the graph layer must keep.
+The scope these tests can speak for is stated rather than implied: they compare the *touched* node's
+incident edges against a rebuild.  Edges between two untouched nodes are never revisited by an
+incremental pass (their weight depends on the touched node's raw link count through the common-neighbour
+term, and the per-node cap re-ranks), so "equivalent to a rebuild" is a claim about the touched node.
 """
 
 import json
-
-import pytest
 
 from vector_lake import db_store, governance_store, indexer
 
@@ -127,14 +126,12 @@ def test_an_id_is_not_a_link_target_in_either_path(isolated_memory):
 
 
 def test_an_alias_edge_survives_updating_its_other_end(isolated_memory):
-    """The read-back's remaining role, which unifying the resolution rule does not replace.
+    """An alias edge must survive updating its other end -- the shape the read-back was for.
 
-    The fixture links by *alias* (``[[Epic]]`` -> ``Vendor_Epic-Systems``), because a link that
-    spells the filename is answered by the untouched page's own raw string and would survive
-    without the read-back.  Updating the vendor is what isolates it: the incremental derivation
-    there works on raw strings (the P1 this batch records), so only the read-back carries the
-    resolved edge forward.  If this ever passes without the read-back, the read-back is
-    load-bearing for nothing and the projection can go back to being one.
+    The fixture links by *alias* (``[[Epic]]`` -> ``Vendor_Epic-Systems``), because a link spelling
+    the filename is answered by the untouched page's own raw string and would survive regardless.
+    Updating the vendor is what isolates it: the touched node re-derives the pair through the shared
+    resolution rule, and nothing is copied from the projection any more.
     """
     items = [
         _entity("e-user", "Concept_User", links=["Epic"]),
@@ -160,8 +157,9 @@ def test_an_alias_edge_survives_updating_its_other_end(isolated_memory):
 def test_a_pair_score_does_not_depend_on_which_end_was_updated(isolated_memory):
     """The orientation the parity fixtures would otherwise miss.
 
-    ``TYPE_AFFINITY`` is asymmetric -- ``["vendor"]["event"]`` exists while ``["event"]`` has no
-    ``"vendor"`` key -- and the full build reads the row from the lexicographically smaller key.
+    ``TYPE_AFFINITY`` is asymmetric -- ``["event"]["vendor"]`` is 1.0 while ``["vendor"]`` has no
+    ``"event"`` key and falls back to 0.5 -- and the full build reads the row from the
+    lexicographically smaller key.
     Every other fixture here uses symmetric pairs, so a derivation that took the score from the
     updated node instead would pass them all and still drift on this one.
     """
@@ -184,26 +182,14 @@ def test_a_pair_score_does_not_depend_on_which_end_was_updated(isolated_memory):
 
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect, measured 2026-09-18: the incremental path carries a node's published edges "
-        "forward from page_graph_edges instead of deriving them, so deleting a link from a page "
-        "leaves its edge in the published graph. Deriving and dropping the read-back is necessary "
-        "but NOT sufficient -- that was tried and reverted (63 edges still differed) -- because the "
-        "incremental loop resolves raw link strings only: the fix must also route its links and "
-        "triple targets through resolve_link_target and take each pair's score from the same "
-        "orientation the full build uses (the lexicographically smaller key, since TYPE_AFFINITY is "
-        "asymmetric). Strict so that fixing it fails loudly and this marker is removed."
-    ),
-)
 def test_removing_a_link_removes_its_edge(isolated_memory):
-    """The consequence of carrying edges forward instead of deriving them.
+    """The fix that let the read-back go, and with it ``page_graph_edges`` as a projection.
 
-    The read-back re-adds whatever the projection already holds for the updated node, so an edge
-    whose link was deleted from the page is put back.  If this fails, the incremental path is
-    publishing a stale edge, which is the defect that makes replacing the read-back with a real
-    derivation worth doing -- and the reason ``page_graph_edges`` cannot yet be a projection.
+    This was a strict xfail: the incremental path carried the updated node's published edges forward
+    from ``page_graph_edges`` instead of deriving them, so an edge whose link had been deleted was
+    re-added.  It passes now that the derivation resolves links and triple targets through the shared
+    rule and scores each pair in the same orientation as a full build -- which is what the read-back
+    had been compensating for.
     """
     items = [
         _entity("e-user", "Concept_User", links=["Concept_Target"]),
@@ -221,3 +207,25 @@ def test_removing_a_link_removes_its_edge(isolated_memory):
     assert _edges_touching(_published(isolated_memory), "Concept_Target") == [], (
         "the edge survived the link that produced it being deleted"
     )
+
+
+def test_a_typed_link_written_by_name_keeps_its_predicate_weight(isolated_memory):
+    """The witness end's triples must be resolved too, not only the touched node's.
+
+    ``calculate_relevance`` reads the *other* node's predicate weight from
+    ``all_nodes_triples``, which was built from raw targets: a typed link written as a name (title,
+    alias or core name) missed that map, so the pair scored as a plain mention (1.2) instead of the
+    predicate's weight.  Because the difference is large, a pair whose decay/alignment multipliers
+    are low enough also fell under the 1.5 gate and disappeared -- which is what the read-back used
+    to hide, and why it could only go after this was fixed.
+    """
+    items = [
+        _entity("e-user", "Concept_User", title="User"),
+        _entity("e-target", "Concept_Target", links=["User"]),
+    ]
+    items[1]["triples"] = [{"predicate": "created", "target": "User"}]
+
+    oracle, incrementally = _incremental_matches_rebuild(isolated_memory, items, "Concept_User")
+
+    assert oracle, "the fixture produced no edge"
+    assert incrementally == oracle, "the name-written typed link lost its predicate weight"

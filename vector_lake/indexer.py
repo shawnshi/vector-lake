@@ -1158,14 +1158,36 @@ def update_index_items(filenames: list[str]):
                     if isinstance(index_data.get("categories"), list):
                         index_data["categories"] = set(index_data["categories"])
     
+                    # The maps the per-node derivation resolves against, built once for the batch
+                    # exactly as the full build builds them: ``_link_map_for_nodes`` uses the shared
+                    # declaration rule and ``core_name_maps`` the shared core rule, so the pairs and
+                    # the weights this touches cannot drift from the ones a rebuild would produce.
+                    #
+                    # They are built from the *pre-batch* node set, so a name the batch itself
+                    # introduces or renames resolves one batch later; the map published into
+                    # ``index_data["aliases"]`` below is the post-batch one.  A two-pass loop would
+                    # remove that lag and is not needed for correctness of the touched pairs.
+                    alias_map = _link_map_for_nodes(index_data["nodes"])
+                    _core_pages, unique_cores = core_name_maps(index_data["nodes"].keys())
+
+                    # Every node's triples, with their targets resolved: ``calculate_relevance`` reads
+                    # the *other* node's predicate weight from this map, so leaving the targets raw
+                    # meant a typed link written by name (title, alias or core name) was scored as a
+                    # plain mention.  The difference is large enough that a pair with low decay or
+                    # alignment fell under the gate and vanished -- which the read-back used to hide.
+                    # ``pre_parsed_data`` holds the pages this batch is about, so a page introduced by
+                    # it is present before its own pass runs.
                     all_nodes_triples = {}
-                    for k, v in (index_data.get("nodes") or {}).items():
+                    for k, v in {**(index_data.get("nodes") or {}), **pre_parsed_data}.items():
                         td = {}
-                        for t in (v.get("triples") or []):
-                            if t.get("target"):
-                                td[t["target"]] = t.get("predicate", "mentions")
+                        for t in ((v or {}).get("triples") or []):
+                            target = t.get("target")
+                            if target:
+                                td[resolve_link_target(target, alias_map, unique_cores) or target] = (
+                                    t.get("predicate", "mentions")
+                                )
                         all_nodes_triples[k] = td
-    
+
                     for filename in valid_filenames:
                         node_key = filename[:-3]
     
@@ -1229,40 +1251,38 @@ def update_index_items(filenames: list[str]):
                                         edge for edge in (index_data.get("weighted_edges") or [])
                                         if edge["source"] != node_key and edge["target"] != node_key
                                     ]
-                                    # Preserve this node's existing page-space edges from the projection.
-                                    try:
-                                        conn = db_store.get_connection()
-                                        cursor = conn.cursor()
-                                        cursor.execute(
-                                            "SELECT source_id, target_id, weight FROM page_graph_edges "
-                                            "WHERE source_id = ? OR target_id = ?",
-                                            (node_key, node_key),
-                                        )
-                                        for row in cursor.fetchall():
-                                            index_data["weighted_edges"].append({
-                                                "source": row["source_id"],
-                                                "target": row["target_id"],
-                                                "weight": float(row["weight"]) if row["weight"] else 1.0,
-                                            })
-                                    except Exception as e:
-                                        log.warning(f"Could not preserve page edges for {node_key}: {e}")
                                     node_data["_key"] = node_key
                                     all_nodes = index_data["nodes"]
     
+                                    # Resolution happens here, not only in the full build.  This loop
+                                    # used to compare *raw* link strings, so a link by core name or
+                                    # alias produced no pair at all -- the difference the read-back
+                                    # that used to follow it had been compensating for, which is why a
+                                    # link deleted from a page kept its edge (the projection was the
+                                    # source of that edge rather than the derivation).
+                                    def _resolved(names):
+                                        return {
+                                            resolve_link_target(name, alias_map, unique_cores) or name
+                                            for name in names
+                                        }
+
                                     td = {}
                                     for t in (node_data.get("triples") or []):
                                         if t.get("target"):
-                                            td[t["target"]] = t.get("predicate", "mentions")
+                                            target = t["target"]
+                                            td[resolve_link_target(target, alias_map, unique_cores) or target] = (
+                                                t.get("predicate", "mentions")
+                                            )
                                     all_nodes_triples[node_key] = td
                                     triples_a = td
                                     
-                                    node_links = set((node_data.get("links") or []))
+                                    node_links = _resolved(node_data.get("links") or [])
                                     node_sources = set((node_data.get("sources") or []))
                                     for other_key, other_node in all_nodes.items():
                                         if other_key == node_key:
                                             continue
                                             
-                                        other_links = set((other_node.get("links") or []))
+                                        other_links = _resolved(other_node.get("links") or [])
                                         other_sources = set((other_node.get("sources") or []))
                                         triples_b = all_nodes_triples.get(other_key)
                                         
@@ -1274,17 +1294,35 @@ def update_index_items(filenames: list[str]):
                                         if not (has_direct or has_source_overlap or has_common_neighbor):
                                             continue
     
-                                        other_node["_key"] = other_key
+                                        # The pair is scored in the orientation the full build uses:
+                                        # "a" is the lexicographically smaller key, because
+                                        # TYPE_AFFINITY is asymmetric and the full build only ever asks
+                                        # for key_a < key_b.  Scoring from the updated node instead gave
+                                        # the same pair a different weight.
+                                        if node_key < other_key:
+                                            first, second = node_data, other_node
+                                            first_key, second_key = node_key, other_key
+                                            first_links, second_links = node_links, other_links
+                                            first_sources, second_sources = node_sources, other_sources
+                                            first_triples, second_triples = triples_a, triples_b
+                                        else:
+                                            first, second = other_node, node_data
+                                            first_key, second_key = other_key, node_key
+                                            first_links, second_links = other_links, node_links
+                                            first_sources, second_sources = other_sources, node_sources
+                                            first_triples, second_triples = triples_b, triples_a
+                                        first["_key"] = first_key
+                                        second["_key"] = second_key
                                         relevance = calculate_relevance(
-                                            node_data, other_node, all_nodes,
-                                            links_a=node_links, links_b=other_links,
-                                            sources_a=node_sources, sources_b=other_sources,
-                                            triples_a=triples_a, triples_b=triples_b
+                                            first, second, all_nodes,
+                                            links_a=first_links, links_b=second_links,
+                                            sources_a=first_sources, sources_b=second_sources,
+                                            triples_a=first_triples, triples_b=second_triples
                                         )
                                         if relevance >= 1.5:
                                             index_data["weighted_edges"].append({
-                                                "source": min(node_key, other_key),
-                                                "target": max(node_key, other_key),
+                                                "source": first_key,
+                                                "target": second_key,
                                                 "weight": relevance,
                                             })
                                         other_node.pop("_key", None)

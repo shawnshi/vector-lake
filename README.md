@@ -18,7 +18,8 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 | 约束 | 事实 | 规避 |
 |---|---|---|
-| 必须常驻守护进程与摄取 Runner | outbox 消费、增量索引、定时 lint 均在 `watchdog_sync.py` 内；摄取任务包的**模型调用**在宿主侧 `scripts/ingest_runner.py`（默认 shadow，只报告不写页面），由 `scripts/ingest_runner_service.py` 负责重启。MCP-only 模式没有消费者，写入会持续堆积；只跑 watchdog 时任务包会停在 `awaiting_subagent` | 生产环境常驻 `watchdog_sync.py` 与 `ingest_runner_service.py`；仅做只读检索时才可省略 |
+| 必须常驻守护进程与摄取 Runner | outbox 消费、增量索引、定时 lint、**到期时的 gram 索引重建**、WAL checkpoint 与备份保留均在 `watchdog_sync.py` 内；摄取任务包的**模型调用**在宿主侧 `scripts/ingest_runner.py`（默认 shadow，只报告不写页面），由 `scripts/ingest_runner_service.py` 负责重启。MCP-only 模式没有消费者，写入会持续堆积；只跑 watchdog 时任务包会停在 `awaiting_subagent` | 生产环境常驻 `watchdog_sync.py` 与 `ingest_runner_service.py`；仅做只读检索时才可省略。**没有守护进程时没有任何定时维护会触发**，gram 索引需人工按 `doctor` 的 `due=` 执行 `python cli.py gram-index --if-due --apply` |
+| 摄取作业有两个消费者，且都在租约下 | 守护进程启动时会在进程内拉起 `ingest_worker`（5 s 轮询 `jobs`），宿主侧 `scripts/ingest_runner.py` **认领的是同一张 `jobs` 表**。两者都能独立工作，同一作业只会被其中一方处理（作业租约），因此同时运行是安全的 | 模型调用在进程内完成时只需守护进程；需要把模型调用交给外部命令（`--model-cmd`）时用宿主侧 Runner。无论哪种，都**不要**为了“多跑一点”而绕开租约手工改 `jobs` |
 | Runner 健康默认只告警 | `runner_absent` / `runner_stalled` / `runner_failing` 默认进 `warnings`，不翻转 `ok`；“从未跑过”与“跑挂了”由 `.meta/runtime/runner_supervisor.json` 区分 | 需要把 Runner 缺失升级为硬门时设 `VECTOR_LAKE_RUNNER_STRICT=1` |
 | 编译依赖 LLM 宿主 | `cli.py sync` 只产出 subagent 任务包，不自行编译；`native_llm.generate_text` 恒抛 `SubagentTaskRequired` | 在具备 subagent 能力的宿主内运行摄取流程 |
 | 向量检索需要显式回填 | 任何页面写入都会使该节点向量失效；无自动重嵌 | 定期 `python cli.py embedding-backfill --apply`；需 `GEMINI_API_KEY`（无 key 时 `search` 输出 `[DEGRADED]` 横幅） |
