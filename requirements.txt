@@ -1,11 +1,14 @@
 # Required runtime dependencies.
 #
-# CJK tokenization is layered (see vector_lake/tokenizer.py):
+# CJK tokenization has one backend (see vector_lake/tokenizer.py):
 #   * rjieba -> jieba-rs (Rust) via the official PyO3 binding. Ships cp38-abi3
 #     wheels for Windows/macOS/manylinux/musllinux, so no compiler is needed on
-#     the supported platforms. Measured 7-15x faster here.
-#   * jieba  -> pure-Python fallback, always installable, and the only backend
-#     exposing add_word() for custom dictionary terms.
+#     the supported platforms. Measured 7-15x faster than the pure-Python
+#     implementation it replaced.
+# The pure-Python jieba fallback was removed on 2026-09-18: the wheels cover
+# every supported platform, and a second segmentation would differ from rjieba's
+# inside one FTS index. Without rjieba, tokenization is `unavailable` and CJK
+# full-text matching degrades -- reported by doctor, not hidden.
 #
 # Community detection uses Leiden (leidenalg on igraph), which replaced
 # python-louvain/Louvain; see scripts/community_clustering_daemon.py.
@@ -29,6 +32,5 @@ google-genai>=2.0.0
 fastmcp>=4.0.0
 sqlite-vec>=0.1.3
 rjieba>=0.2.1
-jieba>=0.42.1
 mistune>=3.0.1
 bm25s>=0.2.0

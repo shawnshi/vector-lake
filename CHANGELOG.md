@@ -1,5 +1,31 @@
 # Unreleased
 
+## 移除纯 Python `jieba` 回退，分词只剩 `rjieba`
+
+按所有者决定执行：`requirements.txt` 去掉 `jieba>=0.42.1`，`tokenizer.py` 的后端链从
+`rjieba → jieba` 变为**单一后端**。
+
+### 为什么这是安全的（而不是「少装一个包」）
+
+`rjieba` 提供 `cp38-abi3` wheel（Windows / macOS / manylinux / musllinux），**覆盖本项目支持的全部平台**；
+回退后端只在支持集合之外才可达。真正的代价不是安装体积，而是**第二套分词**：`jieba` 与 `rjieba` 的切分不同，
+而搜索索引的内容哈希 `indexer._node_content_digest` 把后端身份纳入 key —— 存在的意义就是**不让两套分词混进同一个
+FTS 索引**。少一套后端就少一类这种状态。
+
+**新的事实（已写入 README 的已知限制）**：没有 `rjieba` 的平台现在分词为 `unavailable` —— CJK 预分词被跳过、
+CJK 查询命中下降；`doctor` 与 `backend_name()` 会报出，`tool_search` 已有 `backend_ready` 判据，不会静默错算。
+`VECTOR_LAKE_TOKENIZER` 开关保留（唯一合法值 `rjieba`），写旧值 `jieba` 会告警并走自动选择。
+`add_word()`/`supports_add_word()` 保留为**能力上报**：现在一律返回 False（jieba-rs 内嵌自己的词典），
+`tool_search.QUERY_EXPANSION_DICT` 的注册一次性告警，索引与查询用同一分词器所以召回不受影响，只有这些词的精确
+短语形态不同。
+
+### 改动与验证
+
+`tokenizer.py`（模块 docstring 重写、`VALID_BACKENDS` 单元素、不可用告警改为说明后果、`add_word` 文档与告警措辞）、
+`requirements.txt`（去 jieba、注释改写为单后端）、README（配置项、后端表、模块表、回退移除说明与后果）、
+`tests/test_tokenizer_backend.py`（4 例随回退一并改写/新增：缺后端→`unavailable` 且告警说明后果、写旧后端名被拒、
+强制不可用后端仍是 `unavailable` 而非回退、缓存 key 仍含后端身份；`_PythonBackend` 助手删除）。全量 pytest **841 passed**。
+
 ## O3 定案与其后两条登记项：三副本的权威、一个被保住的索引、一种「缺失」编码
 
 ### O3：边集的第三份副本没有读取方，但**本批不删**

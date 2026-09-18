@@ -1,18 +1,20 @@
-"""Tests for the pluggable tokenizer backend.
+"""Tests for the tokenizer backend.
 
-Backend chain: ``rjieba`` (jieba-rs via PyO3, preferred) -> ``jieba`` (pure
-Python fallback).  The contract that matters:
+``rjieba`` (jieba-rs via PyO3) is the only backend since 2026-09-18; the pure-Python
+``jieba`` fallback was removed because the abi3 wheels cover every supported platform
+and a second segmentation would differ from rjieba's inside one FTS index.  The
+contract that matters now:
 
-* the Rust backend wins when importable, and ``lcut`` degrades to ``cut``
+* the Rust backend is selected when importable, and ``lcut`` degrades to ``cut``
   because the binding exposes no ``lcut``,
-* a missing optional backend degrades to the pure-Python one instead of
-  disabling tokenization,
-* ``VECTOR_LAKE_TOKENIZER`` can force either backend, and forcing an unavailable
-  one warns and still falls back,
-* switching backends invalidates the search-index cache (otherwise two different
+* **a missing backend leaves tokenization ``unavailable``** -- there is no fallback
+  to degrade to, so the warning has to say what stops working,
+* ``VECTOR_LAKE_TOKENIZER`` still validates against the single valid name: an
+  unknown value warns and auto-selection proceeds, and forcing the backend when it
+  is unavailable warns and leaves tokenization unavailable rather than pretending,
+* the backend identity is part of the search-index cache key (otherwise two
   segmentations would be silently mixed inside one FTS index),
-* ``add_word`` reports the Rust backend's lack of a dictionary API instead of
-  pretending success.
+* ``add_word`` reports the lack of a dictionary API instead of pretending success.
 """
 import importlib
 import importlib.machinery
@@ -29,25 +31,6 @@ class _RustBackend(types.ModuleType):
 
     def cut(self, text, hmm=True):
         return [f"rs:{chunk}" for chunk in text.split()]
-
-
-class _PythonBackend(types.ModuleType):
-    """Mirrors jieba: cut plus lcut and a dictionary API."""
-
-    __version__ = "0.42.1"
-
-    def __init__(self, name):
-        super().__init__(name)
-        self.added = []
-
-    def cut(self, text):
-        return [f"py:{chunk}" for chunk in text.split()]
-
-    def lcut(self, text):
-        return self.cut(text)
-
-    def add_word(self, term):
-        self.added.append(term)
 
 
 @pytest.fixture(autouse=True)
@@ -110,31 +93,29 @@ def test_split_degrades_to_cut_when_lcut_is_missing(monkeypatch):
     assert not hasattr(sys.modules["rjieba"], "lcut")
 
 
-def test_falls_back_to_jieba_when_rjieba_missing(monkeypatch):
+def test_a_missing_backend_is_unavailable_and_says_what_stops(monkeypatch, caplog):
+    """There is no fallback any more, so the warning has to state the consequence."""
     _hide(monkeypatch, "rjieba")
-    _install(monkeypatch, "jieba", _PythonBackend("jieba"))
 
-    assert tokenizer.backend_name() == "jieba"
-    assert tokenizer.cut("医疗") == ["py:医疗"]
-    assert tokenizer.tokenize_joined("医疗") == "py:医疗"
+    with caplog.at_level("WARNING", logger="vector-lake-tokenizer"):
+        assert tokenizer.backend_name() == "unavailable"
 
-
-def test_falls_back_to_jieba_when_rjieba_fails_to_load(monkeypatch):
-    _hide(monkeypatch, "rjieba")
-    _install(monkeypatch, "jieba", _PythonBackend("jieba"))
-
-    assert tokenizer.backend_name() == "jieba"
-    assert tokenizer.tokenize_joined("医疗") == "py:医疗"
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("pre-tokenization is disabled" in m for m in warnings), warnings
+    assert tokenizer.cut("医疗") == []
+    assert tokenizer.tokenize_joined("医疗") == ""
 
 
-def test_env_override_can_force_pure_python(monkeypatch):
+def test_a_removed_backend_name_is_rejected_as_an_override(monkeypatch, caplog):
+    """``jieba`` used to be valid; naming it now warns and auto-selection proceeds."""
     _install(monkeypatch, "rjieba", _RustBackend("rjieba"))
-    _install(monkeypatch, "jieba", _PythonBackend("jieba"))
     monkeypatch.setenv("VECTOR_LAKE_TOKENIZER", "jieba")
     tokenizer.reset_backend_cache()
 
-    assert tokenizer.backend_name() == "jieba"
-    assert tokenizer.cut("医疗") == ["py:医疗"]
+    with caplog.at_level("WARNING", logger="vector-lake-tokenizer"):
+        assert tokenizer.backend_name() == "rjieba"
+
+    assert any("is not one of" in r.getMessage() for r in caplog.records)
 
 
 def test_env_override_can_force_rjieba(monkeypatch):
@@ -145,28 +126,29 @@ def test_env_override_can_force_rjieba(monkeypatch):
     assert tokenizer.backend_name() == "rjieba"
 
 
-def test_forced_but_missing_backend_warns_and_falls_back(monkeypatch, caplog):
-    """Forcing an unavailable backend must not disable tokenization."""
+def test_forced_but_missing_backend_warns_and_stays_unavailable(monkeypatch, caplog):
+    """Forcing the backend cannot conjure it: the state is unavailable, not a fallback."""
     _hide(monkeypatch, "rjieba")
-    _install(monkeypatch, "jieba", _PythonBackend("jieba"))
     monkeypatch.setenv("VECTOR_LAKE_TOKENIZER", "rjieba")
     tokenizer.reset_backend_cache()
 
     with caplog.at_level("WARNING", logger="vector-lake-tokenizer"):
-        assert tokenizer.backend_name() == "jieba"
+        assert tokenizer.backend_name() == "unavailable"
 
     assert [r for r in caplog.records if r.levelname == "WARNING"]
-    assert tokenizer.cut("医疗") == ["py:医疗"]
+    assert tokenizer.cut("医疗") == []
 
 
 def test_missing_optional_backend_is_logged_at_debug(monkeypatch, caplog):
+    """Auto-selection stays quiet: a fresh install without the wheel is not a warning."""
     _hide(monkeypatch, "rjieba")
-    _install(monkeypatch, "jieba", _PythonBackend("jieba"))
 
     with caplog.at_level("WARNING", logger="vector-lake-tokenizer"):
-        assert tokenizer.backend_name() == "jieba"
+        assert tokenizer.backend_name() == "unavailable"
 
-    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert not [
+        r for r in caplog.records if r.levelname == "WARNING" and "pre-tokenization" not in r.getMessage()
+    ]
 
 
 def test_backend_is_selected_only_once_per_process(monkeypatch, caplog):
@@ -201,17 +183,24 @@ def test_tokenize_joined_matches_indexer_contract(monkeypatch):
     assert indexer._tokenize_for_fts("") == ""
 
 
-def test_backend_switch_invalidates_the_search_index_cache(monkeypatch):
+def test_the_backend_identity_is_part_of_the_index_cache_key(monkeypatch):
+    """The reason the key exists: two segmentations must never share one FTS index.
+
+    The backend list has one entry now, so the digest cannot differ between backends
+    within a process -- but it must still be *in* the key, because a platform without
+    the wheel digests under the ``unavailable`` identity and a later install must force
+    re-tokenization rather than reuse an index built by a different tokenizer.
+    """
     node = {"title": "T", "summary": "S", "aliases": ["a"]}
 
-    _hide(monkeypatch, "rjieba")
-    _install(monkeypatch, "jieba", _PythonBackend("jieba"))
-    pure = indexer._node_content_digest(node, "body")
-
     _install(monkeypatch, "rjieba", _RustBackend("rjieba"))
-    rust = indexer._node_content_digest(node, "body")
+    with_backend = indexer._node_content_digest(node, "body")
 
-    assert pure != rust, "switching tokenizers must force re-tokenization"
+    _hide(monkeypatch, "rjieba")
+    tokenizer.reset_backend_cache()
+    without_backend = indexer._node_content_digest(node, "body")
+
+    assert with_backend != without_backend, "the tokenizer identity must be in the key"
 
 
 # --- add_word capability reporting ----------------------------------------
@@ -228,13 +217,12 @@ def test_add_word_is_unsupported_on_the_rust_backend(monkeypatch, caplog):
     assert len(warnings) == 1, "the limitation must be reported once, not per term"
 
 
-def test_add_word_works_on_the_python_backend(monkeypatch):
-    _hide(monkeypatch, "rjieba")
-    _install(monkeypatch, "jieba", _PythonBackend("jieba"))
+def test_add_word_is_unsupported_by_every_backend_this_tree_has(monkeypatch):
+    """The pure-Python backend that supported it is gone, so nothing supports it."""
+    _install(monkeypatch, "rjieba", _RustBackend("rjieba"))
 
-    assert tokenizer.supports_add_word() is True
-    assert tokenizer.add_word("电子病历") is True
-    assert sys.modules["jieba"].added == ["电子病历"]
+    assert tokenizer.supports_add_word() is False
+    assert tokenizer.add_word("电子病历") is False
     assert tokenizer.add_word("") is False
 
 

@@ -2,15 +2,20 @@
 
 Backends
 --------
-``rjieba`` (preferred)
+``rjieba`` (the only backend)
     Rust implementation of jieba (``jieba-rs``) exposed through the official
-    PyO3 binding by the same author (messense).  Ships ``cp38-abi3`` wheels, so
-    it installs on CPython 3.8+ without a compiler, and it is measured ~7-15x
-    faster than the pure-Python backend on this project's corpus.
+    PyO3 binding by the same author (messense).  Ships ``cp38-abi3`` wheels for
+    Windows, macOS, manylinux and musllinux, so it installs on CPython 3.8+
+    without a compiler, and it measured ~7-15x faster than the pure-Python
+    implementation this project used to fall back to.
 
-``jieba`` (fallback)
-    Pure Python, always installable.  Retained as the fallback for platforms
-    without a wheel and as the only backend exposing ``add_word``.
+The pure-Python ``jieba`` fallback was removed on 2026-09-18: the abi3 wheels
+cover every platform this project supports, so the fallback was only reachable
+outside that set, while carrying a second segmentation whose token stream differs
+from ``rjieba``'s -- the one thing the search-index cache key exists to keep out of
+a single FTS index.  On a platform with no ``rjieba`` wheel, tokenization is now
+``unavailable``: CJK pre-tokenization is skipped and CJK queries match less,
+which ``doctor`` and :func:`backend_name` report rather than hide.
 
 Why the layering is observable
 ------------------------------
@@ -20,16 +25,18 @@ Every tokenization call goes through this module so that:
 * the search-index cache key includes the backend identity (see
   ``indexer._node_content_digest``), because two backends produce different
   token streams and mixing them inside one FTS index would silently corrupt it,
-* ``VECTOR_LAKE_TOKENIZER`` can force a backend, and an unavailable forced
-  backend degrades with a warning instead of disabling tokenization.
+* ``VECTOR_LAKE_TOKENIZER`` is still accepted (the single valid value is
+  ``rjieba``), so an existing environment file states its intent explicitly; an
+  unavailable forced backend warns and tokenization goes ``unavailable``.
 
 Known limitation
 ----------------
-``rjieba`` does **not** expose ``add_word`` / ``load_userdict`` (neither at
-module level nor on its ``Jieba`` class), and jieba-rs embeds its own dictionary.
-Words registered through the pure-Python fallback therefore have no effect on an
-``rjieba`` token stream.  :func:`add_word` reports this instead of pretending
-success; see :func:`supports_add_word`.
+``rjieba`` does **not** expose ``add_word`` / ``load_userdict`` (neither at module
+level nor on its ``Jieba`` class), and jieba-rs embeds its own dictionary, so
+``QUERY_EXPANSION_DICT`` terms cannot be registered at all now that the pure-Python
+backend is gone.  :func:`add_word` reports that instead of pretending success; see
+:func:`supports_add_word`.  Indexing and querying use the same tokenizer, so recall
+is unaffected apart from the exact phrase forms of those terms.
 """
 from __future__ import annotations
 
@@ -40,8 +47,10 @@ import threading
 
 log = logging.getLogger("vector-lake-tokenizer")
 
-# Preferred-first. `rjieba` is the Rust implementation; `jieba` is the fallback.
-VALID_BACKENDS = ("rjieba", "jieba")
+# The Rust implementation is the only backend; see the module docstring for why the
+# pure-Python fallback was removed.  Kept as a tuple because the selection logic and
+# ``VECTOR_LAKE_TOKENIZER`` validation read it as the set of valid names.
+VALID_BACKENDS = ("rjieba",)
 
 # jieba-rs release that the installed rjieba binding was built against.
 #
@@ -105,7 +114,11 @@ def _select():
                     log.info("Tokenizer backend: rjieba (jieba-rs %s via Rust extension)", JIEBA_RS_PINNED)
                 _RESOLVED["name"] = name
                 return name, module
-        log.warning("No CJK tokenizer backend is importable; FTS pre-tokenization is disabled.")
+        log.warning(
+            "No CJK tokenizer backend is importable (rjieba has no wheel for this platform?); "
+            "FTS pre-tokenization is disabled, so CJK queries will match less. "
+            "Install rjieba, or run without CJK full-text search."
+        )
         _RESOLVED["name"] = "unavailable"
         return "unavailable", None
 
@@ -120,7 +133,7 @@ def reset_backend_cache() -> None:
 
 
 def backend_name() -> str:
-    """Active backend: ``rjieba``, ``jieba`` or ``unavailable``."""
+    """Active backend: ``rjieba``, or ``unavailable`` when it cannot be imported."""
     name, _ = _select()
     return name
 
@@ -173,10 +186,10 @@ def split(text: str) -> list[str]:
 def add_word(term: str) -> bool:
     """Register a domain term where the backend supports it.
 
-    Returns ``False`` when the active backend has no dictionary API, which is
-    the case for the Rust backend.  Callers must not assume this succeeded: a
-    word added to the pure-Python fallback does not affect an ``rjieba`` token
-    stream, so the two must never be mixed.
+    Returns ``False``: no backend in this tree exposes a dictionary API (``rjieba``
+    does not, and the pure-Python backend that did was removed).  Callers must not
+    assume this succeeded -- segmentation stays consistent between indexing and
+    querying, so recall is unaffected apart from the exact phrase forms of those terms.
     """
     global _ADD_WORD_WARNED
     if not term:
@@ -186,7 +199,8 @@ def add_word(term: str) -> bool:
     if module is None or not callable(add):
         if not _ADD_WORD_WARNED:
             log.warning(
-                "Active tokenizer backend %r exposes no add_word(); custom dictionary terms are ignored. "
+                "Active tokenizer backend %r exposes no add_word(); custom dictionary terms are ignored "
+                "(jieba-rs embeds its own dictionary and the pure-Python backend was removed). "
                 "Segmentation stays consistent between indexing and querying, so recall is unaffected "
                 "except for the exact phrase forms of those terms.",
                 backend_name(),

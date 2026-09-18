@@ -315,7 +315,7 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_EMBEDDING_UTILIZATION`：安全水位，默认 `0.8`，即按 2400 RPM / 800k TPM 调度。
 - `VECTOR_LAKE_EMBEDDING_MAX_BATCH_ITEMS` / `VECTOR_LAKE_EMBEDDING_MAX_BATCH_TOKENS`：单批条数与 token 上限，默认 `100` / `200000`。
 - `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
-- `VECTOR_LAKE_TOKENIZER`：强制分词后端，取 `jieba` 或 `rjieba`；不设置则自动优先 `rjieba`。指定的后端不可用时只会告警并回退，不会禁用分词。
+- `VECTOR_LAKE_TOKENIZER`：目前只有一个合法值 `rjieba`（保留该开关是为了让已有的环境配置显式表达意图）；写别的值会告警并走自动选择。安装了 rjieba 就用它，反之分词为 `unavailable`（CJK 全文匹配下降，doctor 会报出）。
 - `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`：outbox 待处理行数阈值，默认 `2000`。**超出后默认只计为降级告警，不阻断写入**（阻断积压等于掉断唯一的自愈路径）；设 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING=1` 才升级为阻断。
 - `VECTOR_LAKE_OUTBOX_FAILURE_NONBLOCKING=1`：把 `mutation_outbox_failed` 从硬故障降为降级告警。默认关闭，因为失败行会阻塞 canonical 写入；打开等于用可用性换安全性。
 - `VECTOR_LAKE_TERMINAL_FAILED_JOBS_BLOCKING=1` / `VECTOR_LAKE_TIMELINE_PARITY_BLOCKING=1`：把终态失败作业与时间线 parity 漂移从降级升级为阻断写入的诊断用闸门，默认关闭。
@@ -378,8 +378,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 
 | 后端 | 角色 | 安装 |
 |---|---|---|
-| **`rjieba`（首选）** | `jieba-rs` 的官方 PyO3 绑定（同作者 messense），Rust 实现 | 必需依赖；提供 `cp38-abi3` wheel（Windows / macOS / manylinux / musllinux），**无需编译器** |
-| **`jieba`（回退）** | 纯 Python，任何平台可装；也是唯一提供 `add_word()` 的后端 | 必需依赖 |
+| **`rjieba`（唯一后端）** | `jieba-rs` 的官方 PyO3 绑定（同作者 messense），Rust 实现 | 必需依赖；提供 `cp38-abi3` wheel（Windows / macOS / manylinux / musllinux），**无需编译器** |
 
 **版本真相（重要）**：`rjieba 0.2.1` 在它的 `Cargo.toml` 里钉定的是 **`jieba-rs = "0.9.0"`**，即实际生效的 Rust crate 是 **0.9.x**，而**不是** 0.11。`jieba-rs 0.11.0` 于 2026-09-16 发布，**目前没有任何已发布的 Python 绑定**；本机也无 Rust 工具链（无 `cargo`/`rustc`/`maturin`），无法从 sdist 自建。该事实在代码中以常量 `tokenizer.JIEBA_RS_PINNED` 记录，并由 `doctor` 与 `backend_version()` 直接显示，例如：
 
@@ -389,11 +388,11 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 
 待 `rjieba` 发布基于 0.11 的版本后，只需同步 `requirements.txt` / `requirements.lock.txt` 的版本号与 `JIEBA_RS_PINNED`。
 
-**已知能力缺口**：`rjieba` 不暴露 `add_word()` / `load_userdict()`（模块级与 `Jieba` 类均无），且 jieba-rs 内嵌自己的词典。因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下**不生效**，代码会输出一次性 WARNING 而非假装成功。影响有限：索引与查询使用**同一**分词器，两侧切分一致，检索仍可命中，仅这几个术语的精确短语形态不同。绝不把词注册到 `jieba` 再指望 `rjieba` 生效（两者词典不共享）。
+**已知能力缺口**：`rjieba` 不暴露 `add_word()` / `load_userdict()`（模块级与 `Jieba` 类均无），且 jieba-rs 内嵌自己的词典。因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下**不生效**，代码会输出一次性 WARNING 而非假装成功。影响有限：索引与查询使用**同一**分词器，两侧切分一致，检索仍可命中，仅这几个术语的精确短语形态不同。回退后端移除后这一点不再需要权衡：`add_word()` 一律返回 False，词表注册无法生效。
 
 **实测收益与语义差异**（同一本机、3210 字符正文）：
 
-| 指标 | 纯 Python `jieba` | `rjieba` |
+| 指标（回退移除前的对比，保留为当初的理由） | 纯 Python `jieba` | `rjieba` |
 |---|---|---|
 | 单页分词 | 4.39 ms | **0.39 ms（11.3×）** |
 | 200 字符短文本 | 0.33 ms | 0.02 ms（15.0×） |
@@ -402,7 +401,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 
 差异集中在拉丁/数字边界（如 `utf-8` vs `utf`+`-`+`8`、`2018-12` vs `2018`+`12`），中文词本身几乎完全一致。
 
-**切换后端必须重建索引**：搜索索引的内容哈希把后端身份包含在内（`indexer._node_content_digest`），因此换后端后下一次 `projection-rebuild-index --apply` 会重新分词，不会在同一 FTS 索引里混用两套分词。可用 `VECTOR_LAKE_TOKENIZER=jieba` 强制回退。
+**纯 Python `jieba` 回退已于 2026-09-18 移除**：abi3 wheel 覆盖本项目支持的全部平台，而第二套分词与 `rjieba` 的切分不同——这正是搜索索引内容哈希要防的事（`indexer._node_content_digest` 把后端身份纳入 key）。因此**没有 rjieba 的平台会变为 `unavailable`**：CJK 预分词被跳过、CJK 查询命中下降，`doctor` 与 `backend_name()` 会报出而不是掩盖；装回 rjieba 后下一次 `projection-rebuild-index --apply` 会按新身份重新分词。
 
 全量重建的剩余瓶颈已不在分词：warm 重建的约 50% 耗时是 `index.json` / `claim_graph.json` 的 `json.dump` 序列化。
 
@@ -444,7 +443,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 |---|---|
 | `vector_lake/indexer.py` | `index.json` / `claim_graph.json` 生成、FTS 投影、稀疏图遍历与增量更新 |
 | `vector_lake/embedding_scheduler.py` | RPM/TPM 限额下的可断点向量回填（`vec_embeddings`） |
-| `vector_lake/tokenizer.py` | 可插拔 CJK 分词后端（`rjieba` → `jieba`），含 `JIEBA_RS_PINNED` |
+| `vector_lake/tokenizer.py` | CJK 分词后端（`rjieba`，单一后端），含 `JIEBA_RS_PINNED` |
 | `vector_lake/tool_search.py` | 混合检索（本地扩展 + FTS5 BM25 + 多跳 PPR + bm25s 同池重排）与 Memory Packet、上下文组装 |
 | `vector_lake/claim_extractor.py` | Markdown 页面 → entity / claim / evidence / source |
 | `vector_lake/tool_memory.py` | 运行态记忆的物理写回（Wiki-as-Database） |
