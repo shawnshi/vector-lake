@@ -78,6 +78,13 @@ GRAM_FORMAT_VERSION = 2
 #: to be amortised over ~190 searches per write.  Only a missing base (never built, a
 #: truncated table, or an older format version) is built on first use, where there is
 #: nothing to serve and the alternative is failing every search.
+#:
+#: It also bounds how long a *reader* can refuse writers.  The build runs in one
+#: transaction, so a first-use build holds the write lock for its whole duration and a
+#: concurrent writer fails closed once ``db_store.BEGIN_LOCK_BUDGET_SECONDS`` (20 s)
+#: elapses.  At the cost above a 2 000-document build is ~6 s, which stays inside that
+#: budget; raising this cap raises what a writer has to wait for, not only what a search
+#: costs.
 AUTO_REBUILD_MAX_DOCS = 2_000
 #: Documents materialised into the overlay per call.
 DEFAULT_FLUSH_DOCS = 400
@@ -273,6 +280,13 @@ def rebuild_memory_gram_index(dry_run: bool = False, batch_docs: int = 2000) -> 
 
     Staging happens in a temporary ``(gram, doc, mask)`` table so SQLite performs
     the external sort; holding 25 M postings in a Python dict would need gigabytes.
+
+    The projection read, the staging and the swap are one transaction, so a writer on
+    another connection cannot commit in between: it is refused for the duration rather
+    than interleaved.  That also means the whole rebuild has to fit in the WAL, so it
+    needs free disk space comparable to the index.  The returned sentence reports work
+    done rather than guaranteeing a commit: a caller already holding a transaction
+    absorbs these statements into it, and they commit with the caller.
     """
     conn = get_connection()
     init_db()
@@ -292,30 +306,39 @@ def rebuild_memory_gram_index(dry_run: bool = False, batch_docs: int = 2000) -> 
         "gram TEXT NOT NULL, doc INTEGER NOT NULL, mask INTEGER NOT NULL, "
         "PRIMARY KEY (gram, doc)) WITHOUT ROWID"
     )
-    # The staging DDL must run before this cursor is opened: a half-consumed
-    # read statement on the same connection blocks the DDL.
-    docs = conn.execute(
-        "SELECT rowid, key_blob, text_blob, page_blob FROM operational_memory_index ORDER BY rowid"
-    )
-    staged_docs = 0
-    while True:
-        rows = docs.fetchmany(batch_docs)
-        if not rows:
-            break
-        payload = []
-        for row in rows:
-            doc = row["rowid"]
-            grams = extract_grams(row["key_blob"], row["text_blob"], row["page_blob"])
-            payload.extend((gram, doc, mask) for gram, mask in grams.items())
-        with transaction():
-            conn.executemany(
-                "INSERT OR REPLACE INTO operational_memory_gram_stage (gram, doc, mask) VALUES (?, ?, ?)",
-                payload,
-            )
-        staged_docs += len(rows)
-
     gram_count = postings_count = 0
+    staged_docs = 0
+    # One transaction for the whole rebuild: the projection read, the staging and the
+    # swap.  Committing once per batch used to open a window between "this document has
+    # been read" and the swap's queue clear, wide enough for a writer on another
+    # connection to commit a change that the swap then erased the marker for -- leaving
+    # the base holding the pre-change grams of a document with nothing left to make the
+    # read path skip them.  Holding the write lock for the duration makes such a writer
+    # fail closed instead (``DatabaseLockTimeout``, after ``BEGIN_LOCK_BUDGET_SECONDS``),
+    # which is visible in its own right and cannot be mistaken for a clean rebuild.
+    #
+    # The staging DDL above runs before the transaction: a half-consumed read statement
+    # on this connection blocks DDL.
     with transaction():
+        docs = conn.execute(
+            "SELECT rowid, key_blob, text_blob, page_blob FROM operational_memory_index ORDER BY rowid"
+        )
+        while True:
+            rows = docs.fetchmany(batch_docs)
+            if not rows:
+                break
+            payload = []
+            for row in rows:
+                doc = row["rowid"]
+                grams = extract_grams(row["key_blob"], row["text_blob"], row["page_blob"])
+                payload.extend((gram, doc, mask) for gram, mask in grams.items())
+            if payload:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO operational_memory_gram_stage (gram, doc, mask) VALUES (?, ?, ?)",
+                    payload,
+                )
+            staged_docs += len(rows)
+
         conn.execute("DELETE FROM operational_memory_gram_overlay")
         conn.execute("DELETE FROM operational_memory_gram_dirty")
         conn.execute("DELETE FROM operational_memory_gram")
@@ -536,17 +559,22 @@ def prune_retired_gram_docs() -> dict:
     path step; until it runs, the retired documents are simply skipped.
     """
     conn = get_connection()
-    retired = {
-        int(row[0])
-        for row in conn.execute(
-            "SELECT doc FROM operational_memory_gram_dirty AS d "
-            "WHERE NOT EXISTS (SELECT 1 FROM operational_memory_index AS i WHERE i.rowid = d.doc)"
-        )
-    }
-    if not retired:
-        return {"retired": 0, "grams_rewritten": 0}
     rewritten = 0
+    # The snapshot is taken *inside* the transaction.  Read outside it, a document
+    # deleted in between -- or a new document that reused a freed rowid, which the
+    # trigger's ``NOT EXISTS`` guard then does not re-mark -- could have its postings
+    # stripped while its marker was cleared: a live document removed from the base with
+    # nothing left to skip it.  The scan is long enough for that window to be real.
     with transaction():
+        retired = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT doc FROM operational_memory_gram_dirty AS d "
+                "WHERE NOT EXISTS (SELECT 1 FROM operational_memory_index AS i WHERE i.rowid = d.doc)"
+            )
+        }
+        if not retired:
+            return {"retired": 0, "grams_rewritten": 0}
         cursor = conn.execute("SELECT gram, postings FROM operational_memory_gram")
         while True:
             rows = cursor.fetchmany(5000)
