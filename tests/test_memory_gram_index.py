@@ -262,7 +262,6 @@ def test_doctor_treats_a_missing_gram_index_as_degradation(isolated_memory):
     with db_store.transaction():
         for table in (
             "operational_memory_gram",
-            "operational_memory_gram_overlay",
             "operational_memory_gram_dirty",
             "operational_memory_gram_state",
         ):

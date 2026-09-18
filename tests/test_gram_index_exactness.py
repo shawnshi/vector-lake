@@ -106,7 +106,6 @@ def test_a_read_leaves_the_index_state_where_it_found_it(one_doc):
     _put(db_store.get_connection(), "mem_x", "影像 云平台 部署")
     before = (
         memory_gram_index.pending_doc_count(),
-        memory_gram_index.overlay_row_count(),
         memory_gram_index.gram_index_state()["updated_at"],
     )
 
@@ -114,7 +113,6 @@ def test_a_read_leaves_the_index_state_where_it_found_it(one_doc):
 
     after = (
         memory_gram_index.pending_doc_count(),
-        memory_gram_index.overlay_row_count(),
         memory_gram_index.gram_index_state()["updated_at"],
     )
     assert after == before, "a search settled (or disturbed) index state"
@@ -134,10 +132,10 @@ def test_an_absent_base_is_still_built_on_first_use(one_doc):
 def test_a_base_from_the_previous_release_is_not_trusted(one_doc):
     """A version-1 base can satisfy the serving predicate over a stale posting.
 
-    The release that shipped version 1 drained the queue and merged the overlay, which
-    leaves no live marker and no overlay row over a base that both misses a
-    document's current grams and still posts the ones it dropped.  No counter tells
-    that state apart from a clean one, so the format version has to.
+    The release that shipped version 1 drained the queue and merged the (since dropped)
+    overlay, which leaves no live marker over a base that both misses a document's
+    current grams and still posts the ones it dropped.  No counter tells that state apart
+    from a clean one, so the format version has to.
     """
     conn = db_store.get_connection()
     _put(conn, "mem_x", "影像 云平台 部署")
@@ -147,7 +145,6 @@ def test_a_base_from_the_previous_release_is_not_trusted(one_doc):
         conn.execute("UPDATE operational_memory_gram_state SET format_version = 1")
 
     assert memory_gram_index.live_dirty_doc_count() == 0
-    assert memory_gram_index.overlay_row_count() == 0
     assert memory_gram_index.gram_index_usable() is False
 
     assert memory_gram_index.ensure_memory_gram_index() is True
@@ -155,3 +152,41 @@ def test_a_base_from_the_previous_release_is_not_trusted(one_doc):
     assert memory_gram_index.accumulate_relevance(
         ["医保"], skip_docs=memory_gram_index.skip_doc_set(conn)
     ) == {}
+
+
+def test_an_unconverged_schema_does_not_serve(one_doc):
+    """The tripwire the dropped table used to be.
+
+    With the overlay table gone, the only thing that could make the base unservable was the
+    queue -- so a database where an old release's process recreated the overlay table (or
+    where the prune was deferred, or that is a read-only snapshot) would be served again with
+    postings split across two structures, which is exactly the state that produced wrong
+    answers before.  The read path now requires the drop to be on the ledger.
+    """
+    from vector_lake import db_store
+
+    conn = db_store.get_connection()
+    before = memory_gram_index.gram_index_usable()
+    assert before is True
+    assert db_store.GRAM_OVERLAY_DROP in db_store.applied_schema_prunes()
+
+    # An old-release writer's DDL, and a row in it: the previous release refused to serve here.
+    with db_store.transaction():
+        conn.execute(
+            "CREATE TABLE operational_memory_gram_overlay ("
+            "gram TEXT NOT NULL, doc INTEGER NOT NULL, mask INTEGER NOT NULL, "
+            "PRIMARY KEY (gram, doc)) WITHOUT ROWID"
+        )
+        conn.execute(
+            "INSERT INTO operational_memory_gram_overlay (gram, doc, mask) VALUES (?, ?, ?)",
+            ("医保", 1, 1),
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE name = ?", (db_store.GRAM_OVERLAY_DROP,))
+
+    assert memory_gram_index.live_dirty_doc_count() == 0
+    assert memory_gram_index.gram_index_usable() is True, "the base itself is still current"
+    assert memory_gram_index.ensure_memory_gram_index() is False, "an unconverged schema served"
+
+    # And the migration converges it back.
+    assert db_store.apply_legacy_schema_prunes() == [db_store.GRAM_OVERLAY_DROP]
+    assert memory_gram_index.ensure_memory_gram_index() is True

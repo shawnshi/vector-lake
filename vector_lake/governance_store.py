@@ -1187,10 +1187,10 @@ def _gram_memory_candidates(
     """Exact relevance from the n-gram index, ordered by the documented key.
 
     Returns ``None`` when the index cannot answer: absent, written by an older format
-    version, or *any* live dirty document or overlay row over it -- a stale base is
-    refused at every corpus size, because a postings blob that still holds a document's
-    dropped grams cannot be told apart from an exact one, and no read-side drain restores
-    that.  Settling the debt is maintenance's job, not a search's.
+    version, or *any* live dirty document over it -- a stale base is refused at every
+    corpus size, because a postings blob that still holds a document's dropped grams
+    cannot be told apart from an exact one, and no read-side drain restores that.
+    Settling the debt is maintenance's job, not a search's.
     """
     from vector_lake import memory_gram_index
 

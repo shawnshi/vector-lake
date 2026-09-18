@@ -452,8 +452,8 @@ def _create_memory_gram_tables(conn: sqlite3.Connection) -> None:
     ``operational_memory`` -- including ones outside this module -- marks its own
     documents stale.  Nothing here computes grams: that needs Python, and replacing the
     base is a maintenance step the operator or the scheduled block triggers (see
-    ``vector_lake.memory_gram_index``, which also explains why the overlay table below is
-    retained but written by nothing).
+    ``vector_lake.memory_gram_index``).  The overlay table an older release filled is
+    neither created nor read any more, and the prune below drops it where it survives.
     """
     conn.execute(
         """
@@ -462,20 +462,6 @@ def _create_memory_gram_tables(conn: sqlite3.Connection) -> None:
             postings BLOB NOT NULL
         )
         """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS operational_memory_gram_overlay (
-            gram TEXT NOT NULL,
-            doc INTEGER NOT NULL,
-            mask INTEGER NOT NULL,
-            PRIMARY KEY (gram, doc)
-        ) WITHOUT ROWID
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_om_gram_overlay_doc "
-        "ON operational_memory_gram_overlay (doc)"
     )
     conn.execute(
         """
@@ -792,7 +778,6 @@ _SCHEMA_SENTINELS: tuple[str, ...] = (
     "page_index_nodes",
     "page_index_edges",
     "page_index_state",
-    "operational_memory_gram_overlay",
 )
 
 
@@ -842,6 +827,26 @@ def _prune_orphaned_legacy_schema(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+#: The prune that removes the gram overlay table.  Named once because the read path checks
+#: for it: a database whose schema has not converged must not serve from that index.
+GRAM_OVERLAY_DROP = "2026-09-18-drop-gram-overlay"
+
+
+def _prune_gram_overlay(conn: sqlite3.Connection) -> None:
+    """Drop the overlay table a released incremental path used to write.
+
+    Nothing creates it, writes it or reads it any more (``memory_gram_index`` explains why
+    it was wrong, not merely unused), so a database that still has it converges here.  The
+    index on it is dropped with the table.
+
+    Convergence is one-shot per database: the ledger skips a migration it has recorded, so a
+    table re-created *afterwards* by a process of a removed release is not dropped again, and
+    no surface reports it.  Re-running the DROP on every ``init_db()`` would take the write
+    lock on every start, which is the cost the ledger exists to avoid.
+    """
+    conn.execute("DROP TABLE IF EXISTS operational_memory_gram_overlay")
+
+
 def _prune_change_sets_change_id(conn: sqlite3.Connection) -> None:
     """Drop ``change_sets.change_id`` while a pre-prune database still has it.
 
@@ -867,6 +872,7 @@ _LEGACY_SCHEMA_PRUNES: tuple[
 ] = (
     ("2026-09-17-prune-orphaned-legacy-schema", (_prune_orphaned_legacy_schema,)),
     ("2026-09-17-drop-change-sets-change-id", (_prune_change_sets_change_id,)),
+    (GRAM_OVERLAY_DROP, (_prune_gram_overlay,)),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """

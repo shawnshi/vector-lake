@@ -26,12 +26,13 @@ Layout
     and 25 430 371 postings = 97 MB, against 162 MB for the dead FTS projection
     this replaced.  A posting list averages 61 entries, so decoding is cheap.
 
-``operational_memory_gram_overlay(gram, doc, mask)``
-    Retained but **written by nothing** in this tree.  It is what an older release's
-    incremental step wrote, and the read path still refuses to serve while it holds a
-    row, so a database restored from such a release, or written by a process still
-    running that code, degrades to the exact scan instead of answering from a stale
-    base.  Dropping the table is deferred; see the module's correctness section.
+``operational_memory_gram_overlay(gram, doc, mask)`` -- **dropped**
+    This table let an older release's incremental step put a document's postings in two
+    structures at once, which the read path summed as if the overlay replaced the base:
+    a document could be credited for a gram it no longer contained.  Nothing wrote it
+    after the incremental path was removed (see the correctness section), so the table
+    and every reader of it are gone; the schema prune that drops it is recorded in
+    ``db_store._LEGACY_SCHEMA_PRUNES`` so existing databases converge too.
 
 ``operational_memory_gram_dirty(doc)``
     Documents whose base postings cannot be trusted.  A dirty document is skipped
@@ -62,16 +63,17 @@ import sqlite3
 import sys
 import time
 
+from vector_lake import db_store
 from vector_lake.db_store import get_connection, init_db, transaction
 
 log = logging.getLogger("vector-lake-memory-gram-index")
 
 #: Bumped when a previously written base can no longer be trusted to be exact.
 #: Version 1 is not: a database drained by the release that shipped it can hold no
-#: live queue entry and no overlay row over a base that is missing a document's
-#: current grams *and* still posting grams it dropped, which is indistinguishable
-#: from a clean base by counters alone.  Raising the version turns every such
-#: database into a visible ``ready=False`` and one rebuild.
+#: live queue entry over a base that is missing a document's current grams *and* still
+#: posting grams it dropped, which is indistinguishable from a clean base by counters
+#: alone.  Raising the version turns every such database into a visible ``ready=False``
+#: and one rebuild.
 GRAM_FORMAT_VERSION = 2
 #: Largest corpus rebuilt automatically on the read path.  The cap has nothing to do
 #: with how much is queued: a base that is *stale* is never rebuilt from a read, no
@@ -264,11 +266,6 @@ def skip_doc_set(conn=None) -> set[int]:
     return {int(row[0]) for row in conn.execute("SELECT doc FROM operational_memory_gram_dirty")}
 
 
-def overlay_row_count(conn=None) -> int:
-    conn = conn or get_connection()
-    return conn.execute("SELECT COUNT(*) FROM operational_memory_gram_overlay").fetchone()[0]
-
-
 def _record_state(conn, doc_count: int, gram_count: int, postings_count: int, base_docs: int) -> None:
     conn.execute(
         "INSERT INTO operational_memory_gram_state "
@@ -352,7 +349,6 @@ def rebuild_memory_gram_index(dry_run: bool = False, batch_docs: int = 2000) -> 
                 )
             staged_docs += len(rows)
 
-        conn.execute("DELETE FROM operational_memory_gram_overlay")
         conn.execute("DELETE FROM operational_memory_gram_dirty")
         conn.execute("DELETE FROM operational_memory_gram")
         cursor = conn.execute(
@@ -398,18 +394,22 @@ def gram_index_usable() -> bool:
     """True when the base is a complete, current snapshot and can answer exactly.
 
     What this reports on is exactness, not speed, so the base has to be the only
-    thing an answer could come from:
-
-    * a **live document in the queue** has base postings that are stale -- they still
-      contain grams the document no longer has -- so serving the base credits a
-      document for terms it dropped, and the read path has no way to tell;
-    * **a row in the overlay** means a document's postings are split across two
-      structures, and the read path sums them while the overlay is deliberately a
-      replacement for the base.
+    thing an answer could come from: a **live document in the queue** has base
+    postings that are stale -- they still contain grams the document no longer has --
+    so serving the base credits a document for terms it dropped, and the read path has
+    no way to tell.
 
     ``retired`` markers are harmless: they name deleted documents, whose base
     postings the read path skips outright, so they cannot contribute.  That is why
     the queue is read as a breakdown rather than as a total.
+
+    There used to be a second condition -- no row in the overlay table -- because that
+    table let a document's postings live in two structures at once while the read path
+    summed them as if the overlay replaced the base.  The table and its machinery are gone;
+    what stands in its place is the schema check in :func:`ensure_memory_gram_index`, which
+    refuses to serve a database where that drop has not been applied.  Without it the
+    predicate would be weaker than the previous release for exactly one state: an overlay
+    table left with rows by a process running a removed release.
 
     No incremental step restores this condition, and none exists any more: the only
     thing that changes the base is :func:`rebuild_memory_gram_index`, which is the
@@ -420,7 +420,7 @@ def gram_index_usable() -> bool:
         if not gram_index_state()["ready"]:
             return False
         _, live, _ = dirty_breakdown()
-        return live == 0 and overlay_row_count() == 0
+        return live == 0
     except Exception:  # noqa: BLE001 - a missing table simply means "not usable"
         return False
 
@@ -447,6 +447,13 @@ def ensure_memory_gram_index() -> bool:
     conn = get_connection()
     try:
         init_db()
+        # Serving is only allowed once the schema has converged past the overlay table.  The
+        # table is dropped by a recorded migration, so a database that still has it -- a
+        # deferred prune, a read-only snapshot, or a writer from a removed release that
+        # recreated it -- degrades to the exact scan instead of answering from a base whose
+        # postings may be split across two structures.
+        if db_store.GRAM_OVERLAY_DROP not in db_store.applied_schema_prunes():
+            return False
         if gram_index_usable():
             return True
         if not gram_index_state()["ready"] and _projection_doc_count(conn) <= AUTO_REBUILD_MAX_DOCS:
@@ -474,8 +481,7 @@ def rebuild_due_reason(conn=None) -> str | None:
 
     Two reasons, and the second is not a matter of degree: a base that cannot answer a
     search at all -- absent (never built, truncated), written by an older
-    :data:`GRAM_FORMAT_VERSION`, or unusable because overlay rows split documents across
-    two structures -- is due whatever the write count says.  A write-count threshold alone
+    :data:`GRAM_FORMAT_VERSION` -- is due whatever the write count says.  A write-count threshold alone
     reports "not due" for that state *forever*, and that is exactly the state a format
     version bump or a restore leaves a large corpus in: the read path refuses to build an
     absent base above :data:`AUTO_REBUILD_MAX_DOCS`, so nothing else would ever settle it.
@@ -486,13 +492,10 @@ def rebuild_due_reason(conn=None) -> str | None:
     try:
         if not gram_index_state()["ready"]:
             return "no usable base (never built, truncated, or an older format version)"
-        overlay_rows = overlay_row_count(conn)
     except sqlite3.OperationalError:
         # The index tables do not exist yet.  That is a real state on a database whose
         # first writer has not run init_db, and a rebuild is what creates them.
         return "the index tables are absent"
-    if overlay_rows:
-        return f"{overlay_rows} overlay row(s) splitting documents across two structures"
     live = writes_since_rebuild(conn)
     if live >= REBUILD_AFTER_WRITES:
         return f"{live} document(s) written since the last rebuild (threshold {REBUILD_AFTER_WRITES})"
@@ -538,22 +541,12 @@ def _term_base(gram: str, conn) -> bytes | None:
     return row[0] if row else None
 
 
-def _term_overlay(gram: str, conn) -> list[tuple[int, int]]:
-    return [
-        (int(row[0]), int(row[1]))
-        for row in conn.execute(
-            "SELECT doc, mask FROM operational_memory_gram_overlay WHERE gram = ?", (gram,)
-        )
-    ]
-
-
 def accumulate_relevance(terms: list[str], skip_docs: set[int] | None = None) -> dict[int, int]:
     """Exact relevance per document id for ``terms``.
 
-    ``skip_docs`` holds dirty documents whose base postings are stale.  They are
-    credited nothing, not corrected: the queue suppresses them and the overlay is never
-    written, so a search that finds any live dirty document is refused before it gets
-    here (see :func:`gram_index_usable`).
+    ``skip_docs`` holds dirty documents whose base postings are stale.  They are credited
+    nothing, not corrected: the queue suppresses them, so a search that finds any live
+    dirty document is refused before it gets here (see :func:`gram_index_usable`).
     """
     conn = get_connection()
     weights = _FIELD_WEIGHTS
@@ -566,9 +559,6 @@ def accumulate_relevance(terms: list[str], skip_docs: set[int] | None = None) ->
             blob = _term_base(term, conn)
             if blob is not None:
                 _accumulate(blob, weights, accumulator, skip_docs)
-            for doc, mask in _term_overlay(term, conn):
-                if mask:
-                    accumulator[doc] = accumulator.get(doc, 0) + weights[mask & 0x0F]
         else:
             composite.append(term)
     if composite:
@@ -583,7 +573,6 @@ def _composite_candidates(term: str, conn) -> set[int]:
     for bigram in bigrams:
         blob = _term_base(bigram, conn)
         docs = {doc for doc, _ in _entries(blob)} if blob is not None else set()
-        docs.update(doc for doc, _ in _term_overlay(bigram, conn))
         if not docs:
             return set()
         if smallest is None or len(docs) < len(smallest):
@@ -640,7 +629,7 @@ def memory_gram_index_report() -> str:
         f"memory gram index: ready={state['ready']} format={state['format_version']} "
         f"grams={int(state['gram_count'] or 0)} base_docs={int(state['base_docs'] or 0)} "
         f"projection_docs={_projection_doc_count(conn)} "
-        f"overlay_rows={overlay_row_count(conn)} "
+
         f"pending={pending_doc_count(conn)} (live={live_dirty_doc_count(conn)} "
         f"retired={retired_doc_count(conn)}) usable={gram_index_usable()} "
         f"backend={backend_requested()}"

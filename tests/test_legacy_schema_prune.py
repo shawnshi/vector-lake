@@ -106,13 +106,23 @@ def test_the_fast_path_still_runs_pending_prunes(isolated_memory):
     conn = db_store.get_connection()
     db_path = db_store.get_db_path()
     _forget_prunes(conn)
+    # The overlay table too, so the production entry point -- not just a direct call to
+    # ``apply_legacy_schema_prunes`` -- is exercised on the live-shaped state: complete schema,
+    # earlier ledger rows absent, both residues present.
+    for statement in _GRAM_OVERLAY_DDL:
+        conn.execute(statement)
+    conn.commit()
     assert _ORPHANED_NAMES <= _object_names(conn)
+    assert "operational_memory_gram_overlay" in _object_names(conn)
     assert db_store._schema_is_complete(db_path) is True
 
     db_store._INITIALIZED_DB_PATHS.discard(str(db_path.resolve()))
     db_store.init_db()
 
     assert _ORPHANED_NAMES.isdisjoint(_object_names(conn))
+    assert "operational_memory_gram_overlay" not in _object_names(conn), (
+        "init_db is the production entry point and did not drop it"
+    )
     assert set(db_store.applied_schema_prunes(conn)) == set(
         db_store.legacy_schema_prune_names()
     )
@@ -248,3 +258,39 @@ def test_one_failing_migration_does_not_undo_an_earlier_one(isolated_memory, mon
 
     assert "first-migration" in _recorded(conn)
     assert "deliberately-broken" not in _recorded(conn)
+
+
+# The overlay table's pre-prune DDL, verbatim from before this batch removed it.  Recreated
+# here for the same reason as the residue above: if the ledger entry were dropped while a
+# database could still hold the table, this fails instead of the table quietly surviving.
+_GRAM_OVERLAY_DDL = (
+    "CREATE TABLE operational_memory_gram_overlay ("
+    "gram TEXT NOT NULL, doc INTEGER NOT NULL, mask INTEGER NOT NULL, "
+    "PRIMARY KEY (gram, doc)) WITHOUT ROWID",
+    "CREATE INDEX idx_om_gram_overlay_doc ON operational_memory_gram_overlay (doc)",
+)
+
+
+def test_the_gram_overlay_is_dropped_by_its_prune(isolated_memory):
+    """The table is gone from the current schema, so only the prune can remove it."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+
+    assert "operational_memory_gram_overlay" not in _object_names(conn), (
+        "the current schema still creates it, so the prune is not what removes it"
+    )
+    for statement in _GRAM_OVERLAY_DDL:
+        conn.execute(statement)
+    conn.commit()
+    conn.execute("DELETE FROM schema_migrations WHERE name = '2026-09-18-drop-gram-overlay'")
+    conn.commit()
+    assert "operational_memory_gram_overlay" in _object_names(conn)
+
+    applied = db_store.apply_legacy_schema_prunes()
+
+    assert "2026-09-18-drop-gram-overlay" in applied
+    assert "operational_memory_gram_overlay" not in _object_names(conn)
+    assert "idx_om_gram_overlay_doc" not in _object_names(conn)
+    assert "2026-09-18-drop-gram-overlay" in _recorded(conn)
+    # Idempotent: a second call applies nothing and the ledger is unchanged.
+    assert db_store.apply_legacy_schema_prunes() == []

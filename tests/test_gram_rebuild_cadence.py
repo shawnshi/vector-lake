@@ -166,25 +166,6 @@ def test_an_older_format_version_is_due(isolated_memory, monkeypatch):
     assert "format version" in memory_gram_index.rebuild_due_reason()
 
 
-def test_overlay_rows_are_due(isolated_memory, monkeypatch):
-    monkeypatch.setattr(memory_gram_index, "REBUILD_AFTER_WRITES", 500)
-    _write(2)
-    _build()
-
-    conn = db_store.get_connection()
-    doc = conn.execute("SELECT rowid FROM operational_memory_index LIMIT 1").fetchone()[0]
-    with db_store.transaction():
-        conn.execute(
-            "INSERT OR REPLACE INTO operational_memory_gram_overlay (gram, doc, mask) "
-            "VALUES (?, ?, ?)",
-            ("医院", doc, 1),
-        )
-
-    assert memory_gram_index.writes_since_rebuild() == 0
-    assert memory_gram_index.rebuild_due() is True
-    assert "overlay row" in memory_gram_index.rebuild_due_reason()
-
-
 def test_the_threshold_is_not_a_read_path_cap(isolated_memory, monkeypatch):
     """A corpus far larger than the read-path cap is still rebuilt from maintenance.
 

@@ -1,5 +1,85 @@
 # Unreleased
 
+## 环境先行：建立可用备份 + 活库 VACUUM + 删除 gram overlay 表
+
+这三件事有因果顺序：**零可用备份**同时阻塞了「删 overlay 表」与 VACUUM，所以先补备份，再回收空间，最后做 schema 变更。
+
+### 1. 建立并独立核验备份（此前活库零可用备份）
+
+用项目自带的 `db_store.backup_database()`（SQLite online backup，正文已带 `integrity_check`）生成
+`.meta/backups/vector_lake_1789710052.db.bak`，**42.7 s**，大小与活库逐字节相同（2,286,682,112 B）。
+随后**独立复验**：`integrity_check ok`、`quick_check ok`，且五项计数（`operational_memory` 146,679、
+`operational_memory_gram` 420,913、`page_graph_edges` 29,837、`change_sets` 26,774、overlay 0）与活库一致。
+
+### 2. 活库 VACUUM：回收 634 MiB，且先证明了 rowid 稳定
+
+已知风险：`operational_memory_index` 的主键是 **TEXT**（`memory_id`），所以它的 rowid 不是别名，SQLite
+**不承诺** rowid 跨 VACUUM 稳定 —— 而 gram 基表恰恰以这些 rowid 为键。先在**备份的副本**上做实验：
+VACUUM 后全表指纹（`COUNT`/`SUM(rowid)`/`MIN`/`MAX` = 146,679 / 15,024,260,925 / 1 / 203,599）与样本
+`memory_id→rowid` 对**完全相同**，回收 664,629,248 B。随后在**活库**执行：2,286,682,112 →
+**1,622,052,864 B**（同样回收 664,629,248 B，与副本一致），freelist 153,287 → 0，指纹仍完全相同，
+`quick_check ok`，计数不变。若指纹曾变化，既定修复是重建 gram 索引。
+
+### 3. 删除 `operational_memory_gram_overlay`（B4）
+
+该表是上一批「增量机制」的遗留：它允许一个文档的倒排同时存在于两个结构，而读路径按「overlay 替代基表」相加
+—— 这正是能给出错答案的形状。增量机制删除后**没有任何代码写它**（活库 0 行），因此表与所有读取者一并删除：
+
+- `db_store.py`：不再创建该表及其索引；从 `_SCHEMA_SENTINELS` 中移除（**必须**——DDL 已不创建它，保留哨兵会让
+  每次 `init_db()` 都认为 schema 不完整）；新增 prune `2026-09-18-drop-gram-overlay`（`_prune_gram_overlay`），
+  经既有台账机制把仍持有该表的库收敛掉。
+- `memory_gram_index.py`：删除 `overlay_row_count()`、`_term_overlay()` 及其全部调用点；`gram_index_usable`
+  的判据变为 **`ready and live == 0`**（少一个条件）；`rebuild_due_reason` 去掉 overlay 分支；
+  `accumulate_relevance`/`_composite_candidates` 不再合并 overlay 倒排；重建不再清空它；运维报告不再打印
+  `overlay_rows`。
+- `tool_doctor.py`：检查行与告警文案去掉 `overlay_rows`。
+- 测试：`test_overlay_rows_are_due` 随对象删除；读路径状态测试与「版本 1 基表不可信」测试去掉 overlay 项；
+  「表缺失」的 DDL 列表去掉该表；`tests/test_legacy_schema_prune.py` 新增一例，**按删除前的原文重建该表的
+  DDL**、清掉台账行，断言 prune 删掉表与索引、记录自身、且幂等。
+
+### 活库应用与验证
+
+`applied: ['2026-09-18-drop-gram-overlay']`；对象数 **123 → 121**（表 + 其索引），台账新增一行，
+`quick_check ok`，计数不变（146,679 / 420,913 / 29,837 / 26,774）。doctor：
+`Schema Migrations: 3 prune(s) applied`、`Memory Gram Index: usable=True ready=True grams=420913
+queued=0 live_backlog=0 retired=0 cap=2000 due=False of 500`（**不再有 overlay_rows 字段**），
+唯一 FAIL 仍是既存的 Watchdog。
+
+**读路径活库差分**（只读）：索引路径与全量扫描在 **7/7** 条查询上结果一致；探针**未写入任何数据**
+（前后计数完全相同）。
+
+### 复核结论（OK with notes，无 P0/P1）与随之补的三处
+
+复核确认了哨兵移除**必需**（DDL 已不创建该表，保留哨兵会让每次 `init_db()` 都走完整 DDL 路径并取写锁，
+且永远无法收敛）、全树已无 overlay 读取方、删除合并**不可能改变结果**（生产路径在进入合并前就已要求
+overlay 为空）、prune 有序且无依赖、以及「备份 → VACUUM → schema 变更」的顺序正确（恢复点必须在**不可逆**的那一步
+之前，而那一步是 VACUUM）。三条 P2 已补：
+
+1. **恢复了被删掉的绊线**：`gram_index_usable` 少掉的唯一「拒绝服务」条件，其真实含义是「schema 尚未收敛」。
+   现在 `ensure_memory_gram_index` 在 `init_db()` 之后要求 `GRAM_OVERLAY_DROP` 已在台账上，否则返回 False
+   （退回精确扫描）。这覆盖三种残留态：prune 被延迟、只读快照、以及**旧版本进程重新建出该表**。
+   代价是每次搜索多一次三行表的只读 SELECT；若不加以防，唯一比上一版**更弱**的状态就会留在那里。
+   测试 `test_an_unconverged_schema_does_not_serve` 构造「表存在且有行 + 基表仍就绪」，断言不服务、prune 后恢复；
+   可失败性：撤掉该检查 → 恰好这例失败。
+2. **一次性收敛的属性写进 docstring**：台账会跳过已记录的迁移，所以**事后**被旧版本进程重建的表不会再被删，
+   也没有任何界面报告它；每次 `init_db()` 都重跑 DROP 会每次启动都取写锁，正是台账要避免的代价。
+3. **补上入口级测试**：`test_the_fast_path_still_runs_pending_prunes` 现在把 overlay 的 DDL 一并加回残留集，
+   于是**生产入口 `init_db()`** 在「完整 schema + 残留存在」的真实形状上被验证，而不只是直接调用 prune 函数。
+
+复核另外指出：本树**没有 restore 入口**（`backup_database` 是唯一的库级入口，CLI/MCP 只有 `backup-retention`
+与 `wiki-restore`），恢复程序是「停进程、替换数据库文件」，应当先写下来；`backup_retention` 只保留最新 3 份、
+且守护进程会定期修剪，所以**在任何一个破坏性步骤前都应重新核验恢复点**而不是相信今天的记录。据此：
+
+- **第二份恢复点已建立**（变更验证通过之后）：`.meta/backups/vector_lake_1789711565.db.bak`，
+  1,622,052,864 B（post-VACUUM、post-drop 状态），38.5 s。因此现在有两份：变更前 2.29 GB 与变更后 1.62 GB。
+
+**恢复程序（先写下来，免得到时候才想）**：停掉写入进程（MCP / 守护进程）→ 备份当前文件 → 用
+`memory/wiki/.meta/backups/` 下的 `.bak` 覆盖 `memory/wiki/.meta/vector_lake.db` → 删除同目录的 `-wal`/`-shm`
+→ 用 `sqlite3 ... "PRAGMA integrity_check"` 与本文开头的五项计数核验。VACUUM 与 prune 都在库内可重放，
+所以恢复点只需回到 VACUUM 之前的镜像。
+
+全量 pytest **810 passed**（808 + 新增 2 例 - 0）。
+
 ## 声明只在唯一时可用，且文件名优先于声明（+ 存根 id 从页面名派生）
 
 上一批把「一条链接指向哪个页面」统一成了核心名规则，这一批收掉剩下的三个小项，并在复核后修掉四个缺陷。

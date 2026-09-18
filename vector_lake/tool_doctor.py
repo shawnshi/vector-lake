@@ -366,10 +366,6 @@ def doctor_vector_lake() -> str:
             total, live_backlog, retired = memory_gram_index.dirty_breakdown(conn)
         except sqlite3.OperationalError:
             total = live_backlog = retired = 0
-        try:
-            overlay_rows = memory_gram_index.overlay_row_count(conn)
-        except sqlite3.OperationalError:
-            overlay_rows = 0
         usable = memory_gram_index.gram_index_usable()
         try:
             due = memory_gram_index.rebuild_due()
@@ -380,13 +376,13 @@ def doctor_vector_lake() -> str:
             True,
             f"usable={usable} ready={gram_ready} grams={gram_count} "
             f"queued={total} live_backlog={live_backlog} retired={retired} "
-            f"overlay_rows={overlay_rows} cap={memory_gram_index.AUTO_REBUILD_MAX_DOCS} "
+            f"cap={memory_gram_index.AUTO_REBUILD_MAX_DOCS} "
             f"due={due} of {memory_gram_index.REBUILD_AFTER_WRITES}",
         ))
         if not usable:
             warnings.append(
                 f"memory_gram_index_unusable:live_backlog={live_backlog} retired={retired} "
-                f"overlay_rows={overlay_rows} due={due} of "
+                f"due={due} of "
                 f"{memory_gram_index.REBUILD_AFTER_WRITES} "
                 "(rebuild: python cli.py gram-index --if-due --apply)"
             )
