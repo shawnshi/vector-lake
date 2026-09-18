@@ -78,14 +78,16 @@ def test_an_untyped_target_gets_a_prefix_so_the_page_is_a_node(isolated_memory):
 
 def test_a_generated_type_is_refused(isolated_memory):
     assert stub_creator.stub_page_name("System_Roadmap") is None
-    assert stub_creator.create_stub(str(get_wiki_dir()), "System_Roadmap") is None
+    outcome = stub_creator.create_stub(str(get_wiki_dir()), "System_Roadmap")
+    assert outcome.stem is None and outcome.reason == "generated"
 
 
 def test_a_page_under_another_prefix_blocks_the_write(isolated_memory):
     """The fork rule: ``Vendor_Epic-Systems`` covers ``Epic-Systems``."""
     wiki = _wiki("Epic-Systems", {"Vendor_Epic-Systems": _VENDOR_PAGE})
 
-    assert stub_creator.create_stub(str(wiki), "Epic-Systems") is None
+    outcome = stub_creator.create_stub(str(wiki), "Epic-Systems")
+    assert outcome.stem is None and outcome.reason == "covered"
     assert _pages(wiki) == ["Concept_Source.md", "Vendor_Epic-Systems.md"]
 
 
@@ -93,14 +95,16 @@ def test_creating_twice_writes_once(isolated_memory):
     wiki = _wiki("BrandNew-Thing")
     index = stub_creator.existence_index(str(wiki))
 
-    assert stub_creator.create_stub(str(wiki), "BrandNew-Thing", index) == "Concept_BrandNew-Thing"
-    assert stub_creator.create_stub(str(wiki), "BrandNew-Thing", index) is None
+    first = stub_creator.create_stub(str(wiki), "BrandNew-Thing", index)
+    assert first.stem == "Concept_BrandNew-Thing" and first.reason == "created"
+    second = stub_creator.create_stub(str(wiki), "BrandNew-Thing", index)
+    assert second.stem is None and second.reason == "covered"
     assert _pages(wiki).count("Concept_BrandNew-Thing.md") == 1
 
 
 def test_the_created_page_passes_the_schema(isolated_memory):
     wiki = _wiki("BrandNew-Thing")
-    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing")
+    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing").stem
 
     frontmatter, body = _frontmatter(wiki, f"{written}.md")
     validate_schema(frontmatter, body, f"{written}.md")
@@ -140,7 +144,7 @@ def test_the_title_and_heading_are_the_core_name_not_the_stem(isolated_memory):
     name nothing ever links to.
     """
     wiki = _wiki("BrandNew-Thing")
-    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing")
+    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing").stem
     frontmatter, body = _frontmatter(wiki, f"{written}.md")
 
     assert frontmatter["title"] == "BrandNew-Thing"
@@ -155,7 +159,7 @@ def test_a_stub_plants_no_link_that_auto_fix_would_turn_into_a_page(isolated_mem
     and the 788 broken links it does have are not to be added to by the fix for broken links.
     """
     wiki = _wiki("BrandNew-Thing")
-    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing")
+    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing").stem
     _, body = _frontmatter(wiki, f"{written}.md")
 
     assert "[[20" not in body, body
@@ -173,7 +177,7 @@ def _links(body: str) -> list[str]:
 
 def test_the_id_shape_matches_the_live_wikis_convention(isolated_memory):
     wiki = _wiki("BrandNew-Thing")
-    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing")
+    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing").stem
     frontmatter, _ = _frontmatter(wiki, f"{written}.md")
 
     stamp, _, suffix = frontmatter["id"].partition("_")
@@ -212,10 +216,10 @@ def test_both_callers_ask_the_one_owner_for_the_same_page(isolated_memory, monke
     wiki = _wiki("BrandNew-Thing")
     stub_path = wiki / "Concept_BrandNew-Thing.md"
 
-    created_by_query = tool_query._generate_stubs_for_broken_links(
+    created_by_query, refused_by_query = tool_query._generate_stubs_for_broken_links(
         str(wiki), {"Concept_Source.md"}
     )
-    assert created_by_query == 1, "the query-side creator still creates nothing"
+    assert (created_by_query, refused_by_query) == (1, 0), "the query-side creator wrote nothing"
     assert calls == ["BrandNew-Thing"], "query does not ask the shared owner"
     query_fm, query_body = _frontmatter(wiki, stub_path.name)
 
@@ -233,3 +237,53 @@ def test_both_callers_ask_the_one_owner_for_the_same_page(isolated_memory, monke
     lint_fm.pop("id")
     assert query_fm == lint_fm
     assert query_body == lint_body
+
+
+# --- a closed gate is not "nothing to do" ------------------------------------
+
+
+def test_a_refused_write_says_so(isolated_memory, monkeypatch):
+    """The defect this replaces: a systemic refusal looked exactly like an empty wiki.
+
+    ``write_markdown_file`` is where the gates live -- the purpose contract, the coordinator,
+    the path check -- so patching it to raise stands in for all of them being closed at once.
+    """
+    wiki = _wiki("BrandNew-Thing")
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("Path traversal blocked")
+
+    monkeypatch.setattr(stub_creator, "write_markdown_file", refuse)
+    outcome = stub_creator.create_stub(str(wiki), "BrandNew-Thing")
+
+    assert outcome.stem is None
+    assert outcome.reason == "refused"
+    assert outcome.refused is True, "a closed gate must be distinguishable from no work"
+    assert _pages(wiki) == ["Concept_Source.md"]
+
+
+def test_lint_reports_refused_writes_instead_of_a_bare_zero(isolated_memory, monkeypatch):
+    """``Auto-fixed: 0`` alone reads as "nothing needed fixing", which is the wrong story."""
+    wiki = _wiki("BrandNew-Thing")
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("purpose contract missing")
+
+    monkeypatch.setattr(stub_creator, "write_markdown_file", refuse)
+    report = tool_lint.lint_vector_lake(auto_fix=True)
+
+    assert "Stub writes refused: 1" in report, report.splitlines()[1]
+    assert "Auto-fixed: 0" in report
+    assert _pages(wiki) == ["Concept_Source.md"]
+
+
+def test_query_reports_refused_writes_instead_of_silence(isolated_memory, monkeypatch):
+    wiki = _wiki("BrandNew-Thing")
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("purpose contract missing")
+
+    monkeypatch.setattr(stub_creator, "write_markdown_file", refuse)
+    created, refused = tool_query._generate_stubs_for_broken_links(str(wiki), {"Concept_Source.md"})
+
+    assert (created, refused) == (0, 1), "a refused write was counted as nothing to do"

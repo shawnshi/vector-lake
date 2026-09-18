@@ -133,6 +133,7 @@ def lint_vector_lake(auto_fix: bool = False):
     files = [name for name in listed if name not in NON_NODE_WIKI_FILES]
     issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment"]}
     fixes_applied = 0
+    stubs_refused = 0
 
     parsed = {}
     id_map = {}
@@ -311,13 +312,17 @@ def lint_vector_lake(auto_fix: bool = False):
                     # logged, so the link was simply never fixed and the report said nothing.
                     # What a stub is now belongs to one owner; see
                     # ``vector_lake.stub_creator`` for the rules and why each was chosen.
-                    written = stub_creator.create_stub(wiki_dir, target, stub_index)
-                    if written:
-                        all_keys.add(written)
-                        link_target_map[written] = written
+                    outcome = stub_creator.create_stub(wiki_dir, target, stub_index)
+                    if outcome.refused:
+                        stubs_refused += 1
+                    elif outcome.stem:
+                        all_keys.add(outcome.stem)
+                        link_target_map[outcome.stem] = outcome.stem
                         # Keep the core map in step: within one pass, a link written before this
                         # stub must resolve against what is now on disk.
-                        unique_cores.setdefault(normalize_entity_name(strip_prefix(written)), written)
+                        unique_cores.setdefault(
+                            normalize_entity_name(strip_prefix(outcome.stem)), outcome.stem
+                        )
                         fixes_applied += 1
 
     # 5. Frontmatter, Type, Status, Category
@@ -579,7 +584,14 @@ def lint_vector_lake(auto_fix: bool = False):
     }
 
     total_issues = sum(len(items) for items in issues.values())
-    lines = ["=== Vector Lake Lint Report ===", f"Scanned: {len(files)} files | Issues: {total_issues} | Auto-fixed: {fixes_applied}", ""]
+    header = f"Scanned: {len(files)} files | Issues: {total_issues} | Auto-fixed: {fixes_applied}"
+    if stubs_refused:
+        # A refusal is a closed gate (no purpose contract, unreachable coordinator, a path
+        # outside the wiki), so every stub in the pass was refused.  That is not the same as
+        # "there was nothing to write", and a report that showed only "Auto-fixed: 0" would
+        # read as the second.
+        header += f" | Stub writes refused: {stubs_refused} (see the log)"
+    lines = ["=== Vector Lake Lint Report ===", header, ""]
     for key, name in check_names.items():
         items = issues[key]
         lines.append(f"{name}: {'[PASS]' if not items else f'[FAIL: {len(items)}]'}")

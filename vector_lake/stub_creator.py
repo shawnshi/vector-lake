@@ -57,6 +57,7 @@ import os
 import random
 import re
 import string
+from dataclasses import dataclass
 
 from vector_lake.node_vocabulary import (
     GENERATED_NODE_TYPES,
@@ -212,17 +213,47 @@ def stub_body(page_stem: str, node_type: str, today: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class StubOutcome:
+    """What :func:`create_stub` did, and why it did not when it did not.
+
+    A bare ``str | None`` conflated "there was nothing to create" with "the write was
+    refused", and those need different responses: the first is the normal state of a wiki, the
+    second means a gate is closed -- a missing purpose contract, an unreachable coordinator, a
+    path outside the wiki -- so every stub in the pass will be refused too.  Silence there is
+    the same failure shape as the defect the shared creator was built to remove (a swallowed
+    exception that created nothing for a whole run).
+    """
+
+    #: The stem written, or ``None``.
+    stem: str | None
+    #: ``created`` / ``generated`` (a type the indexer skips) / ``covered`` (a page already
+    #: answers the name) / ``invalid`` (the target names no page) / ``refused`` (the write
+    #: was refused and logged).
+    reason: str
+
+    @property
+    def refused(self) -> bool:
+        """True when nothing was written because a gate closed, not because it was unneeded."""
+        return self.reason == "refused"
+
+
+#: ``reason`` values that mean "nothing to do", as opposed to a closed gate.
+_NO_WORK = ("generated", "covered", "invalid")
+
+
 def create_stub(
     wiki_dir: str,
     target: str,
     index: tuple[set[str], set[str], dict[str, str]] | None = None,
-) -> str | None:
+) -> StubOutcome:
     """Write the stub ``target`` needs, unless something already covers it.
 
-    Returns the stem written (``"Concept_BrandNew-Thing"`` -- the caller adds it to its own
-    link maps) or ``None`` when nothing was written: generated type, already covered, or the
-    write itself refused.  A refused write is logged and not raised, so one unwritable stub
-    does not abandon the rest of a pass.
+    Returns a :class:`StubOutcome` whose ``stem`` is the page written (``"Concept_BrandNew-Thing"``
+    -- the caller adds it to its own link maps) and whose ``reason`` says why not when it is
+    ``None``.  A refused write is logged, at ``error``, and not raised, so one unwritable stub
+    does not abandon the rest of a pass -- but it is distinguishable from having had nothing to
+    write.
     """
     page_name = stub_page_name(target)
     if page_name is None:
@@ -231,7 +262,7 @@ def create_stub(
             target,
             type_for_node_id(target),
         )
-        return None
+        return StubOutcome(None, "generated")
     index = index if index is not None else existence_index(wiki_dir)
     stem = page_name[:-3]
     covering = covering_page(stem, index)
@@ -242,7 +273,7 @@ def create_stub(
                 stem,
                 covering,
             )
-        return None
+        return StubOutcome(None, "covered")
     node_type = stub_type(stem)
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     try:
@@ -253,11 +284,13 @@ def create_stub(
             skip_validation=False,
         )
     except Exception as exc:  # noqa: BLE001 - one refused stub must not stop the pass
-        log.warning("Failed to create stub %s.md: %s", stem, exc)
-        return None
+        # ``error``, and with the traceback: a refusal is a closed gate, not a benign skip, and
+        # the caller's report says how many of them happened.
+        log.error("Refused to create stub %s.md: %s", stem, exc, exc_info=True)
+        return StubOutcome(None, "refused")
     stems, normalized, cores = index
     stems.add(stem)
     normalized.add(normalize_entity_name(stem))
     cores[strip_prefix(stem)] = stem
     log.info("Created stub page: %s.md", stem)
-    return stem
+    return StubOutcome(stem, "created")

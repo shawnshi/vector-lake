@@ -127,16 +127,27 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
         # Subagent already wrote them via write_wiki_page which calls execute_mutation_plan.
         # We only need to generate stubs.
             
-        stubs_created = _generate_stubs_for_broken_links(wiki_dir, valid_files)
+        stubs_created, stubs_refused = _generate_stubs_for_broken_links(wiki_dir, valid_files)
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
+        refusal_note = (
+            f" {stubs_refused} stub write(s) were refused -- a gate rejected them (see the log)."
+            if stubs_refused
+            else ""
+        )
         return (
-            f"Query finalization completed. {len(valid_files)} page(s) synced. {stubs_created} stub(s) generated.\n"
+            f"Query finalization completed. {len(valid_files)} page(s) synced. {stubs_created} stub(s) generated.{refusal_note}\n"
             f"Canonical change set: mutation_coordinator_handled\n\n{trace}"
         )
     return "Query finalization completed with no valid wiki files synced."
 
 
-def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
+def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> tuple[int, int]:
+    """``(created, refused)`` for the broken links in ``files_to_scan``.
+
+    ``refused`` counts writes a gate rejected -- as opposed to names that needed no page, which
+    are the normal case and are counted nowhere.  Before this split, a run in which every write
+    was refused returned 0 and read exactly like a wiki with nothing to fix.
+    """
     existing_files, normalized_existing, existing_cores = stub_creator.existence_index(wiki_dir)
     existing = (existing_files, normalized_existing, existing_cores)
     broken_targets = set()
@@ -184,6 +195,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
         return 0
 
     stubs = 0
+    refused = 0
     # What a stub is -- its name, type, fields and the write path -- belongs to one owner.
     # This used to build the page here and hand ``<target>.md`` to ``execute_mutation_plan``,
     # which no node may be named: the write was refused and the exception swallowed, so this
@@ -194,7 +206,18 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
     # in place, so a stub written for one target is seen as covering its own name by the next
     # iteration.  A second index here would leave that update on a set nothing reads again.
     for target in sorted(broken_targets):
-        if stub_creator.create_stub(wiki_dir, target, existing):
+        outcome = stub_creator.create_stub(wiki_dir, target, existing)
+        if outcome.stem:
             stubs += 1
-    return stubs
+        elif outcome.refused:
+            refused += 1
+    if refused:
+        # The count is about closed gates, not about missing links; folding it into ``stubs``
+        # would hide a run in which nothing could be written.
+        log.error(
+            "%s stub write(s) refused: every stub in this pass failed the same gate "
+            "(the log above has the traceback).",
+            refused,
+        )
+    return stubs, refused
 
