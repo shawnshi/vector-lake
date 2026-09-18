@@ -371,18 +371,24 @@ def doctor_vector_lake() -> str:
         except sqlite3.OperationalError:
             overlay_rows = 0
         usable = memory_gram_index.gram_index_usable()
+        try:
+            due = memory_gram_index.rebuild_due()
+        except sqlite3.OperationalError:
+            due = False
         checks.append((
             "Memory Gram Index",
             True,
             f"usable={usable} ready={gram_ready} grams={gram_count} "
             f"queued={total} live_backlog={live_backlog} retired={retired} "
-            f"overlay_rows={overlay_rows} cap={memory_gram_index.AUTO_REBUILD_MAX_DOCS}",
+            f"overlay_rows={overlay_rows} cap={memory_gram_index.AUTO_REBUILD_MAX_DOCS} "
+            f"due={due} of {memory_gram_index.REBUILD_AFTER_WRITES}",
         ))
         if not usable:
             warnings.append(
                 f"memory_gram_index_unusable:live_backlog={live_backlog} retired={retired} "
-                f"overlay_rows={overlay_rows} "
-                "(rebuild_memory_gram_index restores the indexed path)"
+                f"overlay_rows={overlay_rows} due={due} of "
+                f"{memory_gram_index.REBUILD_AFTER_WRITES} "
+                "(rebuild: python cli.py gram-index --if-due --apply)"
             )
     except Exception as e:
         checks.append(("Memory Gram Index", False, f"Check failed: {e}"))

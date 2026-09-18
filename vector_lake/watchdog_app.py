@@ -492,6 +492,27 @@ def scheduled_lint_loop():
                         log.info("Graph topology refreshed during scheduled lint.")
                     lint_vector_lake(auto_fix=False)
 
+                    # Settle the index before the checkpoint below, not after: a rebuild
+                    # is the largest single transaction this process runs, so it is also
+                    # what leaves the most in the WAL for that truncate to reclaim.
+                    # "Due" is a write count rather than a duration -- see
+                    # memory_gram_index.REBUILD_AFTER_WRITES -- so a corpus that has not
+                    # moved is left alone instead of being rebuilt every occurrence.
+                    try:
+                        from vector_lake import memory_gram_index
+
+                        if memory_gram_index.rebuild_due():
+                            # The build holds the write lock for minutes, so it has to be
+                            # visible on the status surface while it runs rather than only
+                            # in the log line written after it returns.
+                            write_status("processing", 0, index_queue.qsize(), "Rebuilding memory gram index", "", component="scheduler")
+                        log.info(
+                            "Scheduled gram-index maintenance: %s",
+                            memory_gram_index.maybe_rebuild_memory_gram_index(),
+                        )
+                    except Exception as e:
+                        log.error(f"Scheduled gram-index rebuild failed: {e}")
+
                     # Truncate WAL to prevent unbounded growth
                     from vector_lake.db_store import get_connection
                     try:

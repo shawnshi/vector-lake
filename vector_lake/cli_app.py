@@ -82,6 +82,7 @@ Usage Examples:
         help="[SEARCH] Report or rebuild the exact n-gram index used by operational-memory search.",
     )
     gram_index_parser.add_argument("--apply", action="store_true", help="Run the bulk rebuild. Defaults to dry-run.")
+    gram_index_parser.add_argument("--if-due", action="store_true", dest="if_due", help="Rebuild only if REBUILD_AFTER_WRITES documents have been written since the last rebuild.")
     gram_index_parser.add_argument("--compact", action="store_true", help="Merge the overlay into the base and prune retired documents.")
 
     projection_report_parser = subparsers.add_parser("projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift.")
@@ -207,7 +208,12 @@ def main() -> int:
             if getattr(args, "compact", False):
                 print(tools.compact_memory_gram_overlay())
                 print(tools.prune_retired_gram_docs())
-            if getattr(args, "apply", False):
+            if getattr(args, "if_due", False):
+                # The cadence's operator entry point: rebuild only when the write count
+                # says so, so this can be run on a schedule without rebuilding a corpus
+                # that has not moved.
+                print(tools.maybe_rebuild_memory_gram_index(dry_run=not getattr(args, "apply", False)))
+            elif getattr(args, "apply", False):
                 print(tools.rebuild_memory_gram_index(dry_run=False))
             elif not getattr(args, "compact", False):
                 print(tools.rebuild_memory_gram_index(dry_run=True))

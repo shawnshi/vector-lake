@@ -1,5 +1,100 @@
 # Unreleased
 
+## 给 gram 索引定一个重建节奏
+
+索引只在「上次重建以来没有任何文档被写入」时才精确（`gram_index_usable()`）；任何一次写入之后，搜索都会
+退回精确扫描，直到有人重建。活库（146,679 文档）实测：
+
+| | 索引路径 | 精确扫描 |
+|---|---|---|
+| 每次搜索中位数 | 0.295 s | 0.745 s |
+| 8 条查询合计 | 2.906 s | 5.747 s |
+
+一次重建约 **430 s**，且（上一批之后）整个重建期间**拒绝所有写入**，还会把 WAL 涨到暂存表（约 352 MB）
+加基表重写（约 97 MB）的量级。按每次搜索省 0.355 s 算，一次重建要约 **1200 次搜索**才回本。
+
+所以 `REBUILD_AFTER_WRITES = 500` 这个数不是按回本点定的，而是按「允许多陈旧」定的：真正稀缺的共享资源
+是写入，任何省下的搜索时间都换不回一次因 20 s 锁预算失败而重试的摄取。常数注释里写了这套算术与理由。
+
+### 触发位置
+
+新增 `writes_since_rebuild()`（= 队列中**活文档**数）、`rebuild_due()`、`maybe_rebuild_memory_gram_index()`
+作为唯一维护入口。读路径**未改**：`ensure_memory_gram_index` 在任何语料规模下都不重建陈旧基表，只重建
+**缺失**的基表 —— 这正是本节奏赖以成立的规则，所以专门加了一条守卫测试盯着它（把读路径改成「due 即自愈」
+会让该测试失败，已验证）。
+
+两个触发点：
+
+- 守护进程的定时维护块：在 `global_task_lock` 内、自动 lint 之后、**WAL checkpoint 之前**调用。顺序不是
+  随意的：重建是本进程最大的一笔事务，也正是最需要随后那条 `wal_checkpoint(TRUNCATE)` 去回收的。
+- `gram-index --if-due`（默认 dry-run 报告）/ `--if-due --apply`（重建）。不带 `--if-due` 时 `gram-index`
+  行为不变（报告 + dry-run 预览）。**本机没有守护进程，所以定时那份触发不会发生**——`doctor` 里 `due=True`
+  却没人执行时，索引会一直停在精确扫描上，这正是 `due=` 必须可见的原因。
+
+阈值按**文档数**计，不按事务或时长：同一文档改十次只算一次，因为它只让后续搜索多付一次扫描差价。
+
+### 可见性
+
+doctor 的 `Memory Gram Index` 现在带 `due=False of 500`。这是**欠账的当前值**，不是故障：`usable=False`
+时既有的降级告警已经会出现，`due=` 只是让操作者知道该不该跑 `--if-due --apply`。
+
+**运营前提（必须写明）**：本机没有运行守护进程，所以定时那份触发不会发生，节奏实际由人按 `due=` 手工
+执行 `--if-due --apply`。这不是缺陷，但它意味着「每 500 条写入重建」在无人值守的本机并不自动成立。
+
+### 复核发现并修掉的 P1：阈值看不见「根本不能服务」的基表
+
+独立复核（只读子代理）在「OK with notes」里指出一条 P1，**这条是真的，而且必须修**：`rebuild_due()` 原本
+只看写入计数，因此对 `ready=False` 的基表（从未建立、被截断、或写入版本更旧）在 `live < 500` 时一律回答
+「未到期」——而大语料的读路径拒绝建立缺失基表，于是**永远没人会去建立它**。这恰好是「抬版本号」或「恢复
+备份」给大语料留下的状态：我上一批把 `GRAM_FORMAT_VERSION` 1 抬到 2 时，注释写的就是「这类库变成
+`ready=False` 并重建一次」，但如果没人手工跑 `--apply`，`--if-due` 会说「未到期」。
+
+修法：`rebuild_due_reason()` 成为唯一判据来源，返回**原因文本**而不是布尔值（这同时修掉了 dry-run 文案
+里「0 document(s) written」无法解释「为什么建议重建」的自相矛盾），三条并列原因：基表不可用、有 overlay
+行、写入计数达标。`rebuild_due()` 退化为 `reason is not None`。
+
+活库实证（只读，未写入）：把 `GRAM_FORMAT_VERSION` 临时改成 3 模拟抬版本 →
+
+```
+Memory gram index is due: no usable base (never built, truncated, or an older format version);
+0 retired marker(s) of 0 queued. Rebuild with `gram-index --if-due --apply`.
+[OK] Memory Gram Index: usable=False ready=False ... due=True of 500
+[WARN] ... memory_gram_index_unusable:live_backlog=0 ... due=True of 500 (rebuild: python cli.py gram-index --if-due --apply)
+```
+
+修复前同一状态打印的是「not due: 0 document(s) written」。复验后活库 state 仍为 `format_version=2`、
+计数逐项未变，证明 dry-run 路径确实没有写入。
+
+### 其余复核项（F2–F7，均已修）
+
+- **F2**：重建期间状态文件里仍写着 "Running Scheduled Auto-Lint"，而唯一那行日志是**调用返回之后**才写的
+  （调用本身是 `log.info` 的实参）。现在到期时先 `write_status(..., "Rebuilding memory gram index", ...)`。
+- **F3**：那个调用点与「重建在 checkpoint 之前」的顺序**没有测试**，安全性只靠注释。新增 `tests/test_scheduled_lint.py`
+  一例：走真实 `scheduled_lint_loop()`，用一个包装连接记录 `PRAGMA wal_checkpoint`，断言 `gram` 先于
+  `checkpoint`。可失败性：把两块顺序互换 → `assert 3 < 1` 失败。
+- **F4**：dry-run 文案 "Run with dry_run=False to rebuild." 是 Python API 用语，操作者的开关是 `--apply`；
+  改为 ``Rebuild with `gram-index --if-due --apply`.``
+- **F5**：`Memory Gram Index` 检查恒为 `ok=True`，其 WARN 只写 `live_backlog=N` 而不含阈值，并把
+  `rebuild_memory_gram_index`（Python 符号）当成给操作者的指引。现在 WARN 带 `due=`/阈值并给出可直接运行的
+  命令。
+- **F6**：README 那段列了两个触发点却没写「定时那份需要守护进程在跑」，只有未发布的 CHANGELOG 写了这条前提
+  ——对一个未来的读者来说，操作文档比变更日志更不诚实。README 已补一句，并指向 `doctor` 的 `Watchdog Status`。
+- **F7**：`governance_store._gram_memory_candidates` 的 docstring 仍写着「积压太大所以读路径不排空」，而排空
+  机制早已不存在（真实规则是「陈旧基表在任何规模下都拒绝」）。这句正好与本节奏的前提相反，已改正。属**既有
+  文档漂移**，非本批引入，在此标注。
+
+### 测试
+
+`tests/test_gram_rebuild_cadence.py` **10 例**：阈值按文档计（改两次只算一次）、未达标时维护入口**一次都不
+调用** `rebuild_memory_gram_index`（用 spy 断言零调用，而不是看返回文案）、达标时重建并把欠账清回 0、
+**读路径仍拒绝重建陈旧基表**、维护入口**不继承** `AUTO_REBUILD_MAX_DOCS`（否则大语料永远无法重建，活库正
+处在这个状态），以及三条「不可服务即到期」原因各一例。加上 `tests/test_scheduled_lint.py` 的新顺序例。
+
+可失败性（均实测后恢复）：读路径改成「due 即自愈」→ 恰好那条守卫失败；`rebuild_due` 退回只数写入 → 恰好
+三条「不可服务即到期」失败；把重建移到 checkpoint 之后 → 顺序断言失败。
+
+全量 pytest **772 passed**（761 + 11）；活库计数、队列、`page_graph_edges` 与 state 行在跑套件前后逐项相同。
+
 ## 维护操作各自只取一次快照
 
 `rebuild_memory_gram_index` 原先逐批提交暂存，然后在一个**后置**事务里清空队列。两件事之间开了一个

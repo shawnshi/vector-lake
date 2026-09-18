@@ -56,6 +56,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 
@@ -86,6 +87,24 @@ GRAM_FORMAT_VERSION = 2
 #: budget; raising this cap raises what a writer has to wait for, not only what a search
 #: costs.
 AUTO_REBUILD_MAX_DOCS = 2_000
+#: Documents written since the last rebuild at which the index is due for one.
+#:
+#: Measured on the live lake (146 679 documents, 2026-09-18): the indexed path answers a
+#: search in 0.295 s median against 0.745 s for the exact scan, so restoring it saves
+#: ~0.355 s per search -- while one rebuild costs ~430 s and refuses **every** writer for
+#: its duration.  A rebuild therefore only pays for itself after ~1 200 searches, and the
+#: number that decides this constant is not that break-even but how long a rebuild may
+#: stop writes: writes are the shared resource, and no amount of saved search time buys
+#: back an ingest that failed against a 20 s lock budget.  So rebuilds stay rare
+#: deliberately, and the threshold is set by tolerated staleness rather than by search
+#: savings.  At the observed write rate (~tens of documents a day) 500 means one rebuild
+#: every few weeks; each one costs that 430 s window once.
+#:
+#: This is a *maintenance* trigger, never a read-path one:
+#: :func:`ensure_memory_gram_index` leaves a stale base alone at any size, and only
+#: :func:`maybe_rebuild_memory_gram_index` -- the scheduled block in the watchdog and
+#: ``gram-index --if-due`` -- settles the debt.
+REBUILD_AFTER_WRITES = 500
 #: Documents materialised into the overlay per call.
 DEFAULT_FLUSH_DOCS = 400
 #: Overlay grams merged into the base per explicit compaction call.
@@ -671,6 +690,77 @@ def ensure_memory_gram_index() -> bool:
     except Exception as exc:  # noqa: BLE001 - any fault must degrade, never raise
         log.warning("Memory gram index unusable (%s: %s); falling back to the exact scan.", type(exc).__name__, exc)
         return False
+
+
+def writes_since_rebuild(conn=None) -> int:
+    """Live dirty documents: those whose base postings no longer match them.
+
+    The count is in documents rather than transactions because that is what a search
+    pays for: each such document makes :func:`gram_index_usable` false and sends every
+    later search down the exact scan.  Retired markers are excluded -- they name deleted
+    documents, whose base postings the read path skips outright.
+    """
+    _, live, _ = dirty_breakdown(conn)
+    return live
+
+
+def rebuild_due_reason(conn=None) -> str | None:
+    """Why a rebuild is due, or ``None`` when it is not.
+
+    Two reasons, and the second is not a matter of degree: a base that cannot answer a
+    search at all -- absent (never built, truncated), written by an older
+    :data:`GRAM_FORMAT_VERSION`, or unusable because overlay rows split documents across
+    two structures -- is due whatever the write count says.  A write-count threshold alone
+    reports "not due" for that state *forever*, and that is exactly the state a format
+    version bump or a restore leaves a large corpus in: the read path refuses to build an
+    absent base above :data:`AUTO_REBUILD_MAX_DOCS`, so nothing else would ever settle it.
+    Reporting the reason rather than a bare boolean is also what keeps the dry-run text
+    honest, since "0 documents written" cannot explain why a rebuild is proposed.
+    """
+    conn = conn or get_connection()
+    try:
+        if not gram_index_state()["ready"]:
+            return "no usable base (never built, truncated, or an older format version)"
+        overlay_rows = overlay_row_count(conn)
+    except sqlite3.OperationalError:
+        # The index tables do not exist yet.  That is a real state on a database whose
+        # first writer has not run init_db, and a rebuild is what creates them.
+        return "the index tables are absent"
+    if overlay_rows:
+        return f"{overlay_rows} overlay row(s) splitting documents across two structures"
+    live = writes_since_rebuild(conn)
+    if live >= REBUILD_AFTER_WRITES:
+        return f"{live} document(s) written since the last rebuild (threshold {REBUILD_AFTER_WRITES})"
+    return None
+
+
+def rebuild_due(conn=None) -> bool:
+    """True when a rebuild is due: the index is behind, or it cannot serve at all."""
+    return rebuild_due_reason(conn) is not None
+
+
+def maybe_rebuild_memory_gram_index(dry_run: bool = False) -> str:
+    """Rebuild if the index has fallen far enough behind, otherwise say it has not.
+
+    The cadence's entry point.  A stale base is never rebuilt from the read path, so the
+    debt is settled here: the scheduled maintenance block in the watchdog and
+    ``gram-index --if-due`` both run when holding the write lock for the length of a build
+    is acceptable.  The watchdog runs this *before* its WAL checkpoint, which is what
+    reclaims the WAL this transaction grows.
+    """
+    reason = rebuild_due_reason()
+    if reason is None:
+        return (
+            f"Memory gram index is not due: {writes_since_rebuild()} document(s) written "
+            f"since the last rebuild, threshold {REBUILD_AFTER_WRITES}."
+        )
+    if dry_run:
+        total, _, retired = dirty_breakdown()
+        return (
+            f"Memory gram index is due: {reason}; {retired} retired marker(s) of {total} "
+            "queued. Rebuild with `gram-index --if-due --apply`."
+        )
+    return rebuild_memory_gram_index(dry_run=False)
 
 
 # --- query ------------------------------------------------------------------

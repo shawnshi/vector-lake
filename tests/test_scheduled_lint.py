@@ -119,6 +119,72 @@ def test_loop_runs_a_due_occurrence_and_records_only_a_completed_one(isolated_me
     assert "2026-09-17-10" in events, "a completed occurrence was not recorded"
 
 
+def test_loop_rebuilds_the_gram_index_before_the_checkpoint(isolated_memory, monkeypatch):
+    """Order matters: the rebuild is the largest transaction, so the truncate follows it.
+
+    The cadence only holds if a scheduled occurrence actually calls the rebuild, and the
+    WAL the rebuild grows is only reclaimed by the checkpoint that runs after it.
+    """
+    events = []
+
+    class _Stop(Exception):
+        pass
+
+    monkeypatch.setattr(watchdog_app, "_load_last_scheduled_lint", lambda: "")
+    monkeypatch.setattr(watchdog_app, "_save_last_scheduled_lint", lambda _o: None)
+    monkeypatch.setattr(watchdog_app, "write_status", lambda *a, **k: None)
+    monkeypatch.setattr(watchdog_app.time, "localtime", lambda *a: _local_time(2026, 9, 17, 12))
+    monkeypatch.setattr(
+        watchdog_app.time, "sleep", lambda _s: (_ for _ in ()).throw(_Stop())
+    )
+
+    import vector_lake.db_store as db_store
+    import vector_lake.memory_gram_index as memory_gram_index
+    import vector_lake.tool_lint as tool_lint
+    import vector_lake.indexer as indexer
+
+    monkeypatch.setattr(indexer, "refresh_graph_topology_if_dirty", lambda: False)
+    monkeypatch.setattr(tool_lint, "lint_vector_lake", lambda auto_fix=False: events.append("lint"))
+
+    def _due(conn=None):
+        events.append("due")
+        return True
+
+    def _rebuild(dry_run=False):
+        events.append("gram")
+        return "rebuilt"
+
+    monkeypatch.setattr(memory_gram_index, "rebuild_due", _due)
+    monkeypatch.setattr(memory_gram_index, "maybe_rebuild_memory_gram_index", _rebuild)
+    monkeypatch.setattr(
+        "vector_lake.backup_retention.prune_backups",
+        lambda path, dry_run=False: events.append("backup") or {},
+    )
+
+    # Only the checkpoint block imports get_connection *inside* the function, so patching
+    # the module attribute reaches it without disturbing the modules that bound the name
+    # at import time.
+    real = db_store.get_connection()
+
+    class _Recorder:
+        def execute(self, sql, *args):
+            if "checkpoint" in sql:
+                events.append("checkpoint")
+            return real.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    monkeypatch.setattr(db_store, "get_connection", lambda: _Recorder())
+
+    with pytest.raises(_Stop):
+        watchdog_app.scheduled_lint_loop()
+
+    assert "gram" in events, "a scheduled occurrence never settled the index"
+    assert "checkpoint" in events, "the checkpoint did not run"
+    assert events.index("gram") < events.index("checkpoint"), events
+
+
 def test_loop_does_not_rerun_an_already_completed_occurrence(isolated_memory, monkeypatch):
     monkeypatch.setattr(watchdog_app, "_load_last_scheduled_lint", lambda: "2026-09-17-10")
     monkeypatch.setattr(watchdog_app, "_save_last_scheduled_lint", lambda _o: pytest.fail("re-ran"))

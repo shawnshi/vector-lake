@@ -18,6 +18,7 @@ from vector_lake.tool_timeline import (
 )
 from vector_lake.memory_gram_index import (
     compact_memory_gram_overlay,
+    maybe_rebuild_memory_gram_index,
     memory_gram_index_report,
     prune_retired_gram_docs,
     rebuild_memory_gram_index,
@@ -67,6 +68,7 @@ __all__ = [
     "rebuild_timeline_events_from_claims",
     "repair_timeline_projection",
     "rebuild_memory_gram_index",
+    "maybe_rebuild_memory_gram_index",
     "compact_memory_gram_overlay",
     "prune_retired_gram_docs",
     "memory_gram_index_report",

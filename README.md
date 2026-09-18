@@ -279,6 +279,7 @@ python cli.py embedding-backfill --limit 200
 python cli.py embedding-backfill --apply --limit 200
 python cli.py wiki-restore --apply --limit 10
 python cli.py gram-index
+python cli.py gram-index --if-due --apply
 python cli.py gram-index --apply --compact
 ```
 
@@ -292,7 +293,9 @@ python cli.py repair-idempotency --table mutation_outbox
 python cli.py repair-idempotency --table mutation_outbox --apply
 ```
 
-这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影；`timeline-repair` 就地补齐 `timeline_events` 的 parity 漂移，不重建整表；`gram-index` 报告或重建运行态记忆检索用的精确 n-gram 倒排，`--compact` 把 overlay 合并回 base 并清理退役文档。
+这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影；`timeline-repair` 就地补齐 `timeline_events` 的 parity 漂移，不重建整表；`gram-index` 报告或重建运行态记忆检索用的精确 n-gram 倒排，`--compact` 把 overlay 合并回 base 并清理退役文档；`--if-due` 只在该索引确实落后时才重建（见下）。
+
+`gram-index` 的重建节奏：索引被写入后就不再精确，而是带着陈旧基表继续服务，因此读路径上的搜索会退回精确扫描（实测约 0.745 s，对照索引路径 0.295 s）。让索引重新精确只有重建一条路，代价是活库上约 430 s，且**期间拒绝所有写入**。所以重建只发生在维护位置：守护进程的定时维护块（在 WAL checkpoint 之前）与 `gram-index --if-due --apply`。**后者需要守护进程在运行**：没有守护进程时（如本机现状）不会有任何自动触发，只能由人按 `due=` 手工执行——`doctor` 的 `Watchdog Status` 是判断这一点的依据。阈值为 `REBUILD_AFTER_WRITES = 500`，按文档数计，而不是按事务或时长；选择它的依据不是「搜索省下的时间何时回本」（实测约 1200 次搜索），而是「重建能让写入停多久」——因此宁少勿多。`due=` 与 `of 500` 就是这个欠账的当前值，而不是故障。
 
 `backup-retention` 约束 `.meta/backups`（SQLite 副本目录，与 `MEMORY/backup/` 下的页面恢复点无关）：默认保留最新 3 份副本，其余受 12 GiB 预算约束，**最新一份无论是否超预算都不会被删**；`idempotency-status` 报告各幂等表当前达到的唯一性等级，`repair-idempotency` 清除冗余幂等键以便建成完整唯一索引——它两种模式下都不删除业务行。
 
