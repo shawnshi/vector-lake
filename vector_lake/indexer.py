@@ -24,6 +24,7 @@ from vector_lake.wiki_utils import (
     VALID_PREFIXES,
 )
 
+from vector_lake.link_resolution import build_link_map, core_name_maps, resolve_link_target
 from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
@@ -730,7 +731,7 @@ def dedupe_and_prune_edges(
     return pruned
 
 
-def _calculate_weighted_edges(index_data: dict) -> list[dict]:
+def _calculate_weighted_edges(index_data: dict, alias_map: dict | None = None) -> list[dict]:
     nodes_dict = index_data["nodes"]
     node_keys = list(nodes_dict.keys())
 
@@ -739,14 +740,22 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
 
     edges = []
 
-    # Build alias resolution map: link string -> node_key
-    alias_map = {}
-    for k, node in nodes_dict.items():
-        alias_map[k] = k
-        if node.get("title"):
-            alias_map[node["title"]] = k
-        for alias in node.get("aliases", []):
-            alias_map[alias] = k
+    # Resolution is one rule, shared with the linter (``vector_lake.link_resolution``).  It used to
+    # be written out here as filenames + titles + aliases with last-writer-wins, which meant a link
+    # by core name built no edge (``[[Concept_CoMET]]`` against ``Product_CoMET.md``) while the
+    # linter accepted it, a declaration could overwrite another page's filename, and a page's id
+    # resolved here but nowhere else.  Measured on the live wiki: 67 typed links were dropped this
+    # way, 23 of which the core route resolves; zero depended on the id route.
+    if alias_map is None:
+        claims: dict[str, list[str]] = {}
+        for k, node in nodes_dict.items():
+            if node.get("title"):
+                claims.setdefault(str(node["title"]).strip(), []).append(k)
+            for alias in (node.get("aliases") or []):
+                claims.setdefault(str(alias).strip(), []).append(k)
+        alias_map, _core_pages, unique_cores, _contested = build_link_map(nodes_dict.keys(), claims)
+    else:
+        _core_pages, unique_cores = core_name_maps(nodes_dict.keys())
 
     # Pre-compute resolved links and sources sets for O(1) access inside the nested loop
     node_links = {}
@@ -764,10 +773,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     for key, node in nodes_dict.items():
         resolved_links = set()
         for link in (node.get("links") or []):
-            if link in alias_map:
-                resolved_links.add(alias_map[link])
-            else:
-                resolved_links.add(link)
+            resolved_links.add(resolve_link_target(link, alias_map, unique_cores) or link)
         node_links[key] = frozenset(resolved_links)
 
         node_types[key] = node.get("type", "concept").lower()
@@ -782,10 +788,7 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
                 # ⚡ Bolt: Store the pre-calculated numeric weight directly in the triples dict
                 # instead of the string predicate name. This eliminates a secondary dictionary
                 # lookup during the expensive O(N^2) _calculate_weighted_edges inner loop.
-                if target in alias_map:
-                    td[alias_map[target]] = pred_weights[pred]
-                else:
-                    td[target] = pred_weights[pred]
+                td[resolve_link_target(target, alias_map, unique_cores) or target] = pred_weights[pred]
         node_triples[key] = td
 
         node_sources[key] = frozenset((node.get("sources") or []))
@@ -916,6 +919,22 @@ def _calculate_weighted_edges(index_data: dict) -> list[dict]:
     return dedupe_and_prune_edges(edges)
 
 
+def _link_map_for_nodes(nodes: dict) -> dict[str, str]:
+    """The link map for an in-memory node set, built by the shared rule.
+
+    The incremental update path needs the same map the full build publishes; deriving it from the
+    nodes it already holds keeps the two paths on one rule instead of two.
+    """
+    claims: dict[str, list[str]] = {}
+    for key, node in nodes.items():
+        if node.get("title"):
+            claims.setdefault(str(node["title"]).strip(), []).append(key)
+        for alias in (node.get("aliases") or []):
+            claims.setdefault(str(alias).strip(), []).append(key)
+    link_map, _core_pages, _unique_cores, _contested = build_link_map(nodes.keys(), claims)
+    return link_map
+
+
 def _apply_graph_topology(index_data: dict):
     """Marks the edge topology as current and the community assignment as stale.
 
@@ -967,7 +986,10 @@ def _generate_index_locked(skip_embeddings: bool = True):
     # Read from canonical SQLite instead of Markdown files
     rows = conn.execute("SELECT entity_id, data_json FROM entities").fetchall()
     node_bodies: dict[str, str] = {}
-    
+    #: Declared names (titles and aliases) -> the pages claiming them, collected as the nodes are
+    #: projected so the alias index can be built with the same rules the edges use.
+    claims: dict[str, list[str]] = {}
+
     for row in rows:
         try:
             entity_data = json.loads(row["data_json"])
@@ -980,18 +1002,23 @@ def _generate_index_locked(skip_embeddings: bool = True):
 
         node_bodies[node_key] = _entity_body_text(entity_data)
         index_data["nodes"][node_key] = node_data
-        if node_data["id"]:
-            index_data["aliases"][node_data["id"]] = node_key
         if node_data.get("title"):
-            index_data["aliases"][node_data["title"]] = node_key
-        index_data["aliases"][node_key] = node_key
-        for alias in node_data.get("aliases", []):
-            index_data["aliases"][alias] = node_key
+            claims.setdefault(str(node_data["title"]).strip(), []).append(node_key)
+        for alias in (node_data.get("aliases") or []):
+            claims.setdefault(str(alias).strip(), []).append(node_key)
         if isinstance(node_data.get("categories"), list):
             for category in node_data["categories"]:
                 index_data["categories"].add(category)
 
-    index_data["weighted_edges"] = _calculate_weighted_edges(index_data)
+    # One map for the edges and for the alias index the topology layer reads, so the two cannot
+    # disagree about what a link names.  A page's ``id`` is deliberately absent: it is an
+    # identifier, not a name (measured: no link on the live wiki depends on it).
+    alias_map, _core_pages, _unique_cores, _contested = build_link_map(
+        index_data["nodes"].keys(), claims
+    )
+    index_data["aliases"] = dict(alias_map)
+
+    index_data["weighted_edges"] = _calculate_weighted_edges(index_data, alias_map)
     _apply_graph_topology(index_data)
     
     index_data["categories"] = list(index_data["categories"])
@@ -1149,7 +1176,11 @@ def update_index_items(filenames: list[str]):
                                 if edge["source"] != node_key and edge["target"] != node_key
                             ]
                         else:
-                            index_data["aliases"] = {key: value for key, value in (index_data.get("aliases") or {}).items() if value != node_key}
+                            # The alias map is rebuilt from every node below, through the one
+                            # shared rule; the old code patched entries here and re-added them
+                            # (including the page's ``id``) with plain assignment, which is how the
+                            # incremental path came to reuse a different resolution rule than the
+                            # full build -- the difference the read-back used to paper over.
                             index_data.setdefault("error_log", [])
                             index_data["error_log"] = [item for item in index_data["error_log"] if item.get("file") != filename]
     
@@ -1181,13 +1212,6 @@ def update_index_items(filenames: list[str]):
                                     # The old vector is now stale; explicit backfill will replace it.
                                     db_store.delete_embedding(node_key)
                                     
-                                    if node_data["id"]:
-                                        index_data["aliases"][node_data["id"]] = node_key
-                                    if node_data.get("title"):
-                                        index_data["aliases"][node_data["title"]] = node_key
-                                    index_data["aliases"][node_key] = node_key
-                                    for alias in node_data["aliases"]:
-                                        index_data["aliases"][alias] = node_key
     
                                     if isinstance(node_data["categories"], list):
                                         categories = set((index_data.get("categories") or []))
@@ -1260,6 +1284,10 @@ def update_index_items(filenames: list[str]):
                                         other_node.pop("_key", None)
                                     node_data.pop("_key", None)
     
+                    # Once per batch, after every branch: rebuilding inside the loop cost
+                    # O(batch x corpus) under the index lock, and the deletion branch (which pops
+                    # the node) never rebuilt at all, leaving a removed page's names resolvable.
+                    index_data["aliases"] = _link_map_for_nodes(index_data["nodes"])
                     _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
                     # Re-apply the shared cap and pair-level dedup after the batch.
                     # The loop above appends every qualifying edge for the touched

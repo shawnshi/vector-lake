@@ -20,6 +20,7 @@ from vector_lake.wiki_utils import (
     write_markdown_file,
 )
 from vector_lake import stub_creator
+from vector_lake.link_resolution import build_link_map, resolve_link_target
 from vector_lake.schema_validator import (
     REQUIRED_FIELDS,
     SYSTEM_ARTIFACT_CATEGORIES,
@@ -66,70 +67,6 @@ def _generate_id(stem: str) -> str:
     their stems differ.
     """
     return stub_creator.generate_id(stem, datetime.datetime.now().strftime("%Y-%m-%d"))
-
-def resolve_link_target(
-    target: str, link_target_map: dict, unique_cores: dict[str, str]
-) -> str | None:
-    """The page ``target`` names, or ``None`` when no page answers it.
-
-    Two lookups, and the order is the whole design:
-
-    1. ``link_target_map`` as written -- a filename, a title or an alias.  A page declaring a
-       name settles it here.
-    2. ``unique_cores`` on the target's core name -- ``[[刘宁]]`` for ``Person_刘宁``, or
-       ``[[Concept_CoMET]]`` for ``Product_CoMET``, a link written before the page was filed
-       under its real type.
-
-    The second lookup is the *unique-cores* map, not ``link_target_map`` with the prefix
-    stripped.  Stripping into the general map would also match titles and aliases, and that
-    route reaches a page through a name it merely declares -- so a title equal to an ambiguous
-    core name would silently resolve a link that two pages already contest.  Measured on the
-    live wiki, that mistake resolved 42 further links (788 -> 680 reported broken instead of
-    the 721 the rule predicts), which is why this takes the narrower map.
-
-    Both sides are compared *normalised* (``_`` and ``-`` are one name, as everywhere else in
-    the wiki).  Without it the closure breaks for a target a stub had to sanitise: ``[[Foo Bar]]``
-    produced ``Concept_Foo-Bar.md``, whose core is ``Foo-Bar``, so the raw target matched
-    nothing, the link stayed broken on every run, and the stub that had just been written made
-    the creator skip it silently -- reported broken forever with nothing that could fix it.  It
-    also folds the ``_``/``-`` axis into the uniqueness guard, so ``Concept_Foo-Bar.md`` and
-    ``Product_Foo_Bar.md`` count as one contested core instead of two clean ones.
-    """
-    resolved = link_target_map.get(target)
-    if resolved:
-        return resolved
-    core = normalize_entity_name(strip_prefix(target))
-    return unique_cores.get(core)
-
-
-def core_name_maps(all_keys) -> tuple[dict[str, list[str]], dict[str, str]]:
-    """``(core -> pages, unambiguous core -> page)`` for the pages a link may resolve to.
-
-    One function because the two are built together and answer one question between them.  They
-    are built once per pass: a rename preserves a page's *core* name, so the maps stay correct
-    across the naming auto-fix, and the one stale detail a rename does leave -- a message naming
-    the pre-rename stem -- was measured as unobservable in the verdicts.
-
-    Only unambiguous cores enter the second map, and only for pages that are nodes at all:
-
-    * two pages sharing a core name is a real defect -- the live wiki has 40 such families -- and
-      resolving such a link to whichever page sorts first would hide it; the contested list keeps
-      it visible instead (and the report names the candidates);
-    * ``System_*`` pages and the non-node artifacts are excluded even though their files exist: a
-      link resolving to one would satisfy the check while the indexer deletes that page from the
-      graph, which is the same "hide the gap" trade the stub creator refuses when it declines to
-      create one.  The exact-spelling route still finds them, as it always did.
-
-    Measured on the live wiki: none of the links this rule rescues points at an ambiguous core,
-    so refusing them costs nothing there.
-    """
-    core_pages: dict[str, list[str]] = defaultdict(list)
-    for node_key in all_keys:
-        if node_key.startswith("System_") or f"{node_key}.md" in NON_NODE_WIKI_FILES:
-            continue
-        core_pages[normalize_entity_name(strip_prefix(node_key))].append(node_key)
-    return core_pages, {core: pages[0] for core, pages in core_pages.items() if len(pages) == 1}
-
 
 def lint_vector_lake(auto_fix: bool = False):
     wiki_dir = str(get_wiki_dir())
@@ -207,7 +144,6 @@ def lint_vector_lake(auto_fix: bool = False):
     # deletes that page from the graph, which is the same "hide the gap" trade the stub creator
     # refuses when it declines to *create* one.  The exact-spelling route still finds them, as it
     # always did; this only declines to widen that.
-    core_pages, unique_cores = core_name_maps(all_keys)
     # First Pass: Read and parse the files that are nodes
     for filename in files:
         filepath = os.path.join(wiki_dir, filename)
@@ -260,9 +196,10 @@ def lint_vector_lake(auto_fix: bool = False):
 
     # Only now can a declaration be judged: every page has been read, so "how many pages claim
     # this name" is known.  Unambiguous declarations join the map without displacing anything.
-    for name, claimants in declared.items():
-        if len(claimants) == 1:
-            link_target_map.setdefault(name, claimants[0])
+    # One owner for the rules (``vector_lake.link_resolution``): the linter and the indexer both
+    # resolve links, and when they disagreed the same link was fine here and dropped there.
+    link_map, core_pages, unique_cores, _contested = build_link_map(all_keys, declared)
+    link_target_map = dict(link_map)
 
     for filename, data in parsed.items():
         for target in data["links"]:
