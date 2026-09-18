@@ -1,5 +1,52 @@
 # Unreleased
 
+## lint 用一份列表回答了两个不同的问题，两个方向都出错
+
+`lint_vector_lake` 先过滤出一个文件列表，然后拿它同时决定「哪些文件要 lint」和「哪些链接目标存在」。
+这两半朝相反方向各错了一次。
+
+### 方向一：生成物被当成节点 lint，`auto_fix` 还会重命名它
+
+过滤器里只有 `index.md` / `log.md` / `overview.md` 三个名字，于是
+`orphan_pages.md`、`wiki_link_stats.md`、`Synthesis_log.md` 作为节点被检查 —— 它们不以合法前缀开头、
+也没有 frontmatter，于是被判「Does not start with valid prefix」，且在 `auto_fix` 下**被改名为
+`Concept_orphan_pages.md`**。
+
+测试钉住了这条路径：修复前日志给出
+
+```
+Auto-fix rename failed for orphan_pages.md: Error during atomic rename:
+Schema Violation: Missing required frontmatter field 'id'.
+```
+
+也就是说重命名**是被真正发起过的**，只是恰好在 schema 校验上被拦住（报告没有 `id`），不是被意图挡住 ——
+真实 wiki 里的生成物若带 frontmatter，这一步就会成功，并把它从读它的东西眼前藏掉。
+
+### 方向二：指向 `index`/`log`/`overview` 的链接永远解不开
+
+这三个恰好是被过滤掉的名字，于是它们不在 `all_keys` / `link_target_map` 里：指向它们的链接被判破链，
+`auto_fix` 会在真页面旁边再造一个存根。
+
+### 修法
+
+**lint 范围** = 磁盘上所有 `.md` 减去 `node_vocabulary.NON_NODE_WIKI_FILES`（六项，即批 8 归一的那套
+集合）；**链接目标** = 磁盘上所有 `.md`，lint 与否不影响「页面是否存在」。两者分开后，批 8 那条「六项对
+三项」的差异在这里闭环：`tool_lint` 不再自己维护第三套清单。
+
+新增 `tests/test_lint_scope_and_link_targets.py` 4 例：生成物不被当节点扫、指向生成物的链接能解开、
+`auto_fix` 既不重命名也不造存根、以及指向确实不存在的页面的链接**仍然**被判破链（防止前三条是靠关掉破链
+检测换来的）。**修复前 3 例失败，1 例通过**（第 4 例是覆盖面守卫，两版都通过是预期的）。
+
+### 活库：可观测变化为零
+
+两套排除集合的差异只落在 `orphan_pages.md`/`wiki_link_stats.md`/`Synthesis_log.md` 三个文件上，而它们
+在活库**都不存在**，因此 `files` 集合在活库上与改动前逐一相同、链接解析集合并未新增任何条目 —— 除了
+代码路径本身，活库 lint 输出不变（复验：`Scanned: 7923 files`、`2. Naming Compliance: [PASS]`、
+`7. Broken Links: [FAIL: 788]`）。同期 `11. Semantic Garbage Collection` 由 2 变 5 属**时间衰减**检查，
+与本次改动无关（文件集合未变）。
+
+全量 pytest **759 passed**。
+
 ## 索引只在答案精确时才允许作答
 
 `gram_index_usable()` 原先回答的是「基表够不够新」，而调用方读成「答案对不对」。这两件事在

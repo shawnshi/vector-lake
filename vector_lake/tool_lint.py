@@ -35,6 +35,7 @@ from vector_lake.schema_validator import (
 from vector_lake.node_vocabulary import (
     GENERATED_NODE_TYPES,
     NODE_PREFIXES,
+    NON_NODE_WIKI_FILES,
     type_for_prefix,
 )
 
@@ -71,7 +72,21 @@ def lint_vector_lake(auto_fix: bool = False):
     if not os.path.exists(wiki_dir):
         return "Wiki directory not found."
 
-    skip_files = {"index.md", "log.md", "overview.md"}
+    # Linting scope and link resolution are two different questions, and one list used to
+    # answer both.
+    #
+    # A file the wiki writes about itself is not a node, so it must not be *linted* --
+    # checked for a valid prefix, an id, aliases, a type.  The set here held only the
+    # first three of the six, so ``orphan_pages.md``, ``wiki_link_stats.md`` and
+    # ``Synthesis_log.md`` were linted as nodes: reported as "Does not start with valid
+    # prefix" and, under ``auto_fix``, renamed to ``Concept_orphan_pages.md``.
+    #
+    # But such a file does *exist*, so a link to it must *resolve*: otherwise the link is
+    # reported broken and a stub is invented beside the real page.  Because both
+    # questions read the same list, ``index``/``log``/``overview`` were exactly the three
+    # names that could not resolve a link.
+    listed = [name for name in os.listdir(wiki_dir) if name.endswith(".md")]
+    files = [name for name in listed if name not in NON_NODE_WIKI_FILES]
     # Every vocabulary is imported from its single owner.  The local copies that
     # used to live here had already drifted: ``valid_status`` was missing
     # ``archived`` and ``contested``, so every page using those two legal statuses
@@ -84,7 +99,7 @@ def lint_vector_lake(auto_fix: bool = False):
     valid_prefixes = VALID_PREFIXES
     required_fields = list(REQUIRED_FIELDS)
 
-    files = [name for name in os.listdir(wiki_dir) if name.endswith(".md") and name not in skip_files]
+    files = [name for name in listed if name not in NON_NODE_WIKI_FILES]
     issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment"]}
     fixes_applied = 0
 
@@ -95,11 +110,16 @@ def lint_vector_lake(auto_fix: bool = False):
     link_target_map = {}
     inbound_count = defaultdict(int)
 
-    # First Pass: Read and parse
+    # Every page on disk is a link target, whether or not it is linted.
+    for filename in listed:
+        node_key = filename[:-3]
+        all_keys.add(node_key)
+        link_target_map[node_key] = node_key
+
+    # First Pass: Read and parse the files that are nodes
     for filename in files:
         filepath = os.path.join(wiki_dir, filename)
         node_key = filename[:-3]
-        all_keys.add(node_key)
         try:
             frontmatter, body, content = read_markdown_file(filepath)
         except Exception:
@@ -123,7 +143,6 @@ def lint_vector_lake(auto_fix: bool = False):
         if node_id:
             id_map.setdefault(str(node_id), []).append(filename)
 
-        link_target_map[node_key] = node_key
         title = frontmatter.get("title")
         if title:
             link_target_map[str(title).strip()] = node_key
