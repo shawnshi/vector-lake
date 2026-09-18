@@ -125,3 +125,30 @@ def test_a_non_numeric_ttl_is_absent_in_both_paths(isolated_memory):
 
     assert rows["e1"] == (180.0, 0.5), rows          # a numeric string still parses
     assert rows["e2"] == (0.0, 0.25), rows            # "180d" is absent, not an exception
+
+
+def test_absent_has_one_encoding_after_the_normalisation(isolated_memory):
+    """"Absent" must not be NULL in some rows and 0.0 in others.
+
+    The writers store 0.0 when a record carries no value; rows that were never rewritten still read
+    NULL, so the same state had two spellings.  The json is the indexer's source and is untouched.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    conn.execute(
+        "INSERT INTO entities (entity_id, canonical_name, type, status, ttl, decay_weight, data_json, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("e1", "Concept_One", "concept", "Active", None, None,
+         json.dumps({"page_key": "Concept_One"}), "2026-01-01T00:00:00Z"),
+    )
+    conn.execute("DELETE FROM schema_migrations WHERE name = '2026-09-18-normalise-entities-ttl-encoding'")
+    conn.commit()
+
+    applied = db_store.apply_legacy_schema_prunes()
+
+    assert "2026-09-18-normalise-entities-ttl-encoding" in applied
+    row = conn.execute("SELECT ttl, decay_weight FROM entities WHERE entity_id = 'e1'").fetchone()
+    assert (row["ttl"], row["decay_weight"]) == (0.0, 0.0), row
+    assert conn.execute("SELECT COUNT(*) FROM entities WHERE ttl IS NULL OR decay_weight IS NULL").fetchone()[0] == 0
+    # Idempotent, and a row whose json *does* carry a ttl keeps it.
+    assert db_store.apply_legacy_schema_prunes() == []

@@ -958,6 +958,23 @@ def _prune_governance_queue_index(conn: sqlite3.Connection) -> None:
     conn.execute("DROP INDEX IF EXISTS idx_governance_queue_change_set_status")
 
 
+def _normalise_entities_ttl_encoding(conn: sqlite3.Connection) -> None:
+    """Give "absent" one encoding in ``entities.ttl``/``decay_weight``: ``0.0``.
+
+    Both writers store ``0.0`` when a record carries no value, so a NULL in these columns means the
+    row has simply not been written since they were added as real columns -- two spellings of one
+    state, which is how a column ends up meaning different things depending on its history.  The
+    json is the source the indexer reads, and it is untouched here; ``decay_weight`` has no json
+    counterpart, so ``0.0`` is the writers' own value for "not set".
+
+    Idempotent: after the first run the ``WHERE`` matches nothing.
+    """
+    conn.execute(
+        "UPDATE entities SET ttl = 0.0 WHERE ttl IS NULL AND json_extract(data_json, '$.ttl') IS NULL"
+    )
+    conn.execute("UPDATE entities SET decay_weight = 0.0 WHERE decay_weight IS NULL")
+
+
 def _prune_change_sets_change_id(conn: sqlite3.Connection) -> None:
     """Drop ``change_sets.change_id`` while a pre-prune database still has it.
 
@@ -990,6 +1007,7 @@ _LEGACY_SCHEMA_PRUNES: tuple[
     ("2026-09-18-backfill-entities-ttl", (_backfill_entities_ttl,)),
     ("2026-09-18-claim-evidence-json-indexes", (_prune_claim_evidence_json_indexes,)),
     ("2026-09-18-governance-queue-index", (_prune_governance_queue_index,)),
+    ("2026-09-18-normalise-entities-ttl-encoding", (_normalise_entities_ttl_encoding,)),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """

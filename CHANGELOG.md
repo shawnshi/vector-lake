@@ -1,5 +1,60 @@
 # Unreleased
 
+## O3 定案与其后两条登记项：三副本的权威、一个被保住的索引、一种「缺失」编码
+
+### O3：边集的第三份副本没有读取方，但**本批不删**
+
+全仓实测 `page_graph_edges`（29,807 行）的引用：`db_store`（17，其中多为写入方与一致性检查）、
+`tests/test_page_edge_projection_mirror.py`（10）、`indexer`（5，两个写入方）、
+`tests/test_index_incremental_parity.py`（4）、`tool_doctor`（3）、`governance_store`（3，注释）。
+**没有任何 SELECT 读取它**，唯一的读取方是它自己的一致性检查 `page_graph_edges_mirror_drift` ——
+而那是**库内两份副本互比**（`page_graph_edges` vs `page_index_edges`），并非与已发布文件比对。
+
+同时实测：`page_index_projection` 已经记录 `edge_digest`（连同 `index_mtime`/`index_size`/`node_count`/`edge_count`），
+即**「已发布文件 ↔ 投影」的一致性已由投影侧校验**。因此 `page_graph_edges` 是**第三份副本，其唯一消费者是那条
+DB↔DB 的检查**；O3 的「指针化」问题在这个具体对象上其实就是**该表该不该存在**。
+
+**本批不删**，理由与上一条测量直接相关：就在同一批里，`idx_om_type` 被我先判为「严格前缀、必然冗余」，实测却被推翻
+（见下）。删一张被 6 个文件引用的表需要把「所有引用」都换成 SELECT 之外的形态逐一核对（f-string、属性访问、
+测试断言），并同时改写那条检查（改为**已发布文件 vs `page_index_edges`**，比现有的 DB↔DB 更强）。这是一次
+独立批次，不是本次长会话尾部的动作。
+
+**O3 删除批次的确切写入集**（已记录，供一次做完）：`db_store`（DDL、`replace_page_graph_edges`、
+`replace_page_graph_edges_for_node`、`delete_node_cascade` 的删除、`page_graph_edges_mirror_drift` 改为读文件）、
+`indexer`（两个调用点）、`tool_doctor`（检查改为文件↔投影）、`governance_store`（注释）、
+`tests/test_page_edge_projection_mirror.py` 与 `test_index_incremental_parity.py` 的断言，
+外加一条台账迁移（`DROP TABLE`）。
+
+### 登记项一：`idx_om_type` —— 我判它「必然冗余」，实测**推翻**
+
+推理是：`idx_om_type (memory_type)` 现在是新复合索引 `idx_om_f_memory_key (memory_type, f_memory_key)` 的**严格前缀**，
+且全树没有语句在这张表上按 `memory_type` 单独过滤。在副本上实测（当前 schema 的拷贝）：
+
+| 形状 | 有 `idx_om_type` | 删除后 |
+|---|---|---|
+| `memory_type = ?` | **444.64 ms** | **1240.47 ms** |
+| `memory_type IN (?)` | 451.33 ms | 1238.11 ms |
+| `memory_type = ? AND f_memory_key = ?` | 0.01 ms | 0.01 ms |
+
+**结论：保留。** 前缀索引对**低选择性**谓词并不冗余——复合索引宽，扫它更贵。这推翻了我打算写进模板的
+「严格前缀即可删」规则，因此模板改为：
+
+**规则 16**：前缀索引**不自动**冗余。删之前必须在**当前 schema 的副本**上量它的形状：低选择性谓词（匹配多行）
+下，窄索引可以比它的复合索引快**近 3 倍**。「全树没有语句发出这个形状」不足以成为删除理由——检索路径与
+临场查询会发出（本会话早先那次「按 trace 判未使用」的翻车是同一课）。
+
+### 登记项二：`entities.ttl`/`decay_weight` 的「缺失」现在只有一种编码
+
+两条写路径对「记录里没有值」都写 `0.0`，而**未被重写过的行**仍是 NULL —— 同一个状态两种拼写。已加一条台账迁移
+把 NULL 规整为 `0.0`（json 里带 ttl 的行**原值保留**）。活库：两列各自 **7,924 行全部非空**、无 NULL、
+json 带 ttl 的 **5,720 行原值未被覆盖**、`quick_check ok`。全量 pytest **842 passed**。
+
+### 登记项三：D1 的三条 P2 保持登记（已文档化）
+
+批前快照的解析映射（一个批次的名字延迟解析，代码注释已写明）、未被触碰的两节点之间的边不被增量重访
+（测试 docstring 已收窄适用范围）、`page_graph_edges` 仍有第三个只删的写入方且批量路径不刷新 `page_index_edges`
+（决定 doctor 绿灯的证据边界）。
+
 ## D1/B2：增量推导与全量构建对齐，回读删除，`page_graph_edges` 重新成为投影
 
 strict xfail 写明的三件事全部做完，然后才删回读：
