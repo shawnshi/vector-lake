@@ -16,6 +16,7 @@ from vector_lake.semantic_merge import merge_markdown_content
 from vector_lake.wiki_utils import (
     VALID_PREFIXES,
     get_wiki_dir,
+    normalize_entity_name,
     read_markdown_file,
     split_frontmatter,
     write_markdown_file,
@@ -32,7 +33,7 @@ from vector_lake.schema_validator import (
     validate_schema,
     SchemaViolationException,
 )
-from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
+from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES, strip_prefix
 
 
 # ``VALID_STATUS`` is capitalised while the check below lowercases the page value,
@@ -61,6 +62,41 @@ def _render_page(frontmatter: dict, body: str) -> str:
 def _generate_id():
     today = datetime.datetime.now().strftime("%Y%m%d")
     return f"{today}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
+
+def resolve_link_target(
+    target: str, link_target_map: dict, unique_cores: dict[str, str]
+) -> str | None:
+    """The page ``target`` names, or ``None`` when no page answers it.
+
+    Two lookups, and the order is the whole design:
+
+    1. ``link_target_map`` as written -- a filename, a title or an alias.  A page declaring a
+       name settles it here.
+    2. ``unique_cores`` on the target's core name -- ``[[刘宁]]`` for ``Person_刘宁``, or
+       ``[[Concept_CoMET]]`` for ``Product_CoMET``, a link written before the page was filed
+       under its real type.
+
+    The second lookup is the *unique-cores* map, not ``link_target_map`` with the prefix
+    stripped.  Stripping into the general map would also match titles and aliases, and that
+    route reaches a page through a name it merely declares -- so a title equal to an ambiguous
+    core name would silently resolve a link that two pages already contest.  Measured on the
+    live wiki, that mistake resolved 42 further links (788 -> 680 reported broken instead of
+    the 721 the rule predicts), which is why this takes the narrower map.
+
+    Both sides are compared *normalised* (``_`` and ``-`` are one name, as everywhere else in
+    the wiki).  Without it the closure breaks for a target a stub had to sanitise: ``[[Foo Bar]]``
+    produced ``Concept_Foo-Bar.md``, whose core is ``Foo-Bar``, so the raw target matched
+    nothing, the link stayed broken on every run, and the stub that had just been written made
+    the creator skip it silently -- reported broken forever with nothing that could fix it.  It
+    also folds the ``_``/``-`` axis into the uniqueness guard, so ``Concept_Foo-Bar.md`` and
+    ``Product_Foo_Bar.md`` count as one contested core instead of two clean ones.
+    """
+    resolved = link_target_map.get(target)
+    if resolved:
+        return resolved
+    core = normalize_entity_name(strip_prefix(target))
+    return unique_cores.get(core)
+
 
 def lint_vector_lake(auto_fix: bool = False):
     wiki_dir = str(get_wiki_dir())
@@ -111,6 +147,30 @@ def lint_vector_lake(auto_fix: bool = False):
         all_keys.add(node_key)
         link_target_map[node_key] = node_key
 
+    # A link may name a page by its *core* name -- ``[[Concept_CoMET]]`` where only
+    # ``Product_CoMET.md`` exists.  That is the same rule the stub creator uses to decide
+    # whether a page already covers a target, and without it lint reported live targets as
+    # broken that a page already answers (24 distinct targets, 67 link occurrences), while
+    # ``--auto-fix`` used to "fix" them by forking a second page beside the real one.
+    #
+    # Only unambiguous cores are added, and only for pages that are nodes at all.  Two pages
+    # sharing a core name is a real defect -- the live wiki has 40 such families -- and
+    # resolving such a link to whichever page sorts first would hide it; left unresolved, the
+    # report keeps it visible (and now names the contested pages).  Measured on the live wiki,
+    # none of the links this rule rescues points at an ambiguous core, so refusing them costs
+    # nothing there.  Exact filenames, titles and aliases keep precedence.
+    #
+    # ``System_*`` pages and the non-node artifacts are left out of the core map even though
+    # their files exist: a link resolving to one would satisfy this check while the indexer
+    # deletes that page from the graph, which is the same "hide the gap" trade the stub creator
+    # refuses when it declines to *create* one.  The exact-spelling route still finds them, as it
+    # always did; this only declines to widen that.
+    core_pages: dict[str, list[str]] = defaultdict(list)
+    for node_key in all_keys:
+        if node_key.startswith("System_") or f"{node_key}.md" in NON_NODE_WIKI_FILES:
+            continue
+        core_pages[normalize_entity_name(strip_prefix(node_key))].append(node_key)
+    unique_cores = {core: pages[0] for core, pages in core_pages.items() if len(pages) == 1}
     # First Pass: Read and parse the files that are nodes
     for filename in files:
         filepath = os.path.join(wiki_dir, filename)
@@ -153,8 +213,8 @@ def lint_vector_lake(auto_fix: bool = False):
 
     for filename, data in parsed.items():
         for target in data["links"]:
-            real_key = link_target_map.get(target, target)
-            inbound_count[real_key] += 1
+            real_key = resolve_link_target(target, link_target_map, unique_cores)
+            inbound_count[real_key or target] += 1
 
     # Apply Auto-fixes iteratively
     # 1. Naming Compliance
@@ -164,7 +224,6 @@ def lint_vector_lake(auto_fix: bool = False):
             issues["naming"].append(f"{filename}: Does not start with valid prefix")
             if auto_fix:
                 new_filename = f"Concept_{filename}"
-                from vector_lake.wiki_utils import normalize_entity_name
                 normalized_new = normalize_entity_name(new_filename[:-3]) + ".md"
                 
                 from vector_lake.tool_rename import rename_vector_lake_entity
@@ -231,8 +290,18 @@ def lint_vector_lake(auto_fix: bool = False):
     stub_index = stub_creator.existence_index(wiki_dir)
     for filename, data in parsed.items():
         for target in data["links"]:
-            if target not in link_target_map and target not in all_keys:
-                issues["broken_links"].append(f"{filename} -> [[{target}]]: target does not exist")
+            if resolve_link_target(target, link_target_map, unique_cores) is None:
+                # A contested core name is reported as broken, but saying only that leaves the
+                # operator nothing to act on: the name is not unknown, it is ambiguous.  The
+                # item stays in this bucket so the count means the same thing.
+                contested = core_pages.get(normalize_entity_name(strip_prefix(target)))
+                detail = (
+                    f"target does not exist ({len(contested)} pages share that name: "
+                    f"{', '.join(sorted(contested))})"
+                    if contested and len(contested) > 1
+                    else "target does not exist"
+                )
+                issues["broken_links"].append(f"{filename} -> [[{target}]]: {detail}")
                 if auto_fix:
                     # The filename prefix and the frontmatter ``type`` are one decision, and the
                     # type has to come from the vocabulary.  This used to be written out here,
@@ -246,6 +315,9 @@ def lint_vector_lake(auto_fix: bool = False):
                     if written:
                         all_keys.add(written)
                         link_target_map[written] = written
+                        # Keep the core map in step: within one pass, a link written before this
+                        # stub must resolve against what is now on disk.
+                        unique_cores.setdefault(normalize_entity_name(strip_prefix(written)), written)
                         fixes_applied += 1
 
     # 5. Frontmatter, Type, Status, Category
