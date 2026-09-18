@@ -53,18 +53,14 @@ def one_doc(isolated_memory):
 def test_a_document_is_not_credited_for_a_gram_it_dropped(one_doc):
     """The measured defect, at the level the read path consumes.
 
-    A document is edited to drop a two-character term entirely, then materialised
-    and merged exactly the way the maintenance commands do it.  The base still holds
-    a posting for the dropped term -- ``_compact_gram_chunk`` rewrites only the grams
-    the overlay holds, and a dropped gram is not one of them -- so the term must not
-    reach the accumulator unless the queue is still suppressing that document.
+    A document is edited to drop a two-character term entirely.  The base still holds a
+    posting for that term, so it must not reach the accumulator -- the queue entry is what
+    suppresses it.  This used to be set up by running the incremental maintenance sequence
+    (materialise, then merge); that machinery is gone, and the state it produced is not
+    reachable any more, but the invariant it exposed is the one under test.
     """
     conn = db_store.get_connection()
     _put(conn, "mem_x", "影像 云平台 部署")
-
-    memory_gram_index.flush_memory_gram_dirty()
-    memory_gram_index.compact_memory_gram_overlay(limit_grams=None)
-    assert memory_gram_index.overlay_row_count() == 0
 
     relevance = memory_gram_index.accumulate_relevance(
         ["医保"], skip_docs=memory_gram_index.skip_doc_set(conn)
@@ -74,34 +70,18 @@ def test_a_document_is_not_credited_for_a_gram_it_dropped(one_doc):
 
 
 def test_the_search_agrees_with_the_full_scan_after_a_dropped_gram(one_doc):
+    """Only the *refused* path is exercised here, and it is still worth pinning.
+
+    Both sides below are the projected scan, because the edit makes the index refuse
+    (that refusal is what ``test_a_write_defers_to_the_exact_scan`` and the cadence
+    tests assert directly).  What this adds is that the fallback is not a difference in
+    results.
+    """
     conn = db_store.get_connection()
     _put(conn, "mem_x", "影像 云平台 部署")
-    memory_gram_index.flush_memory_gram_dirty()
-    memory_gram_index.compact_memory_gram_overlay(limit_grams=None)
 
     assert _ids("gram", "医保", top_k=5) == _ids("legacy", "医保", top_k=5)
     assert _ids("gram", "影像 云平台", top_k=5) == _ids("legacy", "影像 云平台", top_k=5)
-
-
-def test_materialising_a_document_does_not_retire_its_queue_entry(one_doc):
-    _put(db_store.get_connection(), "mem_x", "影像 云平台 部署")
-
-    memory_gram_index.flush_memory_gram_dirty()
-
-    assert memory_gram_index.live_dirty_doc_count() == 1
-    assert memory_gram_index.gram_index_usable() is False
-
-
-def test_compaction_does_not_make_the_base_authoritative(one_doc):
-    """Merging the overlay must not look like a return to exactness."""
-    _put(db_store.get_connection(), "mem_x", "影像 云平台 部署")
-    memory_gram_index.flush_memory_gram_dirty()
-
-    memory_gram_index.compact_memory_gram_overlay(limit_grams=None)
-
-    assert memory_gram_index.overlay_row_count() == 0
-    assert memory_gram_index.live_dirty_doc_count() == 1
-    assert memory_gram_index.gram_index_usable() is False
 
 
 def test_retired_markers_alone_still_allow_the_fast_path(one_doc):
@@ -116,29 +96,28 @@ def test_retired_markers_alone_still_allow_the_fast_path(one_doc):
     assert _ids("gram", "医保", top_k=5) == _ids("legacy", "医保", top_k=5) == []
 
 
-def test_the_read_path_does_not_drain_the_queue(one_doc, monkeypatch):
-    """The sequence that produced the wrong answer is not reachable from a read.
+def test_a_read_leaves_the_index_state_where_it_found_it(one_doc):
+    """Settling the debt is maintenance's job, and a read must not move any of it.
 
-    The calls are recorded rather than expected to raise: ``ensure_memory_gram_index``
-    catches every exception and degrades to the exact scan, which is also the oracle
-    the comparison below uses, so a raising stub would let this test pass while the
-    read path was in fact draining.
+    This replaces a test that spied on the two removed incremental functions.  Counting
+    the state instead of the calls is the stronger claim: it also catches a new read-path
+    step that writes anything at all.
     """
     _put(db_store.get_connection(), "mem_x", "影像 云平台 部署")
-    calls: list[str] = []
-
-    def _record(name):
-        def _stub(*args, **kwargs):
-            calls.append(name)
-            return {}
-
-        return _stub
-
-    monkeypatch.setattr(memory_gram_index, "flush_memory_gram_dirty", _record("flush"))
-    monkeypatch.setattr(memory_gram_index, "compact_memory_gram_overlay", _record("compact"))
+    before = (
+        memory_gram_index.pending_doc_count(),
+        memory_gram_index.overlay_row_count(),
+        memory_gram_index.gram_index_state()["updated_at"],
+    )
 
     assert _ids("gram", "影像 云平台", top_k=5) == _ids("legacy", "影像 云平台", top_k=5)
-    assert calls == []
+
+    after = (
+        memory_gram_index.pending_doc_count(),
+        memory_gram_index.overlay_row_count(),
+        memory_gram_index.gram_index_state()["updated_at"],
+    )
+    assert after == before, "a search settled (or disturbed) index state"
 
 
 def test_an_absent_base_is_still_built_on_first_use(one_doc):

@@ -78,7 +78,7 @@ Conflict rules:
 | `vector_lake/tool_piea.py` | PIEA entity schema interceptor |
 | `vector_lake/tool_bulk_reconciliation.py` | Graph reconciliation |
 | `vector_lake/yaml_utils.py` | YAML helpers |
-| `vector_lake/memory_gram_index.py` | Exact n-gram inverted index over operational memory (base postings + overlay + dirty set) that makes `search_operational_memory` sub-second without changing its ranking |
+| `vector_lake/memory_gram_index.py` | Exact n-gram inverted index over operational memory (base postings + a dirty set that suppresses stale documents) that makes `search_operational_memory` sub-second without changing its ranking; it answers only while nothing is queued, and a rebuild is what clears the queue |
 | `vector_lake/page_index_projection.py` | SQLite projection of `index.json` (node table + ordered edge table + process-wide adjacency cache) so read paths never parse the whole file |
 | `benchmarks/bench_hot_paths.py` | Reproducible p50/p95 latency harness for the `search` / `query` / `timeline` read paths |
 | `scripts/community_clustering_daemon.py` | Optional operator-invoked Louvain analysis; not scheduled by watchdog |

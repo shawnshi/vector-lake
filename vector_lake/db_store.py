@@ -450,8 +450,10 @@ def _create_memory_gram_tables(conn: sqlite3.Connection) -> None:
 
     The dirty queue is filled by triggers on the projection, so every writer of
     ``operational_memory`` -- including ones outside this module -- marks its own
-    documents stale.  Nothing here computes grams: that needs Python, and the
-    materialisation is a bounded maintenance step instead (see the module docstring).
+    documents stale.  Nothing here computes grams: that needs Python, and replacing the
+    base is a maintenance step the operator or the scheduled block triggers (see
+    ``vector_lake.memory_gram_index``, which also explains why the overlay table below is
+    retained but written by nothing).
     """
     conn.execute(
         """

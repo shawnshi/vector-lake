@@ -1,5 +1,86 @@
 # Unreleased
 
+## 删除 gram 索引的增量机制（无生产调用者的那条路）
+
+上一批把读路径改成「不允许服务混合态」之后，增量那套就没有生产调用者了：`flush` 已不再把文档移出队列
+（出队只能由重建完成），于是 overlay 永远为空，`compact` 与 `--compact` 成了空操作 —— 复核当时评为
+「给下一个读者的陷阱」。本批把它整体切掉。
+
+**删除**（`memory_gram_index.py` 231 行函数 + 8 行常量）：
+
+- `flush_memory_gram_dirty()`、`compact_memory_gram_overlay()`、`_compact_gram_chunk()`、
+  `prune_retired_gram_docs()`
+- `DEFAULT_FLUSH_DOCS`、`COMPACT_GRAMS_PER_CALL`、`COMPACT_CHUNK_GRAMS`、`COMPACT_MAX_GRAMS`
+- CLI `gram-index --compact`（连同分支）、MCP 工具 `compact_memory_gram_index`、`tools.py` 的导入与
+  `__all__` 条目、README 里的 `--compact` 示例与说明
+
+删除后基表只有一条变更路径：重建。退役标记也不再有一条「不重建就清掉」的捷径——它随重建一起清。
+
+**故意保留**：`operational_memory_gram_overlay` 表及其索引与 `_SCHEMA_SENTINELS` 条目、
+`overlay_row_count()`、`gram_index_usable()` / `rebuild_due_reason()` 里的 overlay 判据、读路径的
+`_term_overlay()`。删表是活库上的 schema 变更，而活库目前**没有可用备份**，所以那一步单独走；判据留着
+就是它本来的作用：一旦真有 overlay 行出现，索引立刻变成不可用且「到期」。
+
+**表面变更要写明**：`gram-index --compact` 现在会**报错退出**（`unrecognized arguments`），不是静默忽略；
+调用过 MCP `compact_memory_gram_index` 的客户端会看到工具消失。
+
+### 测试
+
+6 例随其被删对象一并删除，3 例改写：
+
+- `test_gram_index_exactness.py`：两例原本用「materialise + merge」**搭出**毒化状态，现在直接断言存活的
+  不变量（编辑过的文档不得因丢弃的词而被计入；索引搜索与全量扫描一致）。第三例原本 spy 两个被删函数来证明
+  「读不排空」，改为**比较搜索前后的索引状态**——这是更强的断言（任何读路径写入都会被抓到）。
+- `test_memory_gram_index.py`：`test_a_deleted_document_is_exact_before_any_prune` →
+  `..._without_a_rebuild`（改为用重建清标记，即仅剩的那条路）；`test_compaction_preserves_results` 与两例
+  flush 批次选择测试删除。
+- `test_gram_maintenance_atomicity.py`：prune 那例随对象删除。
+- `test_the_read_path_does_not_drain_a_backlog_beyond_the_cap` 保留，docstring 改成不再提「排空」。
+
+### 证据
+
+- 全量 pytest **766 passed**（772 − 6，删掉的 6 例全部是「测试被删对象」的）。
+- 活库跑套件前后逐项相同：`operational_memory` 146,679、队列 0、**overlay 0**、
+  `page_graph_edges` 29,837、`quick_check = ok`。
+- 活库表面复验：`gram-index --if-due` 仍报「not due: 0 of 500」；`--compact` 报 `unrecognized arguments`；
+  doctor 仍为 `usable=True ... due=False of 500`。
+- 可失败性：把 `skip_doc_set()` 改成返回空集（模拟读路径不再压制陈旧基表）→ 改写后的那例失败并报
+  `the dropped gram still credits the document: {1: 3}`；恢复即通过。
+- 计数对账（复核质疑过 766/772 这个差）：`test_memory_gram_index.py` 17→14、`test_gram_index_exactness.py`
+  8→6、`test_gram_maintenance_atomicity.py` 2→1，合计 **−6**，与被删对象数一致；另外 3 例为原地改写。
+
+### 复核结论与随之修的内容
+
+独立复核（只读子代理）判 **OK with notes**，无 P0/P1；删清单完整、保留面自洽、CLI/MCP/文档表面干净，
+并独立确认「overlay 无人可写」这一前提（全树唯一的 `INSERT INTO ..._overlay` 在测试里）。
+
+一条**判定为不成立**的项（C6「陷阱是否真的清了」），已按它给的清单修掉 6 处仍在暗示「增量路径还存在」
+的文档：
+
+- 模块 docstring 里 overlay 一节（原写「Recent writes … overlay entries winning」）与 dirty 一节（原写
+  「dirty 文档在 overlay 里是权威的」）——这是最可能让下一个读者去找、或重新加回物化器的两句；现在写明
+  **保留但无人写入**，以及精确性来自「拒绝服务」而不是「合并」。
+- `accumulate_relevance` 的 `skip_docs` 说明（原写「权威值来自 overlay」）。
+- `live_dirty_doc_count`（「awaiting materialisation」）、`dirty_breakdown`（「draining the queue」）。
+- `db_store._create_memory_gram_tables`（「materialisation is a bounded maintenance step」，指向一个已不再
+  描述任何维护步骤的 docstring 所在的位置）。
+- `CONTEXT.md` 的一行摘要（原写 base + overlay + dirty set）。
+
+另按复核意见把两处**断言弱于其名称**的测试 docstring 改成如实描述：`test_the_search_agrees_with_the_full_scan_after_a_dropped_gram`
+实际只走到被拒绝后的投影扫描（两边的答案一致性仍值得钉，但它不是「合并后仍一致」），
+`test_a_deleted_document_is_exact_without_a_rebuild` 的判据是计数，等值断言因投影联表会丢掉幽灵 rowid、
+且结果窗宽于语料而无法因缺 skip 失败。
+
+### 保留 overlay 表的判断（复核第 7 问）
+
+复核明确建议**本批不删表**，理由与本批的取舍一致：保留的判据只可能「少服务」（退回精确扫描 + 一次重建，
+且重建会清空 overlay，所以有终止解），却能挡住「旧版本进程或旧备份的带外写入者」；而删表不是纯删除，它
+同时要改 `_SCHEMA_SENTINELS`（否则下一次写入会走完整 DDL 路径把表**重新建出来**）、要加一条
+`_LEGACY_SCHEMA_PRUNES` 记录（否则活库永远留着它），这几件事与「零行为变更」的批次混在一起只会放大爆炸
+半径。`GRAM_FORMAT_VERSION` 也不是干这个的：它管的是**基表内容可信度**，不是 schema；对的是 prune 台账。
+删表批次该动的位置（DDL + 索引 + 哨兵 + prune 记录 + `overlay_row_count` 的 3 个调用点 + `_term_overlay`
+与两处 overlay 循环 + doctor + 4 个测试 + 上述文档）已记录在案，待有备份后单独执行。
+
 ## 给 gram 索引定一个重建节奏
 
 索引只在「上次重建以来没有任何文档被写入」时才精确（`gram_index_usable()`）；任何一次写入之后，搜索都会

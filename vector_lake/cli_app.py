@@ -83,7 +83,6 @@ Usage Examples:
     )
     gram_index_parser.add_argument("--apply", action="store_true", help="Run the bulk rebuild. Defaults to dry-run.")
     gram_index_parser.add_argument("--if-due", action="store_true", dest="if_due", help="Rebuild only if REBUILD_AFTER_WRITES documents have been written since the last rebuild.")
-    gram_index_parser.add_argument("--compact", action="store_true", help="Merge the overlay into the base and prune retired documents.")
 
     projection_report_parser = subparsers.add_parser("projection-report", help="[MAINTENANCE] Report Wiki / canonical / index drift.")
     projection_report_parser.add_argument("--limit", type=int, default=20, help="Sample size per drift bucket.")
@@ -205,9 +204,6 @@ def main() -> int:
             ))
         elif args.command == "gram-index":
             print(tools.memory_gram_index_report())
-            if getattr(args, "compact", False):
-                print(tools.compact_memory_gram_overlay())
-                print(tools.prune_retired_gram_docs())
             if getattr(args, "if_due", False):
                 # The cadence's operator entry point: rebuild only when the write count
                 # says so, so this can be run on a schedule without rebuilding a corpus
@@ -215,7 +211,7 @@ def main() -> int:
                 print(tools.maybe_rebuild_memory_gram_index(dry_run=not getattr(args, "apply", False)))
             elif getattr(args, "apply", False):
                 print(tools.rebuild_memory_gram_index(dry_run=False))
-            elif not getattr(args, "compact", False):
+            else:
                 print(tools.rebuild_memory_gram_index(dry_run=True))
         elif args.command == "projection-report":
             print(tools.projection_diff_report(limit=getattr(args, "limit", 20)))

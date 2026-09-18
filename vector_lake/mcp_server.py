@@ -112,13 +112,6 @@ def rebuild_memory_gram_index(dry_run: bool = True) -> str:
     return tools.rebuild_memory_gram_index(dry_run=dry_run)
 
 @mcp.tool()
-def compact_memory_gram_index() -> str:
-    """Merge the n-gram overlay into the base index and prune deleted documents."""
-    merged = tools.compact_memory_gram_overlay(limit_grams=None)
-    retired = tools.prune_retired_gram_docs()
-    return f"compacted {merged}; pruned {retired}"
-
-@mcp.tool()
 def backup_retention_report(keep: int = 0, max_bytes: int = 0, dry_run: bool = True) -> str:
     """Report the .meta/backups footprint against its retention bound.
 

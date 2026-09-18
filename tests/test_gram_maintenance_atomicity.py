@@ -4,8 +4,9 @@
 *later* transaction.  Between the two, a writer on another connection could commit a
 change whose marker the clear then erased: the base would hold the pre-change grams of a
 document with nothing left to make the read path skip them, and after that rebuild the
-index reported itself usable.  ``prune_retired_gram_docs`` read its set of retired
-documents outside its transaction for the same reason.
+index reported itself usable.  ``prune_retired_gram_docs`` had the same shape
+(it read its set of retired documents outside its transaction) and has since been removed
+altogether: the rebuild is the only thing that changes the base.
 
 The fix is one transaction per operation, which means the writer is refused rather than
 interleaved.  These tests drive the real functions and, from a second connection, check
@@ -91,32 +92,3 @@ def test_the_rebuild_excludes_a_writer_while_it_stages(isolated_memory, monkeypa
 
     assert "Rebuilt the memory gram index" in result
     assert memory_gram_index.gram_index_usable() is True
-
-
-def test_the_prune_excludes_a_writer_while_it_scans(isolated_memory, monkeypatch):
-    """Pins the invariant; it does not distinguish the pre-fix behaviour.
-
-    The prune's scan already ran inside its transaction before the fix -- what was
-    outside was the *snapshot* that decides which documents are retired, and there is no
-    call between that read and the transaction to hang an observer on, so this test
-    passes either way.  It is kept because a writer being refused while the scan runs is
-    the property the fix relies on, and a later refactor that moved the scan back out of
-    the transaction would fail here.  The discriminating test for this batch is the
-    rebuild one above.
-    """
-    _seed()
-    memory_gram_index.rebuild_memory_gram_index()
-    conn = db_store.get_connection()
-    with db_store.transaction():
-        conn.execute("DELETE FROM operational_memory WHERE memory_id = 'mem_1'")
-    assert memory_gram_index.retired_doc_count() == 1
-
-    # ``_entries`` is called once per base blob while prune rewrites them, so it is the
-    # point at which the scan is under way.  It is only reached when at least one
-    # document is retired, which is why the delete above is part of the setup.
-    result = _run_holding_lock_at(
-        monkeypatch, "_entries", memory_gram_index.prune_retired_gram_docs
-    )
-
-    assert result["retired"] == 1
-    assert memory_gram_index.pending_doc_count() == 0
