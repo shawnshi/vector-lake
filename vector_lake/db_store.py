@@ -911,6 +911,53 @@ def _prune_om_json_indexes(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP INDEX IF EXISTS {old_index}")
 
 
+def _backfill_entities_ttl(conn: sqlite3.Connection) -> None:
+    """Fill ``entities.ttl`` from the json it was supposed to mirror, once.
+
+    ``upsert_entity`` and ``save_entities`` have always written the column from the record's
+    ``ttl``, but the batch path omitted it from its ``INSERT OR REPLACE``, which resets any column
+    the statement does not name.  The json is the source the indexer reads, so where it holds a
+    ``ttl`` and the column is NULL, the column is the one that is wrong.  Idempotent: after the
+    first run the ``WHERE`` matches nothing.
+
+    ``decay_weight`` has no json counterpart at all, so there is nothing to backfill it from and
+    this deliberately does not invent a value; both write paths now write it consistently instead.
+    """
+    conn.execute(
+        "UPDATE entities SET ttl = CAST(json_extract(data_json, '$.ttl') AS REAL) "
+        "WHERE ttl IS NULL AND json_extract(data_json, '$.ttl') IS NOT NULL"
+    )
+
+
+def _prune_claim_evidence_json_indexes(conn: sqlite3.Connection) -> None:
+    """Retire the three expression indexes those tables' columns replace.
+
+    Each is replaced by an index on the generated column holding the same expression, created by the
+    DDL that ran before this prune; as with ``operational_memory`` the drop is conditional on the
+    replacement existing, because the DDL is best-effort and the fast path never re-runs it.
+    """
+    present = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    for old_index, replacement in (
+        ("idx_claims_page_key", "idx_claims_f_page_key"),
+        ("idx_claims_claim_type", "idx_claims_f_claim_type"),
+        ("idx_evidence_page_key", "idx_evidence_f_page_key"),
+    ):
+        if replacement in present:
+            conn.execute(f"DROP INDEX IF EXISTS {old_index}")
+
+
+def _prune_governance_queue_index(conn: sqlite3.Connection) -> None:
+    """Drop the expression index on ``governance_queue`` -- no statement can use it.
+
+    The table is read through the generic ``_load_db_queue`` helper, which selects every row and
+    filters nothing, so the tree contains no predicate on either expression this index is built from
+    (``$.change_set_id``, ``$.status``).  Unreachable, not merely unused -- the structural form of the
+    argument the earlier index-slimming attempt lacked.  The current DDL does not create it (an older
+    release did), so a prune is the only way it converges.
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_governance_queue_change_set_status")
+
+
 def _prune_change_sets_change_id(conn: sqlite3.Connection) -> None:
     """Drop ``change_sets.change_id`` while a pre-prune database still has it.
 
@@ -940,6 +987,9 @@ _LEGACY_SCHEMA_PRUNES: tuple[
     ("2026-09-18-entities-json-indexes", (_prune_entities_json_indexes,)),
     ("2026-09-18-entities-type-status-index", (_prune_entities_type_status_index,)),
     ("2026-09-18-om-json-indexes", (_prune_om_json_indexes,)),
+    ("2026-09-18-backfill-entities-ttl", (_backfill_entities_ttl,)),
+    ("2026-09-18-claim-evidence-json-indexes", (_prune_claim_evidence_json_indexes,)),
+    ("2026-09-18-governance-queue-index", (_prune_governance_queue_index,)),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """
@@ -1125,13 +1175,51 @@ def _entities_format_is_stale(conn: sqlite3.Connection) -> bool:
     themselves asking for a column that did not exist yet.  Same shape as
     :func:`_om_index_format_is_stale`.
     """
-    return "f_page_key" not in _table_xcolumns(conn, "entities")
+    if "f_page_key" not in _table_xcolumns(conn, "entities"):
+        return True
+    return "idx_entities_f_page_key" not in _index_names(conn)
+
+
+def _index_names(conn: sqlite3.Connection) -> set[str]:
+    """Read-only: every index name in the database."""
+    try:
+        return {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    except sqlite3.Error:
+        return set()
 
 
 def _om_probability_format_is_stale(conn: sqlite3.Connection) -> bool:
-    """Read-only: are the generated columns the memory queries name missing?"""
+    """Read-only: are the generated columns the memory queries name missing?
+
+    The indexes are checked with the columns, not only the columns.  The ``CREATE INDEX`` statements
+    live in one ``try/except OperationalError`` that only logs, so a failure there -- a full disk, a
+    limit -- skips the rest of the block; the fast path never re-runs it, and the conditional prunes
+    then *keep* the retired expression indexes, which cannot serve `f_page_key = ?`.  The result
+    would be correct answers at full-scan cost, permanently and with no operator-visible signal.
+    Requiring the replacement index makes the DDL run again instead.
+    """
     present = _table_xcolumns(conn, "operational_memory")
-    return not {"f_memory_key", "f_source_claim_id"} <= present
+    if not {"f_memory_key", "f_source_claim_id"} <= present:
+        return True
+    return not {"idx_om_f_memory_key", "idx_om_f_source_claim"} <= _index_names(conn)
+
+
+def _claims_format_is_stale(conn: sqlite3.Connection) -> bool:
+    """Read-only: are the generated columns the claim/evidence/change-set queries name missing?"""
+    expected = {
+        "claims": ({"f_claim_type", "f_page_key", "f_source_page"},
+                   {"idx_claims_f_claim_type", "idx_claims_f_page_key", "idx_claims_f_source_page"}),
+        "evidence": ({"f_page_key"}, {"idx_evidence_f_page_key"}),
+        "change_sets": ({"f_status", "f_idempotency_key"},
+                        {"idx_change_sets_f_status", "idx_change_sets_f_idempotency"}),
+    }
+    indexes = _index_names(conn)
+    for table, (columns, index_names) in expected.items():
+        if not columns <= _table_xcolumns(conn, table):
+            return True
+        if not index_names <= indexes:
+            return True
+    return False
 
 
 def _page_index_state_format_is_stale(conn: sqlite3.Connection) -> bool:
@@ -1153,6 +1241,7 @@ def init_db():
             and not _page_index_state_format_is_stale(get_connection())
             and not _entities_format_is_stale(get_connection())
             and not _om_probability_format_is_stale(get_connection())
+            and not _claims_format_is_stale(get_connection())
         ):
             # The DDL would be a no-op, and running it would block every reader
             # behind the writer's lock.  Keep the cheap gap-fill so a writer that
@@ -1208,6 +1297,16 @@ def _init_db_once(db_key: str):
                 updated_at TEXT
             )
         """)
+        # The three json paths this table is queried by, as generated columns: equal to the json by
+        # construction.  ``status`` is deliberately absent -- ``claims.status`` is already a real
+        # column and nothing filters the json spelling.
+        for column, path in (("f_claim_type", "$.claim_type"), ("f_page_key", "$.locator.page_key"),
+                             ("f_source_page", "$.source_page")):
+            if column not in _table_xcolumns(conn, "claims"):
+                conn.execute(
+                    f"ALTER TABLE claims ADD COLUMN {column} TEXT "
+                    f"GENERATED ALWAYS AS (json_extract(data_json, '{path}')) VIRTUAL"
+                )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS evidence (
                 evidence_id TEXT PRIMARY KEY,
@@ -1215,6 +1314,11 @@ def _init_db_once(db_key: str):
                 updated_at TEXT
             )
         """)
+        if "f_page_key" not in _table_xcolumns(conn, "evidence"):
+            conn.execute(
+                "ALTER TABLE evidence ADD COLUMN f_page_key TEXT "
+                "GENERATED ALWAYS AS (json_extract(data_json, '$.locator.page_key')) VIRTUAL"
+            )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sources (
                 source_id TEXT PRIMARY KEY,
@@ -1229,6 +1333,12 @@ def _init_db_once(db_key: str):
                 updated_at TEXT
             )
         """)
+        for column, path in (("f_status", "$.status"), ("f_idempotency_key", "$.idempotency_key")):
+            if column not in _table_xcolumns(conn, "change_sets"):
+                conn.execute(
+                    f"ALTER TABLE change_sets ADD COLUMN {column} TEXT "
+                    f"GENERATED ALWAYS AS (json_extract(data_json, '{path}')) VIRTUAL"
+                )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS change_set_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -1449,14 +1559,17 @@ def _init_db_once(db_key: str):
         # Add expression-based indexes for performance
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_f_page_key ON entities (f_page_key)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_page_key ON claims (json_extract(data_json, '$.locator.page_key'))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_page_key ON evidence (json_extract(data_json, '$.locator.page_key'))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_f_page_key ON claims (f_page_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_f_source_page ON claims (f_source_page)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_f_page_key ON evidence (f_page_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_change_sets_f_status ON change_sets (f_status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_change_sets_f_idempotency ON change_sets (f_idempotency_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_om_f_memory_key ON operational_memory (memory_type, f_memory_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_om_f_source_claim ON operational_memory (f_source_claim_id)")
-            # ``timeline_projection_parity`` runs on every timeline query and used
-            # to full-scan ``claims`` because the claim_type predicate had no
-            # index.  The expression text must match the query verbatim.
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_claim_type ON claims (json_extract(data_json, '$.claim_type'))")
+            # ``timeline_projection_parity`` runs on every timeline query; the index that serves the
+            # claim_type predicate is on the generated column now, so the predicate no longer has to
+            # match the expression text verbatim (its predecessor was an expression index and did).
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_f_claim_type ON claims (f_claim_type)")
         except sqlite3.OperationalError as e:
             # Older SQLite versions might not support expression indexes
             import logging
@@ -1612,8 +1725,8 @@ def delete_node_cascade(node_key: str):
         placeholders = ",".join("?" for _ in related_ids)
         old_claim_rows = conn.execute(
             "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE "
-            "json_extract(data_json, '$.locator.page_key') = ? OR "
-            "json_extract(data_json, '$.source_page') IN (?, ?)",
+            "f_page_key = ? OR "
+            "f_source_page IN (?, ?)",
             (node_key, node_key, node_key + ".md"),
         ).fetchall()
 
@@ -1622,12 +1735,12 @@ def delete_node_cascade(node_key: str):
         conn.execute(f"DELETE FROM vec_embeddings WHERE entity_id IN ({placeholders})", related_ids)
         conn.execute(
             "DELETE FROM claims WHERE "
-            "json_extract(data_json, '$.locator.page_key') = ? OR "
-            "json_extract(data_json, '$.source_page') IN (?, ?)",
+            "f_page_key = ? OR "
+            "f_source_page IN (?, ?)",
             (node_key, node_key, node_key + ".md"),
         )
         conn.execute(
-            "DELETE FROM evidence WHERE json_extract(data_json, '$.locator.page_key') = ?",
+            "DELETE FROM evidence WHERE f_page_key = ?",
             (node_key,),
         )
         conn.execute(

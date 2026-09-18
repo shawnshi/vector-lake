@@ -109,7 +109,7 @@ def _timeline_claims_fingerprint(conn=None) -> str:
     conn = conn or get_connection()
     count, newest, highest = conn.execute(
         "SELECT COUNT(*), COALESCE(MAX(updated_at), ''), COALESCE(MAX(rowid), 0) "
-        "FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
+        "FROM claims WHERE f_claim_type = 'timeline-event'"
     ).fetchone()
     projected, lowest_id, highest_id = conn.execute(
         "SELECT COUNT(*), COALESCE(MIN(id), ''), COALESCE(MAX(id), '') FROM timeline_events"
@@ -177,7 +177,7 @@ def timeline_projection_parity() -> dict:
         return dict(_PARITY_CACHE["result"])
     claim_rows = conn.execute(
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
-        "WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
+        "WHERE f_claim_type = 'timeline-event'"
     ).fetchall()
     expected_ids = {_event_from_claim_row(row)["id"] for row in claim_rows}
     actual_ids = {str(row["id"]) for row in conn.execute("SELECT id FROM timeline_events")}
@@ -197,7 +197,7 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
     conn = get_connection()
     query = (
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
-        "WHERE json_extract(data_json, '$.claim_type') = 'timeline-event' "
+        "WHERE f_claim_type = 'timeline-event' "
         "ORDER BY updated_at DESC"
     )
     params: list = []
@@ -248,7 +248,7 @@ def repair_timeline_projection(dry_run: bool = True) -> str:
     conn = get_connection()
     claim_rows = conn.execute(
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
-        "WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
+        "WHERE f_claim_type = 'timeline-event'"
     ).fetchall()
     entity_ids: set[str] = set()
     for row in claim_rows:
@@ -331,7 +331,7 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
             f"Run rebuild_timeline_events(dry_run=False) to restore the indexed path.\n\n"
         )
 
-    query = "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE json_extract(data_json, '$.claim_type') = 'timeline-event'"
+    query = "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE f_claim_type = 'timeline-event'"
     params = []
     
     if entity_name:

@@ -1,5 +1,62 @@
 # Unreleased
 
+## D5 收尾：`claims` / `evidence` / `change_sets` + 一处不可达索引 + `ttl`/`decay_weight` 定案
+
+### 按规则 1 分类（实测）
+
+| 表 / 路径 | 分类 | 决定 |
+|---|---|---|
+| `claims.status` | 已是真列，且没有任何语句按 json 拼写过滤 | **不动**（规则 1a） |
+| `claims.$.claim_type`（tool_timeline 5 处）、`$.locator.page_key`（3 处）、`$.source_page`（2 处） | 只有 json，有谓词 | 生成列 + 索引；**同一提交改完全部使用方**（规则 4）—— 那两个表达式索引此前正被查询按**原文**使用 |
+| `evidence.$.locator.page_key`（3 处） | 同上 | 生成列 + 索引 |
+| `change_sets.$.status`（2 处）、`$.idempotency_key`（1 处） | 同上 | 生成列 + 索引 |
+| `governance_queue` 的表达式索引 | **全树没有任何语句碰这张表**（它经 `_load_db_queue` 全表读取，且 `$.change_set_id` 在 14,425 行里**全部缺失**） | 规则 1c：**删**（当前 DDL 从不创建它，只能靠台账收敛） |
+
+改完全部 15 处后，全树再 grep 这些表达式原文已为空。
+
+### `ttl`/`decay_weight`：按你的决定「保留 + 让批量路径一致写入」
+
+根因找到了：`_upsert_canonical_records` 用 `INSERT OR REPLACE` 却**没有把这两列写进语句** —— `INSERT OR REPLACE`
+会把语句未命名的列**重置**，所以每次批量写入都把 `ttl`/`decay_weight` 抹成 NULL（7,919/7,924 行为 NULL，而 json 里
+5,720 行有 `$.ttl`）。现在批量路径按与 `upsert_entity` **完全相同的推导**写入这两列（`record.get(...) or 0.0`）；
+`decay_weight` 在 json 里**没有对应字段**（0/7,924），因此不凭空造值，只保证两条写路径一致。另加一条台账迁移把
+`ttl` 从它真正的来源（json）回填：活库现在是 `ttl` 非空 5,721 行、**drift 0、值不一致 0**。
+
+### 活库证据
+
+`claims` 102,103 行三列全部非空、与 json **不一致 0**；`evidence` 121,249 行同样；`change_sets` 26,774 行两列同样；
+旧表达式索引已删、新列索引已建；`governance_queue` 只剩主键索引；`quick_check ok`；doctor
+`9 prune(s) applied`、State Consistency 不变。全量 pytest **839 passed, 1 xfailed**。
+
+### 构建期的三次自伤（都记录在此，因为都是同一类错）
+
+1. 插入三个表的生成列时，我的替换**把各自的 `CREATE TABLE` 语句吃掉了**，循环落进了 `conn.execute("""...""")`
+   字符串里 → `unrecognized token: #`；
+2. 修好后又留下三个**多余的 `""")`** 终结符 → `IndentationError`；
+3. 一处台账注册与一处 DDL 删除的替换**没加断言而静默失效**（前者导致 prune 未注册、后者发现该索引本来就不在当前
+   DDL 里）。
+
+**教训（已写进提案模板规则 11）**：`INSERT OR REPLACE` 只写语句里命名的列，**未命名的列会被重置** —— 这正是 `ttl`
+漂移的成因，也是「加列时要同时检查所有写入方」这条规则的具体形式。
+
+### 复核 OK with notes（无 P0/P1），三条已处理
+
+1. **我写的 `8 prune(s)` 与事实不符**（复核从代码里数出台账有 9 条）。实测确认：台账 **9 条、无待办**，
+   doctor 现在报 `9 prune(s) applied`；已改。
+2. **探针只查列、不查索引**（复核指出的真实隐患）：DDL 的 `CREATE INDEX` 块整体包在一个只告警的
+   `try/except OperationalError` 里，若其中一条失败，其余八条被跳过、快速路径永不重跑，而**条件式 prune 会因此保留
+   已退役的表达式索引**（它无法服务 `f_page_key = ?`）→ 结果正确但**永久全表扫描且无任何可见信号**。现在
+   `_entities_format_is_stale`/`_om_probability_format_is_stale`/`_claims_format_is_stale` **同时要求替代索引存在**，
+   缺索引会让 `init_db` 重走 DDL 路径。新增两例测试：缺替代索引被判为陈旧并收敛；以及**条件分支本身**
+   （替代索引不存在时旧索引保留、迁移仍被记录）。
+3. **非数值 `ttl` 会在变更集事务里抛异常**（批量路径新继承的行为）。实测活库 **0 个非数值 ttl**（全部 integer），
+   但为消除这个新失败面，两条写路径改为共用一个转换 `_float_or_zero`（数字与数字字符串照常解析，其它按「缺失」处理，
+   与树内其它读取方一致），并加测试覆盖 `ttl: "180"` 与 `ttl: "180d"`。
+
+另修两处被复核指出的**陈述不实**：`idx_claims_claim_type` 的注释（它当初就是为那个谓词加的，变的是「不再需要按表达式
+原文匹配」），以及「`$.change_set_id` 在 14,425 行里全部缺失」这一数据（有两个写入方会写该键，删除该索引的理由是
+**不可达**，与这条数据无关）。
+
 ## D5 第二张表：`operational_memory` —— 模板规则 1 在这里省掉了全部新增
 
 同一模板，但**先分类再动手**让这张 146,679 行的表看起来与第一张完全不同：

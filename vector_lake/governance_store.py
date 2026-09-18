@@ -527,6 +527,20 @@ def canonical_page_versions(page_keys: set[str] | None = None) -> dict[str, str]
         for page_key, page_rows in rows_by_page.items()
     }
 
+def _float_or_zero(value) -> float:
+    """``float(value)``, or ``0.0`` when the value is not a number.
+
+    The two entity writers have to agree on this, and the rest of the tree already treats an
+    unparseable ttl as absent (``indexer``, ``tool_lint`` read it defensively).  The batch path
+    converts ``ttl`` inside the change-set transaction, so an exception there would roll back a whole
+    batch over one bad frontmatter value; accepting numeric strings keeps ``ttl: "180"`` working.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def upsert_entity(entity_id: str, data: dict):
     conn = get_connection()
     now = _utc_now()
@@ -537,8 +551,8 @@ def upsert_entity(entity_id: str, data: dict):
         str(data.get("canonical_name") or data.get("title") or data.get("page_key") or entity_id),
         str(data.get("type", "")),
         str(data.get("status", "Active")),
-        float(data.get("ttl") or 0.0),
-        float(data.get("decay_weight") or 0.0),
+        _float_or_zero(data.get("ttl")),
+        _float_or_zero(data.get("decay_weight")),
         json.dumps(data, ensure_ascii=False),
         now
     ]
@@ -566,15 +580,23 @@ def _upsert_canonical_records(table_name: str, key_name: str, records: list[dict
     now = _utc_now()
     if table_name == "entities":
         conn.executemany(
+            # ``ttl`` and ``decay_weight`` are in the column list for the same reason the fields
+            # above are: ``INSERT OR REPLACE`` *replaces* the row, so a column left out of this
+            # statement is reset to NULL.  That is how 7,919 of 7,924 rows came to have a NULL
+            # ``ttl`` while the json carried one, and why ``decay_weight`` (which has no json
+            # counterpart at all) was wiped by every batch write.  The values are derived exactly as
+            # ``upsert_entity`` derives them, so the two write paths agree by construction.
             "INSERT OR REPLACE INTO entities "
-            "(entity_id, canonical_name, type, status, data_json, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(entity_id, canonical_name, type, status, ttl, decay_weight, data_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     record[key_name],
                     str(record.get("canonical_name") or record.get("title") or record.get("page_key") or record[key_name]),
                     str(record.get("type", "")),
                     str(record.get("status", "Active")),
+                    _float_or_zero(record.get("ttl")),
+                    _float_or_zero(record.get("decay_weight")),
                     json.dumps(record, ensure_ascii=False),
                     now,
                 )
@@ -1702,7 +1724,7 @@ def create_change_set(
     if not force:
         from vector_lake.db_store import get_connection
         conn = get_connection()
-        row = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.idempotency_key') = ?", (idempotency_key,)).fetchone()
+        row = conn.execute("SELECT data_json FROM change_sets WHERE f_idempotency_key = ?", (idempotency_key,)).fetchone()
         if row:
             duplicate = json.loads(row[0])
             duplicate["deduplicated"] = True
@@ -1920,7 +1942,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
         }
         old_claim_rows = conn.execute(
             f"SELECT claim_id, claim_text, data_json, updated_at FROM claims "
-            f"WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
+            f"WHERE f_page_key IN ({placeholders})",
             affected_page_params,
         ).fetchall()
         old_claim_ids = {row["claim_id"] for row in old_claim_rows}
@@ -1948,11 +1970,11 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             affected_page_params,
         )
         conn.execute(
-            f"DELETE FROM claims WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
+            f"DELETE FROM claims WHERE f_page_key IN ({placeholders})",
             affected_page_params,
         )
         conn.execute(
-            f"DELETE FROM evidence WHERE json_extract(data_json, '$.locator.page_key') IN ({placeholders})",
+            f"DELETE FROM evidence WHERE f_page_key IN ({placeholders})",
             affected_page_params,
         )
         # ``page_graph_edges`` is a projection owned by the indexer, which replaces
@@ -2000,7 +2022,7 @@ def publish_change_sets(limit: int | None = None) -> dict:
     initialize_meta_store()
     from vector_lake.db_store import get_connection, transaction
     conn = get_connection()
-    rows = conn.execute("SELECT change_set_id, data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
+    rows = conn.execute("SELECT change_set_id, data_json FROM change_sets WHERE f_status = 'pending'").fetchall()
     
     published = 0
     published_ids = []
@@ -2032,7 +2054,7 @@ def publish_change_sets(limit: int | None = None) -> dict:
 def pending_change_sets() -> list:
     from vector_lake.db_store import get_connection
     conn = get_connection()
-    rows = conn.execute("SELECT data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()
+    rows = conn.execute("SELECT data_json FROM change_sets WHERE f_status = 'pending'").fetchall()
     return [json.loads(r[0]) for r in rows]
 
 
