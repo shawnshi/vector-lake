@@ -1,5 +1,76 @@
 # Unreleased
 
+## D5 第一张表：`entities.page_key` 变成生成列，三个 json 索引退役
+
+提案冻结的模板在本表上落地：**虚拟生成列 + 普通索引**（不是投影表 + 触发器 —— 生成列按构造就等于它派生的
+json，没有漂移可比、没有东西要同步）。
+
+### 表的选择由证据决定，不是我原先的猜测
+
+提案里我按「读写权重」猜的顺序以 `governance_queue` 开头。实测查询点后推翻：`governance_queue` 的 json
+**只出现在一个表达式索引里（零条查询）**，而 `entities.page_key` 有 **13 处查询点、跨 6 个模块**。因此第一张表是
+`entities`。同表另外两类 json 读取也测量而非假定：`type`/`status` **已经是真列且每行都填、与 json 逐行相同**
+（0 个 NULL、0 处不一致），而 `ttl`/`decay_weight` 在 7,924 行里有 7,919 行是 NULL（残留列）；并且**全树没有任何
+语句按 type/status 过滤 entities**（用 grep 证，不是用查询 trace 证 —— 本会话早先那次基于 trace 的「未使用」
+判断已被计时实验推翻）。
+
+### 改动
+
+- 新增生成列 `f_page_key`（幂等 `ALTER`，用新增的 `_table_xcolumns` 探测）与索引 `idx_entities_f_page_key`；
+  DDL 不再创建 `idx_entities_type`/`idx_entities_status`/`idx_entities_page_key`，并由新台账迁移
+  `2026-09-18-entities-json-indexes` 把仍持有它们的库收敛掉；`_entities_format_is_stale` 加入快速路径的探针组。
+- 12 处查询点改为直接引用 `f_page_key`（`db_store`、`governance_store`×2、`indexer`、`runtime_health`×2、
+  `tool_doctor`×2、`tool_projection`×3）。
+- 新增 `tests/test_entities_page_key_column.py` 3 例：列的回答与 json 完全一致且计划使用新索引；缺列的库经
+  `init_db` 收敛且幂等；台账迁移删掉三个索引且 DDL 不再创建它们。
+
+### 构建过程中被测试抓到的两个真缺口
+
+1. **生成列不在 `PRAGMA table_info` 里**（只在 `table_xinfo` 里）。用 `table_info` 做探测会把「列永远缺失」
+   当成事实：每次启动都重跑 `ALTER`，直到报 `duplicate column name`，同时让快速路径永不生效。因此新增
+   `_table_xcolumns`，探测与守卫都用它。
+2. **新增列必须进「陈旧」探针组**，否则哨兵齐全的库走快速路径、永不执行 `ALTER` —— 被改写后的查询随即报
+   `no such column: f_page_key`（测试就是这样抓到的）。
+   另有一处是我自己的疏忽：台账注册那一步的替换没加断言，静默失效，被新测试当场抓住（已改为断言式替换）。
+
+### 活库应用与验证
+
+`applied: ['2026-09-18-entities-json-indexes']`；`f_page_key` 已存在、`idx_entities_f_page_key` 已建、
+三个 json 索引已删。**只读等价性**：7,924 行 entities 中 **7,924 行 `f_page_key` 非空**，
+**与 `json_extract(data_json,'$.page_key')` 不一致的行数为 0**；计划显示
+`SEARCH entities USING INDEX idx_entities_f_page_key`；`quick_check ok`；doctor
+`Schema Migrations: 4 prune(s) applied`，唯一 FAIL 仍是既存 Watchdog。
+
+### 复核判 **BLOCK**（仅一条 P1），已修并复验
+
+复核的 P1 是对的，而且我按它的复现步骤在**临时库**上跑出了同样结果：**写入前健康门会在缺列的库上抛
+`no such column: f_page_key`**。原因链是：`execute_mutation_batch` **先**跑写入健康门、**后**才 `init_db`，
+而 `assess_runtime_health` 只在**数据库文件不存在**时才 init —— 于是「库在、列不在」的中间态下，门先炸，
+而修 schema 的代码在它后面。同类路径还有三处（`tool_projection._canonical_keys`、`indexer` 的两条读列路径）。
+
+修法与复核建议一致：这四处改为**无条件 `init_db()`**（健康门、`_canonical_keys`、`_generate_index_locked`、
+`update_index_items`），而 `doctor` 按契约保持只读，改为报「`entities.f_page_key` 缺失，schema 未收敛，请运行任一
+会调用 `init_db` 的命令」而不是抛裸 SQL 错。复验：同一段「删列 + 换新进程」脚本，修复前 `RAISED OperationalError`，
+修复后 `assess_runtime_health ok: True` 且列已被补上；新增回归测试
+`test_the_health_gate_converges_a_pre_migration_database` 把这条钉住。
+
+其余 P2 也已处理：
+
+- **`idx_entities_type_status`（归档迁移建的，当前 DDL 不再建）**：活库上确实还在。复核指出它必须用**新迁移名**
+  才能收敛（台账会跳过已记录的名字），已单独立 `2026-09-18-entities-type-status-index`；活库现在是
+  `idx_entities_canonical` + `idx_entities_f_page_key` 两个。
+- **测试里一条恒真断言**：我原先用 `_SCHEMA_SENTINELS`（它只含表名）来断言「DDL 不再建那些索引」——复核指出
+  这在改动前也成立。已换成真正能失败的检查：删掉台账行、重跑 `_init_db_once`、断言三个索引名不在 `sqlite_master`。
+- **数量口径**：全树实际是**9 条语句 / 13 行源码**（不是 12 或 13 处「地方」），db_store 的注释已改，CHANGELOG 同步。
+- **模板补充四条**（写进提案）：先分类再决定加列（真列/只有 json/死索引）；命名新列的查询其调用路径必须先
+  `init_db()`；已执行的迁移若要加步骤必须换新名字；不能退役仍被表达式原文使用的索引（`claims`/`evidence` 属于此类）。
+
+复核同时给出下一个表的**已知待办**并被我采纳进提案：`operational_memory` 的 `idx_memory_type`/`idx_memory_status`
+索引的是 json 而查询用的是真列 —— 与 entities 那两个同样死，且这张表有 146k 行；若给它们加生成列就会造出
+**第三种拼写**。而 `idx_memory_key`、`idx_memory_source_claim` 有真实使用方，必须保留。
+
+全量 pytest **824 passed, 1 xfailed**（xfail 是上一批记录的图层缺陷，与本批无关）。
+
 ## 链接解析只留一个所有者（lint 与图不再各答一次），并起出它掩盖的缺陷
 
 `tool_lint` 与 `indexer` 各自回答「这条链接指向哪个页面」，答案不一样 —— 同一个链接在 lint 是「好的」、

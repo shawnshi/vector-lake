@@ -1914,7 +1914,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
         old_entity_ids = {
             row["entity_id"]
             for row in conn.execute(
-                f"SELECT entity_id FROM entities WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
+                f"SELECT entity_id FROM entities WHERE f_page_key IN ({placeholders})",
                 affected_page_params,
             )
         }
@@ -1944,7 +1944,7 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
                 (touched_claim_json, touched_claim_json),
             )
         conn.execute(
-            f"DELETE FROM entities WHERE json_extract(data_json, '$.page_key') IN ({placeholders})",
+            f"DELETE FROM entities WHERE f_page_key IN ({placeholders})",
             affected_page_params,
         )
         conn.execute(

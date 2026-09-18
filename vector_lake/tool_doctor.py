@@ -203,13 +203,22 @@ def doctor_vector_lake() -> str:
                 if not str(key).startswith("System_")
             }
         conn = get_connection()
-        canonical_keys = {
-            row["page_key"] for row in conn.execute(
-                "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
-                "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
-            )
-            if not str(row["page_key"]).startswith("System_")
-        }
+        try:
+            canonical_keys = {
+                row["page_key"] for row in conn.execute(
+                    "SELECT f_page_key AS page_key FROM entities "
+                    "WHERE f_page_key IS NOT NULL"
+                )
+                if not str(row["page_key"]).startswith("System_")
+            }
+        except sqlite3.OperationalError as exc:
+            # The doctor is read-only by contract and must not run the migration that would add the
+            # column; the surrounding handler turns this into a check that names the state instead
+            # of a bare SQL error.
+            raise RuntimeError(
+                f"entities.f_page_key is missing ({exc}); the schema is not converged -- "
+                "run any command that calls init_db()"
+            ) from exc
         missing_index = canonical_keys - index_keys
         extra_index = index_keys - canonical_keys
         missing_canonical = wiki_keys - canonical_keys

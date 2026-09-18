@@ -847,6 +847,37 @@ def _prune_gram_overlay(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS operational_memory_gram_overlay")
 
 
+def _prune_entities_json_indexes(conn: sqlite3.Connection) -> None:
+    """Drop the three indexes the ``entities`` json queries used to need.
+
+    ``$.page_key`` is now a generated column with its own index, and ``$.type``/``$.status`` are
+    read through the real ``type``/``status`` columns wherever they are read at all -- no statement
+    in the tree filters ``entities`` by either one (checked by grep, not by a query trace, which
+    would only say the tests never issued that shape).  They cost a write on every entity insert.
+    Recreatable from the DDL if a future query needs them.
+    """
+    for statement in (
+        "DROP INDEX IF EXISTS idx_entities_type",
+        "DROP INDEX IF EXISTS idx_entities_status",
+        "DROP INDEX IF EXISTS idx_entities_page_key",
+    ):
+        conn.execute(statement)
+
+
+def _prune_entities_type_status_index(conn: sqlite3.Connection) -> None:
+    """Drop the last unused index on ``entities``, under its own migration name.
+
+    ``archive/migrate_v9_to_v10.py`` created ``idx_entities_type_status(type, status)`` and the
+    current DDL does not, so a database that ran that migration still carries it.  No statement in
+    the tree filters ``entities`` by type or status (checked by grep), so it is a write on every
+    entity insert and serves nothing.
+
+    A separate name rather than a step added to the json-index prune: the ledger skips a migration
+    it has already recorded, so adding a step there would never run on the databases that matter.
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_entities_type_status")
+
+
 def _prune_change_sets_change_id(conn: sqlite3.Connection) -> None:
     """Drop ``change_sets.change_id`` while a pre-prune database still has it.
 
@@ -873,6 +904,8 @@ _LEGACY_SCHEMA_PRUNES: tuple[
     ("2026-09-17-prune-orphaned-legacy-schema", (_prune_orphaned_legacy_schema,)),
     ("2026-09-17-drop-change-sets-change-id", (_prune_change_sets_change_id,)),
     (GRAM_OVERLAY_DROP, (_prune_gram_overlay,)),
+    ("2026-09-18-entities-json-indexes", (_prune_entities_json_indexes,)),
+    ("2026-09-18-entities-type-status-index", (_prune_entities_type_status_index,)),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """
@@ -1025,6 +1058,19 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
+def _table_xcolumns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names of ``table`` *including* generated ones; empty when it does not exist.
+
+    ``PRAGMA table_info`` omits a ``GENERATED`` column -- only ``table_xinfo`` lists it -- so a
+    probe built on :func:`_table_columns` cannot see one and would report it missing forever,
+    re-running the ``ALTER`` on every start until it failed with "duplicate column name".
+    """
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_xinfo({table})")}
+    except sqlite3.Error:
+        return set()
+
+
 def _om_index_format_is_stale(conn: sqlite3.Connection) -> bool:
     """Read-only equivalent of ``_init_db_once``'s ``ALTER TABLE`` format probe.
 
@@ -1035,6 +1081,17 @@ def _om_index_format_is_stale(conn: sqlite3.Connection) -> bool:
     stale, which sends the caller down the full initialisation path.
     """
     return "source_rowid" not in _table_columns(conn, "operational_memory_index")
+
+
+def _entities_format_is_stale(conn: sqlite3.Connection) -> bool:
+    """Read-only: is the generated column the ``page_key`` queries use missing?
+
+    Columns added by ``_init_db_once`` need this, or a database that already has every sentinel
+    takes the fast path and never runs the ``ALTER`` -- which is how the rewritten queries found
+    themselves asking for a column that did not exist yet.  Same shape as
+    :func:`_om_index_format_is_stale`.
+    """
+    return "f_page_key" not in _table_xcolumns(conn, "entities")
 
 
 def _page_index_state_format_is_stale(conn: sqlite3.Connection) -> bool:
@@ -1054,6 +1111,7 @@ def init_db():
             _schema_is_complete(db_path)
             and not _om_index_format_is_stale(get_connection())
             and not _page_index_state_format_is_stale(get_connection())
+            and not _entities_format_is_stale(get_connection())
         ):
             # The DDL would be a no-op, and running it would block every reader
             # behind the writer's lock.  Keep the cheap gap-fill so a writer that
@@ -1089,6 +1147,17 @@ def _init_db_once(db_key: str):
                 conn.execute(f"ALTER TABLE entities ADD COLUMN {col} {col_type}")
             except sqlite3.OperationalError:
                 pass
+        # ``page_key`` is named by nine statements across six modules (thirteen source lines) and
+        # was only ever reachable through
+        # ``json_extract``, so it gets a *generated* column: unlike the four above (which a writer
+        # has to keep in step, and which nothing but a full rewrite can backfill), a virtual
+        # column is by construction always equal to the json it derives from -- there is no drift
+        # to compare, no trigger, and no separate projection table to keep consistent.
+        if "f_page_key" not in _table_xcolumns(conn, "entities"):
+            conn.execute(
+                "ALTER TABLE entities ADD COLUMN f_page_key TEXT "
+                "GENERATED ALWAYS AS (json_extract(data_json, '$.page_key')) VIRTUAL"
+            )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claims (
                 claim_id TEXT PRIMARY KEY,
@@ -1326,9 +1395,7 @@ def _init_db_once(db_key: str):
         
         # Add expression-based indexes for performance
         try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities (json_extract(data_json, '$.type'))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_status ON entities (json_extract(data_json, '$.status'))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_page_key ON entities (json_extract(data_json, '$.page_key'))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_f_page_key ON entities (f_page_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_page_key ON claims (json_extract(data_json, '$.locator.page_key'))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_page_key ON evidence (json_extract(data_json, '$.locator.page_key'))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON operational_memory (json_extract(data_json, '$.memory_type'))")
@@ -1486,7 +1553,7 @@ def delete_node_cascade(node_key: str):
         rows = conn.execute(
             "SELECT entity_id FROM entities "
             "WHERE entity_id = ? OR canonical_name = ? "
-            "OR json_extract(data_json, '$.page_key') = ?",
+            "OR f_page_key = ?",
             (node_key, node_key, node_key),
         ).fetchall()
         entity_ids = {row["entity_id"] for row in rows}

@@ -57,8 +57,11 @@ def assess_runtime_health(
 
     try:
         db_path = get_db_path()
-        if not db_path.exists():
-            init_db()
+        # Unconditionally: this check runs *before* the mutation coordinator calls ``init_db``, and
+        # it reads columns that a database predating a migration does not have yet.  Guarding on
+        # "the file exists" meant a pre-migration database raised ``no such column`` here instead of
+        # converging -- the write gate failing before the code that would fix the schema.
+        init_db()
         conn = get_connection()
     except Exception as exc:
         return {"ok": False, "issues": [f"database_unavailable:{exc}"], "warnings": [], "detail": {}}
@@ -271,8 +274,8 @@ def assess_runtime_health(
     wiki_keys = wiki_page_keys(wiki_dir, NON_NODE_WIKI_FILES) if wiki_dir.exists() else set()
     canonical_keys = {
         row["page_key"] for row in conn.execute(
-            "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
-            "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
+            "SELECT f_page_key AS page_key FROM entities "
+            "WHERE f_page_key IS NOT NULL"
         )
         if row["page_key"] and not str(row["page_key"]).startswith("System_")
     }

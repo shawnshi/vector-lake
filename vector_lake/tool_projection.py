@@ -37,14 +37,15 @@ def _wiki_keys() -> set[str]:
 
 
 def _canonical_keys() -> set[str]:
-    if not get_db_path().exists():
-        init_db()
+    # Unconditionally, for the same reason the health gate does it: the query below names a column
+    # that only exists once the DDL (or its ALTER) has run.
+    init_db()
     conn = get_connection()
     return {
         row["page_key"]
         for row in conn.execute(
-            "SELECT json_extract(data_json, '$.page_key') AS page_key FROM entities "
-            "WHERE json_extract(data_json, '$.page_key') IS NOT NULL"
+            "SELECT f_page_key AS page_key FROM entities "
+            "WHERE f_page_key IS NOT NULL"
         )
         if row["page_key"] and not str(row["page_key"]).startswith("System_")
     }
@@ -212,7 +213,7 @@ def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None
     # index.json no longer carries page bodies, so the embedding corpus is taken
     # from canonical SQLite keyed by page_key.
     bodies = {}
-    page_key = "json_extract(data_json, '$.page_key')"
+    page_key = "f_page_key"
     for row in get_connection().execute(
         f"SELECT {page_key} AS page_key, data_json FROM entities WHERE {page_key} IS NOT NULL"
     ):
@@ -254,7 +255,7 @@ def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None
 def _canonical_entity_by_page_key(page_key: str) -> dict | None:
     conn = get_connection()
     row = conn.execute(
-        "SELECT data_json FROM entities WHERE json_extract(data_json, '$.page_key') = ? LIMIT 1",
+        "SELECT data_json FROM entities WHERE f_page_key = ? LIMIT 1",
         (page_key,),
     ).fetchone()
     if row is None:

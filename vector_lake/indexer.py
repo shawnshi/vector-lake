@@ -980,7 +980,11 @@ def generate_index(skip_embeddings: bool = True):
 
 def _generate_index_locked(skip_embeddings: bool = True):
     index_data = _empty_index_data()
-    from vector_lake.db_store import get_connection
+    from vector_lake.db_store import get_connection, init_db
+
+    # The projection reads ``entities.f_page_key``; a database predating that column must converge
+    # before the SELECT runs, or the whole rebuild dies on a missing column.
+    init_db()
     conn = get_connection()
 
     # Read from canonical SQLite instead of Markdown files
@@ -1075,6 +1079,8 @@ def update_index_items(filenames: list[str]):
 
     # Filter valid files
     valid_filenames = []
+    # Same precondition as the full build: the canonical lookup below names ``f_page_key``.
+    db_store.init_db()
     for filename in filenames:
         if not filename.endswith(".md") or filename in NON_NODE_WIKI_FILES or filename.startswith("System_"):
             continue
@@ -1095,7 +1101,7 @@ def update_index_items(filenames: list[str]):
         try:
             row = conn.execute(
                 "SELECT entity_id, data_json FROM entities "
-                "WHERE json_extract(data_json, '$.page_key') = ? LIMIT 1",
+                "WHERE f_page_key = ? LIMIT 1",
                 (node_key,),
             ).fetchone()
             if row:
