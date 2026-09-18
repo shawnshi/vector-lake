@@ -1,25 +1,34 @@
 # Required runtime dependencies.
+#
+# CJK tokenization is layered (see vector_lake/tokenizer.py):
+#   * rjieba -> jieba-rs (Rust) via the official PyO3 binding. Ships cp38-abi3
+#     wheels for Windows/macOS/manylinux/musllinux, so no compiler is needed on
+#     the supported platforms. Measured 7-15x faster here.
+#   * jieba  -> pure-Python fallback, always installable, and the only backend
+#     exposing add_word() for custom dictionary terms.
+#
+# Community detection uses Leiden (leidenalg on igraph), which replaced
+# python-louvain/Louvain; see scripts/community_clustering_daemon.py.
+#
+# mistune is pinned to >=3.0.1, not >=3.0: create_markdown(renderer='ast') raises
+# TypeError on 3.0.0 and only works from 3.0.1 onwards (verified by running both).
 
-
-# 系统基础与配置
-filelock>=3.15.0
-python-dotenv>=1.0.1
-PyYAML>=6.0.2
-watchdog>=5.0.0
-
-# 核心大模型 SDK 与 MCP 协议 (已修正版本号)
-google-genai>=2.2.0,<1.0.0     # 修复：原 2.0.0 不存在，锁定 0.x 最新版
-fastmcp>=4.0.0                  # 修复：原 4.0.0 笔误，修正为 0.4.x
-
-# 图计算与高阶分层社区聚类 (GraphRAG 核心)
-networkx>=3.2.1
+filelock>=3.15
+networkx>=3.2
+python-dotenv>=1.0
 igraph>=0.11.0
 leidenalg>=0.10.0
-
-# 本地混合检索 (Dense 向量 + Sparse 词法)
+PyYAML>=6.0.1
+watchdog>=4.0
+google-genai>=2.0.0
+# fastmcp 4.x is the server framework: mcp_server.py imports `fastmcp.FastMCP`.
+# The MCP Python SDK (`mcp`) is no longer a direct dependency -- fastmcp-slim
+# resolves it (2.2.0) transitively -- and the 2.x `mcp.server.MCPServer` name is
+# not part of this contract. A floor below 4.0 loses the synchronous tool
+# registry (`_tool_manager` is gone), so the floor is load-bearing.
+fastmcp>=4.0.0
 sqlite-vec>=0.1.3
-bm25s>=0.2.0                    # 极速 BM25
-rjieba>=0.2.1                   # Rust 极速中文分词 (已移除冗余的停更版 jieba)
-
-# 文本解析
-mistune>=3.0.2
+rjieba>=0.2.1
+jieba>=0.42.1
+mistune>=3.0.1
+bm25s>=0.2.0
