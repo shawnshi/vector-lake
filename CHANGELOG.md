@@ -1,5 +1,56 @@
 # Unreleased
 
+## D5 第二张表：`operational_memory` —— 模板规则 1 在这里省掉了全部新增
+
+同一模板，但**先分类再动手**让这张 146,679 行的表看起来与第一张完全不同：
+
+| 被查询的 json 路径 | 状态（实测） | 决定 |
+|---|---|---|
+| `$.memory_type` | 真列 `memory_type`，0 个 NULL、与 json 不一致 0 行 | 所有语句读的是**真列**；json 索引无法服务裸列谓词 → **删** `idx_memory_type` |
+| `$.status` | 真列 `status`，同样 0/0 | 同上 → **删** `idx_memory_status` |
+| `$.memory_key` | 无真列，被 `WHERE memory_type = ? AND f_memory_key = ?` 查询 | **生成列** + 复合索引 |
+| `$.source_claim_id` | 无真列，3 处查询（`IN (SELECT value FROM json_each(?))`） | **生成列** + 索引 |
+| `memory_type`/`status` **列** | 本表**没有**语句按它们过滤（那 4 处 `memory_type IN (...)` 过滤的是 `operational_memory_index`） | 真列索引 `idx_om_type`/`idx_om_status`/`idx_memory_type_status` 仍**保留**：整体上删除索引被实测证明有害（status 过滤 9.68 → 632.74 ms），且写成本该由检索路径决定，不由这条迁移决定 |
+
+**「删 json 索引」的判据是结构性的，不是「没被 trace 用到」**：表达式索引无法服务 `WHERE memory_type = ?`
+这种裸列谓词，所以那两个索引是**不可达**而非「恰好没人用」。这正是本会话早先那次「按 trace 判未使用」被计时
+实验推翻之后学到的区别。
+
+### 改动与活库证据
+
+两个生成列（`f_memory_key`、`f_source_claim_id`，`ALTER ... GENERATED ... VIRTUAL`，用 `table_xinfo` 探测守卫）、
+两个列索引（`idx_om_f_memory_key (memory_type, f_memory_key)`、`idx_om_f_source_claim`）、一条新台账迁移删掉四个
+json 索引、`_om_probability_format_is_stale` 加入快速路径探针组；`governance_store` 四处查询改写。活库：
+**146,679 行、两列全部非空、与各自 json 不一致 0 行**；计划显示复合查询走
+`idx_om_f_memory_key (memory_type=? AND f_memory_key=?)`、claim 查询走 `idx_om_f_source_claim`、
+`memory_type IN (?)` 走保留下来的 `idx_om_type`；`quick_check ok`；doctor `6 prune(s) applied`。
+
+### 构建期被测试抓到的两处（都是我的）
+
+1. 生成列的 `ALTER` 起初插在 `operational_memory` **建表之前**（落在 entities 段里），报 `no such table`；
+   已移到该表自己的两个宽容 `ALTER` 旁边。
+2. 我的一条测试断言「新库上有那三个真列索引」—— 新库从来没有它们（来自归档迁移）。改为先创建、再断言
+   prune **不碰**它们（这才是要守的性质：搜索路径用的索引不能被清理误删）。
+
+### 复核 OK with notes（无 P0/P1），但它抓到我一处**事实性错误**
+
+我给出的「保留那三个真列索引」的理由是「有 4 处 `memory_type IN (...)` 查询」——复核指出那 4 处的 FROM 是
+`operational_memory_index`，**根本不是这张表**，而我自己写的 docstring 恰好在说反面（「今天没有语句用那些形状」）。
+保留的决定不变（理由是上面那条：删索引被实测证明有害、且写成本属检索路径问题），但**CHANGELOG 与测试注释里的
+理由已改正**——这正是模板规则 2「说清计数是在哪张表上」的由来。
+
+其余 P2 已修：
+
+- **prune 不再无条件删除「有替代者的」索引**：`idx_memory_type`/`idx_memory_status` 无条件删（任何情况下都不可达），
+  而 `idx_memory_key`/`idx_memory_source_claim` 只在**替代索引存在时**才删 —— 因为替代索引的创建位于一个**只告警的
+  `except OperationalError`** 里，且快速路径不会再跑那段 DDL，先删就会让 claim/delete 路径在 146k 行上走全表扫描
+  且**无从恢复**。
+- `publish_change_sets`（今天全树无调用者）会在 `init_db` 之前命名新列 → 按协议补 `initialize_meta_store()`。
+- 文档措辞：prune docstring 改为「没有语句**按那些表达式过滤**」（而不是「所有语句都通过真列读取」——投影触发器
+  确实会读 json）；生成列注释里的示例谓词改为 `f_memory_key`。
+- 测试：两处等值查询的计划断言改为**断言索引名**（原来只断言出现 "INDEX"，主键自动索引的覆盖扫描也能满足）。
+
+全量 pytest **827 passed, 1 xfailed**。
 ## D5 第一张表：`entities.page_key` 变成生成列，三个 json 索引退役
 
 提案冻结的模板在本表上落地：**虚拟生成列 + 普通索引**（不是投影表 + 触发器 —— 生成列按构造就等于它派生的

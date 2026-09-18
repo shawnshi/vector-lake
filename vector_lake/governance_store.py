@@ -660,13 +660,13 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
             json.loads(row["data_json"])
             for row in conn.execute(
                 "SELECT data_json FROM operational_memory "
-                "WHERE json_extract(data_json, '$.source_claim_id') IN (SELECT value FROM json_each(?))",
+                "WHERE f_source_claim_id IN (SELECT value FROM json_each(?))",
                 (_json_id_list(changed_claim_ids),),
             ).fetchall()
         ]
         conn.execute(
             "DELETE FROM operational_memory "
-            "WHERE json_extract(data_json, '$.source_claim_id') IN (SELECT value FROM json_each(?))",
+            "WHERE f_source_claim_id IN (SELECT value FROM json_each(?))",
             (_json_id_list(changed_claim_ids),),
         )
 
@@ -688,7 +688,7 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
         peer_rows.extend(
             conn.execute(
                 "SELECT data_json FROM operational_memory "
-                "WHERE json_extract(data_json, '$.source_claim_id') IN (SELECT value FROM json_each(?))",
+                "WHERE f_source_claim_id IN (SELECT value FROM json_each(?))",
                 (_json_id_list(related_claim_ids),),
             ).fetchall()
         )
@@ -696,7 +696,7 @@ def _refresh_operational_memory_delta(old_claim_ids: set[str], proposed_claims: 
         peer_rows.extend(
             conn.execute(
                 "SELECT data_json FROM operational_memory "
-                "WHERE memory_type = ? AND json_extract(data_json, '$.memory_key') = ?",
+                "WHERE memory_type = ? AND f_memory_key = ?",
                 (memory_type, memory_key),
             ).fetchall()
         )
@@ -1993,6 +1993,11 @@ def apply_change_set(change_set: dict) -> dict:
 
 
 def publish_change_sets(limit: int | None = None) -> dict:
+    # This path reaches ``_refresh_operational_memory_delta``, which names the generated columns on
+    # ``operational_memory``; a database predating them has to converge first (the protocol the
+    # ``entities`` batch had to learn).  No caller in the tree today, so this is defensive, not a fix
+    # for an observed failure.
+    initialize_meta_store()
     from vector_lake.db_store import get_connection, transaction
     conn = get_connection()
     rows = conn.execute("SELECT change_set_id, data_json FROM change_sets WHERE json_extract(data_json, '$.status') = 'pending'").fetchall()

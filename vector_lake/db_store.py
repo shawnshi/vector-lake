@@ -878,6 +878,39 @@ def _prune_entities_type_status_index(conn: sqlite3.Connection) -> None:
     conn.execute("DROP INDEX IF EXISTS idx_entities_type_status")
 
 
+def _prune_om_json_indexes(conn: sqlite3.Connection) -> None:
+    """Retire the four json indexes on ``operational_memory``.
+
+    Two are replaced by indexes on generated columns of the same data
+    (``idx_om_f_memory_key``, ``idx_om_f_source_claim``, created by the DDL that ran before this
+    prune).  The other two index ``$.memory_type`` and ``$.status``, and *no statement in the tree
+    filters on those expressions* -- the real ``memory_type``/``status`` columns are what statements
+    name, and an expression index cannot serve a bare-column predicate, so those two were
+    unreachable rather than merely unused.
+
+    The real-column indexes (``idx_om_type``, ``idx_om_status``, ``idx_memory_type_status``) are
+    deliberately left alone: no statement in the tree filters *this table* by those columns today
+    (the four ``memory_type IN (...)`` sites filter ``operational_memory_index``), but removing an
+    index was measured harmful in general (9.68 -> 632.74 ms for a status filter once removed), and
+    ``idx_om_type`` is now a strict prefix of ``idx_om_f_memory_key``.  Whether they earn their
+    write cost is a question about the search path, not about this migration.
+    """
+    # The two unreachable json indexes go unconditionally: no statement can use them whatever else
+    # exists.  The two that are *replaced* go only when their replacement is present -- the DDL that
+    # creates it sits inside a warning-only ``except OperationalError`` and the fast path never
+    # re-runs it, so dropping first would leave the claim/delete paths scanning 146k rows with no way
+    # back.  Probing is one read of ``sqlite_master``.
+    present = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    for statement in ("DROP INDEX IF EXISTS idx_memory_type", "DROP INDEX IF EXISTS idx_memory_status"):
+        conn.execute(statement)
+    for old_index, replacement in (
+        ("idx_memory_key", "idx_om_f_memory_key"),
+        ("idx_memory_source_claim", "idx_om_f_source_claim"),
+    ):
+        if replacement in present:
+            conn.execute(f"DROP INDEX IF EXISTS {old_index}")
+
+
 def _prune_change_sets_change_id(conn: sqlite3.Connection) -> None:
     """Drop ``change_sets.change_id`` while a pre-prune database still has it.
 
@@ -906,6 +939,7 @@ _LEGACY_SCHEMA_PRUNES: tuple[
     (GRAM_OVERLAY_DROP, (_prune_gram_overlay,)),
     ("2026-09-18-entities-json-indexes", (_prune_entities_json_indexes,)),
     ("2026-09-18-entities-type-status-index", (_prune_entities_type_status_index,)),
+    ("2026-09-18-om-json-indexes", (_prune_om_json_indexes,)),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """
@@ -1094,6 +1128,12 @@ def _entities_format_is_stale(conn: sqlite3.Connection) -> bool:
     return "f_page_key" not in _table_xcolumns(conn, "entities")
 
 
+def _om_probability_format_is_stale(conn: sqlite3.Connection) -> bool:
+    """Read-only: are the generated columns the memory queries name missing?"""
+    present = _table_xcolumns(conn, "operational_memory")
+    return not {"f_memory_key", "f_source_claim_id"} <= present
+
+
 def _page_index_state_format_is_stale(conn: sqlite3.Connection) -> bool:
     """Whether ``page_index_state`` still lacks the edge digest column."""
     return "edge_digest" not in _table_columns(conn, "page_index_state")
@@ -1112,6 +1152,7 @@ def init_db():
             and not _om_index_format_is_stale(get_connection())
             and not _page_index_state_format_is_stale(get_connection())
             and not _entities_format_is_stale(get_connection())
+            and not _om_probability_format_is_stale(get_connection())
         ):
             # The DDL would be a no-op, and running it would block every reader
             # behind the writer's lock.  Keep the cheap gap-fill so a writer that
@@ -1282,6 +1323,18 @@ def _init_db_once(db_key: str):
             conn.execute("ALTER TABLE operational_memory ADD COLUMN ttl REAL")
         except sqlite3.OperationalError:
             pass
+        # ``memory_key`` and ``source_claim_id`` have no real column and are queried (the composite
+        # one by ``WHERE memory_type = ? AND memory_key = ?``), so they get *generated* columns:
+        # equal to the json by construction, so there is no drift to compare.  The
+        # ``memory_type``/``status`` json indexes are a different case -- every statement names the
+        # real columns, which an expression index cannot serve -- so those are dropped rather than
+        # joined by a third spelling.
+        for column, path in (("f_memory_key", "$.memory_key"), ("f_source_claim_id", "$.source_claim_id")):
+            if column not in _table_xcolumns(conn, "operational_memory"):
+                conn.execute(
+                    f"ALTER TABLE operational_memory ADD COLUMN {column} TEXT "
+                    f"GENERATED ALWAYS AS (json_extract(data_json, '{path}')) VIRTUAL"
+                )
         _create_operational_memory_index(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS claim_graph_edges (
@@ -1398,10 +1451,8 @@ def _init_db_once(db_key: str):
             conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_f_page_key ON entities (f_page_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_page_key ON claims (json_extract(data_json, '$.locator.page_key'))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_page_key ON evidence (json_extract(data_json, '$.locator.page_key'))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON operational_memory (json_extract(data_json, '$.memory_type'))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_status ON operational_memory (json_extract(data_json, '$.status'))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_source_claim ON operational_memory (json_extract(data_json, '$.source_claim_id'))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_key ON operational_memory (memory_type, json_extract(data_json, '$.memory_key'))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_om_f_memory_key ON operational_memory (memory_type, f_memory_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_om_f_source_claim ON operational_memory (f_source_claim_id)")
             # ``timeline_projection_parity`` runs on every timeline query and used
             # to full-scan ``claims`` because the claim_type predicate had no
             # index.  The expression text must match the query verbatim.
