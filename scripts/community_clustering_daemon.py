@@ -7,11 +7,9 @@ from datetime import datetime, timezone
 from filelock import FileLock
 
 try:
-    import networkx as nx
-except ImportError:
-    nx = None
-
-try:
+    # One graph library, not two: igraph already carries the Leiden clustering below, and its
+    # PageRank agrees with networkx's to six decimals on this project's weighted undirected graphs
+    # (both normalise to 1, which is what the scaling in the centrality loop assumes).
     import igraph as ig
     import leidenalg
 except ImportError:
@@ -294,21 +292,27 @@ def run_clustering():
         index_data["community_labels"] = {}
         index_data["graph_insights"] = []
 
-        if not (nx and ig and leidenalg and edges):
+        if not (ig and leidenalg and edges):
             _mark_graph_clean(index_data, clustered=False)
             from vector_lake.wiki_utils import atomic_write_text
             atomic_write_text(index_file, json.dumps(index_data, ensure_ascii=False, indent=2))
             return
 
-        G = nx.Graph()
-        for key in node_keys:
-            G.add_node(key)
-        for edge in edges:
-            G.add_edge(edge["source"], edge["target"], weight=edge["weight"])
+        # The graph the clustering already needs, reused for centrality instead of a second one.
+        position = {key: index for index, key in enumerate(node_keys)}
+        usable_edges = [
+            edge for edge in edges
+            if edge.get("source") in position and edge.get("target") in position
+        ]
+        G = ig.Graph(n=len(node_keys), directed=False)
+        G.add_edges([(position[e["source"]], position[e["target"]]) for e in usable_edges])
+        G.es["weight"] = [float(e.get("weight") or 1.0) for e in usable_edges]
 
-        if nx and G.number_of_nodes() > 0:
+        if ig and G.vcount() > 0:
             try:
-                pageranks = nx.pagerank(G, weight="weight")
+                # igraph returns a list aligned with the vertex order, normalised like networkx's.
+                ranked = G.pagerank(weights="weight", directed=False)
+                pageranks = {key: ranked[position[key]] for key in node_keys}
                 pr_scale = len(node_keys) if len(node_keys) > 0 else 1
                 for node_key in node_keys:
                     pr_score = pageranks.get(node_key, 0.0) * pr_scale
@@ -361,7 +365,12 @@ def run_clustering():
                 written = set()
                 for c_uuid, nodes in community_nodes.items():
                     if len(nodes) < 3: continue
-                    sorted_nodes = sorted(nodes, key=lambda node: G.degree(node), reverse=True)
+                    # igraph's degree takes a vertex index, not a node name; the graph's vertex
+                    # order is ``node_keys``, so the position map is the translation.  Unweighted,
+                    # as networkx's default was.
+                    sorted_nodes = sorted(
+                        nodes, key=lambda node: G.degree(position[node]), reverse=True
+                    )
                     titles = [index_data["nodes"].get(n, {}).get("title", n) for n in sorted_nodes[:2]]
                     label = f"{level_name} Comm: {' / '.join(titles) if titles else 'Unknown'}"
 

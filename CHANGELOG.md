@@ -1,5 +1,45 @@
 # Unreleased
 
+## 剥离 `networkx`，聚类归一为 igraph；PyYAML 的替换经实测**不可行**
+
+### `networkx` 已移除（唯一用途是聚类脚本的中心性计算）
+
+用量实测只有 **2 处**（`scripts/community_clustering_daemon.py` 的 `nx.Graph()` 与 `nx.pagerank`），
+另有 doctor 的「必需模块」表与 `tests/test_dependency_manifest.py` 的清单。改法：直接用**聚类本来就要用的**
+igraph 构建同一张图并算 PageRank，`requirements.txt` 去掉 `networkx>=3.2`。
+
+- **等价性先验证**：加权无向图上 `nx.pagerank` 与 `igraph.Graph.pagerank(weights=…, directed=False)`
+  六位小数内一致（两侧都归一化到 1，因此脚本里 `pr_scale = len(node_keys)` 的量级不变）。
+- **活库端到端**：用 igraph 路径重跑聚类 → `communities 7125 / labels 265 / insights 20`、`clustering_stale: False`、
+  抽样标签与上次（networkx 路径）**完全相同**、`centrality_score` 量级一致 → 行为等价。
+- **反向依赖澄清**：`igraph` 对 `networkx` 的依赖标着 `extra == "test"`（**仅测试**），所以移除后新环境里
+  networkx 真的不再被拉入；`python-louvain`/`torch` 也依赖它，但那两者本就不在本项目的运行依赖里。
+- 顺带修正我上一轮的读法：我先前用 `re.match(r'^networkx')` 判断「igraph 硬依赖 networkx」，忽略了
+  `; extra == "test"` 标记 —— 这是过度断言，已纠正。
+
+**构建中的一次不完整清单**：我用 `grep nx\.` 清点用法，漏掉了 `G.degree(node)`（行 368）—— 它不含 "nx"，
+而 igraph 的 `degree()` 收**顶点下标**而非节点名，于是首次重跑报 `no such vertex`。已按 `G.` 全量清点
+（`add_edges`/`es`/`vcount`/`pagerank`/`degree` 五处）并用 `position[node]` 翻译。
+
+### PyYAML → msgspec：**实测前提不成立，未实施**
+
+`msgspec.yaml.encode/decode` **本身要求 PyYAML**：源码里两者分别 `_import_pyyaml("encode")` →
+`yaml.dump_all(CSafeDumper)` 与 `_import_pyyaml("decode")` → `yaml.CSafeLoader`，文档字符串也写明
+"This function requires that the third-party PyYAML library is installed."。所以「换成 msgspec」只是把
+一个直接依赖改成一个经由 msgspec 的传递依赖，代码少一层调用而依赖不变，**达不到「移除 PyYAML」**。
+
+**我先前那次「msgspec 无 pyyaml 也能用」的测量是无效的**：拦截器用了 Python 3.12 已删除的
+`find_module`/`load_module` 旧 API，被静默忽略 → 实际 `import yaml` 照样成功。改用 `find_spec` 抛
+`ImportError` 的拦截器后，结论反过来：两者都报 `requires PyYAML be installed`。
+
+**若确实要移除 PyYAML**，可选项只有两类，都需要你定：
+1. **保留 PyYAML**（现状）：它是本仓唯一可行的 YAML 引擎，`msgspec` 的 YAML 支持是它的包装。
+2. **改掉 frontmatter 的格式**（JSON/TOML/msgpack 任一）：这是**破坏性格式迁移**，涉及活库 7,923 个页面、
+   `yaml_utils` 与 5 处直接 `import yaml`、以及所有既有页面的重写与校验 —— 属独立批次，且要先冻结格式契约。
+
+`msgspec` 唯一能真正替代的是 **JSON**（其 Rust 编码器是自有实现），而本项目的 `index.json`/快照等内部产物
+目前用标准库 `json`；换它只是性能优化，不减依赖。
+
 ## 跑一次社区聚类 + D1 的两条 P2 + 删除边集的第三份副本（O3）
 
 ### 社区聚类（`scripts/community_clustering_daemon.py`，一次）

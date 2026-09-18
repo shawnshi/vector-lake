@@ -62,7 +62,6 @@ def doctor_vector_lake() -> str:
         "filelock": "filelock",
         "yaml": "PyYAML",
         "watchdog": "watchdog",
-        "networkx": "networkx",
         "igraph": "igraph",
         "leidenalg": "leidenalg",
         "bm25s": "bm25s",

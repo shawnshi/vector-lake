@@ -33,7 +33,7 @@ def _specifier(name: str) -> str | None:
 
 @pytest.mark.parametrize(
     "name",
-    ["filelock", "networkx", "python-dotenv", "igraph", "leidenalg", "PyYAML",
+    ["filelock", "python-dotenv", "igraph", "leidenalg", "PyYAML",
      "watchdog", "google-genai", "fastmcp", "sqlite-vec", "mistune", "bm25s"],
 )
 def test_required_dependency_is_declared(name):
@@ -62,7 +62,6 @@ def test_python_louvain_is_removed_everywhere():
     "name, minimum",
     [
         ("filelock", "3.15"),
-        ("networkx", "3.2"),
         ("igraph", "0.11.0"),
         ("leidenalg", "0.10.0"),
         ("PyYAML", "6.0.1"),
