@@ -134,11 +134,17 @@ def test_gc_force_bypasses_safety_valve(isolated_memory):
     assert backups, "GC must keep a recoverable copy of every deleted page"
 
 
-def test_gc_page_edge_projection_never_contains_claim_ids():
-    """The indexer owns page_graph_edges; save_graph_edges must not mirror claims into it."""
+def test_claim_edges_stay_in_the_claim_key_space():
+    """``save_graph_edges`` writes claim-space edges, and nothing mirrors them into page space.
+
+    The page-space projection is ``page_index_edges``, owned by the indexer and derived from the
+    published file; a second table that held a collapsed copy was removed on 2026-09-18 because
+    nothing read it.  What this pins is the key-space separation: claim ids must not appear among
+    page keys.
+    """
     db_store.init_db()
     governance_store.save_graph_edges([{"source_id": "claim-a", "target_id": "claim-b", "relation": "supports"}])
     conn = db_store.get_connection()
 
     assert conn.execute("SELECT COUNT(*) FROM claim_graph_edges").fetchone()[0] == 1
-    assert conn.execute("SELECT COUNT(*) FROM page_graph_edges").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0] == 0

@@ -1,10 +1,11 @@
 """The incremental update must derive the same edges a full rebuild does.
 
 These two paths used different resolution rules, and the difference was what the read-back in
-``update_index_items`` papered over: it copied a node's existing ``page_graph_edges`` rows forward,
+``update_index_items`` papered over: it copied a node's existing projected edge rows forward,
 because the incremental path could not re-derive the edges alias resolution had produced.  Both paths
 now use one rule (``vector_lake.link_resolution``) for links *and* triple targets, and score a pair in
-the same orientation -- so the read-back is gone and ``page_graph_edges`` is a projection again.
+the same orientation -- so the read-back is gone and the database holds one projection of the edge
+set (``page_index_edges``, derived from the published file) instead of a second table to compare it to.
 
 The scope these tests can speak for is stated rather than implied: they compare the *touched* node's
 incident edges against a rebuild.  Edges between two untouched nodes are never revisited by an
@@ -183,7 +184,7 @@ def test_a_pair_score_does_not_depend_on_which_end_was_updated(isolated_memory):
 
 
 def test_removing_a_link_removes_its_edge(isolated_memory):
-    """The fix that let the read-back go, and with it ``page_graph_edges`` as a projection.
+    """The fix that let the read-back go, and with it the second edge table.
 
     This was a strict xfail: the incremental path carried the updated node's published edges forward
     from ``page_graph_edges`` instead of deriving them, so an edge whose link had been deleted was
@@ -229,3 +230,24 @@ def test_a_typed_link_written_by_name_keeps_its_predicate_weight(isolated_memory
 
     assert oracle, "the fixture produced no edge"
     assert incrementally == oracle, "the name-written typed link lost its predicate weight"
+
+
+def test_a_name_the_batch_itself_introduces_resolves_in_the_same_pass(isolated_memory):
+    """The maps must include the pages this batch is about, not only the published ones.
+
+    ``Concept_User`` links to the *alias of a page the batch introduces*, so the resolution map has
+    to know that alias before the pass runs.  Built from the pre-batch set instead, the pair is
+    dropped here and appears only a batch later -- or on the next rebuild, which is what the parity
+    comparison would then show as a difference.
+    """
+    existing = _entity("e-user", "Concept_User", links=["Fresh Alias"])
+    fresh = _entity("e-fresh", "Concept_Fresh", title="Fresh Alias")
+    db_store.init_db()
+    _save([existing])
+    indexer.generate_index()
+
+    _save([existing, fresh])
+    indexer.update_index_items(["Concept_User.md", "Concept_Fresh.md"])
+
+    edges = _edges_touching(_published(isolated_memory), "Concept_User")
+    assert ("Concept_Fresh", "Concept_User") in [(a, b) for a, b, _w in edges], edges

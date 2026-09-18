@@ -18,7 +18,7 @@ from vector_lake.wiki_utils import (
 )
 from vector_lake.db_store import (
     applied_schema_prunes,
-    page_graph_edges_mirror_drift,
+    published_edge_projection_drift,
     get_db_path,
     get_connection,
     idempotency_index_state,
@@ -301,12 +301,11 @@ def doctor_vector_lake() -> str:
     except Exception as e:
         checks.append(("Idempotency Index", False, f"Check failed: {e}"))
 
-    # ``page_graph_edges`` is a projection of the published ``weighted_edges``, and
-    # ``page_index_edges`` is the read projection of the same set.  Nothing
-    # re-derives the former on its own -- its writer only rewrites the nodes an
-    # update touches -- so drift is invisible until something compares the two.
+    # ``page_index_edges`` is the read projection of the published ``weighted_edges``.  A partial
+    # update rewrites only the nodes it touches, so drift between the file and the projection is
+    # invisible until something compares them -- which is what this check does, against the file.
     try:
-        drift = page_graph_edges_mirror_drift()
+        drift = published_edge_projection_drift()
         clean = not drift["extra"] and not drift["missing"]
         detail = f"mirrors the published {drift['published_rows']} edge(s)"
         if not clean:

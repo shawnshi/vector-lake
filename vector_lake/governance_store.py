@@ -160,7 +160,7 @@ def _default_queue_store() -> dict:
 ALLOWED_TABLES = {
     "entities", "claims", "evidence", "sources", "change_sets",
     "governance_queue", "wiki_search_index", "alias_registry",
-    "operational_memory", "claim_graph_edges", "page_graph_edges",
+    "operational_memory", "claim_graph_edges",
     "timeline_events", "processed_files", "mutation_outbox"
 }
 
@@ -419,7 +419,7 @@ def save_sources(data):
 
 
 def save_graph_edges(edges: list[dict]):
-    """Persist claim-space edges.  `page_graph_edges` is a derived projection
+    """Persist claim-space edges.  The page-space projection is derived
     owned by the indexer and must never receive claim ids."""
     if not edges: return
     conn = get_connection()
@@ -1977,8 +1977,8 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             f"DELETE FROM evidence WHERE f_page_key IN ({placeholders})",
             affected_page_params,
         )
-        # ``page_graph_edges`` is a projection owned by the indexer, which replaces
-        # both directions per node.  This path no longer writes that table.
+        # The page-space edge projection belongs to the indexer, which replaced both
+        # directions per node; this path writes no edge table.
 
     _upsert_canonical_records("entities", "entity_id", proposed_entities)
     _upsert_canonical_records("claims", "claim_id", proposed_claims)

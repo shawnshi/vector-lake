@@ -20,10 +20,10 @@ This module projects what the read paths consume into SQLite:
     the 7 178-node dict never has to exist in memory.
 
 ``page_index_edges``
-    ``weighted_edges`` with an explicit ``sequence`` column.  ``page_graph_edges``
-    happens to mirror the same data on the live corpus, but it is maintained by a
-    different writer, so the projection derives from the sovereign file instead of
-    depending on that coincidence.  The sequence preserves ``index.json``'s edge
+    ``weighted_edges`` with an explicit ``sequence`` column.  It is the only database
+    projection of that set -- a second table used to mirror it, was removed on 2026-09-18 because
+    nothing read it -- and it derives from the published file, which is the source.  The sequence
+    preserves ``index.json``'s edge
     order, which the two-step personalised PageRank walk is sensitive to.
     The undirected adjacency is built once per process and reused.
 
@@ -231,8 +231,8 @@ def refresh_page_index_projection(index_data: dict, node_keys=None) -> dict:
     ``node_keys`` restricts the upsert to those nodes, which is what the indexer's
     partial-update path needs.  Nodes that disappeared still have to be removed,
     so that branch compares the projection against the authoritative key set
-    rather than trusting the partial list.  The edge projection is maintained
-    separately by ``db_store.replace_page_graph_edges_for_node``.
+    rather than trusting the partial list.  The edge rows for a partial update are written by
+    :func:`refresh_page_index_projection` itself, from the published file.
     """
     conn = get_connection()
     nodes = index_data.get("nodes") or {}

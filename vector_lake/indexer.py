@@ -683,7 +683,7 @@ def dedupe_and_prune_edges(
     """Normalise, deduplicate and degree-bound a page-space edge set.
 
     Enforces the two invariants every consumer assumes -- the SQLite
-    ``page_graph_edges`` projection (primary key ``source_id, target_id``),
+    published edge set (primary key ``source_id, target_id``),
     the renderer, and the clustering daemon that reads ``weighted_edges``:
 
     1. exactly one row per unordered ``(source, target)`` pair, stored as
@@ -913,9 +913,9 @@ def _calculate_weighted_edges(index_data: dict, alias_map: dict | None = None) -
     for node in nodes_dict.values():
         node.pop("_key", None)
 
-    # Page-space edges are derived from canonical links/source overlap only.
-    # `claim_graph_edges` lives in a different key space and `page_graph_edges`
-    # is this function's own output projection, so neither is merged in here.
+    # Page-space edges are derived from canonical links/source overlap only.  The claim-space edge
+    # table lives in a different key space and the database holds a single projection of this set
+    # (``page_index_edges``), so nothing is merged in here.
     return dedupe_and_prune_edges(edges)
 
 
@@ -1047,9 +1047,6 @@ def _generate_index_locked(skip_embeddings: bool = True):
     # Each projection below commits per unit of work.  Holding one BEGIN IMMEDIATE
     # across a full-corpus tokenization froze every other writer for minutes.
     search_stats = _sync_search_index(index_data, node_bodies, embeddings_map)
-    # page_graph_edges is a pure projection of the same weighted_edges that are
-    # about to be published.
-    db_store.replace_page_graph_edges(index_data["weighted_edges"])
 
     for staged_path in (tmp_claim, tmp_output):
         if not os.path.exists(staged_path):
@@ -1163,12 +1160,14 @@ def update_index_items(filenames: list[str]):
                     # declaration rule and ``core_name_maps`` the shared core rule, so the pairs and
                     # the weights this touches cannot drift from the ones a rebuild would produce.
                     #
-                    # They are built from the *pre-batch* node set, so a name the batch itself
-                    # introduces or renames resolves one batch later; the map published into
-                    # ``index_data["aliases"]`` below is the post-batch one.  A two-pass loop would
-                    # remove that lag and is not needed for correctness of the touched pairs.
-                    alias_map = _link_map_for_nodes(index_data["nodes"])
-                    _core_pages, unique_cores = core_name_maps(index_data["nodes"].keys())
+                    # ``pre_parsed_data`` is merged in first: it holds the pages this very batch is
+                    # about, so a link to a name the batch introduces (or whose title/alias it
+                    # changes) resolves now rather than one batch later.  Building the maps from the
+                    # post-batch set is what a rebuild would do, and this is that set for the pages
+                    # the batch touches.
+                    nodes_for_maps = {**(index_data.get("nodes") or {}), **pre_parsed_data}
+                    alias_map = _link_map_for_nodes(nodes_for_maps)
+                    _core_pages, unique_cores = core_name_maps(nodes_for_maps.keys())
 
                     # Every node's triples, with their targets resolved: ``calculate_relevance`` reads
                     # the *other* node's predicate weight from this map, so leaving the targets raw
@@ -1178,7 +1177,7 @@ def update_index_items(filenames: list[str]):
                     # ``pre_parsed_data`` holds the pages this batch is about, so a page introduced by
                     # it is present before its own pass runs.
                     all_nodes_triples = {}
-                    for k, v in {**(index_data.get("nodes") or {}), **pre_parsed_data}.items():
+                    for k, v in nodes_for_maps.items():
                         td = {}
                         for t in ((v or {}).get("triples") or []):
                             target = t.get("target")
@@ -1345,16 +1344,6 @@ def update_index_items(filenames: list[str]):
                     # Do not recompute heavy debt metrics on partial update
                     index_data["governance_metrics"] = (index_data.get("governance_metrics") or {})
                     index_data["schema_version"] = "8.0"
-                    # Keep the page-edge projection in sync with this batch.
-                    for filename in valid_filenames:
-                        partial_key = filename[:-3]
-                        db_store.replace_page_graph_edges_for_node(
-                            partial_key,
-                            [
-                                edge for edge in (index_data.get("weighted_edges") or [])
-                                if edge["source"] == partial_key or edge["target"] == partial_key
-                            ],
-                        )
                     # V11.3 Fixed: Write partial updates back to disk to prevent ghost updates
                     _write_index(output_path, index_data)
                     _write_claim_graph(str(get_claim_graph_path()), governance_store.build_claim_graph_projection())

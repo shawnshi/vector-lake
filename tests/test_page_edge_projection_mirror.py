@@ -1,21 +1,40 @@
-"""``page_graph_edges`` must keep mirroring the published edge projection.
+"""The search edge projection must hold the published edge set.
 
-The audit measured the live table at 1,293,200 rows against 29,837 published
-edges -- 1,263,363 rows (97.7%) the published file does not contain.  They were
-written before the degree cap existed, and the incremental writer only rewrites
-the nodes an update touches, so nothing ever cleans them.
+``page_index_edges`` is the read projection of ``index.json``'s ``weighted_edges`` -- the set
+``page_index_projection.adjacency`` walks for the personalised PageRank step.  A partial update
+rewrites only the nodes it touches, so the projection can fall behind the file, and the file can
+gain pairs the projection never saw.
 
-This pins the check that makes that visible, and the repair that clears it.  The
-repair is deliberately the same call the full-rebuild path already makes, so it
-introduces no new code path into the live database.
+This check used to compare the projection against ``page_graph_edges``: a *second* SQLite table
+holding the same pairs, whose only reader was that check.  Two projections of one source being
+compared to each other is not the contract; comparing the projection with the source is.  The table
+and its writers were removed on 2026-09-18, and these tests pin the comparison that replaced it --
+including that it is exact in both directions, because the legacy machinery it replaced existed for a
+1.29M-row state the file never contained and that no longer occurs.
 
-Note the check is *not* a degree bound: the published set itself reaches degree 17
-on 10 live nodes, so ``MAX_EDGES_PER_NODE`` is not the bound the artifact
-satisfies.  Mirroring the published set is.
+Not a degree bound: the published set itself reaches degree 17 on live nodes, so
+``MAX_EDGES_PER_NODE`` is not the bound the artifact satisfies.  Holding the published set is.
 """
-from vector_lake import db_store, tool_doctor
+import json
 
-_STAMP = "2026-09-17T00:00:00+00:00"
+from vector_lake import db_store, tool_doctor
+from vector_lake.wiki_utils import get_index_path
+
+
+def _publish(pairs, *, weighted=True) -> None:
+    """Write ``weighted_edges`` into the published index, creating a minimal file if needed."""
+    path = get_index_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            data = {}
+    data["weighted_edges"] = (
+        [{"source": s, "target": t, "weight": 1.0} for s, t in pairs] if weighted else []
+    )
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 def _seed_projection(conn, pairs) -> None:
@@ -27,20 +46,10 @@ def _seed_projection(conn, pairs) -> None:
     conn.commit()
 
 
-def _seed_graph(conn, pairs) -> None:
-    """Fill ``page_graph_edges``, the mirror under test."""
-    conn.executemany(
-        "INSERT INTO page_graph_edges (source_id, target_id, relation, weight, updated_at) "
-        "VALUES (?, ?, 'related', 1.0, ?)",
-        [(source, target, _STAMP) for source, target in pairs],
-    )
-    conn.commit()
-
-
-def test_a_fresh_database_mirrors_the_published_set(isolated_memory):
+def test_a_database_with_neither_side_reports_no_drift(isolated_memory):
     db_store.init_db()
 
-    assert db_store.page_graph_edges_mirror_drift() == {
+    assert db_store.published_edge_projection_drift() == {
         "projection_rows": 0,
         "published_rows": 0,
         "difference": 0,
@@ -51,13 +60,13 @@ def test_a_fresh_database_mirrors_the_published_set(isolated_memory):
     }
 
 
-def test_rows_the_published_set_does_not_contain_are_extra(isolated_memory):
+def test_a_projected_pair_the_file_does_not_contain_is_extra(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
-    _seed_projection(conn, [("A", "B")])
-    _seed_graph(conn, [("A", "B"), ("A", "Stale")])
+    _publish([("A", "B")])
+    _seed_projection(conn, [("A", "B"), ("A", "Stale")])
 
-    drift = db_store.page_graph_edges_mirror_drift()
+    drift = db_store.published_edge_projection_drift()
 
     assert drift["extra"] is True
     assert drift["missing"] is False
@@ -66,13 +75,13 @@ def test_rows_the_published_set_does_not_contain_are_extra(isolated_memory):
 
 
 def test_a_published_pair_missing_from_the_projection_is_reported(isolated_memory):
-    """The other direction: the projection fell behind what was published."""
+    """The other direction: the projection fell behind what the file publishes."""
     db_store.init_db()
     conn = db_store.get_connection()
-    _seed_projection(conn, [("A", "B"), ("C", "D")])
-    _seed_graph(conn, [("A", "B")])
+    _publish([("A", "B"), ("C", "D")])
+    _seed_projection(conn, [("A", "B")])
 
-    drift = db_store.page_graph_edges_mirror_drift()
+    drift = db_store.published_edge_projection_drift()
 
     assert drift["extra"] is False
     assert drift["missing"] is True
@@ -80,26 +89,41 @@ def test_a_published_pair_missing_from_the_projection_is_reported(isolated_memor
     assert drift["difference"] == -1
 
 
-def test_reprojecting_the_published_set_clears_the_drift(isolated_memory):
-    """What the one-time repair on the live database does, and what a full rebuild does."""
+def test_an_empty_file_with_a_populated_projection_is_drift(isolated_memory):
+    """The projection must not keep answering from a file that no longer publishes edges."""
     db_store.init_db()
     conn = db_store.get_connection()
-    published = [
-        {"source": "A", "target": "B", "weight": 2.0},
-        {"source": "C", "target": "D", "weight": 1.0},
-    ]
-    _seed_projection(conn, [("A", "B"), ("C", "D")])
-    _seed_graph(conn, [("A", "Stale"), ("A", "B"), ("C", "D"), ("X", "Y")])
-    assert db_store.page_graph_edges_mirror_drift()["extra"] is True
+    _publish([], weighted=False)
+    _seed_projection(conn, [("A", "B")])
 
-    db_store.replace_page_graph_edges(published)
+    drift = db_store.published_edge_projection_drift()
 
-    assert db_store.page_graph_edges_mirror_drift()["extra"] is False
-    assert conn.execute("SELECT COUNT(*) FROM page_graph_edges").fetchone()[0] == 2
+    assert drift["published_rows"] == 0
+    assert drift["projection_rows"] == 1
+    assert drift["extra"] is True
+
+
+def test_reprojecting_the_published_set_clears_the_drift(isolated_memory):
+    """What a rebuild does: the projection is written from the file."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _publish([("A", "B"), ("C", "D")])
+    _seed_projection(conn, [("A", "B"), ("C", "D"), ("X", "Y")])
+    assert db_store.published_edge_projection_drift()["extra"] is True
+
+    from vector_lake.page_index_projection import refresh_page_index_projection
+
+    index_data = json.loads(get_index_path().read_text(encoding="utf-8"))
+    with db_store.transaction():
+        refresh_page_index_projection(index_data)
+
+    assert db_store.published_edge_projection_drift()["extra"] is False
+    assert conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0] == 2
 
 
 def test_doctor_reports_a_clean_projection(isolated_memory):
     db_store.init_db()
+    _publish([])
 
     report = tool_doctor.doctor_vector_lake()
 
@@ -107,11 +131,11 @@ def test_doctor_reports_a_clean_projection(isolated_memory):
     assert "page_edge_projection_drift" not in report
 
 
-def test_doctor_flags_drift_and_names_an_example(isolated_memory):
+def test_doctor_flags_a_projected_pair_the_file_lacks(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
-    _seed_projection(conn, [("A", "B")])
-    _seed_graph(conn, [("A", "B"), ("A", "Stale")])
+    _publish([("A", "B")])
+    _seed_projection(conn, [("A", "B"), ("A", "Stale")])
 
     report = tool_doctor.doctor_vector_lake()
 
@@ -123,8 +147,8 @@ def test_doctor_flags_drift_and_names_an_example(isolated_memory):
 def test_doctor_names_a_missing_pair_too(isolated_memory):
     db_store.init_db()
     conn = db_store.get_connection()
-    _seed_projection(conn, [("A", "B"), ("C", "D")])
-    _seed_graph(conn, [("A", "B")])
+    _publish([("A", "B"), ("C", "D")])
+    _seed_projection(conn, [("A", "B")])
 
     report = tool_doctor.doctor_vector_lake()
 

@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from vector_lake.wiki_utils import get_index_path
 from vector_lake.wiki_utils import get_meta_dir
 import sqlite_vec
 
@@ -381,20 +382,15 @@ def _create_operational_memory_index(conn: sqlite3.Connection) -> None:
 def _create_page_index_tables(conn: sqlite3.Connection) -> None:
     """Schema for the ``index.json`` projection in ``vector_lake.page_index_projection``.
 
-    ``page_index_edges`` is not a restatement of ``page_graph_edges``, and the two
-    cannot be substituted for each other:
+    ``page_index_edges`` keeps the published edge multiset together with its ``sequence``, because its
+    reader -- ``page_index_projection.adjacency`` -- needs the order for the two-step personalised
+    PageRank walk, which is order-sensitive for zero-mass candidates.
 
-    * ``page_graph_edges`` is keyed ``(source_id, target_id, relation)``, so it
-      collapses duplicate pairs and assigns no order;
-    * ``page_index_edges`` keeps the multiset together with its ``sequence``.
-
-    Measured on the live corpus the cardinalities differ accordingly -- 1 293 189
-    rows against 1 607 843 -- so the earlier note here, that the two mirror one
-    another "byte-for-byte ... same order", holds only as a set of distinct pairs
-    at maximum weight.  The reader is ``page_index_projection.adjacency``, and it
-    needs the ordered multiset because the two-step personalised PageRank walk is
-    order-sensitive for zero-mass candidates.  Collapsing this table into
-    ``page_graph_edges`` would silently change ranking, not just storage.
+    A second table used to hold the same pairs collapsed to ``(source, target, relation)``.  Nothing
+    read it but the check that compared the two against each other, so it was removed on 2026-09-18;
+    the check now compares this projection against the published file, which is what the contract was
+    always about.  Do not reintroduce a table here: the source of truth for edges is ``index.json``
+    ``weighted_edges``, and the database holds one projection of it.
     """
     conn.execute(
         """
@@ -958,6 +954,16 @@ def _prune_governance_queue_index(conn: sqlite3.Connection) -> None:
     conn.execute("DROP INDEX IF EXISTS idx_governance_queue_change_set_status")
 
 
+def _prune_page_graph_edges(conn: sqlite3.Connection) -> None:
+    """Drop the second SQLite copy of the published edge set.
+
+    Nothing read it: the search projection is ``page_index_edges``, and the only consumer of this
+    table was the consistency check that compared the two against each other, now rewired to compare
+    ``page_index_edges`` against the published file instead.  Its indexes go with it.
+    """
+    conn.execute("DROP TABLE IF EXISTS page_graph_edges")
+
+
 def _normalise_entities_ttl_encoding(conn: sqlite3.Connection) -> None:
     """Give "absent" one encoding in ``entities.ttl``/``decay_weight``: ``0.0``.
 
@@ -1008,6 +1014,7 @@ _LEGACY_SCHEMA_PRUNES: tuple[
     ("2026-09-18-claim-evidence-json-indexes", (_prune_claim_evidence_json_indexes,)),
     ("2026-09-18-governance-queue-index", (_prune_governance_queue_index,)),
     ("2026-09-18-normalise-entities-ttl-encoding", (_normalise_entities_ttl_encoding,)),
+    ("2026-09-18-drop-page-graph-edges", (_prune_page_graph_edges,)),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """
@@ -1475,16 +1482,6 @@ def _init_db_once(db_key: str):
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS page_graph_edges (
-                source_id TEXT,
-                target_id TEXT,
-                relation TEXT,
-                weight REAL,
-                updated_at TEXT,
-                PRIMARY KEY (source_id, target_id, relation)
-            )
-        """)
-        conn.execute("""
             CREATE TABLE IF NOT EXISTS timeline_events (
                 id TEXT PRIMARY KEY,
                 event_date TEXT,
@@ -1779,117 +1776,49 @@ def delete_node_cascade(node_key: str):
 
         sync_timeline_events_for_claim_delta(old_claim_rows, [])
         conn.execute(f"DELETE FROM entities WHERE entity_id IN ({placeholders})", related_ids)
-        conn.execute(
-            "DELETE FROM page_graph_edges WHERE source_id = ? OR target_id = ?",
-            (node_key, node_key),
-        )
 
     return {"page_key": node_key, "entity_ids": sorted(entity_ids)}
 
 
-def replace_page_graph_edges(edges: list[dict]) -> int:
-    """Replace the derived page-key edge projection wholesale.
+def published_edge_projection_drift(max_examples: int = 3) -> dict[str, object]:
+    """Whether the search projection still holds the published edge set.
 
-    `page_graph_edges` is owned by the indexer and holds page_key <-> page_key
-    edges only.  It is a pure projection of `index.json` weighted_edges, so a
-    full replace also purges any legacy rows written in the wrong key space.
+    The published ``weighted_edges`` in ``index.json`` is the source; ``page_index_edges`` is its read
+    projection, which ``page_index_projection.adjacency`` walks.  This check used to compare that
+    projection against ``page_graph_edges`` -- a *second* SQLite table holding the same pairs, whose
+    only reader was this check, so it compared two projections of one source instead of the projection
+    against the source.  That table is gone (nothing read it) and the comparison is now with the file.
+
+    The published set collapses duplicate pairs to their maximum weight, so both sides are compared as
+    distinct pairs.  Read-only, and exact: both sides are tens of thousands of pairs, where the
+    LIMIT-probe machinery this replaced existed for a 1.29M-row legacy state that no longer occurs.
     """
-    init_db()
+    published: set[tuple[str, str]] = set()
+    index_path = get_index_path()
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        for edge in data.get("weighted_edges") or []:
+            source, target = str(edge.get("source") or ""), str(edge.get("target") or "")
+            if source and target:
+                published.add((source, target))
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
-    rows = []
-    for edge in edges:
-        source = str(edge.get("source") or "")
-        target = str(edge.get("target") or "")
-        if not source or not target or source == target:
-            continue
-        rows.append((source, target, str(edge.get("relation") or "related"), float(edge.get("weight") or 1.0), now))
-    with transaction():
-        conn.execute("DELETE FROM page_graph_edges")
-        if rows:
-            conn.executemany(
-                "INSERT OR REPLACE INTO page_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
-                rows,
-            )
-    return len(rows)
-
-
-def replace_page_graph_edges_for_node(node_key: str, edges: list[dict]) -> int:
-    """Replace only the page-key edges touching one node, used by partial updates."""
-    init_db()
-    conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
-    rows = []
-    for edge in edges:
-        source = str(edge.get("source") or "")
-        target = str(edge.get("target") or "")
-        if not source or not target or source == target:
-            continue
-        if node_key not in (source, target):
-            continue
-        rows.append((source, target, str(edge.get("relation") or "related"), float(edge.get("weight") or 1.0), now))
-    with transaction():
-        conn.execute(
-            "DELETE FROM page_graph_edges WHERE source_id = ? OR target_id = ?",
-            (node_key, node_key),
-        )
-        if rows:
-            conn.executemany(
-                "INSERT OR REPLACE INTO page_graph_edges (source_id, target_id, relation, weight, updated_at) VALUES (?, ?, ?, ?, ?)",
-                rows,
-            )
-    return len(rows)
-
-
-def page_graph_edges_mirror_drift(max_examples: int = 3) -> dict[str, object]:
-    """Whether ``page_graph_edges`` still mirrors the published edge projection.
-
-    The table is documented as "a pure projection of ``index.json``
-    ``weighted_edges``", and ``page_index_edges`` is the read projection of that
-    same set.  Both are supposed to hold the same pairs, so the contract is
-    checkable entirely inside SQLite.  Measured on the live corpus before this
-    check existed: 1 293 200 rows against 29 837 published, i.e. 1 263 363 rows
-    (97.7 %) that the published file does not contain.  They were written before
-    the degree cap existed and survive because the incremental writer rewrites
-    only the nodes an update touches.
-
-    Deliberately not a degree bound.  The published set itself reaches degree 17
-    on 10 nodes, so ``MAX_EDGES_PER_NODE`` is not the bound the artifact actually
-    satisfies; mirroring the published set is.  Counting is not used for the
-    verdict either: ``LIMIT`` probes answer "is there a violation" in milliseconds
-    even at 1.29M rows, where an exact ``EXCEPT`` count took 30s -- too slow for
-    a check an operator runs interactively.
-
-    Read-only.  ``difference`` is exact only when one side is clean; when rows are
-    both extra and missing only the net difference is knowable without the count.
-    """
-    conn = get_connection()
-    projection_rows = int(conn.execute("SELECT COUNT(*) FROM page_graph_edges").fetchone()[0])
-    published_rows = int(conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0])
-    extra_examples = [
+    projection = {
         (str(row[0]), str(row[1]))
-        for row in conn.execute(
-            "SELECT g.source_id, g.target_id FROM page_graph_edges g"
-            " LEFT JOIN page_index_edges p"
-            " ON p.source_key = g.source_id AND p.target_key = g.target_id"
-            " WHERE p.sequence IS NULL LIMIT ?",
-            (max_examples,),
-        )
-    ]
-    missing_example = conn.execute(
-        "SELECT p.source_key, p.target_key FROM page_index_edges p"
-        " LEFT JOIN page_graph_edges g"
-        " ON g.source_id = p.source_key AND g.target_id = p.target_key"
-        " WHERE g.source_id IS NULL LIMIT 1"
-    ).fetchone()
+        for row in conn.execute("SELECT DISTINCT source_key, target_key FROM page_index_edges")
+    }
+    extra = sorted(projection - published)
+    missing = sorted(published - projection)
     return {
-        "projection_rows": projection_rows,
-        "published_rows": published_rows,
-        "difference": projection_rows - published_rows,
-        "extra_examples": extra_examples,
-        "extra": bool(extra_examples),
-        "missing": missing_example is not None,
-        "missing_example": None if missing_example is None else tuple(missing_example),
+        "projection_rows": len(projection),
+        "published_rows": len(published),
+        "difference": len(projection) - len(published),
+        "extra_examples": extra[:max_examples],
+        "extra": bool(extra),
+        "missing": bool(missing),
+        "missing_example": missing[0] if missing else None,
     }
 
 
