@@ -1,4 +1,3 @@
-import datetime
 import hashlib
 import logging
 import os
@@ -7,12 +6,8 @@ import time
 
 from vector_lake import get_extension_root, provenance
 from vector_lake.tool_search import assemble_context
-from vector_lake.node_vocabulary import (
-    GENERATED_NODE_TYPES,
-    strip_prefix,
-    type_for_node_id,
-)
-from vector_lake.wiki_utils import get_wiki_dir, sanitize_wiki_node, normalize_entity_name
+from vector_lake import stub_creator
+from vector_lake.wiki_utils import get_wiki_dir, normalize_entity_name, sanitize_wiki_node
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -20,39 +15,12 @@ log = logging.getLogger("vector-lake-tool-query")
 
 # This file used to keep its own copy of the prefix list, and a second, inline copy of
 # the same list further down.  Both omitted ``System_`` while the comment claimed to
-# mirror ``wiki_utils.VALID_PREFIXES``, so the two places that read the list disagreed
-# with the three that did not.  The vocabulary now has one owner.
-#
-# What that omission actually changed, precisely: ``_node_core`` stripped every prefix
-# except ``System_``, and the stub creator labelled every ``System_*`` target
-# ``concept`` -- which ``validate_schema`` then rejected, because a ``System_*.md``
-# filename may not carry the type ``concept``.  So ``System_*`` targets silently
-# produced no stub at all.  Note the limit of the stem fix: link targets are
-# normalised (underscores become hyphens, ``normalize_entity_name``) while the
-# existing-page keys are raw filenames, so a target containing ``_`` still does not
-# match a ``System_*`` file.  That asymmetry affects every prefix equally and is not
-# what this change alters.
-
-
-def _node_core(name: str) -> str:
-    """The page name without its type prefix.
-
-    The existence check below used to be prefix-exact, so a link to ``[[Epic
-    Systems]]`` did not match the existing ``Vendor_Epic-Systems`` page and the
-    stub creator invented a second node, ``Concept_Epic-Systems``, for an entity
-    that was already in the graph.  Four such pairs existed in the live wiki.
-    """
-    return strip_prefix(name)
-
-
-def _node_type(target: str) -> str:
-    """The type a stub for ``target`` must declare.
-
-    An untyped link target gets ``concept``; a typed one gets its own type.  Callers
-    that write a page must check :data:`GENERATED_NODE_TYPES` first (see
-    :func:`_generate_stubs_for_broken_links`).
-    """
-    return type_for_node_id(target) or "concept"
+# mirror ``wiki_utils.VALID_PREFIXES``.  The vocabulary now has one owner, and so does what a
+# stub is: ``node_vocabulary`` for the
+# prefixes and types, ``stub_creator`` for the page a broken link needs.  This file used to
+# keep its own copy of the prefix list, a second inline copy of it, a stub writer, and a
+# covering-page check that only it had -- which is why ``tool_lint`` forked entities that this
+# file refused to fork.
 
 
 def prepare_query_context(query_str: str, dry_run: bool = False):
@@ -168,26 +136,9 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
     return "Query finalization completed with no valid wiki files synced."
 
 
-def _covering_page(target, existing_files, normalized_existing, existing_cores):
-    """The page that already covers ``target``, or ``None`` when nothing does.
-
-    A match is either the target itself (exact or normalised) or the page carrying
-    the same core name under a different type prefix.
-    """
-    if not target:
-        return None
-    if target in normalized_existing or target in existing_files:
-        return target
-    return existing_cores.get(_node_core(target))
-
-
 def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
-    existing_files = {name.replace(".md", "") for name in os.listdir(wiki_dir) if name.endswith(".md")}
-    normalized_existing = {normalize_entity_name(f) for f in existing_files}
-    # A name already present under *any* type prefix.  ``Vendor_Epic-Systems``
-    # covers ``Epic-Systems``; creating ``Concept_Epic-Systems`` next to it would
-    # fork one entity into two nodes.
-    existing_cores = {_node_core(f): f for f in existing_files}
+    existing_files, normalized_existing, existing_cores = stub_creator.existence_index(wiki_dir)
+    existing = (existing_files, normalized_existing, existing_cores)
     broken_targets = set()
 
     for filename in files_to_scan:
@@ -205,7 +156,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
         for match in re.finditer(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]", content):
             raw_target = match.group(1).strip().replace(".md", "")
             target = normalize_entity_name(raw_target)
-            covering = _covering_page(target, existing_files, normalized_existing, existing_cores)
+            covering = stub_creator.covering_page(target, existing)
             if covering:
                 if covering != target:
                     log.warning(
@@ -218,7 +169,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
         for match in re.finditer(r"\[[^\[\]]+?::\s*\[\[([^\]]+?)\]\]\]", content):
             raw_target = match.group(1).strip().split("|")[0].strip().replace(".md", "")
             target = normalize_entity_name(raw_target)
-            covering = _covering_page(target, existing_files, normalized_existing, existing_cores)
+            covering = stub_creator.covering_page(target, existing)
             if covering:
                 if covering != target:
                     log.warning(
@@ -233,67 +184,17 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> int:
         return 0
 
     stubs = 0
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    for target in broken_targets:
-        # A generated artifact is not a graph node.  Writing one would satisfy the
-        # link for the linter while ``indexer`` skips the page, so the gap would
-        # disappear from lint without ever appearing in the graph; and the live wiki
-        # holds 798 ``System_*`` pages precisely because they are generated.  Before
-        # the vocabulary fix this case produced no page either, but only as a side
-        # effect of ``validate_schema`` rejecting the mistyped stub.
-        if type_for_node_id(target) in GENERATED_NODE_TYPES:
-            log.info(
-                "Not creating a stub for '%s': %s pages are generated artifacts, not graph nodes.",
-                target,
-                type_for_node_id(target),
-            )
-            continue
-        node_type = _node_type(target)
-        frontmatter = {
-            "id": target,
-            "title": target.replace("_", " "),
-            "type": node_type,
-            "domain": "General",
-            "topic_cluster": "General",
-            "status": "Active",
-            "epistemic-status": "seed",
-            "categories": ["Uncategorized"],
-            "tags": ["auto-stub"],
-            "created": f"{today}T00:00:00Z",
-            "updated": f"{today}T00:00:00Z",
-            "sources": [],
-        }
-        body = (
-            f"# {target.replace('_', ' ')}\n\n"
-            f"## 1. 编译事实\n"
-            f"*[System Directive: This section represents the LATEST consensus.]*\n\n"
-            f"Auto-generated stub page for {target}. (Last Reshaped: [[{today}]])\n\n"
-        )
-        
-        # Add the first valid slot for the type
-        from vector_lake.schema_validator import VALID_H3_SLOTS
-        slots = VALID_H3_SLOTS.get(node_type, [])
-        if slots:
-            body += f"{slots[0]}\n- [[{target}]] Auto-generated stub.\n\n"
-        else:
-            body += f"### 基本信息 (General Information)\n- [[{target}]] Auto-generated stub.\n\n"
-            
-        body += (
-            f"---\n\n"
-            f"## 2. 证据时间线\n"
-            f"*[System Directive: This is the immutable event ledger.]*\n\n"
-            f"- [{today}] [Observation] Created stub.\n"
-        )
-        try:
-            import yaml
-            from vector_lake.mutation_coordinator import execute_mutation_plan
-            frontmatter_str = "---\n" + yaml.dump(frontmatter, allow_unicode=True, sort_keys=False) + "---\n"
-            execute_mutation_plan(f"{target}.md", content=frontmatter_str + body, is_delete=False)
+    # What a stub is -- its name, type, fields and the write path -- belongs to one owner.
+    # This used to build the page here and hand ``<target>.md`` to ``execute_mutation_plan``,
+    # which no node may be named: the write was refused and the exception swallowed, so this
+    # function created no stub at all for an untyped target (and, as it turned out, none for
+    # a typed one either).  See ``vector_lake.stub_creator``.
+    #
+    # ``index`` is the one built before the scan, not a fresh one: ``create_stub`` updates it
+    # in place, so a stub written for one target is seen as covering its own name by the next
+    # iteration.  A second index here would leave that update on a set nothing reads again.
+    for target in sorted(broken_targets):
+        if stub_creator.create_stub(wiki_dir, target, existing):
             stubs += 1
-            existing_files.add(target)
-            log.info(f"[Stub] Created seed page: {target}.md")
-        except Exception as e:
-            log.warning(f"Failed to create stub {target}.md: {e}")
-
     return stubs
 

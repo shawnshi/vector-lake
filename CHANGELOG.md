@@ -1,5 +1,98 @@
 # Unreleased
 
+## 坏链存根只留一个所有者（此前 lint 会分裂实体，query 一个也建不出来）
+
+`tool_lint --auto-fix` 与 `tool_query` 收尾时各自实现了一套「给坏链写存根」的代码，两边在**每一个**
+决策上都不同：
+
+| 决策 | `tool_lint` | `tool_query` |
+|---|---|---|
+| 无前缀目标的文件名 | `Concept_<target>.md` | `<target>.md` |
+| `id` | 生成式，如 `20260918_0f9t54` | 目标名本身 |
+| 已有同核心名但不同前缀的页面 | **不检查**：「`Vendor_Epic-Systems.md`」旁边会造出 `Concept_Epic-Systems.md` | 检查，不写 |
+| 写入路径 | `write_markdown_file`（校验文件名、schema 与编译事实守卫） | `execute_mutation_plan` + 手拼 YAML 字符串 |
+
+两个结果都是错的，而且都在新测试里**对着调用方**复现出来：
+
+- `tool_lint` 把一个实体**分裂成两个节点**；
+- `tool_query` 对无前缀目标写 `<target>.md`，而那是**非法节点文件名**（`validate_wiki_filename`
+  要求类型前缀），于是写入被拒、异常被吞成一条 warning —— 实测它对无前缀目标**一个存根也建不出来**
+  （有前缀的目标同样 0）。
+
+### 修法：一个拥有者，逐项选定基线（不是折中混合）
+
+新增 `vector_lake/stub_creator.py`：`stub_type`、`stub_page_name`、`existence_index`、
+`covering_page`、`stub_frontmatter`、`stub_body`、`create_stub`。每个决策**只取一边**并写明理由：
+
+- 文件名/类型/校验/`id` 取 `tool_lint` 那套（唯一能通过校验的一边；活库 id 是自由格式的稳定标识，
+  抽样 60 页有 59 页与文件名不同，所以 `tool_query` 的 `id = target` 才是异类）；
+- 「同核心名已被覆盖则不写」取 `tool_query` 那套（lint 缺的正是这条）；
+- 写入走 `write_markdown_file`（校验文件名、schema、编译事实/证据时间线守卫），不用手拼 YAML；
+- 生成型（`System_*`）拒写：两边本来就一致，`indexer` 跳过这类页面，写出来只会让检查通过而图里依旧空缺。
+
+`tool_query` 的 `_node_core`、`_node_type`、`_covering_page` 随之删除（前两者本就分别是
+`node_vocabulary.strip_prefix` 和一行默认值），两个调用方改为调用同一个 `create_stub`；
+`test_broken_link_stub_guard.py` 与 `test_node_vocabulary.py` 改为指向新家。
+
+### 活库影响：零，且可验证
+
+- `python cli.py lint` 走改造后的模块，数字与改造前**逐项相同**：`Scanned: 7923 files | Issues: 5314
+  | Auto-fixed: 0`、`2. Naming Compliance: [PASS]`、`7. Broken Links: [FAIL: 788]`、`11. Semantic
+  Garbage Collection: [FAIL: 5]`、`12. Governance Debt: [FAIL: 1]`；活库计数不变。
+- 守护进程的定时 lint 用的是 `auto_fix=False`，所以活库上不会有任何写入。
+- 活库确实存在 40 个「同一核心名有多个页面」的情况，但其中**没有一页**带 lint 存根的特征
+  （生成式 `id` 且 `sources: []`）→ **lint 的分裂从未在活库发生过**，本次不需要任何清理。
+
+### 测试
+
+新增 `tests/test_stub_creator.py` 8 例：无前缀目标获得前缀（这正是 query 之前建不出页面的原因）、
+生成型拒写、同核心名阻断写入（分裂规则）、重复调用只写一次、成品通过 `validate_schema`、`id` 形状符合
+活库惯例，以及对**两个调用方**各一例：lint 不再分裂已存在实体；两个调用方对同一条链接产出的页面
+（除生成式 `id` 外）逐字相同。
+
+计数对账（避免把新模块带来的连带计入误当成本批新增）：全量 **777 passed** vs HEAD 的 766，
+差额 11 = 本批新增 8 + `test_static_scope.py` 增 2 + `test_portability.py` 增 1 —— 后两者按
+`vector_lake/*.py` 参数化，新模块自动加入了「无未绑定名 / 无函数内导入 / 无机器相关绝对路径」三道守卫。
+
+### 复核结论与随之修的内容
+
+独立复核（只读子代理）判 **OK with notes**，无 P0/P1：C1–C6 全部成立（两个缺陷确实被修掉且由调用方级测试
+盯住、`create_stub` 各条拒绝路径成立、调用方没有丢东西、写入路径是原来两条的严格超集、`id` 无消费方要求
+等于文件名、新模块不引入环也没有第三条延迟上行导入）。第 7 问（是否该把「链接解析」也一起改）判为
+「拆分合理、比改动前更安全」，并指出一个附带收益：旧 lint 对同一条破链会**无条件重写**已存在的
+`Concept_Foo.md`，只因编译事实守卫恰好拦住才不会丢内容；`covering_page` 现在直接拒绝这次写入。
+
+按复核意见修掉 4 条 P2，其中 **F1 是我在本批引入的回归**：
+
+- **F1（回归）**：我把**页面 stem** 传给了 frontmatter/正文构造器，于是 `[[BrandNew-Thing]]` 得到的存根会写
+  `title: Concept_BrandNew-Thing` 与 `# Concept_BrandNew-Thing`。合并前的 lint 写的是 `title: target`（= 裸名），
+  所以这是我这边弄坏的。修法：`title`/H1 一律取**核心名**，自链接指向**真实存在的页面名**（`[[Concept_X]]`，
+  今天就能解析）。活库的既有页面正是写裸名（如 `Vendor_Epic-Systems.md` 写 `title: Epic`）。
+- **F2**：正文原来把日期写成 `[[2026-09-18]]` 链接 —— 今天是一条破链，而任何人跑一次 `lint --auto-fix` 就会
+  给它造出一个 `Concept_2026-09-18.md` 垃圾页。实测证据：`validate_wiki_filename("Concept_2026-09-18.md")`
+  **合法**，且活库**0** 个日期形页面；活库既有页面的写法是裸日期（`Last Reshaped: 2026-06-02)`）。已改为裸日期。
+- **F4（便宜的一半）**：文件名净化比校验器窄——空格/括号/下划线会被拒，且用 `_` 替换也不可行
+  （`Concept_Foo_Bar.md` 被「Strict Naming Violation」拒）。改为把校验器禁止的字符（含下划线）整段替换成
+  单个 `-`：`Foo Bar`/`Foo_Bar`/`Foo(Bar)` → `Concept_Foo-Bar.md`，实测三者现在都合法。**两个调用方在
+  归一化上的分歧**（query 归一化目标、lint 不归一化）属调用方语义，留给下一批。
+- **F5**：query 侧原本又建了第二个索引，导致 `existing_files.add(written)` 是死写入。改为把扫描前那个索引
+  传给 `create_stub`（它在内部就地更新），死写入删除。
+
+**登记为下一批**（复核同意拆开，避免同时改动报告语义）：lint 的**链接解析**改为复用 `covering_page`（否则
+它新建的 `Concept_Foo.md` 并不能让 `[[Foo]]` 解析成功），连同 F3（写入失败与「无需创建」目前返回同一个
+`None`，系统性的闸门失败会被读成「没有需要创建的」）、F4 的归一化分歧、F6（生成式 `id` 未查重）以及
+「`fixes_applied` 会把没修好链接的写入也计入」这个既有报告瑕疵一起做。做链接解析那一步会移动活库报告里的
+788 这个数字，所以必须单独一批并有自己的证据。
+
+### 活库影响：零，且可验证（复核后复验）
+
+`python cli.py lint` 在修复前后数字逐项相同：`Scanned: 7923 files | Issues: 5314 | Auto-fixed: 0`、
+`7. Broken Links: [FAIL: 788]`；活库计数不变；活库日期形页面仍为 **0**。
+
+全量 pytest 由 777 增至 **780**（本批复核修复新增 3 例：标题/一级标题用核心名、不种下会被 auto-fix 变成
+页面的链接、非法文件名被净化）。可失败性实测后恢复：把 `title` 改回 stem → 恰好第 1 例失败并报
+`assert 'Concept_BrandNew-Thing' == 'BrandNew-Thing'`；把日期改回链接 → 恰好第 2 例失败。
+
 ## 删除 gram 索引的增量机制（无生产调用者的那条路）
 
 上一批把读路径改成「不允许服务混合态」之后，增量那套就没有生产调用者了：`flush` 已不再把文档移出队列

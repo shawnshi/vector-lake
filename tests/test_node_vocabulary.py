@@ -19,7 +19,7 @@ import ast
 import pathlib
 import re
 
-from vector_lake import node_vocabulary, schema_validator, tool_query, wiki_utils
+from vector_lake import node_vocabulary, schema_validator, stub_creator, tool_query, wiki_utils
 from vector_lake.node_vocabulary import (
     GENERATED_NODE_TYPES,
     NODE_PREFIXES,
@@ -53,23 +53,23 @@ def test_every_prefix_maps_back_to_exactly_its_type():
 
 
 def test_a_system_node_is_stripped_like_every_other_prefix():
-    """The regression: ``System_`` was absent from the copy ``_node_core`` used."""
+    """The regression: ``System_`` was absent from the copy the stub creator used."""
     for prefix in NODE_PREFIXES:
-        assert tool_query._node_core(f"{prefix}Epic-Systems") == "Epic-Systems"
+        assert strip_prefix(f"{prefix}Epic-Systems") == "Epic-Systems"
 
-    assert tool_query._node_core("Epic-Systems") == "Epic-Systems"
+    assert strip_prefix("Epic-Systems") == "Epic-Systems"
     # ``System_Community_AI`` must not be treated as a prefix-less name.  Note the
-    # remainder keeps its underscore: ``_node_core`` strips a prefix, it does not
+    # remainder keeps its underscore: ``strip_prefix`` strips a prefix, it does not
     # normalise, which is why a hyphenated link target does not match this file.
-    assert tool_query._node_core("System_Community_AI") == "Community_AI"
+    assert strip_prefix("System_Community_AI") == "Community_AI"
 
 
 def test_a_stub_for_a_typed_node_declares_that_type():
     for node_type, prefix in zip(NODE_TYPES, NODE_PREFIXES):
-        assert tool_query._node_type(f"{prefix}Something") == node_type
+        assert stub_creator.stub_type(f"{prefix}Something") == node_type
 
-    assert tool_query._node_type("Vendor_New-Thing") == "vendor"
-    assert tool_query._node_type("Epic-Systems") == "concept"
+    assert stub_creator.stub_type("Vendor_New-Thing") == "vendor"
+    assert stub_creator.stub_type("Epic-Systems") == "concept"
 
 
 def test_generated_artifacts_are_marked_and_excluded():

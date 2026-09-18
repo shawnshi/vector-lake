@@ -20,24 +20,19 @@ from vector_lake.wiki_utils import (
     split_frontmatter,
     write_markdown_file,
 )
+from vector_lake import stub_creator
 from vector_lake.schema_validator import (
     REQUIRED_FIELDS,
     SYSTEM_ARTIFACT_CATEGORIES,
     VALID_CATEGORIES,
     VALID_EPISTEMIC_STATUS,
-    VALID_H3_SLOTS,
     VALID_STATUS,
     VALID_TYPES,
     missing_required_fields,
     validate_schema,
     SchemaViolationException,
 )
-from vector_lake.node_vocabulary import (
-    GENERATED_NODE_TYPES,
-    NODE_PREFIXES,
-    NON_NODE_WIKI_FILES,
-    type_for_prefix,
-)
+from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 
 
 # ``VALID_STATUS`` is capitalised while the check below lowercases the page value,
@@ -231,60 +226,26 @@ def lint_vector_lake(auto_fix: bool = False):
                             fixes_applied += 1
 
     # 4. Broken Links (Stub Creation)
+    # The stub index is built once for the pass and updated in place by the creator, so a
+    # stub created for one link is not "missing" when the next link is looked at.
+    stub_index = stub_creator.existence_index(wiki_dir)
     for filename, data in parsed.items():
         for target in data["links"]:
             if target not in link_target_map and target not in all_keys:
                 issues["broken_links"].append(f"{filename} -> [[{target}]]: target does not exist")
                 if auto_fix:
-                    # The filename prefix and the frontmatter ``type`` are one decision, and
-                    # the type has to come from the vocabulary.  This used to name the file
-                    # after the target's own prefix while always declaring ``concept``, so
-                    # ``[[Vendor_X]]`` produced ``Vendor_X.md`` typed ``concept``.  The
-                    # write goes through ``execute_mutation_plan`` -> ``validate_schema``,
-                    # which refused it -- "Filename prefix 'Vendor' does not match
-                    # frontmatter type 'concept'" -- and the exception was caught and
-                    # logged, so the link was simply never fixed and the report said
-                    # nothing.  The body slot has to follow the type for the same reason:
-                    # ``### 物理机制`` is the concept slot.
-                    declaring_prefix = next(
-                        (prefix for prefix in NODE_PREFIXES if target.startswith(prefix)), None
-                    )
-                    stub_type = (
-                        type_for_prefix(declaring_prefix) if declaring_prefix else None
-                    ) or "concept"
-                    if stub_type in GENERATED_NODE_TYPES:
-                        # ``System_*`` pages are generated artifacts that the indexer
-                        # skips, so a stub would satisfy this very check while never
-                        # entering the graph.  Leave the link broken so it stays visible.
-                        continue
-                    stub_filename = f"{target}.md" if declaring_prefix else f"Concept_{target}.md"
-                    stub_filename = re.sub(r'[\\/*?:"<>|]', "_", stub_filename)
-                    stub_path = os.path.join(wiki_dir, stub_filename)
-                    if not os.path.exists(stub_path):
-                        stub_fm = {
-                            "id": _generate_id(),
-                            "title": target,
-                            "type": stub_type,
-                            "domain": "General",
-                            "status": "Active",
-                            "epistemic-status": "seed",
-                            "categories": ["Uncategorized"],
-                            "sources": [],
-                            "strategic_scope": "edge",
-                            "evidence_tier": "derived",
-                            "created": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z"),
-                            "updated": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00Z")
-                        }
-                        type_slots = VALID_H3_SLOTS.get(stub_type) or ["### 物理机制 (Mechanism)"]
-                        # Types without declared slots (``source``) get the generic line,
-                        # which validates because ``schema_validator`` only enforces slots
-                        # for the types that declare them.  ``synthesis`` is the exception:
-                        # it demands two specific H2 sections that this body does not have,
-                        # so its stubs are still refused -- unchanged from before, and
-                        # recorded in tests/test_lint_stub_type.py rather than left silent.
-                        stub_body = f"\n# {target}\n\n## 1. 编译事实\n*[System Directive: This section represents the LATEST consensus.]*\n\nAuto-generated stub for {target}. (Last Reshaped: [[{datetime.datetime.now().strftime('%Y-%m-%d')}]])\n\n{type_slots[0]}\n- [[{target}]] Auto-generated stub.\n\n---\n\n## 2. 证据时间线\n*[System Directive: This is the immutable event ledger.]*\n\n- [{datetime.datetime.now().strftime('%Y-%m-%d')}] [Observation] Created stub.\n"
-                        _write_fixed_frontmatter(stub_path, stub_fm, stub_body)
-                        all_keys.add(stub_filename[:-3])
+                    # The filename prefix and the frontmatter ``type`` are one decision, and the
+                    # type has to come from the vocabulary.  This used to be written out here,
+                    # naming the file after the target's own prefix while always declaring
+                    # ``concept``, so ``[[Vendor_X]]`` produced ``Vendor_X.md`` typed
+                    # ``concept`` -- which the write refused, and the exception was caught and
+                    # logged, so the link was simply never fixed and the report said nothing.
+                    # What a stub is now belongs to one owner; see
+                    # ``vector_lake.stub_creator`` for the rules and why each was chosen.
+                    written = stub_creator.create_stub(wiki_dir, target, stub_index)
+                    if written:
+                        all_keys.add(written)
+                        link_target_map[written] = written
                         fixes_applied += 1
 
     # 5. Frontmatter, Type, Status, Category
