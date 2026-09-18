@@ -1,5 +1,110 @@
 # Unreleased
 
+## 索引只在答案精确时才允许作答
+
+`gram_index_usable()` 原先回答的是「基表够不够新」，而调用方读成「答案对不对」。这两件事在
+「基表 + overlay 相加」的状态下并不等价，差值有实测。
+
+### 缺陷（P1）与实测
+
+一个活文档被编辑、丢掉某个词，然后按下述运维顺序处理：
+
+1. `flush_memory_gram_dirty()` 把它的新 gram 写进 `operational_memory_gram_overlay`，并**把它从
+   队列里删掉**；
+2. `compact_memory_gram_overlay()` 把 overlay 合进基表。
+
+第 2 步修不好第 1 步：`_compact_gram_chunk` **只遍历 overlay 里存在的 gram**，而被丢掉的词按定义
+不在其中，所以基表里 `(被丢掉的词, 该文档)` 这一行永远不会被重访。而此时队列项已经没了 —— 队列项
+恰恰是读路径跳过该文档陈旧基表行的唯一依据。于是文档为它已不再包含的词得分。
+
+实测（`accumulate_relevance` 层）：应为 `{}`，实得 `{doc: 30}`。新增测试
+`test_a_document_is_not_credited_for_a_gram_it_dropped` 复现该状态，**修复前 7 例新测试中 3 例失败**
+（含 `test_materialising_a_document_does_not_retire_its_queue_entry`、
+`test_compaction_does_not_make_the_base_authoritative`）。
+
+用户可见层有两个面，**只有一个被掩蔽**：2 字以上的词会经 `_accumulate_composite` 回读
+`operational_memory_index` 做精确校验，把陈旧候选滤掉，所以「为丢掉的词计分」这条路不必然表现为检索
+结果错。另一个面是直接可见的：旧 `ensure` 在队列非空时先 flush、flush 又把文档踢出队列，于是**刚编辑
+完、尚未被 flush 的文档基表行被跳过、overlay 里又还没有它** —— 按它新内容去搜会返回 `[]`，而不是返回
+这个文档。本批的判据同时关掉这两面。
+
+### 定下的不变量
+
+**基表是权威的，当且仅当：队列里没有活文档，且 overlay 为空。**
+
+- 活文档在队列里 ⇒ 它的基表行陈旧，跳过它们才是对的；留在队列里是唯一让读路径继续跳过的手段，所以
+  `flush` 不再让文档出队（出队只能由重建完成）。
+- overlay 非空 ⇒ 同一文档的倒排分裂在两个结构里，而读路径对两者是**相加**，overlay 的语义却是
+  **替换** —— 两者必须择一，这里选择不允许服务这种状态。
+- **已删标记（retired）不在此列**：读路径对队列内文档一律跳过基表行，所以它们不可能贡献，不影响精确性。
+  因此可用性判据读的是 `dirty_breakdown()` 的三元组而不是总数。
+
+### 因此不再有增量修复这条路
+
+没有任何增量步骤能消掉「被丢掉的 gram」的基表行，于是拖队列、合 overlay 都不构成通往可用索引的路 ——
+只有 `rebuild_memory_gram_index()` 是。据此：
+
+- `ensure_memory_gram_index()` 不再调用 `flush_memory_gram_dirty()` / `compact_memory_gram_overlay()`；
+  继续走精确扫描，恢复方式是显式重建 —— 这正是 MCP `memory_gram_index_status` 早已写明的路径。
+- `GRAM_FORMAT_VERSION` **1 → 2**：上一版代码留下的库可能正好满足新判据（无活标记、无 overlay）却压着
+  一个陈旧基表 —— 两种状态在计数上无法区分，只能靠版本号。抬版本把这类库变成可见的 `ready=False`，
+  小语料自动重建、大语料留待显式重建。
+- `_compact_gram_chunk()` 把本次合并到的文档**重新标记回队列**：合并一个 gram 并不会让基表对这些文档
+  变权威，反而因为它们仍在队列里而基表被跳过，需要重新标记才不会出现「看起来回到了精确状态、实际仍在
+  为丢掉的词计分」。
+
+### 独立复核（1 个 P1 由复核找出，1 个 P1 与本批引入的设计问题一并修正）
+
+复核（只读子代理）确认了机制、C2/C3/C6 三条断言成立，并找出两处必须先处理的问题与本批自己引入的
+一个设计缺陷：
+
+- **`tool_doctor.py` 自己复述了一遍旧判据。** 它算的是 `gram_ready and live_backlog <= cap`，正是「读
+  路径会排空所以小积压没关系」那句话的镜像。读路径不再排空后，它会把一个 146k 文档库上只有 1 条积压
+  的索引报成 `usable=True`，而实际每次检索都在全表扫描 —— 诊断面在撒谎。改为直接取
+  `memory_gram_index.gram_index_usable()`，并把 overlay 行数一并列出；旧注释里那段「小积压会自愈」
+  一并删除，并说明为什么不再在这里复述判据。
+- **上一版留下的库会被误判为可用。** 旧 `flush` + 旧 `compact` 恰好制造出「无活标记、无 overlay、基表
+  陈旧」这种与干净状态在计数上无法区分的状态。已由版本号抬升关闭（见上）。可失败性已证：把常量改回 1
+  后 `test_a_base_from_the_previous_release_is_not_trusted` 报 `assert True is False`。
+- **本批第一版让「读路径就地重建小语料」每次写后又重建一次。** 在 2000 文档上限处，重建约 6 s 而全表
+  扫描约 32 ms（按代码自述的 3 ms/文档与 0.27 µs/次比较推算，属估算非实测），差约 190 倍，且没有冷却
+  窗口。已收窄为**只在基表缺失时**（从未建过 / 表被截断 / 版本不符）才在读路径中构建：陈旧基表一律交回
+  精确扫描，不管语料多小。相应地 `AUTO_REBUILD_MAX_DOCS` 的含义从「可自愈的积压上限」改为「允许读路径
+  自动重建的语料上限」。
+- **本批的「读路径不排空」测试原本不可能因正确理由失败**：`ensure` 会吞掉所有异常并降级到精确扫描，
+  而精确扫描正是该测试的比较基准，所以让 stub 抛异常等于让测试恒过。已改为**记录调用并断言零调用**。
+
+### 未做，以及为什么
+
+**没有删除 `flush`/`compact` 与 overlay 表。** 它们现在是 overlay 的有界维护，不再是「让读更早可用」的
+手段 —— 这套增量机制整体是「为一条不可能精确的路径维护的剩余物」，且 `flush` 已无生产调用者。删除它要
+连带处理 `gram-index --compact`、MCP `compact_memory_gram_index` 与 `tools.py` 的导出，属独立批次，
+不在本批夹带。批 4 为 `flush` 修的队列头阻塞仍然有效，只是适用面收窄成维护路径。
+
+复核提出、本次**未修**的三条，按既有缺陷登记：
+
+- **重建与清理对并发写者不是原子的（既有）**：`rebuild_memory_gram_index` 逐批提交暂存后，在一个**后置**
+  事务里清空整张队列，另一个连接在此之间提交的写入会连标记一起丢失；`prune_retired_gram_docs` 的 retired
+  快照也取在事务之外，叠加 rowid 复用窗口可能误删活文档。本批的收窄已把读路径触发重建的场景压回「基表
+  缺失」，因此曝光面回到改动前水平；修法（按暂存文档集删标记、快照移入事务）留给独立批次。
+- **`_record_state` 被传入两次 `base_docs`**（`_compact_gram_chunk` 与 `prune_retired_gram_docs` 的调用点），
+  使 `postings_count` 被写成 `base_docs`。该字段无任何读取方，惰性缺陷，登记不修。
+- **基表 postings 以 `operational_memory_index.rowid` 为键**，而 SQLite 不承诺 rowid 跨 `VACUUM` 稳定；
+  活库此前有两次 VACUUM 记录。潜在、本批无法验证，登记。
+
+### 活库：一次未授权的重建（已消除痕迹）
+
+本批定案前的一次只读探针写错了环境变量（`VECTOR_LAKE_MEMORY_ROOT` 不是本项目识别的变量，正确的是
+`VECTOR_LAKE_MEMORY_DIR`），于是脚本跑在了**活库**上：插入了一条测试文档 `mem_x`，并触发了
+`rebuild_memory_gram_index()`。处置与结果：
+
+- 已按精确目标删除 `mem_x`（1 行），并 `prune_retired_gram_docs()` 清掉它在基表里的 57 个 gram；
+- 复验：`operational_memory` = 146,679、`operational_memory_index` = 146,679、`quick_check = ok`、
+  `change_sets`/`mutation_outbox`/`governance_queue` 计数与事发前逐项相同；
+- **不可逆的部分**：gram 基表由 414,914 gram 变为 420,913 gram（按当前投影重建），队列 111,564 → 0，
+  overlay 153 → 0。事件前的队列构成已不存在；但重建后正确的队列本应为空，故这是取证信息的损失，
+  不是正确性损失。此后活库的该索引首次处于「基表 = 当前投影」的干净状态。
+
 ## 「这个文件到底是不是节点」的答案，原先写在六个地方
 
 `{index.md, log.md, overview.md, orphan_pages.md, wiki_link_stats.md, Synthesis_log.md}`

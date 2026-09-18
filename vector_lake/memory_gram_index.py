@@ -63,15 +63,25 @@ from vector_lake.db_store import get_connection, init_db, transaction
 
 log = logging.getLogger("vector-lake-memory-gram-index")
 
-GRAM_FORMAT_VERSION = 1
-#: Below this many stale documents the index self-heals on the read path; above it
-#: the caller keeps using the exact scan until an explicit rebuild runs.  A bulk
-#: rebuild costs roughly 3 ms/document (431 s for the live 142 117-document
-#: corpus), so the automatic path is capped well below that.
+#: Bumped when a previously written base can no longer be trusted to be exact.
+#: Version 1 is not: a database drained by the release that shipped it can hold no
+#: live queue entry and no overlay row over a base that is missing a document's
+#: current grams *and* still posting grams it dropped, which is indistinguishable
+#: from a clean base by counters alone.  Raising the version turns every such
+#: database into a visible ``ready=False`` and one rebuild.
+GRAM_FORMAT_VERSION = 2
+#: Largest corpus rebuilt automatically on the read path.  The cap has nothing to do
+#: with how much is queued: a base that is *stale* is never rebuilt from a read, no
+#: matter how small, because the exact scan is far cheaper than a rebuild for any
+#: corpus this cap admits -- at the 3 ms/document rebuild cost below, a 2 000-document
+#: corpus is ~6 s to rebuild against ~32 ms to scan, so a read-path rebuild would have
+#: to be amortised over ~190 searches per write.  Only a missing base (never built, a
+#: truncated table, or an older format version) is built on first use, where there is
+#: nothing to serve and the alternative is failing every search.
 AUTO_REBUILD_MAX_DOCS = 2_000
 #: Documents materialised into the overlay per call.
 DEFAULT_FLUSH_DOCS = 400
-#: Overlay grams merged into the base per read-path self-heal call.
+#: Overlay grams merged into the base per explicit compaction call.
 COMPACT_GRAMS_PER_CALL = 200
 #: Grams merged per chunk by :func:`compact_memory_gram_overlay` (bounded memory).
 COMPACT_CHUNK_GRAMS = 5000
@@ -346,21 +356,27 @@ def rebuild_memory_gram_index(dry_run: bool = False, batch_docs: int = 2000) -> 
 
 
 def flush_memory_gram_dirty(limit_docs: int = DEFAULT_FLUSH_DOCS) -> dict:
-    """Apply queued document changes to the overlay.
+    """Apply queued document changes to the overlay, without retiring the queue entry.
 
-    Every dirty document that still exists is removed from the overlay and
-    re-inserted from its current projection row.  Documents that no longer exist
-    stay dirty on purpose: the query skips base postings for dirty documents, so
-    staying dirty is what retires a deleted document's postings.
+    Every selectable document is re-inserted into the overlay from its current
+    projection row.  Documents that no longer exist are not selectable here: the
+    query skips base postings for any queued document, so staying queued is what
+    retires a deleted document's postings.  The queue is keyed by document rowid and
+    drained in that order, and a deleted document keeps whatever rowid it had -- the
+    smallest ones belong to the oldest documents, which are exactly the ones that
+    have since been deleted.  So selecting the batch with ``LIMIT`` alone let a head
+    of retired markers consume the entire batch on every call, the flush cleared
+    nothing, and the backlog could never drain: measured on the live lake, the first
+    400 queued documents were 0 live and the first 10 000 were 19 live.
 
-    Retired markers are therefore not *selectable* here, even though they stay
-    queued.  The queue is keyed by document rowid and drained in that order, and a
-    deleted document keeps whatever rowid it had -- the smallest ones belong to the
-    oldest documents, which are exactly the ones that have since been deleted.  So
-    selecting the batch with ``LIMIT`` alone let a head of retired markers consume
-    the entire batch on every call, the flush cleared nothing, and the backlog
-    could never drain: measured on the live lake, the first 400 queued documents
-    were 0 live and the first 10 000 were 19 live.
+    The documents this materialises **stay queued**, because materialising them does
+    not make the base authoritative for them: their base postings still hold grams
+    they no longer have, and nothing incremental removes those.  Draining the queue
+    is therefore not a route to a usable index -- only
+    :func:`rebuild_memory_gram_index` is, which is what :func:`gram_index_usable`
+    checks for.  This function and :func:`compact_memory_gram_overlay` are now useful
+    only as bounded maintenance of the overlay itself, not as a way to serve reads
+    sooner.
     """
     conn = get_connection()
     docs = [
@@ -396,13 +412,12 @@ def flush_memory_gram_dirty(limit_docs: int = DEFAULT_FLUSH_DOCS) -> dict:
                 payload,
             )
             inserted = len(payload)
-        # Only documents that still exist leave the queue; deleted ones stay dirty
-        # so their base postings keep being skipped.
+        # The materialised documents stay in the queue.  Their base postings still
+        # hold grams they no longer have, and no incremental step rewrites those, so
+        # the queue entry is the only thing keeping the read path from treating that
+        # base as authoritative.  A document leaves the queue when the base is
+        # rebuilt, and only then.
         live = [int(row["rowid"]) for row in rows]
-        if live:
-            conn.executemany(
-                "DELETE FROM operational_memory_gram_dirty WHERE doc = ?", [(doc,) for doc in live]
-            )
         state = conn.execute(
             "SELECT base_docs FROM operational_memory_gram_state WHERE singleton = 1"
         ).fetchone()
@@ -423,10 +438,12 @@ def flush_memory_gram_dirty(limit_docs: int = DEFAULT_FLUSH_DOCS) -> dict:
 def compact_memory_gram_overlay(limit_grams: int = COMPACT_GRAMS_PER_CALL) -> dict:
     """Merge overlay rows into the base postings and clear the merged part.
 
-    Read-modify-write per affected gram, so the read path's self-heal calls it
-    with the small default while an operator drain passes ``None`` to merge
-    everything (in bounded chunks).  Safe to interrupt: the overlay rows are
-    deleted in the same transaction that rewrites the base blobs.
+    Read-modify-write per affected gram, in bounded chunks, so an operator can merge
+    an overlay without holding it all in memory.  Safe to interrupt: the overlay rows
+    are deleted in the same transaction that rewrites the base blobs.
+
+    This does not make the base exact -- see :func:`_compact_gram_chunk` -- so it is
+    not a route to a usable index.
     """
     conn = get_connection()
     available = conn.execute(
@@ -482,6 +499,19 @@ def _compact_gram_chunk(limit_grams: int) -> int:
                 (gram, _pack(sorted(entries.items()))),
             )
             merged += 1
+        # Merging a gram into the base does not make the base authoritative for the
+        # documents it touched: a document that dropped a gram keeps that stale base
+        # row, and a dropped gram is by definition absent from the overlay, so
+        # nothing revisits it.  Marking them dirty again keeps the read path
+        # skipping their base postings; without this, draining the queue and merging
+        # the overlay would look like a return to exactness while the base still
+        # credited those documents for terms they dropped.
+        touched = {doc for gram in grams for doc, _ in overlay[gram]}
+        if touched:
+            conn.executemany(
+                "INSERT OR IGNORE INTO operational_memory_gram_dirty (doc) VALUES (?)",
+                [(doc,) for doc in touched],
+            )
         conn.execute(
             f"DELETE FROM operational_memory_gram_overlay WHERE gram IN ({placeholders})", grams
         )
@@ -554,58 +584,61 @@ def prune_retired_gram_docs() -> dict:
 
 
 def gram_index_usable() -> bool:
-    """True when the index can answer exactly right now."""
+    """True when the base is a complete, current snapshot and can answer exactly.
+
+    What this reports on is exactness, not speed, so the base has to be the only
+    thing an answer could come from:
+
+    * a **live document in the queue** has base postings that are stale -- they still
+      contain grams the document no longer has -- so serving the base credits a
+      document for terms it dropped, and the read path has no way to tell;
+    * **a row in the overlay** means a document's postings are split across two
+      structures, and the read path sums them while the overlay is deliberately a
+      replacement for the base.
+
+    ``retired`` markers are harmless: they name deleted documents, whose base
+    postings the read path skips outright, so they cannot contribute.  That is why
+    the queue is read as a breakdown rather than as a total.
+
+    No incremental step restores this condition.  :func:`_compact_gram_chunk`
+    rewrites only the grams the overlay holds, and a document's *dropped* gram is by
+    definition not one of them, so that base row is never revisited -- short of
+    :func:`rebuild_memory_gram_index`, which is the documented recovery.
+    """
     try:
         if not gram_index_state()["ready"]:
             return False
-        # Only documents that still exist need materialising; retired markers are
-        # removed by :func:`prune_retired_gram_docs`, not by the read path.
-        return live_dirty_doc_count() <= AUTO_REBUILD_MAX_DOCS
+        _, live, _ = dirty_breakdown()
+        return live == 0 and overlay_row_count() == 0
     except Exception:  # noqa: BLE001 - a missing table simply means "not usable"
         return False
 
 
 def ensure_memory_gram_index() -> bool:
-    """Drain a bounded backlog and report whether the index is usable.
+    """Report whether the index can answer exactly, building an absent base first.
 
-    A stale-but-small backlog is drained incrementally; a large one needs an
-    explicit :func:`rebuild_memory_gram_index`, so the caller keeps using the
-    exact scan meanwhile rather than paying minutes inside a read.
+    This used to drain a bounded backlog through :func:`flush_memory_gram_dirty` and
+    then merge part of the overlay.  That is the sequence that produced the wrong
+    answers :func:`gram_index_usable` now describes: the flush declared a document's
+    stale base postings authoritative, so a document was credited for a gram it no
+    longer contained, and merging afterwards did not reach that gram.  No drain can
+    restore exactness, so the read path does not attempt one.
 
-    "A large one needs an explicit rebuild" is taken literally, because a partial
-    drain past the cap is not free and does not converge:
-
-    * it cannot reach usability in one call, so the batch is spent and the caller
-      falls back to the exact scan anyway;
-    * it publishes the overlay for a document while that document's *stale base*
-      postings -- grams it no longer contains -- stay in the base.  Nothing
-      rewrites those until :func:`compact_memory_gram_overlay` reaches that gram,
-      and until then the read path sees base-plus-overlay for a document that is no
-      longer dirty, so :func:`skip_doc_set` no longer suppresses it;
-    * once the live backlog reaches zero the queue can still hold nothing but
-      retired markers, and the batch query then has to walk all of them to prove it
-      has nothing to do -- on every read.
+    A *stale* base is deliberately left alone: the caller falls back to the exact
+    scan, which is cheaper than a rebuild for any corpus
+    :data:`AUTO_REBUILD_MAX_DOCS` admits.  Only an *absent* base -- never built, a
+    truncated table, or an older :data:`GRAM_FORMAT_VERSION` -- is built here, and
+    only for a corpus small enough for the build to be bounded, because a database
+    with no base has nothing to serve and every search would otherwise be exact-scanned
+    forever.
     """
     conn = get_connection()
     try:
         init_db()
-        state = gram_index_state()
-        if not state["ready"]:
-            if _projection_doc_count(conn) <= AUTO_REBUILD_MAX_DOCS:
-                rebuild_memory_gram_index()
-            return gram_index_usable()
-        live_backlog = live_dirty_doc_count(conn)
-        if live_backlog == 0:
-            # Nothing serviceable is queued.  Retired markers are not work: they stay
-            # queued so the query keeps skipping their base postings until
-            # :func:`prune_retired_gram_docs` rewrites them away.
-            pass
-        elif live_backlog <= AUTO_REBUILD_MAX_DOCS:
-            flush_memory_gram_dirty()
-        else:
-            return False
-        if overlay_row_count(conn):
-            compact_memory_gram_overlay()
+        if gram_index_usable():
+            return True
+        if not gram_index_state()["ready"] and _projection_doc_count(conn) <= AUTO_REBUILD_MAX_DOCS:
+            rebuild_memory_gram_index()
         return gram_index_usable()
     except Exception as exc:  # noqa: BLE001 - any fault must degrade, never raise
         log.warning("Memory gram index unusable (%s: %s); falling back to the exact scan.", type(exc).__name__, exc)

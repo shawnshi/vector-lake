@@ -110,29 +110,38 @@ def test_gram_relevance_matches_the_sql_scorer(seeded):
         assert indexed == reference, query
 
 
-def test_text_updates_propagate_through_the_overlay(seeded):
+def test_a_write_defers_to_the_exact_scan(seeded):
     conn = db_store.get_connection()
     _put(conn, "mem_a", "医院 电子病历六级 目标")
 
     assert memory_gram_index.pending_doc_count() == 1
     assert _ids("gram", "电子病历 医院", top_k=5) == _ids("legacy", "电子病历 医院", top_k=5)
-    # The read above already drained the queue through its self-heal step.
+    # The answer is the exact one, and it came from the full scan: a stale base is
+    # not rebuilt behind the read's back, however small the corpus, because the scan
+    # is far cheaper than a rebuild.  Only an explicit rebuild clears the queue.
+    assert memory_gram_index.pending_doc_count() == 1
+    assert memory_gram_index.gram_index_usable() is False
+
+    memory_gram_index.rebuild_memory_gram_index()
+
     assert memory_gram_index.pending_doc_count() == 0
-    memory_gram_index.flush_memory_gram_dirty()
     assert _ids("gram", "信创 集成平台", top_k=5) == _ids("legacy", "信创 集成平台", top_k=5)
 
 
-def test_deleted_documents_are_skipped_until_pruned(seeded):
+def test_a_deleted_document_is_exact_before_any_prune(seeded):
     conn = db_store.get_connection()
     with db_store.transaction():
         conn.execute("DELETE FROM operational_memory WHERE memory_id = 'mem_d'")
 
     assert memory_gram_index.retired_doc_count() == 1
+    # The queue entry alone is enough: the read path skips base postings for every
+    # queued document, so the answer is already exact and no rebuild is triggered --
+    # a retired marker cannot block the fast path.
     assert _ids("gram", "DRG 医保支付 合规", top_k=6) == _ids("legacy", "DRG 医保支付 合规", top_k=6)
+    assert memory_gram_index.pending_doc_count() == 1
 
-    memory_gram_index.flush_memory_gram_dirty(limit_docs=100)
-    assert _ids("gram", "DRG", top_k=6) == _ids("legacy", "DRG", top_k=6)
-
+    # The prune is what removes the stale postings themselves, and the marker with
+    # them, without a rebuild.
     assert memory_gram_index.prune_retired_gram_docs()["retired"] == 1
     assert memory_gram_index.pending_doc_count() == 0
     assert _ids("gram", "DRG", top_k=6) == _ids("legacy", "DRG", top_k=6)
@@ -229,9 +238,10 @@ def test_a_retired_marker_cannot_consume_the_whole_batch(seeded):
     result = memory_gram_index.flush_memory_gram_dirty(limit_docs=1)
 
     assert result["flushed"] == 1
-    assert memory_gram_index.pending_doc_count() == 1
-    # The retired marker is still queued on purpose: staying dirty is what keeps
-    # the deleted document's base postings skipped until they are pruned.
+    # Both documents are still queued: the materialised one because materialising it
+    # did not make its base authoritative, and the retired one on purpose.  The
+    # batch was still spent on the live document rather than on the marker.
+    assert memory_gram_index.pending_doc_count() == 2
     assert memory_gram_index.retired_doc_count() == 1
 
 

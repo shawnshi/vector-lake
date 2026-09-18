@@ -341,12 +341,15 @@ def doctor_vector_lake() -> str:
     except Exception as e:
         checks.append(("Schema Migrations", False, f"Check failed: {e}"))
 
-    # The exact n-gram index only serves reads while its backlog is small enough
-    # to drain on the read path.  Past that cap the index is still materialised and
-    # maintained but never read, and nothing fails: search falls back to the full
-    # scan and returns the same answer.  Report the two numbers that decide whether
-    # the indexed path is live, so a 100 MB index that is never consulted is
-    # visible instead of merely inferable.
+    # The exact n-gram index serves a read only when its base is a complete, current
+    # snapshot; anything else falls back to the full scan and returns the same answer.
+    # The predicate is not restated here: it used to be, as "a backlog small enough to
+    # drain on the read path", and that mirror kept reporting the indexed path as live
+    # after the read path stopped draining -- a 1-document backlog on a 146k-document
+    # lake would have been called usable while every search scanned.
+    #
+    # Report the numbers that say *why* it is or is not live, so a 100 MB index that
+    # is never consulted is visible instead of merely inferable.
     #
     # A database written before the index existed has no ``gram_state`` at all.
     # That is a supported degradation -- the same one ``gram_index_usable`` reports
@@ -363,17 +366,22 @@ def doctor_vector_lake() -> str:
             total, live_backlog, retired = memory_gram_index.dirty_breakdown(conn)
         except sqlite3.OperationalError:
             total = live_backlog = retired = 0
-        usable = gram_ready and live_backlog <= memory_gram_index.AUTO_REBUILD_MAX_DOCS
+        try:
+            overlay_rows = memory_gram_index.overlay_row_count(conn)
+        except sqlite3.OperationalError:
+            overlay_rows = 0
+        usable = memory_gram_index.gram_index_usable()
         checks.append((
             "Memory Gram Index",
             True,
             f"usable={usable} ready={gram_ready} grams={gram_count} "
             f"queued={total} live_backlog={live_backlog} retired={retired} "
-            f"cap={memory_gram_index.AUTO_REBUILD_MAX_DOCS}",
+            f"overlay_rows={overlay_rows} cap={memory_gram_index.AUTO_REBUILD_MAX_DOCS}",
         ))
         if not usable:
             warnings.append(
                 f"memory_gram_index_unusable:live_backlog={live_backlog} retired={retired} "
+                f"overlay_rows={overlay_rows} "
                 "(rebuild_memory_gram_index restores the indexed path)"
             )
     except Exception as e:
