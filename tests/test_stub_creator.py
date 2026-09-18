@@ -30,6 +30,8 @@ from vector_lake.wiki_utils import (
 _SOURCE = (
     "---\nid: Concept_Source\ntitle: Source\ntype: concept\ndomain: General\n"
     "status: Active\nepistemic-status: seed\ncategories: [Uncategorized]\n"
+    # the rename path validates the schema, and a rename rewrites the pages that link to it
+    "strategic_scope: edge\n"
     "updated: 2026-01-01T00:00:00Z\nsources: []\n---\n\n# Source\n\n"
     "## 1. 编译事实\n*[System Directive]*\n\n见 [[{link}]]。\n\n"
     "### 物理机制 (Mechanism)\n- x\n\n---\n\n## 2. 证据时间线\n- [2026-01-01] [Observation] x\n"
@@ -207,9 +209,9 @@ def test_both_callers_ask_the_one_owner_for_the_same_page(isolated_memory, monke
     calls: list[str] = []
     real = stub_creator.create_stub
 
-    def spy(wiki_dir, target, index=None):
+    def spy(wiki_dir, target, index=None, contested=None):
         calls.append(target)
-        return real(wiki_dir, target, index)
+        return real(wiki_dir, target, index, contested=contested)
 
     # Both callers reach the owner through the module attribute, so one patch covers both.
     monkeypatch.setattr(stub_creator, "create_stub", spy)
@@ -232,9 +234,8 @@ def test_both_callers_ask_the_one_owner_for_the_same_page(isolated_memory, monke
     assert stub_path.exists(), "lint no longer fixes the broken link at all"
     lint_fm, lint_body = _frontmatter(wiki, stub_path.name)
 
-    # The generated id is the one field that must differ; everything else is the same page.
-    query_fm.pop("id")
-    lint_fm.pop("id")
+    # The id is derived from the page name, so even that field is the same page: the two callers
+    # produce byte-identical output for one link.
     assert query_fm == lint_fm
     assert query_body == lint_body
 
@@ -287,3 +288,28 @@ def test_query_reports_refused_writes_instead_of_silence(isolated_memory, monkey
     created, refused = tool_query._generate_stubs_for_broken_links(str(wiki), {"Concept_Source.md"})
 
     assert (created, refused) == (0, 1), "a refused write was counted as nothing to do"
+
+
+# --- the stub id --------------------------------------------------------------
+
+
+def test_the_stub_id_is_derived_from_the_page_name(isolated_memory):
+    """Two stubs cannot collide by being created in the same second.
+
+    The id used to be drawn at random, so it consulted nothing: a burst of stubs could collide
+    (lint's duplicate-id check would have found it later, on a wiki nobody had said was wrong),
+    and re-creating the same stub produced a different id every time.  Deriving it from the page
+    name makes it stable and removes the timing dependence.  The residual -- two different names
+    hashing to the same six base36 characters -- is stated in ``generate_id`` and is what lint's
+    duplicate-id check would still catch.
+    """
+    wiki = _wiki("BrandNew-Thing")
+    first = stub_creator.generate_id("Concept_BrandNew-Thing", "2026-09-18")
+
+    assert stub_creator.generate_id("Concept_BrandNew-Thing", "2026-09-18") == first
+    assert stub_creator.generate_id("Concept_Other-Thing", "2026-09-18") != first
+    assert stub_creator.generate_id("Concept_BrandNew-Thing", "2026-09-19") != first
+
+    written = stub_creator.create_stub(str(wiki), "BrandNew-Thing").stem
+    frontmatter, _ = _frontmatter(wiki, f"{written}.md")
+    assert frontmatter["id"] == stub_creator.generate_id(written, frontmatter["created"][:10])

@@ -192,10 +192,14 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> tuple
             broken_targets.add(target)
 
     if not broken_targets:
-        return 0
+        return 0, 0
 
     stubs = 0
     refused = 0
+    # A name two pages declare is contested, not missing: the owner refuses it, and this caller
+    # has to say so too -- it writes stubs as well, and with neither claimant's core matching the
+    # name, ``covering_page`` cannot refuse for it.  Measured on the live wiki: 31 such names.
+    contested = stub_creator.contested_names(stub_creator.declared_names(wiki_dir))
     # What a stub is -- its name, type, fields and the write path -- belongs to one owner.
     # This used to build the page here and hand ``<target>.md`` to ``execute_mutation_plan``,
     # which no node may be named: the write was refused and the exception swallowed, so this
@@ -206,7 +210,7 @@ def _generate_stubs_for_broken_links(wiki_dir: str, files_to_scan: set) -> tuple
     # in place, so a stub written for one target is seen as covering its own name by the next
     # iteration.  A second index here would leave that update on a set nothing reads again.
     for target in sorted(broken_targets):
-        outcome = stub_creator.create_stub(wiki_dir, target, existing)
+        outcome = stub_creator.create_stub(wiki_dir, target, existing, contested=contested)
         if outcome.stem:
             stubs += 1
         elif outcome.refused:

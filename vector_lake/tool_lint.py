@@ -1,9 +1,7 @@
 import datetime
 import logging
 import os
-import random
 import re
-import string
 from collections import defaultdict
 from difflib import SequenceMatcher
 
@@ -59,9 +57,15 @@ def _render_page(frontmatter: dict, body: str) -> str:
     )
     return f"---\n{rendered}---\n{body}"
 
-def _generate_id():
-    today = datetime.datetime.now().strftime("%Y%m%d")
-    return f"{today}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
+def _generate_id(stem: str) -> str:
+    """The id a page that has none gets.  One owner: :func:`stub_creator.generate_id`.
+
+    This was a second, random generator -- the opposite convention to the one stubs use, for the
+    same thing, so two answers existed for "what is a page's id".  Delegating also makes the
+    duplicate-id repair idempotent, and two pages sharing an id get different new ones because
+    their stems differ.
+    """
+    return stub_creator.generate_id(stem, datetime.datetime.now().strftime("%Y-%m-%d"))
 
 def resolve_link_target(
     target: str, link_target_map: dict, unique_cores: dict[str, str]
@@ -96,6 +100,35 @@ def resolve_link_target(
         return resolved
     core = normalize_entity_name(strip_prefix(target))
     return unique_cores.get(core)
+
+
+def core_name_maps(all_keys) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """``(core -> pages, unambiguous core -> page)`` for the pages a link may resolve to.
+
+    One function because the two are built together and answer one question between them.  They
+    are built once per pass: a rename preserves a page's *core* name, so the maps stay correct
+    across the naming auto-fix, and the one stale detail a rename does leave -- a message naming
+    the pre-rename stem -- was measured as unobservable in the verdicts.
+
+    Only unambiguous cores enter the second map, and only for pages that are nodes at all:
+
+    * two pages sharing a core name is a real defect -- the live wiki has 40 such families -- and
+      resolving such a link to whichever page sorts first would hide it; the contested list keeps
+      it visible instead (and the report names the candidates);
+    * ``System_*`` pages and the non-node artifacts are excluded even though their files exist: a
+      link resolving to one would satisfy the check while the indexer deletes that page from the
+      graph, which is the same "hide the gap" trade the stub creator refuses when it declines to
+      create one.  The exact-spelling route still finds them, as it always did.
+
+    Measured on the live wiki: none of the links this rule rescues points at an ambiguous core,
+    so refusing them costs nothing there.
+    """
+    core_pages: dict[str, list[str]] = defaultdict(list)
+    for node_key in all_keys:
+        if node_key.startswith("System_") or f"{node_key}.md" in NON_NODE_WIKI_FILES:
+            continue
+        core_pages[normalize_entity_name(strip_prefix(node_key))].append(node_key)
+    return core_pages, {core: pages[0] for core, pages in core_pages.items() if len(pages) == 1}
 
 
 def lint_vector_lake(auto_fix: bool = False):
@@ -140,6 +173,14 @@ def lint_vector_lake(auto_fix: bool = False):
     alias_map = {}
     all_keys = set()
     link_target_map = {}
+    #: Declared names (titles and aliases) -> the pages claiming them, resolved after the parse
+    #: loop so that only unambiguous declarations reach ``link_target_map``.
+    declared: dict[str, list[str]] = defaultdict(list)
+    #: The same claims keyed by *normalised* name, for deciding whether a name is contested.  Raw
+    #: spelling cannot answer that: ``title: Atrium Health`` and ``[[Atrium-Health]]`` are one name
+    #: (``_``/``-`/space), and looking it up literally both mislabelled the link "does not exist"
+    #: and bypassed the auto-fix guard below -- which wrote a third page for a live contested name.
+    declared_norm: dict[str, set[str]] = defaultdict(set)
     inbound_count = defaultdict(int)
 
     # Every page on disk is a link target, whether or not it is linted.
@@ -166,12 +207,7 @@ def lint_vector_lake(auto_fix: bool = False):
     # deletes that page from the graph, which is the same "hide the gap" trade the stub creator
     # refuses when it declines to *create* one.  The exact-spelling route still finds them, as it
     # always did; this only declines to widen that.
-    core_pages: dict[str, list[str]] = defaultdict(list)
-    for node_key in all_keys:
-        if node_key.startswith("System_") or f"{node_key}.md" in NON_NODE_WIKI_FILES:
-            continue
-        core_pages[normalize_entity_name(strip_prefix(node_key))].append(node_key)
-    unique_cores = {core: pages[0] for core, pages in core_pages.items() if len(pages) == 1}
+    core_pages, unique_cores = core_name_maps(all_keys)
     # First Pass: Read and parse the files that are nodes
     for filename in files:
         filepath = os.path.join(wiki_dir, filename)
@@ -199,9 +235,18 @@ def lint_vector_lake(auto_fix: bool = False):
         if node_id:
             id_map.setdefault(str(node_id), []).append(filename)
 
+        # Titles and aliases are *declarations*, and a declaration is only usable when exactly
+        # one page makes it.  These used plain assignment, so a name two pages both claimed
+        # resolved to whichever one ``os.listdir`` happened to read last -- and a declaration
+        # that collided with an existing page's filename overwrote that page's own stem, which
+        # made a link to a real file resolve to a different one.  Now: collect, then add only the
+        # unambiguous ones, and never over a filename (``setdefault``).  A contested name stays
+        # unresolved, which is the visible outcome the core-name rule already chose; the existing
+        # alias-conflict check still reports it.
         title = frontmatter.get("title")
         if title:
-            link_target_map[str(title).strip()] = node_key
+            declared[str(title).strip()].append(node_key)
+            declared_norm[normalize_entity_name(str(title).strip())].add(node_key)
 
         aliases = frontmatter.get("aliases", [])
         if isinstance(aliases, str):
@@ -209,8 +254,15 @@ def lint_vector_lake(auto_fix: bool = False):
         if isinstance(aliases, list):
             for alias in aliases:
                 alias_str = str(alias).strip()
-                link_target_map[alias_str] = node_key
+                declared[alias_str].append(node_key)
+                declared_norm[normalize_entity_name(alias_str)].add(node_key)
                 alias_map.setdefault(alias_str, []).append(filename)
+
+    # Only now can a declaration be judged: every page has been read, so "how many pages claim
+    # this name" is known.  Unambiguous declarations join the map without displacing anything.
+    for name, claimants in declared.items():
+        if len(claimants) == 1:
+            link_target_map.setdefault(name, claimants[0])
 
     for filename, data in parsed.items():
         for target in data["links"]:
@@ -252,6 +304,9 @@ def lint_vector_lake(auto_fix: bool = False):
                 for t, rk in list(link_target_map.items()):
                     if rk == old_key:
                         link_target_map[t] = new_key
+                # The file exists under its new name now, and a filename outranks a declaration --
+                # without this the rest of the pass would still let a declaration spelling it win.
+                link_target_map[new_key] = new_key
                 if old_key in inbound_count:
                     inbound_count[new_key] += inbound_count.pop(old_key)
             else:
@@ -266,7 +321,7 @@ def lint_vector_lake(auto_fix: bool = False):
             if auto_fix:
                 for fname in filenames[1:]:
                     if fname in parsed:
-                        parsed[fname]["fm"]["id"] = _generate_id()
+                        parsed[fname]["fm"]["id"] = _generate_id(fname[:-3])
                         _write_fixed_frontmatter(parsed[fname]["path"], parsed[fname]["fm"], parsed[fname]["body"])
                         fixes_applied += 1
 
@@ -284,8 +339,17 @@ def lint_vector_lake(auto_fix: bool = False):
                             parsed[fname]["fm"]["aliases"] = aliases
                             _write_fixed_frontmatter(parsed[fname]["path"], parsed[fname]["fm"], parsed[fname]["body"])
                             fixes_applied += 1
+                            # The alias is gone from disk now, so it is no longer claimed here:
+                            # otherwise one report says both "claim removed" and "two pages
+                            # declare this name", about the same run.
+                            if len(alias_map[alias]) == 2:
+                                declared_norm.pop(normalize_entity_name(alias), None)
 
     # 4. Broken Links (Stub Creation)
+    # Names two or more pages declare, computed *here* rather than before check 3: the alias
+    # auto-fix above can strip the losing claim from disk, and a set captured earlier would still
+    # call the name contested in the same run that reported removing the claim.
+    contested_names = stub_creator.contested_names(declared_norm)
     # The stub index is built once for the pass and updated in place by the creator, so a
     # stub created for one link is not "missing" when the next link is looked at.
     stub_index = stub_creator.existence_index(wiki_dir)
@@ -296,12 +360,20 @@ def lint_vector_lake(auto_fix: bool = False):
                 # operator nothing to act on: the name is not unknown, it is ambiguous.  The
                 # item stays in this bucket so the count means the same thing.
                 contested = core_pages.get(normalize_entity_name(strip_prefix(target)))
-                detail = (
-                    f"target does not exist ({len(contested)} pages share that name: "
-                    f"{', '.join(sorted(contested))})"
-                    if contested and len(contested) > 1
-                    else "target does not exist"
-                )
+                claimants = sorted(declared_norm.get(normalize_entity_name(target), ()))
+                if contested and len(contested) > 1:
+                    detail = (
+                        f"target does not exist ({len(contested)} pages share that name: "
+                        f"{', '.join(sorted(contested))})"
+                    )
+                elif len(claimants) > 1:
+                    # A title or alias two pages both claim: not unknown, contested.
+                    detail = (
+                        f"target does not exist ({len(claimants)} pages declare that name: "
+                        f"{', '.join(sorted(claimants))})"
+                    )
+                else:
+                    detail = "target does not exist"
                 issues["broken_links"].append(f"{filename} -> [[{target}]]: {detail}")
                 if auto_fix:
                     # The filename prefix and the frontmatter ``type`` are one decision, and the
@@ -312,7 +384,9 @@ def lint_vector_lake(auto_fix: bool = False):
                     # logged, so the link was simply never fixed and the report said nothing.
                     # What a stub is now belongs to one owner; see
                     # ``vector_lake.stub_creator`` for the rules and why each was chosen.
-                    outcome = stub_creator.create_stub(wiki_dir, target, stub_index)
+                    outcome = stub_creator.create_stub(
+                        wiki_dir, target, stub_index, contested=contested_names
+                    )
                     if outcome.refused:
                         stubs_refused += 1
                     elif outcome.stem:
@@ -334,7 +408,7 @@ def lint_vector_lake(auto_fix: bool = False):
         if missing:
             issues["frontmatter"].append(f"{filename}: Missing fields: {', '.join(missing)}")
             if auto_fix:
-                if not frontmatter.get("id"): frontmatter["id"] = _generate_id()
+                if not frontmatter.get("id"): frontmatter["id"] = _generate_id(node_key)
                 if not frontmatter.get("title"): frontmatter["title"] = filename[:-3]
                 if not frontmatter.get("type"): frontmatter["type"] = filename.split("_", 1)[0].lower()
                 if not frontmatter.get("domain"): frontmatter["domain"] = "General"

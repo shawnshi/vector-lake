@@ -18,9 +18,9 @@ An *ambiguous* core name is deliberately not resolved: two pages sharing a core 
 defect, and picking the alphabetically first would hide it.
 """
 
-from tests.test_stub_creator import _VENDOR_PAGE, _pages, _wiki
+from tests.test_stub_creator import _SOURCE, _VENDOR_PAGE, _pages, _wiki
 
-from vector_lake import tool_lint
+from vector_lake import stub_creator, tool_lint, tool_query
 
 
 def _broken_lines(report: str) -> list[str]:
@@ -210,3 +210,203 @@ def test_a_genuinely_missing_target_is_still_reported_and_still_fixed(isolated_m
     assert "[[NoSuchPageAnywhere]]" in report
     tool_lint.lint_vector_lake(auto_fix=True)
     assert "Concept_NoSuchPageAnywhere.md" in _pages(wiki)
+
+
+# --- declarations, and the maps a rename invalidates --------------------------
+
+
+def test_a_name_two_pages_declare_does_not_resolve(isolated_memory):
+    """A declaration is usable only when exactly one page makes it.
+
+    Titles and aliases used plain assignment into the link map, so when two pages claimed the
+    same name the link resolved to whichever one ``os.listdir`` read last -- a coin flip that
+    the report then presented as a fact.  Contested declarations now stay unresolved and the
+    report says why.
+    """
+    twin = _VENDOR_PAGE.replace("id: 20260101_epic9", "id: 20260101_epic9").replace(
+        "title: Epic", "title: Shared-Name"
+    )
+    other = _VENDOR_PAGE.replace("id: 20260101_epic1", "id: 20260101_epic8").replace(
+        "type: vendor", "type: product"
+    ).replace("title: Epic", "title: Shared-Name")
+    wiki = _wiki(
+        "Shared-Name",
+        {"Vendor_Claim-A": twin, "Product_Claim-B": other},
+    )
+
+    report = _report()
+    line = [l for l in report.splitlines() if "[[Shared-Name]]" in l]
+
+    assert line, report
+    assert "2 pages declare that name" in line[0]
+    assert "Vendor_Claim-A" in line[0] and "Product_Claim-B" in line[0]
+
+
+def test_a_declaration_does_not_displace_a_filename(isolated_memory):
+    """The declaration used to overwrite the other page's own stem in the link map.
+
+    With ``Concept_Target.md`` on disk and another page declaring ``title: Concept_Target``, a
+    link ``[[Concept_Target]]`` resolved to the *declaring* page -- a link to a real file
+    answered by a different one.
+    """
+    target = _VENDOR_PAGE.replace("id: 20260101_epic7", "id: 20260101_epic7").replace(
+        "type: vendor", "type: concept"
+    )
+    claimer = _VENDOR_PAGE.replace("id: 20260101_epic1", "id: 20260101_epic6").replace(
+        "title: Epic", "title: Concept_Target"
+    )
+    wiki = _wiki("Concept_Target", {"Concept_Target": target, "Vendor_Claimer": claimer})
+
+    report = _report()
+
+    assert "[[Concept_Target]]" not in report, _broken_lines(report)
+    assert "7. Broken Links: [PASS]" in report
+    # The discriminating part: credit must land on the page whose filename the link names.  Under
+    # plain assignment the declaration won, so Concept_Target.md had zero inbound links and was
+    # reported as an orphan.
+    assert "Concept_Target.md: No inbound links (orphan)" not in report, [
+        l for l in report.splitlines() if "orphan" in l.lower()
+    ]
+
+
+def test_a_rename_leaves_links_that_named_the_old_core_resolvable(isolated_memory):
+    """An invariant guard, not a regression test: it passed before this batch too.
+
+    I set out to fix a stale map here -- ``core_pages``/``unique_cores`` are built once and the
+    naming auto-fix renames files mid-pass -- and could not construct a case where it matters,
+    so the rebuild was dropped rather than kept as unobservable defence.  This is the property
+    that makes it unnecessary: the rename rewrites ``[[Old]]`` and ``[[Old|alias]]`` to the new
+    key, and adds the old core to the renamed page's aliases, so every remaining spelling of the
+    old name still resolves -- through the alias route, which the *fresh* map reads from disk
+    anyway.
+    """
+    wiki = _wiki("BadName")
+    (wiki / "BadName.md").write_text(
+        "---\nid: 20260101_bad1\ntitle: Bad Name\ntype: concept\ndomain: General\n"
+        "status: Active\nepistemic-status: seed\ncategories: [Uncategorized]\n"
+        "strategic_scope: edge\n"
+        "updated: 2026-01-01T00:00:00Z\nsources: []\n---\n\n# Bad Name\n\n"
+        "## 1. 编译事实\n*[System Directive]*\n\nx\n\n"
+        "### 物理机制 (Mechanism)\n- x\n\n---\n\n"
+        "## 2. 证据时间线\n- [2026-01-01] [Observation] x\n",
+        encoding="utf-8",
+    )
+
+    tool_lint.lint_vector_lake(auto_fix=True)
+    pages = _pages(wiki)
+
+    assert "Concept_BadName.md" in pages, "the rename did not happen"
+    report = tool_lint.lint_vector_lake(auto_fix=False)
+    # The wiki holds a link spelling the *old* name, so this can fail; before the fix it resolved
+    # against a stem that no longer existed and the report claimed a page nobody can open.
+    assert "[[BadName]]" not in report, _broken_lines(report)
+    assert "BadName.md" not in report, _broken_lines(report)
+
+
+
+
+def test_a_contested_declaration_is_not_auto_fixed_into_a_third_page(isolated_memory):
+    """Reporting it is the point; inventing a page for it would be the fork again.
+
+    Neither claimant's *core* name matches the contested name, so the stub creator's
+    covering-page guard cannot refuse -- measured on the live wiki, 31 names are in exactly
+    that shape.  Lint therefore declines to attempt the write at all.
+    """
+    first = _VENDOR_PAGE.replace("id: 20260101_epic1", "id: 20260101_epic1").replace(
+        "title: Epic", "title: Atrium Health"
+    )
+    second = _VENDOR_PAGE.replace("id: 20260101_epic2", "id: 20260101_epic2").replace(
+        "type: vendor", "type: product"
+    ).replace("title: Epic", "title: Atrium Health")
+    wiki = _wiki("Atrium Health", {"Vendor_First": first, "Product_Second": second})
+
+    report = tool_lint.lint_vector_lake(auto_fix=True)
+
+    assert "[[Atrium Health]]" in report
+    assert "2 pages declare that name" in report
+    assert "Concept_Atrium-Health.md" not in _pages(wiki), "a third page was invented"
+    assert _pages(wiki) == ["Concept_Source.md", "Product_Second.md", "Vendor_First.md"]
+
+
+def test_a_contested_name_is_refused_whatever_spelling_the_link_uses(isolated_memory):
+    """P1-1: the guard and the message looked the raw spelling up, so a hyphen bypassed both.
+
+    ``title: Atrium Health`` and ``[[Atrium-Health]]`` are one name (``_``/``-``/space), so a
+    literal lookup found no claimants: the link was mislabelled "target does not exist" and
+    ``--auto-fix`` wrote ``Concept_Atrium-Health.md`` -- a third page for a contested name.
+    """
+    first = _VENDOR_PAGE.replace("title: Epic", "title: Atrium Health")
+    second = _VENDOR_PAGE.replace("id: 20260101_epic2", "id: 20260101_epic2").replace(
+        "type: vendor", "type: product"
+    ).replace("title: Epic", "title: Atrium Health")
+    wiki = _wiki("Atrium-Health", {"Vendor_First": first, "Product_Second": second})
+
+    report = tool_lint.lint_vector_lake(auto_fix=True)
+    line = [l for l in report.splitlines() if "[[Atrium-Health]]" in l]
+
+    assert line, _broken_lines(report)
+    assert "2 pages declare that name" in line[0], line[0]
+    assert "Concept_Atrium-Health.md" not in _pages(wiki), "a third page was invented"
+
+
+def test_the_query_side_also_refuses_a_contested_name(isolated_memory):
+    """P1-2: the rule lived in one caller, and the other one wrote the third page.
+
+    Neither claimant's core name matches the contested name, so the covering-page guard cannot
+    refuse -- the refusal has to come from the owner, which both callers use.
+    """
+    first = _VENDOR_PAGE.replace("title: Epic", "title: Atrium Health")
+    second = _VENDOR_PAGE.replace("id: 20260101_epic2", "id: 20260101_epic2").replace(
+        "type: vendor", "type: product"
+    ).replace("title: Epic", "title: Atrium Health")
+    wiki = _wiki("Atrium-Health", {"Vendor_First": first, "Product_Second": second})
+
+    created, refused = tool_query._generate_stubs_for_broken_links(
+        str(wiki), {"Concept_Source.md"}
+    )
+
+    assert (created, refused) == (0, 0)
+    assert "Concept_Atrium-Health.md" not in _pages(wiki), "the query path forked the name"
+
+
+def test_the_query_side_with_nothing_to_do_returns_a_pair(isolated_memory):
+    """The early exit returned a bare 0, which the caller unpacks -- a crash, not a count."""
+    wiki = _wiki("Concept_Known")
+    (wiki / "Concept_Known.md").write_text(_VENDOR_PAGE, encoding="utf-8")
+
+    assert tool_query._generate_stubs_for_broken_links(str(wiki), {"Concept_Source.md"}) == (0, 0)
+
+
+def test_a_core_is_compared_normalised_when_deciding_whether_a_page_exists(isolated_memory):
+    """P1-2's other half: ``Vendor_Foo_Bar.md`` must cover ``[[Foo-Bar]]``.
+
+    Cores were compared raw, so a stub was written beside the page it duplicated.
+    """
+    wiki = _wiki("Foo-Bar")
+    (wiki / "Vendor_Foo_Bar.md").write_text(_VENDOR_PAGE, encoding="utf-8")
+
+    assert stub_creator.covering_page("Concept_Foo-Bar", stub_creator.existence_index(str(wiki)))
+    report = tool_lint.lint_vector_lake(auto_fix=True)
+
+    assert "[[Foo-Bar]]" not in report, _broken_lines(report)
+    assert "Concept_Foo-Bar.md" not in _pages(wiki)
+
+
+def test_a_contested_alias_is_not_reported_as_contested_in_the_same_run(isolated_memory):
+    """P1-3: check 3 strips the losing alias, so check 7 must not still call the name contested."""
+    first = _VENDOR_PAGE.replace("title: Epic", "title: First Claimer")
+    second = _VENDOR_PAGE.replace("id: 20260101_epic2", "id: 20260101_epic2").replace(
+        "type: vendor", "type: product"
+    ).replace("title: Epic", "title: Second Claimer")
+    shared = "aliases: [Atrium Health]"
+    first = first.replace("title: First Claimer", "title: First Claimer\n" + shared)
+    second = second.replace("title: Second Claimer", "title: Second Claimer\n" + shared)
+    wiki = _wiki("Atrium Health", {"Vendor_First": first, "Product_Second": second})
+
+    report = tool_lint.lint_vector_lake(auto_fix=True)
+    lines = report.splitlines()
+
+    assert any("Alias 'Atrium Health' claimed by" in l for l in lines), lines[:12]
+    assert not any("2 pages declare that name" in l for l in lines), [
+        l for l in lines if "Atrium" in l
+    ]

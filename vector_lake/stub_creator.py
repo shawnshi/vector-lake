@@ -52,9 +52,9 @@ how an operator finds pages nothing sourced.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import logging
 import os
-import random
 import re
 import string
 from dataclasses import dataclass
@@ -66,7 +66,7 @@ from vector_lake.node_vocabulary import (
     type_for_node_id,
 )
 from vector_lake.schema_validator import VALID_H3_SLOTS
-from vector_lake.wiki_utils import normalize_entity_name, write_markdown_file
+from vector_lake.wiki_utils import normalize_entity_name, read_markdown_file, write_markdown_file
 
 log = logging.getLogger("vector-lake-stub-creator")
 
@@ -84,9 +84,30 @@ _FALLBACK_SLOT = "### 物理机制 (Mechanism)"
 _STUB_MARKER_TAG = "auto-stub"
 
 
-def _generate_id(today: str) -> str:
-    """``20260918_ab12cd`` -- the shape the live wiki's free-form ids already use."""
-    return f"{today.replace('-', '')}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=6))}"
+#: Base36 alphabet for the id suffix, ordered so the encoding is stable across Python versions.
+_ID_ALPHABET = string.ascii_lowercase + string.digits
+
+
+def generate_id(page_stem: str, today: str) -> str:
+    """``20260918_ab12cd`` -- the shape the live wiki's free-form ids already use.
+
+    The suffix is derived from the page name rather than drawn at random.  A random draw
+    consulted nothing, so two stubs created in the same second could collide (lint's
+    duplicate-id check would have found it later, on a wiki nobody had said was wrong), and
+    re-creating the same stub produced a different id every time.
+
+    The residual risk is stated rather than hidden: this is six base36 characters of a truncated
+    digest, so two *different* names could in principle collide.  Nothing collides because of
+    timing any more, the same name always yields the same id, and the duplicate-id check lint
+    already runs is what would catch the remainder.
+    """
+    digest = int(hashlib.sha1(page_stem.encode("utf-8")).hexdigest()[:12], 16)
+    chars = []
+    while digest and len(chars) < 6:
+        digest, remainder = divmod(digest, 36)
+        chars.append(_ID_ALPHABET[remainder])
+    suffix = "".join(chars).ljust(6, "0")
+    return f"{today.replace('-', '')}_{suffix}"
 
 
 def stub_type(target: str) -> str:
@@ -106,7 +127,10 @@ def existence_index(wiki_dir: str) -> tuple[set[str], set[str], dict[str, str]]:
     """
     stems = {name[:-3] for name in os.listdir(wiki_dir) if name.endswith(".md")}
     normalized = {normalize_entity_name(stem) for stem in stems}
-    cores = {strip_prefix(stem): stem for stem in stems}
+    # Normalised, so ``Vendor_Foo_Bar.md`` covers ``[[Foo-Bar]]``: ``_`` and ``-`` are one name
+    # everywhere else in the wiki, and comparing cores raw let a stub be written beside the page
+    # it duplicated.
+    cores = {normalize_entity_name(strip_prefix(stem)): stem for stem in stems}
     return stems, normalized, cores
 
 
@@ -123,7 +147,7 @@ def covering_page(target: str, index: tuple[set[str], set[str], dict[str, str]])
     stems, normalized, cores = index
     if target in normalized or target in stems:
         return target
-    return cores.get(strip_prefix(target))
+    return cores.get(normalize_entity_name(strip_prefix(target)))
 
 
 def _sanitize_core(name: str) -> str:
@@ -167,7 +191,7 @@ def stub_frontmatter(page_stem: str, node_type: str, today: str) -> dict:
     """
     stamp = f"{today}T00:00:00Z"
     return {
-        "id": _generate_id(today),
+        "id": generate_id(page_stem, today),
         "title": strip_prefix(page_stem),
         "type": node_type,
         "domain": "General",
@@ -228,8 +252,8 @@ class StubOutcome:
     #: The stem written, or ``None``.
     stem: str | None
     #: ``created`` / ``generated`` (a type the indexer skips) / ``covered`` (a page already
-    #: answers the name) / ``invalid`` (the target names no page) / ``refused`` (the write
-    #: was refused and logged).
+    #: answers the name) / ``contested`` (two or more pages declare it) / ``invalid`` (the
+    #: target names no page) / ``refused`` (the write was refused and logged).
     reason: str
 
     @property
@@ -242,10 +266,43 @@ class StubOutcome:
 _NO_WORK = ("generated", "covered", "invalid")
 
 
+def declared_names(wiki_dir: str) -> dict[str, set[str]]:
+    """Normalised names declared as a title or alias -> the pages claiming them.
+
+    Read from disk for callers that have not already parsed every page.  :func:`contested_names`
+    turns this into the set :func:`create_stub` refuses, so the *rule* has one owner even when the
+    *source* differs: ``tool_lint`` builds the same map from the pages it is already reading.
+    """
+    declared: dict[str, set[str]] = {}
+    for name in sorted(os.listdir(wiki_dir)):
+        if not name.endswith(".md"):
+            continue
+        try:
+            frontmatter, _body, _content = read_markdown_file(os.path.join(wiki_dir, name))
+        except Exception:  # noqa: BLE001 - an unreadable page declares nothing
+            continue
+        frontmatter = dict(frontmatter or {})
+        key = name[:-3]
+        claims = [str(frontmatter["title"]).strip()] if frontmatter.get("title") else []
+        aliases = frontmatter.get("aliases")
+        aliases = [aliases] if isinstance(aliases, str) else (aliases or [])
+        claims += [str(alias).strip() for alias in aliases]
+        for claim in claims:
+            if claim:
+                declared.setdefault(normalize_entity_name(claim), set()).add(key)
+    return declared
+
+
+def contested_names(declared: dict[str, set[str]]) -> set[str]:
+    """The names two or more pages declare.  The single place that rule lives."""
+    return {name for name, claimants in declared.items() if len(claimants) > 1}
+
+
 def create_stub(
     wiki_dir: str,
     target: str,
     index: tuple[set[str], set[str], dict[str, str]] | None = None,
+    contested: set[str] | None = None,
 ) -> StubOutcome:
     """Write the stub ``target`` needs, unless something already covers it.
 
@@ -254,7 +311,22 @@ def create_stub(
     ``None``.  A refused write is logged, at ``error``, and not raised, so one unwritable stub
     does not abandon the rest of a pass -- but it is distinguishable from having had nothing to
     write.
+
+    ``contested`` holds normalised names that two or more pages declare as a title or alias.  Such
+    a name is not missing, it is ambiguous, and the fix is a human deciding which page owns it:
+    writing a stub would create a third claimant.  That check belongs here rather than in the
+    caller that noticed it -- the other caller writes stubs too, and did exactly that (measured on
+    the live wiki: 31 contested names where no page's core matches, so ``covering_page`` cannot
+    refuse for us).
     """
+    if contested and normalize_entity_name(target) in contested:
+        log.info(
+            "Not creating a stub for '%s': %s pages declare that name already; it is contested, "
+            "not missing.",
+            target,
+            "two or more",
+        )
+        return StubOutcome(None, "contested")
     page_name = stub_page_name(target)
     if page_name is None:
         log.info(
@@ -291,6 +363,6 @@ def create_stub(
     stems, normalized, cores = index
     stems.add(stem)
     normalized.add(normalize_entity_name(stem))
-    cores[strip_prefix(stem)] = stem
+    cores[normalize_entity_name(strip_prefix(stem))] = stem
     log.info("Created stub page: %s.md", stem)
     return StubOutcome(stem, "created")
