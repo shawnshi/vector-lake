@@ -294,3 +294,35 @@ def test_the_gram_overlay_is_dropped_by_its_prune(isolated_memory):
     assert "2026-09-18-drop-gram-overlay" in _recorded(conn)
     # Idempotent: a second call applies nothing and the ledger is unchanged.
     assert db_store.apply_legacy_schema_prunes() == []
+
+
+# The removed table's pre-prune DDL, verbatim from before the removal.  Recreated here for the same
+# reason as the residue above: if the ledger entry were dropped while a database could still hold the
+# table, this fails instead of the table quietly surviving.
+_PAGE_GRAPH_EDGES_PRUNE = "2026-09-18-drop-page-graph-edges"
+_PAGE_GRAPH_EDGES_DDL = (
+    "CREATE TABLE page_graph_edges (source_id TEXT, target_id TEXT, relation TEXT, "
+    "weight REAL, updated_at TEXT, PRIMARY KEY (source_id, target_id, relation))",
+)
+
+
+def test_the_second_edge_table_is_dropped_by_its_prune(isolated_memory):
+    """The current schema never creates it, so only the prune can remove it."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+
+    assert "page_graph_edges" not in _object_names(conn), (
+        "the current schema still creates it, so the prune is not what removes it"
+    )
+    for statement in _PAGE_GRAPH_EDGES_DDL:
+        conn.execute(statement)
+    conn.execute("DELETE FROM schema_migrations WHERE name = ?", (_PAGE_GRAPH_EDGES_PRUNE,))
+    conn.commit()
+    assert "page_graph_edges" in _object_names(conn)
+
+    applied = db_store.apply_legacy_schema_prunes()
+
+    assert _PAGE_GRAPH_EDGES_PRUNE in applied
+    assert "page_graph_edges" not in _object_names(conn)
+    assert _PAGE_GRAPH_EDGES_PRUNE in _recorded(conn)
+    assert db_store.apply_legacy_schema_prunes() == []

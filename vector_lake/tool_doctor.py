@@ -306,10 +306,15 @@ def doctor_vector_lake() -> str:
     # invisible until something compares them -- which is what this check does, against the file.
     try:
         drift = published_edge_projection_drift()
-        clean = not drift["extra"] and not drift["missing"]
+        clean = not drift["extra"] and not drift["missing"] and not drift["duplicate_pairs"]
         detail = f"mirrors the published {drift['published_rows']} edge(s)"
         if not clean:
-            parts = [
+            parts = []
+            if drift["published_read_error"]:
+                parts.append(f"index.json unreadable ({drift['published_read_error']})")
+            if drift["duplicate_pairs"]:
+                parts.append("duplicate pairs in the projection")
+            parts += [
                 f"projection={drift['projection_rows']}",
                 f"published={drift['published_rows']}",
                 f"difference={drift['difference']}",

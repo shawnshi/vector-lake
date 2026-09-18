@@ -1977,8 +1977,8 @@ def _apply_change_sets_batch_unchecked(change_sets: list[dict]) -> list[dict]:
             f"DELETE FROM evidence WHERE f_page_key IN ({placeholders})",
             affected_page_params,
         )
-        # The page-space edge projection belongs to the indexer, which replaced both
-        # directions per node; this path writes no edge table.
+        # The page-space edge projection belongs to the indexer and is derived from the published
+        # file; this path writes no edge table.
 
     _upsert_canonical_records("entities", "entity_id", proposed_entities)
     _upsert_canonical_records("claims", "claim_id", proposed_claims)

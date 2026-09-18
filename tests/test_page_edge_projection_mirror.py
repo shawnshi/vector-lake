@@ -57,6 +57,8 @@ def test_a_database_with_neither_side_reports_no_drift(isolated_memory):
         "extra": False,
         "missing": False,
         "missing_example": None,
+        "duplicate_pairs": False,
+        "published_read_error": "",
     }
 
 
@@ -154,3 +156,58 @@ def test_doctor_names_a_missing_pair_too(isolated_memory):
 
     assert "[FAIL] Page Edge Projection:" in report
     assert "missing from the projection, e.g. C" in report
+
+
+def test_duplicate_pairs_in_the_projection_are_reported(isolated_memory):
+    """The comparison is over distinct pairs, so multiplicity needs its own flag.
+
+    The projection is re-inserted from the file, which holds one row per unordered pair, so a
+    repeated row means something wrote the table outside that path -- and a pair-set comparison
+    cannot see it.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _publish([("A", "B")])
+    _seed_projection(conn, [("A", "B"), ("A", "B")])
+
+    drift = db_store.published_edge_projection_drift()
+
+    assert drift["extra"] is False and drift["missing"] is False
+    assert drift["duplicate_pairs"] is True
+    report = tool_doctor.doctor_vector_lake()
+    assert "[FAIL] Page Edge Projection:" in report
+    assert "duplicate pairs in the projection" in report
+
+
+def test_an_unreadable_index_is_named_rather_than_reported_as_drift(isolated_memory):
+    """``index.json`` missing the edge list is a different finding from the projection lying."""
+    db_store.init_db()
+    conn = db_store.get_connection()
+    path = get_index_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    _seed_projection(conn, [("A", "B")])
+
+    drift = db_store.published_edge_projection_drift()
+
+    assert drift["published_read_error"], "an unreadable file must be named, not treated as empty"
+    report = tool_doctor.doctor_vector_lake()
+    assert "index.json unreadable" in report
+
+
+def test_the_difference_is_exact_not_a_probe(isolated_memory):
+    """More violations than any probe limit must still be counted.
+
+    The check this replaced used LIMIT probes to answer "is there a violation", which was right at
+    1.29M rows and is unnecessary at tens of thousands; the count is exact now, and this pins it so a
+    future probe-based implementation cannot pass by reporting a boolean.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _publish([("A", "B")])
+    _seed_projection(conn, [("A", "B"), ("C", "D"), ("E", "F"), ("G", "H"), ("I", "J")])
+
+    drift = db_store.published_edge_projection_drift()
+
+    assert drift["difference"] == 4
+    assert len(drift["extra_examples"]) == 3, "the example list stays bounded"

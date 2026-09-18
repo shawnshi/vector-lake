@@ -1794,16 +1794,23 @@ def published_edge_projection_drift(max_examples: int = 3) -> dict[str, object]:
     LIMIT-probe machinery this replaced existed for a 1.29M-row legacy state that no longer occurs.
     """
     published: set[tuple[str, str]] = set()
+    file_rows = 0
+    read_error = ""
     index_path = get_index_path()
     if index_path.exists():
         try:
             data = json.loads(index_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            # Named rather than treated as an empty published set: "the projection has pairs the file
+            # does not" and "the file could not be read" are different findings, and reporting the
+            # second as the first sends the operator looking in the wrong place.
             data = {}
+            read_error = f"{type(exc).__name__}: {exc}"
         for edge in data.get("weighted_edges") or []:
             source, target = str(edge.get("source") or ""), str(edge.get("target") or "")
             if source and target:
                 published.add((source, target))
+                file_rows += 1
     conn = get_connection()
     projection = {
         (str(row[0]), str(row[1]))
@@ -1811,6 +1818,10 @@ def published_edge_projection_drift(max_examples: int = 3) -> dict[str, object]:
     }
     extra = sorted(projection - published)
     missing = sorted(published - projection)
+    # Multiplicity is reported separately because the comparison is over *distinct* pairs: the
+    # published set collapses duplicates to their maximum weight and the projection is re-inserted
+    # from that set, so a repeated row means something wrote the table outside that path.
+    projection_rows_raw = int(conn.execute("SELECT COUNT(*) FROM page_index_edges").fetchone()[0])
     return {
         "projection_rows": len(projection),
         "published_rows": len(published),
@@ -1819,6 +1830,8 @@ def published_edge_projection_drift(max_examples: int = 3) -> dict[str, object]:
         "extra": bool(extra),
         "missing": bool(missing),
         "missing_example": missing[0] if missing else None,
+        "duplicate_pairs": projection_rows_raw != len(projection) or file_rows != len(published),
+        "published_read_error": read_error,
     }
 
 

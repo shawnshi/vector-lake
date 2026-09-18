@@ -1,5 +1,83 @@
 # Unreleased
 
+## 跑一次社区聚类 + D1 的两条 P2 + 删除边集的第三份副本（O3）
+
+### 社区聚类（`scripts/community_clustering_daemon.py`，一次）
+
+边集在 D1 后已更新到 29,807，而 community 数据还是 2026-09-17 的（`clustering_stale: True`）。执行一次
+（89 s，无 dry-run 参数）：
+
+| | 前 | 后 |
+|---|---|---|
+| `communities` / `community_labels` / `graph_insights` | 0 / 0 / 0 | **7125 / 265 / 20** |
+| `graph_state` | `dirty=True, clustering_stale=True` | `dirty=False, clustering_stale=False, reason='Community clustering applied'` |
+| nodes / edges | 7125 / 29807 | 7125 / 29807（未变） |
+| `System_Community*.md` 页 | 568 | 568 |
+
+**副作用（必须记录）**：这次写入把记忆倒排索引踢成不可用 —— 队列 26,528（活 13,691 / 退役 12,837），
+`operational_memory` 146,679 → **147,231**（+552，社区页写入经突变路径产生）。队列在 15 s 内三次读数完全相同
+（静态），且 `operational_memory` = `operational_memory_index` = 147,231 一致。于是按**既定节奏**处理：
+`gram-index --if-due` 报 `due: 13691 document(s) … threshold 500` → `--if-due --apply` 重建为
+**421,496 gram / 26,285,049 posting / 147,231 document**，随后 `usable=True`、队列 0、`due=False`。
+索引路径与全量扫描在活库上仍逐条一致。**这正是「节奏」要覆盖的情形：写入让它退化，维护窗口把它修回。**
+
+### D1 的两条 P2
+
+- **(a) 批内新页的名字不再延迟一批解析**：解析映射原先只用**批前**节点集构建，于是「本批引入/改名的名字」
+  要到下一批（或下一次重建）才解析。现在把本批 `pre_parsed_data` 并入映射输入（`nodes_for_maps`），
+  等于把「重建会用的那份集合」在本批范围内提前拿到。新增测试：一条指向**本批新页别名**的链接必须在同一趟
+  建出边；可失败性：把映射退回批前集合 → 恰好该例失败。
+- **(b) 「未被触碰的两节点之间的边」不被增量重访** —— 这是增量设计的固有边界，**登记并写明修复路径**：
+  其权重经共同邻居项依赖被触碰节点的**原始链接数**，且每节点 15 条上限会重排，因此增量一趟之后它可能与重建
+  不同。逐批把邻域一起重算等于每次做全量重建（度 ≤15 × 批大小），不可行；正确修复路径是**在维护窗口做一次
+  全量重建**，而 `graph_state.dirty`（每次批更新都会置位、由重建或聚类清回）就是「该重建了」的信号。
+- **(c) 投影不再由批路径维护**：`page_index_edges` 的两个写入方是**重建**（`indexer.py:310`）与守护进程的
+  `heal_page_index_projection`（单写者修复；读者在投影落后时回退到 `index.json`）。批路径本来只写自己的
+  那份副本，现在那份副本已删除，于是「批之后投影可能落后」这件事**改由新的 doctor 检查对文件报告**
+  （文件 ↔ 投影），不再隐蔽。本机无守护进程，所以该修复由重建/手工触发。
+
+### O3：删除边集的第三份副本（`page_graph_edges`）
+
+审计与本次复测都确认：全仓**没有任何 SELECT 读取该表**，唯一读取方是它自己那条一致性检查 ——
+即**用两份投影互比**，而不是投影与来源比。已删除：DDL、两个写入方（`replace_page_graph_edges` /
+`replace_page_graph_edges_for_node`）、`delete_node_cascade` 里的删除（第三个、只删的写入方）、
+`ALLOWED_TABLES` 中的名字、`indexer` 的两个调用点，以及 schema docstring 里「两张表的区别」那一段。
+台账迁移 `2026-09-18-drop-page-graph-edges` 在仍有该表的库上删除它。
+
+检查改写为 **`published_edge_projection_drift`**：读 `index.json` 的 `weighted_edges`（去重对）与
+`page_index_edges`（去重对）比较 —— 这正是 docstring 一直描述的那个契约，且比原来**更强**（对来源而非对同伴）。
+活库：表已不存在、`page_index_edges` 29,807、doctor `Page Edge Projection: mirrors the published 29807 edge(s)`、
+`Schema Migrations: 11 prune(s) applied`、`quick_check ok`。
+
+**构建期两道守卫各自抓到我一次**：静态作用域守卫报新函数里 `get_index_path` 未绑定；随后导入分层守卫**拒绝**了
+我加的**函数内**导入（那会成为第三对「延迟上行导入」，而该测试是刻意严格的）。该助手定义在 `wiki_utils`
+（它不导入 `db_store`），因此改为模块级导入，两道守卫均通过。同类疏漏第三次出现：一个补丁脚本算出了替换文本
+却**没有应用**它 —— 立即被测试抓到。
+
+### 复核 OK with notes（无 P0），一条 P1 与四条 P2 已修
+
+- **P1-1**：本批新增的 prune `2026-09-18-drop-page-graph-edges` **没有残留测试** —— 台账里另外十条都有
+  「按原文重建残留 + 抹掉台账行 + 断言 prune 执行且对象消失」，而通用测试因为从不重建该表而**恒真**。
+  已补 `test_the_second_edge_table_is_dropped_by_its_prune`（用删除前的原文 DDL）。
+- **P2-2**：我改写注释时把 `governance_store` 的一句弄成了病句（"is derived owned by"），另有一句仍在描述
+  本批已删除的「按节点替换两个方向」操作 → 均已改正。
+- **P2-3**：`indexer` 两处注释仍在引用已删表（「SQLite 已发布边集（主键 source_id, target_id）」）与实际不符：
+  来源现在是 `index.json` 的 `weighted_edges`，而 `page_index_edges` 的主键是 `sequence` → 已改正。
+- **P2-5**：检查只比较**去重后的对集合**，而 doctor 文案说「mirrors the published N edge(s)」—— 多重性不可见。
+  已加 `duplicate_pairs` 判据（投影原始行数 ≠ 去重数，或文件行数 ≠ 去重数）并在 doctor 里单独报出。
+- **P2-6**：`index.json` 读不出来时原先被当作「发布集为空」，于是把**源不可读**报成**投影说谎**。
+  现在返回 `published_read_error` 并由 doctor 点名，符合「不得把异常伪装成无数据」。
+- **P2-7**：「精确计数而非 LIMIT 探针」原先只是散文：新增测试用 5 对 1（4 处差异）断言 `difference == 4`，
+  探针式实现会失败（可失败性已实测）。
+- **P2-4** 明确**不改**：`ARCH_2026-09-17.md`/`PERF_2026-09-16.md`/`AUDIT_2026-09-16.md` 是有日期的快照，
+  按既有惯例保留为历史，不作为当前状态文档。
+
+计数对账（复核提出 841→843 只解释了 +1）：+2 中的另一例来自本批**同一次会话的另一次改动** ——
+D1 的 P2(a) 新增了 `test_a_name_the_batch_itself_introduces_resolves_in_the_same_pass`（841→842），
+本批的镜像测试重写 +1（842→843），随后四条复核测试（843→**847**）。
+
+全量 pytest **847 passed**。
+
 ## 移除纯 Python `jieba` 回退，分词只剩 `rjieba`
 
 按所有者决定执行：`requirements.txt` 去掉 `jieba>=0.42.1`，`tokenizer.py` 的后端链从

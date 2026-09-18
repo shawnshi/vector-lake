@@ -1332,11 +1332,10 @@ def update_index_items(filenames: list[str]):
                     # the node) never rebuilt at all, leaving a removed page's names resolvable.
                     index_data["aliases"] = _link_map_for_nodes(index_data["nodes"])
                     _mark_graph_dirty(index_data, f"Partial batch update for {len(valid_filenames)} items")
-                    # Re-apply the shared cap and pair-level dedup after the batch.
-                    # The loop above appends every qualifying edge for the touched
-                    # node, and the projection re-add above is not deduplicated
-                    # against those appended rows, so without this the published
-                    # set drifts away from weighted_edges' documented contract.
+                    # Re-apply the shared cap and pair-level dedup after the batch: the loop above
+                    # appends every qualifying edge for each touched node, so the published set has
+                    # to be normalised back to weighted_edges' documented contract (one row per
+                    # unordered pair, min/max orientation, degree cap).
                     index_data["weighted_edges"] = dedupe_and_prune_edges(
                         index_data.get("weighted_edges") or []
                     )
