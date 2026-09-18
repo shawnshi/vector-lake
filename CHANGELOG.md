@@ -49,6 +49,20 @@ DB↔DB 的检查**；O3 的「指针化」问题在这个具体对象上其实�
 把 NULL 规整为 `0.0`（json 里带 ttl 的行**原值保留**）。活库：两列各自 **7,924 行全部非空**、无 NULL、
 json 带 ttl 的 **5,720 行原值未被覆盖**、`quick_check ok`。全量 pytest **842 passed**。
 
+### D5 补漏：`sources` 是唯一被跳过的表 —— 测量后**不改**
+
+本轮核对「还有没有没转的 json 路径」时发现 `sources.$.canonical_source_page` 只出现 1 处
+（`delete_node_cascade` 的 `DELETE FROM sources WHERE source_id = ? OR json_extract(...) = ?`），而该表
+**从未被 D5 处理**。实测后决定不动：该表 4,107 行、除 `source_id`/`data_json`/`updated_at` 外无真列、
+**没有任何索引**，且谓词是 `OR` 扫描。关键事实：**虚拟生成列是读时求值**，没有索引时它与内联表达式逐行等价
+—— 这里既没有可退役的索引（不像 `governance_queue`），加列又不会让这条 DELETE 变快，唯一可能提速的方式是
+为 4,107 行加一条只为 `OR` 一条分支服务的索引，而 `OR` 在 SQLite 里通常仍回落到扫描。**结论：不改**，
+理由与规则 16 同一课（结构性改动必须由测量支持）。
+
+因此 D5 的覆盖现在是：`entities`、`operational_memory`、`claims`、`evidence`、`change_sets` 已转；
+`governance_queue`（删死索引）与 `sources`（测量后不动）已定案。全树剩余的 `json_extract` 查询只有
+`tool_timeline` 的 3 处 `LIKE`/`COALESCE`（模板规则 8 明确不转：任何索引都服务不了）与本批两条回填迁移自身。
+
 ### 登记项三：D1 的三条 P2 保持登记（已文档化）
 
 批前快照的解析映射（一个批次的名字延迟解析，代码注释已写明）、未被触碰的两节点之间的边不被增量重访
