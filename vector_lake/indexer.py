@@ -1371,6 +1371,27 @@ def refresh_graph_topology_if_dirty() -> bool:
     lock_path = output_path + ".lock"
     needs_full_rebuild = False
     changed = False
+
+    # Decide *outside* any transaction.  This used to open the write transaction first, so every
+    # occurrence took the database write lock -- and held it across a 17 MB parse -- even when the
+    # answer was "nothing to do".  Measured: complete under ``PRAGMA query_only=ON`` it raised
+    # "attempt to write a readonly database" immediately, i.e. the write lock was taken before the
+    # decision.  The probe below is a pure read, and the writing path re-loads inside the
+    # transaction exactly as before, so nothing about the write path changes.
+    #
+    # The probe can only skip work, never perform it: a writer that sets ``dirty`` just after this
+    # read is caught by the next refresh (and leaves its flag set in the meantime), whereas the
+    # previous arrangement could overwrite such a flag while holding the lock.
+    try:
+        probe = _load_index_unlocked(output_path)
+    except json.JSONDecodeError:
+        probe = None
+    if probe is not None:
+        stripped_system = _strip_system_nodes(probe)
+        stripped_legacy = _strip_legacy_embedded_payloads(probe)
+        if not stripped_system and not stripped_legacy and not is_graph_dirty(probe):
+            return False
+
     try:
         with FileLock(lock_path, timeout=INDEX_LOCK_TIMEOUT_SECONDS):
             from vector_lake.db_store import transaction
