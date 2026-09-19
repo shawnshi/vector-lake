@@ -315,21 +315,27 @@ def lint_vector_lake(auto_fix: bool = False):
     for filename, data in parsed.items():
         for target in data["links"]:
             if resolve_link_target(target, link_target_map, unique_cores) is None:
-                # A contested core name is reported as broken, but saying only that leaves the
+                # A contested name is reported as broken, but saying only that leaves the
                 # operator nothing to act on: the name is not unknown, it is ambiguous.  The
                 # item stays in this bucket so the count means the same thing.
+                #
+                # Declaration first, because it is the more precise of the two causes and names
+                # the pages that made the claim.  Both tables now hold a name two pages declare
+                # -- the core table folds aliases in so links can reach them -- so testing the
+                # core table first swallowed this branch and reported a declaration contest as a
+                # core-name collision.
                 contested = core_pages.get(entity_identity_key(strip_prefix(target)))
                 claimants = sorted(declared_norm.get(entity_identity_key(target), ()))
-                if contested and len(contested) > 1:
-                    detail = (
-                        f"target does not exist ({len(contested)} pages share that name: "
-                        f"{', '.join(sorted(contested))})"
-                    )
-                elif len(claimants) > 1:
+                if len(claimants) > 1:
                     # A title or alias two pages both claim: not unknown, contested.
                     detail = (
                         f"target does not exist ({len(claimants)} pages declare that name: "
                         f"{', '.join(sorted(claimants))})"
+                    )
+                elif contested and len(contested) > 1:
+                    detail = (
+                        f"target does not exist ({len(contested)} pages share that name: "
+                        f"{', '.join(sorted(contested))})"
                     )
                 else:
                     detail = "target does not exist"

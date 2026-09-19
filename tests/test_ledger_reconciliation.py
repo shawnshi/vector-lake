@@ -208,3 +208,117 @@ def test_stamping_preserves_everything_else_about_the_page(isolated_memory):
     assert tool_ingest._stamp_source_hash(stamped, "deadbeef") == stamped
     assert tool_ingest._stamp_source_hash("plain", "deadbeef") == "plain"
     assert tool_ingest._stamp_source_hash(stamped, "") == stamped
+
+
+# --- naming: one rule for a Source page's *identity*, one for its name -------------------------
+#
+# Two rules name a Source page.  The one in the code is ``canonical_source_name`` = ``Source_<sanitised
+# stem>``, and until this change three call sites hand-rolled a different shape (an unsanitised stem
+# in ``claim_extractor``, a lowercased one in ``tool_delete``): measured over the live corpus, the two
+# disagreed for 1 406 of the 1 874 ledgered raw sources, and a page exists under the hand-rolled name
+# for 10 of them against 1 014 under the sanitised name -- so provenance and the delete guard named a
+# page that does not exist.  The rule now has one owner in ``wiki_utils``, and the stamp below is
+# keyed on the *declaration* (what ``_declared_raw_sources`` already reconciles on) rather than on a
+# name, so a page written under the older convention is still stamped.  For an accepted ingest the
+# mandated name is enforced upstream, which is what makes that fallback defence-in-depth.
+
+
+def _source_item(filename: str, sources: list[str]) -> dict:
+    return {
+        "filename": filename,
+        "content": (
+            "---\n"
+            f'title: "{filename[:-3]}"\n'
+            f"sources: {json.dumps(list(sources))}\n"
+            "---\n"
+            "Body.\n"
+        ),
+    }
+
+
+def test_the_page_named_by_the_packet_is_the_one_stamped():
+    files = [_source_item("Source_Target.md", ["raw/news/target.md"])]
+
+    item, deviation = tool_ingest._source_item_to_stamp(
+        files, "Source_Target.md", "raw/news/target.md"
+    )
+
+    assert item is files[0]
+    assert deviation == ""
+
+
+def test_a_page_named_by_an_older_convention_is_found_by_what_it_declares():
+    """A page under the older convention: it declares the source, so it is the page to stamp."""
+    files = [_source_item("Source_news-target-92f53b7a.md", ["raw/news/target.md"])]
+
+    item, deviation = tool_ingest._source_item_to_stamp(
+        files, "Source_Target.md", "raw/news/target.md"
+    )
+
+    assert item is files[0]
+    assert deviation == "Source_news-target-92f53b7a.md"
+    # Stamped, and named exactly as the model wrote it: nothing is renamed.
+    stamped = tool_ingest._stamp_source_hash(item["content"], "deadbeef")
+    frontmatter, _body = split_frontmatter(stamped)
+    assert frontmatter["source_hash"] == "deadbeef"
+    assert frontmatter["sources"] == ["raw/news/target.md"]
+
+
+def test_a_none_source_page_that_cites_the_source_is_not_the_page_stamped():
+    """A Concept page declares the same raw file; stamping it would put the hash on the wrong page."""
+    files = [
+        _source_item("Concept_Related.md", ["raw/news/target.md"]),
+        _source_item("Source_news-target-92f53b7a.md", ["raw/news/target.md"]),
+    ]
+
+    item, deviation = tool_ingest._source_item_to_stamp(
+        files, "Source_Target.md", "raw/news/target.md"
+    )
+
+    assert item is files[1]
+    assert deviation == "Source_news-target-92f53b7a.md"
+
+
+def test_the_mandated_name_wins_when_both_a_name_and_a_declaration_match():
+    """One page, both signals: no deviation is reported for the normal case."""
+    files = [
+        _source_item("Source_Other-00000000.md", ["raw/news/target.md"]),
+        _source_item("Source_Target.md", ["raw/news/target.md"]),
+    ]
+
+    item, deviation = tool_ingest._source_item_to_stamp(
+        files, "Source_Target.md", "raw/news/target.md"
+    )
+
+    assert item is files[1]
+    assert deviation == ""
+
+
+def test_the_declaration_match_is_path_form_tolerant():
+    """``_raw_key`` is the comparison: separators and case do not decide whether it matches."""
+    files = [_source_item("Source_News-Target-92f53b7a.md", ["raw/News/Target.md"])]
+
+    item, deviation = tool_ingest._source_item_to_stamp(
+        files, "Source_Target.md", "C:/Users/x/MEMORY/raw/news/target.md"
+    )
+
+    assert item is files[0]
+    assert deviation
+
+
+def test_nothing_matches_when_no_page_declares_the_source():
+    files = [_source_item("Source_Unrelated.md", ["raw/news/other.md"])]
+
+    assert tool_ingest._source_item_to_stamp(files, "Source_Target.md", "raw/news/target.md") == (
+        None,
+        "",
+    )
+
+
+def test_a_page_with_unparsable_frontmatter_is_skipped_rather_than_guessed():
+    files = [{"filename": "Source_x-00000000.md", "content": "---\n: :\n---\nBody.\n"}]
+
+    assert tool_ingest._source_item_to_stamp(files, "Source_Target.md", "raw/news/target.md") == (
+        None,
+        "",
+    )

@@ -15,6 +15,7 @@ from vector_lake.db_store import mark_file_processed
 from vector_lake import governance_store
 from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
+    canonical_source_name,
     flush_durable,
     split_frontmatter,
     get_raw_dir,
@@ -325,17 +326,9 @@ def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     expired = expire_stale_subagent_jobs(max_age_seconds=max_age_seconds)
     return f"Expired {expired} awaiting-subagent ingest job(s)."
 
-def canonical_source_name(raw_path: str) -> str:
-    """The Source page name a task packet mandates for this raw file.
+#: The rule itself lives in ``wiki_utils`` beside the other naming functions, where
+#: ``claim_extractor`` and ``tool_delete`` can reach it without importing this module.
 
-    Normalised, because the packet's name must satisfy ``validate_wiki_filename`` or the
-    task can never be finalised: an arXiv-style stem (``2608.19880v1``) contains dots,
-    which the strict ``[Type]_[MainName]-[SubName]`` rule rejects, and ``finalize_ingest``
-    refuses the write.  Those papers sat un-ingested for exactly this reason.
-    """
-    basename = Path(raw_path).stem
-    safe = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", basename).strip("-")
-    return f"Source_{safe or 'unnamed'}.md"
 
 
 _NAME_KEY = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
@@ -344,6 +337,70 @@ _NAME_KEY = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 def _name_key(value: str) -> str:
     """Alphanumeric-only comparison key, so ``a_b`` matches ``a-b``."""
     return _NAME_KEY.sub("", str(value)).lower()
+
+
+def _item_content(item: dict) -> str:
+    """The item's content, read from ``filepath`` once and cached on the item.
+
+    The finalize loop below reads the same way; doing it here means a declaration check does not
+    cost a second read of the same file.
+    """
+    if item.get("content"):
+        return str(item["content"])
+    path = item.get("filepath")
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            item["content"] = handle.read()
+    except OSError:
+        return ""
+    return str(item["content"])
+
+
+def _declares_raw_source(item: dict, raw_key: str) -> bool:
+    """Whether this item's ``sources:`` names the raw file with this :func:`_raw_key`."""
+    if not raw_key:
+        return False
+    try:
+        frontmatter, _body = split_frontmatter(_item_content(item))
+    except Exception:  # noqa: BLE001 - unparsable frontmatter is the validator's business
+        return False
+    sources = frontmatter.get("sources") or []
+    if isinstance(sources, str):
+        sources = [sources]
+    return any(_raw_key(str(source)) == raw_key for source in sources)
+
+
+def _source_item_to_stamp(
+    files: list, canonical_name: str, raw_filepath: str
+) -> tuple[dict | None, str]:
+    """``(item, deviation)``: the Source page this packet's raw file was written to.
+
+    Two rules name a Source page.  ``canonical_source_name`` is the one the packet mandates and the
+    only one the code builds now, and for an *accepted* ingest
+    :func:`_apply_integration_disposition` has already required exactly one item under that name --
+    so the first branch is what normally fires.  The second covers the pages that predate that gate:
+    443 of the 1 782 live Source pages carry the model-chosen ``Source_<dir>-<stem>-<hash8>`` shape,
+    and for 1 406 of the 1 874 ledgered raw sources the two rules disagreed on the name.
+
+    Identity is the *declaration*: a page that lists this raw file in ``sources:`` is the page this
+    source was compiled into, whatever it is called.  That is the rule :func:`_declared_raw_sources`
+    already reconciles on, so this keys the stamp on the same fact instead of on a naming
+    convention.  The deviation is returned so the caller can report it rather than let the two rules
+    diverge quietly.
+    """
+    for item in files:
+        if os.path.basename(str(item.get("filename") or "")) == canonical_name:
+            return item, ""
+    raw_key = _raw_key(raw_filepath)
+    for item in files:
+        filename = os.path.basename(str(item.get("filename") or ""))
+        if not filename.startswith("Source_"):
+            continue
+        if _declares_raw_source(item, raw_key):
+            return item, filename
+    return None, ""
 
 
 def _raw_key(raw_path: str) -> str:
@@ -390,8 +447,11 @@ def _declared_raw_keys() -> set:
     This is the authoritative "already ingested" signal, and it is path-form tolerant
     once normalised (``a_b`` == ``a-b``, spaces and punctuation dropped).  Matching on
     published Source *page names* cannot work for short stems (``AI.md``, ``品牌.md``):
-    the page is named ``Source_<dir>-<stem>-<hash8>``, so a short stem never lands at
-    the start and substring matching over-matches unrelated pages.
+    the page's name cannot be trusted to locate it: pages are named by
+    ``canonical_source_name(raw)`` = ``Source_<sanitised stem>`` from one rule, while 443 of the
+    1 782 live Source pages carry the model-chosen ``Source_<dir>-<stem>-<hash8>`` of an earlier
+    convention, so a short stem never lands at the start and substring matching over-matches
+    unrelated pages.
 
     Built from frontmatter only (one cheap head-read per page) and only when the caller
     actually needs it, so an idle scan pays nothing.
@@ -1354,18 +1414,24 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         canonical_name = str(processed_data.get("canonical_name") or "")
         raw_hash = str(processed_data.get("hash") or "")
         if canonical_name and raw_hash:
-            for item in files:
-                if os.path.basename(str(item.get("filename") or "")) != canonical_name:
-                    continue
-                if "filepath" in item and not item.get("content"):
-                    try:
-                        with open(item["filepath"], "r", encoding="utf-8") as handle:
-                            item["content"] = handle.read()
-                    except OSError:
-                        break
-                if item.get("content"):
-                    item["content"] = _stamp_source_hash(str(item["content"]), raw_hash)
-                break
+            item, deviation = _source_item_to_stamp(
+                files, canonical_name, str(processed_data.get("filepath") or "")
+            )
+            if item is not None:
+                content = _item_content(item)
+                if content:
+                    item["content"] = _stamp_source_hash(content, raw_hash)
+                if deviation:
+                    # Reported, not corrected: renaming a published page would break every link and
+                    # ``sources:`` reference pointing at it, and the reconciliation is keyed on the
+                    # declaration, so a deviation is a naming-convention slip and not a lost source.
+                    log.warning(
+                        "Source page %s was written instead of the mandated %s for %s; the source "
+                        "hash is stamped on the page that declares the raw file",
+                        deviation,
+                        canonical_name,
+                        processed_data.get("filepath"),
+                    )
 
         written_paths = []
         mutations = []

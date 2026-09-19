@@ -43,6 +43,29 @@ def calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
     norm2 = math.sqrt(sum(a * a for a in v2))
     return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
 
+_IDENTITY_SEPARATORS = re.compile(r"[.·、。，;:!?'“”‘’；：！？…]+")
+
+
+def canonical_source_name(raw_path: str) -> str:
+    """The Source page name for a raw file: ``Source_<sanitised stem>.md``.
+
+    One owner for this rule.  It lived in ``tool_ingest`` while ``claim_extractor`` and
+    ``tool_delete`` each hand-rolled the same shape differently -- unsanitised stems in one, a
+    lowercased stem in the other -- so for a raw file named ``2604.24658v3.pdf`` the ingest path
+    named the page ``Source_2604-24658v3.md`` while provenance reported ``Source_2604.24658v3.md``
+    and the delete guard looked for a third spelling.  Two of the three named a page that does not
+    exist.
+
+    Sanitised, because the name has to satisfy ``validate_wiki_filename`` or the task can never be
+    finalised: an arXiv-style stem (``2608.19880v1``) contains dots, which the strict
+    ``[Type]_[MainName]-[SubName]`` rule rejects, and ``finalize_ingest`` refuses the write.  Those
+    papers sat un-ingested for exactly this reason.
+    """
+    basename = Path(str(raw_path)).stem
+    safe = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", basename).strip("-")
+    return f"Source_{safe or 'unnamed'}.md"
+
+
 def entity_identity_key(name: str) -> str:
     """The key two entity names are compared by: normalised, then case-folded.
 
@@ -58,8 +81,19 @@ def entity_identity_key(name: str) -> str:
     go through, and :func:`normalize_entity_name` stays the naming function.  ``casefold`` rather
     than ``lower`` because the corpus is multilingual (it folds ``ß``/``ẞ`` to ``ss`` and leaves CJK
     untouched).
+
+    Separator punctuation is folded the same way, and for the same reason: a page is named
+    ``Product_Gemini-3-5-Flash`` while prose and links write ``Gemini 3.5 Flash``, so ``3.5`` and
+    ``3-5`` have to compare equal or the link is reported broken.  It is folded *here* and not in
+    ``normalize_entity_name`` because the naming function must not restyle a stem: ``Source_2604.24658``
+    is an arXiv identifier whose dot is part of the name.  Only characters that separate words are
+    folded -- never a letter or a digit -- so the folding cannot merge two different identifiers.
     """
-    return normalize_entity_name(name).casefold()
+    # ``normalize_entity_name`` already maps whitespace and _[]<>:"/\|?* to "-"; this stretches the
+    # same convention over the separators it leaves behind (.,·。、，;:!?'"…) and squeezes the result,
+    # so ``a..b`` and ``a-b`` are one key.  Separators only -- a letter or digit is never touched.
+    key = _IDENTITY_SEPARATORS.sub("-", normalize_entity_name(name).casefold())
+    return re.sub(r"-+", "-", key).strip("-")
 
 
 def normalize_entity_name(name: str) -> str:

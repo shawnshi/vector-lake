@@ -104,3 +104,67 @@ def test_both_helpers_are_importable_from_the_one_owner(function_name):
     import vector_lake.wiki_utils as wiki_utils
 
     assert callable(getattr(wiki_utils, function_name))
+
+
+def test_the_identity_key_folds_separator_punctuation_and_the_naming_function_does_not():
+    """``3.5`` and ``3-5`` are one name for comparison and two spellings for naming.
+
+    The reported case: the page is ``Product_Gemini-3-5-Flash`` while prose and links write
+    ``Gemini 3.5 Flash``, so the link was reported broken.  Folding happens on *separators* only --
+    a letter or digit is never touched -- so no two identifiers can be merged by it, and the naming
+    function still keeps the dot because ``Source_2604.24658`` is an arXiv identifier.
+    """
+    # Compared the way resolution compares them: the prefix is stripped by the caller, so the key
+    # function never sees ``Product_``/``Concept_`` on one side only.
+    def key(name: str) -> str:
+        return entity_identity_key(strip_prefix(name))
+
+    for spelled, other in [
+        ("Product_Gemini-3-5-Flash", "Gemini 3.5 Flash"),
+        ("Concept_DRG-3.0", "DRG-3-0"),
+        ("Concept_v1.2", "v1-2"),
+        ("Source_2604.24658v3", "2604-24658v3"),
+        ("Concept_A、B", "Concept_A-B"),
+        ("Concept_问答？", "Concept_问答"),
+    ]:
+        assert key(spelled) == key(other)
+
+    # Separators never swallow a letter or a digit: these are different names.
+    assert key("Concept_AI") != key("Concept_A-I")
+    assert key("Concept_v1.2") != key("Concept_v1.3")
+
+    # Naming keeps the author's punctuation, so no page is renamed by this change.
+    assert normalize_entity_name("Concept_DRG-3.0") == "Concept_DRG-3.0"
+    assert normalize_entity_name("Source_2604.24658v3") == "Source_2604.24658v3"
+
+
+def test_an_alias_reaches_the_core_table_but_never_shadows_a_page_name():
+    """A link may reach a page by any declared name, including one whose core fallback is an alias.
+
+    Measured on the live corpus: two links newly resolve and none regress.  The precedence matters
+    and was measured the hard way -- folding every declared name in unconditionally left 11 links
+    unresolved that had resolved before, because one page's alias contested another page's *own*
+    name (contested keys went 36 -> 185).
+    """
+    nodes = ["Concept_甲", "Concept_乙", "Institution_中国医院协会信息专业委员会"]
+    declared = {"Institution_CHIMA": ["Institution_中国医院协会信息专业委员会"]}
+    _core_pages, unique_cores = link_resolution.core_name_maps(nodes, declared)
+    assert link_resolution.resolve_link_target("Institution_CHIMA", {}, unique_cores) == (
+        "Institution_中国医院协会信息专业委员会"
+    )
+
+    # An alias may not contest a name a page owns.
+    declared = {"乙": ["Concept_甲"]}
+    core_pages, unique_cores = link_resolution.core_name_maps(nodes, declared)
+    assert unique_cores[entity_identity_key("乙")] == "Concept_乙"
+    assert link_resolution.resolve_link_target("Concept_乙", {}, unique_cores) == "Concept_乙"
+
+
+def test_a_name_two_pages_declare_stays_contested_in_the_core_table():
+    """Folding declarations in must not resolve an ambiguous name -- only widen what can resolve."""
+    nodes = ["Concept_源", "Product_甲", "Vendor_乙"]
+    declared = {"Shared": ["Product_甲", "Vendor_乙"]}
+    core_pages, unique_cores = link_resolution.core_name_maps(nodes, declared)
+    assert len(core_pages[entity_identity_key("Shared")]) == 2
+    assert entity_identity_key("Shared") not in unique_cores
+    assert link_resolution.resolve_link_target("Shared", {}, unique_cores) is None

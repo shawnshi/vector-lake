@@ -5,7 +5,13 @@ from pathlib import Path
 
 import yaml
 
-from vector_lake.wiki_utils import get_memory_dir, get_wiki_dir, normalize_sources, read_markdown_file
+from vector_lake.wiki_utils import (
+    canonical_source_name,
+    get_memory_dir,
+    get_wiki_dir,
+    normalize_sources,
+    read_markdown_file,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -22,7 +28,6 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
         return f"[Security Error] The target '{raw_path}' is not within {raw_memory_dir}. Only raw sources can be deleted this way."
 
     raw_basename = raw_path_obj.name
-    raw_stem = raw_path_obj.stem
     try:
         raw_ref = str(raw_path_obj.relative_to(memory_dir)).replace("\\", "/")
     except ValueError:
@@ -33,7 +38,10 @@ def delete_source(raw_path: str, dry_run: bool = True) -> str:
     # Exact source-reference matching.  Substring matching removed the reference
     # from unrelated pages whose source list merely *contained* the basename, and
     # a prefix match on the page name also caught Source_<stem><suffix>.md.
-    canonical_source_page = f"source_{raw_stem.lower()}.md"
+    # The shared rule, lowered because the comparison below is case-insensitive.  Hand-rolling it
+    # as ``source_<stem>.md`` missed every page whose name the sanitiser had to change (a stem with
+    # a dot or a space), so the guard fell back to the ``sources:`` declaration for those.
+    canonical_source_page = canonical_source_name(raw_path_obj).lower()
 
     def _references_raw_source(source: str) -> bool:
         normalized = normalize_sources([source])

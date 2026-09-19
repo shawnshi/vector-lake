@@ -196,6 +196,20 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     if isinstance(tags, list) and len(tags) > MAX_TAGS:
         raise SchemaViolationException(f"Taxonomy Violation: Maximum {MAX_TAGS} tags allowed, but found {len(tags)}.")
         
+    # 1.5b Alias Constraints
+    aliases = frontmatter.get("aliases", [])
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    if isinstance(aliases, list):
+        for alias in aliases:
+            text = str(alias).strip()
+            if text.startswith("#"):
+                raise SchemaViolationException(
+                    f"Schema Violation: alias '{text}' starts with '#', which is tag syntax. "
+                    "Aliases name the entity itself, so a '#'-prefixed entry puts a tag in the "
+                    "entity namespace and would let a tag resolve as a link target. Put it in tags:."
+                )
+
     # 1.6 Dates
     try:
         if "created" in frontmatter:

@@ -3,7 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from vector_lake.wiki_utils import normalize_sources
+from vector_lake.wiki_utils import canonical_source_name, normalize_sources
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 import logging
 
@@ -256,7 +256,8 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         source_records.append({
             "source_id": source_id,
             "raw_ref": raw_ref,
-            "canonical_source_page": page_name if page_type == "source" else f"Source_{os.path.splitext(os.path.basename(raw_ref))[0]}.md",
+            "canonical_source_page": (page_name if page_type == "source"
+                else canonical_source_name(raw_ref)),
             "source_type": os.path.splitext(raw_ref)[1].lstrip(".").lower() or "md",
             "title": title if page_type == "source" else os.path.basename(raw_ref),
             "ingested_at": now,
@@ -299,7 +300,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                     source_records.append({
                         "source_id": sid,
                         "raw_ref": isrc,
-                        "canonical_source_page": f"Source_{os.path.splitext(os.path.basename(isrc))[0]}.md",
+                        "canonical_source_page": canonical_source_name(isrc),
                         "source_type": os.path.splitext(isrc)[1].lstrip(".").lower() or "md",
                         "title": os.path.basename(isrc),
                         "ingested_at": now,

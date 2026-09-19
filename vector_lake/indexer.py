@@ -24,7 +24,12 @@ from vector_lake.wiki_utils import (
     VALID_PREFIXES,
 )
 
-from vector_lake.link_resolution import build_link_map, core_name_maps, resolve_link_target
+from vector_lake.link_resolution import (
+    build_link_map,
+    core_name_maps,
+    declared_names_from_nodes,
+    resolve_link_target,
+)
 from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 
@@ -747,12 +752,7 @@ def _calculate_weighted_edges(index_data: dict, alias_map: dict | None = None) -
     # resolved here but nowhere else.  Measured on the live wiki: 67 typed links were dropped this
     # way, 23 of which the core route resolves; zero depended on the id route.
     if alias_map is None:
-        claims: dict[str, list[str]] = {}
-        for k, node in nodes_dict.items():
-            if node.get("title"):
-                claims.setdefault(str(node["title"]).strip(), []).append(k)
-            for alias in (node.get("aliases") or []):
-                claims.setdefault(str(alias).strip(), []).append(k)
+        claims = declared_names_from_nodes(nodes_dict)
         alias_map, _core_pages, unique_cores, _contested = build_link_map(nodes_dict.keys(), claims)
     else:
         _core_pages, unique_cores = core_name_maps(nodes_dict.keys())
@@ -925,14 +925,15 @@ def _link_map_for_nodes(nodes: dict) -> dict[str, str]:
     The incremental update path needs the same map the full build publishes; deriving it from the
     nodes it already holds keeps the two paths on one rule instead of two.
     """
-    claims: dict[str, list[str]] = {}
-    for key, node in nodes.items():
-        if node.get("title"):
-            claims.setdefault(str(node["title"]).strip(), []).append(key)
-        for alias in (node.get("aliases") or []):
-            claims.setdefault(str(alias).strip(), []).append(key)
-    link_map, _core_pages, _unique_cores, _contested = build_link_map(nodes.keys(), claims)
+    link_map, _core_pages, _unique_cores, _contested = build_link_map(
+        nodes.keys(), declared_names_from_nodes(nodes)
+    )
     return link_map
+
+
+def _declared_names_for_nodes(nodes: dict) -> dict[str, list[str]]:
+    """The same declaration map, named for the caller that needs it beside the core table."""
+    return declared_names_from_nodes(nodes)
 
 
 def _apply_graph_topology(index_data: dict):
@@ -1167,7 +1168,9 @@ def update_index_items(filenames: list[str]):
                     # the batch touches.
                     nodes_for_maps = {**(index_data.get("nodes") or {}), **pre_parsed_data}
                     alias_map = _link_map_for_nodes(nodes_for_maps)
-                    _core_pages, unique_cores = core_name_maps(nodes_for_maps.keys())
+                    _core_pages, unique_cores = core_name_maps(
+                        nodes_for_maps.keys(), _declared_names_for_nodes(nodes_for_maps)
+                    )
 
                     # Every node's triples, with their targets resolved: ``calculate_relevance`` reads
                     # the *other* node's predicate weight from this map, so leaving the targets raw

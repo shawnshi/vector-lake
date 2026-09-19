@@ -1141,3 +1141,72 @@ def test_the_dispatch_step_claims_a_short_lease(isolated_memory):
     assert spy.call_args.kwargs.get("lease_seconds", 3600) <= 300, (
         "the dispatch step holds a lease far longer than the work it protects"
     )
+
+
+def _source_page_content(filename: str, sources: list[str]) -> str:
+    """A valid Source page body: the ``Source``/``System`` prefix skips the dual-schema rules."""
+    return (
+        "---\n"
+        f'id: "source_{filename[:-3].lower()}"\n'
+        f'title: "{filename[:-3]}"\n'
+        "type: source\n"
+        "domain: General\n"
+        "status: Active\n"
+        "epistemic-status: seed\n"
+        "categories: [Source]\n"
+        "updated: 2026-09-19T00:00:00+00:00\n"
+        f"sources: {json.dumps(sources)}\n"
+        "---\n"
+        "## 1. 编译事实\n\nCompiled truth.\n\n## 2. 证据时间线\n"
+    )
+
+
+def test_a_source_page_named_against_the_mandate_is_refused_outright(isolated_memory, monkeypatch):
+    """End to end: the two naming rules cannot diverge for a *new* ingest, and that is the contract.
+
+    ``_apply_integration_disposition`` requires exactly one item named ``canonical_name`` before any
+    page is written, so the older model-chosen shape (``Source_<dir>-<stem>-<hash8>``, which 443 of
+    the 1 782 live pages use) is refused rather than silently accepted; the 443 predate that gate.
+    Pinned because it is what makes the stamp's declaration fallback defence-in-depth rather than a
+    repair: for an accepted ingest the mandated name is already the only possibility.
+    """
+    db_store.init_db()
+    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: [])
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": "raw/news/target.md",
+            "hash": "abc123",
+            "canonical_name": "Source_Target.md",
+            "instructions": "compile this source",
+        },
+    )
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+    deviation_name = "Source_news-target-92f53b7a.md"
+
+    result = mcp_server.tools.finalize_ingest(
+        [{"filename": deviation_name, "content": _source_page_content(deviation_name, ["raw/news/target.md"])}],
+        {
+            "filepath": "raw/news/target.md",
+            "hash": "abc123",
+            "canonical_name": "Source_Target.md",
+            "integration": {
+                "disposition": "standalone",
+                "reason": "Single-source compilation with no cross-page integration.",
+            },
+            "job_id": job_id,
+            "lease_owner": claim["lease_owner"],
+            "lease_token": claim["lease_token"],
+            "lease_generation": claim["lease_generation"],
+        },
+    )
+
+    from vector_lake.wiki_utils import get_wiki_dir
+
+
+    wiki_dir = get_wiki_dir()
+    assert "requires exactly one canonical source page: Source_Target.md" in result
+    assert not (wiki_dir / deviation_name).exists()
+    assert not (wiki_dir / "Source_Target.md").exists()
