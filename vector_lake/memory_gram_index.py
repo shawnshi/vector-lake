@@ -75,6 +75,10 @@ log = logging.getLogger("vector-lake-memory-gram-index")
 #: alone.  Raising the version turns every such database into a visible ``ready=False``
 #: and one rebuild.
 GRAM_FORMAT_VERSION = 2
+
+#: Gram *groups* packed per committed chunk in the rebuild's second pass.  Groups are whole, so
+#: the chunk is bounded by the primary-key range and a commit never straddles one.
+PACK_CHUNK_GRAMS = 5_000
 #: Largest corpus rebuilt automatically on the read path.  The cap has nothing to do
 #: with how much is queued: a base that is *stale* is never rebuilt from a read, no
 #: matter how small, because the exact scan is far cheaper than a rebuild for any
@@ -285,18 +289,94 @@ def _record_state(conn, doc_count: int, gram_count: int, postings_count: int, ba
 # --- maintenance ------------------------------------------------------------
 
 
+def _document_digest(key_blob, text_blob, page_blob) -> str:
+    """Digest of the three indexed fields as they were read.
+
+    The staging pass records one of these per document.  At publish time the digest is
+    recomputed for every document that still carries a change marker and compared: a match
+    proves the projection row is byte-identical to what was staged, so its base postings are
+    current and the marker can be dropped.  A mismatch -- or a missing stamp -- keeps it.
+
+    Bytes rather than a timestamp, deliberately: ``updated_rank`` has millisecond precision, so
+    two writes inside one millisecond compare equal and a timestamp fence would drop the marker
+    for postings that are already stale.  That is exactly the silent staleness this index must
+    never serve.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    for blob in (key_blob or "", text_blob or "", page_blob or ""):
+        digest.update(str(blob).encode("utf-8", "surrogatepass"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _drop_markers_whose_snapshot_is_current(conn) -> tuple[int, int]:
+    """Drop the change markers the freshly published base has already accounted for.
+
+    Returns ``(dropped, kept)``.  Three cases, and only the last is kept:
+
+    * **live, digest matches** -- the projection row is byte-identical to what was staged, so the
+      published postings are current and the marker is finished.
+    * **retired before the snapshot** (absent from the projection and never staged) -- the base
+      does not contain it at all, so there is nothing left for a marker to make the read path
+      skip.  Dropping it is what lets a quiet rebuild drain the queue, which the previous
+      implementation did by clearing the whole queue.
+    * **staged, then deleted** (absent from the projection but present in the stamp table) -- the
+      base holds the postings that were staged, so the marker has to stay: it is what makes the
+      read path skip them.
+
+    A live document that was written during the rebuild keeps its marker too (digest differs),
+    and a document created during it has no stamp at all and is kept.
+    """
+    stamps = dict(conn.execute("SELECT doc, digest FROM operational_memory_gram_stamp"))
+    rows = conn.execute(
+        "SELECT d.doc AS doc, "
+        "       (SELECT 1 FROM operational_memory_index AS i WHERE i.rowid = d.doc) AS alive, "
+        "       i.key_blob AS key_blob, i.text_blob AS text_blob, i.page_blob AS page_blob "
+        "FROM operational_memory_gram_dirty AS d "
+        "LEFT JOIN operational_memory_index AS i ON i.rowid = d.doc"
+    ).fetchall()
+    if not rows:
+        return 0, 0
+    clean = []
+    for row in rows:
+        doc = row["doc"]
+        stamp = stamps.get(doc)
+        if not row["alive"]:
+            if stamp is None:
+                clean.append(doc)
+            continue
+        if stamp and stamp == _document_digest(row["key_blob"], row["text_blob"], row["page_blob"]):
+            clean.append(doc)
+    if clean:
+        conn.executemany(
+            "DELETE FROM operational_memory_gram_dirty WHERE doc = ?", [(doc,) for doc in clean]
+        )
+    return len(clean), len(rows) - len(clean)
+
+
 def rebuild_memory_gram_index(dry_run: bool = False, batch_docs: int = 2000) -> str:
-    """Rebuild the base index from ``operational_memory_index``.
+    """Rebuild the base index from ``operational_memory_index``, batched, with a fenced publish.
 
-    Staging happens in a temporary ``(gram, doc, mask)`` table so SQLite performs
-    the external sort; holding 25 M postings in a Python dict would need gigabytes.
+    Staging happens in temporary tables so SQLite performs the external sort; holding 26 M
+    postings in a Python dict would need gigabytes.
 
-    The projection read, the staging and the swap are one transaction, so a writer on
-    another connection cannot commit in between: it is refused for the duration rather
-    than interleaved.  That also means the whole rebuild has to fit in the WAL, so it
-    needs free disk space comparable to the index.  The returned sentence reports work
-    done rather than guaranteeing a commit: a caller already holding a transaction
-    absorbs these statements into it, and they commit with the caller.
+    **Why it is batched.**  Measured on the live corpus 2026-09-19, the staging pass (projection
+    read + gram extraction + insert) is 436 s of a 465 s rebuild -- 94 %.  Running all of it in
+    one transaction held the database write lock for those 436 s, which refused every other
+    writer and made a routine maintenance step an availability event.  It now commits one short
+    transaction per ``batch_docs`` batch (about 6 s at the measured rate), so the outbox consumer
+    interleaves instead of being blocked, and the publish stays a single short transaction.
+
+    **What replaced the lock.**  The single transaction also made the snapshot atomic, and that
+    atomicity was load-bearing: publishing a base built from a mixed snapshot while clearing the
+    whole change queue would erase the marker for a document whose staged postings are stale, and
+    the read path would then serve it as current.  The fence replaces the exclusion: every staged
+    document records a digest of the bytes it was read from, and the publish drops a change marker
+    only when the document still digests identically.  Anything written during the rebuild keeps
+    its marker, so :func:`gram_index_usable` stays false until a quiet rebuild -- the same honest
+    degradation as before, without the write-lock hold.
     """
     conn = get_connection()
     init_db()
@@ -310,80 +390,175 @@ def rebuild_memory_gram_index(dry_run: bool = False, batch_docs: int = 2000) -> 
             f"{pending_doc_count(conn)} pending change(s)."
         )
 
-    conn.execute("DROP TABLE IF EXISTS operational_memory_gram_stage")
+    scratch_tables = (
+        "operational_memory_gram_stage",
+        "operational_memory_gram_stamp",
+        "operational_memory_gram_new",
+    )
+    # Bulk load: an auto-checkpoint after every commit copies WAL pages back into the main
+    # database in the committing thread, and this rebuild commits once per batch.  Deferring it
+    # to the scheduled ``wal_checkpoint(TRUNCATE)`` that follows the rebuild removes that I/O
+    # without changing durability (the WAL is still written and replayed).
+    previous_autocheckpoint = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    phase_seconds: dict[str, float] = {}
+
+    def _phase(name: str, started_at: float) -> None:
+        phase_seconds[name] = time.perf_counter() - started_at
+
+    for scratch in scratch_tables:
+        conn.execute(f"DROP TABLE IF EXISTS {scratch}")
     conn.execute(
         "CREATE TABLE operational_memory_gram_stage ("
         "gram TEXT NOT NULL, doc INTEGER NOT NULL, mask INTEGER NOT NULL, "
         "PRIMARY KEY (gram, doc)) WITHOUT ROWID"
     )
-    gram_count = postings_count = 0
+    conn.execute(
+        "CREATE TABLE operational_memory_gram_stamp ("
+        "doc INTEGER PRIMARY KEY, digest TEXT NOT NULL) WITHOUT ROWID"
+    )
+    conn.execute(
+        "CREATE TABLE operational_memory_gram_new (gram TEXT PRIMARY KEY, postings BLOB NOT NULL)"
+    )
+
+    # Phase 1 -- staged postings plus the per-document fence, one committed transaction per
+    # batch.  Keyset pagination on ``rowid`` with the cursor closed before the commit: SQLite
+    # plans ``rowid > ?`` as an INTEGER PRIMARY KEY search, and closing it matters.  A read
+    # snapshot that spans a commit by another connection cannot be upgraded to a write
+    # transaction in WAL mode (SQLITE_BUSY_SNAPSHOT), so a long-lived cursor here makes the next
+    # batch fail closed for the whole lock budget -- reproduced as a 20 s timeout with an
+    # external 0.16 s write in between.
     staged_docs = 0
-    # One transaction for the whole rebuild: the projection read, the staging and the
-    # swap.  Committing once per batch used to open a window between "this document has
-    # been read" and the swap's queue clear, wide enough for a writer on another
-    # connection to commit a change that the swap then erased the marker for -- leaving
-    # the base holding the pre-change grams of a document with nothing left to make the
-    # read path skip them.  Holding the write lock for the duration makes such a writer
-    # fail closed instead (``DatabaseLockTimeout``, after ``BEGIN_LOCK_BUDGET_SECONDS``),
-    # which is visible in its own right and cannot be mistaken for a clean rebuild.
-    #
-    # The staging DDL above runs before the transaction: a half-consumed read statement
-    # on this connection blocks DDL.
-    with transaction():
-        docs = conn.execute(
-            "SELECT rowid, key_blob, text_blob, page_blob FROM operational_memory_index ORDER BY rowid"
-        )
-        while True:
-            rows = docs.fetchmany(batch_docs)
-            if not rows:
-                break
-            payload = []
-            for row in rows:
-                doc = row["rowid"]
-                grams = extract_grams(row["key_blob"], row["text_blob"], row["page_blob"])
-                payload.extend((gram, doc, mask) for gram, mask in grams.items())
+    last_doc = 0
+    _started = time.perf_counter()
+    while True:
+        rows = conn.execute(
+            "SELECT rowid AS doc, key_blob, text_blob, page_blob FROM operational_memory_index "
+            "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+            (last_doc, max(1, int(batch_docs))),
+        ).fetchall()
+        if not rows:
+            break
+        payload: list[tuple[str, int, int]] = []
+        stamps: list[tuple[int, str]] = []
+        for row in rows:
+            blobs = (row["key_blob"] or "", row["text_blob"] or "", row["page_blob"] or "")
+            grams = extract_grams(*blobs)
+            payload.extend((gram, row["doc"], mask) for gram, mask in grams.items())
+            stamps.append((row["doc"], _document_digest(*blobs)))
+        with transaction():
             if payload:
+                # Sorted inserts, not incidentally: the staging table is a WITHOUT ROWID b-tree
+                # keyed on ``(gram, doc)`` while the payload is built in document order, so an
+                # unsorted batch touches scattered leaf pages for every row.  Measured on a 5 M-row
+                # b-tree, one 360 000-row batch costs 3.32 s unsorted against 0.66 s sorted -- and
+                # the gap widens with the table, which is what put a ~21 s write-lock hold inside
+                # a late batch of the live rebuild.
+                payload.sort()
                 conn.executemany(
                     "INSERT OR REPLACE INTO operational_memory_gram_stage (gram, doc, mask) VALUES (?, ?, ?)",
                     payload,
                 )
-            staged_docs += len(rows)
+            conn.executemany(
+                "INSERT OR REPLACE INTO operational_memory_gram_stamp (doc, digest) VALUES (?, ?)",
+                stamps,
+            )
+        last_doc = rows[-1]["doc"]
+        staged_docs += len(rows)
+    _phase("stage", _started)
 
-        conn.execute("DELETE FROM operational_memory_gram_dirty")
-        conn.execute("DELETE FROM operational_memory_gram")
-        cursor = conn.execute(
-            "SELECT gram, doc, mask FROM operational_memory_gram_stage ORDER BY gram, doc"
+    # Phase 2 -- pack staging into a private next-generation base, one transaction per chunk of
+    # *whole* gram groups.  The chunk bounds come from the ordered gram list, so a group is
+    # never split across chunks: paging on ``gram > last`` alone would silently drop the rest of
+    # a group that straddled the boundary, and carrying the buffer across chunks instead means
+    # re-reading groups.  ``gram >= ? AND gram <= ?`` is a range search on the primary key, which
+    # a compound ``(gram, doc) > (?, ?)`` keyset is not -- that planned as a full scan and made
+    # the rebuild 2.4x slower.
+    gram_list = [
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT gram FROM operational_memory_gram_stage ORDER BY gram"
         )
+    ]
+    gram_count = postings_count = 0
+    _started = time.perf_counter()
+    for start_index in range(0, len(gram_list), PACK_CHUNK_GRAMS):
+        chunk = gram_list[start_index : start_index + PACK_CHUNK_GRAMS]
+        rows = conn.execute(
+            "SELECT gram, doc, mask FROM operational_memory_gram_stage "
+            "WHERE gram >= ? AND gram <= ? ORDER BY gram, doc",
+            (chunk[0], chunk[-1]),
+        ).fetchall()
+        pending: list[tuple[str, bytes]] = []
         buffer: list[tuple[int, int]] = []
         current_gram: str | None = None
-        while True:
-            rows = cursor.fetchmany(50_000)
-            if not rows:
-                break
-            for gram, doc, mask in rows:
-                if gram != current_gram:
-                    if current_gram is not None:
-                        conn.execute(
-                            "INSERT INTO operational_memory_gram (gram, postings) VALUES (?, ?)",
-                            (current_gram, _pack(buffer)),
-                        )
-                        gram_count += 1
-                        postings_count += len(buffer)
-                    current_gram = gram
-                    buffer = []
-                buffer.append((doc, mask))
+        for gram, doc, mask in rows:
+            if gram != current_gram:
+                if current_gram is not None:
+                    pending.append((current_gram, _pack(buffer)))
+                    gram_count += 1
+                    postings_count += len(buffer)
+                current_gram = gram
+                buffer = []
+            buffer.append((doc, mask))
         if current_gram is not None:
-            conn.execute(
-                "INSERT INTO operational_memory_gram (gram, postings) VALUES (?, ?)",
-                (current_gram, _pack(buffer)),
-            )
+            pending.append((current_gram, _pack(buffer)))
             gram_count += 1
             postings_count += len(buffer)
+        if pending:
+            with transaction():
+                conn.executemany(
+                    "INSERT OR REPLACE INTO operational_memory_gram_new (gram, postings) VALUES (?, ?)",
+                    pending,
+                )
+    _phase("pack", _started)
+
+    # Phase 3 -- publish.  One short transaction: fence the change markers, swap the new base in
+    # by DDL, and record the state.  ``DELETE`` + ``INSERT ... SELECT`` was tried first and
+    # costs ~20 s for 421 575 grams / 105 MB of blobs inside the transaction -- a window longer
+    # than the 20 s writer-lock budget, so a concurrent writer could still be refused once per
+    # rebuild (measured: a 23.5 s lock wait).  ``DROP`` + ``RENAME`` is atomic, transactional and
+    # effectively free; nothing references the table by name (the change markers live in
+    # ``operational_memory_gram_dirty``), and the renamed table brings its own index.
+    _started = time.perf_counter()
+    with transaction():
+        dropped, kept = _drop_markers_whose_snapshot_is_current(conn)
+        conn.execute("DROP TABLE operational_memory_gram")
+        conn.execute("ALTER TABLE operational_memory_gram_new RENAME TO operational_memory_gram")
         _record_state(conn, staged_docs, gram_count, postings_count, staged_docs)
-    conn.execute("DROP TABLE IF EXISTS operational_memory_gram_stage")
+    _phase("publish", _started)
+
+    for scratch in scratch_tables:
+        conn.execute(f"DROP TABLE IF EXISTS {scratch}")
+    try:
+        conn.execute(f"PRAGMA wal_autocheckpoint={int(previous_autocheckpoint or 1000)}")
+    except sqlite3.Error as exc:  # noqa: BLE001 - a lost pragma only costs I/O later
+        log.warning("Could not restore wal_autocheckpoint: %s", exc)
+    # Reclaim what deferring the auto-checkpoint just accumulated.  Without this a manual
+    # ``cli.py gram-index --apply`` left a multi-gigabyte WAL until the next scheduled
+    # occurrence -- measured at 2 051 MB after one live rebuild.  Best effort: the scheduled
+    # block is the backstop, and a busy reader legitimately defers the truncate.
+    try:
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint and int(checkpoint[0]) != 0:
+            log.info("Rebuild finished with a deferred WAL checkpoint (busy=%s pages=%s)", *checkpoint[:2])
+    except sqlite3.Error as exc:
+        log.warning("Post-rebuild WAL checkpoint skipped: %s", exc)
+    log.info(
+        "Gram rebuild phases: %s (batch_docs=%d)",
+        ", ".join(f"{name}={seconds:.1f}s" for name, seconds in phase_seconds.items()),
+        batch_docs,
+    )
+
+    fence = (
+        f" {kept} document(s) written during the rebuild kept their change marker "
+        f"({dropped} cleared by the snapshot fence)."
+        if kept
+        else ""
+    )
     return (
         f"Rebuilt the memory gram index: {gram_count} gram(s), {postings_count} posting(s) "
-        f"over {staged_docs} document(s)."
+        f"over {staged_docs} document(s).{fence}"
     )
 
 
@@ -621,16 +796,39 @@ def backend_requested() -> str:
 
 
 def memory_gram_index_report() -> str:
-    """Human-readable status for the operator surfaces."""
+    """Human-readable status for the operator surfaces.
+
+    The verdict leads, because ``ready=True`` describes the *base* while ``usable``
+    describes what a search actually gets; reporting the base first produced a line that
+    read as healthy on a lake where every memory retrieval was falling back to the
+    O(rows x terms) scan.  When the index cannot serve, the line names the cost the caller
+    is paying and the remedy.
+    """
     conn = get_connection()
     init_db()
     state = gram_index_state()
+    usable = gram_index_usable()
+    total, live, retired = dirty_breakdown(conn)
+    if usable:
+        verdict = "usable=True (memory search is served by the n-gram index)"
+    else:
+        verdict = (
+            "usable=False (memory search is falling back to the exact projected scan; "
+            "rebuild with `python cli.py gram-index --if-due --apply`)"
+        )
+        # The read path refuses at one dirty document while maintenance only rebuilds at
+        # REBUILD_AFTER_WRITES, so this range is a state where nothing is scheduled to
+        # happen.  Naming it is the difference between a known trade and a silent one.
+        if live and not rebuild_due(conn):
+            verdict += (
+                f" -- {live} document(s) written, {REBUILD_AFTER_WRITES} needed before a "
+                "rebuild is due, so the indexed path stays off until then"
+            )
     return (
-        f"memory gram index: ready={state['ready']} format={state['format_version']} "
+        f"memory gram index: {verdict} "
+        f"ready={state['ready']} format={state['format_version']} "
         f"grams={int(state['gram_count'] or 0)} base_docs={int(state['base_docs'] or 0)} "
         f"projection_docs={_projection_doc_count(conn)} "
-
-        f"pending={pending_doc_count(conn)} (live={live_dirty_doc_count(conn)} "
-        f"retired={retired_doc_count(conn)}) usable={gram_index_usable()} "
+        f"pending={total} (live={live} retired={retired}) usable={usable} "
         f"backend={backend_requested()}"
     )

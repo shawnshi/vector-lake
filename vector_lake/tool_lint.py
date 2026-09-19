@@ -39,6 +39,27 @@ from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES, strip_prefix
 # so the comparison view is normalised once here instead of restating the set.
 _LOWERCASE_STATUS = {status.lower() for status in VALID_STATUS}
 
+#: Similarity above which two nodes are reported as duplicates.
+SIMILARITY_MERGE_THRESHOLD = 0.91
+
+
+def _ratio_can_exceed(name_a: str, name_b: str, threshold: float) -> bool:
+    """Whether ``SequenceMatcher(None, a, b).ratio()`` can reach ``threshold``.
+
+    ``ratio()`` is ``2 * matches / (len(a) + len(b))`` and ``matches`` cannot exceed
+    ``min(len(a), len(b))``, so the achievable ceiling is ``2 * min / (min + max)``.
+    Comparing that ceiling first is exact -- it never drops a pair that would have
+    scored above the threshold -- and on the live corpus it removes 255 073 of the
+    375 283 calls, which is where the ~30 s the similarity pass used to take went.
+
+    An empty pair is left to ``SequenceMatcher``: ``ratio()`` returns 1.0 when both
+    sides are empty, so skipping it would change the findings rather than the cost.
+    """
+    longest = max(len(name_a), len(name_b))
+    if longest == 0:
+        return True
+    return (2.0 * min(len(name_a), len(name_b)) / (len(name_a) + len(name_b))) > threshold
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-lint")
@@ -426,11 +447,13 @@ def lint_vector_lake(auto_fix: bool = False):
             prefix_b = key_b.split("_")[0] if "_" in key_b else ""
             if prefix_a != prefix_b:
                 continue
-            name_a = key_a.split("_", 1)[1] if "_" in key_a else key_a
-            name_b = key_b.split("_", 1)[1] if "_" in key_b else key_b
-            ratio = SequenceMatcher(None, name_a.lower(), name_b.lower()).ratio()
-            
-            if ratio > 0.91 and key_a != key_b:
+            name_a = (key_a.split("_", 1)[1] if "_" in key_a else key_a).lower()
+            name_b = (key_b.split("_", 1)[1] if "_" in key_b else key_b).lower()
+            if not _ratio_can_exceed(name_a, name_b, SIMILARITY_MERGE_THRESHOLD):
+                continue
+            ratio = SequenceMatcher(None, name_a, name_b).ratio()
+
+            if ratio > SIMILARITY_MERGE_THRESHOLD and key_a != key_b:
                 issues["similarity"].append(f"Duplicate: {key_a}.md <-> {key_b}.md ({ratio:.0%})")
                 if False: # auto_fix disabled for similarity merge by Mentat
                     # Determine Primary vs Secondary based on 'updated' date

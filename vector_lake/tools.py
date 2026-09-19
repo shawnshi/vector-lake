@@ -6,7 +6,17 @@ from vector_lake.tool_graph import audit_graph, visualize_vector_lake
 from vector_lake.tool_lint import lint_vector_lake
 from vector_lake.tool_merge import merge_suggestions_vector_lake
 from vector_lake.tool_piea import check_duplicate_entity
-from vector_lake.tool_ingest import claim_ingest_tasks, expire_ingest_tasks, list_ingest_tasks, prepare_ingest_batch, finalize_ingest
+from vector_lake.tool_ingest import (
+    claim_ingest_tasks,
+    clear_abandoned_ingest_sources,
+    close_terminal_failed_ingest_jobs,
+    expire_ingest_tasks,
+    finalize_ingest,
+    list_abandoned_ingest_sources,
+    list_terminal_failed_ingest_jobs,
+    list_ingest_tasks,
+    prepare_ingest_batch,
+)
 from vector_lake.tool_query import prepare_query_context, finalize_query_synthesis
 from vector_lake.tool_review import review_vector_lake
 from vector_lake.tool_search import assemble_context, search_vector_lake
@@ -48,6 +58,10 @@ __all__ = [
     "doctor_vector_lake",
     "finalize_ingest",
     "expire_ingest_tasks",
+    "list_abandoned_ingest_sources",
+    "list_terminal_failed_ingest_jobs",
+    "close_terminal_failed_ingest_jobs",
+    "clear_abandoned_ingest_sources",
     "finalize_query_synthesis",
     "gc_vector_lake",
     "lint_vector_lake",

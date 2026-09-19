@@ -461,6 +461,18 @@ def _create_memory_gram_tables(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS ingest_abandoned_sources (
+            filepath TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            reason TEXT,
+            terminal_jobs INTEGER NOT NULL DEFAULT 0,
+            abandoned_at TEXT NOT NULL,
+            PRIMARY KEY (filepath, file_hash)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS operational_memory_gram_dirty (
             doc INTEGER PRIMARY KEY
         )
@@ -774,6 +786,9 @@ _SCHEMA_SENTINELS: tuple[str, ...] = (
     "page_index_nodes",
     "page_index_edges",
     "page_index_state",
+    # A new table has to be a sentinel, or ``_schema_is_complete`` reports an existing
+    # database as complete and the DDL that creates it never runs.
+    "ingest_abandoned_sources",
 )
 
 
@@ -2002,7 +2017,61 @@ def mark_file_processed(filepath: str, file_hash: str):
                 processed_at = excluded.processed_at
         """, (filepath, file_hash, now_str))
 
-def enqueue_job(task_type: str, payload: dict, idempotency_key: str | None = None) -> str:
+#: Statuses from which a job's work is genuinely finished.
+#:
+#: They are the ones ``enqueue_job`` may deduplicate against.  A job that ended ``failed`` or
+#: ``cancelled`` did *not* do the work, and deduplicating against it is a dead end: the raw
+#: source is still un-ingested, but every later scan gets the old terminal job id back instead of
+#: a dispatchable one.  Measured on 2026-09-19, this is what left 11 sources (8 of them transient
+#: "Canonical version conflict" failures) permanently un-ingestable.
+INGEST_JOB_TERMINAL_SUCCESS = ("finalized", "completed")
+
+
+#: Statuses that mean the job gave up rather than finished or being in progress.
+#:
+#: This is what ``replace_terminal`` may supersede.  The first version asked "is it *not*
+#: finished", which is also true of ``queued``, ``awaiting_subagent`` and
+#: ``subagent_processing`` -- so a scan superseded jobs that were still in flight.  Measured on
+#: the live corpus 2026-09-19 10:50: six sources ended up with **three to four concurrent jobs
+#: each**, i.e. three to four model calls for one file.
+INGEST_JOB_TERMINAL_FAILURE = ("failed", "cancelled")
+
+
+def _job_is_terminal_unsuccessful(conn, job_id: str) -> bool:
+    row = conn.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if row is None:
+        return False
+    return str(row["status"]) in INGEST_JOB_TERMINAL_FAILURE
+
+
+def enqueue_job(
+    task_type: str,
+    payload: dict,
+    idempotency_key: str | None = None,
+    replace_terminal: bool = False,
+    supersede_finished: bool = False,
+) -> str:
+    """Enqueue a job, deduplicating against an *unfinished* job with the same key.
+
+    ``replace_terminal`` (used by the ingest scan) lets a new job supersede one that ended
+    ``failed`` or ``cancelled``: the source still needs ingesting, and returning the dead job's id
+    would leave it that way forever.  The superseded row is marked so the history stays readable
+    instead of being deleted.
+
+    ``supersede_finished`` extends that to a ``finalized``/``completed`` job, which is only safe
+    for a caller that has *established the source is not published* -- the ingest scan does, via
+    ``raw_is_published``, before it gets here.  It exists because a source can hold a finished job
+    while having neither a page nor a ``processed_files`` row (measured:
+    ``DHWB-20260913.md``, finalized 2026-09-17, no page anywhere in the wiki).  Without this the
+    scan's enqueue was a silent no-op against the finished job's key: the file was reported
+    "enqueued", marked in-flight, never dispatched, and released again by the next sweep -- a
+    12-minute loop that produced nothing.  The collision is logged, because it means the page and
+    the ledger disagree and an operator should know.
+    """
+    if supersede_finished and not replace_terminal:
+        # A finished job is also "not unfinished"; keep the two switches from being used as if
+        # they were independent when they are nested.
+        replace_terminal = True
     import uuid
     from datetime import datetime, timezone
     init_db()
@@ -2017,12 +2086,51 @@ def enqueue_job(task_type: str, payload: dict, idempotency_key: str | None = Non
                 (key,),
             ).fetchone()
             if existing:
-                return str(existing["job_id"])
+                existing_id = str(existing["job_id"])
+                status_row = conn.execute(
+                    "SELECT status FROM jobs WHERE job_id = ?", (existing_id,)
+                ).fetchone()
+                status = str(status_row["status"]) if status_row else ""
+                unfinished_mismatch = replace_terminal and _job_is_terminal_unsuccessful(conn, existing_id)
+                finished_collision = supersede_finished and status in INGEST_JOB_TERMINAL_SUCCESS
+                if not (unfinished_mismatch or finished_collision):
+                    return existing_id
+                if finished_collision:
+                    logging.getLogger("vector-lake-db").warning(
+                        "Superseding %s job %s for %s: the source is not published but the job "
+                        "table says the work finished, so the page and the ledger disagree.",
+                        status, existing_id, (payload or {}).get("filepath"),
+                    )
+                # Keep the old row as history, but take its key so the new row can hold it.
+                #
+                # ``unfinished_mismatch`` also has to *stop the old row being dispatched*:
+                # clearing the key alone left it ``failed`` with its retries unspent, and
+                # ``claim_pending_jobs`` claims ``failed`` while ``retries < MAX_INGEST_ATTEMPTS``
+                # -- so the superseded job and its replacement were both handed out, i.e. two
+                # model calls for one source.  That is the defect this supersede path was added to
+                # remove (independent review, 2026-09-19).  A *finished* row is already
+                # unclaimable, so its status is left as the record of the work.
+                conn.execute(
+                    "UPDATE jobs SET idempotency_key = NULL, "
+                    "status = CASE WHEN ? THEN 'superseded' ELSE status END, "
+                    "error_msg = COALESCE(NULLIF(error_msg, ''), '') || "
+                    "' [superseded by a fresh dispatch]', updated_at = ? WHERE job_id = ?",
+                    (1 if unfinished_mismatch else 0, now_str, existing_id),
+                )
         conn.execute("""
             INSERT INTO jobs (job_id, task_type, payload, status, created_at, updated_at, available_at, idempotency_key)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (job_id, task_type, json.dumps(payload, ensure_ascii=False), "queued", now_str, now_str, now_str, key))
     return job_id
+
+
+#: Attempts a single ingest job may consume before it becomes terminal.
+#:
+#: One owner for the number: ``claim_pending_jobs`` refuses to dispatch a job at the
+#: cap, and ``tool_ingest.record_ingest_failure`` reports against the same value.  The
+#: two disagreed before -- the runner's failure branches never consumed the budget at
+#: all, so a deterministically rejecting task was re-claimed every hour forever.
+MAX_INGEST_ATTEMPTS = 3
 
 
 def claim_pending_jobs(limit: int = 10, lease_seconds: int = 300) -> list[dict]:
@@ -2034,10 +2142,10 @@ def claim_pending_jobs(limit: int = 10, lease_seconds: int = 300) -> list[dict]:
     with transaction():
         rows = conn.execute(
             "SELECT job_id FROM jobs WHERE "
-            "((status IN ('queued', 'failed') AND retries < 3 AND COALESCE(available_at, created_at, '') <= ?) "
+            "((status IN ('queued', 'failed') AND retries < ? AND COALESCE(available_at, created_at, '') <= ?) "
             "OR (status = 'dispatched' AND COALESCE(lease_until, '') <= ?)) "
             "ORDER BY created_at ASC LIMIT ?",
-            (now, now, max(1, int(limit))),
+            (MAX_INGEST_ATTEMPTS, now, now, max(1, int(limit))),
         ).fetchall()
         job_ids = [row["job_id"] for row in rows]
         if not job_ids:
@@ -2233,6 +2341,168 @@ def expire_stale_subagent_jobs(max_age_seconds: int = 86400) -> int:
             (now_str, now_str, cutoff),
         )
         return int(cursor.rowcount or 0)
+
+def record_abandoned_source(filepath: str, file_hash: str, reason: str) -> int:
+    """Stop dispatching this exact source content after it kept failing deterministically.
+
+    Keyed on ``(filepath, file_hash)`` on purpose: editing the source changes its hash, so a
+    corrected file is dispatchable again without any operator action, while the exact bytes that
+    keep failing stop consuming model calls.  Only deterministic failures land here -- a
+    transient one is released for retry instead (see ``release_job_for_retry``).
+
+    Returns the number of terminal jobs recorded for this content.
+    """
+    from datetime import datetime, timezone
+
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        conn.execute(
+            "INSERT INTO ingest_abandoned_sources (filepath, file_hash, reason, terminal_jobs, abandoned_at) "
+            "VALUES (?, ?, ?, 1, ?) "
+            "ON CONFLICT(filepath, file_hash) DO UPDATE SET "
+            "reason = excluded.reason, terminal_jobs = terminal_jobs + 1, abandoned_at = excluded.abandoned_at",
+            (str(filepath), str(file_hash), str(reason)[:500], now),
+        )
+        row = conn.execute(
+            "SELECT terminal_jobs FROM ingest_abandoned_sources WHERE filepath = ? AND file_hash = ?",
+            (str(filepath), str(file_hash)),
+        ).fetchone()
+    return int(row["terminal_jobs"]) if row else 1
+
+
+def abandoned_source_keys() -> set[tuple[str, str]]:
+    """``{(filepath, file_hash), ...}`` of sources that must not be re-dispatched."""
+    try:
+        return {
+            (str(row[0]), str(row[1]))
+            for row in get_connection().execute(
+                "SELECT filepath, file_hash FROM ingest_abandoned_sources"
+            )
+        }
+    except sqlite3.OperationalError:
+        # A database predating the table simply has no abandoned sources.
+        return set()
+
+
+def list_abandoned_sources() -> list[dict]:
+    """Abandoned sources, newest first, for an operator to inspect or clear."""
+    try:
+        return [
+            dict(row)
+            for row in get_connection().execute(
+                "SELECT filepath, file_hash, reason, terminal_jobs, abandoned_at "
+                "FROM ingest_abandoned_sources ORDER BY abandoned_at DESC"
+            )
+        ]
+    except sqlite3.OperationalError:
+        return []
+
+
+def list_terminal_failed_jobs() -> list[dict]:
+    """Jobs that reached the attempt budget, newest first, with the source each names."""
+    try:
+        rows = get_connection().execute(
+            "SELECT job_id, task_type, retries, updated_at, error_msg, payload FROM jobs "
+            "WHERE status = 'failed' AND retries >= ? ORDER BY updated_at DESC",
+            (MAX_INGEST_ATTEMPTS,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    jobs = []
+    for row in rows:
+        try:
+            filepath = json.loads(row["payload"] or "{}").get("filepath", "")
+        except (TypeError, ValueError):
+            filepath = ""
+        jobs.append(
+            {
+                "job_id": str(row["job_id"]),
+                "task_type": str(row["task_type"]),
+                "retries": int(row["retries"] or 0),
+                "updated_at": str(row["updated_at"]),
+                "error_msg": str(row["error_msg"] or ""),
+                "filepath": str(filepath),
+            }
+        )
+    return jobs
+
+
+def close_terminal_failed_jobs(source_ingested_only: bool = True) -> dict:
+    """Mark terminal-failed jobs ``superseded`` once their source is genuinely ingested.
+
+    These are the jobs that spent their attempt budget, and they are what makes ``doctor`` report
+    ``[FAIL] Ingest Jobs: terminal_failed:N``.  A job whose source has since been ingested (a
+    ledger row) is finished business recorded twice: the *work* is done and the failure is
+    history.  Leaving them ``failed`` keeps a FAIL on the health surface that no longer describes
+    anything actionable -- measured on 2026-09-19: 11 jobs, every one of whose sources was in the
+    ledger.
+
+    ``source_ingested_only`` refuses to close a job whose source has no ledger row, because that
+    one really is unfinished work and the abandonment mechanism is what decides its fate.
+    """
+    conn = get_connection()
+    ledger = {str(row[0]) for row in conn.execute("SELECT filepath FROM processed_files")}
+    closed: list[str] = []
+    kept: list[str] = []
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        for job in list_terminal_failed_jobs():
+            filepath = job["filepath"]
+            if source_ingested_only and (not filepath or filepath not in ledger):
+                kept.append(job["job_id"])
+                continue
+            conn.execute(
+                "UPDATE jobs SET status = 'superseded', updated_at = ?, "
+                "error_msg = error_msg || ' [closed: the source was ingested by a later job]' "
+                "WHERE job_id = ? AND status = 'failed'",
+                (now, job["job_id"]),
+            )
+            closed.append(job["job_id"])
+    return {"closed": closed, "kept": kept}
+
+
+def clear_abandoned_sources(filepath: str | None = None) -> int:
+    """Allow abandoned source(s) to be dispatched again; returns how many were cleared."""
+    conn = get_connection()
+    with transaction():
+        if filepath:
+            cursor = conn.execute(
+                "DELETE FROM ingest_abandoned_sources WHERE filepath = ?", (str(filepath),)
+            )
+        else:
+            cursor = conn.execute("DELETE FROM ingest_abandoned_sources")
+    return int(cursor.rowcount or 0)
+
+
+def release_job_for_retry(job_id: str, reason: str) -> None:
+    """Make a job dispatchable again *without* spending its terminal attempt budget.
+
+    The budget exists to stop a deterministic rejection being retried forever (a schema
+    violation, a name that no gate will ever accept).  A transient rejection is a different
+    thing: ``Canonical version conflict`` means the page moved between the model reading it and
+    ``finalize_ingest`` writing it, and the next attempt reads the new version.  Counting those
+    against the cap turned 8 transient conflicts on the live corpus into permanently
+    un-ingested sources -- terminal, and (before ``enqueue_job`` grew ``replace_terminal``)
+    impossible to re-enqueue because the dead job held the idempotency key.
+
+    ``retries`` is left alone, so ``claim_pending_jobs`` keeps dispatching while the budget
+    lasts; only the lease is released.
+    """
+    from datetime import datetime, timezone
+
+    conn = get_connection()
+    now_str = datetime.now(timezone.utc).isoformat()
+    immediate = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    with transaction():
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', error_msg = ?, updated_at = ?, available_at = ?, "
+            "lease_until = NULL, lease_owner = NULL, lease_token = NULL WHERE job_id = ?",
+            (f"{str(reason)[:460]} [transient, retry does not spend the attempt budget]", now_str, immediate, job_id),
+        )
+
 
 def update_job_status(job_id: str, status: str, error_msg: str = ""):
     from datetime import datetime, timezone

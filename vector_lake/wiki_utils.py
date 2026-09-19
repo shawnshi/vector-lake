@@ -128,6 +128,37 @@ def _configured_memory_dir() -> Path | None:
 DEFAULT_EXCLUDE_PATHS = ("stocks/", "garmin/", "personal-insights/")
 DEFAULT_SUPPORTED_EXTENSIONS = (".md", ".txt")
 
+#: Path segments that make a raw source private by construction.
+#:
+#: This is a *privacy invariant*, not a user preference, so it does not live in
+#: ``config.json``'s ``exclude_paths``: the per-machine file may add exclusions, but it must
+#: not be able to remove this one.  It is enforced by :func:`is_private_raw_source`, which
+#: every entry point that can enqueue raw work has to call.
+PRIVATE_RAW_PATH_SEGMENTS = ("privacy", "diary")
+
+
+def is_private_raw_source(path) -> bool:
+    """Whether ``path`` is private raw material that must never be ingested.
+
+    ``raw/privacy/Diary`` holds the operator's own diary and audit text.  The rule used to
+    be an inline ``"privacy" in filepath and "Diary" in filepath`` check inside the raw
+    event handler, and only there -- so the batch scan that the same handler then called
+    walked the whole raw tree and enqueued the very files the handler had just refused to
+    trigger on.  One owner, both entry points.
+
+    Segments are compared rather than substrings, so a directory merely *named* with those
+    letters (``privacy-reports/``, ``Diarystudies/``) is not treated as private and a
+    private path cannot be disguised as ``priv\u200bacy``-adjacent text.
+    """
+    if not path:
+        return False
+    parts = [part.strip().lower() for part in str(path).replace("\\", "/").split("/") if part]
+    for index, part in enumerate(parts):
+        if part == PRIVATE_RAW_PATH_SEGMENTS[0]:
+            if any(later == PRIVATE_RAW_PATH_SEGMENTS[1] for later in parts[index + 1:]):
+                return True
+    return False
+
 
 def load_config() -> dict:
     """Extension config merged over the shipped defaults.

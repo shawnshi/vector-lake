@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from vector_lake import db_store, governance_store, mcp_server, mutation_coordinator
+from vector_lake import db_store, governance_store, mcp_server, mutation_coordinator, tool_ingest
 from vector_lake.ingest_worker import _ingest_finalization_proven, process_jobs
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.tool_ingest import (
@@ -1038,3 +1038,79 @@ def test_finalize_requires_every_lease_credential(isolated_memory, missing_key):
 
     with pytest.raises(ValueError, match=missing_key):
         db_store.validate_ingest_job_finalization(job_id, processed)
+
+
+def test_finalize_ingest_stamps_the_raw_hash_on_the_source_page(isolated_memory, monkeypatch):
+    """The hash the page was compiled from is recorded by finalize, not by the model.
+
+    Nothing else records it: the page carries ``sources: [raw/…]`` and a date, so the
+    published-source reconciliation can only *infer* whether the raw file changed since.  With the
+    stamp that question becomes a comparison -- and a model-authored hash would be one more thing
+    to verify, which is why the stamp is applied on the write path.
+    """
+    db_store.init_db()
+    # The write path validates against the purpose contract read from the memory root.
+    _write_purpose_contract(isolated_memory)
+    monkeypatch.setenv("VECTOR_LAKE_SUBAGENT_RUN_ID", "pytest-stamp")
+    monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
+    monkeypatch.setattr("vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: [])
+    job_id = db_store.enqueue_job(
+        "ingest",
+        {
+            "filepath": "raw/stamp.md",
+            "hash": "stamp-hash-1234",
+            "canonical_name": "Source_Stamp.md",
+            "instructions": "compile this source",
+        },
+    )
+    from vector_lake.native_llm import create_subagent_task
+
+    task_path = create_subagent_task("ingest", "test", "JSON array", {"job_id": job_id})
+    db_store.mark_job_awaiting_subagent(job_id, str(task_path))
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+
+    page = (
+        "---\n"
+        'id: "20260919_stamp"\n'
+        'title: "Source Stamp"\n'
+        "aliases: []\n"
+        'type: "source"\n'
+        'domain: "Medical_IT"\n'
+        'topic_cluster: "General"\n'
+        'status: "Active"\n'
+        'epistemic-status: "seed"\n'
+        "ttl: 365\n"
+        'memory_type: "fact"\n'
+        'memory_key: "ingest_source_stamp"\n'
+        'categories: ["Healthcare_IT"]\n'
+        "tags: []\n"
+        'strategic_scope: "core"\n'
+        'evidence_tier: "primary"\n'
+        'updated: "2026-09-19"\n'
+        'sources: ["raw/stamp.md"]\n'
+        "---\n"
+        "Body.\n"
+    )
+    result = mcp_server.tools.finalize_ingest(
+        [{"filename": "Source_Stamp.md", "content": page}],
+        {
+            "filepath": "raw/stamp.md",
+            "hash": "stamp-hash-1234",
+            "canonical_name": "Source_Stamp.md",
+            "integration": {
+                "disposition": "standalone",
+                "reason": "Standalone capture; no candidate pages to integrate with.",
+            },
+            "job_id": job_id,
+            "lease_owner": claim["lease_owner"],
+            "lease_token": claim["lease_token"],
+            "lease_generation": claim["lease_generation"],
+        },
+    )
+
+    assert result.startswith("Successfully finalized ingestion"), result
+    written = tool_ingest.get_wiki_dir() / "Source_Stamp.md"
+    assert written.exists(), "the canonical Source page was not written"
+    frontmatter, _ = tool_ingest.split_frontmatter(written.read_text(encoding="utf-8"))
+    assert frontmatter.get("source_hash") == "stamp-hash-1234"
+    assert frontmatter.get("sources") == ["raw/stamp.md"]

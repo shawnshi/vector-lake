@@ -10,7 +10,7 @@ status file so health can tell "the runner is down" apart from "the runner never
 and it exits cleanly (taking the child with it) on SIGINT/SIGTERM.
 
 Usage:
-    python scripts/ingest_runner_service.py --limit 1 --interval 180
+    python scripts/ingest_runner_service.py --limit 2 --interval 120
 """
 from __future__ import annotations
 
@@ -38,6 +38,15 @@ def _supervisor_status_path() -> Path:
 SUPERVISOR_STATUS = _supervisor_status_path()
 BACKOFF = [5, 15, 60, 300]
 HEALTHY_RUN_SECONDS = 900  # a run this long resets the restart ladder
+#: How often to refresh ``updated_at`` while a child is running.
+#:
+#: ``runner_supervisor.json`` is this process's health surface, and health decides
+#: staleness from ``updated_at`` (``VECTOR_LAKE_RUNNER_STALE_SECONDS``, default 2 400 s).
+#: The child runner is long-lived -- it loops internally and only exits on failure -- so a
+#: supervisor that wrote only on a transition would report itself stalled 40 minutes into a
+#: perfectly healthy run.  That was survivable while a human started it by hand; the
+#: watchdog now keeps one resident, which makes it the normal path.
+SUPERVISOR_HEARTBEAT_SECONDS = 60
 
 
 def _utc_now() -> str:
@@ -67,12 +76,36 @@ def write_status(**fields) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Resident supervisor for the ingest runner.")
-    parser.add_argument("--limit", type=int, default=1)
-    parser.add_argument("--interval", type=int, default=180)
+    parser.add_argument("--limit", type=int, default=2)
+    parser.add_argument("--interval", type=int, default=120)
     parser.add_argument("--model-cmd", required=True)
     parser.add_argument("--no-shadow", action="store_true", help="Let the runner write real pages.")
     parser.add_argument("--max-restarts", type=int, default=0, help="0 = unlimited.")
     args = parser.parse_args()
+
+    # One supervisor per MEMORY root.  The watchdog starts this script automatically, so a
+    # second instance started by hand would publish a second runner against the same task
+    # queue: leases would stop two consumers fighting over the same packets, but a duplicate
+    # is still wasted work and a confusing status surface.  The loser of the race exits
+    # cleanly (code 0) after recording why, which is also the signal the watchdog reads as
+    # "another supervisor is live; check again shortly".
+    from filelock import FileLock, Timeout
+
+    from vector_lake.wiki_utils import get_meta_dir
+
+    lock_path = get_meta_dir() / "runtime" / ".runner_service.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    instance_lock = FileLock(str(lock_path))
+    try:
+        instance_lock.acquire(timeout=0)
+    except Timeout:
+        # Deliberately no status write: ``runner_supervisor.json`` is the *winner's* record,
+        # and the watchdog reads it to report which supervisor owns the runner.  A loser
+        # that overwrote it with its own pid and status="duplicate" made health show a dead
+        # pid as the owner.  Exiting 0 is the signal the watchdog reads as "another
+        # supervisor is live"; it does not need this file to learn that.
+        print(f"Ingest runner supervisor already running for this MEMORY root ({lock_path}).", flush=True)
+        return 0
 
     child_argv = [
         sys.executable or "python",
@@ -139,7 +172,16 @@ def main() -> int:
         write_status(status="running", child_pid=child.pid, restarts=restarts,
                      last_started_at=_utc_now())
 
-        exit_code = child.wait()
+        exit_code = None
+        while exit_code is None:
+            try:
+                exit_code = child.wait(timeout=SUPERVISOR_HEARTBEAT_SECONDS)
+            except subprocess.TimeoutExpired:
+                if stopping["flag"]:
+                    # The signal handler terminated it; reap it and fall through.
+                    exit_code = child.wait()
+                else:
+                    write_status(status="running", child_pid=child.pid, restarts=restarts)
         elapsed = time.monotonic() - started
         if stopping["flag"]:
             break
@@ -165,4 +207,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The instance lock is a local of ``main`` and stays referenced for as long as the
+    # supervisor runs; the process exit releases it, including on the return paths above.
     raise SystemExit(main())

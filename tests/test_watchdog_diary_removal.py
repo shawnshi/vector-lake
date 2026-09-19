@@ -67,3 +67,44 @@ def test_write_status_still_merges_and_aggregates_the_worst_component(isolated_m
     assert set(data["components"]) == {"watchdog", "outbox"}
     assert data["status"] == "processing"
     assert data["current_action"] == "batch"
+
+
+def test_the_batch_scan_skips_diary_text_too(isolated_memory):
+    """The guard has to hold at the *scan*, not only at the event that triggers it.
+
+    ``RawWatchdogHandler`` refused to trigger on a diary edit, but it triggers a scan of the
+    whole raw tree for any other file -- and that scan had no diary rule, so the three
+    ``raw/privacy/Diary`` files were enqueued for real ingestion by an unrelated raw event.
+    """
+    import json
+
+    from vector_lake import db_store, tool_ingest
+
+    raw = isolated_memory / "raw"
+    (raw / "privacy" / "Diary").mkdir(parents=True, exist_ok=True)
+    (raw / "privacy" / "Diary" / "2026-Q3.md").write_text("# private diary\n", encoding="utf-8")
+    (raw / "news").mkdir(parents=True, exist_ok=True)
+    ordinary = raw / "news" / "briefing.md"
+    ordinary.write_text("# ordinary source\n", encoding="utf-8")
+
+    db_store.init_db()
+    message = tool_ingest.prepare_ingest_batch(batch_size=50)
+    assert "enqueued" in message
+
+    enqueued = [
+        json.loads(row["payload"]).get("filepath")
+        for row in db_store.get_connection().execute("SELECT payload FROM jobs")
+    ]
+    assert str(ordinary) in enqueued
+    assert not any("Diary" in str(path) for path in enqueued), enqueued
+
+
+def test_private_source_predicate_compares_segments():
+    from vector_lake.wiki_utils import is_private_raw_source
+
+    assert is_private_raw_source(r"C:\MEMORY\raw\privacy\Diary\2026-Q3.md") is True
+    assert is_private_raw_source("/mnt/memory/raw/privacy/Diary/audit/2026-Q2.md") is True
+    assert is_private_raw_source("raw/privacy/Diary.md") is False
+    assert is_private_raw_source("raw/privacy-reports/2026.md") is False
+    assert is_private_raw_source("raw/Diarystudies/notes.md") is False
+    assert is_private_raw_source("") is False

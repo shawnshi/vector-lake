@@ -41,7 +41,14 @@ def _check_ast(module_path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Error: {e}"
 
-def doctor_vector_lake() -> str:
+def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
+    """Health report for the runtime.
+
+    ``deep_dependency_check`` imports every declared dependency instead of resolving it,
+    which catches a package that is present but whose own imports fail -- at a measured
+    4.2 s, ``google.genai`` being 3.5 s of it.  The default resolves the module on the
+    import path, which answers the same "installed?" question for ~0.5 ms per package.
+    """
     checks = []
     warnings: list[str] = []
 
@@ -57,6 +64,14 @@ def doctor_vector_lake() -> str:
     ))
 
     # 2. Dependencies
+    #
+    # The presence probe is ``find_spec``, which resolves the module on the import path
+    # without executing its body.  Importing each package for real answered the same
+    # "installed?" question at a measured 4.2 s -- ``google.genai`` alone is 3.5 s -- and
+    # that cost landed on every ``doctor``, including the MCP one.  The deep check (does it
+    # actually import, so a broken transitive dependency is caught) is still available and
+    # opt-in, because it is the same information at the same price; ``find_spec`` cannot
+    # see a package whose own imports fail.
     dependencies = {
         "google.genai": "google-genai",
         "filelock": "filelock",
@@ -72,11 +87,19 @@ def doctor_vector_lake() -> str:
         "mistune": "mistune"
     }
     for module_name, package_name in dependencies.items():
+        if deep_dependency_check:
+            try:
+                importlib.import_module(module_name)
+                checks.append((package_name, True, "installed (imported)"))
+            except Exception as exc:  # noqa: BLE001 - report the failure, do not raise it
+                checks.append((package_name, False, f"import failed: {type(exc).__name__}"))
+            continue
         try:
-            importlib.import_module(module_name)
-            checks.append((package_name, True, "installed"))
-        except ImportError:
-            checks.append((package_name, False, "missing"))
+            found = importlib.util.find_spec(module_name) is not None
+        except Exception as exc:  # noqa: BLE001 - a broken parent package is a missing one
+            checks.append((package_name, False, f"unresolvable: {type(exc).__name__}"))
+            continue
+        checks.append((package_name, found, "installed" if found else "missing"))
 
     from vector_lake import tokenizer as _tokenizer
 
@@ -132,17 +155,32 @@ def doctor_vector_lake() -> str:
             f"{plan['entry_count']} entr(ies), {plan['total_bytes'] / 1024 ** 3:.2f} GiB total; "
             f"bound keep<={plan['keep_count']} and <= {plan['max_bytes'] / 1024 ** 3:.1f} GiB"
         )
+        over_bytes_bound = plan["total_bytes"] > plan["max_bytes"]
         if plan["remove"]:
             detail += (
                 f"; {len(plan['remove'])} prunable ({plan['removable_bytes'] / 1024 ** 3:.2f} GiB)"
             )
-            warnings.append(
-                f"backup_footprint_over_bound:{plan['total_bytes'] / 1024 ** 3:.2f}GiB "
-                f"({len(plan['remove'])} entr(ies) prunable by prune_backups)"
-            )
+            # Two different conditions used to share one name: "there is pruning pending
+            # because more than ``keep_count`` entries exist" (normal between scheduled
+            # occurrences, and the reported GiB was under the byte bound) and "the byte budget
+            # is actually exceeded" (retention cannot keep up).  Naming them apart is the
+            # difference between a routine note and a real gate.
+            if over_bytes_bound:
+                warnings.append(
+                    f"backup_bytes_over_bound:{plan['total_bytes'] / 1024 ** 3:.2f}GiB > "
+                    f"{plan['max_bytes'] / 1024 ** 3:.1f}GiB; {len(plan['remove'])} entr(ies) prunable"
+                )
+            else:
+                warnings.append(
+                    f"backup_retention_pending:{len(plan['remove'])} entr(ies) prunable by the next "
+                    f"scheduled prune (total {plan['total_bytes'] / 1024 ** 3:.2f} GiB, "
+                    f"keep<={plan['keep_count']})"
+                )
         if plan["unrecognized"]:
             detail += f"; unrecognized (never pruned): {', '.join(plan['unrecognized'][:3])}"
-        checks.append(("Backups", not plan["remove"], detail))
+        # Only a byte-budget breach is a check failure: a count-only backlog is what retention
+        # removes on its next run, and failing on it made an ordinary state look broken.
+        checks.append(("Backups", not over_bytes_bound, detail))
     except Exception as e:
         checks.append(("Backups", False, f"Check failed: {e}"))
 

@@ -1481,9 +1481,19 @@ def search_memory_packet_views(
 ) -> tuple[list[dict], list[dict]]:
     """Return ``(active, history_inclusive)`` slices for the Memory Packet.
 
-    Irrespective of backend this is two retrievals, but they share the loaded
-    collection (``legacy``) or the projected scan (``index``) instead of
-    decoding the whole ``operational_memory`` table twice per query.
+    Two retrievals, and for the ``legacy`` backend they share the loaded collection so the
+    whole ``operational_memory`` table is not decoded twice.
+
+    For the ``gram`` and ``index`` backends this is two *independent*
+    :func:`search_operational_memory` calls, each with its own projected scan.  The two
+    differ only by the ``validity_state`` predicate and ``top_k``, so a single scan looks
+    like it should serve both -- but the active slice needs the top ``active_top_k`` rows
+    *among the non-hidden ones*, which cannot be derived from an unfiltered window: the
+    live corpus carries 26 540 hidden rows of 147 231 (18 %), so any unfiltered window
+    provably wide enough to contain ``active_top_k`` non-hidden rows is wider than the
+    filtered query it was meant to replace.  This docstring used to claim the projected
+    scan was shared; it is not, and the duplication is only expensive while the n-gram
+    index cannot serve (see :mod:`vector_lake.memory_gram_index`).
     """
     terms = _query_terms(query)
     if _memory_search_backend() == "legacy":
@@ -2149,18 +2159,29 @@ def migrate_existing_wiki(dry_run: bool = False) -> dict:
 
 
 def ensure_canonical_store_populated() -> dict:
+    """Report the canonical-store bootstrap, performing it only when the store is empty.
+
+    The emptiness question used to be answered by decoding every row of ``entities``,
+    ``claims`` and ``sources`` -- 102 117 + 7 924 + 4 107 JSON payloads on the live corpus,
+    3.5 s of a 8.1 s ``trace`` -- because the same call also returned the decoded lengths.
+    ``COUNT(*)`` answers both the question and the lengths with no decode, because each map
+    store is keyed by the table's primary key, so ``len(store["items"])`` is the row count
+    (verified against the live corpus: 7 924 / 102 117 / 4 107).
+    """
     initialize_meta_store()
-    entities = load_entities()["items"]
-    claims = load_claims()["items"]
-    sources = load_sources()["items"]
+    conn = get_connection()
+    counts = {}
+    for table in ("entities", "claims", "sources"):
+        _validate_table_name(table)
+        counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
     wiki_pages = _count_wiki_pages()
 
-    if claims or entities or sources or wiki_pages == 0:
+    if counts["claims"] or counts["entities"] or counts["sources"] or wiki_pages == 0:
         return {
             "bootstrapped": False,
-            "entities": len(entities),
-            "claims": len(claims),
-            "sources": len(sources),
+            "entities": counts["entities"],
+            "claims": counts["claims"],
+            "sources": counts["sources"],
             "pages_scanned": wiki_pages,
         }
 

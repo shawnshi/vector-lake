@@ -16,6 +16,7 @@ import re
 import threading
 import time
 import uuid
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,8 @@ from filelock import FileLock, Timeout
 
 from vector_lake import db_store
 from vector_lake.wiki_utils import get_meta_dir
+
+log = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL = "gemini-embedding-2"
@@ -287,6 +290,77 @@ class EmbeddingBudgetExceeded(RuntimeError):
     """
 
 
+EMBEDDING_TRANSPORT_ENV = "VECTOR_LAKE_EMBEDDING_TRANSPORT"
+REST_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
+
+
+def embedding_transport() -> str:
+    """``"rest"`` (default) or ``"sdk"``.
+
+    The SDK path costs ``import google.genai`` (3.5 s) plus ``genai.Client()`` (1.3 s) in every
+    fresh process -- measured, and 80 % of what looked like "embedding latency" on the first
+    query of a server or the whole of a CLI search.  The REST call is the same endpoint the SDK
+    posts to, so the default avoids that import entirely and the SDK stays available as the
+    proven fallback (``VECTOR_LAKE_EMBEDDING_TRANSPORT=sdk``, or an unexpected REST failure).
+    """
+    value = str(os.environ.get(EMBEDDING_TRANSPORT_ENV, "rest") or "rest").strip().lower()
+    return value if value in {"rest", "sdk"} else "rest"
+
+
+def _rest_embed_contents(contents: list[str], config) -> list[list[float]]:
+    """One ``batchEmbedContents`` POST, with the SDK's error semantics.
+
+    Raises on any non-200 so the caller's retry/budget loop behaves exactly as it did with the
+    SDK: the loop classifies a quota error from the message text, and a 429 body carries it.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    api_key = str(os.environ.get("GEMINI_API_KEY") or "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    timeout_ms = _env_int("VECTOR_LAKE_EMBEDDING_TIMEOUT_MS", 30_000)
+    payload = _json.dumps(
+        {
+            "requests": [
+                {"model": f"models/{config.model}", "content": {"parts": [{"text": str(text)}]}}
+                for text in contents
+            ]
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        REST_ENDPOINT.format(model=config.model),
+        data=payload,
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(1.0, timeout_ms / 1000.0)) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:  # noqa: BLE001 - the status is the useful part
+            pass
+        raise RuntimeError(f"HTTP {exc.code} from the embedding endpoint: {detail}") from exc
+    payload_json = _json.loads(body.decode("utf-8"))
+    embeddings = payload_json.get("embeddings") or []
+    values_list = [list(item.get("values") or []) for item in embeddings]
+    if len(values_list) != len(contents):
+        raise EmbeddingResponseError(
+            f"Embedding response count mismatch: expected {len(contents)}, got {len(values_list)}"
+        )
+    for index, values in enumerate(values_list):
+        if len(values) != config.dimension:
+            raise EmbeddingResponseError(
+                f"Embedding dimension mismatch at position {index}: "
+                f"expected {config.dimension}, got {len(values)}"
+            )
+    return values_list
+
+
 def _provider_contents(contents: list[str]) -> list[Any]:
     from google.genai import types
 
@@ -339,6 +413,57 @@ def reset_client_cache() -> None:
         _CLIENT_CACHE = None
 
 
+def prewarm_client() -> bool:
+    """Build the embedding client before the first request needs it.
+
+    ``import google.genai`` costs 3.5 s and ``genai.Client()`` a further 1.3 s on the
+    operator machine -- both are paid inside the first embedding-needing call, which put
+    4.8 s in front of the first search of every fresh process (a fresh ``search`` at 5.02 s
+    against 0.76 s for the next one in the same server).  Neither step performs network I/O
+    (auth is lazy), so a long-lived server can pay for them while it is still starting.
+
+    Best effort by construction: a server that cannot build the client must still serve
+    lexical search, so every failure is swallowed and reported as ``False``.  Returns
+    ``True`` when a client is cached.  Callers run this off the request path; see
+    :func:`start_prewarm_thread`.
+    """
+    if not os.environ.get("GEMINI_API_KEY"):
+        return False
+    if embedding_transport() != "sdk":
+        # The REST transport never builds a client, so paying 4.8 s to warm one would be pure
+        # cost -- the opposite of what this function is for.
+        return False
+    try:
+        _shared_client()
+        return True
+    except Exception as exc:  # noqa: BLE001 - prewarming must never fail a server start
+        log.warning("Embedding client prewarm failed (%s: %s).", type(exc).__name__, exc)
+        return False
+
+
+def start_prewarm_thread() -> threading.Thread | None:
+    """Pre-warm the client on a daemon thread, unless disabled or unnecessary.
+
+    ``VECTOR_LAKE_EMBEDDING_PREWARM=off`` (or ``0``) disables it -- a host that starts many
+    short-lived processes should not pay a background import it may never use.
+
+    Returns the thread, or ``None`` when nothing was started.
+    """
+    if str(os.environ.get("VECTOR_LAKE_EMBEDDING_PREWARM", "")).strip().lower() in {"off", "0", "false"}:
+        return None
+    if not os.environ.get("GEMINI_API_KEY"):
+        return None
+    if embedding_transport() != "sdk":
+        # Nothing to warm: the REST transport never constructs a client, so a thread that only
+        # calls :func:`prewarm_client` would return False without doing anything.
+        return None
+    thread = threading.Thread(
+        target=prewarm_client, name="embedding-client-prewarm", daemon=True
+    )
+    thread.start()
+    return thread
+
+
 def _validated_response_values(response: Any, expected_count: int, dimension: int) -> list[list[float]]:
     embeddings = list(getattr(response, "embeddings", []) or [])
     if len(embeddings) != expected_count:
@@ -376,10 +501,14 @@ def _request_embeddings(
     """
     last_error: Exception | None = None
     deadline = None if budget_seconds is None else time.monotonic() + float(budget_seconds)
-    provider_contents = _provider_contents(contents)
+    transport = embedding_transport()
+    # Built lazily: this import is the 3.5 s the REST transport exists to avoid.
+    provider_contents = _provider_contents(contents) if transport == "sdk" else []
     for attempt in range(config.max_retries + 1):
         try:
             limiter.reserve(request_tokens, deadline=deadline, durable=durable_reservation)
+            if transport == "rest":
+                return _rest_embed_contents(contents, config)
             response = client.models.embed_content(model=config.model, contents=provider_contents)
             return _validated_response_values(response, len(contents), config.dimension)
         except EmbeddingBudgetExceeded:
@@ -422,7 +551,7 @@ def embed_texts(
     normalized = [str(text)[:config.max_chars_per_item] for text in texts]
     tokens = sum(estimate_embedding_tokens(text) for text in normalized)
     return _request_embeddings(
-        _shared_client(),
+        _shared_client() if embedding_transport() == "sdk" else None,
         normalized,
         tokens,
         config,
@@ -483,7 +612,11 @@ def embedding_backfill(
     last_error = ""
     consecutive_failures = 0
     try:
-        client = _shared_client()
+        # Only the SDK transport needs a client.  Building one unconditionally imported
+        # ``google.genai`` (and raised ImportError on a host without it) even though
+        # ``_request_embeddings`` would ignore the client and post over REST -- the cost the
+        # REST transport exists to remove, on the one path that embeds in bulk.
+        client = _shared_client() if embedding_transport() == "sdk" else None
         limiter = MinuteRateLimiter(config)
         for batch in batches:
             contents = [item["text"] for item in batch]

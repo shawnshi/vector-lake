@@ -200,6 +200,56 @@ def test_index_report_is_operator_readable(seeded, monkeypatch):
     assert "backend=gram" in report
 
 
+def test_index_report_leads_with_the_serving_verdict(seeded, monkeypatch):
+    """``ready`` describes the base, ``usable`` describes what a search gets.
+
+    The report used to open with ``ready=True``, which reads as healthy on a lake where
+    every memory retrieval was falling back to the exact scan, so the verdict has to come
+    first and an unusable index has to name the cost and the remedy.
+    """
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_SEARCH", "gram")
+    assert memory_gram_index.gram_index_usable()
+
+    usable_report = memory_gram_index.memory_gram_index_report()
+    assert usable_report.startswith("memory gram index: usable=True")
+    assert usable_report.index("usable=True") < usable_report.index("ready=")
+
+    conn = db_store.get_connection()
+    for index in range(memory_gram_index.AUTO_REBUILD_MAX_DOCS + 1):
+        _put(conn, f"dirty_{index}", f"dirty payload {index}")
+    assert not memory_gram_index.gram_index_usable()
+
+    stale_report = memory_gram_index.memory_gram_index_report()
+    assert stale_report.startswith("memory gram index: usable=False")
+    assert "falling back to the exact projected scan" in stale_report
+    assert "gram-index --if-due --apply" in stale_report
+    assert stale_report.index("usable=False") < stale_report.index("ready=")
+
+
+def test_index_report_names_a_window_where_nothing_is_scheduled(seeded, monkeypatch):
+    """Below the rebuild threshold the index is unusable and no rebuild is due.
+
+    That range used to be indistinguishable in the report from "a rebuild is coming",
+    which is how a silently degraded read path stays silently degraded.
+    """
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_SEARCH", "legacy")
+    report = memory_gram_index.memory_gram_index_report()
+    assert "usable=True" in report
+
+    monkeypatch.setenv("VECTOR_LAKE_MEMORY_SEARCH", "gram")
+    conn = db_store.get_connection()
+    _put(conn, "one_write", "a single recorded fact")
+    assert memory_gram_index.writes_since_rebuild(conn) == 1
+    assert memory_gram_index.writes_since_rebuild(conn) < memory_gram_index.REBUILD_AFTER_WRITES
+    assert not memory_gram_index.rebuild_due(conn)
+    assert not memory_gram_index.gram_index_usable()
+
+    report = memory_gram_index.memory_gram_index_report()
+    assert "not due" not in report
+    assert "before a rebuild is due" in report
+    assert f"{memory_gram_index.REBUILD_AFTER_WRITES} needed" in report
+
+
 def test_doctor_reports_a_usable_gram_index(seeded):
     report = tool_doctor.doctor_vector_lake()
 

@@ -1,8 +1,11 @@
-import os
 import json
+import os
 import hashlib
 import logging
 import re
+import time
+
+import yaml
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
@@ -13,13 +16,16 @@ from vector_lake import governance_store
 from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
     flush_durable,
+    split_frontmatter,
     get_raw_dir,
     get_wiki_dir,
     get_index_path,
+    is_private_raw_source,
     load_config,
     read_frontmatter_only,
     validate_wiki_filename,
 )
+from vector_lake.schema_validator import VALID_PREDICATES
 from vector_lake.purpose_contract import (
     PurposeContractError,
     build_synthesis_proposals,
@@ -104,6 +110,214 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
     return json.dumps(tasks, ensure_ascii=False, indent=2)
 
 
+#: Failure reasons that a later attempt can fix, so they must not spend the attempt budget.
+#:
+#: Matched on the message the finalize gates produce, deliberately narrow: a conflict means the
+#: page moved under the model and the next attempt reads the new version, whereas a schema or
+#: naming rejection will reject the same payload every time.
+TRANSIENT_FAILURE_MARKERS = (
+    "canonical version conflict",
+    "version conflict",
+    "is no longer finalizable",
+)
+
+
+def is_transient_failure(reason: str) -> bool:
+    """Whether ``reason`` describes something a retry can resolve."""
+    lowered = str(reason or "").lower()
+    return any(marker in lowered for marker in TRANSIENT_FAILURE_MARKERS)
+
+
+def record_ingest_failure(job_id: str, reason: str) -> str:
+    """Consume one attempt of a job's bounded budget; report whether it is now terminal.
+
+    The runner's failure branches used to increment only a local counter.  The job stayed in
+    ``subagent_processing`` holding a one-hour lease, ``claim_ingest_tasks`` re-claims the
+    oldest job first, and the same deterministically-rejecting task was therefore re-attempted
+    every hour forever -- one model call each time, with no attempt cap and nothing visible in
+    the queue.  The contract in ``scripts/ingest_runner.py`` already promised "C3 bounded
+    attempts; never re-claim a job to try once more"; this is what makes that true.
+
+    A transient failure (:func:`is_transient_failure`) is released for retry without consuming
+    the budget, because terminalizing it would abandon a source a later attempt would ingest.
+    """
+    from vector_lake.db_store import (
+        MAX_INGEST_ATTEMPTS,
+        get_connection,
+        release_job_for_retry,
+        update_job_status,
+    )
+
+    reason = str(reason or "unspecified failure")[:500]
+    row = get_connection().execute(
+        "SELECT retries FROM jobs WHERE job_id = ?", (str(job_id),)
+    ).fetchone()
+    if row is None:
+        return f"job {job_id} is not in the jobs table; nothing recorded"
+    if is_transient_failure(reason):
+        release_job_for_retry(str(job_id), reason)
+        return f"job {job_id} released for retry (transient: {reason[:80]}); attempt budget untouched"
+    attempt = int(row["retries"] or 0) + 1
+    update_job_status(str(job_id), "failed", reason)
+    if attempt < MAX_INGEST_ATTEMPTS:
+        return f"job {job_id} failed attempt {attempt}/{MAX_INGEST_ATTEMPTS}: will be re-dispatched"
+
+    # Terminal: remember the *content* so the scan stops re-dispatching it.  Without this the
+    # source cycles forever -- each new job gets a fresh attempt budget, so "bounded attempts"
+    # only bounds one job, not the source (measured: ``DHWB-20260913.md``, six days of a
+    # deterministic ``categories`` rejection at three model calls per round).
+    payload = get_connection().execute(
+        "SELECT payload FROM jobs WHERE job_id = ?", (str(job_id),)
+    ).fetchone()
+    abandoned = 0
+    if payload:
+        try:
+            fields = json.loads(payload["payload"] or "{}")
+        except (TypeError, ValueError):
+            fields = {}
+        filepath = str(fields.get("filepath") or "")
+        file_hash = str(fields.get("hash") or "")
+        if filepath and file_hash:
+            from vector_lake.db_store import record_abandoned_source
+
+            abandoned = record_abandoned_source(filepath, file_hash, reason)
+    suffix = (
+        f"; source abandoned after {abandoned} terminal job(s) on this content "
+        "(clear with `cli.py ingest-tasks --clear-abandoned`)"
+        if abandoned
+        else ""
+    )
+    return (
+        f"job {job_id} failed attempt {attempt}/{MAX_INGEST_ATTEMPTS}: attempt budget "
+        f"spent, no further dispatch ({reason}){suffix}"
+    )
+
+
+def reconcile_ingest_in_flight(grace_seconds: float = 120.0) -> dict:
+    """Release in-flight markers whose source has no dispatchable job behind it.
+
+    The ledger exists to stop two scans scheduling the same source twice, so a marker is only
+    meaningful while a job is actually queued, leased or awaiting a subagent.  A marker left
+    without one makes the source invisible: ``prepare_ingest_batch`` skips it, so it never gets
+    enqueued, and the marker is refreshed on every later scan that sees it expire.
+
+    Measured on the live corpus 2026-09-19 07:41: 24 sources marked in one batch while only 2
+    jobs were created, three of them with no job row at all and no key match either.  The
+    producer of that particular batch was not identified, which is exactly why this is written
+    as a reconciliation rather than a fix to one caller: any path that leaves a marker behind
+    becomes a transient state instead of a stuck one.
+
+    ``grace_seconds`` keeps a marker that a scan is legitimately holding right now (the batch
+    is marked before it is enqueued) from being reaped out from under it.
+    """
+    import time
+
+    from vector_lake.db_store import get_connection
+
+    ledger = _load_ingest_in_flight()
+    if not ledger:
+        return {"checked": 0, "released": []}
+
+    conn = get_connection()
+    # Statuses from which the pipeline will still act on the job.  ``failed`` only counts while
+    # its attempt budget is unspent: at the cap ``claim_pending_jobs`` refuses to dispatch it, so
+    # a marker pointing at such a job is exactly the orphan this function exists to release.
+    # Getting that wrong is not theoretical -- measured on 2026-09-19, 7 of the 11 terminal
+    # failures held in-flight markers, and treating them as active kept every one of those sources
+    # invisible to the scan that would have re-enqueued them.
+    from vector_lake.db_store import MAX_INGEST_ATTEMPTS
+
+    dispatchable = ("queued", "dispatched", "awaiting_subagent", "subagent_processing", "completed")
+    placeholders = ", ".join("?" for _ in dispatchable)
+    active: set[str] = set()
+    rows = conn.execute(
+        f"SELECT payload FROM jobs WHERE status IN ({placeholders}) "
+        f"OR (status = 'failed' AND retries < ?)",
+        (*dispatchable, MAX_INGEST_ATTEMPTS),
+    )
+    for (payload,) in rows:
+        try:
+            filepath = json.loads(payload or "{}").get("filepath")
+        except (TypeError, ValueError):
+            continue
+        if filepath:
+            active.add(_ingest_ref(filepath))
+
+    now = time.time()
+    released = [
+        ref
+        for ref, entry in ledger.items()
+        if now - float(entry.get("since", 0) or 0) >= grace_seconds and ref not in active
+    ]
+    for ref in released:
+        _clear_ingest_in_flight(ref)
+    return {"checked": len(ledger), "released": released}
+
+
+def list_terminal_failed_ingest_jobs() -> str:
+    """Jobs that spent their attempt budget, with the source each names."""
+    from vector_lake.db_store import list_terminal_failed_jobs
+
+    jobs = list_terminal_failed_jobs()
+    if not jobs:
+        return "No terminal-failed ingest jobs."
+    lines = [f"{len(jobs)} terminal-failed ingest job(s):"]
+    for job in jobs:
+        name = os.path.basename(job["filepath"]) or "(no filepath)"
+        lines.append(
+            f"- {job['job_id']} retries={job['retries']} at {job['updated_at'][:19]} "
+            f"{name}: {job['error_msg'][:150]}"
+        )
+    lines.append(
+        "Close those whose source is now ingested with `cli.py ingest-tasks --close-terminal-failed`."
+    )
+    return "\n".join(lines)
+
+
+def close_terminal_failed_ingest_jobs(source_ingested_only: bool = True) -> str:
+    """Mark terminal-failed jobs superseded once their source is ingested."""
+    from vector_lake.db_store import close_terminal_failed_jobs
+
+    result = close_terminal_failed_jobs(source_ingested_only=source_ingested_only)
+    kept = len(result["kept"])
+    message = f"Closed {len(result['closed'])} terminal-failed job(s) as superseded."
+    if kept:
+        message += (
+            f" Kept {kept} whose source has no processed_files row: those are still unfinished, "
+            "and the abandonment rule decides their fate."
+        )
+    return message
+
+
+def list_abandoned_ingest_sources() -> str:
+    """Sources withheld from dispatch after repeated deterministic failures."""
+    from vector_lake.db_store import list_abandoned_sources
+
+    rows = list_abandoned_sources()
+    if not rows:
+        return "No abandoned ingest sources."
+    lines = [f"{len(rows)} abandoned ingest source(s):"]
+    for row in rows:
+        lines.append(
+            f"- {row['filepath']} (terminal_jobs={row['terminal_jobs']}, "
+            f"since {str(row['abandoned_at'])[:19]}): {str(row['reason'])[:160]}"
+        )
+    lines.append("Re-dispatch with `cli.py ingest-tasks --clear-abandoned [FILE]`, or fix the source.")
+    return "\n".join(lines)
+
+
+def clear_abandoned_ingest_sources(filepath: str | None = None) -> str:
+    """Allow abandoned source(s) to be dispatched again."""
+    from vector_lake.db_store import clear_abandoned_sources
+
+    cleared = clear_abandoned_sources(filepath)
+    scope = f"'{filepath}'" if filepath else "all sources"
+    return (
+        f"Cleared {cleared} abandoned ingest source record(s) for {scope}. "
+        "They are eligible for dispatch on the next scan."
+    )
+
+
 def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     """Mark stale awaiting-subagent ingest jobs as failed so they can be retried explicitly."""
     from vector_lake.db_store import expire_stale_subagent_jobs
@@ -135,6 +349,39 @@ def _name_key(value: str) -> str:
 def _raw_key(raw_path: str) -> str:
     """Comparison key for a raw source: its stem, alphanumerics only."""
     return _name_key(Path(str(raw_path)).stem)
+
+
+def _declared_raw_sources() -> dict[str, dict]:
+    """``{stem_key: {"page", "created", "source_hash"}}`` for every declared raw source.
+
+    Same scan as :func:`_declared_raw_keys`, carrying the three facts the reconciliation below
+    needs: which page declares the source, when that page was written, and -- for pages written
+    since :func:`_stamp_source_hash` exists -- the raw content hash the page was compiled from.
+    """
+    wiki_dir = get_wiki_dir()
+    if not wiki_dir.exists():
+        return {}
+    declared: dict[str, dict] = {}
+    for entry in os.scandir(wiki_dir):
+        if not entry.is_file() or not entry.name.endswith(".md"):
+            continue
+        try:
+            frontmatter = read_frontmatter_only(entry.path)
+        except Exception:
+            continue
+        record = {
+            "page": entry.name,
+            "created": str(frontmatter.get("created") or ""),
+            "source_hash": str(frontmatter.get("source_hash") or ""),
+        }
+        for source in frontmatter.get("sources") or []:
+            text = str(source).replace("\\", "/")
+            if "raw/" not in text:
+                continue
+            key = _raw_key(text)
+            if key:
+                declared.setdefault(key, record)
+    return declared
 
 
 def _declared_raw_keys() -> set:
@@ -217,7 +464,11 @@ def raw_publication_index() -> dict:
     verdicts drifted (a name-only predicate called 88 raw files un-ingested where the
     union calls 73, and would have re-ingested 15 that were already published).
     """
-    return {"name_keys": _published_source_keys(), "declared_keys": _declared_raw_keys()}
+    return {
+        "name_keys": _published_source_keys(),
+        "declared_keys": _declared_raw_keys(),
+        "declared_pages": _declared_raw_sources(),
+    }
 
 
 def raw_is_published(filepath: str, index: dict | None = None) -> bool:
@@ -225,6 +476,80 @@ def raw_is_published(filepath: str, index: dict | None = None) -> bool:
     if index is None:
         index = raw_publication_index()
     return _already_published(filepath, index["name_keys"], index["declared_keys"])
+
+
+def _stamp_source_hash(content: str, raw_hash: str) -> str:
+    """Record the raw content hash in the Source page's frontmatter.
+
+    This is the durable form of "which content was this page compiled from".  Nothing else
+    records it: the page carries ``sources: [raw/…]`` and a creation date, so the reconciliation
+    in :func:`_published_source_verdict` has to *infer* whether the raw file changed since.
+    Stamping the hash at finalize -- where the packet already carries it -- turns that inference
+    into a comparison.
+
+    Best effort by contract: content without frontmatter, or unparsable frontmatter, is returned
+    unchanged rather than made to fail.  The page's own validation is the authority on whether it
+    may be written.
+    """
+    if not raw_hash:
+        return content
+    try:
+        frontmatter, body = split_frontmatter(content)
+    except Exception:  # noqa: BLE001 - a page whose frontmatter will not parse is not ours to fix
+        return content
+    if not frontmatter or frontmatter.get("source_hash") == raw_hash:
+        return content
+    frontmatter["source_hash"] = raw_hash
+    try:
+        rendered = yaml.safe_dump(
+            frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False
+        )
+    except Exception:  # noqa: BLE001 - same
+        return content
+    return "---\n" + rendered + "---\n" + body
+
+
+def _published_source_verdict(filepath: str, index: dict) -> str:
+    """What to do with a source the publication check calls already published.
+
+    ``"record"`` -- a page **declares** this raw path and the file cannot have changed since that
+    page was written, so the missing ``processed_files`` row is written and the source is skipped.
+    ``"stale"`` -- declared, but the raw file is newer than the page, so the page predates the
+    current content and the source must stay pending: re-ingesting is the only way the edit is ever
+    seen.  ``"skip"`` -- only the loose name signal matched (over-eager by design, so it may not
+    retire a source permanently), or the page records no usable date.
+
+    The state this exists for: a source ingested while the pipeline was stalled has a page but no
+    ledger row, and the published branch runs *before* the hash comparison a row would enable.  So
+    without this the ledger is permanently wrong **and** a later edit to that source is silently
+    ignored -- measured on 2026-09-19, one source in exactly that state
+    (``raw/医疗信息化/推动健康中国建设取得决定性进展有关情况.md``).  No raw hash is stored on the
+    page, so the evidence is its ``created`` date against the file's mtime, and the ambiguous
+    direction resolves to re-ingesting rather than retiring.
+    """
+    declared = index.get("declared_pages", {}).get(_raw_key(filepath))
+    if not declared:
+        return "skip"
+
+    # A stamped hash is proof; prefer it over any inference.
+    recorded_hash = str(declared.get("source_hash") or "").strip()
+    if recorded_hash:
+        current_hash = calculate_hash(filepath)
+        if not current_hash:
+            return "skip"
+        return "record" if current_hash == recorded_hash else "stale"
+
+    # Legacy pages carry no hash, so fall back to dates: compared as YYYY-MM-DD strings because
+    # this module rebinds ``datetime`` to the class on the ``from datetime import datetime``
+    # line, which makes ``datetime.date`` a method descriptor here.
+    created_date = str(declared.get("created") or "")[:10]
+    if len(created_date) != 10 or created_date[4] != "-" or created_date[7] != "-":
+        return "skip"
+    try:
+        raw_date = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(filepath)))
+    except OSError:
+        return "skip"
+    return "record" if raw_date <= created_date else "stale"
 
 
 def calculate_hash(filepath: str) -> str:
@@ -618,6 +943,7 @@ def _build_ingest_instructions(filepath: str, file_hash: str, canonical_name: st
         .replace("{{schema_content}}", schema_content)
         .replace("{{index_summary}}", _read_relevant_index_context(filepath))
         .replace("{{purpose_content}}", _read_purpose())
+        .replace("{{valid_predicates}}", ", ".join(sorted(VALID_PREDICATES)))
     )
 
 
@@ -803,6 +1129,10 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 path_str = filepath.replace("\\", "/")
                 if any(exclude in path_str for exclude in exclude_paths):
                     continue
+                # The same privacy decision the raw event handler makes.  Without it this
+                # scan enqueued the diary text that handler refused to trigger on.
+                if is_private_raw_source(path_str):
+                    continue
 
                 if os.path.splitext(file)[1].lower() in supported_exts:
                     files_to_process.append(filepath)
@@ -814,7 +1144,14 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     processed = {row["filepath"]: {"hash": row["file_hash"], "processed_at": row["processed_at"]} for row in cur.fetchall()}
     
     in_flight = _load_ingest_in_flight()
+    from vector_lake.db_store import abandoned_source_keys
+
+    abandoned = abandoned_source_keys()
     pending_files = []
+    skipped_abandoned: list[str] = []
+    reconciled: list[str] = []
+    skipped_name_only: list[str] = []
+    skipped_undated: list[str] = []
     publication_index = None  # built lazily: one frontmatter scan per call, only when needed
 
     for filepath in files_to_process:
@@ -844,16 +1181,81 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 if publication_index is None:
                     publication_index = raw_publication_index()
                 if raw_is_published(filepath, publication_index):
-                    log.info("Skipping raw source already published: %s", filepath)
-                    continue
+                    verdict = _published_source_verdict(filepath, publication_index)
+                    if verdict == "record":
+                        # The page exists, declares this raw path, and the file has not been
+                        # touched since: record the missing ledger row so the accounting is
+                        # accurate and a *future* edit is detected as a changed hash.
+                        mark_file_processed(filepath, calculate_hash(filepath))
+                        reconciled.append(filepath)
+                        continue
+                    if verdict == "skip":
+                        # Two very different reasons share this branch, so they are counted apart:
+                        # a page that *declares* the source but records no usable date, and a
+                        # match on the loose name signal only.  The second is the over-eager
+                        # duplicate-prevention trade from ``_already_published`` -- deliberate,
+                        # but it skips the source on every scan, so it must not be silent
+                        # (independent review, 2026-09-19).
+                        if _raw_key(filepath) not in publication_index.get("declared_pages", {}):
+                            skipped_name_only.append(filepath)
+                        else:
+                            skipped_undated.append(filepath)
+                        log.info("Skipping raw source already published: %s", filepath)
+                        continue
+                    # "stale": the page predates the file's current content.  Fall through and
+                    # treat the source as pending, so the edit is ingested rather than ignored.
+                    log.info(
+                        "Raw source changed since it was published; re-ingesting: %s", filepath
+                    )
                 file_hash = calculate_hash(filepath)
 
             if file_hash:
+                # Keyed on content: a corrected source has a new hash and is dispatchable again
+                # without an operator clearing anything.
+                if (str(filepath), str(file_hash)) in abandoned:
+                    skipped_abandoned.append(filepath)
+                    continue
                 pending_files.append((filepath, file_hash))
         except OSError:
             log.warning("Skipping unreadable raw source: %s", filepath)
 
     if not pending_files:
+        notes: list[str] = []
+        if skipped_name_only:
+            log.info(
+                "Skipped %d source(s) matched only by the loose page-name signal: %s",
+                len(skipped_name_only),
+                ", ".join(sorted(os.path.basename(p) for p in skipped_name_only)[:3]),
+            )
+            notes.append(
+                f"{len(skipped_name_only)} source(s) skipped on the page-name signal alone "
+                "(no page declares them); see `vector_lake.tool_ingest._already_published`."
+            )
+        if skipped_undated:
+            notes.append(
+                f"{len(skipped_undated)} declared source(s) whose page records no usable date."
+            )
+        if reconciled:
+            log.info(
+                "Recorded %d published source(s) that had a page but no processed_files row: %s",
+                len(reconciled), ", ".join(sorted(os.path.basename(p) for p in reconciled)[:3]),
+            )
+            notes.append(
+                f"Recorded {len(reconciled)} already-published source(s) that had no "
+                "processed_files row."
+            )
+        if skipped_abandoned:
+            log.info(
+                "Not dispatching %d abandoned source(s) whose content keeps failing: %s",
+                len(skipped_abandoned), ", ".join(sorted(os.path.basename(p) for p in skipped_abandoned)[:3]),
+            )
+            notes.append(
+                f"{len(skipped_abandoned)} source(s) abandoned after repeated deterministic "
+                "failures (inspect with `cli.py ingest-tasks --abandoned`, re-dispatch with "
+                "`--clear-abandoned`)."
+            )
+        if notes:
+            return "No new files to ingest. " + " ".join(notes)
         return "No new files to ingest. System is fully synced."
 
     pending_files = pending_files[:batch_size]
@@ -862,34 +1264,67 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     from vector_lake.db_store import enqueue_job
     enqueued_count = 0
     last_payload = None
+    # The batch is marked in-flight up front so a concurrent scan cannot schedule the same
+    # source twice.  That leaves a window: if one file's enqueue raises, the loop aborts and
+    # every file marked *after* it keeps a marker with no job behind it, so the source is
+    # skipped for the whole TTL while looking scheduled.  Measured on 2026-09-19: 5 sources in
+    # that state.  Release the markers of everything that never got enqueued.
+    enqueued_paths: set = set()
 
-    for filepath, file_hash in pending_files:
-        try:
-            canonical_name = canonical_source_name(filepath)
-            canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
-            source_hash = governance_store.canonical_page_versions({canonical_key}).get(canonical_key, "")
-            instructions = _build_ingest_instructions(filepath, file_hash, canonical_name)
+    try:
+        for filepath, file_hash in pending_files:
+            try:
+                canonical_name = canonical_source_name(filepath)
+                canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
+                source_hash = governance_store.canonical_page_versions({canonical_key}).get(canonical_key, "")
+                instructions = _build_ingest_instructions(filepath, file_hash, canonical_name)
 
-            payload = {
-                "filepath": str(filepath),
-                "hash": file_hash,
-                "canonical_name": canonical_name,
-                "source_hash": source_hash,
-                "instructions": instructions,
-            }
+                payload = {
+                    "filepath": str(filepath),
+                    "hash": file_hash,
+                    "canonical_name": canonical_name,
+                    "source_hash": source_hash,
+                    "instructions": instructions,
+                }
 
-            enqueue_job("ingest", payload)
-            enqueued_count += 1
-            last_payload = payload
-        except Exception:
-            _clear_ingest_in_flight(filepath)
-            log.exception("Failed to enqueue ingest work for %s", filepath)
-            raise
+                # ``supersede_finished`` is safe here and only here: this point in the scan is
+                # reached after ``raw_is_published`` said the source has no page, so a finished
+                # job for it is a contradiction (page and ledger disagree) rather than work to
+                # preserve.  Without it such a source loops forever: enqueue returns the finished
+                # job's id, the file is marked in-flight, nothing is dispatched, and the next
+                # sweep releases the marker and tries again.
+                enqueue_job("ingest", payload, replace_terminal=True, supersede_finished=True)
+                enqueued_paths.add(_ingest_ref(filepath))
+                enqueued_count += 1
+                last_payload = payload
+            except Exception:
+                _clear_ingest_in_flight(filepath)
+                log.exception("Failed to enqueue ingest work for %s", filepath)
+                raise
+    finally:
+        unenqueued = [
+            _ingest_ref(filepath)
+            for filepath, _ in pending_files
+            if _ingest_ref(filepath) not in enqueued_paths
+        ]
+        for ref in unenqueued:
+            _clear_ingest_in_flight(ref)
 
     if batch_size == 1 and enqueued_count == 1:
         return json.dumps(last_payload)
 
-    return f"Successfully enqueued {enqueued_count} files for ingestion."
+    abandoned_note = (
+        f" {len(skipped_abandoned)} abandoned source(s) were not dispatched."
+        if skipped_abandoned else ""
+    )
+    reconciled_note = (
+        f" Recorded {len(reconciled)} already-published source(s) that had no processed_files row."
+        if reconciled else ""
+    )
+    return (
+        f"Successfully enqueued {enqueued_count} files for ingestion."
+        f"{abandoned_note}{reconciled_note}"
+    )
 
 def finalize_ingest(files_written: list, processed_data: dict) -> str:
     """Finalizes an ingest operation from a subagent using direct data."""
@@ -912,7 +1347,26 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         node_records = validate_ingest_payload(files, contract)
                 
         wiki_dir = get_wiki_dir()
-        
+
+        # Stamp the raw content hash onto the canonical Source page.  Done here rather than by
+        # the model: the value has to be the packet's own hash, and a model-authored hash would
+        # be one more thing to verify.
+        canonical_name = str(processed_data.get("canonical_name") or "")
+        raw_hash = str(processed_data.get("hash") or "")
+        if canonical_name and raw_hash:
+            for item in files:
+                if os.path.basename(str(item.get("filename") or "")) != canonical_name:
+                    continue
+                if "filepath" in item and not item.get("content"):
+                    try:
+                        with open(item["filepath"], "r", encoding="utf-8") as handle:
+                            item["content"] = handle.read()
+                    except OSError:
+                        break
+                if item.get("content"):
+                    item["content"] = _stamp_source_hash(str(item["content"]), raw_hash)
+                break
+
         written_paths = []
         mutations = []
         for item in files:

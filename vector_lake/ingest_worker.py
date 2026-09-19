@@ -4,6 +4,7 @@ import json
 
 from vector_lake.db_store import claim_pending_jobs, get_connection, mark_job_awaiting_subagent, update_job_status
 from vector_lake.native_llm import create_subagent_task
+from vector_lake.schema_validator import VALID_PREDICATES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ingest-worker")
@@ -26,6 +27,14 @@ def _subagent_ingest_prompt(instructions: str) -> str:
         + "Return or persist ONLY a JSON array. Each item must be an object with exactly these keys:\n"
         + "- filename: target wiki filename\n"
         + "- content: complete Markdown content, including YAML frontmatter\n"
+        + "Frontmatter rules the validator enforces (violating one refuses the whole ingest):\n"
+        + "- categories: a YAML list with EXACTLY one element, one of the SCHEMA_CATEGORIES domains"
+        + ' (e.g. categories: ["Healthcare_IT"]); never a bare string, never two elements\n'
+        + "- strategic_scope: exactly `core` or `edge`; aliases: a list; epistemic-status is one of"
+        + " sprouting/evergreen/seed; and id/title/type/domain/topic_cluster/status/ttl/memory_type/"
+        + "memory_key/tags/evidence_tier present\n"
+        + "- every typed link must be [predicate:: [[Target]]] with a predicate from this closed"
+        + f" vocabulary: {', '.join(sorted(VALID_PREDICATES))}\n"
         + "Add processed_data.integration with disposition integrated, standalone, or rejected.\n"
         + "Preserve the task packet source_hash. Integrated relations must use candidate canonical target_hash values; standalone and rejected require an auditable reason.\n"
         + "After producing both payloads, call the Vector Lake finalize_ingest tool or CLI-compatible finalize path with the processed_data object from this task packet.\n"

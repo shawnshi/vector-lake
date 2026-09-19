@@ -143,6 +143,18 @@ def check_placeholder_sources(new_sources, previous_sources=()) -> None:
             )
 
 
+#: The controlled vocabulary for ``[predicate:: [[Target]]]`` links, from ``schema.md``.
+#: Kept backward compatible with the shapes that were already in the corpus.
+VALID_PREDICATES = frozenset({
+    "is-a", "part-of", "evolved-from", "created", "founded", "authored", "architected",
+    "competes-with", "supplies-to", "supplied-by", "blocks", "controls", "manages", "invested-in", "allied-with",
+    "integrates-with", "runs-on", "deployed-at", "complies-with", "certified-by",
+    "validates", "falsifies", "depends-on", "instantiated-by", "mentions", "related_to", "has_part",
+    "属于", "核心构件", "关联", "提及", "引用", "类似",
+    "parent", "belongs_to", "instance_of", "peer", "see_also", "conflicts-with",
+})
+
+
 def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Path = None):
     """
     Validates a Vector Lake Wiki node against the strict constraints of schema.md.
@@ -295,14 +307,12 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     clean_body = re.sub(r'```.*?```', '', body, flags=re.DOTALL)
     clean_body = re.sub(r'`.*?`', '', clean_body)
     
-    # Check for invalid predicates in typed links
-    # Allowed predicates based on schema.md
-    valid_predicates = {
-        "is-a", "part-of", "evolved-from", "created", "founded", "authored", "architected",
-        "competes-with", "supplies-to", "supplied-by", "blocks", "controls", "manages", "invested-in", "allied-with",
-        "integrates-with", "runs-on", "deployed-at", "complies-with", "certified-by",
-        "validates", "falsifies", "depends-on", "instantiated-by", "mentions", "related_to", "has_part", "属于", "核心构件", "关联", "提及", "引用", "类似", "parent", "belongs_to", "instance_of", "peer", "see_also", "conflicts-with"
-    } # Keeping backward compatible but standardized.
+    # Check for invalid predicates in typed links.
+    #
+    # The vocabulary is a module constant so it has one owner and the ingest prompt can state it
+    # instead of the model inventing one: ``Invalid predicate 'derived_from'`` was a live failure
+    # on 2026-09-19, alongside the ``categories`` shape.
+    valid_predicates = VALID_PREDICATES
     
     for match in re.finditer(r"\[([^\[\]]+?)::\s*\[\[(.*?)\]\]\]", clean_body):
         predicate = match.group(1).strip()

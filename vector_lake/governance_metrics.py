@@ -287,17 +287,56 @@ def find_merge_candidates(limit: int = 20) -> list[dict]:
     return candidates[:limit]
 
 
-def compute_debt_metrics(skip_heavy: bool = False) -> dict:
+def _memory_projection_aggregates() -> tuple[int, dict[str, int], dict[str, int]]:
+    """``(total, validity_state counts, memory_type counts)`` from the projection.
+
+    The debt metrics used to answer these from ``load_memory_objects()``, which decodes all
+    147 231 ``operational_memory`` payloads -- 5.2 s of the 12.7 s ``compute_debt_metrics``
+    took, to produce four counters and one histogram.  Every one of those fields is a
+    column of ``operational_memory_index``, which triggers keep in step with ``data_json``;
+    on the live corpus both sides agree exactly (147 231 rows, all six states and all four
+    types).  The aggregate costs ~48 ms instead of 5 200 ms.
+    """
+    from vector_lake.db_store import get_connection
+
+    conn = get_connection()
+    total = conn.execute("SELECT COUNT(*) FROM operational_memory_index").fetchone()[0]
+    states = {
+        str(state): int(count)
+        for state, count in conn.execute(
+            "SELECT validity_state, COUNT(*) FROM operational_memory_index GROUP BY validity_state"
+        )
+    }
+    types = {
+        str(memory_type): int(count)
+        for memory_type, count in conn.execute(
+            "SELECT memory_type, COUNT(*) FROM operational_memory_index GROUP BY memory_type"
+        )
+    }
+    return int(total), states, types
+
+
+def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] | None = None) -> dict:
+    """Corpus-wide governance debt.
+
+    ``merge_candidates`` lets a caller that already computed the candidate list hand it in
+    instead of paying for a second ``find_merge_candidates`` (``debt_vector_lake`` printed
+    the list and this function re-derived its length, so the entity load and the pairwise
+    scoring ran twice per dashboard).  ``None`` keeps the previous behaviour of computing it
+    here at the same ``limit=20``.
+    """
     # ⚡ Bolt: Hoist _utc_now() out of the loop.
     # Measurement: Avoids calling datetime.now(timezone.utc) N times, reducing compute_debt_metrics execution time by ~50% in large datasets.
     now = _utc_now()
     claims = [annotate_claim_validity(claim, now=now) for claim in governance_store.load_claims()["items"].values()]
     sources = governance_store.load_sources()["items"].values()
     queue = governance_store.load_governance_queue()["items"]
-    memory_store = governance_store.load_memory_objects()
-    if not memory_store.get("items") and claims:
-        memory_store = governance_store.rebuild_operational_memory()
-    memory_items = list(memory_store.get("items", {}).values())
+    memory_total, memory_states, memory_types = _memory_projection_aggregates()
+    if not memory_total and claims:
+        # The bootstrap case the decoded path repaired: memory absent while canonical
+        # claims exist.  It rebuilds, so the aggregate has to be re-read afterwards.
+        governance_store.rebuild_operational_memory()
+        memory_total, memory_states, memory_types = _memory_projection_aggregates()
 
     validity_state_counts = {}
     unsupported_claim_count = 0
@@ -329,7 +368,10 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
     source_ids_with_claims = {source_id for claim in claims for source_id in claim.get("source_ids", [])}
     orphan_source_count = len([source for source in sources if source["source_id"] not in source_ids_with_claims])
     pending_items = [item for item in queue if item.get("status") == "pending"]
-    merge_candidates = [] if skip_heavy else find_merge_candidates(limit=20)
+    if skip_heavy:
+        merge_candidates = []
+    elif merge_candidates is None:
+        merge_candidates = find_merge_candidates(limit=20)
 
     return {
         "stale_claim_count": stale_claim_count,
@@ -343,10 +385,10 @@ def compute_debt_metrics(skip_heavy: bool = False) -> dict:
         "orphan_source_count": orphan_source_count,
         "high_centrality_low_confidence_count": high_centrality_low_confidence,
         "pending_governance_item_count": len(pending_items),
-        "operational_memory_count": len(memory_items),
-        "superseded_memory_count": len([item for item in memory_items if item.get("validity_state") == "superseded"]),
-        "conflicted_memory_count": len([item for item in memory_items if item.get("validity_state") == "conflicted"]),
-        "memory_type_counts": memory_store.get("memory_type_counts", {}),
+        "operational_memory_count": memory_total,
+        "superseded_memory_count": memory_states.get("superseded", 0),
+        "conflicted_memory_count": memory_states.get("conflicted", 0),
+        "memory_type_counts": memory_types,
         "validity_state_counts": validity_state_counts,
     }
 

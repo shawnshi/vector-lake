@@ -198,7 +198,19 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
             
         categories = frontmatter.get("categories")
         if not isinstance(categories, list) or len(categories) != 1:
-            raise PurposeContractError(f"{filename}: categories must be a list with exactly one domain.")
+            # The message has to say what arrived, not only what was expected: this is the one
+            # rule a model kept violating, and the recorded reason is all an operator sees.
+            # ``DHWB-20260913.md`` failed six days of rounds on it.
+            if isinstance(categories, list):
+                received = f"a list of {len(categories)} element(s): {categories!r}"
+            elif categories is None:
+                received = "no value"
+            else:
+                received = f"{type(categories).__name__} {categories!r}"
+            raise PurposeContractError(
+                f"{filename}: categories must be a list with exactly one domain. "
+                f"Received {received}."
+            )
             
         records.append({
             "filename": filename,

@@ -51,6 +51,10 @@ Usage Examples:
     ingest_tasks_parser.add_argument("--claim", action="store_true", help="Lease awaiting task packets to this host runtime.")
     ingest_tasks_parser.add_argument("--max-age-seconds", type=int, default=86400, help="Age threshold for --expire-stale.")
     ingest_tasks_parser.add_argument("--lease-seconds", type=int, default=3600, help="Lease duration for --claim.")
+    ingest_tasks_parser.add_argument("--abandoned", action="store_true", help="List sources withheld after repeated deterministic failures.")
+    ingest_tasks_parser.add_argument("--terminal-failed", action="store_true", help="List jobs that spent their attempt budget.")
+    ingest_tasks_parser.add_argument("--close-terminal-failed", action="store_true", help="Mark terminal-failed jobs superseded once their source is ingested.")
+    ingest_tasks_parser.add_argument("--clear-abandoned", nargs="?", const="", default=None, metavar="FILE", help="Allow abandoned source(s) to be dispatched again (all, or one FILE).")
 
     lint_parser = subparsers.add_parser("lint", help="[LINT] Run self-healing audit on the Wiki nodes.")
     lint_parser.add_argument("--auto-fix", action="store_true", help="Automatically fix issues such as decaying notes.")
@@ -166,7 +170,16 @@ def main() -> int:
         if args.command == "sync":
             print(tools.sync_vector_lake())
         elif args.command == "ingest-tasks":
-            if getattr(args, "expire_stale", False):
+            if getattr(args, "close_terminal_failed", False):
+                print(tools.close_terminal_failed_ingest_jobs())
+            elif getattr(args, "terminal_failed", False):
+                print(tools.list_terminal_failed_ingest_jobs())
+            elif getattr(args, "clear_abandoned", None) is not None:
+                target = getattr(args, "clear_abandoned") or None
+                print(tools.clear_abandoned_ingest_sources(target))
+            elif getattr(args, "abandoned", False):
+                print(tools.list_abandoned_ingest_sources())
+            elif getattr(args, "expire_stale", False):
                 print(tools.expire_ingest_tasks(getattr(args, "max_age_seconds", 86400)))
             elif getattr(args, "claim", False):
                 print(tools.claim_ingest_tasks(

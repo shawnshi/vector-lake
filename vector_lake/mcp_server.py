@@ -430,6 +430,30 @@ def claim_ingest_tasks(limit: int = 5, lease_seconds: int = 3600) -> str:
     return tools.claim_ingest_tasks(limit=limit, lease_seconds=lease_seconds)
 
 @mcp.tool()
+def list_terminal_failed_ingest_jobs() -> str:
+    """List ingest jobs that spent their attempt budget, with the source each names."""
+    return tools.list_terminal_failed_ingest_jobs()
+
+
+@mcp.tool()
+def close_terminal_failed_ingest_jobs(source_ingested_only: bool = True) -> str:
+    """Mark terminal-failed jobs superseded once their source has been ingested."""
+    return tools.close_terminal_failed_ingest_jobs(source_ingested_only=source_ingested_only)
+
+
+@mcp.tool()
+def list_abandoned_ingest_sources() -> str:
+    """List raw sources withheld from dispatch after repeated deterministic failures."""
+    return tools.list_abandoned_ingest_sources()
+
+
+@mcp.tool()
+def clear_abandoned_ingest_sources(filepath: str = "") -> str:
+    """Allow abandoned ingest source(s) to be dispatched again (empty filepath = all)."""
+    return tools.clear_abandoned_ingest_sources(filepath or None)
+
+
+@mcp.tool()
 def expire_ingest_tasks(max_age_seconds: int = 86400) -> str:
     """Expire stale awaiting-subagent ingest jobs so they can be retried deliberately."""
     return tools.expire_ingest_tasks(max_age_seconds=max_age_seconds)
@@ -614,4 +638,12 @@ def bulk_reconciliation(payload_file: str, dry_run: bool = True) -> str:
 
 if __name__ == "__main__":
     # stdout carries the JSON-RPC stream; no banner, no version check.
+    #
+    # The embedding SDK costs ~4.8 s of first-use latency (``import google.genai`` 3.5 s plus
+    # ``genai.Client()`` 1.3 s) and this process answers many searches, so it pays that off
+    # the request path while the host completes the handshake.  Best effort: if it does not
+    # finish in time, the first embedding call simply pays the cost as before.
+    from vector_lake.embedding_scheduler import start_prewarm_thread
+
+    start_prewarm_thread()
     mcp.run(show_banner=False)

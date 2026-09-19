@@ -10,6 +10,17 @@ from vector_lake.embedding_scheduler import embedding_backfill, estimate_embeddi
 from vector_lake.mutation_coordinator import execute_mutation_plan
 
 
+@pytest.fixture(autouse=True)
+def _sdk_transport(monkeypatch):
+    """These tests inject a fake client and assert on its call/response semantics.
+
+    They are about the SDK transport's retry and validation behaviour; the REST transport (the
+    default) never touches a client, so pinning the transport here keeps the assertions about the
+    path they were written for instead of silently issuing a real request.
+    """
+    monkeypatch.setenv(embedding_scheduler.EMBEDDING_TRANSPORT_ENV, "sdk")
+
+
 def _purpose(memory_dir):
     (memory_dir / "purpose.md").write_text(
         """---

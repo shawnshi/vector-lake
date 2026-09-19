@@ -38,6 +38,7 @@ from vector_lake.tool_ingest import (  # noqa: E402
     finalize_ingest,
     raw_is_published,
     raw_publication_index,
+    record_ingest_failure,
 )
 
 def _runtime_dir() -> Path:
@@ -115,9 +116,17 @@ def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict) -> dict:
     for task in claimed:
         packet = task.get("task_packet") or {}
         processed = (packet.get("metadata") or {}).get("processed_data")
+        job_id = str(task.get("job_id") or "")
         if packet.get("error") or not processed:
             # C7: leave it to the runtime (it retires unreadable packets at claim time).
+            # The reason still has to reach the status file and the attempt budget: this
+            # branch used to count an error and record nothing, so the failure had no cause
+            # anywhere and the job was re-claimed until its lease expired.
+            reason = str(packet.get("error") or "task packet carries no processed_data")
             batch["errors"] += 1
+            stats["last_error"] = reason
+            if job_id:
+                record_ingest_failure(job_id, f"unusable task packet: {reason}")
             continue
         verdict = classify(processed, publication_index)
         try:
@@ -132,6 +141,8 @@ def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict) -> dict:
                     # blocking gate looked like "no progress" with no recorded reason.
                     batch["errors"] += 1
                     stats["last_error"] = result
+                    if job_id:
+                        record_ingest_failure(job_id, f"rejection could not be finalized: {result}")
             elif shadow or not model_cmd:
                 batch["needs-model"] += 1  # stays leased; nothing written
             else:
@@ -141,6 +152,8 @@ def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict) -> dict:
                     # assign, not setdefault: stats already carries "last_error": "",
                     # so setdefault silently discarded the only diagnostic for the failure.
                     stats["last_error"] = error
+                    if job_id:
+                        record_ingest_failure(job_id, f"model seam: {error}")
                     continue
                 result = finalize_ingest(files, {**processed, "integration": {"disposition": "standalone",
                                                                             "reason": "ingest runner standalone ingest"}})
@@ -149,9 +162,13 @@ def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict) -> dict:
                 else:
                     batch["errors"] += 1
                     stats["last_error"] = result
+                    if job_id:
+                        record_ingest_failure(job_id, f"finalize rejected: {result}")
         except Exception as exc:  # C7: contain per-task failure
             batch["errors"] += 1
             stats["last_error"] = f"{type(exc).__name__}: {exc}"
+            if job_id:
+                record_ingest_failure(job_id, f"{type(exc).__name__}: {exc}")
     return batch
 
 
@@ -216,7 +233,8 @@ def main() -> int:
                 # Resident process: cool down and keep the heartbeat alive instead of
                 # exiting, so a transient outage does not silently end supervision.
                 cooldown = max(60, int(os.environ.get("VECTOR_LAKE_RUNNER_COOLDOWN", "300")))
-                write_status(status="halted", reason=f"consecutive failures; cooling down {cooldown}s", **stats)
+                # ``recovering``: a cooldown that retries is not a terminal state (S4).
+                write_status(status="recovering", reason=f"consecutive failures; cooling down {cooldown}s", **stats)
                 time.sleep(cooldown)
                 stats["consecutive_failures"] = 0
             if batch["claimed"] == 0 and args.once:

@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from vector_lake import get_extension_root
 from vector_lake.watchdog_status import reset_components, write_status
-from vector_lake.wiki_utils import DEFAULT_EXCLUDE_PATHS, load_config
+from vector_lake.wiki_utils import DEFAULT_EXCLUDE_PATHS, is_private_raw_source, load_config
 
 # Config: shipped defaults merged with the optional per-machine ``config.json``.
 # Opening that file at import time used to make a checkout without it
@@ -120,7 +120,10 @@ class RawWatchdogHandler(FileSystemEventHandler):
             return
         filepath = event.src_path
 
-        if "privacy" in filepath and "Diary" in filepath:
+        # One owner for the privacy rule (see wiki_utils.is_private_raw_source): this
+        # handler and the batch scan it calls must agree, or the scan re-enqueues what
+        # this handler refuses to trigger on.
+        if is_private_raw_source(filepath):
             return
             
         filename = os.path.basename(filepath)
@@ -321,8 +324,11 @@ def index_worker_loop():
     while True:
         try:
             if consecutive_failures >= max_failures:
-                write_status("halted", 0, index_queue.qsize(), "Outbox Consumer Halted", "Max consecutive failures reached", component="outbox")
-                log.error("Outbox Consumer Halted. Entering 60s cooldown before retry.")
+                # ``recovering``, not ``halted``: this is a cooldown that retries, and the
+                # aggregate takes the worst component, so the old word pinned the whole
+                # daemon to a fault state for a condition that heals itself.
+                write_status("recovering", 0, index_queue.qsize(), "Outbox consumer cooling down", "Max consecutive failures reached", component="outbox")
+                log.error("Outbox consumer cooling down for 60s before retry.")
                 time.sleep(60)
                 consecutive_failures = 0
                 continue
@@ -402,13 +408,27 @@ def index_worker_loop():
             write_status("error", 0, index_queue.qsize(), "Outbox consumer exception", str(exc), component="outbox")
             time.sleep(min(backoff_base ** consecutive_failures, 60))
         finally:
-            from vector_lake.db_store import close_connection
-            close_connection()
+            # Closing the connection is housekeeping, not a reason to end the loop: this used
+            # to sit after ``except``, so an error while closing escaped and killed the outbox
+            # consumer for the life of the process.
+            try:
+                from vector_lake.db_store import close_connection
+
+                close_connection()
+            except Exception as exc:  # noqa: BLE001 - the loop must survive its own cleanup
+                log.warning("Outbox consumer could not close its connection: %s: %s", type(exc).__name__, exc)
 
 
 # Hours of the day at which the autonomous lint (and the only periodic
 # ``wal_checkpoint(TRUNCATE)``) is due.
 SCHEDULED_LINT_HOURS = (10, 23)
+#: Ticks an occurrence may fail before it is recorded as failed and the cadence moves on.
+#:
+#: A failure used to leave ``last_occurrence`` untouched, so the block retried every 30 s --
+#: and because the whole block holds ``global_task_lock``, a permanently failing lint also
+#: starved the outbox consumer forever.  Three attempts is enough to ride out a transient
+#: cause; after that the next scheduled hour is the retry.
+MAX_OCCURRENCE_ATTEMPTS = 3
 
 
 def scheduled_lint_occurrence(now) -> str:
@@ -447,12 +467,21 @@ def _load_last_scheduled_lint() -> str:
     return str(data.get("last_occurrence") or "") if isinstance(data, dict) else ""
 
 
-def _save_last_scheduled_lint(occurrence: str) -> None:
+def _save_last_scheduled_lint(occurrence: str, outcome: str = "completed", detail: str = "") -> None:
+    """Record an occurrence, completed or given up on.
+
+    ``outcome`` exists because "the occurrence ran" and "the occurrence succeeded" are
+    different facts: a failing lint used to leave the marker alone so it retried every 30 s
+    forever, with no record that anything had been given up on.
+    """
     path = _scheduled_lint_state_path()
     payload = {
         "last_occurrence": occurrence,
+        "outcome": outcome,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
+    if detail:
+        payload["detail"] = detail[:500]
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_name(path.name + ".tmp")
@@ -475,6 +504,8 @@ def scheduled_lint_loop():
         # Operator escape hatch for a deliberate forced re-run.
         last_occurrence = ""
 
+    occurrence_failures = 0
+
     while True:
         try:
             # DB connection opens only inside actual work blocks now
@@ -487,69 +518,128 @@ def scheduled_lint_loop():
 
                 from vector_lake.tool_lint import lint_vector_lake
                 from vector_lake import indexer
+                # The lint gets its own blast radius.  It used to sit bare at the top of the
+                # block, so a lint failure skipped the WAL checkpoint, the gram rebuild and the
+                # backup retention that follow it -- the only periodic maintenance this system
+                # has.  Record the failure and run them anyway.
+                failures: list[str] = []
+                # Only the graph refresh writes, and it takes the database write lock for its
+                # whole body (it opens a write transaction *before* deciding whether anything is
+                # dirty -- measured: it raises ``attempt to write a readonly database``
+                # immediately under ``PRAGMA query_only``).  It therefore stays under the mutex,
+                # which queues the outbox drain behind it instead of letting the drain fail
+                # against the 20 s lock budget.
                 with global_task_lock:
-                    if indexer.refresh_graph_topology_if_dirty():
-                        log.info("Graph topology refreshed during scheduled lint.")
+                    try:
+                        if indexer.refresh_graph_topology_if_dirty():
+                            log.info("Graph topology refreshed during scheduled lint.")
+                    except Exception as exc:  # noqa: BLE001 - maintenance below must still run
+                        failures.append(f"graph refresh: {type(exc).__name__}: {exc}")
+                        log.error("Scheduled graph refresh failed: %s: %s", type(exc).__name__, exc)
+
+                # The lint is read-only: under ``PRAGMA query_only=ON`` it completes a 13.1 s scan
+                # of the live corpus without attempting a single write (the only writers in it are
+                # guarded by ``auto_fix``).  It used to hold the same mutex as the outbox drain,
+                # which serialised a ~13 s (and growing) read against the mutation path for no
+                # reason at all.
+                try:
                     lint_vector_lake(auto_fix=False)
+                except Exception as exc:  # noqa: BLE001 - maintenance below must still run
+                    failures.append(f"lint: {type(exc).__name__}: {exc}")
+                    log.error("Scheduled auto-lint failed: %s: %s", type(exc).__name__, exc)
+                lint_failure = "; ".join(failures)
 
-                    # Settle the index before the checkpoint below, not after: a rebuild
-                    # is the largest single transaction this process runs, so it is also
-                    # what leaves the most in the WAL for that truncate to reclaim.
-                    # "Due" is a write count rather than a duration -- see
-                    # memory_gram_index.REBUILD_AFTER_WRITES -- so a corpus that has not
-                    # moved is left alone instead of being rebuilt every occurrence.
-                    try:
-                        from vector_lake import memory_gram_index
+                # The gram rebuild deliberately runs *outside* ``global_task_lock``.  It used to
+                # hold the in-process mutex for its whole duration, which blocked the outbox
+                # consumer for ~8-10 minutes and made every scheduled rebuild an outage for the
+                # mutation path (observed twice on 2026-09-18: the drain froze at 1 110 then 610
+                # pending rows and logged lock failures throughout).  It now commits one short
+                # transaction per batch instead of one transaction for the whole build, so the
+                # consumer interleaves; exactness under that interleaving is enforced by the
+                # snapshot fence in
+                # :func:`vector_lake.memory_gram_index.rebuild_memory_gram_index`, which keeps a
+                # change marker for every document whose staged bytes are no longer current.
+                try:
+                    from vector_lake import memory_gram_index
 
-                        if memory_gram_index.rebuild_due():
-                            # The build holds the write lock for minutes, so it has to be
-                            # visible on the status surface while it runs rather than only
-                            # in the log line written after it returns.
-                            write_status("processing", 0, index_queue.qsize(), "Rebuilding memory gram index", "", component="scheduler")
+                    if memory_gram_index.rebuild_due():
+                        # The build is still the largest single piece of work this process runs,
+                        # so it has to be visible on the status surface while it runs rather than
+                        # only in the log line written after it returns.
+                        write_status("processing", 0, index_queue.qsize(), "Rebuilding memory gram index", "", component="scheduler")
+                    log.info(
+                        "Scheduled gram-index maintenance: %s",
+                        memory_gram_index.maybe_rebuild_memory_gram_index(),
+                    )
+                except Exception as e:
+                    log.error(f"Scheduled gram-index rebuild failed: {e}")
+
+                # Truncate WAL to prevent unbounded growth.  It follows the rebuild because the
+                # rebuild defers its own auto-checkpoint (see the bulk-load note in
+                # ``rebuild_memory_gram_index``), so this is the truncate that reclaims it.
+                from vector_lake.db_store import get_connection
+                try:
+                    conn = get_connection()
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
+                except Exception as e:
+                    log.error(f"Failed to truncate WAL: {e}")
+
+                # Backups are written by the repair, projection and ingest paths and nothing ever
+                # removed them, so the tree grows without bound.  Housekeeping belongs here, next
+                # to the other scheduled maintenance; the bound never drops below the newest copy
+                # (see vector_lake.backup_retention).
+                try:
+                    from vector_lake.backup_retention import prune_backups
+                    from vector_lake.wiki_utils import get_meta_dir
+
+                    retention = prune_backups(get_meta_dir() / "backups", dry_run=False)
+                    if retention["deleted"]:
                         log.info(
-                            "Scheduled gram-index maintenance: %s",
-                            memory_gram_index.maybe_rebuild_memory_gram_index(),
+                            "Backup retention removed %s entr(ies), %s bytes; %s kept.",
+                            len(retention["deleted"]),
+                            retention["removable_bytes"],
+                            len(retention["keep"]),
                         )
-                    except Exception as e:
-                        log.error(f"Scheduled gram-index rebuild failed: {e}")
-
-                    # Truncate WAL to prevent unbounded growth
-                    from vector_lake.db_store import get_connection
-                    try:
-                        conn = get_connection()
-                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        log.info("SQLite WAL checkpoint (TRUNCATE) completed successfully.")
-                    except Exception as e:
-                        log.error(f"Failed to truncate WAL: {e}")
-
-                    # Backups are written by the repair, projection and ingest
-                    # paths and nothing ever removed them, so the tree grows
-                    # without bound.  Housekeeping belongs here, next to the other
-                    # scheduled maintenance; the bound never drops below the newest
-                    # copy (see vector_lake.backup_retention).
-                    try:
-                        from vector_lake.backup_retention import prune_backups
-                        from vector_lake.wiki_utils import get_meta_dir
-
-                        retention = prune_backups(get_meta_dir() / "backups", dry_run=False)
-                        if retention["deleted"]:
-                            log.info(
-                                "Backup retention removed %s entr(ies), %s bytes; %s kept.",
-                                len(retention["deleted"]),
-                                retention["removable_bytes"],
-                                len(retention["keep"]),
-                            )
-                        for failure in retention["failures"]:
-                            log.warning(f"Backup retention left {failure}")
-                    except Exception as e:
-                        log.error(f"Backup retention failed: {e}")
+                    for failure in retention["failures"]:
+                        log.warning(f"Backup retention left {failure}")
+                except Exception as e:
+                    log.error(f"Backup retention failed: {e}")
 
                 log.info("Scheduled Autonomous Auto-Lint completed.")
-                # Only a completed occurrence is recorded, so a failure is retried
-                # on the next tick instead of being silently skipped.
-                last_occurrence = due
-                _save_last_scheduled_lint(due)
-                write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "", component="scheduler")
+                # A failing occurrence must not be retried forever: an unbounded retry every
+                # 30 s held ``global_task_lock`` each time, which starved the outbox consumer
+                # behind a permanently failing lint.
+                if lint_failure:
+                    occurrence_failures += 1
+                    if occurrence_failures >= MAX_OCCURRENCE_ATTEMPTS:
+                        log.error(
+                            "Scheduled occurrence %s failed %d time(s); recording it as failed "
+                            "so the cadence waits for the next scheduled hour instead of "
+                            "retrying every tick: %s",
+                            due, occurrence_failures, lint_failure,
+                        )
+                        last_occurrence = due
+                        _save_last_scheduled_lint(
+                            due, outcome="failed", detail=lint_failure
+                        )
+                        occurrence_failures = 0
+                        write_status(
+                            "error", 0, index_queue.qsize(),
+                            f"Scheduled Lint FAILED ({due}); occurrence recorded",
+                            lint_failure, component="scheduler",
+                        )
+                    else:
+                        write_status(
+                            "error", 0, index_queue.qsize(),
+                            f"Scheduled Lint failed ({occurrence_failures}/{MAX_OCCURRENCE_ATTEMPTS})",
+                            lint_failure, component="scheduler",
+                        )
+                else:
+                    occurrence_failures = 0
+                    last_occurrence = due
+                    _save_last_scheduled_lint(due)
+                    write_status("idle", 0, index_queue.qsize(), "Scheduled Lint finished", "", component="scheduler")
 
             time.sleep(30)
 
@@ -565,11 +655,33 @@ def _start_watchdog_locked():
     # forever, and because the aggregate takes the worst status, one stale "error"
     # pins the whole daemon to error.
     reset_components()
-    threading.Thread(target=index_worker_loop, daemon=True).start()
-    threading.Thread(target=scheduled_lint_loop, daemon=True).start()
-    
+    # Every loop is owned by the registry, so a thread that stops running is restartable and
+    # reportable instead of silent.  The main loop below is the supervisor of last resort and
+    # is the one thread that never returns.
+    from vector_lake import thread_supervision
+
+    thread_supervision.start("outbox", index_worker_loop)
+    thread_supervision.start("scheduler", scheduled_lint_loop)
+
+    # The ingest runner is what consumes the task packets this process publishes.  It is a
+    # separate process on purpose (the model call must not happen inside the runtime), but
+    # its *lifecycle* belongs here: without an owner, "start the daemon" leaves packets
+    # piling up in awaiting_subagent with nothing claiming them.  See
+    # vector_lake.runner_supervision for the switches and the boundary this keeps.
+    from vector_lake.runner_supervision import runner_supervisor_loop
+
+    thread_supervision.start("runner-supervisor", runner_supervisor_loop)
+
+    # The recovery sweep: re-enqueue un-ingested sources and retire stale tasks on a timer.
+    # Without it a lost, cancelled or never-enqueued source has no path back into the queue
+    # short of a human call (see vector_lake.periodic_catch_up).
+    from vector_lake.periodic_catch_up import catch_up_loop
+
+    thread_supervision.start("catch-up", catch_up_loop)
+
     from vector_lake.ingest_worker import start_worker
-    threading.Thread(target=start_worker, daemon=True).start()
+
+    thread_supervision.start("ingest-worker", start_worker)
 
     observer = Observer()
 
@@ -600,6 +712,11 @@ def _start_watchdog_locked():
         while True:
             now = time.time()
             if now - last_heartbeat >= 30:
+                # Liveness of every loop, then the heartbeat itself.  This is what makes a
+                # dead thread observable: the aggregate timestamp stays fresh either way, so
+                # the *threads* component is the only place the death can show up.
+                state, message = thread_supervision.describe(thread_supervision.supervise_once())
+                write_status(state, 0, index_queue.qsize(), message, "", component="threads")
                 write_status("idle", 0, index_queue.qsize(), "Watchdog heartbeat", "", component="watchdog")
                 last_heartbeat = now
             time.sleep(1)
@@ -607,6 +724,14 @@ def _start_watchdog_locked():
         log.info("Termination signal received. Shutting down Watchdog...")
         observer.stop()
     finally:
+        # Taking the supervised runner down with the watchdog keeps one owner for the
+        # ingest queue; the supervisor's own atexit hook covers an abrupt exit.
+        from vector_lake.runner_supervision import stop as stop_runner_supervision
+
+        try:
+            stop_runner_supervision()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+            log.warning("Could not stop the ingest runner supervisor: %s: %s", type(exc).__name__, exc)
         try:
             observer.stop()
         except Exception:
