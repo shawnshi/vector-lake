@@ -107,7 +107,14 @@ def _resolve_locked(item_id: str, resolution: str = "skip", change_manifest: dic
 
                     left_content = Path(left_path).read_text(encoding="utf-8")
                     right_content = Path(right_path).read_text(encoding="utf-8")
-                    merged_content = merge_markdown_content(left_content, right_content)
+                    # The consumed page's filename is not derivable from its frontmatter,
+                    # and inbound ``[[ConsumedKey]]`` links depend on it surviving as an
+                    # alias.  Passing it here is what stops a merge from breaking them.
+                    merged_content = merge_markdown_content(
+                        left_content,
+                        right_content,
+                        consumed_page_key=Path(right_path).stem,
+                    )
 
                     def commit_resolution():
                         # One transaction with the canonical mutation: the registry

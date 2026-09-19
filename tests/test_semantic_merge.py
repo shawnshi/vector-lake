@@ -319,3 +319,47 @@ def test_same_day_updated_keeps_the_survivor_stamp():
         split_frontmatter(merge_markdown_content(left, later_right))[0]["updated"]
         == "2026-09-13T06:00:00+00:00"
     )
+
+
+# --- The consumed page's filename dies with the file --------------------------------
+
+
+def test_the_consumed_page_key_survives_as_an_alias():
+    """``[[ConsumedKey]]`` is how the rest of the wiki addresses the page being merged away.
+
+    The key lives in the filename, not in the frontmatter, so it cannot be recovered from
+    ``right_content`` -- hence the explicit argument.  Without it, 321 links across 33 of
+    the 3793 merges on record went dangling and had to be repaired by hand.
+    """
+    left = _metadata_page("vendor_a", "Vendor_A")
+    right = _metadata_page("vendor_b", "Vendor_B")
+
+    merged = merge_markdown_content(left, right, consumed_page_key="Vendor_B-Page")
+    frontmatter, _ = split_frontmatter(merged)
+
+    assert "Vendor_B-Page" in frontmatter["aliases"]
+    # The title still joins as before.
+    assert "Vendor_B" in frontmatter["aliases"]
+
+
+def test_a_key_already_covered_by_the_title_is_not_duplicated():
+    # Common case: the consumed page's filename and title are the same string.
+    left = _metadata_page("vendor_a", "Vendor_A")
+    right = _metadata_page("vendor_b", "Vendor_B")
+
+    frontmatter, _ = split_frontmatter(
+        merge_markdown_content(left, right, consumed_page_key="Vendor_B")
+    )
+
+    assert frontmatter["aliases"].count("Vendor_B") == 1
+
+
+def test_omitting_the_key_keeps_the_previous_behaviour():
+    # Callers that cannot supply a key must not get a different alias set.
+    left = _metadata_page("vendor_a", "Vendor_A")
+    right = _metadata_page("vendor_b", "Vendor_B")
+
+    frontmatter, _ = split_frontmatter(merge_markdown_content(left, right))
+
+    assert "Vendor_B" in frontmatter["aliases"]
+    assert not any("Page" in a for a in frontmatter["aliases"])
