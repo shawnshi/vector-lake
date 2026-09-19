@@ -32,8 +32,17 @@
 - `finalize_ingest` 的 `source_hash` 盖章改为按**声明**定位（"该页在 `sources:` 里声明了这个 raw 文件"，
   与 `_declared_raw_sources` 同一规则），命名偏离记 warn 而不是静默跳过。端到端测试确认：新 ingest 用别的命名
   会被 `_apply_integration_disposition` **直接拒绝**（443 个历史页早于该门），所以盖章的声明回退是纵深防御而非补修。
-- **未修（需单独授权）**：存量 `sources` 表 4,131 条 `canonical_source_page` 中 **2,237** 条指向不存在的页，
-  统一规则能修好其中 **1,011** 条。属有状态数据回填，需在停机或持锁窗口内单独执行。
+- **存量回填已执行（授权后）**：`sources` 表 4,131 条带 `canonical_source_page` 的记录中 **2,237** 条指向不存在的页。
+  按“身份=声明”的严格规则（新值必须是**声明了该 raw 源**的 `Source_*` 页，而非仅凭名字存在）重写 **747** 条：
+  657 条落到统一命名的页、90 条落到旧命名但确实声明了该源的页。应用后页面存在数 1,894→**2,641**，缺失 2,237→**1,490**，
+  747 条逐条回查均仍指向“存在且声明了该源”的页；`doctor` 健康（Backups/Ingest Jobs/Watchdog 均 OK）。
+  - 回滚点：`wiki/.meta/migrations/2026-09-19-source-page-backfill.rollback.jsonl`（4,131 行 / 2.52 MB，
+    sha256 `6435ad4c…`）配 `.restore.py`，同目录另存 `.manifest.json`（含逐条 old→new）。
+  - 在 `db_store.transaction()` 内一次提交，写锁持有 **0.14s**；应用的是**已复核的计划文件**而非当场重算。
+  - **残留 1,490 条未改（不猜）**：3 条歧义（多张 Source 页都声明了同一 raw 源）、884 条同词干页声明的是**别的**源、
+    22 条同词干页没有任何 `sources:`、584 条根本没有同词干的 Source 页。要修得靠内容侧补齐声明或先消歧。
+  - 干跑曾否掉一版规则：直接复用 `_declared_raw_sources`（匹配任何声明了该 raw 的页）会把该字段指向
+    `Concept_*`/`Institution_*` 页——这个字段必须指向 Source 页。
 
 ### 标签与实体命名空间隔离
 
