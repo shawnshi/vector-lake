@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import io
 import json
-import sys
 import urllib.error
 
 import pytest
@@ -125,7 +124,6 @@ def test_a_missing_key_is_an_error_not_a_silent_empty_result(monkeypatch):
 def test_embed_texts_does_not_import_the_sdk_on_the_default_path(monkeypatch):
     """The whole point: the 3.5 s import must not happen for a REST round trip."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    config = _config()
     monkeypatch.setattr(
         embedding_scheduler, "_rest_embed_contents",
         lambda contents, cfg: [[0.1] * cfg.dimension for _ in contents],
@@ -172,3 +170,35 @@ def test_prewarming_is_skipped_on_the_rest_path(monkeypatch):
     assert embedding_scheduler.start_prewarm_thread() is None
 
     monkeypatch.setenv(embedding_scheduler.EMBEDDING_TRANSPORT_ENV, "sdk")
+
+
+def test_the_backfill_never_builds_an_sdk_client_on_the_rest_path(isolated_memory, monkeypatch):
+    """Independent review, finding 1: the *bulk* path built the client unconditionally.
+
+    ``embedding_backfill`` called ``_shared_client()`` no matter the transport, so it paid the
+    4.8 s import and raised ``ImportError`` on a host without ``google-genai`` before
+    ``_request_embeddings`` could post over REST -- the exact cost the REST transport exists to
+    remove, on the path that embeds the most text.
+    """
+    from vector_lake import db_store
+    from vector_lake.embedding_scheduler import embedding_backfill
+
+    db_store.init_db()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        embedding_scheduler, "_create_client",
+        lambda: pytest.fail("an SDK client was built on the REST path"),
+    )
+    monkeypatch.setattr(
+        embedding_scheduler, "_rest_embed_contents",
+        lambda contents, cfg: [[0.4] * cfg.dimension for _ in contents],
+    )
+
+    result = embedding_backfill(
+        {"nodes": {"Concept_A": {"title": "A"}, "Concept_B": {"title": "B"}}},
+        dry_run=False,
+    )
+
+    assert result["embedded"] == 2, result
+    assert result["failed_batches"] == 0
+    assert result.get("last_error", "") == ""

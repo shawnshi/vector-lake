@@ -1,12 +1,14 @@
 import json
 import re
 import sqlite3
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from vector_lake import db_store, governance_store, mcp_server, mutation_coordinator, tool_ingest
+from vector_lake import ingest_worker
 from vector_lake.ingest_worker import _ingest_finalization_proven, process_jobs
 from vector_lake.mutation_coordinator import execute_mutation_plan
 from vector_lake.tool_ingest import (
@@ -1114,3 +1116,28 @@ def test_finalize_ingest_stamps_the_raw_hash_on_the_source_page(isolated_memory,
     frontmatter, _ = tool_ingest.split_frontmatter(written.read_text(encoding="utf-8"))
     assert frontmatter.get("source_hash") == "stamp-hash-1234"
     assert frontmatter.get("sources") == ["raw/stamp.md"]
+
+
+def test_the_dispatch_step_claims_a_short_lease(isolated_memory):
+    """Building a packet is local and fast, so a crash must not hide the job for an hour.
+
+    The worker claimed with ``lease_seconds=3600`` for a step that writes one file and flips a
+    status, so a restart between the claim and the mark left the job ``dispatched`` until the lease
+    expired -- observed 2026-09-19: one job sat that way for 45 minutes and nothing could touch it,
+    because ``claim_pending_jobs`` will not reclaim an unexpired ``dispatched`` row.
+    """
+    db_store.init_db()
+    payload = {
+        "filepath": "raw/lease.md",
+        "hash": "lease-hash",
+        "canonical_name": "Source_Lease.md",
+        "instructions": "compile this source",
+    }
+    db_store.enqueue_job("ingest", payload)
+
+    with patch.object(ingest_worker, "claim_pending_jobs", wraps=db_store.claim_pending_jobs) as spy:
+        ingest_worker.process_jobs()
+
+    assert spy.call_args.kwargs.get("lease_seconds", 3600) <= 300, (
+        "the dispatch step holds a lease far longer than the work it protects"
+    )

@@ -45,7 +45,12 @@ def process_jobs():
     from vector_lake.tool_ingest import requeue_legacy_ingest_jobs
 
     requeue_legacy_ingest_jobs()
-    jobs = claim_pending_jobs(limit=1, lease_seconds=3600)
+    # Short lease: this step only builds a task packet and marks the job awaiting, which is
+    # milliseconds of local work.  It used to claim for an hour, so a restart (or a crash) between
+    # the claim and the mark hid the job for the rest of that hour -- observed 2026-09-19: one job
+    # sat ``dispatched`` for 45 minutes after a daemon restart it could not have been part of.  The
+    # long lease belongs where the slow work is, i.e. the runner's claim on ``awaiting_subagent``.
+    jobs = claim_pending_jobs(limit=1, lease_seconds=120)
     if not jobs:
         return
 
