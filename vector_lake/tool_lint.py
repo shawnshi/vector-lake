@@ -14,6 +14,7 @@ from vector_lake.semantic_merge import merge_markdown_content
 from vector_lake.wiki_utils import (
     VALID_PREFIXES,
     get_wiki_dir,
+    entity_identity_key,
     normalize_entity_name,
     read_markdown_file,
     split_frontmatter,
@@ -203,7 +204,7 @@ def lint_vector_lake(auto_fix: bool = False):
         title = frontmatter.get("title")
         if title:
             declared[str(title).strip()].append(node_key)
-            declared_norm[normalize_entity_name(str(title).strip())].add(node_key)
+            declared_norm[entity_identity_key(str(title).strip())].add(node_key)
 
         aliases = frontmatter.get("aliases", [])
         if isinstance(aliases, str):
@@ -212,7 +213,7 @@ def lint_vector_lake(auto_fix: bool = False):
             for alias in aliases:
                 alias_str = str(alias).strip()
                 declared[alias_str].append(node_key)
-                declared_norm[normalize_entity_name(alias_str)].add(node_key)
+                declared_norm[entity_identity_key(alias_str)].add(node_key)
                 alias_map.setdefault(alias_str, []).append(filename)
 
     # Only now can a declaration be judged: every page has been read, so "how many pages claim
@@ -301,7 +302,7 @@ def lint_vector_lake(auto_fix: bool = False):
                             # otherwise one report says both "claim removed" and "two pages
                             # declare this name", about the same run.
                             if len(alias_map[alias]) == 2:
-                                declared_norm.pop(normalize_entity_name(alias), None)
+                                declared_norm.pop(entity_identity_key(alias), None)
 
     # 4. Broken Links (Stub Creation)
     # Names two or more pages declare, computed *here* rather than before check 3: the alias
@@ -317,8 +318,8 @@ def lint_vector_lake(auto_fix: bool = False):
                 # A contested core name is reported as broken, but saying only that leaves the
                 # operator nothing to act on: the name is not unknown, it is ambiguous.  The
                 # item stays in this bucket so the count means the same thing.
-                contested = core_pages.get(normalize_entity_name(strip_prefix(target)))
-                claimants = sorted(declared_norm.get(normalize_entity_name(target), ()))
+                contested = core_pages.get(entity_identity_key(strip_prefix(target)))
+                claimants = sorted(declared_norm.get(entity_identity_key(target), ()))
                 if contested and len(contested) > 1:
                     detail = (
                         f"target does not exist ({len(contested)} pages share that name: "
@@ -353,7 +354,7 @@ def lint_vector_lake(auto_fix: bool = False):
                         # Keep the core map in step: within one pass, a link written before this
                         # stub must resolve against what is now on disk.
                         unique_cores.setdefault(
-                            normalize_entity_name(strip_prefix(outcome.stem)), outcome.stem
+                            entity_identity_key(strip_prefix(outcome.stem)), outcome.stem
                         )
                         fixes_applied += 1
 

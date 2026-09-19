@@ -43,8 +43,31 @@ def calculate_cosine_similarity(v1: list[float], v2: list[float]) -> float:
     norm2 = math.sqrt(sum(a * a for a in v2))
     return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
 
+def entity_identity_key(name: str) -> str:
+    """The key two entity names are compared by: normalised, then case-folded.
+
+    ``normalize_entity_name`` answers "what filename does this name get", so it must preserve the
+    author's spelling -- 4 269 of the 7 968 live page names carry an acronym (``Concept_WASM``,
+    ``Vendor_OpenAI``, ``Concept_DRG``) and lowercasing it would rename them.  Comparing with it was
+    the defect: ``[[Concept_WASM]]`` did not resolve against a page named ``Concept_wasm``, so the
+    link was reported broken and ``stub_creator`` wrote a second page beside the first -- and on
+    Windows, where the filesystem is case-insensitive, that second write lands on the *same file*,
+    so the outcome is silent loss rather than a visible duplicate.
+
+    Identity is therefore separated from spelling: this is what dicts are keyed by and what lookups
+    go through, and :func:`normalize_entity_name` stays the naming function.  ``casefold`` rather
+    than ``lower`` because the corpus is multilingual (it folds ``ß``/``ẞ`` to ``ss`` and leaves CJK
+    untouched).
+    """
+    return normalize_entity_name(name).casefold()
+
+
 def normalize_entity_name(name: str) -> str:
-    """Normalizes an entity name by replacing spaces and invalid chars with hyphens and collapsing multiples."""
+    """The filename spelling of an entity name; separators collapse to one hyphen.
+
+    This is a *naming* function -- it decides what a page is called, so it keeps the author's case.
+    Use :func:`entity_identity_key` to compare two names.
+    """
     prefix = ""
     for p in VALID_PREFIXES:
         if name.startswith(p):

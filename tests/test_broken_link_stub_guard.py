@@ -10,14 +10,21 @@ merge item and a set of dangling links once the duplicate was noticed.
 
 from vector_lake.node_vocabulary import strip_prefix
 from vector_lake.stub_creator import covering_page
-from vector_lake.wiki_utils import normalize_entity_name
+from vector_lake.wiki_utils import entity_identity_key
 
 
 def _index(existing):
+    """The same shape and the same key function ``existence_index`` builds.
+
+    Hand-built with its own key function, this fixture asserted against a *different* index than
+    production used -- and it is why an earlier ``covering_page`` could return the caller's spelling
+    (``Concept_wasm``) rather than the page that exists (``Concept_WASM``) without any test noticing.
+    """
+    stems = set(existing)
     return (
-        set(existing),
-        {normalize_entity_name(name) for name in existing},
-        {strip_prefix(name): name for name in existing},
+        stems,
+        {entity_identity_key(name): name for name in stems},
+        {entity_identity_key(strip_prefix(name)): name for name in stems},
     )
 
 

@@ -37,7 +37,7 @@ from vector_lake.node_vocabulary import (
     NON_NODE_WIKI_FILES,
     strip_prefix,
 )
-from vector_lake.wiki_utils import normalize_entity_name
+from vector_lake.wiki_utils import entity_identity_key
 
 
 def declaration_map(claims: Mapping[str, Iterable[str]]) -> dict[str, str]:
@@ -59,7 +59,7 @@ def core_name_maps(node_keys: Iterable[str]) -> tuple[dict[str, list[str]], dict
     for node_key in node_keys:
         if node_key.startswith("System_") or f"{node_key}.md" in NON_NODE_WIKI_FILES:
             continue
-        core_pages[normalize_entity_name(strip_prefix(node_key))].append(node_key)
+        core_pages[entity_identity_key(strip_prefix(node_key))].append(node_key)
     return core_pages, {core: pages[0] for core, pages in core_pages.items() if len(pages) == 1}
 
 
@@ -75,7 +75,7 @@ def resolve_link_target(
     resolved = link_map.get(target)
     if resolved:
         return resolved
-    return unique_cores.get(normalize_entity_name(strip_prefix(target)))
+    return unique_cores.get(entity_identity_key(strip_prefix(target)))
 
 
 def build_link_map(

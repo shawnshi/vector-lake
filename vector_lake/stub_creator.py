@@ -66,7 +66,7 @@ from vector_lake.node_vocabulary import (
     type_for_node_id,
 )
 from vector_lake.schema_validator import VALID_H3_SLOTS
-from vector_lake.wiki_utils import normalize_entity_name, read_markdown_file, write_markdown_file
+from vector_lake.wiki_utils import entity_identity_key, read_markdown_file, write_markdown_file
 
 log = logging.getLogger("vector-lake-stub-creator")
 
@@ -119,22 +119,25 @@ def stub_type(target: str) -> str:
     return type_for_node_id(target) or "concept"
 
 
-def existence_index(wiki_dir: str) -> tuple[set[str], set[str], dict[str, str]]:
-    """``(stems, normalized stems, core name -> stem)`` for every page in ``wiki_dir``.
+def existence_index(wiki_dir: str) -> tuple[set[str], dict[str, str], dict[str, str]]:
+    """``(stems, identity key -> stem, core name -> stem)`` for every page in ``wiki_dir``.
 
     Built once per pass and updated in place by :func:`create_stub`, so creating several stubs
-    in one run cannot fork its own output.
+    in one run cannot fork its own output.  The middle map is keyed by the case-folded identity of
+    the *full* page name (prefix included) and carries the page it belongs to, because that is what
+    ``covering_page`` has to return: an earlier version held only a set of keys and returned the
+    caller's spelling instead, which is not a file whenever the link's case differs from the page's.
     """
     stems = {name[:-3] for name in os.listdir(wiki_dir) if name.endswith(".md")}
-    normalized = {normalize_entity_name(stem) for stem in stems}
+    normalized = {entity_identity_key(stem): stem for stem in stems}
     # Normalised, so ``Vendor_Foo_Bar.md`` covers ``[[Foo-Bar]]``: ``_`` and ``-`` are one name
     # everywhere else in the wiki, and comparing cores raw let a stub be written beside the page
     # it duplicated.
-    cores = {normalize_entity_name(strip_prefix(stem)): stem for stem in stems}
+    cores = {entity_identity_key(strip_prefix(stem)): stem for stem in stems}
     return stems, normalized, cores
 
 
-def covering_page(target: str, index: tuple[set[str], set[str], dict[str, str]]) -> str | None:
+def covering_page(target: str, index: tuple[set[str], dict[str, str], dict[str, str]]) -> str | None:
     """The page that already covers ``target``, or ``None`` when nothing does.
 
     A match is either the target itself (exact or normalised) or the page carrying the same
@@ -145,9 +148,11 @@ def covering_page(target: str, index: tuple[set[str], set[str], dict[str, str]])
     if not target:
         return None
     stems, normalized, cores = index
-    if target in normalized or target in stems:
+    if target in stems:
         return target
-    return cores.get(normalize_entity_name(strip_prefix(target)))
+    return normalized.get(entity_identity_key(target)) or cores.get(
+        entity_identity_key(strip_prefix(target))
+    )
 
 
 def _sanitize_core(name: str) -> str:
@@ -289,7 +294,7 @@ def declared_names(wiki_dir: str) -> dict[str, set[str]]:
         claims += [str(alias).strip() for alias in aliases]
         for claim in claims:
             if claim:
-                declared.setdefault(normalize_entity_name(claim), set()).add(key)
+                declared.setdefault(entity_identity_key(claim), set()).add(key)
     return declared
 
 
@@ -319,7 +324,7 @@ def create_stub(
     the live wiki: 31 contested names where no page's core matches, so ``covering_page`` cannot
     refuse for us).
     """
-    if contested and normalize_entity_name(target) in contested:
+    if contested and entity_identity_key(target) in contested:
         log.info(
             "Not creating a stub for '%s': %s pages declare that name already; it is contested, "
             "not missing.",
@@ -362,7 +367,7 @@ def create_stub(
         return StubOutcome(None, "refused")
     stems, normalized, cores = index
     stems.add(stem)
-    normalized.add(normalize_entity_name(stem))
-    cores[normalize_entity_name(strip_prefix(stem))] = stem
+    normalized[entity_identity_key(stem)] = stem
+    cores[entity_identity_key(strip_prefix(stem))] = stem
     log.info("Created stub page: %s.md", stem)
     return StubOutcome(stem, "created")
