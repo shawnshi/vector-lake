@@ -30,6 +30,17 @@ TENSION_H3_SLOT = "### 认知张力与未决争议 (Controversies & Tensions)"
 # merge path has to respect the bound, and a second literal would let the two drift.
 MAX_TAGS = 3
 
+# Source pages that exist only to satisfy the schema for nodes whose real provenance was
+# never assigned.  ``Source_Auto_Fixed`` is the live example; its own body says the
+# connected nodes "require future manual review to assign their true provenance".  Citing
+# one therefore asserts that provenance is *unknown* -- it is a marker, not evidence.
+#
+# The size of the backlog decides the enforcement: a census on 2026-09-19 found 2 267
+# live pages citing it (28.6% of the wiki).  A flat ban would make more than a quarter of
+# the store unwritable and freeze the very pages the anchor was created for, so the rule
+# is about *growth* -- see ``check_placeholder_sources``.
+PLACEHOLDER_SOURCES = frozenset({"source_auto_fixed"})
+
 VALID_CATEGORIES = {
     "Uncategorized",
     "Artificial_Intelligence",
@@ -87,6 +98,50 @@ CONTROLLED_METRICS = {
 }
 
 INLINE_SOURCE_ANCHOR = re.compile(r"\(Source:\s*\[\[Source_[^\]]+\]\](?:[^)]*)\)")
+
+
+def source_key(entry) -> str:
+    """A ``sources`` entry reduced to a comparable key.
+
+    Three shapes have to collapse to one key.  ``sources`` holds both ``raw/...`` paths
+    and ``[[Source_X|display]]`` links; the link is written with and without the ``.md``
+    suffix; and an unquoted ``- [[Source_Auto_Fixed]]`` is valid YAML *flow sequence*
+    syntax, so a hand-written entry arrives here as a nested list rather than a string.
+    A string-only comparison silently misses that last form, which is the one a writer is
+    most likely to produce by hand.
+    """
+    if isinstance(entry, (list, tuple)):
+        return " ".join(source_key(item) for item in entry)
+    text = str(entry).strip()
+    match = re.match(r"^\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]$", text)
+    if match:
+        text = match.group(1).strip()
+    if text.lower().endswith(".md"):
+        text = text[:-3]
+    return text.lower()
+
+
+def check_placeholder_sources(new_sources, previous_sources=()) -> None:
+    """Raise when a placeholder source appears that the page did not already carry.
+
+    Deliberately not a blanket ban.  Every page that already cites a placeholder keeps
+    working, so the gate stops the marker from spreading without freezing the thousands of
+    pages it was invented for, and a repair write that removes it is never blocked.
+
+    ``previous_sources`` is the page's current ``sources`` list, or empty when the page
+    does not exist yet -- which is exactly the case that must be caught.
+    """
+    previous = {source_key(entry) for entry in (previous_sources or [])}
+    for entry in new_sources or []:
+        key = source_key(entry)
+        if key in PLACEHOLDER_SOURCES and key not in previous:
+            raise SchemaViolationException(
+                f"Provenance Violation: '{entry}' is a placeholder for pages whose real "
+                "provenance is unassigned, and this page did not already carry it. Cite "
+                "the actual source, or leave 'sources' empty -- an empty list is honest, "
+                "the placeholder is not."
+            )
+
 
 def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Path = None):
     """

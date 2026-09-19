@@ -6,7 +6,7 @@ from typing import Callable, Iterable
 
 from vector_lake import db_store
 from vector_lake.defense_hook import verify_asset
-from vector_lake.schema_validator import validate_schema
+from vector_lake.schema_validator import check_placeholder_sources, validate_schema
 from vector_lake.wiki_utils import (
     atomic_write_text,
     get_index_path,
@@ -80,6 +80,21 @@ def _signal_outbox_consumer():
         log.warning(f"Could not write outbox wake-up hint: {exc}")
 
 
+def _previous_sources(filepath: Path) -> list:
+    """The ``sources`` the page carries right now, for the growth-only placeholder rule.
+
+    Read from the Markdown projection rather than from canonical state: this runs before
+    the database transaction, and the projection is what the caller is replacing.  A file
+    that cannot be read is left to raise -- returning an empty list here would report
+    "the page had no sources" for a read error and turn a transient I/O fault into a
+    provenance verdict.
+    """
+    if not filepath.exists():
+        return []
+    frontmatter, _ = split_frontmatter(filepath.read_text(encoding="utf-8"))
+    return list(frontmatter.get("sources") or [])
+
+
 def _prepare_mutations(
     mutations: Iterable[dict],
     validation_mode: str = "full",
@@ -113,6 +128,10 @@ def _prepare_mutations(
             if content is None:
                 raise ValueError("Update mutations require full Markdown content.")
             frontmatter, _ = split_frontmatter(content)
+            # Growth-only, and checked before the mode branch so both validation modes
+            # answer to it: `verify_asset` and `validate_schema` are both pure, and
+            # neither can see the page being replaced.
+            check_placeholder_sources(frontmatter.get("sources"), _previous_sources(filepath))
             if validation_mode == "full":
                 verify_asset(content, filename, frontmatter, get_index_path())
             else:
