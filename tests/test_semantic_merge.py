@@ -225,9 +225,43 @@ def test_merge_unions_evidence_metadata_and_keeps_survivor_identity():
     # The consumed page's evidence metadata survives the deletion of its file.
     assert frontmatter["sources"] == ["raw/left.md", "raw/right.md"]
     assert frontmatter["tags"] == ["#left", "#right"]
-    assert frontmatter["categories"] == ["System_Architecture", "Healthcare_IT"]
     assert frontmatter["evidence_tier"] == "commercial-commitment"
 
+    validate_schema(frontmatter, body, "Vendor_A.md")
+
+
+def test_merge_does_not_union_the_single_valued_category():
+    """``categories`` looks additive because it is a list; it is not.
+
+    The purpose contract requires exactly one domain, so unioning two pages' categories
+    produces a page the write gate then refuses.  This test previously asserted the union,
+    which is how the defect shipped: it encoded the wrong contract and nothing ran the
+    merged frontmatter through the gate.
+    """
+    left = _metadata_page("vendor_a", "Vendor_A", categories=["System_Architecture"])
+    right = _metadata_page("vendor_b", "Vendor_B", categories=["Healthcare_IT"])
+
+    frontmatter, body = split_frontmatter(merge_markdown_content(left, right))
+
+    assert frontmatter["categories"] == ["System_Architecture"]
+    assert len(frontmatter["categories"]) == 1
+    validate_schema(frontmatter, body, "Vendor_A.md")
+
+
+def test_a_merge_between_different_domains_stays_writable():
+    """The failure that exposed this: the merge produced two domains and was rejected.
+
+    Both halves matter.  The gate refusing is correct, but a merge that cannot commit
+    leaves the pair permanently unmergeable, so the merge must simply not produce it.
+    """
+    left = _metadata_page("vendor_a", "Vendor_A", categories=["Policy_and_Governance"],
+                          tags="['#a']", sources="[raw/a.md]")
+    right = _metadata_page("vendor_b", "Vendor_B", categories=["System_Architecture"],
+                           tags="['#b']", sources="[raw/b.md]")
+
+    frontmatter, body = split_frontmatter(merge_markdown_content(left, right))
+
+    assert frontmatter["categories"] == ["Policy_and_Governance"]
     validate_schema(frontmatter, body, "Vendor_A.md")
 
 

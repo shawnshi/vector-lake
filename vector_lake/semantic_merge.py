@@ -18,11 +18,14 @@ what this function used to do, apart from aliases -- deleted the consumed page's
 ``sources``, ``tags`` and ``categories`` along with its file, which is silent
 evidence loss in a provenance-first store.  Two rules bound the union:
 
-* additive fields (``aliases``, ``sources``, ``tags``, ``categories``) keep the
-  survivor's order and then append what the consumed page adds;
+* additive fields (``aliases``, ``sources``, ``tags``) keep the survivor's order and
+  then append what the consumed page adds;
 * ``tags`` is capped at ``schema_validator.MAX_TAGS`` with the survivor's tags
   preferred, because the write gate rejects an over-long list anyway; the drop is
-  logged rather than performed silently.
+  logged rather than performed silently;
+* ``categories`` is single-valued despite being stored as a list (the purpose contract
+  requires exactly one domain), so the survivor keeps its own and the union is never
+  attempted -- see ``_ADDITIVE_FIELDS``.
 
 Everything else the consumed page declares and the survivor does not is copied
 across (``evidence_tier``, ``tension_edges``, ...), so a field cannot disappear
@@ -44,7 +47,18 @@ log = logging.getLogger("vector-lake-semantic-merge")
 
 # Values that accumulate across a merge instead of being replaced.  Dropping any of
 # these is the defect described in the module docstring.
-_ADDITIVE_FIELDS = ("aliases", "sources", "tags", "categories")
+#
+# ``categories`` is deliberately **not** here even though the write gate stores it as a
+# list.  ``purpose_contract.validate_ingest_payload`` requires it to be a list with
+# *exactly one* domain, so it is a single-valued field wearing a list: unioning two pages'
+# categories produces a page the gate then refuses.  It looked additive when this list was
+# written and only a merge between two pages with different domains exposed it -- the
+# survivor keeps its own domain, which is also the only answer consistent with the rule.
+_ADDITIVE_FIELDS = ("aliases", "sources", "tags")
+
+# Single-valued fields expressed as lists.  The survivor's value wins outright; the
+# consumed page's value is not merged in and cannot make the union invalid.
+_SINGLE_VALUE_LIST_FIELDS = ("categories",)
 
 # Fields that describe *which entity this page is*.  They are never inherited from
 # the consumed page: `id` and `title` would re-label the survivor as the thing that
@@ -208,7 +222,6 @@ def _union_frontmatter(left_frontmatter: dict, right_frontmatter: dict) -> dict:
         if field == "aliases":
             continue
         additive[field] = _as_list(right_frontmatter.get(field))
-
     for field, right_values in additive.items():
         merged = _as_list(left_frontmatter.get(field))
         for value in right_values:
@@ -238,6 +251,8 @@ def _union_frontmatter(left_frontmatter: dict, right_frontmatter: dict) -> dict:
 
     for field, value in right_frontmatter.items():
         if field in _IDENTITY_FIELDS or field in _ADDITIVE_FIELDS or field == "updated":
+            continue
+        if field in _SINGLE_VALUE_LIST_FIELDS:
             continue
         if field not in left_frontmatter and value not in (None, "", [], {}):
             left_frontmatter[field] = value
