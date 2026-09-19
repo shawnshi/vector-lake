@@ -62,7 +62,7 @@ graph LR
 - **`Event_*`**：重要会议、行业突发事件。
 - **`Concept_*`**：抽象架构、理论、业务机制。域总览页沿用 `Concept_Overview_<domain>.md` 形式（由 `scripts/compile_domain_overviews.py` 生成）。
 - **`Policy_*` / `Standard_*`**：政策法规、行业标准。
-- **`Source_*`**：`raw/` 原始信源的一对一摘要节点。
+- **`Source_*`**：`raw/` 原始信源的一对一摘要节点。页面名由**唯一一条规则**生成（`wiki_utils.canonical_source_name` = `Source_<消毒后的 stem>.md`，消毒是因为 arXiv 式 stem 里的点号过不了严格命名校验）；而“这一页对应哪份 raw”靠 frontmatter 的 `sources:` **声明**判定，不靠页名——历史上有 443 个页沿用旧约定命名为 `Source_<目录>-<stem>-<hash8>`，它们仍然有效，重命名会打断所有指向它们的链接。
 - **`Synthesis_*`**：推演、跨界比较与调研长文。
 - **`System_*`**：系统投影页（社区页、总览等）。前缀校验直接放行，且不参与 purpose 契约门。
 
@@ -82,6 +82,10 @@ graph LR
 
 - **适用类型**：`Source_`, `Synthesis_`
 - **结构要求**：自由格式，不切割“事实 / 时间线”，用于单篇文献精读、书籍伴读笔记与横向战略研报。
+
+#### 两个命名空间不要混（实体名 vs 标签）
+
+`title` / `aliases` 是**实体名**，参与链接解析（连 core 名回退也认它们）；`tags` 是**标签**，从不参与链接解析。两者刻意保持不相交：标签撞上任何实体名会被拒绝（`Tag Collision`），而 `aliases` 里以 `#` 开头的条目会被视为把标签塞进实体命名空间、写入即拒绝（改用 `tags:`）。
 
 ## Quick Start
 
@@ -121,7 +125,7 @@ graph LR
 
 运行态记忆由 `vector_lake/governance_store.py` 从 canonical claims 编译生成。它解决的问题是：Agent 常常只需要一个事实、偏好、决策或任务状态，不应该每次加载整页 Markdown。
 
-> **"Wiki-as-Database" 写回范式**：Agent 在运行态生成的新记忆，**严禁**直接写入 SQLite。它们必须通过 `update_operational_memory` 工具，按严格的 **Dual-Schema（双架构）** 规范，即 `# 1. 编译实体特征 (Compiled Truth)` 与 `## 2. 证据时间线 (Evidence Timeline)`，物理追加到相应的 Wiki 实体文件（如 `Concept_UserPreferences.md`）的时间线下方。这确保了在图谱完全重建时，Agent 记忆依然通过 Markdown 原质保留。
+> **"Wiki-as-Database" 写回范式**：Agent 在运行态生成的新记忆，**严禁**直接写入 SQLite。它们必须通过 `update_operational_memory` 工具，按严格的 **Dual-Schema（双架构）** 规范，即 `## 1. 编译事实 (Compiled Truth)` 与 `## 2. 证据时间线 (Evidence Timeline)`，物理追加到相应的 Wiki 实体文件（如 `Concept_UserPreferences.md`）的时间线下方。这确保了在图谱完全重建时，Agent 记忆依然通过 Markdown 原质保留。
 
 内置类型：
 
@@ -440,9 +444,9 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `vector_lake/governance_store.py` | canonical store、change set、别名注册、operational memory 与冲突解析 |
 | `vector_lake/mutation_coordinator.py` | 统一突变编排：canonical 事务 + 持久化 outbox + 投影 materialize |
 | `vector_lake/runtime_health.py` | 运行时健康评估与写入门（硬故障阻断 / 可修复降级放行） |
-| `vector_lake/wiki_utils.py` | 路径解析、frontmatter、原子写入与位置辅助（runtime/outbox 信号目录等） |
+| `vector_lake/wiki_utils.py` | 路径解析、frontmatter、原子写入与位置辅助（runtime/outbox 信号目录等）；**命名与身份词表的唯一所有者**（`normalize_entity_name` 决定文件名，`entity_identity_key` 决定比较，`canonical_source_name` 决定 Source 页名） |
 | `vector_lake/node_vocabulary.py` | 节点类型词表的唯一来源（类型 ⇄ 前缀、严格文件名模式），零 import 的叶片模块 |
-| `vector_lake/schema_validator.py` | frontmatter 与正文结构的 schema 校验 |
+| `vector_lake/schema_validator.py` | frontmatter 与正文结构的 schema 校验（含标签与实体命名空间的隔离门） |
 | `vector_lake/defense_hook.py` | 写入前防御钩子（schema + purpose 契约统一入口） |
 | `vector_lake/purpose_contract.py` | 战略目的解析、摄取门、SIR 复审与 Synthesis-Proposal 阈值 |
 | `vector_lake/yaml_utils.py` | YAML 存取封装 |
@@ -462,7 +466,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 | `vector_lake/governance_service.py` | canonical 治理服务面（队列、变更集与投影的组合入口） |
 | `vector_lake/page_index_projection.py` | `index.json` → SQLite 投影（节点 / 边 / 状态戳）与邻接读取 |
 | `vector_lake/memory_gram_index.py` | 运行态记忆的精确 n-gram 倒排索引：分批重建、快照指纹与就绪判定 |
-| `vector_lake/link_resolution.py` | 链接解析的唯一实现（文件名 / 唯一标题 / 唯一别名 → core 名），lint 与索引器共用 |
+| `vector_lake/link_resolution.py` | 链接解析的唯一实现（文件名 / 唯一标题 / 唯一别名 → core 名），lint 与索引器共用；core 名回退同样认声明名（title/alias），但**本名优先**——别名不能夺走某页自己的名字 |
 | `vector_lake/stub_creator.py` | 破损链接 stub 的创建规则与既存页面覆盖判定 |
 
 摄取与治理工具（均在 `tools.py` 注册）：
@@ -505,9 +509,9 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 
 本轮实测结果（2026-09-19）：
 
-- `python -m pytest -p no:cacheprovider -q` → **1168 passed**。
+- `python -m pytest -p no:cacheprovider -q` → **1187 passed**。
 - `python -m compileall -q vector_lake tests` → OK。
-- `python cli.py doctor` → `Write Gate: clean`、`Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)`、`Ingest Jobs: queued:0 awaiting_subagent:0 terminal_failed:0`；`Summary: healthy with degradation`（降级项为设计内的 subagent 文本运行时委托）。
+- `python cli.py doctor` → `Write Gate: clean`、`Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)`、`Ingest Jobs: queued:0 awaiting_subagent:0 terminal_failed:0`；`Summary: healthy with degradation`，降级项为两类而非一类：① 设计内的 subagent 文本运行时委托；② 运行态记忆的精确 n-gram 索引落后（`due=True`）——基表落后时不带着它继续服务，搜索退回精确扫描，按 `doctor` 提示跑 `python cli.py gram-index --if-due --apply` 即恢复快速路径。
 - 端到端：raw 源 → `sync` → `ingest-tasks` → `finalize_ingest` → outbox 消费 → 索引 → `search` / `query` 全链路在隔离根上跑通。
 
 **本文件不记录语料规模类数字**（节点数、边数、memory 条数）。这类数值取决于运行实例，无法从仓库复现，容易在版本迭代后变成误导性基线；需要时以目标实例上的 `doctor` / `debt` / `projection-report` 实测输出为准。
@@ -515,5 +519,5 @@ $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ## Notes
 
 - Windows 控制台建议设置 `PYTHONUTF8=1`，避免中文路径或中文输出触发编码问题。
-- 长任务由 `filelock` 串行化（`index.json.lock`、`.meta/governance_queue.lock`、`.watchdog.instance.lock`、`<meta>/runtime/ingest_processing.json.lock`）。遇到占用时先确认没有残留的 watchdog / MCP 进程，再重试，不要直接删锁文件。
+- 长任务由 `filelock` 串行化（`index.json.lock`、`.meta/governance_queue.lock`、`.watchdog.instance.lock`、`<meta>/runtime/ingest_processing.json.lock`、`<meta>/runtime/.runner_service.lock`）。遇到占用时先确认没有残留的 watchdog / MCP / ingest Runner 进程，再重试，不要直接删锁文件。
 - `.gitignore` 默认忽略 `brain/`（subagent 任务包）、`tmp/`、`data/`、`*.bak`、`*.tmp`、`__pycache__/`、`.pytest_cache/`。
