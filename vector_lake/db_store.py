@@ -368,6 +368,7 @@ def _create_operational_memory_index(conn: sqlite3.Connection) -> None:
     )
     _create_memory_gram_tables(conn)
     _create_page_index_tables(conn)
+    _create_claim_index_tables(conn)
     # ``CREATE TABLE IF NOT EXISTS`` leaves an existing table alone, so a column
     # added after a schema's first release needs its own tolerated ALTER, exactly
     # as ``operational_memory_index.source_rowid`` does.  ``_table_columns``
@@ -377,6 +378,173 @@ def _create_operational_memory_index(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass
     ensure_operational_memory_index(conn, force=stale_format)
+
+
+_CLAIM_INDEX_VALUE_COLUMNS = (
+    "claim_type",
+    "status",
+    "confidence",
+    "freshness_tier",
+    "valid_to",
+    "review_after",
+    "evidence_count",
+    "contradicts_count",
+    "subject_entity_count",
+    "source_page",
+    "claim_text",
+    "source_ids",
+)
+_CLAIM_INDEX_COLUMNS = ("claim_id",) + _CLAIM_INDEX_VALUE_COLUMNS + ("source_rowid",)
+
+
+def _claim_count_expr(source: str, field: str) -> str:
+    """``len(claim.get(field, []))`` expressed in SQL, type by type.
+
+    ``json_array_length`` raises "malformed JSON" on a scalar and returns NULL for an absent path,
+    so each shape is handled explicitly.  ``length()`` on the extracted text reproduces ``len()``
+    for a *string* value, which is what the Python oracle would count; a number, a bool or an
+    explicit null would make ``len()`` raise there, so 0 is the projection's answer and the
+    differential test in ``tests/test_claim_index.py`` pins both behaviours.
+    """
+    extracted = f"json_extract({source}.data_json, '$.{field}')"
+    kind = f"json_type({source}.data_json, '$.{field}')"
+    return (
+        f"CASE WHEN {kind} = 'array' THEN json_array_length({extracted}) "
+        f"WHEN {kind} = 'text' THEN length({extracted}) ELSE 0 END"
+    )
+
+
+def _claim_index_value_expr(source: str) -> str:
+    """Projection value expressions bound to ``source`` (``NEW``/``src``), one per column."""
+    expressions = (
+        f"lower(COALESCE(json_extract({source}.data_json, '$.claim_type'), ''))",
+        f"lower(COALESCE(json_extract({source}.data_json, '$.status'), 'Active'))",
+        f"COALESCE(CAST(json_extract({source}.data_json, '$.confidence') AS REAL), 0.0)",
+        f"lower(COALESCE(json_extract({source}.data_json, '$.freshness_tier'), 'unknown'))",
+        f"COALESCE(json_extract({source}.data_json, '$.valid_to'), '')",
+        f"COALESCE(json_extract({source}.data_json, '$.review_after'), '')",
+        _claim_count_expr(source, "evidence_ids"),
+        _claim_count_expr(source, "contradicts"),
+        _claim_count_expr(source, "subject_entity_ids"),
+        f"COALESCE(json_extract({source}.data_json, '$.source_page'), '')",
+        f"lower(COALESCE(json_extract({source}.data_json, '$.claim_text'), ''))",
+        f"CASE WHEN json_type({source}.data_json, '$.source_ids') IS NULL THEN NULL "
+        f"ELSE json_quote(json_extract({source}.data_json, '$.source_ids')) END",
+    )
+    separator = "," + chr(10)
+    return separator.join("            " + expression for expression in expressions)
+
+
+def _create_claim_index_tables(conn: sqlite3.Connection) -> None:
+    """Schema for the narrow claim projection (``claim_index``).
+
+    Why it exists: ``trace`` scans every claim's text and ``debt`` annotates every claim, and both
+    read a fixed handful of fields -- while ``load_claims`` decodes all 101 323 JSON payloads to get
+    them (3.2 s of a 4.2 s trace, and the same share of debt).  The projection carries exactly the
+    fields those two consume, maintained by triggers the way ``operational_memory_index`` is, so
+    the scan and the annotation read columns and only the returned rows are decoded.
+
+    ``source_rowid`` reproduces the store's natural ``SELECT *`` order, which is the order the
+    previous full scan iterated in and therefore the tie-break of its stable sort.
+
+    Two columns carry their exact JSON spelling rather than a derived form.  ``source_page`` is
+    **not** lowercased, because ``trace`` both lowercases it into a haystack *and* tests it for
+    membership in the FTS result set, whose keys are raw; lowercasing here would change that test
+    for any page whose key has capitals.  ``source_ids`` is stored as JSON text (not a count) since
+    ``debt`` iterates its values, and stays NULL when the key is absent so a reader can apply the
+    same ``[]`` default the JSON path did.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS claim_index (
+            claim_id TEXT PRIMARY KEY,
+            claim_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            freshness_tier TEXT NOT NULL,
+            valid_to TEXT NOT NULL DEFAULT '',
+            review_after TEXT NOT NULL DEFAULT '',
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            contradicts_count INTEGER NOT NULL DEFAULT 0,
+            subject_entity_count INTEGER NOT NULL DEFAULT 0,
+            source_page TEXT NOT NULL DEFAULT '',
+            claim_text TEXT NOT NULL DEFAULT '',
+            source_ids TEXT,
+            source_rowid INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_index_status ON claim_index (status)")
+    columns = ", ".join(_CLAIM_INDEX_COLUMNS)
+    upsert = ", ".join(
+        f"{column} = excluded.{column}" for column in _CLAIM_INDEX_COLUMNS if column != "claim_id"
+    )
+    for trigger, event in (
+        ("trg_claim_index_insert", "AFTER INSERT"),
+        ("trg_claim_index_update", "AFTER UPDATE"),
+    ):
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {trigger}
+            {event} ON claims
+            BEGIN
+                INSERT INTO claim_index ({columns})
+                VALUES (
+                    NEW.claim_id,
+{_claim_index_value_expr("NEW")},
+                    NEW.rowid
+                )
+                ON CONFLICT(claim_id) DO UPDATE SET {upsert};
+            END
+            """
+        )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_claim_index_delete
+        AFTER DELETE ON claims
+        BEGIN
+            DELETE FROM claim_index WHERE claim_id = OLD.claim_id;
+        END
+        """
+    )
+    ensure_claim_index(conn)
+
+
+def ensure_claim_index(conn: sqlite3.Connection | None = None, force: bool = False) -> dict:
+    """Reconcile ``claim_index`` with ``claims``; ``force`` re-derives every row."""
+    conn = conn or get_connection()
+    result = {
+        "canonical": conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0],
+        "projected": conn.execute("SELECT COUNT(*) FROM claim_index").fetchone()[0],
+        "deleted": 0,
+        "rebuilt": 0,
+    }
+    if not force and result["canonical"] == result["projected"]:
+        return result
+    columns = ", ".join(_CLAIM_INDEX_COLUMNS)
+    if force:
+        result["deleted"] = conn.execute("DELETE FROM claim_index").rowcount
+        gap_clause = ""
+    else:
+        result["deleted"] = conn.execute(
+            "DELETE FROM claim_index WHERE claim_id NOT IN (SELECT claim_id FROM claims)"
+        ).rowcount
+        gap_clause = "WHERE src.claim_id NOT IN (SELECT claim_id FROM claim_index)"
+    # ``INSERT OR REPLACE ... SELECT`` rather than an upsert: SQLite requires a WHERE clause to
+    # disambiguate an ON CONFLICT attached to a SELECT, so the "fill the gaps" path would have to
+    # synthesise one.  This mirrors ``ensure_operational_memory_index``.
+    cursor = conn.execute(
+        f"""
+        INSERT OR REPLACE INTO claim_index ({columns})
+        SELECT src.claim_id,
+{_claim_index_value_expr("src")},
+               src.rowid
+        FROM claims AS src
+        {gap_clause}
+        """
+    )
+    result["rebuilt"] = int(cursor.rowcount or 0)
+    return result
 
 
 def _create_page_index_tables(conn: sqlite3.Connection) -> None:
@@ -789,6 +957,7 @@ _SCHEMA_SENTINELS: tuple[str, ...] = (
     # A new table has to be a sentinel, or ``_schema_is_complete`` reports an existing
     # database as complete and the DDL that creates it never runs.
     "ingest_abandoned_sources",
+    "claim_index",
 )
 
 

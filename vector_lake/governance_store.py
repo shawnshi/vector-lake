@@ -352,6 +352,80 @@ def upsert_alias(key: str, value: str) -> None:
         )
 
 
+def load_claims_by_ids(claim_ids: list[str]) -> dict[str, dict]:
+    """Decode only the named claims, keyed by id.
+
+    ``trace`` returns a handful of claims out of the 101 323 it scans; decoding those rows keeps
+    the returned fields complete without paying for the corpus.
+    """
+    conn = get_connection()
+    wanted = [str(claim_id) for claim_id in claim_ids if str(claim_id)]
+    if not wanted:
+        return {}
+    decoded: dict[str, dict] = {}
+    for start in range(0, len(wanted), 400):
+        chunk = wanted[start : start + 400]
+        placeholders = ", ".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT claim_id, data_json FROM claims WHERE claim_id IN ({placeholders})",
+            chunk,
+        ):
+            try:
+                decoded[str(row["claim_id"])] = json.loads(row["data_json"])
+            except (TypeError, ValueError):
+                continue
+    return decoded
+
+
+def load_claim_scan_rows() -> list[dict] | None:
+    """The claim fields ``trace`` and ``debt`` read, from the ``claim_index`` projection.
+
+    ``load_claims`` decodes all 101 323 JSON payloads for these fields (3.2 s of a 4.2 s trace).
+    The rows come back in ``source_rowid`` order -- the store's natural ``SELECT *`` order, which is
+    the order the previous full scan iterated in and therefore the tie-break of its stable sort --
+    with ``source_ids`` parsed, and ``[]`` for the absent case exactly as ``claim.get(..., [])``
+    would have produced.
+
+    Returns ``None`` when the projection is unusable (absent, or empty while claims exist), so a
+    caller degrades to the decoded path rather than answering from a partial projection.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT claim_id, status, confidence, freshness_tier, valid_to, review_after, "
+            "evidence_count, contradicts_count, subject_entity_count, source_page, claim_text, "
+            "source_ids, source_rowid FROM claim_index ORDER BY source_rowid"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        try:
+            if conn.execute("SELECT EXISTS (SELECT 1 FROM claims)").fetchone()[0]:
+                return None
+        except sqlite3.OperationalError:
+            return None
+    claims = []
+    for row in rows:
+        raw_ids = row["source_ids"]
+        claims.append(
+            {
+                "claim_id": str(row["claim_id"]),
+                "status": str(row["status"]),
+                "confidence": float(row["confidence"]),
+                "freshness_tier": str(row["freshness_tier"]),
+                "valid_to": str(row["valid_to"]) or None,
+                "review_after": str(row["review_after"]) or None,
+                "evidence_ids": [None] * int(row["evidence_count"]),
+                "contradicts": [None] * int(row["contradicts_count"]),
+                "subject_entity_ids": [None] * int(row["subject_entity_count"]),
+                "source_page": str(row["source_page"]),
+                "claim_text": str(row["claim_text"]),
+                "source_ids": json.loads(raw_ids) if raw_ids is not None else [],
+            }
+        )
+    return claims
+
+
 def load_memory_objects():
     return _load_db_map("operational_memory", "memory_id")
 

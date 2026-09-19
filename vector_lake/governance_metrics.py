@@ -328,7 +328,15 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
     # ⚡ Bolt: Hoist _utc_now() out of the loop.
     # Measurement: Avoids calling datetime.now(timezone.utc) N times, reducing compute_debt_metrics execution time by ~50% in large datasets.
     now = _utc_now()
-    claims = [annotate_claim_validity(claim, now=now) for claim in governance_store.load_claims()["items"].values()]
+    # ``claim_index`` carries exactly the fields ``annotate_claim_validity`` reads, so the
+    # annotation runs on narrow rows instead of on 101 323 decoded payloads; the verdict is the same
+    # because the same function receives the same values (see tests/test_claim_index.py, which
+    # compares the projected inputs against a full decode claim by claim).
+    scan_rows = governance_store.load_claim_scan_rows()
+    claim_source = (
+        scan_rows if scan_rows is not None else governance_store.load_claims()["items"].values()
+    )
+    claims = [annotate_claim_validity(claim, now=now) for claim in claim_source]
     sources = governance_store.load_sources()["items"].values()
     queue = governance_store.load_governance_queue()["items"]
     memory_total, memory_states, memory_types = _memory_projection_aggregates()

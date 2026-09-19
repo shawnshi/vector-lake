@@ -16,12 +16,27 @@ def build_trace_for_query(query: str, top_k: int = 5) -> dict:
     search_results = search_wiki(query, limit=10)
     relevant_pages = {res["node_key"] for res in search_results}
     
-    claims = governance_store.load_claims()["items"].values()
+    # The scan reads two fields per claim, so it runs over the narrow ``claim_index`` projection
+    # instead of decoding all 101 549 payloads (3.2 s of this function's 8.0 s).  The haystack is
+    # rebuilt exactly as before -- separator, lowercasing, and the *raw* source page used for the FTS
+    # membership test are unchanged -- and only the returned rows are decoded, so the projection
+    # cannot narrow what a caller sees, only how many rows were read to find it.
+    scan_rows = governance_store.load_claim_scan_rows()
+    if scan_rows is None:
+        scan_rows = [
+            {
+                **claim,
+                "claim_id": str(claim.get("claim_id", "")),
+                "source_page": claim.get("source_page", ""),
+                "claim_text": str(claim.get("claim_text", "")).lower(),
+            }
+            for claim in governance_store.load_claims()["items"].values()
+        ]
     entities = governance_store.load_entities()["items"]
     sources = governance_store.load_sources()["items"]
 
     matches = []
-    for claim in claims:
+    for claim in scan_rows:
         # Boost score if the claim comes from a top FTS match
         source_page = claim.get('source_page', '')
         base_score = 5 if source_page in relevant_pages else 0
@@ -34,8 +49,13 @@ def build_trace_for_query(query: str, top_k: int = 5) -> dict:
             matches.append((score, claim))
     matches.sort(key=lambda item: item[0], reverse=True)
 
+    top_claims = governance_store.load_claims_by_ids(
+        [str(claim.get("claim_id", "")) for _, claim in matches[:top_k]]
+    )
+
     trace_items = []
     for _, claim in matches[:top_k]:
+        claim = top_claims.get(str(claim.get("claim_id", "")), claim)
         annotated = governance_metrics.annotate_claim_validity(claim)
         trace_items.append({
             "claim_id": annotated["claim_id"],
