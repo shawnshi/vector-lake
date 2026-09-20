@@ -113,3 +113,56 @@ def test_every_required_package_is_pinned_in_the_lock():
         assert re.search(rf"^{re.escape(name)}==(\S+)", LOCK, re.M), (
             f"{name} is required but not pinned in requirements.lock.txt"
         )
+
+
+def test_the_removed_fallbacks_are_not_pinned_or_checked():
+    """jieba and networkx are leaves of dependencies this project no longer has.
+
+    jieba was the pure-Python tokenizer fallback removed on 2026-09-18; networkx
+    was python-louvain's requirement before Leiden replaced it.  Both survived that
+    removal for a while, in two places at once: the lock still pinned them, and
+    ``tool_doctor`` still listed jieba in its dependency map -- so doctor reported
+    ``[OK] jieba: installed`` for a package the runtime cannot use, which is also
+    how the pin kept looking justified.  A removal the tree does not check is a
+    removal that comes back, which is what this pins shut.
+
+    ``rjieba`` is the tokenizer that stayed, so the pin pattern is anchored to the
+    line, not a substring.
+    """
+    pinned = [
+        line.strip()
+        for line in LOCK.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for gone in ("jieba", "networkx"):
+        assert not [line for line in pinned if line.startswith(f"{gone}==")], (
+            f"{gone} is pinned in requirements.lock.txt but nothing depends on it"
+        )
+    assert any(line.startswith("rjieba==") for line in pinned), (
+        "rjieba is the tokenizer backend and must stay pinned"
+    )
+
+    doctor = (ROOT / "vector_lake" / "tool_doctor.py").read_text(encoding="utf-8")
+    assert '"jieba": "jieba"' not in doctor, (
+        "tool_doctor reports a dependency the tokenizer no longer has; its backend "
+        "line already names the real one"
+    )
+
+
+def test_no_document_describes_the_abandoned_projection_store():
+    """A layout that was designed and never built must not be advertised.
+
+    schema.md described ``index.json`` / ``claim_graph.json`` as projection-v2
+    locators whose immutable components live under
+    ``MEMORY/wiki/.projection-store/objects/sha256/``.  That store has zero
+    references in the tree and no directory on disk, and the artifact is
+    ``claim_topology.json``.  Documents are cheaper to fix than a reader misled by
+    them, so the names are checked where they are written.
+    """
+    for name in ("schema.md", "CONTEXT.md", "README.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert "projection-store" not in text, f"{name} advertises a store that was never built"
+        assert "claim_graph.json" not in text, f"{name} names the superseded projection file"
+        assert "operational_memory.json" not in text, (
+            f"{name} names a runtime-memory file; it is a SQLite table"
+        )
