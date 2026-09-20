@@ -184,11 +184,11 @@ def canonical_backfill_missing_wiki(dry_run: bool = True, limit: int = 50) -> st
 
 
 def rebuild_index_projection(dry_run: bool = True) -> str:
-    """Rebuild index.json / FTS / claim_graph from SQLite canonical state."""
+    """Rebuild index.json / FTS / claim_topology from SQLite canonical state."""
     diff = _diff_sets()
     if dry_run:
         return (
-            "[DRY RUN] Would rebuild index.json, wiki_search_index, and claim_graph.json "
+            "[DRY RUN] Would rebuild index.json, wiki_search_index, and claim_topology.json "
             f"from {len(diff['canonical'])} canonical entity row(s), while preserving existing vec_embeddings. "
             f"Current drift: missing_index={len(diff['missing_index'])}, extra_index={len(diff['extra_index'])}."
         )

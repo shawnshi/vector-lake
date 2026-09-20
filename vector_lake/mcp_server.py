@@ -166,7 +166,7 @@ def canonical_backfill(dry_run: bool = True, limit: int = 50) -> str:
 
 @mcp.tool()
 def projection_rebuild_index(dry_run: bool = True) -> str:
-    """Rebuild index.json, FTS, embeddings, and claim_graph from SQLite canonical state."""
+    """Rebuild index.json, FTS, embeddings, and claim_topology from SQLite canonical state."""
     return tools.rebuild_index_projection(dry_run=dry_run)
 
 @mcp.tool()

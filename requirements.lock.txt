@@ -1,7 +1,8 @@
 # Pinned direct dependencies for a known-good Vector Lake environment.
 #
 # This file pins the *direct* dependencies resolved on 2026-09-16
-# (Windows, CPython 3.13).  It is a reproducibility aid, not a full
+# (Windows, CPython 3.13), minus two stale entries dropped on 2026-09-20 (see
+# below).  It is a reproducibility aid, not a full
 # transitive lock: transitive dependency versions are still decided by the
 # resolver, and no artifact hashes are recorded.
 #
@@ -18,6 +19,13 @@
 # Notes
 # -----
 # * python-louvain is gone: community detection is Leiden via leidenalg+igraph.
+# * networkx and jieba pins dropped 2026-09-20: both were leaves of a dependency
+#   this project no longer has.  jieba was the pure-Python tokenizer fallback
+#   removed on 2026-09-18; networkx was python-louvain's requirement before Leiden
+#   (igraph's PageRank replaced it).  No distribution in requirements.txt requires
+#   either -- the only remaining edges are igraph's `test` extra and, outside this
+#   project's declared set, torch.  Tree shape: -2 leaf packages, and neither had
+#   dependents inside the declared set.
 # * rjieba wheel used: rjieba-0.2.1-cp38-abi3-win_amd64.whl, carrying jieba-rs
 #   0.9.x.  Update this pin and tokenizer.JIEBA_RS_PINNED together when a
 #   binding for jieba-rs 0.11 is published.
@@ -33,7 +41,6 @@
 # * igraph/leidenalg install from cp39/cp38-abi3 wheels; no compiler needed.
 
 filelock==3.29.0
-networkx==3.6.1
 python-dotenv==1.2.2
 igraph==1.0.0
 leidenalg==0.12.0
@@ -43,6 +50,5 @@ google-genai==2.7.0
 fastmcp==4.0.4
 sqlite-vec==0.1.9
 rjieba==0.2.1
-jieba==0.42.1
 mistune==3.3.2
 bm25s==0.3.11

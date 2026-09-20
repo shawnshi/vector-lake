@@ -8,10 +8,10 @@ Current boundary:
 
 - Human-facing memory: `MEMORY/wiki/*.md`
 - Page runtime index: `MEMORY/wiki/index.json`
-- Claim topology: `MEMORY/wiki/claim_graph.json`
+- Claim topology: `MEMORY/wiki/claim_topology.json`
 - Strategic intent: `MEMORY/purpose.md` (YAML contract parsed by `purpose_contract.py`)
 - Canonical governance store: `MEMORY/wiki/.meta/vector_lake.db` (SQLite)
-- Agent runtime memory: `operational_memory.json`
+- Agent runtime memory: `operational_memory` table in that same SQLite store
 
 The durable architecture is:
 
@@ -177,9 +177,9 @@ The Vector Lake system is designed for high-concurrency ingestion and graph main
 - **Native Vector Engine (V11.5)**: Integrated `sqlite-vec` extension for FTS5 + Vector hybrid search. Eliminated the `embeddings.pkl` O(N) memory bottleneck, offloading similarity calculation directly into the SQLite C-backend.
 - **Rate-Aware Embedding Scheduler**: Gemini embeddings are a resumable projection. All processes reserve requests and tokens through one SQLite rolling window, validate response cardinality and 3072-dimensional vectors, use an explicit HTTP timeout, and record resumable batch progress. Index rebuild and incremental index maintenance never invoke the embedding API.
 - **O(V+E) Graph Indexing (V11.5)**: Eliminated catastrophic O(N²) CPU deadlocks during node overlapping frequency calculations by utilizing an inverted-index map. 
-- **Chinese Tokenization (V11.5)**: Implemented offline `jieba` pre-tokenization pipeline before SQLite `MATCH` execution, fixing the precision drop caused by `porter unicode61` character splitting.
+- **Chinese Tokenization (V11.5; backend replaced 2026-09-18)**: CJK pre-tokenization runs before SQLite `MATCH` execution, fixing the precision drop caused by `porter unicode61` character splitting.  The backend is `rjieba` (jieba-rs via PyO3) alone; the pure-Python `jieba` fallback is gone, and a host without `rjieba` reports `unavailable` rather than degrading silently.
 - **Subagent Text Runtime Boundary (V11.13)**: Search expansion and reranking are deterministic; ingest creates current-environment subagent task packets; semantic dedupe no longer calls a text arbiter. `google-genai` remains only for embedding paths when `GEMINI_API_KEY` is configured.
-- **Canonical Transaction Boundary**: SQLite canonical changes and durable outbox intent commit together. Markdown, FTS, `index.json`, and `claim_graph.json` are recoverable projections written after commit.
+- **Canonical Transaction Boundary**: SQLite canonical changes and durable outbox intent commit together. Markdown, FTS, `index.json`, and `claim_topology.json` are recoverable projections written after commit.
 - **Pure Canonical Architecture & Outbox (V11.11)**: Mutation entrypoints converge on `mutation_coordinator`; the outbox is polled even when the wake-up signal is missing, claims rows with leases, retries transient failures, and records terminal errors. Full and incremental index paths read SQLite entities and identify nodes by `page_key`.
 - **Fenced Subagent Completion**: Ingest claims issue owner/token/generation credentials. Finalization validates them before work and repeats a compare-and-set inside the canonical transaction, so expired workers cannot commit late results.
 - **Timeline Projection Parity**: Claim deltas update Timeline rows in the same transaction. Queries verify stable event-ID parity and fall back to canonical claims whenever the projection is incomplete; deep Doctor checks report exact missing/extra counts.

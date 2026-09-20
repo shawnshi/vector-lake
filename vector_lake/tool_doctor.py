@@ -83,7 +83,6 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
         "dotenv": "python-dotenv",
         "fastmcp": "fastmcp",
         "sqlite_vec": "sqlite-vec",
-        "jieba": "jieba",
         "mistune": "mistune"
     }
     for module_name, package_name in dependencies.items():
