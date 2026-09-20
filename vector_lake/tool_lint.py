@@ -2,7 +2,7 @@ import datetime
 import logging
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 
 import yaml
@@ -43,23 +43,91 @@ _LOWERCASE_STATUS = {status.lower() for status in VALID_STATUS}
 #: Similarity above which two nodes are reported as duplicates.
 SIMILARITY_MERGE_THRESHOLD = 0.91
 
+#: One naming series: two keys that differ only in their numbers are members of one convention
+#: (``Source_intelligence-20260219-briefing`` and ``...-20260220-...``), not two names for one
+#: entity.  Measured on the live corpus, 3 782 of the 3 797 pairs the similarity pass reported
+#: were exactly this, while none of the genuinely duplicated names differs *only* by digits -- so
+#: folding digits before drawing the distinction is what separates the two cases.
+_NUMERIC_RUN = re.compile(r"\d+")
+
+
+def _naming_series_key(key: str) -> str:
+    """``Source_intelligence-20260219-briefing`` -> ``intelligence-#-briefing``.
+
+    Case is folded for the same reason ``entity_identity_key`` folds it -- spelling is not identity
+    -- and the type prefix is dropped because a naming convention is a property of the *name*:
+    ``Source_Intelligence-20260715-Briefing`` and ``Source_intelligence-20260315-briefing`` are one
+    convention, and comparing raw keys called them duplicates of each other.
+    """
+    return _NUMERIC_RUN.sub("#", strip_prefix(key).casefold())
+
+
+def _type_prefix(key: str) -> str:
+    """``Concept_HIS`` -> ``Concept``; an untyped stem keeps its whole self."""
+    return key.split("_")[0] if "_" in key else ""
+
+
+#: Bits in the character mask the similarity pass filters by.  256 is enough that two names of
+#: realistic length collide rarely (measured: the filter keeps 1.7% of length-band pairs), and a
+#: collision only *weakens* the bound, never invalidates it -- which is what lets the filter be a
+#: hashed one and still exact.
+_CHARACTER_MASK_BITS = 256
+
+
+def _length_ceiling_can_exceed(length_a: int, length_b: int, threshold: float) -> bool:
+    """Whether two names of these lengths can reach ``threshold``.
+
+    ``ratio()`` is ``2 * matches / (len(a) + len(b))`` and ``matches`` cannot exceed
+    ``min(len(a), len(b))``, so ``2 * min / (min + max)`` is a hard ceiling on the score.
+    Comparing that ceiling before constructing a ``SequenceMatcher`` is exact: it never drops a
+    pair that would have scored above the threshold.
+
+    This is the whole of the length rule and it has two callers, so it lives here rather than in
+    either: ``_ratio_can_exceed`` for a pair of names it already has, and the similarity pass to
+    decide which length buckets can still pair up at all.
+
+    An empty pair is left to ``SequenceMatcher``: ``ratio()`` returns 1.0 when both sides are
+    empty, so skipping it would change the findings rather than the cost.
+    """
+    longest = max(length_a, length_b)
+    if longest == 0:
+        return True
+    return (2.0 * min(length_a, length_b) / (length_a + length_b)) > threshold
+
 
 def _ratio_can_exceed(name_a: str, name_b: str, threshold: float) -> bool:
     """Whether ``SequenceMatcher(None, a, b).ratio()`` can reach ``threshold``.
 
-    ``ratio()`` is ``2 * matches / (len(a) + len(b))`` and ``matches`` cannot exceed
-    ``min(len(a), len(b))``, so the achievable ceiling is ``2 * min / (min + max)``.
-    Comparing that ceiling first is exact -- it never drops a pair that would have
-    scored above the threshold -- and on the live corpus it removes 255 073 of the
-    375 283 calls, which is where the ~30 s the similarity pass used to take went.
+    On the live corpus the length ceiling removes 255 073 of the 375 283 comparisons the old
+    50-wide window made, which is where the ~30 s the similarity pass used to take went.
 
     An empty pair is left to ``SequenceMatcher``: ``ratio()`` returns 1.0 when both
     sides are empty, so skipping it would change the findings rather than the cost.
     """
-    longest = max(len(name_a), len(name_b))
-    if longest == 0:
-        return True
-    return (2.0 * min(len(name_a), len(name_b)) / (len(name_a) + len(name_b))) > threshold
+    return _length_ceiling_can_exceed(len(name_a), len(name_b), threshold)
+
+
+def _character_mask(name: str) -> int:
+    """One bit per distinct character, hashed into ``_CHARACTER_MASK_BITS``."""
+    mask = 0
+    for character in name:
+        mask |= 1 << (ord(character) % _CHARACTER_MASK_BITS)
+    return mask
+
+
+def _common_character_count(counts_a: Counter, counts_b: Counter) -> int:
+    """The most characters a common subsequence of the two names can possibly use.
+
+    A subsequence uses each character at most as often as either side holds it, so the sum of the
+    per-character minima is an upper bound on ``SequenceMatcher.matches`` -- which is what makes
+    this usable as a filter rather than a score.
+    """
+    get = counts_b.get
+    common = 0
+    for character, count in counts_a.items():
+        other = get(character, 0)
+        common += count if count < other else other
+    return common
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -444,69 +512,160 @@ def lint_vector_lake(auto_fix: bool = False):
     # 6. Similarity Merge (>0.91)
     keys_list = sorted(list(all_keys))
     merged_keys = set()
-    for index, key_a in enumerate(keys_list):
-        if key_a in merged_keys: continue
-        for other_index in range(index + 1, min(index + 50, len(keys_list))):
-            key_b = keys_list[other_index]
-            if key_b in merged_keys: continue
-            
-            prefix_a = key_a.split("_")[0] if "_" in key_a else ""
-            prefix_b = key_b.split("_")[0] if "_" in key_b else ""
-            if prefix_a != prefix_b:
-                continue
-            name_a = (key_a.split("_", 1)[1] if "_" in key_a else key_a).lower()
-            name_b = (key_b.split("_", 1)[1] if "_" in key_b else key_b).lower()
-            if not _ratio_can_exceed(name_a, name_b, SIMILARITY_MERGE_THRESHOLD):
-                continue
-            ratio = SequenceMatcher(None, name_a, name_b).ratio()
+    series_excluded = 0
 
-            if ratio > SIMILARITY_MERGE_THRESHOLD and key_a != key_b:
-                issues["similarity"].append(f"Duplicate: {key_a}.md <-> {key_b}.md ({ratio:.0%})")
-                if False: # auto_fix disabled for similarity merge by Mentat
-                    # Determine Primary vs Secondary based on 'updated' date
-                    file_a = f"{key_a}.md"
-                    file_b = f"{key_b}.md"
-                    if file_a not in parsed or file_b not in parsed: continue
-                    
-                    fm_a = parsed[file_a]["fm"]
-                    fm_b = parsed[file_b]["fm"]
-                    primary_order = establishment_key(fm_a.get("created"), fm_a.get("id") or key_a)
-                    secondary_order = establishment_key(fm_b.get("created"), fm_b.get("id") or key_b)
-                    
-                    if secondary_order < primary_order:
-                        primary, secondary = file_b, file_a
-                        s_key = key_a
-                    else:
-                        primary, secondary = file_a, file_b
-                        s_key = key_b
-                    
-                    p_data = parsed[primary]
-                    s_data = parsed[secondary]
-                    
-                    # Body, aliases and the survivor's frontmatter come from the
-                    # shared section-aware merger: a naive concatenation put the
-                    # consumed page's compiled-truth bullets after
-                    # `## 2. 证据时间线`, where the schema validator reads them as
-                    # malformed timeline entries.
-                    merged_content = merge_markdown_content(
-                        _render_page(p_data["fm"], p_data["body"]),
-                        _render_page(s_data["fm"], s_data["body"]),
-                    )
-                    merged_fm, merged_body = split_frontmatter(merged_content)
-                    merged_fm["updated"] = datetime.datetime.now().strftime("%Y-%m-%d")
+    # The name-likeness pass below cannot see the corpus's dominant duplication shape: one name
+    # under two type prefixes.  It refuses any pair whose type prefix differs, and its window is
+    # positional, so ``Concept_DRG-DIP`` and ``Policy_DRG-DIP`` are excluded by that guard *and*
+    # far apart in sorted order.  Same name under a different type is not near-name similarity, it
+    # is an identity collision, so it is grouped by the identity key the rest of the lake already
+    # resolves links by: ``strip_prefix`` removes the type and ``entity_identity_key`` folds case
+    # and separators -- the same rule ``link_resolution`` and ``stub_creator`` use, rather than a
+    # third answer to "when are two names the same name".
+    identity_groups: dict[str, list[str]] = defaultdict(list)
+    for key in keys_list:
+        identity_groups[entity_identity_key(strip_prefix(key))].append(key)
+    for members in identity_groups.values():
+        if len(members) < 2 or len({_type_prefix(member) for member in members}) < 2:
+            continue
+        ordered = sorted(members)
+        for left_index, key_a in enumerate(ordered):
+            for key_b in ordered[left_index + 1:]:
+                # No series test here.  A cross-type pair qualifies only because the *name* is the
+                # same, and the same name is a duplicate however many digits it contains --
+                # ``Concept_2023全国深化医改经验推广会`` and ``Event_2023全国深化医改经验推广会``
+                # are one event.  Two names whose digits differ have different identity keys and
+                # never reach this loop.
+                issues["similarity"].append(
+                    f"Duplicate: {key_a}.md <-> {key_b}.md (same name, different type prefix: "
+                    f"{_type_prefix(key_a)} vs {_type_prefix(key_b)})"
+                )
 
-                    # Write Primary
-                    _write_fixed_frontmatter(p_data["path"], merged_fm, merged_body)
-                    
-                    # Delete Secondary
-                    try:
-                        from vector_lake.mutation_coordinator import execute_mutation_plan
-                        execute_mutation_plan(secondary, is_delete=True)
-                    except Exception as e:
-                        log.error(f"Failed to delete merged secondary {s_data['path']}: {e}")
-                    
-                    merged_keys.add(s_key)
-                    fixes_applied += 1
+    # One name under one type prefix, compared exactly.  The pass this replaced compared each key
+    # with the 49 that follow it in sorted order, on the assumption that lexicographic neighbours
+    # are the similar ones.  They are not: measured on the live corpus it reported 3 797 of the
+    # 6 058 pairs that clear the threshold -- 37% of candidates silently dropped -- and the pairs
+    # that look most like real duplicates were among the misses (``Concept_LLM-as-a-Judge`` /
+    # ``Concept_VLM-as-a-judge``, ``Concept_Transformer`` / ``Concept_循环Transformer``), because
+    # ``Concept_L...`` and ``Concept_V...`` sit ~1 000 positions apart among 3 983 concept pages.
+    #
+    # Exactness is affordable if the filters are ordered by cost, and all three are *upper bounds*
+    # on ``ratio()``, so none of them can drop a pair the score itself would have accepted:
+    #
+    #  1. length band -- ``_length_ceiling_can_exceed``: a pair whose lengths are further apart than
+    #     ``threshold / (2 - threshold)`` cannot reach the threshold at all;
+    #  2. character mask -- every character of ``a`` that ``b`` lacks entirely contributes at least
+    #     one unmatched character, so ``matches <= len(a) - popcount(mask_a & ~mask_b)``;
+    #  3. character multiset -- ``_common_character_count`` bounds ``matches`` by the per-character
+    #     minima, which is much tighter and rules out all but a fraction of a percent.
+    #
+    # Measured on the live corpus: 1 761 216 length-band pairs -> 29 777 after the mask -> 6 532
+    # after the multiset -> 6 058 ``SequenceMatcher`` calls, in 2.7 s.  The old window made 375 283
+    # comparisons in ~1 s and found 3 797 of those 6 058.
+    core_names = {key: (key.split("_", 1)[1] if "_" in key else key).lower() for key in keys_list}
+    core_lengths = {key: len(name) for key, name in core_names.items()}
+    character_counts = {key: Counter(name) for key, name in core_names.items()}
+    character_masks = {key: _character_mask(name) for key, name in core_names.items()}
+    series_keys = {key: _naming_series_key(key) for key in keys_list}
+    by_type_prefix: dict[str, list[str]] = defaultdict(list)
+    for key in keys_list:
+        by_type_prefix[_type_prefix(key)].append(key)
+
+    for type_members in by_type_prefix.values():
+        by_length: dict[int, list[str]] = defaultdict(list)
+        for key in type_members:
+            by_length[core_lengths[key]].append(key)
+        lengths = sorted(by_length)
+        for length_index, length in enumerate(lengths):
+            for other_length in lengths[length_index:]:
+                if not _length_ceiling_can_exceed(
+                    length, other_length, SIMILARITY_MERGE_THRESHOLD
+                ):
+                    # The ceiling only falls as the other length grows, so the rest are out too.
+                    break
+                left = by_length[length]
+                right = by_length[other_length]
+                for position, key_a in enumerate(left):
+                    if key_a in merged_keys:
+                        continue
+                    for key_b in right[position + 1 if other_length == length else 0:]:
+                        if key_b in merged_keys:
+                            continue
+                        length_a = core_lengths[key_a]
+                        length_b = core_lengths[key_b]
+                        if length_a + length_b:
+                            unmatched = bin(
+                                character_masks[key_a] & ~character_masks[key_b]
+                            ).count("1")
+                            if 2.0 * (length_a - unmatched) / (length_a + length_b) <= SIMILARITY_MERGE_THRESHOLD:
+                                continue
+                            common = _common_character_count(
+                                character_counts[key_a], character_counts[key_b]
+                            )
+                            if 2.0 * common / (length_a + length_b) <= SIMILARITY_MERGE_THRESHOLD:
+                                continue
+                            ratio = SequenceMatcher(None, core_names[key_a], core_names[key_b]).ratio()
+                        else:
+                            # Two empty stems.  ``ratio()`` is 1.0 by definition, and the length
+                            # filters would divide by zero, so the answer is stated rather than
+                            # computed.
+                            ratio = 1.0
+                        if ratio > SIMILARITY_MERGE_THRESHOLD:
+                            if series_keys[key_a] == series_keys[key_b]:
+                                # Same convention, different date/issue/version: a distinct entity,
+                                # not a second name for this one.  Counted *after* the score, so
+                                # the number means "pairs this pass would have called duplicates",
+                                # which is what the operator needs to see.
+                                series_excluded += 1
+                                continue
+                            issues["similarity"].append(
+                                f"Duplicate: {key_a}.md <-> {key_b}.md ({ratio:.0%})"
+                            )
+                            if False: # auto_fix disabled for similarity merge by Mentat
+                                # Determine Primary vs Secondary based on 'updated' date
+                                file_a = f"{key_a}.md"
+                                file_b = f"{key_b}.md"
+                                if file_a not in parsed or file_b not in parsed: continue
+
+                                fm_a = parsed[file_a]["fm"]
+                                fm_b = parsed[file_b]["fm"]
+                                primary_order = establishment_key(fm_a.get("created"), fm_a.get("id") or key_a)
+                                secondary_order = establishment_key(fm_b.get("created"), fm_b.get("id") or key_b)
+
+                                if secondary_order < primary_order:
+                                    primary, secondary = file_b, file_a
+                                    s_key = key_a
+                                else:
+                                    primary, secondary = file_a, file_b
+                                    s_key = key_b
+
+                                p_data = parsed[primary]
+                                s_data = parsed[secondary]
+
+                                # Body, aliases and the survivor's frontmatter come from the
+                                # shared section-aware merger: a naive concatenation put the
+                                # consumed page's compiled-truth bullets after
+                                # `## 2. 证据时间线`, where the schema validator reads them as
+                                # malformed timeline entries.
+                                merged_content = merge_markdown_content(
+                                    _render_page(p_data["fm"], p_data["body"]),
+                                    _render_page(s_data["fm"], s_data["body"]),
+                                )
+                                merged_fm, merged_body = split_frontmatter(merged_content)
+                                merged_fm["updated"] = datetime.datetime.now().strftime("%Y-%m-%d")
+
+                                # Write Primary
+                                _write_fixed_frontmatter(p_data["path"], merged_fm, merged_body)
+
+                                # Delete Secondary
+                                try:
+                                    from vector_lake.mutation_coordinator import execute_mutation_plan
+                                    execute_mutation_plan(secondary, is_delete=True)
+                                except Exception as e:
+                                    log.error(f"Failed to delete merged secondary {s_data['path']}: {e}")
+
+                                merged_keys.add(s_key)
+                                fixes_applied += 1
 
     # Remaining checks (Orphans, Decay, Governance, Alignment)
     for filename in files:
@@ -634,6 +793,10 @@ def lint_vector_lake(auto_fix: bool = False):
         header += f" | Stub writes refused: {stubs_refused} (see the log)"
     lines = ["=== Vector Lake Lint Report ===", header, ""]
     for key, name in check_names.items():
+        if key == "similarity" and series_excluded:
+            # Without this a pass that excludes 3 782 date-series pairs and reports 42 identity
+            # collisions looks like it reported 42 out of 3 824, when the ratio is the point.
+            name += f" ({series_excluded} pairs excluded as one naming series)"
         items = issues[key]
         lines.append(f"{name}: {'[PASS]' if not items else f'[FAIL: {len(items)}]'}")
         for item in items[:10]:
