@@ -356,9 +356,7 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 告警从 `warnings` 升入 `degraded`（两者都不阻断写入）。
 - `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。
 - `VECTOR_LAKE_FUSION`：FTS 与向量两路的融合方式。默认 `sum`（历史行为：`-bm25` 与 `sim²·15` 两个原始量级相加）；`rrf` 改按名次融合（`Σ 1/(60+rank)`，常量见 `tool_search.RRF_K`），并把**图扩展也表达成同一量纲的第三路名次**。
-  **40 条已判定查询 + 真实嵌入下的实测**：`rrf` 在四个指标上方向一致地更好 —— success@5 `0.975 → 1.000`、recall@5 `0.7796 → 0.8242`、MRR `0.855 → 0.9229`、nDCG@5 `0.7757 → 0.8303`。但证据偏弱：四维里只有 MRR 的配对 bootstrap 95% CI 不含 0（`[+0.001, +0.147]`，p=0.046），符号检验 p=0.125（6 胜 1 负 33 平），recall 与 nDCG 的区间跏 0。
-  两者的取舍方向不同：`rrf` 更会把“最该看的那一页”顶到第 1（`CDSS` 从“前 5 无相关页”到第 1；`电子病历 六级 评级` 3→1），但会把多相关页查询里靠后的相关页挤下去（`紧密型县域医共体` nDCG 1.0→0.485；`南湖HIT论坛 2024` 0.905→0.586）。
-  **所以默认仍是 `sum`**：方向一致但强度不足，且该评测只有一位判定者、无一致性度量、指标四维（只报显著的那一维就是挑选结果）。要定论需扩充到 100+ 查询、加第二位独立判定者，并**预先登记主指标**。工具：`benchmarks/search_replay.py`（`--pool` 出候选池供盲判、`--compare` 出配对统计）。
+  **判定：默认保持 `sum`。** 预登记的主指标是 nDCG@5（规则见 `benchmarks/search_eval_decisions.md`）。确认集 76 条查询、两位独立判定者（kappa 0.73）下，`rrf` 在 **16/16 个「指标×标注集」组合**里方向一致更好，但主指标的配对 bootstrap 95% CI 在四个标注集上**全部包含 0**（judge-a 恰在边缘 p=0.051），符号检验也全不显著 → 规则给 **NOT MET**。把主指标换成 recall@5 的话，judge-a 下会“通过”（`0.7302 → 0.8535`，CI `[+0.029, +0.219]`，p=0.011）—— 这正是预登记要防的事。更早的 40 条单判定者一轮（仅 MRR 显著）方向与本轮一致，结论同样未成立。
 - `VECTOR_LAKE_EXPANSION_QUOTA`：给图扩展预留的候选池槽位数。不设＝维持历史行为，即扩展只能捡融合剩下的槽位（实测一半查询捡到 0）；设 N 后每次查询都保证有扩展候选进池。受 `expansion_limit`（general 5 / entity 12）约束，故有效上限是 `min(N, expansion_limit)`。
 - `VECTOR_LAKE_LEIDEN_L1_RESOLUTION` / `VECTOR_LAKE_LEIDEN_L0_RESOLUTION`：Leiden 的 Micro / Global 分辨率，默认 `2.0` / `1.0`。分辨率越高社区越小。
 - `VECTOR_LAKE_LEIDEN_SEED`：Leiden 随机种子，默认 `42`。**必须固定**才能保证社区划分可复现。
