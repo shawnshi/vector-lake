@@ -1,0 +1,10 @@
+# Every file in this repository is LF -- in the working copy as much as in the index.  HEAD is
+# 219/219 LF, and a CRLF working copy is what broke previous tooling here.
+#
+# The convention used to live only in a README instruction ("clone with core.autocrlf=false").
+# That is not a policy: a system-level core.autocrlf=true still rewrote the working copy to CRLF
+# on every checkout, and 87 of the 219 tracked files had drifted by the time it was measured.
+# Declaring it here puts the rule where no machine setting can override it.
+#
+# text=auto, not text: binary files must keep their bytes, and only git decides which is which.
+* text=auto eol=lf
