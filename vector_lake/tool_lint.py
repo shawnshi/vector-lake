@@ -5,19 +5,14 @@ import re
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 
-import yaml
-
 from vector_lake import governance_metrics
 from vector_lake import governance_store
-from vector_lake.governance_metrics import establishment_key
-from vector_lake.semantic_merge import merge_markdown_content
 from vector_lake.wiki_utils import (
     VALID_PREFIXES,
     get_wiki_dir,
     entity_identity_key,
     normalize_entity_name,
     read_markdown_file,
-    split_frontmatter,
     write_markdown_file,
 )
 from vector_lake import stub_creator
@@ -65,6 +60,41 @@ def _naming_series_key(key: str) -> str:
 def _type_prefix(key: str) -> str:
     """``Concept_HIS`` -> ``Concept``; an untyped stem keeps its whole self."""
     return key.split("_")[0] if "_" in key else ""
+
+
+def _family_sizes(pairs: list[tuple[str, str]]) -> list[int]:
+    """Sizes of the connected components of a pair graph, largest first.
+
+    A pair list is not a finding list: ``Concept_A-1``/``Concept_A-2`` and
+    ``Concept_A-2``/``Concept_A-3`` are one family of three names, and reporting three lines for it
+    hides that the operator has one thing to decide.  The component sizes are what the headline
+    should say.
+    """
+    parent: dict[str, str] = {}
+
+    def find(item: str) -> str:
+        parent.setdefault(item, item)
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    for left, right in pairs:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[left_root] = right_root
+    sizes: Counter = Counter()
+    for item in list(parent):
+        sizes[find(item)] += 1
+    return sorted(sizes.values(), reverse=True)
+
+
+def _histogram(sizes: list[int], top: int = 4) -> str:
+    """``[4, 3, 2, 2, 1]`` -> ``4×1, 3×1, 2×2, 1×1`` (largest sizes first)."""
+    counts = Counter(sizes)
+    return ", ".join(
+        f"{size}×{count}" for size, count in sorted(counts.items(), reverse=True)[:top]
+    )
 
 
 #: Bits in the character mask the similarity pass filters by.  256 is enough that two names of
@@ -140,13 +170,6 @@ def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str):
     except Exception as e:
         log.warning(f"Failed to write fixed frontmatter to {filepath}: {e}")
 
-
-def _render_page(frontmatter: dict, body: str) -> str:
-    """Rebuild the text ``merge_markdown_content`` consumes from a parsed page."""
-    rendered = yaml.safe_dump(
-        frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False
-    )
-    return f"---\n{rendered}---\n{body}"
 
 def _generate_id(stem: str) -> str:
     """The id a page that has none gets.  One owner: :func:`stub_creator.generate_id`.
@@ -509,10 +532,17 @@ def lint_vector_lake(auto_fix: bool = False):
         except SchemaViolationException as e:
             issues["schema"].append(f"{filename}: {str(e)}")
 
-    # 6. Similarity Merge (>0.91)
+    # 6. Name collisions: one name under two type prefixes, and near names within one type.
+    #
+    # This check reports name shape, and stops short of calling it duplication.  What counts as
+    # the same entity is decided by ``governance_metrics.find_merge_candidates`` -- which reads
+    # the canonical entities, weighs declared names and aliases, and carries reasons and an
+    # ambiguity guard -- and lands in the governance queue through
+    # ``merge_suggestions_vector_lake``.  Two detectors of "are these duplicates" is how the
+    # weaker one came to be the one an operator read, so this one no longer claims the answer.
     keys_list = sorted(list(all_keys))
-    merged_keys = set()
-    series_excluded = 0
+    collision_pairs: list[tuple[str, str]] = []
+    series_pairs: list[tuple[str, str]] = []
 
     # The name-likeness pass below cannot see the corpus's dominant duplication shape: one name
     # under two type prefixes.  It refuses any pair whose type prefix differs, and its window is
@@ -537,9 +567,10 @@ def lint_vector_lake(auto_fix: bool = False):
                 # are one event.  Two names whose digits differ have different identity keys and
                 # never reach this loop.
                 issues["similarity"].append(
-                    f"Duplicate: {key_a}.md <-> {key_b}.md (same name, different type prefix: "
-                    f"{_type_prefix(key_a)} vs {_type_prefix(key_b)})"
+                    f"Identity collision: {key_a}.md <-> {key_b}.md (same name, different type "
+                    f"prefix: {_type_prefix(key_a)} vs {_type_prefix(key_b)})"
                 )
+                collision_pairs.append((key_a, key_b))
 
     # One name under one type prefix, compared exactly.  The pass this replaced compared each key
     # with the 49 that follow it in sorted order, on the assumption that lexicographic neighbours
@@ -586,11 +617,7 @@ def lint_vector_lake(auto_fix: bool = False):
                 left = by_length[length]
                 right = by_length[other_length]
                 for position, key_a in enumerate(left):
-                    if key_a in merged_keys:
-                        continue
                     for key_b in right[position + 1 if other_length == length else 0:]:
-                        if key_b in merged_keys:
-                            continue
                         length_a = core_lengths[key_a]
                         length_b = core_lengths[key_b]
                         if length_a + length_b:
@@ -613,63 +640,34 @@ def lint_vector_lake(auto_fix: bool = False):
                         if ratio > SIMILARITY_MERGE_THRESHOLD:
                             if series_keys[key_a] == series_keys[key_b]:
                                 # Same convention, different date/issue/version: a distinct entity,
-                                # not a second name for this one.  Counted *after* the score, so
-                                # the number means "pairs this pass would have called duplicates",
-                                # which is what the operator needs to see.
-                                series_excluded += 1
+                                # not a second name for this one.  Kept for the summary rather
+                                # than reported, and decided after the score so the count means
+                                # "pairs the score would have called duplicates".
+                                series_pairs.append((key_a, key_b))
                                 continue
                             issues["similarity"].append(
-                                f"Duplicate: {key_a}.md <-> {key_b}.md ({ratio:.0%})"
+                                f"Name collision: {key_a}.md <-> {key_b}.md ({ratio:.0%})"
                             )
-                            if False: # auto_fix disabled for similarity merge by Mentat
-                                # Determine Primary vs Secondary based on 'updated' date
-                                file_a = f"{key_a}.md"
-                                file_b = f"{key_b}.md"
-                                if file_a not in parsed or file_b not in parsed: continue
+                            collision_pairs.append((key_a, key_b))
 
-                                fm_a = parsed[file_a]["fm"]
-                                fm_b = parsed[file_b]["fm"]
-                                primary_order = establishment_key(fm_a.get("created"), fm_a.get("id") or key_a)
-                                secondary_order = establishment_key(fm_b.get("created"), fm_b.get("id") or key_b)
-
-                                if secondary_order < primary_order:
-                                    primary, secondary = file_b, file_a
-                                    s_key = key_a
-                                else:
-                                    primary, secondary = file_a, file_b
-                                    s_key = key_b
-
-                                p_data = parsed[primary]
-                                s_data = parsed[secondary]
-
-                                # Body, aliases and the survivor's frontmatter come from the
-                                # shared section-aware merger: a naive concatenation put the
-                                # consumed page's compiled-truth bullets after
-                                # `## 2. 证据时间线`, where the schema validator reads them as
-                                # malformed timeline entries.
-                                merged_content = merge_markdown_content(
-                                    _render_page(p_data["fm"], p_data["body"]),
-                                    _render_page(s_data["fm"], s_data["body"]),
-                                )
-                                merged_fm, merged_body = split_frontmatter(merged_content)
-                                merged_fm["updated"] = datetime.datetime.now().strftime("%Y-%m-%d")
-
-                                # Write Primary
-                                _write_fixed_frontmatter(p_data["path"], merged_fm, merged_body)
-
-                                # Delete Secondary
-                                try:
-                                    from vector_lake.mutation_coordinator import execute_mutation_plan
-                                    execute_mutation_plan(secondary, is_delete=True)
-                                except Exception as e:
-                                    log.error(f"Failed to delete merged secondary {s_data['path']}: {e}")
-
-                                merged_keys.add(s_key)
-                                fixes_applied += 1
+    collision_families = _family_sizes(collision_pairs)
+    series_families = _family_sizes(series_pairs)
+    identity_collisions = sum(
+        1 for key_a, key_b in collision_pairs if _type_prefix(key_a) != _type_prefix(key_b)
+    )
+    collision_summary = [
+        f"collisions: {identity_collisions} identity (same name, different type prefix) + "
+        f"{len(collision_pairs) - identity_collisions} name (near name, same type)",
+        f"families: {len(collision_families)} over {sum(collision_families)} names"
+        + (f"; sizes {_histogram(collision_families)}" if collision_families else ""),
+        f"excluded as one naming convention: {len(series_pairs)} pairs in "
+        f"{len(series_families)} families (largest {max(series_families, default=0)} names)",
+        "merge decisions belong to merge_suggestions_vector_lake and the governance queue, "
+        "not to this pass",
+    ]
 
     # Remaining checks (Orphans, Decay, Governance, Alignment)
     for filename in files:
-        if filename[:-3] in merged_keys: continue
         node_key = filename[:-3]
         if inbound_count.get(node_key, 0) == 0 and not filename.startswith("Source_"):
             issues["orphan"].append(f"{filename}: No inbound links (orphan)")
@@ -688,7 +686,6 @@ def lint_vector_lake(auto_fix: bool = False):
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     for filename, data in parsed.items():
-        if filename[:-3] in merged_keys: continue
         frontmatter = data["fm"]
         updated_str = str(frontmatter.get("updated", ""))
         if not updated_str:
@@ -722,7 +719,6 @@ def lint_vector_lake(auto_fix: bool = False):
     archive_dir = os.path.join(wiki_dir, ".archive")
     import shutil
     for filename, data in parsed.items():
-        if filename[:-3] in merged_keys: continue
         frontmatter = data["fm"]
         node_status = str(frontmatter.get("status", "")).lower()
         node_key = filename[:-3]
@@ -775,7 +771,7 @@ def lint_vector_lake(auto_fix: bool = False):
         "alias_conflict": "6. Alias Conflicts",
         "broken_links": "7. Broken Links",
         "orphan": "8. Orphan Pages",
-        "similarity": "9. Filename Similarity",
+        "similarity": "9. Name Collisions",
         "decay": "10. Knowledge Decay",
         "semantic_gc": "11. Semantic Garbage Collection",
         "governance": "12. Governance Debt",
@@ -793,15 +789,19 @@ def lint_vector_lake(auto_fix: bool = False):
         header += f" | Stub writes refused: {stubs_refused} (see the log)"
     lines = ["=== Vector Lake Lint Report ===", header, ""]
     for key, name in check_names.items():
-        if key == "similarity" and series_excluded:
-            # Without this a pass that excludes 3 782 date-series pairs and reports 42 identity
-            # collisions looks like it reported 42 out of 3 824, when the ratio is the point.
-            name += f" ({series_excluded} pairs excluded as one naming series)"
         items = issues[key]
         lines.append(f"{name}: {'[PASS]' if not items else f'[FAIL: {len(items)}]'}")
-        for item in items[:10]:
+        # A pair list is not a finding list: ten samples out of thousands is what made this number
+        # unreadable, so name collisions report how many distinct families there are and hand the
+        # merge decision to its owner.  Every other check keeps the flat sample list it had.
+        if key == "similarity":
+            lines.extend(f"    {line}" for line in collision_summary)
+            sample_limit = 5
+        else:
+            sample_limit = 10
+        for item in items[:sample_limit]:
             lines.append(f"    {item}")
-        if len(items) > 10:
-            lines.append(f"    ... and {len(items) - 10} more")
+        if len(items) > sample_limit:
+            lines.append(f"    ... and {len(items) - sample_limit} more")
         lines.append("")
     return "\n".join(lines)

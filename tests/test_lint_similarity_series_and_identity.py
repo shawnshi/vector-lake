@@ -1,23 +1,27 @@
-"""Two rules the similarity pass was missing, in opposite directions.
+"""What check 9 reports, and what it deliberately does not.
 
-The pass compared *names* and called the result a duplicate, which failed both ways at once:
+The pass compared *names* and called the result a duplicate, which failed in three ways at once:
 
 * **It reported a naming convention as duplication.**  On the live corpus 3 782 of the 3 797
   pairs were keys differing only in their numbers -- ``Source_intelligence-20260219-briefing``
-  against ``...-20260220-...``, ``Event_南湖HIT论坛-2021`` against ``-2022``.  Those are
-  distinct entities that share a filing convention.  Digits are folded before the comparison,
-  so members of one series are no longer called duplicates of each other.
-* **It could not see the corpus's dominant duplication shape at all.**  ``prefix_a != prefix_b:
+  against ``...-20260220-...``, ``Event_南湖HIT论坛-2021`` against ``-2022``.  Those are distinct
+  entities sharing a filing convention.  Digits are now folded before the distinction is drawn,
+  so a series is counted as a series instead of reported as a duplicate.
+* **It could not see the shape this corpus actually duplicates in.**  ``prefix_a != prefix_b:
   continue`` refuses every cross-type pair, and the window is positional, so ``Concept_DRG-DIP``
   and ``Policy_DRG-DIP`` -- the same name filed under two types -- were excluded twice over.
-  Same name under a different type is an identity collision, not near-name similarity, so it is
-  grouped by the identity key the rest of the lake resolves links by.
+  That is an identity collision, not near-name similarity, so it is grouped by the identity key
+  the rest of the lake resolves links by.
+* **The window dropped 2 262 of the 6 058 threshold-passing pairs (37%)**, and the misses were
+  the ones worth reading -- ``Concept_LLM-as-a-Judge`` against ``Concept_VLM-as-a-judge`` sits
+  about 1 000 positions away among 3 983 concept pages.  It is replaced by three exact upper
+  bounds (length band, character mask, character multiset), which is the whole of what is
+  asserted below: a brute-force pass over the same band is the oracle.
 
-The prefilter (``_ratio_can_exceed``) and the threshold are deliberately untouched;
-``test_lint_similarity_prefilter.py`` pins those.
+And the check now reports name shape rather than answering "are these duplicates", which is
+``find_merge_candidates``'s question and lands in the governance queue.  The summary says so.
 
-Measured on the live wiki: 3 797 reported pairs -> 57 (42 identity collisions + 15 survivors of
-the window), with 3 782 pairs excluded as one naming series.
+The prefilter and the threshold are pinned elsewhere (``test_lint_similarity_prefilter.py``).
 """
 
 from __future__ import annotations
@@ -38,8 +42,25 @@ def _page(stem: str, node_type: str, title: str) -> str:
     )
 
 
-def _similarity_line(report: str) -> str:
-    return next(line for line in report.splitlines() if line.startswith("9. Filename Similarity"))
+def _similarity_block(report: str) -> list[str]:
+    """The check-9 section: header, summary lines, then samples."""
+    lines = report.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("9. Name Collisions"))
+    block: list[str] = []
+    for line in lines[start:]:
+        if block and not line.strip():
+            break
+        block.append(line)
+    return block
+
+
+def _similarity_header(report: str) -> str:
+    return _similarity_block(report)[0]
+
+
+def _similarity_summary(report: str) -> str:
+    """Everything in check 9 that is not a sample finding."""
+    return "\n".join(line for line in _similarity_block(report) if "collision:" not in line)
 
 
 def _report() -> str:
@@ -78,6 +99,18 @@ def test_type_prefix_is_the_filing_type_not_the_whole_stem():
     assert tool_lint._type_prefix("untyped") == ""
 
 
+def test_family_sizes_are_components_not_pairs():
+    """Three names in a chain are one family, and the headline must say one, not three."""
+    assert tool_lint._family_sizes([("a", "b"), ("b", "c")]) == [3]
+    assert tool_lint._family_sizes([("a", "b"), ("c", "d")]) == [2, 2]
+    assert tool_lint._family_sizes([]) == []
+
+
+def test_histogram_reads_largest_first():
+    assert tool_lint._histogram([4, 3, 2, 2, 1]) == "4×1, 3×1, 2×2, 1×1"
+    assert tool_lint._histogram([]) == ""
+
+
 # --- rule 1: one naming series is not duplication ---------------------------
 
 
@@ -93,10 +126,10 @@ def test_a_date_series_is_not_reported_as_duplicates(isolated_memory):
 
     report = _report()
 
-    assert "[PASS]" in _similarity_line(report), _similarity_line(report)
+    assert "[PASS]" in _similarity_header(report), _similarity_header(report)
     # The exclusion must be visible: a PASS that silently dropped 3 782 pairs reads as "nothing
     # was found", which is not what happened.
-    assert "excluded as one naming series" in _similarity_line(report)
+    assert "excluded as one naming convention: 1 pairs in 1 families" in _similarity_summary(report)
 
 
 def test_only_a_pure_number_difference_counts_as_one_series(isolated_memory):
@@ -111,7 +144,7 @@ def test_only_a_pure_number_difference_counts_as_one_series(isolated_memory):
 
     report = _report()
 
-    assert "[FAIL: 1]" in _similarity_line(report), _similarity_line(report)
+    assert "[FAIL: 1]" in _similarity_header(report), _similarity_header(report)
 
 
 # --- rule 2: the same name under two types is a collision -------------------
@@ -129,9 +162,9 @@ def test_one_name_under_two_type_prefixes_is_reported(isolated_memory):
 
     report = _report()
 
-    assert "[FAIL: 1]" in _similarity_line(report), _similarity_line(report)
+    assert "[FAIL: 1]" in _similarity_header(report), _similarity_header(report)
+    assert "Identity collision: Concept_DRG-DIP.md <-> Policy_DRG-DIP.md" in report
     assert "different type prefix: Concept vs Policy" in report
-    assert "Concept_DRG-DIP.md <-> Policy_DRG-DIP.md" in report
 
 
 def test_a_cross_type_pair_that_is_only_a_number_series_is_still_excluded(isolated_memory):
@@ -146,11 +179,11 @@ def test_a_cross_type_pair_that_is_only_a_number_series_is_still_excluded(isolat
 
     report = _report()
 
-    assert "[PASS]" in _similarity_line(report), _similarity_line(report)
+    assert "[PASS]" in _similarity_header(report), _similarity_header(report)
 
 
 def test_the_same_name_under_one_type_is_left_to_the_name_pass(isolated_memory):
-    """The identity pass groups cross-type only; a same-type pair is the window's job."""
+    """The identity pass groups cross-type only; a same-type pair is the name pass's job."""
     _wiki(
         "Concept_A",
         {
@@ -161,9 +194,9 @@ def test_the_same_name_under_one_type_is_left_to_the_name_pass(isolated_memory):
 
     report = _report()
 
-    line = _similarity_line(report)
-    assert "[FAIL: 1]" in line, line
-    assert "different type prefix" not in report
+    assert "[FAIL: 1]" in _similarity_header(report), _similarity_header(report)
+    assert "Identity collision" not in report
+    assert "Name collision: Concept_Agentic-AI.md" in report
 
 
 def test_a_cross_type_pair_keeps_its_digits(isolated_memory):
@@ -172,7 +205,7 @@ def test_a_cross_type_pair_keeps_its_digits(isolated_memory):
     ``Concept_2023全国深化医改经验推广会`` and ``Event_2023全国深化医改经验推广会`` differ only
     in their type prefix, so they are one thing and the digits are part of its name.  Screening the
     identity pass by naming series -- where the same name trivially shares a series -- would hide
-    exactly the duplicates that pass exists to find.
+    exactly the collisions that pass exists to find.
     """
     _wiki(
         "Concept_A",
@@ -191,6 +224,9 @@ def test_a_cross_type_pair_keeps_its_digits(isolated_memory):
     assert "different type prefix: Concept vs Event" in report, report
 
 
+# --- rule 3: the window's blind spot is closed ------------------------------
+
+
 def test_a_previously_missed_near_pair_is_now_found(isolated_memory):
     """The window's blind spot: these sit ~1 000 positions apart among 3 983 concept pages."""
     _wiki(
@@ -203,7 +239,7 @@ def test_a_previously_missed_near_pair_is_now_found(isolated_memory):
 
     report = _report()
 
-    assert "[FAIL: 1]" in _similarity_line(report), _similarity_line(report)
+    assert "[FAIL: 1]" in _similarity_header(report), _similarity_header(report)
     assert "Concept_LLM-as-a-Judge.md <-> Concept_VLM-as-a-judge.md" in report
 
 
@@ -219,4 +255,60 @@ def test_the_same_pair_is_found_whichever_way_round_the_loop_reaches_it(isolated
 
     report = _report()
 
-    assert "[FAIL: 1]" in _similarity_line(report), _similarity_line(report)
+    assert "[FAIL: 1]" in _similarity_header(report), _similarity_header(report)
+
+
+# --- the report says what the check is, and who decides ---------------------
+
+
+def test_the_check_reports_name_shape_and_stops_short_of_duplication(isolated_memory):
+    """It no longer answers a question that has an owner elsewhere."""
+    _wiki(
+        "Concept_A",
+        {
+            "Concept_DRG-DIP": _page("Concept_DRG-DIP", "concept", "DRG/DIP"),
+            "Policy_DRG-DIP": _page("Policy_DRG-DIP", "policy", "DRG/DIP"),
+        },
+    )
+
+    report = _report()
+
+    assert "9. Name Collisions" in report
+    assert "Duplicate:" not in report
+    assert "merge decisions belong to merge_suggestions_vector_lake" in report
+
+
+def test_findings_are_summarised_as_families_not_sample_lines(isolated_memory):
+    """Three names in a chain is one decision, and the summary is where that shows."""
+    _wiki(
+        "Concept_A",
+        {
+            "Concept_Transformer": _page("Concept_Transformer", "concept", "Transformer"),
+            "Concept_Transformers": _page("Concept_Transformers", "concept", "Transformers"),
+            "Concept_Transformerz": _page("Concept_Transformerz", "concept", "Transformerz"),
+        },
+    )
+
+    report = _report()
+    summary = _similarity_summary(report)
+
+    assert "families: 1 over 3 names" in summary, summary
+    assert "sizes 3×1" in summary, summary
+
+
+def test_the_sample_list_is_cut_short_when_there_is_a_summary(isolated_memory):
+    """Ten samples out of thousands is what made the number unreadable."""
+    _wiki(
+        "Concept_A",
+        {
+            f"Concept_Near-Case-{index}": _page(
+                f"Concept_Near-Case-{index}", "concept", f"Near Case {index}"
+            )
+            for index in range(8)
+        },
+    )
+
+    report = _report()
+    block = _similarity_block(report)
+
+    assert sum(1 for line in block if "collision:" in line) <= 5, block
