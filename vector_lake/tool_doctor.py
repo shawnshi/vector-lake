@@ -101,7 +101,6 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
         checks.append((package_name, found, "installed" if found else "missing"))
 
     from vector_lake import tokenizer as _tokenizer
-
     tokenizer_backend = _tokenizer.backend_name()
     if tokenizer_backend == "unavailable":
         checks.append((
@@ -114,6 +113,23 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
         if not _tokenizer.supports_add_word():
             detail += "; no add_word() on this backend (custom dictionary terms ignored)"
         checks.append(("Tokenizer Backend", True, detail))
+
+    # The retrieval ledger is the only record of what search answered, so whether it is on and
+    # how much it holds belongs in the same report as everything else that can silently be off.
+    try:
+        from vector_lake import search_ledger as _ledger
+
+        if not _ledger.enabled():
+            checks.append(("Search Ledger", True, "disabled by VECTOR_LAKE_SEARCH_LEDGER=0"))
+        else:
+            ledger = _ledger.summary()
+            checks.append((
+                "Search Ledger",
+                True,
+                f"{ledger['entries']} entr(ies), {ledger['distinct_queries']} distinct quer(ies)",
+            ))
+    except Exception as exc:  # noqa: BLE001 - a status line must not fail the report
+        checks.append(("Search Ledger", False, f"unavailable: {type(exc).__name__}: {exc}"))
 
     # Community detection: Leiden via igraph + leidenalg (was Louvain).
     try:

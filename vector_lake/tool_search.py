@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import threading
+import time
 from array import array
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ import functools
 import ast
 import operator
 
-from vector_lake import governance_store
+from vector_lake import governance_store, search_ledger
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 
@@ -38,6 +39,45 @@ DEFAULT_MAX_CHARS = 200000
 # warm on this host; a quota-retry loop used to sleep a flat 60 s per attempt.
 # The budget is generous against the healthy path and hard against the loop.
 QUERY_EMBEDDING_BUDGET_SECONDS = 20.0
+
+#: Reciprocal-rank-fusion constant, used when ``VECTOR_LAKE_FUSION=rrf``.  It is the only knob
+#: because it is the only insensitive one: moving k shifts ranks by a few positions, whereas the
+#: magnitude sum decides its winner by which source's arbitrary scale happens to be larger for
+#: that query (``-bm25`` measured 5.1-47.6 across five queries against a hard vector ceiling of 15).
+RRF_K = 60
+
+FUSION_MODES = ("sum", "rrf")
+
+
+def _fusion_mode() -> str:
+    """``sum`` (the long-standing blend) or ``rrf`` (``VECTOR_LAKE_FUSION=rrf``)."""
+    requested = os.environ.get("VECTOR_LAKE_FUSION", "sum").strip().lower()
+    if requested not in FUSION_MODES:
+        log.warning("Unknown VECTOR_LAKE_FUSION=%r; using 'sum'.", requested)
+        return "sum"
+    return requested
+
+
+def _expansion_quota(pool_size: int) -> int | None:
+    """Pool slots guaranteed to graph expansion, or ``None`` for the long-standing behaviour.
+
+    Unset means expansion competes for whatever the fusion stage left over.  Both recall paths are
+    asked for ``top_k * 5`` candidates and the pool is ``max(40, top_k * 3)``, so the leftovers are
+    often nothing: measured on the live lake, three of five sampled queries left zero slots, which
+    made graph expansion a documented candidate source that could not supply a candidate.
+    """
+    raw = os.environ.get("VECTOR_LAKE_EXPANSION_QUOTA")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        log.warning("Unknown VECTOR_LAKE_EXPANSION_QUOTA=%r; using the default.", raw)
+        return None
+    if value < 0:
+        log.warning("VECTOR_LAKE_EXPANSION_QUOTA must be >= 0; using the default.")
+        return None
+    return min(value, pool_size)
 
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 STOP_WORDS = {
@@ -542,6 +582,19 @@ def _search_scored_pages(
     """
     from vector_lake import page_index_projection
 
+    started = time.perf_counter()
+
+    def _record(returned_rows, notes, error=None):
+        search_ledger.record(
+            query,
+            mode="page",
+            top_k=top_k,
+            returned=returned_rows,
+            notes=notes,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            error=error,
+        )
+
     # Read-only source selection.  A reader never repairs the projection: the
     # rebuild needs the write lock, and a reader that lost that race used to give
     # up entirely (a 60 s MCP timeout with no answer).  ``index.json`` is the
@@ -555,36 +608,49 @@ def _search_scored_pages(
         catalog, projection_note = page_index_projection.read_catalog()
     if catalog is None:
         if page_index_projection.index_file_stamp() is None:
-            return [], [], "Lake is drying. No index.json found, please ingest sources first."
-        return [], [], "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
+            answer = "Lake is drying. No index.json found, please ingest sources first."
+            _record([], [], error=answer)
+            return [], [], answer
+        answer = "Error reading the knowledge base index. Please ensure the index exists and is not corrupted."
+        _record([], [], error=answer)
+        return [], [], answer
 
     intent = _classify_intent(query)
     tokens = _expand_query_locally(query)
     if not tokens:
+        _record([], [], error="No valid search tokens.")
         return [], [], "No valid search tokens."
 
+    fusion_mode = _fusion_mode()
     scored = []
     
     # PHASE 2 FTS5 + VECTOR HYBRID QUERY
     hybrid_scores = {}
     
     # 1. FTS5 Search
+    fts_ranked: list[str] = []
     try:
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
         fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
-        for row in fts_results:
+        for position, row in enumerate(fts_results):
             key = row['node_key']
             raw_score = row.get('rank')
             if raw_score is None:
                 raw_score = row.get('score', 0)
-            fts_score = raw_score * -1.0  # SQLite BM25 is negative
-            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + fts_score
+            if fusion_mode == "rrf":
+                # Reciprocal rank: the source's position, not its arbitrary magnitude.
+                contribution = 1.0 / (RRF_K + position + 1)
+            else:
+                contribution = raw_score * -1.0  # SQLite BM25 is negative
+            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + contribution
+            fts_ranked.append(key)
     except Exception as e:
         log.error(f"FTS5 Search failed: {e}")
 
     # 2. Vector Search (Hybrid blending)
     vector_notes = []
+    vector_ranked: list[str] = []
     query_vector, embedding_error = _get_query_embedding(query)
     if query_vector:
         vector_results, vector_error = _get_vector_search_results(query_vector, limit=top_k * 5)
@@ -594,12 +660,21 @@ def _search_scored_pages(
             vector_notes.append(
                 "no stored vectors matched; run `embedding-backfill --apply` to (re)build the vector projection"
             )
-        for key, sim in vector_results.items():
-            # scale similarity so it competes/blends with BM25.
-            vec_score = (sim ** 2) * 15.0
-            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + vec_score
+        # ``_get_vector_search_results`` inserts in ascending distance, so enumeration order is
+        # the vector ranking that RRF needs.
+        for position, (key, sim) in enumerate(vector_results.items()):
+            if fusion_mode == "rrf":
+                contribution = 1.0 / (RRF_K + position + 1)
+            else:
+                # scale similarity so it competes/blends with BM25.
+                contribution = (sim ** 2) * 15.0
+            hybrid_scores[key] = hybrid_scores.get(key, 0.0) + contribution
+            vector_ranked.append(key)
     else:
         vector_notes.append(embedding_error or "query embedding unavailable")
+
+    fts_hits = set(fts_ranked)
+    vector_hits = set(vector_ranked)
 
     # Only the keys the hybrid stage actually produced are materialised, so the
     # 7 178-node dict never has to exist in memory.
@@ -609,7 +684,13 @@ def _search_scored_pages(
         node = nodes.get(key)
         if node is None:
             continue
-        node = {"_key": key, **node}
+        if key in fts_hits and key in vector_hits:
+            origin = "both"
+        elif key in fts_hits:
+            origin = "fts"
+        else:
+            origin = "vec"
+        node = {"_key": key, **node, "_origin": origin}
         if not _passes_filters(node, domain, cluster, include_history, filter_expr):
             continue
         if not include_history and node.get('status', '').lower() == 'decayed' and intent != 'temporal':
@@ -660,26 +741,47 @@ def _search_scored_pages(
             # from the caller's filters.
             if not _passes_filters(expanded_node, domain, cluster, include_history, filter_expr):
                 continue
-            scored.append((ppr_weight * 15.0, {"_key": expanded_key, **expanded_node}))
+            scored.append((ppr_weight * 15.0, {"_key": expanded_key, **expanded_node, "_origin": "ppr"}))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
     # Phase 1: Expand candidate pool for reranking
-    candidate_pool = []
-    source_count = 0
     pool_size = max(40, top_k * 3)
     max_sources_pool = int(pool_size * 0.6)
-    for score, node in scored:
-        node_type = node.get("type", "").lower()
-        if node_type == "source":
-            if source_count < max_sources_pool:
-                candidate_pool.append((score, node))
-                source_count += 1
-        else:
-            candidate_pool.append((score, node))
-        if len(candidate_pool) >= pool_size:
-            break
-            
+    expansion_quota = _expansion_quota(pool_size)
+    source_budget = [0]
+
+    def _fill(entries, capacity):
+        """Take up to ``capacity`` entries in score order, with the source-type cap applied.
+
+        ``source_budget`` is shared across calls so the cap stays pool-wide, exactly as the single
+        loop it replaces applied it.
+        """
+        taken = []
+        for score, node in entries:
+            if node.get("type", "").lower() == "source":
+                if source_budget[0] >= max_sources_pool:
+                    continue
+                source_budget[0] += 1
+            taken.append((score, node))
+            if len(taken) >= capacity:
+                break
+        return taken
+
+    if expansion_quota:
+        primary = [(s, n) for s, n in scored if n.get("_origin") != "ppr"]
+        expanded = [(s, n) for s, n in scored if n.get("_origin") == "ppr"]
+        candidate_pool = _fill(primary, pool_size - expansion_quota)
+        candidate_pool += _fill(expanded, expansion_quota)
+        if len(candidate_pool) < pool_size:
+            # The reservation is a floor for expansion, not a ceiling for the rest: what expansion
+            # did not use goes back to the fusion candidates, still in score order.
+            already = {node["_key"] for _, node in candidate_pool}
+            leftover = [(s, n) for s, n in scored if n["_key"] not in already]
+            candidate_pool += _fill(leftover, pool_size - len(candidate_pool))
+        candidate_pool.sort(key=lambda item: item[0], reverse=True)
+    else:
+        candidate_pool = _fill(scored, pool_size)
     # Phase 2: Local deterministic ranking. Text-model reranking is delegated
     # to the host agent when explicitly requested, not performed by runtime code.
     reranked = _rerank_candidates_locally(query, candidate_pool)
@@ -706,6 +808,13 @@ def _search_scored_pages(
 
     if projection_note:
         vector_notes.append(projection_note)
+    _record(
+        [
+            {"key": node["_key"], "origin": node.get("_origin", "?"), "score": round(score, 6)}
+            for score, node in final_scored
+        ],
+        vector_notes,
+    )
     return final_scored, vector_notes, None
 
 

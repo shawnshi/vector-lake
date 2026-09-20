@@ -355,6 +355,8 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_RUNNER_STALE_SECONDS`：Runner / 监督器心跳过期阈值，默认 `2400` 秒。
 - `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 告警从 `warnings` 升入 `degraded`（两者都不阻断写入）。
 - `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。
+- `VECTOR_LAKE_FUSION`：FTS 与向量两路的融合方式。默认 `sum`（历史行为：`-bm25` 与 `sim²·15` 两个原始量级相加）；`rrf` 改按名次融合（`Σ 1/(60+rank)`，常量见 `tool_search.RRF_K`）。**`rrf` 目前是实测回退，不要开**：图扩展那一段的 `ppr_weight*15` 是按旧融合量纲写的，在 RRF 尺度下反而压倒两路召回（40 条评测查询：recall@5 `0.75 → 0.33`，MRR `0.572 → 0.107`，返回页中扩展来源占比 `1% → 78%`）。要启用必须先同时把扩展阶段改成同一量纲，并用 `benchmarks/search_replay.py` 度量。
+- `VECTOR_LAKE_EXPANSION_QUOTA`：给图扩展预留的候选池槽位数。不设＝维持历史行为，即扩展只能捡融合剩下的槽位（实测一半查询捡到 0）；设 N 后每次查询都保证有扩展候选进池。受 `expansion_limit`（general 5 / entity 12）约束，故有效上限是 `min(N, expansion_limit)`。
 - `VECTOR_LAKE_LEIDEN_L1_RESOLUTION` / `VECTOR_LAKE_LEIDEN_L0_RESOLUTION`：Leiden 的 Micro / Global 分辨率，默认 `2.0` / `1.0`。分辨率越高社区越小。
 - `VECTOR_LAKE_LEIDEN_SEED`：Leiden 随机种子，默认 `42`。**必须固定**才能保证社区划分可复现。
 - 所有进程通过 SQLite 滚动窗口共享 RPM/TPM 预算；索引重建和增量索引不调用 embedding API，内容变更后的旧向量由显式 `embedding-backfill` 补齐。
@@ -376,6 +378,7 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_MAX_AWAITING_SUBAGENT_AGE_SECONDS`：等待中 subagent 作业的年龄阈值，默认 `86400` 秒。
 - `VECTOR_LAKE_SUBAGENT_BACKLOG_BLOCKING=1`：把 subagent 积压从降级告警升级为阻断写入。默认关闭。
 - `VECTOR_LAKE_SUBAGENT_RUN_ID`：本进程作为 outbox / job 租约持有者的标识；不设置时用 `hostname:pid`。
+- `VECTOR_LAKE_SEARCH_LEDGER=0`：关闭检索台账（默认开启）。每次检索向 `<meta>/runtime/search_ledger.jsonl` 追加一行：查询的**摘要而非原文**（`q_hash` + `q_chars`）、返回页键、每页来源（`fts` / `vec` / `both` / `ppr`）、耗时与降级说明；文件达 2 MiB 轮转一代，故上限 2×。它回答“同一条查询是不是答得不一样了”，也是 `benchmarks/search_replay.py` 与生产可比的前提；写入失败只会记 `debug`，不影响检索。
 - Ingest 完成必须提交领取阶段返回的 `job_id`、`lease_owner`、`lease_token` 和 `lease_generation`；过期 Worker 的结果会被最终 CAS 拒绝。
 
 ### 依赖与分词后端 (Dependencies & Tokenizer)

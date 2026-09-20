@@ -1,0 +1,40 @@
+{"query": "医院数据平台 信创 下一步", "expect": ["Concept_新一代医院数据平台"]}
+{"query": "OMOP 通用数据模型 映射", "expect": ["Standard_OMOP-CDM"]}
+{"query": "DRG 支付 合规", "expect": ["Policy_DRG-DIP"]}
+{"query": "信创替代 底座 架构", "expect": ["Concept_信创"]}
+{"query": "FAST 身份 与 同意", "expect": ["Standard_HL7-FAST"]}
+{"query": "齐鲁医院 数智化 底座", "expect": ["Institution_齐鲁医院"]}
+{"query": "WiNEX DnA 数据平台", "expect": ["Product_WiNEX-DnA"]}
+{"query": "医疗语义层 MSL", "expect": ["Concept_医疗语义层"]}
+{"query": "联邦学习 多中心 协作", "expect": ["Concept_联邦学习"]}
+{"query": "南湖HIT论坛 2024", "expect": ["Event_南湖HIT论坛-2024"]}
+{"query": "数智中医药 科研", "expect": ["Concept_数智中医药"]}
+{"query": "卫宁健康 产品线", "expect": ["Vendor_卫宁健康"]}
+{"query": "电子病历 六级 评级"}
+{"query": "AI 医院"}
+{"query": "HIS 解耦 微服务"}
+{"query": "互联互通 五级乙等"}
+{"query": "智慧服务 分级评估"}
+{"query": "医疗大模型 幻觉 治理"}
+{"query": "医院 数据治理 组织"}
+{"query": "主索引 EMPI 患者"}
+{"query": "电子病历 内涵质控"}
+{"query": "临床决策支持 CDSS"}
+{"query": "病历 质控 大模型"}
+{"query": "医保 智能监控 两库"}
+{"query": "公立医院 绩效考核"}
+{"query": "紧密型县域医共体"}
+{"query": "医疗数据 出域 监管"}
+{"query": "可信数据空间 医疗"}
+{"query": "中台 微服务 医院架构"}
+{"query": "智能体 Agent 医院落地"}
+{"query": "算力 智算中心 医院"}
+{"query": "血液 专科 大模型"}
+{"query": "病理 数字化 AI"}
+{"query": "影像 云 PACS"}
+{"query": "科研大数据平台 专病库"}
+{"query": "分级诊疗 双向转诊"}
+{"query": "电子病历 信息使用管理 通知"}
+{"query": "十五五 医疗 规划"}
+{"query": "医院 信息中心 组织变革"}
+{"query": "数据要素 三权分置"}
