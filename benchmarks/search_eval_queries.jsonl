@@ -1,15 +1,15 @@
-{"query": "医院数据平台 信创 下一步", "expect": ["Concept_新一代医院数据平台"]}
-{"query": "OMOP 通用数据模型 映射", "expect": ["Standard_OMOP-CDM"]}
-{"query": "DRG 支付 合规", "expect": ["Policy_DRG-DIP"]}
-{"query": "信创替代 底座 架构", "expect": ["Concept_信创"]}
-{"query": "FAST 身份 与 同意", "expect": ["Standard_HL7-FAST"]}
-{"query": "齐鲁医院 数智化 底座", "expect": ["Institution_齐鲁医院"]}
-{"query": "WiNEX DnA 数据平台", "expect": ["Product_WiNEX-DnA"]}
-{"query": "医疗语义层 MSL", "expect": ["Concept_医疗语义层"]}
-{"query": "联邦学习 多中心 协作", "expect": ["Concept_联邦学习"]}
-{"query": "南湖HIT论坛 2024", "expect": ["Event_南湖HIT论坛-2024"]}
-{"query": "数智中医药 科研", "expect": ["Concept_数智中医药"]}
-{"query": "卫宁健康 产品线", "expect": ["Vendor_卫宁健康"]}
+{"query": "医院数据平台 信创 下一步"}
+{"query": "OMOP 通用数据模型 映射"}
+{"query": "DRG 支付 合规"}
+{"query": "信创替代 底座 架构"}
+{"query": "FAST 身份 与 同意"}
+{"query": "齐鲁医院 数智化 底座"}
+{"query": "WiNEX DnA 数据平台"}
+{"query": "医疗语义层 MSL"}
+{"query": "联邦学习 多中心 协作"}
+{"query": "南湖HIT论坛 2024"}
+{"query": "数智中医药 科研"}
+{"query": "卫宁健康 产品线"}
 {"query": "电子病历 六级 评级"}
 {"query": "AI 医院"}
 {"query": "HIS 解耦 微服务"}

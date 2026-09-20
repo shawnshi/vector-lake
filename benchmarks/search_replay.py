@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
-"""Replay a fixed query set through the retrieval path, and compare two runs.
+"""Replay a fixed query set, score it against judged labels, and compare two runs.
 
-The A1/A2 ranking work changes which candidates reach ``top_k``, and this lake keeps no record
-that could show whether a change improved retrieval or damaged it: there is no ``log.md`` and no
-query table.  ``search_ledger`` now records production answers, but only as digests, which answers
-"is the same query answering differently" and not "is the answer better".
+The A1/A2 ranking work changes which candidates reach ``top_k``, and this lake keeps no record that
+could show whether a change improved retrieval or damaged it: there is no ``log.md`` and no query
+table.  ``search_ledger`` records production answers as digests, which answers "is the same query
+answering differently" but not "is the answer better".  This harness supplies the other half.
 
-This harness supplies the other half: a committed query set, a deterministic replay, and a diff of
-two runs.  It is an A/B instrument, not a benchmark -- most queries are deliberately unlabelled,
-and the metric block says how many were scored.
+Three modes:
+
+    replay   (default) run the set and score it against ``search_eval_labels.jsonl``
+    --pool   run every fusion under comparison and print their union, *blinded*, for judging
+    --compare A B   paired comparison: per-query deltas, win/loss/tie, sign test, bootstrap CI
+
+Judging method, because the metric is only as good as this part:
+
+* the pool is the union of every configuration's top-k, so a document either system ranks in the top
+  k is judged.  Pooling at the *same depth as the metric* is what makes that exact for recall@k and
+  MRR@k: nothing outside the pool can affect either.
+* the listing is sorted by page key and shows no scores and no origins, so the judgement cannot see
+  which system proposed what.  Judging from a system's own output would just re-score that system.
+* a judged-relevant page is one whose content answers the query, most often because the page *is*
+  what the query names.  Unjudged documents count as not relevant -- the standard pool assumption,
+  and the reason the pool depth has to match the metric depth.
 
 Vector source (the vector path needs a query embedding, which is a provider round trip):
 
@@ -16,20 +29,16 @@ Vector source (the vector path needs a query embedding, which is a provider roun
     live      call the provider and refresh the snapshot
     stored    one stored vector for every query -- offline, deterministic, and *not* a measure of
               retrieval quality; it exercises the fusion mechanics only
-
-Usage:
-
-    python benchmarks/search_replay.py --out /tmp/sum.json
-    VECTOR_LAKE_FUSION=rrf python benchmarks/search_replay.py --out /tmp/rrf.json
-    python benchmarks/search_replay.py --compare /tmp/sum.json /tmp/rrf.json
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
+import random
 import struct
 import sys
 from unittest import mock
@@ -45,6 +54,15 @@ try:  # absent before the ledger landed; the harness must also run against an ol
 except ImportError:  # pragma: no cover - only reachable when replaying an older checkout
     search_ledger = None
 
+QUERY_SET = REPO / "benchmarks" / "search_eval_queries.jsonl"
+LABEL_SET = REPO / "benchmarks" / "search_eval_labels.jsonl"
+SNAPSHOT_NAME = "search_eval_vectors.json"
+#: Fusions the pool is built from, so a comparison cannot be biased by judging only one side's
+#: candidates.
+POOL_FUSIONS = ("sum", "rrf")
+BOOTSTRAP_RESAMPLES = 20000
+BOOTSTRAP_SEED = 20260920
+
 
 def query_digest(query: str) -> str:
     """Prefers the ledger's digest so a replay keys match production entries."""
@@ -54,18 +72,34 @@ def query_digest(query: str) -> str:
 
     return hashlib.sha256(str(query).encode("utf-8")).hexdigest()[:16]
 
-QUERY_SET = REPO / "benchmarks" / "search_eval_queries.jsonl"
-SNAPSHOT_NAME = "search_eval_vectors.json"
 
-
-def load_queries(path: pathlib.Path, limit: int = 0) -> list[dict]:
-    queries = []
+def _read_jsonl(path: pathlib.Path) -> list[dict]:
+    rows: list[dict] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if line and not line.startswith("#"):
-                queries.append(json.loads(line))
+                rows.append(json.loads(line))
+    return rows
+
+
+def load_queries(path: pathlib.Path, limit: int = 0) -> list[dict]:
+    queries = _read_jsonl(path)
     return queries[:limit] if limit else queries
+
+
+def load_labels(path: pathlib.Path) -> dict[str, set[str]]:
+    """``{query_digest: {relevant page keys}}`` -- the only owner of relevance judgement.
+
+    The query set deliberately carries no ``expect`` field: two places to record what is relevant
+    is two places to disagree, and only this file should be able to move a metric.
+    """
+    if not path.exists():
+        return {}
+    return {
+        query_digest(row["query"]): set(row.get("relevant") or [])
+        for row in _read_jsonl(path)
+    }
 
 
 def snapshot_path() -> pathlib.Path:
@@ -94,11 +128,7 @@ def build_vectors(queries: list[dict], mode: str) -> dict[str, list[float]]:
     if mode == "snapshot" and path.exists():
         cached = json.loads(path.read_text(encoding="utf-8"))
 
-    missing = [
-        item["query"]
-        for item in queries
-        if query_digest(item["query"]) not in cached
-    ]
+    missing = [item["query"] for item in queries if query_digest(item["query"]) not in cached]
     if mode == "live" or missing:
         if missing and mode == "snapshot":
             print(f"[vectors] {len(missing)} quer{'y' if len(missing) == 1 else 'ies'} not in the "
@@ -118,87 +148,225 @@ def build_vectors(queries: list[dict], mode: str) -> dict[str, list[float]]:
     return cached
 
 
-def run(queries: list[dict], vectors: dict[str, list[float]], top_k: int) -> dict:
-    results = {}
-    for item in queries:
-        query = item["query"]
-        digest = query_digest(query)
-        vector = vectors.get(digest) or []
-        with mock.patch.object(tool_search, "_get_query_embedding", lambda q, v=vector: (v, None)):
-            final, notes, error = tool_search._search_scored_pages(query, top_k=top_k)
-        results[digest] = {
-            "query_chars": len(query),
-            "expect": item.get("expect") or [],
-            "returned": [
-                {"key": node["_key"], "origin": node.get("_origin", "?"), "score": round(score, 6)}
-                for score, node in final
-            ],
-            "notes": list(notes or []),
-            "error": error,
-        }
-    return results
+#: Distinct from ``None``, which is a fusion a caller could legitimately ask for as "unset":
+#: the sentinel means "do not touch the environment at all".
+_UNSET = object()
 
 
-def metrics(results: dict) -> dict:
-    labelled = {k: v for k, v in results.items() if v["expect"]}
-    hits = 0
-    reciprocal = 0.0
-    for row in labelled.values():
-        keys = [entry["key"] for entry in row["returned"]]
-        positions = [keys.index(key) + 1 for key in row["expect"] if key in keys]
-        if positions:
-            hits += 1
-            reciprocal += 1.0 / min(positions)
+def run(queries: list[dict], vectors: dict[str, list[float]], top_k: int, fusion=_UNSET) -> dict:
+    """Replay every query.
+
+    ``fusion`` is the sentinel by default, and that matters: the replay path must use whatever the
+    environment says, because that is how ``VECTOR_LAKE_FUSION=rrf python search_replay.py`` selects
+    a configuration.  An earlier version of this function cleared the variable when no fusion was
+    passed, which silently pinned every replay to ``sum`` -- two "different" runs then produced
+    byte-identical metrics, and the comparison reported 40 ties.
+    """
+    previous = os.environ.get("VECTOR_LAKE_FUSION")
+    touched = fusion is not _UNSET
+    if touched:
+        if fusion is None:
+            os.environ.pop("VECTOR_LAKE_FUSION", None)
+        else:
+            os.environ["VECTOR_LAKE_FUSION"] = fusion
+    try:
+        results = {}
+        for item in queries:
+            query = item["query"]
+            digest = query_digest(query)
+            vector = vectors.get(digest) or []
+            with mock.patch.object(tool_search, "_get_query_embedding", lambda q, v=vector: (v, None)):
+                final, notes, error = tool_search._search_scored_pages(query, top_k=top_k)
+            results[digest] = {
+                "query": query,
+                "returned": [
+                    {"key": node["_key"], "origin": node.get("_origin", "?"), "score": round(score, 6)}
+                    for score, node in final
+                ],
+                "notes": list(notes or []),
+                "error": error,
+            }
+        return results
+    finally:
+        if touched:
+            if previous is None:
+                os.environ.pop("VECTOR_LAKE_FUSION", None)
+            else:
+                os.environ["VECTOR_LAKE_FUSION"] = previous
+
+
+# --- scoring -----------------------------------------------------------------------------------
+
+
+def _per_query(row: dict, relevant: set[str], top_k: int) -> dict:
+    """The four per-query numbers the comparison is paired on."""
+    keys = [entry["key"] for entry in row["returned"]][:top_k]
+    positions = [index + 1 for index, key in enumerate(keys) if key in relevant]
+    first = min(positions) if positions else None
+    gains = [1.0 if key in relevant else 0.0 for key in keys]
+    dcg = sum(gain / math.log2(index + 2) for index, gain in enumerate(gains))
+    ideal = sum(1.0 / math.log2(index + 2) for index in range(min(len(relevant), top_k)))
+    return {
+        "success": 1.0 if first else 0.0,
+        "recall": (len(set(keys) & relevant) / len(relevant)) if relevant else 0.0,
+        "reciprocal_rank": (1.0 / first) if first else 0.0,
+        "ndcg": (dcg / ideal) if ideal else 0.0,
+        "first_relevant": first,
+    }
+
+
+def metrics(results: dict, labels: dict[str, set[str]], top_k: int) -> dict:
+    judged = {digest: labels[digest] for digest in results if digest in labels}
+    per_query = {digest: _per_query(results[digest], relevant, top_k) for digest, relevant in judged.items()}
     origins: dict[str, int] = {}
     for row in results.values():
         for entry in row["returned"]:
             origins[entry["origin"]] = origins.get(entry["origin"], 0) + 1
+
+    def mean(field: str) -> float | None:
+        if not per_query:
+            return None
+        return round(sum(row[field] for row in per_query.values()) / len(per_query), 4)
+
     return {
         "queries": len(results),
-        "labelled": len(labelled),
-        "recall_at_k": round(hits / len(labelled), 4) if labelled else None,
-        "mrr": round(reciprocal / len(labelled), 4) if labelled else None,
+        "judged": len(judged),
+        "relevant_pages": sum(len(relevant) for relevant in judged.values()),
+        "success_at_k": mean("success"),
+        "recall_at_k": mean("recall"),
+        "mrr": mean("reciprocal_rank"),
+        "ndcg_at_k": mean("ndcg"),
         "origins": dict(sorted(origins.items())),
-        "errors": sum(1 for row in results.values() if row["error"]),
+        "errors": sum(1 for row in results.values() if row.get("error")),
+        "per_query": per_query,
     }
 
 
-def compare(left_path: str, right_path: str) -> int:
+# --- comparison --------------------------------------------------------------------------------
+
+
+def _sign_test(wins: int, losses: int) -> float | None:
+    """Two-sided exact binomial p for ``wins`` vs ``losses``, ties excluded.  No dependencies.
+
+    Unrounded: a p-value that has been rounded to four places cannot be tested against its own
+    definition, and ``_sign_test(10, 0)`` rounds to the same 0.002 as several neighbours.
+    """
+    trials = wins + losses
+    if trials == 0:
+        return None
+    tail = sum(math.comb(trials, index) for index in range(0, min(wins, losses) + 1))
+    return min(1.0, 2.0 * tail / 2 ** trials)
+
+
+def _bootstrap_ci(differences: list[float]) -> tuple[float, float, float] | None:
+    """Paired bootstrap of the mean difference: ``(low, high, p_one_sided)``, deterministic seed."""
+    if not differences:
+        return None
+    rng = random.Random(BOOTSTRAP_SEED)
+    count = len(differences)
+    means = []
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        means.append(sum(differences[rng.randrange(count)] for _ in range(count)) / count)
+    means.sort()
+    low = means[int(0.025 * len(means))]
+    high = means[int(0.975 * len(means)) - 1]
+    non_positive = sum(1 for value in means if value <= 0) / len(means)
+    return round(low, 4), round(high, 4), min(non_positive, 1 - non_positive) * 2
+
+
+def compare(left_path: str, right_path: str, top_k: int) -> int:
     left = json.loads(pathlib.Path(left_path).read_text(encoding="utf-8"))
     right = json.loads(pathlib.Path(right_path).read_text(encoding="utf-8"))
-    left_rows, right_rows = left["results"], right["results"]
-    changed = []
-    for digest, row in left_rows.items():
-        other = right_rows.get(digest)
-        if other is None:
-            continue
-        before = [entry["key"] for entry in row["returned"]]
-        after = [entry["key"] for entry in other["returned"]]
-        if before != after:
-            changed.append((row.get("query_chars"), before, after))
+    if left.get("config") == right.get("config"):
+        # The failure this catches: a harness that pins the environment produces two identical runs
+        # and a table of 40 ties, which reads as "no difference" rather than "nothing was compared".
+        print(f"refusing to compare: both runs used the same config {left.get('config')}", file=sys.stderr)
+        return 2
+    left_per = left["metrics"].get("per_query") or {}
+    right_per = right["metrics"].get("per_query") or {}
+    shared = sorted(set(left_per) & set(right_per))
+    if not shared:
+        print("no query is judged in both runs; build the labels first (--pool, then judge)",
+              file=sys.stderr)
+        return 2
 
-    print(f"left : {left_path}  {json.dumps(left['metrics'], sort_keys=True)}")
-    print(f"right: {right_path}  {json.dumps(right['metrics'], sort_keys=True)}")
-    print(f"queries with a different ordering: {len(changed)}/{len(left_rows)}")
-    for chars, before, after in changed:
-        print(f"\n  query({chars} chars)")
-        print(f"    before: {before}")
-        print(f"    after : {after}")
-    return 1 if changed else 0
+    fields = ("success", "recall", "reciprocal_rank", "ndcg")
+    print(f"left : {left_path}\n  {json.dumps({k: v for k, v in left['metrics'].items() if k != 'per_query'}, sort_keys=True)}")
+    print(f"right: {right_path}\n  {json.dumps({k: v for k, v in right['metrics'].items() if k != 'per_query'}, sort_keys=True)}")
+    print(f"judged queries: {len(shared)}")
+    print()
+    print(f"{'metric':18} {'left':>8} {'right':>8} {'diff':>9} {'wins':>5} {'losses':>6} {'ties':>5} {'sign p':>7} {'bootstrap 95% CI':>22}")
+    for field in fields:
+        diffs = [right_per[d][field] - left_per[d][field] for d in shared]
+        wins = sum(1 for value in diffs if value > 1e-9)
+        losses = sum(1 for value in diffs if value < -1e-9)
+        ties = len(diffs) - wins - losses
+        ci = _bootstrap_ci(diffs)
+        mean_left = sum(left_per[d][field] for d in shared) / len(shared)
+        mean_right = sum(right_per[d][field] for d in shared) / len(shared)
+        ci_text = f"[{ci[0]:+.3f}, {ci[1]:+.3f}] p={ci[2]:.3f}" if ci else "-"
+        sign = _sign_test(wins, losses)
+        sign_text = f"{sign:.4f}" if sign is not None else "-"
+        print(f"{field:18} {mean_left:8.4f} {mean_right:8.4f} {mean_right - mean_left:+9.4f} "
+              f"{wins:5d} {losses:6d} {ties:5d} {sign_text:>7} {ci_text:>22}")
+
+    print()
+    print("per-query MRR deltas (right - left), only the queries that moved:")
+    moved = [d for d in shared if abs(right_per[d]["reciprocal_rank"] - left_per[d]["reciprocal_rank"]) > 1e-9]
+    for digest in moved:
+        row = right["results"].get(digest, {})
+        print(f"  {row.get('query', digest)!r}: {left_per[digest]['reciprocal_rank']:.3f} -> "
+              f"{right_per[digest]['reciprocal_rank']:.3f}")
+    if not moved:
+        print("  none")
+        # Identical output under different configs is possible but it is also what a harness that
+        # pins the environment produces, and a table of 40 ties reads as "no difference" rather than
+        # "nothing was compared".  The configs are compared above; this says so out loud.
+        print("  WARNING: every judged query is identical under two different configs -- check that the "
+              "harness is not forcing one of them", file=sys.stderr)
+    return 0
+
+
+# --- pool building for judging -----------------------------------------------------------------
+
+
+def build_pool(queries: list[dict], vectors: dict[str, list[float]], top_k: int) -> None:
+    """Print the union of every fusion's top-k, blinded: keys sorted, no scores, no origins."""
+    pooled: dict[str, set[str]] = {query_digest(item["query"]): set() for item in queries}
+    for fusion in POOL_FUSIONS:
+        for digest, row in run(queries, vectors, top_k, fusion=fusion).items():
+            pooled[digest].update(entry["key"] for entry in row["returned"])
+
+    catalog, _note = None, None
+    from vector_lake import page_index_projection
+
+    catalog, _note = page_index_projection.read_catalog()
+    for item in queries:
+        digest = query_digest(item["query"])
+        keys = sorted(pooled[digest])
+        print(f"### {item['query']}  [{digest}]  ({len(keys)} candidates)")
+        for key in keys:
+            node = catalog.nodes_by_key([key]).get(key) if catalog else None
+            title = (node or {}).get("title") or ""
+            summary = " ".join(str((node or {}).get("summary") or "").split())[:230]
+            print(f"- {key} | {title} | {summary}")
+        print()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--queries", default=str(QUERY_SET))
+    parser.add_argument("--labels", default=str(LABEL_SET))
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--vectors", choices=("snapshot", "live", "stored"), default="snapshot")
     parser.add_argument("--out", default="")
+    parser.add_argument("--pool", action="store_true")
     parser.add_argument("--compare", nargs=2, metavar=("LEFT", "RIGHT"), default=None)
     args = parser.parse_args()
 
     if args.compare:
-        return compare(*args.compare)
+        return compare(args.compare[0], args.compare[1], args.top_k)
 
     # Evaluation runs must not be mixed into the production ledger, where they would look like
     # operator queries and inflate the distinct-query count.
@@ -206,6 +374,12 @@ def main() -> int:
 
     queries = load_queries(pathlib.Path(args.queries), args.limit)
     vectors = build_vectors(queries, args.vectors)
+
+    if args.pool:
+        build_pool(queries, vectors, args.top_k)
+        return 0
+
+    labels = load_labels(pathlib.Path(args.labels))
     results = run(queries, vectors, args.top_k)
     payload = {
         "config": {
@@ -213,8 +387,9 @@ def main() -> int:
             "expansion_quota": os.environ.get("VECTOR_LAKE_EXPANSION_QUOTA", ""),
             "top_k": args.top_k,
             "vectors": args.vectors,
+            "labels": str(args.labels),
         },
-        "metrics": metrics(results),
+        "metrics": metrics(results, labels, args.top_k),
         "results": results,
     }
     text = json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True)
@@ -222,8 +397,9 @@ def main() -> int:
         pathlib.Path(args.out).write_text(text, encoding="utf-8")
     else:
         print(text)
+    summary = {k: v for k, v in payload["metrics"].items() if k != "per_query"}
     print(json.dumps(payload["config"], sort_keys=True), file=sys.stderr)
-    print(json.dumps(payload["metrics"], sort_keys=True), file=sys.stderr)
+    print(json.dumps(summary, sort_keys=True), file=sys.stderr)
     return 0
 
 

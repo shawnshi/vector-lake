@@ -1,0 +1,40 @@
+{"query": "医院数据平台 信创 下一步", "relevant": ["Concept_信创融合平台", "Concept_新一代医院数据平台", "Source_在AI与可信数据空间驱动下的新一代医院数据平台-定位-框架与建设策略", "Source_数据赋能-精准管理-开启医院数字化运营新时代"]}
+{"query": "OMOP 通用数据模型 映射", "relevant": ["Concept_OMOP-CDM", "Concept_健康医疗通用数据模型", "Concept_医疗通用数据模型", "Concept_通用数据模型", "Source_医疗机构可信数据空间建设策略与实施路径", "Source_高质量医疗数据集建设-现状-挑战与未来路径"]}
+{"query": "DRG 支付 合规", "relevant": ["Source_2026医疗数字化-一场剥离幻觉的冷酷清算-20260419", "Source_医保支付3-0时代的医院重构从被动控费到临床价值与数智解耦20260911", "Source_医疗数字化三十讲-第二讲"]}
+{"query": "信创替代 底座 架构", "relevant": ["Concept_信创融合平台", "Concept_医疗信创", "Concept_数据底座", "Source_article-digitalhealthobserve-十五五医院数智化整体架构-厂商视角分析20260728-137614b9", "Synthesis_齐鲁医院信息化攻坚策略", "Vendor_麒麟软件"]}
+{"query": "FAST 身份 与 同意", "relevant": ["Concept_FAST-Consent", "Standard_HL7-FAST"]}
+{"query": "齐鲁医院 数智化 底座", "relevant": ["Institution_齐鲁医院", "Source_20260603-山东大学齐鲁医院-CSO-Brief", "Source_齐鲁医院-c462ca64"]}
+{"query": "WiNEX DnA 数据平台", "relevant": ["Product_WiNEX-DnA", "Source_Winning-World-2022成功召开-卫宁健康正式发布-1-X-战略与WiNEX-系列新产品", "Source_数据赋能-精准管理-开启医院数字化运营新时代"]}
+{"query": "医疗语义层 MSL", "relevant": ["Concept_Semantic-Self-Healing", "Concept_医疗语义层", "Source_MSL-医疗语义层-原型-Schema-深度设计方案-20260305", "Source_医疗机构语义层-MSL-建设白皮书-20260215-final-report", "Source_基于-GraphQL-Schema-的医疗语义层-MSL-建模与实现架构-20260215-final-report"]}
+{"query": "联邦学习 多中心 协作", "relevant": ["Concept_联邦学习", "Concept_联邦生成式提示学习", "Concept_联邦研究网络", "Concept_隐私增强技术", "Product_FedFound", "Product_多中心临床研究数据平台"]}
+{"query": "南湖HIT论坛 2024", "relevant": ["Event_南湖HIT论坛-2024", "Source_刘海一-如何提升与评估电子病历系统的价值-2024年南湖HIT论坛", "Source_薛万国-以价值为导向开展医院信息化建设-2024年南湖HIT论坛", "Source_追寻医院高质量发展中的技术价值-卫宁健康出席Event-南湖HIT论坛-2024"]}
+{"query": "数智中医药 科研", "relevant": ["Concept_数智中医药", "Source_从-千人千方-到-智能化验证-医渡科技推动中医科研进入AI循证时代"]}
+{"query": "卫宁健康 产品线", "relevant": ["Source_DHLS-20260621", "Source_卫宁健康-Winning-Health-企业深度分析研报20260406", "Vendor_卫宁健康"]}
+{"query": "电子病历 六级 评级", "relevant": ["Standard_电子病历评级"]}
+{"query": "AI 医院", "relevant": ["Concept_AI医院", "Institution_国际AI医院智联体", "Source_智能体驱动的未来-AI-医院建设方案"]}
+{"query": "HIS 解耦 微服务", "relevant": ["Concept_Event-Driven-Architecture-and-Microservices", "Concept_事件驱动架构", "Concept_原子服务解耦", "Concept_微服务架构", "Source_research-gap-1plusX", "Source_research-gap-winning-1-x-strategy", "Source_医疗-HIS-性能瓶颈深度对比-微服务-vs-EDA20260426"]}
+{"query": "互联互通 五级乙等", "relevant": ["Concept_1-Plus-X战略", "Policy_医院信息互联互通标准化成熟度测评", "Source_research-gap-nanhu-hit-2021", "Source_research-research-gap-autonomous-batch-20260905-bc43b2a7"]}
+{"query": "智慧服务 分级评估", "relevant": ["Concept_智慧服务", "Source_医疗数字化三十讲-战场解析篇"]}
+{"query": "医疗大模型 幻觉 治理", "relevant": ["Concept_信任审计权", "Concept_医疗AI-幻觉", "Concept_医疗大模型", "Source_从-超级点读机-到-硅基药-的认知越狱医疗大模型落地验证的生死线20260618"]}
+{"query": "医院 数据治理 组织", "relevant": ["Concept_三层分离机制", "Concept_医疗-数据治理", "Source_医疗数字化三十讲-第二十讲大数据", "Source_如何为集团化医院构建合理的信息架构"]}
+{"query": "主索引 EMPI 患者", "relevant": ["Concept_主数据管理", "Source_国家卫健委会议"]}
+{"query": "电子病历 内涵质控", "relevant": ["Concept_全流程实时内涵式质控", "Concept_无感质控", "Concept_门诊电子病历质控", "Source_2026中国门诊电子病历质控市场深度研究报告"]}
+{"query": "临床决策支持 CDSS", "relevant": ["Concept_CDS-Hooks", "Concept_Clinical-Decision-Support"]}
+{"query": "病历 质控 大模型", "relevant": ["Concept_全流程实时内涵式质控", "Concept_门诊电子病历质控", "Source_2026中国门诊电子病历质控市场深度研究报告"]}
+{"query": "医保 智能监控 两库", "relevant": ["Policy_医保基金智能监控两库建设", "Source_DigitalHealthWeeklyBrief-DHWB-20260726-4bf3d747", "Source_HealthcareIndustryRadar-DHWB-Radar-20260719-afc01169", "Source_HealthcareIndustryRadar-DHWB-Radar-20260726-53d6b655"]}
+{"query": "公立医院 绩效考核", "relevant": ["Event_2022年度三级公立医院绩效考核", "Source_2022年度全国三级公立医院绩效考核国家监测分析情况", "Source_2023年度全国三级公立医院绩效监测分析情况", "Source_公立医院属性与国考指标政策摘编"]}
+{"query": "紧密型县域医共体", "relevant": ["Concept_区域医疗服务协同", "Concept_紧密型医共体", "Concept_紧密型县域医共体", "Event_紧密型县域医共体信息化功能指引", "Policy_紧密型县域医共体信息化功能指引", "Source_紧密型县域医共体信息化功能指引-解读"]}
+{"query": "医疗数据 出域 监管", "relevant": ["Concept_Medical-Data-Sovereignty", "Concept_联邦学习", "Source_DHWB-20260413", "Source_intelligence-20260515-briefing", "Source_关于促进和规范-人工智能-医疗卫生-应用发展的实施意见"]}
+{"query": "可信数据空间 医疗", "relevant": ["Concept_医疗机构可信数据空间", "Concept_可信数据空间", "Source_关于促进和规范-人工智能-医疗卫生-应用发展的实施意见", "Source_可信数据空间发展行动计划-2024-2028年", "Source_高质量医疗数据集建设-现状-挑战与未来路径"]}
+{"query": "中台 微服务 医院架构", "relevant": ["Concept_三中台联动", "Concept_微服务双维度拆分", "Concept_适度微服务回调", "Concept_适度领域组件化", "Product_iBDP", "Source_research-gap-winex-product-matrix-cloud-native-hos", "Source_微服务架构仍处于-战国时期-它适合你吗"]}
+{"query": "智能体 Agent 医院落地", "relevant": ["Concept_智能体医院", "Source_Epic-Systems医疗人工智能产品演进-生态架构与项目落地全景深度解析", "Source_医疗数智化的下半场-从套壳聊天到智能体医院的范式坍塌与重构-20260304-final", "Source_展望2026-从通用AI智能体到医疗垂直领域的深度演进", "Synthesis_智能体医院架构"]}
+{"query": "算力 智算中心 医院", "relevant": ["Concept_全国一体化算力网", "Concept_医疗智算中心", "Concept_算力基础设施", "Source_北京大学人民医院目讨论", "Vendor_英伟达"]}
+{"query": "血液 专科 大模型", "relevant": ["Concept_血液专科大语言模型", "Source_intelligence-20260505-briefing", "Source_北京大学人民医院目讨论"]}
+{"query": "病理 数字化 AI", "relevant": ["Concept_Virtual-Biopsy", "Concept_无创分子病理", "Source_news-2026Q3-intelligence-20260808-briefing-44a38c3e"]}
+{"query": "影像 云 PACS", "relevant": ["Concept_医保影像云索引编码方案", "Policy_医保影像云索引上传试点", "Policy_检查检验结果互认规范", "Source_医疗政策-关于开展医保影像云索引上传试点工作的通知-4480089c", "Vendor_深睿医疗"]}
+{"query": "科研大数据平台 专病库", "relevant": ["Product_全病种数据库平台", "Product_多中心临床研究数据平台", "Product_新一代科研大数据平台", "Source_从-千人千方-到-智能化验证-医渡科技推动中医科研进入AI循证时代"]}
+{"query": "分级诊疗 双向转诊", "relevant": ["Concept_基层医疗外骨骼", "Policy_家庭医生签约服务六个拓展", "Source_医疗政策-进一步深化-六个拓展-做实家庭医生签约服务若干措施的通知-11288357", "Source_数智驱动基层全科诊疗能力与健康服务全链路建设方案-20260208"]}
+{"query": "电子病历 信息使用管理 通知", "relevant": ["Concept_电子病历信息使用管理", "Policy_关于进一步加强医疗机构电子病历信息使用管理的通知", "Source_互联网诊疗电子病历管理技术规范-试行", "Source_关于进一步加强医疗机构电子病历信息使用管理的通知"]}
+{"query": "十五五 医疗 规划", "relevant": ["Concept_医疗产业寒武纪", "Event_十五五医疗数字化", "Policy_十五五医疗规划", "Source_医疗政策-上海市卫生健康发展-十五五-规划-1c25fd9e", "Source_医疗政策-全民医疗保障-十五五-规划-759a0dc5", "Source_管仲军-赵国光-公立医院如何谋篇-十五五"]}
+{"query": "医院 信息中心 组织变革", "relevant": ["Concept_医院数字化转型", "Source_article-digitalhealthobserve-大型三级综合医院十五五数智化建设20260727-a5b05e2d", "Source_医院都应进行数字化重构-医院数字化转型路线图", "Source_如何为集团化医院构建合理的信息架构", "Source_数字化转型助力医院高质量发展"]}
+{"query": "数据要素 三权分置", "relevant": ["Concept_国家数据基础设施", "Concept_数据元件", "Concept_数据资产运营商-Data-Operator", "Event_高质量数据集建设行动实施方案发布", "Source_可信数据空间发展行动计划-2024-2028年", "Source_数据要素-三年行动计划-2024-2026年"]}
