@@ -274,6 +274,45 @@ def _bootstrap_ci(differences: list[float]) -> tuple[float, float, float] | None
     return round(low, 4), round(high, 4), min(non_positive, 1 - non_positive) * 2
 
 
+#: The pre-registered decision rule, from ``benchmarks/search_eval_decisions.md`` -- that file is the
+#: authority and this is its implementation.  Registered before the confirming queries existed, so
+#: the primary metric cannot be chosen after seeing which one passed.
+#:
+#: PRIMARY_METRIC is nDCG@5 because it penalises both ways the two fusions trade off (a query's own
+#: page not ranking first, and later relevant pages being pushed out), while MRR sees only the first.
+PRIMARY_METRIC = "ndcg"
+SECONDARY_METRICS = ("success", "recall", "reciprocal_rank")
+MIN_CONFIRMING_QUERIES = 60
+PRIMARY_SIGN_ALPHA = 0.05
+
+
+def _decision(diffs: list[float], secondary: list[list[float]]) -> list[str]:
+    """Evaluate the registered rule.  Returns one line per condition, pass or fail."""
+    wins = sum(1 for value in diffs if value > 1e-9)
+    losses = sum(1 for value in diffs if value < -1e-9)
+    mean = sum(diffs) / len(diffs) if diffs else 0.0
+    ci = _bootstrap_ci(diffs)
+    sign = _sign_test(wins, losses) if (wins + losses) else None
+    lines = []
+    lines.append(f"  {'PASS' if mean > 0 else 'FAIL'}  primary mean difference > 0  ({mean:+.4f})")
+    excluded = ci is not None and ci[0] > 0
+    lines.append(f"  {'PASS' if excluded else 'FAIL'}  primary bootstrap 95% CI excludes 0  "
+                 f"({'[%+.3f, %+.3f]' % (ci[0], ci[1]) if ci else '-'})")
+    significant = sign is not None and sign < PRIMARY_SIGN_ALPHA
+    lines.append(f"  {'PASS' if significant else 'FAIL'}  primary sign test p < {PRIMARY_SIGN_ALPHA}  "
+                 f"({sign:.4f} on {wins} wins / {losses} losses)" if sign is not None
+                 else f"  FAIL  primary sign test p < {PRIMARY_SIGN_ALPHA}  (no discordant pair)")
+    regressions = [
+        name for name, values in zip(SECONDARY_METRICS, secondary)
+        if values and sum(values) / len(values) < 0
+    ]
+    lines.append(f"  {'PASS' if not regressions else 'FAIL'}  no secondary metric regresses  "
+                 f"({', '.join(regressions) if regressions else 'none'})")
+    lines.append(f"  {'PASS' if len(diffs) >= MIN_CONFIRMING_QUERIES else 'FAIL'}  "
+                 f"at least {MIN_CONFIRMING_QUERIES} confirming queries  ({len(diffs)})")
+    return lines
+
+
 def compare(left_path: str, right_path: str, top_k: int) -> int:
     left = json.loads(pathlib.Path(left_path).read_text(encoding="utf-8"))
     right = json.loads(pathlib.Path(right_path).read_text(encoding="utf-8"))
@@ -310,6 +349,18 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
         print(f"{field:18} {mean_left:8.4f} {mean_right:8.4f} {mean_right - mean_left:+9.4f} "
               f"{wins:5d} {losses:6d} {ties:5d} {sign_text:>7} {ci_text:>22}")
 
+    primary_diffs = [right_per[d][PRIMARY_METRIC] - left_per[d][PRIMARY_METRIC] for d in shared]
+    secondary_diffs = [
+        [right_per[d][field] - left_per[d][field] for d in shared] for field in SECONDARY_METRICS
+    ]
+
+    print()
+    print(f"pre-registered decision rule (benchmarks/search_eval_decisions.md), primary={PRIMARY_METRIC}:")
+    decision = _decision(primary_diffs, secondary_diffs)
+    for line in decision:
+        print(line)
+    print(f"  => {'RULE MET: flipping the default is warranted' if all('FAIL' not in l for l in decision) else 'RULE NOT MET: keep the default'}")
+
     print()
     print("per-query MRR deltas (right - left), only the queries that moved:")
     moved = [d for d in shared if abs(right_per[d]["reciprocal_rank"] - left_per[d]["reciprocal_rank"]) > 1e-9]
@@ -330,8 +381,19 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
 # --- pool building for judging -----------------------------------------------------------------
 
 
-def build_pool(queries: list[dict], vectors: dict[str, list[float]], top_k: int) -> None:
-    """Print the union of every fusion's top-k, blinded: keys sorted, no scores, no origins."""
+def build_pool(
+    queries: list[dict],
+    vectors: dict[str, list[float]],
+    top_k: int,
+    judged: set[str] | None = None,
+) -> None:
+    """Print the union of every fusion's top-k, blinded: keys sorted, no scores, no origins.
+
+    ``judged`` skips queries that already have labels, so a second round of queries can be pooled
+    without re-reading the first round's candidates.
+    """
+    if judged:
+        queries = [item for item in queries if query_digest(item["query"]) not in judged]
     pooled: dict[str, set[str]] = {query_digest(item["query"]): set() for item in queries}
     for fusion in POOL_FUSIONS:
         for digest, row in run(queries, vectors, top_k, fusion=fusion).items():
@@ -362,6 +424,8 @@ def main() -> int:
     parser.add_argument("--vectors", choices=("snapshot", "live", "stored"), default="snapshot")
     parser.add_argument("--out", default="")
     parser.add_argument("--pool", action="store_true")
+    parser.add_argument("--pool-judged", action="store_true",
+                        help="pool queries that already have labels too")
     parser.add_argument("--compare", nargs=2, metavar=("LEFT", "RIGHT"), default=None)
     args = parser.parse_args()
 
@@ -376,7 +440,8 @@ def main() -> int:
     vectors = build_vectors(queries, args.vectors)
 
     if args.pool:
-        build_pool(queries, vectors, args.top_k)
+        judged = set() if args.pool_judged else set(load_labels(pathlib.Path(args.labels)))
+        build_pool(queries, vectors, args.top_k, judged)
         return 0
 
     labels = load_labels(pathlib.Path(args.labels))
