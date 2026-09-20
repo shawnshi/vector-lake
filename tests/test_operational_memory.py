@@ -1,6 +1,7 @@
 import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vector_lake import governance_store, wiki_utils
 from vector_lake.tool_search import build_memory_packet, search_vector_lake
@@ -130,6 +131,60 @@ class TestOperationalMemory(unittest.TestCase):
         self.assertEqual(preference["validity_state"], "active")
         self.assertNotIn("superseded_by", preference)
         self.assertFalse(any(item.get("source_claim_id") == "claim_new" for item in memories))
+
+    def test_the_packet_reports_true_counts_not_the_displayed_slice(self):
+        """``warning_count`` and ``omitted_count`` are read by callers, so they cannot be slices.
+
+        The packet shows at most six warnings and twelve evidence pointers.  The counters used to
+        be taken from those slices: ``warning_count`` reported 6 for any larger set, and
+        ``omitted_count`` was ``len(memories) - 12`` -- a number that matched neither the memories
+        dropped nor the pointers capped, and that stayed 0 when no character truncation happened
+        even though half the pointers had been dropped.  ``memory_warning_count`` is printed to the
+        caller as "warnings" and gates the burst re-render, so a capped counter misreports all
+        three.
+        """
+        memories = [
+            {"memory_type": "fact", "memory_key": f"k{index}", "text": "x" * 300,
+             "memory_score": 0.5, "validity_state": "active", "source_page": "Concept_X",
+             "source_claim_id": f"claim_{index}"}
+            for index in range(30)
+        ]
+        historical = [
+            {"memory_type": "decision", "memory_key": f"h{index}", "text": "y" * 100,
+             "validity_state": "superseded"}
+            for index in range(9)
+        ]
+        with mock.patch.object(
+            governance_store,
+            "search_memory_packet_views",
+            lambda query: (memories, historical),
+        ):
+            roomy = build_memory_packet("q", max_chars=60000)
+            tight = build_memory_packet("q", max_chars=2000)
+            zero = build_memory_packet("q", max_chars=200)
+
+        # The true count, while the display block stays capped at six.
+        for packet in (roomy, tight, zero):
+            self.assertEqual(packet["warning_count"], 9)
+            self.assertEqual(packet["memory_count"], 30)
+        self.assertEqual(
+            sum(1 for line in roomy["packet"].splitlines() if "superseded" in line), 6
+        )
+
+        # Nothing was dropped when everything fits; that is the number the field claims to be.
+        self.assertEqual(roomy["omitted_count"], 0)
+        # Some fit at 2000 chars, but not all.
+        self.assertTrue(0 < tight["omitted_count"] < tight["memory_count"])
+        # A budget that cannot even carry the frame drops every memory line, and says so.
+        self.assertEqual(zero["omitted_count"], zero["memory_count"])
+
+        # The budget invariant ``assemble_context`` depends on holds even when the frame alone
+        # overruns it, and the packet stays parseable in every case.
+        for packet, budget in ((roomy, 60000), (tight, 2000), (zero, 200)):
+            text = packet["packet"]
+            self.assertLessEqual(len(text), budget)
+            self.assertEqual(text.count("<MEMORY_PACKET>"), 1)
+            self.assertTrue(text.rstrip().endswith("</MEMORY_PACKET>"))
 
 
 if __name__ == "__main__":

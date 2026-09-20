@@ -334,4 +334,8 @@ def test_assemble_context_parses_index_json_at_most_once(searchable_memory, monk
     assert len(parses) == 1
     assert context["wiki_page_count"] >= 1
     assert any("fell back to index.json" in note for note in context["retrieval_notes"])
+    # Once, not twice.  The note is owned by ``_search_scored_pages``, which is handed the same
+    # ``projection_note`` this function resolved; ``assemble_context`` re-appending it made every
+    # degraded answer report the same fallback twice.
+    assert sum(1 for note in context["retrieval_notes"] if "fell back to index.json" in note) == 1
     assert "Alpha" in context["index_summary"]

@@ -265,7 +265,7 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     stale_or_conflicted = [
         item for item in historical
         if str(item.get("validity_state", "")).lower() in {"conflicted", "review-due", "needs-review", "superseded", "expired"}
-    ][:6]
+    ]
 
     sections = {
         "Current Preferences": [],
@@ -296,38 +296,72 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
                 f"- {memory.get('source_claim_id')} -> {memory.get('source_page', 'unknown')}"
             )
 
-    lines = [
+    # The packet is built to fit rather than assembled and then cut.  Cutting at ``max_chars``
+    # severed lines and could leave the closing tag detached, and it made ``omitted_count``
+    # uncomputable: the field reported ``len(memories) - 12``, a number that matched neither the
+    # memories dropped nor the 12-pointer display cap.  It is now exactly the number of memory
+    # lines the budget could not carry, and the packet stays well-formed.
+    #
+    # ``warning_count`` is the true count while only six warnings are shown, because the field is
+    # read as ``memory_warning_count``, printed to the caller as "warnings", and used as the
+    # trigger for the burst re-render -- a capped counter made all three report "6" for any larger
+    # set.
+    section_order = ("Current Preferences", "Open Decisions", "Task State", "Relevant Facts")
+    truncated_marker = "...[memory packet truncated]"
+
+    warnings_block = [
+        f"- [{memory.get('validity_state')}] {memory.get('memory_type')}:{memory.get('memory_key')} "
+        f"-> {str(memory.get('text', ''))[:260]}"
+        for memory in stale_or_conflicted[:6]
+    ] or ["- None matched."]
+
+    head = [
         "<MEMORY_PACKET>",
         f"Generated: {datetime.now(timezone.utc).isoformat()}",
         f"Query: {query}",
         "Policy: Use this packet as the machine-facing runtime memory. If it conflicts with wiki prose, prefer active non-conflicted memory items and surface the conflict.",
         "",
     ]
-    for title in ("Current Preferences", "Open Decisions", "Task State", "Relevant Facts"):
-        lines.append(f"## {title}")
-        lines.extend(sections[title] or ["- None matched."])
-        lines.append("")
+    tail = [
+        "",
+        "## Conflicts / Stale Warnings",
+        *warnings_block,
+        "",
+        "## Evidence Pointers",
+        *(evidence_pointers[:12] or ["- None matched."]),
+        "</MEMORY_PACKET>",
+    ]
 
-    lines.append("## Conflicts / Stale Warnings")
-    if stale_or_conflicted:
-        for memory in stale_or_conflicted:
-            lines.append(
-                f"- [{memory.get('validity_state')}] {memory.get('memory_type')}:{memory.get('memory_key')} "
-                f"-> {str(memory.get('text', ''))[:260]}"
-            )
-    else:
-        lines.append("- None matched.")
-    lines.append("")
+    # The marker is reserved whether or not it is needed, so appending it cannot push the packet
+    # past the budget it was fitted to.
+    overhead = sum(len(line) + 1 for line in head + tail) + len(truncated_marker) + 1
+    body_budget = max(0, max_chars - overhead)
 
-    lines.append("## Evidence Pointers")
-    lines.extend(evidence_pointers[:12] or ["- None matched."])
-    lines.append("</MEMORY_PACKET>")
+    body: list[str] = []
+    used = 0
+    truncated = False
+    for title in section_order:
+        if truncated:
+            break
+        block = [f"## {title}", *(sections[title] or ["- None matched."]), ""]
+        for line in block:
+            if used + len(line) + 1 > body_budget:
+                truncated = True
+                break
+            body.append(line)
+            used += len(line) + 1
+    if truncated:
+        body.append(truncated_marker)
 
-    packet = "\n".join(lines)
-    omitted = 0
+    emitted_memories = sum(1 for line in body if line.startswith("- ["))
+    omitted = max(0, len(memories) - emitted_memories)
+
+    packet = "\n".join(head + body + tail)
     if len(packet) > max_chars:
-        packet = packet[: max(0, max_chars - 80)].rstrip() + "\n...[memory packet truncated]\n</MEMORY_PACKET>"
-        omitted = max(0, len(memories) - 12)
+        # ``head`` plus ``tail`` alone overran the budget, so there was nothing to fit: no memory
+        # line was emitted above, and the packet is cut to keep the ``budget_used <= budget_max``
+        # invariant ``assemble_context`` depends on.
+        packet = packet[: max(0, max_chars - 80)].rstrip() + f"\n{truncated_marker}\n</MEMORY_PACKET>"
     return {
         "packet": packet,
         "memory_count": len(memories),
@@ -653,7 +687,12 @@ def _search_scored_pages(
     # Phase 3: Final top_k extraction
     final_scored = []
     source_count = 0
-    max_sources_final = int(top_k * 0.6)
+    # ``max(1, ...)`` because the cap exists to keep an answer from being all-Source pages, and
+    # that needs at least two slots to mean anything.  With ``int(top_k * 0.6)`` a ``top_k=1``
+    # query computed a cap of 0, so a single-result search could never return the Source page that
+    # was the best match -- and the cap was non-monotone on the way there (top_k=2 and top_k=3 both
+    # gave 1).  Measured: top_k=1 -> 0 before, 1 now.
+    max_sources_final = max(1, int(top_k * 0.6))
     for score, node in reranked:
         node_type = node.get("type", "").lower()
         if node_type == "source":
@@ -771,8 +810,10 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
                 index_summary = "[Index read failed]"
             else:
                 index_summary = "\n".join(catalog.node_summary_lines(50))[:index_budget]
-                if projection_note:
-                    vector_notes = list(vector_notes or []) + [projection_note]
+                # The projection note is not appended here: ``_search_scored_pages`` already
+                # returned it in ``vector_notes`` from the same ``projection_note`` this function
+                # handed it, and appending it a second time made every degraded answer report the
+                # same fallback twice.
         except Exception as exc:
             index_summary = "[Index read failed]"
             log.error("Index summary unavailable: %s", exc)
