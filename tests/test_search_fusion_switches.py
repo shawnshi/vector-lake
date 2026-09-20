@@ -123,12 +123,16 @@ def _crowded_lake(memory_dir):
 _VECTOR_HITS = {f"Concept_Vec_{index:02d}": 0.99 - index * 0.001 for index in range(25)}
 
 
-def _pool_origins(monkeypatch, quota):
-    """The candidate pool's origin tally for one query, with ``quota`` in force."""
+def _pool(monkeypatch, quota, fusion=None):
+    """The candidate pool for one query, with ``quota`` and ``fusion`` in force."""
     if quota is None:
         monkeypatch.delenv("VECTOR_LAKE_EXPANSION_QUOTA", raising=False)
     else:
         monkeypatch.setenv("VECTOR_LAKE_EXPANSION_QUOTA", str(quota))
+    if fusion is None:
+        monkeypatch.delenv("VECTOR_LAKE_FUSION", raising=False)
+    else:
+        monkeypatch.setenv("VECTOR_LAKE_FUSION", fusion)
     monkeypatch.setattr(tool_search, "_get_query_embedding", lambda query: ([0.5] * 3072, None))
     monkeypatch.setattr(
         tool_search, "_get_vector_search_results", lambda vector, limit=50: (dict(_VECTOR_HITS), None)
@@ -145,8 +149,12 @@ def _pool_origins(monkeypatch, quota):
     tool_search._search_scored_pages("共享 关键词", top_k=5)
 
     assert pools, "the reranker was never reached"
+    return pools[0]
+
+
+def _pool_origins(monkeypatch, quota, fusion=None):
     return {
-        origin: sum(1 for _, node in pools[0] if node.get("_origin") == origin)
+        origin: sum(1 for _, node in _pool(monkeypatch, quota, fusion) if node.get("_origin") == origin)
         for origin in ("fts", "vec", "both", "ppr")
     }
 
@@ -173,3 +181,37 @@ def test_a_quota_admits_expansion_into_a_full_pool(isolated_memory, monkeypatch)
     assert without["ppr"] == 0
     assert with_quota["ppr"] > 0
     assert with_quota["ppr"] <= 5
+
+
+def test_expansion_is_ranked_in_the_same_units_under_rrf(isolated_memory, monkeypatch):
+    """One list, one vote -- the fix for the regression RRF landed on the live corpus.
+
+    Scaling expansion by 15 left it in the space the other two lists no longer use under RRF:
+    about 0.45 against RRF's ~0.015, so it dominated instead of competing.  On 40 real-embedding
+    queries that moved expansion's share of returned pages from 2/200 to 156/200 and took recall@5
+    from 0.75 to 0.33.  Expressed as a rank it ties with a single-list rank-1 hit rather than
+    outranking it.
+    """
+    _crowded_lake(isolated_memory)
+
+    pool = _pool(monkeypatch, quota=5, fusion="rrf")
+    fused = [score for score, node in pool if node.get("_origin") != "ppr"]
+    expanded = [score for score, node in pool if node.get("_origin") == "ppr"]
+
+    assert expanded, "the fixture must place expansion candidates in the pool"
+    assert max(expanded) <= max(fused) * 1.001, "expansion may not outrank the best fused hit"
+    assert max(expanded) >= max(fused) / 4, "nor be pushed an order of magnitude below it"
+
+
+def test_the_default_fusion_leaves_expansion_on_its_old_scale(isolated_memory, monkeypatch):
+    """The default path must not have moved: expansion is still scored ``ppr_weight * 15``."""
+    _crowded_lake(isolated_memory)
+
+    pool = _pool(monkeypatch, quota=5, fusion=None)
+    fused = [score for score, node in pool if node.get("_origin") != "ppr"]
+    expanded = [score for score, node in pool if node.get("_origin") == "ppr"]
+
+    assert expanded
+    # Under the sum fusion the stages live on different scales -- that is the defect A1 describes,
+    # and changing it is what the switch is for, not what the default does.
+    assert max(expanded) < max(fused) / 10

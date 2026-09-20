@@ -1504,6 +1504,12 @@ def _init_db_once(db_key: str):
             )
         """)
         conn.execute("""
+            -- ``entity_id`` holds a **page key** (``Concept_...``), which is what every caller passes
+            -- and what ``delete_embedding`` matches on.  It is not ``entities.entity_id``: that column
+            -- is a different identifier, so a join between the two returns nothing and does so
+            -- silently.  The FTS table keys by ``node_key``, so vector hits and lexical hits stay in
+            -- one namespace.  Renaming this column is not an ``ALTER`` -- vec0 refuses both RENAME and
+            -- ADD COLUMN -- so the fix is a staged rebuild, not yet done.
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
                 entity_id TEXT PRIMARY KEY,
                 embedding float[3072]
@@ -1855,6 +1861,13 @@ def search_index_state() -> dict[str, str]:
     }
 
 def upsert_embedding(entity_id: str, embedding: list[float]):
+    """Store one unit vector under a page key.
+
+    The normalisation is load-bearing, not cosmetic: ``tool_search`` converts sqlite-vec's L2
+    distance with ``1 - d^2/2`` and gates on a cosine threshold, and both are only correct for unit
+    vectors.  A sampled norm measures exactly 1.000000 because of this function -- if it were
+    removed, the conversion and the gate would go wrong together and quietly.
+    """
     if not embedding:
         return
     import math

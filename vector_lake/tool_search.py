@@ -40,6 +40,15 @@ DEFAULT_MAX_CHARS = 200000
 # The budget is generous against the healthy path and hard against the loop.
 QUERY_EMBEDDING_BUDGET_SECONDS = 20.0
 
+#: Minimum cosine similarity a vector hit must reach to enter the fusion.
+#:
+#: It is a cosine threshold and not an L2 one because of the conversion above: ``vec_embeddings``
+#: stores unit vectors (``db_store.upsert_embedding`` normalises before writing, which is why a
+#: sampled norm measures exactly 1.000000), so ``1 - d^2/2`` is the cosine.  If that write-time
+#: normalisation were ever removed, this gate and the conversion would both go wrong silently --
+#: they are one assumption, stated here rather than implied by a bare literal.
+VECTOR_MIN_COSINE = 0.5
+
 #: Reciprocal-rank-fusion constant, used when ``VECTOR_LAKE_FUSION=rrf``.  It is the only knob
 #: because it is the only insensitive one: moving k shifts ranks by a few positions, whereas the
 #: magnitude sum decides its winner by which source's arbitrary scale happens to be larger for
@@ -80,6 +89,9 @@ def _expansion_quota(pool_size: int) -> int | None:
     return min(value, pool_size)
 
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+
+#: A four-digit year, not the substring the intent guess used to match on.
+_YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
 STOP_WORDS = {
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
     "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for",
@@ -180,11 +192,16 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tu
 
         results = {}
         for row in cursor.fetchall():
+            # ``vec_embeddings.entity_id`` holds a **page key** (the writer passes ``node_key``, and
+            # ``db_store`` deletes by the same name), not ``entities.entity_id``.  The column name is
+            # a trap: a join to ``entities.entity_id`` returns nothing, silently.  The FTS path keys
+            # by ``node_key`` too, so the two remain in one namespace and the fusion cannot mix them.
+            page_key = row["entity_id"]
             # distance is L2. convert to approx sim: 1 - (dist^2)/2
             dist = row["distance"]
             sim = 1.0 - (dist * dist) / 2.0
-            if sim > 0.5:
-                results[row["entity_id"]] = sim
+            if sim > VECTOR_MIN_COSINE:
+                results[page_key] = sim
         return results, None
     except Exception as e:
         log.warning(f"Failed to query vec_embeddings: {e}")
@@ -216,18 +233,57 @@ def _get_fts_search_results(query: str, limit: int = 50) -> list[dict]:
         log.warning(f"Failed to query fts5: {e}")
         return []
 
-def _classify_intent(query: str) -> str:
-    temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday", "202"}
+def _keyword_intent(query: str) -> str:
+    """A keyword guess at the query's shape -- not an intent classifier, and named accordingly.
+
+    Two consumers only: it exempts a decayed page from the relevance penalty when the query looks
+    temporal, and it chooses between 12 and 5 graph-expansion candidates.  The year used to be the
+    substring ``"202"``, which matched any query containing those digits (an identifier, a version,
+    a price) and called it temporal; it is a number pattern now.  ``"公司"``/``"关联"`` stay
+    deliberately broad: they are hints, and a wrong ``entity`` guess costs five more expansion
+    candidates, not a wrong answer.
+    """
+    temporal_keywords = {"上周", "去年", "昨天", "最近", "历史", "last week", "yesterday"}
     entity_keywords = {"是谁", "哪里", "谁在", "who is", "where is", "公司", "人员", "关联", "图谱", "网络"}
-    for kw in temporal_keywords:
-        if kw in query.lower(): return "temporal"
+    lowered = query.lower()
+    if _YEAR_PATTERN.search(lowered) or any(kw in lowered for kw in temporal_keywords):
+        return "temporal"
     for kw in entity_keywords:
-        if kw in query.lower(): return "entity"
+        if kw in lowered:
+            return "entity"
     return "general"
 
 
+_QUERY_TERMS_REGISTERED = False
+
+
+def _ensure_query_terms() -> None:
+    """Register ``QUERY_EXPANSION_DICT`` terms once, *outside* any cached function.
+
+    This used to run inside ``_expand_query_locally``, which is ``lru_cache``d: the side effect
+    happened on a miss and not on a hit, and the cache key covered the backend identity but not the
+    dictionary state.  No backend in this tree exposes ``add_word`` -- ``tokenizer.add_word`` returns
+    False and warns once -- so nothing depends on it today.  It is still the wrong place for a
+    global mutation: the next backend that does support it would make indexing and querying disagree
+    about where words end, which is exactly what the search index's content digest exists to prevent.
+    """
+    global _QUERY_TERMS_REGISTERED
+    if _QUERY_TERMS_REGISTERED:
+        return
+    from vector_lake import tokenizer as _tokenizer
+
+    if _tokenizer.backend_name() != "unavailable":
+        for term in QUERY_EXPANSION_DICT:
+            _tokenizer.add_word(term)
+        for expansions in QUERY_EXPANSION_DICT.values():
+            for expansion in expansions:
+                _tokenizer.add_word(expansion)
+    _QUERY_TERMS_REGISTERED = True
+
+
 @functools.lru_cache(maxsize=128)
-def _expand_query_locally(query: str) -> list[str]:
+def _local_expansions(query: str) -> tuple[str, ...]:
+    """The token set for a query.  Pure: same input, same output, no global side effects."""
     expanded_terms = set([query])
     for key, expansions in QUERY_EXPANSION_DICT.items():
         if key in query:
@@ -237,12 +293,6 @@ def _expand_query_locally(query: str) -> list[str]:
     from vector_lake import tokenizer as _tokenizer
 
     backend_ready = _tokenizer.backend_name() != "unavailable"
-    if backend_ready:
-        for term in QUERY_EXPANSION_DICT.keys():
-            _tokenizer.add_word(term)
-        for expansions in QUERY_EXPANSION_DICT.values():
-            for exp in expansions:
-                _tokenizer.add_word(exp)
 
     for term in expanded_terms:
         if backend_ready and CJK_REGEX.search(term):
@@ -265,7 +315,15 @@ def _expand_query_locally(query: str) -> list[str]:
                     tokens.add(word)
                 else:
                     tokens.add(word_lower)
-    return list(tokens)
+    # A tuple, not a list: this value is the cache entry, and a caller that mutated what it got
+    # back would corrupt the cache for every later query.
+    return tuple(tokens)
+
+
+def _expand_query_locally(query: str) -> list[str]:
+    """The expansion tokens for a query.  Registers the dictionary terms first, once."""
+    _ensure_query_terms()
+    return list(_local_expansions(query))
 
 
 def _format_memory_result(memory: dict, as_xml: bool = False, index: int = 0) -> str:
@@ -615,7 +673,7 @@ def _search_scored_pages(
         _record([], [], error=answer)
         return [], [], answer
 
-    intent = _classify_intent(query)
+    intent = _keyword_intent(query)
     tokens = _expand_query_locally(query)
     if not tokens:
         _record([], [], error="No valid search tokens.")
@@ -733,7 +791,7 @@ def _search_scored_pages(
         expansion_keys = [key for key, _ in sorted_expansions[:expansion_limit]]
         expanded_nodes = catalog.nodes_by_key(expansion_keys)
         
-        for expanded_key, ppr_weight in sorted_expansions[:expansion_limit]:
+        for expansion_rank, (expanded_key, ppr_weight) in enumerate(sorted_expansions[:expansion_limit]):
             expanded_node = expanded_nodes.get(expanded_key)
             if expanded_node is None:
                 continue
@@ -741,7 +799,17 @@ def _search_scored_pages(
             # from the caller's filters.
             if not _passes_filters(expanded_node, domain, cluster, include_history, filter_expr):
                 continue
-            scored.append((ppr_weight * 15.0, {"_key": expanded_key, **expanded_node, "_origin": "ppr"}))
+            if fusion_mode == "rrf":
+                # The expansion ordering is a third *ranked list*, expressed in the same units as
+                # the fused ones.  Scaling it by 15 instead put it in the space the other two no
+                # longer use after RRF: at sum-fusion ``ppr_weight * 15`` is about 0.45 against
+                # BM25 magnitudes, but against RRF's ~0.015 it dominated -- measured 40 queries with
+                # real embeddings, expansion's share of returned pages went 2/200 to 156/200 and
+                # recall@5 fell 0.75 to 0.33.  One list, one vote, or the stages are not comparable.
+                expansion_score = 1.0 / (RRF_K + expansion_rank + 1)
+            else:
+                expansion_score = ppr_weight * 15.0
+            scored.append((expansion_score, {"_key": expanded_key, **expanded_node, "_origin": "ppr"}))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
