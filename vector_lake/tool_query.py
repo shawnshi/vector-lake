@@ -7,7 +7,12 @@ import time
 from vector_lake import get_extension_root, provenance
 from vector_lake.tool_search import assemble_context
 from vector_lake import stub_creator
-from vector_lake.wiki_utils import get_wiki_dir, normalize_entity_name, sanitize_wiki_node
+from vector_lake.wiki_utils import (
+    get_wiki_dir,
+    normalize_entity_name,
+    sanitize_wiki_node,
+    validate_wiki_filename,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -23,11 +28,52 @@ log = logging.getLogger("vector-lake-tool-query")
 # file refused to fork.
 
 
+QUERY_CONTEXT_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _prune_stale_query_contexts(tmp_dir) -> None:
+    """Drop payload files left by finished queries, so the directory cannot grow without bound.
+
+    Every call to :func:`prepare_query_context` writes a payload and nothing used to remove it:
+    the only reference to the name anywhere in the tree was the line that created it, and 24 files
+    had accumulated.  Pruning runs *before* this query's payload is written, so a file a live
+    reader may still be holding is never removed underneath it, and the window is generous enough
+    that an agent's own follow-up read is unaffected.
+
+    Housekeeping only: a failure degrades to a warning and must never cost the caller its query.
+    """
+    cutoff = time.time() - QUERY_CONTEXT_TTL_SECONDS
+    try:
+        stale = [
+            entry
+            for entry in tmp_dir.glob("query_context_*.md")
+            if entry.stat().st_mtime < cutoff
+        ]
+    except OSError as exc:
+        log.warning("Could not scan %s for stale query payloads: %s", tmp_dir, exc)
+        return
+    for entry in stale:
+        try:
+            entry.unlink()
+        except OSError as exc:
+            log.warning("Could not remove stale query payload %s: %s", entry.name, exc)
+
+
+COMPARATIVE_QUERY_PATTERN = re.compile(
+    # A word-boundary match, because ``"vs" in query_str`` also fires on "always", "canvas",
+    # "reviews" and "obvious".  This is a prompt hint only: the comment it replaced called this
+    # "V11.2 Multi-Hop Parallel Retrieval", but no parallel retrieval exists here -- the flag adds
+    # one sentence asking the model to weight both sides evenly.
+    r"(?<![a-z0-9])vs\.?(?![a-z0-9])|versus|对比",
+    re.IGNORECASE,
+)
+
+
 def prepare_query_context(query_str: str, dry_run: bool = False):
-    wiki_dir = str(get_wiki_dir())
+    # ``wiki_dir`` was read only by the dead ``{{wiki_dir}}`` substitution at the end of this
+    # function; the template never contained that placeholder.
     
-    # V11.2 Multi-Hop Parallel Retrieval detection
-    is_comparative = "vs" in query_str.lower() or "对比" in query_str
+    is_comparative = bool(COMPARATIVE_QUERY_PATTERN.search(query_str))
     
     context = assemble_context(query_str)
     context_block = ""
@@ -45,12 +91,40 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
             f"\n\n--- RELEVANT WIKI PAGES ({context['wiki_page_count']} pages, "
             f"{context['budget_used']}/{context['budget_max']} chars) ---\n{context['wiki_context']}"
         )
+    if context.get("index_summary"):
+        context_block += f"\n\n--- NODE INDEX SUMMARY ---\n{context['index_summary']}"
+
+    # Computed diagnostics used to be dropped here, so a vector-retrieval failure or a budget
+    # eviction looked exactly like a complete context -- the silent-degradation shape this tree
+    # forbids elsewhere.  ``budget_used`` already charges for these bytes, so surfacing them
+    # makes the payload match what the accounting claims was delivered.
+    retrieval_notes = [str(note) for note in (context.get("retrieval_notes") or []) if note]
+    omitted_memory = int(context.get("memory_omitted_count") or 0)
+    if retrieval_notes or omitted_memory:
+        degradations = [f"- {note}" for note in retrieval_notes]
+        if omitted_memory:
+            degradations.append(
+                f"- {omitted_memory} operational memory item(s) were dropped to fit the budget."
+            )
+        context_block += "\n\n--- RETRIEVAL NOTES (degradations) ---\n" + "\n".join(degradations)
+
     if context["purpose"]:
         context_block += f"\n\n--- PURPOSE ---\n{context['purpose']}"
+
+    # The template is resolved and read *before* the payload is written.  It used to be read
+    # afterwards, and a missing template merely set the template text to its own error message --
+    # which was then returned as the instruction with no placeholder substituted at all.  The
+    # ingest prompt builder already resolves this by raising; the query path was the outlier.
+    templates_dir = get_extension_root() / "templates"
+    prompt_path = templates_dir / "query_prompt.md"
+    if not prompt_path.exists():
+        raise FileNotFoundError("templates/query_prompt.md not found")
+    prompt_template = prompt_path.read_text(encoding="utf-8")
 
     # Write context to a temporary payload file
     tmp_dir = get_extension_root() / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    _prune_stale_query_contexts(tmp_dir)
     
     # Create a unique hash for this query with anti-collision
     import uuid
@@ -65,16 +139,12 @@ def prepare_query_context(query_str: str, dry_run: bool = False):
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
         return f"[DRY RUN] Context assembled at {payload_path}\n\nTrace:\n{trace}"
 
-    templates_dir = get_extension_root() / "templates"
-    prompt_path = templates_dir / "query_prompt.md"
-    if prompt_path.exists():
-        prompt_template = prompt_path.read_text(encoding="utf-8")
-    else:
-        prompt_template = "Error: templates/query_prompt.md not found."
-        
+    # ``{{wiki_dir}}`` used to be substituted into a template that never contained it. It is
+    # removed rather than given a home in the template: this prompt's own trust model forbids the
+    # model from naming paths at all ("Do not return paths..."), so handing it a directory to
+    # write into would contradict the contract it is being asked to honour.
     instructions = prompt_template.replace("{{payload_path}}", str(payload_path)) \
-        .replace("{{query_str}}", query_str) \
-        .replace("{{wiki_dir}}", wiki_dir)
+        .replace("{{query_str}}", query_str)
         
     return instructions
 
@@ -86,6 +156,7 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
     changed_node_files = set([f.strip() for f in files_written_str.split(",") if f.strip()])
     
     valid_files = set()
+    absent: list[str] = []
     import pathlib
     wiki_path = pathlib.Path(wiki_dir).resolve()
     
@@ -100,43 +171,57 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
             log.warning(f"Security: Invalid path {filename}: {e}")
             continue
 
-        # P1-3: Dynamic Ontology Prefix Checking
-        prefix = filename.split('_')[0] + "_" if "_" in filename else ""
-        if not prefix or not prefix[0].isupper() or not filename.endswith(".md"):
-            log.warning(f"File {filename} missing standard prefix. Treating as Orphan.")
-            new_filename = f"Orphan_{filename}" if not filename.startswith("Orphan_") else filename
-            new_target_path = (wiki_path / new_filename).resolve()
-            if not new_target_path.is_relative_to(wiki_path):
-                log.warning(f"Security: Path traversal attempt in renamed file: {new_filename}")
-                continue
-                
-            if filename != new_filename and target_path.exists():
-                os.rename(target_path, new_target_path)
-                filename = new_filename
-        
+        # The prefix rule defers to its single owner (``node_vocabulary`` via
+        # ``validate_wiki_filename``).  This used to re-derive the rule inline as
+        # ``filename.split('_')[0].isupper()`` and then *repair* the name with a bare
+        # ``os.rename`` -- a raw filesystem write with no CAS, no outbox row, no change set and no
+        # lease, in a tree whose safety model is that writes go through ``execute_mutation_plan``.
+        # The repair was also wrong on its own terms: it produced ``Orphan_<name>.md``, and
+        # ``Orphan_`` is not in ``VALID_PREFIXES``, so the coordinator's own validator would have
+        # refused the name it invented.  A name the canonical validator rejects is now withheld
+        # and reported rather than silently rewritten behind the coordinator's back.
+        try:
+            validate_wiki_filename(filename)
+        except ValueError as exc:
+            log.warning(
+                "Query finalization withheld %s: %s. Rename it through ``rename_entity``, which "
+                "also rewrites the internal links a bare rename leaves dangling.",
+                filename,
+                exc,
+            )
+            continue
+
         file_path = os.path.join(wiki_dir, filename)
         if os.path.exists(file_path):
-            # P1-2: Quality Gate for Gap Analysis
-            if filename.startswith("Synthesis_"):
-                # Synthesis structure is already validated by execute_mutation_plan during subagent write_wiki_page
-                pass
             valid_files.add(filename)
             sanitize_wiki_node(file_path)
+        else:
+            absent.append(filename)
             
     if valid_files:
-        # Subagent already wrote them via write_wiki_page which calls execute_mutation_plan.
-        # We only need to generate stubs.
-            
+        # ``valid_files`` means "present on disk", nothing more.  The write belongs to the subagent,
+        # so this function cannot attest a change set: it used to print
+        # "Canonical change set: mutation_coordinator_handled" while never calling the coordinator.
+        #
+        # A canonical-version probe was tried as the missing check and **rejected**: a page written
+        # with a plain ``write_text`` still reports a version, because the version is derived from
+        # the page's own extracted entities rather than from a write record.  It would have passed
+        # unconditionally while claiming to prove provenance.  What is reported here is therefore
+        # only what was actually observed -- presence, stub counts, and absent names.
         stubs_created, stubs_refused = _generate_stubs_for_broken_links(wiki_dir, valid_files)
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
-        refusal_note = (
-            f" {stubs_refused} stub write(s) were refused -- a gate rejected them (see the log)."
-            if stubs_refused
-            else ""
-        )
+
+        notes = []
+        if stubs_refused:
+            notes.append(f"{stubs_refused} stub write(s) were refused -- a gate rejected them (see the log).")
+        if absent:
+            notes.append(f"{len(absent)} named file(s) were absent from the wiki: {', '.join(absent[:3])}.")
+
         return (
-            f"Query finalization completed. {len(valid_files)} page(s) synced. {stubs_created} stub(s) generated.{refusal_note}\n"
-            f"Canonical change set: mutation_coordinator_handled\n\n{trace}"
+            f"Query finalization completed. {len(valid_files)} page(s) verified present. "
+            f"{stubs_created} stub(s) generated."
+            + (" " + " ".join(notes) if notes else "")
+            + f"\n\n{trace}"
         )
     return "Query finalization completed with no valid wiki files synced."
 

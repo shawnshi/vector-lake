@@ -1,13 +1,14 @@
-[TRUSTED CONTROLLER REQUIRED]
+[PROPOSAL-ONLY PROMPT]
 
-This template is outside the default read-only query path. It may be loaded
-only by a trusted controller after an operator explicitly enables
-`VECTOR_LAKE_ALLOW_MANUAL_QUERY_SYNTHESIS=1` and requests `dry_run: false`.
-The model itself never owns or activates that capability.
+This template is served by the default read-only query path: the MCP tool `query_logic_lake`
+renders it through `prepare_query_context` for any caller. This header used to claim that an
+operator had to enable it first, naming a condition no code ever checked -- worse than a missing
+gate, because a reviewer reads such a header as protection that exists. `dry_run: true` stops
+after the context envelope is written and returns a provenance trace instead of this prompt.
 
-The trusted Vector Lake controller owns the query job, nonce, prepared
-projection/canonical baselines, content digests, atomic mutation batch, and
-final receipt. The synthesis model is a proposal-only worker.
+What this prompt can rely on is the division of labour below. The trusted Vector Lake controller
+owns the query job, nonce, prepared projection/canonical baselines, content digests, atomic
+mutation batch, and final receipt. The synthesis model is a proposal-only worker.
 
 Context provenance: {{payload_path}}
 
@@ -53,6 +54,14 @@ Constraints:
 6. Preserve the strict Vector Lake AST and frontmatter contract, including
    typed links such as `[predicate:: [[Target]]]` where applicable.
 
-The trusted controller will reject proposals that fail the query-job nonce,
-query hash, prepared baselines, content hashes, bounded-stub limit, schema gate,
-or single-batch commit contract.
+What the trusted controller enforces on this path, stated so that nothing here reads as more
+protection than exists:
+
+* every filename must be a strict node basename and must resolve inside the wiki directory;
+* every proposed page passes the schema gate before it is accepted;
+* stubs written for broken links go through the same canonical write path as any other page, and
+  a gate that refuses one is reported rather than folded into the count.
+
+There is no nonce, no query hash, no prepared baseline, no content comparison, no stub-count
+cap and no all-or-nothing batch requirement on this path. This prompt must not be read as
+claiming them: the previous wording asserted all six, and none was implemented.

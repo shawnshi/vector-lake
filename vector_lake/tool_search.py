@@ -17,8 +17,15 @@ from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vector-lake-tool-search")
 
-TOKEN_BUDGET = {
+BUDGET_SHARES = {
+    # Character shares.  The constant was called ``TOKEN_BUDGET``, but nothing here counts tokens:
+    # ``assemble_context`` compares these shares against ``len(str)`` and ``DEFAULT_MAX_CHARS``.  ``operational_memory`` is the nominal memory share and
+    # ``memory_burst`` the ceiling the documented alert burst may raise it to; ``wiki_pages`` is
+    # realised as the budget's *remainder* rather than as this share, and ``chat_history`` is not
+    # used by this assembler at all.  Three of these five keys were read nowhere, while the memory
+    # share was a 0.50 literal that contradicted ``operational_memory``.
     "operational_memory": 0.30,
+    "memory_burst": 0.50,
     "wiki_pages": 0.45,
     "chat_history": 0.05,
     "index_summary": 0.05,
@@ -720,11 +727,19 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
 
-    index_budget = int(max_chars * TOKEN_BUDGET["index_summary"])
+    index_budget = int(max_chars * BUDGET_SHARES["index_summary"])
 
-    # P2-2: Dynamic Sliding Window for Budget
-    # Allow memory to burst up to 50% if there are critical alerts
-    memory_packet = build_memory_packet(query, max_chars=int(max_chars * 0.50))
+    # The nominal share, with the burst the comment below documents: memory used to take a
+    # hardcoded 0.50 of *every* budget, so the declared ``operational_memory`` share was
+    # decorative and the alert condition was never tested.  The packet is rebuilt at the burst
+    # ceiling only when it actually reports alerts, which is a rare second call.
+    memory_packet = build_memory_packet(
+        query, max_chars=int(max_chars * BUDGET_SHARES["operational_memory"])
+    )
+    if memory_packet["warning_count"]:
+        memory_packet = build_memory_packet(
+            query, max_chars=int(max_chars * BUDGET_SHARES["memory_burst"])
+        )
     actual_memory_used = len(memory_packet["packet"])
 
     purpose = ""
@@ -734,10 +749,8 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
         purpose = render_strategy_directive()
     except Exception as exc:
         log.warning("Strategy directive unavailable for context assembly: %s", exc)
-    purpose_budget = int(max_chars * TOKEN_BUDGET["system_prompt"])
-
-    # Wiki dynamically eats the remaining budget.
-    wiki_budget = max(0, max_chars - actual_memory_used - index_budget - purpose_budget)
+    purpose_budget = int(max_chars * BUDGET_SHARES["system_prompt"])
+    purpose = purpose[:purpose_budget]
 
     from vector_lake import page_index_projection
 
@@ -747,6 +760,25 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     scored_pages, vector_notes, retrieval_error = _search_scored_pages(
         query, top_k=15, catalog=catalog, projection_note=projection_note
     )
+
+    # The index summary is materialised *before* the wiki budget so the wiki gets whatever the
+    # summary did not use.  Charging the wiki budget for the index's *allocation* rather than its
+    # actual size lost the difference on every request whose catalog was small.
+    index_summary = ""
+    if os.path.exists(str(get_index_path())):
+        try:
+            if catalog is None:
+                index_summary = "[Index read failed]"
+            else:
+                index_summary = "\n".join(catalog.node_summary_lines(50))[:index_budget]
+                if projection_note:
+                    vector_notes = list(vector_notes or []) + [projection_note]
+        except Exception as exc:
+            index_summary = "[Index read failed]"
+            log.error("Index summary unavailable: %s", exc)
+
+    # Wiki dynamically eats what memory, the index summary and the purpose left.
+    wiki_budget = max(0, max_chars - actual_memory_used - len(index_summary) - len(purpose))
 
     wiki_dir = str(get_wiki_dir())
     wiki_blocks: list[str] = []
@@ -769,20 +801,8 @@ def assemble_context(query: str, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
         page_count += 1
     wiki_context = "".join(wiki_blocks)
 
-    index_summary = ""
-    if os.path.exists(str(get_index_path())):
-        try:
-            if catalog is None:
-                index_summary = "[Index read failed]"
-            else:
-                index_summary = "\n".join(catalog.node_summary_lines(50))[:index_budget]
-                if projection_note:
-                    vector_notes = list(vector_notes or []) + [projection_note]
-        except Exception as exc:
-            index_summary = "[Index read failed]"
-            log.error("Index summary unavailable: %s", exc)
-
-    # ``purpose`` is the last claimant on the budget and must not overflow it.
+    # ``purpose`` is the last claimant on the budget and must not overflow it.  It was already
+    # capped at its own share above; this is the invariant's backstop.
     remaining = max_chars - (len(memory_packet["packet"]) + len(wiki_context) + len(index_summary))
     purpose = purpose[:max(0, min(purpose_budget, remaining))]
 
