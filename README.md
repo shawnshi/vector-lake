@@ -6,7 +6,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 
 - `MEMORY/raw`：原始信源层，只读输入。
 - `MEMORY/wiki`：人类可读的 Markdown 发布层，用于审计、浏览、复盘和长期资产沉淀。
-- `MEMORY/wiki/index.json`：页面级运行索引，用于搜索和拓扑扩展 (基于 BM25)。
+- `MEMORY/wiki/index.json` 与 `MEMORY/wiki/claim_topology.json`：从 canonical 写出的投影（页面节点 + 加权边；断言拓扑）。检索实际读的是它们的 SQLite 投影（`page_index_*` + FTS5），投影落后时回退读 `index.json`，并在输出头部打 `[DEGRADED]` 横页。
 - `MEMORY/wiki/.meta/vector_lake.db`：统一的 SQLite 底层引擎，不仅保存实体 (Entities)、断言 (Claims)、证据 (Evidence)、信源 (Sources)、图拓扑、变更集和治理队列，同时也作为 Agent 运行态记忆层，把 `Claim` 编译为 `fact / preference / decision / task_state` 存入 `operational_memory` 表。
 - `MEMORY/purpose.md`：版本化战略控制面。YAML 契约驱动摄取范围、证据等级、意图权重、SIR 复审和张力合成阈值；营销噪音与范围外资料不进入主图谱，但保留最小丢弃审计。`purpose_vectors.json` 仅保留为旧版回退，不再是权重主源。
 
@@ -20,7 +20,7 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 |---|---|---|
 | 必须常驻守护进程 | outbox 消费、增量索引、定时 lint、**到期时的 gram 索引重建**、WAL checkpoint、备份保留、兜底扫描与 Loop 线程监督均在 `watchdog_sync.py` 内，**它同时拉起并看护摄取 Runner**；摄取任务包的**模型调用**在宿主侧 `scripts/ingest_runner.py`（默认写入页面；`VECTOR_LAKE_RUNNER_SHADOW=1` 时只报告），由 `scripts/ingest_runner_service.py` 负责重启，后者自身持有单实例锁 | 只读检索才可省略守护进程。**没有守护进程时没有任何定时维护会触发**（写入也会在 5 分钟后进入 outbox 积压告警），gram 索引需人工按 `doctor` 的 `due=` 执行 `python cli.py gram-index --if-due --apply` |
 | 摄取是一条中继流水线，各段职责不重叠 | `ingest_worker`（守护进程内）只认领 `queued` / `failed`（预算未用尽）/ 租约过期的 `dispatched`，产出任务包并转入 `awaiting_subagent`；宿主侧 `ingest_runner.py` 只认领 `awaiting_subagent` 与租约过期的 `subagent_processing`，因此两段不会争抢同一作业。作业租约、`lease_token` 与 `lease_generation` 保证同一个作业不会被并发提交；被顶替或终态失败的作业不会再被派发（前者的状态被标为 `superseded`） | 想让某个源重跑时用 `ingest-tasks --clear-abandoned` 或改源文件（废弃键按内容哈希）；**不要**为“多跑一点”而绕开租约手工改 `jobs` |
-| Runner 健康默认只告警 | `runner_absent` / `runner_stalled` / `runner_failing` 默认进 `warnings`，不翻转 `ok`；“从未跑过”与“跑挂了”由 `.meta/runtime/runner_supervisor.json` 区分 | 需要把 Runner 缺失升级为硬门时设 `VECTOR_LAKE_RUNNER_STRICT=1` |
+| Runner 健康默认只告警 | `runner_absent` / `runner_stalled` / `runner_failing` 默认进 `warnings`，不翻转 `ok`；“从未跑过”与“跑挂了”由 `.meta/runtime/runner_supervisor.json` 区分 | 需要把这几项并入 `degraded` 列表（依然不阻断写入）时设 `VECTOR_LAKE_RUNNER_STRICT=1` |
 | 编译依赖 LLM 宿主 | `cli.py sync` 只产出 subagent 任务包，不自行编译；`native_llm.generate_text` 恒抛 `SubagentTaskRequired` | 在具备 subagent 能力的宿主内运行摄取流程 |
 | 向量检索需要显式回填 | 任何页面写入都会使该节点向量失效；无自动重嵌 | 定期 `python cli.py embedding-backfill --apply`；需 `GEMINI_API_KEY`（无 key 时 `search` 输出 `[DEGRADED]` 横幅） |
 | GC 的孤儿判据是拓扑度数 ≤ 1 | 度数来自 canonical 的 `links` / 共享来源 / claim 共现；**不是**可视化边集 | 先 `python cli.py gc` 做 dry-run，它会在同一调用中打印每个页面的实际度数。单次删除超过候选页 50% 时会自动中止，需 `--force` 才继续 |
@@ -32,20 +32,40 @@ Vector Lake 是一个本地文件优先的知识编译器。它不是传统向�
 ## Architecture
 
 ```mermaid
-graph LR
-    RAW["MEMORY/raw<br>Immutable sources"] --> INGEST["Native Subagents<br>Asynchronous Ingestion Pipeline"]
-    INGEST --> WIKI["MEMORY/wiki<br>Markdown pages"]
-    WIKI --> INDEX["index.json<br>page index + BM25"]
-    WIKI --> META["vector_lake.db<br>SQLite Canonical Store"]
-    META --> CLAIM["SQLite claim_graph_edges<br>governed topology"]
-    META --> MEMORY["SQLite operational_memory<br>agent runtime memory"]
-    MEMORY --> PACKET["Memory Packet<br>selective context injection"]
-    INDEX --> QUERY["search<br>Local Expansion + BM25 + Graph Spreading"]
-    CLAIM --> QUERY
-    PACKET --> QUERY
+graph TD
+    subgraph relay [摄取中继：模型调用永远在运行时之外]
+        RAW["MEMORY/raw<br>immutable sources"] --> SYNC["cli.py sync<br>ingest task packets"]
+        SYNC --> WORKER["ingest_worker<br>claim + dispatch"]
+        WORKER --> HOST["host subagent<br>model call"]
+        HOST --> FINAL["finalize_ingest"]
+    end
+    subgraph write [写入：一个 canonical 事务 + 一条持久化 outbox 意图]
+        FINAL --> COORD["MutationCoordinator"]
+        COORD --> DB["vector_lake.db<br>canonical SQLite"]
+        COORD --> MD["MEMORY/wiki/*.md<br>Markdown projection"]
+    end
+    subgraph proj [投影：可重建；落后时读侧降级而不隐藏]
+        MD --> IDX["index.json"]
+        DB --> CG["claim_graph_edges"]
+        CG --> CT["claim_topology.json"]
+        IDX --> PINDEX["page_index_* + FTS5"]
+        DB --> VEC["vec_embeddings<br>sqlite-vec"]
+        DB --> OM["operational_memory"]
+        DB --> GOV["governance_queue"]
+    end
+    subgraph read [读路径]
+        PINDEX --> SEARCH["search<br>expand + FTS5 BM25 + PPR + bm25s 重排"]
+        VEC --> SEARCH
+        OM --> PACKET["Memory Packet"]
+        SEARCH --> QUERY["query<br>预算受控的上下文组装"]
+        PACKET --> QUERY
+    end
+    WATCH["watchdog_sync.py<br>outbox 消费 · 增量索引 · 定时维护"]
+    WATCH -.-> MD
+    WATCH -.-> PINDEX
 ```
 
-核心原则：**Markdown 是人类界面，`.meta` 是事实底座，`operational_memory` 是 Agent 运行层。**
+核心原则：**Markdown 是人类界面，`.meta` 是事实底座，`operational_memory` 是 Agent 运行层**；投影可重建，而唯一的写入顺序是「canonical 事务 → outbox → 投影」。
 
 ## 📂 受控类型与文件结构规范 (Controlled Types & File Structures)
 
@@ -169,10 +189,12 @@ MEMORY/
     delete-source/    <-- Recovery points written before a cascade delete
   wiki/
     *.md
-    index.json
+    index.json          <-- Page index projection: nodes (summary only) + weighted edges
+    claim_topology.json <-- Claim topology projection (claim_graph_edges -> JSON)
     .meta/
       purpose_vectors.json <-- Optional legacy fallback for intent weights
-      vector_lake.db       <-- Unified SQLite Store (Entities, Claims, Graph, Timeline, Operational Memory)
+      vector_lake.db       <-- Unified SQLite Store (entities, claims, graph, timeline,
+                           <--   operational memory, page_index_* projection, vec_embeddings)
       backups/             <-- Bounded SQLite copies (.db.bak + -wal / -shm sidecars)
       runtime/             <-- Runner / supervisor / 锁争用状态 JSON
 ```
@@ -181,25 +203,20 @@ MEMORY/
 
 ## Commands
 
-> **Note**: Vector Lake 现已全面接入 MCP (Model Context Protocol)。大语言模型 Agent 将直接通过 `vector_lake/mcp_server.py` 调用底层 Tool 接口，不再需要通过终端模拟。
-> 
-> **Slash Commands**: 本仓库**不随附**任何 slash command 兼容层，`commands/` 目录已不存在。所有能力通过 MCP 工具面调用；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
+> **MCP 是主接口**：Agent 直接调用 `vector_lake/mcp_server.py` 注册的工具，不经过终端模拟。本仓库**不随附**任何 slash command 兼容层（`commands/` 目录已不存在）；打包技能的宿主可另用 `$vector-lake:query`、`$vector-lake:timeline` 同名技能。
 >
-> 仅可通过 MCP 工具或 CLI 调用（无 slash command 层）：
-> - `sync_vector_lake`：按当前 raw 清单**入队摄取作业**（`prepare_ingest_batch` 的兼容别名），模型调用由宿主侧 Runner 完成
-> - `review_governance_list`：检查统一治理队列
-> - `resolve_governance_item`：处理治理队列中的待办项
-> - `trigger_audit_graph`：合成图拓扑并执行审查
-> - `get_governance_debt`：查看图谱治理债务指标
-> - `lint_vector_lake`：执行节点健康度自愈审查（支持 `auto_fix=True` 自动修复残缺元数据与图谱断层）
-> - `trigger_autonomous_research`：自主扫描并下发网络检索指令
-> - `visualize_vector_lake`：直接生成并刷新 3D 可视化拓扑面板
-> - `doctor_vector_lake`：运行环境与依赖健康体检
-> - `gc_vector_lake`：垃圾回收与孤儿节点自动清理（默认 dry-run）
-> - `delete_source`：级联删除信源与切断图谱边（默认 dry-run）
-> - `trace_vector_lake`：展示实体或知识断言的溯源追踪
-> - `merge_suggestions_vector_lake`：扫描并提出知识合并建议
-> 
+> 工具面共 **45 个**（`doctor` 报出实际注册数，`test_command_surface.py` 守住下限），按职责分组：
+
+| 组 | 工具 |
+|---|---|
+| 摄取交接 | `sync_vector_lake` · `prepare_ingest_batch` · `list_ingest_tasks` · `claim_ingest_tasks` · `finalize_ingest` · `expire_ingest_tasks` · `list_abandoned_ingest_sources` · `clear_abandoned_ingest_sources` · `list_terminal_failed_ingest_jobs` · `close_terminal_failed_ingest_jobs` |
+| 检索与运行态记忆 | `search_vector_lake` · `query_logic_lake` · `search_timeline` · `update_operational_memory` · `finalize_query_synthesis` |
+| 治理与审查 | `review_governance_list` · `resolve_governance_item` · `get_governance_debt` · `trigger_audit_graph` · `merge_suggestions_vector_lake` · `check_duplicate_entity` · `bulk_reconciliation` · `review_strategic_purpose` |
+| 自愈与体检 | `lint_vector_lake` · `gc_vector_lake` · `doctor_vector_lake` · `trace_vector_lake` · `trigger_autonomous_research` |
+| 写入与结构 | `write_wiki_page` · `rename_entity` · `batch_replace_links` · `delete_source` · `propose_schema_mutation` |
+| 维护与投影 | `projection_report` · `canonical_backfill` · `projection_rebuild_index` · `embedding_backfill` · `wiki_restore` · `rebuild_timeline_events` · `memory_gram_index_status` · `rebuild_memory_gram_index` · `backup_retention_report` · `idempotency_index_status` · `repair_idempotency_keys` |
+| 可视化 | `visualize_vector_lake` |
+
 > 以下底层 CLI 命令仍然保留，供人类开发者日常手动调试与状态维护。
 
 基础体检：
@@ -299,7 +316,7 @@ python cli.py repair-idempotency --table mutation_outbox
 python cli.py repair-idempotency --table mutation_outbox --apply
 ```
 
-这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_graph.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影；`timeline-repair` 就地补齐 `timeline_events` 的 parity 漂移，不重建整表；`gram-index` 报告或重建运行态记忆检索用的精确 n-gram 倒排，`--if-due` 只在该索引确实落后时才重建（见下，`--compact` 已随增量机制一并删除）。
+这些维护命令默认以 dry-run 或显式 `--apply` 分离执行。`canonical-backfill` 只从已有 Wiki Markdown 回填 SQLite canonical；`projection-rebuild-index` 只从 canonical 重建 `index.json`、FTS 和 `claim_topology.json`，并保留已有 `vec_embeddings`；`embedding-backfill` 按 RPM/TPM 限额断点补齐缺失向量；`wiki-restore` 只把 canonical-only 记录恢复为缺失的 Markdown 投影；`timeline-repair` 就地补齐 `timeline_events` 的 parity 漂移，不重建整表；`gram-index` 报告或重建运行态记忆检索用的精确 n-gram 倒排，`--if-due` 只在该索引确实落后时才重建（见下，`--compact` 已随增量机制一并删除）。
 
 `gram-index` 的重建节奏：基表只要落后就不再精确，而**不精确的基表会被读路径直接拒绝**（不是带着陈旧基表继续服务），所以搜索会退回精确扫描，凭 n-gram 倒排服务时才有快速路径。恢复精确只有重建一条路：重建现在**分批提交**——分批 staging、分批打包、最后用一个短事务发布，发布由内容指纹把关（重建期间被写过的文档保留其变更标记，不会被当作最新）。实测活库上一次重建约 150 s（空闲）到 570 s（边摄入边重建），**最长写锁持有约 2 s**，不再是整场重建期间拒绝所有写入。触发位置只有两处：守护进程的定时维护块（在 WAL checkpoint 之前）与 `gram-index --if-due --apply`；**后者需要守护进程在运行**才有自动节拍，否则只能由人按 `due=` 手工执行——`doctor` 的 `Watchdog Status` 是判断这一点的依据。阈值为 `REBUILD_AFTER_WRITES = 500`，按文档数计，而不是按事务或时长；选择它的依据不是「搜索省下的时间何时回本」，而是「重建能让写入停多久」——因此宁少勿多。`due=` 与 `of 500` 就是这个欠账的当前值，而不是故障。
 
@@ -322,7 +339,7 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_EMBEDDING_UTILIZATION`：安全水位，默认 `0.8`，即按 2400 RPM / 800k TPM 调度。
 - `VECTOR_LAKE_EMBEDDING_MAX_BATCH_ITEMS` / `VECTOR_LAKE_EMBEDDING_MAX_BATCH_TOKENS`：单批条数与 token 上限，默认 `100` / `200000`。
 - `VECTOR_LAKE_EMBEDDING_TIMEOUT_MS`：单次 embedding HTTP 超时，默认 `30000` 毫秒。
-- `VECTOR_LAKE_EMBEDDING_TRANSPORT`：embedding 传输层，默认 `rest`（直接用 `batchEmbedContents` REST 调用），可选 `sdk`（走 `google-genai`）。同一文本两条路径返回的向量**逐位相同**（实测 cosine=1.00000000），而 REST 路径首次调用 1.54 秒且**不 import `google.genai`**，SDK 路径 8.33 秒（其中 3.5 秒 import + 1.3 秒建 client）。
+- `VECTOR_LAKE_EMBEDDING_TRANSPORT`：embedding 传输层，默认 `rest`（直接 `batchEmbedContents`），可选 `sdk`（走 `google-genai`）。两条路径对同一文本返回**逐位相同**的向量；默认取 `rest` 是因为它不 import `google.genai`，因而没有 SDK 的 import + client 构造成本（下面的 `VECTOR_LAKE_EMBEDDING_PREWARM` 也只对 `sdk` 有意义）。
 - `VECTOR_LAKE_EMBEDDING_PREWARM=off`：关闭 MCP server 启动时的 embedding 客户端预热——**仅对 `sdk` 传输有意义**；`rest` 路径从不构造 client，预热线程会被直接跳过。
 - `VECTOR_LAKE_TOKENIZER`：目前只有一个合法值 `rjieba`（保留该开关是为了让已有的环境配置显式表达意图）；写别的值会告警并走自动选择。安装了 rjieba 就用它，反之分词为 `unavailable`（CJK 全文匹配下降，doctor 会报出）。
 - `VECTOR_LAKE_OUTBOX_MAX_BACKLOG`：outbox 待处理行数阈值，默认 `2000`。**超出后默认只计为降级告警，不阻断写入**（阻断积压等于掉断唯一的自愈路径）；设 `VECTOR_LAKE_OUTBOX_BACKLOG_BLOCKING=1` 才升级为阻断。
@@ -331,13 +348,12 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_BACKUP_KEEP` / `VECTOR_LAKE_BACKUP_MAX_BYTES`：`backup-retention` 的默认保留份数（`3`）与字节预算（`12 GiB`）。
 - `VECTOR_LAKE_RUNNER_EXPECTED=0`：不再把缺失的摄取 Runner 报为告警；用于不需要摄取的主机。
 - `VECTOR_LAKE_RUNNER_AUTOSTART=0`：不让 `watchdog_sync.py` 拉起并看护摄取 Runner（保留 `runner_absent` 告警，用于手工管理 Runner 的主机）。默认开启。
-- `VECTOR_LAKE_RUNNER_MODEL_CMD`：自动拉起的 Runner 使用的模型接缝命令，默认 `python scripts/ingest_model_pi_subagents.py`（即本机 `runner_supervisor.json` 记录的生产值）。
+- `VECTOR_LAKE_RUNNER_MODEL_CMD`：自动拉起的 Runner 使用的模型接缝命令（等价于 `--model-cmd`），默认 `python scripts/ingest_model_pi_subagents.py`（即本机 `runner_supervisor.json` 记录的生产值）。相关脚本另读 `VECTOR_LAKE_RUNNER_PI_BIN`、`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT`、`VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`、`VECTOR_LAKE_RUNNER_COOLDOWN`。
 - `VECTOR_LAKE_RUNNER_SHADOW=1`：让自动拉起的 Runner 只报告 `needs-model`、不写页面。默认关闭，因为默认复现的是本机原本常驻的写入配置（`shadow=false`）；新主机若只想观察应先打开它。
 - `VECTOR_LAKE_CATCHUP_INTERVAL_SECONDS`：守护进程的周期性兜底间隔（默认 `900` 秒；`0` 关闭）。兜底做两件事：把未摄入的 raw 源重新入队（否则失去事件、被取消或从未入队的源没有回到队列的路径），以及把超过时限的陈旧摄取任务作废。
 - `VECTOR_LAKE_STALE_TASK_MAX_AGE_SECONDS`：兜底把多旧的摄取任务视为陈旧（默认 `86400` 秒）。
 - `VECTOR_LAKE_RUNNER_STALE_SECONDS`：Runner / 监督器心跳过期阈值，默认 `2400` 秒。
-- `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 相关告警提升为降级。默认只告警，不影响 `ok`。
-- `VECTOR_LAKE_RUNNER_MODEL_CMD`：Runner 的模型接缝命令（等价于 `--model-cmd`），默认 `python scripts/ingest_model_pi_subagents.py`。相关脚本另读 `VECTOR_LAKE_RUNNER_PI_BIN`、`VECTOR_LAKE_RUNNER_SUBAGENT_AGENT`、`VECTOR_LAKE_RUNNER_MODEL_TIMEOUT`、`VECTOR_LAKE_RUNNER_COOLDOWN`。
+- `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 告警从 `warnings` 升入 `degraded`（两者都不阻断写入）。
 - `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。
 - `VECTOR_LAKE_LEIDEN_L1_RESOLUTION` / `VECTOR_LAKE_LEIDEN_L0_RESOLUTION`：Leiden 的 Micro / Global 分辨率，默认 `2.0` / `1.0`。分辨率越高社区越小。
 - `VECTOR_LAKE_LEIDEN_SEED`：Leiden 随机种子，默认 `42`。**必须固定**才能保证社区划分可复现。
@@ -364,9 +380,9 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 
 ### 依赖与分词后端 (Dependencies & Tokenizer)
 
-必需依赖见 `requirements.txt`；已验证版本的直接依赖钉版见 `requirements.lock.txt`。
+必需依赖见 `requirements.txt`；`requirements.lock.txt` 是 2026-09-16 在本机（Windows / CPython 3.13）解析出的直接依赖钉版，作为**复现辅助**而非带哈希的传递锁，依赖变动后需重新生成。
 
-#### 社区检测：Leiden（已取代 Louvain）
+#### 社区检测：Leiden
 
 `python-louvain` 已移除，改为 **`igraph` + `leidenalg`**。实现在 `scripts/community_clustering_daemon.py`：
 
@@ -404,20 +420,11 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 
 **已知能力缺口**：`rjieba` 不暴露 `add_word()` / `load_userdict()`（模块级与 `Jieba` 类均无），且 jieba-rs 内嵌自己的词典。因此 `tool_search.QUERY_EXPANSION_DICT` 的术语注册在 Rust 后端下**不生效**，代码会输出一次性 WARNING 而非假装成功。影响有限：索引与查询使用**同一**分词器，两侧切分一致，检索仍可命中，仅这几个术语的精确短语形态不同。回退后端移除后这一点不再需要权衡：`add_word()` 一律返回 False，词表注册无法生效。
 
-**实测收益与语义差异**（同一本机、3210 字符正文）：
-
-| 指标（回退移除前的对比，保留为当初的理由） | 纯 Python `jieba` | `rjieba` |
-|---|---|---|
-| 单页分词 | 4.39 ms | **0.39 ms（11.3×）** |
-| 200 字符短文本 | 0.33 ms | 0.02 ms（15.0×） |
-| 9630 字符长文本 | 13.51 ms | 1.82 ms（7.4×） |
-| 词元一致性（66 段项目文档中文语料） | — | 62/66 段逐词完全一致，全局词表 Jaccard **0.9957** |
-
-差异集中在拉丁/数字边界（如 `utf-8` vs `utf`+`-`+`8`、`2018-12` vs `2018`+`12`），中文词本身几乎完全一致。
+**实测收益与语义差异**：`rjieba` 相对它所取代的纯 Python 实现快 7–15×（单页 4.39 ms → 0.39 ms），词元一致性的差异只在拉丁/数字边界（如 `utf-8` vs `utf`+`-`+`8`），中文词本身几乎完全一致。旧的对比数据与逐项测量保留在 `CHANGELOG.md`。
 
 **纯 Python `jieba` 回退已于 2026-09-18 移除**：abi3 wheel 覆盖本项目支持的全部平台，而第二套分词与 `rjieba` 的切分不同——这正是搜索索引内容哈希要防的事（`indexer._node_content_digest` 把后端身份纳入 key）。因此**没有 rjieba 的平台会变为 `unavailable`**：CJK 预分词被跳过、CJK 查询命中下降，`doctor` 与 `backend_name()` 会报出而不是掩盖；装回 rjieba 后下一次 `projection-rebuild-index --apply` 会按新身份重新分词。
 
-全量重建的剩余瓶颈已不在分词：warm 重建的约 50% 耗时是 `index.json` / `claim_graph.json` 的 `json.dump` 序列化。
+全量重建的剩余瓶颈已不在分词：warm 重建的约 50% 耗时是 `index.json` / `claim_topology.json` 的 `json.dump` 序列化。
 
 ## Module Map
 
@@ -456,7 +463,7 @@ CJK 分词采用两层后端（统一入口 `vector_lake/tokenizer.py`）：
 
 | Path | Role |
 |---|---|
-| `vector_lake/indexer.py` | `index.json` / `claim_graph.json` 生成、FTS 投影、稀疏图遍历与增量更新 |
+| `vector_lake/indexer.py` | `index.json` / `claim_topology.json` 生成、FTS 投影、稀疏图遍历与增量更新 |
 | `vector_lake/embedding_scheduler.py` | RPM/TPM 限额下的可断点向量回填（`vec_embeddings`） |
 | `vector_lake/tokenizer.py` | CJK 分词后端（`rjieba`，单一后端），含 `JIEBA_RS_PINNED` |
 | `vector_lake/tool_search.py` | 混合检索（本地扩展 + FTS5 BM25 + 多跳 PPR + bm25s 同池重排）与 Memory Packet、上下文组装 |
@@ -507,11 +514,11 @@ $env:PYTHONUTF8='1'; python cli.py search "<keyword>" --mode memory --top_k 3
 $env:PYTHONUTF8='1'; python cli.py debt --top 1
 ```
 
-本轮实测结果（2026-09-19）：
+本轮实测结果（2026-09-20）：
 
-- `python -m pytest -p no:cacheprovider -q` → **1187 passed**。
+- `python -m pytest -p no:cacheprovider -q` → **1274 passed**。
 - `python -m compileall -q vector_lake tests` → OK。
-- `python cli.py doctor` → `Write Gate: clean`、`Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)`、`Ingest Jobs: queued:0 awaiting_subagent:0 terminal_failed:0`；`Summary: healthy with degradation`，降级项为两类而非一类：① 设计内的 subagent 文本运行时委托；② 运行态记忆的精确 n-gram 索引落后（`due=True`）——基表落后时不带着它继续服务，搜索退回精确扫描，按 `doctor` 提示跑 `python cli.py gram-index --if-due --apply` 即恢复快速路径。
+- `python cli.py doctor` → `Write Gate: clean`、`Idempotency Index: jobs=full(dups=0), mutation_outbox=full(dups=0)`、`Ingest Jobs: queued:0 awaiting_subagent:0 terminal_failed:0`、`MCP Server: Import OK, 45 tools exposed`；`Summary: healthy with degradation`，降级项为两类而非一类：① 设计内的 subagent 文本运行时委托；② 运行态记忆的精确 n-gram 索引落后（`due=True`）——基表落后时不带着它继续服务，搜索退回精确扫描，按 `doctor` 提示跑 `python cli.py gram-index --if-due --apply` 即恢复快速路径。
 - 端到端：raw 源 → `sync` → `ingest-tasks` → `finalize_ingest` → outbox 消费 → 索引 → `search` / `query` 全链路在隔离根上跑通。
 
 **本文件不记录语料规模类数字**（节点数、边数、memory 条数）。这类数值取决于运行实例，无法从仓库复现，容易在版本迭代后变成误导性基线；需要时以目标实例上的 `doctor` / `debt` / `projection-report` 实测输出为准。
