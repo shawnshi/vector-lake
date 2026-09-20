@@ -16,7 +16,53 @@ from vector_lake.tool_ingest import (
     claim_ingest_tasks,
     list_ingest_tasks,
 )
+from vector_lake.wiki_utils import projection_hash
 from tests.test_mutation_coordinator import _source_content, _write_purpose_contract
+
+
+def _manifest_record(target, target_hash):
+    """The candidate record the packet would carry for ``target``."""
+    if not target_hash:
+        key = target[:-3] if target.endswith(".md") else target
+        target_hash = governance_store.canonical_page_versions({key}).get(key, "")
+    try:
+        content = tool_ingest._read_canonical_target_content(target, target_hash)
+    except ValueError:
+        # A deliberately stale token (the staleness tests): the markdown projection is then the
+        # only readable form, and the version check reports the staleness before any hash compare.
+        content = (tool_ingest.get_wiki_dir() / target).read_text(encoding="utf-8")
+    return {
+        "target": target,
+        "target_hash": target_hash,
+        "target_projection_hash": projection_hash(content),
+        "type": "concept",
+        "title": target,
+        "summary": "",
+        "match_score": 999,
+        "match_reasons": ["test-fixture"],
+    }
+
+
+def _finalize(files, processed_data):
+    """``finalize_ingest`` with the packet's v2 dispatch manifest filled in from its relations.
+
+    The manifest is derived from what each test already names, so the tests keep exercising the
+    finalize path without every one of them restating the packet contract.  What the manifest
+    *bounds* is tested on its own in ``test_ingest_manifest.py``; because it is derived here,
+    these tests say nothing about the allowlist.
+    """
+    integration = processed_data.get("integration")
+    relations = integration.get("relations") if isinstance(integration, dict) else None
+    if relations and "integration_candidates" not in processed_data:
+        manifest = []
+        for relation in relations:
+            record = _manifest_record(
+                str(relation.get("target") or ""), str(relation.get("target_hash") or "")
+            )
+            relation.setdefault("target_projection_hash", record["target_projection_hash"])
+            manifest.append(record)
+        processed_data = {**processed_data, "integration_candidates": manifest}
+    return mcp_server.tools.finalize_ingest(files, processed_data)
 
 
 def _concept_content(title="Target Concept"):
@@ -246,7 +292,7 @@ def test_finalize_ingest_rejects_mismatched_job_payload(isolated_memory, monkeyp
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [],
         {
             "filepath": "raw/other.md",
@@ -285,7 +331,7 @@ def test_finalize_ingest_rejects_source_hash_not_bound_to_job_payload(isolated_m
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [],
         {
             "filepath": "raw/source-version.md",
@@ -323,7 +369,7 @@ def test_finalize_ingest_marks_subagent_job_finalized(isolated_memory, monkeypat
     db_store.mark_job_awaiting_subagent(job_id, str(task_path))
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [],
         {
             "filepath": "raw/finalize.md",
@@ -355,7 +401,7 @@ def test_finalize_ingest_requires_claimed_job(isolated_memory, monkeypatch):
     monkeypatch.setattr("vector_lake.tool_ingest.load_purpose_contract", lambda: {})
     monkeypatch.setattr("vector_lake.tool_ingest.validate_ingest_payload", lambda files, contract: [])
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [],
         {"filepath": "raw/unbound.md", "hash": "unbound-hash"},
     )
@@ -386,7 +432,7 @@ def test_stale_subagent_lease_cannot_finalize_after_reclaim(isolated_memory, mon
         )
     current = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    stale_result = mcp_server.tools.finalize_ingest(
+    stale_result = _finalize(
         [],
         {
             "filepath": "raw/fenced.md",
@@ -435,7 +481,7 @@ def test_final_cas_rolls_back_processed_marker_if_lease_changes_after_validation
         return []
 
     monkeypatch.setattr("vector_lake.tool_ingest.validate_ingest_payload", reclaim_during_payload_validation)
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [],
         {
             "filepath": "raw/race.md",
@@ -572,7 +618,7 @@ def test_finalize_ingest_rejects_missing_semantic_disposition(isolated_memory, m
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [],
         {
             "filepath": "raw/no-disposition.md",
@@ -603,7 +649,7 @@ def test_finalize_ingest_accepts_audited_standalone_source(isolated_memory):
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{"filename": "Source_Standalone.md", "content": _source_content()}],
         {
             "filepath": "raw/standalone.md",
@@ -641,7 +687,7 @@ def test_standalone_ingest_cannot_overwrite_existing_source_without_queued_versi
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{
             "filename": "Source_Standalone.md",
             "content": _source_content().replace("Primary source content.", "Unauthorized rewrite."),
@@ -686,7 +732,7 @@ def test_finalize_ingest_integrates_source_and_target_atomically(isolated_memory
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{"filename": "Source_Integrated.md", "content": _source_content()}],
         {
             "filepath": "raw/integrated.md",
@@ -758,7 +804,7 @@ def test_integration_uses_canonical_outbox_snapshot_when_markdown_projection_is_
     job_id = db_store.enqueue_job("ingest", payload)
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{"filename": "Source_Stale-Projection.md", "content": _source_content()}],
         {
             **payload,
@@ -801,7 +847,7 @@ def test_reingest_replaces_relation_evidence_without_duplicate_anchors(isolated_
         job_id = db_store.enqueue_job("ingest", payload)
         db_store.mark_job_awaiting_subagent(job_id, "")
         claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
-        return mcp_server.tools.finalize_ingest(
+        return _finalize(
             [{"filename": "Source_Integrated.md", "content": _source_content()}],
             {
                 **payload,
@@ -900,7 +946,7 @@ def test_finalize_ingest_integrates_into_synthesis_supporting_topology(isolated_
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{"filename": "Source_Synthesis-Support.md", "content": _source_content()}],
         {
             **payload,
@@ -942,7 +988,7 @@ def test_finalize_ingest_rejects_stale_target_hash(isolated_memory):
     db_store.mark_job_awaiting_subagent(job_id, "")
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{"filename": "Source_Stale-Target.md", "content": _source_content()}],
         {
             "filepath": "raw/stale-target.md",
@@ -1093,7 +1139,7 @@ def test_finalize_ingest_stamps_the_raw_hash_on_the_source_page(isolated_memory,
         "---\n"
         "Body.\n"
     )
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{"filename": "Source_Stamp.md", "content": page}],
         {
             "filepath": "raw/stamp.md",
@@ -1186,7 +1232,7 @@ def test_a_source_page_named_against_the_mandate_is_refused_outright(isolated_me
     claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
     deviation_name = "Source_news-target-92f53b7a.md"
 
-    result = mcp_server.tools.finalize_ingest(
+    result = _finalize(
         [{"filename": deviation_name, "content": _source_page_content(deviation_name, ["raw/news/target.md"])}],
         {
             "filepath": "raw/news/target.md",
@@ -1210,3 +1256,140 @@ def test_a_source_page_named_against_the_mandate_is_refused_outright(isolated_me
     assert "requires exactly one canonical source page: Source_Target.md" in result
     assert not (wiki_dir / deviation_name).exists()
     assert not (wiki_dir / "Source_Target.md").exists()
+
+
+def _graph_section_heading():
+    return "## Graph Integration"
+
+
+def _relation_line(evidence, marker):
+    return f"- [validates:: [[Concept_Target]]] {evidence} (confidence: 0.93) {marker}"
+
+
+def test_the_legacy_relation_dedup_still_replaces_a_markless_generated_line():
+    """The narrowed token set must keep doing the job it exists for.
+
+    A relation written before markers existed carries no marker, so the only way a re-ingest
+    can avoid appending a duplicate is to recognise the legacy shape.
+    """
+    heading = _graph_section_heading()
+    legacy = "- [validates:: [[Concept_Target]]] 早期生成的关系 (confidence: 0.80)"
+    out = tool_ingest._upsert_section_relation(
+        f"# Source\n\n{heading}\n\n{legacy}\n",
+        heading,
+        "<!-- vector-lake-relation:abc123 -->",
+        _relation_line("新证据", "<!-- vector-lake-relation:abc123 -->"),
+        legacy_tokens=("[[Concept_Target]]", "confidence:"),
+    )
+
+    assert "新证据" in out
+    assert "早期生成的关系" not in out, "the markless generated line must be replaced, not duplicated"
+    assert out.count("[[Concept_Target]]") == 1
+
+
+def test_a_hand_authored_bullet_that_merely_mentions_the_target_survives():
+    """The source page's dedup token used to be the bare wikilink.
+
+    The merge step deletes every line it matches, so any hand-authored bullet that merely
+    mentioned the target was replaced by the generated relation and lost.  Requiring the
+    legacy ``confidence:`` token as well keeps the dedup on generated lines only.
+    """
+    heading = _graph_section_heading()
+    prose = "- 手工批注：[[Concept_Target]] 的口径与本源的结论有出入，需人工复核。"
+    out = tool_ingest._upsert_section_relation(
+        f"# Source\n\n{heading}\n\n{prose}\n",
+        heading,
+        "<!-- vector-lake-relation:abc123 -->",
+        _relation_line("新证据", "<!-- vector-lake-relation:abc123 -->"),
+        legacy_tokens=("[[Concept_Target]]", "confidence:"),
+    )
+
+    assert prose in out, "a hand-authored bullet that only mentions the target must survive"
+    assert "新证据" in out
+    assert out.count("[[Concept_Target]]") == 2
+
+
+def test_the_coarse_token_set_is_what_deleted_the_hand_authored_bullet():
+    """Differential oracle for the fix, on the exact input above.
+
+    Runs the pre-fix token set over the same content so the regression stays honest: if some
+    later change makes the bare wikilink harmless for another reason, this fails instead of
+    the suite passing while the documented cause is no longer true.
+    """
+    heading = _graph_section_heading()
+    prose = "- 手工批注：[[Concept_Target]] 的口径与本源的结论有出入，需人工复核。"
+    out = tool_ingest._upsert_section_relation(
+        f"# Source\n\n{heading}\n\n{prose}\n",
+        heading,
+        "<!-- vector-lake-relation:abc123 -->",
+        _relation_line("新证据", "<!-- vector-lake-relation:abc123 -->"),
+        legacy_tokens=("[[Concept_Target]]",),
+    )
+
+    assert prose not in out, "the pre-fix token set is expected to destroy this bullet"
+    assert out.count("[[Concept_Target]]") == 1
+
+
+def test_finalize_ingest_keeps_a_hand_authored_bullet_that_mentions_the_target(isolated_memory):
+    """End-to-end guard on the production call site that supplies the token set.
+
+    The unit tests above pin the behaviour of the helper; this one pins the fact that
+    ``_apply_integration_disposition`` actually passes the narrowed tokens.
+    """
+    _write_purpose_contract(isolated_memory)
+    target_path = isolated_memory / "wiki" / "Concept_Target.md"
+    execute_mutation_plan("Concept_Target.md", content=_concept_content())
+    target_version = governance_store.canonical_page_versions({"Concept_Target"})["Concept_Target"]
+
+    prose = "- 手工批注：[[Concept_Target]] 的口径与本源的结论有出入，需人工复核。"
+    legacy = "- [validates:: [[Concept_Target]]] 早期生成的关系 (confidence: 0.80)"
+    source = _source_content().replace(
+        "Primary source content.",
+        f"""Primary source content.
+
+{_graph_section_heading()}
+
+{prose}
+{legacy}
+""",
+    )
+
+    payload = {
+        "filepath": "raw/prose-mention.md",
+        "hash": "prose-mention",
+        "canonical_name": "Source_Prose-Mention.md",
+    }
+    db_store.init_db()
+    job_id = db_store.enqueue_job("ingest", payload)
+    db_store.mark_job_awaiting_subagent(job_id, "")
+    claim = json.loads(claim_ingest_tasks(limit=1, lease_seconds=60))[0]
+
+    result = _finalize(
+        [{"filename": "Source_Prose-Mention.md", "content": source}],
+        {
+            **payload,
+            "integration": {
+                "disposition": "integrated",
+                "relations": [{
+                    "target": "Concept_Target.md",
+                    "target_hash": target_version,
+                    "predicate": "validates",
+                    "evidence": "The source directly supports the target mechanism.",
+                    "confidence": 0.93,
+                    "event_date": "2026-07-15",
+                    "event_tag": "Validation",
+                }],
+            },
+            "job_id": job_id,
+            "lease_owner": claim["lease_owner"],
+            "lease_token": claim["lease_token"],
+            "lease_generation": claim["lease_generation"],
+        },
+    )
+
+    assert result.startswith("Successfully finalized ingestion"), result
+    written = (isolated_memory / "wiki" / "Source_Prose-Mention.md").read_text(encoding="utf-8")
+    assert prose in written, "the hand-authored bullet was destroyed by the integration merge"
+    assert legacy not in written, "the markless generated relation line must still be replaced"
+    assert "[validates:: [[Concept_Target]]]" in written
+    assert written.count("[[Concept_Target]]") == 2

@@ -1185,6 +1185,30 @@ def _prune_change_sets_change_id(conn: sqlite3.Connection) -> None:
 # Each migration is a name plus ordered steps.  Steps are callables rather than
 # SQL strings so a step can make a decision (probe a column) instead of relying
 # on an error message to tell "already done" apart from "failed".
+def _restore_processed_files_observation_snapshot(conn: sqlite3.Connection) -> None:
+    """Restore the ledger's observation snapshot columns.
+
+    ``processed_files`` carried ``observed_mtime_ns``/``observed_size`` until the 2026-09-17
+    refactor dropped the writer.  The columns stayed in the live database, this DDL reverted
+    to three columns, and no migration recorded either the addition or the abandonment -- so
+    a fresh database has three columns while the operator's database had five.
+
+    What replaced them was unsound: the scan gate compared the file's mtime against the
+    row's wall-clock ``processed_at``.  A file edited after finalize can still carry an mtime
+    a few milliseconds *earlier* than that row (NTFS clock granularity is ~15.6 ms), and the
+    gate then skipped the edit permanently -- measured 2026-09-20: a 3.9 ms inversion hid a
+    real edit, and the same gate silently ignores any change restored with an older mtime
+    (``cp -p``, ``git checkout``).  The snapshot makes "unchanged" an observation rather than
+    a clock comparison, and the content hash stays the authority whenever it disagrees.
+    """
+    present = _table_columns(conn, "processed_files")
+    if not present:
+        return
+    for column in ("observed_mtime_ns", "observed_size"):
+        if column not in present:
+            conn.execute(f"ALTER TABLE processed_files ADD COLUMN {column} INTEGER")
+
+
 _LEGACY_SCHEMA_PRUNES: tuple[
     tuple[str, tuple[Callable[[sqlite3.Connection], None], ...]], ...
 ] = (
@@ -1199,6 +1223,10 @@ _LEGACY_SCHEMA_PRUNES: tuple[
     ("2026-09-18-governance-queue-index", (_prune_governance_queue_index,)),
     ("2026-09-18-normalise-entities-ttl-encoding", (_normalise_entities_ttl_encoding,)),
     ("2026-09-18-drop-page-graph-edges", (_prune_page_graph_edges,)),
+    (
+        "2026-09-20-restore-processed-files-observation-snapshot",
+        (_restore_processed_files_observation_snapshot,),
+    ),
 )
 
 _SCHEMA_MIGRATIONS_DDL = """
@@ -1684,7 +1712,9 @@ def _init_db_once(db_key: str):
             CREATE TABLE IF NOT EXISTS processed_files (
                 filepath TEXT PRIMARY KEY,
                 file_hash TEXT,
-                processed_at TEXT
+                processed_at TEXT,
+                observed_mtime_ns INTEGER,
+                observed_size INTEGER
             )
         """)
         conn.execute("""
@@ -2173,18 +2203,35 @@ def get_processed_files() -> dict[str, str]:
     cur = conn.execute("SELECT filepath, file_hash FROM processed_files")
     return {row["filepath"]: row["file_hash"] for row in cur.fetchall()}
 
-def mark_file_processed(filepath: str, file_hash: str):
+def mark_file_processed(
+    filepath: str,
+    file_hash: str,
+    *,
+    mtime_ns: int | None = None,
+    size: int | None = None,
+):
+    """Record a raw source as processed, with the observation snapshot when supplied.
+
+    The snapshot is what lets the scan skip an unchanged file without hashing it.  It is
+    optional so the callers that legitimately cannot stat the file (and the contract tests)
+    keep working; ``COALESCE`` then keeps any snapshot already on the row instead of clearing
+    it on a write that carries none.
+    """
     from datetime import datetime, timezone
     conn = get_connection()
     now_str = datetime.now(timezone.utc).isoformat()
     with transaction():
         conn.execute("""
-            INSERT INTO processed_files (filepath, file_hash, processed_at)
-            VALUES (?, ?, ?)
+            INSERT INTO processed_files (
+                filepath, file_hash, processed_at, observed_mtime_ns, observed_size
+            )
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(filepath) DO UPDATE SET
                 file_hash = excluded.file_hash,
-                processed_at = excluded.processed_at
-        """, (filepath, file_hash, now_str))
+                processed_at = excluded.processed_at,
+                observed_mtime_ns = COALESCE(excluded.observed_mtime_ns, processed_files.observed_mtime_ns),
+                observed_size = COALESCE(excluded.observed_size, processed_files.observed_size)
+        """, (filepath, file_hash, now_str, mtime_ns, size))
 
 #: Statuses from which a job's work is genuinely finished.
 #:

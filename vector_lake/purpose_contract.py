@@ -7,7 +7,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from vector_lake.wiki_utils import get_purpose_path
+from vector_lake.wiki_utils import get_purpose_path, read_ingest_item_content
 from vector_lake.yaml_utils import load_yaml
 
 
@@ -170,8 +170,10 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
         if not isinstance(item, dict) or "filename" not in item:
             raise PurposeContractError("Each ingest item requires filename.")
         if "filepath" in item and not item.get("content"):
-            with open(item["filepath"], "r", encoding="utf-8") as f:
-                item["content"] = f.read()
+            # Single owner for the read, and the reason it is not a bare ``open``: the path
+            # comes from the ingest packet, so it must resolve inside the raw root before a
+            # payload can turn it into a published page.
+            item["content"] = read_ingest_item_content(item, required=True)
         if "content" not in item:
             raise PurposeContractError("Each ingest item requires content or filepath.")
         filename = Path(str(item["filename"])).name

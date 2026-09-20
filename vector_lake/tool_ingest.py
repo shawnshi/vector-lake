@@ -17,6 +17,9 @@ from vector_lake.skeleton_parser import parse_static_skeleton
 from vector_lake.wiki_utils import (
     canonical_source_name,
     flush_durable,
+    projection_hash,
+    read_ingest_item_content,
+    resolve_ingest_source_path,
     split_frontmatter,
     get_raw_dir,
     get_wiki_dir,
@@ -339,31 +342,12 @@ def _name_key(value: str) -> str:
     return _NAME_KEY.sub("", str(value)).lower()
 
 
-def _item_content(item: dict) -> str:
-    """The item's content, read from ``filepath`` once and cached on the item.
-
-    The finalize loop below reads the same way; doing it here means a declaration check does not
-    cost a second read of the same file.
-    """
-    if item.get("content"):
-        return str(item["content"])
-    path = item.get("filepath")
-    if not path:
-        return ""
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            item["content"] = handle.read()
-    except OSError:
-        return ""
-    return str(item["content"])
-
-
 def _declares_raw_source(item: dict, raw_key: str) -> bool:
     """Whether this item's ``sources:`` names the raw file with this :func:`_raw_key`."""
     if not raw_key:
         return False
     try:
-        frontmatter, _body = split_frontmatter(_item_content(item))
+        frontmatter, _body = split_frontmatter(read_ingest_item_content(item))
     except Exception:  # noqa: BLE001 - unparsable frontmatter is the validator's business
         return False
     sources = frontmatter.get("sources") or []
@@ -630,6 +614,11 @@ def _read_purpose() -> str:
         log.error("Strategic purpose contract is unavailable: %s", exc)
         return "[STRATEGIC PURPOSE CONTRACT UNAVAILABLE: halt and repair purpose.md before ingesting.]"
 
+# Bumped when the task-packet dispatch manifest changes shape.  A packet carries the version it
+# was built with, so a consumer can tell a rebuilt packet from a stale one instead of inferring it
+# from whichever fields happen to be present.
+INGEST_CONTRACT_VERSION = 2
+
 INTEGRATION_DISPOSITIONS = {"integrated", "standalone", "rejected"}
 INTEGRATION_PREDICATES = {"validates", "falsifies", "depends-on", "mentions", "related_to"}
 INTEGRATION_EVENT_TAGS = {
@@ -658,14 +647,20 @@ def _normalise_search_text(value: str) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
 
 
-def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
-    """Return deterministic source-relevant candidates from the complete index.
+_COLD_KB_CONTEXT = "- (no existing nodes: cold knowledge base)"
 
-    A cold knowledge base (no index yet, no wiki pages) has nothing to link to,
-    so an empty candidate list is the correct answer.  A knowledge base whose
-    wiki is populated but whose index is missing is a real projection fault and
-    stays a hard error, because ingesting without the existing-node context is
-    how duplicate entities are created.
+
+def ingest_context_and_candidates(filepath: str, max_nodes: int = 40) -> tuple[str, list[dict]]:
+    """The prompt's index context and the dispatch manifest, from one computation.
+
+    They must come from the same calculation: the model is told to use only relations from the
+    packet's ``integration_candidates`` manifest, so a manifest computed separately from the list
+    the prompt shows would validate the model against a set it never saw.
+
+    A cold knowledge base (no index yet, no wiki pages) has nothing to link to, so an empty
+    candidate list is the correct answer.  A knowledge base whose wiki is populated but whose
+    index is missing is a real projection fault and stays a hard error, because ingesting without
+    the existing-node context is how duplicate entities are created.
     """
     index_path = get_index_path()
     if not index_path.exists():
@@ -680,10 +675,36 @@ def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
                 f"{len(wiki_pages)} wiki page(s) exist. Rebuild the index projection "
                 "(`projection-rebuild-index`) before ingesting new sources."
             )
-        return "- (no existing nodes: cold knowledge base)"
+        return _COLD_KB_CONTEXT, []
+    candidates = select_ingest_candidates(filepath, max_nodes)
+    return _render_index_context(candidates), candidates
+
+
+def _render_index_context(candidates: list[dict]) -> str:
+    return "\n".join(f"- {json.dumps(candidate, ensure_ascii=False)}" for candidate in candidates)
+
+
+def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
+    """The rendered candidate context, for callers that only need the prompt text."""
+    return ingest_context_and_candidates(filepath, max_nodes)[0]
+
+
+def select_ingest_candidates(filepath: str, max_nodes: int = 40) -> list[dict]:
+    """Source-relevant candidates from the complete index, as dispatch-manifest records."""
+    index_path = get_index_path()
     try:
-        source_text = Path(filepath).read_text(encoding="utf-8", errors="replace")[:200_000]
-        source_norm = _normalise_search_text(f"{Path(filepath).stem} {source_text}")
+        # The path comes from the ingest packet, so it resolves through the same root check the
+        # content readers use.  This text is scored into the prompt the model then compiles from,
+        # which makes it one more way an unconstrained path could reach a published page.
+        source_path = resolve_ingest_source_path(filepath)
+        source_text = (
+            source_path.read_text(encoding="utf-8", errors="replace")[:200_000]
+            if source_path is not None
+            else ""
+        )
+        source_norm = _normalise_search_text(
+            f"{source_path.stem if source_path is not None else ''} {source_text}"
+        )
         source_words = Counter(
             word for word in re.findall(r"\b[a-z0-9]{2,}\b", source_text.lower())
             if word not in INGEST_SEARCH_STOP_WORDS and not word.isdigit()
@@ -694,7 +715,7 @@ def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
         index_data = json.loads(index_path.read_text(encoding="utf-8"))
         nodes = index_data.get("nodes", {})
         if not nodes:
-            return ""
+            return []
         canonical_versions = governance_store.canonical_page_versions(set(nodes))
         scored = []
         wiki_dir = get_wiki_dir()
@@ -750,26 +771,30 @@ def _read_relevant_index_context(filepath: str, max_nodes: int = 40) -> str:
                 continue
             scored.append((score, key, node, target_hash, sorted(match_reasons)))
         scored.sort(key=lambda item: (-item[0], item[1]))
-        lines = []
+        candidates = []
         candidate_limit = max(1, int(max_nodes))
         scan_limit = max(100, candidate_limit * 5)
         for score, key, node, target_hash, match_reasons in scored[:scan_limit]:
             try:
-                _read_canonical_target_content(f"{key}.md", target_hash)
+                projection = _read_canonical_target_content(f"{key}.md", target_hash)
             except ValueError:
                 continue
-            lines.append(json.dumps({
+            candidates.append({
                 "target": f"{key}.md",
                 "target_hash": target_hash,
+                # The exact Markdown baseline, so the model names the *content* it saw and not
+                # only the SQLite version token.  Derived from the same canonical projection the
+                # finalize side re-reads, through the one :func:`projection_hash` implementation.
+                "target_projection_hash": projection_hash(projection),
                 "type": node.get("type", "unknown"),
                 "title": node.get("title", key),
                 "summary": (node.get("summary", "") or "")[:160],
                 "match_score": score,
                 "match_reasons": match_reasons[:8],
-            }, ensure_ascii=False))
-            if len(lines) >= candidate_limit:
+            })
+            if len(candidates) >= candidate_limit:
                 break
-        return "\n".join(f"- {line}" for line in lines)
+        return candidates
     except Exception as exc:
         raise RuntimeError(
             f"Could not build source-relevant ingest context for {filepath}: {exc}"
@@ -822,6 +847,14 @@ def _upsert_section_relation(
     line: str,
     legacy_tokens: tuple[str, ...] = (),
 ) -> str:
+    """Add ``line`` to the section under ``heading``, replacing what it supersedes.
+
+    A line is superseded when it carries this relation's ``marker``.  ``legacy_tokens`` covers
+    the lines written *before* markers existed: it matches only when **every** token is present,
+    because the merge step deletes every match.  A caller that passes a single token as loose as
+    a wikilink therefore lets the merge eat unrelated prose -- the source page did exactly that
+    and replaced any hand-authored bullet that merely mentioned the target.
+    """
     start = content.find(heading)
     if start < 0:
         raise ValueError(f"Integration target is missing the required section: {heading}")
@@ -854,6 +887,49 @@ def _upsert_section_relation(
     return _updated_now(merged)
 
 
+def _candidate_manifest(processed_data: dict) -> dict[str, dict] | None:
+    """The packet's candidate allowlist, or ``None`` for a pre-manifest packet.
+
+    The two states are deliberately distinct.  An absent key is a packet built before the
+    manifest existed and is tolerated while the migration runs; a present but empty list is a
+    packet that says there was nothing to integrate with, and must therefore permit no
+    relation at all rather than fall back to "any page".
+    """
+    candidates = processed_data.get("integration_candidates")
+    if not isinstance(candidates, list):
+        return None
+    return {
+        str(candidate.get("target")): candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("target")
+    }
+
+
+def _verify_source_projection(processed_data: dict) -> None:
+    """Fail when the raw source changed after the packet was built.
+
+    ``source_projection_hash`` baselines the source the model actually read.  A raw file edited
+    between dispatch and finalize means the compiled page describes text that no longer exists,
+    and the ledger's reconciliation only notices on a later pass.  A packet from before the
+    manifest carries no baseline and is tolerated while the migration runs.
+    """
+    declared = str(processed_data.get("source_projection_hash") or "")
+    if not declared:
+        return
+    filepath = str(processed_data.get("filepath") or "")
+    text = read_ingest_item_content({"filepath": filepath})
+    if not text:
+        raise ValueError(
+            f"could not re-read the raw source to verify its projection baseline: {filepath}"
+        )
+    actual = projection_hash(text)
+    if actual != declared:
+        raise ValueError(
+            f"the raw source changed after the ingest packet was built for {filepath}: "
+            f"source_projection_hash {declared[:12]} != {actual[:12]}"
+        )
+
+
 def _apply_integration_disposition(files_written: list, processed_data: dict) -> tuple[list, str]:
     """Validate semantic completion and materialize bounded source/target updates."""
     integration = processed_data.get("integration")
@@ -867,7 +943,7 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
     for item in files_written:
         record = dict(item)
         if "filepath" in record and not record.get("content"):
-            record["content"] = Path(record["filepath"]).read_text(encoding="utf-8")
+            record["content"] = read_ingest_item_content(record, required=True)
         files.append(record)
 
     reason = str(integration.get("reason") or "").strip()
@@ -878,6 +954,10 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
             raise ValueError("rejected ingest disposition requires an auditable reason")
         return [], disposition
 
+    # Not for ``rejected``: nothing is published from it, so a source that changed underneath
+    # cannot produce a page describing text that no longer exists.
+    _verify_source_projection(processed_data)
+
     canonical_name = str(processed_data.get("canonical_name") or "").strip()
     source_items = [item for item in files if os.path.basename(str(item.get("filename", ""))) == canonical_name]
     if len(source_items) != 1:
@@ -885,8 +965,24 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
     source_item = source_items[0]
     source_item["expected_version"] = str(processed_data.get("source_hash") or "")
     for item in files:
-        if item is not source_item:
-            item.setdefault("expected_version", "")
+        if item is source_item:
+            continue
+        # Forced, not defaulted.  ``expected_version`` is a *write permission*: the coordinator
+        # reads a supplied non-empty value as "overwrite the page at this version"
+        # (``mutation_coordinator`` only version-checks the mutations that carry the key).
+        # Defaulting therefore left a payload free to name any existing page, quote its version,
+        # and have the ingest rewrite it with no relation, no predicate and no ``target_hash``
+        # check -- the entire integration contract bypassed, on the disposition the host runner
+        # hardcodes.  A submitted item is create-only unless it is the canonical source page
+        # (version forced on the line above) or a validated relation target (which carries its
+        # own checked version and is appended after this loop).
+        if item.get("expected_version"):
+            log.warning(
+                "Ignoring a caller-supplied expected_version for %s: only the canonical source "
+                "page and validated relation targets may name an existing version.",
+                item.get("filename"),
+            )
+        item["expected_version"] = ""
     relations = integration.get("relations") or []
     if disposition == "standalone":
         if relations:
@@ -898,6 +994,20 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
         raise ValueError("integrated ingest disposition requires at least one relation")
 
     submitted_names = {os.path.basename(str(item.get("filename", ""))) for item in files}
+    # The packet's dispatch manifest is the allowlist.  The prompt tells the model that only
+    # these relations are permitted, so the check has to exist here or the sentence is a promise
+    # the code does not keep -- every candidate used to be any page that merely existed.
+    manifest = _candidate_manifest(processed_data)
+    if manifest is None:
+        # M1, fail-closed.  A packet with no manifest is one built before the contract existed,
+        # and the manifest is what bounds which pages a relation may name -- accepting it would
+        # restore the "any existing page" behaviour the manifest was introduced to remove.
+        # ``standalone`` and ``rejected`` are unaffected: they declare no relations at all.
+        # ``requeue_legacy_ingest_jobs`` rebuilds such a packet and re-dispatches it.
+        raise ValueError(
+            "integrated ingest requires the packet's dispatch manifest; this packet predates "
+            "``integration_candidates``. Requeue it so the packet is rebuilt."
+        )
     source_content = str(source_item.get("content") or "").rstrip()
     source_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
     graph_heading = "## Graph Integration"
@@ -912,6 +1022,10 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
         if target != str(relation.get("target") or ""):
             raise ValueError("integration relation target must be a wiki basename")
         validate_wiki_filename(target)
+        if target not in manifest:
+            raise ValueError(
+                f"integration target is not in the packet's candidate manifest: {target}"
+            )
         if target == canonical_name or target in submitted_names or target in seen_targets:
             raise ValueError(f"integration target is duplicated or conflicts with submitted files: {target}")
         seen_targets.add(target)
@@ -923,7 +1037,18 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
         expected_hash = str(relation.get("target_hash") or "")
         if not expected_hash or expected_hash != actual_hash:
             raise ValueError(f"integration target_hash is stale or missing for {target}")
+        if expected_hash != str(manifest[target].get("target_hash") or ""):
+            raise ValueError(
+                f"integration target_hash does not match the candidate manifest for {target}"
+            )
         target_content = _read_canonical_target_content(target, expected_hash)
+        # The content baseline the model was given, and now required: a version token cannot see
+        # a projection that changed without one, which is the case this field exists for.
+        declared_projection = str(relation.get("target_projection_hash") or "")
+        if not declared_projection:
+            raise ValueError(f"integration relation requires target_projection_hash for {target}")
+        if declared_projection != projection_hash(target_content):
+            raise ValueError(f"integration target_projection_hash is stale for {target}")
         predicate = str(relation.get("predicate") or "").strip()
         if predicate not in INTEGRATION_PREDICATES:
             raise ValueError(f"unsupported integration predicate: {predicate}")
@@ -952,7 +1077,13 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
             marker,
             f"- [{predicate}:: [[{target_key}]]] {evidence} "
             f"(confidence: {confidence:.2f}) {marker}",
-            legacy_tokens=(f"[[{target_key}]]",),
+            # Both tokens are required: ``[[target]]`` alone also matches a hand-authored
+            # line that merely mentions the target, and the merge deletes what it matches.
+            # ``confidence:`` is what the pre-marker generated relation always carried, so the
+            # AND keeps the dedup working on legacy lines and leaves prose alone.  The target
+            # side stays on ``(Source: [[source]])``: that anchor *is* the generated shape, and
+            # the bare wikilink is contained in it, so it cannot be narrowed further.
+            legacy_tokens=(f"[[{target_key}]]", "confidence:"),
         )
         source_anchor = f"(Source: [[{source_key}]])"
         target_heading = (
@@ -982,7 +1113,12 @@ def _apply_integration_disposition(files_written: list, processed_data: dict) ->
     return files + target_mutations, disposition
 
 
-def _build_ingest_instructions(filepath: str, file_hash: str, canonical_name: str) -> str:
+def _build_ingest_instructions(
+    filepath: str,
+    file_hash: str,
+    canonical_name: str,
+    index_context: str | None = None,
+) -> str:
     schema_content = ""
     try:
         schema_content = (get_extension_root() / "schema.md").read_text(encoding="utf-8")
@@ -1001,7 +1137,10 @@ def _build_ingest_instructions(filepath: str, file_hash: str, canonical_name: st
         .replace("{{canonical_name}}", canonical_name)
         .replace("{{skeleton_block}}", parse_static_skeleton(filepath))
         .replace("{{schema_content}}", schema_content)
-        .replace("{{index_summary}}", _read_relevant_index_context(filepath))
+        .replace(
+            "{{index_summary}}",
+            _read_relevant_index_context(filepath) if index_context is None else index_context,
+        )
         .replace("{{purpose_content}}", _read_purpose())
         .replace("{{valid_predicates}}", ", ".join(sorted(VALID_PREDICATES)))
     )
@@ -1023,7 +1162,7 @@ def requeue_legacy_ingest_jobs() -> int:
             payload = json.loads(row["payload"] or "{}")
         except json.JSONDecodeError:
             continue
-        if "source_hash" in payload:
+        if payload.get("ingest_contract_version") == INGEST_CONTRACT_VERSION:
             continue
         filepath = str(payload.get("filepath") or "")
         file_hash = str(payload.get("hash") or "")
@@ -1035,7 +1174,14 @@ def requeue_legacy_ingest_jobs() -> int:
             canonical_key,
             "",
         )
-        payload["instructions"] = _build_ingest_instructions(filepath, file_hash, canonical_name)
+        index_context, candidates = ingest_context_and_candidates(filepath)
+        payload["instructions"] = _build_ingest_instructions(
+            filepath, file_hash, canonical_name, index_context=index_context
+        )
+        source_text = read_ingest_item_content({"filepath": filepath})
+        payload["ingest_contract_version"] = INGEST_CONTRACT_VERSION
+        payload["source_projection_hash"] = projection_hash(source_text) if source_text else ""
+        payload["integration_candidates"] = candidates
         migrations.append((str(row["job_id"]), payload, str(row["task_packet_path"] or "")))
 
     if not migrations:
@@ -1200,8 +1346,19 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
     from vector_lake.db_store import get_connection
     init_db()
     conn = get_connection()
-    cur = conn.execute("SELECT filepath, file_hash, processed_at FROM processed_files")
-    processed = {row["filepath"]: {"hash": row["file_hash"], "processed_at": row["processed_at"]} for row in cur.fetchall()}
+    cur = conn.execute(
+        "SELECT filepath, file_hash, processed_at, observed_mtime_ns, observed_size"
+        " FROM processed_files"
+    )
+    processed = {
+        row["filepath"]: {
+            "hash": row["file_hash"],
+            "processed_at": row["processed_at"],
+            "mtime_ns": row["observed_mtime_ns"],
+            "size": row["observed_size"],
+        }
+        for row in cur.fetchall()
+    }
     
     in_flight = _load_ingest_in_flight()
     from vector_lake.db_store import abandoned_source_keys
@@ -1216,23 +1373,39 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
 
     for filepath in files_to_process:
         try:
-            mtime = os.stat(filepath).st_mtime
+            stat = os.stat(filepath)
             # A file already carrying an in-flight ingest is skipped so two workers
             # cannot compile the same source concurrently.
             if _ingest_ref(filepath) in in_flight:
                 continue
 
             if filepath in processed:
-                processed_at_str = processed[filepath]["processed_at"]
-                if processed_at_str:
-                    processed_at_dt = datetime.fromisoformat(processed_at_str.replace("Z", "+00:00"))
-                    if processed_at_dt.tzinfo is None:
-                        processed_at_dt = processed_at_dt.replace(tzinfo=timezone.utc)
-                    if mtime <= processed_at_dt.timestamp():
-                        continue
+                # The observation snapshot is the only sound "unchanged" signal.  Comparing the
+                # file mtime against the row's wall-clock ``processed_at`` skipped edits whose
+                # mtime fell in the same clock tick as the row (NTFS is ~15.6 ms; measured
+                # 2026-09-20, a 3.9 ms inversion hid a real edit), and it silently ignored any
+                # change restored with an older mtime (``cp -p``, ``git checkout``).  The content
+                # hash stays the authority whenever the snapshot disagrees.
+                row = processed[filepath]
+                if (
+                    row.get("mtime_ns") is not None
+                    and row.get("size") is not None
+                    and row["mtime_ns"] == stat.st_mtime_ns
+                    and row["size"] == stat.st_size
+                ):
+                    continue
 
                 file_hash = calculate_hash(filepath)
-                if file_hash == processed[filepath]["hash"]:
+                if file_hash == row["hash"]:
+                    # Content is unchanged.  Backfill a missing snapshot so later scans can skip
+                    # without hashing; rows kept by the pre-2026-09-17 writer already carry one.
+                    if row.get("mtime_ns") is None or row.get("size") is None:
+                        mark_file_processed(
+                            filepath,
+                            file_hash,
+                            mtime_ns=stat.st_mtime_ns,
+                            size=stat.st_size,
+                        )
                     continue
             else:
                 # No ledger row.  Normally that means a genuinely new file - but a source
@@ -1246,7 +1419,12 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                         # The page exists, declares this raw path, and the file has not been
                         # touched since: record the missing ledger row so the accounting is
                         # accurate and a *future* edit is detected as a changed hash.
-                        mark_file_processed(filepath, calculate_hash(filepath))
+                        mark_file_processed(
+                            filepath,
+                            calculate_hash(filepath),
+                            mtime_ns=stat.st_mtime_ns,
+                            size=stat.st_size,
+                        )
                         reconciled.append(filepath)
                         continue
                     if verdict == "skip":
@@ -1337,7 +1515,13 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                 canonical_name = canonical_source_name(filepath)
                 canonical_key = canonical_name[:-3] if canonical_name.endswith(".md") else canonical_name
                 source_hash = governance_store.canonical_page_versions({canonical_key}).get(canonical_key, "")
-                instructions = _build_ingest_instructions(filepath, file_hash, canonical_name)
+                # One computation supplies both the prompt's candidate list and the dispatch
+                # manifest, so the model can only ever name a candidate it was shown.
+                index_context, candidates = ingest_context_and_candidates(str(filepath))
+                instructions = _build_ingest_instructions(
+                    filepath, file_hash, canonical_name, index_context=index_context
+                )
+                source_text = read_ingest_item_content({"filepath": str(filepath)})
 
                 payload = {
                     "filepath": str(filepath),
@@ -1345,6 +1529,9 @@ def prepare_ingest_batch(batch_size: int = 5) -> str:
                     "canonical_name": canonical_name,
                     "source_hash": source_hash,
                     "instructions": instructions,
+                    "ingest_contract_version": INGEST_CONTRACT_VERSION,
+                    "source_projection_hash": projection_hash(source_text) if source_text else "",
+                    "integration_candidates": candidates,
                 }
 
                 # ``supersede_finished`` is safe here and only here: this point in the scan is
@@ -1418,7 +1605,7 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
                 files, canonical_name, str(processed_data.get("filepath") or "")
             )
             if item is not None:
-                content = _item_content(item)
+                content = read_ingest_item_content(item)
                 if content:
                     item["content"] = _stamp_source_hash(content, raw_hash)
                 if deviation:
@@ -1438,8 +1625,9 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
         for item in files:
             fname = os.path.basename(item["filename"])
             if "filepath" in item and not item.get("content"):
-                with open(item["filepath"], "r", encoding="utf-8") as f:
-                    item["content"] = f.read()
+                # ``required``: an unreadable source must fail the finalize rather than be
+                # published as an empty canonical page.
+                item["content"] = read_ingest_item_content(item, required=True)
             fcontent = item["content"]
             
             if "Concept_Decision_" in fname:
@@ -1455,11 +1643,19 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
 
         filepath = processed_data["filepath"]
         file_hash = processed_data["hash"]
+        # The observation snapshot travels with the ledger row so the next scan can skip an
+        # unchanged file without hashing.  A source that has since been removed reports no
+        # observation and the row keeps whatever it already had.
+        try:
+            _stat = os.stat(filepath)
+            snapshot = {"mtime_ns": _stat.st_mtime_ns, "size": _stat.st_size}
+        except OSError:
+            snapshot = {}
         if mutations:
             from vector_lake.mutation_coordinator import execute_mutation_batch
 
             def mark_ingest_processed():
-                mark_file_processed(filepath, file_hash)
+                mark_file_processed(filepath, file_hash, **snapshot)
                 finalize_ingest_job(
                     str(job_id),
                     lease_owner,
@@ -1476,7 +1672,7 @@ def finalize_ingest(files_written: list, processed_data: dict) -> str:
             from vector_lake.db_store import transaction
 
             with transaction():
-                mark_file_processed(filepath, file_hash)
+                mark_file_processed(filepath, file_hash, **snapshot)
                 finalize_ingest_job(
                     str(job_id),
                     lease_owner,

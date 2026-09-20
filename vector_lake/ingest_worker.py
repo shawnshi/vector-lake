@@ -76,6 +76,16 @@ def process_jobs():
                     "canonical_name": canonical_name,
                     "source_hash": str(payload.get("source_hash") or ""),
                     "job_id": job_id,
+                    # The dispatch manifest travels with the packet.  The prompt tells the model
+                    # to preserve these fields verbatim, so the finalizer can validate relations
+                    # against the candidate list the model was actually shown instead of trusting
+                    # whatever it chose to name.
+                    "ingest_contract_version": payload.get("ingest_contract_version"),
+                    "source_projection_hash": str(payload.get("source_projection_hash") or ""),
+                    # Absent stays absent: the finalizer treats "no manifest" (a pre-manifest
+                    # packet, tolerated during the migration) differently from "an empty
+                    # manifest" (a packet that permits no relation at all).
+                    "integration_candidates": payload.get("integration_candidates"),
                 }
                 task_path = create_subagent_task(
                     "ingest",

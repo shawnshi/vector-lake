@@ -54,6 +54,40 @@ REJECT_DUPLICATE = (
     "此任务为重复准备；由 ingest runner 自动关闭以免重复入库。"
 )
 REJECT_MISSING_SOURCE = "原始文件在 raw 目录下已不存在，任务无法完成；由 ingest runner 自动关闭。"
+STANDALONE_FALLBACK_REASON = "ingest runner standalone ingest"
+
+
+def _with_disposition(processed: dict) -> dict:
+    """The packet's ``processed_data`` with the runner's fallback stacked *under* the model's.
+
+    The model's own disposition -- and above all its ``relations`` -- is the semantic output this
+    step exists to obtain.  The call site used to build ``{**processed, "integration": {...}}``,
+    which *replaced* the key: a model that returned ``integrated`` with relations had them
+    silently discarded, the source was recorded as standalone, and no target page ever received
+    its relation line.  Nothing failed, so the loss was invisible.
+
+    Only gaps are filled here.  A disposition the runner invents is a fallback for output that
+    declared none, never an override of judgement the model actually supplied.
+    """
+    integration = processed.get("integration")
+    if not isinstance(integration, dict):
+        return {
+            **processed,
+            "integration": {
+                "disposition": "standalone",
+                "reason": STANDALONE_FALLBACK_REASON,
+            },
+        }
+    merged = dict(integration)
+    disposition = str(merged.get("disposition") or "").strip().lower()
+    if not disposition:
+        disposition = "standalone"
+        merged["disposition"] = disposition
+    # ``standalone`` needs an auditable reason (the finalizer enforces a 12-character floor); the
+    # runner supplies its own rather than letting a missing reason fail an otherwise valid packet.
+    if disposition == "standalone" and len(str(merged.get("reason") or "").strip()) < 12:
+        merged["reason"] = STANDALONE_FALLBACK_REASON
+    return {**processed, "integration": merged}
 
 
 def _utc_now() -> str:
@@ -155,8 +189,7 @@ def process_once(limit: int, shadow: bool, model_cmd: str, stats: dict) -> dict:
                     if job_id:
                         record_ingest_failure(job_id, f"model seam: {error}")
                     continue
-                result = finalize_ingest(files, {**processed, "integration": {"disposition": "standalone",
-                                                                            "reason": "ingest runner standalone ingest"}})
+                result = finalize_ingest(files, _with_disposition(processed))
                 if "Successfully finalized" in result:
                     batch["finalized"] += 1
                 else:

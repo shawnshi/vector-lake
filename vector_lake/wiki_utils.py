@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import io
 import logging
 import os
@@ -259,6 +260,83 @@ def get_wiki_dir() -> Path:
 
 def get_raw_dir() -> Path:
     return get_memory_dir() / "raw"
+
+
+def projection_hash(content: str) -> str:
+    """SHA-256 of a page projection, normalised to LF line endings.
+
+    The hash baselines *content*, so it must not depend on how a checkout wrote the file: the
+    repository index is 907/907 LF, and a CRLF working copy would otherwise produce a different
+    hash for byte-identical knowledge.  Normalising before hashing is what makes a
+    ``source_projection_hash`` or ``target_projection_hash`` comparable across hosts -- the
+    single implementation, so the producer and the verifier cannot drift apart.
+    """
+    text = str(content).replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def resolve_ingest_source_path(raw) -> Path | None:
+    """Resolve a raw source path inside the raw root, or ``None`` when it escapes it.
+
+    An ingest item names its source as ``filepath``, and that string is not trustworthy: it
+    arrives in a task packet built by the host runner.  Every reader used to hand it straight
+    to ``open``, so a malformed packet could publish any file the ingest process can read -- a
+    key, a database, another application's config -- as a canonical wiki page.  Accepting only
+    a path that resolves inside ``raw/`` is what makes "the source of this page" a fact about
+    the raw tree rather than about the filesystem.
+
+    Both spellings that occur in practice are accepted: a rooted path (all 1866 live ledger
+    rows are absolute) and one written relative to the memory root or the raw root
+    (``raw/x.md``, ``x.md`` -- the form hand-written packets and tests use).
+    """
+    raw_text = str(raw or "").strip()
+    if not raw_text:
+        return None
+    root = get_raw_dir().resolve()
+    path = Path(raw_text)
+    if not path.is_absolute():
+        parts = [part for part in re.split(r"[\\/]+", raw_text) if part]
+        if parts and parts[0].lower() == root.name:
+            parts = parts[1:]
+        path = root.joinpath(*parts) if parts else root
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved if resolved.is_relative_to(root) else None
+
+
+def read_ingest_item_content(item: dict, *, required: bool = False) -> str:
+    """The item's content, read once from its ``filepath`` and cached on the item.
+
+    Single owner for a read that four call sites used to perform themselves -- none of them
+    constraining the path (see :func:`resolve_ingest_source_path`).
+
+    ``required`` selects the failure contract, because the callers genuinely disagree: the
+    declaration check and the hash stamp want ``""`` for a source they cannot read, while the
+    finalize path must fail loudly.  Returning ``""`` there would let an unreadable source be
+    written as an empty canonical page, which publishes a page with no content where the job
+    should have stayed pending.
+    """
+    cached = item.get("content")
+    if cached:
+        return str(cached)
+    raw = str(item.get("filepath") or "")
+    if not raw:
+        return ""
+    path = resolve_ingest_source_path(raw)
+    if path is None:
+        if required:
+            raise ValueError(f"ingest item filepath is outside the raw root: {raw}")
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        if required:
+            raise
+        return ""
+    item["content"] = text
+    return text
 
 
 def get_meta_dir() -> Path:
