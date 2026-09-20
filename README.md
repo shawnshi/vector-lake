@@ -356,7 +356,7 @@ python cli.py repair-idempotency --table mutation_outbox --apply
 - `VECTOR_LAKE_RUNNER_STRICT=1`：把 Runner 告警从 `warnings` 升入 `degraded`（两者都不阻断写入）。
 - `VECTOR_LAKE_RERANK_WEIGHT`：检索 Phase-2 重排的权重，默认 `0.4`，即 `0.6 × 上游归一化分 + 0.4 × bm25s 词汇分`；设为 `0` 可完全恢复旧排序。
 - `VECTOR_LAKE_FUSION`：FTS 与向量两路的融合方式。默认 `sum`（历史行为：`-bm25` 与 `sim²·15` 两个原始量级相加）；`rrf` 改按名次融合（`Σ 1/(60+rank)`，常量见 `tool_search.RRF_K`），并把**图扩展也表达成同一量纲的第三路名次**。
-  **判定：默认保持 `sum`。** 预登记的主指标是 nDCG@5（规则见 `benchmarks/search_eval_decisions.md`）。确认集 76 条查询、两位独立判定者（kappa 0.73）下，`rrf` 在 **16/16 个「指标×标注集」组合**里方向一致更好，但主指标的配对 bootstrap 95% CI 在四个标注集上**全部包含 0**（judge-a 恰在边缘 p=0.051），符号检验也全不显著 → 规则给 **NOT MET**。把主指标换成 recall@5 的话，judge-a 下会“通过”（`0.7302 → 0.8535`，CI `[+0.029, +0.219]`，p=0.011）—— 这正是预登记要防的事。更早的 40 条单判定者一轮（仅 MRR 显著）方向与本轮一致，结论同样未成立。
+  **判定：默认保持 `sum`。** 预登记的主指标是 nDCG@5（规则见 `benchmarks/search_eval_decisions.md`，含事后加的最小效应量 ≥ +0.05）。确认集 76 条查询、**三位独立判定者**（两位 `deepseek` 同族 + 一位 `gemini` 跨族；三对 kappa 0.70–0.77）下，`rrf` 在 **16/16 个「指标×标注集」组合**里方向一致更好，但主指标配对 bootstrap 95% CI 在四个标注集上**全部包含 0**、符号检验全不显著，且四个点估计（`+0.035 / +0.047 / +0.046 / +0.044`）**全部低于 +0.05** → 规则 **NOT MET**。稳定的是次要指标 recall@5（三处 CI 不含 0），不是主指标 —— 改主指标会翻结论，这正是预登记要防的事。跨族一致率与同族同带（0.70–0.77 vs 0.73），说明判定分歧是判定者特异的，不是共享模型偏置。
 - `VECTOR_LAKE_EXPANSION_QUOTA`：给图扩展预留的候选池槽位数。不设＝维持历史行为，即扩展只能捡融合剩下的槽位（实测一半查询捡到 0）；设 N 后每次查询都保证有扩展候选进池。受 `expansion_limit`（general 5 / entity 12）约束，故有效上限是 `min(N, expansion_limit)`。
 - `VECTOR_LAKE_LEIDEN_L1_RESOLUTION` / `VECTOR_LAKE_LEIDEN_L0_RESOLUTION`：Leiden 的 Micro / Global 分辨率，默认 `2.0` / `1.0`。分辨率越高社区越小。
 - `VECTOR_LAKE_LEIDEN_SEED`：Leiden 随机种子，默认 `42`。**必须固定**才能保证社区划分可复现。

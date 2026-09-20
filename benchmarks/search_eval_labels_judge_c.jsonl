@@ -1,0 +1,76 @@
+{"query": "医疗信创 政策 要求", "relevant": ["Policy_医疗信创"]}
+{"query": "空驾驶舱效应 自动化偏见", "relevant": ["Concept_空驾驶舱效应", "Concept_自动化偏见"]}
+{"query": "Epic 系统 产品 演进", "relevant": ["Product_Epic-Payer-Platform", "Source_Epic-Systems-产品深度分析报告20260406", "Source_Epic-Systems医疗人工智能产品演进-生态架构与项目落地全景深度解析"]}
+{"query": "HIMSS 2026 观察", "relevant": ["Event_HIMSS-2026", "Source_医疗数字化的重力迁徙-HIMSS2026战略观察"]}
+{"query": "DICOM 影像 标准", "relevant": ["Standard_DICOM"]}
+{"query": "病历 数据 脱敏 最小授权", "relevant": ["Concept_Config-医疗数据分类分级标准", "Concept_Personal-Data-Authorization-Account"]}
+{"query": "Med-PaLM 医学 问答", "relevant": ["Product_Med-PaLM2"]}
+{"query": "John Halamka 数字医学", "relevant": []}
+{"query": "医共体 权力下沉", "relevant": ["Concept_权力下沉", "Concept_紧密型县域医共体", "Policy_紧密型县域医共体信息化功能指引", "Source_紧密型县域医共体信息化功能指引-解读"]}
+{"query": "医保基金 监管 专项行动", "relevant": ["Event_医保基金监管专项行动-2026"]}
+{"query": "智能体医院 架构", "relevant": ["Source_AI-原生医院中的多智能体协作架构-1ea6e179", "Source_医疗数智化的下半场-从套壳聊天到智能体医院的范式坍塌与重构-20260304-final", "Source_智能体驱动的未来-AI-医院建设方案", "Synthesis_智能体医院架构"]}
+{"query": "DeepSeek 医疗 部署", "relevant": ["Concept_医疗机构部署DeepSeek专家共识", "Event_医疗机构部署DeepSeek专家共识", "Source_三甲医院如何应对AI落地的五大挑战-这有实战干货"]}
+{"query": "WiNGPT 产品 能力", "relevant": ["Product_WiNGPT", "Source_AI内生-价值超越-WINNING-WORLD-2025-AI全维赋能产品", "Source_Winning-World-2023顺利召开-卫宁健康正式发布WiNGPT-WiNEX-Copilot"]}
+{"query": "数据要素 三年行动计划", "relevant": ["Source_数据要素-三年行动计划-2024-2026年"]}
+{"query": "医院 算力 外包 争议", "relevant": ["Concept_算力房东", "Source_DigitalHealthWeeklyBrief-DHWB-20260712-0068c580", "Source_stqm_weekly_tensions_20260712"]}
+{"query": "大模型 训练 数据 质量", "relevant": ["Source_2502-02737v1"]}
+{"query": "护理 信息化 闭环", "relevant": ["Source_医疗质量管理闭环流程知多少", "Source_第九讲-临床路径与闭环管理-医嘱、护理、手术麻醉、重症监护系统"]}
+{"query": "手术 麻醉 信息系统", "relevant": ["Concept_AIMS", "Source_第九讲-临床路径与闭环管理-医嘱、护理、手术麻醉、重症监护系统"]}
+{"query": "院感 监测 智能预警", "relevant": []}
+{"query": "药事 管理 智能审方", "relevant": ["Source_医疗政策-关于加强居民连续用药管理工作的通知-6ebdb65d"]}
+{"query": "DRG 单病种 成本", "relevant": ["Policy_国家医保DRG-DIP-3-0版分组方案", "Source_医疗政策-按病组和病种分值付费3-0版分组方案并做好落地实施相关工作的通知-73c27afa", "Source_第十四讲-医保控费的-指挥棒-DRGDIP-核心应用与临床路径优化-1ca31911"]}
+{"query": "四级 手术 分级 管理", "relevant": []}
+{"query": "门诊 预约 号源 管理", "relevant": ["Source_第十讲-入口与流程再造-线上线下一体化的门诊服务-d65667e4"]}
+{"query": "互联网医院 复诊 处方", "relevant": ["Concept_处方自动续方", "Source_互联网诊疗电子病历管理技术规范-试行", "Source_公立医疗机构互联网医院建设-从牌照狂欢到实质破局20260918", "Source_第十七讲-延伸的围墙-互联网医院与远程医疗的模式与挑战-0e9ceaca"]}
+{"query": "电子病历 结构化 录入", "relevant": ["Concept_EMR", "Source_第六讲-心脏与大脑-上-以电子病历-EMR-为核心的临床数据体系-8915d22b"]}
+{"query": "医学 知识图谱 构建", "relevant": ["Concept_Dynamic-Clinical-Knowledge-Graph", "Concept_层次化超关系知识图谱", "Source_大模型时代知识图谱赋能高血压智能诊疗实践", "Source_被锁死的生命图谱-用语义流动性摧毁医疗系统的孤岛摩擦-2026-04-13"]}
+{"query": "临床 科研 数据 治理", "relevant": ["Concept_新一代医院数据平台", "Product_多中心临床研究数据平台", "Product_新一代科研大数据平台", "Product_灵析智研", "Source_在AI与可信数据空间驱动下的新一代医院数据平台-定位-框架与建设策略", "Source_寻求科研效能新高峰-且看临床科研平台如何重塑真实世界研究的高效之路"]}
+{"query": "真实世界 研究 数据", "relevant": ["Concept_真实世界数据", "Concept_真实世界研究", "Product_多中心临床研究数据平台", "Source_youtube-真实世界证据的工业级封装-2026-09-02-c168522f", "Source_寻求科研效能新高峰-且看临床科研平台如何重塑真实世界研究的高效之路"]}
+{"query": "医保 结算 清单 质控", "relevant": ["Concept_全流程实时内涵式质控", "Concept_病案首页智能质控", "Source_医保支付3-0时代的医院重构从被动控费到临床价值与数智解耦20260911"]}
+{"query": "病案 首页 填写 质量", "relevant": []}
+{"query": "医院 绩效考核 国考", "relevant": ["Source_2022-2023年度全国二级公立医院绩效监测分析情况", "Source_2022年度全国三级公立医院绩效考核国家监测分析情况", "Source_公立医院属性与国考指标政策摘编"]}
+{"query": "公立医院 高质量 发展", "relevant": ["Source_十五五-时期大型公立医院数字化建设迈向高质量发展的重点与路径战略分析", "Source_如何实现公立医院运营管理的核心目标", "Source_数据赋能-精准管理-开启医院数字化运营新时代", "Source_薛万国-找问题-补短板-促进医院信息化高质量发展-2021年南湖HIT论坛"]}
+{"query": "县域 医共体 信息化 指引", "relevant": ["Event_紧密型县域医共体信息化功能指引", "Policy_紧密型县域医共体信息化功能指引", "Source_紧密型县域医共体信息化功能指引-解读"]}
+{"query": "处方 流转 监管", "relevant": []}
+{"query": "检验 检查 结果 互认", "relevant": ["Concept_七个数智化就医场景", "Concept_质控AI", "Policy_检查检验结果互认", "Policy_检查检验结果互认规范"]}
+{"query": "影像 互认 云", "relevant": ["Concept_七个数智化就医场景", "Concept_医保影像云索引编码方案", "Policy_医保影像云索引上传试点", "Policy_检查检验结果互认规范", "Source_医疗政策-关于开展医保影像云索引上传试点工作的通知-4480089c"]}
+{"query": "患者 主索引 建设", "relevant": ["Concept_主数据管理", "Source_关于促进和规范-人工智能-医疗卫生-应用发展的实施意见", "Source_国家卫健委会议"]}
+{"query": "医院 集成平台 选型", "relevant": ["Concept_集成平台模式", "Concept_顶级集成商", "Product_iBDP", "Source_如何为集团化医院构建合理的信息架构"]}
+{"query": "信创 数据库 替换", "relevant": ["Concept_7543-全栈信创架构", "Source_北京协和医院会议记录", "Source_齐鲁医院数字化建设方案20260305"]}
+{"query": "操作系统 国产化 医院", "relevant": ["Policy_医疗信创", "Vendor_麒麟软件"]}
+{"query": "AI 辅助 诊断 审批", "relevant": ["Source_DHLS-20260505", "Source_北京市支持创新医药高质量发展若干措施-2026年"]}
+{"query": "医疗 AI 三类 器械", "relevant": ["Source_关于促进和规范-人工智能-医疗卫生-应用发展的实施意见", "Source_医疗AI分法域对照表-20260919"]}
+{"query": "数字疗法 商业化", "relevant": ["Concept_数字疗法", "Product_Pear-001", "Vendor_Pear-Therapeutics", "Vendor_zanadio"]}
+{"query": "临床 试验 数字化", "relevant": ["Concept_试验模拟", "Concept_随机对照试验"]}
+{"query": "统一 数据 模型 OMOP", "relevant": ["Concept_OMOP-CDM", "Concept_OMOP强制归宗", "Standard_OMOP-CDM"]}
+{"query": "FHIR 资源 映射", "relevant": ["Concept_跨设备语义映射-MSL", "Standard_FHIR"]}
+{"query": "SNOMED CT 落地", "relevant": ["Concept_SNOMED-CT", "Source_ai时代医院数据平台建设-20260919"]}
+{"query": "ICD 编码 智能", "relevant": ["Concept_Autonomous-Coding", "Concept_病案首页智能质控"]}
+{"query": "医院 数据 资产管理", "relevant": ["Concept_医疗数据资产化", "Concept_数据即服务", "Concept_数据治理蓝图", "Concept_数据资产运营商-Data-Operator"]}
+{"query": "数据 分类 分级 标准", "relevant": ["Concept_Config-医疗数据分类分级标准", "Policy_医疗卫生机构网络安全管理办法", "Source_网络数据安全管理条例"]}
+{"query": "隐私 计算 医疗", "relevant": ["Concept_医疗机构可信数据空间", "Concept_联邦学习", "Concept_隐私增强技术"]}
+{"query": "可信 执行 环境 医疗", "relevant": ["Concept_中立计算", "Concept_医疗机构可信数据空间", "Concept_隐私增强技术", "Source_医疗机构可信数据空间建设策略与实施路径", "Source_可信数据空间发展行动计划-2024-2028年"]}
+{"query": "多院区 一体化 管理", "relevant": ["Source_article-digitalhealthobserve-国家医学中心与国家区域医疗中心十五五数智化建设20260727-9a7394e7", "Source_创业慧康-HI-HIS-产品深度分析报告20260406", "Source_数据赋能-精准管理-开启医院数字化运营新时代"]}
+{"query": "集团化 医院 信息 架构", "relevant": ["Source_创业慧康-HI-HIS-产品深度分析报告20260406", "Source_如何为集团化医院构建合理的信息架构", "Source_薛万国-三种集团医院信息系统架构模式的比较与选择"]}
+{"query": "信息中心 组织 变革", "relevant": ["Concept_IT部门赋能转型", "Source_企业真的需要CDO来领导数字化转型吗", "Source_医院都应进行数字化重构-医院数字化转型路线图", "Source_激荡20年-系列报道-忆往昔HIT做强做大梦未圆-看明朝挺立潮头唯务实"]}
+{"query": "CIO 职责 变化", "relevant": ["Concept_CDO", "Concept_首席信息官", "Concept_首席数据官", "Source_企业真的需要CDO来领导数字化转型吗", "Source_除了CIO-CTO-企业为什么还需要CDO"]}
+{"query": "医院 信息安全 等保", "relevant": ["Policy_国家医疗健康信息医院信息互联互通标准化成熟度测评", "Source_中医医院信息与数字化建设规范-2024版"]}
+{"query": "医疗 数据 出境 合规", "relevant": ["Policy_医疗卫生机构网络安全管理办法"]}
+{"query": "商保 直付 实时 结算", "relevant": ["Concept_直赔付"]}
+{"query": "智慧 管理 分级", "relevant": ["Event_医院智慧管理分级评估标准体系发布", "Source_刘海一-提升医院效益是建设智慧管理系统的最终目的PHITA2021"]}
+{"query": "后勤 一体化 平台", "relevant": ["Source_第十九讲-物联网-IoT-连接物理世界与数字世界的-神经末梢-d874a248", "Source_第十五讲-看不见的战场-后勤与支持系统的数字化-2d7e7851"]}
+{"query": "财务 HRP 成本 核算", "relevant": ["Source_从-会计-到-智财-重构财务管理的新范式", "Source_第十二讲-医院的-大管家-新一代医院资源规划-HRP-系统-e1650ef7"]}
+{"query": "供应链 SPD 耗材 管理", "relevant": ["Concept_AI数字审计师", "Policy_医疗耗材SPD与反腐透明化治理", "Source_第十二讲-医院的-大管家-新一代医院资源规划-HRP-系统-e1650ef7"]}
+{"query": "科研 门诊 新模式", "relevant": ["Concept_科研门诊", "Source_医渡科技-科研门诊-开诊-打造智慧科研-AI平台-服务-新模式"]}
+{"query": "专病 数据库 建设", "relevant": ["Product_全病种数据库平台"]}
+{"query": "医学 影像 AI 审批", "relevant": ["Concept_医学影像AI"]}
+{"query": "大模型 幻觉 检测", "relevant": ["Concept_医疗AI-幻觉", "Concept_对抗性审计", "Source_从-超级点读机-到-硅基药-的认知越狱医疗大模型落地验证的生死线20260618"]}
+{"query": "提示 工程 医疗 应用", "relevant": []}
+{"query": "GraphRAG 医疗 问答", "relevant": ["Concept_GraphRAG", "Concept_GraphRAG-and-Enterprise-Digital-Twins", "Concept_RAG-First-Architecture", "Product_DB-GPT", "Source_Graph-AI-时代私域知识问答链路的建设与优化"]}
+{"query": "Text2SQL 电子病历", "relevant": ["Concept_Generative-EHR"]}
+{"query": "医疗 语义 互操作", "relevant": ["Concept_CDS-Hooks", "Concept_Semantic-Interoperability", "Concept_健康数据标准", "Concept_医院信息标准化", "Concept_跨设备语义映射-MSL"]}
+{"query": "知识 中台 医院", "relevant": ["Concept_AI中台", "Concept_三中台联动", "Source_熙牛医疗墙辉-数字化的分层开放体系支撑智慧医疗的全局智能"]}
+{"query": "AI 原生 医院", "relevant": ["Concept_AI-原生医院", "Concept_原生AI临床副驾", "Source_AI-原生医院的交互范式设计与实施指南-20260310-final", "Source_北大医疗集团-AI-原生医院建设蓝图-20260303", "Source_跨越概率鸿沟-基于-OpenAI-Frontier-架构的-AI-原生医院建设与问责重构-2026-2026-02-07"]}
+{"query": "智能 导诊 分诊", "relevant": ["Concept_临床分诊路径", "Concept_智能导诊", "Source_Weekly-DigitalHealth-20260322"]}
+{"query": "病历 内涵 质控 指标", "relevant": ["Concept_全流程实时内涵式质控", "Concept_日间医疗质量控制指标", "Concept_门诊电子病历质控", "Source_2026中国门诊电子病历质控市场深度研究报告", "Source_日间医疗质量控制指标体系专家共识-2025版"]}
+{"query": "DRG 高倍率 病例", "relevant": ["Concept_特例单议"]}
