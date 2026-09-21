@@ -958,6 +958,7 @@ _SCHEMA_SENTINELS: tuple[str, ...] = (
     # database as complete and the DDL that creates it never runs.
     "ingest_abandoned_sources",
     "claim_index",
+    "vec_embedding_projection",
 )
 
 
@@ -1515,6 +1516,22 @@ def _init_db_once(db_key: str):
                 embedding float[3072]
             )
         """)
+        conn.execute("""
+            -- Which model produced the projection currently in ``vec_embeddings``.
+            --
+            -- ``embedding_runs`` records the model per *run*, so once more than one run exists it
+            -- cannot answer "which model produced the vectors now stored", and that is the question
+            -- that matters: changing ``VECTOR_LAKE_EMBEDDING_MODEL`` moves the query encoder while
+            -- the stored vectors stay where they are, so every similarity quietly becomes
+            -- meaningless with nothing to compare against.  vec0 refuses extra columns, hence a
+            -- separate single-row marker rather than per-row provenance.
+            CREATE TABLE IF NOT EXISTS vec_embedding_projection (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                model TEXT,
+                dimension INTEGER,
+                written_at TEXT
+            )
+        """)
         for col, col_type in [("type", "TEXT"), ("status", "TEXT"), ("ttl", "INTEGER"), ("decay_weight", "REAL")]:
             try:
                 conn.execute(f"ALTER TABLE entities ADD COLUMN {col} {col_type}")
@@ -1901,6 +1918,31 @@ def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
 def count_embeddings() -> int:
     conn = get_connection()
     return int(conn.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone()[0])
+
+
+def record_embedding_projection(model: str, dimension: int) -> None:
+    """Record which model produced the vectors currently in ``vec_embeddings``.
+
+    Called by the backfill once it has written rows, because that is the only moment the
+    table's content and this marker agree.  See the DDL for why the model cannot live on the
+    vector rows themselves.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with transaction():
+        get_connection().execute(
+            "INSERT INTO vec_embedding_projection (id, model, dimension, written_at) VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET model = excluded.model, "
+            "dimension = excluded.dimension, written_at = excluded.written_at",
+            (str(model), int(dimension), now),
+        )
+
+
+def embedding_projection_state() -> dict:
+    """The recorded model/dimension of the stored projection, or ``{}`` when unrecorded."""
+    row = get_connection().execute(
+        "SELECT model, dimension, written_at FROM vec_embedding_projection WHERE id = 1"
+    ).fetchone()
+    return dict(row) if row else {}
 
 
 def start_embedding_run(run_id: str, model: str, candidates: int):

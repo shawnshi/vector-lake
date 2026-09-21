@@ -18,6 +18,7 @@ from vector_lake.wiki_utils import (
 )
 from vector_lake.db_store import (
     applied_schema_prunes,
+    embedding_projection_state,
     published_edge_projection_drift,
     get_db_path,
     get_connection,
@@ -453,6 +454,108 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
             )
     except Exception as e:
         checks.append(("Memory Gram Index", False, f"Check failed: {e}"))
+
+    # The vector projection is the second ranking arm, and a gap in it is invisible from the
+    # outside: a 36%-full ``vec_embeddings`` still answers every query, just with fewer
+    # semantic candidates and a systematic bias toward whichever pages happened to keep a
+    # vector.  Measured 2026-09-21: 2 602 of 7 175 nodes had one, every page rewritten on or
+    # after 2026-09-16 was among the missing, and nothing in this report mentioned it --
+    # ``embedding_coverage`` was referenced only from its own module.
+    #
+    # An incomplete projection is a repairable degradation, not a failure: the periodic
+    # catch-up sweep refills it in batches, so the check stays OK and the gap is a warning
+    # (same shape as the gram index above).
+    try:
+        from vector_lake.embedding_scheduler import embedding_coverage
+
+        index_path = get_index_path()
+        if index_path.exists():
+            with open(index_path, "r", encoding="utf-8") as handle:
+                index_data = json.load(handle)
+        else:
+            index_data = {"nodes": {}}
+        coverage = embedding_coverage(index_data)
+        checks.append((
+            "Vector Projection",
+            True,
+            f"nodes={coverage['nodes']} embedded={coverage['embedded']} "
+            f"missing={coverage['missing']} stale={coverage['stale']}",
+        ))
+        if coverage["missing"]:
+            warnings.append(
+                f"vector_projection_incomplete:missing={coverage['missing']} of "
+                f"{coverage['nodes']} nodes (refilled in batches by the periodic catch-up "
+                "sweep; force now: python cli.py embedding-backfill --apply)"
+            )
+        if coverage["stale"]:
+            warnings.append(
+                f"vector_projection_orphaned:{coverage['stale']} row(s) with no node "
+                "(the next index rebuild removes them)"
+            )
+    except Exception as e:
+        checks.append(("Vector Projection", False, f"Check failed: {e}"))
+
+    # Which model produced the stored vectors.  ``embedding_runs`` records the model per run, so
+    # on its own it cannot answer this once more than one run exists -- and a changed
+    # ``VECTOR_LAKE_EMBEDDING_MODEL`` moves the query encoder while the stored vectors stay put,
+    # turning every similarity into a number with no meaning and no visible symptom.
+    #
+    # The marker is the exact answer, but it is only written when a backfill writes rows, so a
+    # projection that is already complete has no marker until the next one runs.  Falling back to
+    # a single-model run ledger is the best available statement in that case, and it still catches
+    # the misconfiguration: a homogeneous ledger that disagrees with the configured model means
+    # the config moved after the last write, which is exactly the silent case.  The check line
+    # names which basis it used, so an inference is never read as a recording.
+    try:
+        from vector_lake.embedding_scheduler import load_embedding_rate_config
+
+        config = load_embedding_rate_config()
+        try:
+            state = embedding_projection_state()
+        except sqlite3.OperationalError:
+            # A database that has not run ``init_db()`` since the marker was introduced has no
+            # table yet, and the doctor is read-only by contract: it reports the state instead of
+            # running the migration.  Same supported degradation as a pre-gram-index database.
+            state = {}
+        recorded = state.get("model")
+        run_models = {
+            str(row[0]) for row in get_connection().execute(
+                "SELECT DISTINCT model FROM embedding_runs WHERE model IS NOT NULL AND model <> ''"
+            )
+        }
+        if recorded:
+            basis, claimed = "marker", str(recorded)
+        elif len(run_models) == 1:
+            basis, claimed = "run-ledger", next(iter(run_models))
+        else:
+            basis, claimed = "", ""
+        checks.append((
+            "Vector Model",
+            True,
+            f"stored={claimed or '<unknown>'} (by {basis or 'nothing'}) "
+            f"dimension={state.get('dimension') or '<unrecorded>'} "
+            f"configured={config.model}/{config.dimension} runs={sorted(run_models)}",
+        ))
+        if not claimed:
+            warnings.append(
+                "vector_model_unrecorded:no marker and no single-model run ledger, so the model "
+                "behind the stored vectors cannot be checked (stamp it: python cli.py "
+                "embedding-backfill --apply)"
+            )
+        elif claimed != str(config.model):
+            warnings.append(
+                f"vector_model_changed:stored={claimed} (by {basis}) configured={config.model}; "
+                "the query encoder and the stored vectors are in different spaces, so rankings "
+                "are meaningless (rebuild: python cli.py embedding-backfill --apply --include-existing)"
+            )
+        if len(run_models) > 1:
+            warnings.append(
+                f"vector_model_mixed_history:{sorted(run_models)} appear in embedding_runs, so "
+                "rows from more than one space may be stored together (rebuild: python cli.py "
+                "embedding-backfill --apply --include-existing)"
+            )
+    except Exception as e:
+        checks.append(("Vector Model", False, f"Check failed: {e}"))
 
     lines = ["=== Vector Lake Doctor ==="]
     all_ok = True

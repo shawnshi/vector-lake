@@ -1,3 +1,4 @@
+import json
 import pytest
 
 from vector_lake import db_store, indexer, periodic_catch_up
@@ -292,6 +293,86 @@ def test_the_sweep_does_not_call_the_provider_when_coverage_is_complete(isolated
 
     assert summary["embeddings"]["embedded"] == 0
     assert summary["embeddings"]["coverage_after"]["missing"] == 0
+
+
+def test_the_sweep_bounds_how_long_one_batch_may_wait(isolated_memory, monkeypatch):
+    """A quota error sleeps a flat 60 s per retry, so an unbounded batch can eat the interval."""
+    _purpose(isolated_memory)
+    execute_mutation_plan("Source_Budget.md", content=_source_content("source_budget", "Budgeted"))
+    indexer.generate_index()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("VECTOR_LAKE_CATCHUP_EMBEDDING_BUDGET_SECONDS", "7.5")
+    seen: dict = {}
+
+    def _record(client, contents, tokens, config, limiter, **kwargs):
+        seen.update(kwargs)
+        return [[1.0] * config.dimension for _ in contents]
+
+    monkeypatch.setattr(embedding_scheduler, "_request_embeddings", _record)
+
+    summary = periodic_catch_up.catch_up_once()
+
+    assert summary["embeddings"]["embedded"] == 1, summary["embeddings"]
+    assert seen.get("budget_seconds") == 7.5, seen
+
+
+def test_the_backfill_stamps_which_model_produced_the_stored_vectors(isolated_memory, monkeypatch):
+    """``embedding_runs`` records the model per run, so it cannot answer this per projection.
+
+    A changed ``VECTOR_LAKE_EMBEDDING_MODEL`` moves the query encoder while the stored vectors
+    stay put: every similarity becomes meaningless with no visible symptom.  The marker is what
+    gives doctor something to compare against.
+    """
+    _purpose(isolated_memory)
+    execute_mutation_plan("Source_Stamped.md", content=_source_content("source_stamped", "Stamped"))
+    indexer.generate_index()
+    assert db_store.embedding_projection_state() == {}
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv(embedding_scheduler.EMBEDDING_TRANSPORT_ENV, "sdk")
+    monkeypatch.setattr(
+        embedding_scheduler,
+        "_create_client",
+        lambda: SimpleNamespace(
+            models=SimpleNamespace(
+                embed_content=lambda model, contents: SimpleNamespace(
+                    embeddings=[SimpleNamespace(values=[1.0] * 3072) for _ in contents]
+                )
+            )
+        ),
+    )
+
+    result = embedding_backfill(
+        json.loads((isolated_memory / "wiki" / "index.json").read_text(encoding="utf-8")),
+        dry_run=False,
+    )
+
+    assert result["embedded"] == 1, result
+    state = db_store.embedding_projection_state()
+    assert state["model"] == embedding_scheduler.DEFAULT_MODEL, state
+    assert state["dimension"] == 3072, state
+    assert state["written_at"], state
+
+
+def test_a_database_without_the_projection_marker_is_not_reported_complete(isolated_memory):
+    """The sentinel is what makes ``init_db`` still run its DDL on an existing database.
+
+    ``_schema_is_complete`` short-circuits ``_init_db_once``, so a new table that is not a
+    sentinel is never created on the databases that already hold vectors -- which is exactly
+    where the model question matters.  A sentinel that is present must also stop being the
+    thing that forces a DDL transaction on every read, hence the True/False pair.
+    """
+    assert "vec_embedding_projection" in db_store._SCHEMA_SENTINELS
+    db_store.init_db()
+    db_path = db_store.get_db_path()
+    assert db_store._schema_is_complete(db_path) is True
+
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DROP TABLE IF EXISTS vec_embedding_projection")
+
+    assert db_store._schema_is_complete(db_path) is False
 
 
 def test_start_embedding_run_marks_crashed_run_abandoned(isolated_memory, monkeypatch):

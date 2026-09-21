@@ -613,11 +613,18 @@ def embedding_backfill(
     include_existing: bool = False,
     bodies: dict[str, str] | None = None,
     body_loader: Callable[[list[str]], dict[str, str]] | None = None,
+    budget_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Backfill missing vector embeddings under Gemini RPM/TPM limits.
 
     ``body_loader`` lets a recurring caller embed a bounded batch without reading the whole
     body corpus; see :func:`_candidate_items`.
+
+    ``budget_seconds`` bounds the *wait* for one batch.  A recurring caller has to pass it:
+    a quota error sleeps a flat 60 s per retry, so five retries on two batches is 600 s inside
+    a sweep that is meant to run every 900 s.  The overshoot surfaces as a failed batch, which
+    the caller reports and the next sweep retries -- the same shape as any other provider
+    outage, and cheaper than holding the loop.
     """
     config = load_embedding_rate_config()
     coverage_before = embedding_coverage(index_data)
@@ -677,7 +684,9 @@ def embedding_backfill(
             contents = [item["text"] for item in batch]
             batch_tokens = sum(int(item["tokens"]) for item in batch)
             try:
-                values_list = _request_embeddings(client, contents, batch_tokens, config, limiter)
+                values_list = _request_embeddings(
+                    client, contents, batch_tokens, config, limiter, budget_seconds=budget_seconds
+                )
                 for item, values in zip(batch, values_list, strict=True):
                     db_store.upsert_embedding(item["node_key"], values)
                     plan["embedded"] += 1
@@ -704,6 +713,10 @@ def embedding_backfill(
             plan["failed_batches"],
             last_error,
         )
+        if plan["embedded"]:
+            # Only when rows were written: that is the one moment the stored projection and this
+            # marker are guaranteed to describe the same model.
+            db_store.record_embedding_projection(config.model, config.dimension)
         plan["coverage_after"] = embedding_coverage(index_data)
         return plan
     except Exception as exc:

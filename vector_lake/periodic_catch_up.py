@@ -38,6 +38,10 @@ DEFAULT_STALE_TASK_MAX_AGE_SECONDS = 86400
 #: page's vector on every rewrite, so the sweep has to keep up with ingest traffic without
 #: holding the loop for minutes; ``0`` disables the sweep.
 DEFAULT_EMBEDDING_BATCH_SIZE = 200
+#: Seconds one batch of the vector sweep may wait -- rate-limit window plus retries -- before the
+#: overshoot is reported as a failed batch and left to the next sweep.  A quota error sleeps a
+#: flat 60 s per retry, so an unbounded batch can consume most of a 900 s interval on its own.
+DEFAULT_EMBEDDING_BUDGET_SECONDS = 120.0
 
 
 def _declare_finished(name: str, reason: str) -> None:
@@ -86,6 +90,17 @@ def embedding_batch_size() -> int:
         return DEFAULT_EMBEDDING_BATCH_SIZE
 
 
+def embedding_budget_seconds() -> float:
+    raw = str(os.environ.get("VECTOR_LAKE_CATCHUP_EMBEDDING_BUDGET_SECONDS", "")).strip()
+    if not raw:
+        return DEFAULT_EMBEDDING_BUDGET_SECONDS
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        log.warning("Ignoring unparsable VECTOR_LAKE_CATCHUP_EMBEDDING_BUDGET_SECONDS=%r", raw)
+        return DEFAULT_EMBEDDING_BUDGET_SECONDS
+
+
 def _embedding_catch_up(batch_size: int) -> dict:
     """Re-embed pages whose vector the incremental index path invalidated.
 
@@ -117,6 +132,7 @@ def _embedding_catch_up(batch_size: int) -> dict:
         dry_run=False,
         limit=batch_size,
         body_loader=page_bodies_for_keys,
+        budget_seconds=embedding_budget_seconds(),
     )
     return {
         "candidates": plan.get("candidates", 0),
