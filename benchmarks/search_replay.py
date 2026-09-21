@@ -34,11 +34,13 @@ Vector source (the vector path needs a query embedding, which is a provider roun
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import pathlib
 import random
+import sqlite3
 import struct
 import sys
 from unittest import mock
@@ -104,6 +106,51 @@ def load_labels(path: pathlib.Path) -> dict[str, set[str]]:
 
 def snapshot_path() -> pathlib.Path:
     return get_meta_dir() / "runtime" / SNAPSHOT_NAME
+
+
+def corpus_fingerprint() -> str:
+    """A short, stable digest of the *corpus* a run retrieves from.
+
+    The query vectors are pinned in a snapshot; the corpus was not pinned at all, and it moved under
+    a live evaluation: the second batch's candidate pool was frozen while the vector projection still
+    held 2602 of what became 7175 vectors, and the scoring runs happened after the backfill filled
+    it in.  Measured afterwards: the frozen pool and the same-day k=5 runs disagreed for 330 of 333
+    queries (664 keys returned that the pool never saw, 1348 pool keys no longer returned), and 97.6%
+    of the new keys arrived through the vector arm.  The relative comparison survived -- both fusions
+    were scored against the same runs and labels -- but its absolute level and its coverage numbers
+    described the older index, not the system under test.
+
+    This digest covers what retrieval actually reads: which pages exist, which of them have vectors,
+    and how big the full-text index is.  It is a fingerprint of the corpus, not of its contents, and
+    it costs two counts and one key scan.
+    """
+    conn = db_store.get_connection()
+    digest = hashlib.sha256()
+    for table, column in (("page_index_nodes", "node_key"),
+                          ("vec_embeddings", "entity_id"),
+                          ("wiki_search_index", "node_key")):
+        try:
+            rows = conn.execute(f"select {column} from {table} order by {column}").fetchall()
+        except sqlite3.Error as exc:
+            digest.update(f"{table}:unavailable:{exc}".encode())
+            continue
+        digest.update(f"{table}:{len(rows)}".encode())
+        for row in rows:
+            digest.update(str(row[0]).encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+def labels_corpus(path: pathlib.Path) -> str | None:
+    """The corpus a label set was judged against, if its header records one."""
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("# corpus "):
+                return line.strip().split(" ", 2)[2]
+            if not line.startswith("#"):
+                return None
+    return None
 
 
 def _stored_vector() -> list[float]:
@@ -341,6 +388,13 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
         if side.get("metrics", {}).get("judged") == 0:
             print(f"refusing to compare: the {name} run judged no queries (judged=0)", file=sys.stderr)
             return 2
+    left_corpus = (left.get("config") or {}).get("corpus")
+    right_corpus = (right.get("config") or {}).get("corpus")
+    if left_corpus and right_corpus and left_corpus != right_corpus:
+        # Two runs over two different corpora are two experiments, not two arms of one.
+        print(f"refusing to compare: different corpora ({left_corpus} vs {right_corpus})",
+              file=sys.stderr)
+        return 2
     left_per = left["metrics"].get("per_query") or {}
     right_per = right["metrics"].get("per_query") or {}
     shared = sorted(set(left_per) & set(right_per))
@@ -461,6 +515,9 @@ def main() -> int:
     vectors = build_vectors(queries, args.vectors)
 
     if args.pool:
+        # Leading comment so the pool file records the corpus it was drawn from; the pool builders
+        # and ``_read_jsonl`` both skip lines starting with ``#``.
+        print(f"# corpus {corpus_fingerprint()}")
         judged = set() if args.pool_judged else set(load_labels(pathlib.Path(args.labels)))
         build_pool(queries, vectors, args.top_k, judged)
         return 0
@@ -472,6 +529,13 @@ def main() -> int:
         print(f"refusing to replay: {args.labels} produced no labels; a run that judges nothing "
               f"cannot tell two systems apart (check the path)", file=sys.stderr)
         return 2
+    corpus = corpus_fingerprint()
+    judged_against = labels_corpus(pathlib.Path(args.labels))
+    if judged_against and judged_against != corpus:
+        # Not fatal -- re-scoring an old label set can be the point -- but it must not be silent:
+        # this is exactly how the second batch's pool and its scoring runs came apart.
+        print(f"[corpus] WARNING: labels were judged against corpus {judged_against}, "
+              f"this run reads {corpus}; unjudged pages count as not relevant", file=sys.stderr)
     results = run(queries, vectors, args.top_k)
     payload = {
         "config": {
@@ -480,6 +544,8 @@ def main() -> int:
             "top_k": args.top_k,
             "vectors": args.vectors,
             "labels": str(args.labels),
+            "corpus": corpus,
+            "labels_corpus": judged_against or "unrecorded",
         },
         "metrics": metrics(results, labels, args.top_k),
         "results": results,

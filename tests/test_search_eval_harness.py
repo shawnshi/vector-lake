@@ -122,3 +122,65 @@ def test_every_label_names_a_real_page():
     for row in rows:
         assert row["query"]
         assert isinstance(row["relevant"], list)
+
+
+def test_compare_refuses_two_runs_over_different_corpora(tmp_path, capsys):
+    """Two corpora are two experiments.
+
+    The second batch's candidate pool was frozen before the vector backfill finished while its
+    scoring runs happened after, so 330 of 333 queries disagreed between the two -- and nothing in
+    the record said so.  A run now names the corpus it read.
+    """
+    digest = harness.query_digest("q")
+    per = {digest: {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0}}
+    metrics = {"judged": 1, "per_query": per}
+    left = _write(tmp_path / "a.json", {"fusion": "sum", "corpus": "aaaa"}, metrics)
+    right = _write(tmp_path / "b.json", {"fusion": "rrf", "corpus": "bbbb"}, metrics)
+
+    assert harness.compare(left, right, 5) == 2
+    assert "different corpora" in capsys.readouterr().err
+
+
+def test_runs_without_a_recorded_corpus_still_compare(tmp_path):
+    """Old run files predate the field; refusing them would refuse the record they came from."""
+    digest = harness.query_digest("q")
+    per = {digest: {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0}}
+    metrics = {"judged": 1, "per_query": per}
+    left = _write(tmp_path / "a.json", {"fusion": "sum"}, metrics)
+    right = _write(tmp_path / "b.json", {"fusion": "rrf"}, metrics)
+
+    assert harness.compare(left, right, 5) == 0
+
+
+def test_the_corpus_fingerprint_is_stable_and_moves_with_the_corpus(isolated_memory):
+    """Stable enough to compare, sensitive enough to notice a page appearing."""
+    from vector_lake import db_store
+
+    db_store.init_db()
+    first = harness.corpus_fingerprint()
+    assert first == harness.corpus_fingerprint()
+
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO wiki_search_index (node_key, title, summary, text) VALUES (?, ?, ?, ?)",
+            ("Concept_New", "New", "新页", "新页"),
+        )
+
+    assert harness.corpus_fingerprint() != first
+
+
+def test_a_label_file_can_record_the_corpus_it_was_judged_against(tmp_path):
+    """The header is what turns a silent drift into a warning."""
+    path = tmp_path / "labels.jsonl"
+    path.write_text('# corpus abc123\n{"query": "q", "relevant": []}\n', encoding="utf-8")
+
+    assert harness.labels_corpus(path) == "abc123"
+    assert harness.load_labels(path) == {harness.query_digest("q"): set()}
+
+
+def test_labels_without_a_header_report_no_corpus(tmp_path):
+    path = tmp_path / "labels.jsonl"
+    path.write_text('{"query": "q", "relevant": ["A"]}\n', encoding="utf-8")
+
+    assert harness.labels_corpus(path) is None
