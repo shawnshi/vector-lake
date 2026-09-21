@@ -36,22 +36,70 @@ def _collapse_text(text: str) -> str:
 
 
 # Reader-facing markers written by the page-shaping tools (``tool_query``, the
-# lint stub builder).  They are emitted *inside* the compiled-truth and timeline
-# sections, so the heading rule below turns them into claims even though they
-# record nothing.
+# lint stub builder) and by the page template itself.  They are emitted *inside*
+# the compiled-truth and timeline sections, so the heading rule below turns them
+# into claims even though they record nothing.
 SYSTEM_DIRECTIVE_MARKER = "[System Directive:"
+# The template's section caption, written as a paragraph above the ledger.  On the live
+# corpus 199 claims are exactly ``(Timeline - EVENT STORE)``: no date, no proposition.
+TIMELINE_CAPTION_PREFIXES = ("(timeline", "timeline - event store")
+# The scope disclaimer the ingest template puts above the ledger.  On the live corpus 345
+# claims carry that same sentence.
+PAGE_SCOPE_MARKER = "本页只记录证据"
+
+# The heading markers that decide a block's claim type.  They live here, next to the rule that
+# uses them, because a bare ``证据`` used to qualify a block as a ledger entry -- which typed
+# every evidence-boundary/limitation section as an event log: on the live corpus 1595 claims
+# came from headings like ``证据边界`` and 99% of them carried no date.
+COMPILED_TRUTH_HEADING_MARKERS = ("编译事实", "compiled truth", "事实", "truth")
+LEDGER_HEADING_MARKERS = ("证据时间线", "时间线", "timeline", "event store")
 
 
-def _is_system_directive(text) -> bool:
-    """True for a block that only carries a reader instruction.
+def claim_type_for_heading(kind: str, heading: str, text: str) -> str:
+    """The claim type the heading rule gives one block of a page.
 
-    A directive is not a claim, but it sits under a ``证据时间线``/``编译事实``
-    heading.  Its text is rewritten on every reshape (it embeds a ``Last Reshaped``
-    date), and because the timeline projection id is content-addressed, each
-    reshape moved the id and orphaned the previous ``timeline_events`` row -- the
-    one defect that kept regenerating timeline-projection drift.
+    Named rather than inlined in :func:`extract_page_objects` because the classification is
+    also re-derived against already-stored claims (``scripts/reclassify_timeline_claims.py``)
+    when the rule changes; two copies of it would drift.
     """
-    return SYSTEM_DIRECTIVE_MARKER in str(text or "")
+    heading_lower = (heading or "").lower()
+    if any(k in heading_lower for k in COMPILED_TRUTH_HEADING_MARKERS):
+        return "compiled-truth"
+    if (
+        any(k in heading_lower for k in LEDGER_HEADING_MARKERS)
+        and not _is_page_scope_disclaimer(text)
+    ):
+        return "timeline-event"
+    return _claim_type_for_block(kind)
+
+
+def _is_page_boilerplate(text) -> bool:
+    """True for a block that only carries a template caption or a reader instruction.
+
+    Neither is a claim, but both sit under a ``证据时间线``/``编译事实`` heading.  A
+    directive's text is rewritten on every reshape (it embeds a ``Last Reshaped`` date),
+    and because the timeline projection id is content-addressed, each reshape moved the id
+    and orphaned the previous ``timeline_events`` row -- the one defect that kept
+    regenerating timeline-projection drift.  The caption is markup: no date and no
+    proposition, yet it reached the timeline as an undated "event" that the projection then
+    dated with its *ingestion* time.
+    """
+    normalized = _collapse_text(text).lower()
+    if not normalized:
+        return False
+    if SYSTEM_DIRECTIVE_MARKER.lower() in normalized:
+        return True
+    return any(normalized.startswith(prefix) for prefix in TIMELINE_CAPTION_PREFIXES)
+
+
+def _is_page_scope_disclaimer(text) -> bool:
+    """The scope sentence the ingest template puts above the ledger.
+
+    It says how the page was built, so it stays a claim -- it is just not a ledger entry.
+    Reaching the timeline it became an undated "event" on 345 live rows, each dated by the
+    projection with its own ingestion time.
+    """
+    return _collapse_text(text).lower().startswith(PAGE_SCOPE_MARKER)
 
 
 def _body_summary(body: str, limit: int = 320) -> str:
@@ -179,10 +227,25 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         }
 
     def _parse_temporal(text: str):
-        match = re.match(r"^\[(20\d\d(?:-[H|Q]\d|-[0-1]\d)?)\]\s*", text)
-        if match:
-            return match.group(1), text[match.end():]
-        return None, text
+        """The date a ledger entry carries as a ``[...]`` prefix, or ``None``.
+
+        The prefix is deliberately *not* stripped.  This text is the input to ``claim_id``,
+        ``evidence_id`` and the embedded ``claim_text``, so removing it would re-mint the
+        identity of every dated entry on the next compile, while the projection reads the
+        same date off the text either way (``tool_timeline._TEXT_EVENT_DATE``).  It would be
+        a corpus-wide identity rewrite for nothing.
+
+        The previous pattern accepted only ``[2026-07]`` / ``[2026-Q1]`` (its ``[H|Q]`` is a
+        character class, not an alternation) and silently skipped the ``[YYYY-MM-DD]`` form
+        the ledger format in ``README`` actually mandates -- which is why 7246 of 9974 live
+        timeline claims carried no ``temporal_anchor`` and every reader had to re-parse the
+        date out of free text.
+        """
+        match = re.match(
+            r"^\s*\[(\d{4}-\d{2}-\d{2}|\d{4}-[QH]\d|\d{4}-\d{2}|\d{4})\]",
+            str(text or ""),
+        )
+        return match.group(1) if match else None
 
     def _parse_inline_sources(raw_text: str):
         found_sources = []
@@ -273,21 +336,20 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         }]
 
     for block_index, block in enumerate(blocks, start=1):
-        if _is_system_directive(block["text"]) or _is_system_directive(block.get("raw_text")):
+        if _is_page_boilerplate(block["text"]) or _is_page_boilerplate(block.get("raw_text")):
             continue
-        block_temporal, cleaned_text = _parse_temporal(block["text"])
+        block_temporal = _parse_temporal(block["text"])
         final_temporal = block_temporal or validity_defaults.get("temporal_anchor")
+        # ``_iter_blocks`` already cleaned this; ``_parse_temporal`` adds an anchor without
+        # editing it, so the claim text is the block text verbatim.
+        block_text = block["text"]
 
         raw_text = block.get("raw_text", block["text"])
         inline_sources = _parse_inline_sources(raw_text)
 
-        custom_claim_type = _claim_type_for_block(block["kind"])
-        heading = block.get("heading") or title
-        heading_lower = (heading or "").lower()
-        if any(k in heading_lower for k in ["编译事实", "compiled truth", "事实", "truth"]):
-            custom_claim_type = "compiled-truth"
-        elif any(k in heading_lower for k in ["证据时间线", "timeline", "证据", "时间线"]):
-            custom_claim_type = "timeline-event"
+        custom_claim_type = claim_type_for_heading(
+            block["kind"], block.get("heading") or title, block_text
+        )
             
         combined_sources = list(sources)
         combined_source_ids = list(source_ids)
@@ -311,7 +373,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
         for raw_ref, source_id in zip(combined_sources, combined_source_ids):
             if len(sources) > 1 and page_type != "source" and raw_ref not in inline_sources:
                 continue
-            evidence_id = _stable_id("evidence", f"{page_key}:{raw_ref}:{cleaned_text}")
+            evidence_id = _stable_id("evidence", f"{page_key}:{raw_ref}:{block_text}")
             evidence_ids.append(evidence_id)
             evidence_records.append({
                 "evidence_id": evidence_id,
@@ -321,7 +383,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                     "heading": block.get("heading") or title,
                     "block_index": block_index,
                 },
-                "evidence_text": cleaned_text,
+                "evidence_text": block_text,
                 "evidence_type": f"block-{block['kind']}",
                 "created_at": now,
                 "supports_claim_ids": [],
@@ -329,11 +391,11 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             })
 
         claim_id = frontmatter.get("claim_id") if block_index == 1 else None
-        claim_id = claim_id or _stable_id("claim", f"{page_key}:{cleaned_text}")
+        claim_id = claim_id or _stable_id("claim", f"{page_key}:{block_text}")
         from vector_lake.wiki_utils import enforce_claim_dict
         claim_record = enforce_claim_dict({
             "claim_id": claim_id,
-            "claim_text": cleaned_text,
+            "claim_text": block_text,
             "claim_type": custom_claim_type,
             "claim_scope": "block",
             "status": frontmatter.get("status", "Active"),
@@ -359,7 +421,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                 evidence_record["supports_claim_ids"].append(claim_id)
 
     if summary:
-        summary_temporal, cleaned_summary = _parse_temporal(summary)
+        summary_temporal = _parse_temporal(summary)
         final_summary_temporal = summary_temporal or validity_defaults.get("temporal_anchor")
 
         summary_evidence_ids = []
@@ -370,17 +432,17 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                 "evidence_id": evidence_id,
                 "source_id": source_id,
                 "locator": {"page_key": page_key, "heading": title, "block_index": 0},
-                "evidence_text": cleaned_summary,
+                "evidence_text": summary,
                 "evidence_type": "page-summary",
                 "created_at": now,
                 "supports_claim_ids": [],
                 "contradicts_claim_ids": [],
             })
 
-        summary_claim_id = _stable_id("claim", f"{page_key}:summary:{cleaned_summary}")
+        summary_claim_id = _stable_id("claim", f"{page_key}:summary:{summary}")
         summary_claim = enforce_claim_dict({
             "claim_id": summary_claim_id,
-            "claim_text": cleaned_summary,
+            "claim_text": summary,
             "claim_type": "summary",
             "claim_scope": "page",
             "status": frontmatter.get("status", "Active"),

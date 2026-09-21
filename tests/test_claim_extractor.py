@@ -149,5 +149,99 @@ This page mentions OtherPage and defines [is-a:: [[Category]]].
         self.assertEqual(result["entities"][0]["page_key"], "Source_Primary")
         self.assertEqual(result["entities"][0]["type"], "source")
 
+    def test_the_ledger_date_prefix_becomes_a_temporal_anchor(self):
+        """The ``[YYYY-MM-DD]`` form the format mandates used to parse to nothing.
+
+        ``_parse_temporal``'s pattern accepted only ``[2026-07]``/``[2026-Q1]`` (its
+        ``[H|Q]`` is a character class, not an alternation), so 7246 of 9974 live timeline
+        claims carried no anchor and every reader had to re-parse the date out of free
+        text.  The prefix must still stay *in* the text: it is an input to ``claim_id`` and
+        ``evidence_id``, so stripping it would re-mint the identity of every dated entry.
+        """
+        fm = _timeline_frontmatter("concept_anchor")
+        body = """## 1. 编译事实
+
+A compiled sentence.
+
+## 2. 证据时间线
+
+- [2026-09-17] [Observation] A dated event.
+"""
+        result = extract_page_objects("Concept_Anchor.md", fm, body)
+
+        timeline = [c for c in result["claims"] if c.get("claim_type") == "timeline-event"]
+        self.assertEqual(len(timeline), 1)
+        self.assertEqual(timeline[0]["temporal_anchor"], "2026-09-17")
+        self.assertEqual(timeline[0]["claim_text"], "[2026-09-17] [Observation] A dated event.")
+
+    def test_an_evidence_boundary_section_is_not_an_event_ledger(self):
+        """A bare ``证据`` used to qualify a block as a ledger entry.
+
+        On the live corpus that typed 1595 claims from headings like ``证据边界`` as events;
+        99% of them carry no date, so the projection then dated them by ingestion time.
+        """
+        fm = _timeline_frontmatter("concept_boundary")
+        body = """## 1. 编译事实
+
+A compiled sentence.
+
+## 2. 证据时间线
+
+- [2026-09-17] [Observation] A real event.
+
+## 3. 证据边界
+
+本页未使用上述映射范围之外的材料。
+"""
+        result = extract_page_objects("Concept_Boundary.md", fm, body)
+
+        timeline = [c for c in result["claims"] if c.get("claim_type") == "timeline-event"]
+        self.assertEqual([c["claim_text"] for c in timeline], ["[2026-09-17] [Observation] A real event."])
+        # The boundary sentence is still a claim, it is just not an event.
+        self.assertIn("本页未使用上述映射范围之外的材料。", [c["claim_text"] for c in result["claims"]])
+
+    def test_the_ledger_caption_is_markup_and_the_scope_sentence_is_not_an_event(self):
+        """The template's own text reaches the ledger as an undated "event" otherwise.
+
+        Live corpus: 199 claims whose whole text is ``(Timeline - EVENT STORE)`` -- markup,
+        dropped -- and 345 carrying the ingest template's scope sentence, which stays a claim
+        because it says how the page was built, but is not an event.
+        """
+        fm = _timeline_frontmatter("concept_caption")
+        body = """## 1. 编译事实
+
+A compiled sentence.
+
+## 2. 证据时间线
+
+(Timeline - EVENT STORE)
+
+本页只记录证据中明确出现的定义、机制、适用范围或限制。
+
+- [2026-09-17] [Observation] A real event.
+"""
+        result = extract_page_objects("Concept_Caption.md", fm, body)
+
+        texts = [c["claim_text"] for c in result["claims"]]
+        events = [c["claim_text"] for c in result["claims"] if c.get("claim_type") == "timeline-event"]
+        self.assertEqual(events, ["[2026-09-17] [Observation] A real event."])
+        self.assertFalse([t for t in texts if "EVENT STORE" in t], texts)
+        self.assertIn("本页只记录证据中明确出现的定义、机制、适用范围或限制。", texts)
+
+
+def _timeline_frontmatter(page_id: str) -> dict:
+    return {
+        "title": "Anchor Test",
+        "type": "concept",
+        "id": page_id,
+        "domain": "General",
+        "status": "Active",
+        "epistemic-status": "seed",
+        "categories": ["Testing"],
+        "updated": "2026-09-17T00:00:00+00:00",
+        "sources": [],
+    }
+
+
 if __name__ == "__main__":
     unittest.main()

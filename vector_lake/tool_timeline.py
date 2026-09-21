@@ -2,14 +2,36 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from vector_lake.db_store import get_connection
+from vector_lake.db_store import get_connection, init_db
 
-# The ingest pipeline prefixes every extracted timeline claim with its event
-# date, e.g. ``[2026-05-02] [Observation] ...``.  On the live corpus 6573 of
-# 9286 timeline claims carry the date only here (974 have a temporal anchor and
-# 1739 have neither), so without this the projection reported the *ingestion*
-# timestamp as the event date and ``ORDER BY event_date DESC`` was meaningless.
+# An event-ledger entry carries its date, and optionally its event tag, as a text prefix:
+# ``[2026-05-02] [Observation] ...`` (README, section 2).  On the live corpus 7246 of 9974
+# timeline claims carry the date only here -- 771 carry a temporal anchor and 2342 have
+# neither -- so without this the projection reported the *ingestion* timestamp as the event
+# date and ``ORDER BY event_date DESC`` was meaningless.  The extractor now records the
+# anchor as well (``claim_extractor._parse_temporal``), but the prefix stays the source for
+# every claim compiled before that and the two are read the same way.
 _TEXT_EVENT_DATE = re.compile(r"^\s*\[(\d{4}-\d{2}-\d{2})\]")
+# The tag in the same prefix.  Only 376 of the 7617 live tag-bearing claims also carry a
+# structured ``event_tag``, so reading the field alone left 96% of ``action`` values at the
+# literal fallback string ``timeline-event`` while the corpus already said what they were.
+_TEXT_EVENT_TAG = re.compile(
+    r"^\s*\[(?:\d{4}-\d{2}-\d{2}|\d{4}-[QH]\d|\d{4}-\d{2}|\d{4})\]\s*\[([^\]\n]{1,40})\]"
+)
+
+# ``event_date`` holds the event date and nothing else.  When a claim carries no date at all
+# the column is NULL -- not the ingestion timestamp: spending ``updated_at`` there put a
+# fifth of the corpus at the top of ``ORDER BY event_date DESC`` and made the newest 100
+# rows 94% ingestion artifacts.  ``event_date_source`` records which shape of date it is, so
+# a month- or quarter-precision anchor is never presented as a day.
+DATE_SOURCE_DAY = "day"
+DATE_SOURCE_COARSE = "coarse"
+DATE_SOURCE_UNKNOWN = "unknown"
+UNKNOWN_DATE_LABEL = "Unknown Date"
+_DAY_PRECISION = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The fallback path matches an ``action`` tag inside the entry's prefix, which is the first
+# two bracket groups.  60 characters is comfortably past the longest live one.
+_ACTION_PREFIX_WINDOW = 60
 
 
 def _stable_event_date(row, data: dict):
@@ -25,25 +47,36 @@ def _stable_event_date(row, data: dict):
     return match.group(1) if match else None
 
 
-def claim_event_date(row, data: dict) -> str:
-    """Canonical event date for display: stable source, else the text prefix, else updated_at."""
-    stable = _stable_event_date(row, data)
-    return stable if stable is not None else str(row["updated_at"] or "Unknown Date")
+def claim_event_date(row, data: dict):
+    """The event date a claim carries, or ``None`` when it carries none at all.
 
+    Only :func:`_stable_event_date` qualifies.  This used to fall through to
+    ``updated_at`` for the 2342 of 9974 live timeline claims that carry no anchor and no
+    dated text, which turned their *ingestion* time into their event date and is why the
+    newest rows of ``ORDER BY event_date DESC`` were the last ingested ones.  That fallback
+    is gone: the column now says NULL and the writer records ``event_date_source``.  An
+    event's date is either known or unknown, and the two are no longer spelled the same way.
 
-def identity_event_date(row, data: dict) -> str:
-    """The date component allowed into the content-addressed event id.
-
-    Only :func:`_stable_event_date` qualifies.  The id used to be
-    ``sha256(claim_id, event_date, text)`` with ``event_date`` taken from
-    :func:`claim_event_date`, i.e. from ``updated_at`` for the 2444 of 9996 live
-    timeline claims that carry no anchor and no dated text.  Every rewrite of such
-    a claim therefore minted a new id, and unless the delta sync was handed the
-    exact previous row the old ``timeline_events`` row was orphaned for good.
-
-    Displaying the fallback is fine; identifying a row by it is not.
+    Identity uses the same value (see ``_event_from_claim_row``): the id used to be
+    ``sha256(claim_id, event_date, text)`` with ``event_date`` itself falling back to
+    ``updated_at``, so every rewrite of a date-less claim minted a new id and orphaned the
+    previous ``timeline_events`` row for good.  Displaying a fallback is one thing;
+    identifying a row by it is another.
     """
-    return _stable_event_date(row, data) or ""
+    return _stable_event_date(row, data)
+
+
+def event_date_source(stable_date) -> str:
+    """Which shape of date the projection is storing, so precision survives the column."""
+    if not stable_date:
+        return DATE_SOURCE_UNKNOWN
+    return DATE_SOURCE_DAY if _DAY_PRECISION.match(str(stable_date)) else DATE_SOURCE_COARSE
+
+
+def _text_event_tag(row) -> str:
+    """The event tag the ledger prefix carries, e.g. ``Observation``; ``""`` when absent."""
+    match = _TEXT_EVENT_TAG.match(str(row["claim_text"] or ""))
+    return match.group(1).strip() if match else ""
 
 
 def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> dict:
@@ -57,12 +90,21 @@ def _event_from_claim_row(row, entity_titles: dict[str, str] | None = None) -> d
     event_date = claim_event_date(row, data)
     description = row["claim_text"]
     entity_id = entities[0] if entities else ""
-    # Identity uses only immutable inputs; ``event_date`` above is presentation.
-    stable_raw = "\0".join([str(row["claim_id"]), identity_event_date(row, data), str(description)])
+    # Identity uses only inputs a rewrite cannot move: the claim id, the event date a source
+    # actually states, and the text.  The text stays an input on purpose (a rewritten entry
+    # is a different fact); ``updated_at`` never is.
+    stable_raw = "\0".join([str(row["claim_id"]), str(event_date or ""), str(description)])
     return {
         "id": hashlib.sha256(stable_raw.encode("utf-8")).hexdigest()[:24],
-        "event_date": str(event_date),
-        "action": str(data.get("action") or data.get("event_tag") or data.get("claim_type") or "timeline-event"),
+        "event_date": str(event_date) if event_date else None,
+        "event_date_source": event_date_source(event_date),
+        "action": str(
+            data.get("action")
+            or data.get("event_tag")
+            or _text_event_tag(row)
+            or data.get("claim_type")
+            or "timeline-event"
+        ),
         "sentiment": str(data.get("sentiment") or "neutral"),
         "description": description,
         "entity_id": entity_id,
@@ -106,9 +148,23 @@ _PARITY_CACHE: dict = {"fingerprint": None, "result": None}
 
 
 def _timeline_claims_fingerprint(conn=None) -> str:
+    """A cheap proof that neither input to the id set can have moved.
+
+    Every aggregate here is servable from an index -- ``idx_claims_f_claim_type`` and the
+    ``timeline_events`` primary-key index -- so the gate is a walk over index entries and
+    never over table rows.
+
+    ``MAX(updated_at)`` used to be part of this and cost ~55 ms on every timeline query on
+    the live corpus.  Since event identity stopped depending on ``updated_at`` (see
+    :func:`claim_event_date`), a moved ``updated_at`` can no longer change the id set, so
+    that term could only ever force a full recomputation that reported ``missing=0
+    extra=0`` -- the most expensive way to learn nothing.  A content rewrite still moves the
+    id set and is still caught: it is an ``INSERT OR REPLACE``, which raises ``MAX(rowid)``
+    unless the row replaced was the highest one (then the projection's id extremes move).
+    """
     conn = conn or get_connection()
-    count, newest, highest = conn.execute(
-        "SELECT COUNT(*), COALESCE(MAX(updated_at), ''), COALESCE(MAX(rowid), 0) "
+    count, highest = conn.execute(
+        "SELECT COUNT(*), COALESCE(MAX(rowid), 0) "
         "FROM claims WHERE f_claim_type = 'timeline-event'"
     ).fetchone()
     projected, lowest_id, highest_id = conn.execute(
@@ -116,7 +172,7 @@ def _timeline_claims_fingerprint(conn=None) -> str:
     ).fetchone()
     from vector_lake.db_store import get_db_path
 
-    return f"{get_db_path()}|{count}:{newest}:{highest}|{projected}:{lowest_id}:{highest_id}"
+    return f"{get_db_path()}|{count}:{highest}|{projected}:{lowest_id}:{highest_id}"
 
 
 def invalidate_timeline_parity_cache() -> None:
@@ -157,8 +213,10 @@ def sync_timeline_events_for_claim_delta(old_claim_rows: list, proposed_claims: 
     if new_events:
         conn.executemany(
             "INSERT OR REPLACE INTO timeline_events "
-            "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
-            "VALUES (:id, :event_date, :action, :sentiment, :description, :entity_id, :entity_title, :source_file, :extracted_at)",
+            "(id, event_date, event_date_source, action, sentiment, description, entity_id, entity_title, "
+            "source_file, extracted_at) "
+            "VALUES (:id, :event_date, :event_date_source, :action, :sentiment, :description, :entity_id, "
+            ":entity_title, :source_file, :extracted_at)",
             new_events,
         )
     invalidate_timeline_parity_cache()
@@ -194,6 +252,7 @@ def timeline_projection_parity() -> dict:
 
 def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None = None) -> str:
     """Rebuild the timeline_events projection from timeline-event claims."""
+    init_db()
     conn = get_connection()
     query = (
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
@@ -219,8 +278,10 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
         conn.execute("DELETE FROM timeline_events")
         conn.executemany(
             "INSERT OR REPLACE INTO timeline_events "
-            "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
-            "VALUES (:id, :event_date, :action, :sentiment, :description, :entity_id, :entity_title, :source_file, :extracted_at)",
+            "(id, event_date, event_date_source, action, sentiment, description, entity_id, entity_title, "
+            "source_file, extracted_at) "
+            "VALUES (:id, :event_date, :event_date_source, :action, :sentiment, :description, :entity_id, "
+            ":entity_title, :source_file, :extracted_at)",
             events,
         )
     invalidate_timeline_parity_cache()
@@ -230,21 +291,28 @@ def rebuild_timeline_events_from_claims(dry_run: bool = True, limit: int | None 
 def repair_timeline_projection(dry_run: bool = True) -> str:
     """Close the parity gap in place: drop orphan ids, project the missing ones.
 
-    The event id is content-addressed -- ``sha256(claim_id, event_date, text)`` --
-    on purpose, so that a row rewritten out of band with the same row count is
-    detectable (``test_timeline_search_rejects_equal_count_wrong_event_ids``).
-    ``event_date`` falls back to ``claim.updated_at`` when a claim carries no
-    temporal anchor and no dated text, which is the case for roughly a quarter of
-    the corpus, so a claim edit can legitimately move its id.
+    The event id is content-addressed -- ``sha256(claim_id, event_date, text)`` -- on
+    purpose, so a row rewritten out of band with the same row count is detectable
+    (``test_timeline_search_rejects_equal_count_wrong_event_ids``).  Content addressing is
+    not the same as churn: the id is derived from inputs a *source* states (the claim id,
+    the date a source gives, the text), never from ``updated_at``, so an unrelated rewrite
+    no longer moves it (see :func:`claim_event_date`).  A row whose id moved therefore
+    means the claim's content or date actually changed, or that something wrote outside the
+    delta path -- ``sync_timeline_events_for_claim_delta`` is the only writer, and both
+    places that write ``claims`` call it inside the same transaction, so what is left to
+    catch is an out-of-band SQL write.
 
-    ``sync_timeline_events_for_claim_delta`` deletes the id derived from the row
-    content it is handed, so a delta that is not handed the *exact* previous row
-    leaves an orphan that no later delta can ever match again.  Parity drift is
-    therefore monotonic until the whole table is rebuilt.
-
-    This removes only the orphan ids and inserts only the ids the claims now
-    derive, so the projection converges without replacing ``timeline_events``.
+    A row the current writer would no longer produce is drift too, even when its id is
+    correct: a projection row predating ``event_date_source`` carries NULL there, its
+    ``event_date`` may still be showing an ingestion timestamp, and its ``action`` may still
+    be the literal claim-type fallback.  Those three columns are updated in place -- the row
+    is not re-inserted, so ``extracted_at`` survives -- and the projection converges without
+    replacing ``timeline_events``.
     """
+    # The column this reads is added by ``init_db``'s migration, and this entry point used to
+    # depend on no schema at all: without this call a CLI that only runs ``timeline-repair``
+    # fails with "no such column: event_date_source" instead of migrating.
+    init_db()
     conn = get_connection()
     claim_rows = conn.execute(
         "SELECT claim_id, claim_text, data_json, updated_at FROM claims "
@@ -258,13 +326,20 @@ def repair_timeline_projection(dry_run: bool = True) -> str:
     for row in claim_rows:
         event = _event_from_claim_row(row, entity_titles=entity_titles)
         expected[event["id"]] = event
-    actual = {str(row["id"]) for row in conn.execute("SELECT id FROM timeline_events")}
-    orphan_ids = sorted(actual - set(expected))
-    missing_ids = sorted(set(expected) - actual)
+    actual = {
+        str(row["id"]): row["event_date_source"]
+        for row in conn.execute("SELECT id, event_date_source FROM timeline_events")
+    }
+    orphan_ids = sorted(set(actual) - set(expected))
+    missing_ids = sorted(set(expected) - set(actual))
+    stale_ids = sorted(
+        event_id for event_id, source in actual.items() if event_id in expected and source is None
+    )
     if dry_run:
         return (
             "[DRY RUN] Would delete "
-            f"{len(orphan_ids)} orphan row(s) and insert {len(missing_ids)} missing row(s)."
+            f"{len(orphan_ids)} orphan row(s), insert {len(missing_ids)} missing row(s) and "
+            f"rewrite {len(stale_ids)} row(s) written before the event_date_source column."
         )
 
     from vector_lake.db_store import transaction
@@ -274,37 +349,89 @@ def repair_timeline_projection(dry_run: bool = True) -> str:
             conn.executemany(
                 "DELETE FROM timeline_events WHERE id = ?", [(i,) for i in orphan_ids]
             )
-        if missing_ids:
+        to_insert = missing_ids
+        if to_insert:
             conn.executemany(
                 "INSERT OR REPLACE INTO timeline_events "
-                "(id, event_date, action, sentiment, description, entity_id, entity_title, source_file, extracted_at) "
-                "VALUES (:id, :event_date, :action, :sentiment, :description, :entity_id, :entity_title, :source_file, :extracted_at)",
-                [expected[i] for i in missing_ids],
+                "(id, event_date, event_date_source, action, sentiment, description, entity_id, "
+                "entity_title, source_file, extracted_at) "
+                "VALUES (:id, :event_date, :event_date_source, :action, :sentiment, :description, "
+                ":entity_id, :entity_title, :source_file, :extracted_at)",
+                [expected[i] for i in to_insert],
+            )
+        if stale_ids:
+            # Deliberately not a re-insert: the row is right except for the three columns the
+            # writer's rules changed, and rewriting the whole row would discard
+            # ``extracted_at`` -- the only field recording when this row was first projected.
+            conn.executemany(
+                "UPDATE timeline_events SET event_date = :event_date, "
+                "event_date_source = :event_date_source, action = :action WHERE id = :id",
+                [
+                    {
+                        "id": event_id,
+                        "event_date": expected[event_id]["event_date"],
+                        "event_date_source": expected[event_id]["event_date_source"],
+                        "action": expected[event_id]["action"],
+                    }
+                    for event_id in stale_ids
+                ],
             )
     invalidate_timeline_parity_cache()
     return (
         f"Repaired timeline_events: deleted {len(orphan_ids)} orphan row(s), "
-        f"inserted {len(missing_ids)} missing row(s)."
+        f"inserted {len(missing_ids)} missing row(s), rewrote {len(stale_ids)} legacy row(s)."
     )
 
-def search_timeline_events(entity_name: str = None, sentiment: str = None, action: str = None, limit: int = 10) -> str:
-    """Query the timeline_events projection; fall back to timeline-event claims if the projection is empty."""
+def _sql_stable_date_expr() -> str:
+    """The ledger date of a canonical claim, expressed in SQL for the fallback ordering.
+
+    Mirrors :func:`_stable_event_date`: ``temporal_anchor``, else ``event_date``, else a
+    ``[YYYY-MM-DD]`` text prefix.  ``GLOB`` does the digit test because ``LIKE`` has no
+    character ranges.  ``ltrim`` strips spaces where the Python pattern also accepts a tab,
+    which is not a shape the ledger format uses.
+    """
+    head = "ltrim(claim_text)"
+    return (
+        "COALESCE("
+        "NULLIF(json_extract(data_json, '$.temporal_anchor'), ''), "
+        "NULLIF(json_extract(data_json, '$.event_date'), ''), "
+        f"CASE WHEN substr({head}, 1, 1) = '[' "
+        f"AND substr({head}, 2, 10) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "
+        f"THEN substr({head}, 2, 10) END)"
+    )
+
+
+def search_timeline_events(entity_name: str = None, action: str = None, limit: int = 10) -> str:
+    """Query the timeline_events projection; fall back to timeline-event claims if it drifts.
+
+    ``sentiment`` is deliberately not a parameter.  The projection still stores the column
+    written from ``claim.sentiment``, but nothing in the pipeline produces that field --
+    9974 of 9974 live events are ``neutral`` -- so a filter over it could only ever match
+    everything or nothing while reading as if it discriminated.  The column stays for a
+    future producer; the parameter comes back with it.
+    """
     conn = get_connection()
     cursor = conn.cursor()
 
     parity = timeline_projection_parity()
     if parity["projection"] and not parity["missing"] and not parity["extra"]:
-        query = "SELECT event_date, action, sentiment, description, entity_id, entity_title, source_file FROM timeline_events WHERE 1=1"
+        query = (
+            "SELECT event_date, action, description, entity_id, entity_title, source_file "
+            "FROM timeline_events WHERE 1=1"
+        )
         params = []
         if entity_name:
             query += " AND (entity_id LIKE ? OR entity_title LIKE ? OR description LIKE ?)"
             params.extend([f"%{entity_name}%", f"%{entity_name}%", f"%{entity_name}%"])
-        if sentiment:
-            query += " AND sentiment = ?"
-            params.append(sentiment)
         if action:
             query += " AND action LIKE ?"
             params.append(f"%{action}%")
+        # An unknown date is NULL, and SQLite orders NULLs last for DESC -- which is exactly
+        # the contract, and the reason this stays a plain order by one column: adding
+        # ``(event_date IS NULL)`` ahead of it to say the same thing replaces an index-ordered
+        # scan with a full table sort (measured on the live 10k-row projection: 0.03 ms ->
+        # 14.9 ms, plan ``USE TEMP B-TREE FOR ORDER BY``).  ``event_date_source`` tells the
+        # reader which rows those were.
         query += " ORDER BY event_date DESC LIMIT ?"
         params.append(max(1, int(limit)))
         try:
@@ -315,9 +442,9 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
         if not rows:
             return "No timeline events found matching the criteria."
         return "\n\n".join(
-            f"[{r['event_date']}] <{r['entity_title'] or r['entity_id']}>\n"
+            f"[{r['event_date'] or UNKNOWN_DATE_LABEL}] <{r['entity_title'] or r['entity_id']}>\n"
             f"  -> {r['description']}\n"
-            f"  Action: {r['action']} | Sentiment: {r['sentiment']} | Source: {r['source_file']}"
+            f"  Action: {r['action']} | Source: {r['source_file']}"
             for r in rows
         )
 
@@ -333,7 +460,7 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
 
     query = "SELECT claim_id, claim_text, data_json, updated_at FROM claims WHERE f_claim_type = 'timeline-event'"
     params = []
-    
+
     if entity_name:
         # ``claims`` has no ``entity_id`` column; the subjects live inside
         # ``data_json``.  The previous predicate referenced ``entity_id`` and
@@ -341,14 +468,24 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
         # fallback could never return a result.
         query += " AND (claim_text LIKE ? OR json_extract(data_json, '$.subject_entity_ids') LIKE ?)"
         params.extend([f"%{entity_name}%", f"%{entity_name}%"])
-    if sentiment:
-        query += " AND COALESCE(json_extract(data_json, '$.sentiment'), 'neutral') = ?"
-        params.append(sentiment)
     if action:
-        query += " AND COALESCE(json_extract(data_json, '$.action'), json_extract(data_json, '$.event_tag'), '') LIKE ?"
-        params.append(f"%{action}%")
+        # The same three sources the projection's ``action`` resolves, in the same order.
+        # SQLite cannot run the tag pattern, so the text case asks whether the tag appears
+        # inside the entry's prefix -- which is where a ledger entry keeps it.
+        query += (
+            " AND (COALESCE(json_extract(data_json, '$.action'), '') LIKE ?"
+            " OR COALESCE(json_extract(data_json, '$.event_tag'), '') LIKE ?"
+            " OR substr(ltrim(claim_text), 1, ?) LIKE '%[' || ? || ']%')"
+        )
+        params.extend([f"%{action}%", f"%{action}%", _ACTION_PREFIX_WINDOW, action])
 
-    query += " ORDER BY updated_at DESC LIMIT ?"
+    # Same ordering rule as the indexed path, expressed over canonical claims: a degraded
+    # answer is the same answer, slower.  This used to be ``ORDER BY updated_at DESC``, so
+    # with the projection one row out of parity the same query returned the *oldest* events
+    # instead of the newest.  NULLs sort last on DESC here too, and this path is a scan
+    # either way, so the computed key costs it nothing it was not already paying.
+    stable_date = _sql_stable_date_expr()
+    query += f" ORDER BY ({stable_date} IS NULL), {stable_date} DESC LIMIT ?"
     params.append(max(1, int(limit)))
     
     try:
@@ -371,10 +508,16 @@ def search_timeline_events(entity_name: str = None, sentiment: str = None, actio
 
     results = []
     for data, subjects, r in decoded_events:
-        date = claim_event_date(r, data)
+        date = claim_event_date(r, data) or UNKNOWN_DATE_LABEL
         entities = ", ".join(entity_titles.get(item, item) for item in subjects)
         source = ", ".join(data.get("source_ids", []))
-        action = data.get("action") or data.get("event_tag") or data.get("claim_type") or "timeline-event"
+        action = (
+            data.get("action")
+            or data.get("event_tag")
+            or _text_event_tag(r)
+            or data.get("claim_type")
+            or "timeline-event"
+        )
         results.append(
             f"[{date}] <{entities}>\n  -> {r['claim_text']}\n"
             f"  Action: {action} | Source: {source}"

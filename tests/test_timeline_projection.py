@@ -230,9 +230,13 @@ def test_filtered_search_works_on_the_canonical_fallback(isolated_memory):
     assert "Vendor_Fallback shipped." in output
     assert output.startswith("[DEGRADED]")
 
-    sentiment_miss = search_timeline_events(sentiment="negative", limit=5)
-    assert "Vendor_Fallback shipped." not in sentiment_miss
-    assert "no such column" not in sentiment_miss
+    action_miss = search_timeline_events(action="Earnings", limit=5)
+    assert "Vendor_Fallback shipped." not in action_miss
+    assert "no such column" not in action_miss
+
+    action_hit = search_timeline_events(action="Release", limit=5)
+    assert "Vendor_Fallback shipped." in action_hit
+    assert "no such column" not in action_hit
 
 
 def test_event_date_comes_from_the_claim_text_prefix(isolated_memory):
@@ -463,3 +467,278 @@ def test_timeline_repair_is_a_noop_when_parity_is_clean(isolated_memory):
 
     assert "deleted 0" in message and "inserted 0" in message, message
     assert tool_timeline.timeline_projection_parity()["missing"] == 0
+
+
+def test_an_undated_claim_is_not_given_its_ingestion_time_as_an_event_date(isolated_memory):
+    """``event_date`` states the event date or nothing -- never the ingestion time.
+
+    The projection used to spend ``claim.updated_at`` there for the 2342 of 9974 live
+    timeline claims that state no date, which is what put a fifth of the corpus -- and 94 of
+    the newest 100 rows -- at the top of ``ORDER BY event_date DESC``.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    payload = {
+        "claim_type": "timeline-event",
+        "subject_entity_ids": ["Concept_Undated"],
+        "source_ids": ["Source_Undated"],
+    }
+    _insert_timeline_claim(
+        conn,
+        "claim_undated",
+        "An event the source never dated.",
+        dict(payload),
+        "2026-09-17T04:33:42+00:00",
+    )
+    _insert_timeline_claim(
+        conn,
+        "claim_dated",
+        "[2026-05-02] [Release] A dated event.",
+        dict(payload),
+        "2026-01-01T00:00:00+00:00",
+    )
+
+    assert "Rebuilt 2 timeline_events" in rebuild_timeline_events_from_claims(dry_run=False)
+
+    rows = {
+        row["description"]: (row["event_date"], row["event_date_source"])
+        for row in conn.execute("SELECT description, event_date, event_date_source FROM timeline_events")
+    }
+    assert rows["An event the source never dated."] == (None, "unknown")
+    assert rows["[2026-05-02] [Release] A dated event."] == ("2026-05-02", "day")
+
+    output = search_timeline_events(limit=5)
+    # The undated entry is listed last, not dated 2026-09-17 and listed first.
+    assert output.index("2026-05-02") < output.index("Unknown Date")
+
+
+def test_the_action_falls_back_to_the_tag_in_the_ledger_prefix(isolated_memory):
+    """Only 376 of the 7617 tag-bearing live claims carry a structured ``event_tag``.
+
+    Reading that field alone left 9598 of 9974 ``action`` values at the literal fallback
+    string, while the tag sat in the entry's ``[date] [Tag]`` prefix the whole time.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    payload = {
+        "claim_type": "timeline-event",
+        "subject_entity_ids": ["Concept_Tag"],
+        "source_ids": ["Source_Tag"],
+    }
+    _insert_timeline_claim(
+        conn,
+        "claim_tag_text",
+        "[2026-05-02] [Observation] Tagged in the text.",
+        dict(payload),
+        "2026-07-14T00:00:00+00:00",
+    )
+    structured = dict(payload, event_tag="Pivot")
+    _insert_timeline_claim(
+        conn,
+        "claim_tag_field",
+        "[2026-05-03] [Observation] The structured field wins.",
+        structured,
+        "2026-07-15T00:00:00+00:00",
+    )
+    assert "Rebuilt 2 timeline_events" in rebuild_timeline_events_from_claims(dry_run=False)
+
+    actions = {
+        row["description"]: row["action"]
+        for row in conn.execute("SELECT description, action FROM timeline_events")
+    }
+    assert actions["[2026-05-02] [Observation] Tagged in the text."] == "Observation"
+    assert actions["[2026-05-03] [Observation] The structured field wins."] == "Pivot"
+    assert "Action: Observation" in search_timeline_events(action="Observation", limit=5)
+
+
+def test_the_degraded_path_keeps_the_order_of_the_indexed_path(isolated_memory):
+    """A degraded answer is the same answer, slower.
+
+    The fallback ordered by ``updated_at`` where the indexed path ordered by ``event_date``,
+    so with the projection one row out of parity the same ``limit`` query returned the
+    *oldest* events instead of the newest.
+    """
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        for index in range(12):
+            claim = {
+                "claim_id": f"claim_order_{index:02d}",
+                "claim_type": "timeline-event",
+                "claim_text": f"[2026-06-{index + 1:02d}] [Release] Ordered event {index:02d}.",
+                "subject_entity_ids": ["Concept_Order"],
+                "source_ids": ["Source_Order"],
+            }
+            conn.execute(
+                "INSERT INTO claims (claim_id, claim_text, status, data_json, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    claim["claim_id"],
+                    claim["claim_text"],
+                    "active",
+                    json.dumps(claim),
+                    # Deliberately the reverse of the event order, so an ingestion-ordered
+                    # answer cannot pass by accident.
+                    f"2026-01-{12 - index:02d}T00:00:00+00:00",
+                ),
+            )
+    rebuild_timeline_events_from_claims(dry_run=False)
+    indexed = [
+        line for line in search_timeline_events(limit=3).splitlines() if line.startswith("[2026-")
+    ]
+
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO timeline_events "
+            "(id, event_date, event_date_source, action, sentiment, description, entity_id, "
+            "entity_title, source_file, extracted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("orphan-order", "2000-01-01", "day", "old", "neutral", "Orphan", "", "", "", "2000-01-01"),
+        )
+    degraded = [
+        line for line in search_timeline_events(limit=3).splitlines() if line.startswith("[2026-")
+    ]
+
+    assert indexed == degraded, (indexed, degraded)
+    assert "2026-06-12" in indexed[0]
+
+
+def test_timeline_repair_rewrites_rows_written_before_event_date_source(isolated_memory):
+    """A row the current writer would no longer produce is drift, even with a correct id.
+
+    Before ``event_date_source`` existed, a claim stating no date stored its ingestion
+    timestamp as ``event_date``: the id was right and the date shown was an artifact.  The
+    id-parity check calls that projection clean, so repair has to look at the column too --
+    otherwise converging needs a full rebuild.
+    """
+    from vector_lake import tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    _insert_timeline_claim(
+        conn,
+        "claim_legacy",
+        "An event the source never dated.",
+        {
+            "claim_type": "timeline-event",
+            "subject_entity_ids": ["Concept_Legacy"],
+            "source_ids": ["Source_Legacy"],
+        },
+        "2026-07-14T00:00:00+00:00",
+    )
+    rebuild_timeline_events_from_claims(dry_run=False)
+    event_id = conn.execute("SELECT id FROM timeline_events").fetchone()["id"]
+    projected_at = conn.execute(
+        "SELECT extracted_at FROM timeline_events WHERE id = ?", (event_id,)
+    ).fetchone()["extracted_at"]
+
+    # A row written by the previous writer, when the column did not exist yet.
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE timeline_events SET event_date = ?, event_date_source = NULL WHERE id = ?",
+            ("2026-07-14T00:00:00+00:00", event_id),
+        )
+
+    assert tool_timeline.timeline_projection_parity()["missing"] == 0
+    assert "rewrite 1 row(s)" in tool_timeline.repair_timeline_projection(dry_run=True)
+
+    message = tool_timeline.repair_timeline_projection(dry_run=False)
+
+    assert "rewrote 1 legacy row(s)" in message, message
+    row = conn.execute(
+        "SELECT event_date, event_date_source, extracted_at FROM timeline_events WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+    assert (row["event_date"], row["event_date_source"]) == (None, "unknown")
+    # Only the three derived columns move: the row was not re-inserted, so the time it was
+    # first projected survives.
+    assert row["extracted_at"] == projected_at
+
+
+def test_the_parity_gate_follows_the_id_inputs_and_not_updated_at(isolated_memory):
+    """The gate must move when the id set can move, and stop moving when it cannot.
+
+    ``MAX(updated_at)`` was dropped from the fingerprint: since event identity stopped
+    depending on ``updated_at``, a moved timestamp can only force a full recomputation that
+    reports ``missing=0 extra=0``.  It cost ~55 ms on every timeline query to do that.
+    """
+    from vector_lake import tool_timeline
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    empty = tool_timeline._timeline_claims_fingerprint(conn)
+
+    _insert_timeline_claim(
+        conn,
+        "claim_fp",
+        "[2026-04-11] [Release] Fingerprint event.",
+        {
+            "claim_type": "timeline-event",
+            "subject_entity_ids": ["Concept_Fp"],
+            "source_ids": ["Source_Fp"],
+        },
+        "2026-07-14T00:00:00+00:00",
+    )
+    inserted = tool_timeline._timeline_claims_fingerprint(conn)
+    assert inserted != empty
+
+    # An ``updated_at`` bounce cannot move an id, so it must not invalidate the memo.
+    with db_store.transaction():
+        conn.execute(
+            "UPDATE claims SET updated_at = ? WHERE claim_id = 'claim_fp'",
+            ("2026-08-01T00:00:00+00:00",),
+        )
+    assert tool_timeline._timeline_claims_fingerprint(conn) == inserted
+
+    # A write to the projection outside the delta path must invalidate it.
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO timeline_events "
+            "(id, event_date, event_date_source, action, sentiment, description, entity_id, "
+            "entity_title, source_file, extracted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("zzz-out-of-band", "2000-01-01", "day", "old", "neutral", "Out of band", "", "", "", "2000-01-01"),
+        )
+    assert tool_timeline._timeline_claims_fingerprint(conn) != inserted
+
+
+def test_init_db_adds_event_date_source_to_a_complete_schema_that_lacks_it(isolated_memory):
+    """A column added to an existing table needs its own staleness probe.
+
+    ``init_db()`` skips the DDL transaction when every sentinel already exists, so an
+    ``ALTER`` that is not gated by a probe never runs on a database that lacks only the new
+    column -- which is every already-migrated corpus in the field, and it is how
+    ``timeline-repair`` came to fail with "no such column" instead of migrating.  Dropping
+    the column from a schema that is otherwise complete reproduces that state exactly;
+    building a half-empty database (as this test used to) takes the DDL path and proves
+    nothing about the fast one.
+    """
+    import sqlite3
+
+    if sqlite3.sqlite_version_info < (3, 35, 0):  # pragma: no cover - old SQLite has no DROP COLUMN
+        import pytest
+
+        pytest.skip("ALTER TABLE ... DROP COLUMN needs SQLite 3.35+")
+
+    db_store.init_db()
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute(
+            "INSERT INTO timeline_events "
+            "(id, event_date, event_date_source, action, sentiment, description, entity_id, "
+            "entity_title, source_file, extracted_at) "
+            "VALUES ('legacy', '2026-09-17T00:00:00+00:00', NULL, 'x', 'neutral', 'Legacy row', "
+            "'', '', '', '2026-09-17')"
+        )
+    with db_store.transaction():
+        conn.execute("ALTER TABLE timeline_events DROP COLUMN event_date_source")
+    assert db_store._timeline_format_is_stale(conn)
+
+    db_store._INITIALIZED_DB_PATHS.clear()
+    db_store.init_db()
+
+    row = conn.execute(
+        "SELECT event_date, event_date_source FROM timeline_events WHERE id = 'legacy'"
+    ).fetchone()
+    assert row["event_date"] == "2026-09-17T00:00:00+00:00"
+    # NULL is what tells repair this row's ``event_date`` still means "ingestion time".
+    assert row["event_date_source"] is None

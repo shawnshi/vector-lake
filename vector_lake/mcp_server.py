@@ -72,18 +72,20 @@ def registered_tool_names(server=None) -> list[str]:
 
 
 @mcp.tool()
-def search_timeline(entity_name: str = "", sentiment: str = "", action: str = "", limit: int = 10) -> str:
+def search_timeline(entity_name: str = "", action: str = "", limit: int = 10) -> str:
     """Search the strategic timeline events database.
-    
+
+    Entries are ordered by event date, newest first.  A claim that states no date sorts last
+    and reads ``Unknown Date``; it is never given its ingestion timestamp as an event date.
+
     Args:
         entity_name: Filter by entity title (e.g., '卫宁健康'). Leave empty to search all.
-        sentiment: Filter by sentiment ('positive', 'neutral', 'negative'). Leave empty for all.
-        action: Filter by action type (e.g., 'Release', 'Earnings'). Leave empty for all.
+        action: Filter by the ledger's event tag (e.g., 'Release', 'Observation'), read from
+            the claim's structured field or from its ``[date] [Tag]`` prefix. Leave empty for all.
         limit: Number of events to return (default 10).
     """
     return search_timeline_events(
         entity_name=entity_name if entity_name else None,
-        sentiment=sentiment if sentiment else None,
         action=action if action else None,
         limit=limit
     )

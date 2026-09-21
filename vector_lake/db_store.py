@@ -1419,6 +1419,18 @@ def _entities_format_is_stale(conn: sqlite3.Connection) -> bool:
     return "idx_entities_f_page_key" not in _index_names(conn)
 
 
+def _timeline_format_is_stale(conn: sqlite3.Connection) -> bool:
+    """Read-only: is the ``timeline_events.event_date_source`` column missing?
+
+    Columns added by ``_init_db_once`` need this, or a database that already has every
+    sentinel takes the fast path and never runs the ``ALTER`` -- which is how
+    ``repair_timeline_projection`` came to ask for a column that did not exist yet on a
+    corpus whose schema was otherwise complete.  Same shape as
+    :func:`_entities_format_is_stale`.
+    """
+    return "event_date_source" not in _table_xcolumns(conn, "timeline_events")
+
+
 def _index_names(conn: sqlite3.Connection) -> set[str]:
     """Read-only: every index name in the database."""
     try:
@@ -1481,6 +1493,7 @@ def init_db():
             and not _entities_format_is_stale(get_connection())
             and not _om_probability_format_is_stale(get_connection())
             and not _claims_format_is_stale(get_connection())
+            and not _timeline_format_is_stale(get_connection())
         ):
             # The DDL would be a no-op, and running it would block every reader
             # behind the writer's lock.  Keep the cheap gap-fill so a writer that
@@ -1741,6 +1754,7 @@ def _init_db_once(db_key: str):
             CREATE TABLE IF NOT EXISTS timeline_events (
                 id TEXT PRIMARY KEY,
                 event_date TEXT,
+                event_date_source TEXT,
                 action TEXT,
                 sentiment TEXT,
                 description TEXT,
@@ -1750,6 +1764,14 @@ def _init_db_once(db_key: str):
                 extracted_at TEXT
             )
         """)
+        # ``event_date_source`` (``day``/``coarse``/``unknown``) records what ``event_date``
+        # is: before it existed, a claim that states no date stored its *ingestion* timestamp
+        # in ``event_date`` and no reader could tell that apart from a real event date.  The
+        # column is additive, but rows written earlier keep the old meaning until
+        # ``repair_timeline_projection`` (or ``rebuild_timeline_events_from_claims``) rewrites
+        # them; ``init_db`` only guarantees the column is there to write to.
+        if "event_date_source" not in _table_xcolumns(conn, "timeline_events"):
+            conn.execute("ALTER TABLE timeline_events ADD COLUMN event_date_source TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_events(event_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timeline_entity ON timeline_events(entity_id)")
         conn.execute("""
