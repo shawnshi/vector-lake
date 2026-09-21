@@ -88,7 +88,37 @@
 - 单一语料、单一嵌入模型、单一 top_k=5；结论不外推。
 - `sum` 与 `rrf` 的对比不含"更好的融合"（如归一加权和、学习式融合）；它只回答"要不要把默认换成 RRF"。
 
-## 10. 待确认（两处，其余按上面执行）
+## 执行状态（2026-09-21）
+
+- **查询集已冻结并入库**：333 条新查询（下限 300），`6bf2681`。提交时 15 个判定 child 仍在跑。与第一批 116 条归一化后重叠 0 条；含年份 12 · 英文/混合 85 · 长度中位 11。
+- **盲判池**：333 查询 × ≤10 候选 = 2344 行 / 1.25 MB，按 **5 片 × ~250 KB** 切分（落在已验证可读的 271 KB 包线内）。池文件不入库（可由查询集 + 两套融合复现）。
+- **三位判定者 × 5 片 = 15 个 child 已启动**：
+  | 判定者 | 模型 | 状态 |
+  |---|---|---|
+  | p（主） | `antigravity/gemini-3.8-flash` | 5 片运行中 |
+  | d1 | `deepseek/deepseek-v4-pro` | 5 片运行中 |
+  | d2 | `google/gemini-3.5-flash` | **s1/s2/s3 失败（429）**，s4/s5 运行中 |
+
+### 失败特征（原文）
+
+```
+code 429 RESOURCE_EXHAUSTED
+quotaMetric: generativelanguage.googleapis.com/generate_content_paid_tier_input_token_count
+quotaId:     GenerateContentPaidTierInputTokensPerModelPerMinute
+model: gemini-3.5-flash   quotaValue: 2000000
+retryDelay: 5s / 23s / 56s（三次不同）
+```
+
+这是**提供方限流**，属于「连接、超时、限流」行：可按提供方合同做**有界退避重试**，而不是语义 blocker。根因清楚：`gemini-3.5-flash` 的**每分钟输入 token** 上限为 2M，而 5 片并行、每片 ~250 KB（~100k token）且子代理会重读上下文，一分钟内就把该模型的配额打满。两个其他模型走不同配额，未受影响。
+
+### 处理计划（先定后做，不静默换协议）
+
+1. 等当前 workflow 跑完，清点哪些标注文件已落盘；
+2. **只重试缺失的 d2 片，且串行**（一次一个 child，`await runs.run` 逐个等完），让每分钟输入 token 不超 2M；
+3. 若重试仍持续 429 → 将**第三位判定者换成非 Google 线路**（保持 ≥2 模型族；主判定者与判定规则均不变），并在本文件记录该替换；
+4. 任何情况下不因为限流而降低判定质量（不缩池、不缩片、不改判定标准）。
+
+## 待确认（两处，其余按上面执行）
 
 1. **样本量**：300 条新查询 + 最小效应 +0.05（推荐，自洽），还是 150 条 + +0.07？
 2. **主判定者**：由你指定（不同模型族的候选：`antigravity/gemini-3.8-flash`、`google/gemini-3.5-flash`、`deepseek/deepseek-v4-pro`），还是按"与第一批主判定者不同族"自动选？
