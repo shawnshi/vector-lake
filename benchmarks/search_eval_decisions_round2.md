@@ -95,9 +95,18 @@
 - **三位判定者 × 5 片 = 15 个 child 已启动**：
   | 判定者 | 模型 | 状态 |
   |---|---|---|
-  | p（主） | `antigravity/gemini-3.8-flash` | 5 片运行中 |
-  | d1 | `deepseek/deepseek-v4-pro` | 5 片运行中 |
-  | d2 | `google/gemini-3.5-flash` | **s1/s2/s3 失败（429）**，s4/s5 运行中 |
+  | p（主） | `antigravity/gemini-3.8-flash` | s1–s3 完成（各 67 行），s4/s5 运行中 |
+  | d1 | `deepseek/deepseek-v4-pro` | s1–s3 完成（各 67 行），s4/s5 运行中 |
+  | d2 | `google/gemini-3.5-flash` | **5/5 分片全部 429 失败，零产出** → 已按计划替换 |
+  | **d2b（替换）** | **`openai-codex/gpt-5.6-luna`** | 已启动，5 片，输出 `labels_r2_d2b_s{1..5}.jsonl` |
+
+### 替换记录（按本文件“处理计划”第 3 条执行）
+
+**替换理由**：d2 的 5 个分片 **5/5** 都死在同一配额上（`GenerateContentPaidTierInputTokensPerModelPerMinute`，`gemini-3.5-flash`，上限 2 M/分钟）。这不是偶发：单次分片 ~250 KB（~100k token）且子代理会多轮重读，**一个 child 自己就可能撞满该模型每分钟限额** —— 串行重试也不会改变这个量级，而“缩片去迁就配额”是本文件明文禁止的。
+
+**替换不影响判定规则**：主判定者仍是 `antigravity/gemini-3.8-flash`，主指标、最小效应量、确认集、两处同时的判定动作全部不变。换的只是第三位判定者的线路，而且换来的是**第三个模型族**（替换前是 gemini 家族的第二条线路）。
+
+**输出路径改用 `d2b`**：避免与仍在收尾的旧 d2 workflow 写同一文件名；分析时“第三位判定者”读 `labels_r2_d2b_s{1..5}.jsonl`。
 
 ### 失败特征（原文）
 
@@ -116,6 +125,7 @@ retryDelay: 5s / 23s / 56s（三次不同）
 1. 等当前 workflow 跑完，清点哪些标注文件已落盘；
 2. **只重试缺失的 d2 片，且串行**（一次一个 child，`await runs.run` 逐个等完），让每分钟输入 token 不超 2M；
 3. 若重试仍持续 429 → 将**第三位判定者换成非 Google 线路**（保持 ≥2 模型族；主判定者与判定规则均不变），并在本文件记录该替换；
+   **→ 已执行：d2 `google/gemini-3.5-flash` 5/5 分片失败，已换为 `openai-codex/gpt-5.6-luna`（输出 `labels_r2_d2b_s*`）。**
 4. 任何情况下不因为限流而降低判定质量（不缩池、不缩片、不改判定标准）。
 
 ## 待确认（两处，其余按上面执行）
