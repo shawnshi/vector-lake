@@ -334,6 +334,13 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
         # and a table of 40 ties, which reads as "no difference" rather than "nothing was compared".
         print(f"refusing to compare: both runs used the same config {left.get('config')}", file=sys.stderr)
         return 2
+    for side, name in ((left, "left"), (right, "right")):
+        # The sibling failure of the one below: comparing a real run against one that judged nothing
+        # reads as "identical", which is the same wrong answer as "no difference".  Only an explicit
+        # zero counts -- a hand-built payload without the key is not a claims about judging nothing.
+        if side.get("metrics", {}).get("judged") == 0:
+            print(f"refusing to compare: the {name} run judged no queries (judged=0)", file=sys.stderr)
+            return 2
     left_per = left["metrics"].get("per_query") or {}
     right_per = right["metrics"].get("per_query") or {}
     shared = sorted(set(left_per) & set(right_per))
@@ -459,6 +466,12 @@ def main() -> int:
         return 0
 
     labels = load_labels(pathlib.Path(args.labels))
+    if not labels:
+        # Found by using it: a wrong ``--labels`` path silently yielded ``judged: 0``, a run file that
+        # looks perfectly valid, and a comparison of two systems over nothing.  Refuse instead.
+        print(f"refusing to replay: {args.labels} produced no labels; a run that judges nothing "
+              f"cannot tell two systems apart (check the path)", file=sys.stderr)
+        return 2
     results = run(queries, vectors, args.top_k)
     payload = {
         "config": {
