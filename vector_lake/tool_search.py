@@ -71,9 +71,10 @@ def _expansion_quota(pool_size: int) -> int | None:
     """Pool slots guaranteed to graph expansion, or ``None`` for the long-standing behaviour.
 
     Unset means expansion competes for whatever the fusion stage left over.  Both recall paths are
-    asked for ``top_k * 5`` candidates and the pool is ``max(40, top_k * 3)``, so the leftovers are
-    often nothing: measured on the live lake, three of five sampled queries left zero slots, which
-    made graph expansion a documented candidate source that could not supply a candidate.
+    asked for ``_candidate_depth()`` candidates and the pool is ``_candidate_pool()``, so the
+    leftovers are often nothing: measured on the live lake, three of five sampled queries left zero
+    slots, which made graph expansion a documented candidate source that could not supply a
+    candidate.
     """
     raw = os.environ.get("VECTOR_LAKE_EXPANSION_QUOTA")
     if raw is None or not str(raw).strip():
@@ -87,6 +88,52 @@ def _expansion_quota(pool_size: int) -> int | None:
         log.warning("VECTOR_LAKE_EXPANSION_QUOTA must be >= 0; using the default.")
         return None
     return min(value, pool_size)
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        log.warning("Ignoring unparsable %s=%r", name, raw)
+        return default
+    if value < 1:
+        log.warning("%s must be >= 1; using %d", name, default)
+        return default
+    return value
+
+
+#: How deep each retrieval stage looks, and how large the pool the reranker sees.
+#:
+#: These are properties of the *pipeline*, not of the window the caller asked for, and the values
+#: are exactly what the pipeline computed at the default ``top_k=5`` before this change
+#: (``top_k * 5`` candidates, ``max(40, top_k * 3)`` pool, ``int(pool * 0.6)`` source slots in the
+#: pool, ``max(1, int(top_k * 0.6))`` source slots in the answer).
+#:
+#: They used to scale with ``top_k``, which meant ``top_k`` did not only decide how many answers
+#: came back -- it decided *which* pages were eligible.  A larger window drew a deeper candidate
+#: list, resized the pool, refilled the source caps and therefore changed the pool-local min-max
+#: normalisation inside the reranker, so the top-5 of a top-20 request was not the top-5 of a top-5
+#: request.  Measured: of 268 queries whose top-5 pool held no relevant page, 36 (13.4%) had their
+#: best page inside the top five of the same ranking asked for twenty, while that page was absent
+#: from the top-5 result -- the evaluation read "not found" where the pipeline had capped it out,
+#: and D2 had already recorded the same heuristic's non-monotonicity at ``top_k=1``.
+#:
+#: With the depth fixed, the first *k* of a top-k result are the first *k* of any larger one.  The
+#: two knobs exist so a deeper pipeline can be measured as its own change, one variable at a time.
+CANDIDATE_DEPTH = 25
+CANDIDATE_POOL = 40
+RESULT_SOURCE_CAP = 3
+
+
+def _candidate_depth() -> int:
+    return _env_positive_int("VECTOR_LAKE_CANDIDATE_DEPTH", CANDIDATE_DEPTH)
+
+
+def _candidate_pool() -> int:
+    return _env_positive_int("VECTOR_LAKE_CANDIDATE_POOL", CANDIDATE_POOL)
 
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 
@@ -690,7 +737,7 @@ def _search_scored_pages(
     try:
         # Use expanded tokens as the query basis to preserve LLM synonym expansions
         expanded_query = query + " " + " ".join(tokens)
-        fts_results = _get_fts_search_results(expanded_query, limit=top_k * 5)
+        fts_results = _get_fts_search_results(expanded_query, limit=_candidate_depth())
         for position, row in enumerate(fts_results):
             key = row['node_key']
             raw_score = row.get('rank')
@@ -711,7 +758,7 @@ def _search_scored_pages(
     vector_ranked: list[str] = []
     query_vector, embedding_error = _get_query_embedding(query)
     if query_vector:
-        vector_results, vector_error = _get_vector_search_results(query_vector, limit=top_k * 5)
+        vector_results, vector_error = _get_vector_search_results(query_vector, limit=_candidate_depth())
         if vector_error:
             vector_notes.append(vector_error)
         elif not vector_results:
@@ -813,8 +860,9 @@ def _search_scored_pages(
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
-    # Phase 1: Expand candidate pool for reranking
-    pool_size = max(40, top_k * 3)
+    # Phase 1: Expand candidate pool for reranking.  Pool size is fixed, so the reranker's
+    # pool-local min-max normalisation no longer depends on how many answers the caller asked for.
+    pool_size = _candidate_pool()
     max_sources_pool = int(pool_size * 0.6)
     expansion_quota = _expansion_quota(pool_size)
     source_budget = [0]
@@ -854,15 +902,14 @@ def _search_scored_pages(
     # to the host agent when explicitly requested, not performed by runtime code.
     reranked = _rerank_candidates_locally(query, candidate_pool)
 
-    # Phase 3: Final top_k extraction
+    # Phase 3: Final top_k extraction.  The source cap is absolute, not ``int(top_k * 0.6)``:
+    # a cap that shrinks with the window would drop a Source page that a smaller window kept, which
+    # is the same defect as above in miniature.  ``max(1, ...)`` remains expressed in the constant
+    # itself -- the cap exists to keep an answer from being all-Source stubs, and one slot has
+    # nothing to mix.
     final_scored = []
     source_count = 0
-    # ``max(1, ...)`` because the cap exists to keep an answer from being all-Source pages, and
-    # that needs at least two slots to mean anything.  With ``int(top_k * 0.6)`` a ``top_k=1``
-    # query computed a cap of 0, so a single-result search could never return the Source page that
-    # was the best match -- and the cap was non-monotone on the way there (top_k=2 and top_k=3 both
-    # gave 1).  Measured: top_k=1 -> 0 before, 1 now.
-    max_sources_final = max(1, int(top_k * 0.6))
+    max_sources_final = RESULT_SOURCE_CAP
     for score, node in reranked:
         node_type = node.get("type", "").lower()
         if node_type == "source":
