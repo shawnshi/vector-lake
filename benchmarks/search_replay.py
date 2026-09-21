@@ -278,16 +278,22 @@ def _bootstrap_ci(differences: list[float]) -> tuple[float, float, float] | None
 #: authority and this is its implementation.  Registered before the confirming queries existed, so
 #: the primary metric cannot be chosen after seeing which one passed.
 #:
-#: The second batch raised this gate from 60 to 300 in its own registration, for power rather than
-#: taste: at the observed difference SD (0.26-0.31) a sample of 300 has an MDE of 0.047-0.050, which
-#: is where the +0.05 minimum effect sits.
-#: ``benchmarks/search_eval_decisions_round2.md`` §3 and §4 are the authority for that number.
+#: Two of the registered conditions were recorded in the registrations and never implemented here:
+#:
+#: * the +0.05 minimum effect (``search_eval_decisions.md`` §修正点, then the second batch's §3);
+#:   without it the harness passes a difference of +0.0132 that the registration calls a failure;
+#: * the sign test's demotion to a reported number.  The first batch showed the sign test only reads
+#:   signs, needs ~780 discordant pairs at the observed win rate and is therefore almost impossible
+#:   to pass even when the effect is real, so the second batch made the bootstrap interval the only
+#:   significance gate.  Requiring it here would fail the run on the wrong condition -- and would
+#:   report a failure on a gate the registration no longer has.
 #:
 #: PRIMARY_METRIC is nDCG@5 because it penalises both ways the two fusions trade off (a query's own
 #: page not ranking first, and later relevant pages being pushed out), while MRR sees only the first.
 PRIMARY_METRIC = "ndcg"
 SECONDARY_METRICS = ("success", "recall", "reciprocal_rank")
 MIN_CONFIRMING_QUERIES = 300
+MIN_PRIMARY_EFFECT = 0.05
 PRIMARY_SIGN_ALPHA = 0.05
 
 
@@ -299,14 +305,16 @@ def _decision(diffs: list[float], secondary: list[list[float]]) -> list[str]:
     ci = _bootstrap_ci(diffs)
     sign = _sign_test(wins, losses) if (wins + losses) else None
     lines = []
-    lines.append(f"  {'PASS' if mean > 0 else 'FAIL'}  primary mean difference > 0  ({mean:+.4f})")
+    lines.append(f"  {'PASS' if mean >= MIN_PRIMARY_EFFECT else 'FAIL'}  "
+                 f"primary mean difference >= registered minimum effect  "
+                 f"({mean:+.4f} vs {MIN_PRIMARY_EFFECT:+.2f})")
     excluded = ci is not None and ci[0] > 0
     lines.append(f"  {'PASS' if excluded else 'FAIL'}  primary bootstrap 95% CI excludes 0  "
                  f"({'[%+.3f, %+.3f]' % (ci[0], ci[1]) if ci else '-'})")
-    significant = sign is not None and sign < PRIMARY_SIGN_ALPHA
-    lines.append(f"  {'PASS' if significant else 'FAIL'}  primary sign test p < {PRIMARY_SIGN_ALPHA}  "
+    # Report-only since the second batch; see the note on this module's rule constants.
+    lines.append(f"  (report-only)  primary sign test p < {PRIMARY_SIGN_ALPHA}  "
                  f"({sign:.4f} on {wins} wins / {losses} losses)" if sign is not None
-                 else f"  FAIL  primary sign test p < {PRIMARY_SIGN_ALPHA}  (no discordant pair)")
+                 else f"  (report-only)  primary sign test  (no discordant pair)")
     regressions = [
         name for name, values in zip(SECONDARY_METRICS, secondary)
         if values and sum(values) / len(values) < 0
@@ -360,7 +368,8 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
     ]
 
     print()
-    print(f"pre-registered decision rule (benchmarks/search_eval_decisions.md), primary={PRIMARY_METRIC}:")
+    print(f"pre-registered decision rule (benchmarks/search_eval_decisions.md,\n"
+          f"  benchmarks/search_eval_decisions_round2.md), primary={PRIMARY_METRIC}:")
     decision = _decision(primary_diffs, secondary_diffs)
     for line in decision:
         print(line)
