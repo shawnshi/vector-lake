@@ -278,11 +278,16 @@ def _bootstrap_ci(differences: list[float]) -> tuple[float, float, float] | None
 #: authority and this is its implementation.  Registered before the confirming queries existed, so
 #: the primary metric cannot be chosen after seeing which one passed.
 #:
+#: The second batch raised this gate from 60 to 300 in its own registration, for power rather than
+#: taste: at the observed difference SD (0.26-0.31) a sample of 300 has an MDE of 0.047-0.050, which
+#: is where the +0.05 minimum effect sits.
+#: ``benchmarks/search_eval_decisions_round2.md`` §3 and §4 are the authority for that number.
+#:
 #: PRIMARY_METRIC is nDCG@5 because it penalises both ways the two fusions trade off (a query's own
 #: page not ranking first, and later relevant pages being pushed out), while MRR sees only the first.
 PRIMARY_METRIC = "ndcg"
 SECONDARY_METRICS = ("success", "recall", "reciprocal_rank")
-MIN_CONFIRMING_QUERIES = 60
+MIN_CONFIRMING_QUERIES = 300
 PRIMARY_SIGN_ALPHA = 0.05
 
 
