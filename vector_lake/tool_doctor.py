@@ -18,6 +18,7 @@ from vector_lake.wiki_utils import (
 )
 from vector_lake.db_store import (
     applied_schema_prunes,
+    embedding_input_digests,
     embedding_projection_state,
     published_edge_projection_drift,
     get_db_path,
@@ -466,7 +467,11 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
     # catch-up sweep refills it in batches, so the check stays OK and the gap is a warning
     # (same shape as the gram index above).
     try:
-        from vector_lake.embedding_scheduler import embedding_coverage
+        from vector_lake.embedding_scheduler import (
+            embedding_coverage,
+            page_bodies_for_keys,
+            stale_embedding_keys,
+        )
 
         index_path = get_index_path()
         if index_path.exists():
@@ -475,17 +480,44 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
         else:
             index_data = {"nodes": {}}
         coverage = embedding_coverage(index_data)
+        node_keys = list((index_data.get("nodes") or {}).keys())
+        try:
+            recorded = embedding_input_digests()
+        except sqlite3.OperationalError:
+            # A database that has not run ``init_db()`` since the ledger was introduced has no
+            # ledger, and the doctor must not run the migration.  Everything then reads as
+            # unstamped, which is the honest statement: no vector here has verified provenance.
+            recorded = {}
+        unstamped = {key for key in node_keys if key not in recorded}
+        stale_inputs = stale_embedding_keys(
+            index_data, page_bodies_for_keys(node_keys), recorded=recorded
+        ) - unstamped
         checks.append((
             "Vector Projection",
             True,
             f"nodes={coverage['nodes']} embedded={coverage['embedded']} "
-            f"missing={coverage['missing']} stale={coverage['stale']}",
+            f"missing={coverage['missing']} stale={coverage['stale']} "
+            f"stale_inputs={len(stale_inputs)} unstamped={len(unstamped)}",
         ))
         if coverage["missing"]:
             warnings.append(
                 f"vector_projection_incomplete:missing={coverage['missing']} of "
                 f"{coverage['nodes']} nodes (refilled in batches by the periodic catch-up "
                 "sweep; force now: python cli.py embedding-backfill --apply)"
+            )
+        if stale_inputs:
+            warnings.append(
+                f"vector_input_stale:{len(stale_inputs)} node(s) have a vector that was built from "
+                "input which has since changed -- present, but answering from old text "
+                "(rebuilt in batches by the periodic catch-up sweep; force now: python cli.py "
+                "embedding-backfill --apply)"
+            )
+        if unstamped:
+            warnings.append(
+                f"vector_input_unstamped:{len(unstamped)} node(s) predate the input ledger, so "
+                "their vectors cannot be verified as current and are rebuilt to establish it "
+                "(in batches by the periodic catch-up sweep; force now: python cli.py "
+                "embedding-backfill --apply)"
             )
         if coverage["stale"]:
             warnings.append(

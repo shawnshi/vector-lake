@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from filelock import FileLock
 
 from vector_lake import embedding_scheduler
-from vector_lake.embedding_scheduler import embedding_backfill, estimate_embedding_tokens
+from vector_lake.embedding_scheduler import (
+    embedding_backfill,
+    estimate_embedding_tokens,
+    stale_embedding_keys,
+)
 from vector_lake.mutation_coordinator import execute_mutation_plan
 
 
@@ -215,6 +219,46 @@ def test_rate_limiter_uses_shared_sqlite_window(isolated_memory, monkeypatch):
     assert [(row["reserved_at"], row["token_count"]) for row in rows] == [(1060.1, 10)]
 
 
+def _fake_provider(monkeypatch, calls: list | None = None) -> list:
+    """Replace the provider with a recorder and return the call log.
+
+    Recording rather than raising is deliberate.  ``embedding_backfill`` catches ``Exception``
+    around each batch on purpose -- one bad batch must not lose the run -- and that also swallows
+    an ``AssertionError`` raised from inside it, so a test that leans on the raise passes whether
+    or not the call ever happened.
+    """
+    calls = calls if calls is not None else []
+
+    def _record(client, contents, tokens, config, limiter, **kwargs):
+        calls.append(list(contents))
+        return [[1.0] * config.dimension for _ in contents]
+
+    monkeypatch.setattr(embedding_scheduler, "_request_embeddings", _record)
+    return calls
+
+
+def _embed_index(isolated_memory) -> dict:
+    return json.loads((isolated_memory / "wiki" / "index.json").read_text(encoding="utf-8"))
+
+
+def _backfill_now(isolated_memory) -> dict:
+    """Embed the corpus the way the CLI does, so the stamped digest covers the canonical input.
+
+    Passing no bodies would stamp a body-less digest, and the sweep -- which always reads bodies --
+    would then correctly call the row stale.  That is a fixture bug, not a product one, and the
+    assertion below the call is what keeps the two paths from drifting apart unnoticed.
+    """
+    from vector_lake.embedding_scheduler import page_bodies_for_keys
+
+    index_data = _embed_index(isolated_memory)
+    bodies = page_bodies_for_keys(list(index_data["nodes"]))
+    result = embedding_backfill(index_data, dry_run=False, bodies=bodies)
+    assert stale_embedding_keys(index_data, bodies) == set(), (
+        "the CLI path and the sweep path disagree about the input digest"
+    )
+    return result
+
+
 def _stored_vector_count(node_key: str) -> int:
     return db_store.get_connection().execute(
         "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = ?", (node_key,)
@@ -275,24 +319,93 @@ def test_the_periodic_sweep_restores_a_vector_the_incremental_index_dropped(isol
     assert any("New Title" in text for text in requested[0]), requested[0]
 
 
-def test_the_sweep_does_not_call_the_provider_when_coverage_is_complete(isolated_memory, monkeypatch):
-    """A 15-minute loop must be free when the projection is whole."""
+def test_the_sweep_does_not_call_the_provider_when_the_projection_is_current(isolated_memory, monkeypatch):
+    """A 15-minute loop must be free when every vector is present and verified."""
     _purpose(isolated_memory)
     execute_mutation_plan("Source_Only.md", content=_source_content("source_only", "Only Page"))
     indexer.generate_index()
-    db_store.upsert_embedding("Source_Only", [1.0] * 3072)
-
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(
-        embedding_scheduler,
-        "_request_embeddings",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sweep embedded a complete corpus")),
-    )
+    calls = _fake_provider(monkeypatch)
+    # Establish the ledger the way production does.  A hand-written vector is unstamped and
+    # correctly reads as unverified, so stamping it by hand would test nothing.
+    assert _backfill_now(isolated_memory)["embedded"] == 1
+    calls.clear()
 
     summary = periodic_catch_up.catch_up_once()
 
+    assert calls == [], "the sweep embedded a projection that was already current"
     assert summary["embeddings"]["embedded"] == 0
+    assert summary["embeddings"]["stale_inputs"] == 0
     assert summary["embeddings"]["coverage_after"]["missing"] == 0
+
+
+def test_the_sweep_rebuilds_a_vector_whose_input_changed(isolated_memory, monkeypatch):
+    """The class only a full re-embed could find: the vector is present, and stale.
+
+    Nothing deletes a vector when a full index rebuild changes the aliases and summary that the
+    embedding text is built from, so the row survives and keeps answering from text that no
+    longer exists.  Measured on the live lake 2026-09-21 by re-embedding all 7 175 nodes and
+    diffing bit for bit: 7 172 identical, 3 changed -- and the provider is bit-deterministic, so
+    those 3 were stale inputs rather than noise.
+    """
+    _purpose(isolated_memory)
+    execute_mutation_plan("Source_Drift.md", content=_source_content("source_drift", "Original Title"))
+    indexer.generate_index()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    calls = _fake_provider(monkeypatch)
+    assert _backfill_now(isolated_memory)["embedded"] == 1
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM vec_embedding_inputs WHERE node_key = 'Source_Drift'"
+    ).fetchone()[0] == 1
+    calls.clear()
+
+    # A rebuild rewrites the node's summary and leaves the vector alone -- exactly the live shape,
+    # where the input moved under a vector that stayed put.
+    path = isolated_memory / "wiki" / "index.json"
+    index_data = json.loads(path.read_text(encoding="utf-8"))
+    index_data["nodes"]["Source_Drift"]["summary"] = "Rewritten after the last embed."
+    path.write_text(json.dumps(index_data, ensure_ascii=False), encoding="utf-8")
+    assert _stored_vector_count("Source_Drift") == 1, "must stay present to be the stale case"
+
+    summary = periodic_catch_up.catch_up_once()
+
+    assert summary["embeddings"]["stale_inputs"] == 1, summary["embeddings"]
+    assert summary["embeddings"]["embedded"] == 1, summary["embeddings"]
+    assert calls, "the sweep left a stale vector in place"
+    assert any("Rewritten after the last embed" in text for text in calls[0]), calls[0]
+
+
+def test_an_unstamped_vector_is_rebuilt_to_establish_its_digest(isolated_memory, monkeypatch):
+    """No ledger row is no evidence of currency, so the sweep rebuilds instead of assuming."""
+    _purpose(isolated_memory)
+    execute_mutation_plan("Source_Legacy.md", content=_source_content("source_legacy", "Legacy"))
+    indexer.generate_index()
+    db_store.upsert_embedding("Source_Legacy", [1.0] * 3072)  # a vector from before the ledger
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    _fake_provider(monkeypatch)
+
+    summary = periodic_catch_up.catch_up_once()
+
+    assert summary["embeddings"]["embedded"] == 1, summary["embeddings"]
+    assert db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM vec_embedding_inputs WHERE node_key = 'Source_Legacy'"
+    ).fetchone()[0] == 1
+
+
+def test_deleting_a_vector_also_drops_its_input_digest(isolated_memory, monkeypatch):
+    """A ledger row that outlives its vector would make every later orphan read as stale."""
+    _purpose(isolated_memory)
+    execute_mutation_plan("Source_Clean.md", content=_source_content("source_clean", "Clean"))
+    indexer.generate_index()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    _fake_provider(monkeypatch)
+    _backfill_now(isolated_memory)
+    conn = db_store.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM vec_embedding_inputs").fetchone()[0] == 1
+
+    db_store.delete_embedding("Source_Clean")
+
+    assert conn.execute("SELECT COUNT(*) FROM vec_embedding_inputs").fetchone()[0] == 0
 
 
 def test_the_sweep_bounds_how_long_one_batch_may_wait(isolated_memory, monkeypatch):
@@ -360,19 +473,20 @@ def test_a_database_without_the_projection_marker_is_not_reported_complete(isola
 
     ``_schema_is_complete`` short-circuits ``_init_db_once``, so a new table that is not a
     sentinel is never created on the databases that already hold vectors -- which is exactly
-    where the model question matters.  A sentinel that is present must also stop being the
-    thing that forces a DDL transaction on every read, hence the True/False pair.
+    where the model and staleness questions matter.  A sentinel that is present must also stop
+    being the thing that forces a DDL transaction on every read, hence the True/False pair.
     """
     assert "vec_embedding_projection" in db_store._SCHEMA_SENTINELS
+    assert "vec_embedding_inputs" in db_store._SCHEMA_SENTINELS
     db_store.init_db()
     db_path = db_store.get_db_path()
     assert db_store._schema_is_complete(db_path) is True
 
     conn = db_store.get_connection()
-    with db_store.transaction():
-        conn.execute("DROP TABLE IF EXISTS vec_embedding_projection")
-
-    assert db_store._schema_is_complete(db_path) is False
+    for table in ("vec_embedding_projection", "vec_embedding_inputs"):
+        with db_store.transaction():
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        assert db_store._schema_is_complete(db_path) is False
 
 
 def test_start_embedding_run_marks_crashed_run_abandoned(isolated_memory, monkeypatch):

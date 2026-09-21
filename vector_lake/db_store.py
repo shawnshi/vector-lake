@@ -959,6 +959,7 @@ _SCHEMA_SENTINELS: tuple[str, ...] = (
     "ingest_abandoned_sources",
     "claim_index",
     "vec_embedding_projection",
+    "vec_embedding_inputs",
 )
 
 
@@ -1532,6 +1533,26 @@ def _init_db_once(db_key: str):
                 written_at TEXT
             )
         """)
+        conn.execute("""
+            -- The embedding *input* each stored vector was built from, per page.
+            --
+            -- A vector can be present and still wrong: nothing deletes it when a page is rewritten
+            -- by a path that bypasses the incremental index, or when a full rebuild changes the
+            -- aliases and summary that ``embedding_text_for_node`` reads.  Measured 2026-09-21 by
+            -- re-embedding all 7 175 nodes and comparing bit for bit: 7 172 came back identical
+            -- and 3 did not -- and the provider is bit-deterministic (same text twice gives
+            -- max|delta| = 0), so those 3 were stale inputs, not noise.  Without this table that
+            -- class is only findable by paying for a full re-embed and diffing.
+            --
+            -- ``content_digest`` is a digest of the inputs, not of the derived text: the text is a
+            -- pure function of them, and digesting the inputs avoids re-running the whitespace
+            -- collapse and the token estimate over the corpus on every check.
+            CREATE TABLE IF NOT EXISTS vec_embedding_inputs (
+                node_key TEXT PRIMARY KEY,
+                content_digest TEXT NOT NULL,
+                updated_at TEXT
+            )
+        """)
         for col, col_type in [("type", "TEXT"), ("status", "TEXT"), ("ttl", "INTEGER"), ("decay_weight", "REAL")]:
             try:
                 conn.execute(f"ALTER TABLE entities ADD COLUMN {col} {col_type}")
@@ -1877,7 +1898,7 @@ def search_index_state() -> dict[str, str]:
         for row in get_connection().execute("SELECT node_key, content_hash FROM wiki_search_index_state")
     }
 
-def upsert_embedding(entity_id: str, embedding: list[float]):
+def upsert_embedding(entity_id: str, embedding: list[float], *, content_digest: str | None = None):
     """Store one unit vector under a page key.
 
     The normalisation is load-bearing, not cosmetic: ``tool_search`` converts sqlite-vec's L2
@@ -1897,12 +1918,37 @@ def upsert_embedding(entity_id: str, embedding: list[float]):
     with transaction():
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (entity_id,))
         conn.execute("INSERT INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)", (entity_id, query_blob))
+        # A digest is written only when the caller actually has one.  Storing a NULL or guessed
+        # digest would make an unverified row look verified, and the reader treats "no row" as
+        # "needs stamping", so the no-digest path converges instead of lying.
+        if content_digest is not None:
+            conn.execute(
+                "INSERT INTO vec_embedding_inputs (node_key, content_digest, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(node_key) DO UPDATE SET "
+                "content_digest = excluded.content_digest, updated_at = excluded.updated_at",
+                (str(entity_id), str(content_digest), datetime.now(timezone.utc).isoformat()),
+            )
+
+
+def embedding_input_digests() -> dict[str, str]:
+    """The recorded embedding-input digest per page key.
+
+    A key absent from this mapping has a vector that was never stamped, which the staleness
+    check treats as unverified rather than current.
+    """
+    conn = get_connection()
+    return {
+        row["node_key"]: row["content_digest"]
+        for row in conn.execute("SELECT node_key, content_digest FROM vec_embedding_inputs")
+    }
 
 
 def delete_embedding(entity_id: str):
     conn = get_connection()
     with transaction():
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (str(entity_id),))
+        conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (str(entity_id),))
+
 
 def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
     conn = get_connection()
@@ -1913,6 +1959,9 @@ def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
         return 0
     with transaction():
         conn.executemany("DELETE FROM vec_embeddings WHERE entity_id = ?", [(entity_id,) for entity_id in stale])
+        # The input ledger is keyed the same way and would otherwise keep rows for pages that no
+        # longer exist, which reads as "every orphan is stale" on the next sweep.
+        conn.executemany("DELETE FROM vec_embedding_inputs WHERE node_key = ?", [(entity_id,) for entity_id in stale])
     return len(stale)
 
 def count_embeddings() -> int:
@@ -1994,6 +2043,7 @@ def delete_search_index(node_key: str):
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
+        conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (node_key,))
 
 def delete_node_cascade(node_key: str):
     conn = get_connection()
@@ -2017,6 +2067,7 @@ def delete_node_cascade(node_key: str):
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
         conn.execute(f"DELETE FROM vec_embeddings WHERE entity_id IN ({placeholders})", related_ids)
+        conn.execute(f"DELETE FROM vec_embedding_inputs WHERE node_key IN ({placeholders})", related_ids)
         conn.execute(
             "DELETE FROM claims WHERE "
             "f_page_key = ? OR "

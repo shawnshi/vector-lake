@@ -10,7 +10,7 @@ The scheduler treats embeddings as a resumable projection:
 
 from __future__ import annotations
 
-import json
+import hashlib
 import math
 import os
 import re
@@ -144,6 +144,10 @@ def page_bodies_for_keys(keys: list[str] | tuple[str, ...]) -> dict[str, str]:
     backfill unaffordable: the periodic sweep runs every 15 minutes, and the corpus is now
     7 974 entities.  Chunked ``IN`` lists keep the statement inside SQLite's variable limit
     while staying a bounded number of round trips.
+
+    This is the one implementation of that read.  The CLI backfill used to parse ``data_json``
+    itself, which meant two body sources that could disagree about the same page while the
+    staleness ledger compared their digests.
     """
     wanted = [str(key) for key in keys if key]
     if not wanted:
@@ -153,17 +157,79 @@ def page_bodies_for_keys(keys: list[str] | tuple[str, ...]) -> dict[str, str]:
     for start in range(0, len(wanted), 400):
         chunk = wanted[start:start + 400]
         placeholders = ",".join("?" for _ in chunk)
+        # ``json_extract`` rather than parsing ``data_json`` in Python: the corpus is 22 MB of
+        # JSON around 13 MB of text, and parsing the wrapper cost 2.59 s per pass against 0.39 s
+        # for this (measured on 7 175 nodes, 2026-09-21) -- which matters because the staleness
+        # check runs on every sweep.  ``json_valid`` keeps a malformed row from failing the whole
+        # statement; it is skipped, exactly as the per-row decode used to skip it.
         rows = conn.execute(
-            "SELECT f_page_key AS page_key, data_json FROM entities "
-            f"WHERE f_page_key IN ({placeholders})",
+            "SELECT f_page_key AS page_key, json_extract(data_json, '$.raw_text') AS body "
+            f"FROM entities WHERE f_page_key IN ({placeholders}) AND json_valid(data_json)",
             chunk,
         )
         for row in rows:
-            try:
-                bodies[row["page_key"]] = str(json.loads(row["data_json"]).get("raw_text") or "")
-            except (json.JSONDecodeError, TypeError):
-                continue
+            bodies[row["page_key"]] = str(row["body"] or "")
     return bodies
+
+
+def embedding_input_digest(
+    node: dict[str, Any],
+    body_text: str | None,
+    config: EmbeddingRateConfig | None = None,
+) -> str:
+    """Digest of every field :func:`embedding_text_for_node` reads, plus the two knobs that clip it.
+
+    Digesting the *inputs* is equivalent to digesting the derived text -- the text is a pure
+    function of these fields -- and avoids re-running the whitespace collapse and the token
+    estimate over the whole corpus on every staleness check.  The clipping knobs are part of it so
+    that lowering ``VECTOR_LAKE_EMBEDDING_MAX_CHARS_PER_ITEM`` marks the projection stale instead
+    of silently leaving every vector built to the old limit.
+
+    A field separator is written after every part so that two different field splits cannot
+    collide into one digest.
+    """
+    config = config or load_embedding_rate_config()
+    aliases = node.get("aliases") or []
+    aliases_text = " ".join(str(item) for item in aliases) if isinstance(aliases, list) else str(aliases)
+    body = body_text if body_text is not None else node.get("raw_text")
+    digest = hashlib.sha256()
+    for part in (
+        node.get("title"),
+        aliases_text,
+        node.get("summary"),
+        body,
+        config.max_chars_per_item,
+        config.max_tokens_per_item,
+    ):
+        digest.update(str(part if part is not None else "").encode("utf-8"))
+        digest.update(b"\x1f")
+    return digest.hexdigest()
+
+
+def stale_embedding_keys(
+    index_data: dict[str, Any],
+    bodies: dict[str, str],
+    config: EmbeddingRateConfig | None = None,
+    recorded: dict[str, str] | None = None,
+) -> set[str]:
+    """Nodes whose stored vector was built from input that no longer matches, or was never stamped.
+
+    Both cases have to be re-embedded: the digest can only be recorded by the same call that
+    writes the vector, so an unstamped row cannot be verified without rebuilding it.  That is
+    deliberate -- stamping the *current* input onto an old vector would assert a provenance the
+    projection never established, which is the same mistake the model marker refuses to make.
+
+    Measured 2026-09-21: re-embedding all 7 175 nodes and diffing bit for bit left 7 172 identical
+    and 3 changed, and the provider is bit-deterministic -- so the 3 were stale inputs, not noise.
+    That is the class this finds, and it was previously findable only by paying for the re-embed.
+    """
+    config = config or load_embedding_rate_config()
+    recorded = db_store.embedding_input_digests() if recorded is None else recorded
+    stale: set[str] = set()
+    for node_key, node in (index_data.get("nodes") or {}).items():
+        if recorded.get(node_key) != embedding_input_digest(node, bodies.get(node_key), config):
+            stale.add(node_key)
+    return stale
 
 
 def embedding_coverage(index_data: dict[str, Any]) -> dict[str, int]:
@@ -185,6 +251,7 @@ def _candidate_items(
     config: EmbeddingRateConfig | None = None,
     bodies: dict[str, str] | None = None,
     body_loader: Callable[[list[str]], dict[str, str]] | None = None,
+    extra_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Nodes that still need a vector, in a stable key order.
 
@@ -192,11 +259,15 @@ def _candidate_items(
     7 974 page bodies -- the periodic sweep -- hands in a loader and only the keys about to
     be embedded are read.  Passing ``bodies`` keeps the whole-corpus behaviour for callers
     that already hold them (the CLI/MCP backfill).
+
+    ``extra_keys`` forces a rebuild of nodes that already have a vector, which is how a stale
+    input is repaired; see :func:`stale_embedding_keys`.
     """
     config = config or load_embedding_rate_config()
     nodes = index_data.get("nodes") or {}
     existing = existing_embedding_ids() if not include_existing else set()
-    pending = [key for key in sorted(nodes) if key not in existing]
+    must_refresh = set(extra_keys or ())
+    pending = [key for key in sorted(nodes) if key not in existing or key in must_refresh]
     if limit is not None:
         pending = pending[: max(1, int(limit))]
     if body_loader is not None and bodies is None:
@@ -204,13 +275,15 @@ def _candidate_items(
     bodies = bodies or {}
     items: list[dict[str, Any]] = []
     for node_key in pending:
+        node = nodes[node_key]
+        digest = embedding_input_digest(node, bodies.get(node_key), config)
         text = embedding_text_for_node(
-            nodes[node_key], max_chars=config.max_chars_per_item, body_text=bodies.get(node_key)
+            node, max_chars=config.max_chars_per_item, body_text=bodies.get(node_key)
         )
         text, tokens = clamp_to_token_budget(text, config.max_tokens_per_item)
         if not text:
             continue
-        items.append({"node_key": node_key, "text": text, "tokens": tokens})
+        items.append({"node_key": node_key, "text": text, "tokens": tokens, "content_digest": digest})
     if limit is not None:
         items = items[: max(1, int(limit))]
     return items
@@ -614,6 +687,7 @@ def embedding_backfill(
     bodies: dict[str, str] | None = None,
     body_loader: Callable[[list[str]], dict[str, str]] | None = None,
     budget_seconds: float | None = None,
+    extra_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """Backfill missing vector embeddings under Gemini RPM/TPM limits.
 
@@ -635,6 +709,7 @@ def embedding_backfill(
         config=config,
         bodies=bodies,
         body_loader=body_loader,
+        extra_keys=extra_keys,
     )
     batches = _batch_items(items, config)
     estimated_tokens = sum(int(item["tokens"]) for item in items)
@@ -688,7 +763,9 @@ def embedding_backfill(
                     client, contents, batch_tokens, config, limiter, budget_seconds=budget_seconds
                 )
                 for item, values in zip(batch, values_list, strict=True):
-                    db_store.upsert_embedding(item["node_key"], values)
+                    db_store.upsert_embedding(
+                        item["node_key"], values, content_digest=item["content_digest"]
+                    )
                     plan["embedded"] += 1
                 consecutive_failures = 0
             except Exception as exc:

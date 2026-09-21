@@ -119,7 +119,11 @@ def _embedding_catch_up(batch_size: int) -> dict:
     if batch_size <= 0:
         return {"candidates": 0, "embedded": 0, "skipped": "disabled by VECTOR_LAKE_CATCHUP_EMBEDDING_BATCH=0"}
 
-    from vector_lake.embedding_scheduler import embedding_backfill, page_bodies_for_keys
+    from vector_lake.embedding_scheduler import (
+        embedding_backfill,
+        page_bodies_for_keys,
+        stale_embedding_keys,
+    )
     from vector_lake.wiki_utils import get_index_path
 
     index_path = get_index_path()
@@ -127,17 +131,28 @@ def _embedding_catch_up(batch_size: int) -> dict:
         return {"candidates": 0, "embedded": 0, "skipped": "index.json not found"}
 
     index_data = json.loads(index_path.read_text(encoding="utf-8"))
+    # A vector can be present and still wrong: nothing deletes it when a page is rewritten by a
+    # path that bypasses the incremental index, or when a full rebuild changes the aliases and
+    # summary the embedding text is built from.  Coverage alone therefore does not say whether the
+    # projection is current, so every sweep also compares each node's recorded input digest with
+    # the input it would use now.  That pass is one body scan plus one digest per node -- measured
+    # at 0.39 s for 7 175 nodes on 2026-09-21 -- which is why it runs every sweep rather than on a
+    # slower cadence of its own.
+    bodies = page_bodies_for_keys(list((index_data.get("nodes") or {}).keys()))
+    stale = stale_embedding_keys(index_data, bodies)
     plan = embedding_backfill(
         index_data,
         dry_run=False,
         limit=batch_size,
-        body_loader=page_bodies_for_keys,
+        bodies=bodies,
+        extra_keys=stale,
         budget_seconds=embedding_budget_seconds(),
     )
     return {
         "candidates": plan.get("candidates", 0),
         "embedded": plan.get("embedded", 0),
         "failed_batches": plan.get("failed_batches", 0),
+        "stale_inputs": len(stale),
         "skipped": plan.get("skipped", ""),
         "coverage_after": plan.get("coverage_after") or plan.get("coverage_before") or {},
     }
@@ -204,7 +219,10 @@ def describe(summary: dict) -> str:
     if embeddings.get("skipped"):
         vectors = f"skipped({embeddings['skipped']})"
     else:
-        vectors = f"+{embeddings.get('embedded', 0)} missing={coverage.get('missing', '?')}"
+        vectors = (
+            f"+{embeddings.get('embedded', 0)} missing={coverage.get('missing', '?')}"
+            f" stale_inputs={embeddings.get('stale_inputs', 0)}"
+        )
     parts = [
         f"markers_released={summary.get('markers_released', 0)}",
         f"expired={summary['expired']}",

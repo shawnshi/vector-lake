@@ -203,30 +203,39 @@ def rebuild_index_projection(dry_run: bool = True) -> str:
 
 
 def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None, include_existing: bool = False) -> str:
-    """Backfill missing vec_embeddings rows under rate limits without rebuilding index.json."""
-    from vector_lake.embedding_scheduler import embedding_backfill
+    """Backfill vectors that are missing, or that were built from input that has since changed.
+
+    Coverage alone does not decide the candidate set any more: a vector can be present and stale,
+    so the same input digest the periodic sweep compares is compared here too.  ``--include-existing``
+    still means "rebuild everything", which is the force path when the ledger is absent or the
+    model changed.
+    """
+    from vector_lake.embedding_scheduler import (
+        embedding_backfill,
+        page_bodies_for_keys,
+        stale_embedding_keys,
+    )
 
     index_path = get_index_path()
     if not index_path.exists():
         return "index.json not found; run projection-rebuild-index first."
+    # The input ledger is a newer table than most databases; converge the schema before reading it
+    # rather than reading its absence as "every node is unstamped", which would turn one call into
+    # a whole-corpus re-embed.
+    init_db()
     index_data = json.loads(index_path.read_text(encoding="utf-8"))
-    # index.json no longer carries page bodies, so the embedding corpus is taken
-    # from canonical SQLite keyed by page_key.
-    bodies = {}
-    page_key = "f_page_key"
-    for row in get_connection().execute(
-        f"SELECT {page_key} AS page_key, data_json FROM entities WHERE {page_key} IS NOT NULL"
-    ):
-        try:
-            bodies[row["page_key"]] = str(json.loads(row["data_json"]).get("raw_text") or "")
-        except (json.JSONDecodeError, TypeError):
-            continue
+    # index.json no longer carries page bodies, so the embedding corpus is taken from canonical
+    # SQLite keyed by page_key -- through the same reader the sweep uses, so the digest written
+    # here is the digest the sweep will compare against.
+    bodies = page_bodies_for_keys(list((index_data.get("nodes") or {}).keys()))
+    stale_inputs = stale_embedding_keys(index_data, bodies)
     result = embedding_backfill(
         index_data,
         dry_run=dry_run,
         limit=limit,
         include_existing=include_existing,
         bodies=bodies,
+        extra_keys=stale_inputs,
     )
     before = result.get("coverage_before") or {}
     after = result.get("coverage_after") or before
@@ -240,6 +249,7 @@ def embedding_backfill_projection(dry_run: bool = True, limit: int | None = None
         f"estimated_tokens: {result.get('estimated_tokens')}",
         f"max_chars_per_item: {result.get('max_chars_per_item')} max_tokens_per_item: {result.get('max_tokens_per_item')}",
         f"coverage_before: nodes={before.get('nodes')} embedded={before.get('embedded')} missing={before.get('missing')} stale={before.get('stale')}",
+        f"stale_inputs: {len(stale_inputs)}",
     ]
     if not dry_run:
         lines.append(f"embedded_this_run: {result.get('embedded')}")
