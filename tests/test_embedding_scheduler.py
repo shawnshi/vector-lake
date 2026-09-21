@@ -1,6 +1,6 @@
 import pytest
 
-from vector_lake import db_store, indexer
+from vector_lake import db_store, indexer, periodic_catch_up
 from types import SimpleNamespace
 
 from filelock import FileLock
@@ -214,6 +214,12 @@ def test_rate_limiter_uses_shared_sqlite_window(isolated_memory, monkeypatch):
     assert [(row["reserved_at"], row["token_count"]) for row in rows] == [(1060.1, 10)]
 
 
+def _stored_vector_count(node_key: str) -> int:
+    return db_store.get_connection().execute(
+        "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = ?", (node_key,)
+    ).fetchone()[0]
+
+
 def test_incremental_index_invalidates_stale_vector_without_api(isolated_memory, monkeypatch):
     _purpose(isolated_memory)
     execute_mutation_plan("Source_Changed.md", content=_source_content("source_changed", "Old Title"))
@@ -232,6 +238,60 @@ def test_incremental_index_invalidates_stale_vector_without_api(isolated_memory,
     assert db_store.get_connection().execute(
         "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = 'Source_Changed'"
     ).fetchone()[0] == 0
+
+
+def test_the_periodic_sweep_restores_a_vector_the_incremental_index_dropped(isolated_memory, monkeypatch):
+    """The counterpart the contract test above *assumed* existed.
+
+    Measured on the live lake 2026-09-21: 4 573 of 7 175 nodes had no vector, and all 4 573
+    were pages rewritten on or after 2026-09-16 -- i.e. every page the incremental path had
+    touched.  ``embedding_backfill`` existed the whole time, but as a manual CLI/MCP call, so
+    the projection only ever shrank.
+    """
+    _purpose(isolated_memory)
+    execute_mutation_plan("Source_Changed.md", content=_source_content("source_changed", "Old Title"))
+    indexer.generate_index()
+    db_store.upsert_embedding("Source_Changed", [1.0] * 3072)
+    execute_mutation_plan("Source_Changed.md", content=_source_content("source_changed", "New Title"))
+    indexer.update_index_items(["Source_Changed.md"])
+    assert _stored_vector_count("Source_Changed") == 0
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    requested: list[list[str]] = []
+
+    def _record(client, contents, tokens, config, limiter, **kwargs):
+        requested.append(list(contents))
+        return [[1.0] * config.dimension for _ in contents]
+
+    monkeypatch.setattr(embedding_scheduler, "_request_embeddings", _record)
+
+    summary = periodic_catch_up.catch_up_once()
+
+    assert summary["embeddings"]["embedded"] == 1, summary["embeddings"]
+    assert _stored_vector_count("Source_Changed") == 1
+    assert requested, "the sweep never asked the provider for a vector"
+    # Rebuilt from the rewritten page, not resurrected: the title is the one just written.
+    assert any("New Title" in text for text in requested[0]), requested[0]
+
+
+def test_the_sweep_does_not_call_the_provider_when_coverage_is_complete(isolated_memory, monkeypatch):
+    """A 15-minute loop must be free when the projection is whole."""
+    _purpose(isolated_memory)
+    execute_mutation_plan("Source_Only.md", content=_source_content("source_only", "Only Page"))
+    indexer.generate_index()
+    db_store.upsert_embedding("Source_Only", [1.0] * 3072)
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        embedding_scheduler,
+        "_request_embeddings",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sweep embedded a complete corpus")),
+    )
+
+    summary = periodic_catch_up.catch_up_once()
+
+    assert summary["embeddings"]["embedded"] == 0
+    assert summary["embeddings"]["coverage_after"]["missing"] == 0
 
 
 def test_start_embedding_run_marks_crashed_run_abandoned(isolated_memory, monkeypatch):

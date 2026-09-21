@@ -18,6 +18,7 @@ operator would, on a timer, and reports what they did.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -33,6 +34,10 @@ DEFAULT_INTERVAL_SECONDS = 900
 DEFAULT_FIRST_DELAY_SECONDS = 30
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_STALE_TASK_MAX_AGE_SECONDS = 86400
+#: Nodes the vector sweep may re-embed per run.  The incremental index path invalidates a
+#: page's vector on every rewrite, so the sweep has to keep up with ingest traffic without
+#: holding the loop for minutes; ``0`` disables the sweep.
+DEFAULT_EMBEDDING_BATCH_SIZE = 200
 
 
 def _declare_finished(name: str, reason: str) -> None:
@@ -70,21 +75,75 @@ def stale_task_max_age_seconds() -> int:
         return DEFAULT_STALE_TASK_MAX_AGE_SECONDS
 
 
+def embedding_batch_size() -> int:
+    raw = str(os.environ.get("VECTOR_LAKE_CATCHUP_EMBEDDING_BATCH", "")).strip()
+    if not raw:
+        return DEFAULT_EMBEDDING_BATCH_SIZE
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        log.warning("Ignoring unparsable VECTOR_LAKE_CATCHUP_EMBEDDING_BATCH=%r", raw)
+        return DEFAULT_EMBEDDING_BATCH_SIZE
+
+
+def _embedding_catch_up(batch_size: int) -> dict:
+    """Re-embed pages whose vector the incremental index path invalidated.
+
+    ``indexer.update_index_items`` drops a page's vector the moment the page is rewritten and,
+    by contract, never calls an embedding provider (pinned by
+    ``test_incremental_index_invalidates_stale_vector_without_api``).  The intended
+    counterpart was "explicit backfill" -- a manual CLI/MCP call -- so nothing ever put the
+    vector back, and the projection only shrank.  Measured 2026-09-21: 4 573 of 7 175 nodes
+    had no vector, and those 4 573 were exactly the pages rewritten on or after 2026-09-16;
+    every page untouched before that date still had one.
+
+    This is that missing counterpart.  It reuses the rate-limited backfill, so the RPM/TPM
+    window, the ``GEMINI_API_KEY`` guard and the single-writer ``.embedding-backfill.lock``
+    all still apply, and an operator-run backfill in flight simply makes this sweep skip.
+    """
+    if batch_size <= 0:
+        return {"candidates": 0, "embedded": 0, "skipped": "disabled by VECTOR_LAKE_CATCHUP_EMBEDDING_BATCH=0"}
+
+    from vector_lake.embedding_scheduler import embedding_backfill, page_bodies_for_keys
+    from vector_lake.wiki_utils import get_index_path
+
+    index_path = get_index_path()
+    if not index_path.exists():
+        return {"candidates": 0, "embedded": 0, "skipped": "index.json not found"}
+
+    index_data = json.loads(index_path.read_text(encoding="utf-8"))
+    plan = embedding_backfill(
+        index_data,
+        dry_run=False,
+        limit=batch_size,
+        body_loader=page_bodies_for_keys,
+    )
+    return {
+        "candidates": plan.get("candidates", 0),
+        "embedded": plan.get("embedded", 0),
+        "failed_batches": plan.get("failed_batches", 0),
+        "skipped": plan.get("skipped", ""),
+        "coverage_after": plan.get("coverage_after") or plan.get("coverage_before") or {},
+    }
+
+
 def catch_up_once(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_age_seconds: int | None = None,
+    embedding_batch: int | None = None,
 ) -> dict:
     """Run one recovery sweep and return what it did.
 
-    Both halves are independent and each is contained: a failure to expire must not stop the
-    scan, and vice versa.  The scan is the same call the raw watcher makes, so an in-flight
-    source is still skipped and concurrent enqueue is still prevented.
+    The halves are independent and each is contained: a failure to expire must not stop the
+    scan, and neither must stop the vector sweep.  The scan is the same call the raw watcher
+    makes, so an in-flight source is still skipped and concurrent enqueue is still prevented.
     """
     from vector_lake import tool_ingest
     from vector_lake.db_store import expire_stale_subagent_jobs
 
     age = stale_task_max_age_seconds() if max_age_seconds is None else int(max_age_seconds)
-    summary = {"expired": 0, "enqueued": "", "markers_released": 0, "errors": []}
+    embed_batch = embedding_batch_size() if embedding_batch is None else int(embedding_batch)
+    summary = {"expired": 0, "enqueued": "", "markers_released": 0, "embeddings": {}, "errors": []}
 
     try:
         # Markers first: a source whose marker outlived its job is invisible to the scan below,
@@ -112,15 +171,29 @@ def catch_up_once(
         summary["errors"].append(f"scan: {type(exc).__name__}: {exc}")
         log.warning("Catch-up scan failed: %s: %s", type(exc).__name__, exc)
 
+    try:
+        summary["embeddings"] = _embedding_catch_up(embed_batch)
+    except Exception as exc:  # noqa: BLE001 - a provider outage must not stop the other halves
+        summary["embeddings"] = {"candidates": 0, "embedded": 0, "skipped": ""}
+        summary["errors"].append(f"embeddings: {type(exc).__name__}: {exc}")
+        log.warning("Catch-up vector sweep failed: %s: %s", type(exc).__name__, exc)
+
     return summary
 
 
 def describe(summary: dict) -> str:
     """One line for the status surface."""
+    embeddings = summary.get("embeddings") or {}
+    coverage = embeddings.get("coverage_after") or {}
+    if embeddings.get("skipped"):
+        vectors = f"skipped({embeddings['skipped']})"
+    else:
+        vectors = f"+{embeddings.get('embedded', 0)} missing={coverage.get('missing', '?')}"
     parts = [
         f"markers_released={summary.get('markers_released', 0)}",
         f"expired={summary['expired']}",
         f"scan={str(summary['enqueued'])[:80]}",
+        f"vectors={vectors}",
     ]
     if summary["errors"]:
         parts.append("errors=" + "; ".join(summary["errors"])[:160])
@@ -158,7 +231,7 @@ def catch_up_loop(stop_event: threading.Event | None = None) -> None:
 
         state = "processing" if summary["errors"] else "idle"
         write_status(state, 0, 0, "Catch-up: " + describe(summary), "; ".join(summary["errors"])[:200], component=COMPONENT)
-        if summary["expired"] or "enqueued 0" not in str(summary["enqueued"]):
+        if summary["expired"] or "enqueued 0" not in str(summary["enqueued"]) or (summary.get("embeddings") or {}).get("embedded"):
             log.info("Catch-up: %s", describe(summary))
         delay = interval
 

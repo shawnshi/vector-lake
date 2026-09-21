@@ -10,6 +10,7 @@ The scheduler treats embeddings as a resumable projection:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -18,7 +19,7 @@ import time
 import uuid
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from filelock import FileLock, Timeout
 
@@ -135,6 +136,36 @@ def existing_embedding_ids() -> set[str]:
     return {row["entity_id"] for row in conn.execute("SELECT entity_id FROM vec_embeddings")}
 
 
+def page_bodies_for_keys(keys: list[str] | tuple[str, ...]) -> dict[str, str]:
+    """Canonical ``raw_text`` bodies for the given page keys, read in one statement per chunk.
+
+    ``index.json`` no longer carries page bodies, so a candidate's text has to come from
+    SQLite.  Loading every entity body to embed a handful of nodes is what made an automatic
+    backfill unaffordable: the periodic sweep runs every 15 minutes, and the corpus is now
+    7 974 entities.  Chunked ``IN`` lists keep the statement inside SQLite's variable limit
+    while staying a bounded number of round trips.
+    """
+    wanted = [str(key) for key in keys if key]
+    if not wanted:
+        return {}
+    bodies: dict[str, str] = {}
+    conn = db_store.get_connection()
+    for start in range(0, len(wanted), 400):
+        chunk = wanted[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            "SELECT f_page_key AS page_key, data_json FROM entities "
+            f"WHERE f_page_key IN ({placeholders})",
+            chunk,
+        )
+        for row in rows:
+            try:
+                bodies[row["page_key"]] = str(json.loads(row["data_json"]).get("raw_text") or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return bodies
+
+
 def embedding_coverage(index_data: dict[str, Any]) -> dict[str, int]:
     node_keys = set((index_data.get("nodes") or {}).keys())
     existing = existing_embedding_ids()
@@ -153,21 +184,35 @@ def _candidate_items(
     limit: int | None = None,
     config: EmbeddingRateConfig | None = None,
     bodies: dict[str, str] | None = None,
+    body_loader: Callable[[list[str]], dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Nodes that still need a vector, in a stable key order.
+
+    ``body_loader`` is the bounded path: a caller that cannot afford to materialise all
+    7 974 page bodies -- the periodic sweep -- hands in a loader and only the keys about to
+    be embedded are read.  Passing ``bodies`` keeps the whole-corpus behaviour for callers
+    that already hold them (the CLI/MCP backfill).
+    """
     config = config or load_embedding_rate_config()
-    bodies = bodies or {}
+    nodes = index_data.get("nodes") or {}
     existing = existing_embedding_ids() if not include_existing else set()
+    pending = [key for key in sorted(nodes) if key not in existing]
+    if limit is not None:
+        pending = pending[: max(1, int(limit))]
+    if body_loader is not None and bodies is None:
+        bodies = body_loader(pending)
+    bodies = bodies or {}
     items: list[dict[str, Any]] = []
-    for node_key, node in sorted((index_data.get("nodes") or {}).items()):
-        if node_key in existing:
-            continue
-        text = embedding_text_for_node(node, max_chars=config.max_chars_per_item, body_text=bodies.get(node_key))
+    for node_key in pending:
+        text = embedding_text_for_node(
+            nodes[node_key], max_chars=config.max_chars_per_item, body_text=bodies.get(node_key)
+        )
         text, tokens = clamp_to_token_budget(text, config.max_tokens_per_item)
         if not text:
             continue
         items.append({"node_key": node_key, "text": text, "tokens": tokens})
-        if limit is not None and len(items) >= max(1, int(limit)):
-            break
+    if limit is not None:
+        items = items[: max(1, int(limit))]
     return items
 
 
@@ -567,12 +612,22 @@ def embedding_backfill(
     limit: int | None = None,
     include_existing: bool = False,
     bodies: dict[str, str] | None = None,
+    body_loader: Callable[[list[str]], dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Backfill missing vector embeddings under Gemini RPM/TPM limits."""
+    """Backfill missing vector embeddings under Gemini RPM/TPM limits.
+
+    ``body_loader`` lets a recurring caller embed a bounded batch without reading the whole
+    body corpus; see :func:`_candidate_items`.
+    """
     config = load_embedding_rate_config()
     coverage_before = embedding_coverage(index_data)
     items = _candidate_items(
-        index_data, include_existing=include_existing, limit=limit, config=config, bodies=bodies
+        index_data,
+        include_existing=include_existing,
+        limit=limit,
+        config=config,
+        bodies=bodies,
+        body_loader=body_loader,
     )
     batches = _batch_items(items, config)
     estimated_tokens = sum(int(item["tokens"]) for item in items)

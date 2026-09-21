@@ -1239,7 +1239,15 @@ def update_index_items(filenames: list[str]):
                                         t_text,
                                         content_hash=_node_content_digest(node_data, body_text),
                                     )
-                                    # The old vector is now stale; explicit backfill will replace it.
+                                    # The stale vector must not outlive the rewrite, and this path
+                                    # must not call an embedding provider (pinned by
+                                    # ``test_incremental_index_invalidates_stale_vector_without_api``),
+                                    # so invalidation here is deliberate.  The counterpart that puts
+                                    # the vector back is the periodic sweep
+                                    # (``periodic_catch_up._embedding_catch_up``); the old comment
+                                    # promised "explicit backfill", which only ever ran when an
+                                    # operator remembered, and the projection shrank to 2 602 of
+                                    # 7 175 nodes before that was noticed on 2026-09-21.
                                     db_store.delete_embedding(node_key)
                                     
     
