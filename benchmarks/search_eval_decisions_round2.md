@@ -128,6 +128,23 @@ retryDelay: 5s / 23s / 56s（三次不同）
    **→ 已执行：d2 `google/gemini-3.5-flash` 5/5 分片失败，已换为 `openai-codex/gpt-5.6-luna`（输出 `labels_r2_d2b_s*`）。**
 4. 任何情况下不因为限流而降低判定质量（不缩池、不缩片、不改判定标准）。
 
+### 事故与协议修正（2026-09-21）
+
+**事实**：`benchmarks/search_eval_labels.jsonl`（第一批已闭合记录，HEAD 40 行）在本次运行中被**改写为 76 行**。已 `git checkout --` 回滚（现为 40 行），覆盖版本留档于 `scratch/INCIDENT_forked_child_overwrote_round1_labels.jsonl`。
+
+**原因**：本次 15 个判定 child 跑在 **`context: fork`**（继承父会话上下文），不是 fresh。证据在 d2-s4 的推理轨迹里：它没有做自己的分片判定，而是复述并执行**父代理的编排计划**——“the user asked to 继续处理 … the next step (step 3) is to run the evaluation and produce a verdict”，并计划改写第一批标注文件与 `analyze_judge_c.py`。另一个 child（d1-s5）也在复述父会话的进度判断。
+
+fork 上下文同时造成两个后果：
+1. **判定独立性被污染** —— child 知道本实验的假设与历史结果，不再是只看到盲判池的判定者；
+2. **角色混淆** —— 带 `write` 权限的 child 会去执行父代理的计划，而不是它被分派的那一个任务。
+
+**协议修正（强制，适用于以后所有判定批）**：
+1. 判定 child **必须 `context: "fresh"`**。任务文本已自带完整判定标准与格式要求，不依赖继承上下文；fresh 同时消除上述两种后果。
+2. 判定 child 的输出路径一律限于 `scratch/` 且以 `labels_*` 前缀，**禁止其触碰 `benchmarks/`**。
+3. 每批结束后父代理必须 `git status` 核对仓库：**任何非父代理写入的改动都按事故处理**：回滚、留档、记录。
+
+**本次运行的处置**：p（3/5）与 d1（4/5）已落盘的分片、d2（0/5，配额）、d2b（发现事故后主动停止，0/5）**均不作决策依据**，只作流程诊断。三位判定者将以 fresh 上下文重跑。
+
 ## 待确认（两处，其余按上面执行）
 
 1. **样本量**：300 条新查询 + 最小效应 +0.05（推荐，自洽），还是 150 条 + +0.07？
