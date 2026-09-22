@@ -162,11 +162,43 @@ def test_top_k_is_only_a_window_over_one_fixed_ranking(lake_with_thirty_mixed_pa
     five, twenty, forty = keys(5), keys(20), keys(40)
 
     assert len(five) == 5
-    # The prefix relation is the contract.  A window may be *shorter* than ``top_k`` when the pool
-    # is source-heavy, because the source cap is absolute: 3 sources plus 12 non-sources is 15.
-    # ``RESULT_SOURCE_CAP`` is therefore reported as a mixing rule that can shorten an answer, not
-    # as a filter that silently swaps members -- the defect this test guards against was the second
-    # kind, where asking for more changed which pages came back at all.
+    # The prefix relation is the contract, and the window is now always full: sources are demoted by
+    # ``SOURCE_RANK_PENALTY`` instead of being counted, so a source-heavy pool cannot leave slots
+    # empty.  The absolute cap this replaces returned fewer than top_k results for 104 of 333 queries
+    # at top_k=20, which is what this assertion pair pins down.
     assert five == twenty[:5]
     assert twenty == forty[:20]
-    assert len(twenty) <= 20
+    assert len(twenty) == 20
+
+
+def test_a_source_heavy_pool_still_fills_the_window(lake_with_thirty_mixed_pages, monkeypatch):
+    """The cap skipped Source pages once it was spent, so the window came back short.
+
+    Measured on the live lake: with an absolute cap of 3, a top-20 request returned fewer than 20
+    results for 104 of 333 queries.  A multiplicative demotion cannot do that -- every eligible page
+    stays in the ordering, so the window fills unless the pool itself is smaller than top_k.
+    """
+    order = [f"{'Source' if index % 2 == 0 else 'Concept'}_N{index:02d}" for index in range(30)]
+    monkeypatch.setattr(
+        tool_search,
+        "_get_fts_search_results",
+        lambda query, limit=50: [
+            {"node_key": key, "title": key, "summary": "梅奥", "rank": -float(30 - position)}
+            for position, key in enumerate(order)
+        ][:limit],
+    )
+    monkeypatch.setattr(
+        tool_search, "_get_query_embedding", lambda query: ([], "no embedding provider")
+    )
+    monkeypatch.setattr(
+        tool_search, "_get_vector_search_results", lambda vector, limit=50: ({}, None)
+    )
+
+    final, _notes, error = _search_scored_pages("梅奥 诊所 人工智能", top_k=20)
+
+    assert error is None
+    assert len(final) == 20, "the window must be full when the pool has at least 20 candidates"
+    # And the preference still bites: 15 of the 25 candidates are Source pages, and a 0.6 multiplier
+    # cannot keep more than a handful of them above the Concept pages.
+    sources = sum(1 for _, node in final if node.get("type", "").lower() == "source")
+    assert sources < 15

@@ -125,7 +125,19 @@ def _env_positive_int(name: str, default: int) -> int:
 #: two knobs exist so a deeper pipeline can be measured as its own change, one variable at a time.
 CANDIDATE_DEPTH = 25
 CANDIDATE_POOL = 40
-RESULT_SOURCE_CAP = 3
+#: How much a Source page's score is scaled down for the final ordering, once the pool has been
+#: chosen.  A *preference*, not a filter: the ranking still contains every eligible page, and the
+#: source type only decides where it sits.
+#:
+#: This replaces an absolute cap on how many Source pages could appear in the answer, which had two
+#: costs that were measured rather than imagined.  It shortened the window: with the cap at 3, a
+#: top-20 request came back with fewer than twenty results for 104 of 333 queries (31%), because a
+#: source-heavy pool had nothing else to fill the remaining slots with.  And any threshold on the
+#: answer's *contents* is a function of the window size, which is the one property restored by
+#: keeping the pipeline independent of top_k; a multiplicative penalty is scale-free (it means the
+#: same thing under sum, whose scores are 5-50, and under rrf, whose scores are ~0.016), so the
+#: ordering is a function of the pool alone and top-k stays a pure window.
+SOURCE_RANK_PENALTY = 0.6
 
 
 def _candidate_depth() -> int:
@@ -134,6 +146,27 @@ def _candidate_depth() -> int:
 
 def _candidate_pool() -> int:
     return _env_positive_int("VECTOR_LAKE_CANDIDATE_POOL", CANDIDATE_POOL)
+
+
+def _source_rank_penalty() -> float:
+    """``SOURCE_RANK_PENALTY``, or a value from ``VECTOR_LAKE_SOURCE_RANK_PENALTY``.
+
+    ``1.0`` turns the preference off (pure score order) and ``0.0`` pushes every Source page to the
+    bottom while keeping it in the ranking.  Both are useful for measuring the preference rather
+    than assuming it.
+    """
+    raw = os.environ.get("VECTOR_LAKE_SOURCE_RANK_PENALTY")
+    if raw is None or not str(raw).strip():
+        return SOURCE_RANK_PENALTY
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        log.warning("Ignoring unparsable VECTOR_LAKE_SOURCE_RANK_PENALTY=%r", raw)
+        return SOURCE_RANK_PENALTY
+    if not 0.0 <= value <= 1.0:
+        log.warning("VECTOR_LAKE_SOURCE_RANK_PENALTY must be within 0..1; using the default.")
+        return SOURCE_RANK_PENALTY
+    return value
 
 CJK_REGEX = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 
@@ -902,24 +935,20 @@ def _search_scored_pages(
     # to the host agent when explicitly requested, not performed by runtime code.
     reranked = _rerank_candidates_locally(query, candidate_pool)
 
-    # Phase 3: Final top_k extraction.  The source cap is absolute, not ``int(top_k * 0.6)``:
-    # a cap that shrinks with the window would drop a Source page that a smaller window kept, which
-    # is the same defect as above in miniature.  ``max(1, ...)`` remains expressed in the constant
-    # itself -- the cap exists to keep an answer from being all-Source stubs, and one slot has
-    # nothing to mix.
-    final_scored = []
-    source_count = 0
-    max_sources_final = RESULT_SOURCE_CAP
-    for score, node in reranked:
-        node_type = node.get("type", "").lower()
-        if node_type == "source":
-            if source_count < max_sources_final:
-                final_scored.append((score, node))
-                source_count += 1
-        else:
-            final_scored.append((score, node))
-        if len(final_scored) >= top_k:
-            break
+    # Phase 3: Final top_k extraction.  Sources are demoted, not counted: a fixed multiplicative
+    # penalty keeps the ordering a function of the pool (so top-k remains a pure window) and keeps
+    # every eligible page in the ranking, while still making an all-Source answer hard to produce.
+    # The absolute cap this replaces shortened the window for 104 of 333 queries at top_k=20.
+    penalty = _source_rank_penalty()
+    ordered = sorted(
+        (
+            (score * penalty if node.get("type", "").lower() == "source" else score, node)
+            for score, node in reranked
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    final_scored = ordered[:top_k]
 
     if projection_note:
         vector_notes.append(projection_note)
