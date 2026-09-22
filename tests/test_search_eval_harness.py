@@ -88,10 +88,15 @@ def test_compare_refuses_to_compare_a_run_with_itself(tmp_path, capsys):
 
 def test_compare_says_so_when_nothing_moved_across_different_configs(tmp_path, capsys):
     """Forty ties under two configs is worth a warning, because it is also how a pinned harness looks."""
-    digest = harness.query_digest("q")
-    same = {"per_query": {digest: {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0}}}
-    left = _write(tmp_path / "a.json", {"fusion": "sum"}, same)
-    right = _write(tmp_path / "b.json", {"fusion": "rrf"}, same)
+    labels = _labels_file(tmp_path)
+    pinned = {"labels": str(labels), "labels_sha256": harness.file_sha256(labels)}
+    # A confirmable universe needs a query whose label set is non-empty *and* which the run scored,
+    # so the shared digest is the one the label file actually marks relevant.
+    digest = harness.query_digest("has-pages")
+    same = {"judged": 1,
+            "per_query": {digest: {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0}}}
+    left = _write(tmp_path / "a.json", {"fusion": "sum", **pinned}, same)
+    right = _write(tmp_path / "b.json", {"fusion": "rrf", **pinned}, same)
 
     harness.compare(left, right, 5)
 
@@ -142,12 +147,14 @@ def test_compare_refuses_two_runs_over_different_corpora(tmp_path, capsys):
 
 
 def test_runs_without_a_recorded_corpus_still_compare(tmp_path):
-    """Old run files predate the field; refusing them would refuse the record they came from."""
-    digest = harness.query_digest("q")
+    """Old run files predate the corpus field; refusing them would refuse the record they came from."""
+    labels = _labels_file(tmp_path)
+    pinned = {"labels": str(labels), "labels_sha256": harness.file_sha256(labels)}
+    digest = harness.query_digest("has-pages")
     per = {digest: {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0}}
     metrics = {"judged": 1, "per_query": per}
-    left = _write(tmp_path / "a.json", {"fusion": "sum"}, metrics)
-    right = _write(tmp_path / "b.json", {"fusion": "rrf"}, metrics)
+    left = _write(tmp_path / "a.json", {"fusion": "sum", **pinned}, metrics)
+    right = _write(tmp_path / "b.json", {"fusion": "rrf", **pinned}, metrics)
 
     assert harness.compare(left, right, 5) == 0
 
@@ -210,15 +217,15 @@ def test_the_rule_constants_come_from_the_card():
 
 
 def test_the_card_records_which_gates_are_reported_and_not_required(tmp_path):
-    """The sign test and the SD-unit threshold are lines, not verdicts, and the card says so."""
+    """The sign test and the absolute effect bar are lines; the SD bar is the effect gate from 1.2."""
     card = json.loads(harness.RULE_PATH.read_text(encoding="utf-8"))
 
-    assert card["gates"]["primary_mean_difference"]["role"] == "gate"
+    assert card["gates"]["primary_mean_difference"]["role"] == "report_only"
     assert card["gates"]["bootstrap_ci"]["role"] == "gate"
     assert card["gates"]["secondary_metrics"]["role"] == "gate"
     assert card["gates"]["minimum_sample"]["role"] == "gate"
     assert card["gates"]["sign_test"]["role"] == "report_only"
-    assert card["gates"]["primary_mean_difference_sd"]["role"] == "report_only"
+    assert card["gates"]["primary_mean_difference_sd"]["role"] == "gate"
 
 
 def test_a_missing_rule_card_fails_closed(tmp_path):
@@ -261,17 +268,23 @@ def test_the_decision_reports_every_denominator_next_to_the_gate():
     assert sample.strip().startswith("FAIL")  # 3 < 300, however the three are counted
 
 
-def test_the_sd_unit_line_is_reported_and_does_not_decide():
-    """An absolute bar is not comparable across query compositions; that is a line, not a gate."""
+def test_the_sd_unit_line_decides_and_the_absolute_bar_reports():
+    """1.2: an absolute bar is not comparable across compositions, so the SD bar decides.
+
+    +0.30..0.40 gives a mean of +0.35 and an SD near 0.05, about +7 SD -- past the registered +0.30.
+    The absolute line is now the one that only reports.
+    """
     diffs = [0.30, 0.35, 0.40]
     lines = harness._decision(diffs, [[0.2, 0.2, 0.2]], {"judged": 3, "confirmable": 3, "discordant": 3})
 
     sd_line = [line for line in lines if "SD units" in line][0]
-    assert sd_line.strip().startswith("(report-only)")
-    assert "PASS" not in sd_line and "FAIL" not in sd_line
-    # And the verdict is what it was before the line existed.
+    assert sd_line.strip().startswith("PASS")
+    absolute_line = [line for line in lines if "absolute" in line and "SD units" not in line][0]
+    assert absolute_line.strip().startswith("(report-only)")
+    # Five comparable lines: the SD bar, the CI, the secondary metrics, the sample gate and the
+    # confirmable floor (registered at 100 in 1.2, so it is no longer inert).
     comparable = [line for line in lines if line.strip().startswith(("PASS", "FAIL"))]
-    assert len(comparable) == 4
+    assert len(comparable) == 5
 
 
 def test_compare_refuses_two_runs_under_different_rule_cards(tmp_path, capsys):
@@ -345,13 +358,13 @@ def test_a_registered_confirmable_floor_is_actually_read(monkeypatch):
     monkeypatch.setattr(harness, "MIN_CONFIRMABLE_QUERIES", 150)
     with_floor = harness._decision(diffs, [[0.1, 0.1, 0.0]], counts)
 
-    assert not any("confirmable queries" in line for line in without)
-    floor_line = [line for line in with_floor if "confirmable queries" in line][0]
+    assert not any("at least 150 confirmable" in line for line in without)
+    floor_line = [line for line in with_floor if "at least 150 confirmable" in line][0]
     assert floor_line.strip().startswith("FAIL")  # 65 < 150
     assert "(65)" in floor_line
     # And an unverifiable count fails closed rather than being treated as a pass.
     unverifiable = harness._decision(diffs, [[0.1, 0.1, 0.0]], dict(counts, confirmable=None, labels_pin="stale"))
-    assert [line for line in unverifiable if "confirmable queries" in line][0].strip().startswith("FAIL")
+    assert [line for line in unverifiable if "at least 150 confirmable" in line][0].strip().startswith("FAIL")
 
 
 # --- the labels revision is pinned, or said not to be ------------------------------------------
@@ -401,20 +414,14 @@ def test_compare_reports_the_count_but_marks_labels_the_run_did_not_pin(tmp_path
     assert line.endswith("; labels not pinned by the run)"), line
 
 
-def test_compare_withholds_the_count_when_the_labels_moved(tmp_path, capsys):
-    """The verdict lives in the run; the count does not, so an edited file must not renumber it."""
+def test_a_stale_labels_revision_refuses_the_comparison(tmp_path, capsys):
+    """1.2 reads a confirmable universe, so relevance that cannot be verified is refused, not assumed."""
     labels = _labels_file(tmp_path)
     left, right = _pair(tmp_path, {"labels": str(labels), "labels_sha256": "0" * 64})
 
-    harness.compare(left, right, 5)
-    captured = capsys.readouterr()
-
-    line = [row for row in captured.out.splitlines() if "comparison universe" in row][0]
-    assert "confirmable ?" in line
-    assert line.endswith("; labels stale at the recorded path)"), line
-    assert "no longer hash to the revision" in captured.err
-    # The verdict itself is unchanged: the diff is the same and the primary mean still decides.
-    assert "primary mean difference >= registered minimum effect" in captured.out
+    assert harness.compare(left, right, 5) == 2
+    err = capsys.readouterr().err
+    assert "no longer hash to the revision" in err
 
 
 def test_compare_refuses_two_revisions_of_one_label_file(tmp_path, capsys):

@@ -406,6 +406,12 @@ MIN_SAMPLE = int(RULE["gates"]["minimum_sample"]["value"])
 MIN_CONFIRMABLE_QUERIES = (RULE.get("query_construction") or {}).get("min_confirmable_queries")
 MIN_PRIMARY_EFFECT = float(RULE["gates"]["primary_mean_difference"]["value"])
 MIN_PRIMARY_EFFECT_SD = float(RULE["gates"]["primary_mean_difference_sd"]["value"])
+#: Which of the two effect units actually gates.  Read from the card rather than decided here: from
+#: 1.2 the absolute bar is reported and the SD bar gates, because one absolute value is not comparable
+#: across query compositions (0.18 SD on batch 1, 0.41 SD on batch 2).  A future rule change that
+#: moves the role back must not need a code change.
+PRIMARY_EFFECT_ROLE = str(RULE["gates"]["primary_mean_difference"].get("role", "gate"))
+PRIMARY_EFFECT_SD_ROLE = str(RULE["gates"]["primary_mean_difference_sd"].get("role", "report_only"))
 PRIMARY_SIGN_ALPHA = float(RULE["gates"]["sign_test"]["alpha"])
 
 
@@ -476,17 +482,28 @@ def _decision(diffs: list[float], secondary: list[list[float]], counts: dict | N
     ci = _bootstrap_ci(diffs)
     sign = _sign_test(wins, losses) if (wins + losses) else None
     lines = []
-    lines.append(f"  {'PASS' if mean >= MIN_PRIMARY_EFFECT else 'FAIL'}  "
-                 f"primary mean difference >= registered minimum effect  "
-                 f"({mean:+.4f} vs {MIN_PRIMARY_EFFECT:+.2f})")
-    # Report-only on purpose: the card records both units because one absolute bar is not
-    # comparable across query compositions, and this line is what makes that visible when read.
+    # Both units are always printed; the card decides which one decides.  Reading the role instead of
+    # hard-coding it here is what keeps this module an implementation of the rule rather than a second
+    # copy of it -- the failure this whole card exists to prevent.
     ratio = (mean / sd) if sd else 0.0
     bar_in_sd = (MIN_PRIMARY_EFFECT / sd) if sd else 0.0
-    lines.append(f"  (report-only)  primary mean difference in SD units  "
-                 f"({ratio:+.3f} observed; the {MIN_PRIMARY_EFFECT:+.2f} absolute bar is "
-                 f"{bar_in_sd:+.3f} SD on this composition, registered bar "
-                 f"{MIN_PRIMARY_EFFECT_SD:+.2f} SD)")
+    if PRIMARY_EFFECT_ROLE == "gate":
+        lines.append(f"  {'PASS' if mean >= MIN_PRIMARY_EFFECT else 'FAIL'}  "
+                     f"primary mean difference >= registered minimum effect  "
+                     f"({mean:+.4f} vs {MIN_PRIMARY_EFFECT:+.2f})")
+    else:
+        lines.append(f"  (report-only)  primary mean difference >= {MIN_PRIMARY_EFFECT:+.2f} absolute  "
+                     f"({mean:+.4f})")
+    if PRIMARY_EFFECT_SD_ROLE == "gate":
+        lines.append(f"  {'PASS' if ratio >= MIN_PRIMARY_EFFECT_SD else 'FAIL'}  "
+                     f"primary mean difference >= registered minimum effect in SD units  "
+                     f"({ratio:+.3f} vs {MIN_PRIMARY_EFFECT_SD:+.2f} SD; the {MIN_PRIMARY_EFFECT:+.2f} "
+                     f"absolute bar is {bar_in_sd:+.3f} SD on this composition)")
+    else:
+        lines.append(f"  (report-only)  primary mean difference in SD units  "
+                     f"({ratio:+.3f} observed; the {MIN_PRIMARY_EFFECT:+.2f} absolute bar is "
+                     f"{bar_in_sd:+.3f} SD on this composition, registered bar "
+                     f"{MIN_PRIMARY_EFFECT_SD:+.2f} SD)")
     excluded = ci is not None and ci[0] > 0
     lines.append(f"  {'PASS' if excluded else 'FAIL'}  primary bootstrap 95% CI excludes 0  "
                  f"({'[%+.3f, %+.3f]' % (ci[0], ci[1]) if ci else '-'})")
