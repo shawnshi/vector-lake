@@ -1,0 +1,107 @@
+{
+  "contract_version": "search-eval-rule/1.0",
+  "created_at": "2026-09-22T11:45:00+08:00",
+  "status": "implemented_rule",
+  "retro_application": "This card restates the rule that governed batches 1 and 2, so that it has one implemented home instead of a copy in each decision file and a third in search_replay.py. It changes no verdict: every role below is the role that batch's registration already carried. Any change to a value or a role is a rule change -- register it before the labels it will be read against are collected, and it governs only measurements taken after that date. The two decision files stay the record of what was registered when and of the reasoning; this card is the single implemented source and they cite it.",
+  "history": {
+    "sources": [
+      "benchmarks/search_eval_decisions.md",
+      "benchmarks/search_eval_decisions_round2.md"
+    ],
+    "note": "Batch 1 registered the rule; its 2026-09-21 section added the minimum effect. Batch 2 registered the sample size, demoted the sign test and fixed two drifts between the registration and this module. Neither file restates the whole rule, so a third batch had to stack two deltas by hand to learn what it was being read against."
+  },
+  "primary_metric": "ndcg",
+  "secondary_metrics": ["success", "recall", "reciprocal_rank"],
+  "top_k": 5,
+  "comparison_universe": {
+    "denominator": "judged",
+    "changed_on": null,
+    "allowed": ["judged", "confirmable", "discordant"],
+    "definition": {
+      "judged": "every query that has a label row and a result in both runs. A query whose relevant set is empty still counts, as a zero -- it is a measurement of the retriever, not an absence of one.",
+      "confirmable": "the subset of judged queries whose relevant set is non-empty: the queries where the two arms can differ at all.",
+      "discordant": "the subset of judged queries where the two arms actually differ (wins + losses)."
+    },
+    "applies_to": [
+      "primary mean difference",
+      "bootstrap CI",
+      "sign test",
+      "minimum sample gate"
+    ],
+    "does_not_apply_to": [
+      "per-query level metrics: nDCG@5 and the secondary means are reported over every judged query, because a query with nothing to find still measures the retriever"
+    ],
+    "note": "Batches 1 and 2 were both read under `judged`. On batch 2's label sets that universe carries 268 of 333 (primary) and 271 of 333 (consensus) queries with an empty relevant set, so the same absolute +0.05 is worth ~0.41 SD there against ~0.18 SD on batch 1's composition -- see effect_calibration. Choosing a different denominator is a registered decision that must precede the third batch's labels: it moves the mean and the sample gate in opposite directions (batch 2 primary: +0.0132 over 333 against +0.0675 over the 65 confirmable ones, with 65 failing the 300 sample gate)."
+  },
+  "gates": {
+    "primary_mean_difference": {
+      "role": "gate",
+      "operator": ">=",
+      "value": 0.05,
+      "unit": "absolute nDCG@5, mean of paired differences",
+      "source": "search_eval_decisions.md 规则修正 (2026-09-21), restated in search_eval_decisions_round2.md 3"
+    },
+    "primary_mean_difference_sd": {
+      "role": "report_only",
+      "operator": ">=",
+      "value": 0.25,
+      "unit": "SD of the paired differences",
+      "source": "registered 2026-09-22 as a reported calibration line",
+      "note": "An absolute effect bar is not comparable across query compositions: +0.05 is 0.18 SD on batch 1 and 0.41 SD on batch 2, which is why batch 2 failed a bar its own confirmable subset cleared. Report-only because no registration read it as a gate, and adding one would re-decide a batch that was measured without it."
+    },
+    "bootstrap_ci": {
+      "role": "gate",
+      "operator": "excludes_zero",
+      "confidence": 0.95,
+      "source": "batch 1, kept by batch 2 as the only significance gate"
+    },
+    "sign_test": {
+      "role": "report_only",
+      "alpha": 0.05,
+      "source": "search_eval_decisions_round2.md 3 (demoted from gate)",
+      "note": "It reads only signs and needs ~780 discordant pairs at the observed win rate, so requiring it would fail a run on a condition the registration had already dropped."
+    },
+    "secondary_metrics": {
+      "role": "gate",
+      "operator": "no_regression",
+      "source": "both batches"
+    },
+    "minimum_sample": {
+      "role": "gate",
+      "operator": ">=",
+      "value": 300,
+      "denominator": "judged",
+      "source": "search_eval_decisions_round2.md 3/4",
+      "note": "The line used to read 'confirming queries' while counting judged queries, so it passed on any label set of >=300 judged queries even when none of them had a page to find (batch 2: 65 confirmable). The count is now reported for all three definitions next to the gate."
+    }
+  },
+  "effect_calibration": {
+    "note": "Recorded so a third batch re-derives the bar and the sample against its own composition instead of inheriting numbers that were computed for another one. `empty_relevant` is the share of judged queries that cannot show a difference at all.",
+    "batch_1": {
+      "sample_sd": [0.259, 0.305],
+      "empty_relevant": "3-6 of 76",
+      "bar_in_sd": 0.18
+    },
+    "batch_2_primary": {
+      "sample_sd": 0.1218,
+      "empty_relevant": "268 of 333",
+      "bar_in_sd": 0.41,
+      "confirmable_n": 65,
+      "confirmable_sd": 0.2706,
+      "confirmable_bar_in_sd": 0.185
+    },
+    "batch_2_consensus": {
+      "sample_sd": 0.1032,
+      "empty_relevant": "271 of 333",
+      "bar_in_sd": 0.48,
+      "confirmable_n": 62,
+      "confirmable_sd": 0.2334,
+      "confirmable_bar_in_sd": 0.214
+    }
+  },
+  "query_construction": {
+    "min_new_queries": 300,
+    "min_confirmable_queries": null,
+    "note": "min_confirmable_queries is deliberately null: no batch has registered a floor on how many of its queries must have a page to find, which is how batch 2 came to be read against a power calculation taken from batch 1. Set it in the same registration that fixes comparison_universe.denominator, before the third batch's labels are collected."
+  }
+}

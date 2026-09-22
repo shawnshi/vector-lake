@@ -321,40 +321,137 @@ def _bootstrap_ci(differences: list[float]) -> tuple[float, float, float] | None
     return round(low, 4), round(high, 4), min(non_positive, 1 - non_positive) * 2
 
 
-#: The pre-registered decision rule, from ``benchmarks/search_eval_decisions.md`` -- that file is the
-#: authority and this is its implementation.  Registered before the confirming queries existed, so
-#: the primary metric cannot be chosen after seeing which one passed.
+#: The pre-registered decision rule has one implemented home: ``benchmarks/search_eval_rule.json``.
+#: This module reads it rather than restating it, because the restatement is what drifted twice: the
+#: sample gate sat at batch 1's 60 while batch 2's registration said 300, and the minimum effect was
+#: registered and never implemented.  Both were found by reading the two decision files by hand.
 #:
-#: Two of the registered conditions were recorded in the registrations and never implemented here:
-#:
-#: * the +0.05 minimum effect (``search_eval_decisions.md`` §修正点, then the second batch's §3);
-#:   without it the harness passes a difference of +0.0132 that the registration calls a failure;
-#: * the sign test's demotion to a reported number.  The first batch showed the sign test only reads
-#:   signs, needs ~780 discordant pairs at the observed win rate and is therefore almost impossible
-#:   to pass even when the effect is real, so the second batch made the bootstrap interval the only
-#:   significance gate.  Requiring it here would fail the run on the wrong condition -- and would
-#:   report a failure on a gate the registration no longer has.
+#: The card also names the **comparison universe** (which queries the paired comparison is read
+#: over), because that one field decides a verdict: read over every judged query, batch 2's primary
+#: difference is +0.0132 and fails the +0.05 bar; read over the 65 queries that have a page to find,
+#: it is +0.0675 and passes it, while 65 fails the sample gate.  Both batches were read over
+#: ``judged``, and the card keeps that so no verdict moves retroactively -- see
+#: ``comparison_universe.note`` and ``effect_calibration`` in the card.
 #:
 #: PRIMARY_METRIC is nDCG@5 because it penalises both ways the two fusions trade off (a query's own
 #: page not ranking first, and later relevant pages being pushed out), while MRR sees only the first.
-PRIMARY_METRIC = "ndcg"
-SECONDARY_METRICS = ("success", "recall", "reciprocal_rank")
-MIN_CONFIRMING_QUERIES = 300
-MIN_PRIMARY_EFFECT = 0.05
-PRIMARY_SIGN_ALPHA = 0.05
+#: The sign test is reported and not required: the first batch showed it reads only signs, needs ~780
+#: discordant pairs at the observed win rate, and is therefore almost impossible to pass even when
+#: the effect is real, so the second batch made the bootstrap interval the only significance gate.
+RULE_PATH = REPO / "benchmarks" / "search_eval_rule.json"
 
 
-def _decision(diffs: list[float], secondary: list[list[float]]) -> list[str]:
-    """Evaluate the registered rule.  Returns one line per condition, pass or fail."""
+def load_rule(path: pathlib.Path) -> dict:
+    """Read the rule card, or fail closed.
+
+    A missing or malformed card stops the harness instead of falling back to defaults: thresholds
+    that were guessed are the failure this card exists to prevent, and a silent fallback would also
+    hide a card that no longer matches the code that reads it.
+    """
+    try:
+        rule = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"search eval rule card is missing: {path} ({exc})") from exc
+    except ValueError as exc:
+        raise SystemExit(f"search eval rule card is not valid JSON: {path} ({exc})") from exc
+    required = ("contract_version", "primary_metric", "secondary_metrics", "comparison_universe", "gates")
+    missing = [key for key in required if key not in rule]
+    if missing:
+        raise SystemExit(f"search eval rule card is missing {missing}: {path}")
+    gate_keys = ("primary_mean_difference", "bootstrap_ci", "secondary_metrics", "minimum_sample")
+    absent = [key for key in gate_keys if key not in rule["gates"]]
+    if absent:
+        raise SystemExit(f"search eval rule card is missing gate(s) {absent}: {path}")
+    universe = rule["comparison_universe"]
+    if universe.get("denominator") not in (universe.get("allowed") or []):
+        raise SystemExit(
+            f"search eval rule card declares denominator {universe.get('denominator')!r}, "
+            f"which is not one of {universe.get('allowed')}: {path}"
+        )
+    if rule["gates"]["minimum_sample"].get("denominator") != universe.get("denominator") and \
+            rule["gates"]["minimum_sample"].get("denominator") not in (universe.get("allowed") or []):
+        raise SystemExit(f"search eval rule card sample denominator is unknown: {path}")
+    return rule
+
+
+RULE = load_rule(RULE_PATH)
+RULE_SHA256 = hashlib.sha256(RULE_PATH.read_bytes()).hexdigest()
+RULE_VERSION = str(RULE["contract_version"])
+PRIMARY_METRIC = str(RULE["primary_metric"])
+SECONDARY_METRICS = tuple(RULE["secondary_metrics"])
+COMPARISON_DENOMINATOR = str(RULE["comparison_universe"]["denominator"])
+SAMPLE_DENOMINATOR = str(RULE["gates"]["minimum_sample"]["denominator"])
+MIN_SAMPLE = int(RULE["gates"]["minimum_sample"]["value"])
+MIN_PRIMARY_EFFECT = float(RULE["gates"]["primary_mean_difference"]["value"])
+MIN_PRIMARY_EFFECT_SD = float(RULE["gates"]["primary_mean_difference_sd"]["value"])
+PRIMARY_SIGN_ALPHA = float(RULE["gates"]["sign_test"]["alpha"])
+
+
+def rule_provenance() -> dict:
+    """What ran, recorded in every payload so two runs can be told apart by rule, not only by config."""
+    return {
+        "contract_version": RULE_VERSION,
+        "path": RULE_PATH.relative_to(REPO).as_posix(),
+        "sha256": RULE_SHA256,
+        "comparison_denominator": COMPARISON_DENOMINATOR,
+    }
+
+
+def comparison_universe(
+    per_query: dict,
+    labels: dict[str, set[str]],
+    denominator: str,
+    deltas: dict[str, float] | None = None,
+) -> list[str]:
+    """The queries the paired comparison is read over, per the card's declared denominator.
+
+    ``judged`` is every query with a result in both runs; ``confirmable`` drops the ones whose
+    relevant set is empty, i.e. the queries where no arm could ever differ; ``discordant`` keeps
+    only the queries where the two arms actually differ.  The level metrics in :func:`metrics` do
+    not use this: a query with nothing to find still measures the retriever, which is a different
+    question from whether the two arms differ.
+    """
+    universe = sorted(per_query)
+    if denominator == "judged":
+        return universe
+    if denominator == "confirmable":
+        return [digest for digest in universe if labels.get(digest)]
+    if denominator == "discordant":
+        if deltas is None:
+            raise SystemExit(
+                "the 'discordant' denominator needs the paired differences; call it once both "
+                "runs are scored"
+            )
+        return [digest for digest in universe if abs(deltas.get(digest, 0.0)) > 1e-9]
+    raise SystemExit(f"unknown comparison denominator {denominator!r}; see {RULE_PATH.name}")
+
+
+def _decision(diffs: list[float], secondary: list[list[float]], counts: dict | None = None) -> list[str]:
+    """Evaluate the rule card.  Returns one line per condition, pass or fail.
+
+    ``counts`` carries the three candidate denominators so the sample line can report the ones the
+    gate did not use.  Without it the line still evaluates the gate the run recorded; it just cannot
+    say how many of those queries had a page to find, which is the number the old line named.
+    """
     wins = sum(1 for value in diffs if value > 1e-9)
     losses = sum(1 for value in diffs if value < -1e-9)
     mean = sum(diffs) / len(diffs) if diffs else 0.0
+    variance = sum((value - mean) ** 2 for value in diffs) / (len(diffs) - 1) if len(diffs) > 1 else 0.0
+    sd = math.sqrt(variance)
     ci = _bootstrap_ci(diffs)
     sign = _sign_test(wins, losses) if (wins + losses) else None
     lines = []
     lines.append(f"  {'PASS' if mean >= MIN_PRIMARY_EFFECT else 'FAIL'}  "
                  f"primary mean difference >= registered minimum effect  "
                  f"({mean:+.4f} vs {MIN_PRIMARY_EFFECT:+.2f})")
+    # Report-only on purpose: the card records both units because one absolute bar is not
+    # comparable across query compositions, and this line is what makes that visible when read.
+    ratio = (mean / sd) if sd else 0.0
+    bar_in_sd = (MIN_PRIMARY_EFFECT / sd) if sd else 0.0
+    lines.append(f"  (report-only)  primary mean difference in SD units  "
+                 f"({ratio:+.3f} observed; the {MIN_PRIMARY_EFFECT:+.2f} absolute bar is "
+                 f"{bar_in_sd:+.3f} SD on this composition, registered bar "
+                 f"{MIN_PRIMARY_EFFECT_SD:+.2f} SD)")
     excluded = ci is not None and ci[0] > 0
     lines.append(f"  {'PASS' if excluded else 'FAIL'}  primary bootstrap 95% CI excludes 0  "
                  f"({'[%+.3f, %+.3f]' % (ci[0], ci[1]) if ci else '-'})")
@@ -368,8 +465,13 @@ def _decision(diffs: list[float], secondary: list[list[float]]) -> list[str]:
     ]
     lines.append(f"  {'PASS' if not regressions else 'FAIL'}  no secondary metric regresses  "
                  f"({', '.join(regressions) if regressions else 'none'})")
-    lines.append(f"  {'PASS' if len(diffs) >= MIN_CONFIRMING_QUERIES else 'FAIL'}  "
-                 f"at least {MIN_CONFIRMING_QUERIES} confirming queries  ({len(diffs)})")
+    counts = counts or {}
+    breakdown = " / ".join(
+        f"{name} {counts.get(name, '?')}" for name in ("judged", "confirmable", "discordant")
+    )
+    lines.append(f"  {'PASS' if len(diffs) >= MIN_SAMPLE else 'FAIL'}  "
+                 f"at least {MIN_SAMPLE} {COMPARISON_DENOMINATOR} queries  "
+                 f"({len(diffs)}; {breakdown})")
     return lines
 
 
@@ -395,6 +497,37 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
         print(f"refusing to compare: different corpora ({left_corpus} vs {right_corpus})",
               file=sys.stderr)
         return 2
+    left_rule = (left.get("rule") or {}).get("sha256")
+    right_rule = (right.get("rule") or {}).get("sha256")
+    if left_rule and right_rule and left_rule != right_rule:
+        # Same argument as the corpus gate: a rule card is part of the experiment, and a run read
+        # under a different card was read under a different rule, not under the same one twice.
+        print(f"refusing to compare: the runs were scored under different rule cards "
+              f"({(left.get('rule') or {}).get('contract_version')} vs "
+              f"{(right.get('rule') or {}).get('contract_version')})", file=sys.stderr)
+        return 2
+    left_labels_path = (left.get("config") or {}).get("labels")
+    right_labels_path = (right.get("config") or {}).get("labels")
+    if left_labels_path and right_labels_path and str(left_labels_path) != str(right_labels_path):
+        print(f"refusing to compare: the runs were scored against different label files "
+              f"({left_labels_path} vs {right_labels_path})", file=sys.stderr)
+        return 2
+    labels: dict[str, set[str]] = {}
+    labels_path = left_labels_path or right_labels_path
+    if COMPARISON_DENOMINATOR != "judged":
+        # The declared denominator needs relevance.  Fail closed rather than fall back to the
+        # recorded universe: quietly reading a 'confirmable' rule over every judged query is the
+        # mismatch this card exists to make visible.
+        if not labels_path:
+            print(f"refusing to compare: the rule card declares the '{COMPARISON_DENOMINATOR}' "
+                  f"denominator and neither run recorded the labels it was scored against",
+                  file=sys.stderr)
+            return 2
+        labels = load_labels(pathlib.Path(labels_path))
+        if not labels:
+            print(f"refusing to compare: the '{COMPARISON_DENOMINATOR}' denominator needs the "
+                  f"labels at {labels_path}, and they are empty or unreadable", file=sys.stderr)
+            return 2
     left_per = left["metrics"].get("per_query") or {}
     right_per = right["metrics"].get("per_query") or {}
     shared = sorted(set(left_per) & set(right_per))
@@ -403,35 +536,60 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
               file=sys.stderr)
         return 2
 
+    if not labels and labels_path:
+        # Reported, not gated: how many of these queries could have differed is part of reading the
+        # result, and leaving it out is how a "confirming" gate passed on queries that could not
+        # confirm anything.  A label file that has moved leaves the count '?' rather than blocking a
+        # 'judged' card, which does not need it.
+        labels = load_labels(pathlib.Path(labels_path))
+
+    primary_deltas = {d: right_per[d][PRIMARY_METRIC] - left_per[d][PRIMARY_METRIC] for d in shared}
+    counts = {
+        "judged": len(shared),
+        "confirmable": len(comparison_universe(shared, labels, "confirmable")) if labels else None,
+        "discordant": sum(1 for value in primary_deltas.values() if abs(value) > 1e-9),
+    }
+    universe = comparison_universe(shared, labels, COMPARISON_DENOMINATOR, primary_deltas)
+    if not universe:
+        print(f"refusing to compare: the '{COMPARISON_DENOMINATOR}' comparison universe is empty",
+              file=sys.stderr)
+        return 2
+
     fields = ("success", "recall", "reciprocal_rank", "ndcg")
     print(f"left : {left_path}\n  {json.dumps({k: v for k, v in left['metrics'].items() if k != 'per_query'}, sort_keys=True)}")
     print(f"right: {right_path}\n  {json.dumps({k: v for k, v in right['metrics'].items() if k != 'per_query'}, sort_keys=True)}")
-    print(f"judged queries: {len(shared)}")
+    print(f"rule : {RULE_VERSION} sha256={RULE_SHA256[:12]} denominator={COMPARISON_DENOMINATOR} "
+          f"({rule_provenance()['path']})")
+    print(f"judged queries: {len(shared)}   comparison universe: {COMPARISON_DENOMINATOR} = "
+          f"{len(universe)}   (judged {counts['judged']} / confirmable "
+          f"{counts['confirmable'] if counts['confirmable'] is not None else '?'} / discordant "
+          f"{counts['discordant']})")
     print()
     print(f"{'metric':18} {'left':>8} {'right':>8} {'diff':>9} {'wins':>5} {'losses':>6} {'ties':>5} {'sign p':>7} {'bootstrap 95% CI':>22}")
     for field in fields:
-        diffs = [right_per[d][field] - left_per[d][field] for d in shared]
+        diffs = [right_per[d][field] - left_per[d][field] for d in universe]
         wins = sum(1 for value in diffs if value > 1e-9)
         losses = sum(1 for value in diffs if value < -1e-9)
         ties = len(diffs) - wins - losses
         ci = _bootstrap_ci(diffs)
-        mean_left = sum(left_per[d][field] for d in shared) / len(shared)
-        mean_right = sum(right_per[d][field] for d in shared) / len(shared)
+        mean_left = sum(left_per[d][field] for d in universe) / len(universe)
+        mean_right = sum(right_per[d][field] for d in universe) / len(universe)
         ci_text = f"[{ci[0]:+.3f}, {ci[1]:+.3f}] p={ci[2]:.3f}" if ci else "-"
         sign = _sign_test(wins, losses)
         sign_text = f"{sign:.4f}" if sign is not None else "-"
         print(f"{field:18} {mean_left:8.4f} {mean_right:8.4f} {mean_right - mean_left:+9.4f} "
               f"{wins:5d} {losses:6d} {ties:5d} {sign_text:>7} {ci_text:>22}")
 
-    primary_diffs = [right_per[d][PRIMARY_METRIC] - left_per[d][PRIMARY_METRIC] for d in shared]
+    primary_diffs = [right_per[d][PRIMARY_METRIC] - left_per[d][PRIMARY_METRIC] for d in universe]
     secondary_diffs = [
-        [right_per[d][field] - left_per[d][field] for d in shared] for field in SECONDARY_METRICS
+        [right_per[d][field] - left_per[d][field] for d in universe] for field in SECONDARY_METRICS
     ]
 
     print()
-    print(f"pre-registered decision rule (benchmarks/search_eval_decisions.md,\n"
-          f"  benchmarks/search_eval_decisions_round2.md), primary={PRIMARY_METRIC}:")
-    decision = _decision(primary_diffs, secondary_diffs)
+    print(f"pre-registered decision rule ({rule_provenance()['path']} {RULE_VERSION}; history: "
+          f"benchmarks/search_eval_decisions.md, benchmarks/search_eval_decisions_round2.md), "
+          f"primary={PRIMARY_METRIC}:")
+    decision = _decision(primary_diffs, secondary_diffs, counts)
     for line in decision:
         print(line)
     print(f"  => {'RULE MET: flipping the default is warranted' if all('FAIL' not in l for l in decision) else 'RULE NOT MET: keep the default'}")
@@ -538,6 +696,7 @@ def main() -> int:
               f"this run reads {corpus}; unjudged pages count as not relevant", file=sys.stderr)
     results = run(queries, vectors, args.top_k)
     payload = {
+        "rule": rule_provenance(),
         "config": {
             "fusion": os.environ.get("VECTOR_LAKE_FUSION", "sum"),
             "expansion_quota": os.environ.get("VECTOR_LAKE_EXPANSION_QUOTA", ""),

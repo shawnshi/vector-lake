@@ -184,3 +184,125 @@ def test_labels_without_a_header_report_no_corpus(tmp_path):
     path.write_text('{"query": "q", "relevant": ["A"]}\n', encoding="utf-8")
 
     assert harness.labels_corpus(path) is None
+
+
+# --- the rule card ----------------------------------------------------------------------------
+#
+# The rule used to live in three places: two decision files written as deltas against each other and
+# a third copy in this module.  Two drifts between the copies were found by hand (the sample gate sat
+# at 60 while the registration said 300; the minimum effect was registered and never implemented), so
+# the constants now come from the card and these tests keep that from quietly becoming a fourth copy.
+
+
+def test_the_rule_constants_come_from_the_card():
+    """A literal that disagrees with the card is the drift this replaced."""
+    card = json.loads(harness.RULE_PATH.read_text(encoding="utf-8"))
+
+    assert harness.PRIMARY_METRIC == card["primary_metric"]
+    assert harness.SECONDARY_METRICS == tuple(card["secondary_metrics"])
+    assert harness.COMPARISON_DENOMINATOR == card["comparison_universe"]["denominator"]
+    assert harness.MIN_SAMPLE == card["gates"]["minimum_sample"]["value"]
+    assert harness.MIN_PRIMARY_EFFECT == card["gates"]["primary_mean_difference"]["value"]
+    assert harness.MIN_PRIMARY_EFFECT_SD == card["gates"]["primary_mean_difference_sd"]["value"]
+    assert harness.PRIMARY_SIGN_ALPHA == card["gates"]["sign_test"]["alpha"]
+    assert harness.RULE_VERSION == card["contract_version"]
+    assert harness.RULE_SHA256 == harness.hashlib.sha256(harness.RULE_PATH.read_bytes()).hexdigest()
+
+
+def test_the_card_records_which_gates_are_reported_and_not_required(tmp_path):
+    """The sign test and the SD-unit threshold are lines, not verdicts, and the card says so."""
+    card = json.loads(harness.RULE_PATH.read_text(encoding="utf-8"))
+
+    assert card["gates"]["primary_mean_difference"]["role"] == "gate"
+    assert card["gates"]["bootstrap_ci"]["role"] == "gate"
+    assert card["gates"]["secondary_metrics"]["role"] == "gate"
+    assert card["gates"]["minimum_sample"]["role"] == "gate"
+    assert card["gates"]["sign_test"]["role"] == "report_only"
+    assert card["gates"]["primary_mean_difference_sd"]["role"] == "report_only"
+
+
+def test_a_missing_rule_card_fails_closed(tmp_path):
+    """Guessed thresholds are the failure the card exists to prevent, so absence is fatal."""
+    with pytest.raises(SystemExit):
+        harness.load_rule(tmp_path / "absent.json")
+
+
+def test_a_rule_card_naming_an_unknown_denominator_fails_closed(tmp_path):
+    card = json.loads(harness.RULE_PATH.read_text(encoding="utf-8"))
+    card["comparison_universe"]["denominator"] = "whatever"
+    path = tmp_path / "card.json"
+    path.write_text(json.dumps(card), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        harness.load_rule(path)
+
+
+def test_the_declared_denominator_selects_the_universe():
+    """The one field that decides a verdict has to mean exactly one thing."""
+    judged = {harness.query_digest("has-pages"): {"A"}, harness.query_digest("empty"): set()}
+    per_query = dict.fromkeys(judged, {})
+    deltas = {harness.query_digest("has-pages"): 0.1, harness.query_digest("empty"): 0.0}
+
+    assert harness.comparison_universe(per_query, judged, "judged") == sorted(judged)
+    assert harness.comparison_universe(per_query, judged, "confirmable") == [harness.query_digest("has-pages")]
+    assert harness.comparison_universe(per_query, judged, "discordant", deltas) == [harness.query_digest("has-pages")]
+    with pytest.raises(SystemExit):
+        harness.comparison_universe(per_query, judged, "discordant")
+
+
+def test_the_decision_reports_every_denominator_next_to_the_gate():
+    """`at least 300 confirming queries (333)` named a number it did not count."""
+    diffs = [0.2, 0.0, 0.0]
+    lines = harness._decision(diffs, [[0.1, 0.0, 0.0]], {"judged": 3, "confirmable": 1, "discordant": 1})
+
+    sample = [line for line in lines if "queries" in line][0]
+    assert "judged 3 / confirmable 1 / discordant 1" in sample
+    assert f"at least {harness.MIN_SAMPLE} {harness.COMPARISON_DENOMINATOR} queries" in sample
+    assert sample.strip().startswith("FAIL")  # 3 < 300, however the three are counted
+
+
+def test_the_sd_unit_line_is_reported_and_does_not_decide():
+    """An absolute bar is not comparable across query compositions; that is a line, not a gate."""
+    diffs = [0.30, 0.35, 0.40]
+    lines = harness._decision(diffs, [[0.2, 0.2, 0.2]], {"judged": 3, "confirmable": 3, "discordant": 3})
+
+    sd_line = [line for line in lines if "SD units" in line][0]
+    assert sd_line.strip().startswith("(report-only)")
+    assert "PASS" not in sd_line and "FAIL" not in sd_line
+    # And the verdict is what it was before the line existed.
+    comparable = [line for line in lines if line.strip().startswith(("PASS", "FAIL"))]
+    assert len(comparable) == 4
+
+
+def test_compare_refuses_two_runs_under_different_rule_cards(tmp_path, capsys):
+    """A rule card is part of the experiment, the same way a corpus is."""
+    digest = harness.query_digest("q")
+    per = {digest: {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0}}
+    left = _write(tmp_path / "a.json", {"fusion": "sum", "corpus": "c1"}, {"judged": 1, "per_query": per})
+    right = _write(tmp_path / "b.json", {"fusion": "rrf", "corpus": "c1"}, {"judged": 1, "per_query": per})
+    for path, version in ((left, "search-eval-rule/1.0"), (right, "search-eval-rule/1.1")):
+        payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        payload["rule"] = {"contract_version": version, "sha256": version}
+        pathlib.Path(path).write_text(json.dumps(payload), encoding="utf-8")
+
+    assert harness.compare(left, right, 5) == 2
+    assert "different rule cards" in capsys.readouterr().err
+
+
+def test_compare_fails_closed_when_the_denominator_needs_labels_that_are_not_there(tmp_path, capsys, monkeypatch):
+    """A 'confirmable' card read over every judged query is the mismatch the card makes visible."""
+    digest = harness.query_digest("q")
+    per = {digest: {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0}}
+    left = _write(tmp_path / "a.json", {"fusion": "sum"}, {"judged": 1, "per_query": per})
+    right = _write(tmp_path / "b.json", {"fusion": "rrf"}, {"judged": 1, "per_query": per})
+    monkeypatch.setattr(harness, "COMPARISON_DENOMINATOR", "confirmable")
+
+    assert harness.compare(left, right, 5) == 2
+    assert "recorded the labels" in capsys.readouterr().err
+
+
+def test_the_two_decision_files_cite_the_rule_card():
+    """The card is the implemented source; the decision files are the record of why."""
+    for name in ("search_eval_decisions.md", "search_eval_decisions_round2.md"):
+        text = (REPO / "benchmarks" / name).read_text(encoding="utf-8")
+        assert "search_eval_rule.json" in text, f"{name} does not cite the rule card"
