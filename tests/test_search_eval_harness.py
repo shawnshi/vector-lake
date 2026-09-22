@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 
 import pytest
@@ -444,3 +445,41 @@ def test_compare_warns_when_only_one_side_records_its_labels(tmp_path, capsys):
 
     assert harness.compare(left, right, 5) == 0
     assert "only the left run recorded the labels" in capsys.readouterr().err
+
+
+def test_a_replay_does_not_write_to_the_production_ledger(isolated_memory, monkeypatch):
+    """A replay is a measurement; the ledger is operator traffic.
+
+    Measured before this guard existed: 3071 rows of measurement traffic landed in the live ledger,
+    and every one of its 333 distinct queries was a batch-1 or batch-2 query -- so the ledger claimed
+    to hold operator queries and held none of them.  The guard has to be scoped to the replay, not to
+    ``main()`` (measurement scripts import ``run()`` directly) and not to import time (that turned the
+    ledger off process-wide and broke its own tests).
+    """
+    from vector_lake import search_ledger
+
+    monkeypatch.delenv("VECTOR_LAKE_SEARCH_LEDGER", raising=False)
+    query = "梅奥 诊所 人工智能"
+    vectors = {harness.query_digest(query): [0.0] * 3072}
+
+    harness.run([{"query": query}], vectors, 5)
+
+    assert search_ledger.entries() == []
+    # And it must not leave the switch flipped for the rest of the process.
+    assert os.environ.get("VECTOR_LAKE_SEARCH_LEDGER") is None
+
+
+def test_a_deliberate_ledger_opt_in_survives_a_replay(isolated_memory, monkeypatch):
+    """The guard is a default, not an override: an operator can still record a replay on purpose."""
+    from vector_lake import search_ledger
+
+    monkeypatch.setenv("VECTOR_LAKE_SEARCH_LEDGER", "1")
+    query = "梅奥 诊所 人工智能"
+    vectors = {harness.query_digest(query): [0.0] * 3072}
+
+    harness.run([{"query": query}], vectors, 5)
+
+    assert os.environ["VECTOR_LAKE_SEARCH_LEDGER"] == "1"
+    # The lake is empty in this fixture, so the entry records a search that returned nothing -- that
+    # is still a write, which is the point.
+    assert len(search_ledger.entries()) == 1

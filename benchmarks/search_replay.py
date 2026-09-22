@@ -216,6 +216,16 @@ def run(queries: list[dict], vectors: dict[str, list[float]], top_k: int, fusion
             os.environ.pop("VECTOR_LAKE_FUSION", None)
         else:
             os.environ["VECTOR_LAKE_FUSION"] = fusion
+    #: A replay is a measurement, not operator traffic, so the ledger stays out of it.  This guard
+    #: belongs around the retrieval loop rather than in ``main()`` or at import: ``main()`` is not the
+    #: only entry point (measurement scripts import ``run()`` directly, and doing so wrote 3071 rows --
+    #: all 333 distinct queries in the live ledger were batch-1 or batch-2 queries, so it held no
+    #: operator traffic at all), and setting it at import turned the ledger off process-wide, which
+    #: broke its own tests.  Scoped here, it lasts exactly as long as the replay and leaves an
+    #: explicit ``VECTOR_LAKE_SEARCH_LEDGER=1`` alone.
+    ledger_previous = os.environ.get("VECTOR_LAKE_SEARCH_LEDGER")
+    if ledger_previous is None:
+        os.environ["VECTOR_LAKE_SEARCH_LEDGER"] = "0"
     try:
         results = {}
         for item in queries:
@@ -240,6 +250,8 @@ def run(queries: list[dict], vectors: dict[str, list[float]], top_k: int, fusion
                 os.environ.pop("VECTOR_LAKE_FUSION", None)
             else:
                 os.environ["VECTOR_LAKE_FUSION"] = previous
+        if ledger_previous is None:
+            os.environ.pop("VECTOR_LAKE_SEARCH_LEDGER", None)
 
 
 # --- scoring -----------------------------------------------------------------------------------
@@ -772,10 +784,6 @@ def main() -> int:
 
     if args.compare:
         return compare(args.compare[0], args.compare[1], args.top_k)
-
-    # Evaluation runs must not be mixed into the production ledger, where they would look like
-    # operator queries and inflate the distinct-query count.
-    os.environ.setdefault("VECTOR_LAKE_SEARCH_LEDGER", "0")
 
     queries = load_queries(pathlib.Path(args.queries), args.limit)
     vectors = build_vectors(queries, args.vectors)
