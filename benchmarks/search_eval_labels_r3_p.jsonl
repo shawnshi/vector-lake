@@ -1,0 +1,301 @@
+# corpus 47f13074f363
+{"query": "AI 时代医院数据平台 建设策略", "relevant": ["Concept_平台优先-应用在后", "Concept_平台优先战略", "Concept_新一代医院数据平台", "Source_在AI与可信数据空间驱动下的新一代医院数据平台-定位-框架与建设策略"]}
+{"query": "AI政策全球对比分析 2026-09-19 四种形态 硬法 风险分级", "relevant": ["Source_AI政策全球对比分析-20260919"]}
+{"query": "AI时代医院数据平台建设 架构重构 语义解耦 工程落地", "relevant": ["Source_ai时代医院数据平台建设-20260919"]}
+{"query": "AI算力极权与物理碰撞", "relevant": ["Source_youtube-AI算力极权与物理碰撞的终极碰撞-2026-08-31-c1251585"]}
+{"query": "CETS No.225 欧洲委员会框架公约 OECD UNESCO G7广岛 AISI国际网络 国际层", "relevant": ["Source_AI政策全球对比分析-20260919"]}
+{"query": "CMS Alaska 160 million 21 hospitals AI imaging HIE", "relevant": ["Event_CMS-Alaska-Rural-Health-Technology-20260825"]}
+{"query": "Epic 人工智能 AI 战略", "relevant": ["Source_Epic-Systems-医疗人工智能战略全景解析-20260322-Full", "Source_Epic-Systems医疗人工智能产品演进-生态架构与项目落地全景深度解析"]}
+{"query": "FDA EU AI Act 医疗AI 监管政策 对比", "relevant": ["Concept_合规三难困境", "Source_AI政策全球对比分析-20260919"]}
+{"query": "FHIR", "relevant": ["Standard_FHIR", "Standard_HL7-FHIR"]}
+{"query": "FHIR OMOP 边界 交换 研究 分层", "relevant": ["Source_youtube-真实世界证据的工业级封装-2026-09-02-c168522f"]}
+{"query": "FHIR OMOP 边界 数据模型 分层", "relevant": []}
+{"query": "InterSystems 人工智能 AI 平台", "relevant": ["Source_InterSystems-医疗AI进展与落地20260322"]}
+{"query": "Mayo Clinic AI 梅奥 AI 实践", "relevant": ["Product_ECG-AI", "Source_article-digitalhealthobserve-算力向左-人性向右梅奥诊所的AI实战与现代医院的认知重构-20260822-5d79ab86", "Source_梅奥诊所人工智能应用现状-战略与未来展望", "Vendor_Mayo-Clinic"]}
+{"query": "OMOP", "relevant": ["Concept_OMOP-CDM", "Standard_OMOP-CDM"]}
+{"query": "OMOP 大模型 临床AI 语义层 数据底座 幻觉 确定性", "relevant": ["Concept_OMOP-Common-Data-Model-Ecosystem", "Concept_OMOP强制归宗", "Concept_医疗语义层"]}
+{"query": "OMOP 数据平台 大模型 临床人工智能 语义层", "relevant": ["Concept_OMOP-Common-Data-Model-Ecosystem", "Concept_OMOP强制归宗", "Concept_医疗语义层", "Concept_新一代医院数据平台"]}
+{"query": "WiNEX", "relevant": ["Product_WiNEX"]}
+{"query": "WiNEX 产品 优劣势 竞争力", "relevant": []}
+{"query": "cener", "relevant": ["Vendor_Cerner"]}
+{"query": "reconciliation canonical index", "relevant": ["Concept_Page"]}
+{"query": "shawnshi", "relevant": ["Product_shawnshi-skills", "Source_认知工业化-为-AI-原生时代打造个人-逻辑编译器"]}
+{"query": "vector lake search query timeline", "relevant": []}
+{"query": "winex", "relevant": ["Product_WiNEX"]}
+{"query": "三层联邦架构 编排", "relevant": ["Concept_Three-tier-Reference-Architecture", "Concept_三层联邦架构"]}
+{"query": "中国 人工智能+医疗卫生 实施意见 分级分类 大模型备案 持牌上路", "relevant": ["Concept_医疗卫生大模型备案", "Concept_穿透式监管", "Policy_促进和规范人工智能医疗应用实施意见", "Policy_关于促进和规范人工智能医疗卫生应用发展的实施意见"]}
+{"query": "争议注意力机制 新媒体 品牌", "relevant": ["Concept_争议注意力机制-理论", "Concept_品牌即人-理论", "Source_品牌即人-为什么-不制造争议-才是新媒体时代的最大自杀-2026-06-19"]}
+{"query": "人工智能", "relevant": ["Concept_人工智能2-0", "Concept_人工智能三起两落", "Concept_人工智能系统分类"]}
+{"query": "人工智能 中心 hub 索引 核心", "relevant": ["Concept_AI为中心的数字化转型", "Concept_动态上下文中枢", "Source_AI为中心的数字化转型战略理解"]}
+{"query": "人工智能 政策 立法 治理 AI Act 监管 全球", "relevant": ["Concept_合规三难困境", "Policy_UK-National-AI-Strategy", "Source_AI政策全球对比分析-20260919"]}
+{"query": "人工智能时代对策医院数据平台", "relevant": ["Concept_平台优先-应用在后", "Concept_平台优先战略", "Concept_数据与智能中台", "Concept_新一代医院数据平台"]}
+{"query": "全民健康", "relevant": ["Concept_4128架构", "Concept_健康素养", "Source_十三五-卫生与健康规划", "Source_徐向东等-数字时代全民健康信息平台建设的重点要素分析"]}
+{"query": "全民健康数智化", "relevant": ["Concept_4128架构", "Source_十五五全民健康数智化战略全景蓝图20260414", "Source_卫健委数智健康-4128-规划分析20260507", "Source_徐向东等-数字时代全民健康信息平台建设的重点要素分析"]}
+{"query": "全球 医疗AI 政策 监管 法规 治理", "relevant": ["Concept_合规三难困境", "Policy_ONC-HTI-1-算法透明度规则", "Policy_智能体规范应用实施意见"]}
+{"query": "创业慧康", "relevant": ["Vendor_创业慧康"]}
+{"query": "北京大学人民医院", "relevant": ["Institution_北京大学人民医院"]}
+{"query": "北京大学人民医院 HIS 电子病历 互联互通 智慧医院 评级", "relevant": ["Institution_北京大学人民医院"]}
+{"query": "北京大学人民医院 信息化建设", "relevant": ["Concept_西城区国家医疗高质量建设试点", "Institution_北京大学人民医院"]}
+{"query": "北京大学人民医院 信息化现状", "relevant": ["Institution_北京大学人民医院"]}
+{"query": "北京大学人民医院 数据平台 中台 云原生 系统替换 厂商", "relevant": ["Concept_医疗行业Agent落地"]}
+{"query": "北京大学人民医院 机构定位 核心诉求 信创 评级", "relevant": ["Institution_北京大学人民医院"]}
+{"query": "北京大学人民医院 目讨论 算力 信创支持 卫宁 合作关系 agent", "relevant": ["Concept_医疗行业Agent落地", "Source_北京大学人民医院目讨论"]}
+{"query": "北京大学人民医院目讨论 十个AI项目 端到端闭环 业务价值", "relevant": ["Source_北京大学人民医院目讨论"]}
+{"query": "医疗AI分法域对照表 SaMD 上市前路径 变更管理 PCCP WHO", "relevant": ["Source_医疗AI分法域对照表-20260919"]}
+{"query": "医疗人工智能现状及风险", "relevant": ["Concept_医疗大模型风险分级", "Synthesis_医疗人工智能挑战与应对措施"]}
+{"query": "医院数据平台三阶段推进 一鱼三吃 互联互通 电子病历分级", "relevant": ["Source_ai时代医院数据平台建设-20260919"]}
+{"query": "十五五规划", "relevant": ["Event_十五五医疗数字化", "Policy_上海市十五五规划", "Policy_十五五医疗规划", "Policy_十五五规划-医疗健康", "Source_医疗政策-全民医疗保障-十五五-规划-759a0dc5"]}
+{"query": "卫宁健康", "relevant": ["Event_卫宁健康2025年首亏", "Event_卫宁健康成立AI医疗事业部", "Event_卫宁健康注销式回购与换帅-20260513", "Source_卫宁健康Winning-World-2019成功举办", "Synthesis_WinningHealth", "Vendor_卫宁健康"]}
+{"query": "各国医学人工智能政策 监管 国家战略", "relevant": ["Policy_UK-National-AI-Strategy", "Policy_关于促进和规范人工智能医疗卫生应用发展的实施意见"]}
+{"query": "技术与医疗数字化资讯信号 2026-08-31", "relevant": ["Source_news-intelligence-20260831-briefing-82505650"]}
+{"query": "数智化战略", "relevant": ["Concept_数智化", "Concept_数智北京", "Source_数字化转型三阶段-信息化-数字化-数智化", "Source_数智化融合-逻辑-特征与未来战略"]}
+{"query": "梅奥 Mayo Clinic Platform 平台 架构 去标识 数据", "relevant": ["Product_Mayo-Clinic-Platform", "Source_梅奥诊所人工智能应用现状-战略与未来展望"]}
+{"query": "梅奥AI", "relevant": ["Product_Mayo-Clinic-Platform", "Source_article-digitalhealthobserve-算力向左-人性向右梅奥诊所的AI实战与现代医院的认知重构-20260822-5d79ab86", "Source_梅奥诊所人工智能应用现状-战略与未来展望", "Vendor_Mayo-Clinic"]}
+{"query": "梅奥诊所人工智能实践", "relevant": ["Product_Mayo-Clinic-Platform", "Source_article-digitalhealthobserve-算力向左-人性向右梅奥诊所的AI实战与现代医院的认知重构-20260822-5d79ab86", "Source_梅奥诊所人工智能应用现状-战略与未来展望", "Vendor_Mayo-Clinic"]}
+{"query": "欧盟 AI Act 医疗器械 附录I 高风险 合格评定 公告机构 产能", "relevant": ["Source_AI政策全球对比分析-20260919", "Source_医疗AI分法域对照表-20260919"]}
+{"query": "田宗梅 北京大学人民医院 信息中心 AI落地五大挑战", "relevant": ["Person_田宗梅", "Source_三甲医院如何应对AI落地的五大挑战-这有实战干货"]}
+{"query": "美国医疗人工智能应用现状及挑战", "relevant": ["Source_能写病历-给患者回消息的AI-距离真正-行医-还有多远", "Synthesis_医疗人工智能挑战与应对措施"]}
+{"query": "西城区国家医疗高质量建设试点 北京大学人民医院", "relevant": ["Concept_西城区国家医疗高质量建设试点"]}
+{"query": "语义契约化", "relevant": ["Concept_语义契约化"]}
+{"query": "语义契约化 医院 AI 落地", "relevant": ["Concept_AI-原生医院", "Concept_语义契约化", "Source_OpenAI-Frontier-架构在医疗机构的落地路径与战略切入点-2026-02-08"]}
+{"query": "重庆医科大学附属第二医院 信息化 副院长 信息处", "relevant": []}
+{"query": "阿拉斯加", "relevant": ["Event_CMS-Alaska-Rural-Health-Technology-20260825", "Source_CMS-Alaska-Rural-Health-Technology-20260825", "Source_news-2026Q3-intelligence-20260826-briefing-a9b182bb"]}
+{"query": "韩国 AI基本法 日本 AI推进法 英国 新加坡 美国 联邦 监管 医疗AI", "relevant": ["Source_AI政策全球对比分析-20260919"]}
+{"query": "数字化服务契约层 落地的条件", "relevant": ["Concept_数字化服务契约层"]}
+{"query": "智慧监管新模式 落地的条件", "relevant": ["Concept_智慧监管新模式"]}
+{"query": "如何评估 数字化商业模式创新 的效果", "relevant": ["Concept_数字化商业模式创新", "Concept_数字化收益度量"]}
+{"query": "北京大学人民医院 与 瑞金医院 的边界", "relevant": ["Institution_北京大学人民医院", "Institution_瑞金医院"]}
+{"query": "如何评估 思考路径数据 的效果", "relevant": ["Concept_思考路径数据"]}
+{"query": "医院如何落实 ONC HTI-1 算法透明度与互操作性规则", "relevant": ["Concept_HL7-AI-Transparency-IG", "Policy_ONC-HTI-1-算法透明度规则"]}
+{"query": "如何评估 主权AI-医疗 的效果", "relevant": ["Concept_主权AI-医疗"]}
+{"query": "数据元件 与 信息化 的边界", "relevant": ["Concept_信息化", "Concept_数据元件"]}
+{"query": "医保基金监管专项行动-2026 的关键判断", "relevant": ["Event_医保基金监管专项行动-2026"]}
+{"query": "健康中国建设 落地的条件", "relevant": ["Concept_健康中国", "Concept_健康中国建设", "Concept_健康中国行动"]}
+{"query": "日间医疗质量控制指标 落地的条件", "relevant": ["Concept_日间医疗质量控制指标", "Event_日间医疗质量控制指标体系专家共识"]}
+{"query": "国家卫生健康委医院管理研究所 与 中国医学科学院肿瘤医院 的边界", "relevant": ["Institution_中国医学科学院肿瘤医院", "Institution_国家卫生健康委医院管理研究所"]}
+{"query": "医疗卫生机构网络安全管理办法 与合规的边界", "relevant": ["Policy_医疗卫生机构网络安全管理办法"]}
+{"query": "主权数据中心 (Sovereign Cloud) 落地的条件", "relevant": ["Concept_Sovereign-Cloud"]}
+{"query": "残疾人友好医疗机构 与合规的边界", "relevant": ["Concept_残疾人友好医疗机构", "Source_关于开展残疾人友好医疗机构建设的意见"]}
+{"query": "多中心临床研究 与 医院数字化运营 的边界", "relevant": ["Concept_医院运营指挥中心", "Concept_多中心临床研究"]}
+{"query": "人工智能-药品监管 落地的条件", "relevant": ["Concept_人工智能-药品监管", "Concept_智慧监管新模式", "Source_国家药监局关于-人工智能-药品监管-的实施意见"]}
+{"query": "HDRS (健康数据研究服务) 的成本与收益", "relevant": ["Product_HDRS"]}
+{"query": "关于进一步加强医疗机构电子病历信息使用管理的通知 与合规的边界", "relevant": ["Concept_电子病历信息使用管理", "Policy_关于进一步加强医疗机构电子病历信息使用管理的通知", "Source_关于进一步加强医疗机构电子病历信息使用管理的通知"]}
+{"query": "城市全域数字化转型 与 医疗收入循环管理 的边界", "relevant": ["Concept_医疗收入循环管理", "Concept_城市全域数字化转型"]}
+{"query": "Anna's Archive 20万美元语料悬赏 对行业的影响", "relevant": ["Event_Annas-Archive-Bounty"]}
+{"query": "数据联邦 与合规的边界", "relevant": ["Concept_联邦研究网络"]}
+{"query": "数据即产品 落地的条件", "relevant": ["Concept_数据即产品"]}
+{"query": "专有医疗语义层 与 健康优先发展战略 的边界", "relevant": ["Concept_专有医疗语义层", "Concept_健康优先发展战略"]}
+{"query": "医院如何应对 人工智能拟人化互动服务管理暂行办法", "relevant": ["Event_人工智能拟人化互动服务管理暂行办法", "Source_人工智能拟人化互动服务管理暂行办法"]}
+{"query": "信息互通共享三年攻坚行动方案 对行业的影响", "relevant": ["Event_信息互通共享三年攻坚行动方案"]}
+{"query": "如何评估 数字化管控平台 的效果", "relevant": ["Concept_数字化收益度量", "Concept_数字化管控平台"]}
+{"query": "家庭医生签约服务六个拓展 与 检查检验结果互认 的边界", "relevant": ["Policy_家庭医生签约服务六个拓展", "Policy_检查检验结果互认", "Policy_检查检验结果互认规范", "Source_医疗政策-进一步深化-六个拓展-做实家庭医生签约服务若干措施的通知-11288357"]}
+{"query": "哈密项目 对行业的影响", "relevant": ["Event_哈密项目"]}
+{"query": "北京大学 的信息化对区域的影响", "relevant": ["Event_北大AI项目", "Institution_北京大学", "Source_激荡20年-首届北大HIT论坛特别报道-锲而不舍20年-脚踏实地前行路"]}
+{"query": "数据与智能中台 与合规的边界", "relevant": ["Concept_数据与智能中台"]}
+{"query": "医疗大模型 与 企业数字化转型评价模型 的边界", "relevant": ["Concept_企业数字化转型评价模型"]}
+{"query": "医院如何应对 McKesson 网络安全事件调查与响应更新", "relevant": ["Event_McKesson-Cybersecurity-Incident-Update-20260829", "Source_news-intelligence-20260902-briefing-267846d5"]}
+{"query": "医院如何落实 国家生育支持政策体系", "relevant": ["Concept_1米高度看医院", "Concept_医育结合", "Concept_生育友好医院", "Policy_国家生育支持政策体系"]}
+{"query": "基层医疗云平台 与合规的边界", "relevant": ["Concept_基层医疗云平台", "Standard_智慧医联体平台建设指南拟议"]}
+{"query": "医院数字化转型 与 医疗AI第一性原理 的边界", "relevant": ["Concept_医疗AI第一性原理", "Concept_医院数字化转型"]}
+{"query": "医院如何应对 Anthropic 结盟 FIS", "relevant": ["Event_Anthropic-FIS-Partnership"]}
+{"query": "华检医疗 的成本与收益", "relevant": ["Vendor_华检医疗"]}
+{"query": "如何评估 互联网诊疗电子病历 的达标程度", "relevant": ["Standard_互联网诊疗电子病历", "Standard_电子病历评级"]}
+{"query": "日间手术病历 与 套壳HIS 的边界", "relevant": ["Concept_套壳HIS", "Concept_日间手术病历"]}
+{"query": "如何评估 欧洲标准化委员会（CEN） 的数据能力", "relevant": ["Institution_欧洲标准化委员会-CEN"]}
+{"query": "十五五医疗数字化重塑 与合规的边界", "relevant": ["Concept_十五五医疗数字化重塑"]}
+{"query": "医院如何落实 医疗耗材SPD与反腐透明化治理", "relevant": ["Policy_医疗耗材SPD与反腐透明化治理"]}
+{"query": "武汉同济医院 与 首都医科大学附属北京儿童医院 的边界", "relevant": ["Institution_华中科技大学同济医学院附属同济医院", "Institution_武汉同济医院", "Institution_首都医科大学附属北京儿童医院"]}
+{"query": "MedFMC挑战赛 对行业的影响", "relevant": ["Event_MedFMC挑战赛"]}
+{"query": "如何评估 数据巴别塔 的效果", "relevant": ["Concept_数据巴别塔"]}
+{"query": "主数据管理 落地的条件", "relevant": ["Concept_主数据管理"]}
+{"query": "TEFCA 可信交换框架与通用协议 对医院运营的影响", "relevant": ["Concept_TEFCA", "Policy_TEFCA-可信交换框架"]}
+{"query": "医院如何落实 长期护理保险支付管理指导意见（2026）", "relevant": ["Policy_长期护理保险支付管理指导意见-2026"]}
+{"query": "数字化技术采纳 与合规的边界", "relevant": ["Concept_数字化技术采纳"]}
+{"query": "如何评估 数据战略 的效果", "relevant": ["Concept_数据战略"]}
+{"query": "区域医疗服务协同 与 医疗系统重构 的边界", "relevant": ["Concept_区域医疗服务协同", "Concept_医疗系统重构"]}
+{"query": "中国医院协会信息专业委员会（CHIMA） 的成本与收益", "relevant": ["Institution_CHIMA"]}
+{"query": "医疗数据语义重组与高维翻译中枢 的前提是否成立", "relevant": ["Synthesis_医疗数据语义重组与高维翻译中枢"]}
+{"query": "医院如何应对 生物医学新技术条例", "relevant": ["Event_生物医学新技术条例"]}
+{"query": "医疗元数据管理 与 医疗信息孤岛效应 的边界", "relevant": ["Concept_医疗-元数据管理", "Concept_医疗信息孤岛效应"]}
+{"query": "齐鲁医院 的成本与收益", "relevant": ["Institution_齐鲁医院", "Synthesis_齐鲁医院信息化攻坚策略"]}
+{"query": "科研门诊 与合规的边界", "relevant": ["Concept_科研门诊", "Source_医渡科技-科研门诊-开诊-打造智慧科研-AI平台-服务-新模式"]}
+{"query": "数据封建主义 与合规的边界", "relevant": ["Concept_医疗数据封建主义", "Concept_数据封建主义", "Concept_数据联邦", "Policy_关于促进和规范人工智能医疗卫生应用发展的实施意见"]}
+{"query": "香港养和医院 与 国务院国资委 的边界", "relevant": ["Institution_国务院国资委", "Institution_香港养和医院"]}
+{"query": "中信医疗 对医院选型的影响", "relevant": ["Vendor_中信医疗"]}
+{"query": "医疗资源引力法则 与合规的边界", "relevant": ["Concept_医疗资源引力法则", "Policy_医疗卫生强基工程实施方案"]}
+{"query": "数据要素-医疗 与合规的边界", "relevant": ["Concept_医疗数据要素", "Concept_数据入表前置与SBOM强制锁"]}
+{"query": "英国国家健康与护理研究所 与 鹰潭桐乡医共体 的边界", "relevant": ["Vendor_NIHR", "Vendor_英国国家健康与护理研究所", "Vendor_鹰潭桐乡医共体"]}
+{"query": "医院如何应对 2023全国深化医改经验推广会", "relevant": ["Concept_2023全国深化医改经验推广会", "Event_2023全国深化医改经验推广会"]}
+{"query": "城乡居民基本医疗保险 与合规的边界", "relevant": ["Concept_城乡居民基本医疗保险", "Policy_医保基金智能监控两库建设"]}
+{"query": "医院如何落实 HHS AI战略计划", "relevant": ["Event_HHS-AI-Strategic-Plan", "Policy_HHS-AI-Strategy"]}
+{"query": "数字化2.0 与 职工基本医疗保险 的边界", "relevant": ["Concept_数字化2-0", "Concept_职工基本医疗保险"]}
+{"query": "预见性医院 落地的条件", "relevant": ["Concept_Predictive-Hospital", "Concept_预见性医院", "Source_预见性医院-融合管理智能于临床流程-开启质量与效率新纪元"]}
+{"query": "如何评估 县级中医医院 的数据能力", "relevant": ["Institution_县级中医医院", "Standard_中医医院信息与数字化建设规范"]}
+{"query": "医院如何应对 医疗机构人工智能应用与治理专家共识-2026版", "relevant": ["Event_医疗机构人工智能应用与治理专家共识-2026版"]}
+{"query": "如何评估 数据底座 (Data Foundation) 的效果", "relevant": ["Concept_数字化收益度量", "Concept_数据底座"]}
+{"query": "数据要素型企业 落地的条件", "relevant": ["Concept_数据要素型企业", "Source_中共中央办公厅-国务院办公厅关于加快公共数据资源开发利用的意见"]}
+{"query": "医院运营管理智能助理 与合规的边界", "relevant": ["Concept_医院运营管理智能助理"]}
+{"query": "医院如何落实 医疗AI合规与政策", "relevant": ["Concept_医疗AI合规护盾", "Policy_促进和规范人工智能医疗应用实施意见", "Policy_关于促进和规范人工智能医疗卫生应用发展的实施意见"]}
+{"query": "广州医科大学附属第一医院 与 国家卫生健康委员会 的边界", "relevant": ["Institution_广州医科大学附属第一医院"]}
+{"query": "如何评估 数字化 的效果", "relevant": ["Concept_企业数字化5A模型", "Concept_企业数字化转型成熟度模型", "Concept_企业数字化转型评价模型", "Concept_华为数字化转型成熟度评估模型", "Concept_数字化收益度量"]}
+{"query": "东软医疗 的成本与收益", "relevant": []}
+{"query": "北京大学第六医院 的成本与收益", "relevant": []}
+{"query": "信息化 与 医院运营指挥中心 的边界", "relevant": ["Concept_医院运营指挥中心", "Source_数据赋能-精准管理-开启医院数字化运营新时代"]}
+{"query": "DRG防损引擎 落地的条件", "relevant": ["Concept_DRG防损引擎", "Source_AI原生医院建设策略20260414"]}
+{"query": "如何评估 医学影像人工智能 的效果", "relevant": []}
+{"query": "如何评估 浙江大学 的数据能力", "relevant": []}
+{"query": "医疗AI外围工程 与 数字化转型六步法 的边界", "relevant": ["Concept_医疗AI外围工程", "Concept_数字化转型六步法", "Source_华为数字化转型成功的六步法"]}
+{"query": "北京大学口腔医院 的成本与收益", "relevant": []}
+{"query": "如何评估 智慧中医医院 的效果", "relevant": ["Concept_智慧中医医院", "Standard_中医医院信息与数字化建设规范"]}
+{"query": "医疗智能编排者 与合规的边界", "relevant": ["Concept_医疗智能编排者"]}
+{"query": "南湖HIT论坛-第五届 与 托克逊三期建设 的边界", "relevant": []}
+{"query": "如何评估 医疗闭环管理 的效果", "relevant": []}
+{"query": "数字化核心三要素 落地的条件", "relevant": ["Concept_连接思维"]}
+{"query": "如何评估 健康老龄化 的效果", "relevant": []}
+{"query": "中国人民解放军总后勤部卫生部 与 县级中医医院 的边界", "relevant": []}
+{"query": "如何评估 临床自治智能体 的效果", "relevant": ["Concept_LLM临床评估分歧"]}
+{"query": "儿童友好医院 与合规的边界", "relevant": []}
+{"query": "医疗文书减负 落地的条件", "relevant": ["Concept_临床文书减负", "Concept_医疗文书减负"]}
+{"query": "国家临床专科能力评估办法发布 与 生物医学新技术界定指导原则发布 的边界", "relevant": []}
+{"query": "医疗智算中心 与合规的边界", "relevant": []}
+{"query": "紧密型县域医共体信息化功能指引 对医院运营的影响", "relevant": ["Concept_权力重塑", "Policy_紧密型县域医共体信息化功能指引"]}
+{"query": "修正数据 与合规的边界", "relevant": []}
+{"query": "上海交通大学医学院附属第九人民医院 的成本与收益", "relevant": []}
+{"query": "如何评估 医疗AI 的效果", "relevant": ["Concept_CARE评估模型", "Synthesis_STORM-Investigation-on-Medical-LLM-Evaluation"]}
+{"query": "美国科学研究与开发办公室(OSRD) 的信息化对区域的影响", "relevant": []}
+{"query": "神州医疗 与合规的边界", "relevant": []}
+{"query": "医疗智能体协作网络 与 研究者发起的临床研究 的边界", "relevant": []}
+{"query": "如何评估 主动健康 的效果", "relevant": []}
+{"query": "如何评估 责任医疗组织 (ACO) 的效果", "relevant": ["Concept_责任医疗组织-ACO"]}
+{"query": "临床领导力 落地的条件", "relevant": ["Concept_临床领导力"]}
+{"query": "数据基础设施 与 医疗AI可解释性 的边界", "relevant": ["Concept_医疗AI可解释性", "Concept_数据底座"]}
+{"query": "十五五医疗规划 与合规的边界", "relevant": ["Policy_十五五医疗规划", "Policy_十五五规划-医疗健康"]}
+{"query": "医疗AI四层知识架构 落地的条件", "relevant": ["Concept_医疗AI四层知识架构", "Concept_四层知识体系架构", "Source_构建医疗AI的认知内核-穿越集团-科室-专病到个人的四层知识体系架构"]}
+{"query": "如何评估 中国医疗信息化演进 的结论", "relevant": ["Synthesis_中国医疗信息化演进"]}
+{"query": "医疗AI可解释性 与 医疗语义防线 的边界", "relevant": ["Concept_医疗AI可解释性", "Concept_医疗语义防线"]}
+{"query": "虚拟护士 与合规的边界", "relevant": ["Concept_Virtual-Nursing", "Concept_虚拟护士"]}
+{"query": "第四军医大学 的信息化对区域的影响", "relevant": ["Institution_第四军医大学", "Person_刘丹红", "Person_徐勇勇"]}
+{"query": "健康医疗通用数据模型 与合规的边界", "relevant": ["Concept_健康医疗通用数据模型", "Concept_医疗通用数据模型", "Concept_通用数据模型"]}
+{"query": "智慧医院 与 数据安全合规体系 的边界", "relevant": ["Concept_智慧医院", "Policy_医疗卫生机构网络安全管理办法"]}
+{"query": "临床共情 与合规的边界", "relevant": ["Concept_临床共情", "Concept_规模化共情幻觉"]}
+{"query": "如何评估 医康养数字化服务平台 的效果", "relevant": ["Concept_数字健康价值评估框架", "Product_医康养数字化服务平台"]}
+{"query": "深空数据中心 落地的条件", "relevant": ["Concept_太空数据中心", "Concept_深空数据中心", "Source_算力暴政与原子枷锁-千亿美元狂奔下的智能终局拷问-2026-04-12"]}
+{"query": "哈密市卫健委 与 北京市卫生健康委员会 的边界", "relevant": ["Institution_北京市卫生健康委员会", "Institution_哈密市卫健委"]}
+{"query": "健康素养 落地的条件", "relevant": ["Concept_健康中国行动", "Concept_健康素养"]}
+{"query": "医疗数据困境 与合规的边界", "relevant": ["Concept_医疗数据困境"]}
+{"query": "福建省立医院 的信息化对区域的影响", "relevant": ["Institution_福建省立医院"]}
+{"query": "药品全品种全链条信息化追溯管理 与 医院信息互联互通标准化成熟度测评 的边界", "relevant": ["Concept_三位一体智慧医院建设与评价体系", "Policy_医院信息互联互通标准化成熟度测评", "Policy_国家医疗健康信息医院信息互联互通标准化成熟度测评", "Policy_药品全品种全链条信息化追溯管理-2026年第85号", "Policy_药品全品种全链条信息化追溯要求", "Standard_互联互通标准化成熟度测评"]}
+{"query": "医疗IT双态架构 落地的条件", "relevant": ["Concept_医疗IT双态架构"]}
+{"query": "如何评估 2026版全国医院信息化建设标准发布（未核验） 的达标程度", "relevant": []}
+{"query": "国家医疗健康信息医院信息互联互通标准化成熟度测评 对医院运营的影响", "relevant": ["Policy_医院信息互联互通标准化成熟度测评", "Policy_国家医疗健康信息医院信息互联互通标准化成熟度测评"]}
+{"query": "数据热力学暴政 与 紧密型县域医共体 的边界", "relevant": []}
+{"query": "如何评估 数据暴政 的效果", "relevant": ["Concept_数据暴政", "Source_数据暴政的终结与降维打击-从暴力穷举到高维认知坍缩-2026-06-09"]}
+{"query": "如何评估 国家智慧教育平台 的效果", "relevant": ["Product_国家智慧教育平台"]}
+{"query": "医保盈亏预测Agent 落地的条件", "relevant": ["Concept_医保盈亏预测Agent"]}
+{"query": "医务人员职业道德准则（2025年版）发布 的关键判断", "relevant": ["Event_医务人员职业道德准则-2025年版"]}
+{"query": "健康中国2030 与合规的边界", "relevant": ["Concept_健康中国", "Policy_健康中国2030"]}
+{"query": "数字健康价值评估框架 与合规的边界", "relevant": ["Concept_数字健康价值评估框架"]}
+{"query": "多模态数据湖 (Lakehouse) 落地的条件", "relevant": ["Concept_Lakehouse", "Concept_多模态数据湖"]}
+{"query": "阿里健康 与 纳里健康 的边界", "relevant": ["Vendor_纳里健康", "Vendor_阿里健康"]}
+{"query": "智慧服务 与合规的边界", "relevant": ["Concept_智慧服务"]}
+{"query": "加快场景培育和开放推动新场景大规模应用的实施意见 对行业的影响", "relevant": ["Event_加快场景培育和开放推动新场景大规模应用的实施意见", "Source_国务院办公厅关于加快场景培育和开放推动新场景大规模应用的实施意见"]}
+{"query": "山西医科大学白求恩医院 的成本与收益", "relevant": ["Institution_山西医科大学白求恩医院"]}
+{"query": "医疗信创 与 医疗场景代运营 的边界", "relevant": ["Concept_医疗信创", "Concept_医疗场景代运营", "Policy_医疗信创"]}
+{"query": "如何评估 解放军总医院 的数据能力", "relevant": ["Institution_解放军总医院"]}
+{"query": "动态临床路径 落地的条件", "relevant": ["Concept_动态临床路径"]}
+{"query": "医疗卫生大模型备案 与合规的边界", "relevant": ["Concept_医疗卫生大模型备案", "Concept_合规三难困境", "Policy_关于促进和规范人工智能医疗卫生应用发展的实施意见"]}
+{"query": "临床路径算法硬约束 与 健康中国行动 的边界", "relevant": ["Concept_临床路径算法硬约束", "Concept_健康中国行动"]}
+{"query": "LMM (大医疗模型) 落地的条件", "relevant": ["Concept_LMM", "Concept_医疗大模型", "Synthesis_STORM-Investigation-on-Medical-LLM-Evaluation"]}
+{"query": "如何评估 国家数据基础设施 的效果", "relevant": ["Concept_国家数据基础设施"]}
+{"query": "雄安宣武医院 的信息化对区域的影响", "relevant": ["Institution_雄安宣武医院"]}
+{"query": "多中心临床研究数据平台 与 医疗智能体平台 的边界", "relevant": ["Concept_Clinical-Multi-Agent-Systems", "Product_多中心临床研究数据平台"]}
+{"query": "如何评估 中国移动研究院 的数据能力", "relevant": ["Institution_中国移动研究院"]}
+{"query": "如何评估 数据资产运营商 (Data Operator) 的效果", "relevant": ["Concept_数据资产运营商", "Concept_数据资产运营商-Data-Operator"]}
+{"query": "医疗服务与技术 (HST) 落地的条件", "relevant": ["Concept_HST", "Concept_医疗服务与技术", "Event_HST-利润池迁移报告"]}
+{"query": "智慧医联体平台建设指南拟议 与 ICD 体系 的边界", "relevant": ["Standard_ICD", "Standard_智慧医联体平台建设指南拟议"]}
+{"query": "1米高度看医院 落地的条件", "relevant": ["Concept_1米高度看医院", "Concept_儿童友好医院", "Source_关于开展儿童友好医院建设的意见"]}
+{"query": "医院如何应对 南湖HIT论坛-2025", "relevant": ["Event_南湖HIT论坛-2025"]}
+{"query": "百度健康 的成本与收益", "relevant": ["Vendor_百度健康"]}
+{"query": "数字化转型六步法 与 医疗AI的不可能三角 的边界", "relevant": ["Concept_不可能三角-医疗AI", "Concept_数字化转型六步法"]}
+{"query": "医院如何应对 卫宁健康成立AI医疗事业部", "relevant": ["Event_卫宁健康成立AI医疗事业部", "Event_卫宁健康注销式回购与换帅-20260513", "Synthesis_WinningHealth"]}
+{"query": "数据驱动战略 落地的条件", "relevant": ["Concept_数据驱动战略"]}
+{"query": "医院如何应对 中关村论坛", "relevant": []}
+{"query": "重要数据处理者 与 中医药适宜技术 的边界", "relevant": []}
+{"query": "如何评估 数据中台 的效果", "relevant": []}
+{"query": "第37手 对行业的影响", "relevant": ["Concept_Move-37", "Event_第37手"]}
+{"query": "医院如何应对 玻璃翼项目", "relevant": ["Event_玻璃翼项目"]}
+{"query": "北京同仁医院 与 CMS(美国医保局) 的边界", "relevant": []}
+{"query": "医疗五大范式 落地的条件", "relevant": ["Concept_医疗五大范式"]}
+{"query": "智慧管理 落地的条件", "relevant": ["Concept_智慧管理"]}
+{"query": "关于促进和规范人工智能医疗卫生应用发展的实施意见 对医院运营的影响", "relevant": ["Policy_促进和规范人工智能医疗应用实施意见", "Policy_关于促进和规范人工智能医疗卫生应用发展的实施意见", "Source_关于促进和规范-人工智能-医疗卫生-应用发展的实施意见"]}
+{"query": "数字化转型切入点 与 医院运营指挥中心 的边界", "relevant": []}
+{"query": "数据归IT，分析归业务 与合规的边界", "relevant": ["Concept_数据归IT-分析归业务"]}
+{"query": "环境感知电子病历 落地的条件", "relevant": ["Concept_环境感知电子病历"]}
+{"query": "真实世界数据 落地的条件", "relevant": ["Concept_真实世界数据"]}
+{"query": "端侧医疗AI 与 医疗产业寒武纪 的边界", "relevant": []}
+{"query": "医院如何落实 国家医保DRG-DIP 3.0版分组方案", "relevant": ["Policy_国家医保DRG-DIP-3-0版分组方案"]}
+{"query": "大健康产业 与合规的边界", "relevant": []}
+{"query": "检查检验结果互认规范 的政策要求", "relevant": ["Policy_检查检验结果互认", "Policy_检查检验结果互认规范"]}
+{"query": "生物医学新技术界定指导原则发布 现状与趋势", "relevant": ["Event_生物医学新技术界定指导原则发布", "Source_生物医学新技术与药品-医疗器械界定指导原则-暂行"]}
+{"query": "电子病历系统功能应用水平分级评价 要点解读", "relevant": ["Policy_电子病历系统功能应用水平分级评价", "Standard_电子病历评级"]}
+{"query": "数字化员工技能 现状与趋势", "relevant": ["Concept_数字化员工技能"]}
+{"query": "卫宁健康2025年首亏 的要点", "relevant": ["Event_卫宁健康2025年首亏"]}
+{"query": "北大医疗集团 的产品线", "relevant": []}
+{"query": "以患者为中心 的核心机制", "relevant": ["Concept_以患者为中心"]}
+{"query": "通用数据模型 现状与趋势", "relevant": ["Concept_健康医疗通用数据模型", "Concept_医疗通用数据模型", "Concept_通用数据模型"]}
+{"query": "数据管理能力体系 现状与趋势", "relevant": ["Concept_数据管理能力体系"]}
+{"query": "北京大学人民医院雄安健康管理中心 现状与趋势", "relevant": ["Institution_北京大学人民医院雄安健康管理中心"]}
+{"query": "挪威小学AI禁令 现状与趋势", "relevant": ["Event_挪威小学AI禁令"]}
+{"query": "日间医疗质量控制指标体系专家共识 的行业影响", "relevant": ["Concept_日间医疗质量控制指标", "Event_日间医疗质量控制指标体系专家共识"]}
+{"query": "复旦大学附属儿科医院 数据能力现状", "relevant": []}
+{"query": "医疗语义防线 现状与趋势", "relevant": ["Concept_医疗语义防线"]}
+{"query": "数据信息地图 是什么", "relevant": ["Concept_数据信息地图"]}
+{"query": "WiNGPT (医疗大模型) 现状与趋势", "relevant": ["Product_WiNGPT"]}
+{"query": "企业数字化转型成熟度模型 的核心机制", "relevant": ["Concept_企业数字化转型成熟度模型", "Source_中国信通院-央国企数字化转型评估框架介绍"]}
+{"query": "硅基药 (Silicon-based Drug) 是什么", "relevant": ["Concept_硅基药"]}
+{"query": "临床路径管理 的核心机制", "relevant": ["Concept_临床路径算法硬约束", "Concept_临床路径管理"]}
+{"query": "JCI (国际医疗卫生机构认证) 现状与趋势", "relevant": ["Standard_JCI"]}
+{"query": "医疗IT产业寒武纪 的核心机制", "relevant": ["Concept_医疗IT产业寒武纪"]}
+{"query": "医院智慧管理分级评估标准体系发布 的要点", "relevant": ["Event_医院智慧管理分级评估标准体系发布"]}
+{"query": "医疗大数据4V特征 是什么", "relevant": ["Concept_医疗大数据-4V特征"]}
+{"query": "检验医学 技术路线", "relevant": ["Concept_检验医学", "Source_方冬等-多学科交叉的检验医学的现状与进展"]}
+{"query": "医疗AI现金流门神 技术路线", "relevant": ["Concept_Medical-AI-Gatekeeper", "Concept_医疗AI合规护盾"]}
+{"query": "微软研究院 数据能力现状", "relevant": ["Institution_微软研究院"]}
+{"query": "天津血研所 数据能力现状", "relevant": ["Institution_天津血研所"]}
+{"query": "企业数字化转型评价模型 的核心机制", "relevant": ["Concept_企业数字化转型成熟度模型", "Concept_企业数字化转型评价模型"]}
+{"query": "总数据师 现状与趋势", "relevant": ["Concept_总数据师", "Concept_首席数据官"]}
+{"query": "数据治理 是什么", "relevant": ["Concept_数据治理"]}
+{"query": "南湖HIT论坛-2023 现状与趋势", "relevant": ["Event_南湖HIT论坛-2023"]}
+{"query": "香港医院管理局 (HA) 数据能力现状", "relevant": ["Institution_香港医院管理局"]}
+{"query": "医疗产业寒武纪 的核心机制", "relevant": ["Concept_医疗IT产业寒武纪", "Concept_医疗产业寒武纪"]}
+{"query": "数据即服务-DaaS 技术路线", "relevant": ["Concept_数据即服务", "Concept_数据即服务-DaaS"]}
+{"query": "数据偏见 (Demographic Bias) 的核心机制", "relevant": ["Concept_数据偏见"]}
+{"query": "吐鲁番政府 的信息化建设", "relevant": ["Institution_吐鲁番政府"]}
+{"query": "数字化使能 是什么", "relevant": ["Concept_数字化使能"]}
+{"query": "医疗行业推理一体机 现状与趋势", "relevant": ["Product_医疗行业推理一体机", "Product_慧康-医疗一体机"]}
+{"query": "数据治理与知识工程 的核心机制", "relevant": ["Concept_数据治理与知识工程"]}
+{"query": "数据血缘 (Data Provenance) 的核心机制", "relevant": ["Concept_数据血缘"]}
+{"query": "医疗新基建 现状与趋势", "relevant": ["Policy_医疗-新基建", "Source_冰与火之歌-一份医疗AI-新基建-的工业革命蓝图"]}
+{"query": "医院双操作系统 技术路线", "relevant": ["Concept_公立医院双操作系统", "Concept_医院双操作系统"]}
+{"query": "HITECH法案 的政策要求", "relevant": ["Policy_HITECH-Act", "Policy_HITECH法案"]}
+{"query": "中国医学科学院阜外心血管病医院 数据能力现状", "relevant": []}
+{"query": "数据治理蓝图 技术路线", "relevant": ["Concept_数据治理蓝图"]}
+{"query": "数字化转型方法论 技术路线", "relevant": ["Concept_数字化转型六步法", "Concept_数字化转型方法论"]}
+{"query": "医疗数据主权博弈 技术路线", "relevant": ["Concept_医疗数据主权博弈", "Concept_数字主权"]}
+{"query": "医疗AI系统工程 现状与趋势", "relevant": ["Concept_医疗AI系统工程", "Concept_医疗AI系统工程架构", "Synthesis_临床医疗AI演进趋势-2026-06"]}
+{"query": "科技部 现状与趋势", "relevant": ["Institution_科技部"]}
+{"query": "十八项医疗质量安全核心制度 要点解读", "relevant": ["Policy_医疗质量安全核心制度", "Policy_十八项医疗质量安全核心制度"]}
+{"query": "医院资源规划 (HRP) 是什么", "relevant": ["Concept_HRP", "Concept_医院资源规划-HRP"]}
+{"query": "新时代党的卫生与健康工作方针 现状与趋势", "relevant": ["Concept_新时代党的卫生与健康工作方针", "Source_贯彻落实新时代党的卫生与健康工作方针-奋力谱写健康中国建设新篇章"]}
+{"query": "1-5-2工作体系 (医疗) 现状与趋势", "relevant": ["Concept_1-5-2工作体系-医疗"]}
+{"query": "全病种数据库平台 选型要点", "relevant": ["Product_全病种数据库平台"]}
+{"query": "华为医疗 的产品线", "relevant": ["Vendor_华为", "Vendor_华为医疗"]}
+{"query": "统一医疗记录 的核心机制", "relevant": ["Concept_统一医疗记录"]}
+{"query": "数据即服务 技术路线", "relevant": ["Concept_数据即服务", "Concept_数据即服务-DaaS"]}
+{"query": "医疗高质量数据集 是什么", "relevant": ["Concept_医疗高质量数据集", "Concept_高质量医疗数据集", "Source_锻造生命数据-医疗高质量数据集的构建之道与演化逻辑"]}
+{"query": "健康中国 的核心机制", "relevant": ["Concept_健康中国行动"]}
+{"query": "531政策工具箱 要点解读", "relevant": ["Policy_531政策工具箱"]}
+{"query": "数字化转型 现状与趋势", "relevant": ["Source_国企数字化转型的进展-趋势与政策选择", "Source_数字化转型战略-实践与趋势-基于机器学习的大规模回顾性研究"]}
+{"query": "临床科室经理 是什么", "relevant": ["Concept_临床科室经理"]}
+{"query": "合成数据 (Synthetic Data) 是什么", "relevant": ["Concept_Synthetic-Data", "Concept_合成数据"]}
+{"query": "远程医疗 现状与趋势", "relevant": ["Concept_远程医疗"]}
