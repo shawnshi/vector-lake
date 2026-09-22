@@ -80,8 +80,8 @@ async def async_run_daemon():
         from array import array
         from vector_lake.db_store import get_connection
 
-        for row in get_connection().execute("SELECT entity_id, embedding FROM vec_embeddings"):
-            key = str(row["entity_id"])
+        for row in get_connection().execute("SELECT page_key, embedding FROM vec_embeddings"):
+            key = str(row["page_key"])
             if key not in entities:
                 continue
             values = array("f")

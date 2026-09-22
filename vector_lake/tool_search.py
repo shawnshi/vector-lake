@@ -266,17 +266,17 @@ def _get_vector_search_results(query_vector: list[float], limit: int = 50) -> tu
         # Using match because it's fast. It returns L2 distance.
         # Cosine similarity for normalized vectors: 1 - L2^2 / 2
         cursor = conn.execute(
-            "SELECT entity_id, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            "SELECT page_key, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
             (query_blob, limit)
         )
 
         results = {}
         for row in cursor.fetchall():
-            # ``vec_embeddings.entity_id`` holds a **page key** (the writer passes ``node_key``, and
+            # ``vec_embeddings.page_key`` holds a **page key** (the writer passes ``node_key``, and
             # ``db_store`` deletes by the same name), not ``entities.entity_id``.  The column name is
             # a trap: a join to ``entities.entity_id`` returns nothing, silently.  The FTS path keys
             # by ``node_key`` too, so the two remain in one namespace and the fusion cannot mix them.
-            page_key = row["entity_id"]
+            page_key = row["page_key"]
             # distance is L2. convert to approx sim: 1 - (dist^2)/2
             dist = row["distance"]
             sim = 1.0 - (dist * dist) / 2.0

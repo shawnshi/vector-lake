@@ -1519,14 +1519,15 @@ def _init_db_once(db_key: str):
             )
         """)
         conn.execute("""
-            -- ``entity_id`` holds a **page key** (``Concept_...``), which is what every caller passes
-            -- and what ``delete_embedding`` matches on.  It is not ``entities.entity_id``: that column
-            -- is a different identifier, so a join between the two returns nothing and does so
-            -- silently.  The FTS table keys by ``node_key``, so vector hits and lexical hits stay in
-            -- one namespace.  Renaming this column is not an ``ALTER`` -- vec0 refuses both RENAME and
-            -- ADD COLUMN -- so the fix is a staged rebuild, not yet done.
+            -- ``page_key`` holds a **page key** (``Concept_...``).  Until 2026-09-22 this column was
+            -- named ``entity_id``, and that name was wrong in a way that stayed quiet: it is *not*
+            -- ``entities.entity_id``, a different identifier, so a join between the two returned
+            -- nothing and returned it silently.  The FTS table keys by ``node_key``, so vector hits
+            -- and lexical hits share one namespace.  vec0 refuses both RENAME and ADD COLUMN, so the
+            -- rename was a staged rebuild: rows out to a plain table, drop, recreate under the same
+            -- name, rows back -- all inside one transaction.
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
-                entity_id TEXT PRIMARY KEY,
+                page_key TEXT PRIMARY KEY,
                 embedding float[3072]
             )
         """)
@@ -1920,7 +1921,7 @@ def search_index_state() -> dict[str, str]:
         for row in get_connection().execute("SELECT node_key, content_hash FROM wiki_search_index_state")
     }
 
-def upsert_embedding(entity_id: str, embedding: list[float], *, content_digest: str | None = None):
+def upsert_embedding(page_key: str, embedding: list[float], *, content_digest: str | None = None):
     """Store one unit vector under a page key.
 
     The normalisation is load-bearing, not cosmetic: ``tool_search`` converts sqlite-vec's L2
@@ -1938,8 +1939,8 @@ def upsert_embedding(entity_id: str, embedding: list[float], *, content_digest: 
     import sqlite_vec
     query_blob = sqlite_vec.serialize_float32(embedding)
     with transaction():
-        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (entity_id,))
-        conn.execute("INSERT INTO vec_embeddings (entity_id, embedding) VALUES (?, ?)", (entity_id, query_blob))
+        conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (page_key,))
+        conn.execute("INSERT INTO vec_embeddings (page_key, embedding) VALUES (?, ?)", (page_key, query_blob))
         # A digest is written only when the caller actually has one.  Storing a NULL or guessed
         # digest would make an unverified row look verified, and the reader treats "no row" as
         # "needs stamping", so the no-digest path converges instead of lying.
@@ -1948,7 +1949,7 @@ def upsert_embedding(entity_id: str, embedding: list[float], *, content_digest: 
                 "INSERT INTO vec_embedding_inputs (node_key, content_digest, updated_at) "
                 "VALUES (?, ?, ?) ON CONFLICT(node_key) DO UPDATE SET "
                 "content_digest = excluded.content_digest, updated_at = excluded.updated_at",
-                (str(entity_id), str(content_digest), datetime.now(timezone.utc).isoformat()),
+                (str(page_key), str(content_digest), datetime.now(timezone.utc).isoformat()),
             )
 
 
@@ -1965,25 +1966,25 @@ def embedding_input_digests() -> dict[str, str]:
     }
 
 
-def delete_embedding(entity_id: str):
+def delete_embedding(page_key: str):
     conn = get_connection()
     with transaction():
-        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (str(entity_id),))
-        conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (str(entity_id),))
+        conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (str(page_key),))
+        conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (str(page_key),))
 
 
-def delete_stale_embeddings(valid_entity_ids: set[str]) -> int:
+def delete_stale_embeddings(valid_page_keys: set[str]) -> int:
     conn = get_connection()
-    valid = {str(item) for item in valid_entity_ids if item}
-    rows = conn.execute("SELECT entity_id FROM vec_embeddings").fetchall()
-    stale = [row["entity_id"] for row in rows if row["entity_id"] not in valid]
+    valid = {str(item) for item in valid_page_keys if item}
+    rows = conn.execute("SELECT page_key FROM vec_embeddings").fetchall()
+    stale = [row["page_key"] for row in rows if row["page_key"] not in valid]
     if not stale:
         return 0
     with transaction():
-        conn.executemany("DELETE FROM vec_embeddings WHERE entity_id = ?", [(entity_id,) for entity_id in stale])
+        conn.executemany("DELETE FROM vec_embeddings WHERE page_key = ?", [(page_key,) for page_key in stale])
         # The input ledger is keyed the same way and would otherwise keep rows for pages that no
         # longer exist, which reads as "every orphan is stale" on the next sweep.
-        conn.executemany("DELETE FROM vec_embedding_inputs WHERE node_key = ?", [(entity_id,) for entity_id in stale])
+        conn.executemany("DELETE FROM vec_embedding_inputs WHERE node_key = ?", [(page_key,) for page_key in stale])
     return len(stale)
 
 def count_embeddings() -> int:
@@ -2064,7 +2065,7 @@ def delete_search_index(node_key: str):
     with transaction():
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
-        conn.execute("DELETE FROM vec_embeddings WHERE entity_id = ?", (node_key,))
+        conn.execute("DELETE FROM vec_embeddings WHERE page_key = ?", (node_key,))
         conn.execute("DELETE FROM vec_embedding_inputs WHERE node_key = ?", (node_key,))
 
 def delete_node_cascade(node_key: str):
@@ -2088,7 +2089,7 @@ def delete_node_cascade(node_key: str):
 
         conn.execute("DELETE FROM wiki_search_index WHERE node_key = ?", (node_key,))
         conn.execute("DELETE FROM wiki_search_index_state WHERE node_key = ?", (node_key,))
-        conn.execute(f"DELETE FROM vec_embeddings WHERE entity_id IN ({placeholders})", related_ids)
+        conn.execute(f"DELETE FROM vec_embeddings WHERE page_key IN ({placeholders})", related_ids)
         conn.execute(f"DELETE FROM vec_embedding_inputs WHERE node_key IN ({placeholders})", related_ids)
         conn.execute(
             "DELETE FROM claims WHERE "

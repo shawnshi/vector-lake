@@ -133,7 +133,7 @@ def existing_embedding_ids() -> set[str]:
     silently returning an empty set turned a broken table into "everything is
     missing" and triggered a full re-embed."""
     conn = db_store.get_connection()
-    return {row["entity_id"] for row in conn.execute("SELECT entity_id FROM vec_embeddings")}
+    return {row["page_key"] for row in conn.execute("SELECT page_key FROM vec_embeddings")}
 
 
 def page_bodies_for_keys(keys: list[str] | tuple[str, ...]) -> dict[str, str]:

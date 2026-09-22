@@ -1,5 +1,34 @@
 # Unreleased
 
+## `vec_embeddings.entity_id` → `page_key`：列的读音终于和它的内容一致
+
+这一列一直存的是**页键**（`Concept_...`），却叫 `entity_id` —— 与隔壁 `entities.entity_id`（`entity_<hex>`，另一个标识符）同名。
+风险从来不是活着的 bug（迁移前实测：前者命中 `page_index_nodes.node_key` 7175/7175、命中 `entities.entity_id` 0/7175），
+而是一句"看着对、跑不出错、返回空"的连接：它读同一个名字，返回零行，不报错。
+
+vec0 既不支持 `RENAME COLUMN` 也不支持 `ADD COLUMN`，且**任何** `RENAME` 都会打碎影子表
+（`no such table: main.v_rowids`；"DROP+改名新表"与"直接改名旧表"两种写法都在一次性小库上实测复现）。
+可行路径只有一条：普通暂存表把行搬出 → `DROP` 旧表 → **以最终名字**重建 vec0 → 搬回 → 删暂存表，**全程单事务**。
+
+落地与验证（`migrate_vec_column.py`，先 `--probe` 只读核对再执行）：
+
+| | |
+|---|---|
+| 行数 | 7175 → **7175** |
+| 列名 | `entity_id` → **`page_key`** |
+| 键集合 | 迁移前后**完全一致**，且与 `page_index_nodes` 命中 **7175/7175** |
+| 影子表 | `vec_embeddings_{chunks,info,rowids,vector_chunks00}` 完整 |
+| 数据完好性 | 用某行自身向量做 `MATCH`，首条即该页、`distance=0.0` |
+| 事务耗时 | 101 s（库 2.33 GB / 向量 88 MB） |
+| 恢复点 | `C:/Users/shich/backups/vector-lake/vector_lake.db.bak-a4-20260922`（`VACUUM INTO`，1745 MB，已校验 7175 行且仍是旧列名） |
+| 端到端 | 真实代码路径（`_get_query_embedding` → `_get_vector_search_results`）命中 5 条、无错误；`count_embeddings()` = 7175；**全量测试 1378 passed** |
+
+代码侧同步改名：`db_store`（DDL + `upsert_embedding`/`delete_embedding`/`delete_stale_embeddings` 的参数名）、
+`embedding_scheduler`、`tool_search`、`scripts/semantic_dedup_daemon`、`benchmarks/search_replay`（语料指纹读的就是这张表）。
+`tests/test_vec_embedding_key_contract.py` 从"守着一个会误导人的旧名字"升级为守两件事：不得跨命名空间连接，以及**旧列名不得回来**
+—— 能悄悄撤销的改名不算改名。
+
+
 ## 别名参与核心名解析、标点归一到身份键、Source 页命名规则归一、标签与实体命名空间隔离
 
 四份缺陷报告逐条实测后的结果。前三项各有"代码里两套规则"这一共同病根；第 4 项是写入期闸门。

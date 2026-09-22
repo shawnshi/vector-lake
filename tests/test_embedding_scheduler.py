@@ -106,7 +106,7 @@ def test_generate_index_preserves_existing_embeddings_when_compute_returns_empty
     indexer.generate_index()
 
     conn = db_store.get_connection()
-    count = conn.execute("SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = 'Source_Existing'").fetchone()[0]
+    count = conn.execute("SELECT COUNT(*) FROM vec_embeddings WHERE page_key = 'Source_Existing'").fetchone()[0]
     assert count == 1
 
 
@@ -261,7 +261,7 @@ def _backfill_now(isolated_memory) -> dict:
 
 def _stored_vector_count(node_key: str) -> int:
     return db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = ?", (node_key,)
+        "SELECT COUNT(*) FROM vec_embeddings WHERE page_key = ?", (node_key,)
     ).fetchone()[0]
 
 
@@ -281,7 +281,7 @@ def test_incremental_index_invalidates_stale_vector_without_api(isolated_memory,
     indexer.update_index_items(["Source_Changed.md"])
 
     assert db_store.get_connection().execute(
-        "SELECT COUNT(*) FROM vec_embeddings WHERE entity_id = 'Source_Changed'"
+        "SELECT COUNT(*) FROM vec_embeddings WHERE page_key = 'Source_Changed'"
     ).fetchone()[0] == 0
 
 

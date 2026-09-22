@@ -1,16 +1,17 @@
-"""``vec_embeddings.entity_id`` holds a page key, and nothing may join it as an entity id.
+"""``vec_embeddings.page_key`` holds a page key, and nothing may join it as an entity id.
 
-The column is named ``entity_id`` and the neighbouring table has a column of the same name holding
-a *different* identifier (``entities.entity_id`` is ``entity_<hex>``; the vector row's value is
-``Concept_...``).  Measured on the live lake: five sampled rows matched
-``page_index_nodes.node_key`` 5/5 and ``entities.entity_id`` 0/5.  Every current caller passes a page
-key -- ``db_store.delete_embedding`` deletes by ``node_key``, and ``tool_search`` fuses the result
-with FTS rows that are keyed by ``node_key`` -- so retrieval is correct today.
+The column held a page key (``Concept_...``) from the start, but was *named* ``entity_id`` until
+2026-09-22 -- the same name as ``entities.entity_id``, a different identifier (``entity_<hex>``).
+Measured on the live lake before the rename: five sampled rows matched
+``page_index_nodes.node_key`` 5/5 and ``entities.entity_id`` 0/5.  The danger was never a live bug;
+it was the join nobody had written yet, one that reads the shared name, returns nothing, and raises
+no error.
 
-What this guards is the join nobody has written yet: one that reads the shared column name and
-returns nothing, with no error to notice.  vec0 refuses ``ALTER TABLE`` (both RENAME COLUMN and ADD
-COLUMN), so the rename is a staged rebuild rather than a fix that can be applied on the spot; until
-it happens, the name has to be checked.
+vec0 refuses both RENAME COLUMN and ADD COLUMN, so the fix was a staged rebuild -- rows out to a
+plain table, drop, recreate under the same name with ``page_key``, rows back, all in one
+transaction.  This file now guards two things instead of one: that no statement joins the vector
+column to the entity identifier, and that the old column name does not come back -- a rename that
+can silently un-happen is not a rename.
 """
 
 from __future__ import annotations
@@ -25,10 +26,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 #: next to ``vec_embeddings`` is fine -- the schema comment does exactly that on purpose -- so the
 #: pattern looks for the join itself, not for co-occurrence.
 CROSS_NAMESPACE_JOIN = re.compile(
-    r"(entities\.entity_id\s*=\s*vec_embeddings\.entity_id"
-    r"|vec_embeddings\.entity_id\s*=\s*entities\.entity_id"
-    r"|vec_embeddings\.entity_id\s*=\s*entities\b)"
+    r"(entities\.entity_id\s*=\s*vec_embeddings\.page_key"
+    r"|vec_embeddings\.page_key\s*=\s*entities\.entity_id"
+    r"|vec_embeddings\.page_key\s*=\s*entities\b)"
 )
+
+#: The name this column used to have.  Reintroducing it anywhere in a statement that touches the
+#: vector table would undo the rename for its readers while the schema kept the new name.
+OLD_COLUMN_NAME = re.compile(r"vec_embeddings\.entity_id|entity_id\s+TEXT PRIMARY KEY")
 
 
 def _string_literals(path: pathlib.Path) -> list[str]:
@@ -62,14 +67,27 @@ def test_no_statement_joins_the_vector_column_to_the_entity_identifier():
         if CROSS_NAMESPACE_JOIN.search(literal)
     ]
     assert not offenders, (
-        "vec_embeddings.entity_id is a page key; joining it to entities.entity_id returns nothing "
+        "vec_embeddings.page_key is a page key; joining it to entities.entity_id returns nothing "
         "and reports no error: " + "; ".join(offenders)
+    )
+
+
+def test_the_old_column_name_does_not_come_back():
+    """The rename has to be able to fail loudly if it is undone, or it is only a comment."""
+    offenders = [
+        f"{name}: {OLD_COLUMN_NAME.search(literal).group(0)}"
+        for name, literal in sql_sources()
+        if OLD_COLUMN_NAME.search(literal)
+    ]
+    assert not offenders, (
+        "the vector table's column is page_key; an entity_id column there would repeat the trap the "
+        "rename removed: " + "; ".join(offenders)
     )
 
 
 def test_the_pattern_fires_on_the_join_it_describes():
     """Synthetic input, so the assertion above cannot pass by matching nothing ever."""
-    assert CROSS_NAMESPACE_JOIN.search("SELECT 1 FROM vec_embeddings JOIN entities ON entities.entity_id = vec_embeddings.entity_id")
-    assert CROSS_NAMESPACE_JOIN.search("SELECT 1 WHERE vec_embeddings.entity_id = entities.entity_id")
+    assert CROSS_NAMESPACE_JOIN.search("SELECT 1 FROM vec_embeddings JOIN entities ON entities.entity_id = vec_embeddings.page_key")
+    assert CROSS_NAMESPACE_JOIN.search("SELECT 1 WHERE vec_embeddings.page_key = entities.entity_id")
     # Prose is not a join.
     assert not CROSS_NAMESPACE_JOIN.search("It is not entities.entity_id; see vec_embeddings.")

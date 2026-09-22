@@ -127,7 +127,7 @@ def corpus_fingerprint() -> str:
     conn = db_store.get_connection()
     digest = hashlib.sha256()
     for table, column in (("page_index_nodes", "node_key"),
-                          ("vec_embeddings", "entity_id"),
+                          ("vec_embeddings", "page_key"),
                           ("wiki_search_index", "node_key")):
         try:
             rows = conn.execute(f"select {column} from {table} order by {column}").fetchall()
@@ -156,7 +156,7 @@ def labels_corpus(path: pathlib.Path) -> str | None:
 def _stored_vector() -> list[float]:
     """One row of the vector projection, chosen deterministically, for the offline mode."""
     conn = db_store.get_connection()
-    row = conn.execute("select embedding from vec_embeddings order by entity_id limit 1").fetchone()
+    row = conn.execute("select embedding from vec_embeddings order by page_key limit 1").fetchone()
     if row is None:
         raise SystemExit("vec_embeddings is empty; use --vectors live or run embedding-backfill")
     blob = row["embedding"]

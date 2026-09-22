@@ -67,7 +67,7 @@ rrf 相对 sum 在 16/16 个"指标 × 标注集"组合上点估计都为正，�
 
 ### P2 契约与精度加固（不动排序，可与 P0/P1 并行）
 
-1. **A4 键契约**：`vec_embeddings.entity_id` 存的是 **page key** 而非 `entities.entity_id`（实测命中 `page_index_nodes.node_key` 5/5，命中 `entities.entity_id` 0/5）。列名会诱导一个"看起来对、静默返回空"的连接。迁移 SQL 已验证（vec0 不支持 `ALTER TABLE`：改名会打碎影子表 `vec_embeddings_rowids`；可行路径是暂存表 + 单事务重建）。需要一个独占写的窗口与回滚点。
+1. ~~**A4 键契约**~~ **✓ 已完成 2026-09-22**：`vec_embeddings.entity_id` → `page_key`。vec0 拒绝 `RENAME/ADD COLUMN`，且任何 RENAME 都会打碎影子表（两种写法都在一次性小库实测复现）→ 走“暂存表 → DROP → 以最终名字重建 → 搬回”的单事务路径；7175 行、键集合、影子表全部完好，自身向量的 `MATCH` 首条 `distance=0.0`，全量测试 1378 passed。恢复点在 `C:/Users/shich/backups/vector-lake/`。守卫测试升级为“不得跨命名空间连接 + 旧列名不得回来”。
 2. **D3 两个对外数字**：`memory_warning_count` 结构性封顶 6（`[:6]` 先截断再计数）；`omitted_count` 只在字符截断时置值，实测 24 条记忆时 `Evidence Pointers` 只出 12 条却报 0。都是喂给 Agent 的机器可读字段，"报了但不对"。
 
 ### P3 评测基础设施（今天暴露出来的）
