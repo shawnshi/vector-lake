@@ -1,8 +1,22 @@
 {
-  "contract_version": "search-eval-rule/1.0",
+  "contract_version": "search-eval-rule/1.1",
   "created_at": "2026-09-22T11:45:00+08:00",
   "status": "implemented_rule",
   "retro_application": "This card restates the rule that governed batches 1 and 2, so that it has one implemented home instead of a copy in each decision file and a third in search_replay.py. It changes no verdict: every role below is the role that batch's registration already carried. Any change to a value or a role is a rule change -- register it before the labels it will be read against are collected, and it governs only measurements taken after that date. The two decision files stay the record of what was registered when and of the reasoning; this card is the single implemented source and they cite it.",
+  "version_history": [
+    {
+      "version": "search-eval-rule/1.1",
+      "date": "2026-09-22",
+      "change": "query_construction.min_confirmable_queries is now read (inert while null, fails closed when the count cannot be verified), every run records labels_sha256, --compare marks the reported counts with the labels revision it could verify, and unknown card fields are refused.",
+      "verdict_impact": "none: no gate value or role changed. Both batches were read under 1.0's values, which 1.1 restates unchanged."
+    },
+    {
+      "version": "search-eval-rule/1.0",
+      "date": "2026-09-22",
+      "change": "first card: restated the rule that governed batches 1 and 2 as a single implemented source.",
+      "verdict_impact": "none: restatement only."
+    }
+  ],
   "history": {
     "sources": [
       "benchmarks/search_eval_decisions.md",
@@ -15,7 +29,6 @@
   "top_k": 5,
   "comparison_universe": {
     "denominator": "judged",
-    "changed_on": null,
     "allowed": ["judged", "confirmable", "discordant"],
     "definition": {
       "judged": "every query that has a label row and a result in both runs. A query whose relevant set is empty still counts, as a zero -- it is a measurement of the retriever, not an absence of one.",
@@ -31,7 +44,7 @@
     "does_not_apply_to": [
       "per-query level metrics: nDCG@5 and the secondary means are reported over every judged query, because a query with nothing to find still measures the retriever"
     ],
-    "note": "Batches 1 and 2 were both read under `judged`. On batch 2's label sets that universe carries 268 of 333 (primary) and 271 of 333 (consensus) queries with an empty relevant set, so the same absolute +0.05 is worth ~0.41 SD there against ~0.18 SD on batch 1's composition -- see effect_calibration. Choosing a different denominator is a registered decision that must precede the third batch's labels: it moves the mean and the sample gate in opposite directions (batch 2 primary: +0.0132 over 333 against +0.0675 over the 65 confirmable ones, with 65 failing the 300 sample gate)."
+    "note": "Batches 1 and 2 were both read under `judged`. On batch 2's label sets that universe carries 268 of 333 (primary) and 271 of 333 (consensus) queries with an empty relevant set, so the same absolute +0.05 is worth ~0.41 SD there against ~0.18 SD on batch 1's composition -- see effect_calibration. Choosing a different denominator is a registered decision that must precede the third batch's labels: it moves the mean and the sample gate in opposite directions (batch 2 primary: +0.0132 over 333 against +0.0675 over the 65 confirmable ones, with 65 failing the 300 sample gate). Ordering is proved by evidence, not by a card field: a rule change has to be committed before the label file it will be read against, and every run records the labels revision it was scored on (config.labels_sha256), so 'registered first' is checkable rather than asserted."
   },
   "gates": {
     "primary_mean_difference": {
@@ -102,6 +115,6 @@
   "query_construction": {
     "min_new_queries": 300,
     "min_confirmable_queries": null,
-    "note": "min_confirmable_queries is deliberately null: no batch has registered a floor on how many of its queries must have a page to find, which is how batch 2 came to be read against a power calculation taken from batch 1. Set it in the same registration that fixes comparison_universe.denominator, before the third batch's labels are collected."
+    "note": "min_confirmable_queries is null because no batch has registered a floor on how many of its queries must have a page to find, which is how batch 2 came to be read against a power calculation taken from batch 1. It is read by the harness and inert while null: set it in the same registration that fixes comparison_universe.denominator, before the third batch's labels are collected. It fails closed when the count cannot be verified against the run's recorded labels revision. min_new_queries is a construction rule for the person building the query set, not a gate -- the harness cannot refuse queries it was never given, so nothing in the code reads it and the known-key guard below is what keeps that visible."
   }
 }

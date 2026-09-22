@@ -306,3 +306,134 @@ def test_the_two_decision_files_cite_the_rule_card():
     for name in ("search_eval_decisions.md", "search_eval_decisions_round2.md"):
         text = (REPO / "benchmarks" / name).read_text(encoding="utf-8")
         assert "search_eval_rule.json" in text, f"{name} does not cite the rule card"
+
+
+# --- a registration has to be enforceable -------------------------------------------------------
+#
+# `query_construction.min_confirmable_queries` was in the first card and read by nothing: a batch
+# could have registered a floor and the harness would have ignored it, which is the same drift the
+# card was built to remove.  These keep a field from becoming a promise nobody keeps.
+
+
+def test_the_card_refuses_a_field_nothing_reads(tmp_path):
+    card = json.loads(harness.RULE_PATH.read_text(encoding="utf-8"))
+    card["query_construction"]["min_confirmable_queries_typo"] = 150
+    path = tmp_path / "card.json"
+    path.write_text(json.dumps(card), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="unknown query_construction field"):
+        harness.load_rule(path)
+
+
+def test_the_card_refuses_a_floor_that_is_not_a_positive_integer(tmp_path):
+    card = json.loads(harness.RULE_PATH.read_text(encoding="utf-8"))
+    for bad in (0, -1, "150", True):
+        card["query_construction"]["min_confirmable_queries"] = bad
+        path = tmp_path / "card.json"
+        path.write_text(json.dumps(card), encoding="utf-8")
+        with pytest.raises(SystemExit, match="positive integer"):
+            harness.load_rule(path)
+
+
+def test_a_registered_confirmable_floor_is_actually_read(monkeypatch):
+    """The test the first card would have failed: registering the floor must change a line."""
+    counts = {"judged": 333, "confirmable": 65, "discordant": 31, "labels_pin": "matched"}
+    diffs = [0.2, 0.1, -0.05]
+
+    monkeypatch.setattr(harness, "MIN_CONFIRMABLE_QUERIES", None)
+    without = harness._decision(diffs, [[0.1, 0.1, 0.0]], counts)
+    monkeypatch.setattr(harness, "MIN_CONFIRMABLE_QUERIES", 150)
+    with_floor = harness._decision(diffs, [[0.1, 0.1, 0.0]], counts)
+
+    assert not any("confirmable queries" in line for line in without)
+    floor_line = [line for line in with_floor if "confirmable queries" in line][0]
+    assert floor_line.strip().startswith("FAIL")  # 65 < 150
+    assert "(65)" in floor_line
+    # And an unverifiable count fails closed rather than being treated as a pass.
+    unverifiable = harness._decision(diffs, [[0.1, 0.1, 0.0]], dict(counts, confirmable=None, labels_pin="stale"))
+    assert [line for line in unverifiable if "confirmable queries" in line][0].strip().startswith("FAIL")
+
+
+# --- the labels revision is pinned, or said not to be ------------------------------------------
+
+
+def test_file_sha256_reads_bytes_and_reports_a_missing_file(tmp_path):
+    path = tmp_path / "labels.jsonl"
+    path.write_text('{"query": "q", "relevant": ["A"]}\n', encoding="utf-8")
+
+    assert harness.file_sha256(path) == harness.hashlib.sha256(path.read_bytes()).hexdigest()
+    assert harness.file_sha256(tmp_path / "absent.jsonl") is None
+
+
+def _labels_file(tmp_path: pathlib.Path) -> pathlib.Path:
+    path = tmp_path / "labels.jsonl"
+    path.write_text(
+        json.dumps({"query": "has-pages", "relevant": ["A"]}) + "\n"
+        + json.dumps({"query": "empty", "relevant": []}) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _pair(tmp_path: pathlib.Path, config_extra: dict) -> tuple[str, str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    digest = harness.query_digest
+    per = {
+        digest("has-pages"): {"success": 1.0, "recall": 1.0, "reciprocal_rank": 1.0, "ndcg": 1.0},
+        digest("empty"): {"success": 0.0, "recall": 0.0, "reciprocal_rank": 0.0, "ndcg": 0.0},
+    }
+    left = _write(tmp_path / "a.json", {"fusion": "sum", "corpus": "c1", **config_extra},
+                  {"judged": 2, "per_query": per})
+    right = _write(tmp_path / "b.json", {"fusion": "rrf", "corpus": "c1", **config_extra},
+                   {"judged": 2, "per_query": per})
+    return left, right
+
+
+def test_compare_reports_the_count_but_marks_labels_the_run_did_not_pin(tmp_path, capsys):
+    """A run that predates the hash cannot be checked; the count still has to be readable."""
+    labels = _labels_file(tmp_path)
+    left, right = _pair(tmp_path, {"labels": str(labels)})
+
+    harness.compare(left, right, 5)
+
+    line = [row for row in capsys.readouterr().out.splitlines() if "comparison universe" in row][0]
+    assert "confirmable 1" in line
+    assert line.endswith("; labels not pinned by the run)"), line
+
+
+def test_compare_withholds_the_count_when_the_labels_moved(tmp_path, capsys):
+    """The verdict lives in the run; the count does not, so an edited file must not renumber it."""
+    labels = _labels_file(tmp_path)
+    left, right = _pair(tmp_path, {"labels": str(labels), "labels_sha256": "0" * 64})
+
+    harness.compare(left, right, 5)
+    captured = capsys.readouterr()
+
+    line = [row for row in captured.out.splitlines() if "comparison universe" in row][0]
+    assert "confirmable ?" in line
+    assert line.endswith("; labels stale at the recorded path)"), line
+    assert "no longer hash to the revision" in captured.err
+    # The verdict itself is unchanged: the diff is the same and the primary mean still decides.
+    assert "primary mean difference >= registered minimum effect" in captured.out
+
+
+def test_compare_refuses_two_revisions_of_one_label_file(tmp_path, capsys):
+    """One path, two revisions means the two arms were scored against different relevance."""
+    labels = _labels_file(tmp_path)
+    left, _ = _pair(tmp_path / "l", {"labels": str(labels), "labels_sha256": "a" * 64})
+    _, right = _pair(tmp_path / "r", {"labels": str(labels), "labels_sha256": "b" * 64})
+
+    assert harness.compare(left, right, 5) == 2
+    assert "different revisions of the label file" in capsys.readouterr().err
+
+
+def test_compare_warns_when_only_one_side_records_its_labels(tmp_path, capsys):
+    """Not fatal -- a hand-built payload may omit the key -- but the silence is what to fix."""
+    labels = _labels_file(tmp_path)
+    left, right = _pair(tmp_path, {"labels": str(labels)})
+    payload = json.loads(pathlib.Path(right).read_text(encoding="utf-8"))
+    payload["config"] = {k: v for k, v in payload["config"].items() if k != "labels"}
+    pathlib.Path(right).write_text(json.dumps(payload), encoding="utf-8")
+
+    assert harness.compare(left, right, 5) == 0
+    assert "only the left run recorded the labels" in capsys.readouterr().err

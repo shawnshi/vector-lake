@@ -371,6 +371,27 @@ def load_rule(path: pathlib.Path) -> dict:
     if rule["gates"]["minimum_sample"].get("denominator") != universe.get("denominator") and \
             rule["gates"]["minimum_sample"].get("denominator") not in (universe.get("allowed") or []):
         raise SystemExit(f"search eval rule card sample denominator is unknown: {path}")
+    # A field nothing reads is a registration that cannot be enforced: batch 2's floor could have
+    # been set on this card and silently ignored.  Adding one means adding its consumer and this
+    # list, which keeps that visible instead of discovering it a batch later.
+    known = {
+        "comparison_universe": {
+            "denominator", "allowed", "definition", "applies_to", "does_not_apply_to", "note",
+        },
+        "query_construction": {"min_new_queries", "min_confirmable_queries", "note"},
+    }
+    for section, allowed in known.items():
+        unknown = set(rule.get(section) or {}) - allowed
+        if unknown:
+            raise SystemExit(
+                f"search eval rule card has unknown {section} field(s) {sorted(unknown)}: a field "
+                f"nothing reads cannot be enforced, so add its consumer and this list: {path}"
+            )
+    floor = (rule.get("query_construction") or {}).get("min_confirmable_queries")
+    if floor is not None and (not isinstance(floor, int) or isinstance(floor, bool) or floor < 1):
+        raise SystemExit(
+            f"search eval rule card min_confirmable_queries is not a positive integer: {path}"
+        )
     return rule
 
 
@@ -382,9 +403,23 @@ SECONDARY_METRICS = tuple(RULE["secondary_metrics"])
 COMPARISON_DENOMINATOR = str(RULE["comparison_universe"]["denominator"])
 SAMPLE_DENOMINATOR = str(RULE["gates"]["minimum_sample"]["denominator"])
 MIN_SAMPLE = int(RULE["gates"]["minimum_sample"]["value"])
+MIN_CONFIRMABLE_QUERIES = (RULE.get("query_construction") or {}).get("min_confirmable_queries")
 MIN_PRIMARY_EFFECT = float(RULE["gates"]["primary_mean_difference"]["value"])
 MIN_PRIMARY_EFFECT_SD = float(RULE["gates"]["primary_mean_difference_sd"]["value"])
 PRIMARY_SIGN_ALPHA = float(RULE["gates"]["sign_test"]["alpha"])
+
+
+def file_sha256(path: pathlib.Path) -> str | None:
+    """The bytes digest of a file, or ``None`` when it cannot be read.
+
+    Recorded for the labels a run was scored against.  Without it, the count of queries that could
+    have differed is read from whatever sits at that path *now*, so a file edited after the run
+    changes a number the run is reported with -- and no verdict input, which stays inside the run.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def rule_provenance() -> dict:
@@ -472,6 +507,18 @@ def _decision(diffs: list[float], secondary: list[list[float]], counts: dict | N
     lines.append(f"  {'PASS' if len(diffs) >= MIN_SAMPLE else 'FAIL'}  "
                  f"at least {MIN_SAMPLE} {COMPARISON_DENOMINATOR} queries  "
                  f"({len(diffs)}; {breakdown})")
+    if MIN_CONFIRMABLE_QUERIES is not None:
+        # Registered and inert only while null.  It cannot be read off the run: the count lives in
+        # the labels, so an unverifiable or stale revision fails closed instead of guessing.
+        confirmable = counts.get("confirmable")
+        pin = counts.get("labels_pin")
+        if confirmable is None or pin == "stale":
+            lines.append(f"  FAIL  at least {MIN_CONFIRMABLE_QUERIES} confirmable queries  "
+                         f"(unverifiable: the labels are {pin or 'missing'})")
+        else:
+            lines.append(f"  {'PASS' if confirmable >= MIN_CONFIRMABLE_QUERIES else 'FAIL'}  "
+                         f"at least {MIN_CONFIRMABLE_QUERIES} confirmable queries  "
+                         f"({confirmable}{'' if pin == 'matched' else ', labels not pinned'})")
     return lines
 
 
@@ -508,12 +555,42 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
         return 2
     left_labels_path = (left.get("config") or {}).get("labels")
     right_labels_path = (right.get("config") or {}).get("labels")
+    if bool(left_labels_path) != bool(right_labels_path):
+        # Not fatal, because a hand-built payload is allowed to omit the key, but it is worth
+        # saying: the side that stayed silent may have been scored against something else.
+        only = left_labels_path or right_labels_path
+        side = "left" if left_labels_path else "right"
+        print(f"warning: only the {side} run recorded the labels it was scored against ({only}); "
+              f"the other run's relevance is unknown to this comparison", file=sys.stderr)
     if left_labels_path and right_labels_path and str(left_labels_path) != str(right_labels_path):
         print(f"refusing to compare: the runs were scored against different label files "
               f"({left_labels_path} vs {right_labels_path})", file=sys.stderr)
         return 2
+    left_labels_sha = (left.get("config") or {}).get("labels_sha256")
+    right_labels_sha = (right.get("config") or {}).get("labels_sha256")
+    if left_labels_sha and right_labels_sha and left_labels_sha != right_labels_sha:
+        # One path, two revisions: the two arms were not scored against the same relevance.
+        print(f"refusing to compare: the runs were scored against different revisions of the label "
+              f"file ({str(left_labels_sha)[:12]} vs {str(right_labels_sha)[:12]})", file=sys.stderr)
+        return 2
     labels: dict[str, set[str]] = {}
     labels_path = left_labels_path or right_labels_path
+    recorded_labels_sha = left_labels_sha or right_labels_sha
+    labels_pin = "unpinned"
+    if labels_path:
+        current_labels_sha = file_sha256(pathlib.Path(labels_path))
+        if not recorded_labels_sha:
+            # A run that predates the hash cannot be checked.  Say so rather than implying the
+            # count was reproduced from the revision the run actually used.
+            labels_pin = "unpinned"
+        elif current_labels_sha == recorded_labels_sha:
+            labels_pin = "matched"
+        else:
+            labels_pin = "stale"
+            print(f"warning: the labels at {labels_path} no longer hash to the revision this run "
+                  f"recorded (recorded {str(recorded_labels_sha)[:12]}, now "
+                  f"{(current_labels_sha or 'unreadable')[:12]}); the reported counts are "
+                  f"withheld", file=sys.stderr)
     if COMPARISON_DENOMINATOR != "judged":
         # The declared denominator needs relevance.  Fail closed rather than fall back to the
         # recorded universe: quietly reading a 'confirmable' rule over every judged query is the
@@ -522,6 +599,11 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
             print(f"refusing to compare: the rule card declares the '{COMPARISON_DENOMINATOR}' "
                   f"denominator and neither run recorded the labels it was scored against",
                   file=sys.stderr)
+            return 2
+        if labels_pin == "stale":
+            print(f"refusing to compare: the rule card declares the '{COMPARISON_DENOMINATOR}' "
+                  f"denominator and the labels at {labels_path} are not the revision this run was "
+                  f"scored against", file=sys.stderr)
             return 2
         labels = load_labels(pathlib.Path(labels_path))
         if not labels:
@@ -546,8 +628,12 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
     primary_deltas = {d: right_per[d][PRIMARY_METRIC] - left_per[d][PRIMARY_METRIC] for d in shared}
     counts = {
         "judged": len(shared),
-        "confirmable": len(comparison_universe(shared, labels, "confirmable")) if labels else None,
+        "confirmable": (
+            len(comparison_universe(shared, labels, "confirmable"))
+            if labels and labels_pin != "stale" else None
+        ),
         "discordant": sum(1 for value in primary_deltas.values() if abs(value) > 1e-9),
+        "labels_pin": labels_pin,
     }
     universe = comparison_universe(shared, labels, COMPARISON_DENOMINATOR, primary_deltas)
     if not universe:
@@ -560,10 +646,15 @@ def compare(left_path: str, right_path: str, top_k: int) -> int:
     print(f"right: {right_path}\n  {json.dumps({k: v for k, v in right['metrics'].items() if k != 'per_query'}, sort_keys=True)}")
     print(f"rule : {RULE_VERSION} sha256={RULE_SHA256[:12]} denominator={COMPARISON_DENOMINATOR} "
           f"({rule_provenance()['path']})")
+    pin_note = {
+        "matched": "labels pinned",
+        "unpinned": "labels not pinned by the run",
+        "stale": "labels stale at the recorded path",
+    }[labels_pin]
     print(f"judged queries: {len(shared)}   comparison universe: {COMPARISON_DENOMINATOR} = "
           f"{len(universe)}   (judged {counts['judged']} / confirmable "
           f"{counts['confirmable'] if counts['confirmable'] is not None else '?'} / discordant "
-          f"{counts['discordant']})")
+          f"{counts['discordant']}; {pin_note})")
     print()
     print(f"{'metric':18} {'left':>8} {'right':>8} {'diff':>9} {'wins':>5} {'losses':>6} {'ties':>5} {'sign p':>7} {'bootstrap 95% CI':>22}")
     for field in fields:
@@ -703,6 +794,7 @@ def main() -> int:
             "top_k": args.top_k,
             "vectors": args.vectors,
             "labels": str(args.labels),
+            "labels_sha256": file_sha256(pathlib.Path(args.labels)),
             "corpus": corpus,
             "labels_corpus": judged_against or "unrecorded",
         },
