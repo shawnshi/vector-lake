@@ -912,6 +912,21 @@ def _query_terms(query: str) -> list[str]:
 
 
 def infer_memory_type(claim: dict) -> str:
+    """Which memory slot a claim belongs in, or ``fact`` when the claim does not say.
+
+    Only two things may choose a slot: the claim's own ``memory_type``, or a ``claim_type`` that
+    names one.  A keyword scan over the prose used to decide when neither was present, and it
+    fabricated both non-fact slots: of the 6,681 records it produced, *every* one of the 4,842
+    ``decision`` and 1,338 ``task_state`` records was a page section whose text happened to contain
+    方案/采用/状态 -- keys like ``decision_物理机制_mechanism`` (465), ``decision_2_证据时间线`` (331)
+    and ``decision_中文摘要`` (112) -- so "Open Decisions" listed compiled-fact sections and "Task
+    State" listed timelines.  The 431 inferred preferences were unmatchable by construction: a
+    preference is a statement about what someone wants, not a sentence containing 偏好.
+
+    The slots are filled by explicit writes (:mod:`vector_lake.tool_memory` writes
+    ``memory_type`` into the page's frontmatter), and the 70 records that had an explicit
+    declaration survived the same audit unchanged.
+    """
     explicit = str(claim.get("memory_type") or "").strip().lower().replace("-", "_")
     if explicit in OPERATIONAL_MEMORY_TYPES:
         return explicit
@@ -920,13 +935,6 @@ def infer_memory_type(claim: dict) -> str:
     if claim_type in OPERATIONAL_MEMORY_TYPES:
         return claim_type
 
-    text = f"{claim.get('claim_text', '')} {claim.get('source_page', '')}".lower()
-    if any(token in text for token in ("preference", "preferred", "用户偏好", "偏好", "首选", "不要", "倾向")):
-        return "preference"
-    if any(token in text for token in ("decision", "decided", "approved", "决策", "决定", "方案", "采用", "选型")):
-        return "decision"
-    if any(token in text for token in ("task", "todo", "pending", "blocked", "open item", "待办", "未完成", "阻塞", "状态")):
-        return "task_state"
     return "fact"
 
 
