@@ -744,6 +744,13 @@ def lint_vector_lake(auto_fix: bool = False):
     # Remaining checks (Orphans, Decay, Governance, Alignment)
     for filename in files:
         node_key = filename[:-3]
+        # A page the wiki generates about itself has no inbound links by design: nothing links to
+        # a cluster index, and the indexer skips the namespace entirely.  This check used to
+        # exempt only ``Source_*``, so 799 generated indexes -- 98% of the 812 orphans it reported
+        # -- were the report.  Identity comes from the same owner the schema exemption uses.
+        entry = parsed.get(filename) or {}
+        if is_generated_artifact(entry.get("fm"), filename, entry.get("body")):
+            continue
         if inbound_count.get(node_key, 0) == 0 and not filename.startswith("Source_"):
             issues["orphan"].append(f"{filename}: No inbound links (orphan)")
 

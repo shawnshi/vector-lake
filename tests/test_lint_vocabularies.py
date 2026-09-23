@@ -284,6 +284,38 @@ def test_one_name_under_two_knowledge_types_is_still_a_collision(isolated_memory
     assert "Concept_Beta.md <-> Product_Beta.md" in report, report
 
 
+def test_a_generated_index_is_not_an_orphan(isolated_memory):
+    """98% of the 812 orphans this report carried were the wiki's own machinery.
+
+    Nothing links to a cluster index and the indexer skips the namespace, so a check that
+    exempted only ``Source_*`` was reporting generated pages as unlinked knowledge.  The
+    knowledge page beside it, with no inbound links, is still reported.
+    """
+    _write_purpose_contract(isolated_memory)
+    wiki = get_wiki_dir()
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "System_Topic.md").write_text(
+        "---\n"
+        "id: gov_topic\ntitle: System_Topic\ntype: system\nstatus: Active\n"
+        "categories: [Uncategorized]\nupdated: 2026-09-23T00:00:00Z\n---\n\n"
+        "# L0 Comm: A cluster\n\n## 核心节点 (Hubs)\n\n## 社区成员 (Members)\n",
+        encoding="utf-8",
+    )
+    _page(
+        "Concept_Lonely.md",
+        type_="concept",
+        status="Active",
+        epistemic="seed",
+        category="System_Architecture",
+    )
+
+    report = lint_vector_lake(auto_fix=False)
+    orphan_lines = [line for line in report.splitlines() if "No inbound links" in line]
+
+    assert any("Concept_Lonely.md" in line for line in orphan_lines), orphan_lines
+    assert not any("System_Topic.md" in line for line in orphan_lines), orphan_lines
+
+
 def test_missing_required_fields_is_the_single_source():
     """The linter and the write gate must agree on which keys a page needs."""
     system = {
