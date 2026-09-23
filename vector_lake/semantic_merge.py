@@ -50,7 +50,7 @@ log = logging.getLogger("vector-lake-semantic-merge")
 # these is the defect described in the module docstring.
 #
 # ``categories`` is deliberately **not** here even though the write gate stores it as a
-# list.  ``purpose_contract.validate_ingest_payload`` requires it to be a list with
+# list.  ``schema_validator.category_shape_violation`` requires it to be a list with
 # *exactly one* domain, so it is a single-valued field wearing a list: unioning two pages'
 # categories produces a page the gate then refuses.  It looked additive when this list was
 # written and only a merge between two pages with different domains exposed it -- the

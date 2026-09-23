@@ -132,10 +132,15 @@ def _prepare_mutations(
             # answer to it: `verify_asset` and `validate_schema` are both pure, and
             # neither can see the page being replaced.
             check_placeholder_sources(frontmatter.get("sources"), _previous_sources(filepath))
+            # A page this batch is about to create is held to the new-node rules -- but only in
+            # ``full`` mode.  ``schema`` mode is the bounded legacy-maintenance path: it
+            # re-materializes nodes that already exist (projections, restores, renames), and a
+            # legacy node keeps the classification it was written under.
+            is_new = validation_mode == "full" and not filepath.exists()
             if validation_mode == "full":
-                verify_asset(content, filename, frontmatter, get_index_path())
+                verify_asset(content, filename, frontmatter, get_index_path(), is_new)
             else:
-                validate_schema(frontmatter, content, filename, get_index_path())
+                validate_schema(frontmatter, content, filename, get_index_path(), is_new)
 
         prepared.append(
             {

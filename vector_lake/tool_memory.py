@@ -21,7 +21,7 @@ id: {stable_id}
 title: {title}
 type: concept
 memory_type: {memory_type}
-domain: system
+domain: System_Architecture
 status: Active
 epistemic-status: seed
 categories: [System_Architecture]
@@ -63,7 +63,7 @@ def update_operational_memory(memory_type: str, content: str) -> str:
             frontmatter.setdefault("title", title)
             frontmatter["type"] = "concept"
             frontmatter["memory_type"] = memory_type
-            frontmatter.setdefault("domain", "system")
+            frontmatter.setdefault("domain", "System_Architecture")
             frontmatter["status"] = "Active"
             frontmatter.setdefault("epistemic-status", "seed")
             frontmatter.setdefault("categories", ["System_Architecture"])

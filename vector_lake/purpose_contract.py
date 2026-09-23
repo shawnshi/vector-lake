@@ -198,22 +198,12 @@ def validate_ingest_payload(items: list[dict[str, Any]], contract: dict[str, Any
         if aliases is not None and not isinstance(aliases, list):
             raise PurposeContractError(f"{filename}: aliases must be a list.")
             
-        categories = frontmatter.get("categories")
-        if not isinstance(categories, list) or len(categories) != 1:
-            # The message has to say what arrived, not only what was expected: this is the one
-            # rule a model kept violating, and the recorded reason is all an operator sees.
-            # ``DHWB-20260913.md`` failed six days of rounds on it.
-            if isinstance(categories, list):
-                received = f"a list of {len(categories)} element(s): {categories!r}"
-            elif categories is None:
-                received = "no value"
-            else:
-                received = f"{type(categories).__name__} {categories!r}"
-            raise PurposeContractError(
-                f"{filename}: categories must be a list with exactly one domain. "
-                f"Received {received}."
-            )
-            
+        # ``categories`` used to be checked here as well, and that second copy is gone: the rule
+        # has one owner now -- ``schema_validator.category_shape_violation``, enforced on every
+        # write through ``verify_asset``.  Two copies agreed only by luck, and between them they
+        # still missed the case both were supposed to cover: an update in ``schema`` mode, where
+        # this gate does not run and the new-node rules do not apply.
+
         records.append({
             "filename": filename,
             "sources": _normalise_sources(frontmatter.get("sources")),

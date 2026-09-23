@@ -16,9 +16,11 @@ def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
     )
     (wiki_dir / "Concept_Ref.md").write_text("ref [[Concept_Old]]", encoding="utf-8")
     captured = []
+    modes = []
 
-    def fake_batch(mutations):
+    def fake_batch(mutations, validation_mode="full"):
         captured.append(mutations)
+        modes.append(validation_mode)
         return True, "ok"
 
     monkeypatch.setattr("vector_lake.tool_rename.execute_mutation_batch", fake_batch)
@@ -26,6 +28,9 @@ def test_rename_builds_one_atomic_mutation_batch(isolated_memory, monkeypatch):
 
     assert result.startswith("Successfully renamed")
     assert len(captured) == 1
+    # A rename moves an existing node; it is legacy maintenance, not authoring, so it must not
+    # answer to the new-node classification rules.
+    assert modes == ["schema"], modes
     assert [item["filename"] for item in captured[0]] == [
         "Concept_Old.md",
         "Concept_New.md",
@@ -67,7 +72,7 @@ def test_schema_tag_collision_is_not_swallowed(tmp_path):
         "domain": "General",
         "status": "Active",
         "epistemic-status": "seed",
-        "categories": ["Source"],
+        "categories": ["System_Architecture"],
         "updated": "2026-07-14T00:00:00+00:00",
         "sources": [],
         "tags": ["Existing"],

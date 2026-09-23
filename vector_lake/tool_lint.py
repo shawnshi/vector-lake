@@ -19,16 +19,17 @@ from vector_lake import stub_creator
 from vector_lake.link_resolution import build_link_map, resolve_link_target
 from vector_lake.schema_validator import (
     REQUIRED_FIELDS,
-    SYSTEM_ARTIFACT_CATEGORIES,
-    VALID_CATEGORIES,
+    VALID_DOMAINS,
     VALID_EPISTEMIC_STATUS,
     VALID_STATUS,
     VALID_TYPES,
+    asserted_metric_keys,
+    category_shape_violation,
     missing_required_fields,
     validate_schema,
     SchemaViolationException,
 )
-from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES, strip_prefix
+from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES, is_generated_artifact, strip_prefix
 
 
 # ``VALID_STATUS`` is capitalised while the check below lowercases the page value,
@@ -164,6 +165,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vector-lake-tool-lint")
 
 
+def _type_from_filename(filename: str) -> str:
+    """The node type the filename's prefix already declares.  Mechanical, not a judgement.
+
+    One owner for the derivation: the missing-field repair and the invalid-type repair both
+    need it, and they disagreed -- one read the prefix, the other wrote ``concept`` for every
+    page regardless of what its name said.
+    """
+    return filename.split("_", 1)[0].lower() if "_" in filename else "concept"
+
+
 def _write_fixed_frontmatter(filepath: str, frontmatter: dict, body: str):
     try:
         write_markdown_file(filepath, frontmatter, body, skip_validation=False)
@@ -206,17 +217,23 @@ def lint_vector_lake(auto_fix: bool = False):
     # ``archived`` and ``contested``, so every page using those two legal statuses
     # was reported as an invalid status even though schema_validator accepts them.
     # tests/test_lint_vocabularies.py fails if a copy reappears.
+    #
+    # ``categories`` is not aliased here at all: that rule is not read, it is *asked* -- see
+    # ``category_shape_violation`` below.  An alias would still be a second copy of the
+    # decision, which is what this file's history is a list of.
     valid_types = VALID_TYPES
     valid_status = _LOWERCASE_STATUS
     valid_epistemic = VALID_EPISTEMIC_STATUS
-    valid_categories = VALID_CATEGORIES
+    valid_domains = VALID_DOMAINS
     valid_prefixes = VALID_PREFIXES
     required_fields = list(REQUIRED_FIELDS)
 
     files = [name for name in listed if name not in NON_NODE_WIKI_FILES]
-    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment"]}
+    issues = {key: [] for key in ["frontmatter", "schema", "naming", "type_status", "category", "domain", "duplicate_id", "alias_conflict", "broken_links", "orphan", "similarity", "decay", "semantic_gc", "governance", "alignment", "evidence"]}
     fixes_applied = 0
     stubs_refused = 0
+    #: how many pages assert a controlled metric, keyed by the tier that supports them.
+    metric_tiers: Counter = Counter()
 
     parsed = {}
     id_map = {}
@@ -464,64 +481,69 @@ def lint_vector_lake(auto_fix: bool = False):
         if missing:
             issues["frontmatter"].append(f"{filename}: Missing fields: {', '.join(missing)}")
             if auto_fix:
+                # Repair only what the filename already determines.  This block used to invent a
+                # value for every judgement field it found missing -- ``Active``, ``seed``,
+                # ``edge``, ``General`` and ``["Uncategorized"]`` -- which is where the corpus's
+                # 3 000 unclassified pages came from and why the status axis read 99.5%
+                # ``Active``.  A missing judgement is a governance event: it is reported above and
+                # left for the author or the migration, not filled in behind their back.
+                #
+                # ``evidence_tier="derived"`` was worse than the others: ``derived`` is not one
+                # of the five tiers ``purpose.md`` declares, so the write this repair produced
+                # was refused by the purpose gate and never landed at all.
                 if not frontmatter.get("id"): frontmatter["id"] = _generate_id(node_key)
                 if not frontmatter.get("title"): frontmatter["title"] = filename[:-3]
-                if not frontmatter.get("type"): frontmatter["type"] = filename.split("_", 1)[0].lower()
-                if not frontmatter.get("domain"): frontmatter["domain"] = "General"
-                if not frontmatter.get("topic_cluster"): frontmatter["topic_cluster"] = "General"
-                if not frontmatter.get("status"): frontmatter["status"] = "Active"
-                if not frontmatter.get("epistemic-status"): frontmatter["epistemic-status"] = "seed"
-                if not frontmatter.get("categories"): frontmatter["categories"] = ["Uncategorized"]
+                if not frontmatter.get("type"): frontmatter["type"] = _type_from_filename(filename)
                 if not frontmatter.get("updated"): frontmatter["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 if "sources" not in frontmatter: frontmatter["sources"] = []
-                if not frontmatter.get("strategic_scope"): frontmatter["strategic_scope"] = "edge"
-                if not frontmatter.get("evidence_tier"): frontmatter["evidence_tier"] = "derived"
                 changed = True
 
         file_type = str(frontmatter.get("type", "")).lower()
         if file_type and file_type not in valid_types:
             issues["type_status"].append(f"{filename}: Invalid type '{file_type}'")
             if auto_fix:
-                frontmatter["type"] = "concept"
+                # An invalid type is corrected to what the *name* says it is.  Writing
+                # ``concept`` instead renamed every Vendor_/Product_ page's type to the same
+                # value the name already contradicted.
+                frontmatter["type"] = _type_from_filename(filename)
                 changed = True
 
         status = str(frontmatter.get("status", "")).lower()
         if status and status not in valid_status:
             issues["type_status"].append(f"{filename}: Invalid status '{status}'")
-            if auto_fix:
-                frontmatter["status"] = "Active"
-                changed = True
 
         epistemic = str(frontmatter.get("epistemic-status", "")).lower()
         if epistemic and epistemic not in valid_epistemic:
             issues["type_status"].append(f"{filename}: Invalid epistemic-status '{epistemic}'")
-            if auto_fix:
-                frontmatter["epistemic-status"] = "seed"
-                changed = True
 
-        categories = frontmatter.get("categories", [])
-        if isinstance(categories, str): categories = [categories]
-        if isinstance(categories, list):
-            # ``SCHEMA_CATEGORIES.md`` covers entities, concepts and synthesis nodes.
-            # A derived system artifact is none of those, so its own marker category
-            # is allowed -- and only there.
-            system_artifact = filename.startswith("System_")
-            new_cats = []
-            for category in categories:
-                if category not in valid_categories and not (
-                    system_artifact and category in SYSTEM_ARTIFACT_CATEGORIES
-                ):
-                    issues["category"].append(f"{filename}: Invalid category '{category}'")
-                    if auto_fix:
-                        changed = True
-                        if "Uncategorized" not in new_cats: new_cats.append("Uncategorized")
-                else:
-                    new_cats.append(category)
-            if auto_fix and not new_cats:
-                new_cats.append("Uncategorized")
-                changed = True
-            if auto_fix and changed:
-                frontmatter["categories"] = new_cats
+        system_artifact = is_generated_artifact(frontmatter, filename)
+        # The category rule is reported from its single owner rather than re-implemented here.
+        # When this file carried its own copy it drifted from the gate it was describing.
+        shape = category_shape_violation(frontmatter, filename)
+        if shape:
+            issues["category"].append(f"{filename}: {shape}")
+
+        domain = str(frontmatter.get("domain") or "").strip()
+        if domain and not system_artifact and domain not in valid_domains:
+            issues["domain"].append(
+                f"{filename}: domain '{domain}' is outside the controlled vocabulary"
+            )
+
+        # Metric evidence.  ``evidence_tier`` was required of every page and filled on 10% of
+        # them, because nothing read it.  It is the machine-readable form of "the vendor said so"
+        # against "independently verified", so it is asked for where that distinction changes a
+        # decision: a page that puts a number into its compiled truth.  The gate refuses a new
+        # page that asserts a metric without one; this census is the reader that makes the field
+        # worth writing at all.
+        metric_keys = asserted_metric_keys(data["body"])
+        if metric_keys:
+            tier = str(frontmatter.get("evidence_tier") or "").strip()
+            metric_tiers[tier or "<none>"] += 1
+            if not tier:
+                issues["evidence"].append(
+                    f"{filename}: asserts {', '.join(sorted(set(metric_keys)))} without an "
+                    "evidence_tier"
+                )
 
         if auto_fix and changed:
             _write_fixed_frontmatter(data["path"], frontmatter, data["body"])
@@ -532,8 +554,22 @@ def lint_vector_lake(auto_fix: bool = False):
         except SchemaViolationException as e:
             issues["schema"].append(f"{filename}: {str(e)}")
 
-    # 6. Name collisions: one name under two type prefixes, and near names within one type.
-    #
+    # The census line is what makes the field readable at a glance: how many pages put a number
+    # into their compiled truth, and how many of them said what supports it.
+    if metric_tiers:
+        total_asserting = sum(metric_tiers.values())
+        missing = metric_tiers.get("<none>", 0)
+        spread = ", ".join(
+            f"{tier} {count}"
+            for tier, count in metric_tiers.most_common()
+            if tier != "<none>"
+        )
+        issues["evidence"].append(
+            f"coverage: {total_asserting - missing} of {total_asserting} metric-asserting page(s) "
+            f"declare a tier ({spread or 'none declared'})"
+        )
+
+    # 6. Name collisions: one name under two type prefixes, and near names within one type.    #
     # This check reports name shape, and stops short of calling it duplication.  What counts as
     # the same entity is decided by ``governance_metrics.find_merge_candidates`` -- which reads
     # the canonical entities, weighs declared names and aliases, and carries reasons and an
@@ -777,6 +813,13 @@ def lint_vector_lake(auto_fix: bool = False):
         "governance": "12. Governance Debt",
         "alignment": "13. Alignment Drift",
         "schema": "14. Strict Schema Verification",
+        # Appended rather than inserted beside ``category`` so the numbered sections keep their
+        # numbers: reports are read across time, and "9. Name Collisions" turning into "10." would
+        # invalidate every earlier reference to it.
+        "domain": "15. Domain Vocabulary",
+        # Appended for the same reason as ``domain``: the numbered sections are referenced across
+        # time, so a new check goes last rather than renumbering the ones an operator already reads.
+        "evidence": "16. Metric Evidence",
     }
 
     total_issues = sum(len(items) for items in issues.values())

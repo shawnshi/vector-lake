@@ -20,8 +20,16 @@ from vector_lake.schema_validator import (
     VALID_TYPES,
     missing_required_fields,
 )
-from vector_lake.wiki_utils import get_wiki_dir
+from vector_lake.wiki_utils import get_wiki_dir, read_markdown_file
+
+from tests.test_mutation_coordinator import _write_purpose_contract
 from vector_lake.tool_lint import lint_vector_lake
+
+
+_BODY = (
+    "## 1. 编译事实 (Compiled Truth - READ MODEL)\n\n- x\n\n"
+    "## 2. 证据时间线 (Timeline - EVENT STORE)\n\n- [2026-09-23] [Observation] x\n"
+)
 
 
 def _page(name: str, *, type_: str, status: str, epistemic: str, category: str) -> None:
@@ -115,6 +123,138 @@ def test_system_artifacts_may_carry_their_own_category(isolated_memory):
     )
     report = lint_vector_lake(auto_fix=False)
     assert "Invalid category 'System'" in report, report
+
+
+def test_a_missing_judgement_field_is_reported_not_invented(isolated_memory):
+    """The repair may fill in what the filename determines, not what someone must decide.
+
+    This block used to write ``Active``, ``seed``, ``edge``, ``General`` and
+    ``["Uncategorized"]`` for whatever it found missing -- the origin of 3 000 unclassified
+    pages and of a status axis that read 99.5% ``Active``.  A missing judgement is a governance
+    event, so it is reported and left alone.
+    """
+    wiki = get_wiki_dir()
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "Concept_Bare.md").write_text(
+        "---\nid: bare\ntitle: Bare\ntype: concept\n---\n\n" + _BODY,
+        encoding="utf-8",
+    )
+
+    report = lint_vector_lake(auto_fix=True)
+
+    frontmatter, _, _ = read_markdown_file(wiki / "Concept_Bare.md")
+    assert "Missing fields" in report, report
+    for field in (
+        "domain",
+        "topic_cluster",
+        "status",
+        "epistemic-status",
+        "categories",
+        "strategic_scope",
+        "evidence_tier",
+    ):
+        assert field not in frontmatter, f"{field} was invented: {frontmatter.get(field)!r}"
+
+
+def test_a_missing_mechanical_field_is_still_repaired(isolated_memory):
+    """Positive control: a filename-derived field and a timestamp are not judgements."""
+    _write_purpose_contract(isolated_memory)
+    wiki = get_wiki_dir()
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "Concept_Repairable.md").write_text(
+        "---\n"
+        "title: Repairable\n"
+        "type: concept\n"
+        "domain: General\n"
+        "status: Active\n"
+        "epistemic-status: seed\n"
+        "categories: [System_Architecture]\n"
+        "strategic_scope: core\n"
+        "---\n\n" + _BODY,
+        encoding="utf-8",
+    )
+
+    lint_vector_lake(auto_fix=True)
+
+    frontmatter, _, _ = read_markdown_file(wiki / "Concept_Repairable.md")
+    assert frontmatter.get("id"), "the id is derivable from the name"
+    assert frontmatter.get("updated"), "the timestamp is a fact about this write"
+    assert frontmatter.get("sources") == [], "an absent sources key means nothing recorded"
+
+
+def test_an_invalid_type_is_corrected_to_what_the_name_says(isolated_memory):
+    """``concept`` for every page renamed a Vendor_ page's type to a value its name contradicts."""
+    _write_purpose_contract(isolated_memory)
+    wiki = get_wiki_dir()
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "Vendor_Wrong-Type.md").write_text(
+        "---\n"
+        "id: vendor_wrong_type\n"
+        "title: Wrong Type\n"
+        "type: nonsense\n"
+        "domain: General\n"
+        "status: Active\n"
+        "epistemic-status: seed\n"
+        "categories: [System_Architecture]\n"
+        "strategic_scope: core\n"
+        "updated: 2026-09-23T00:00:00Z\n"
+        "sources: []\n"
+        "---\n\n" + _BODY,
+        encoding="utf-8",
+    )
+
+    lint_vector_lake(auto_fix=True)
+
+    frontmatter, _, _ = read_markdown_file(wiki / "Vendor_Wrong-Type.md")
+    assert frontmatter["type"] == "vendor", frontmatter["type"]
+
+
+def test_an_invalid_status_is_reported_and_not_rewritten(isolated_memory):
+    """``Contested`` and ``Archived`` are legal; a typo is a report, not an overwrite to Active."""
+    _page("Concept_Odd-Status.md", type_="concept", status="Retired", epistemic="seed", category="System_Architecture")
+
+    report = lint_vector_lake(auto_fix=True)
+
+    assert "Invalid status 'retired'" in report, report
+    frontmatter, _, _ = read_markdown_file(get_wiki_dir() / "Concept_Odd-Status.md")
+    assert frontmatter["status"] == "Retired", frontmatter["status"]
+
+
+def test_the_metric_evidence_census_reports_coverage_and_gaps(isolated_memory):
+    """The reader that makes ``evidence_tier`` worth writing.
+
+    Not every page is asked for a tier -- that was the shape that left 89.6% of the corpus empty.
+    A page that puts a number into its compiled truth is, and this census is where the answer is
+    read.
+    """
+    _write_purpose_contract(isolated_memory)
+    wiki = get_wiki_dir()
+    wiki.mkdir(parents=True, exist_ok=True)
+
+    def body(metric: bool) -> str:
+        line = "- [[Concept_X]] 的 {Metric: Market_Share} 为 12% (Source: [[Source_X]])\n"
+        head, sep, tail = _BODY.partition("## 2. 证据时间线")
+        return f"{head}{line if metric else ''}\n{sep}{tail}"
+
+    def page(name: str, tier: str, metric: bool) -> None:
+        (wiki / name).write_text(
+            "---\n"
+            f"id: {name[:-3].lower()}\ntitle: {name[:-3]}\ntype: concept\ndomain: Medical_IT\n"
+            "status: Active\nepistemic-status: seed\ncategories: [System_Architecture]\n"
+            f"strategic_scope: core\n{f'evidence_tier: {tier}\n' if tier else ''}"
+            "updated: 2026-09-23T00:00:00Z\nsources: []\n---\n\n" + body(metric),
+            encoding="utf-8",
+        )
+
+    page("Concept_Metric-No-Tier.md", "", metric=True)
+    page("Concept_Metric-With-Tier.md", "primary", metric=True)
+    page("Concept_No-Metric.md", "", metric=False)
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "asserts Market_Share without an evidence_tier" in report, report
+    assert "coverage: 1 of 2 metric-asserting page(s)" in report, report
+    assert "Concept_No-Metric.md: asserts" not in report, "a page with no number was counted"
 
 
 def test_missing_required_fields_is_the_single_source():

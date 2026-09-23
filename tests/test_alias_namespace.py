@@ -34,7 +34,7 @@ def _frontmatter(**overrides):
         "domain": "General",
         "status": "Active",
         "epistemic-status": "seed",
-        "categories": ["Concept"],
+        "categories": ["System_Architecture"],
         "updated": "2026-09-19T00:00:00+00:00",
         "sources": [],
         "tags": [],

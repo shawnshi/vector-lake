@@ -1199,7 +1199,7 @@ def _source_page_content(filename: str, sources: list[str]) -> str:
         "domain: General\n"
         "status: Active\n"
         "epistemic-status: seed\n"
-        "categories: [Source]\n"
+        "categories: [System_Architecture]\n"
         "updated: 2026-09-19T00:00:00+00:00\n"
         f"sources: {json.dumps(sources)}\n"
         "---\n"

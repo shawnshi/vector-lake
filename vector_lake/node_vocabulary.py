@@ -103,6 +103,48 @@ NODE_TYPE_ALTERNATION: str = "|".join(
 #: pages must refuse these types rather than label a page with them.
 GENERATED_NODE_TYPES: frozenset[str] = frozenset({"system"})
 
+#: The tag ``stub_creator`` puts on the placeholder page it invents for a broken link.  It
+#: lives here because two layers need it and neither may import the other: the stub writer
+#: owns the page, and the schema gate has to tell a placeholder from a classified node
+#: (``Uncategorized`` is honest on a placeholder and forbidden on a real node).
+STUB_MARKER_TAG: str = "auto-stub"
+
+#: Name family of the pages the clustering daemon generates about the wiki itself
+#: (``System_Community_*``).  These are the pages the schema exempts from ``domain``,
+#: ``epistemic-status`` and ``sources``.
+#:
+#: The exemption is scoped by *family*, not by the ``System_`` prefix it sits under.  Scoping it by
+#: ``System_`` would exempt knowledge pages that happen to be filed there, and the prefix is not
+#: even the whole family: see ``GENERATED_ARTIFACT_MARKERS``.
+GENERATED_ARTIFACT_PREFIX: str = "System_Community_"
+
+#: Frontmatter markers the clustering daemon writes on every page it generates.  The name is not
+#: a reliable identity: 235 community indexes were renamed to their titles
+#: (``System_集团化医院信息架构与溯源.md``), and a name-only rule read all of them as knowledge
+#: pages -- inventing a "235 misfiled knowledge nodes" defect out of generated indexes, and
+#: denying those pages the exemptions they are entitled to.  Identity is what the daemon wrote,
+#: not what the filename currently says.
+GENERATED_ARTIFACT_MARKERS: tuple[str, ...] = ("community_id", "level")
+
+
+def is_generated_artifact_name(filename: str) -> bool:
+    """True for a name in the daemon's own naming family, without looking at the page."""
+    return str(filename).startswith(GENERATED_ARTIFACT_PREFIX)
+
+
+def is_generated_artifact(frontmatter: dict | None, filename: str) -> bool:
+    """True for a page the wiki generates *about itself*, not a knowledge node.
+
+    Either source of identity is enough: the ``System_Community_*`` name family, or the markers
+    the daemon leaves in frontmatter.  Use this whenever the frontmatter is in hand; use
+    ``is_generated_artifact_name`` only when a filename is genuinely all a caller has.
+    """
+    if is_generated_artifact_name(filename):
+        return True
+    if isinstance(frontmatter, dict):
+        return any(key in frontmatter for key in GENERATED_ARTIFACT_MARKERS)
+    return False
+
 
 def type_for_node_id(node_id: str) -> str | None:
     """The declared type of a node id such as ``Vendor_Epic-Systems``.

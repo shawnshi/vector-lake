@@ -32,7 +32,7 @@ Test purpose.
 
 def _page(key: str, marker: str = "初始") -> str:
     return "\n".join([
-        "---", f"id: {key}", f"title: {key}", "type: concept", "domain: Healthcare_IT",
+        "---", f"id: {key}", f"title: {key}", "type: concept", "domain: Medical_IT",
         "status: Active", "epistemic-status: evergreen", "categories: [Entities_and_Actors]",
         "strategic_scope: core", "evidence_tier: primary", "tags: [t1]",
         "updated: 2026-01-01T00:00:00+00:00", "links: []", "sources: []", "---", "",

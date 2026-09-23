@@ -5,12 +5,14 @@ from vector_lake.purpose_contract import validate_ingest_payload, load_purpose_c
 class DefenseHookException(Exception):
     pass
 
-def verify_asset(content: str, filename: str, frontmatter: dict, index_path: Path):
+def verify_asset(
+    content: str, filename: str, frontmatter: dict, index_path: Path, is_new: bool | None = None
+):
     """
     Adapter for the legacy Defense Hook to route everything through the new strict SchemaValidator.
     """
     try:
-        validate_schema(frontmatter, content, filename, index_path)
+        validate_schema(frontmatter, content, filename, index_path, is_new)
         
         # Unified PurposeGate: Enforce strategic scope and evidence tier on all wiki content
         if filename.endswith(".md") and not filename.startswith("System_") and not filename.startswith("Orphan_"):

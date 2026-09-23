@@ -558,12 +558,16 @@ def atomic_write_text(
     if path.name.endswith(".md") and "wiki" in path.parts:
         try:
             frontmatter = pre_parsed_frontmatter if pre_parsed_frontmatter is not None else split_frontmatter(content)[0]
+            # Existence is read before the write, which is the only moment it answers "is this
+            # a new node": the new-node classification rules hang off that answer.  ``schema``
+            # mode is the legacy-maintenance path and is exempt from them.
+            is_new = validation_mode == "full" and not path.exists()
             if validation_mode == "full":
                 from vector_lake.defense_hook import verify_asset
-                verify_asset(content, path.name, frontmatter, get_index_path())
+                verify_asset(content, path.name, frontmatter, get_index_path(), is_new)
             else:
                 from vector_lake.schema_validator import validate_schema
-                validate_schema(frontmatter, content, path.name, get_index_path())
+                validate_schema(frontmatter, content, path.name, get_index_path(), is_new)
         except ImportError:
             # The defense hook stack itself is unavailable; nothing to validate with.
             log.warning("Defense hook unavailable; %s written without semantic validation", path.name)

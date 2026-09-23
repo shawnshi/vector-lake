@@ -20,9 +20,11 @@ import logging
 from pathlib import Path
 
 import pytest
+import yaml
 
 from vector_lake import db_store, tool_ingest
 from vector_lake.purpose_contract import PurposeContractError, validate_ingest_payload
+from vector_lake.schema_validator import category_shape_violation
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -91,6 +93,16 @@ def _validate(categories: str):
     return validate_ingest_payload([_item(categories)], contract=None)
 
 
+def _shape(categories: str):
+    return category_shape_violation(
+        {"categories": _parse_categories(categories), "tags": []}, "Concept_Cats.md"
+    )
+
+
+def _parse_categories(categories: str):
+    return yaml.safe_load(f"categories: {categories}\n")["categories"]
+
+
 def test_the_validator_accepts_a_single_element_list():
     records = _validate('["Healthcare_IT"]')
     assert [record["filename"] for record in records] == ["Concept_Cats.md"]
@@ -105,22 +117,42 @@ def test_the_validator_accepts_a_single_element_list():
     ],
 )
 def test_a_bad_categories_shape_is_refused_with_what_arrived(categories, described):
-    """The recorded reason is all an operator sees, so it has to name the offending value."""
-    with pytest.raises(PurposeContractError) as excinfo:
-        _validate(categories)
+    """The recorded reason is all an operator sees, so it has to name the offending value.
 
-    message = str(excinfo.value)
+    The rule moved: it used to live in ``purpose_contract.validate_ingest_payload`` *and* in the
+    new-node branch of ``schema_validator``, and between them they still let a bad shape through
+    on an update in ``schema`` mode.  It is now ``category_shape_violation``, enforced on every
+    write, so this asserts the owner instead of the gate that used to carry a copy.
+    """
+    message = _shape(categories)
+
     assert "categories must be a list with exactly one domain" in message
     assert described in message
 
 
 def test_missing_categories_is_reported_as_missing():
-    item = {"filename": "Concept_None.md", "content": FRONTMATTER.format(id="x", title="t", categories='""')}
     # A flow-style empty scalar parses as "", which is neither a list nor absent; the strict
     # case (field omitted entirely) is what "no value" describes, asserted separately.
-    with pytest.raises(PurposeContractError) as excinfo:
-        validate_ingest_payload([item], contract=None)
-    assert "categories" in str(excinfo.value)
+    message = category_shape_violation({"categories": ""}, "Concept_None.md")
+    assert "Received str" in message, message
+
+    assert category_shape_violation({}, "Concept_None.md") == (
+        "categories must be a list with exactly one domain. Received no value."
+    )
+
+
+def test_the_purpose_gate_no_longer_carries_its_own_copy_of_the_rule():
+    """Guard on the merge: a payload with a bad shape passes this gate and is refused later.
+
+    One owner, one check.  The gate that used to raise here answers to the purpose contract, not
+    to the schema, and the write it precedes is refused by ``category_shape_violation``.
+    """
+    assert [record["filename"] for record in _validate("Healthcare_IT")] == ["Concept_Cats.md"]
+
+    import inspect
+
+    source = inspect.getsource(validate_ingest_payload)
+    assert "exactly one domain" not in source
 
 
 def test_both_prompts_state_the_rule_the_validator_enforces():

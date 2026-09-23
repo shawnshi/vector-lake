@@ -43,7 +43,7 @@ type: source
 domain: General
 status: Active
 epistemic-status: seed
-categories: [Source]
+categories: [System_Architecture]
 updated: 2026-07-13T00:00:00+00:00
 sources: [raw/test.pdf]
 strategic_scope: core
@@ -68,7 +68,7 @@ type: concept
 domain: General
 status: Active
 epistemic-status: seed
-categories: [Concept]
+categories: [System_Architecture]
 updated: 2026-07-13T00:00:00+00:00
 sources: []
 strategic_scope: core

@@ -71,7 +71,11 @@ def rename_vector_lake_entity(old_name: str, new_name: str, dry_run: bool = True
             f"and update links in {updated_files} file(s)."
         )
     try:
-        execute_mutation_batch(mutations)
+        # A rename moves an existing node to a new name: it creates no knowledge, so it goes
+        # through the legacy-maintenance mode rather than the authoring gate.  Without this the
+        # new-node classification rules read the missing new path as "a new node" and refuse to
+        # rename a page whose classification has not been migrated yet.
+        execute_mutation_batch(mutations, validation_mode="schema")
     except Exception as exc:
         return f"Error during atomic rename: {exc}"
     return f"Successfully renamed '{old_name}' to '{normalized_new_name}'. Updated links in {updated_files} files."

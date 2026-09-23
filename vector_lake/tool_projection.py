@@ -286,7 +286,11 @@ def _frontmatter_from_entity(entity: dict) -> dict:
     page_key = str(entity.get("page_key") or entity.get("source_page") or "").replace(".md", "")
     inferred_type = page_key.split("_", 1)[0].lower() if "_" in page_key else "concept"
     entity_type = str(entity.get("type") or entity.get("entity_type") or inferred_type or "concept").lower()
-    categories = entity.get("categories") or [entity_type.capitalize()]
+    # An entity row with no category is an unclassified *legacy* node, and the ontology has a
+    # marker for exactly that.  This used to write ``[entity_type.capitalize()]`` -- the node
+    # type wearing a category's coat -- which put values like ``Source`` and ``Concept`` into
+    # pages, none of which are in ``VALID_CATEGORIES``.
+    categories = entity.get("categories") or ["Uncategorized"]
     if isinstance(categories, str):
         categories = [categories]
     return {

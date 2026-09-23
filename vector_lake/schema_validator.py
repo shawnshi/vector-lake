@@ -3,7 +3,13 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from vector_lake.node_vocabulary import NODE_TYPE_SET, NON_NODE_WIKI_FILES
+from vector_lake.node_vocabulary import (
+    GENERATED_ARTIFACT_PREFIX,
+    NODE_TYPE_SET,
+    NON_NODE_WIKI_FILES,
+    STUB_MARKER_TAG,
+    is_generated_artifact,
+)
 
 class SchemaViolationException(Exception):
     pass
@@ -63,6 +69,98 @@ VALID_EPISTEMIC_STATUS = {"seed", "sprouting", "evergreen"}
 # a category outside ``VALID_CATEGORIES``.
 SYSTEM_ARTIFACT_CATEGORIES = frozenset({"System"})
 
+# The ``domain`` facet had no controlled vocabulary, and 192 distinct values accumulated by
+# 2026-09-23 (67 of them used on exactly one page) while ``categories`` -- the axis that *is*
+# governed -- sat 39% empty.  This is the canonical set.  It applies to **new** nodes only:
+# refusing a legacy value here would freeze 7 400 pages that have not been migrated yet, and
+# the migration is a separate reviewable pass.
+VALID_DOMAINS = frozenset({
+    "Medical_IT",
+    "Artificial_Intelligence",
+    "System_Architecture",
+    "Enterprise_Software",
+    "Strategy_and_Business",
+    "Policy_and_Governance",
+    "Biomedicine",
+    "Cognitive_Science",
+    "General",
+})
+
+
+def category_shape_violation(frontmatter: dict, filename: str) -> str | None:
+    """The category contract's shape and vocabulary, enforced on **every** write.
+
+    This is the rule's single owner.  It lived in two places -- here for a new node, and in
+    ``purpose_contract.validate_ingest_payload`` for whatever that gate happened to see -- which
+    is worse than duplication: an update in ``schema`` mode was checked by neither, so a bare
+    string could be written back onto an existing page.
+
+    The message names what arrived, not only what was expected.  It is the recorded reason an
+    operator reads, and ``DHWB-20260913.md`` failed six days of ingest rounds on this one rule.
+    """
+    categories = frontmatter.get("categories")
+    if isinstance(categories, list):
+        received = f"a list of {len(categories)} element(s): {categories!r}"
+    elif categories is None:
+        received = "no value"
+    else:
+        received = f"{type(categories).__name__} {categories!r}"
+
+    if not isinstance(categories, list) or len(categories) != 1:
+        return f"categories must be a list with exactly one domain. Received {received}."
+
+    category = categories[0]
+    if not isinstance(category, str):
+        return f"category must be a string. Received {received}."
+    artifact = is_generated_artifact(frontmatter, filename)
+    if category not in VALID_CATEGORIES and not (
+        artifact and category in SYSTEM_ARTIFACT_CATEGORIES
+    ):
+        return f"Invalid category '{category}'. Allowed: {sorted(VALID_CATEGORIES)}"
+    return None
+
+
+def classification_violations(frontmatter: dict, filename: str) -> list[str]:
+    """The category rules that apply to a **newly authored** node only.
+
+    Shape and vocabulary are deliberately absent: they are ``category_shape_violation``, enforced
+    on every write, because a legacy page does not stop needing a well-formed category.  What is
+    left here is what a page that already exists may keep and a new one may not.
+    """
+    violations: list[str] = []
+    artifact = is_generated_artifact(frontmatter, filename)
+
+    # The legacy marker is the one category value a new node may not declare.
+    categories = frontmatter.get("categories")
+    if isinstance(categories, list) and len(categories) == 1:
+        category = categories[0]
+        if category == "Uncategorized" and STUB_MARKER_TAG not in (frontmatter.get("tags") or []):
+            violations.append(
+                "'Uncategorized' is for imported legacy nodes only. Align the new node to one of "
+                "the macro-domains, or propose a schema mutation."
+            )
+
+    # domain: the subject facet stops drifting at the point of creation.  ~~~~~~~~~~~~~~~~~~
+    domain = str(frontmatter.get("domain") or "").strip()
+    if domain and not artifact and domain not in VALID_DOMAINS:
+        violations.append(
+            f"domain '{domain}' is not in the controlled vocabulary. "
+            f"Pick one of {sorted(VALID_DOMAINS)}."
+        )
+
+    # The generated namespace is not a knowledge namespace.  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # A page the wiki generates about itself is identified by its markers, not by its filename:
+    # 235 community indexes were renamed to their titles and a name-only rule read them as
+    # knowledge.
+    if str(filename).startswith("System_") and not artifact:
+        violations.append(
+            "the System_ namespace holds generated artifacts "
+            f"({GENERATED_ARTIFACT_PREFIX}*), not knowledge. File this node under a knowledge "
+            "prefix (Concept_, Source_, Vendor_, ...) instead."
+        )
+
+    return violations
+
 # The single source for "which frontmatter keys must be present".  ``tool_lint``
 # used to keep its own shorter list with no system-file exemption, so the linter
 # and the write gate disagreed about the same page.
@@ -71,8 +169,9 @@ REQUIRED_FIELDS = (
     "epistemic-status", "categories", "updated", "sources",
 )
 # Derived system artifacts (community indexes and the like) carry no domain, no
-# epistemic status and no sources by design, so those keys are not required on a
-# ``System_*`` page.
+# epistemic status and no sources by design, so those keys are not required on one.  The
+# exemption is scoped by artifact family, not by the ``System_`` prefix: 235 knowledge pages
+# sit under that prefix and have to satisfy the same contract as any other node.
 SYSTEM_FILE_EXEMPT_FIELDS = frozenset({"domain", "epistemic-status", "sources"})
 
 
@@ -83,7 +182,7 @@ def missing_required_fields(frontmatter: dict, filename: str) -> list[str]:
     contract lists them in.  Key *presence* is what counts: ``sources: []`` is a
     present, satisfiable value, not a missing field.
     """
-    exempt = SYSTEM_FILE_EXEMPT_FIELDS if str(filename).startswith("System_") else frozenset()
+    exempt = SYSTEM_FILE_EXEMPT_FIELDS if is_generated_artifact(frontmatter, filename) else frozenset()
     return [field for field in REQUIRED_FIELDS if field not in frontmatter and field not in exempt]
 
 # Metric keys double as a physical unit contract.  Keep legacy keys readable,
@@ -98,6 +197,38 @@ CONTROLLED_METRICS = {
 }
 
 INLINE_SOURCE_ANCHOR = re.compile(r"\(Source:\s*\[\[Source_[^\]]+\]\](?:[^)]*)\)")
+
+#: The one spelling of a controlled-metric assertion.  ``validate_schema`` and the evidence census
+#: in ``tool_lint`` both read the corpus through this, so a change to the syntax cannot leave one
+#: of them counting something else.
+METRIC_ASSERTION = re.compile(r"\{Metric:\s*([^}]+)\}")
+
+
+def asserted_metric_keys(body: str) -> list[str]:
+    """The controlled-metric keys a page asserts, in document order."""
+    return [match.strip() for match in METRIC_ASSERTION.findall(body)]
+
+
+def metric_evidence_violation(frontmatter: dict, body: str) -> str | None:
+    """A page that asserts a controlled metric has to say what supports the number.
+
+    ``evidence_tier`` is the machine-readable form of "the vendor said so" against "independently
+    verified" -- the distinction that decides whether a figure may be quoted as established.
+    Requiring it of *every* page was the wrong shape: 89.6% of the corpus left it empty because
+    nothing read it, and it is a judgement, not a default.
+
+    Requiring it exactly where a number is asserted is a claim about that number's support, and it
+    costs one field on the handful of pages that make a quantitative claim.
+    """
+    keys = asserted_metric_keys(body)
+    if not keys:
+        return None
+    if str(frontmatter.get("evidence_tier") or "").strip():
+        return None
+    return (
+        f"this page asserts a controlled metric ({', '.join(sorted(set(keys)))}) without an "
+        "evidence_tier. State what supports the number."
+    )
 
 
 def source_key(entry) -> str:
@@ -155,7 +286,9 @@ VALID_PREDICATES = frozenset({
 })
 
 
-def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Path = None):
+def validate_schema(
+    frontmatter: dict, body: str, filename: str, index_path: Path = None, is_new: bool | None = None
+):
     """
     Validates a Vector Lake Wiki node against the strict constraints of schema.md.
     Raises SchemaViolationException on any failure.
@@ -180,6 +313,20 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
     doc_type = frontmatter.get("type", "").lower()
     if doc_type not in VALID_TYPES:
         raise SchemaViolationException(f"Schema Violation: Invalid type '{doc_type}'. Must be one of {VALID_TYPES}.")
+
+    # 1.2b The classification contract.  Shape and vocabulary are checked on every write, new
+    # node or not; the rules that follow apply only when this write *creates* one, because a
+    # legacy page keeps the classification it was written under until the migration runs.
+    shape = category_shape_violation(frontmatter, filename)
+    if shape:
+        raise SchemaViolationException(f"Schema Violation: {shape}")
+    if is_new:
+        violations = classification_violations(frontmatter, filename)
+        if violations:
+            raise SchemaViolationException(f"Schema Violation: {violations[0]}")
+        evidence = metric_evidence_violation(frontmatter, body)
+        if evidence:
+            raise SchemaViolationException(f"Schema Violation: {evidence}")
 
     # 1.3 Epistemic Status
     epistemic_status = str(frontmatter.get("epistemic-status", "")).lower()
@@ -284,7 +431,7 @@ def validate_schema(frontmatter: dict, body: str, filename: str, index_path: Pat
             raise SchemaViolationException(f"Schema Violation: 'tension_edges' defined in YAML but missing '{TENSION_H3_SLOT}' slot.")
 
         # Metric Constraint
-        metric_matches = re.findall(r'\{Metric:\s*([^\}]+)\}', section_1_text)
+        metric_matches = asserted_metric_keys(section_1_text)
         for m in metric_matches:
             if m.strip() not in CONTROLLED_METRICS:
                 raise SchemaViolationException(f"Schema Violation: Invalid Metric key '{m.strip()}'. Allowed keys: {sorted(CONTROLLED_METRICS)}.")

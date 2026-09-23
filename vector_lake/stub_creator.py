@@ -61,6 +61,7 @@ from dataclasses import dataclass
 
 from vector_lake.node_vocabulary import (
     GENERATED_NODE_TYPES,
+    STUB_MARKER_TAG,
     prefix_for,
     strip_prefix,
     type_for_node_id,
@@ -80,8 +81,10 @@ _FORBIDDEN_FILENAME_CHARS = re.compile(r'[\[\]<>:"/\\|\?\*\(\)\s_]+')
 #: Slot used when a type declares no H3 slots of its own.
 _FALLBACK_SLOT = "### 物理机制 (Mechanism)"
 
-#: What a stub declares that no rule derives from the target.
-_STUB_MARKER_TAG = "auto-stub"
+#: What a stub declares that no rule derives from the target.  The constant itself lives in
+#: ``node_vocabulary`` so the schema gate can tell a placeholder from a classified node
+#: without importing this module (which imports ``schema_validator`` in turn).
+_STUB_MARKER_TAG = STUB_MARKER_TAG
 
 
 #: Base36 alphabet for the id suffix, ordered so the encoding is stable across Python versions.
