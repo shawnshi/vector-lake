@@ -60,7 +60,11 @@ def infer_claim_validity(claim: dict, now=None) -> dict:
         reasons.append("conflicts")
         return {"validity_state": "conflicted", "reasons": reasons}
     if evidence_count == 0:
-        reasons.append("missing_evidence")
+        # The extractor records *which* gap it is, and the two have different owners: a page that
+        # records no source at all is an ingest-contract problem, while a page that records
+        # several and a block that does not say which is the block's own missing anchor.  A claim
+        # written before the field existed still lands on the general reason.
+        reasons.append(str(claim.get("evidence_gap") or "missing_evidence"))
         return {"validity_state": "unsupported", "reasons": reasons}
     if review_after and review_after < now:
         reasons.append("review_after")
@@ -348,6 +352,8 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
 
     validity_state_counts = {}
     unsupported_claim_count = 0
+    ambiguous_source_claim_count = 0
+    unsourced_claim_count = 0
     conflicted_claim_count = 0
     stale_claim_count = 0
     expired_claim_count = 0
@@ -360,6 +366,10 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
         validity_state_counts[state] = validity_state_counts.get(state, 0) + 1
         if state == "unsupported":
             unsupported_claim_count += 1
+            if "ambiguous_source" in (claim.get("validity_reasons") or []):
+                ambiguous_source_claim_count += 1
+            else:
+                unsourced_claim_count += 1
         if state == "conflicted":
             conflicted_claim_count += 1
         if state in {"review-due", "needs-review", "expiring-soon"}:
@@ -386,6 +396,8 @@ def compute_debt_metrics(skip_heavy: bool = False, merge_candidates: list[dict] 
         "expired_claim_count": expired_claim_count,
         "review_due_claim_count": review_due_claim_count,
         "unsupported_claim_count": unsupported_claim_count,
+        "ambiguous_source_claim_count": ambiguous_source_claim_count,
+        "unsourced_claim_count": unsourced_claim_count,
         "conflicted_claim_count": conflicted_claim_count,
         "provisional_claim_count": provisional_claim_count,
         "pending_change_set_count": len(governance_store.pending_change_sets()),

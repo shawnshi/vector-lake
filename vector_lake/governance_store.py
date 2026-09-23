@@ -394,7 +394,7 @@ def load_claim_scan_rows() -> list[dict] | None:
         rows = conn.execute(
             "SELECT claim_id, status, confidence, freshness_tier, valid_to, review_after, "
             "evidence_count, contradicts_count, subject_entity_count, source_page, claim_text, "
-            "source_ids, source_rowid FROM claim_index ORDER BY source_rowid"
+            "source_ids, evidence_gap, source_rowid FROM claim_index ORDER BY source_rowid"
         ).fetchall()
     except sqlite3.OperationalError:
         return None
@@ -413,6 +413,7 @@ def load_claim_scan_rows() -> list[dict] | None:
                 "status": str(row["status"]),
                 "confidence": float(row["confidence"]),
                 "freshness_tier": str(row["freshness_tier"]),
+                "evidence_gap": str(row["evidence_gap"] or ""),
                 "valid_to": str(row["valid_to"]) or None,
                 "review_after": str(row["review_after"]) or None,
                 "evidence_ids": [None] * int(row["evidence_count"]),

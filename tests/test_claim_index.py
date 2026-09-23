@@ -29,7 +29,8 @@ CLAIMS = [
     ("c_expired_valid_to", {"status": "Active", "confidence": 0.9, "evidence_ids": ["e1"], "valid_to": "2020-01-01T00:00:00+00:00"}),
     ("c_review_due", {"status": "Active", "confidence": 0.9, "evidence_ids": ["e1"], "review_after": "2020-01-01T00:00:00+00:00"}),
     ("c_conflicted", {"status": "Active", "confidence": 0.9, "evidence_ids": ["e1"], "contradicts": ["other"]}),
-    ("c_unsupported", {"status": "Active", "confidence": 0.9, "evidence_ids": []}),
+    ("c_unsupported", {"status": "Active", "confidence": 0.9, "evidence_ids": [], "evidence_gap": "no_source"}),
+    ("c_ambiguous_source", {"status": "Active", "confidence": 0.9, "evidence_ids": [], "evidence_gap": "ambiguous_source"}),
     ("c_needs_review", {"status": "Active", "confidence": 0.9, "evidence_ids": ["e1"], "freshness_tier": "volatile"}),
     ("c_missing_fields", {}),
     ("c_scalar_evidence", {"status": "Active", "confidence": 0.9, "evidence_ids": "not-a-list"}),
@@ -106,7 +107,7 @@ def test_the_annotation_inputs_equal_a_full_decode(populated):
         for row in conn.execute(
             "SELECT claim_id, status, confidence, freshness_tier, valid_to, review_after, "
             "evidence_count, contradicts_count, subject_entity_count, source_page, claim_text, "
-            "source_ids FROM claim_index"
+            "source_ids, evidence_gap FROM claim_index"
         )
     }
 
@@ -119,6 +120,7 @@ def test_the_annotation_inputs_equal_a_full_decode(populated):
         assert row["valid_to"] == str(claim.get("valid_to") or ""), claim_id
         assert row["review_after"] == str(claim.get("review_after") or ""), claim_id
         assert row["source_page"] == str(claim.get("source_page") or "").lower(), claim_id
+        assert row["evidence_gap"] == str(claim.get("evidence_gap") or ""), claim_id
         assert row["claim_text"] == str(claim.get("claim_text") or "").lower(), claim_id
         if "source_ids" in claim:
             assert json.loads(row["source_ids"]) == claim["source_ids"], claim_id
@@ -141,7 +143,8 @@ def test_the_validity_verdict_equals_the_json_decoded_one(populated):
         projected = dict(
             conn.execute(
                 "SELECT status, confidence, freshness_tier, valid_to, review_after, "
-                "evidence_count, contradicts_count FROM claim_index WHERE claim_id = ?",
+                "evidence_count, contradicts_count, evidence_gap FROM claim_index "
+                "WHERE claim_id = ?",
                 (row["claim_id"],),
             ).fetchone()
         )
@@ -153,6 +156,7 @@ def test_the_validity_verdict_equals_the_json_decoded_one(populated):
             "valid_to": projected["valid_to"] or None,
             "review_after": projected["review_after"] or None,
             "evidence_ids": [None] * projected["evidence_count"],
+            "evidence_gap": projected["evidence_gap"],
             "contradicts": [None] * projected["contradicts_count"],
         }
         try:

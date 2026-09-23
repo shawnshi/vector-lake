@@ -839,6 +839,12 @@ def lint_vector_lake(auto_fix: bool = False):
     metrics = governance_metrics.compute_debt_metrics()
     if metrics["unsupported_claim_count"] > 0:
         issues["governance"].append(f"Unsupported claims: {metrics['unsupported_claim_count']}")
+        # Split, because the two have different owners: a page that records no source is an
+        # ingest-contract problem, a block that does not name which source is the block's anchor.
+        issues["governance"].append(
+            f"  of which: no source recorded {metrics.get('unsourced_claim_count', 0)}, "
+            f"source not named by the block {metrics.get('ambiguous_source_claim_count', 0)}"
+        )
     if metrics["stale_claim_count"] > 0:
         issues["governance"].append(f"Stale claims: {metrics['stale_claim_count']}")
     if metrics["pending_change_set_count"] > 0:

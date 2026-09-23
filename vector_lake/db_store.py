@@ -393,6 +393,11 @@ _CLAIM_INDEX_VALUE_COLUMNS = (
     "source_page",
     "claim_text",
     "source_ids",
+    # The annotation reads this through the projection: ``infer_claim_validity`` splits "the page
+    # records no source" from "the block does not say which one", and the debt metric runs on
+    # these narrow rows.  A projection that carried every other field the annotation reads and not
+    # this one reported both gaps as the same number.
+    "evidence_gap",
 )
 _CLAIM_INDEX_COLUMNS = ("claim_id",) + _CLAIM_INDEX_VALUE_COLUMNS + ("source_rowid",)
 
@@ -430,6 +435,7 @@ def _claim_index_value_expr(source: str) -> str:
         f"lower(COALESCE(json_extract({source}.data_json, '$.claim_text'), ''))",
         f"CASE WHEN json_type({source}.data_json, '$.source_ids') IS NULL THEN NULL "
         f"ELSE json_quote(json_extract({source}.data_json, '$.source_ids')) END",
+        f"COALESCE(json_extract({source}.data_json, '$.evidence_gap'), '')",
     )
     separator = "," + chr(10)
     return separator.join("            " + expression for expression in expressions)
@@ -470,10 +476,24 @@ def _create_claim_index_tables(conn: sqlite3.Connection) -> None:
             source_page TEXT NOT NULL DEFAULT '',
             claim_text TEXT NOT NULL DEFAULT '',
             source_ids TEXT,
-            source_rowid INTEGER NOT NULL DEFAULT 0
+            source_rowid INTEGER NOT NULL DEFAULT 0,
+            evidence_gap TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    # ``evidence_gap`` is the one field the annotation needs that a database predating it does not
+    # carry, and the triggers are created with ``IF NOT EXISTS`` -- so the column is added, the two
+    # projection triggers are dropped to be re-created with it, and the projection is re-derived
+    # once.  Without the rebuild every existing row would keep the empty default and the metric
+    # would still read one number instead of two.
+    try:
+        conn.execute("ALTER TABLE claim_index ADD COLUMN evidence_gap TEXT NOT NULL DEFAULT ''")
+        stale_claim_projection = True
+    except sqlite3.OperationalError:
+        stale_claim_projection = False
+    if stale_claim_projection:
+        for trigger in ("trg_claim_index_insert", "trg_claim_index_update"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_index_status ON claim_index (status)")
     columns = ", ".join(_CLAIM_INDEX_COLUMNS)
     upsert = ", ".join(
@@ -507,7 +527,7 @@ def _create_claim_index_tables(conn: sqlite3.Connection) -> None:
         END
         """
     )
-    ensure_claim_index(conn)
+    ensure_claim_index(conn, force=stale_claim_projection)
 
 
 def ensure_claim_index(conn: sqlite3.Connection | None = None, force: bool = False) -> dict:

@@ -4,6 +4,7 @@ import re
 from datetime import datetime, timezone
 
 from vector_lake.wiki_utils import canonical_source_name, normalize_sources
+from vector_lake.node_vocabulary import is_generated_artifact
 from vector_lake.schema_validator import validate_schema, SchemaViolationException
 import logging
 
@@ -202,6 +203,22 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
     now = _utc_now()
     page_name = os.path.basename(page_path)
     page_key = os.path.splitext(page_name)[0]
+    # A page the wiki generates about itself is not knowledge, and the ingestion and index layers
+    # already treat it that way -- ``indexer`` skips the namespace outright.  This extractor did
+    # not, so it minted claims from cluster indexes: 29 392 of the 47 636 claims the debt report
+    # called unsupported sat on those pages, 99.1% of everything extracted from them, because a
+    # generated index records no source by design and its Hubs/Members lines are not assertions.
+    if is_generated_artifact(frontmatter, page_name, body):
+        log.debug("Skipping generated artifact %s: the wiki's own bookkeeping, not knowledge.", page_name)
+        return {
+            "entities": [],
+            "claims": [],
+            "evidence": [],
+            "sources": [],
+            "edges": [],
+            "page_key": page_key,
+            "page_type": str(frontmatter.get("type", "system")).lower(),
+        }
     title = frontmatter.get("title", page_key)
     page_type = str(frontmatter.get("type", "concept")).lower()
     aliases = frontmatter.get("aliases") or []
@@ -390,6 +407,13 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
                 "contradicts_claim_ids": [],
             })
 
+        # Why this block carries no evidence, kept distinct from the other gap: a page that
+        # records no source at all is an ingest-contract problem, while a page that records
+        # several and a block that does not say which is the block's own missing anchor.
+        evidence_gap = ""
+        if not evidence_ids:
+            evidence_gap = "no_source" if not sources else "ambiguous_source"
+
         claim_id = frontmatter.get("claim_id") if block_index == 1 else None
         claim_id = claim_id or _stable_id("claim", f"{page_key}:{block_text}")
         from vector_lake.wiki_utils import enforce_claim_dict
@@ -402,6 +426,12 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             "confidence": frontmatter.get("confidence", 0.6 if page_type == "synthesis" else 0.8),
             "subject_entity_ids": list(subject_entity_ids),
             "evidence_ids": evidence_ids,
+            # Why a block carries no evidence, recorded rather than flattened into one number:
+            # "the page records no source at all" and "the page records several and this block
+            # does not say which" are different problems with different owners -- an ingest
+            # contract that let a page land without provenance, against a block that owes its
+            # inline anchor.  Both used to read as the same ``unsupported``.
+            "evidence_gap": evidence_gap,
             "source_ids": list(source_ids),
             "inline_sources": inline_sources,
             "locator": {
@@ -449,6 +479,7 @@ def extract_page_objects(page_path: str, frontmatter: dict, body: str) -> dict:
             "confidence": frontmatter.get("confidence", 0.65 if page_type == "synthesis" else 0.82),
             "subject_entity_ids": list(subject_entity_ids),
             "evidence_ids": summary_evidence_ids,
+            "evidence_gap": "" if summary_evidence_ids else "no_source",
             "source_ids": list(source_ids),
             "locator": {"page_key": page_key, "heading": title, "block_index": 0},
             **validity_defaults,
