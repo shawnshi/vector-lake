@@ -120,7 +120,7 @@ def category_shape_violation(frontmatter: dict, filename: str) -> str | None:
     return None
 
 
-def classification_violations(frontmatter: dict, filename: str) -> list[str]:
+def classification_violations(frontmatter: dict, filename: str, body: str | None = None) -> list[str]:
     """The category rules that apply to a **newly authored** node only.
 
     Shape and vocabulary are deliberately absent: they are ``category_shape_violation``, enforced
@@ -128,7 +128,7 @@ def classification_violations(frontmatter: dict, filename: str) -> list[str]:
     left here is what a page that already exists may keep and a new one may not.
     """
     violations: list[str] = []
-    artifact = is_generated_artifact(frontmatter, filename)
+    artifact = is_generated_artifact(frontmatter, filename, body)
 
     # The legacy marker is the one category value a new node may not declare.
     categories = frontmatter.get("categories")
@@ -175,14 +175,18 @@ REQUIRED_FIELDS = (
 SYSTEM_FILE_EXEMPT_FIELDS = frozenset({"domain", "epistemic-status", "sources"})
 
 
-def missing_required_fields(frontmatter: dict, filename: str) -> list[str]:
+def missing_required_fields(frontmatter: dict, filename: str, body: str | None = None) -> list[str]:
     """Required frontmatter keys absent from ``frontmatter``, in contract order.
 
     Callers raise on ``missing[0]`` so the reported field matches the order the
     contract lists them in.  Key *presence* is what counts: ``sources: []`` is a
     present, satisfiable value, not a missing field.
     """
-    exempt = SYSTEM_FILE_EXEMPT_FIELDS if is_generated_artifact(frontmatter, filename) else frozenset()
+    exempt = (
+        SYSTEM_FILE_EXEMPT_FIELDS
+        if is_generated_artifact(frontmatter, filename, body)
+        else frozenset()
+    )
     return [field for field in REQUIRED_FIELDS if field not in frontmatter and field not in exempt]
 
 # Metric keys double as a physical unit contract.  Keep legacy keys readable,
@@ -306,7 +310,7 @@ def validate_schema(
 
     # 1.1 Required Fields
     # strategic_scope and evidence_tier are highly recommended but we allow legacy files without them
-    missing = missing_required_fields(frontmatter, filename)
+    missing = missing_required_fields(frontmatter, filename, body)
     if missing:
         raise SchemaViolationException(f"Schema Violation: Missing required frontmatter field '{missing[0]}'.")
     # 1.2 Type Validation
@@ -321,7 +325,7 @@ def validate_schema(
     if shape:
         raise SchemaViolationException(f"Schema Violation: {shape}")
     if is_new:
-        violations = classification_violations(frontmatter, filename)
+        violations = classification_violations(frontmatter, filename, body)
         if violations:
             raise SchemaViolationException(f"Schema Violation: {violations[0]}")
         evidence = metric_evidence_violation(frontmatter, body)

@@ -519,7 +519,7 @@ def lint_vector_lake(auto_fix: bool = False):
         if epistemic and epistemic not in valid_epistemic:
             issues["type_status"].append(f"{filename}: Invalid epistemic-status '{epistemic}'")
 
-        system_artifact = is_generated_artifact(frontmatter, filename)
+        system_artifact = is_generated_artifact(frontmatter, filename, data["body"])
         # The category rule is reported from its single owner rather than re-implemented here.
         # When this file carried its own copy it drifted from the gate it was describing.
         shape = category_shape_violation(frontmatter, filename)
@@ -596,12 +596,24 @@ def lint_vector_lake(auto_fix: bool = False):
         identity_groups[entity_identity_key(strip_prefix(key))].append(key)
     #: pairs withheld because the pattern is by design, not because they are the same entity.
     source_anchor_pairs = 0
+    artifact_pairs = 0
+    #: the pages the wiki generates about itself: a community index is not a duplicate of the page
+    #: it was named after (4 of the 33 identity pairs were exactly that, and 3 of them would have
+    #: been "merged" into the concept whose cluster they index).
+    artifact_keys = {
+        name[:-3]
+        for name, data in parsed.items()
+        if is_generated_artifact(data["fm"], name, data["body"])
+    }
     for members in identity_groups.values():
         if len(members) < 2 or len({_type_prefix(member) for member in members}) < 2:
             continue
         ordered = sorted(members)
         for left_index, key_a in enumerate(ordered):
             for key_b in ordered[left_index + 1:]:
+                if key_a in artifact_keys or key_b in artifact_keys:
+                    artifact_pairs += 1
+                    continue
                 # A ``Source_*`` page records the *document* a node came from, so a source page and
                 # the node derived from it share a name whenever the document is named after its
                 # subject -- ``Source_哲学家的工具箱`` beside ``Concept_哲学家的工具箱``.  That is
@@ -714,6 +726,8 @@ def lint_vector_lake(auto_fix: bool = False):
         f"{len(series_families)} families (largest {max(series_families, default=0)} names)",
         f"excluded as a source page beside its own node: {source_anchor_pairs} pairs "
         "(the provenance record and the node it fed share a name by design)",
+        f"excluded as a generated index: {artifact_pairs} pairs "
+        "(a community index is not a duplicate of the page it was named after)",
         "merge decisions belong to merge_suggestions_vector_lake and the governance queue, "
         "not to this pass",
     ]

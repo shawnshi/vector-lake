@@ -183,3 +183,25 @@ def test_the_vocabulary_module_imports_nothing():
     ]
 
     assert found == [], [ast.dump(node) for node in found]
+
+
+def test_a_generated_index_is_recognised_without_a_marker():
+    """The daemon's two H2 sections are identity too, and seven pages had only that.
+
+    They carried no ``community_id``, no ``level`` and no ``System_Community_`` name -- and the
+    earlier reading of that gap, "knowledge pages misfiled under System_", was wrong: their body
+    opens ``# L0 Comm: ...`` and carries the generated-index note.  Identity by shape is what
+    stops such a page from being classified, or merged, as if it were knowledge.
+    """
+    from vector_lake.node_vocabulary import is_generated_artifact
+
+    artifact_body = (
+        "# L0 Comm: A cluster\n\n"
+        "> [!NOTE]\n> 这是一个系统自动生成的社区索引文件\n\n"
+        "## 核心节点 (Hubs)\n\n## 社区成员 (Members)\n"
+    )
+
+    assert is_generated_artifact({}, "System_Topic.md", artifact_body) is True
+    assert is_generated_artifact({}, "Concept_Topic.md", artifact_body) is True
+    assert is_generated_artifact({}, "Concept_Topic.md", "## 1. 编译事实\n\n- x\n") is False
+    assert is_generated_artifact({"community_id": 7}, "Concept_Topic.md") is True

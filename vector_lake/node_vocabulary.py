@@ -126,23 +126,37 @@ GENERATED_ARTIFACT_PREFIX: str = "System_Community_"
 #: not what the filename currently says.
 GENERATED_ARTIFACT_MARKERS: tuple[str, ...] = ("community_id", "level")
 
+#: The two H2 sections the daemon writes on every community index: the third identity signal, and
+#: the one that does not depend on the generator remembering a marker.  Measured on the corpus,
+#: 797 pages carry both and every one of them is in the generated shape; seven of those had no
+#: ``community_id``, no ``level`` and no ``System_Community_`` name.  The earlier reading of that
+#: gap -- "knowledge pages misfiled under System_" -- was wrong: their body says
+#: ``# L0 Comm: ...`` and carries the generated-index note.
+GENERATED_ARTIFACT_H2: tuple[str, ...] = ("## 核心节点 (Hubs)", "## 社区成员 (Members)")
+
 
 def is_generated_artifact_name(filename: str) -> bool:
     """True for a name in the daemon's own naming family, without looking at the page."""
     return str(filename).startswith(GENERATED_ARTIFACT_PREFIX)
 
 
-def is_generated_artifact(frontmatter: dict | None, filename: str) -> bool:
+def is_generated_artifact(frontmatter: dict | None, filename: str, body: str | None = None) -> bool:
     """True for a page the wiki generates *about itself*, not a knowledge node.
 
-    Either source of identity is enough: the ``System_Community_*`` name family, or the markers
-    the daemon leaves in frontmatter.  Use this whenever the frontmatter is in hand; use
-    ``is_generated_artifact_name`` only when a filename is genuinely all a caller has.
+    Any one of three signals is enough: the ``System_Community_*`` name family, the markers the
+    daemon leaves in frontmatter, or the artifact's own two H2 sections.  A caller holding the
+    body should pass it, because the generator has not always written the markers -- and the
+    cost of guessing wrong is a knowledge rule applied to a generated index, or a generated
+    index reported as a duplicate of the page it was named after.
     """
     if is_generated_artifact_name(filename):
         return True
-    if isinstance(frontmatter, dict):
-        return any(key in frontmatter for key in GENERATED_ARTIFACT_MARKERS)
+    if isinstance(frontmatter, dict) and any(
+        key in frontmatter for key in GENERATED_ARTIFACT_MARKERS
+    ):
+        return True
+    if body and all(section in body for section in GENERATED_ARTIFACT_H2):
+        return True
     return False
 
 
