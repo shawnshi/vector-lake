@@ -322,3 +322,38 @@ def test_doctor_treats_a_missing_gram_index_as_degradation(isolated_memory):
     assert "[FAIL] Memory Gram Index" not in report
     assert "[OK] Memory Gram Index:" in report
     assert "memory_gram_index_unusable" in report
+
+
+def test_a_bookkeeping_edit_is_not_content_drift(seeded):
+    """``validity_state`` and ``memory_score`` churn constantly and change no gram.
+
+    Before the ``WHEN`` clause, any update queued the document, and one queued live document makes
+    the whole index unusable -- measured: 200 of 200 sampled queued documents had postings that
+    already matched their content.
+    """
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DELETE FROM operational_memory_gram_dirty")
+        conn.execute(
+            "UPDATE operational_memory_index SET memory_score = memory_score + 0.1, "
+            "validity_state = 'archived', updated_rank = updated_rank + 1 WHERE memory_id = 'mem_a'"
+        )
+
+    total, live, retired = memory_gram_index.dirty_breakdown(conn)
+
+    assert (total, live, retired) == (0, 0, 0), "a bookkeeping edit is not content drift"
+
+
+def test_a_content_edit_still_queues_the_document(seeded):
+    """Positive control: the fix must not swallow the case the queue exists for."""
+    conn = db_store.get_connection()
+    with db_store.transaction():
+        conn.execute("DELETE FROM operational_memory_gram_dirty")
+        conn.execute(
+            "UPDATE operational_memory_index SET text_blob = text_blob || ' 新结论' "
+            "WHERE memory_id = 'mem_a'"
+        )
+
+    total, live, _ = memory_gram_index.dirty_breakdown(conn)
+
+    assert (total, live) == (1, 1), "a changed indexed field has to keep the marker"

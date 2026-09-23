@@ -679,10 +679,25 @@ def _create_memory_gram_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    for trigger, event, doc in (
-        ("trg_om_gram_dirty_insert", "AFTER INSERT", "NEW.rowid"),
-        ("trg_om_gram_dirty_update", "AFTER UPDATE", "NEW.rowid"),
-        ("trg_om_gram_dirty_delete", "AFTER DELETE", "OLD.rowid"),
+    for trigger, event, doc, when in (
+        ("trg_om_gram_dirty_insert", "AFTER INSERT", "NEW.rowid", ""),
+        # Only a change to a gram-bearing column can make the base postings stale.  Firing on
+        # every update marked the index unusable for bookkeeping edits alone -- ``validity_state``,
+        # ``memory_score``, ``updated_rank`` and ``source_updated_at`` churn constantly, and a
+        # sample of 200 queued documents found 200 of them with postings that already matched
+        # their content byte for byte.  The read path refuses the whole index while any live
+        # document is queued, so a false marker is not merely wasted maintenance: it takes the
+        # indexed path away from every search until the next rebuild, which the next bookkeeping
+        # write then undoes again.
+        (
+            "trg_om_gram_dirty_update",
+            "AFTER UPDATE",
+            "NEW.rowid",
+            "WHEN OLD.key_blob IS NOT NEW.key_blob "
+            "OR OLD.text_blob IS NOT NEW.text_blob "
+            "OR OLD.page_blob IS NOT NEW.page_blob",
+        ),
+        ("trg_om_gram_dirty_delete", "AFTER DELETE", "OLD.rowid", ""),
     ):
         # ``INSERT OR IGNORE``/``OR REPLACE`` are rejected here: this trigger runs
         # nested inside the projection's own upsert, and SQLite raises the UNIQUE
@@ -697,6 +712,7 @@ def _create_memory_gram_tables(conn: sqlite3.Connection) -> None:
             f"""
             CREATE TRIGGER {trigger}
             {event} ON operational_memory_index
+            {when}
             BEGIN
                 INSERT INTO operational_memory_gram_dirty (doc)
                 SELECT {doc} WHERE NOT EXISTS (
