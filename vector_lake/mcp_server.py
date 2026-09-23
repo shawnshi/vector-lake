@@ -278,13 +278,17 @@ def lint_vector_lake(auto_fix: bool = False) -> str:
         return f"MCP Exception: {str(e)}\n{traceback.format_exc()}"
 
 @mcp.tool()
-def query_logic_lake(query_str: str) -> str:
+def query_logic_lake(query_str: str, dry_run: bool = False) -> str:
     """Deep reasoning with budget-controlled context.
-    
+
     Args:
         query_str: The topic or command for reasoning.
+        dry_run: Return the provenance trace instead of the synthesis prompt.  The prompt
+            template documents this switch (``dry_run: true`` stops after the context
+            envelope is written), but this wrapper dropped the argument while the CLI has
+            always passed it -- so the documented behaviour was unreachable from MCP.
     """
-    return tools.prepare_query_context(query_str)
+    return tools.prepare_query_context(query_str, dry_run)
 
 @mcp.tool()
 def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:

@@ -17,9 +17,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 from vector_lake import get_extension_root, tool_query
-from vector_lake.wiki_utils import validate_wiki_filename
+from vector_lake.wiki_utils import validate_wiki_filename, write_markdown_file
 
-from tests.test_ingest_contract import _concept_content
+from tests.test_ingest_contract import _concept_content, _synthesis_content
 from tests.test_mutation_coordinator import _write_purpose_contract
 
 
@@ -203,6 +203,121 @@ def test_an_absent_name_beside_a_present_one_is_counted(isolated_memory):
     result = tool_query.finalize_query_synthesis("Concept_Target.md,Concept_Missing.md", "q")
 
     assert "1 named file(s) were absent" in result, result
+
+
+def test_a_page_a_write_gate_refuses_does_not_abort_the_batch(isolated_memory):
+    """A refused proposal has to be reported, and the pages after it still have to be checked.
+
+    ``sanitize_wiki_node`` writes each proposal back through the canonical path, whose gate
+    refuses a page it will not accept.  Measured on this host the reachable class is the schema
+    violation (``defense_hook``) rather than ``SafeWriteError``.  That raise sat inside the loop
+    with no handler, so it left the function entirely: every later file went unchecked and no
+    stub was generated for the pages that had passed.
+    """
+    _write_purpose_contract(isolated_memory)
+    wiki = isolated_memory / "wiki"
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "Concept_Target.md").write_text(_concept_content(), encoding="utf-8")
+    refused = wiki / "Concept_SchemaGap.md"
+    refused.write_text("# No frontmatter at all\n\nbody only\n", encoding="utf-8")
+    before = refused.read_text(encoding="utf-8")
+
+    result = tool_query.finalize_query_synthesis(
+        "Concept_Target.md,Concept_SchemaGap.md", "q"
+    )
+
+    assert "1 page(s) verified present" in result, result
+    assert "Concept_SchemaGap.md" in result, "a refused page must be named, not silent"
+    assert refused.read_text(encoding="utf-8") == before, (
+        "a refused page must be left exactly as proposed, not half-rewritten"
+    )
+
+
+def test_a_batch_where_nothing_was_accepted_raises_instead_of_summarising(isolated_memory):
+    """Zero accepted pages is an environment failure, not a per-page refusal.
+
+    Reporting it as a tidy "0 verified, N withheld" summary would be the silent-degradation
+    shape this tree forbids -- a missing purpose contract looks exactly like that.
+    """
+    from vector_lake.defense_hook import DefenseHookException
+
+    _write_purpose_contract(isolated_memory)
+    wiki = isolated_memory / "wiki"
+    wiki.mkdir(parents=True, exist_ok=True)
+    (wiki / "Concept_SchemaGap.md").write_text(
+        "# No frontmatter at all\n\nbody only\n", encoding="utf-8"
+    )
+
+    with pytest.raises(DefenseHookException, match="Schema Violation"):
+        tool_query.finalize_query_synthesis("Concept_SchemaGap.md", "q")
+
+
+# ---------------------------------------------------------------------------------------------
+# The retired STORM section list: a gate that could only ever refuse nothing.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_storm_synthesis_is_not_held_to_a_literal_english_section_list(isolated_memory):
+    """The write path required five literal English H2s of any ``Synthesis_STORM_*`` page.
+
+    No page can be named that way -- ``validate_wiki_filename`` allows one underscore and every
+    STORM synthesis in the wiki is ``Synthesis_STORM-<Name>.md`` -- so the branch never ran.
+    The headings also contradicted the owning contract: the ``cognitive-storm-research`` skill
+    ships a Chinese template and states that headings may be adapted per audience and language.
+    What is asserted here is therefore the positive shape: a STORM page in the real naming form
+    with the sections this repository actually enforces writes through the canonical path.
+    """
+    _write_purpose_contract(isolated_memory)
+    wiki = isolated_memory / "wiki"
+    wiki.mkdir(parents=True, exist_ok=True)
+    path = wiki / "Synthesis_STORM-Handling-Contract.md"
+    validate_wiki_filename("Synthesis_STORM-Handling-Contract.md")
+    frontmatter = {
+        "id": "synthesis_storm_handling",
+        "title": "Synthesis_STORM-Handling-Contract",
+        "type": "synthesis",
+        "domain": "General",
+        "status": "Active",
+        "epistemic-status": "seed",
+        "categories": ["System_Architecture"],
+        "updated": "2026-09-23T00:00:00+00:00",
+        "sources": ["raw/original.md"],
+        "strategic_scope": "core",
+        "evidence_tier": "primary",
+    }
+    body = (
+        "## 1. 决策摘要\n\n- x\n\n"
+        "## 核心合成论点 (Core Synthesized Claims)\n\n- claim\n\n"
+        "## 支撑拓扑 (Supporting Topology)\n\n- topology\n"
+    )
+
+    write_markdown_file(path, frontmatter, body)
+
+    assert path.exists(), "a STORM page in the real naming form was refused"
+    written = path.read_text(encoding="utf-8")
+    assert "决策摘要" in written
+    assert "Top 5 Key Findings" not in written
+
+
+def test_the_retired_storm_section_list_stays_retired():
+    """Guard on the other side: the branch must not come back without its contract.
+
+    ``Synthesis_STORM_`` is not nameable and the literal heading list is owned by no skill,
+    template or test in this repository.  The check reads string literals rather than raw text,
+    so the comment recording the removal does not trip it: what must not return is the
+    enforcement, not the note that it is gone.
+    """
+    import ast
+
+    source = (REPO_ROOT / "vector_lake" / "wiki_utils.py").read_text(encoding="utf-8")
+    literals = [
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+
+    assert not any(value.startswith("Synthesis_STORM_") for value in literals)
+    assert not any("Top 5 Key Findings" in value for value in literals)
 
 
 def test_the_memory_share_is_nominal_and_the_burst_needs_an_alert(isolated_memory, monkeypatch):

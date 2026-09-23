@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 
@@ -20,6 +21,28 @@ def test_query_and_timeline_mcp_tools_are_registered():
 def test_query_and_timeline_codex_skills_are_packaged():
     assert (ROOT / "skills" / "query" / "SKILL.md").is_file()
     assert (ROOT / "skills" / "timeline" / "SKILL.md").is_file()
+
+
+def test_the_mcp_query_tool_forwards_the_documented_dry_run_switch(monkeypatch):
+    """The prompt template documents ``dry_run: true``; the wrapper dropped the argument.
+
+    ``prepare_query_context`` has always accepted it and the CLI passes it, so an MCP caller
+    had no way to reach the behaviour the template promises.
+    """
+    parameters = inspect.signature(mcp_server.query_logic_lake).parameters
+    assert "dry_run" in parameters, parameters
+
+    seen = []
+
+    def fake(query_str, dry_run=False):
+        seen.append((query_str, dry_run))
+        return "rendered"
+
+    monkeypatch.setattr(mcp_server.tools, "prepare_query_context", fake)
+
+    assert mcp_server.query_logic_lake("q") == "rendered"
+    assert mcp_server.query_logic_lake("q", dry_run=True) == "rendered"
+    assert seen == [("q", False), ("q", True)], seen
 
 
 def test_host_mcp_manifests_are_identical():

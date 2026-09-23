@@ -608,18 +608,16 @@ def write_markdown_file(path: str | Path, frontmatter: dict, body: str, skip_val
     filename = path.name
     if not skip_validation:
         validate_wiki_filename(filename)
-    
-    if filename.startswith("Synthesis_STORM_") and not skip_validation:
-        required_headers = [
-            "## 1. Top 5 Key Findings",
-            "## 2. The Contradiction Map",
-            "## 3. Actionable Insights",
-            "## 4. Multi-Perspective Raw Scan",
-            "## 5. Peer Review"
-        ]
-        for header in required_headers:
-            if header not in body:
-                raise SafeWriteError(f"STORM Synthesis Structural Violation: The file {filename} is missing mandatory H2 section '{header}'. Please strictly follow the references/storm_report_template.md structure.")
+
+    # A literal STORM section list used to be enforced here for names starting with
+    # ``Synthesis_STORM_``.  It was removed rather than repaired, because there was nothing to
+    # repair it to: no page can carry that name (``validate_wiki_filename`` above allows one
+    # underscore, and every STORM synthesis in the wiki is ``Synthesis_STORM-<Name>.md``), the
+    # five English headings contradicted the owning contract (the ``cognitive-storm-research``
+    # skill, whose template is Chinese and which states that headings may be adapted per
+    # audience and language), and the ``references/storm_report_template.md`` it told the writer
+    # to follow does not exist in this repository.  The branch could only ever refuse nothing
+    # while reading, to anyone auditing this file, as a gate that exists.
     yaml_block = dump_yaml(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
     full_content = f"---\n{yaml_block}---\n{body.lstrip()}"
     expected_path = (get_wiki_dir() / filename).resolve()

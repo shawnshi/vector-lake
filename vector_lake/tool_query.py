@@ -157,6 +157,8 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
     
     valid_files = set()
     absent: list[str] = []
+    withheld: list[tuple[str, str]] = []
+    first_refusal: Exception | None = None
     import pathlib
     wiki_path = pathlib.Path(wiki_dir).resolve()
     
@@ -192,12 +194,41 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
             continue
 
         file_path = os.path.join(wiki_dir, filename)
-        if os.path.exists(file_path):
-            valid_files.add(filename)
-            sanitize_wiki_node(file_path)
-        else:
+        if not os.path.exists(file_path):
             absent.append(filename)
+            continue
+
+        # A proposal the write gate refuses is a result, not a crash: the page is left exactly
+        # as the proposal wrote it, it stays out of the verified set, and the rest of the batch
+        # still runs.  The raise used to leave the function from inside the loop -- every later
+        # file went unchecked and no stub was generated for the pages that had passed.
+        #
+        # The refusal class is deliberately not pinned to a tuple.  The gate is a stack:
+        # ``defense_hook`` reports schema violations, ``write_markdown_file`` raises
+        # ``SafeWriteError`` for its content and path rules, and the YAML parser raises its own
+        # error.  Measured on this host, the reachable class is the schema violation -- an
+        # earlier guess that named only ``SafeWriteError`` was wrong, and a tuple of today's
+        # classes is the same guess.  The exception's own type and message reach the caller, so
+        # a refusal here is reported rather than folded into a count.
+        try:
+            sanitize_wiki_node(file_path)
+        except Exception as exc:  # noqa: BLE001 - one refused proposal must not cost the batch
+            refusal = f"{type(exc).__name__}: {exc}"
+            withheld.append((filename, refusal))
+            if first_refusal is None:
+                first_refusal = exc
+            log.error("Query finalization refused %s: %s", filename, refusal, exc_info=True)
+            continue
+
+        valid_files.add(filename)
             
+    # Nothing accepted is not a per-page refusal, it is an environment that refused every page
+    # (a missing purpose contract is the standing example).  A "0 verified, N withheld" summary
+    # would be the silent-degradation shape this tree forbids, so the first refusal is raised
+    # instead.  A batch that accepted at least one page remains a report.
+    if not valid_files and first_refusal is not None:
+        raise first_refusal
+
     if valid_files:
         # ``valid_files`` means "present on disk", nothing more.  The write belongs to the subagent,
         # so this function cannot attest a change set: it used to print
@@ -212,6 +243,12 @@ def finalize_query_synthesis(files_written_str: str, query_str: str) -> str:
         trace = provenance.format_trace(provenance.build_trace_for_query(query_str))
 
         notes = []
+        if withheld:
+            notes.append(
+                f"{len(withheld)} page(s) were refused by a write gate and left exactly as "
+                f"proposed: {', '.join(name for name, _ in withheld[:3])} "
+                f"(the refusal reason is in the log)."
+            )
         if stubs_refused:
             notes.append(f"{stubs_refused} stub write(s) were refused -- a gate rejected them (see the log).")
         if absent:
