@@ -34,7 +34,7 @@ updated: '2026-09-23'
 
 *[System Directive: This section represents the LATEST consensus. NO historical narrative here. NO marketing fluff.]*
 
-<50 字终极定义，ELI5 风格。> (Last Reshaped: [[2026-09-23]] timeline anchor)
+<50 字终极定义，ELI5 风格。> (Last Reshaped: 2026-09-23 timeline anchor)
 
 ### <该 type 允许的 H3 槽位之一，见 schema.md §4.A>
 
@@ -51,6 +51,8 @@ Rules that apply to this page:
 2. H3 headings are closed per type (`VALID_H3_SLOTS`) — inventing one is a fatal AST error.
 3. Every line carries an inline `(Source: [[Source_*]])` anchor; every bullet restates the entity
    name (no pronouns).
+4. The reshape date is written bare (`(Last Reshaped: 2026-09-23)`), never as a link: `[[2026-09-23]]`
+   is a broken link on write and a junk `Concept_2026-09-23.md` after the next `lint --auto-fix`.
 4. If the page declares `tension_edges`, it must also carry
    `### 认知张力与未决争议 (Controversies & Tensions)` in section 1.
 5. `categories` is exactly one macro-domain and `domain` one of the 9 canonical facets. A new page

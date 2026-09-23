@@ -88,7 +88,13 @@ Format Constraint: These files MUST adhere to the "Compiled Truth | Timeline" ph
 ## 1. 编译事实 (Compiled Truth - READ MODEL)
 *[System Directive: This section represents the LATEST consensus. NO historical narrative here. NO marketing fluff.]*
 
-[Provide a concise 50-word ultimate definition. ELI5 style.] (Last Reshaped: [[YYYY-MM-DD]] timeline anchor)
+[Provide a concise 50-word ultimate definition. ELI5 style.] (Last Reshaped: YYYY-MM-DD)
+
+> **Date is not a link.** Write the reshape date bare, exactly as the live wiki does
+> (3 915 pages) and as ``stub_creator.stub_body`` explains: ``[[2026-06-02]]`` is a broken
+> link the moment it is written, and the next ``lint --auto-fix`` turns it into a junk
+> ``Concept_2026-06-02.md``. Three pages reached the corpus that way before this line said
+> so; the optional ``timeline anchor`` suffix is kept by 817 pages and is harmless.
 
 > **Chunking Rule (No-Pronoun & Metrics Constraint):**
 > Every bullet point in this section MUST restate the entity's explicit name (e.g., "[[Vendor_Acme]] 的底层架构是...", NOT "它的底层架构是..."). 
