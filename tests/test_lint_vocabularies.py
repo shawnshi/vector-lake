@@ -257,6 +257,33 @@ def test_the_metric_evidence_census_reports_coverage_and_gaps(isolated_memory):
     assert "Concept_No-Metric.md: asserts" not in report, "a page with no number was counted"
 
 
+def test_a_source_page_beside_its_own_node_is_not_a_collision(isolated_memory):
+    """The provenance record and the node it fed share a name by design.
+
+    ``Source_哲学家的工具箱`` and ``Concept_哲学家的工具箱`` are one document and one concept, not
+    one entity recorded twice: merging them deletes either the provenance record or the knowledge.
+    Nine of the 42 identity pairs were this shape, and nine of the merge detector's twenty
+    candidates for the same reason (it matches on alias overlap).
+    """
+    _page("Source_Alpha.md", type_="source", status="Active", epistemic="seed", category="System_Architecture")
+    _page("Concept_Alpha.md", type_="concept", status="Active", epistemic="seed", category="System_Architecture")
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "Concept_Alpha.md <-> Source_Alpha.md" not in report, report
+    assert "excluded as a source page beside its own node: 1 pairs" in report, report
+
+
+def test_one_name_under_two_knowledge_types_is_still_a_collision(isolated_memory):
+    """Positive control: the exclusion is about ``Source_``, not about cross-type pairs."""
+    _page("Concept_Beta.md", type_="concept", status="Active", epistemic="seed", category="System_Architecture")
+    _page("Product_Beta.md", type_="product", status="Active", epistemic="seed", category="System_Architecture")
+
+    report = lint_vector_lake(auto_fix=False)
+
+    assert "Concept_Beta.md <-> Product_Beta.md" in report, report
+
+
 def test_missing_required_fields_is_the_single_source():
     """The linter and the write gate must agree on which keys a page needs."""
     system = {

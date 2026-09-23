@@ -594,12 +594,23 @@ def lint_vector_lake(auto_fix: bool = False):
     identity_groups: dict[str, list[str]] = defaultdict(list)
     for key in keys_list:
         identity_groups[entity_identity_key(strip_prefix(key))].append(key)
+    #: pairs withheld because the pattern is by design, not because they are the same entity.
+    source_anchor_pairs = 0
     for members in identity_groups.values():
         if len(members) < 2 or len({_type_prefix(member) for member in members}) < 2:
             continue
         ordered = sorted(members)
         for left_index, key_a in enumerate(ordered):
             for key_b in ordered[left_index + 1:]:
+                # A ``Source_*`` page records the *document* a node came from, so a source page and
+                # the node derived from it share a name whenever the document is named after its
+                # subject -- ``Source_哲学家的工具箱`` beside ``Concept_哲学家的工具箱``.  That is
+                # the ingest contract, not a duplicate: merging them would delete either the
+                # provenance record or the knowledge.  Measured: 9 of the 42 identity pairs, and 9
+                # of the merge detector's 20 candidates for the same reason (alias overlap).
+                if (_type_prefix(key_a) == "Source") != (_type_prefix(key_b) == "Source"):
+                    source_anchor_pairs += 1
+                    continue
                 # No series test here.  A cross-type pair qualifies only because the *name* is the
                 # same, and the same name is a duplicate however many digits it contains --
                 # ``Concept_2023全国深化医改经验推广会`` and ``Event_2023全国深化医改经验推广会``
@@ -701,6 +712,8 @@ def lint_vector_lake(auto_fix: bool = False):
         + (f"; sizes {_histogram(collision_families)}" if collision_families else ""),
         f"excluded as one naming convention: {len(series_pairs)} pairs in "
         f"{len(series_families)} families (largest {max(series_families, default=0)} names)",
+        f"excluded as a source page beside its own node: {source_anchor_pairs} pairs "
+        "(the provenance record and the node it fed share a name by design)",
         "merge decisions belong to merge_suggestions_vector_lake and the governance queue, "
         "not to this pass",
     ]
