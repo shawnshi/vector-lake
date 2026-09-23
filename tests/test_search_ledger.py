@@ -107,3 +107,39 @@ def test_entries_reads_back_what_was_written_and_skips_torn_lines(isolated_memor
 def test_anything_but_zero_leaves_it_on(isolated_memory, monkeypatch, value):
     monkeypatch.setenv("VECTOR_LAKE_SEARCH_LEDGER", value)
     assert search_ledger.enabled() is True
+
+
+def test_the_summary_reports_the_readiness_numbers_not_just_the_count(isolated_memory):
+    """A count says the ledger is on; empty rate, latency and origin say what it answered.
+
+    Before the evaluation traffic was moved out, 893 of 901 entries were batch-1/2 rows, so a
+    reading taken from this file described the evaluation sets rather than the lake in use.
+    """
+    search_ledger.record("q1", mode="page", top_k=5,
+                         returned=[{"key": "Concept_A", "origin": "vec"}, {"key": "Concept_B", "origin": "fts"}],
+                         elapsed_ms=100.0)
+    search_ledger.record("q2", mode="page", top_k=5, returned=[], elapsed_ms=300.0,
+                         notes=["no stored vectors matched"])
+    search_ledger.record("q1", mode="page", top_k=5, returned=[{"key": "Concept_A", "origin": "vec"}],
+                         elapsed_ms=200.0, error="boom")
+
+    summary = search_ledger.summary()
+
+    assert summary["entries"] == 3
+    assert summary["distinct_queries"] == 2, "the same query twice is one distinct query"
+    assert summary["answered"] == 2
+    assert summary["empty"] == 1
+    assert summary["empty_rate"] == pytest.approx(1 / 3, abs=1e-4)
+    assert summary["errors"] == 1
+    assert summary["latency_ms_p50"] == 200.0
+    assert summary["latency_ms_p90"] == 300.0
+    assert summary["origins"] == {"vec": 2, "fts": 1}
+
+
+def test_an_empty_ledger_reports_no_rate_rather_than_zero(isolated_memory):
+    """``0%`` empty and "nothing recorded" are different readiness statements."""
+    summary = search_ledger.summary()
+
+    assert summary["entries"] == 0
+    assert summary["empty_rate"] is None
+    assert summary["latency_ms_p50"] is None

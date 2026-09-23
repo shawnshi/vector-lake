@@ -125,10 +125,17 @@ def doctor_vector_lake(deep_dependency_check: bool = False) -> str:
             checks.append(("Search Ledger", True, "disabled by VECTOR_LAKE_SEARCH_LEDGER=0"))
         else:
             ledger = _ledger.summary()
+            empty_rate = ledger.get("empty_rate")
+            # A count alone says the ledger is on.  What makes it a readiness reading is whether
+            # answers come back empty and how long they take; a ledger full of evaluation rows
+            # (893 of 901 before the split) reported neither about the lake in use.
             checks.append((
                 "Search Ledger",
                 True,
-                f"{ledger['entries']} entr(ies), {ledger['distinct_queries']} distinct quer(ies)",
+                f"{ledger['entries']} production entr(ies), {ledger['distinct_queries']} distinct "
+                f"quer(ies); empty {ledger.get('empty')} "
+                f"({'' if empty_rate is None else str(round(empty_rate * 100)) + '%'}), "
+                f"p50 {ledger.get('latency_ms_p50')}ms, errors {ledger.get('errors')}",
             ))
     except Exception as exc:  # noqa: BLE001 - a status line must not fail the report
         checks.append(("Search Ledger", False, f"unavailable: {type(exc).__name__}: {exc}"))

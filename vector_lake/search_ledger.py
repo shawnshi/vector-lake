@@ -116,10 +116,47 @@ def entries(limit: int = 0) -> list[dict]:
 
 
 def summary() -> dict:
-    """Entry count and distinct-query count, for a doctor line."""
+    """What the ledger says about production retrieval, for the doctor line and for readiness.
+
+    Entries are operator traffic only: the evaluation harness turns the ledger off for the duration
+    of a replay (``benchmarks/search_replay.py``), and the rows written before that guard existed
+    were moved aside to ``search_ledger.eval-legacy.jsonl`` by
+    ``benchmarks/purge_eval_traffic_from_ledger.py``.  Measured before that split: 893 of 901
+    entries were evaluation traffic, so every reading taken from this file was describing the
+    evaluation sets rather than the lake in use.
+
+    The query text is not stored (see the module docstring), so this is a count of what happened --
+    how often an answer was empty, how long it took, and which route produced the pages -- not a
+    list of what was asked.
+    """
     rows = entries()
+    answered = [row for row in rows if row.get("returned")]
+    empty = [row for row in rows if not row.get("returned")]
+    latencies = sorted(
+        float(row["ms"]) for row in rows if isinstance(row.get("ms"), (int, float))
+    )
+    origins: dict[str, int] = {}
+    for row in rows:
+        for entry in row.get("returned") or []:
+            origin = str(entry.get("origin") or "unknown")
+            origins[origin] = origins.get(origin, 0) + 1
+
+    def _percentile(values: list[float], fraction: float) -> float | None:
+        if not values:
+            return None
+        return round(values[min(len(values) - 1, int(len(values) * fraction))], 1)
+
     return {
         "entries": len(rows),
         "distinct_queries": len({row.get("q_hash") for row in rows}),
+        "answered": len(answered),
+        "empty": len(empty),
+        "empty_rate": (len(empty) / len(rows)) if rows else None,
+        "errors": sum(1 for row in rows if row.get("error")),
+        "latency_ms_p50": _percentile(latencies, 0.5),
+        "latency_ms_p90": _percentile(latencies, 0.9),
+        "origins": dict(sorted(origins.items(), key=lambda item: -item[1])),
+        "first_at": rows[0].get("at") if rows else None,
+        "last_at": rows[-1].get("at") if rows else None,
         "path": str(ledger_path()),
     }
