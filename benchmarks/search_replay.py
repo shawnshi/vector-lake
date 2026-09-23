@@ -816,6 +816,11 @@ def main() -> int:
         "config": {
             "fusion": os.environ.get("VECTOR_LAKE_FUSION", "sum"),
             "expansion_quota": os.environ.get("VECTOR_LAKE_EXPANSION_QUOTA", ""),
+            # The entity-name tier changes the ordering, so it belongs in the config record for the
+            # same reason fusion and the expansion quota do: without it, --compare refuses the pair
+            # as "the same configuration" -- which is the honest reading, and it also means two runs
+            # with different ranking behaviour would otherwise look identical in the record.
+            "entity_name_priority": os.environ.get("VECTOR_LAKE_ENTITY_NAME_PRIORITY", "0"),
             "top_k": args.top_k,
             "vectors": args.vectors,
             "labels": str(args.labels),

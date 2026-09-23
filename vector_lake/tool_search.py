@@ -12,6 +12,7 @@ import ast
 import operator
 
 from vector_lake import governance_store, search_ledger
+from vector_lake.node_vocabulary import strip_prefix
 from vector_lake.wiki_utils import get_index_path, get_wiki_dir
 
 
@@ -548,6 +549,80 @@ def build_memory_packet(query: str, max_chars: int = 60000) -> dict:
     }
 
 
+#: How much the query naming an entity counts when ranking.  A query like “卫宁健康的公司战略、核心
+#: 市场及经营风险” contains a span whose presence in a page's *own name* is identity, not lexical
+#: similarity -- and blending the two is what let an analysis page (0.600, whose opening sentence
+#: carries 市场竞争力) outrank the subject page (0.186).  Measured over nine query shapes on three
+#: subjects: bare name -> subject page rank 1; adding framework words -> rank 2, 5, 6 or 13.
+#:
+#: Off by default (0): the ordering is a function the labelled replays were measured against, and
+#: changing it is a decision for the operator, not a side effect of a fix.  Set to 1 to put pages the
+#: query names ahead of pages that merely talk about them, preserving the blended order within each
+#: tier.
+ENTITY_NAME_PRIORITY_DEFAULT = 0.0
+
+#: Shortest declared name that counts as naming an entity.  Two characters, because a Chinese
+#: personal name is two characters -- “师成” was refused at three, and the query that exposed it
+#: (“师成关于医疗人工智能的观点”) then fell to rank 3 as a field page won the tier by score.  The
+#: population was measured before lowering it: 84 two-character names, 86 occurrences, overwhelmingly
+#: real entities (东软, 华为, 王涛, 祁典, 陈飞, 腾讯, 德勤...).  A few look generic (架构, 推理, 幻觉),
+#: and those pages enter the named tier when a query says the word -- which is the intended reading,
+#: not a collision.
+ENTITY_NAME_MIN_CHARS = 2
+
+#: Sort sentinel for a candidate the query does not name: larger than any position, so named pages
+#: come first and keep their order by earliest mention.
+_NO_ENTITY_MATCH = 10 ** 6
+
+
+def _normalize_entity_name(text: str) -> str:
+    """Lower-case, whitespace- and punctuation-free form used to test containment."""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(text).lower())
+
+
+def _entity_name_positions(query: str, candidates: list[tuple[float, dict]]) -> dict[str, int]:
+    """Keys the query names outright, mapped to where in the query their name starts.
+
+    The node name (``strip_prefix``) is included so a page needs no alias to be found by the name
+    its own key carries: ``Product_WiNEX`` is named by “WiNEX” even without the alias the page
+    happens to declare.
+
+    The *position* matters because a query can name more than one entity -- “师成关于医疗人工智能
+    的观点” names both a person and a field, and a tier that treats them as equal lets the field's
+    page push the person's page down by score.  A question puts its subject first (“X 的公司战略…”,
+    “X 关于 Y”), so the earliest mention is the one being asked about.
+    """
+    normalized_query = _normalize_entity_name(query)
+    positions: dict[str, int] = {}
+    if not normalized_query:
+        return positions
+    for _, node in candidates:
+        key = str(node.get("_key") or "")
+        aliases = node.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        names = [node.get("title"), strip_prefix(key), *aliases]
+        best = None
+        for name in names:
+            normalized = _normalize_entity_name(name)
+            if len(normalized) < ENTITY_NAME_MIN_CHARS:
+                continue
+            at = normalized_query.find(normalized)
+            if at != -1 and (best is None or at < best):
+                best = at
+        if best is not None:
+            positions[key] = best
+    return positions
+
+
+def _entity_name_priority() -> float:
+    try:
+        value = float(os.environ.get("VECTOR_LAKE_ENTITY_NAME_PRIORITY", str(ENTITY_NAME_PRIORITY_DEFAULT)))
+    except ValueError:
+        return ENTITY_NAME_PRIORITY_DEFAULT
+    return min(1.0, max(0.0, value))
+
+
 def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
     """Phase 2: local reranking of the retrieved candidate pool with BM25.
 
@@ -629,6 +704,22 @@ def _rerank_candidates_locally(query: str, candidates: list[tuple[float, dict]])
     # Stable: ties keep their upstream relative order.
     order = sorted(range(len(candidates)), key=lambda index: (-blended[index], index))
     return [(round(blended[index], 6), candidates[index][1]) for index in order]
+
+
+def _entity_first_order(
+    query: str, scored: list[tuple[float, dict]]
+) -> list[tuple[float, dict]]:
+    """The final ordering: pages the query *names* first, then by score.
+
+    Two tiers, not a bonus.  A bonus large enough to achieve the same thing is this partition
+    expressed the hard way, and keeping the order a sort key means the score values keep their
+    pool-normalised meaning.
+    """
+    named = _entity_name_positions(query, scored) if _entity_name_priority() > 0 else {}
+    return sorted(
+        scored,
+        key=lambda item: (named.get(item[1].get("_key"), _NO_ENTITY_MATCH), -item[0]),
+    )
 
 
 def _safe_eval(expr: str, context: dict) -> bool:
@@ -940,15 +1031,14 @@ def _search_scored_pages(
     # every eligible page in the ranking, while still making an all-Source answer hard to produce.
     # The absolute cap this replaces shortened the window for 104 of 333 queries at top_k=20.
     penalty = _source_rank_penalty()
-    ordered = sorted(
-        (
-            (score * penalty if node.get("type", "").lower() == "source" else score, node)
-            for score, node in reranked
-        ),
-        key=lambda item: item[0],
-        reverse=True,
-    )
-    final_scored = ordered[:top_k]
+    penalised = [
+        (score * penalty if node.get("type", "").lower() == "source" else score, node)
+        for score, node in reranked
+    ]
+    # The entity tier belongs *here*, at the final ordering: the sort below is by score, so a tier
+    # expressed inside the reranker (which only reorders, it does not rescore) was overwritten by
+    # this very statement -- measured, the switch changed no rank at all.
+    final_scored = _entity_first_order(query, penalised)[:top_k]
 
     if projection_note:
         vector_notes.append(projection_note)
