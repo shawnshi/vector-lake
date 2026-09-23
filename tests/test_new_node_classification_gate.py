@@ -88,12 +88,25 @@ def test_a_bare_string_category_is_refused(isolated_memory):
         _write("Concept_New.md", categories="Healthcare_IT")
 
 
-def test_a_new_node_cannot_use_an_uncontrolled_domain(isolated_memory):
-    """192 domain flavours accumulated while the field had no vocabulary at all."""
+def test_a_new_node_cannot_use_an_unregistered_domain(isolated_memory):
+    """The facet has two tiers: a macro domain, or a vertical registered in the schema.
+
+    192 domain flavours accumulated while the field had no vocabulary at all; the answer was not
+    to force every subject into one of nine macro values -- the pages left outside them were
+    verticals whose tags carried the subject in 1 case of 118.
+    """
     _write_purpose_contract(isolated_memory)
 
-    with pytest.raises(DefenseHookException, match="controlled vocabulary"):
+    with pytest.raises(DefenseHookException, match="neither a macro domain nor a registered"):
         _write("Concept_New.md", domain="AI_Industry")
+
+
+def test_a_registered_vertical_is_accepted_on_a_new_node(isolated_memory):
+    """Positive control: a registered subject passes, and so does a macro domain."""
+    _write_purpose_contract(isolated_memory)
+
+    assert _write("Concept_Media.md", domain="Media").exists()
+    assert _write("Concept_Macro.md", domain="Medical_IT").exists()
 
 
 def test_a_new_node_cannot_enter_the_generated_namespace(isolated_memory):
@@ -276,7 +289,7 @@ def test_the_rules_have_one_owner_each():
         {"categories": ["Healthcare_IT"], "domain": "AI_Industry", "tags": []}, "System_Topic.md"
     )
     assert len(found) == 2, found
-    assert any("controlled vocabulary" in item for item in found)
+    assert any("neither a macro domain nor a registered" in item for item in found)
     assert any("generated artifacts" in item for item in found)
 
 
@@ -327,10 +340,27 @@ def test_lint_does_not_append_a_second_uncategorized(isolated_memory):
     assert frontmatter["categories"] == ["Source", "Uncategorized"]
 
 
-def test_lint_reports_a_domain_outside_the_vocabulary(isolated_memory):
+def test_lint_reports_an_unregistered_domain_and_excuses_a_stub(isolated_memory):
+    """The report names only what needs registering, and a placeholder has no subject yet."""
     _write_purpose_contract(isolated_memory)
     _lintable_page("Concept_Odd-Domain.md", **{"domain: General": "domain: AI_Industry"})
+    stub = _lintable_page("Concept_Placeholder.md")
+    stub.write_text(
+        stub.read_text(encoding="utf-8")
+        .replace("domain: General", "domain: Uncategorized")
+        # The shared fixture has no tags key at all, so the marker is added rather than replaced.
+        .replace("epistemic-status: seed", f"epistemic-status: seed\ntags: [{STUB_MARKER_TAG}]"),
+        encoding="utf-8",
+    )
 
     report = tool_lint.lint_vector_lake(auto_fix=False)
+    lines = report.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("15. "))
+    end = next(i for i, line in enumerate(lines) if line.startswith("16. "))
+    domain_section = "\n".join(lines[start:end])
 
-    assert "outside the controlled vocabulary" in report, report
+    assert "neither a macro domain nor a registered vertical" in domain_section, domain_section
+    assert "Concept_Odd-Domain.md" in domain_section, domain_section
+    assert "Concept_Placeholder.md" not in domain_section, (
+        "a placeholder has no subject yet, so it is not reported for one: " + domain_section
+    )

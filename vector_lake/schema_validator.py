@@ -86,6 +86,45 @@ VALID_DOMAINS = frozenset({
     "General",
 })
 
+# The second tier of the same facet, and the reason it exists: ``domain`` is read in the corpus as
+# a *subject or industry*, not as a second copy of the macro axis.  Measured 2026-09-23, the pages
+# left outside ``VALID_DOMAINS`` were not junk -- 54 verticals (Sociology, Startup, Venture_Capital,
+# Semiconductor, Defense_Tech, Tobacco, ...) whose ``categories`` already said the macro thing and
+# whose tags carried the vertical in exactly 1 page of 118.  Flattening them into the nine macro
+# values would have deleted the only record of their subject.
+#
+# So the facet is **open but curated**: a new node may use a macro domain or one of these
+# registered verticals, and anything else is reported -- and refused on a new node -- until it is
+# registered here.  Registration is a governance act, not a consequence of a page existing.
+DOMAIN_VERTICALS = frozenset({
+    # Social science and the humanities: no macro value names them faithfully.
+    "Sociology",
+    "Academic_Sociology",
+    "Science_Epistemology",
+    "Science",
+    "Scientific_Research",
+    "Mathematics",
+    "History",
+    "Arts",
+    "Narratology",
+    "Communication",
+    "Neuroscience",
+    "Study",
+    # Media, as an industry and as a subject.
+    "Media",
+    "New_Media",
+    # Industries with no faithful macro home.
+    "Tobacco",
+    "Space_Technology",
+    "Agriculture_Machinery",
+    "Consumer_Electronics",
+})
+
+
+def is_registered_domain(domain: str) -> bool:
+    """A macro domain or a registered vertical: the two tiers of the ``domain`` facet."""
+    return domain in VALID_DOMAINS or domain in DOMAIN_VERTICALS
+
 
 def category_shape_violation(frontmatter: dict, filename: str) -> str | None:
     """The category contract's shape and vocabulary, enforced on **every** write.
@@ -140,12 +179,15 @@ def classification_violations(frontmatter: dict, filename: str, body: str | None
                 "the macro-domains, or propose a schema mutation."
             )
 
-    # domain: the subject facet stops drifting at the point of creation.  ~~~~~~~~~~~~~~~~~~
+    # domain: the subject facet stops drifting at the point of creation.  It has two tiers -- a
+    # macro domain, or a vertical registered in DOMAIN_VERTICALS (see the note there for why a
+    # second tier exists at all).  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     domain = str(frontmatter.get("domain") or "").strip()
-    if domain and not artifact and domain not in VALID_DOMAINS:
+    if domain and not artifact and not is_registered_domain(domain):
         violations.append(
-            f"domain '{domain}' is not in the controlled vocabulary. "
-            f"Pick one of {sorted(VALID_DOMAINS)}."
+            f"domain '{domain}' is neither a macro domain nor a registered vertical. "
+            f"Use one of {sorted(VALID_DOMAINS)}, or register the vertical in "
+            "SCHEMA_CATEGORIES.md and DOMAIN_VERTICALS."
         )
 
     # The generated namespace is not a knowledge namespace.  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -19,17 +19,22 @@ from vector_lake import stub_creator
 from vector_lake.link_resolution import build_link_map, resolve_link_target
 from vector_lake.schema_validator import (
     REQUIRED_FIELDS,
-    VALID_DOMAINS,
     VALID_EPISTEMIC_STATUS,
     VALID_STATUS,
     VALID_TYPES,
     asserted_metric_keys,
     category_shape_violation,
+    is_registered_domain,
     missing_required_fields,
     validate_schema,
     SchemaViolationException,
 )
-from vector_lake.node_vocabulary import NON_NODE_WIKI_FILES, is_generated_artifact, strip_prefix
+from vector_lake.node_vocabulary import (
+    NON_NODE_WIKI_FILES,
+    STUB_MARKER_TAG,
+    is_generated_artifact,
+    strip_prefix,
+)
 
 
 # ``VALID_STATUS`` is capitalised while the check below lowercases the page value,
@@ -224,7 +229,6 @@ def lint_vector_lake(auto_fix: bool = False):
     valid_types = VALID_TYPES
     valid_status = _LOWERCASE_STATUS
     valid_epistemic = VALID_EPISTEMIC_STATUS
-    valid_domains = VALID_DOMAINS
     valid_prefixes = VALID_PREFIXES
     required_fields = list(REQUIRED_FIELDS)
 
@@ -526,10 +530,15 @@ def lint_vector_lake(auto_fix: bool = False):
         if shape:
             issues["category"].append(f"{filename}: {shape}")
 
+        # A stub has no subject yet and a generated artifact has none by design, so neither is
+        # reported for an unregistered one: 13 of the 118 pages this section used to flag were
+        # ``auto-stub`` placeholders carrying the literal word ``Uncategorized`` as their domain.
+        # The facet has two tiers -- macro domain, or a vertical registered in the schema.
         domain = str(frontmatter.get("domain") or "").strip()
-        if domain and not system_artifact and domain not in valid_domains:
+        is_stub = STUB_MARKER_TAG in (frontmatter.get("tags") or [])
+        if domain and not system_artifact and not is_stub and not is_registered_domain(domain):
             issues["domain"].append(
-                f"{filename}: domain '{domain}' is outside the controlled vocabulary"
+                f"{filename}: domain '{domain}' is neither a macro domain nor a registered vertical"
             )
 
         # Metric evidence.  ``evidence_tier`` was required of every page and filled on 10% of
